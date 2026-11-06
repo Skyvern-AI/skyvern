@@ -796,6 +796,8 @@ class WorkflowRunContext:
         self._bitwarden_resolved_collection_id: str | None = None
         self.workflow_run_outputs: dict[str, Any] = {}
         self.carried_block_labels: set[str] = set()
+        # In memory only, so a retried or resumed attempt starts empty.
+        self.succeeded_code_block_labels: set[str] = set()
         # Blocks whose loop iterates page-derived values: their current_value/current_item came from a page.
         self.page_derived_loop_labels: set[str] = set()
         # ContextParameter keys a page-derived loop wrote. Never cleared: the value outlives the loop.

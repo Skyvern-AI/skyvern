@@ -723,6 +723,7 @@ const ATTACHMENT_EXTENSIONS = [
   ".xlsx",
   ".xls",
   ".pdf",
+  ".docx",
   ".png",
   ".jpg",
   ".jpeg",

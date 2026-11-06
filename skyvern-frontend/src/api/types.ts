@@ -1136,6 +1136,7 @@ export type ActionsApiResponse = {
   created_by: string | null;
   text: string | null;
   screenshot_artifact_id?: string | null;
+  created_at?: string | null;
   // On the base Action, so it survives the timeline's `list[Action]` serialization. Subclass-only
   // fields (url, keys) do not and must not be declared here.
   file_name?: string | null;

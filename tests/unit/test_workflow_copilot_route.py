@@ -2268,7 +2268,7 @@ async def test_a_cancel_reports_a_paused_or_unfinished_run_only_by_its_recorded_
     unfinished_content = (await _persist_stopped_turn(monkeypatch, unfinished, draft=False))["content"]
     paused_content = (await _persist_stopped_turn(monkeypatch, paused, draft=False))["content"]
 
-    _assert_in_order(unfinished_content, CANCEL_STOP_AT_USER_REQUEST, "wr_open", "no recorded result")
+    _assert_in_order(unfinished_content, CANCEL_STOP_AT_USER_REQUEST, "wr_open", "I had not received its result")
     _assert_in_order(paused_content, CANCEL_STOP_AT_USER_REQUEST, "wr_paused", "Open_Page paused")
     for content in (unfinished_content, paused_content):
         assert not any(word in content for word in ("finished", "passed", "failed", "tested"))
@@ -2403,7 +2403,7 @@ def _draft_another_turn_owns() -> CopilotContext:
         (
             _dispatched_only,
             None,
-            (CANCEL_STOP_AT_USER_REQUEST, "wr_open", "no recorded result"),
+            (CANCEL_STOP_AT_USER_REQUEST, "wr_open", "I had not received its result"),
             [],
             {"editedBlockLabels": None, "runId": "wr_open"},
         ),

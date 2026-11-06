@@ -47,6 +47,7 @@ from skyvern.webeye.browser_acquisition_sample import (
     current_browser_acquisition_sample,
 )
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, DownloadBinding
+from skyvern.webeye.browser_diagnostics import _driver_call, _schedule_detach
 from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.browser_factory import BrowserCleanupFunc, BrowserContextFactory, resolve_artifact_path
 from skyvern.webeye.browser_health import BrowserOperation
@@ -209,6 +210,11 @@ def _chain_browser_cleanups(first: BrowserCleanupFunc, second: BrowserCleanupFun
 _NO_DOCUMENT_STATUSES = frozenset({204, 205, 304})
 # Past this many remembered requests a page's documents' requests are unknown.
 _MAX_REMEMBERED_REQUESTS = 512
+
+# Playwright learns of a document commit from the renderer, which can be before the browser has recorded it as the
+# current history entry. A reload in that gap reloads the previous entry, so it waits this long for the two to agree.
+_COMMITTED_ENTRY_WAIT_SECONDS = 0.5
+_COMMITTED_ENTRY_POLL_SECONDS = 0.02
 
 
 @runtime_checkable
@@ -2077,11 +2083,49 @@ class RealBrowserState(BrowserState):
         if is_engine_timeout(error, self.engine_selection):
             skyvern_context.record_browser_timeout(BrowserOperation.RELOAD)
 
+    async def _wait_for_browser_to_record_page(self, page: Page) -> None:
+        """Wait, bounded, until the browser's current history entry is the page's url, so a reload cannot land on
+        the entry before it and submit an auto-submitting form again. Entries with the same url cannot be told apart,
+        and an error page is left alone since its url is not its entry's. Any failure lets the reload proceed."""
+        if page.url.startswith("chrome-error:"):
+            return
+        started = time.monotonic()
+        deadline = started + _COMMITTED_ENTRY_WAIT_SECONDS
+        session = None
+        behind_polls = 0
+        try:
+            session = await _driver_call(
+                page.context.new_cdp_session(page), deadline - time.monotonic(), on_late_result=_schedule_detach
+            )
+            while True:
+                history = await _driver_call(session.send("Page.getNavigationHistory"), deadline - time.monotonic())
+                entry_url = history["entries"][history["currentIndex"]]["url"]
+                if entry_url.split("#", 1)[0] == page.url.split("#", 1)[0]:
+                    break
+                behind_polls += 1
+                if time.monotonic() >= deadline:
+                    raise TimeoutError
+                await asyncio.sleep(_COMMITTED_ENTRY_POLL_SECONDS)
+            if behind_polls:
+                LOG.info(
+                    "Waited for the browser to record the page before reloading it",
+                    waited_ms=int((time.monotonic() - started) * 1000),
+                    behind_polls=behind_polls,
+                )
+        except TimeoutError:
+            LOG.warning("The browser had not recorded the page before reloading it", url=page.url)
+        except Exception:
+            LOG.debug("Could not confirm the browser recorded the page before reloading it", exc_info=True)
+        finally:
+            if session is not None:
+                _schedule_detach(session)
+
     async def reload_page(self, degradation: bool = False, page: Page | None = None) -> None:
         # A caller that pins its own page passes it, since the working-page accessor would reload
         # (and repoint to) the newest tab instead.
         if page is None:
             page = await self.__assert_page()
+        await self._wait_for_browser_to_record_page(page)
         url = page.url
 
         if not degradation:

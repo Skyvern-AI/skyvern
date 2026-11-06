@@ -34,12 +34,16 @@ from skyvern.forge.sdk.copilot.agent import (
 )
 from skyvern.forge.sdk.copilot.agent_context import RegisteredArtifactEntry, RegisteredArtifactEvidence
 from skyvern.forge.sdk.copilot.build_test_connect_failure import (
+    BROWSER_TOOLS_UNAVAILABLE_ERROR,
+    RAW_SECRET_BROWSER_ERROR,
     BuildTestConnectFailureState,
     build_test_connect_failure_sentence,
 )
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     BLOCK_FACT_SCREEN_NOTICE_MAX_CHARS,
     BLOCK_FACT_URL_MAX_CHARS,
+    DOWNLOAD_TEXT_OVER_PACKET_LIMIT,
+    DOWNLOAD_TEXT_PAST_CHAR_LIMIT,
     OBSERVED_BLOCK_END_URLS_EMPTY,
     OBSERVED_BLOCK_END_URLS_UNREPORTABLE,
     OBSERVED_BLOCK_END_URLS_WITHHELD,
@@ -231,7 +235,7 @@ def test_run_blocks_outcome_records_requested_labels_and_shape_hashes() -> None:
 
 
 def _evidence_naming(run_id: str, file_name: str) -> RegisteredArtifactEvidence:
-    entry = RegisteredArtifactEntry(artifact_id="a_dl_9", file_name=file_name, parsed_text="text")
+    entry = RegisteredArtifactEntry(artifact_id="a_dl_9", file_name=file_name, text="text")
     return RegisteredArtifactEvidence(entries=(entry,), workflow_run_id=run_id)
 
 
@@ -279,6 +283,64 @@ def test_registered_block_download_reaches_packet_with_its_best_known_name(
 
     assert [(d.artifact_id, d.file_name, d.generated) for d in packet.downloads] == [("a_dl_9", expected_name, None)]
     assert any("another run" in notice for notice in packet.omission_notices) is expect_other_run_notice
+
+
+def _statement_download(index: int) -> BuildTestPacketDownload:
+    return BuildTestPacketDownload(
+        artifact_id=f"a_dl_{index}",
+        file_name=f"statement_{index}.pdf",
+        text="Amount due 89.68 " * 1_000,
+        page_count=2,
+        char_count=17_000,
+        truncated=False,
+    )
+
+
+def test_an_over_budget_packet_shortens_download_text_before_the_workflow_readback() -> None:
+    packet = build_test_evidence_packet(make_copilot_ctx(), {"ok": True, "data": {"workflow_run_id": "wr_1"}})
+    statement = BuildTestPacketDownload(
+        artifact_id="a_dl_1",
+        file_name="statement.pdf",
+        text="Amount due 89.68 " * 1_200,
+        page_count=2,
+        char_count=20_400,
+        truncated=False,
+    )
+    oversized = packet.model_copy(
+        update={
+            "canonical_workflow_yaml": "w" * 29_000,
+            "canonical_workflow_yaml_complete": True,
+            "downloads": [statement],
+        }
+    )
+
+    projected = project_build_test_packet_for_llm(oversized)
+
+    assert projected.canonical_workflow_yaml == "w" * 29_000
+    assert projected.canonical_workflow_yaml_complete is True
+    shortened = projected.downloads[0]
+    assert shortened.text is not None and statement.text is not None
+    assert 0 < len(shortened.text) < len(statement.text)
+    assert statement.text.startswith(shortened.text)
+    assert (shortened.page_count, shortened.char_count, shortened.truncated) == (2, 20_400, True)
+    assert DOWNLOAD_TEXT_OVER_PACKET_LIMIT in projected.omission_notices
+    assert len(json.dumps(projected.model_dump(mode="json", exclude_none=True), ensure_ascii=False)) <= 47_000
+
+
+def test_the_direct_test_handoff_keeps_download_text_omission_notices() -> None:
+    packet = build_test_evidence_packet(make_copilot_ctx(), {"ok": True, "data": {"workflow_run_id": "wr_1"}})
+    recorded = packet.model_copy(
+        update={
+            "downloads": [_statement_download(1)],
+            "omission_notices": [DOWNLOAD_TEXT_PAST_CHAR_LIMIT, "run-supplied prose that must not be relayed"],
+        }
+    )
+
+    handoff = project_direct_test_handoff_packet_for_llm(recorded)
+
+    assert DOWNLOAD_TEXT_PAST_CHAR_LIMIT in handoff.omission_notices
+    assert "run-supplied prose that must not be relayed" not in handoff.omission_notices
+    assert handoff.downloads[0].text == _statement_download(1).text
 
 
 def test_packet_workflow_readback_hides_saved_notes_with_doc_editor_off() -> None:
@@ -535,7 +597,7 @@ def test_connect_failure_projects_through_recorded_outcome_and_packet() -> None:
     )
     result = {
         "ok": False,
-        "error": "Build-test browser acquisition stopped: cdp_connect_failed.",
+        "error": build_test_connect_failure_sentence(failure),
         "data": {
             "workflow_run_id": "wr_1",
             "overall_status": "setup_failed",
@@ -555,6 +617,77 @@ def test_connect_failure_projects_through_recorded_outcome_and_packet() -> None:
     assert packet.failure is not None
     assert packet.failure.connect_failure == failure
     assert packet.canonical_workflow_yaml == "title: preserved draft"
+
+
+_BROWSER_LOST_AFTER_RUN_START = (
+    "The test run started, but its browser was lost before any block ran, so nothing was tested. "
+    "Trying again in a fresh browser may work."
+)
+
+
+@pytest.mark.parametrize(
+    ("state", "workflow_run_id", "sentence"),
+    [
+        (
+            "provisioning_unavailable",
+            None,
+            "Build test did not start: no test browser was ready in time. This was a problem on Skyvern's side, "
+            "not with the workflow or the account's credits. No run started. Trying again may work.",
+        ),
+        (
+            "cdp_connect_failed",
+            None,
+            "Build test did not start: Skyvern could not connect to the test browser. This was a problem on "
+            "Skyvern's side, not with the workflow or the account's credits. No run started. Trying again may work.",
+        ),
+        (
+            "already_closed",
+            None,
+            "Build test did not start: the test browser had already closed. No run started. "
+            "Trying again in a fresh browser may work.",
+        ),
+        ("provisioning_unavailable", "wr_1", _BROWSER_LOST_AFTER_RUN_START),
+        ("cdp_connect_failed", "wr_1", _BROWSER_LOST_AFTER_RUN_START),
+        ("already_closed", "wr_1", _BROWSER_LOST_AFTER_RUN_START),
+    ],
+)
+def test_a_browser_start_failure_reads_as_a_plain_sentence_and_keeps_its_typed_state(
+    state: BuildTestConnectFailureState, workflow_run_id: str | None, sentence: str
+) -> None:
+    failure = BuildTestConnectFailure(state=state, workflow_run_id=workflow_run_id)
+
+    result = runtime._build_test_connect_failure_result(failure)
+
+    assert build_test_connect_failure_sentence(failure) == sentence
+    assert state not in sentence
+    assert result["error"] == sentence
+    assert result["data"]["build_test_connect_failure"]["state"] == state
+
+
+@pytest.mark.parametrize("diagnostic", [BROWSER_TOOLS_UNAVAILABLE_ERROR, RAW_SECRET_BROWSER_ERROR])
+def test_a_denied_browser_keeps_its_denial_instead_of_a_retry_invitation(diagnostic: str) -> None:
+    failure = BuildTestConnectFailure(state="provisioning_unavailable", diagnostic=diagnostic)
+
+    assert build_test_connect_failure_sentence(failure) == diagnostic
+
+
+@pytest.mark.asyncio
+async def test_a_finished_run_hands_its_recorded_live_and_cached_credits_to_the_packet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_get_run_results_harness(
+        monkeypatch,
+        run_status="completed",
+        blocks=[run_result_block_row("open_site", "completed", "https://fixture.test/")],
+        run_credits=(40, 15),
+    )
+
+    hydrated = await run_execution_module.hydrate_prior_run_packet(
+        make_copilot_ctx(workflow_permanent_id="wpid-1"), workflow_run_id="wr-1"
+    )
+
+    assert hydrated is not None
+    assert hydrated["run"]["credits_used"] == 55
 
 
 def test_billing_credit_refusal_schema_requires_no_retry_or_new_identity() -> None:
@@ -795,7 +928,10 @@ def test_a_post_run_connect_failure_keeps_the_block_failures_diagnostic_evidence
             reason_code="unrecoverable_tool_error",
             workflow_run_id="wr_1",
             structural_failure_identity="build_test_connect:cdp_connect_failed",
-            observed_evidence_summary="Build-test browser acquisition stopped: cdp_connect_failed.",
+            observed_evidence_summary=(
+                "Build test did not start: Skyvern could not connect to the test browser. This was a problem on "
+                "Skyvern's side, not with the workflow or the account's credits. No run started. Trying again may work."
+            ),
             connect_failure=BuildTestConnectFailure(
                 state="cdp_connect_failed",
                 browser_session_id="pbs_stale",
@@ -842,7 +978,10 @@ def test_a_block_that_died_on_a_plain_exception_is_preserved_like_a_browser_fail
             verdict="not_authoritative",
             reason_code="unrecoverable_tool_error",
             workflow_run_id="wr_1",
-            observed_evidence_summary="Build-test browser acquisition stopped: cdp_connect_failed.",
+            observed_evidence_summary=(
+                "Build test did not start: Skyvern could not connect to the test browser. This was a problem on "
+                "Skyvern's side, not with the workflow or the account's credits. No run started. Trying again may work."
+            ),
             connect_failure=BuildTestConnectFailure(
                 state="cdp_connect_failed",
                 browser_session_id="pbs_stale",
@@ -2189,6 +2328,8 @@ async def test_failed_run_complete_fact_packet_reaches_ordinary_repair_input(
         created_at=datetime(2026, 4, 21, 12, 0),
         trigger_type=None,
         workflow_definition_sha256=None,
+        credits_used=0,
+        cached_credits_used=0,
     )
     block = SimpleNamespace(
         workflow_run_block_id="wrb_failed_complete_packet",

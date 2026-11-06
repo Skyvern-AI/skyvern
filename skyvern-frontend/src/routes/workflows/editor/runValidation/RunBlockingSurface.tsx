@@ -278,10 +278,10 @@ export function RunBlockingSurface() {
   const setCollapsed = useRunBlockingPanelStore((state) => state.setCollapsed);
   const yamlActive = useWorkflowYamlEditorStore((state) => state.active);
   const doc = useWorkflowPresentationStore(
-    (state) => state.enabled && state.presentation === "doc" && !yamlActive,
+    (state) => state.docMounted && !yamlActive,
   );
 
-  // In the Doc the same problem already shows once on its step and in the problem chip.
+  // Only while the Doc is on screen: it shows the same problem on its step and in the problem chip.
   if (blocks.length === 0 || doc) {
     return null;
   }

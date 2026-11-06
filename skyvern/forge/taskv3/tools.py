@@ -31,6 +31,7 @@ from collections import Counter, defaultdict, deque
 from collections.abc import Mapping, Sequence
 from contextvars import ContextVar
 from datetime import datetime
+from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal, NamedTuple, TypeVar
 from urllib.parse import unquote, urlparse
@@ -136,6 +137,11 @@ from skyvern.forge.taskv3.target_label import TARGET_KIND_TOKENS, TARGET_NAME_CA
 from skyvern.utils.contained_effects import contained_effect
 from skyvern.utils.date_values import canonical_iso_date
 from skyvern.webeye.action_deadline import cancellable_driver_call, under_action_deadline
+from skyvern.webeye.actions.handler import (
+    _BLOCKED_INLINE_PDF_RECOVERY_TIMEOUT_SECONDS,
+    _collect_inline_iframe_src_candidates,
+    _recover_blocked_inline_pdf_download,
+)
 from skyvern.webeye.actions.key_names import normalize_key_chord
 from skyvern.webeye.browser_driver_errors import is_driver_error, is_driver_timeout_error
 from skyvern.webeye.browser_state import BLANK_PAGE_URLS, is_selectable_page_url
@@ -1243,16 +1249,39 @@ def _without_split_hidden_tail(text: str, tidy: Callable[[str], str] | None = No
 
 
 # Removed from a quoted layer's text after it is masked: the page script's label set, plus the marks below.
-_FORGEABLE_TEXT = re.compile(
-    "[\x00-\x08\x0e-\x1f\x7f\u0085\u2028\u2029\u200b-\u200f\u202a-\u202e\u2066-\u2069"
-    # Default-ignorable marks a page can hide inside a value: they render as nothing but split it for the mask.
-    "\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180e\u2060\ufeff\uffa0\ufe00-\ufe0f"
-    "\U000e0000-\U000e007f\U000e0100-\U000e01ef]"
+# A str.translate delete table rather than a regex character class, because the same ranges inside a
+# character class trip CodeQL's py/overly-large-range check.
+_FORGEABLE_TEXT = dict.fromkeys(
+    code_point
+    for first, last in (
+        (0x00, 0x08),
+        (0x0E, 0x1F),
+        (0x7F, 0x7F),
+        (0x85, 0x85),
+        (0x2028, 0x2029),
+        (0x200B, 0x200F),
+        (0x202A, 0x202E),
+        (0x2066, 0x2069),
+        # Default-ignorable marks a page can hide inside a value: they render as nothing but split it for the mask.
+        (0xAD, 0xAD),
+        (0x34F, 0x34F),
+        (0x61C, 0x61C),
+        (0x115F, 0x1160),
+        (0x17B4, 0x17B5),
+        (0x180B, 0x180E),
+        (0x2060, 0x2060),
+        (0xFE00, 0xFE0F),
+        (0xFEFF, 0xFEFF),
+        (0xFFA0, 0xFFA0),
+        (0xE0000, 0xE007F),
+        (0xE0100, 0xE01EF),
+    )
+    for code_point in range(first, last + 1)
 )
 
 
 def _tidied_layer_text(text: str) -> str:
-    return " ".join(_FORGEABLE_TEXT.sub("", text).split())
+    return " ".join(text.translate(_FORGEABLE_TEXT).split())
 
 
 def _layer_text_clause(occluder: dict[str, Any] | None, layer_selector: str | None) -> str:
@@ -1574,7 +1603,8 @@ _OFF_CANVAS_JS = r"""(el, r) => {
 # isHoverPointerElement, domUtils.js), recording each root and its name in `state.roots`. An element is
 # not a root when the reading already covers it: it is or is inside a control `listable` keeps, or its
 # pointer parent is itself a root or covered. One that holds such a control is a holder: at most one
-# named, control-free pointer descendant is listed for it, recorded in `state.held`.
+# named, control-free pointer descendant is listed for it, recorded in `state.held`. A named href-less <a>
+# inside a root whose centre misses it is listed beside that root, recorded in `state.extra`.
 _SCROLL_GEOMETRY_JS = r"""
   const flowNegative = (cs) => {
     const wm = cs.writingMode || 'horizontal-tb';
@@ -2387,7 +2417,7 @@ _WITH_POINTER_ROOTS_JS = (
     if (!hasSlotDescendant.has(el)) return false;
     for (const slot of qsa.call(el, 'slot')) {
       for (const a of slot.assignedElements({ flatten: true })) {
-        if (state.roots.has(a) || inListable(a) || anyListable(qsa.call(a, q))) return true;
+        if ((state.roots.has(a) && !state.extra.has(a)) || inListable(a) || anyListable(qsa.call(a, q))) return true;
       }
     }
     return false;
@@ -2532,6 +2562,27 @@ _WITH_POINTER_ROOTS_JS = (
     const hit = l.getRootNode().elementFromPoint(x, y);
     return !!hit && (hit === l || l.contains(hit));
   };
+  // An <a> with no href is not a control to `q`, so the pointer root around it is listed and the anchor covered.
+  // A click on that root lands on its centre, so this returns the root when the centre is outside an anchor that
+  // takes clicks (one with pointer-events:none passes them through to the root).
+  const upOf = (n) => {
+    const p = parentOf.call(n);
+    if (p) return p;
+    const r = Node.prototype.getRootNode.call(n);
+    return r && r.nodeType === 11 ? hostOf.call(r) : null;
+  };
+  const rootMissing = (el) => {
+    if (!state.extra || String(localNameOf.call(el) || '') !== 'a' || getAttr.call(el, 'href') !== null
+      || matches.call(el, q) || getComputedStyle(el).pointerEvents === 'none') return null;
+    for (let a = upOf(el), i = 0; a && i < 64 && isPointer(a); a = upOf(a), i++) {
+      if (state.icons.has(a) || matches.call(a, q)) return null;
+      if (!state.roots.has(a)) continue;
+      const ar = bcr.call(a), r = bcr.call(el);
+      const x = ar.left + ar.width / 2, y = ar.top + ar.height / 2;
+      return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom ? null : a;
+    }
+    return null;
+  };
   // Every label of a dropped control performs the same click, so only its most-named label a pointer can land on is
   // a root; the rest would spend the pointer-root cap on duplicates of one action. A box under 2px a side is unseen,
   // as _unseen holds, so a screen-reader-only label never wins. No eligible label leaves every label to the gates.
@@ -2562,7 +2613,24 @@ _WITH_POINTER_ROOTS_JS = (
         // The cursor is inherited, so a covered parent is the target. A shadow root's top-level element
         // inherits from its host.
         const parent = parentOf.call(el) || root.host || null;
-        if (isPointer(parent) && state.covered.has(parent)) { state.covered.add(el); continue; }
+        if (isPointer(parent) && state.covered.has(parent)) {
+          state.covered.add(el);
+          // Listed beside the root, never instead of it, and under its own budget: the root's line and every
+          // other root's place stay as they were.
+          if (state.extraCount >= state.heldCap || !rootMissing(el)
+            || closest.call(el, '[aria-hidden="true"], [inert]')) continue;
+          const er = bcr.call(el);
+          if (!rootable(el, er) || !hitsItself(el, er)) continue;
+          const name = nameOf(el);
+          if (!name) continue;
+          state.roots.set(el, name.replace(/\s+/g, ' ').slice(0, retain));
+          state.extra.add(el);
+          state.extraCount++;
+          const node = { el, next: null };
+          if (tail) tail.next = node; else head = node;
+          tail = node;
+          continue;
+        }
         const tag = String(localNameOf.call(el) || '');
         // A page-wide pointer cursor says nothing about any one element under it.
         if (tag === 'html' || tag === 'body') { state.covered.add(el); continue; }
@@ -10258,12 +10326,14 @@ async (__tv3TextArgs) => {
   const _screenListable = (el) => {
     try { return _screen(el, false).why === null; } catch (e) { return false; }
   };
-  const _pointerState = { pointer: new Map(), covered: new Set(), roots: new Map(), holders: new Set(), represented: new Set(), held: new Set(), icons: new Set(), iconCount: 0, iconOverflow: 0, notIcon: 0, notIconRoots: new Set(), heldCount: 0, heldCap: """
+  const _pointerState = { pointer: new Map(), covered: new Set(), roots: new Map(), holders: new Set(), represented: new Set(), held: new Set(), extra: new Set(), extraCount: 0, icons: new Set(), iconCount: 0, iconOverflow: 0, notIcon: 0, notIconRoots: new Set(), heldCount: 0, heldCap: """
     + str(OBSERVE_POINTER_ROOT_CAP)
     + r""", count: 0, retain: _RETAIN_WIDTH, ceiling: """
     + str(_POINTER_ROOT_SCAN_CEILING)
     + r""" };
   let pointerListed = 0;
+  // Anchors listed beside the root that misses them (`extra`): a budget of their own, so none takes a root's place.
+  let extraListed = 0;
   // Pointer roots past the cap, and those past the element budget: counted apart from `truncated`,
   // which the budget spends on semantic controls only.
   let pointerCapped = 0;
@@ -11210,7 +11280,8 @@ async (__tv3TextArgs) => {
     const iconRoot = _pointerState.icons.has(el);
     if (iconRoot && iconsListed >= iconRoom) { iconsTruncated++; continue; }
     pointerRoot = _pointerState.roots.has(el) && !iconRoot;
-    if (pointerRoot && !_pointerState.held.has(el)) pointerReserved--;
+    const extraRoot = pointerRoot && _pointerState.extra.has(el);
+    if (pointerRoot && !_pointerState.held.has(el) && !extraRoot) pointerReserved--;
     const screened = _screen(el, pointerRoot);
     const { r, gr, gateEl, ownGated } = screened;
     if (screened.why === 'offCanvas') { hiddenDropped++; hiddenDroppedOffCanvas++; continue; }
@@ -11280,7 +11351,9 @@ async (__tv3TextArgs) => {
         continue;
       }
     }
-    if (pointerRoot && pointerListed + (_pointerState.held.has(el) ? pointerReserved : 0) >= _POINTER_ROOT_CAP) { pointerCapped++; continue; }
+    // Main never listed these anchors, so one past its budget is not a cut the cap note reports.
+    if (extraRoot && extraListed >= _POINTER_ROOT_CAP) continue;
+    if (!extraRoot && pointerRoot && pointerListed + (_pointerState.held.has(el) ? pointerReserved : 0) >= _POINTER_ROOT_CAP) { pointerCapped++; continue; }
     let selector = naturalSelector(el);
     let bind = '';
     if (!selector) {
@@ -11334,6 +11407,7 @@ async (__tv3TextArgs) => {
     if (pointerRoot) rec.pointerRoot = true;
     if (iconRoot) rec.icon = true;
     if (pointerRoot && _pointerState.held.has(el)) rec.pointerHeld = true;
+    if (extraRoot) rec.pointerExtra = true;
     if (placeholder && placeholder !== label) rec.placeholder = placeholder.slice(0, _RETAIN_WIDTH);
     const shows = _shownText(el, label);
     if (shows) rec.shows = shows;
@@ -11465,7 +11539,8 @@ async (__tv3TextArgs) => {
     // _resolve_ref, which requires the element the record NAMES to be the one carrying the act token.
     rec[__OBSERVE_EL_KEY__] = el;
     out.push(rec);
-    if (pointerRoot) pointerListed++;
+    if (extraRoot) extraListed++;
+    else if (pointerRoot) pointerListed++;
     if (iconRoot) iconsListed++;
     elOfRec.set(rec, el);
     stampOfRec.set(rec, { fp: fingerprint(el), anchor: lastAnchor && lastAnchor.sel === selector ? lastAnchor : null });
@@ -11482,6 +11557,7 @@ async (__tv3TextArgs) => {
           const r2 = els[k].el.getBoundingClientRect();
           if (r2.width === 0 || r2.height === 0) continue;
           if (_pointerState.icons.has(els[k].el)) { iconsTruncated++; continue; }
+          if (_pointerState.extra.has(els[k].el)) continue;
           if (_pointerState.roots.has(els[k].el)) {
             if (pointerListed + pointerTruncated < _POINTER_ROOT_CAP) pointerTruncated++;
             else pointerCapped++;
@@ -11525,7 +11601,7 @@ async (__tv3TextArgs) => {
         const at = c.rec === null ? -1 : out.indexOf(c.rec);
         if (at !== -1) {
           out.splice(at, 1); labelOfControl.delete(c.el); boundLabelOfControl.delete(c.el);
-          if (c.rec.pointerRoot) { pointerListed--; pointerDropped++; } else dropped++;
+          if (c.rec.pointerRoot) { if (c.rec.pointerExtra) extraListed--; else pointerListed--; pointerDropped++; } else dropped++;
         }
       }
       if (lost && !rem.shared) { if (rem.fresh) markersWritten--; else markersReused--; }
@@ -11535,7 +11611,7 @@ async (__tv3TextArgs) => {
       const at = rem.rec === null ? -1 : out.indexOf(rem.rec);
       if (at !== -1) {
         out.splice(at, 1); labelOfControl.delete(rem.el); boundLabelOfControl.delete(rem.el);
-        if (rem.rec.pointerRoot) { pointerListed--; pointerDropped++; } else dropped++;
+        if (rem.rec.pointerRoot) { if (rem.rec.pointerExtra) extraListed--; else pointerListed--; pointerDropped++; } else dropped++;
       }
       if (rem.fresh) markersWritten--; else markersReused--;
     }
@@ -11595,7 +11671,7 @@ async (__tv3TextArgs) => {
       // as holding one field when it holds two.
       if (el && connected) droppedStillLive.push(el);
       labelOfControl.delete(el); boundLabelOfControl.delete(el); out.splice(k, 1);
-      if (rec.pointerRoot) { pointerListed--; pointerDropped++; } else dropped++;
+      if (rec.pointerRoot) { if (rec.pointerExtra) extraListed--; else pointerListed--; pointerDropped++; } else dropped++;
     }
     else if (el) {
       // Recomputed after the drain rather than added to the fingerprint above: a page's own observer
@@ -13533,13 +13609,15 @@ def _merge_realm(into: dict[str, Any], other: dict[str, Any]) -> list[int]:
     # page-wide, so neither limit ever costs the other kind a place.
     room = max(0, OBSERVE_MERGED_ELEMENT_MAX - sum(1 for e in elements if not (e.get("pointerRoot") or e.get("icon"))))
     pointer_room = max(
-        0, OBSERVE_POINTER_ROOT_CAP - sum(1 for e in elements if e.get("pointerRoot") and not e.get("pointerHeld"))
+        0,
+        OBSERVE_POINTER_ROOT_CAP
+        - sum(1 for e in elements if e.get("pointerRoot") and not (e.get("pointerHeld") or e.get("pointerExtra"))),
     )
     kept: list[int] = []
     pointer_over_cap = 0
     over_page_cap = 0
     for i, e in enumerate(incoming):
-        if e.get("pointerHeld") or e.get("icon"):
+        if e.get("pointerHeld") or e.get("pointerExtra") or e.get("icon"):
             pass  # Ranked page-wide by _rank_held_pointer_roots_last once every realm is merged.
         elif e.get("pointerRoot"):
             if pointer_room == 0:
@@ -13580,11 +13658,15 @@ def _merge_realm(into: dict[str, Any], other: dict[str, Any]) -> list[int]:
 
 
 def _rank_held_pointer_roots_last(data: dict[str, Any]) -> list[int]:
-    """Keep a holder's stand-in child only in the page-wide pointer cap left after every other pointer root, and an
-    icon only in the page-wide element budget left after every control. Returns the kept indices, which the caller
-    applies to its handle and owner lists."""
+    """Keep a holder's stand-in child only in the page-wide pointer cap left after every other pointer root, an
+    anchor listed beside the root that misses it only in a page-wide cap of its own, and an icon only in the
+    page-wide element budget left after every control. Returns the kept indices, which the caller applies to its
+    handle and owner lists."""
     elements = data.get("elements") or []
-    room = OBSERVE_POINTER_ROOT_CAP - sum(1 for e in elements if e.get("pointerRoot") and not e.get("pointerHeld"))
+    room = OBSERVE_POINTER_ROOT_CAP - sum(
+        1 for e in elements if e.get("pointerRoot") and not (e.get("pointerHeld") or e.get("pointerExtra"))
+    )
+    extra_room = OBSERVE_POINTER_ROOT_CAP
     icon_room = OBSERVE_MERGED_ELEMENT_MAX - sum(1 for e in elements if not (e.get("pointerRoot") or e.get("icon")))
     kept: list[int] = []
     held_over = 0
@@ -13595,6 +13677,10 @@ def _rank_held_pointer_roots_last(data: dict[str, Any]) -> list[int]:
                 held_over += 1
                 continue
             room -= 1
+        elif e.get("pointerExtra"):
+            if extra_room <= 0:
+                continue
+            extra_room -= 1
         elif e.get("icon"):
             if icon_room <= 0:
                 icons_over += 1
@@ -14705,7 +14791,9 @@ def build_browser_tools(
             "icons_truncated": int(data.get("iconsTruncated") or 0),
             # Distinct unnamed pointer roots rejected by the icon heuristic, separate from budget and selector drops.
             "unnamed_not_icon": int(data.get("unnamedNotIcon") or 0),
-            "pointer_roots_listed": sum(1 for e in elements if e.get("pointerRoot")),
+            "pointer_roots_listed": sum(1 for e in elements if e.get("pointerRoot") and not e.get("pointerExtra")),
+            # Href-less anchors listed beside the pointer root whose click would miss them.
+            "pointer_extras_listed": sum(1 for e in elements if e.get("pointerExtra")),
             "pointer_capped": int(data.get("pointerCapped") or 0),
             "pointer_truncated": int(data.get("pointerTruncated") or 0),
             "pointer_dropped": int(data.get("pointerDropped") or 0),
@@ -24052,7 +24140,7 @@ def build_browser_tools(
             _tool_spec.handler = _with_act_deadline(_tool_spec.name, _tool_spec.handler)
     # Inside the download signal, so download lines and failures follow the page-text delta.
     _apply_text_delta(tools)
-    _apply_download_signal(tools, downloads_dir, download_failures, download_wait)
+    _apply_download_signal(tools, downloads_dir, download_failures, download_wait, page_provider)
     if unseen_text is not None:
         unseen_text.unreported = _unreported_text
     return tools
@@ -24379,6 +24467,7 @@ _DOWNLOAD_FAILURE_RESOURCE_TYPES = frozenset({"xhr", "fetch"})
 _DOWNLOAD_FAILURE_SETTLE_SECONDS = 2.5
 _SESSION_DOWNLOAD_LIST_TIMEOUT_SECONDS = 2.0
 DOWNLOAD_NO_FILE_THIS_ACTION = "No file downloaded during this action."
+_BLOCKED_INLINE_FRAME_BASELINE_TIMEOUT_SECONDS = 5.0
 DOWNLOAD_NO_SESSION_FILE_YET = "No file has reached the browser session's storage yet."
 _DOWNLOAD_FAILURE_URL_MAX = 120
 _DOWNLOAD_NAME_WAIT_SECONDS = 1.0
@@ -24625,11 +24714,15 @@ def _apply_download_signal(
     downloads_dir: str | None,
     failure_watch: DownloadFailureWatch | None = None,
     download_wait: Callable[[], Awaitable[None]] | None = None,
+    page_provider: PageProvider | None = None,
 ) -> None:
     """Wrap every tool so the next wrapped result reports files landing in `downloads_dir` and failures `failure_watch`
     saw. A billable call, or one that leaves a download in flight, first awaits `download_wait` so it names its file."""
     if not downloads_dir and failure_watch is None:
         return
+    # Only a block the engine built a download wait for: elsewhere the per-call iframe enumeration
+    # below would be paid by every click for a recovery that has no file to stand in for.
+    recover_blocked_frames = bool(downloads_dir) and download_wait is not None and page_provider is not None
 
     seen_completed: set[str] = set()
     seen_started: set[str] = set()
@@ -24693,6 +24786,60 @@ def _apply_download_signal(
             session_baselined = True
             return None
         return listed
+
+    def _landed_a_file_this_call(session_files: list[str] | None) -> bool:
+        completed, in_progress = _list_split()
+        return (
+            any(name not in seen_completed for name in completed)
+            or bool(in_progress)
+            or any(uri not in seen_session for uri in session_files or ())
+        )
+
+    async def _inline_iframe_baseline() -> tuple[Any, list[str]] | None:
+        """The page and its iframe srcs before the call, which the recovery below attributes a frame by."""
+        assert page_provider is not None
+        try:
+            page = await page_provider()
+            if page is None:
+                return None
+            # Unlike v1's once-per-download-action read, this runs before every may-submit call on a
+            # download block, so it is bounded: enumeration is one evaluate per frame, and a frame
+            # that will not answer must delay the click itself by a known amount, not by its own timeout.
+            async with asyncio.timeout(_BLOCKED_INLINE_FRAME_BASELINE_TIMEOUT_SECONDS):
+                return page, await _collect_inline_iframe_src_candidates(page)
+        except Exception:
+            LOG.info("taskv3 inline iframe baseline failed", exc_info=True)
+            return None
+
+    async def _recover_blocked_inline_pdf(baseline: tuple[Any, list[str]]) -> None:
+        """Save a PDF this call rendered in a frame the browser refused to display, so the lines below name it.
+
+        The target downloads fine; it just cannot be framed, so no download event ever fires and
+        nothing reaches `downloads_dir`. v1 recovers the bytes same-origin from the refused frame's
+        own src (SKY-12559); writing them into `downloads_dir` here rejoins the same reporting,
+        settle and finalize path a browser download takes.
+        """
+        assert page_provider is not None and downloads_dir
+        baseline_page, iframe_srcs_before = baseline
+        context = skyvern_context.current()
+        try:
+            page = await page_provider()
+            # A call that took the working page somewhere else (a popup it opened, a page it closed)
+            # leaves a baseline that belongs to a document this one no longer holds, so nothing in the
+            # page we can read now is attributable to it.
+            if page is None or page is not baseline_page:
+                return
+            # One whole-operation budget over every candidate fetch, as v1 caps it: a hung
+            # same-origin server must not out-wait the loop this recovery backstops.
+            async with asyncio.timeout(_BLOCKED_INLINE_PDF_RECOVERY_TIMEOUT_SECONDS):
+                await _recover_blocked_inline_pdf_download(
+                    page,
+                    Path(downloads_dir),
+                    workflow_run_id=context.workflow_run_id if context is not None else None,
+                    iframe_srcs_before=iframe_srcs_before,
+                )
+        except Exception:
+            LOG.warning("taskv3 blocked-inline PDF recovery failed", exc_info=True)
 
     def _with_file_lines(
         result: ToolResult, compactable: bool, page_names: Mapping[str, str], session_files: list[str]
@@ -24779,6 +24926,10 @@ def _apply_download_signal(
                     except Exception:
                         LOG.warning("taskv3 download signal baseline snapshot failed", tool=_tool_name, exc_info=True)
                     baseline["done"] = True
+            # Before the handler: a frame already on the page is not the one this call opened.
+            iframe_baseline = (
+                await _inline_iframe_baseline() if recover_blocked_frames and _may_submit(_tool_name, args) else None
+            )
             call = await failure_watch.begin() if failure_watch is not None else 0
             try:
                 result = await _handler(args)
@@ -24806,6 +24957,9 @@ def _apply_download_signal(
                 if landed:
                     page_names = await failure_watch.page_names(landed)
             session_files = await _new_session_files()
+            # Last, after every signal that a file did arrive: a recovery is for the call that got none.
+            if iframe_baseline is not None and not _landed_a_file_this_call(session_files):
+                await _recover_blocked_inline_pdf(iframe_baseline)
             reported = True
             try:
                 result, reported = _with_file_lines(result, _compactable, page_names, session_files or [])

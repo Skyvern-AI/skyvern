@@ -160,6 +160,7 @@ def test_no_hardcoded_workflow_routes_outside_constants() -> None:
     allowed = {
         _workflow_http.PUBLIC_WORKFLOW_ROUTE,
         _workflow_http.INTERNAL_WORKFLOW_ROUTE,
+        _workflow_http.INTERNAL_WORKFLOW_RUN_BLOCK_ROUTE,
     }
     tree = ast.parse(inspect.getsource(_workflow_http))
     offenders: list[str] = []

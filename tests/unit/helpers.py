@@ -31,11 +31,13 @@ from skyvern.forge.sdk.artifact.storage.base import (
 )
 from skyvern.forge.sdk.artifact.storage.unique_pdfs import unique_pdf_file_infos
 from skyvern.forge.sdk.db.enums import TaskType
+from skyvern.forge.sdk.db.repositories.workflow_runs import WorkflowRunBlockErrorRow
 from skyvern.forge.sdk.executor.run_liveness import RunWriteAuthority
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
+from skyvern.forge.sdk.workflow.service import _merge_workflow_run_errors
 from skyvern.forge.taskv3.loop import JUSTIFY_HOLD_MESSAGE
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.utils.action_redaction import REDACTED_INPUT_VALUE, REDACTED_OTP_VALUE
@@ -1049,3 +1051,26 @@ async def unique_stored_pdf_ids(monkeypatch: Any, storage: Any, prefix: str, cla
     monkeypatch.setattr(app, "STORAGE", storage)
     monkeypatch.setattr(app.DATABASE.artifacts, "get_artifacts_by_ids", AsyncMock(return_value=rows))
     return [file_info.artifact_id or "" for file_info in await unique_pdf_file_infos(files, "o_1", ["wr_1"])]
+
+
+BLOCK_ERROR_FACT_KEYS = frozenset(
+    {
+        "workflow_run_block_id",
+        "block_label",
+        "block_type",
+        "loop_index",
+        "final_url",
+        "exception_class",
+        "exception_message",
+        "failing_line",
+        "source_line",
+    }
+)
+
+
+def merge_block_error_reasons(
+    task_errors: list[dict[str, Any]], rows: list[tuple[Any, ...]], **kwargs: Any
+) -> list[dict[str, Any]]:
+    """The merged errors rows without the per-block facts, for tests that pin codes and reasoning."""
+    errors = _merge_workflow_run_errors(task_errors, [WorkflowRunBlockErrorRow(*row) for row in rows], **kwargs)
+    return [{key: value for key, value in error.items() if key not in BLOCK_ERROR_FACT_KEYS} for error in errors]

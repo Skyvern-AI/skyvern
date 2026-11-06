@@ -1,7 +1,5 @@
 import { ChevronDownIcon } from "@radix-ui/react-icons";
 
-import { Badge } from "@/components/ui/badge";
-
 import type { CodeBlockFailure } from "./codeBlockFailure";
 
 export function CodeBlockFailureDetails({
@@ -11,42 +9,43 @@ export function CodeBlockFailureDetails({
   failure: CodeBlockFailure;
   reason: string | null;
 }) {
+  const facts: Array<[string, string]> = [];
+  if (failure.exceptionClass) {
+    facts.push(["Exception", failure.exceptionClass]);
+  }
+  if (failure.line !== null) {
+    facts.push(["Line", String(failure.line)]);
+  }
+  if (failure.sourceLine) {
+    facts.push(["Source", failure.sourceLine]);
+  }
+  if (failure.code) {
+    facts.push(["Error code", failure.code]);
+  }
+  if (facts.length === 0 && !reason) {
+    return null;
+  }
   return (
-    <>
-      {failure.line !== null || failure.code ? (
-        <div className="mt-2 flex flex-wrap items-center gap-1.5">
-          {failure.line !== null ? (
-            <Badge
-              variant="secondary"
-              className="h-5 px-1.5 py-0 text-[10px] tabular-nums"
-            >
-              Line {failure.line}
-            </Badge>
-          ) : null}
-          {failure.code ? (
-            <Badge
-              variant="outline"
-              className="h-5 max-w-full overflow-hidden px-1.5 py-0 text-[10px] font-normal"
-              title={`Error code ${failure.code}`}
-            >
-              <span className="truncate font-mono">
-                Error code {failure.code}
-              </span>
-            </Badge>
-          ) : null}
-        </div>
+    <details className="group mt-2">
+      <summary className="flex w-fit cursor-pointer list-none items-center gap-1 rounded text-[11px] font-medium text-muted-foreground outline-none hover:text-foreground focus-visible:ring-1 focus-visible:ring-ring [&::-webkit-details-marker]:hidden">
+        <ChevronDownIcon className="h-3 w-3 transition-transform group-open:rotate-180" />
+        Technical details
+      </summary>
+      {facts.length > 0 ? (
+        <dl className="mt-1.5 grid grid-cols-[auto_1fr] gap-x-2 gap-y-0.5 text-[11px]">
+          {facts.map(([label, value]) => (
+            <div key={label} className="contents">
+              <dt className="text-muted-foreground">{label}</dt>
+              <dd className="min-w-0 break-words font-mono">{value}</dd>
+            </div>
+          ))}
+        </dl>
       ) : null}
       {reason ? (
-        <details className="group mt-2">
-          <summary className="flex w-fit cursor-pointer list-none items-center gap-1 rounded text-[11px] font-medium text-muted-foreground outline-none hover:text-foreground focus-visible:ring-1 focus-visible:ring-ring [&::-webkit-details-marker]:hidden">
-            <ChevronDownIcon className="h-3 w-3 transition-transform group-open:rotate-180" />
-            Technical details
-          </summary>
-          <p className="mt-1.5 max-h-32 overflow-auto whitespace-pre-wrap break-words rounded bg-slate-elevation2 px-2.5 py-2 font-mono text-[11px] leading-relaxed text-muted-foreground">
-            {reason}
-          </p>
-        </details>
+        <p className="mt-1.5 max-h-32 overflow-auto whitespace-pre-wrap break-words rounded bg-slate-elevation2 px-2.5 py-2 font-mono text-[11px] leading-relaxed text-muted-foreground">
+          {reason}
+        </p>
       ) : null}
-    </>
+    </details>
   );
 }

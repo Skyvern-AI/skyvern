@@ -3,6 +3,11 @@ import { useRef } from "react";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { toast } from "@/components/ui/use-toast";
+import {
+  INVALID_SOP_FILE_TOAST,
+  SOP_ACCEPT,
+  isSopFile,
+} from "@/routes/workflows/editor/workspaceAuthoringActions";
 import { ControlTooltip } from "@/routes/workflows/studio/ControlTooltip";
 import { cn } from "@/util/utils";
 
@@ -28,7 +33,8 @@ type StartFromCardsProps = {
   gridClassName?: string;
 };
 
-const UPLOAD_SOP_HINT = "Attach a procedure PDF for Copilot to build from";
+const UPLOAD_SOP_HINT =
+  "Attach a procedure (PDF or Word .docx) for Copilot to build from";
 const RECORD_TASK_HINT =
   "Skyvern records your clicks, typing, and navigation, then turns them into workflow steps";
 
@@ -76,7 +82,7 @@ function StartFromCards({
                   Upload an SOP
                 </span>
                 <span className="mt-0.5 block text-xs leading-snug text-muted-foreground">
-                  A PDF of the procedure
+                  A PDF or Word (.docx) file of the procedure
                 </span>
               </span>
             </button>
@@ -112,8 +118,8 @@ function StartFromCards({
       <input
         ref={sopFileInputRef}
         type="file"
-        accept=".pdf,application/pdf"
-        aria-label="Choose an SOP PDF"
+        accept={SOP_ACCEPT}
+        aria-label="Choose an SOP file"
         className="hidden"
         onChange={(event) => {
           const file = event.target.files?.[0];
@@ -121,12 +127,8 @@ function StartFromCards({
           // Reset first: picking the same file twice in a row fires no change event otherwise.
           event.target.value = "";
           if (uploadDisabled) return;
-          if (!file.name.toLowerCase().endsWith(".pdf")) {
-            toast({
-              variant: "destructive",
-              title: "Invalid file type",
-              description: "Please select a PDF file",
-            });
+          if (!isSopFile(file)) {
+            toast(INVALID_SOP_FILE_TOAST);
             return;
           }
           uploadSOP.onFile(file);

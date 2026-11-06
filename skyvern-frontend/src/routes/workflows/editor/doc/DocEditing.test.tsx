@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -21,6 +22,8 @@ import {
 import { useWorkflowSnapshotStore } from "@/store/WorkflowSnapshotStore";
 
 import { DocEditBar, DocStepPicker } from "./DocEditing";
+import { useDocSaveFailureStore } from "./docSaveState";
+import { caretOnEdge } from "./docCaret";
 import { DocStepHeader } from "./DocStep";
 import { WorkflowDocActionsContext } from "./WorkflowDocActionsContext";
 import { createDocEditApi, TOP_SCOPE } from "./docEditApi";
@@ -59,6 +62,8 @@ afterEach(() => {
   useWorkflowHistoryAccessStore.getState().reset();
   useWorkflowSnapshotStore.getState().clearSnapshot();
   useWorkflowHasChangesStore.setState({ hasChanges: false });
+  useWorkflowYamlEditorStore.setState({ editorOwner: null, pendingSaves: {} });
+  useDocSaveFailureStore.setState({ failures: {} });
 });
 
 describe("Doc edit bar row", () => {
@@ -95,7 +100,23 @@ describe("Doc Save", () => {
     expect(save).toHaveBeenCalledTimes(1);
   });
 
+  test("Cmd+S saves the Doc and keeps the browser's own save out", () => {
+    useWorkflowHasChangesStore.setState({ hasChanges: true });
+    render(<DocEditBar />);
+
+    const proceeded = fireEvent.keyDown(document.body, {
+      key: "s",
+      metaKey: true,
+    });
+
+    expect(proceeded).toBe(false);
+    expect(save).toHaveBeenCalledTimes(1);
+  });
+
   test("a failed save says why, keeps the edit and offers Try again", async () => {
+    useWorkflowYamlEditorStore.setState({
+      editorOwner: { workflowPermanentId: "wpid_1", active: true },
+    });
     useWorkflowHasChangesStore.setState({ hasChanges: true });
     save.mockRejectedValueOnce(new AxiosError("Network Error", "ERR_NETWORK"));
     render(<DocEditBar />);
@@ -132,13 +153,59 @@ describe("Doc Save", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
-    await screen.findByText(/Couldn't save/);
-    const pendingSaves = useWorkflowYamlEditorStore.getState().pendingSaves;
-    expect(pendingSaves.wpid_a).toBeUndefined();
-    expect(pendingSaves.wpid_b?.persisting).toBe(true);
+    await waitFor(() =>
+      expect(
+        useWorkflowYamlEditorStore.getState().pendingSaves.wpid_a,
+      ).toBeUndefined(),
+    );
+    expect(
+      useWorkflowYamlEditorStore.getState().pendingSaves.wpid_b?.persisting,
+    ).toBe(true);
+    // The reason belongs to the workflow that failed, not to the one now open.
+    expect(useDocSaveFailureStore.getState().failures).toEqual({
+      wpid_a: "can't reach the server",
+    });
+    expect(screen.queryByText(/Couldn't save/)).toBe(null);
+  });
+
+  test("a failure recorded for another workflow does not show on this bar", () => {
     useWorkflowYamlEditorStore.setState({
-      editorOwner: null,
-      pendingSaves: {},
+      editorOwner: { workflowPermanentId: "wpid_b", active: true },
+    });
+    useDocSaveFailureStore.setState({
+      failures: { wpid_a: "can't reach the server" },
+    });
+    useWorkflowHasChangesStore.setState({ hasChanges: true });
+    render(<DocEditBar />);
+
+    expect(screen.queryByText(/Couldn't save/)).toBe(null);
+    expect(screen.getByRole("button", { name: "Save" })).toBeTruthy();
+  });
+
+  test("the bar drops only its own workflow's failure when the Doc unmounts or has no unsaved changes", () => {
+    useWorkflowYamlEditorStore.setState({
+      editorOwner: { workflowPermanentId: "wpid_1", active: true },
+    });
+    const failures = {
+      wpid_1: "can't reach the server",
+      wpid_2: "the server had a problem",
+    };
+    useDocSaveFailureStore.setState({ failures });
+    useWorkflowHasChangesStore.setState({ hasChanges: true });
+    const { unmount } = render(<DocEditBar />);
+    expect(
+      screen.getByText(/Couldn't save: can't reach the server/),
+    ).toBeTruthy();
+    unmount();
+    expect(useDocSaveFailureStore.getState().failures).toEqual({
+      wpid_2: "the server had a problem",
+    });
+
+    useDocSaveFailureStore.setState({ failures });
+    render(<DocEditBar />);
+    act(() => useWorkflowHasChangesStore.getState().setHasChanges(false));
+    expect(useDocSaveFailureStore.getState().failures).toEqual({
+      wpid_2: "the server had a problem",
     });
   });
 
@@ -263,5 +330,39 @@ describe("Add a step search", () => {
     );
     fireEvent.change(input, { target: { value: "For" } });
     expect(screen.getAllByRole("option")[0]!.textContent).toMatch(/^Loop/);
+  });
+});
+
+describe("caretOnEdge", () => {
+  test("a caret with no box in the middle of wrapped text is not on an edge", () => {
+    const rect = (top: number, height: number) =>
+      ({ top, bottom: top + height, height }) as DOMRect;
+    const el = document.createElement("div");
+    el.contentEditable = "true";
+    el.textContent = "first wrapped line second wrapped line";
+    el.getBoundingClientRect = () => rect(0, 40);
+    document.body.appendChild(el);
+    const proto = Range.prototype as unknown as Record<string, unknown>;
+    const saved = [proto.getClientRects, proto.getBoundingClientRect];
+    // jsdom has no layout: a collapsed caret has no box, and the one character next to it sits on the second line.
+    proto.getBoundingClientRect = () => rect(0, 0);
+    proto.getClientRects = function (this: Range) {
+      return this.startOffset === 25 && this.endOffset === 26
+        ? [rect(20, 20)]
+        : [];
+    };
+    try {
+      const text = el.firstChild as Text;
+      const range = document.createRange();
+      range.setStart(text, 25);
+      range.collapse(true);
+      window.getSelection()!.removeAllRanges();
+      window.getSelection()!.addRange(range);
+      expect(caretOnEdge(el, "first")).toBe(false);
+      expect(caretOnEdge(el, "last")).toBe(true);
+    } finally {
+      [proto.getClientRects, proto.getBoundingClientRect] = saved;
+      el.remove();
+    }
   });
 });

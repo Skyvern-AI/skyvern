@@ -14,8 +14,6 @@ import {
   filenameForDownloadedFileUrl,
   getBlockDownloadedFileUrls,
 } from "../../workflowRun/blockDownloadedFiles";
-import { describeCodeBlockFailure } from "../../workflowRun/codeBlockFailure";
-import { formatFailureReason } from "../../workflowRun/failureReasonFormat";
 import { StatusDot } from "../../workflowRun/StatusDot";
 import {
   HeroScreenshot,
@@ -25,8 +23,8 @@ import { useHeroScreenshot } from "../../studio/runview/useHeroScreenshot";
 import { useBlockScreenshot } from "../../workflowRun/useBlockScreenshot";
 import type { WorkflowRunBlock } from "../../types/workflowRunTypes";
 import { useDocRun } from "./useDocRun";
-import { failureHeadlineInPlainWords } from "./docFailureText";
 import {
+  blockFailureHeadline,
   docLoopProgressText,
   docRunStoppedByStep,
   stoppedOnPurpose,
@@ -63,11 +61,16 @@ function DocLoopItems({ progress }: { progress: DocLoopProgress }) {
               isFinalized={item.state !== "running"}
             />
           </span>
-          <span className="min-w-0 [overflow-wrap:anywhere]">
+          <span
+            className={cn(
+              "min-w-0",
+              item.state === "failed" ? "truncate" : "[overflow-wrap:anywhere]",
+            )}
+          >
             Item {item.index + 1}
             {item.value ? ` · ${item.value}` : ""}
-            {item.state === "failed" && item.failureReason
-              ? ` · ${formatFailureReason(item.failureReason).headline ?? "failed"}`
+            {item.state === "failed" && item.failureHeadline
+              ? ` · ${item.failureHeadline}`
               : ""}
           </span>
         </li>
@@ -78,13 +81,7 @@ function DocLoopItems({ progress }: { progress: DocLoopProgress }) {
 
 // Same short headline the Run panel states; the full text is in the expanded inspector.
 function failureLine(block: WorkflowRunBlock): string {
-  if (!block.failure_reason?.trim()) return "Failed";
-  const headline =
-    describeCodeBlockFailure(block)?.title ??
-    failureHeadlineInPlainWords(
-      block.failure_reason,
-      (raw) => formatFailureReason(raw).headline,
-    );
+  const headline = blockFailureHeadline(block);
   return headline ? `Failed: ${headline}` : "Failed";
 }
 
@@ -240,8 +237,10 @@ export function DocStepResult({
           </span>
           <span
             className={cn(
-              "min-w-0 [overflow-wrap:anywhere]",
-              failed ? "text-destructive" : "text-muted-foreground",
+              "min-w-0",
+              failed
+                ? "truncate text-destructive"
+                : "text-muted-foreground [overflow-wrap:anywhere]",
             )}
           >
             {loopText && block.status !== Status.Failed ? loopText : text}

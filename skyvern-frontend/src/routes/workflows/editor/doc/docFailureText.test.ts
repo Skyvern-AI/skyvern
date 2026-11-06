@@ -41,6 +41,21 @@ describe("a Browser Action whose instruction needs several actions", () => {
   const action = (goal: string) =>
     ({ id: "a", type: "action", data: { navigationGoal: goal } }) as never;
 
+  test("two actions joined by 'and' still count", () => {
+    expect(
+      docOneActionStepWantsTask(action("Click Submit and refresh the page")),
+    ).toBe(true);
+  });
+
+  test("a plain 'and' joining two objects of one action does not count", () => {
+    for (const goal of [
+      "Enter username and password",
+      "Read the title and price",
+    ]) {
+      expect(docOneActionStepWantsTask(action(goal))).toBe(false);
+    }
+  });
+
   test("is offered a Browser Task, a one-action instruction is not", () => {
     expect(
       docOneActionStepWantsTask(
@@ -53,6 +68,11 @@ describe("a Browser Action whose instruction needs several actions", () => {
     expect(docOneActionStepWantsTask(action("{{ first and second }}"))).toBe(
       false,
     );
+    expect(
+      docOneActionStepWantsTask(
+        action("Search for apple stock and then open the first result"),
+      ),
+    ).toBe(true);
     expect(
       docOneActionStepWantsTask({
         id: "n",

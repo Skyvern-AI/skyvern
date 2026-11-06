@@ -353,6 +353,9 @@ async def _replay_events(
         if text
     ]
     insertion = f" The requested insertion bounds are {' and '.join(bounds)}." if bounds else ""
+    replace_label = safe_label(insertion_data.get("replace_label"))
+    if replace_label:
+        insertion += f" The user demonstrated this as a replacement for the {replace_label} block."
     instruction = DEMONSTRATION_DONE_INSTRUCTION.format(insertion=insertion)
     stop_reason = record.stop_reason
     if stop_reason is not None and stop_reason != "stopped":

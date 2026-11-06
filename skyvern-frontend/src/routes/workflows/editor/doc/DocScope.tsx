@@ -25,6 +25,12 @@ import { DocEditableLine, DocInsertPopover } from "./DocEditing";
 import { NOTE_MAX_LENGTH, type DocScopeRef } from "./docGraphEdits";
 import { TOP_SCOPE, type DocPlace } from "./docEditApi";
 import { DocStepResult } from "./DocStepResult";
+import {
+  requestCaretAtStart,
+  runStepByKey,
+  type LineSplit,
+  type PickerOpener,
+} from "./docKeys";
 import { DocOneActionHint } from "./DocOneActionHint";
 
 type PlacedItem = Exclude<DocItem, DocNoteItem>;
@@ -114,7 +120,7 @@ function DocStepProblem({
           {fix.message.split("\n").map((message) => (
             <li
               key={message}
-              className="text-[13px] leading-[1.55] text-muted-foreground"
+              className="text-[13px] leading-[1.55] text-muted-foreground [overflow-wrap:anywhere]"
             >
               {message}
             </li>
@@ -145,11 +151,11 @@ function DocNode({
   byId: Map<string, AppNode>;
   readOnly: boolean;
   place?: DocStepPlace;
-  onEnter?: () => void;
+  onEnter?: (split: LineSplit | null, key?: string) => void;
   noteProblems: ReadonlyMap<string, DocNoteProblem>;
 }) {
   const [inserting, setInserting] = useState(false);
-  const finishSlash = useRef<((keepSlash: boolean) => void) | null>(null);
+  const finishSlash = useRef<Parameters<PickerOpener>[0] | null>(null);
   const actions = useContext(WorkflowDocActionsContext);
   const open = actions.loopOpen(item.nodeId);
   const node = byId.get(item.nodeId);
@@ -226,6 +232,20 @@ function DocNode({
           onPick={(type) => {
             finishSlash.current?.(false);
             if (!place || !actions.edit) return;
+            // "/" on a line changes that line's step type; a loop or If can't be turned into, so it goes in below.
+            // A step with settings of its own keeps them, so it is not turned into another type here.
+            if (
+              item.kind === "step" &&
+              type !== "loop" &&
+              type !== "conditional" &&
+              actions.edit.canBePlainText(node.id)
+            ) {
+              if (type !== node.type) actions.edit.turnInto(node.id, type);
+              // The step may already be the focus target; clear it so setting it again reopens the line.
+              actions.setFocusId(null);
+              requestAnimationFrame(() => actions.setFocusId(node.id));
+              return;
+            }
             actions.setFocusId(
               actions.edit.insertStep(
                 { scope: place.scope, index: place.index + 1 },
@@ -239,6 +259,25 @@ function DocNode({
               node={node}
               editable={editable && Boolean(actions.edit)}
               onEnter={onEnter}
+              onMove={
+                place && actions.edit && !place.isFinally
+                  ? (delta) => {
+                      const to = place.index + delta;
+                      if (to < 0 || to >= place.count) return true;
+                      const moved = actions.edit!.move(node.id, {
+                        scope: place.scope,
+                        index: to,
+                      });
+                      // The moved line remounts, so refocus after it.
+                      if (moved)
+                        requestAnimationFrame(() =>
+                          actions.setFocusId(node.id),
+                        );
+                      return true;
+                    }
+                  : undefined
+              }
+              onRunStep={() => runStepByKey(node.id)}
               onSlash={
                 place
                   ? (keep) => {
@@ -401,7 +440,9 @@ function DocNote({
 }) {
   const actions = useContext(WorkflowDocActionsContext);
   const [inserting, setInserting] = useState(false);
-  const finishSlash = useRef<((keepSlash: boolean) => void) | null>(null);
+  const finishSlash = useRef<Parameters<PickerOpener>[0] | null>(null);
+  // Set when Tab nested this note into an empty loop or branch: the picked step goes in there, holding the note's text.
+  const pickInto = useRef<DocScopeRef | null>(null);
   const key = placement === "above" ? "notes" : "trailingNotes";
   const pending =
     actions.pendingNote?.ownerNodeId === ownerNodeId &&
@@ -410,9 +451,25 @@ function DocNote({
     <DocInsertPopover
       open={inserting}
       onOpenChange={setInserting}
-      onDismiss={() => finishSlash.current?.(true)}
+      onDismiss={() => {
+        // Closing the Tab menu leaves the note where it was; closing the "/" menu types the "/".
+        finishSlash.current?.(true, !pickInto.current);
+        pickInto.current = null;
+      }}
       onPick={(type) => {
         finishSlash.current?.(false);
+        const target = pickInto.current;
+        pickInto.current = null;
+        if (target && actions.edit) {
+          const adopted = actions.edit.adoptNote(
+            { ownerNodeId, placement },
+            target,
+            type,
+          );
+          actions.setPendingNote(null);
+          actions.setFocusId(adopted);
+          return;
+        }
         if (!place || !actions.edit) return;
         const added = actions.edit.insertStep(place, type);
         // "/" on an empty line turns that line into the step. The text edit goes after the insert, on the latest graph.
@@ -462,11 +519,12 @@ function DocNote({
                     { ownerNodeId, placement },
                     outdent,
                   );
-                  if (moved && "stepId" in moved) {
-                    actions.setPendingNote(null);
-                    actions.setFocusId(moved.stepId);
-                    return true;
-                  }
+                  if (moved && "pickIn" in moved)
+                    return (finish) => {
+                      finishSlash.current = finish;
+                      pickInto.current = moved.pickIn;
+                      setInserting(true);
+                    };
                   if (!moved) return false;
                   requestAnimationFrame(() => actions.setPendingNote(moved));
                   return true;
@@ -525,14 +583,52 @@ export function DocScope({
         i.ownerNodeId === owner &&
         i.placement === placement,
     );
-  // Enter at the end of a step starts the note under it: the next step's note, or this one's trailing note.
-  const enterAfter = (nodeId: string) => {
+  const noteBelow = (nodeId: string) => {
     const at = steps.findIndex((s) => s.nodeId === nodeId);
     const next = steps[at + 1];
     const note = next
       ? { ownerNodeId: next.nodeId, placement: "above" as const }
       : { ownerNodeId: nodeId, placement: "trailing" as const };
     actions.setPendingNote(note);
+  };
+  // Enter on a step makes a step of the same type below, splitting its text at the caret. Enter on an empty step
+  // turns it back into a note, as Enter leaves an empty list item. Loops and Ifs start the note under them.
+  const enterAfter = (
+    nodeId: string,
+    split: LineSplit | null,
+    key: string | undefined,
+  ) => {
+    const node = byId.get(nodeId);
+    const place = placeOf(nodeId);
+    const edit = actions.edit;
+    if (
+      !edit ||
+      !place ||
+      place.isFinally ||
+      !key ||
+      !node ||
+      !isWorkflowBlockNode(node) ||
+      node.type === "loop" ||
+      node.type === "conditional"
+    )
+      return noteBelow(nodeId);
+    if (
+      split &&
+      !split.before.trim() &&
+      !split.after.trim() &&
+      edit.canBePlainText(nodeId)
+    ) {
+      const note = edit.toPlainText(nodeId);
+      if (note) {
+        actions.setPendingNote(note);
+        return;
+      }
+      // Refused (a lone step, or its output is used): Enter still adds the next step.
+    }
+    const added = edit.splitStep(place, nodeId, split && { key, ...split });
+    if (!added) return noteBelow(nodeId);
+    if (split?.after.trim()) requestCaretAtStart(added);
+    actions.setFocusId(added);
   };
   const pendingFor = (owner: string, placement: "above" | "trailing") =>
     actions.pendingNote?.ownerNodeId === owner &&
@@ -711,7 +807,11 @@ export function DocScope({
               byId={byId}
               readOnly={readOnly}
               place={placeOf(item.nodeId)}
-              onEnter={editable ? () => enterAfter(item.nodeId) : undefined}
+              onEnter={
+                editable
+                  ? (split, key) => enterAfter(item.nodeId, split, key)
+                  : undefined
+              }
               noteProblems={noteProblems}
             />
           </div>

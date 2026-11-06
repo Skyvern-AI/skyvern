@@ -136,12 +136,13 @@ async def execute_blocks(
 
         block_output_parameters[block_label] = output_parameter
 
-    for block_label, output_parameter in block_output_parameters.items():
+    # block_runs is keyed on workflow_run_id, so a run of several blocks records its last one.
+    if block_labels:
         await app.DATABASE.debug.create_block_run(
             organization_id=organization.organization_id,
             user_id=user_id,
-            block_label=block_label,
-            output_parameter_id=output_parameter.output_parameter_id,
+            block_label=block_labels[-1],
+            output_parameter_id=block_output_parameters[block_labels[-1]].output_parameter_id,
             workflow_run_id=workflow_run_id,
         )
 

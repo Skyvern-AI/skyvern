@@ -6,7 +6,8 @@ import os
 import pickle
 import struct
 import sys
-from typing import Any, NamedTuple
+from collections.abc import Callable, Iterable
+from typing import Any, NamedTuple, TypeVar
 
 if sys.platform != "win32":
     import resource
@@ -17,11 +18,17 @@ MEMINFO_PATH = "/proc/meminfo"
 CGROUP_HEADROOM_MARGIN_BYTES = 256 * 1024 * 1024
 # Less free memory than this fails the call outright instead of spending the pod's last memory on it.
 MIN_MEMORY_BUDGET_BYTES = 128 * 1024 * 1024
+# Room a child's text result keeps under the result cap for the rest of the pickle: counts, flags and framing.
+_RESULT_MARGIN_BYTES = 1024 * 1024
+# What pickling a str adds to its UTF-8 bytes, rounded up.
+_PICKLED_STR_OVERHEAD_BYTES = 16
 
 # cgroup v1 reports "no limit" as a number just under 2^63.
 _CGROUP_V1_NO_LIMIT_BYTES = 1 << 62
 _MAX_EXCEPTION_CHAIN = 16
 _MAX_MESSAGE_CHARS = 4096
+
+T = TypeVar("T")
 
 
 class _NoHeadroom(Exception):
@@ -30,6 +37,31 @@ class _NoHeadroom(Exception):
 
 class ResultTooLarge(Exception):
     """Raised by the work to say that its result cannot fit the size the parent allows."""
+
+
+def collect_texts(
+    items: Iterable[T], text_of: Callable[[T], str], char_limit: int | None, max_bytes: int
+) -> tuple[list[str], bool]:
+    """Return each item's text in order and whether every item was read. Reading stops once char_limit characters are
+    collected, or before an item that would push the pickled texts past max_bytes less a margin, and a first item that
+    does not fit is a result that is too large."""
+    budget = max_bytes - min(_RESULT_MARGIN_BYTES, max_bytes // 2)
+    texts: list[str] = []
+    chars = 0
+    pickled_bytes = 0
+    for entry in items:
+        if char_limit is not None and chars > char_limit:
+            return texts, False
+        text = text_of(entry)
+        utf8_bytes = len(text) if text.isascii() else len(text.encode("utf-8", "surrogatepass"))
+        if pickled_bytes + utf8_bytes + _PICKLED_STR_OVERHEAD_BYTES > budget:
+            if not texts:
+                raise ResultTooLarge("the first text passes the result limit")
+            return texts, False
+        texts.append(text)
+        chars += len(text)
+        pickled_bytes += utf8_bytes + _PICKLED_STR_OVERHEAD_BYTES
+    return texts, True
 
 
 def main() -> None:

@@ -37,7 +37,8 @@ TEST_TRIGGER_MAPPING_DESCRIPTION = (
     "Resolves `mapping` (workflow input key to JSON Pointer) on `sample_payload` as a real event would be, then\n"
     "validates the inputs against this workflow's saved inputs. A rejection's `reason_code` is `mapping_path_missing`\n"
     "(a pointer finds nothing), `invalid_mapping` (a value is not a JSON Pointer), `invalid_parameters` (inputs unknown,\n"
-    "missing or invalid for the saved workflow) or `owner_lookup_failed` (role lookup failed; retry later). The user\n"
+    "missing or invalid for the saved workflow), `owner_lookup_failed` (role lookup failed; retry later) or\n"
+    "`owner_not_authorized` (the trigger owner cannot access a required credential; fix credential access). The user\n"
     "sees each resolved `input = value` pair in this step's result row."
 )
 LIST_TRIGGERS_DESCRIPTION = (

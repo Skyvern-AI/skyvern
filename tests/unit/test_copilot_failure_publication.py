@@ -1845,3 +1845,33 @@ def test_hard_expiry_keeps_specific_recorded_failure_facts_without_empty_termina
         "recordedFailure": "specific runner failure",
         "ranCleanOnCurrentSource": False,
     }
+
+
+def test_recorded_block_result_screens_typed_input_out_of_code_failure() -> None:
+    now = datetime.now(UTC)
+    row = WorkflowRunBlock(
+        workflow_run_block_id="wrb_test",
+        workflow_run_id="wr_test",
+        organization_id="o_test",
+        block_type=BlockType.CODE,
+        label="run_code",
+        status=BlockStatus.failed.value,
+        output={
+            "status": BlockStatus.failed.value,
+            "failure_reason": "CodeBlock failed with ValueError at line 2.",
+            "code_failure": {
+                "exception_class": "ValueError",
+                "message": 'The field <input value="4111 1111 1111 1111"> stayed hidden. totp_identifier=me@x.test',
+                "line": 2,
+                "source_line": 'raise ValueError("stayed hidden")',
+            },
+        },
+        created_at=now,
+        modified_at=now,
+    )
+
+    code_failure = _recorded_run_block_result(row)["output"]["code_failure"]
+
+    assert "4111" not in code_failure["message"] and "me@x.test" not in code_failure["message"]
+    assert code_failure["source_line"] == 'raise ValueError("stayed hidden")'
+    assert code_failure["exception_class"] == "ValueError" and code_failure["line"] == 2

@@ -14,6 +14,7 @@ import structlog
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError, field_validator, model_validator
 
+from skyvern.forge.sdk.copilot.agent_context import RegisteredDownloadTextError
 from skyvern.forge.sdk.copilot.build_test_connect_failure import (
     BuildTestConnectFailure,
     build_test_connect_failure_sentence,
@@ -250,6 +251,7 @@ class BuildTestPacketRun(BaseModel):
     execution_source: dict[str, Any] | None = None
     browser_start: dict[str, Any] | None = None
     loop_inputs: LoopInputs | LoopInputsUnavailable | None = None
+    credits_used: int | None = None
 
 
 class BuildTestPacketPageState(BaseModel):
@@ -417,6 +419,36 @@ class BuildTestPacketDownload(BaseModel):
     file_name: str | None = None
     # Rendered by the run's own code, so it is not evidence that a site delivered a file.
     generated: Literal[True] | None = None
+    text: str | None = None
+    page_count: int | None = None
+    char_count: int | None = None
+    truncated: bool | None = None
+    text_layer_problem: str | None = None
+    error: RegisteredDownloadTextError | None = None
+
+
+DOWNLOAD_TEXT_PAST_FILE_LIMIT = "downloads[].text omitted for registered downloads past the per-run file limit."
+DOWNLOAD_TEXT_OVER_SIZE_LIMIT = "downloads[].text omitted for a registered download over the per-file size limit."
+DOWNLOAD_TEXT_PAST_CHAR_LIMIT = "downloads[].text omitted past the per-run download text limit."
+DOWNLOAD_TEXT_AFTER_PARSE_TIMEOUT = (
+    "downloads[].text omitted for registered downloads read after one exceeded its parse time limit."
+)
+DOWNLOAD_TEXT_AFTER_TIME_LIMIT = (
+    "downloads[].text omitted for registered downloads not read before the copilot time limit."
+)
+DOWNLOAD_TEXT_WITHHELD = "downloads[].text withheld: this run's secret values are not registered for redaction yet."
+DOWNLOAD_TEXT_OVER_PACKET_LIMIT = "downloads[].text shortened to keep the packet under its character limit."
+DOWNLOAD_TEXT_OMISSION_NOTICES = frozenset(
+    {
+        DOWNLOAD_TEXT_PAST_FILE_LIMIT,
+        DOWNLOAD_TEXT_OVER_SIZE_LIMIT,
+        DOWNLOAD_TEXT_PAST_CHAR_LIMIT,
+        DOWNLOAD_TEXT_AFTER_PARSE_TIMEOUT,
+        DOWNLOAD_TEXT_AFTER_TIME_LIMIT,
+        DOWNLOAD_TEXT_WITHHELD,
+        DOWNLOAD_TEXT_OVER_PACKET_LIMIT,
+    }
+)
 
 
 class BuildTestPacketScreenshot(BaseModel):

@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import base64
+import codecs
 import copy
 import hashlib
 import json
@@ -13,11 +14,13 @@ import time
 import uuid
 from collections import defaultdict
 from collections.abc import Collection, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from functools import partial
+from pathlib import Path
 from typing import Any, Literal, NamedTuple, NotRequired, TypedDict
 from urllib.parse import urlparse
 
@@ -29,6 +32,7 @@ from skyvern.exceptions import (
     BrowserSessionClosed,
     BrowserSessionStartupTimeout,
     CopilotInlineSequentialCredentialUnsupported,
+    PDFParsingError,
     WorkflowNotFound,
 )
 from skyvern.forge import app
@@ -46,6 +50,7 @@ from skyvern.forge.sdk.copilot.agent_context import (
     PreRunPageReference,
     RegisteredArtifactEntry,
     RegisteredArtifactEvidence,
+    RegisteredDownloadTextError,
 )
 from skyvern.forge.sdk.copilot.authoring_parameter_binding import _literal_locator_selector
 from skyvern.forge.sdk.copilot.blocker_signal import (
@@ -66,6 +71,12 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     ACTION_OBSERVATIONS_EMPTY,
     ACTION_TRACE_PER_TASK_LIMIT,
     BLOCK_FACT_MAX_CHARS,
+    DOWNLOAD_TEXT_AFTER_PARSE_TIMEOUT,
+    DOWNLOAD_TEXT_AFTER_TIME_LIMIT,
+    DOWNLOAD_TEXT_OVER_SIZE_LIMIT,
+    DOWNLOAD_TEXT_PAST_CHAR_LIMIT,
+    DOWNLOAD_TEXT_PAST_FILE_LIMIT,
+    DOWNLOAD_TEXT_WITHHELD,
     INFRASTRUCTURE_RUNNER_ERROR_CODES,
     OBSERVED_BLOCK_END_URLS_UNREPORTABLE,
     OBSERVED_BLOCK_END_URLS_WITHHELD,
@@ -274,8 +285,10 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.services.request_principal import get_request_principal, requesting_user_id
 from skyvern.forge.sdk.settings_manager import SettingsManager
-from skyvern.forge.sdk.utils.pdf_parser import extract_pdf_file
+from skyvern.forge.sdk.utils.pdf_parser import PdfExtractStats
 from skyvern.forge.sdk.workflow.block_notes import drop_submitted_note_fields
+from skyvern.forge.sdk.workflow.document_text import SUPPORTED_DOCUMENT_EXTENSIONS, DocumentText
+from skyvern.forge.sdk.workflow.exceptions import FileParseTimeout
 from skyvern.forge.sdk.workflow.models.block import (
     BlockTypeVar,
     CodeBlock,
@@ -284,6 +297,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     WhileLoopBlock,
     get_all_blocks,
     labels_only_on_untaken_branches,
+    read_pdf_text_layer,
     resolve_conditional_merge_edges,
 )
 from skyvern.forge.sdk.workflow.models.code_block_recorder import RECORDED_FAILURE_RESPONSE_MAX_CHARS
@@ -394,7 +408,11 @@ LOG = structlog.get_logger()
 _MAX_REGISTERED_ARTIFACTS = 3
 _MAX_REGISTERED_ARTIFACT_BYTES = 5 * 1024 * 1024
 _MAX_REGISTERED_ARTIFACT_TEXT_CHARS = 20_000
-_REGISTERED_ARTIFACT_PARSE_EXTENSIONS = frozenset({".txt", ".csv", ".json"})
+# Logged in place of the file name, which can carry customer document metadata.
+_REGISTERED_DOWNLOAD_PARSE_IDENTIFIER = "copilot_registered_download"
+# Shared by every copilot session in this API process, so parses a timeout left running never hold more than two
+# threads; a read queued behind them times out instead.
+_REGISTERED_DOWNLOAD_PARSE_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="copilot_download_text")
 
 _POST_RUN_PAGE_HTML_ARTIFACT_TYPES = (ArtifactType.HTML_ACTION, ArtifactType.HTML_SCRAPE)
 _MAX_POST_RUN_PAGE_HTML_CHARS = 1_500_000
@@ -715,7 +733,8 @@ def _without_typed_input(text: str) -> str:
 
 
 def _screened_failure_output(output: Any) -> Any:
-    """A failed block's output repeats its failure text as ``failure_reason`` and as each error's ``reasoning``."""
+    """A failed block's output repeats its failure text as ``failure_reason``, each error's ``reasoning`` and
+    ``code_failure``."""
     if not isinstance(output, dict) or output.get("status") != BlockStatus.failed.value:
         return output
     screened = dict(output)
@@ -728,6 +747,14 @@ def _screened_failure_output(output: Any) -> Any:
             else error
             for error in screened["errors"]
         ]
+    if isinstance(screened.get("code_failure"), dict):
+        # diagnostic=True is explicit because the TOTP screen recognizes diagnostics by key name and does not list these.
+        screened["code_failure"] = {
+            key: redact_totp_runtime_values(_without_typed_input(value), diagnostic=True)
+            if key in ("message", "source_line") and isinstance(value, str)
+            else value
+            for key, value in screened["code_failure"].items()
+        }
     return screened
 
 
@@ -1524,7 +1551,79 @@ WatchdogExitReason = Literal[
     "ceiling",
     "task_exit_unfinalized",
     "paused",
+    "loop_iteration_failed",
 ]
+
+_LOOP_BLOCK_TYPES = frozenset({BlockType.FOR_LOOP, BlockType.WHILE_LOOP})
+_FAILED_ITERATION_STATUSES = frozenset(
+    {BlockStatus.failed.value, BlockStatus.terminated.value, BlockStatus.timed_out.value}
+)
+
+
+@dataclass(frozen=True)
+class _FailedLoopIteration:
+    loop_label: str
+    iteration_index: int
+    block_label: str
+    failure_reason: str | None
+    iterations_started: int
+    total_iterations: int | None
+
+    @property
+    def iterations_not_run(self) -> int | None:
+        return None if self.total_iterations is None else max(0, self.total_iterations - self.iterations_started)
+
+
+def _failed_loop_iteration_carried_past(rows: Sequence[WorkflowRunBlock]) -> _FailedLoopIteration | None:
+    """The earliest loop iteration whose last block failed while a later iteration of the same loop has a row.
+
+    Status, not success: a TaskV2 block reports success under continue_on_failure."""
+    iterations_by_loop: dict[str, dict[int, list[WorkflowRunBlock]]] = defaultdict(lambda: defaultdict(list))
+    rows_by_id = {row.workflow_run_block_id: row for row in rows}
+    for row in rows:
+        # A branch block inside a loop is parented to its conditional's row, not the loop's.
+        parent_id = row.parent_workflow_run_block_id
+        while (parent := rows_by_id.get(parent_id or "")) is not None and parent.block_type == BlockType.CONDITIONAL:
+            parent_id = parent.parent_workflow_run_block_id
+        if parent_id and row.current_index is not None:
+            iterations_by_loop[parent_id][row.current_index].append(row)
+    for loop_row in sorted(rows, key=lambda row: row.created_at):
+        iterations = iterations_by_loop.get(loop_row.workflow_run_block_id)
+        if loop_row.block_type not in _LOOP_BLOCK_TYPES or not iterations:
+            continue
+        last_started = max(iterations)
+        for index in sorted(iterations):
+            if index == last_started:
+                break
+            last_block = max(iterations[index], key=lambda row: row.created_at)
+            if last_block.status in _FAILED_ITERATION_STATUSES:
+                return _FailedLoopIteration(
+                    loop_label=loop_row.label or "",
+                    iteration_index=index,
+                    block_label=last_block.label or "",
+                    failure_reason=redact_totp_runtime_values(_without_typed_input(last_block.failure_reason))
+                    if last_block.failure_reason
+                    else None,
+                    iterations_started=last_started + 1,
+                    total_iterations=len(loop_row.loop_values) if loop_row.loop_values is not None else None,
+                )
+    return None
+
+
+def _failed_iteration_message(failed: _FailedLoopIteration) -> str:
+    reason = f": {failed.failure_reason}" if failed.failure_reason else ""
+    message = (
+        f"Stopped this test after iteration {failed.iteration_index} of loop '{failed.loop_label}' ended on a "
+        f"failed block ('{failed.block_label}'{reason}). "
+    )
+    if failed.iterations_not_run is not None:
+        message += f"{failed.iterations_not_run} of {failed.total_iterations} iterations did not run. "
+    else:
+        message += f"{failed.iterations_started} iterations had started. "
+    return message + (
+        "A saved run of this workflow keeps the loop's settings and would continue past this failure. "
+        "To run every iteration, call again with run_every_loop_iteration=true."
+    )
 
 
 async def _read_progress_sources(
@@ -1563,6 +1662,7 @@ async def _watchdog_error_message(
     budget_seconds: int,
     dispatch_to_worker: bool = False,
     origin_registry: OriginRunRedactionRegistry | None = None,
+    failed_iteration: _FailedLoopIteration | None = None,
 ) -> str:
     """LLM-facing error string for a non-success watchdog exit. No variant uses
     "timed out" or other retry-inviting phrasing — those are SKY-9163 traps.
@@ -1571,6 +1671,9 @@ async def _watchdog_error_message(
     owns the run's persistent browser session, so the API must not attach to it.
     """
     suppress_live_page = dispatch_to_worker or _origin_run_secrets_unregistered(origin_registry, workflow_run_id)
+    if failed_iteration is not None:
+        # The recorded failure is the outcome, so the shared "outcome is uncertain" tail would be false here.
+        return _failed_iteration_message(failed_iteration)
     if exit_reason == "paused":
         # A pause is a healthy waiting state rather than an uncertain outcome, so it returns here
         # instead of picking up the shared "outcome is uncertain" tail below.
@@ -1606,7 +1709,15 @@ def _watchdog_user_facing_summary(
     exit_reason: WatchdogExitReason,
     budget_seconds: int,
     run: WorkflowRun | None,
+    failed_iteration: _FailedLoopIteration | None = None,
 ) -> str:
+    if failed_iteration is not None:
+        summary = f"Stopped the test after row {failed_iteration.iteration_index + 1} failed"
+        if failed_iteration.iterations_not_run is None:
+            return f"{summary}."
+        return (
+            f"{summary}; {failed_iteration.iterations_not_run} of {failed_iteration.total_iterations} rows did not run."
+        )
     if exit_reason == "paused":
         return "The run is paused, waiting for a person to approve or reject it."
     if exit_reason == "ceiling":
@@ -2639,29 +2750,43 @@ def _artifact_file_name(artifact: Artifact) -> str:
     return artifact_filename_from_uri(artifact.uri) or artifact.artifact_id
 
 
-def _parse_registered_artifact_text(file_name: str, artifact_bytes: bytes) -> str | None:
-    suffix = os.path.splitext(file_name)[1].lower()
-    if suffix == ".pdf":
-        temp_file_path: str | None = None
+def _is_supported_document(artifact: Artifact) -> bool:
+    return os.path.splitext(_artifact_file_name(artifact))[1].lower() in SUPPORTED_DOCUMENT_EXTENSIONS
+
+
+async def _read_registered_download_text(suffix: str, content: bytes) -> DocumentText | RegisteredDownloadTextError:
+    if suffix != ".pdf":
         try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
-                temp_file_path = temp_file.name
-                temp_file.write(artifact_bytes)
-            return extract_pdf_file(temp_file_path, file_identifier=file_name) or None
-        except Exception:
-            return None
-        finally:
-            if temp_file_path is not None:
-                try:
-                    os.unlink(temp_file_path)
-                except OSError:
-                    pass
-    if suffix in _REGISTERED_ARTIFACT_PARSE_EXTENSIONS:
+            text = content.removeprefix(codecs.BOM_UTF8).decode("utf-8")
+        except UnicodeDecodeError:
+            return "not_utf8"
+        return {
+            "text": text,
+            "page_count": None,
+            "char_count": len(text),
+            "truncated": False,
+            "text_layer_problem": None,
+        }
+    stats = PdfExtractStats()
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "document.pdf"
+        await asyncio.to_thread(path.write_bytes, content)
         try:
-            return artifact_bytes.decode("utf-8", errors="ignore") or None
-        except Exception:
-            return None
-    return None
+            text, problem = await read_pdf_text_layer(
+                _REGISTERED_DOWNLOAD_PARSE_IDENTIFIER,
+                str(path),
+                stats=stats,
+                executor=_REGISTERED_DOWNLOAD_PARSE_EXECUTOR,
+            )
+        except PDFParsingError:
+            return "parse_failed"
+    return {
+        "text": text,
+        "page_count": stats.page_count,
+        "char_count": len(text),
+        "truncated": stats.truncated,
+        "text_layer_problem": problem,
+    }
 
 
 def _collect_downloaded_artifact_ids(
@@ -2724,6 +2849,7 @@ async def _capture_registered_artifact_evidence(
     organization_id: str,
     downloaded_artifact_ids: Sequence[str] | None = None,
     generated_artifact_ids: frozenset[str] = frozenset(),
+    withhold_text: bool = False,
 ) -> None:
     try:
         artifacts = await _fetch_registered_download_artifacts(
@@ -2734,38 +2860,101 @@ async def _capture_registered_artifact_evidence(
         )
     except Exception:
         LOG.debug("Registered-artifact evidence fetch failed", run_id=run_id, exc_info=True)
-        return
+        artifacts = []
     entries: list[RegisteredArtifactEntry] = []
+    notices: list[str] = []
+    documents = [artifact for artifact in artifacts if _is_supported_document(artifact)]
+    if len(documents) > _MAX_REGISTERED_ARTIFACTS:
+        notices.append(DOWNLOAD_TEXT_PAST_FILE_LIMIT)
+    readable_ids = {artifact.artifact_id for artifact in documents[:_MAX_REGISTERED_ARTIFACTS]}
     total_chars = 0
-    for artifact in artifacts[:_MAX_REGISTERED_ARTIFACTS]:
+    stopped: str | None = None
+    for artifact in artifacts:
         file_name = _artifact_file_name(artifact)
         suffix = os.path.splitext(file_name)[1].lower()
-        if suffix != ".pdf" and suffix not in _REGISTERED_ARTIFACT_PARSE_EXTENSIONS:
+        entry = RegisteredArtifactEntry(artifact_id=artifact.artifact_id, file_name=file_name)
+        if artifact.artifact_id not in readable_ids:
+            entries.append(entry)
             continue
-        file_size = artifact.file_size
-        if isinstance(file_size, int) and file_size > _MAX_REGISTERED_ARTIFACT_BYTES:
-            LOG.debug("Skipping oversize registered artifact", artifact_id=artifact.artifact_id, file_size=file_size)
+        if withhold_text:
+            append_omission_notice(notices, DOWNLOAD_TEXT_WITHHELD)
+            entries.append(entry)
+            continue
+        if stopped is None and ctx.copilot_total_timeout_exceeded:
+            stopped = DOWNLOAD_TEXT_AFTER_TIME_LIMIT
+        skipped = stopped
+        if skipped is None and total_chars >= _MAX_REGISTERED_ARTIFACT_TEXT_CHARS:
+            skipped = DOWNLOAD_TEXT_PAST_CHAR_LIMIT
+        if (
+            skipped is None
+            and isinstance(artifact.file_size, int)
+            and artifact.file_size > _MAX_REGISTERED_ARTIFACT_BYTES
+        ):
+            skipped = DOWNLOAD_TEXT_OVER_SIZE_LIMIT
+        if skipped is not None:
+            append_omission_notice(notices, skipped)
+            entries.append(entry)
             continue
         try:
             artifact_bytes = await app.ARTIFACT_MANAGER.retrieve_artifact(artifact)
         except Exception:
             LOG.debug("Registered-artifact retrieve failed", artifact_id=artifact.artifact_id, exc_info=True)
+            artifact_bytes = None
+        if artifact_bytes is None:
+            entries.append(replace(entry, error="unavailable"))
             continue
-        if not artifact_bytes or len(artifact_bytes) > _MAX_REGISTERED_ARTIFACT_BYTES:
+        if len(artifact_bytes) > _MAX_REGISTERED_ARTIFACT_BYTES:
+            append_omission_notice(notices, DOWNLOAD_TEXT_OVER_SIZE_LIMIT)
+            entries.append(entry)
             continue
-        parsed_text = _parse_registered_artifact_text(file_name, artifact_bytes)
-        if not parsed_text:
+        try:
+            read = await _read_registered_download_text(suffix, artifact_bytes)
+        except FileParseTimeout:
+            # ponytail: the timed-out parse thread keeps running, so later files are not parsed behind it.
+            entries.append(replace(entry, error="parse_timeout"))
+            stopped = DOWNLOAD_TEXT_AFTER_PARSE_TIMEOUT
             continue
+        except Exception as exc:
+            LOG.warning(
+                "Registered-download text read failed",
+                artifact_id=artifact.artifact_id,
+                error_type=type(exc).__name__,
+            )
+            read = "parse_failed"
+        if not isinstance(read, dict):
+            entries.append(replace(entry, error=read))
+            continue
+        text = scrub_secrets_from_text(ctx, read["text"])
+        char_count = len(text)
+        truncated = read["truncated"]
         remaining = _MAX_REGISTERED_ARTIFACT_TEXT_CHARS - total_chars
-        if remaining <= 0:
-            break
-        clipped = parsed_text[:remaining]
-        total_chars += len(clipped)
+        if len(text) > remaining:
+            append_omission_notice(notices, DOWNLOAD_TEXT_PAST_CHAR_LIMIT)
+            text = text[:remaining]
+            truncated = True
+        total_chars += len(text)
         entries.append(
-            RegisteredArtifactEntry(artifact_id=artifact.artifact_id, file_name=file_name, parsed_text=clipped)
+            replace(
+                entry,
+                text=text,
+                page_count=read["page_count"],
+                char_count=char_count,
+                truncated=truncated,
+                text_layer_problem=read["text_layer_problem"],
+            )
         )
-    if entries:
-        ctx.registered_artifact_evidence = RegisteredArtifactEvidence(entries=tuple(entries), workflow_run_id=run_id)
+    if downloaded_artifact_ids:
+        entries_by_id = {entry.artifact_id: entry for entry in entries}
+        entries = [
+            entries_by_id.get(artifact_id)
+            or RegisteredArtifactEntry(artifact_id=artifact_id, file_name=None, error="unavailable")
+            for artifact_id in dict.fromkeys(downloaded_artifact_ids)
+            if artifact_id not in generated_artifact_ids
+        ]
+    if entries or notices:
+        ctx.registered_artifact_evidence = RegisteredArtifactEvidence(
+            entries=tuple(entries), workflow_run_id=run_id, omission_notices=tuple(notices)
+        )
 
 
 # The failure this enrichment describes is often a wedged page, so its own reads need a
@@ -3873,6 +4062,7 @@ async def run_workflow_end_to_end(
     parameters: dict[str, Any] | None = None,
     *,
     seed_like_normal_run: bool = False,
+    run_every_loop_iteration: bool = False,
 ) -> dict[str, Any]:
     """Run every block of a candidate workflow, frontier bypassed, in one browser minted for this run so a
     clean result earns composition credit for the whole chain. ``seed_like_normal_run`` loads the saved
@@ -3918,7 +4108,11 @@ async def run_workflow_end_to_end(
         return {"ok": False, "error": "This workflow has no blocks to run."}
 
     result = await _run_blocks_and_collect_debug(
-        {"block_labels": labels, "parameters": parameters or {}},
+        {
+            "block_labels": labels,
+            "parameters": parameters or {},
+            "run_every_loop_iteration": run_every_loop_iteration,
+        },
         ctx,
         labels_to_execute=labels,
         frontier_start_label=(_executable_workflow_block_labels(workflow.workflow_definition) or labels)[0],
@@ -4036,17 +4230,17 @@ async def _attach_post_run_browser_enrichment(
             observation_deadline_exceeded=ctx.copilot_total_timeout_exceeded,
         )
 
-    if not dispatch_to_worker and not ctx.copilot_total_timeout_exceeded:
-        generated = generated_file_artifact_ids(
-            [*(row.output for row in run_block_rows), *block_outputs_by_label.values()]
-        )
-        await _capture_registered_artifact_evidence(
-            ctx,
-            run_id=workflow_run_id,
-            organization_id=ctx.organization_id,
-            downloaded_artifact_ids=_collect_downloaded_artifact_ids(block_outputs_by_label, generated=generated),
-            generated_artifact_ids=generated,
-        )
+    # Past the copilot deadline the capture still lists the run's downloads but reads no file, so each
+    # supported one reports that its text was skipped.
+    generated = generated_file_artifact_ids([*(row.output for row in run_block_rows), *block_outputs_by_label.values()])
+    await _capture_registered_artifact_evidence(
+        ctx,
+        run_id=workflow_run_id,
+        organization_id=ctx.organization_id,
+        downloaded_artifact_ids=_collect_downloaded_artifact_ids(block_outputs_by_label, generated=generated),
+        generated_artifact_ids=generated,
+        withhold_text=secrets_unregistered,
+    )
 
     # Dispatched runs are worker-owned, so the API cannot CDP-capture the terminal page; read the
     # worker-persisted terminal HTML artifact instead and route it through the same post-run sink.
@@ -5398,10 +5592,27 @@ async def _run_blocks_with_minted_browser_claim(
             seen_block_states: dict[str, str] = {}
             prior_block_ts: datetime | None = initial_block_ts
             last_block_fetch_monotonic = 0.0
+            stop_at_failed_iteration = params.get("run_every_loop_iteration") is not True
+            # Unset, not the initial timestamp: a failure already recorded by the first read is still unchecked.
+            iteration_check_block_ts: datetime | None = None
+            failed_iteration: _FailedLoopIteration | None = None
+            tick_block_rows: list[WorkflowRunBlock] | None = None
+
+            async def _fetch_tick_block_rows() -> list[WorkflowRunBlock]:
+                # One read per poll, shared by the narrator and the failed-iteration check.
+                nonlocal tick_block_rows
+                if tick_block_rows is None:
+                    tick_block_rows = await app.DATABASE.observer.get_workflow_run_blocks(
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        organization_id=ctx.organization_id,
+                    )
+                return tick_block_rows
+
             while True:
                 await asyncio.sleep(RUN_BLOCKS_POLL_INTERVAL_SECONDS)
 
                 run, block_ts = await _read_progress_sources(ctx, workflow_run.workflow_run_id)
+                tick_block_rows = None
 
                 if progress_enabled:
                     assert narrator_state is not None
@@ -5411,10 +5622,7 @@ async def _run_blocks_with_minted_browser_claim(
                         prior_block_ts=prior_block_ts,
                         last_block_fetch_monotonic=last_block_fetch_monotonic,
                         seen_block_states=seen_block_states,
-                        fetch_block_statuses=lambda: app.DATABASE.observer.get_workflow_run_blocks(
-                            workflow_run_id=workflow_run.workflow_run_id,
-                            organization_id=ctx.organization_id,
-                        ),
+                        fetch_block_statuses=_fetch_tick_block_rows,
                         stream=ctx.stream,
                         narrative_block_attempts=ctx.narrative_block_attempts,
                         workflow_run_id=workflow_run.workflow_run_id,
@@ -5440,6 +5648,21 @@ async def _run_blocks_with_minted_browser_claim(
                     exit_reason = "paused"
                     run_paused = True
                     break
+
+                if stop_at_failed_iteration and block_ts is not None and block_ts != iteration_check_block_ts:
+                    try:
+                        failed_iteration = _failed_loop_iteration_carried_past(await _fetch_tick_block_rows())
+                    except Exception:
+                        LOG.warning(
+                            "Copilot test block rows read failed",
+                            workflow_run_id=workflow_run.workflow_run_id,
+                            exc_info=True,
+                        )
+                    else:
+                        iteration_check_block_ts = block_ts
+                        if failed_iteration is not None:
+                            exit_reason = "loop_iteration_failed"
+                            break
 
                 if time.monotonic() - started_monotonic >= budget_seconds:
                     exit_reason = "ceiling"
@@ -5496,6 +5719,21 @@ async def _run_blocks_with_minted_browser_claim(
                         )
                         or origin_registry
                     )
+                watchdog_block_rows, watchdog_blocks = await _recorded_watchdog_block_receipts(
+                    workflow_run.workflow_run_id,
+                    ctx.organization_id,
+                )
+                if failed_iteration is not None:
+                    # Recounted after the cancel: iterations kept starting until the run saw it.
+                    failed_iteration = _failed_loop_iteration_carried_past(watchdog_block_rows) or failed_iteration
+                    LOG.info(
+                        "copilot_test_stopped_at_failed_iteration",
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        loop_label=failed_iteration.loop_label,
+                        failed_iteration_index=failed_iteration.iteration_index,
+                        iterations_started=failed_iteration.iterations_started,
+                        loop_length=failed_iteration.total_iterations,
+                    )
                 error_msg = await _watchdog_error_message(
                     exit_reason,
                     ctx,
@@ -5504,8 +5742,9 @@ async def _run_blocks_with_minted_browser_claim(
                     budget_seconds,
                     dispatch_to_worker,
                     origin_registry,
+                    failed_iteration=failed_iteration,
                 )
-                user_facing_summary = _watchdog_user_facing_summary(exit_reason, budget_seconds, run)
+                user_facing_summary = _watchdog_user_facing_summary(exit_reason, budget_seconds, run, failed_iteration)
                 # This exit is not terminal, so a run still owed its handoff has one-time codes or
                 # worker-resolved secrets the scrubber cannot catch yet: live page facts stay out.
                 secrets_unregistered = _origin_run_secrets_unregistered(origin_registry, workflow_run.workflow_run_id)
@@ -5514,10 +5753,6 @@ async def _run_blocks_with_minted_browser_claim(
                     ("", "")
                     if dispatch_to_worker or secrets_unregistered
                     else await _fallback_page_info(ctx, session_id_override=run_session_id)
-                )
-                watchdog_block_rows, watchdog_blocks = await _recorded_watchdog_block_receipts(
-                    workflow_run.workflow_run_id,
-                    ctx.organization_id,
                 )
                 await _observe_completed_run_outputs(
                     ctx, execution, workflow_run, watchdog_block_rows, seeded_only_labels
@@ -5531,6 +5766,7 @@ async def _run_blocks_with_minted_browser_claim(
                         "requested_block_labels": list(block_labels),
                         "planned_block_labels": list(labels_to_execute),
                         "overall_status": run.status if run is not None else None,
+                        "credits_used": _run_credits_used(run),
                         "failure_reason": user_facing_summary,
                         "current_url": current_url,
                         "current_url_live_observed": bool(current_url) and not dispatch_to_worker,
@@ -5746,6 +5982,7 @@ async def _run_blocks_with_minted_browser_claim(
             "workflow_id": snapshot.workflow.workflow_id,
             "browser_session_id": run_session_id,
             "overall_status": final_status,
+            "credits_used": _run_credits_used(run),
             "requested_block_labels": list(block_labels),
             "planned_block_labels": list(labels_to_execute),
             "executed_block_labels": executed_block_labels,
@@ -5981,6 +6218,10 @@ class RunSelectionFacts(TypedDict):
     newer_finished_runs_unavailable: NotRequired[Literal[True]]
 
 
+def _run_credits_used(run: WorkflowRun | None) -> int | None:
+    return None if run is None else run.credits_used + run.cached_credits_used
+
+
 def _as_utc(value: datetime) -> datetime:
     return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
 
@@ -6137,6 +6378,7 @@ async def _get_run_results(
         **selection_facts,
         "browser_session_id": run.browser_session_id,
         "overall_status": run.status,
+        "credits_used": _run_credits_used(run),
         "requested_block_labels": [result["label"] for result in results if result.get("label")],
         "executed_block_labels": [
             result["label"]
@@ -8139,23 +8381,41 @@ def _packet_downloads(
         and isinstance(file.get("artifact_id"), str)
         and (name := _packet_string(file.get("filename")))
     }
+    entries_by_id: dict[str, RegisteredArtifactEntry] = {}
     if isinstance(evidence, RegisteredArtifactEvidence):
         if evidence.workflow_run_id == run_id:
-            names_by_id |= {
-                entry.artifact_id: name for entry in evidence.entries if (name := _packet_string(entry.file_name))
+            entries_by_id = {
+                entry.artifact_id: entry for entry in evidence.entries if entry.artifact_id not in generated
             }
+            names_by_id |= {
+                artifact_id: name
+                for artifact_id, entry in entries_by_id.items()
+                if (name := _packet_string(entry.file_name))
+            }
+            artifact_ids.extend(artifact_id for artifact_id in entries_by_id if artifact_id not in artifact_ids)
+            for notice in evidence.omission_notices:
+                append_omission_notice(omission_notices, notice)
         elif any(names_by_id.get(artifact_id) is None for artifact_id in artifact_ids):
             omission_notices.append(
                 f"{DOWNLOADS_NOTICE_PREFIX}omitted file names from artifact evidence belonging to another run."
             )
-    return [
-        BuildTestPacketDownload(
-            artifact_id=artifact_id,
-            file_name=names_by_id.get(artifact_id),
-            generated=True if artifact_id in generated else None,
+    downloads: list[BuildTestPacketDownload] = []
+    for artifact_id in artifact_ids:
+        entry = entries_by_id.get(artifact_id)
+        downloads.append(
+            BuildTestPacketDownload(
+                artifact_id=artifact_id,
+                file_name=names_by_id.get(artifact_id),
+                generated=True if artifact_id in generated else None,
+                text=entry.text if entry else None,
+                page_count=entry.page_count if entry else None,
+                char_count=entry.char_count if entry else None,
+                truncated=entry.truncated if entry else None,
+                text_layer_problem=entry.text_layer_problem if entry else None,
+                error=entry.error if entry else None,
+            )
         )
-        for artifact_id in artifact_ids
-    ]
+    return downloads
 
 
 def _packet_unfinished_items(
@@ -8422,6 +8682,7 @@ def build_test_evidence_packet(
             browser_session_id=_packet_string(data.get("browser_session_id")),
             status=run_status,
             browser=_packet_run_browser(data),
+            credits_used=data.get("credits_used"),
         ),
         action_observations=action_observations,
         observed_block_end_urls=observed_block_end_urls,

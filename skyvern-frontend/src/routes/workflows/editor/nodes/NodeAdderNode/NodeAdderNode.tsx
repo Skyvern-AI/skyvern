@@ -27,6 +27,7 @@ import {
   blockLabelFor,
   demonstrationInsertionFromNodes,
   sopAttachmentDraft,
+  SOP_ACCEPT,
   stageSopFile,
 } from "../../workspaceAuthoringActions";
 
@@ -221,7 +222,7 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
       <input
         ref={fileInputRef}
         type="file"
-        accept=".pdf"
+        accept={SOP_ACCEPT}
         className="hidden"
         onChange={handleSOPFileChange}
       />
