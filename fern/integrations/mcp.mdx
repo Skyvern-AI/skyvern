@@ -34,7 +34,7 @@ If you have a Skyvern Cloud account, use the cloud setup below. It takes 30 seco
 
 ## Quick start
 
-Get your API key from [Settings](https://app.skyvern.com) in the Skyvern dashboard, then pick your client below.
+Pick your client below. For API-key-based setups, get your key from [Settings](https://app.skyvern.com) in the Skyvern dashboard.
 
 <Tabs>
 <Tab title="Claude Code">
@@ -45,7 +45,13 @@ claude mcp add-json skyvern '{"type":"http","url":"https://api.skyvern.com/mcp/"
 
 </Tab>
 <Tab title="Claude Desktop">
-**macOS / Windows (recommended, no Node.js required)**
+**Recommended: custom connector for Skyvern Cloud**
+
+1. Open **Customize > Connectors > Add custom connector** in Claude Desktop.
+2. Enter `https://api.skyvern.com/mcp/` as the connector URL.
+3. Sign in with your Skyvern account when prompted. No API key or local Node.js installation is required for this path.
+
+**API-key fallback on macOS / Windows (no separate Node.js installation required)**
 
 1. Download [`skyvern-claude-desktop.mcpb`](https://github.com/Skyvern-AI/skyvern/raw/main/skyvern/cli/mcpb/releases/skyvern-claude-desktop.mcpb).
 2. Double-click the downloaded `.mcpb` file.
@@ -57,31 +63,32 @@ If double-clicking is blocked by your system, you can instead open **Claude Desk
 
 The bundle defaults to `https://api.skyvern.com/mcp/` and removes the separate Node.js requirement.
 
-**Linux, self-hosted, or advanced fallback (requires Node.js >= 20)**
+**Linux, self-hosted, or advanced fallback (requires Node.js >= 20.18.1 and the Skyvern CLI)**
 
-Add this manual bridge to your Claude Desktop config file:
+Set `SKYVERN_API_KEY` in your environment, then run:
+
+```bash
+skyvern setup claude
+```
+
+For another HTTPS deployment, use `skyvern setup claude --url https://your-host/mcp`.
+The CLI extracts the API-key adapter and its pinned SDK 2.3.1 dependencies from the
+`.mcpb` shipped with the Python package into a cache keyed by the archive SHA-256.
+It writes a direct Node.js entry with the key and URL in the environment; it does
+not run `npx` or install npm packages. Existing cached runtime bytes are verified
+against the archive before setup reuses them. Set `SKYVERN_MCP_CACHE_DIR` to choose
+the cache location. Dry run and declining the config prompt do not extract files.
+
+The adapter supports API-key authentication and HTTPS Streamable HTTP. HTTP-only
+endpoints and OAuth are not supported by this fallback. For a private CA, set
+`NODE_EXTRA_CA_CERTS` to its PEM file before setup; the generated entry retains
+that explicit trust setting. The OS trust store is not changed.
+
+The CLI preserves unrelated entries in the Claude Desktop configuration:
 
 - **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
 - **Linux**: `~/.config/Claude/claude_desktop_config.json`
 - **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
-
-```json
-{
-  "mcpServers": {
-    "Skyvern": {
-      "command": "npx",
-      "args": [
-        "mcp-remote",
-        "https://api.skyvern.com/mcp/",
-        "--header",
-        "x-api-key:YOUR_SKYVERN_API_KEY"
-      ]
-    }
-  }
-}
-```
-
-This fallback uses [mcp-remote](https://www.npmjs.com/package/mcp-remote) to bridge the remote MCP server to stdio. It still requires Node.js >= 20.
 
 </Tab>
 <Tab title="Cursor">
@@ -177,7 +184,7 @@ No API key is required — OAuth handles authentication.
 </Tab>
 </Tabs>
 
-That's it — no Python, no `pip install`, no local server. Your AI assistant connects directly to Skyvern Cloud over HTTPS. Claude Desktop on macOS and Windows can use the one-click Skyvern bundle; Linux and advanced setups can still use [mcp-remote](https://www.npmjs.com/package/mcp-remote) with Node.js >= 20.
+That's it — no Python, no `pip install`, no local server. Your AI assistant connects directly to Skyvern Cloud over HTTPS. For Claude Desktop, use the custom connector for browser sign-in. The one-click bundle on macOS and Windows and the bundled API-key adapter (SDK 2.3.1) JSON bridge remain API-key alternatives; the JSON bridge requires Node.js >= 20.
 
 <Tip>
 Prefer a CLI? For Skyvern Cloud, `pip install skyvern` then run `skyvern setup`. For the local self-hosted path, run `skyvern quickstart` or `skyvern init` and choose Claude Code during the MCP step.
