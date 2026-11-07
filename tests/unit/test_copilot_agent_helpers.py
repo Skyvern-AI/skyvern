@@ -108,7 +108,6 @@ from skyvern.forge.sdk.copilot.context import (
     CodeAuthoringRepairContext,
     CopilotContext,
 )
-from skyvern.forge.sdk.copilot.credential_pause import SiteAnswer
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisFailureType,
     DiagnosisInput,
@@ -137,7 +136,7 @@ from skyvern.forge.sdk.copilot.interruption import (
 )
 from skyvern.forge.sdk.copilot.model_resolver import CopilotLitellmProvider
 from skyvern.forge.sdk.copilot.model_telemetry import current_model_attempt_telemetry
-from skyvern.forge.sdk.copilot.output_policy import OutputPolicyReason, OutputPolicyVerdict, evaluate_output_policy
+from skyvern.forge.sdk.copilot.output_policy import OutputPolicyReason, OutputPolicyVerdict
 from skyvern.forge.sdk.copilot.recoverable_failure import build_recoverable_failure
 from skyvern.forge.sdk.copilot.request_policy import (
     _REDACTED_REFUSED_SECRET_TURN,
@@ -1079,46 +1078,12 @@ workflow_definition:
 
         assert _rewrite_failed_test_response(factual_report, ctx) == factual_report
 
-    def test_rewrite_untested_draft_request_surfaces_explicit_unverified_copy(self) -> None:
+    def test_rewrite_keeps_the_model_reply_on_an_untested_redacted_secret_draft(self) -> None:
         ctx = _ctx(
-            allow_untested_workflow_draft=True,
             last_workflow=object(),
             last_workflow_yaml="title: drafted",
             last_update_block_count=2,
             last_test_ok=None,
-        )
-        rewritten = _rewrite_failed_test_response("Done.", ctx)
-
-        assert "without testing it, as requested" in rewritten
-        assert "not been verified end-to-end" in rewritten
-        assert "successful" not in rewritten.lower()
-
-    def test_rewrite_redacted_secret_draft_points_to_saved_credentials(self) -> None:
-        ctx = _ctx(
-            allow_untested_workflow_draft=True,
-            last_workflow=object(),
-            last_workflow_yaml="title: drafted",
-            last_update_block_count=2,
-            last_test_ok=None,
-            request_policy=RequestPolicy(raw_secret_detected=True, raw_secret_handling="redacted_draft"),
-        )
-
-        rewritten = _rewrite_failed_test_response("Done.", ctx)
-
-        assert "pasted" not in rewritten
-        assert "saved credential" in rewritten
-        assert "not been verified end-to-end" in rewritten
-
-    def test_rewrite_names_the_card_connected_credential_on_a_redacted_secret_draft(self) -> None:
-        ctx = _ctx(
-            last_workflow=object(),
-            last_workflow_yaml=(
-                "workflow_definition:\n  parameters:\n    - parameter_type: workflow\n      key: login\n"
-                "      workflow_parameter_type: credential_id\n      default_value: cred_1\n  blocks: []\n"
-            ),
-            last_update_block_count=2,
-            last_test_ok=None,
-            credential_pause_connected_credential_id="cred_1",
             request_policy=RequestPolicy(
                 raw_secret_detected=True,
                 raw_secret_handling="redacted_draft",
@@ -1126,68 +1091,9 @@ workflow_definition:
             ),
         )
 
-        rewritten = _rewrite_failed_test_response("I bound the credential you picked.", ctx)
-
-        assert "bound your saved credential Portal login" in rewritten
-        assert "untested" in rewritten
-        assert "Store the secret" not in rewritten
-        verdict = evaluate_output_policy(
-            request_policy=ctx.request_policy, response_type="REPLY", user_response=rewritten, unvalidated=True
+        assert _rewrite_failed_test_response("Bound it and started the test run.", ctx) == (
+            "Bound it and started the test run."
         )
-        assert verdict.reason_codes == []
-
-    @pytest.mark.parametrize(
-        ("card", "site_answer", "expected"),
-        [
-            ("skipped", None, "You chose not to connect a saved credential"),
-            ("timeout", None, "The credential card went unanswered"),
-            ("declined", None, "The credential card could not be shown"),
-            ("not_admitted", None, "saved for a different site"),
-            (
-                "not_admitted",
-                SiteAnswer("no", "https://a.example.com", "https://b.example.com"),
-                "You chose not to use",
-            ),
-            ("not_admitted", SiteAnswer("add", "https://a.example.com", "https://b.example.com"), "a different site"),
-        ],
-    )
-    def test_rewrite_states_why_no_credential_connected_on_a_redacted_secret_draft(
-        self, card: str, site_answer: SiteAnswer | None, expected: str
-    ) -> None:
-        ctx = _ctx(
-            last_workflow=object(),
-            last_workflow_yaml="title: drafted",
-            last_update_block_count=2,
-            last_test_ok=None,
-            credential_pause_outcome=card,
-            credential_pause_site_answer=site_answer,
-            request_policy=RequestPolicy(raw_secret_detected=True, raw_secret_handling="redacted_draft"),
-        )
-
-        rewritten = _rewrite_failed_test_response("Go to the Credentials page.", ctx)
-
-        assert expected in rewritten
-        assert "not been verified" in rewritten
-
-    def test_rewrite_does_not_claim_a_binding_the_draft_lacks(self) -> None:
-        ctx = _ctx(
-            last_workflow=object(),
-            last_workflow_yaml="title: drafted",
-            last_update_block_count=2,
-            last_test_ok=None,
-            credential_pause_connected_credential_id="cred_1",
-            request_policy=RequestPolicy(
-                raw_secret_detected=True,
-                raw_secret_handling="redacted_draft",
-                resolved_credentials=[Credential.model_construct(credential_id="cred_1", name="Portal login")],
-            ),
-        )
-
-        rewritten = _rewrite_failed_test_response("Bound it.", ctx)
-
-        assert "Portal login" in rewritten
-        assert "does not bind yet" in rewritten
-        assert "bound your saved credential" not in rewritten
 
     def test_request_policy_agent_inputs_redacts_blocked_raw_secret_turns(self) -> None:
         from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
@@ -1202,25 +1108,6 @@ workflow_definition:
         assert "hunter2" not in user_message
         assert "[REDACTED_SECRET]" in user_message
         assert chat_history_text == "prior context"
-
-    def test_should_surface_untested_draft_fires_on_workflow_credential_inputs_unbound(self) -> None:
-        from skyvern.forge.sdk.copilot.agent import _should_surface_untested_draft_despite_question
-        from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
-
-        ctx = _ctx(
-            last_workflow=object(),
-            last_workflow_yaml="title: drafted",
-            last_test_ok=None,
-            last_run_skipped_unbound_credentials=True,
-            request_policy=RequestPolicy(
-                clarification_reason="workflow_credential_inputs_unbound",
-                allow_run_blocks=False,
-                allow_missing_credentials_in_draft=True,
-            ),
-        )
-
-        assert _should_surface_untested_draft_despite_question(ctx, "ASK_QUESTION") is True
-        assert _should_surface_untested_draft_despite_question(ctx, "REPLY") is False
 
     def test_runtime_repair_context_prompt_exposes_literal_page_location(self) -> None:
         repair_context = CodeAuthoringRepairContext(
@@ -2150,7 +2037,6 @@ class TestRequestPolicyInputGuardrail:
 
         assert result.output.tripwire_triggered is False
         assert ctx.request_policy is policy
-        assert ctx.allow_untested_workflow_draft is False
         assert ctx.user_message == "just draft without testing"
         assert "build the login workflow" not in ctx.user_message
         assert result.output.output_info["policy_present"] is True
@@ -2305,18 +2191,17 @@ class TestRequestPolicyInputGuardrail:
         assert ctx.request_policy.allow_run_blocks is True
 
     @pytest.mark.asyncio
-    async def test_raw_secret_redacted_draft_policy_sanitizes_agent_input(self, monkeypatch) -> None:
+    async def test_raw_secret_redacted_draft_policy_sanitizes_agent_input_and_keeps_run_authority(
+        self, monkeypatch
+    ) -> None:
         raw_message = (
             "Convert this SDK snippet into a workflow:\n"
             "client = DemoClient(api_key='sk-abcdefghijklmnopqrstuvwxyz1234567890')"
         )
         policy = RequestPolicy(
-            testing_intent="skip_test",
             credential_input_kind="placeholder",
             raw_secret_detected=True,
             raw_secret_handling="redacted_draft",
-            allow_run_blocks=False,
-            allow_missing_credentials_in_draft=True,
             canonical_user_message=redact_raw_secrets_for_prompt(raw_message),
         )
         monkeypatch.setattr(agent_module, "build_request_policy_trust_floor", AsyncMock(return_value=policy))
@@ -2342,7 +2227,8 @@ class TestRequestPolicyInputGuardrail:
         assert "sk-abcdefghijklmnopqrstuvwxyz1234567890" not in ctx.user_message
         assert ctx.user_message == redact_raw_secrets_for_prompt(raw_message)
         assert "[REDACTED_SECRET]" in ctx.user_message
-        assert ctx.allow_untested_workflow_draft is True
+        assert policy.allow_run_blocks is True
+        assert policy.testing_intent == "unspecified"
         assert "sk-abcdefghijklmnopqrstuvwxyz1234567890" not in policy.canonical_user_message
 
     @pytest.mark.asyncio
@@ -2408,7 +2294,7 @@ class TestRequestPolicyInputGuardrail:
         assert result.output.tripwire_triggered is False
         assert policy.raw_secret_handling == "redacted_draft"
         assert policy.allow_update_workflow is True
-        assert policy.allow_run_blocks is False
+        assert policy.allow_run_blocks is True
         assert "sk-abcdefghijklmnopqrstuvwxyz1234567890" not in ctx.user_message
 
     @pytest.mark.asyncio
@@ -2844,7 +2730,6 @@ workflow_definition:
             captured_metadata.extend(payload["code_artifact_metadata"])
             return {"ok": False, "error": "sentinel update reached", "data": {"from_update": True}}
 
-        monkeypatch.setattr(tools_module, "_update_and_run_requires_skipped_run", lambda *args: False)
         monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
         monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
         monkeypatch.setattr(tools_module, "_update_workflow", fake_update_workflow)
@@ -2878,7 +2763,6 @@ workflow_definition:
         async def fake_update_workflow(
             payload,
             ctx,
-            allow_missing_credentials=False,
             originating_call_id=None,
         ):
             captured["workflow_yaml"] = payload["workflow_yaml"]
@@ -2906,7 +2790,6 @@ workflow_definition:
         monkeypatch.setattr(
             "skyvern.forge.app.WORKFLOW_SERVICE.get_workflow_by_permanent_id", AsyncMock(return_value=None)
         )
-        monkeypatch.setattr(tools_module, "_update_and_run_requires_skipped_run", lambda *args: False)
         monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
         monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
         monkeypatch.setattr(tools_module, "_update_workflow", fake_update_workflow)
@@ -2975,7 +2858,6 @@ workflow_definition:
         monkeypatch.setattr(
             "skyvern.forge.app.WORKFLOW_SERVICE.get_workflow_by_permanent_id", AsyncMock(return_value=None)
         )
-        monkeypatch.setattr(tools_module, "_update_and_run_requires_skipped_run", lambda *args: False)
         monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
         monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
         monkeypatch.setattr(tools_module, "_update_workflow", fake_update_workflow)
@@ -3116,78 +2998,6 @@ workflow_definition:
             "run_every_loop_iteration": False,
         }
 
-    @pytest.mark.asyncio
-    async def test_unbound_credentials_persist_draft_and_skip_run(self, monkeypatch) -> None:
-        workflow_yaml = """title: Test workflow
-workflow_definition:
-  blocks:
-    - block_type: code
-      label: sign_in
-      code: |
-        return credential.username
-"""
-        captured: dict[str, object] = {}
-
-        async def fake_update_workflow(
-            payload, ctx, *, allow_missing_credentials=False, originating_call_id=None, **_kwargs
-        ):
-            captured["persisted_yaml"] = payload["workflow_yaml"]
-            captured["allow_missing_credentials"] = allow_missing_credentials
-            ctx.last_workflow_yaml = payload["workflow_yaml"]
-            ctx.last_update_block_count = 1
-            return {"ok": True, "data": {"block_count": 1}}
-
-        run_blocks = AsyncMock()
-        monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
-        monkeypatch.setattr(
-            tools_module,
-            "_get_prior_workflow_definition",
-            AsyncMock(return_value=WorkflowDefinition(parameters=[], blocks=[])),
-        )
-        monkeypatch.setattr(tools_module, "_update_workflow", fake_update_workflow)
-        monkeypatch.setattr(tools_module, "_run_blocks_and_collect_debug", run_blocks)
-        monkeypatch.setattr(tools_module, "_record_workflow_update_result", lambda *args, **kwargs: None)
-        monkeypatch.setattr(tools_module, "_record_diagnosis_repair_contract", lambda *args, **kwargs: None)
-        monkeypatch.setattr(tools_module, "record_tool_step_result_for_ctx", lambda *args, **kwargs: None)
-        monkeypatch.setattr(tools_module, "_clear_pending_browser_interaction_observation", lambda *args: None)
-
-        ctx = _ctx(
-            workflow_yaml=workflow_yaml,
-            last_workflow_yaml=workflow_yaml,
-            request_policy=RequestPolicy(
-                allow_missing_credentials_in_draft=True,
-                clarification_reason="workflow_credential_inputs_unbound",
-            ),
-        )
-        result = await tools_module.edit_block_and_run_tool.on_invoke_tool(
-            SimpleNamespace(context=ctx, tool_name="edit_block_and_run"),
-            json.dumps(
-                {
-                    "label": "sign_in",
-                    "expected_code": "credential.username",
-                    "replacement_code": "credential.password",
-                }
-            ),
-        )
-
-        parsed = json.loads(result)
-        assert parsed["ok"] is True
-        assert {key: value for key, value in parsed["data"].items() if key != "build_test_packet"} == {
-            "block_count": 1,
-            "workflow_updated": True,
-            "skipped_run": True,
-            "skip_reason": "workflow_credential_inputs_unbound",
-        }
-        packet = parsed["data"]["build_test_packet"]
-        assert packet["canonical_workflow_yaml"] == workflow_yaml.replace("credential.username", "credential.password")
-        assert packet["canonical_workflow_source"] == "accepted_write_readback"
-        assert packet["run"] == {}
-        assert any("no workflow run was recorded" in notice for notice in packet["omission_notices"])
-        assert captured["allow_missing_credentials"] is True
-        assert "credential.password" in str(captured["persisted_yaml"])
-        assert ctx.last_run_skipped_unbound_credentials is True
-        run_blocks.assert_not_awaited()
-
 
 class TestSharedBuildTestPacket:
     _SAVED_WORKFLOW = """title: Test workflow
@@ -3318,7 +3128,6 @@ workflow_definition:
                 ctx.last_update_block_count = 1
 
         monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
-        monkeypatch.setattr(tools_module, "_update_and_run_requires_skipped_run", lambda *args: False)
         monkeypatch.setattr(
             tools_module,
             "_get_prior_workflow_definition",
@@ -4803,13 +4612,11 @@ class TestTranslateToAgentResultGating:
             "skyvern.forge.sdk.copilot.tools._process_workflow_yaml",
             AsyncMock(return_value=replacement),
         )
-        verdicts = iter(
-            [
-                OutputPolicyVerdict(),
-                OutputPolicyVerdict(reason_codes=[OutputPolicyReason.RAW_SECRET_LEAK]),
-            ]
+        monkeypatch.setattr(
+            agent_module,
+            "evaluate_output_policy",
+            lambda **_kwargs: OutputPolicyVerdict(reason_codes=[OutputPolicyReason.RAW_SECRET_LEAK]),
         )
-        monkeypatch.setattr(agent_module, "evaluate_output_policy", lambda **_kwargs: next(verdicts))
         ctx = _ctx(
             last_workflow=original,
             last_workflow_yaml="title: direct test success",
@@ -5047,46 +4854,6 @@ workflow_definition:
         assert "focused `code` blocks" in agent_result.user_response
         assert agent_result.updated_workflow is None
         assert agent_result.workflow_yaml is None
-
-    def test_inline_replace_verdict_steers_a_reason_the_tool_seam_demotes(self, monkeypatch) -> None:
-        # This seam persists a draft, so it is graded like the update_workflow tool body. Grading it
-        # like a final reply walled drafts on reasons the tool seam only steers on, which is how the
-        # test-run signal was lost on this path.
-        monkeypatch.setattr(
-            agent_module,
-            "evaluate_output_policy",
-            lambda **kwargs: OutputPolicyVerdict(reason_codes=[OutputPolicyReason.PERSISTENCE_STATE_MISMATCH]),
-        )
-
-        _, raw_verdict, author_time_verdict = agent_module._inline_replace_workflow_credential_verdict(
-            _ctx(), {"workflow_yaml": "title: Example\n"}, "REPLACE_WORKFLOW", "Here you go."
-        )
-
-        assert author_time_verdict.allowed is True
-        assert list(author_time_verdict.reason_codes) == []
-        # The raw verdict is what diagnostics report, so demotion must not consume it.
-        assert list(raw_verdict.reason_codes) == [OutputPolicyReason.PERSISTENCE_STATE_MISMATCH]
-
-    def test_inline_replace_verdict_still_blocks_a_credential_reason_co_firing_with_a_demoted_one(
-        self, monkeypatch
-    ) -> None:
-        monkeypatch.setattr(
-            agent_module,
-            "evaluate_output_policy",
-            lambda **kwargs: OutputPolicyVerdict(
-                reason_codes=[
-                    OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED,
-                    OutputPolicyReason.PERSISTENCE_STATE_MISMATCH,
-                ]
-            ),
-        )
-
-        _, _, author_time_verdict = agent_module._inline_replace_workflow_credential_verdict(
-            _ctx(), {"workflow_yaml": "title: Example\n"}, "REPLACE_WORKFLOW", "Here you go."
-        )
-
-        assert author_time_verdict.allowed is False
-        assert list(author_time_verdict.reason_codes) == [OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED]
 
     def test_inline_replace_with_invalid_yaml_keeps_prior_pass(self, monkeypatch) -> None:
         tested_wf = SimpleNamespace(name="tested")
@@ -6143,69 +5910,6 @@ workflow_definition:
         get_credentials_by_ids.assert_awaited_once_with(
             ["cred_valid"], organization_id="org-1", allowed_folder_ids=None, include_deleted=False
         )
-
-    @pytest.mark.asyncio
-    async def test_update_workflow_allows_missing_credentials_for_explicit_untested_draft(self, monkeypatch) -> None:
-        from skyvern.forge.sdk.copilot.tools import _update_workflow
-
-        ctx = _ctx(
-            allow_untested_workflow_draft=True,
-            request_policy=RequestPolicy(
-                allow_update_workflow=True,
-                allow_run_blocks=False,
-                allow_missing_credentials_in_draft=True,
-                invalid_credential_ids=["cred_missing"],
-            ),
-        )
-
-        workflow = MagicMock()
-        workflow.title = "Untested Draft"
-        workflow.description = ""
-        workflow.workflow_definition = MagicMock()
-        workflow.workflow_definition.blocks = []
-        workflow.proxy_location = None
-        workflow.webhook_callback_url = None
-        workflow.persist_browser_session = False
-        workflow.model = None
-        workflow.max_screenshot_scrolls = None
-        workflow.extra_http_headers = None
-        workflow.run_with = None
-        workflow.ai_fallback = None
-        workflow.cache_key = None
-        workflow.run_sequentially = False
-        workflow.sequential_key = None
-
-        monkeypatch.setattr(
-            "skyvern.forge.sdk.copilot.tools.workflow_update._process_workflow_yaml",
-            AsyncMock(return_value=workflow),
-        )
-        workflow_service = MagicMock()
-        workflow_service.update_workflow_definition = AsyncMock()
-        monkeypatch.setattr("skyvern.forge.sdk.copilot.tools.app.WORKFLOW_SERVICE", workflow_service)
-        get_credentials_by_ids = AsyncMock(return_value=[])
-        monkeypatch.setattr(
-            agent_module.app,
-            "DATABASE",
-            SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=get_credentials_by_ids)),
-        )
-
-        result = await _update_workflow(
-            {
-                "workflow_yaml": """
-workflow_definition:
-  parameters:
-    - parameter_type: workflow
-      workflow_parameter_type: credential_id
-      key: login_credentials
-      default_value: cred_missing
-  blocks: []
-"""
-            },
-            ctx,
-        )
-
-        assert result["ok"] is True, result
-        get_credentials_by_ids.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_update_workflow_canonicalizes_a_cited_google_connection_name(self, monkeypatch) -> None:
@@ -8322,19 +8026,14 @@ class TestCopilotConfig:
         assert run.result.user_response != "unused"
 
     @pytest.mark.asyncio
-    async def test_tool_bearing_empty_completion_final_reply_is_not_retried_for_untested_draft(
+    async def test_tool_bearing_empty_completion_final_reply_runs_once_after_a_model_lookup_failure(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        def allow_untested_draft(ctx: CopilotContext) -> None:
-            ctx.allow_untested_workflow_draft = True
-
         run = await _run_tool_bearing_empty_completion_turn(
             monkeypatch,
             LiteLLMNotFoundError(message="missing model", llm_provider="azure", model="test"),
-            during_attempt=allow_untested_draft,
         )
 
-        assert run.ctx.allow_untested_workflow_draft is True
         assert len(run.drain_calls) == 1
         assert run.result.turn_outcome is not None
         assert run.result.turn_outcome.terminal_reason == "empty_completion"

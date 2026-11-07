@@ -4,7 +4,7 @@ import asyncio
 import json
 import time
 from types import SimpleNamespace
-from typing import Any
+from typing import Literal
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -13,18 +13,21 @@ from structlog.testing import capture_logs
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot import credential_pause as credential_pause_module
 from skyvern.forge.sdk.copilot import request_policy as request_policy_module
-from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.agent import (
     RequestPolicyGuardrailInputs,
     _request_policy_agent_inputs,
-    _rewrite_failed_test_response,
     _store_request_policy_on_context,
 )
+from skyvern.forge.sdk.copilot.agent_context import ScoutedInteraction
+from skyvern.forge.sdk.copilot.code_block_synthesis import CREDENTIAL_FILL_TOOL_NAME
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import (
     ApprovedCredential,
+    CopilotContext,
+    ProposedCredential,
     StructuredContext,
     record_approved_credentials_in_global_llm_context,
+    record_proposed_credential_in_global_llm_context,
 )
 from skyvern.forge.sdk.copilot.eval_llm_overrides import EvalLLMOverrides, eval_llm_override_scope
 from skyvern.forge.sdk.copilot.request_policy import (
@@ -34,6 +37,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     _seed_prior_approved_credentials,
     build_request_policy_trust_floor,
     credential_prompt_reason,
+    resolve_credential_for_live_page,
     screen_raw_secret_safety,
 )
 from skyvern.forge.sdk.copilot.tools.credential_fill import (
@@ -42,9 +46,10 @@ from skyvern.forge.sdk.copilot.tools.credential_fill import (
     _request_credential,
     _within_grant,
 )
-from skyvern.forge.sdk.copilot.tools.guardrails import _authority_tool_error, _update_and_run_requires_skipped_run
+from skyvern.forge.sdk.copilot.tools.guardrails import _authority_tool_error
+from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotStreamMessageType
-from tests.unit.copilot_test_helpers import make_copilot_ctx
+from tests.unit.copilot_test_helpers import make_copilot_ctx, redact_mid_turn, resolve_exact_credential_data
 from tests.unit.scoped_asyncio import ScopedAsyncio
 from tests.unit.scoped_time import ScopedTime
 from tests.unit.test_copilot_credential_pause import (
@@ -142,16 +147,12 @@ async def test_semantic_secret_is_redacted_without_discarding_the_turn() -> None
     assert policy.raw_secret_safety_status == "detected"
     assert policy.raw_secret_safety_citation_count == 1
     assert policy.raw_secret_evidence is None
-    # The secret is gone; everything the user asked for survives.
     assert literal not in policy.canonical_user_message
     assert policy.canonical_user_message == "Draft a login for the billing portal with [REDACTED_SECRET]"
-    # Continues as an update-only draft rather than a refusal.
     assert policy.user_response_policy == "proceed"
     assert policy.allow_update_workflow is True
     assert policy.clarification_question is None
-    # A turn that carried raw material still cannot drive a browser.
-    assert policy.allow_run_blocks is False
-    assert policy.allow_missing_credentials_in_draft is True
+    assert policy.allow_run_blocks is True
 
 
 @pytest.mark.asyncio
@@ -254,11 +255,11 @@ async def test_url_auth_material_not_delegated_as_destination_remains_redacted()
         "Use the token from https://portal.example/account?token=[REDACTED_SECRET] as authentication material."
     )
     assert policy.allow_update_workflow is True
-    assert policy.allow_run_blocks is False
+    assert policy.allow_run_blocks is True
 
 
 @pytest.mark.asyncio
-async def test_reusable_password_inside_delegated_url_is_redacted_and_update_only() -> None:
+async def test_reusable_password_inside_delegated_url_is_redacted_and_keeps_run_authority() -> None:
     message = "Download from https://portal.example/export?password=Hunter2Portal!"
     policy, handler = await _build(
         message,
@@ -269,7 +270,7 @@ async def test_reusable_password_inside_delegated_url_is_redacted_and_update_onl
     assert policy.raw_secret_safety_status == "detected"
     assert policy.canonical_user_message == ("Download from https://portal.example/export?password=[REDACTED_SECRET]")
     assert policy.allow_update_workflow is True
-    assert policy.allow_run_blocks is False
+    assert policy.allow_run_blocks is True
 
 
 @pytest.mark.asyncio
@@ -315,7 +316,7 @@ async def test_userinfo_delimiters_do_not_validate_partial_query_value_citations
 
 
 @pytest.mark.asyncio
-async def test_standalone_access_material_remains_redacted_and_update_only() -> None:
+async def test_standalone_access_material_remains_redacted_and_keeps_run_authority() -> None:
     policy, _ = await _build(
         _STANDALONE_ACCESS_MATERIAL_PROMPT,
         {"version": "1", "state": "detected", "citations": [_ACCESS_LINK_VALUE]},
@@ -328,7 +329,7 @@ async def test_standalone_access_material_remains_redacted_and_update_only() -> 
         "My access key is [REDACTED_SECRET]. Use it as authentication material when drafting the workflow."
     )
     assert policy.allow_update_workflow is True
-    assert policy.allow_run_blocks is False
+    assert policy.allow_run_blocks is True
 
 
 @pytest.mark.asyncio
@@ -545,7 +546,7 @@ async def test_saved_credential_name_citation_is_redacted_not_exonerated() -> No
     )
     assert policy.user_response_policy == "proceed"
     assert policy.allow_update_workflow is True
-    assert policy.allow_run_blocks is False
+    assert policy.allow_run_blocks is True
 
 
 @pytest.mark.asyncio
@@ -849,58 +850,36 @@ async def test_uncited_deterministic_redaction_preserves_run_authority() -> None
     ctx, policy = await _uncited_redaction_ctx()
 
     assert policy.allow_run_blocks is True
-    assert _update_and_run_requires_skipped_run(ctx, "update_and_run_blocks") is False
     assert _authority_tool_error(ctx, "update_workflow") is None
     assert "sk-abcdefghijklmnopqrstuvwxyz1234567890" not in ctx.user_message
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "tool_name",
-    [
-        "run_blocks_and_collect_debug",
-        "edit_block_and_run",
-        "discover_workflow_entrypoint",
-        "search_web",
-        "run_browser_code",
-        "inspect_page_for_composition",
-        "inspect_locator_matches",
-    ],
+_REDACTED_LITERAL = "Hunter2Portal!"
+_REDACTED_TURN_MESSAGE = "Log into the billing portal and download the invoice"
+_RedactionSource = Literal["chat_message", "question_answer", "steer"]
+_BROWSER_AND_RUN_TOOLS = (
+    "run_blocks_and_collect_debug",
+    "edit_block_and_run",
+    "discover_workflow_entrypoint",
+    "search_web",
+    "run_browser_code",
+    "solve_page_challenge",
+    "start_fresh_browser",
+    "upload_attached_file",
+    "inspect_page_for_composition",
+    "inspect_locator_matches",
 )
-async def test_verified_cited_raw_secret_blocks_browser_acting_tools(tool_name: str) -> None:
-    literal = "Hunter2Portal!"
-    policy, _ = await _build(
-        f"The password is {literal}",
-        {"version": "1", "state": "detected", "citations": [literal]},
-    )
-    ctx = make_copilot_ctx(request_policy=policy)
-
-    error = _authority_tool_error(ctx, tool_name)
-
-    assert error is not None
-    assert ctx.blocker_signal is not None
-    assert ctx.blocker_signal.internal_reason_code == "raw_secret_browser_action_blocked"
-    assert ctx.blocker_signal.blocked_tool == tool_name
 
 
-@pytest.mark.asyncio
-async def test_verified_cited_raw_secret_blocks_saved_credential_fill() -> None:
-    literal = "Hunter2Portal!"
-    policy, _ = await _build(
-        f"The password is {literal}",
-        {"version": "1", "state": "detected", "citations": [literal]},
-    )
-    ctx = make_copilot_ctx(request_policy=policy)
-    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
-
-    assert _credential_fill_prerequisite_error(ctx, "cred_1") is not None
-
-
-@pytest.mark.asyncio
-async def test_detected_turn_becomes_an_update_only_draft_carrying_the_users_intent() -> None:
-    literal = "Hunter2Portal!"
-    message = f"Build a workflow that logs into the billing portal with {literal} and downloads the invoice"
-    policy, _ = await _build(message, {"version": "1", "state": "detected", "citations": [literal]})
+async def _redacted_turn(
+    source: _RedactionSource, value: str = _REDACTED_LITERAL
+) -> tuple[CopilotContext, RequestPolicy]:
+    message = _REDACTED_TURN_MESSAGE
+    verdict: dict[str, object] = {"version": "1", "state": "clean", "citations": []}
+    if source == "chat_message":
+        message = f"{_REDACTED_TURN_MESSAGE} with {value}"
+        verdict = {"version": "1", "state": "detected", "citations": [value]}
+    policy, _ = await _build(message, verdict)
     ctx = make_copilot_ctx()
     _store_request_policy_on_context(
         ctx,
@@ -916,12 +895,138 @@ async def test_detected_turn_becomes_an_update_only_draft_carrying_the_users_int
         ),
         reconcile_completion_criteria=False,
     )
+    if source != "chat_message":
+        redact_mid_turn(policy, source)
+    return ctx, policy
 
-    assert ctx.allow_untested_workflow_draft is True
-    assert policy.testing_intent == "skip_test"
-    assert policy.allow_run_blocks is False
-    assert literal not in ctx.user_message
-    assert "downloads the invoice" in ctx.user_message
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["chat_message", "question_answer", "steer"])
+async def test_a_redacted_value_keeps_browser_scouting_fill_and_run_authority(source: _RedactionSource) -> None:
+    ctx, policy = await _redacted_turn(source)
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+
+    assert policy.raw_secret_redacted_draft
+    assert policy.allow_run_blocks is True
+    assert policy.testing_intent != "skip_test"
+    for tool_name in _BROWSER_AND_RUN_TOOLS:
+        assert _authority_tool_error(ctx, tool_name) is None, tool_name
+    assert ctx.blocker_signal is None
+    assert _credential_fill_prerequisite_error(ctx, "cred_1") is None
+    assert "download the invoice" in ctx.user_message
+    assert _REDACTED_LITERAL not in ctx.user_message
+    assert _REDACTED_LITERAL not in policy.canonical_user_message
+
+
+_PAGE_URL = "https://portal.example.com/login"
+
+
+async def _page_bound_login(policy: RequestPolicy) -> Credential:
+    login = _make_credential().model_copy(update={"tested_url": _PAGE_URL})
+    await resolve_credential_for_live_page(
+        policy, organization_id="org-1", page_url=_PAGE_URL, load_org_credentials=AsyncMock(return_value=[login])
+    )
+    assert policy.live_page_admitted_urls == {login.credential_id: _PAGE_URL}
+    return login
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["question_answer", "steer"])
+async def test_a_redacted_value_mid_turn_keeps_a_login_the_page_bound(
+    source: Literal["question_answer", "steer"],
+) -> None:
+    policy = RequestPolicy(canonical_user_message=f"log in at {_PAGE_URL} and download the invoice")
+    login = await _page_bound_login(policy)
+    ctx = make_copilot_ctx(request_policy=policy)
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+
+    redact_mid_turn(policy, source)
+    grant, error = await _credential_fill_origin_grant(ctx, login.credential_id)
+
+    assert error is None and grant is not None
+    assert [credential.credential_id for credential in policy.resolved_credentials] == [login.credential_id]
+    assert policy.live_page_admitted_urls == {login.credential_id: _PAGE_URL}
+
+
+@pytest.mark.asyncio
+async def test_a_login_the_user_named_stays_pinned_to_the_admitted_page_after_a_redacted_steer() -> None:
+    policy = RequestPolicy(canonical_user_message=f"use cred_1 at {_PAGE_URL}")
+    login = await _page_bound_login(policy)
+    await resolve_exact_credential_data("cred_1", policy, [login])
+    ctx = make_copilot_ctx(request_policy=policy)
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+
+    redact_mid_turn(policy, "steer")
+    grant, error = await _credential_fill_origin_grant(ctx, login.credential_id)
+
+    assert error is None and grant is not None
+    assert _within_grant("https://portal.example.com/password", grant)
+    assert not _within_grant("https://other.example.net/login", grant)
+
+
+def _fill_trajectory(credential_id: str) -> list[ScoutedInteraction]:
+    return [
+        {
+            "tool_name": CREDENTIAL_FILL_TOOL_NAME,
+            "credential_id": credential_id,
+            "executed_selector": "#username",
+            "source_url": _PAGE_URL,
+        }
+    ]
+
+
+async def _carried_login_outcome(message: str, verdict: dict[str, object]) -> tuple[bool, bool]:
+    login = _make_credential().model_copy(update={"tested_url": _PAGE_URL})
+    seeded = StructuredContext(
+        proposed_credential=ProposedCredential(
+            credential_id=login.credential_id, admitted_url=_PAGE_URL, origin_arm="live_page_admitted"
+        )
+    ).to_json_str()
+    with (
+        patch("skyvern.forge.app.DATABASE.credentials.get_credentials", new=AsyncMock(return_value=[login])),
+        patch("skyvern.forge.app.DATABASE.credentials.get_credentials_by_ids", new=AsyncMock(return_value=[login])),
+    ):
+        policy = await build_request_policy_trust_floor(
+            user_message=message,
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context=seeded,
+            organization_id="org-1",
+            handler=AsyncMock(return_value=verdict),
+        )
+    ctx = make_copilot_ctx()
+    _store_request_policy_on_context(
+        ctx,
+        policy,
+        RequestPolicyGuardrailInputs(
+            user_message=message,
+            workflow_yaml="",
+            chat_history_text="",
+            chat_history_messages=[],
+            global_llm_context=seeded,
+            organization_id="org-1",
+            request_policy_handler=None,
+        ),
+        reconcile_completion_criteria=False,
+    )
+    resolved = await resolve_exact_credential_data(login.credential_id, policy, [login])
+    ctx.scout_trajectory = _fill_trajectory(login.credential_id)
+    carried = StructuredContext.from_json_str(
+        record_proposed_credential_in_global_llm_context(ctx, seeded, "ASK_QUESTION")
+    ).proposed_credential
+    return resolved["status"] == "resolved", carried is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reply", ["yep, that one works", "yep, use cred_1"])
+async def test_a_redacted_first_message_keeps_the_carried_login_as_a_clean_one_would(reply: str) -> None:
+    clean = await _carried_login_outcome(reply, {"version": "1", "state": "clean", "citations": []})
+    redacted = await _carried_login_outcome(
+        f"{reply}, the password is {_REDACTED_LITERAL}",
+        {"version": "1", "state": "detected", "citations": [_REDACTED_LITERAL]},
+    )
+
+    assert redacted == clean
 
 
 @pytest.mark.asyncio
@@ -934,7 +1039,6 @@ async def test_clean_turn_reaches_the_browser_and_runs() -> None:
 
     assert policy.raw_secret_detected is False
     assert _authority_tool_error(ctx, "run_blocks_and_collect_debug") is None
-    assert _update_and_run_requires_skipped_run(ctx, "update_and_run_blocks") is False
 
 
 _CARD_SECRET = "Sentinel-Pass-7Q2"
@@ -950,7 +1054,7 @@ _CARD_LOGIN = "sentinel-login"
     ],
     ids=["query", "path"],
 )
-async def test_redacted_secret_turn_opens_the_card_for_the_users_site_and_keeps_the_run_gate_closed(
+async def test_redacted_secret_turn_opens_the_card_for_the_users_site_then_binds_fills_and_runs(
     monkeypatch: pytest.MonkeyPatch, user_url: str
 ) -> None:
     message = (
@@ -961,18 +1065,16 @@ async def test_redacted_secret_turn_opens_the_card_for_the_users_site_and_keeps_
     ctx = _tool_ctx(monkeypatch, _answered_cache("connected", "cred_1"))
     monkeypatch.setattr(credential_pause_module, "_new_resume_token", lambda: "tok-1")
     ctx.request_policy = policy
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
     ctx.test_after_update_done = True
     _stub_credential_lookup(monkeypatch, _make_credential())
 
     with capture_logs() as logs:
         result = await _request_credential("https://portal.example.com/sign-in", "The portal needs a sign-in.", ctx)
+        grant, grant_error = await _credential_fill_origin_grant(ctx, "cred_1")
         carried = record_approved_credentials_in_global_llm_context(ctx, None)
 
     assert result["status"] == "connected"
-    ctx.last_workflow = object()
-    ctx.last_update_block_count = 1
-    final = _rewrite_failed_test_response(f"Done. Bound your saved login for {user_url}.", ctx)
-    assert "untested" in final
     frame = ctx.stream.send.await_args_list[0].args[0]
     assert frame.type is WorkflowCopilotStreamMessageType.CREDENTIAL_REQUIRED
     assert frame.login_page_urls == ["https://portal.example.com"]
@@ -982,29 +1084,20 @@ async def test_redacted_secret_turn_opens_the_card_for_the_users_site_and_keeps_
         "ask_urls": json.dumps(policy.credential_ask_login_page_urls),
         "admitted": json.dumps(policy.live_page_admitted_urls),
         "carried": carried or "",
-        "final": final,
         "logs": json.dumps(logs, default=str),
     }
     for surface, text in surfaces.items():
         assert _CARD_SECRET not in text, surface
         assert _CARD_LOGIN not in text, surface
 
-    assert policy.allow_run_blocks is False
-    assert policy.allow_missing_credentials_in_draft is True
-    assert ctx.test_after_update_done is True
+    assert policy.allow_run_blocks is True
+    assert ctx.test_after_update_done is False
     assert credential_prompt_reason(policy) is None
-    assert _update_and_run_requires_skipped_run(ctx, "update_and_run_blocks") is True
-    for tool_name in (
-        "run_blocks_and_collect_debug",
-        "search_web",
-        "run_browser_code",
-        "inspect_page_for_composition",
-        "inspect_locator_matches",
-    ):
-        assert _authority_tool_error(ctx, tool_name) is not None
-    grant, error = await _credential_fill_origin_grant(ctx, "cred_1")
-    assert grant is None
-    assert error is not None
+    for tool_name in _BROWSER_AND_RUN_TOOLS:
+        assert _authority_tool_error(ctx, tool_name) is None, tool_name
+    assert grant_error is None and grant is not None
+    assert _within_grant("https://portal.example.com/password", grant)
+    assert not _within_grant("https://other.example.net/login", grant)
 
     next_policy = RequestPolicy()
     await _seed_prior_approved_credentials(next_policy, organization_id="org-1", global_llm_context=carried)
@@ -1033,32 +1126,6 @@ async def test_a_user_url_carrying_userinfo_authorizes_no_card_on_a_redacted_sec
     ctx.stream.send.assert_not_awaited()
     assert policy.credential_ask_login_page_urls == []
     assert _CARD_SECRET not in json.dumps(result)
-
-
-@pytest.mark.parametrize(
-    ("user_url", "card_can_open", "expected"),
-    [
-        ("https://portal.example.com/login?pw=" + _CARD_SECRET, True, "request_credential"),
-        ("", True, "ask the user for it"),
-        ("https://portal.example.com/login", False, "Credentials UI"),
-    ],
-    ids=["user_site", "no_site", "card_unavailable"],
-)
-def test_a_redacted_secret_draft_result_points_at_the_card_while_it_can_open(
-    monkeypatch: pytest.MonkeyPatch, user_url: str, card_can_open: bool, expected: str
-) -> None:
-    ctx = _tool_ctx(monkeypatch)
-    ctx.client_supports_credential_pause = card_can_open
-    ctx.request_policy = RequestPolicy(user_provided_site_urls=[user_url] if user_url else [])
-    ctx.request_policy.apply_raw_secret_redacted_draft()
-    result: dict[str, Any] = {"ok": True}
-
-    tools_module._mark_credential_deferred_draft(ctx, result)
-
-    message = result["data"]["message"]
-    assert expected in message
-    assert _CARD_SECRET not in message
-    assert ("Credentials UI" in message) is not card_can_open
 
 
 _CLEAN_VERDICT = {"version": "1", "state": "clean", "citations": []}

@@ -1497,10 +1497,10 @@ class TestSharedBrowserCallOutcome:
         assert records[0]["cancelled"] is True
 
     @pytest.mark.asyncio
-    async def test_raw_secret_and_pre_hook_rejections_are_not_dispatched(self) -> None:
+    async def test_a_redacted_secret_call_dispatches_and_a_pre_hook_rejection_does_not(self) -> None:
         raw_secret_ctx = make_copilot_ctx(
             browser_session_id="pbs_1",
-            request_policy=RequestPolicy(raw_secret_detected=True),
+            request_policy=RequestPolicy(raw_secret_detected=True, raw_secret_handling="redacted_draft"),
         )
         raw_secret_ctx.browser_session_continuity_disposition = "reestablished"
         raw_secret_server = _make_server(
@@ -1528,13 +1528,12 @@ class TestSharedBrowserCallOutcome:
             raw_secret_result = await raw_secret_server.call_tool("evaluate", {})
             await screenshot_server.call_tool("get_browser_screenshot", {})
 
-        assert copilot_runtime.RAW_SECRET_BROWSER_ERROR in raw_secret_result.content[0].text
+        assert raw_secret_result.isError is False
         records = _browser_outcome_records(captured)
-        assert len(records) == 2
-        assert all(record["dispatched"] is False for record in records)
+        assert [record["dispatched"] for record in records] == [True, False]
 
     @pytest.mark.asyncio
-    async def test_raw_secret_refuses_an_internal_browser_call_on_an_already_open_session(self) -> None:
+    async def test_a_redacted_secret_turn_dispatches_an_internal_browser_call(self) -> None:
         ctx = make_copilot_ctx(
             browser_session_id="pbs_1",
             request_policy=RequestPolicy(raw_secret_detected=True, raw_secret_handling="redacted_draft"),
@@ -1545,10 +1544,10 @@ class TestSharedBrowserCallOutcome:
         with capture_logs() as captured:
             result = await server.call_internal_tool("skyvern_navigate", {"url": "https://portal.example.com/login"})
 
-        assert result["ok"] is False
-        dispatched.assert_not_called()
+        assert result["ok"] is True
+        dispatched.assert_called_once()
         timing = [entry for entry in captured if entry["event"] == "MCP tool timing"]
-        assert [entry["call_status"] for entry in timing] == ["raw_secret_denied"]
+        assert [entry["call_status"] for entry in timing] == ["ok"]
 
     def test_a_protocol_failure_reports_the_model_surface_tool_and_both_session_identities(self) -> None:
         """A bare 'evaluate failed' leaves the model no way to tell where it now is, so the failed
@@ -3865,9 +3864,6 @@ class TestPageStateOnBrowserResults:
         [
             pytest.param({}, {"expression": "1", "target": "elsewhere"}, None, id="unknown-target"),
             pytest.param(
-                {"request_policy": RequestPolicy(raw_secret_detected=True)}, {"expression": "1"}, None, id="raw-secret"
-            ),
-            pytest.param(
                 {},
                 {"expression": "1"},
                 (None, mcp_adapter._browser_session_loss_result({}, disposition="failed"), "failed"),
@@ -4624,23 +4620,19 @@ class TestPageCrashes:
     @pytest.mark.usefixtures("_stub_browser_session")
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        ("raw_result", "raw_secret"),
+        "raw_result",
         [
-            pytest.param({"ok": True}, True, id="raw-secret-denied"),
-            pytest.param(TimeoutError(), False, id="timed-out-without-a-read"),
-            pytest.param(CopilotBrowserSessionUnavailable("pbs_failures"), False, id="session-unavailable"),
+            pytest.param(TimeoutError(), id="timed-out-without-a-read"),
+            pytest.param(CopilotBrowserSessionUnavailable("pbs_failures"), id="session-unavailable"),
         ],
     )
     async def test_a_result_whose_page_was_not_read_still_carries_the_crash(
-        self, monkeypatch: pytest.MonkeyPatch, raw_result: dict[str, Any] | Exception, raw_secret: bool
+        self, monkeypatch: pytest.MonkeyPatch, raw_result: Exception
     ) -> None:
         ctx = make_copilot_ctx(browser_session_id="pbs_failures")
         _form_tab_with_crash(monkeypatch, ctx)
         monkeypatch.setattr(mcp_adapter, "_browser_session_error_disposition", AsyncMock(return_value="failed"))
-        ctx.request_policy = RequestPolicy(raw_secret_detected=True) if raw_secret else None
-
         unread = await _evaluate_result(_evaluate_browser_server(ctx, raw_result))
-        ctx.request_policy = None
         read = await _evaluate_result(_evaluate_browser_server(ctx, {"ok": True}))
 
         assert unread["page_state"]["read"] == "failed"

@@ -1300,20 +1300,6 @@ class TestSummarizeToolResult:
         )
         assert summary == "Updated the workflow and ran it"
 
-    def test_update_and_run_blocks_skipped_run_still_reported(self) -> None:
-        summary = self._summarize(
-            "update_and_run_blocks",
-            {"ok": True, "data": {"block_count": 3, "skipped_run": True}},
-        )
-        assert summary == "Workflow updated (3 blocks); browser run skipped"
-
-    def test_edit_block_and_run_skipped_run_still_reported(self) -> None:
-        summary = self._summarize(
-            "edit_block_and_run",
-            {"ok": True, "data": {"block_count": 3, "skipped_run": True}},
-        )
-        assert summary == "Workflow updated (3 blocks); browser run skipped"
-
     def test_discover_workflow_entrypoint_found(self) -> None:
         summary = self._summarize(
             "discover_workflow_entrypoint",
@@ -2252,7 +2238,6 @@ class TestStagedWriteSummaryFrame:
 
     def test_no_frame_claims_an_update_while_the_result_says_staged(self) -> None:
         update = {"ok": True, "data": dict(self.STAGED)}
-        skipped = {"ok": True, "data": {**self.STAGED, "skipped_run": True}}
         ran = {
             "ok": True,
             "data": {k: v for k, v in self.STAGED.items() if k != "block_count"} | {"overall_status": "completed"},
@@ -2261,7 +2246,6 @@ class TestStagedWriteSummaryFrame:
         frames = [
             format_tool_result_for_user("update_workflow", update),
             summarize_tool_result("update_workflow", update),
-            summarize_tool_result("update_and_run_blocks", skipped),
             summarize_tool_result("update_and_run_blocks", ran),
         ]
 

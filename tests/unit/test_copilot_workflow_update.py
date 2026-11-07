@@ -25,7 +25,6 @@ from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.output_utils import BUILD_TEST_PACKET_KEY, sanitize_tool_result_for_llm
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
-from skyvern.forge.sdk.copilot.tools import _mark_credential_deferred_draft
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools import workflow_update as workflow_update_module
 from skyvern.forge.sdk.copilot.tools.run_execution import _packet_workflow_readback
@@ -288,7 +287,7 @@ workflow_definition:
     ctx.request_policy = RequestPolicy(allow_update_workflow=True, allow_run_blocks=True)
     ctx.google_connection_turn_start_bindings = ()
 
-    result = await _update_workflow({"workflow_yaml": edited}, ctx, allow_missing_credentials=True)
+    result = await _update_workflow({"workflow_yaml": edited}, ctx)
 
     assert result["ok"] is True
     assert persisted
@@ -340,7 +339,7 @@ async def _staged_update(
     ctx.auto_accept = auto_accept
     ctx.canonical_was_persisted_due_to_param_change = canonical_param_write
 
-    result = await _update_workflow({"workflow_yaml": edited}, ctx, allow_missing_credentials=True)
+    result = await _update_workflow({"workflow_yaml": edited}, ctx)
     return result, ctx
 
 
@@ -374,7 +373,7 @@ async def test_a_rename_that_omits_a_saved_note_reports_its_text_so_copilot_can_
     ctx.doc_editor_enabled = True
     ctx.auto_accept = False
 
-    result = await _update_workflow({"workflow_yaml": workflow("open_site", "")}, ctx, allow_missing_credentials=True)
+    result = await _update_workflow({"workflow_yaml": workflow("open_site", "")}, ctx)
 
     assert result["ok"] is True
     assert result["data"]["stored_notes_dropped"] == ["open_page"]
@@ -432,7 +431,7 @@ async def test_a_same_label_type_change_reports_the_saved_note_as_dropped(monkey
         "      data_schema: {type: object, properties: {}}\n"
     )
 
-    result = await _update_workflow({"workflow_yaml": submitted}, ctx, allow_missing_credentials=True)
+    result = await _update_workflow({"workflow_yaml": submitted}, ctx)
 
     assert result["ok"] is True
     assert result["data"]["stored_notes_dropped"] == ["lookup"]
@@ -469,7 +468,6 @@ async def test_flag_off_says_nothing_about_dropped_notes(
     result = await _update_workflow(
         {"workflow_yaml": "title: Lookup\nworkflow_definition:\n  parameters: []\n  blocks: []\n"},
         ctx,
-        allow_missing_credentials=True,
     )
 
     assert result["ok"] is True
@@ -528,7 +526,7 @@ workflow_definition:
     ctx.auto_accept = False
     ctx.doc_editor_enabled = True
 
-    result = await _update_workflow({"workflow_yaml": submitted}, ctx, allow_missing_credentials=True)
+    result = await _update_workflow({"workflow_yaml": submitted}, ctx)
 
     assert result["ok"] is True
     assert result["data"]["stored_notes_kept"] == ["read_tax", "read_total"]
@@ -574,20 +572,11 @@ async def test_combined_tool_result_carries_staging_without_overwriting_its_run_
         "data": {"message": "Ran 1 block. Extracted total: $42.00.", "workflow_updated": True},
     }
 
-    skip_result: dict[str, Any] = {
-        "ok": True,
-        "message": "Skipped test run: required credentials are not configured.",
-        "data": {"workflow_updated": True, "skipped_run": True},
-    }
-
     carried = carry_author_time_findings(update_result, run_result)["data"]
-    skipped = carry_author_time_findings(update_result, skip_result)["data"]
 
     assert carried["persistence"] == "staged"
     assert carried["persistence_message"] == update_result["data"]["persistence_message"]
     assert carried["message"] == "Ran 1 block. Extracted total: $42.00."
-    assert skipped["persistence"] == "staged"
-    assert skipped["persistence_message"] == update_result["data"]["persistence_message"]
 
 
 def test_combined_tool_result_carries_sheet_tab_resolution() -> None:
@@ -683,21 +672,6 @@ async def test_unknown_auto_accept_and_a_rolled_back_canonical_write_stay_staged
     assert rolled_back["data"]["persistence"] == "staged"
     assert _save_claims(result["data"]) == []
     assert _save_claims(rolled_back["data"]) == []
-
-
-@pytest.mark.asyncio
-async def test_credential_deferred_draft_rewrites_the_message_but_keeps_the_disposition(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    result, ctx = await _staged_update(monkeypatch)
-
-    _mark_credential_deferred_draft(ctx, result)
-
-    data = result["data"]
-    assert data["persistence"] == "staged"
-    assert data["persistence_message"] == _PERSISTENCE_MESSAGES["staged"]
-    assert data["message"] != data["persistence_message"]
-    assert _save_claims(data) == []
 
 
 @pytest.mark.asyncio
@@ -839,9 +813,7 @@ async def test_update_carried_invalid_url_is_not_disclosed(
     if authored:
         document[field_name] = private_url
     with capture_logs() as logs:
-        result = await _update_workflow(
-            {"workflow_yaml": yaml.safe_dump(document)}, ctx, allow_missing_credentials=True
-        )
+        result = await _update_workflow({"workflow_yaml": yaml.safe_dump(document)}, ctx)
     model_result = sanitize_tool_result_for_llm("update_workflow", result)
     if authored:
         assert result["ok"] is False
@@ -881,7 +853,7 @@ async def test_update_explicit_private_settings_are_absent_from_readback(
     ctx.google_connection_turn_start_bindings = ()
     monkeypatch.setattr(workflow_update_module, "_get_prior_workflow", AsyncMock(return_value=None))
     params = {"workflow_yaml": yaml.safe_dump(document)}
-    result = await _update_workflow(params, ctx, allow_missing_credentials=True)
+    result = await _update_workflow(params, ctx)
     assert result["ok"] is True
     workflow_update_module._record_workflow_update_result(ctx, result)
     readback, source = _packet_workflow_readback(ctx)
@@ -930,7 +902,7 @@ async def test_workflow_write_preserves_label_equal_to_private_value(
     )
     ctx.google_connection_turn_start_bindings = ()
     monkeypatch.setattr(workflow_update_module, "_get_prior_workflow", AsyncMock(return_value=None))
-    result = await _update_workflow({"workflow_yaml": workflow_yaml}, ctx, allow_missing_credentials=True)
+    result = await _update_workflow({"workflow_yaml": workflow_yaml}, ctx)
     assert result["ok"], result
     block = ctx.staged_workflow.workflow_definition.blocks[0]
     assert block.label == private_value
@@ -1647,7 +1619,7 @@ workflow_definition:
     ctx.auto_accept = False
 
     submitted = workflow("      notes: Click Delete first.\n      description: Reads the total.\n")
-    result = await _update_workflow({"workflow_yaml": submitted}, ctx, allow_missing_credentials=True)
+    result = await _update_workflow({"workflow_yaml": submitted}, ctx)
 
     assert result["ok"] is True
     staged = safe_load_no_dates(ctx.staged_workflow_yaml)["workflow_definition"]["blocks"][0]

@@ -470,7 +470,7 @@ def test_output_policy_blocked_result_surfaces_workflow_when_no_blocker() -> Non
     verdict = OutputPolicyVerdict(
         allowed=False,
         output_kind=CopilotOutputKind.REFUSAL,
-        reason_codes=[OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED],
+        reason_codes=[OutputPolicyReason.PERSISTENCE_STATE_MISMATCH],
     )
     result = _build_output_policy_blocked_result(
         ctx,

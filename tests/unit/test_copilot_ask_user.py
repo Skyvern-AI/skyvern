@@ -8,6 +8,8 @@ import pytest
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from skyvern.forge import app
+from skyvern.forge.sdk.cache.local import LocalCache
 from skyvern.forge.sdk.copilot.ask_user import (
     AskUserArguments,
     QuestionAnswer,
@@ -720,7 +722,9 @@ async def test_invalid_and_duplicate_replies_do_not_call_secret_provider(sqlite_
 async def test_question_reply_persists_raw_secret_detection(sqlite_engine, monkeypatch):
     from skyvern.forge.sdk.routes import workflow_copilot as routes
 
-    _, client, ctx, frames = await setup_question_chat(sqlite_engine, monkeypatch)
+    sentinel = "Sentinel-Pass-7Q2"
+    repo, client, ctx, frames = await setup_question_chat(sqlite_engine, monkeypatch)
+    monkeypatch.setattr(app, "CACHE", LocalCache())
     ctx.request_policy = RequestPolicy()
     monkeypatch.setattr(
         routes,
@@ -747,10 +751,22 @@ async def test_question_reply_persists_raw_secret_detection(sqlite_engine, monke
             json={
                 "workflow_copilot_chat_id": ctx.workflow_copilot_chat_id,
                 "interaction_id": question["interaction_id"],
-                "text": "https://portal.example.com/login password=hunter2",
+                "text": f"https://portal.example.com/login password={sentinel}",
             },
         )
-        await asyncio.wait_for(task, 5)
+        tool_result = await asyncio.wait_for(task, 5)
+        steer = await client.post(
+            "/steer",
+            json={
+                "workflow_copilot_chat_id": ctx.workflow_copilot_chat_id,
+                "cancel_token": "stop",
+                "steer_id": "steer_1",
+                "message": f"also {sentinel}",
+            },
+        )
+        history = await client.get("/history", params={"workflow_copilot_chat_id": ctx.workflow_copilot_chat_id})
+    resolved_frame = await frames.get()
+    stored = await repo.get_workflow_copilot_chat_by_id("org", ctx.workflow_copilot_chat_id)
 
     assert result.status_code == 200
     assert result.json()["response"] == {
@@ -759,10 +775,19 @@ async def test_question_reply_persists_raw_secret_detection(sqlite_engine, monke
         "skipped": False,
         "raw_secret_detected": True,
     }
-    assert ctx.request_policy.raw_secret_detected is True
-    assert ctx.request_policy.testing_intent == "skip_test"
-    assert ctx.request_policy.allow_run_blocks is False
-    assert ctx.allow_untested_workflow_draft is True
+    assert ctx.request_policy.raw_secret_redacted_draft is True
+    assert ctx.request_policy.testing_intent != "skip_test"
+    assert ctx.request_policy.allow_run_blocks is True
+    egress = {
+        "reply": result.text,
+        "steer": steer.text,
+        "history": history.text,
+        "resolved_frame": json.dumps(resolved_frame),
+        "tool_result": json.dumps(tool_result),
+        "stored_pending_turn": stored.pending_turns["turn"].model_dump_json(),
+    }
+    for surface, text in egress.items():
+        assert sentinel not in text, surface
 
 
 @pytest.mark.asyncio

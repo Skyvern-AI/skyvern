@@ -92,7 +92,6 @@ async def _reject_unsafe_submission(ctx: CopilotContext) -> dict[str, object]:
     return await _update_workflow(
         {"workflow_yaml": _UNSAFE_YAML},
         ctx,
-        allow_missing_credentials=True,
         originating_call_id=_SUBMISSION_REF,
     )
 
@@ -136,7 +135,6 @@ async def test_unsafe_arm_keeps_each_reason_bound_to_its_block_and_submission() 
     result = await _update_workflow(
         {"workflow_yaml": _MULTI_BLOCK_UNSAFE_YAML},
         ctx,
-        allow_missing_credentials=True,
         originating_call_id=_SUBMISSION_REF,
     )
 
@@ -195,7 +193,6 @@ async def test_rejection_fact_scrubs_and_structurally_encodes_adversarial_label(
     result = await _update_workflow(
         {"workflow_yaml": _yaml("await page.context.cookies()", label=adversarial_label)},
         ctx,
-        allow_missing_credentials=True,
         originating_call_id=_SUBMISSION_REF,
     )
 
@@ -226,13 +223,11 @@ async def test_rejection_fact_preserves_distinct_long_sanitized_identities() -> 
     await _update_workflow(
         {"workflow_yaml": _yaml("await page.context.cookies()", label=shared_prefix + "_first")},
         first_ctx,
-        allow_missing_credentials=True,
         originating_call_id=shared_prefix + "_submission_first",
     )
     await _update_workflow(
         {"workflow_yaml": _yaml("await page.context.cookies()", label=shared_prefix + "_second")},
         second_ctx,
-        allow_missing_credentials=True,
         originating_call_id=shared_prefix + "_submission_second",
     )
 
@@ -258,7 +253,6 @@ async def test_submission_ref_is_typed_but_does_not_change_structural_key() -> N
     await _update_workflow(
         {"workflow_yaml": _UNSAFE_YAML},
         second_ctx,
-        allow_missing_credentials=True,
         originating_call_id="call_code_safety_repair_2",
     )
 
@@ -294,7 +288,6 @@ async def test_safe_helper_arm_persists_and_reaches_test_run(
     monkeypatch.setattr(workflow_update_module, "_get_prior_workflow", AsyncMock(return_value=None))
     monkeypatch.setattr(workflow_update_module, "_process_workflow_yaml", process_workflow_yaml)
     monkeypatch.setattr(workflow_update_module, "_scanner_advisory_labels_by_message", AsyncMock(return_value={}))
-    monkeypatch.setattr(tools_module, "_update_and_run_requires_skipped_run", lambda *args: False)
     monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
     monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
     monkeypatch.setattr(

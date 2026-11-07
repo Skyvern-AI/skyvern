@@ -10,7 +10,6 @@ import pytest
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.mcp_adapter import _EFFECT_UNKNOWN_GUIDANCE, SchemaOverlay, SkyvernOverlayMCPServer
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
-from skyvern.forge.sdk.copilot.runtime import RAW_SECRET_BROWSER_ERROR
 
 
 class _RaisingClient:
@@ -77,22 +76,15 @@ async def test_mcp_browser_tool_ignores_current_page_challenge_as_an_admission_g
 
 
 @pytest.mark.asyncio
-async def test_redacted_raw_secret_refuses_browser_mcp_call_at_action_seam() -> None:
+async def test_redacted_raw_secret_dispatches_browser_mcp_call() -> None:
     ctx = _agent_ctx()
     ctx.request_policy = RequestPolicy(raw_secret_detected=True, raw_secret_handling="redacted_draft")
-    server = SkyvernOverlayMCPServer(
-        transport=MagicMock(),
-        overlays={"click": SchemaOverlay(requires_browser=True)},
-        alias_map={},
-        allowlist=frozenset(),
-        context_provider=lambda: ctx,
-    )
-    server._client = _RaisingClient()
+    server = _make_server(ctx, "click")
 
     result = await server.call_tool("click", {"selector": "#submit"})
 
     text = "".join(getattr(block, "text", "") for block in result.content)
-    assert RAW_SECRET_BROWSER_ERROR in text
+    assert "Timeout 5000ms exceeded" in text
 
 
 class _HangingClient:

@@ -5338,22 +5338,25 @@ def test_test_end_to_end_provenance_earns_composition_credit_and_flips_the_latch
     assert _verified_workflow_or_none(ctx) == (ctx.last_workflow, ctx.last_workflow_yaml)
 
 
+class _RunPathReached(Exception):
+    pass
+
+
 @pytest.mark.asyncio
-async def test_test_end_to_end_will_not_touch_the_browser_after_a_raw_secret(
+async def test_test_end_to_end_reaches_the_run_path_after_a_redacted_secret(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def _unreachable(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        raise AssertionError("the browser must not be reached on a raw-secret turn")
+    async def _reached(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise _RunPathReached
 
-    monkeypatch.setattr(run_execution_module, "_process_workflow_yaml", _unreachable)
-    monkeypatch.setattr(run_execution_module, "_run_blocks_and_collect_debug", _unreachable)
+    monkeypatch.setattr(run_execution_module, "_process_workflow_yaml", _reached)
+    monkeypatch.setattr(run_execution_module, "_run_blocks_and_collect_debug", _reached)
 
     ctx = _make_ctx()
     ctx.request_policy = RequestPolicy(raw_secret_detected=True, raw_secret_handling="redacted_draft")
 
-    result = await run_workflow_end_to_end(ctx, "workflow: yaml")
-
-    assert result["ok"] is False
+    with pytest.raises(_RunPathReached):
+        await run_workflow_end_to_end(ctx, "workflow: yaml")
 
 
 _APPROVAL_VALUE = {"extracted_information": {"authorized": True, "note": ORIGIN_OUTPUT_SENTINEL}}
