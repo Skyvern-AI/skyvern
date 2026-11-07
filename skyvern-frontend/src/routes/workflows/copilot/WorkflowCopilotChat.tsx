@@ -237,6 +237,7 @@ import {
   getReviewGateVerdict,
 } from "./cards/ReviewGateCard";
 import { TURN_ROW_INSET } from "./cards/cardLayout";
+import { CardFooter, CardHeader, CopilotCard } from "./cards/cardChrome";
 import { type AttentionTrayPresentation } from "./cards/AttentionTray";
 import { TestRunOutputCard } from "./cards/TestRunOutputCard";
 import { GoogleReconnectCard } from "./cards/GoogleReconnectCard";
@@ -1544,48 +1545,50 @@ const constrainPosition = (
   };
 };
 
-function DemonstrateTaskButton({
-  label = "Demonstrate task",
+function DemonstrationOfferCard({
   disabled,
   disabledReason,
-  onClick,
+  onStart,
 }: {
-  label?: string;
   disabled: boolean;
   disabledReason: string;
-  onClick: () => void;
+  onStart: () => void;
 }) {
   return (
-    <TooltipProvider>
-      <ControlTooltip
-        content={
-          disabled
-            ? disabledReason
-            : "Skyvern records your clicks, typing, and navigation, then turns them into workflow steps"
+    <CopilotCard>
+      <CardHeader
+        icon={
+          <span
+            aria-hidden="true"
+            className="h-2.5 w-2.5 rounded-full bg-red-500"
+          />
         }
-        blocked={disabled}
-        side="top"
-        wrapperClassName="min-w-0 w-full"
-      >
-        <button
-          type="button"
-          aria-label={label}
-          className="flex w-full min-w-0 items-center gap-3 rounded-lg border border-border bg-slate-elevation3 p-3 text-left transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50"
-          disabled={disabled}
-          onClick={onClick}
-        >
-          <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-border bg-slate-elevation2">
-            <span className="h-2.5 w-2.5 rounded-full bg-red-500" />
-          </span>
-          <span className="min-w-0">
-            <span className="block font-medium text-foreground">{label}</span>
-            <span className="mt-0.5 block text-xs leading-snug text-muted-foreground">
-              Show Copilot how in the browser
-            </span>
-          </span>
-        </button>
-      </ControlTooltip>
-    </TooltipProvider>
+        wrapTitle
+        title="Show Copilot how in the browser"
+      />
+      <CardFooter className="flex items-center">
+        <TooltipProvider>
+          <ControlTooltip
+            content={
+              disabled
+                ? disabledReason
+                : "Skyvern records your clicks, typing, and navigation, then turns them into workflow steps"
+            }
+            blocked={disabled}
+            side="top"
+          >
+            <Button
+              type="button"
+              size="sm"
+              disabled={disabled}
+              onClick={onStart}
+            >
+              Start demonstration
+            </Button>
+          </ControlTooltip>
+        </TooltipProvider>
+      </CardFooter>
+    </CopilotCard>
   );
 }
 
@@ -11224,26 +11227,23 @@ export function WorkflowCopilotChat({
                         ),
                       )}
                       {message.narrative.demonstrationOffer ? (
-                        <div className="max-w-sm">
-                          <DemonstrateTaskButton
-                            label="Start demonstration"
-                            disabled={
-                              !isLastMessage ||
-                              isLoading ||
-                              hasPendingQuestion ||
-                              isDemonstrating ||
-                              recordTaskDisabled
-                            }
-                            disabledReason={
-                              recordTaskDisabled
-                                ? recordTaskUnavailableReason
-                                : !isLastMessage
-                                  ? "Only the latest message can start a demonstration"
-                                  : "Demonstrate task is unavailable right now"
-                            }
-                            onClick={startRecordTask}
-                          />
-                        </div>
+                        <DemonstrationOfferCard
+                          disabled={
+                            !isLastMessage ||
+                            isLoading ||
+                            hasPendingQuestion ||
+                            isDemonstrating ||
+                            recordTaskDisabled
+                          }
+                          disabledReason={
+                            recordTaskDisabled
+                              ? recordTaskUnavailableReason
+                              : !isLastMessage
+                                ? "Only the latest message can start a demonstration"
+                                : "Demonstrate task is unavailable right now"
+                          }
+                          onStart={startRecordTask}
+                        />
                       ) : null}
                       {showReviewGate ? (
                         <div className="space-y-2">
