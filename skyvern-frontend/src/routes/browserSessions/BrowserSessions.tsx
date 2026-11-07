@@ -200,9 +200,16 @@ function BrowserSessionsContent() {
           <Table className="w-full table-fixed">
             <TableHeader>
               <TableRow>
-                <TableHead className="w-[20%] truncate">ID</TableHead>
+                <TableHead
+                  className={cn(
+                    "truncate",
+                    showCreator ? "w-[25%]" : "w-[31%]",
+                  )}
+                >
+                  ID
+                </TableHead>
                 <TableHead className="w-[8%] truncate">Open</TableHead>
-                <TableHead className="w-[12%]">
+                <TableHead className="w-[15%]">
                   <span className="inline-flex items-center gap-1.5">
                     Occupied
                     <HelpTooltip
@@ -215,11 +222,11 @@ function BrowserSessionsContent() {
                   <TableHead className="w-[14%] truncate">Created By</TableHead>
                 )}
                 <TableHead className="w-[12%] truncate">Started</TableHead>
-                <TableHead className="w-[10%] truncate">Timeout</TableHead>
+                <TableHead className="w-[12%] truncate">Timeout</TableHead>
                 <TableHead
                   className={cn(
                     "truncate",
-                    showCreator ? "w-[24%]" : "w-[38%]",
+                    showCreator ? "w-[14%]" : "w-[22%]",
                   )}
                 >
                   CDP Url
