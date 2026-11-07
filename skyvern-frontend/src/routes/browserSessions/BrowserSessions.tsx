@@ -24,14 +24,7 @@ import { HelpTooltip } from "@/components/HelpTooltip";
 import { Pill } from "@/components/StatusBadge";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import {
-  Pagination,
-  PaginationContent,
-  PaginationItem,
-  PaginationLink,
-  PaginationNext,
-  PaginationPrevious,
-} from "@/components/ui/pagination";
+import { SimplePagination } from "@/components/ui/pagination";
 import { ProxySelector } from "@/components/ProxySelector";
 import {
   Select,
@@ -56,7 +49,7 @@ import {
   type BrowserSessionExtension,
   type BrowserSessionType,
 } from "@/routes/workflows/types/browserSessionTypes";
-import { CopyText } from "@/routes/workflows/editor/Workspace";
+import { CopyButton } from "@/components/CopyButton";
 import { basicTimeFormat } from "@/util/timeFormat";
 import { cn, formatMs, toDate } from "@/util/utils";
 
@@ -125,16 +118,6 @@ function BrowserSessionsContent() {
     const params = new URLSearchParams(searchParams);
     Object.entries(patch).forEach(([k, v]) => params.set(k, v));
     setSearchParams(params, { replace: true });
-  }
-
-  function handlePreviousPage() {
-    if (page === 1) return;
-    setParamPatch({ page: String(page - 1) });
-  }
-
-  function handleNextPage() {
-    if (isNextDisabled) return;
-    setParamPatch({ page: String(page + 1) });
   }
 
   const createBrowserSessionMutation = useCreateBrowserSessionMutation();
@@ -279,9 +262,10 @@ function BrowserSessionsContent() {
                           <div className="truncate text-muted-foreground">
                             {browserSession.browser_session_id}
                           </div>
-                          <CopyText
+                          <CopyButton
                             className="opacity-60 hover:opacity-100"
-                            text={browserSession.browser_session_id}
+                            value={browserSession.browser_session_id}
+                            ariaLabel="Copy session ID"
                           />
                         </div>
                       </TableCell>
@@ -317,9 +301,10 @@ function BrowserSessionsContent() {
                             {cdpUrl}
                           </div>
                           {cdpUrl !== "-" ? (
-                            <CopyText
+                            <CopyButton
                               className="opacity-75 hover:opacity-100"
-                              text={cdpUrl}
+                              value={cdpUrl}
+                              ariaLabel="Copy CDP URL"
                             />
                           ) : null}
                         </div>
@@ -353,29 +338,14 @@ function BrowserSessionsContent() {
                 </SelectContent>
               </Select>
             </div>
-            <Pagination className="pt-0">
-              <PaginationContent>
-                <PaginationItem>
-                  <PaginationPrevious
-                    className={cn({
-                      "cursor-not-allowed opacity-50": page === 1,
-                    })}
-                    onClick={handlePreviousPage}
-                  />
-                </PaginationItem>
-                <PaginationItem>
-                  <PaginationLink>{page}</PaginationLink>
-                </PaginationItem>
-                <PaginationItem>
-                  <PaginationNext
-                    className={cn({
-                      "cursor-not-allowed opacity-50": isNextDisabled,
-                    })}
-                    onClick={handleNextPage}
-                  />
-                </PaginationItem>
-              </PaginationContent>
-            </Pagination>
+            <SimplePagination
+              className="pt-0"
+              page={page}
+              hasNext={!isNextDisabled}
+              onPageChange={(nextPage) =>
+                setParamPatch({ page: String(nextPage) })
+              }
+            />
           </div>
         </div>
       </div>

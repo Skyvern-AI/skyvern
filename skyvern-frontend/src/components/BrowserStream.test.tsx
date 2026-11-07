@@ -150,9 +150,6 @@ vi.mock(
     }),
   }),
 );
-vi.mock("@/routes/workflows/editor/Workspace", () => ({
-  CopyText: () => null,
-}));
 vi.mock("@/components/ui/toaster", () => ({ Toaster: () => null }));
 vi.mock("@/routes/browserProfiles/SaveSessionAsBrowserProfileDialog", () => ({
   SaveSessionAsBrowserProfileDialog: () => null,

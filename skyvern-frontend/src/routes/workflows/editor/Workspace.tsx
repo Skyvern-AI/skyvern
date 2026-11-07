@@ -42,10 +42,8 @@ import {
 import { nanoid } from "nanoid";
 import { parse as parseYAML, stringify as convertToYAML } from "yaml";
 import {
-  CheckIcon,
   ChevronRightIcon,
   ChevronLeftIcon,
-  CopyIcon,
   GlobeIcon,
   PlayIcon,
   ReloadIcon,
@@ -163,7 +161,7 @@ import {
   getOrderedBlockLabels,
   shouldPollForGeneratedCode,
 } from "@/routes/workflows/utils";
-import { copyText } from "@/util/copyText";
+import { CopyButton } from "@/components/CopyButton";
 import { isMacPlatform } from "@/util/platform";
 import { parseHeaderJson } from "@/util/secretHeaders";
 import { getJsonParseErrorDetail } from "@/util/jsonParseError";
@@ -382,7 +380,7 @@ interface Dom {
 function bash(text: string, alternateText?: string) {
   return (
     <div className="flex items-center justify-start gap-1">
-      <CopyText className="min-w-[2.25rem]" text={alternateText ?? text} />
+      <CopyButton className="min-w-[2.25rem]" value={alternateText ?? text} />
       <code className="text-xs text-neutral-600 dark:text-neutral-300">
         {text}
       </code>
@@ -441,32 +439,8 @@ function CopyAndExplainCode({
           </DialogFooter>
         </DialogContent>
       </Dialog>
-      {showCopy ? <CopyText text={code} /> : null}
+      {showCopy ? <CopyButton value={code} /> : null}
     </div>
-  );
-}
-
-function CopyText({ className, text }: { className?: string; text: string }) {
-  const [wasCopied, setWasCopied] = useState(false);
-
-  async function handleCopy(code: string) {
-    await copyText(code);
-    setWasCopied(true);
-    setTimeout(() => setWasCopied(false), 2000);
-  }
-
-  return (
-    <Button
-      className={className}
-      size="icon"
-      variant="link"
-      onClick={(e) => {
-        e.stopPropagation();
-        handleCopy(text);
-      }}
-    >
-      {wasCopied ? <CheckIcon /> : <CopyIcon />}
-    </Button>
   );
 }
 
@@ -3759,4 +3733,4 @@ function Workspace({
   );
 }
 
-export { CopyText, CopyAndExplainCode, Workspace };
+export { CopyAndExplainCode, Workspace };
