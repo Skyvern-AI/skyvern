@@ -84,6 +84,14 @@ def truncate_previous_extracted_information(
     rendered_before = value if isinstance(value, str) else json.dumps(value, default=str)
     before_tokens = count_tokens(rendered_before)
 
+    # A value already within budget passes through unchanged. The str and list
+    # branches short-circuit on their own, but the dict branch would otherwise
+    # still impose a per-key cap and could coerce an under-budget value (e.g. a
+    # list or nested dict) into a tail-cropped, invalid-JSON string. This also
+    # keeps an empty list/dict from being rendered to its string form.
+    if before_tokens <= max_tokens:
+        return value
+
     if isinstance(value, str):
         result: Any = _crop_string(value, max_tokens)
     elif isinstance(value, list):
