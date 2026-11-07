@@ -17,6 +17,9 @@ dependencies = [
     "click>=8.4.2,<9",
     "httpx[socks]>=0.27.0",
     "rich>=13.7.0,<14",
+    # Needed by `skyvern setup` / `skyvern mcp`, which the MCP docs run after a plain `pip install skyvern`.
+    "pyyaml>=6.0.1,<7",
+    "json5>=0.15.0,<1",
 ]
 
 [project.optional-dependencies]
