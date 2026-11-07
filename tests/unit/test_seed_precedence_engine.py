@@ -1304,6 +1304,7 @@ def _existing_run(
         start_fresh_browser=start_fresh_browser,
         reuse_browser_session=None,
         max_screenshot_scrolls=None,
+        max_scrape_screenshots=None,
         max_elapsed_time_minutes=None,
         extra_http_headers=None,
         cdp_connect_headers=None,

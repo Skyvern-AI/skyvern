@@ -442,6 +442,7 @@ async def initialize_task_v2(
     create_task_run: bool = False,
     model: dict[str, Any] | None = None,
     max_screenshot_scrolling_times: int | None = None,
+    max_scrape_screenshots: int | None = None,
     browser_session_id: str | None = None,
     browser_profile_id: str | None = None,
     start_fresh_browser: bool = False,
@@ -484,6 +485,7 @@ async def initialize_task_v2(
         workflow_system_prompt=workflow_system_prompt,
         model=model,
         max_screenshot_scrolling_times=max_screenshot_scrolling_times,
+        max_scrape_screenshots=max_scrape_screenshots,
         extra_http_headers=extra_http_headers,
         cdp_connect_headers=cdp_connect_headers,
         browser_address=browser_address,
@@ -495,6 +497,7 @@ async def initialize_task_v2(
         context.task_v2_id = task_v2.observer_cruise_id
         context.run_id = context.run_id or task_v2.observer_cruise_id
         context.max_screenshot_scrolls = max_screenshot_scrolling_times
+        context.max_scrape_screenshots = max_scrape_screenshots
 
     # create workflow and workflow run
     max_steps_override = 10
@@ -514,6 +517,7 @@ async def initialize_task_v2(
             request_id=None,
             workflow_request=WorkflowRequestBody(
                 max_screenshot_scrolls=max_screenshot_scrolling_times,
+                max_scrape_screenshots=max_scrape_screenshots,
                 browser_session_id=browser_session_id,
                 browser_profile_id=browser_profile_id,
                 start_fresh_browser=start_fresh_browser,
@@ -1018,6 +1022,7 @@ async def run_task_v2_helper(
     context.run_id = current_run_id
     context.browser_session_id = browser_session_id
     context.max_screenshot_scrolls = task_v2.max_screenshot_scrolls
+    context.max_scrape_screenshots = task_v2.max_scrape_screenshots
 
     if await run_lease_lost(workflow_run_id):
         current = await app.DATABASE.observer.get_task_v2(task_v2_id, organization_id=organization_id)

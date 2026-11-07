@@ -36,6 +36,8 @@ def _patch_paths(monkeypatch, tmp_path: Path) -> tuple[Path, Path, Path]:
     monkeypatch.setattr(settings, "TEMP_PATH", str(temp_dir))
     monkeypatch.setattr(settings, "LOG_PATH", str(log_dir))
     monkeypatch.setattr(settings, "DOWNLOAD_PATH", str(download_dir))
+    monkeypatch.setattr(settings, "VIDEO_PATH", str(tmp_path / "video"))
+    monkeypatch.setattr(settings, "HAR_PATH", str(tmp_path / "har"))
     return temp_dir, log_dir, download_dir
 
 

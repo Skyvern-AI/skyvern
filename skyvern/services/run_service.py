@@ -163,6 +163,7 @@ async def get_run_response(
                 data_extraction_schema=task_v1_response.request.extracted_information_schema,
                 error_code_mapping=task_v1_response.request.error_code_mapping,
                 max_screenshot_scrolls=task_v1_response.request.max_screenshot_scrolls,
+                max_scrape_screenshots=task_v1_response.request.max_scrape_screenshots,
             ),
             errors=task_v1_response.errors,
             step_count=task_v1_response.step_count,

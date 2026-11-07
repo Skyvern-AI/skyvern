@@ -362,6 +362,7 @@ class Skyvern(AsyncSkyvern):
         max_screenshot_scrolls: int | None = None,
         browser_address: str | None = None,
         request_options: RequestOptions | None = None,
+        max_scrape_screenshots: int | None = None,
     ) -> TaskRunResponse:
         task_run = await super().run_task(
             prompt=prompt,
@@ -382,6 +383,7 @@ class Skyvern(AsyncSkyvern):
             publish_workflow=publish_workflow,
             include_action_history_in_verification=include_action_history_in_verification,
             max_screenshot_scrolls=max_screenshot_scrolls,
+            max_scrape_screenshots=max_scrape_screenshots,
             browser_address=browser_address,
             request_options=request_options,
         )
@@ -419,6 +421,7 @@ class Skyvern(AsyncSkyvern):
         wait_for_completion: bool = False,
         timeout: float = DEFAULT_AGENT_TIMEOUT,
         request_options: RequestOptions | None = None,
+        max_scrape_screenshots: int | None = None,
     ) -> WorkflowRunResponse:
         workflow_run = await super().run_workflow(
             agent_id=workflow_id,
@@ -434,6 +437,7 @@ class Skyvern(AsyncSkyvern):
             user_agent=user_agent,
             browser_profile_id=browser_profile_id,
             max_screenshot_scrolls=max_screenshot_scrolls,
+            max_scrape_screenshots=max_scrape_screenshots,
             max_elapsed_time_minutes=max_elapsed_time_minutes,
             extra_http_headers=extra_http_headers,
             browser_address=browser_address,
