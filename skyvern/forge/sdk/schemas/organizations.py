@@ -90,24 +90,34 @@ class AzureOrganizationAuthToken(OrganizationAuthTokenBase):
 
 
 class BitwardenCredential(BaseModel):
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     email: EmailStr = Field(..., description="Bitwarden account email")
-    master_password: str = Field(..., min_length=1, description="Bitwarden master password")
+    master_password: str = Field(..., min_length=1, repr=False, description="Bitwarden master password")
+    client_id: str | None = None
+    client_secret: str | None = Field(default=None, repr=False)
+
+    @field_validator("client_id", "client_secret", mode="before")
+    @classmethod
+    def normalize_api_key_field(cls, value: Any) -> Any:
+        return value.strip() or None if isinstance(value, str) else value
 
 
 class BitwardenCredentialSafe(BaseModel):
-    """Response-safe view of BitwardenCredential — master_password is never returned."""
+    """Response-safe view of BitwardenCredential — passwords and client secrets are never returned."""
 
     email: EmailStr
+    client_id: str | None = None
 
 
 class BitwardenOrganizationAuthToken(OrganizationAuthTokenBase):
-    """Represents OrganizationAuthToken for Bitwarden; defined by 2 fields: email and master_password"""
+    """Bitwarden account email and master password, with an optional personal API key."""
 
     credential: BitwardenCredential
 
 
 class BitwardenOrganizationAuthTokenSafe(OrganizationAuthTokenBase):
-    """Response-safe view — omits master_password for security."""
+    """Response-safe view — omits master_password and client_secret for security."""
 
     credential: BitwardenCredentialSafe
 
