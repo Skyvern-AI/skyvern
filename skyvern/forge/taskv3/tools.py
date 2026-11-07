@@ -1498,7 +1498,8 @@ _MENU_ROW_ROLES_JS = (
 
 # Counts the VISIBLE menu-row descendants of a node, using the SAME row definition _FIND_MENU_JS
 # reports on (its MENU_ROW_ROLES plus native <button>/<a>), so the growth signal and the finder cannot
-# disagree about what a row is. Assumes an enclosing `vis(el)` helper. Shared by the two click probes.
+# disagree about what a row is. It also holds the pick's state read, which both click probes share. Assumes an
+# enclosing `vis(el)` helper.
 _VIS_ROWS_JS = (
     r"""
   const MENU_ROW_ROLES = """
@@ -1507,12 +1508,47 @@ _VIS_ROWS_JS = (
   const _visRows = (el) => {
     let n = 0;
     try {
-      for (const d of el.querySelectorAll('[role], button, a')) {
+      for (const d of flatQueryAll(el, '[role], button, a')) {
         const t = d.tagName;
         if ((MENU_ROW_ROLES.has(d.getAttribute('role')) || t === 'BUTTON' || t === 'A') && vis(d)) n++;
       }
     } catch (e) {}
     return n;
+  };
+  const state = (el) => {
+    // .checked is a DOM property, not an attribute: a native-checkbox multi-select commits by
+    // flipping only it, with no aria/class/text change, as a row whose inner checkbox carries aria-checked does.
+    // Same for inline-style-only toggles.
+    let kids = '';
+    try {
+      for (const i of flatQueryAll(el, 'input,[aria-checked]')) {
+        kids += (i.localName === 'input' ? i.checked : i.getAttribute('aria-checked') === 'true') ? '1' : '0';
+      }
+    } catch (e) {}
+    return [
+      el.getAttribute('aria-checked'), el.getAttribute('aria-selected'), el.getAttribute('aria-pressed'),
+      el.className, flatChildCount(el), (el.innerText || '').trim(), composedRowText(el),
+      el.getAttribute('style'), kids,
+    ].join('|');
+  };
+  // Fixed-arity on purpose: every component is one attribute of the row itself, so a row that
+  // restructures cannot change this string, and only being picked can.
+  const selState = (el) => {
+    return [
+      el.getAttribute('aria-checked'), el.getAttribute('aria-selected'), el.getAttribute('aria-pressed'),
+    ].join('|');
+  };
+  // A pick shows on the leaf clicked or on its declared row, so both are read.
+  const pickState = (pick) => {
+    const parts = pick.leaf && pick.leaf !== pick.row ? [pick.leaf, pick.row] : [pick.row];
+    const sum = (f) => parts.reduce((n, el) => n + f(el), 0);
+    return {
+      optState: parts.map(state).join('#'),
+      optSel: parts.map(selState).join('#'),
+      optKids: sum(flatChildCount),
+      optH: sum((el) => Math.round(el.getBoundingClientRect().height)),
+      optVis: sum(_visRows),
+    };
   };
 """
 )
@@ -2757,14 +2793,189 @@ _PIERCED_QUERY_JS = (
     }
     return acc;
   };
+  // The flat-tree walk reads the DOM through its prototypes: a <form> exposes its named inputs as properties, so an
+  // input named `matches` or `parentNode` shadows the method on the form (and `document.host` reads a form named
+  // `host`), and a walk over those reads cycles. A read that still fails reads as "no such node".
+  const _getterOf = (proto, name) => {
+    try { const d = Object.getOwnPropertyDescriptor(proto, name); return d ? d.get : null; } catch (e) { return null; }
+  };
+  const _typeOf = _getterOf(Node.prototype, 'nodeType');
+  const _parentOf = _getterOf(Node.prototype, 'parentNode');
+  const _hostOf = _getterOf(ShadowRoot.prototype, 'host');
+  const _elSlotOf = _getterOf(Element.prototype, 'assignedSlot');
+  const _textSlotOf = _getterOf(Text.prototype, 'assignedSlot');
+  const _elMatches = Element.prototype.matches;
   // The composed-tree step, and the only one any probe below takes: parentNode, or the host at a
   // shadow boundary (a ShadowRoot has no parentNode, and parentElement is null there). A walk that
   // stops at the boundary answers about the component's inside, which is not the page's structure.
-  const composedParent = (n) => (n && (n.parentNode || n.host)) || null;
+  const composedParent = (n) => {
+    try {
+      if (!n) return null;
+      return (_typeOf.call(n) === 11 ? _hostOf.call(n) : _parentOf.call(n)) || null;
+    } catch (e) { return null; }
+  };
   const composedParentElement = (n) => {
     let p = composedParent(n);
     while (p && p.nodeType !== 1) p = composedParent(p);
     return p;
+  };
+  // The flat-tree step: a slotted node is drawn inside its assigned slot, so a row a component projects its
+  // text into is an ancestor of that text only through the slot. An unslotted node takes the composed step.
+  const flatParentNode = (n) => {
+    try {
+      if (!n) return null;
+      const t = _typeOf.call(n);
+      const slotOf = t === 1 ? _elSlotOf : (t === 3 ? _textSlotOf : null);
+      const slot = slotOf ? slotOf.call(n) : null;
+      return slot || composedParent(n);
+    } catch (e) { return null; }
+  };
+  const flatMatches = (n, sel) => {
+    try { return _typeOf.call(n) === 1 && _elMatches.call(n, sel); } catch (e) { return false; }
+  };
+  // The nearest flat-tree ancestor-or-self matching `sel`; null once the walk meets one matching `stop` first.
+  const flatClosest = (el, sel, stop) => {
+    for (let n = el, hops = 0; n && hops < 256; hops++, n = flatParentNode(n)) {
+      if (flatMatches(n, sel)) return n;
+      if (stop && flatMatches(n, stop)) return null;
+    }
+    return null;
+  };
+  const flatContains = (a, b) => {
+    if (!a || !b) return false;
+    for (let n = b, hops = 0; n && hops < 256; hops++, n = flatParentNode(n)) if (n === a) return true;
+    return false;
+  };
+  const OPT_SEL = '[role="option"],[role="menuitemradio"],[role="menuitemcheckbox"],[role="treeitem"],[role="radio"]';
+  const LIST_SEL = '[role="listbox"],[role="menu"],[role="tree"],[role="grid"],[role="radiogroup"],datalist';
+  const DECLARED_ROW_SEL = OPT_SEL + ',[role="menuitem"]';
+  // querySelectorAll over the flat tree below `el`: what a slot inside it draws is part of it. A Set, because a
+  // slot's fallback content is both its child and, with nothing assigned, what it draws.
+  const _shadowOf = _getterOf(Element.prototype, 'shadowRoot');
+  const _openRootOf = (e) => {
+    try { const sr = _shadowOf.call(e); return sr && _typeOf.call(sr) === 11 ? sr : null; } catch (err) { return null; }
+  };
+  const flatQueryAll = (el, sel) => {
+    const out = new Set();
+    const walked = new Set();
+    const walk = (root, depth) => {
+      if (walked.has(root)) return;
+      walked.add(root);
+      for (const e of root.querySelectorAll(sel)) out.add(e);
+      if (depth >= 8) return;
+      const own = _typeOf.call(root) === 1 ? _openRootOf(root) : null;
+      if (own) walk(own, depth + 1);
+      for (const h of root.querySelectorAll('*')) {
+        const sr = _openRootOf(h);
+        if (sr) walk(sr, depth + 1);
+      }
+      for (const s of root.querySelectorAll('slot')) {
+        for (const a of s.assignedElements({ flatten: true })) {
+          if (flatMatches(a, sel)) out.add(a);
+          walk(a, depth + 1);
+        }
+      }
+    };
+    try { walk(el, 0); } catch (e) {}
+    return Array.from(out);
+  };
+  // A row's child count over the flat tree: a slot counts as what it draws.
+  const flatChildCount = (el) => {
+    let n = 0;
+    try {
+      for (const c of el.children) {
+        n += c.localName === 'slot' ? (c.assignedElements({ flatten: true }).length || c.children.length) : 1;
+      }
+    } catch (e) {}
+    return n;
+  };
+  // A leaf's declared row, within the leaf's own list: a component projects an option's text into a row in its own
+  // root, which the text reaches only through the slot.
+  const declaredRowOf = (el) => flatClosest(el, DECLARED_ROW_SEL, LIST_SEL);
+  // The text a row renders, read through the flat tree: innerText stops at a shadow host, so an option
+  // component that draws its label in its own root would read as ''. A row declared inside the row is its
+  // own row, so a category's text is its own label, not its children's.
+  const composedRowText = (top, skip) => {
+    let out = '';
+    let budget = 2000;
+    const walk = (n, depth) => {
+      if (depth > 32) return;
+      let kids = null;
+      if (String(n.localName || '') === 'slot') {
+        try { kids = n.assignedNodes({ flatten: true }); } catch (e) { kids = null; }
+      }
+      if (!kids || !kids.length) {
+        let sr = null;
+        try { sr = n.nodeType === 1 ? n.shadowRoot : null; } catch (e) { sr = null; }
+        kids = sr && sr.nodeType === 11 ? sr.childNodes : n.childNodes;
+      }
+      for (const c of kids) {
+        if (budget-- <= 0) return;
+        if (c.nodeType === 3) {
+          const p = c.parentElement || (c.parentNode && c.parentNode.host) || null;
+          let shown = true;
+          try { shown = !p || getComputedStyle(p).visibility !== 'hidden'; } catch (e) { shown = true; }
+          if (shown) out += c.data;
+          continue;
+        }
+        if (c.nodeType !== 1) continue;
+        const name = String(c.localName || '');
+        if (name === 'script' || name === 'style' || name === 'template' || name === 'noscript') continue;
+        if (name === 'br') { out += ' '; continue; }
+        try {
+          if (c.matches(DECLARED_ROW_SEL) || (skip && c.matches(skip))) continue;
+        } catch (e) { /* unmatchable: read it */ }
+        let display = '';
+        try { display = getComputedStyle(c).display; } catch (e) { display = ''; }
+        if (display === 'none') continue;
+        const block = display !== '' && display !== 'contents' && !/^inline/.test(display);
+        if (block) out += ' ';
+        walk(c, depth + 1);
+        if (block) out += ' ';
+      }
+    };
+    try { walk(top, 0); } catch (e) { /* a partial read is still the row's text so far */ }
+    return out.replace(/\s+/g, ' ').trim();
+  };
+  const CONTROL_SEL = 'button,a[href],input,[role="button"],[role="checkbox"],[role="switch"],[role="radio"]';
+  const separateControl = (leaf, row) => {
+    const m = flatClosest(leaf, CONTROL_SEL);
+    if (!m || m === row) return false;
+    return flatContains(row, m);
+  };
+  // What a click on `target` picks among a menu's tagged `leaves`. A leaf that is or holds the target is the pick, the
+  // innermost when tags nest. Else the innermost declared row holding the target, named by its label leaf (a link of
+  // the row, else its first leaf outside a control). A target inside a control of the row that does not hold its label
+  // (a favourite star, a remove icon, a checkbox) picks nothing; neither does a target outside every row.
+  const menuPickOf = (leaves, target, after) => {
+    if (!target) return null;
+    let leaf = null;
+    for (const l of leaves) if (flatContains(l, target) && (!leaf || flatContains(leaf, l))) leaf = l;
+    let row = leaf ? (declaredRowOf(leaf) || leaf) : null;
+    if (!leaf) {
+      for (const l of leaves) {
+        const r = declaredRowOf(l);
+        if (r && flatContains(r, target) && (!row || flatContains(row, r))) row = r;
+      }
+      if (!row) return null;
+      // A row holding other rows is a parent: a click on it lands on whichever child its centre covers.
+      if (leaves.some((l) => { const r = declaredRowOf(l); return r && r !== row && flatContains(row, r); })) return null;
+      // So does a row of several links, or of a link beside text outside every control: which it lands on is not
+      // known. The text is read before the click only, since a pick may draw its mark into the row.
+      const links = flatQueryAll(row, 'a[href]').filter((a) => a !== row);
+      if (links.length > 1 || (links.length === 1 && !after && composedRowText(row, CONTROL_SEL) !== '')) return null;
+    }
+    const own = leaves.filter((l) => l === row || declaredRowOf(l) === row);
+    const label = own.find((l) => {
+      const a = flatClosest(l, 'a[href]');
+      return a ? a !== row && flatContains(row, a) : false;
+    }) || own.find((l) => !separateControl(l, row)) || null;
+    const ctl = flatClosest(target, CONTROL_SEL);
+    if (label && ctl && ctl !== row && flatContains(row, ctl) && !flatMatches(ctl, 'a[href]') && !flatContains(ctl, label)) {
+      return null;
+    }
+    if (leaf) return { leaf, row, level: 'leaf' };
+    return { leaf: label || own[0], row, level: 'row' };
   };
   // The nearest ancestor matching `sel`, across shadow boundaries: closest() covers the whole chain
   // within one root, then the walk hops to that root's host and repeats. Bounded by shadow depth --
@@ -2900,10 +3111,7 @@ _PRESNAPSHOT_JS = (
 # closest declaring ANCESTOR, not the reduced leaf (`<a href><span>` reduces to the span).
 _ROW_SEMANTICS_JS = (
     r"""
-  const OPT_SEL = '[role="option"],[role="menuitemradio"],[role="menuitemcheckbox"],[role="treeitem"],[role="radio"]';
   const NAV_SEL = 'a[href],button,[role="button"],[role="link"],[role="menuitem"],[role="tab"]';
-  const LIST_SEL = '[role="listbox"],[role="menu"],[role="tree"],[role="grid"],[role="radiogroup"],datalist';
-  const DECLARED_ROW_SEL = OPT_SEL + ',[role="menuitem"]';
   // An empty-state row is a list's own "nothing matched" line, never an answer: one the widget disables, or one that
   // echoes the typed query back inside quotation marks ('No results for "x"'), which is how a list quotes the input.
   const EMPTY_QUOTES = '"\'\u201c\u201d\u2018\u2019\u00ab\u00bb\u201e';
@@ -2912,49 +3120,6 @@ _ROW_SEMANTICS_JS = (
     const t = (n.innerText || '').replace(/\s+/g, ' ').trim().toLowerCase();
     const at = typedNorm ? t.indexOf(typedNorm) : -1;
     return at > 0 && EMPTY_QUOTES.includes(t[at - 1]) && EMPTY_QUOTES.includes(t[at + typedNorm.length] || '');
-  };
-  // The text a row renders, read through the flat tree: innerText stops at a shadow host, so an option
-  // component that draws its label in its own root would read as ''. A row declared inside the row is its
-  // own row, so a category's text is its own label, not its children's.
-  const composedRowText = (top) => {
-    let out = '';
-    let budget = 2000;
-    const walk = (n, depth) => {
-      if (depth > 32) return;
-      let kids = null;
-      if (String(n.localName || '') === 'slot') {
-        try { kids = n.assignedNodes({ flatten: true }); } catch (e) { kids = null; }
-      }
-      if (!kids || !kids.length) {
-        let sr = null;
-        try { sr = n.nodeType === 1 ? n.shadowRoot : null; } catch (e) { sr = null; }
-        kids = sr && sr.nodeType === 11 ? sr.childNodes : n.childNodes;
-      }
-      for (const c of kids) {
-        if (budget-- <= 0) return;
-        if (c.nodeType === 3) {
-          const p = c.parentElement || (c.parentNode && c.parentNode.host) || null;
-          let shown = true;
-          try { shown = !p || getComputedStyle(p).visibility !== 'hidden'; } catch (e) { shown = true; }
-          if (shown) out += c.data;
-          continue;
-        }
-        if (c.nodeType !== 1) continue;
-        const name = String(c.localName || '');
-        if (name === 'script' || name === 'style' || name === 'template' || name === 'noscript') continue;
-        if (name === 'br') { out += ' '; continue; }
-        try { if (c.matches(DECLARED_ROW_SEL)) continue; } catch (e) { /* unmatchable: read it */ }
-        let display = '';
-        try { display = getComputedStyle(c).display; } catch (e) { display = ''; }
-        if (display === 'none') continue;
-        const block = display !== '' && display !== 'contents' && !/^inline/.test(display);
-        if (block) out += ' ';
-        walk(c, depth + 1);
-        if (block) out += ' ';
-      }
-    };
-    try { walk(top, 0); } catch (e) { /* a partial read is still the row's text so far */ }
-    return out.replace(/\s+/g, ' ').trim();
   };
   // An undeclared leaf's row box: its largest ancestor that holds no other of the list's `leaves`, so a label whose
   // identifier sits in a sibling element reads as one row. A leaf no other leaf bounds (a lone filtered row) climbs
@@ -3011,13 +3176,13 @@ _ROW_SEMANTICS_JS = (
   // this one value. A closed root reads as '', so the leaf's own text stands in for it.
   const rowIdentity = (el, box) => {
     let row = null;
-    try { row = composedClosest(el, DECLARED_ROW_SEL); } catch (e) { row = null; }
+    try { row = declaredRowOf(el); } catch (e) { row = null; }
     return composedRowText(row || box || el) || (el.innerText || '').replace(/\s+/g, ' ').trim();
   };
   // Composed, not closest(): an option component declares the row's role on its HOST, outside the
   // root the pointer leaf lives in, so a same-root lookup reads that row as a bare button.
   const isNavRow = (el) => {
-    try { return !composedClosest(el, OPT_SEL) && !!composedClosest(el, NAV_SEL); } catch (e) { return true; }
+    try { return !flatClosest(el, OPT_SEL) && !!composedClosest(el, NAV_SEL); } catch (e) { return true; }
   };
   // A screen-reader announcement renders inside a log, status or alert region, which is never a list; bare
   // aria-live is left alone because widgets also put it on their own list. Rows of a list nested inside the
@@ -3041,8 +3206,8 @@ _ROW_SEMANTICS_JS = (
     + r""";
   const declaresOption = (el) => {
     try {
-      return el.matches(DECLARED_ROW_SEL) || !!el.querySelector(DECLARED_ROW_SEL) || !!composedClosest(el, DECLARED_ROW_SEL)
-        || !!composedClosest(el, '[role="listbox"],[role="menu"]');
+      return flatClosest(el, DECLARED_ROW_SEL) !== null || !!el.querySelector(DECLARED_ROW_SEL)
+        || !!flatClosest(el, '[role="listbox"],[role="menu"]');
     } catch (e) { return false; }
   };
   const admitRow = (el, txt, o) => {
@@ -4928,11 +5093,18 @@ _MARKER_MATCH_COUNT_JS = (
     + r""";
   const matches = new Set();
   let unreadable = false;
+  // With `rendered`, only holders drawn on screen count: no box, visibility hidden, or opacity 0 up the chain is none.
+  const drawn = (e) => {
+    if (!arg.rendered) return true;
+    if (!e.getClientRects().length) return false;
+    if (typeof e.checkVisibility === 'function') return e.checkVisibility({ opacityProperty: true, visibilityProperty: true });
+    return getComputedStyle(e).visibility !== 'hidden';
+  };
   try {
     for (const root of _roots(document)) {
-      try { for (const e of root.querySelectorAll(arg.sel)) matches.add(e); } catch (e) { unreadable = true; }
+      try { for (const e of root.querySelectorAll(arg.sel)) if (drawn(e)) matches.add(e); } catch (e) { unreadable = true; }
     }
-    if (matches.size === 0 && arg.el && arg.el.isConnected) matches.add(arg.el);
+    if (matches.size === 0 && arg.el && arg.el.isConnected && drawn(arg.el)) matches.add(arg.el);
   } catch (e) { unreadable = true; }
   if (matches.size > 1) return matches.size;
   return unreadable ? 1 : matches.size;
@@ -8195,24 +8367,6 @@ _CLICK_PRECHECK_JS = (
     } catch (e) {}
     return true;
   };
-  const state = (el) => {
-    // .checked is a DOM property, not an attribute: a native-checkbox multi-select commits by
-    // flipping only it, with no aria/class/text change. Same for inline-style-only toggles.
-    let kids = '';
-    try { for (const i of el.querySelectorAll('input')) kids += i.checked ? '1' : '0'; } catch (e) {}
-    return [
-      el.getAttribute('aria-checked'), el.getAttribute('aria-selected'), el.getAttribute('aria-pressed'),
-      el.className, el.children.length, (el.innerText || '').trim(),
-      el.getAttribute('style'), kids,
-    ].join('|');
-  };
-  // Fixed-arity on purpose: every component is one attribute of the row itself, so a row that
-  // restructures cannot change this string, and only being picked can.
-  const selState = (el) => {
-    return [
-      el.getAttribute('aria-checked'), el.getAttribute('aria-selected'), el.getAttribute('aria-pressed'),
-    ].join('|');
-  };
   const openRows = [];
   for (const el of pQSA('[data-tv3-menu]')) if (vis(el)) openRows.push(el);
   let target = null;
@@ -8228,27 +8382,24 @@ _CLICK_PRECHECK_JS = (
 """
     + _VIS_ROWS_JS
     + r"""
+  let optLevel = '';
   if (target && openRows.length) {
-    for (const el of openRows) {
-      // The target being the row or inside it is an option pick. The target merely CONTAINING rows
-      // (the card around the menu) is not — and since a center-point click on the card can land on
-      // an arbitrary row, that case is flagged so the handler makes no claims about it at all.
-      if (el === target || pContains(el, target)) {
-        isOption = true;
-        optText = (el.innerText || '').trim();
-        optState = state(el);
-        optSel = selState(el);
-        optKids = el.children.length;
-        optH = Math.round(el.getBoundingClientRect().height);
-        optVis = _visRows(el);
-        break;
-      }
-      if (pContains(target, el)) containsMenu = true;
+    // A pick reads its declared row, which a component may draw in its own root. The target merely CONTAINING rows
+    // (the card around the menu) is not a pick, and since a center-point click on the card can land on an arbitrary
+    // row, that case is flagged so the handler makes no claims about it at all.
+    const pick = menuPickOf(openRows, target);
+    if (pick) {
+      isOption = true;
+      optLevel = pick.level;
+      optText = (pick.leaf.innerText || '').trim() || composedRowText(pick.leaf);
+      ({ optState, optSel, optKids, optH, optVis } = pickState(pick));
+    } else if (openRows.some((el) => flatContains(target, el))) {
+      containsMenu = true;
     }
   }
   preReset();
   pScopeEach((el, inShadow) => { if (vis(el)) preMark(el, inShadow); });
-  return { menuOpen: openRows.length > 0, isOption, containsMenu, optText, optState, optSel, optKids, optH, optVis };
+  return { menuOpen: openRows.length > 0, isOption, containsMenu, optLevel, optText, optState, optSel, optKids, optH, optVis };
 }"""
 )
 
@@ -8329,24 +8480,6 @@ _MENU_AFTER_JS = (
     } catch (e) {}
     return true;
   };
-  const state = (el) => {
-    // .checked is a DOM property, not an attribute: a native-checkbox multi-select commits by
-    // flipping only it, with no aria/class/text change. Same for inline-style-only toggles.
-    let kids = '';
-    try { for (const i of el.querySelectorAll('input')) kids += i.checked ? '1' : '0'; } catch (e) {}
-    return [
-      el.getAttribute('aria-checked'), el.getAttribute('aria-selected'), el.getAttribute('aria-pressed'),
-      el.className, el.children.length, (el.innerText || '').trim(),
-      el.getAttribute('style'), kids,
-    ].join('|');
-  };
-  // Fixed-arity on purpose: every component is one attribute of the row itself, so a row that
-  // restructures cannot change this string, and only being picked can.
-  const selState = (el) => {
-    return [
-      el.getAttribute('aria-checked'), el.getAttribute('aria-selected'), el.getAttribute('aria-pressed'),
-    ].join('|');
-  };
 """
     + _VIS_ROWS_JS
     + r"""
@@ -8360,18 +8493,9 @@ _MENU_AFTER_JS = (
   let optKids = -1;
   let optH = -1;
   let optVis = -1;
-  if (target) {
-    for (const el of rows) {
-      if (el === target || pContains(el, target)) {
-        optState = state(el);
-        optSel = selState(el);
-        optKids = el.children.length;
-        optH = Math.round(el.getBoundingClientRect().height);
-        optVis = _visRows(el);
-        break;
-      }
-    }
-  }
+  // The same rule, so this reads the row the pre-click probe read.
+  const pick = menuPickOf(rows, target, true);
+  if (pick) ({ optState, optSel, optKids, optH, optVis } = pickState(pick));
   return { stillOpen, optState, optSel, optKids, optH, optVis };
 }"""
 )
@@ -8460,6 +8584,23 @@ _TAG_SUGG_SCROLLER_JS = (
 # ids (the staging trace's staleness trap). Existing tags are cleared only when a new menu is tagged.
 _FIND_MENU_JS = (
     r"""(arg) => {
+  // `keepOpenTags`: the scan follows a click inside a menu that stayed open (a pick that grew its row, a control
+  // beside a label). The finder clears every tag before it looks, so a scan that finds no new menu puts back the tags
+  // of the open menu's rows that are still rendered.
+  const kept = [];
+  const _keepRoots = """
+    + _SHADOW_ROOTS_JS
+    + r""";
+  if (arg && arg.keepOpenTags) {
+    for (const root of _keepRoots(document)) {
+      try {
+        for (const e of root.querySelectorAll('[data-tv3-menu],[data-tv3-menu-scroller]')) {
+          kept.push([e, e.getAttribute('data-tv3-menu'), e.getAttribute('data-tv3-menu-scroller')]);
+        }
+      } catch (e) {}
+    }
+  }
+  const found = ((arg) => {
   const clicked = arg.sel;"""
     + _PIERCED_QUERY_JS
     + _ROW_SEMANTICS_JS
@@ -8660,7 +8801,7 @@ _FIND_MENU_JS = (
         // Test the closest option-role ANCESTOR, not the reduced leaf: a role=option row with a styled
         // <span> child reduces to the span (null role), so a leaf-only check would wrongly reject it.
         // menuitem rows are enumerable here too: a menu in a dialog is still a menu.
-        if (!g.every((c) => composedClosest(c.el, OPT_SEL + ',[role="menuitem"]'))) continue;
+        if (!g.every((c) => declaredRowOf(c.el))) continue;
       }
     } catch (e) {}
     const pr = p.getBoundingClientRect();
@@ -8677,12 +8818,6 @@ _FIND_MENU_JS = (
   // The leaves of one declared row are one entry, shown with the row's text and pointing at the tag of its
   // link, else its first leaf that is not a separate control; a row that nests declared rows, existed before the click,
   // exceeds the row caps or holds only controls is not that unit.
-  const CONTROL_SEL = 'button,a[href],input,[role="button"],[role="checkbox"],[role="switch"],[role="radio"]';
-  const separateControl = (leaf, row) => {
-    const m = composedClosest(leaf, CONTROL_SEL);
-    if (!m || m === row) return false;
-    return pContains(row, m);
-  };
   // An undeclared leaf is a fragment when a visible text node outside every leaf sits directly in the leaf's
   // own wrapper below the container (a second line, a bare identifier beside a label), or when its row box
   // renders text the leaf does not (an identifier in a sibling element). A header in its own element does not
@@ -8690,7 +8825,7 @@ _FIND_MENU_JS = (
   const boxes = leafBoxes(best.g.map((c) => c.el));
   const bareTextBeside = (c) => {
     let declared = null;
-    try { declared = composedClosest(c.el, DECLARED_ROW_SEL); } catch (e) { declared = null; }
+    try { declared = declaredRowOf(c.el); } catch (e) { declared = null; }
     const box = boxes.get(c.el);
     if (!declared && box && box !== c.el && composedRowText(box) !== composedRowText(c.el)) return true;
     let a = composedParentElement(c.el);
@@ -8706,11 +8841,11 @@ _FIND_MENU_JS = (
   const byRow = new Map();
   const leavesIn = new Map();
   for (const c of best.g) {
-    const row = composedClosest(c.el, DECLARED_ROW_SEL);
+    const row = declaredRowOf(c.el);
     if (row) leavesIn.set(row, (leavesIn.get(row) || 0) + 1);
   }
   for (const c of best.g) {
-    const row = composedClosest(c.el, DECLARED_ROW_SEL);
+    const row = declaredRowOf(c.el);
     if (!row || row === c.el) {
       entries.push({ leaves: [c], reason: row ? null : (bareTextBeside(c) ? 'bare_text_beside' : null) });
       continue;
@@ -8740,8 +8875,8 @@ _FIND_MENU_JS = (
     // A link inside the row is the row's own action (clicking a badge beside it does nothing). A button is
     // not preferred: a row's button is as often a separate control (a favourite star) as its action.
     const link = e.leaves.find((c) => {
-      const a = composedClosest(c.el, 'a[href]');
-      return a ? a !== e.row && pContains(e.row, a) : false;
+      const a = flatClosest(c.el, 'a[href]');
+      return a ? a !== e.row && flatContains(e.row, a) : false;
     });
     const label = link || e.leaves.find((c) => !separateControl(c.el, e.row));
     if (label) { listed.push({ leaves: e.leaves, head: label, reason: null }); continue; }
@@ -8806,10 +8941,21 @@ _FIND_MENU_JS = (
   } catch (e) { declared = 0; }
   // `count` is the note's rows; `tagged` is the leaves the full-text read should find, row pieces included;
   // `rows` is the distinct rendered rows those leaves sit in, the unit aria-setsize counts.
-  const rendered = new Set(best.g.map((c) => composedClosest(c.el, DECLARED_ROW_SEL) || c.el)).size;
+  const rendered = new Set(best.g.map((c) => declaredRowOf(c.el) || c.el)).size;
   const out = { count, tagged: n, rows: rendered, options, scroller, whole: !withheld, withheld_reason: withheld ? withheld.reason : null };
   if (declared > count) out.declared = declared;
   return out;
+  })(arg);
+  if (!found || (!found.count && !found.withheld_reason)) {
+    for (const [e, tag, scroller] of kept) {
+      try {
+        if (!e.isConnected || !e.getClientRects().length || getComputedStyle(e).visibility === 'hidden') continue;
+        if (tag !== null) e.setAttribute('data-tv3-menu', tag);
+        if (scroller !== null) e.setAttribute('data-tv3-menu-scroller', scroller);
+      } catch (err) {}
+    }
+  }
+  return found;
 }"""
 )
 
@@ -8859,9 +9005,8 @@ _MENU_OPTION_TEXTS_JS = (
   const tagged = Array.from(pQSA('[data-tv3-' + attr + ']'));
   const boxes = leafBoxes(tagged);
   // aria-setsize counts rows, and a declared row can hold several tagged leaves: only its first leaf leads it.
-  const rowOf = (el) => { try { return composedClosest(el, DECLARED_ROW_SEL); } catch (e) { return null; } };
   const leadOf = new Map();
-  for (const el of tagged) { const r = rowOf(el); if (r && !leadOf.has(r)) leadOf.set(r, el); }
+  for (const el of tagged) { const r = declaredRowOf(el); if (r && !leadOf.has(r)) leadOf.set(r, el); }
   return tagged.map((el) => {
     // An option whose ancestor declares aria-setsize is a child that declares none, so read the
     // closest declaring ancestor or the incomplete-list guard is bypassed.
@@ -8958,9 +9103,9 @@ _MENU_OPTION_TEXTS_JS = (
       // aria-setsize="-1" declares the total unknown, so the rendered rows are never the whole list.
       setsize_unknown: setsize === -1,
       group: grp ? accessibleName(grp) || grp.id || 'group' : '',
-      lead: !rowOf(el) || leadOf.get(rowOf(el)) === el,
+      lead: !declaredRowOf(el) || leadOf.get(declaredRowOf(el)) === el,
       // The tag of the declared row's first leaf: leaves of one row are one option to the matcher.
-      unit: rowOf(el) ? num(leadOf.get(rowOf(el))) : null,
+      unit: declaredRowOf(el) ? num(leadOf.get(declaredRowOf(el))) : null,
       box: box,
       after: after,
       line: Number.isFinite(line) && line > 0 ? line : null,
@@ -15994,9 +16139,10 @@ def build_browser_tools(
             error_class="ambiguous_selector",
         )
 
-    async def _marker_matches(page: Any, selector: str) -> int:
+    async def _marker_matches(page: Any, selector: str, *, rendered: bool = False) -> int:
         try:
-            return int(await page.evaluate(_MARKER_MATCH_COUNT_JS, await _probe_arg(page, selector)))
+            arg = {**await _probe_arg(page, selector), "rendered": rendered}
+            return int(await page.evaluate(_MARKER_MATCH_COUNT_JS, arg))
         except Exception:
             return 1
 
@@ -16087,9 +16233,9 @@ def build_browser_tools(
         menu_note_census.update(_menu_note_fields(found))
         return _menu_open_note(found, selector, clicked_row=clicked_row)
 
-    async def _click_menu_scan(page: Any, arg: dict[str, Any]) -> Any:
+    async def _click_menu_scan(page: Any, arg: dict[str, Any], *, keep_open_tags: bool = False) -> Any:
         # Every menu the click tool reports goes through here, so a withheld one never keeps guessable numbers.
-        return await page.evaluate(_FIND_MENU_JS, {**arg, "saltUnlisted": True})
+        return await page.evaluate(_FIND_MENU_JS, {**arg, "saltUnlisted": True, "keepOpenTags": keep_open_tags})
 
     async def _click_reaction(
         page: Any, selector: str, pre: dict[str, Any], url_before: str, *, doc_planted: bool
@@ -16177,12 +16323,12 @@ def build_browser_tools(
                     "blindly and do not assume the selection committed; re-observe first."
                 )
 
-            async def _child_menu_note() -> str | None:
+            async def _child_menu_note(still_open: bool) -> str | None:
                 # A row that expands a sub-list mutates ITSELF, so the fingerprint cannot tell
                 # "committed" from "expanded" and the child rows can -- a cascading click that opened
                 # them committed nothing yet.
                 try:
-                    found = await _click_menu_scan(page, await _probe_arg(page, selector))
+                    found = await _click_menu_scan(page, await _probe_arg(page, selector), keep_open_tags=still_open)
                 except Exception:
                     return None
                 if isinstance(found, dict) and found.get("count"):
@@ -16222,7 +16368,7 @@ def build_browser_tools(
                 # A row that did not grow cannot have expanded into itself, so nothing competes with
                 # the commit reading and the probe is not worth its page walk -- which is the
                 # ordinary multi-select click.
-                child = await _child_menu_note() if _grew(after) else None
+                child = await _child_menu_note(bool(after.get("stillOpen"))) if _grew(after) else None
                 if not child:
                     return f"{_selected(opt_text)} — its state changed (the menu stayed open)."
                 # It grew AND opened child rows, so a selection attribute means it did both and
@@ -16264,6 +16410,11 @@ def build_browser_tools(
                     return _unverified("state-hold")
                 if held is not None:
                     return await _state_change_note(opt, held), None
+            if pre.get("optLevel") == "row":
+                # The click landed on a row outside its tagged leaves (its padding, a wrapper): only a closed menu or
+                # a changed row is reported, since a pick shown on a part of the row the state does not read is not
+                # evidence that it failed.
+                return None, None
             # Menus routinely close through a fade or an async server ack; declaring "did not commit"
             # off the instantaneous read would turn those healthy commits into false errors. One
             # bounded settle, only on this would-be-error path.
@@ -16288,7 +16439,7 @@ def build_browser_tools(
                     return await _state_change_note(opt, held), None
             # No-commit evidence is already established: a crash of this last informational probe must
             # not fall through to the caller's fail-open bare ok (_child_menu_note swallows).
-            late_child = await _child_menu_note()
+            late_child = await _child_menu_note(bool(settled.get("stillOpen")))
             if late_child:
                 return late_child, None
             return None, (
@@ -16306,13 +16457,14 @@ def build_browser_tools(
                 after_raw = await page.evaluate(_MENU_AFTER_JS, await _probe_arg(page, selector))
             except Exception:
                 return None, None
-            found = await _click_menu_scan(page, await _probe_arg(page, selector))
+            still_open = isinstance(after_raw, dict) and bool(after_raw.get("stillOpen"))
+            found = await _click_menu_scan(page, await _probe_arg(page, selector), keep_open_tags=still_open)
             if isinstance(found, dict) and found.get("count"):
                 return _menu_note(found, selector), None
-            if isinstance(after_raw, dict) and not after_raw.get("stillOpen"):
+            if isinstance(after_raw, dict) and not still_open:
                 return (
-                    "Note: this click CLOSED the open menu — no option was selected. To select, click "
-                    'an option\'s [data-tv3-menu="N"] selector while the menu is open.'
+                    "Note: this click CLOSED the open menu; the field's value in the next observe shows whether "
+                    'an option was chosen. While the menu is open, an option\'s [data-tv3-menu="N"] selector picks it.'
                 ), None
             return None, None
         found = await _click_menu_scan(page, await _probe_arg(page, selector))
@@ -16372,12 +16524,17 @@ def build_browser_tools(
             )
         if _TV3_MARKER_SELECTOR_RE.match(selector.strip()):
             matches = await _marker_matches(page, selector)
-            if matches == 0:
+            # A menu tag held only by rows its menu has since hidden (one that faded out after the click read it
+            # open) is as stale as one nothing holds.
+            numbered = bool(_NUMBERED_MENU_SELECTOR_RE.match(selector.strip()))
+            if matches == 0 or (numbered and await _marker_matches(page, selector, rendered=True) == 0):
                 # An absent marker cannot reappear without a re-observe, so Playwright's full 15s
                 # actionability wait is pure loss (4x in the specimen trace). Short attach grace
                 # tolerates a framework re-attaching the same node mid-render.
                 try:
-                    await page.wait_for_selector(selector, state="attached", timeout=1200)
+                    await page.wait_for_selector(selector, state="visible" if numbered else "attached", timeout=1200)
+                    if numbered and await _marker_matches(page, selector, rendered=True) == 0:
+                        raise LookupError(selector)
                 except Exception:
                     raise ToolRefusal(
                         f"{selector} no longer exists on the page — element markers vanish when the "
