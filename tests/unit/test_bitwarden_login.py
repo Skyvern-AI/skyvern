@@ -570,10 +570,10 @@ async def test_run_command_scrubs_inherited_cli_output_modes(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("subcommand", "noninteractive"), [("get", "true"), ("login", None)])
+@pytest.mark.parametrize(("subcommand", "noninteractive"), [("get", "true"), ("login", "true")])
 async def test_run_command_never_lets_a_read_prompt(tmp_path, subcommand: str, noninteractive: str | None) -> None:
     # A locked read that may prompt exits 0 with no output on a closed stdin and hangs on an open one;
-    # with BW_NOINTERACTION it fails with "Vault is locked.". Login stays interactive for its device prompt.
+    # with BW_NOINTERACTION it fails with "Vault is locked.". Login also fails instead of waiting for a code.
     fake_cli = tmp_path / "bw"
     fake_cli.write_text(
         f"#!{sys.executable}\n"
@@ -899,6 +899,8 @@ async def test_an_email_session_keeps_its_login_plus_read_attempt(
     overrides: dict = {}
     if email_source == "request":
         overrides["email"] = "vault@example.test"
+        overrides["client_id"] = None
+        overrides["client_secret"] = None
     else:
         monkeypatch.setattr(bitwarden_module.settings, "BITWARDEN_EMAIL", "vault@example.test")
 
