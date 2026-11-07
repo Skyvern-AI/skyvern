@@ -148,7 +148,7 @@ def loop_entered_through_executor() -> bool:
 
 @pytest.fixture(autouse=True)
 def _loop_runs_only_inside_the_executor(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The runtime half of tests/cloud/test_taskv3_single_loop_call_site.py: it sees calls the static scan cannot,
+    """The runtime half of a static scan in the cloud test suite: it sees calls the static scan cannot,
     such as a name computed at runtime."""
     if request.node.path.name in LOOP_OWNER_EXEMPT_TEST_FILES:
         return

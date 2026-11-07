@@ -199,8 +199,8 @@ def refs_for(action: Action) -> tuple[ProtectedReference, ...]:
 class TestObservationVerdictContract:
     def test_member_values_are_pinned_literal_strings(self) -> None:
         # Pins THIS enum's wire values, which is the half of the contract this package controls.
-        # It cannot observe cloud/prompt_security.DetectionOutcome — the OSS boundary forbids
-        # importing it — so the two-sided cross-check belongs in tests/cloud/ once that lands.
+        # It cannot observe the cloud detector's outcome enum — the OSS boundary forbids
+        # importing it — so the two-sided cross-check belongs in the cloud test suite once that lands.
         assert ObservationVerdict.NO_MATCH.value == "no_match"
         assert ObservationVerdict.SUSPICIOUS.value == "suspicious"
         assert ObservationVerdict.UNKNOWN.value == "unknown"

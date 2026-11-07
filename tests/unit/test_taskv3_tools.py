@@ -23164,7 +23164,7 @@ _PAIRING_ATTACKS = {
 # TOGETHER keeps them consistent: the check compares Beta-selector against Beta-element, agrees, and
 # passes, while the digest (which renders neither) still reads Alpha. Closing it needs an operand the
 # record never carried, which means running observe in an isolated world; see the residual note in
-# `_names_the_holder` and cloud_docs/task-v3/GOTCHAS.md.
+# `_names_the_holder` and the Task V3 gotchas doc.
 _COUPLED_TRANSPOSITION = """
   const realPush = Array.prototype.push;
   let held = null;

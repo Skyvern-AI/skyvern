@@ -2756,7 +2756,7 @@ _PAGE_FREE_SYSTEM_PROMPT_SHA256 = "f2467a7f82ea2db5e08b6da7576a3e58371295af0569c
 def test_system_prompts_are_pinned() -> None:
     message = (
         "{} changed. Any change to the Task V3 system prompt needs a dated operator ruling cited in the PR "
-        "(cloud_docs/task-v3/CHARTER.md, Governance) and a deliberate update of this pin."
+        "(the Task V3 charter, Governance) and a deliberate update of this pin."
     )
     assert hashlib.sha256(SYSTEM_PROMPT.encode()).hexdigest() == _SYSTEM_PROMPT_SHA256, message.format("SYSTEM_PROMPT")
     assert hashlib.sha256(PAGE_FREE_SYSTEM_PROMPT.encode()).hexdigest() == _PAGE_FREE_SYSTEM_PROMPT_SHA256, (
