@@ -21,8 +21,11 @@ from skyvern.forge.sdk.db.repositories.microsoft_oauth import (  # noqa: F401
     STATE_PENDING_CONSENT,
     STATE_REVOKED,
     ActiveCredentialCiphertext,
+    IncompatibleScopeProfileError,
     InvalidConsentNonceError,
     PendingConsentContext,
+    PowerBIReconnectAccessDenied,
+    ReconnectIdentityUnavailableError,
 )
 from skyvern.forge.sdk.encrypt import encryptor
 from skyvern.forge.sdk.encrypt.base import DEFAULT_ENCRYPT_METHOD, EncryptMethod
@@ -64,7 +67,10 @@ class MissingAccessTokenError(RuntimeError):
 
 
 class MicrosoftOAuthError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, status_code: int | None = None, error_code: str | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.error_code = error_code
 
 
 class InvalidRedirectURIError(ValueError):
@@ -80,6 +86,10 @@ class UnsupportedScopeProfileError(ValueError):
 
 
 class MicrosoftOAuthAccessDenied(PermissionError):
+    pass
+
+
+class CredentialNotReauthorizableError(ValueError):
     pass
 
 
@@ -195,11 +205,7 @@ def is_powerbi_scope_profile(
     scopes_requested: list[str] | tuple[str, ...] | None,
     scopes_granted: list[str] | tuple[str, ...] | None,
 ) -> bool:
-    return _matches_scope_profile(
-        MICROSOFT_OAUTH_SCOPE_PROFILE_POWERBI_DATASET_READ,
-        scopes_requested,
-        scopes_granted,
-    )
+    return _matches_scope_profile(MICROSOFT_OAUTH_SCOPE_PROFILE_POWERBI_DATASET_READ, scopes_requested, scopes_granted)
 
 
 def _matches_scope_profile(
@@ -374,6 +380,7 @@ async def start_authorization(
     scopes_requested: str | list[str] | tuple[str, ...] | None = None,
     scope_profile: str | None = None,
     app_origin: str | None = None,
+    credential_id: str | None = None,
     initiator_id: str | None = None,
 ) -> MicrosoftAuthorizationStart:
     _require_encryption()
@@ -381,26 +388,48 @@ async def start_authorization(
     if app_origin is not None:
         _validate_app_origin(app_origin)
 
-    credential_id = generate_microsoft_oauth_credential_id()
     state = oauth_consent.generate_consent_state()
     nonce = oauth_consent.consent_nonce(state, initiator_id)
     code_verifier = secrets.token_urlsafe(64)
     now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
-    requested_scopes = (
-        scopes_for_profile(scope_profile) if scopes_requested is None else _coerce_scopes(scopes_requested)
-    )
-
-    await app.DATABASE.microsoft_oauth.insert_pending_credential(
-        credential_id=credential_id,
-        organization_id=organization_id,
-        credential_name=credential_name,
-        scopes_requested=requested_scopes,
-        consent_nonce=nonce,
-        consent_redirect_uri=redirect_uri,
-        consent_expires_at=now + datetime.timedelta(seconds=CONSENT_TTL_SECONDS),
-        consent_app_origin=app_origin,
-        consent_code_verifier=code_verifier,
-    )
+    consent_expires_at = now + datetime.timedelta(seconds=CONSENT_TTL_SECONDS)
+    if credential_id is not None:
+        requested_scopes = scopes_for_profile(scope_profile) if scope_profile is not None else None
+        reauthorized = await app.DATABASE.microsoft_oauth.begin_reauthorization(
+            credential_id=credential_id,
+            organization_id=organization_id,
+            consent_nonce=nonce,
+            consent_redirect_uri=redirect_uri,
+            consent_expires_at=consent_expires_at,
+            consent_code_verifier=code_verifier,
+            now=now,
+            outlook_scopes=list(OUTLOOK_MAIL_SCOPES),
+            powerbi_scopes=list(POWERBI_DATASET_READ_SCOPES),
+            requested_scopes=requested_scopes,
+            consent_app_origin=app_origin,
+            requesting_user_id=initiator_id,
+        )
+        if reauthorized is None:
+            raise CredentialNotReauthorizableError(
+                "Microsoft OAuth credential not found or not in a reconnectable state"
+            )
+        requested_scopes = reauthorized.scopes_requested
+    else:
+        credential_id = generate_microsoft_oauth_credential_id()
+        requested_scopes = (
+            scopes_for_profile(scope_profile) if scopes_requested is None else _coerce_scopes(scopes_requested)
+        )
+        await app.DATABASE.microsoft_oauth.insert_pending_credential(
+            credential_id=credential_id,
+            organization_id=organization_id,
+            credential_name=credential_name,
+            scopes_requested=requested_scopes,
+            consent_nonce=nonce,
+            consent_redirect_uri=redirect_uri,
+            consent_expires_at=consent_expires_at,
+            consent_app_origin=app_origin,
+            consent_code_verifier=code_verifier,
+        )
 
     authorize_url, _ = build_authorize_url(
         redirect_uri=redirect_uri,
@@ -424,7 +453,7 @@ async def promote_pending_credential(
     _require_encryption()
     encrypted_token = await _encrypt_refresh_token(refresh_token, organization_id)
     now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
-    return await app.DATABASE.microsoft_oauth.promote_pending_to_active(
+    credential = await app.DATABASE.microsoft_oauth.promote_pending_to_active(
         organization_id=organization_id,
         nonce=oauth_consent.consent_nonce(state, initiator_id),
         encrypted_refresh_token=encrypted_token,
@@ -435,6 +464,19 @@ async def promote_pending_credential(
         object_id=object_id,
         now=now,
     )
+    try:
+        await app.CACHE.set(
+            microsoft_access_token_cache_key(organization_id, credential.id),
+            "",
+            ex=datetime.timedelta(seconds=30),
+        )
+    except Exception:
+        LOG.warning(
+            "Failed to invalidate Microsoft access-token cache after promotion",
+            credential_id=credential.id,
+            exc_info=True,
+        )
+    return credential
 
 
 async def load_pending_consent_context(
@@ -468,10 +510,16 @@ async def _post_token_form(data: dict[str, str]) -> dict:
             payload = {}
         if response.status_code in (400, 401) and error == "invalid_grant":
             raise MicrosoftOAuthError(
-                "Microsoft authorization expired or was revoked. Reconnect the Microsoft account."
+                "Microsoft authorization expired or was revoked. Reconnect the Microsoft account.",
+                status_code=response.status_code,
+                error_code=error,
             )
         detail = payload.get("error_description") or response.text[:200]
-        raise MicrosoftOAuthError(f"Microsoft token endpoint returned HTTP {response.status_code}: {detail}")
+        raise MicrosoftOAuthError(
+            f"Microsoft token endpoint returned HTTP {response.status_code}: {detail}",
+            status_code=response.status_code,
+            error_code=error,
+        )
 
     try:
         return response.json()

@@ -285,8 +285,59 @@ async def test_powerbi_authorization_binds_the_authenticated_owner(monkeypatch: 
         credential_name="Default",
         scope_profile="powerbi_dataset_read",
         app_origin=None,
+        credential_id=None,
         initiator_id="user-owner",
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "status_code"),
+    [
+        (
+            microsoft_oauth_service.CredentialNotReauthorizableError(
+                "Microsoft OAuth credential not found or not in a reconnectable state"
+            ),
+            404,
+        ),
+        (
+            microsoft_oauth_service.IncompatibleScopeProfileError(
+                "Microsoft Graph and Power BI permissions require separate connections. Connect a separate account."
+            ),
+            409,
+        ),
+        (
+            microsoft_oauth_service.ReconnectIdentityUnavailableError(
+                "This Microsoft connection has no recorded account identity. Create a new connection instead."
+            ),
+            409,
+        ),
+        (microsoft_oauth_service.PowerBIReconnectAccessDenied("Only the owner can reconnect this connection"), 403),
+    ],
+)
+async def test_microsoft_reconnect_authorize_maps_safe_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+    status_code: int,
+) -> None:
+    monkeypatch.setattr(
+        microsoft_oauth_routes.microsoft_oauth_service,
+        "start_authorization",
+        AsyncMock(side_effect=error),
+    )
+
+    with pytest.raises(HTTPException) as rejected:
+        await microsoft_oauth_routes.microsoft_oauth_authorize(
+            CreateMicrosoftOAuthAuthorizeRequest(
+                redirect_uri="https://app/cb",
+                credential_id="msoac_existing",
+            ),
+            SimpleNamespace(organization_id="org_1"),
+            "user-1",
+        )
+
+    assert rejected.value.status_code == status_code
+    assert rejected.value.detail == str(error)
 
 
 @pytest.mark.asyncio
@@ -405,11 +456,6 @@ async def test_powerbi_callback_promotes_only_the_restricted_owner_bound_grant(
         AsyncMock(return_value=True),
     )
     monkeypatch.setattr(microsoft_oauth_routes, "record_request_audit_event", AsyncMock())
-    monkeypatch.setattr(
-        microsoft_oauth_routes.app,
-        "DATABASE",
-        SimpleNamespace(microsoft_oauth=SimpleNamespace(get_credential_state=AsyncMock(return_value=None))),
-    )
 
     response = await microsoft_oauth_routes.microsoft_oauth_callback(
         CreateMicrosoftOAuthCallbackRequest(code="code", state="state"),
@@ -608,6 +654,9 @@ async def test_promote_pending_credential_stores_refresh_token_as_gcm(monkeypatc
     promote_pending_to_active = AsyncMock()
     repository = SimpleNamespace(promote_pending_to_active=promote_pending_to_active)
     monkeypatch.setattr(microsoft_oauth_service.app, "DATABASE", SimpleNamespace(microsoft_oauth=repository))
+    cache = SimpleNamespace(set=AsyncMock())
+    monkeypatch.setattr(microsoft_oauth_service.app, "CACHE", cache)
+    promote_pending_to_active.return_value = SimpleNamespace(id="msoac-1")
 
     await microsoft_oauth_service.promote_pending_credential(
         organization_id="org-1",
@@ -620,6 +669,8 @@ async def test_promote_pending_credential_stores_refresh_token_as_gcm(monkeypatc
     persisted = promote_pending_to_active.await_args.kwargs
     assert persisted["encrypted_refresh_token"].startswith("skyvern_enc:aesgcm-v1:")
     assert persisted["encrypted_method"] == microsoft_oauth_service.DEFAULT_ENCRYPT_METHOD
+    cache.set.assert_awaited_once()
+    assert cache.set.await_args.args[0] == microsoft_oauth_service.microsoft_access_token_cache_key("org-1", "msoac-1")
     assert (
         await microsoft_oauth_service.secret_encryption.decrypt_secret_field_value(
             persisted["encrypted_refresh_token"],
@@ -1204,8 +1255,11 @@ async def test_invalid_grant_raises_reconnect_message(monkeypatch: pytest.Monkey
 
     _install_microsoft_transport(monkeypatch, handler)
 
-    with pytest.raises(microsoft_oauth_service.MicrosoftOAuthError, match="Reconnect"):
+    with pytest.raises(microsoft_oauth_service.MicrosoftOAuthError, match="Reconnect") as exc_info:
         await microsoft_oauth_service.refresh_access_token("rt-1")
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.error_code == "invalid_grant"
 
 
 @pytest.mark.asyncio
@@ -1242,6 +1296,114 @@ async def test_callback_rejects_missing_mail_read_before_promoting(monkeypatch: 
     assert exc_info.value.detail == (
         "Microsoft did not grant Mail.Read. Please re-connect and accept all requested permissions."
     )
+    promote.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_outlook_reconnect_same_account_promotes_existing_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+    credential = MicrosoftOAuthCredentialBase(
+        id="msoac_existing",
+        organization_id="org_1",
+        credential_name="Outlook",
+        state="active",
+        scopes_requested=["Mail.Read", "User.Read", "offline_access", "openid", "profile"],
+        scopes_granted=["Mail.Read", "User.Read", "offline_access"],
+        created_at=now,
+        modified_at=now,
+    )
+    context = PendingConsentContext(
+        credential_id=credential.id,
+        consent_redirect_uri="https://app/cb",
+        consent_code_verifier="verifier",
+        state=microsoft_oauth_service.STATE_ACTIVE,
+        scopes_requested=credential.scopes_requested,
+        scopes_granted=credential.scopes_granted,
+        tenant_id="tenant-1",
+        object_id="object-1",
+    )
+    monkeypatch.setattr(
+        microsoft_oauth_routes.microsoft_oauth_service,
+        "load_pending_consent_context",
+        AsyncMock(return_value=context),
+    )
+    monkeypatch.setattr(
+        microsoft_oauth_routes.microsoft_oauth_service,
+        "exchange_code_for_tokens",
+        AsyncMock(
+            return_value={
+                "refresh_token": "refresh-new",
+                "access_token": "access-new",
+                "scope": "Mail.Read User.Read offline_access",
+                "id_token": _unsigned_id_token({"tid": "tenant-1", "oid": "object-1"}),
+            }
+        ),
+    )
+    promote = AsyncMock(return_value=credential)
+    monkeypatch.setattr(microsoft_oauth_routes.microsoft_oauth_service, "promote_pending_credential", promote)
+    monkeypatch.setattr(microsoft_oauth_routes.outlook, "fetch_primary_account_email", AsyncMock(return_value=None))
+    monkeypatch.setattr(microsoft_oauth_routes, "record_request_audit_event", AsyncMock())
+
+    response = await microsoft_oauth_routes.microsoft_oauth_callback(
+        CreateMicrosoftOAuthCallbackRequest(code="code", state="state"),
+        SimpleNamespace(organization_id="org_1"),
+        "user-1",
+    )
+
+    assert response.credential.id == "msoac_existing"
+    promote.assert_awaited_once()
+    assert promote.await_args.kwargs["tenant_id"] == "tenant-1"
+    assert promote.await_args.kwargs["object_id"] == "object-1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["wrong-object", "partial-grant"])
+async def test_outlook_reconnect_rejection_does_not_promote(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    context = PendingConsentContext(
+        credential_id="msoac_existing",
+        consent_redirect_uri="https://app/cb",
+        consent_code_verifier="verifier",
+        state=microsoft_oauth_service.STATE_ACTIVE,
+        scopes_requested=["Mail.Read", "User.Read", "offline_access", "openid", "profile"],
+        scopes_granted=["Mail.Read", "User.Read", "offline_access"],
+        tenant_id="tenant-1",
+        object_id="object-1",
+    )
+    object_id = "object-2" if failure == "wrong-object" else "object-1"
+    scopes = "Mail.Read User.Read offline_access" if failure == "wrong-object" else "Mail.Read offline_access"
+    monkeypatch.setattr(
+        microsoft_oauth_routes.microsoft_oauth_service,
+        "load_pending_consent_context",
+        AsyncMock(return_value=context),
+    )
+    monkeypatch.setattr(
+        microsoft_oauth_routes.microsoft_oauth_service,
+        "exchange_code_for_tokens",
+        AsyncMock(
+            return_value={
+                "refresh_token": "refresh-new",
+                "access_token": "access-new",
+                "scope": scopes,
+                "id_token": _unsigned_id_token({"tid": "tenant-1", "oid": object_id}),
+            }
+        ),
+    )
+    promote = AsyncMock()
+    monkeypatch.setattr(microsoft_oauth_routes.microsoft_oauth_service, "promote_pending_credential", promote)
+
+    with pytest.raises(HTTPException) as rejected:
+        await microsoft_oauth_routes.microsoft_oauth_callback(
+            CreateMicrosoftOAuthCallbackRequest(code="code", state="state"),
+            SimpleNamespace(organization_id="org_1"),
+            "user-1",
+        )
+
+    assert rejected.value.status_code == 409
     promote.assert_not_awaited()
 
 
@@ -1763,7 +1925,6 @@ async def test_microsoft_oauth_callback_rejects_state_redeemed_by_another_caller
             microsoft_oauth=SimpleNamespace(
                 insert_pending_credential=insert_pending_credential,
                 load_pending_by_nonce=load_pending_by_nonce,
-                get_credential_state=AsyncMock(return_value=None),
             )
         ),
         raising=False,

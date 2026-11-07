@@ -5,7 +5,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import structlog
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 
 from skyvern.forge.sdk.db._error_handling import db_operation
@@ -50,9 +50,11 @@ class PendingConsentContext:
     credential_id: str
     consent_redirect_uri: str | None
     consent_code_verifier: str | None
+    state: str = STATE_PENDING_CONSENT
     consent_app_origin: str | None = None
     client_id: str | None = None
     scopes_requested: tuple[str, ...] = ()
+    scopes_granted: tuple[str, ...] = ()
     email_address: str | None = None
     google_subject: str | None = None
 
@@ -98,16 +100,6 @@ class RevocableCiphertext:
 
 class GoogleOAuthRepository(BaseRepository):
     """All DB access for Google OAuth credentials. Owns session lifecycle."""
-
-    @db_operation("get_credential_state")
-    async def get_credential_state(self, organization_id: str, credential_id: str) -> str | None:
-        async with self.Session() as session:
-            return await session.scalar(
-                select(GoogleOAuthCredentialModel.state).where(
-                    GoogleOAuthCredentialModel.organization_id == organization_id,
-                    GoogleOAuthCredentialModel.id == credential_id,
-                )
-            )
 
     @db_operation("insert_pending_credential")
     async def insert_pending_credential(
@@ -165,9 +157,11 @@ class GoogleOAuthRepository(BaseRepository):
                 GoogleOAuthCredentialModel.id,
                 GoogleOAuthCredentialModel.consent_redirect_uri,
                 GoogleOAuthCredentialModel.consent_code_verifier,
+                GoogleOAuthCredentialModel.state,
                 GoogleOAuthCredentialModel.consent_app_origin,
                 GoogleOAuthCredentialModel.client_id,
                 GoogleOAuthCredentialModel.scopes_requested,
+                GoogleOAuthCredentialModel.scopes_granted,
                 GoogleOAuthCredentialModel.email_address,
                 GoogleOAuthCredentialModel.google_subject,
             ).where(
@@ -183,11 +177,13 @@ class GoogleOAuthRepository(BaseRepository):
                 credential_id=row[0],
                 consent_redirect_uri=row[1],
                 consent_code_verifier=row[2],
-                consent_app_origin=row[3],
-                client_id=row[4],
-                scopes_requested=tuple(row[5] or ()),
-                email_address=row[6],
-                google_subject=row[7],
+                state=row[3],
+                consent_app_origin=row[4],
+                client_id=row[5],
+                scopes_requested=tuple(row[6] or ()),
+                scopes_granted=tuple(row[7] or ()),
+                email_address=row[8],
+                google_subject=row[9],
             )
 
     @db_operation("get_credential")
@@ -348,8 +344,8 @@ class GoogleOAuthRepository(BaseRepository):
                     encrypted_refresh_token=encrypted_refresh_token,
                     encrypted_method=encrypted_method.value,
                     scopes_granted=scopes_granted,
-                    email_address=email_address,
-                    google_subject=google_subject,
+                    email_address=func.coalesce(email_address, GoogleOAuthCredentialModel.email_address),
+                    google_subject=func.coalesce(google_subject, GoogleOAuthCredentialModel.google_subject),
                     consent_nonce=None,
                     consent_redirect_uri=None,
                     consent_expires_at=None,

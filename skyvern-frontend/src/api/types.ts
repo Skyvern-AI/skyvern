@@ -429,6 +429,7 @@ export interface GoogleOAuthCredential {
   valid?: boolean | null;
   // Decided by the server: active, send permission granted, and a verified account identity on record.
   gmail_send_ready?: boolean;
+  account_recorded?: boolean;
   created_at: string;
   modified_at: string;
 }
@@ -478,6 +479,7 @@ export interface CreateGoogleOAuthAuthorizeRequest {
   // Existing credential to re-authenticate in place, preserving its id so
   // workflows referencing it keep working without edits.
   credential_id?: string;
+  set_account?: boolean;
 }
 
 export interface GoogleOAuthAuthorizeResponse {
