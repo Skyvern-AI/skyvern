@@ -45,11 +45,18 @@ def strip_query_params(url: str) -> str:
     """
     if not url:
         return ""
-    parsed = urlparse(url)
+    try:
+        parsed = urlparse(url)
+        # ``.port`` raises ValueError for a non-numeric or out-of-range port, and ``urlparse``
+        # itself raises for a malformed bracketed IPv6 netloc. Callers pass unvalidated strings
+        # (e.g. ``Task.totp_verification_url``), so a bad netloc must cost the field, not the caller.
+        port = parsed.port
+    except ValueError:
+        return ""
     if not parsed.scheme or not parsed.hostname:
         return ""
     host = parsed.hostname
-    port_str = f":{parsed.port}" if parsed.port else ""
+    port_str = f":{port}" if port else ""
     return f"{parsed.scheme}://{host}{port_str}{parsed.path}"
 
 
