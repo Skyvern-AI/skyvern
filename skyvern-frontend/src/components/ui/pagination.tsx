@@ -43,7 +43,7 @@ type PaginationLinkProps = {
   isActive?: boolean;
   isDisabled?: boolean;
 } & Pick<ButtonProps, "size"> &
-  React.ComponentProps<"a">;
+  React.ComponentProps<"button">;
 
 const PaginationLink = ({
   className,
@@ -52,8 +52,10 @@ const PaginationLink = ({
   size = "icon",
   ...props
 }: PaginationLinkProps) => (
-  <a
+  <button
+    type="button"
     aria-current={isActive ? "page" : undefined}
+    disabled={isDisabled}
     className={cn(
       buttonVariants({
         variant: isDisabled ? "disabled" : isActive ? "outline" : "ghost",
@@ -114,6 +116,45 @@ const PaginationEllipsis = ({
 );
 PaginationEllipsis.displayName = "PaginationEllipsis";
 
+type SimplePaginationProps = {
+  page: number;
+  hasNext: boolean;
+  onPageChange: (page: number) => void;
+  className?: string;
+};
+
+const SimplePagination = ({
+  page,
+  hasNext,
+  onPageChange,
+  className,
+}: SimplePaginationProps) => (
+  <Pagination className={className}>
+    <PaginationContent>
+      <PaginationItem>
+        <PaginationPrevious
+          isDisabled={page <= 1}
+          onClick={() => onPageChange(page - 1)}
+        />
+      </PaginationItem>
+      <PaginationItem>
+        <span
+          aria-current="page"
+          className={buttonVariants({ variant: "outline", size: "icon" })}
+        >
+          {page}
+        </span>
+      </PaginationItem>
+      <PaginationItem>
+        <PaginationNext
+          isDisabled={!hasNext}
+          onClick={() => onPageChange(page + 1)}
+        />
+      </PaginationItem>
+    </PaginationContent>
+  </Pagination>
+);
+
 export {
   Pagination,
   PaginationContent,
@@ -122,4 +163,5 @@ export {
   PaginationPrevious,
   PaginationNext,
   PaginationEllipsis,
+  SimplePagination,
 };

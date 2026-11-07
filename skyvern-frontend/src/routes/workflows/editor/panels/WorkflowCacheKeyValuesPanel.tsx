@@ -184,6 +184,7 @@ function WorkflowCacheKeyValuesPanel({
             <PaginationContent>
               <PaginationItem>
                 <PaginationPrevious
+                  isDisabled={displayPage <= 1}
                   className={cn({
                     "pointer-events-none opacity-50": displayPage <= 1,
                   })}
@@ -202,6 +203,7 @@ function WorkflowCacheKeyValuesPanel({
               </PaginationItem>
               <PaginationItem>
                 <PaginationNext
+                  isDisabled={displayPage === totalPages}
                   className={cn({
                     "pointer-events-none opacity-50":
                       displayPage === totalPages,

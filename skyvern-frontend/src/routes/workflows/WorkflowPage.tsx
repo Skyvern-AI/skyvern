@@ -14,14 +14,7 @@ import { WorkflowRunAttemptChip } from "@/components/WorkflowRunAttemptChip";
 import { CredentialFallbackRetryBadge } from "@/components/CredentialFallbackRetryBadge";
 import { StatusFilterDropdown } from "@/components/StatusFilterDropdown";
 import { Button } from "@/components/ui/button";
-import {
-  Pagination,
-  PaginationContent,
-  PaginationItem,
-  PaginationLink,
-  PaginationNext,
-  PaginationPrevious,
-} from "@/components/ui/pagination";
+import { SimplePagination } from "@/components/ui/pagination";
 import {
   Select,
   SelectContent,
@@ -697,43 +690,16 @@ function WorkflowPage() {
                     </SelectContent>
                   </Select>
                 </div>
-                <Pagination className="pt-0">
-                  <PaginationContent>
-                    <PaginationItem>
-                      <PaginationPrevious
-                        className={cn({ "cursor-not-allowed": page === 1 })}
-                        onClick={() => {
-                          if (page === 1) {
-                            return;
-                          }
-                          const params = new URLSearchParams(searchParams);
-                          params.set("page", String(Math.max(1, page - 1)));
-                          setSearchParams(params, { replace: true });
-                        }}
-                      />
-                    </PaginationItem>
-                    <PaginationItem>
-                      <PaginationLink>{page}</PaginationLink>
-                    </PaginationItem>
-                    <PaginationItem>
-                      <PaginationNext
-                        className={cn({
-                          "cursor-not-allowed":
-                            workflowRuns !== undefined &&
-                            workflowRuns.length < pageSize,
-                        })}
-                        onClick={() => {
-                          if (workflowRuns && workflowRuns.length < pageSize) {
-                            return;
-                          }
-                          const params = new URLSearchParams(searchParams);
-                          params.set("page", String(page + 1));
-                          setSearchParams(params, { replace: true });
-                        }}
-                      />
-                    </PaginationItem>
-                  </PaginationContent>
-                </Pagination>
+                <SimplePagination
+                  className="pt-0"
+                  page={page}
+                  hasNext={!workflowRuns || workflowRuns.length >= pageSize}
+                  onPageChange={(nextPage) => {
+                    const params = new URLSearchParams(searchParams);
+                    params.set("page", String(nextPage));
+                    setSearchParams(params, { replace: true });
+                  }}
+                />
               </div>
             </div>
           </>
