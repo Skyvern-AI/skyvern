@@ -120,7 +120,7 @@ def _reads_like_a_word(word: str) -> bool:
         return False
     if len(word) >= 6 and any(ch.isalpha() for ch in word) and any(ch.isdigit() for ch in word):
         return False
-    # Random mixed case ("aHVudGVy") flips from lower to upper more than once; a brand ("LinkedIn") once.
+    # Random mixed case ("aHVudGVy") flips from lower to upper more than once; a brand ("JobBoard") once.
     return sum(1 for a, b in zip(word, word[1:]) if a.islower() and b.isupper()) < 2
 
 
