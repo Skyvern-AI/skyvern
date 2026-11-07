@@ -1,13 +1,30 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { useEffect } from "react";
-import { afterEach, describe, expect, test, vi } from "vitest";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
+import { type ComponentProps, useEffect } from "react";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import type { StreamStateChangeHandler } from "@/routes/streaming/streamState";
+import {
+  FakeStreamSocket,
+  SCREENCAST_PATH,
+  closeVncAndServeFrame,
+  expectForcedCdpFrame,
+  expectUnforcedInputSocket,
+  socketsAt,
+  stubAnimationFrame,
+} from "@/testUtils/fakeStreamSocket";
+import { RunLiveStream } from "./RunLiveStream";
 
 let transport: string | undefined = "cdp";
 let external = false;
+const realSessionStream = vi.hoisted(() => ({ enabled: false }));
 
 vi.mock("@/hooks/useRuntimeConfig", () => ({
   useStreamTransport: () => ({
@@ -32,24 +49,45 @@ vi.mock("@/components/BrowserStream", () => ({
   ),
 }));
 
-vi.mock("@/routes/browserSessions/BrowserSessionStream", () => ({
-  BrowserSessionStream: ({
-    onStreamStateChange,
-  }: {
-    onStreamStateChange?: StreamStateChangeHandler;
-  }) => {
-    useEffect(() => {
-      onStreamStateChange?.("live", "pbs_1");
-    }, [onStreamStateChange]);
-    return <div data-testid="session-stream" />;
+vi.mock(
+  "@/routes/browserSessions/BrowserSessionStream",
+  async (importOriginal) => {
+    const actual =
+      await importOriginal<
+        typeof import("@/routes/browserSessions/BrowserSessionStream")
+      >();
+    type Props = ComponentProps<typeof actual.BrowserSessionStream>;
+    const StubSessionStream = ({ onStreamStateChange }: Props) => {
+      useEffect(() => {
+        onStreamStateChange?.("live", "pbs_1");
+      }, [onStreamStateChange]);
+      return <div data-testid="session-stream" />;
+    };
+    return {
+      BrowserSessionStream: (props: Props) =>
+        realSessionStream.enabled ? (
+          <actual.BrowserSessionStream {...props} />
+        ) : (
+          <StubSessionStream {...props} />
+        ),
+    };
   },
-}));
+);
 
 vi.mock("../../workflowRun/WorkflowRunStream", () => ({
   WorkflowRunStream: () => <div data-testid="run-stream" />,
 }));
 
-import { RunLiveStream } from "./RunLiveStream";
+vi.mock("@/util/env", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/util/env")>()),
+  newWssBaseUrl: "ws://127.0.0.1:8000/api/v1",
+  getWebSocketProtocols: async () => ["skyvern.v1", "apikey.test"],
+}));
+
+vi.mock("@/hooks/useCredentialGetter", () => {
+  const credentialGetter = async () => null;
+  return { useCredentialGetter: () => credentialGetter };
+});
 
 afterEach(() => {
   cleanup();
@@ -194,4 +232,61 @@ test("shows retry waits through the theme-aware status panel", () => {
   expect(panel.className).toContain("bg-white");
   expect(panel.className).toContain("text-neutral-600");
   expect(screen.queryByTestId("run-stream")).toBeNull();
+});
+
+describe("RunLiveStream CDP fallback through the real session stream", () => {
+  const SESSION = "pbs_fallback";
+
+  class NoopResizeObserver {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  }
+
+  function renderStream(interactive = false) {
+    return render(
+      <RunLiveStream
+        workflowRunId="wr_1"
+        browserSessionId={SESSION}
+        interactive={interactive}
+      />,
+    );
+  }
+
+  beforeEach(() => {
+    realSessionStream.enabled = true;
+    stubAnimationFrame();
+    vi.stubGlobal("WebSocket", FakeStreamSocket);
+    vi.stubGlobal("ResizeObserver", NoopResizeObserver);
+  });
+
+  afterEach(() => {
+    cleanup();
+    realSessionStream.enabled = false;
+    FakeStreamSocket.instances.length = 0;
+    vi.unstubAllGlobals();
+  });
+
+  test("renders a frame from a force_cdp screencast instead of the 4001 panel", async () => {
+    transport = "vnc";
+    renderStream();
+    const socket = await closeVncAndServeFrame("frame-1");
+    await expectForcedCdpFrame(socket, SESSION, "frame-1");
+  });
+
+  test("keeps the interactive input socket on its own unforced path", async () => {
+    transport = "vnc";
+    renderStream(true);
+    const socket = await closeVncAndServeFrame("frame-2");
+    await expectForcedCdpFrame(socket, SESSION, "frame-2");
+    expectUnforcedInputSocket(SESSION);
+  });
+
+  test("opens the screencast without force_cdp on the cdp transport", async () => {
+    transport = "cdp";
+    renderStream();
+    expect(screen.queryByTestId("vnc-stream")).toBeNull();
+    await waitFor(() => expect(socketsAt(SCREENCAST_PATH)).toHaveLength(1));
+    expect(new URL(socketsAt(SCREENCAST_PATH)[0]!.url).search).toBe("");
+  });
 });

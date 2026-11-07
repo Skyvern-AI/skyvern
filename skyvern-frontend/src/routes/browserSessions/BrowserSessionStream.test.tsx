@@ -8,6 +8,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useSettingsStore } from "@/store/SettingsStore";
 import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
 import {
+  FakeStreamSocket,
+  stubAnimationFrame,
+} from "@/testUtils/fakeStreamSocket";
+import {
   STREAM_MAX_RECONNECT_DELAY_MS,
   isTerminalStreamStatus,
   shouldReconnectStream,
@@ -115,51 +119,6 @@ vi.mock("@/routes/streaming/InteractiveStreamView", () => ({
   },
 }));
 
-class FakeStreamSocket {
-  static readonly OPEN = 1;
-  static instances: FakeStreamSocket[] = [];
-
-  readonly readyState = FakeStreamSocket.OPEN;
-  readonly send = vi.fn();
-  close = vi.fn();
-  readonly url: string;
-  readonly protocols: string | string[] | undefined;
-  onopen: ((event: Event) => void) | null = null;
-  onmessage: ((event: MessageEvent) => void) | null = null;
-  onclose: ((event: CloseEvent) => void) | null = null;
-
-  private listeners: Record<string, Array<(event: unknown) => void>> = {};
-
-  constructor(url: string, protocols?: string | string[]) {
-    this.url = url;
-    this.protocols = protocols;
-    FakeStreamSocket.instances.push(this);
-  }
-
-  addEventListener(type: string, listener: (event: unknown) => void) {
-    this.listeners[type] = [...(this.listeners[type] ?? []), listener];
-  }
-
-  removeEventListener() {}
-
-  emit(type: string, event: unknown) {
-    if (type === "open") {
-      this.onopen?.(event as Event);
-    } else if (type === "message") {
-      this.onmessage?.(event as MessageEvent);
-    } else if (type === "close") {
-      this.onclose?.(event as CloseEvent);
-    }
-    for (const listener of this.listeners[type] ?? []) {
-      listener(event);
-    }
-  }
-
-  emitStreamMessage(message: Record<string, unknown>) {
-    this.emit("message", { data: JSON.stringify(message) });
-  }
-}
-
 const messageSockets = (browserSessionId: string) =>
   FakeStreamSocket.instances.filter((socket) =>
     socket.url.includes(`/stream/messages/browser_session/${browserSessionId}`),
@@ -167,19 +126,6 @@ const messageSockets = (browserSessionId: string) =>
 
 const sentMessages = (socket: FakeStreamSocket) =>
   socket.send.mock.calls.map((call) => JSON.parse(String(call[0])));
-
-function stubAnimationFrame(): void {
-  vi.stubGlobal(
-    "requestAnimationFrame",
-    vi.fn((callback: FrameRequestCallback) =>
-      window.setTimeout(() => callback(performance.now()), 0),
-    ),
-  );
-  vi.stubGlobal(
-    "cancelAnimationFrame",
-    vi.fn((handle: number) => window.clearTimeout(handle)),
-  );
-}
 
 class DisconnectingWebSocketServer {
   private readonly server: Server;
@@ -974,6 +920,22 @@ describe("BrowserSessionStream reconnect lifecycle", () => {
     await act(async () => vi.advanceTimersByTimeAsync(1000));
 
     expect(socket.close).toHaveBeenCalledOnce();
+    expect(FakeStreamSocket.instances).toHaveLength(1);
+  });
+
+  it("a credential rejection never retries", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeStreamSocket);
+    render(<BrowserSessionStream browserSessionId="pbs_no_credential" />);
+    await act(async () => Promise.resolve());
+
+    act(() => {
+      const socket = FakeStreamSocket.instances[0]!;
+      socket.emit("message", { data: "No valid credential provided" });
+      socket.emit("close", { code: 1000, reason: "" });
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(1000));
+
     expect(FakeStreamSocket.instances).toHaveLength(1);
   });
 
