@@ -1,6 +1,7 @@
 import { BitwardenIcon } from "@/components/icons/BitwardenIcon";
 import { getHostname } from "@/util/getHostname";
 import { useBitwardenItemsQuery } from "@/routes/workflows/hooks/useBitwardenItemsQuery";
+import { isAxiosError } from "axios";
 
 type Props = {
   search?: string;
@@ -8,7 +9,7 @@ type Props = {
 };
 
 function BitwardenCredentialsList({ search, folderId }: Props) {
-  const { data, isLoading, isError } = useBitwardenItemsQuery();
+  const { data, isLoading, isError, error } = useBitwardenItemsQuery();
   const normalizedSearch = search?.trim().toLowerCase() ?? "";
   const muted = "text-sm text-neutral-600 dark:text-slate-400";
   const filteredItems = (data?.items ?? []).filter(
@@ -36,11 +37,18 @@ function BitwardenCredentialsList({ search, folderId }: Props) {
   }
 
   if (isError) {
+    const errorDetail =
+      isAxiosError<{ detail?: unknown }>(error) &&
+      error.response?.status === 400
+        ? error.response.data?.detail
+        : undefined;
     return (
       <div className="space-y-4">
         {header}
         <div className="rounded-lg bg-slate-elevation2 p-4 text-sm text-neutral-600 dark:text-slate-400">
-          Couldn&apos;t load Bitwarden items.
+          {typeof errorDetail === "string"
+            ? errorDetail
+            : "Couldn't load Bitwarden items."}
         </div>
       </div>
     );
