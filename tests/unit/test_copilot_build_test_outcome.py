@@ -7980,7 +7980,7 @@ def _install_rescued_run(
 
     code_row = run_result_block_row("collect_metrics", "completed", task_id="tsk_code")
     code_row.block_type = BlockType.CODE
-    recovery_row = run_result_block_row("Self-heal recovery", "completed", task_id="tsk_fallback")
+    recovery_row = run_result_block_row("Fallback to AI", "completed", task_id="tsk_fallback")
     recovery_row.parent_workflow_run_block_id = code_row.workflow_run_block_id
     fired = any(episode.status != HealStatus.skipped for episode in heal_episodes)
     ctx = install_get_run_results_harness(
@@ -8025,11 +8025,11 @@ async def test_a_rescued_block_reads_as_an_ai_fallback_rescue_in_run_results_and
         "failing_line": 5,
         "failure_text": _CODE_ERROR,
     }
-    assert rows["Self-heal recovery"]["parent_block_label"] == "collect_metrics"
+    assert rows["Fallback to AI"]["parent_block_label"] == "collect_metrics"
     assert "ai_fallback" not in rows["write_sheet"]
     compacted = {row["label"]: row for row in json.loads(_summarize_tool_output(json.dumps(page)))["blocks"]}
     assert compacted["collect_metrics"]["ai_fallback"] == {"status": "fired_completed", "failure_text": _CODE_ERROR}
-    assert compacted["Self-heal recovery"]["parent_block_label"] == "collect_metrics"
+    assert compacted["Fallback to AI"]["parent_block_label"] == "collect_metrics"
 
 
 @pytest.mark.asyncio
