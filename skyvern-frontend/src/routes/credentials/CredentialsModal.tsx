@@ -2164,8 +2164,8 @@ function CredentialsModal({
             <>
               {/* A backend that predates extra sites returns no list and drops them on save. */}
               {isEditMode && editingCredential?.extra_site_urls != null ? (
-                <div className="flex items-start gap-12">
-                  <div className="w-40 shrink-0">
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:gap-12">
+                  <div className="shrink-0 sm:w-40">
                     <Label htmlFor="extra-site-urls">Also signs in on</Label>
                   </div>
                   <div className="w-full space-y-1">
@@ -2494,7 +2494,7 @@ function CredentialsModal({
               event.preventDefault();
             }
           }}
-          className="ph-no-capture max-h-[90vh] w-[700px] max-w-[700px] overflow-y-auto [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:border-2 [&::-webkit-scrollbar-thumb]:border-slate-100 [&::-webkit-scrollbar-thumb]:bg-slate-300 dark:[&::-webkit-scrollbar-thumb]:border-slate-800 dark:[&::-webkit-scrollbar-thumb]:bg-slate-600 [&::-webkit-scrollbar-track]:bg-slate-100 dark:[&::-webkit-scrollbar-track]:bg-slate-800 [&::-webkit-scrollbar]:w-2"
+          className="ph-no-capture max-h-[90vh] w-[calc(100vw-2rem)] max-w-[700px] overflow-y-auto [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:border-2 [&::-webkit-scrollbar-thumb]:border-slate-100 [&::-webkit-scrollbar-thumb]:bg-slate-300 dark:[&::-webkit-scrollbar-thumb]:border-slate-800 dark:[&::-webkit-scrollbar-thumb]:bg-slate-600 [&::-webkit-scrollbar-track]:bg-slate-100 dark:[&::-webkit-scrollbar-track]:bg-slate-800 [&::-webkit-scrollbar]:w-2"
         >
           <DialogHeader>
             <DialogTitle className="font-bold">
