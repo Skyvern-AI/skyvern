@@ -26,6 +26,12 @@ import {
 } from "@/store/WorkflowYamlEditorStore";
 import { ArtifactDownloadLink } from "@/components/ArtifactDownloadLink";
 import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { StartFromCards } from "@/components/StartFromCards";
 import { useWorkflowDocEditorFlag } from "@/hooks/useWorkflowDocEditorFlag";
 import {
@@ -10763,6 +10769,15 @@ export function WorkflowCopilotChat({
     if (refuseMutationDuringYamlCommit()) return;
     onRecordTask?.();
   };
+  const composerDemonstrateDisabledReason = recordTaskDisabled
+    ? recordTaskUnavailableReason
+    : isDemonstrating
+      ? "A demonstration is already open"
+      : hasPendingQuestion
+        ? "Answer Copilot's question first"
+        : isLoading
+          ? "Wait for Copilot to finish"
+          : null;
   const content = (
     <div
       className={
@@ -12119,16 +12134,59 @@ export function WorkflowCopilotChat({
             />
             {/* As tall as one textarea line box, so the controls center on the last line as the textarea grows. */}
             <div className="flex h-10 shrink-0 items-center gap-1.5">
-              <button
-                type="button"
-                onClick={() => attachmentInputRef.current?.click()}
-                disabled={attachDisabledReason !== null}
-                title={attachDisabledReason ?? "Attach a file"}
-                aria-label="Attach a file"
-                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-muted-foreground transition hover:bg-accent hover:text-accent-foreground disabled:opacity-50"
-              >
-                <PlusIcon className="h-4 w-4" />
-              </button>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <button
+                    type="button"
+                    disabled={
+                      attachDisabledReason !== null &&
+                      composerDemonstrateDisabledReason !== null
+                    }
+                    title={
+                      attachDisabledReason !== null &&
+                      composerDemonstrateDisabledReason !== null
+                        ? attachDisabledReason
+                        : "Attach a file or demonstrate"
+                    }
+                    aria-label="Attach a file or demonstrate"
+                    className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-muted-foreground transition hover:bg-accent hover:text-accent-foreground disabled:opacity-50"
+                  >
+                    <PlusIcon className="h-4 w-4" />
+                  </button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent side="top" align="start" className="w-64">
+                  <DropdownMenuItem
+                    disabled={attachDisabledReason !== null}
+                    onSelect={() => attachmentInputRef.current?.click()}
+                    className="items-start gap-2 p-2"
+                  >
+                    <FileIcon className="mt-0.5 h-4 w-4 shrink-0" />
+                    <span className="min-w-0">
+                      <span className="block">Attach a file</span>
+                      <span className="block text-xs text-muted-foreground">
+                        {attachDisabledReason ??
+                          "A document, spreadsheet, or SOP for Copilot"}
+                      </span>
+                    </span>
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    disabled={composerDemonstrateDisabledReason !== null}
+                    onSelect={startRecordTask}
+                    className="items-start gap-2 p-2"
+                  >
+                    <span className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center">
+                      <span className="h-2.5 w-2.5 rounded-full bg-red-500" />
+                    </span>
+                    <span className="min-w-0">
+                      <span className="block">Demonstrate task</span>
+                      <span className="block text-xs text-muted-foreground">
+                        {composerDemonstrateDisabledReason ??
+                          "Show Copilot how in the browser"}
+                      </span>
+                    </span>
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
               <SpeechInputButton
                 isSupported={isSpeechSupported}
                 isListening={isSpeechListening}
