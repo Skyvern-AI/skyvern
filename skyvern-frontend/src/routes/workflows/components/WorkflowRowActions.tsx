@@ -18,7 +18,7 @@ import {
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { toast } from "@/components/ui/use-toast";
 import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
-import { useUpdateWorkflowFolderMutation } from "../hooks/useFolderMutations";
+import { useMoveWorkflowToFolder } from "../hooks/useMoveWorkflowToFolder";
 import { useApplyWorkflowTagsMutation } from "../hooks/useWorkflowTagMutations";
 import { useWorkflowRowActions } from "../hooks/useWorkflowRowActions";
 import { workflowEditorPath } from "../studioNavigation";
@@ -59,7 +59,9 @@ function WorkflowRowActions({
   children,
 }: Props) {
   const studioEnabled = useWorkflowStudioEnabled();
-  const updateFolderMutation = useUpdateWorkflowFolderMutation();
+  const { moveToFolder } = useMoveWorkflowToFolder(
+    workflow.workflow_permanent_id,
+  );
   const applyTagsMutation = useApplyWorkflowTagsMutation();
   const [deleteOpen, setDeleteOpen] = React.useState(false);
   const [tagError, setTagError] = React.useState<string | null>(null);
@@ -110,27 +112,6 @@ function WorkflowRowActions({
         },
       },
     );
-  }
-
-  async function moveToFolder(folderId: string | null) {
-    try {
-      await updateFolderMutation.mutateAsync({
-        workflowPermanentId: workflow.workflow_permanent_id,
-        data: { folder_id: folderId },
-      });
-      toast({
-        title: folderId ? "Moved to folder." : "Removed from folder.",
-        variant: "success",
-      });
-    } catch (error) {
-      toast({
-        variant: "destructive",
-        title: folderId
-          ? "Failed to move agent to folder"
-          : "Failed to remove agent from folder",
-        description: error instanceof Error ? error.message : undefined,
-      });
-    }
   }
 
   const items: Array<RowActionItem> = [];
