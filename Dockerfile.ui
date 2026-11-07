@@ -1,5 +1,11 @@
+# The publish workflow passes the value from .nvmrc; do not duplicate it here.
+ARG NODE_VERSION=required
+FROM node:${NODE_VERSION}-slim AS node-base
+ARG NODE_VERSION
+RUN test "$(node --version)" = "v${NODE_VERSION}" && node --version
+
 # Stage 1: Build frontend assets
-FROM node:24.14-slim AS builder
+FROM node-base AS builder
 
 WORKDIR /app
 
@@ -37,7 +43,7 @@ ENV NODE_OPTIONS=--max-old-space-size=4096
 RUN npm run build
 
 # Stage 2: Runtime image (only built assets + servers)
-FROM node:24.14-slim
+FROM node-base
 
 # Install tini for proper signal handling and zombie reaping
 RUN apt-get update && apt-get install -y --no-install-recommends tini && rm -rf /var/lib/apt/lists/*
