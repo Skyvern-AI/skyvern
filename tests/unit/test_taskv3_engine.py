@@ -7,6 +7,7 @@ from the tools test, so the engine's wiring is exercised without a real LLM or b
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import random
@@ -71,6 +72,7 @@ from skyvern.forge.taskv3.run_arms import ANSWER_AUDIT_LOG_ONLY_FLAG, APPLICATIO
 from skyvern.forge.taskv3.tools import PAGE_UNAVAILABLE_ERROR, DownloadFailureWatch
 from skyvern.forge.taskv3.turn_dom import TurnDomCapture
 from skyvern.schemas.llm import LLMConfig, LLMRouterConfig, LLMRouterModelConfig
+from skyvern.schemas.workflows import BlockType
 from skyvern.utils.prompt_engine import PROMPT_HARD_CEILING_TOKENS
 from skyvern.utils.token_counter import count_tokens
 from tests.unit.helpers import fallback_receipts
@@ -1810,6 +1812,8 @@ async def _run_with_application_context_arm(
     hook: Any = ("TIER ONE", "AGE TEXT", "SIX TEXT"),
     page_free: bool = False,
     payload_check: tuple[str | None, str] = ("SIX AND TIER ONE", "rendered"),
+    block_type: BlockType | None = None,
+    caller_type: type[_ScriptedCaller] = _ScriptedCaller,
 ) -> tuple[Any, _ScriptedCaller, dict[str, Any], list[Any]]:
     """Today's hooks qualify the payload; the audit hook records that it ran, whatever the run declares."""
     context_calls: list[Any] = []
@@ -1838,7 +1842,7 @@ async def _run_with_application_context_arm(
     ctx = SkyvernContext()
     ctx.run_arms = {APPLICATION_CONTEXT_FLAG: ("wr_1", arm)}
     skyvern_context.set(ctx)
-    caller = _ScriptedCaller(script)
+    caller = caller_type(script)
     try:
         with capture_logs() as logs:
             outcome = await run_task_v3_agent_loop(
@@ -1847,11 +1851,12 @@ async def _run_with_application_context_arm(
                 goal="Apply.",
                 parameters={"resume": "text"},
                 page_free=page_free,
+                block_type=block_type,
             )
     finally:
         skyvern_context.reset()
     terminal = next(e for e in logs if e.get("event") == "taskv3 engine loop finished")
-    declaring_run = arm == "treatment" and hook is not None and not page_free
+    declaring_run = arm == "treatment" and hook is not None and not page_free and block_type != BlockType.EXTRACTION
     assert audit_calls == ([] if page_free else [True if declaring_run else "absent"])
     # A declaring run reads every log fact off its one context call.
     assert payload_hook_calls == ([] if page_free or declaring_run else ["age", "defaults"])
@@ -2114,6 +2119,54 @@ async def test_a_run_that_never_gets_a_turn_reads_not_asked(monkeypatch: pytest.
     assert outcome.status == "terminated"
     terminal = next(e for e in logs if e.get("event") == "taskv3 engine loop finished")
     assert terminal["application_context"] == "not_asked"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("block_type", list(BlockType))
+async def test_an_extraction_block_is_not_offered_the_declaration_but_still_reads_its_arm(
+    monkeypatch: pytest.MonkeyPatch, block_type: BlockType
+) -> None:
+    arm_reads: list[str] = []
+
+    def spy(flag: str, forced: bool) -> bool:
+        arm_reads.append(flag)
+        return real_run_arm_enabled(flag, forced)
+
+    real_run_arm_enabled = engine_mod.run_arm_enabled
+    monkeypatch.setattr(engine_mod, "run_arm_enabled", spy)
+    outcome, caller, terminal, context_calls = await _run_with_application_context_arm(
+        monkeypatch, "treatment", _FINISH_ONLY, block_type=block_type
+    )
+    offered = block_type != BlockType.EXTRACTION
+    assert arm_reads.count(APPLICATION_CONTEXT_FLAG) == 1
+    assert terminal["application_context_arm"] == "treatment"
+    assert len(context_calls) == (1 if offered else 0)
+    assert ("declare_application_context" in _sent_tool_names(caller)) is offered
+    assert any("declare_application_context" in text for text in _user_texts(outcome)) is offered
+    assert (terminal["application_context"] is None) is not offered
+
+
+class _RequestRecordingCaller(_ScriptedCaller):
+    def __init__(self, script: list[list[tuple[str, dict[str, Any]]]]) -> None:
+        super().__init__(script)
+        self.requests: list[dict[str, Any]] = []
+
+    async def call(self, **kwargs: Any) -> dict[str, Any]:
+        self.requests.append({**copy.deepcopy(kwargs), "message_history": copy.deepcopy(self.message_history)})
+        return await super().call(**kwargs)
+
+
+@pytest.mark.asyncio
+async def test_a_treatment_extraction_block_sends_the_control_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    runs = {}
+    for arm in ("control", "treatment"):
+        outcome, caller, terminal, _ = await _run_with_application_context_arm(
+            monkeypatch, arm, _FINISH_ONLY, block_type=BlockType.EXTRACTION, caller_type=_RequestRecordingCaller
+        )
+        assert isinstance(caller, _RequestRecordingCaller) and caller.requests
+        assert terminal["application_context_arm"] == arm
+        runs[arm] = (caller.requests, outcome.messages, caller.sent_tools)
+    assert runs["treatment"] == runs["control"]
 
 
 @pytest.mark.asyncio
