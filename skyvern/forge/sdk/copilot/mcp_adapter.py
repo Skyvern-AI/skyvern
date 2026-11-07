@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import json
 import logging
 import posixpath
@@ -35,6 +37,7 @@ from mcp.types import (
     ListPromptsResult,
     TextContent,
 )
+from PIL import Image
 from playwright.async_api import Browser, BrowserContext, Page
 from pydantic import ValidationError
 
@@ -492,9 +495,13 @@ def _scrub_stamped_tool_result(
     # failures go first, so a crash that fits without them is kept.
     if isinstance(result, dict):
         for key in (PAGE_REQUEST_FAILURES_KEY, PAGE_CRASHES_KEY):
-            if key in result and _scrub_model_facing_tool_result(ctx, result) == "redaction_budget":
+            if (
+                key in result
+                and _scrub_model_facing_tool_result(ctx, result, tool_name=tool_name, carry_inline=False)
+                == "redaction_budget"
+            ):
                 del result[key]
-    scrubbed = scrub_model_facing_tool_result(ctx, result, tool_name=tool_name)
+    scrubbed = scrub_model_facing_tool_result(ctx, result, tool_name=tool_name, carry_inline=False)
     if PAGE_REQUEST_FAILURES_KEY not in scrubbed:
         held.restore_request_failures()
     if PAGE_CRASHES_KEY not in scrubbed:
@@ -503,7 +510,7 @@ def _scrub_stamped_tool_result(
 
 
 def _screenshot_reference(raw_tool_name: str, raw_result: dict[str, Any]) -> tuple[bool, str | None]:
-    if raw_tool_name != "skyvern_screenshot":
+    if raw_tool_name != _SCREENSHOT_TOOL_NAME:
         return False, None
     data = raw_result.get("data")
     reference = data.get("path") if isinstance(data, dict) else None
@@ -1144,16 +1151,93 @@ def _redaction_withheld_result(
     return {"ok": False, "error": error, "data": {_REDACTION_WITHHELD_KEY: withheld}}
 
 
-def scrub_model_facing_tool_result(ctx: AgentContext, result: Any, *, tool_name: str | None = None) -> dict[str, Any]:
+_SCREENSHOT_TOOL_NAME = "skyvern_screenshot"
+_SCREENSHOT_IMAGE_MAX_CHARS = 8_000_000
+_SCREENSHOT_IMAGE_MAX_PIXELS = 40_000_000
+_PNG_IEND_CHUNK = b"\x00\x00\x00\x00IEND\xaeB`\x82"
+_SCREENSHOT_IMAGE_OMITTED_NOTE = "The screenshot image could not be prepared and was left out."
+
+
+_ScreenshotImageCheck = Literal["valid", "over_cap", "invalid"]
+
+
+def _check_png_image(value: str) -> _ScreenshotImageCheck:
+    # verify() checks the PNG header and chunk CRCs but stops at the first IEND, so bytes after it are checked here.
+    if len(value) > _SCREENSHOT_IMAGE_MAX_CHARS:
+        return "over_cap"
+    try:
+        decoded = base64.b64decode(value, validate=True)
+        with Image.open(io.BytesIO(decoded), formats=("PNG",)) as image:
+            image.verify()
+            pixels = image.width * image.height
+    except Image.DecompressionBombError:
+        return "over_cap"
+    except Exception:  # noqa: BLE001
+        return "invalid"
+    if decoded.find(_PNG_IEND_CHUNK) != len(decoded) - len(_PNG_IEND_CHUNK):
+        return "invalid"
+    return "over_cap" if pixels > _SCREENSHOT_IMAGE_MAX_PIXELS else "valid"
+
+
+def _set_aside_screenshot_image(
+    result: Any, tool_name: str | None, *, carry_inline: bool, log_drops: bool = True
+) -> tuple[Any, dict[str, str]]:
+    data = result.get("data") if isinstance(result, dict) else None
+    if tool_name != _SCREENSHOT_TOOL_NAME or not isinstance(data, dict):
+        return result, {}
+    text_data = dict(data)
+    carried: dict[str, str] = {}
+
+    def drop(field: str, reason: str, value: str) -> None:
+        if log_drops:
+            LOG.warning(
+                "copilot_screenshot_image_dropped", tool_name=tool_name, field=field, reason=reason, length=len(value)
+            )
+
+    inline_image = data.get("data")
+    if isinstance(inline_image, str) and inline_image:
+        inline_png = data.get("inline") is True and data.get("mime") == "image/png"
+        # A successful post-hook moves the image to screenshot_base64, so one still inline after it is never carried.
+        if not carry_inline:
+            drop("data", "inline_after_post_hook", inline_image)
+            text_data["data"] = _SCREENSHOT_IMAGE_OMITTED_NOTE
+        elif not inline_png or (inline_check := _check_png_image(inline_image)) == "invalid":
+            # Blanked rather than noted: internal callers read a non-empty data.data as image bytes.
+            drop("data", "invalid_image" if inline_png else "not_inline_png", inline_image)
+            text_data["data"] = ""
+        elif inline_check == "valid":
+            text_data["data"] = ""
+            carried["data"] = inline_image
+    screenshot = data.get("screenshot_base64")
+    if isinstance(screenshot, str):
+        check = _check_png_image(screenshot) if screenshot else "invalid"
+        if check == "valid":
+            text_data["screenshot_base64"] = ""
+            carried["screenshot_base64"] = screenshot
+        elif check == "invalid":
+            # The sanitizer reports any screenshot_base64, even an empty one, as a successful screenshot.
+            if screenshot:
+                drop("screenshot_base64", "invalid_image", screenshot)
+            del text_data["screenshot_base64"]
+            text_data["data"] = _SCREENSHOT_IMAGE_OMITTED_NOTE
+    if text_data == data:
+        return result, {}
+    return {**result, "data": text_data}, carried
+
+
+def scrub_model_facing_tool_result(
+    ctx: AgentContext, result: Any, *, tool_name: str | None = None, carry_inline: bool = True
+) -> dict[str, Any]:
     driver_codes = {
         path: code
         for path in _NAV_ERROR_CODE_PARENTS
         if (code := _preserved_nav_code(ctx, tool_name, (_mapping_at(result, path) or {}).get("nav_error_code")))
         is not None
     }
-    scrubbed = _scrub_model_facing_tool_result(ctx, result)
+    text_only, carried = _set_aside_screenshot_image(result, tool_name, carry_inline=carry_inline)
+    scrubbed = _scrub_set_aside_result(ctx, text_only, carried)
     if not isinstance(scrubbed, dict):
-        return _redaction_withheld_result(ctx, result, tool_name=tool_name, failure=scrubbed)
+        return _redaction_withheld_result(ctx, text_only, tool_name=tool_name, failure=scrubbed)
     for path, code in driver_codes.items():
         parent = _mapping_at(scrubbed, path)
         if parent is not None:
@@ -1161,7 +1245,23 @@ def scrub_model_facing_tool_result(ctx: AgentContext, result: Any, *, tool_name:
     return scrubbed
 
 
-def _scrub_model_facing_tool_result(ctx: AgentContext, result: Any) -> dict[str, Any] | _RedactionWithheldReason:
+def _scrub_model_facing_tool_result(
+    ctx: AgentContext, result: Any, *, tool_name: str | None = None, carry_inline: bool = True
+) -> dict[str, Any] | _RedactionWithheldReason:
+    text_only, carried = _set_aside_screenshot_image(result, tool_name, carry_inline=carry_inline, log_drops=False)
+    return _scrub_set_aside_result(ctx, text_only, carried)
+
+
+def _scrub_set_aside_result(
+    ctx: AgentContext, text_only: Any, carried: dict[str, str]
+) -> dict[str, Any] | _RedactionWithheldReason:
+    scrubbed = _scrub_model_facing_text(ctx, text_only)
+    if carried and isinstance(scrubbed, dict):
+        scrubbed["data"].update(carried)
+    return scrubbed
+
+
+def _scrub_model_facing_text(ctx: AgentContext, result: Any) -> dict[str, Any] | _RedactionWithheldReason:
     scrubbed_secrets = scrub_secrets_from_structure(ctx, result)
     if not isinstance(scrubbed_secrets, dict) or not _mapping_keys_preserved(result, scrubbed_secrets):
         return "redaction_unavailable"
