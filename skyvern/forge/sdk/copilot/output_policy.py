@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import ast
 import re
-from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, cast
 
-from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
 from skyvern.forge.sdk.copilot.context import COPILOT_RESPONSE_TYPES, ResponseType
 from skyvern.forge.sdk.copilot.request_policy import (
     RequestPolicy,
@@ -18,17 +16,7 @@ from skyvern.forge.sdk.copilot.secret_redaction import (
     SECRET_KEYWORD_ASSIGNMENT_PATTERN,
     SECRET_KEYWORD_LABEL_PATTERN,
 )
-from skyvern.forge.sdk.copilot.workflow_credential_utils import (
-    block_credential_ids,
-    credential_param_ids,
-    parse_workflow_yaml,
-    saved_credential_ids,
-    url_origin,
-    workflow_blocks,
-    workflow_credential_origins_from_parsed,
-)
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import OutputPolicyReason
-from skyvern.forge.sdk.workflow.models.credential_release import saved_site_urls
 
 WORKFLOW_PRESENT_SENTINEL = object()
 _PLACEHOLDER_MARKERS = ("{{", "{%", "[REDACTED_SECRET]")
@@ -83,41 +71,14 @@ class OutputPolicyVerdict:
             self.reason_codes.append(reason)
         self.allowed = False
 
-    def remove(self, reason: OutputPolicyReason) -> None:
-        if reason in self.reason_codes:
-            self.reason_codes.remove(reason)
-        self.allowed = not self.reason_codes
-
 
 _FINAL_OUTPUT_HARD_BLOCK_REASONS: frozenset[OutputPolicyReason] = frozenset(
     {
         OutputPolicyReason.RAW_SECRET_LEAK,
-        OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED,
         OutputPolicyReason.PERSISTENCE_STATE_MISMATCH,
         OutputPolicyReason.OUTPUT_POLICY_CONTEXT_MISSING,
     }
 )
-
-
-# The authoring seam refuses only a credential reference that reaches a site outside the
-# credential's own, because that disclosure is irreversible once the workflow runs; everything
-# else steers. Each member's surface and the reason it cannot be dropped are in
-# cloud_docs/workflow-copilot/architecture/output-policy-disposition.md.
-_AUTHOR_TIME_HARD_BLOCK_REASONS: frozenset[OutputPolicyReason] = frozenset(
-    {
-        OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED,
-    }
-)
-
-
-def demote_author_time_steer_reasons(verdict: OutputPolicyVerdict) -> list[OutputPolicyReason]:
-    """Drop the reasons that only steer the next authoring attempt, flipping ``allowed``
-    back to True when nothing that outlives the turn remains. Returns the demoted reasons
-    so the caller can trace them."""
-    steered = [reason for reason in verdict.reason_codes if reason not in _AUTHOR_TIME_HARD_BLOCK_REASONS]
-    for reason in steered:
-        verdict.remove(reason)
-    return steered
 
 
 def hard_block_output_policy_verdict(verdict: OutputPolicyVerdict) -> OutputPolicyVerdict:
@@ -260,7 +221,6 @@ def evaluate_output_policy(
     response_type: str = "REPLY",
     user_response: str | None = None,
     global_llm_context: str | None = None,
-    workflow_yaml: str | None = None,
     has_workflow_proposal: bool = False,
     workflow_was_persisted: bool = False,
     workflow_attempted: bool = False,
@@ -282,21 +242,12 @@ def evaluate_output_policy(
     if raw_secret_label(user_response) is not None:
         verdict.add(OutputPolicyReason.RAW_SECRET_LEAK)
 
-    if isinstance(request_policy, RequestPolicy):
-        _apply_credential_policy(verdict, request_policy, workflow_yaml)
-
     if output_kind == CopilotOutputKind.WORKFLOW_UPDATE_PROPOSAL and not workflow_was_persisted:
         verdict.add(OutputPolicyReason.PERSISTENCE_STATE_MISMATCH)
     elif output_kind == CopilotOutputKind.WORKFLOW_DRAFT_PROPOSAL and workflow_was_persisted:
         verdict.add(OutputPolicyReason.PERSISTENCE_STATE_MISMATCH)
 
     return verdict
-
-
-def format_output_policy_tool_error(verdict: OutputPolicyVerdict) -> str:
-    reasons = ", ".join(reason.value for reason in verdict.reason_codes) or "unknown"
-    message = f"Output policy blocked this Copilot output before persistence. Reason codes: {reasons}."
-    return message
 
 
 def raw_secret_label(value: str | None) -> str | None:
@@ -426,139 +377,3 @@ def _is_lexical_token_assignment(matched: str, assignment: str) -> bool:
     # The keyword pattern ends at the first whitespace, so the rest of the line carries the expression.
     rhs_match = _SECRET_ASSIGNMENT_RHS_RE.search(assignment)
     return rhs_match is not None and _parses_a_value_out_of_something(rhs_match.group(1))
-
-
-def _apply_credential_policy(
-    verdict: OutputPolicyVerdict,
-    request_policy: RequestPolicy,
-    workflow_yaml: str | None,
-) -> None:
-    parsed_workflow = parse_workflow_yaml(workflow_yaml) if workflow_yaml else None
-    if not isinstance(parsed_workflow, dict):
-        return
-
-    proposed_origins = workflow_credential_origins_from_parsed(parsed_workflow)
-    if _workflow_broadens_credential_scope(parsed_workflow, request_policy) or (
-        _existing_workflow_broadens_credential_scope(parsed_workflow, proposed_origins, request_policy)
-    ):
-        verdict.add(OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED)
-
-
-def _existing_workflow_credential_ids(request_policy: RequestPolicy) -> set[str]:
-    return saved_credential_ids(request_policy.existing_workflow_credential_ids)
-
-
-def _existing_workflow_broadens_credential_scope(
-    parsed_workflow: dict[str, Any],
-    proposed_origins: dict[str, set[str]],
-    request_policy: RequestPolicy,
-) -> bool:
-    existing_ids = _existing_workflow_credential_ids(request_policy)
-    if not existing_ids:
-        return False
-
-    prior_origins = {
-        credential_id: {
-            origin for origin in origins if isinstance(origin, str) and origin.startswith(("http://", "https://"))
-        }
-        for credential_id, origins in request_policy.existing_workflow_credential_origins.items()
-        if isinstance(credential_id, str)
-    }
-    for credential_id in existing_ids:
-        new_origins = proposed_origins.get(credential_id, set())
-        if not new_origins:
-            continue
-        allowed_origins = prior_origins.get(credential_id)
-        if not allowed_origins:
-            if not _blocks_stay_on_intended_origin(parsed_workflow, credential_id, request_policy):
-                return True
-            continue
-        allowed_origins = allowed_origins | request_policy.user_confirmed_site_origins.get(credential_id, set())
-        if any(origin not in allowed_origins for origin in new_origins):
-            return True
-    return False
-
-
-def _blocks_stay_on_intended_origin(
-    parsed_workflow: dict[str, Any], credential_id: str, request_policy: RequestPolicy
-) -> bool:
-    # With no prior origin, only a site the login fill would use can authorize a block URL, as the fill seam
-    # decides it: any saved site of a login saved for several, else the one intended URL. Discovered never do.
-    if not any(c.credential_id == credential_id for c in request_policy.resolved_credentials):
-        return False
-    saved_sites = request_policy.credential_saved_site_urls(credential_id)
-    fill_urls = list(saved_sites) if len(saved_sites) > 1 else []
-    intended_origins = {
-        origin
-        for url in [*fill_urls, request_policy.credential_intended_url(credential_id)]
-        if (origin := canonicalize_origin(url)) is not None
-    }
-    if not intended_origins:
-        return False
-    workflow_definition = parsed_workflow.get("workflow_definition")
-    if not isinstance(workflow_definition, dict):
-        return False
-    credential_params_by_key = credential_param_ids(workflow_definition.get("parameters"))
-    for block in workflow_blocks(parsed_workflow):
-        if credential_id not in block_credential_ids(block, credential_params_by_key):
-            continue
-        block_url = block.get("url")
-        if isinstance(block_url, str) and block_url.strip() and canonicalize_origin(block_url) not in intended_origins:
-            return False
-    return True
-
-
-def _workflow_broadens_credential_scope(parsed_workflow: dict[str, Any], request_policy: RequestPolicy) -> bool:
-    approved_origins = _approved_origins_by_id(request_policy)
-    if not approved_origins:
-        # No tested_url metadata means there is no deterministic origin scope
-        # to compare against. The request policy still controls whether the
-        # credential itself is approved; do not infer URL broadening from
-        # missing credential metadata.
-        return False
-
-    workflow_definition = parsed_workflow.get("workflow_definition")
-    if not isinstance(workflow_definition, dict):
-        return False
-
-    credential_params_by_key = credential_param_ids(workflow_definition.get("parameters"))
-    if not credential_params_by_key:
-        return False
-
-    return any(
-        _block_broadens_credential_scope(block, credential_params_by_key, approved_origins)
-        for block in workflow_blocks(parsed_workflow)
-    )
-
-
-def _approved_origins_by_id(request_policy: RequestPolicy) -> dict[str, set[str]]:
-    origins: dict[str, set[str]] = {}
-    for credential in [*request_policy.resolved_credentials, *request_policy.discovered_credentials]:
-        for url in saved_site_urls(credential.tested_url, credential.extra_site_urls):
-            origin = url_origin(url)
-            if origin:
-                origins.setdefault(credential.credential_id, set()).add(origin)
-    return origins
-
-
-def _block_broadens_credential_scope(
-    block: dict[str, Any],
-    credential_params_by_key: Mapping[str, str | set[str]],
-    approved_origins: dict[str, set[str]],
-) -> bool:
-    credential_ids = block_credential_ids(block, credential_params_by_key)
-    if not credential_ids:
-        return False
-
-    block_url = block.get("url")
-    if not isinstance(block_url, str) or not block_url.strip():
-        return False
-    origin = url_origin(block_url)
-    if not origin:
-        return True
-
-    for credential_id in credential_ids:
-        allowed_origins = approved_origins.get(credential_id)
-        if allowed_origins and origin not in allowed_origins:
-            return True
-    return False

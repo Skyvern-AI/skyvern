@@ -20,10 +20,6 @@ _SAVED_PROFILE_STATES = ("saved_profile_unresolved", "saved_profile_not_applied"
 
 SUPERSEDED_BY_NEWER_TEST_REASON = "Stopped because a newer test in this chat took over the browser."
 BROWSER_TOOLS_UNAVAILABLE_ERROR = "Browser tools are unavailable on this turn."
-RAW_SECRET_BROWSER_ERROR = (
-    "This turn withheld a value that may be a secret. Do not use the browser; persist only the redacted draft and call "
-    "`request_credential` with the user's sign-in URL so they can connect a saved credential before testing."
-)
 
 
 class BuildTestConnectFailure(BaseModel):
@@ -82,7 +78,7 @@ class BuildTestConnectFailure(BaseModel):
 def build_test_connect_failure_sentence(failure: BuildTestConnectFailure) -> str:
     """A run id means the session was lost after the run started, so the operator must not be
     pointed at provisioning."""
-    if failure.diagnostic in (BROWSER_TOOLS_UNAVAILABLE_ERROR, RAW_SECRET_BROWSER_ERROR):
+    if failure.diagnostic == BROWSER_TOOLS_UNAVAILABLE_ERROR:
         return failure.diagnostic
     if failure.state == "billing_credit_admission_refusal":
         return (

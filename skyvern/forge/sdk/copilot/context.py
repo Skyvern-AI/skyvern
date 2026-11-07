@@ -1328,7 +1328,6 @@ class CopilotContext(AgentContext):
     pre_run_gated_output_warning_fingerprint: tuple[tuple[str, str, bool, str], ...] = ()
     user_message: str = ""
     block_goal_main_goal: str = ""
-    allow_untested_workflow_draft: bool = False
     request_policy: RequestPolicy | None = None
     copilot_config: CopilotConfig | None = None
     block_authoring_policy: BlockAuthoringPolicy = BlockAuthoringPolicy.TASK_V3_PURE
@@ -1347,10 +1346,8 @@ class CopilotContext(AgentContext):
     latest_diagnosis_repair_contract: DiagnosisRepairContract | None = None
     blocked_reply_signatures: list[str] = field(default_factory=list)
 
-    # Mid-build credential pause (credential_pause.py). last_run_skipped_unbound_credentials
-    # is set by tools/__init__.py's update_and_run_blocks skip branch; client_supports_credential_pause
-    # is set from the chat request at construction; the rest are owned by maybe_credential_pause.
-    last_run_skipped_unbound_credentials: bool = False
+    # Mid-build credential pause (credential_pause.py). client_supports_credential_pause is set from the
+    # chat request at construction; the rest are owned by maybe_credential_pause.
     client_supports_credential_pause: bool = False
     client_supports_credential_pause_recovery: bool = False
     client_supports_credential_generation: bool = False
