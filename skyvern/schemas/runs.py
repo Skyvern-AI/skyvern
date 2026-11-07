@@ -818,6 +818,14 @@ class WorkflowRunResponse(BaseRunResponse):
         description="Whether the workflow run was executed with agent or code",
         examples=["agent", "code"],
     )
+    total_cost: float | None = Field(
+        default=None,
+        description=(
+            "Estimated cost of this run as the list-price value of credits consumed, not the amount invoiced. "
+            "Null when cost is unavailable (e.g. self-hosted)."
+        ),
+    )
+    credits_used: int | None = Field(default=None, description="Credits consumed by this run")
 
     @field_validator("run_with", mode="before")
     @classmethod
