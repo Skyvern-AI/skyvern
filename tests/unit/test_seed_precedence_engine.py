@@ -476,7 +476,7 @@ async def test_preview_resolves_indirect_credential_binding_like_the_run(monkeyp
 
 
 # --- C behavior table: (toggle, pick, role) -> (seed, source, sink) ----------
-# Canonical table: cloud_docs/design/2026-07-16-browser-profile-picker-design.md (quick-win redesign).
+# Canonical table: the browser profile picker design doc (quick-win redesign).
 # An explicit pick "always starts there" and never forks a hidden own profile; the sink is the profile
 # THIS workflow writes (own auto-profile, or a plain pick with save on) — None means no workflow write.
 

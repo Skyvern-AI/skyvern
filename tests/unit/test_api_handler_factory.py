@@ -1990,9 +1990,9 @@ class TestThinkingBudgetOptimization:
 
 
 # SKY-10200 — runtime tests for the router timeout-precedence fix and per-hop
-# fallback chain expansion. These complement the config-shape tests in
-# tests/cloud/test_llm_router_fallback.py by pinning the api_handler_factory
-# wiring: that the router is constructed with a default timeout, the call
+# fallback chain expansion. These complement the router config-shape tests in
+# the cloud test suite by pinning the api_handler_factory wiring: that the
+# router is constructed with a default timeout, the call
 # sites don't pass a per-call timeout kwarg (which would clobber per-deployment
 # values), and the fallbacks list expands into per-hop entries.
 
