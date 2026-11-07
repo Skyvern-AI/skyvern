@@ -181,7 +181,6 @@ async def test_concurrent_writes_stash_their_diffs_under_their_own_call_id(
         await _update_workflow(
             {"workflow_yaml": _code_yaml(code, label=label), "code_artifact_metadata": []},
             ctx,
-            allow_missing_credentials=True,
             originating_call_id=call_id,
         )
 
@@ -231,7 +230,6 @@ async def test_accept_path_persists_model_yaml_and_code_exactly(monkeypatch: pyt
     result = await _update_workflow(
         {"workflow_yaml": submitted, "code_artifact_metadata": []},
         ctx,
-        allow_missing_credentials=True,
     )
 
     assert result["ok"] is True
@@ -258,7 +256,6 @@ async def test_accept_path_preserves_model_authored_goal_prompt_bytes(monkeypatc
     result = await _update_workflow(
         {"workflow_yaml": submitted, "code_artifact_metadata": []},
         ctx,
-        allow_missing_credentials=True,
     )
 
     assert result["ok"] is True
@@ -281,7 +278,6 @@ async def test_accept_path_does_not_synthesize_an_omitted_goal_prompt(monkeypatc
     result = await _update_workflow(
         {"workflow_yaml": submitted, "code_artifact_metadata": []},
         ctx,
-        allow_missing_credentials=True,
     )
 
     assert result["ok"] is True
@@ -325,7 +321,6 @@ async def test_a_missing_goal_takes_the_declared_goal_from_a_rejected_row_but_a_
         result = await _update_workflow(
             {"workflow_yaml": _DATA_ONLY_WITHOUT_GOAL_YAML, "code_artifact_metadata": [row]},
             ctx,
-            allow_missing_credentials=True,
         )
 
         assert result["ok"] is True
@@ -359,7 +354,6 @@ async def test_accept_path_keeps_the_user_written_goal_in_the_staged_yaml(monkey
     result = await _update_workflow(
         {"workflow_yaml": submitted, "code_artifact_metadata": [_rebuild_artifact_row()]},
         ctx,
-        allow_missing_credentials=True,
     )
 
     assert result["ok"] is True
@@ -431,7 +425,6 @@ async def test_a_metadata_row_that_names_the_block_clears_the_rebuild_even_when_
     result = await _update_workflow(
         {"workflow_yaml": submitted, "code_artifact_metadata": [bare_row]},
         ctx,
-        allow_missing_credentials=True,
     )
 
     assert result["ok"] is True
@@ -456,7 +449,6 @@ async def test_accept_path_leaves_the_rebuild_pending_when_no_artifact_claims_th
     result = await _update_workflow(
         {"workflow_yaml": submitted, "code_artifact_metadata": []},
         ctx,
-        allow_missing_credentials=True,
     )
 
     assert result["ok"] is True
@@ -486,7 +478,6 @@ async def test_a_block_scoped_code_edit_clears_the_rebuild_without_an_artifact_r
             "_rebuilt_block_labels": ["submit_search"],
         },
         ctx,
-        allow_missing_credentials=True,
     )
 
     assert result["ok"] is True
@@ -643,9 +634,7 @@ async def test_a_write_names_exactly_the_blocks_it_changed(
     ctx = _ctx(opening_yaml)
 
     if isinstance(write, str):
-        result = await _update_workflow(
-            {"workflow_yaml": write, "code_artifact_metadata": []}, ctx, allow_missing_credentials=True
-        )
+        result = await _update_workflow({"workflow_yaml": write, "code_artifact_metadata": []}, ctx)
     else:
         result = await _edit_block(ctx, **write)
 
@@ -771,7 +760,7 @@ async def test_promoting_an_executed_source_clears_the_rebuild_for_that_block(mo
     update_params: dict[str, Any] = {"workflow_yaml": _code_yaml("", prompt="Check the order status")}
 
     assert tools_module._promote_executed_sources(ctx, update_params, {"submit_search": "ref"}) is None
-    result = await _update_workflow(update_params, ctx, allow_missing_credentials=True)
+    result = await _update_workflow(update_params, ctx)
 
     assert result["ok"] is True, result
     assert _single_code(ctx.staged_workflow_yaml).strip() == executed
@@ -791,7 +780,6 @@ async def test_a_goal_the_copilot_cannot_build_from_is_never_refused_at_author_t
     result = await _update_workflow(
         {"workflow_yaml": submitted, "code_artifact_metadata": []},
         ctx,
-        allow_missing_credentials=True,
     )
 
     assert result["ok"] is True
@@ -812,7 +800,6 @@ async def test_accept_path_leaves_a_model_owned_goal_alone_when_a_prior_goal_dif
     result = await _update_workflow(
         {"workflow_yaml": submitted, "code_artifact_metadata": []},
         ctx,
-        allow_missing_credentials=True,
     )
 
     assert result["ok"] is True
@@ -840,7 +827,6 @@ async def test_a_hand_edited_model_owned_block_clears_its_flag_only_when_the_wri
     result = await _update_workflow(
         {"workflow_yaml": _code_yaml(_REBUILT_CODE), "code_artifact_metadata": metadata_rows},
         ctx,
-        allow_missing_credentials=True,
     )
 
     assert result["ok"] is True
@@ -870,7 +856,6 @@ async def test_a_scrub_value_inside_a_stored_goal_never_reaches_the_persisted_ya
     result = await _update_workflow(
         {"workflow_yaml": submitted, "code_artifact_metadata": []},
         ctx,
-        allow_missing_credentials=True,
     )
 
     assert result["ok"] is True
@@ -898,7 +883,6 @@ async def test_a_renamed_block_reports_the_user_owned_goal_it_dropped(monkeypatc
     result = await _update_workflow(
         {"workflow_yaml": submitted, "code_artifact_metadata": []},
         ctx,
-        allow_missing_credentials=True,
     )
 
     assert result["ok"] is True
@@ -932,7 +916,6 @@ async def test_requested_output_contract_does_not_rewrite_model_code(monkeypatch
     result = await _update_workflow(
         {"workflow_yaml": submitted},
         ctx,
-        allow_missing_credentials=True,
     )
 
     assert result["ok"] is True
@@ -970,7 +953,6 @@ async def test_google_lookup_failure_reuses_collected_bindings_without_retravers
     result = await _update_workflow(
         {"workflow_yaml": _code_yaml('return {"ok": True}')},
         ctx,
-        allow_missing_credentials=True,
     )
 
     assert result["ok"] is True
@@ -1017,7 +999,6 @@ async def test_google_notice_baseline_is_captured_before_an_update_without_sheet
     result = await _update_workflow(
         {"workflow_yaml": submitted_yaml},
         ctx,
-        allow_missing_credentials=True,
     )
 
     assert result["ok"] is True
@@ -1063,7 +1044,6 @@ async def test_google_notice_skips_lookup_when_turn_start_baseline_cannot_be_par
     result = await _update_workflow(
         {"workflow_yaml": submitted_yaml},
         ctx,
-        allow_missing_credentials=True,
     )
 
     assert result["ok"] is True
@@ -1116,7 +1096,6 @@ async def test_google_notice_capture_records_every_sheets_binding_including_reso
     first = await _update_workflow(
         {"workflow_yaml": _code_yaml('return {"step": 1}')},
         ctx,
-        allow_missing_credentials=True,
     )
     assert first["ok"] is True
     assert captures == []
@@ -1125,7 +1104,6 @@ async def test_google_notice_capture_records_every_sheets_binding_including_reso
         accepted = await _update_workflow(
             {"workflow_yaml": _code_yaml(f'return {{"step": {step}}}')},
             ctx,
-            allow_missing_credentials=True,
         )
         assert accepted["ok"] is True
 
@@ -1167,7 +1145,6 @@ async def test_model_declared_download_contract_is_written_into_proposed_yaml(
     result = await _update_workflow(
         {"workflow_yaml": submitted, "code_artifact_metadata": normalized_metadata},
         ctx,
-        allow_missing_credentials=True,
     )
 
     assert result["ok"] is True
@@ -1221,7 +1198,6 @@ async def test_model_declared_download_contract_keeps_write_seam_secret_redactio
     result = await _update_workflow(
         {"workflow_yaml": submitted, "code_artifact_metadata": normalized_metadata},
         ctx,
-        allow_missing_credentials=True,
     )
 
     assert result["ok"] is True
@@ -1243,7 +1219,7 @@ async def test_a_rewritten_submission_returns_the_stored_bytes_and_names_the_rew
     register_secret_scrub_value(ctx, secret)
     submitted = _code_yaml(f'await page.locator("#password").fill("{secret}")')
 
-    result = await _update_workflow({"workflow_yaml": submitted}, ctx, allow_missing_credentials=True)
+    result = await _update_workflow({"workflow_yaml": submitted}, ctx)
 
     stored = result["data"]["stored_code"]["submit_search"]
     assert result["data"]["stored_code_rewritten"] == ["submit_search"]
@@ -1271,7 +1247,7 @@ async def test_a_submission_the_server_stored_verbatim_names_no_rewrite(monkeypa
     ctx = _ctx()
     submitted = _code_yaml('await page.locator("#go").click()')
 
-    result = await _update_workflow({"workflow_yaml": submitted}, ctx, allow_missing_credentials=True)
+    result = await _update_workflow({"workflow_yaml": submitted}, ctx)
 
     assert result["data"]["stored_code"]["submit_search"]
     assert "stored_code_rewritten" not in result["data"]
@@ -1337,7 +1313,6 @@ async def test_deleting_download_block_removes_its_model_declared_contract(
     result = await _update_workflow(
         {"workflow_yaml": submitted, "code_artifact_metadata": normalized_metadata},
         ctx,
-        allow_missing_credentials=True,
     )
 
     assert result["ok"] is True
@@ -1360,7 +1335,7 @@ async def test_unsafe_code_is_rejected_without_persisting(monkeypatch: pytest.Mo
         """
     )
 
-    result = await _update_workflow({"workflow_yaml": submitted}, ctx, allow_missing_credentials=True)
+    result = await _update_workflow({"workflow_yaml": submitted}, ctx)
 
     assert result["ok"] is False
     assert result["block_id"] == "code_safety"
@@ -1377,7 +1352,7 @@ async def test_registered_live_secret_is_redacted_at_hard_safety_boundary(monkey
     register_secret_scrub_value(ctx, secret)
     submitted = _code_yaml(f'await page.locator("#password").fill("{secret}")')
 
-    result = await _update_workflow({"workflow_yaml": submitted}, ctx, allow_missing_credentials=True)
+    result = await _update_workflow({"workflow_yaml": submitted}, ctx)
 
     assert result["ok"] is True
     assert secret not in ctx.workflow_yaml
@@ -1402,7 +1377,6 @@ async def test_exact_source_promotion_persists_when_the_code_is_unchanged(
             "_expected_exact_code_by_label": {"submit_search": source},
         },
         ctx,
-        allow_missing_credentials=True,
     )
 
     assert result["ok"] is True
@@ -1428,7 +1402,6 @@ async def test_exact_source_promotion_rejects_a_persistence_scrub_that_would_cha
             "_expected_exact_code_by_label": {"submit_search": source},
         },
         ctx,
-        allow_missing_credentials=True,
     )
 
     assert result["ok"] is False
@@ -1456,7 +1429,6 @@ async def test_run_path_rejects_changed_raw_load_balancer_webhook(monkeypatch: p
     result = await _update_workflow(
         {"workflow_yaml": workflow_yaml},
         ctx,
-        allow_missing_credentials=True,
     )
 
     assert result["ok"] is False
@@ -1538,7 +1510,6 @@ async def test_wrapper_scope_advisory_is_its_own_finding_on_a_draft_that_persist
     result = await _update_workflow(
         {"workflow_yaml": submitted, "code_artifact_metadata": []},
         ctx,
-        allow_missing_credentials=True,
     )
 
     assert result["ok"] is True
@@ -1593,7 +1564,6 @@ async def test_wrapper_scope_advisory_covers_a_global_on_a_declared_workflow_par
     result = await _update_workflow(
         {"workflow_yaml": submitted, "code_artifact_metadata": []},
         ctx,
-        allow_missing_credentials=True,
     )
 
     assert result["ok"] is True
@@ -1620,7 +1590,6 @@ async def test_scanner_advisory_findings_never_block_a_save(monkeypatch: pytest.
     result = await _update_workflow(
         {"workflow_yaml": submitted, "code_artifact_metadata": []},
         ctx,
-        allow_missing_credentials=True,
     )
 
     assert result["ok"] is True
@@ -1649,7 +1618,6 @@ async def test_scanner_failure_never_blocks_a_save(monkeypatch: pytest.MonkeyPat
     result = await _update_workflow(
         {"workflow_yaml": submitted, "code_artifact_metadata": []},
         ctx,
-        allow_missing_credentials=True,
     )
 
     assert result["ok"] is True
@@ -1668,7 +1636,6 @@ async def test_oss_base_hook_yields_no_scanner_findings(monkeypatch: pytest.Monk
     result = await _update_workflow(
         {"workflow_yaml": submitted, "code_artifact_metadata": []},
         ctx,
-        allow_missing_credentials=True,
     )
 
     assert result["ok"] is True
@@ -1701,7 +1668,6 @@ async def test_executed_source_fills_an_empty_code_block_byte_for_byte(
             "_expected_exact_code_by_label": {"count_rows": executed},
         },
         ctx,
-        allow_missing_credentials=True,
     )
 
     assert result["ok"] is True, result
@@ -1781,11 +1747,9 @@ async def test_a_write_that_drops_and_retypes_prior_blocks_persists_and_names_bo
     assert data["block_type_changes"] == _RETYPED_BY_SINGLE_CODE_WRITE
 
     run_result = {"ok": True, "data": {"workflow_run_id": "wr_x", "overall_status": "completed"}}
-    skip_result = {"ok": True, "data": {"skipped_run": True, "skip_reason": "workflow_credential_inputs_unbound"}}
-    for combined in (run_result, skip_result):
-        carried = carry_author_time_findings(result, combined)["data"]
-        assert carried["dropped_prior_blocks"] == _DROPPED_BY_SINGLE_CODE_WRITE
-        assert carried["block_type_changes"] == _RETYPED_BY_SINGLE_CODE_WRITE
+    carried = carry_author_time_findings(result, run_result)["data"]
+    assert carried["dropped_prior_blocks"] == _DROPPED_BY_SINGLE_CODE_WRITE
+    assert carried["block_type_changes"] == _RETYPED_BY_SINGLE_CODE_WRITE
 
 
 @pytest.mark.asyncio

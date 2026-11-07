@@ -80,12 +80,6 @@ from skyvern.forge.sdk.copilot.output_contracts import (
     code_block_available_contracts_by_label,
     declared_workflow_parameter_keys,
 )
-from skyvern.forge.sdk.copilot.output_policy import (
-    demote_author_time_steer_reasons,
-    evaluate_output_policy,
-    format_output_policy_tool_error,
-    output_policy_verdict_to_trace_data,
-)
 from skyvern.forge.sdk.copilot.output_utils import (
     _BUILD_TEST_WORKFLOW_MAX_CHARS,
     INTERNAL_VALIDATION_FAILURE_PREFIX,
@@ -4399,7 +4393,6 @@ async def _update_workflow(
     params: dict[str, Any],
     ctx: AgentContext,
     *,
-    allow_missing_credentials: bool | None = None,
     originating_call_id: str | None = None,
     block_scoped_authoring_prior_yaml: str | None = None,
 ) -> dict[str, Any]:
@@ -4520,12 +4513,9 @@ async def _update_workflow(
     if vault_login_error is not None:
         return _blocked(AuthorTimeBlock(block_id=CREDENTIAL_SCOUT_BLOCK_ID, error=vault_login_error))
     params["workflow_yaml"] = workflow_yaml
-    if allow_missing_credentials is None:
-        allow_missing_credentials = ctx.allow_untested_workflow_draft is True
-    if not allow_missing_credentials:
-        credential_error = await _credential_reference_validation_error(workflow_yaml, ctx)
-        if credential_error is not None:
-            return _blocked(AuthorTimeBlock(block_id=CREDENTIAL_SCOUT_BLOCK_ID, error=credential_error))
+    credential_error = await _credential_reference_validation_error(workflow_yaml, ctx)
+    if credential_error is not None:
+        return _blocked(AuthorTimeBlock(block_id=CREDENTIAL_SCOUT_BLOCK_ID, error=credential_error))
 
     misbinding_findings = _credential_id_misbinding_findings(workflow_yaml)
     if misbinding_findings:
@@ -4535,35 +4525,6 @@ async def _update_workflow(
             workflow_id=ctx.workflow_id,
             findings=misbinding_findings,
         )
-
-    output_policy_verdict = evaluate_output_policy(
-        request_policy=ctx.request_policy,
-        workflow_yaml=workflow_yaml,
-    )
-    output_policy_steered_reasons = demote_author_time_steer_reasons(output_policy_verdict)
-    if not output_policy_verdict.allowed:
-        output_policy_trace_data = output_policy_verdict_to_trace_data(
-            output_policy_verdict,
-            surface="tool_body",
-            tool_name="update_workflow",
-        )
-        if output_policy_steered_reasons:
-            output_policy_trace_data = {
-                **output_policy_trace_data,
-                "steered_reason_codes": [reason.value for reason in output_policy_steered_reasons],
-            }
-        output_policy_error = format_output_policy_tool_error(output_policy_verdict)
-        LOG.info(
-            "copilot output policy tool body verdict",
-            **output_policy_trace_data,
-        )
-        _record_author_time_reject_outcome(
-            ctx,
-            reason_code="output_policy_reject",
-            summary=output_policy_error,
-            structural_payload=output_policy_trace_data,
-        )
-        return _blocked(AuthorTimeBlock(block_id=CREDENTIAL_SCOUT_BLOCK_ID, error=output_policy_error))
 
     prior_yaml = _latest_draft_yaml(ctx)
 

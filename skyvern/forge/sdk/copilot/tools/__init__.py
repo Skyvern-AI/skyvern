@@ -59,8 +59,6 @@ from skyvern.forge.sdk.copilot.context import (
 from skyvern.forge.sdk.copilot.credential_fill_fields import CREDENTIAL_FILL_FIELD_NAMES
 from skyvern.forge.sdk.copilot.credential_pause import (
     await_pending_credential_pause,
-    credential_pause_transport_ready,
-    raw_secret_card_origin,
     release_credential_pause_gate,
 )
 from skyvern.forge.sdk.copilot.enforcement import requested_output_paths_for_derivation
@@ -254,14 +252,9 @@ from .frontier import (
 )
 from .frontier import inputs_only_read_by_deleted_block as inputs_only_read_by_deleted_block
 from .guardrails import (
-    _WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL,
     _authority_tool_error,
-    _credential_deferred_draft_requires_skipped_run,
 )
 from .guardrails import _parameter_binding_invariant_error as _parameter_binding_invariant_error
-from .guardrails import (
-    _update_and_run_requires_skipped_run,
-)
 from .integrations import (
     _list_integrations,
     _read_google_sheet,
@@ -357,28 +350,6 @@ from .workflow_update import carry_author_time_findings as carry_author_time_fin
 
 LOG = structlog.get_logger()
 
-_CREDENTIAL_DEFERRED_DRAFT_MESSAGE = (
-    "I can save this as a draft without running it because the credentials aren't set up yet. "
-    "Add them in the Credentials UI and ask me to test the workflow."
-)
-_REDACTED_SECRET_DEFERRED_DRAFT_MESSAGE = (
-    "Saved this as a draft without running it: this turn withheld a value that may be a secret, so its credential "
-    "parameter is unbound and nothing runs. The in-chat credential card is available: call "
-    "`request_credential` with the user's sign-in URL{site_hint} so they can connect a saved credential."
-)
-
-
-def _credential_deferred_draft_message(copilot_ctx: CopilotContext) -> str:
-    """The Credentials-UI direction is the fallback for when the in-chat card cannot be shown."""
-    policy = copilot_ctx.request_policy
-    if policy is None or not policy.raw_secret_redacted_draft:
-        return _CREDENTIAL_DEFERRED_DRAFT_MESSAGE
-    if not credential_pause_transport_ready(copilot_ctx, copilot_ctx.copilot_config):
-        return _CREDENTIAL_DEFERRED_DRAFT_MESSAGE
-    origins = {raw_secret_card_origin(url) for url in policy.user_provided_site_urls} - {""}
-    site_hint = f" ({', '.join(sorted(origins))})" if origins else "; ask the user for it if they gave none"
-    return _REDACTED_SECRET_DEFERRED_DRAFT_MESSAGE.format(site_hint=site_hint)
-
 
 def _originating_call_id(ctx: RunContextWrapper) -> str | None:
     """The id of the tool call currently executing, so a write's diff can be handed back to that
@@ -387,24 +358,10 @@ def _originating_call_id(ctx: RunContextWrapper) -> str | None:
     return ctx.tool_call_id if isinstance(ctx, ToolContext) else None
 
 
-def _mark_credential_deferred_draft(copilot_ctx: CopilotContext, result: dict[str, Any]) -> None:
-    """Credential-deferred drafts persist without a run, so they carry the same skip markers and
-    set the same flag the combined tool's skip branch does — credential-pause routing reads it."""
-    copilot_ctx.last_run_skipped_unbound_credentials = True
-    data = result.get("data")
-    if not isinstance(data, dict):
-        data = {}
-        result["data"] = data
-    data["skipped_run"] = True
-    data["skip_reason"] = "workflow_credential_inputs_unbound"
-    data["message"] = _credential_deferred_draft_message(copilot_ctx)
-
-
 @function_tool(
     failure_error_function=copilot_tool_failure,
     name_override="update_workflow",
     strict_mode=False,
-    tool_input_guardrails=[_WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL],
 )
 async def update_workflow_tool(
     ctx: RunContextWrapper,
@@ -440,9 +397,6 @@ async def update_workflow_tool(
     """
     workflow_yaml = dump_workflow_yaml(workflow)
     copilot_ctx = ctx.context
-    # Mirrors the combined tool: a stale True from an earlier call in the same turn would
-    # misreport this call's authoring error as a credential ask.
-    copilot_ctx.last_run_skipped_unbound_credentials = False
     serialized_code_artifact_metadata: object = _code_artifact_metadata_as_tool_argument(code_artifact_metadata)
     normalized_block_observation_refs = normalize_block_observation_refs(block_observation_refs)
     arguments = {
@@ -450,7 +404,6 @@ async def update_workflow_tool(
         "block_observation_refs": normalized_block_observation_refs,
         "code_artifact_metadata": serialized_code_artifact_metadata,
     }
-    credential_deferred_draft = _credential_deferred_draft_requires_skipped_run(copilot_ctx)
 
     async with copilot_ctx.block_edit_lock:
         prior_definition = await _get_prior_workflow_definition(copilot_ctx)
@@ -461,12 +414,8 @@ async def update_workflow_tool(
                     "raw_code_artifact_metadata": code_artifact_metadata,
                 },
                 copilot_ctx,
-                allow_missing_credentials=credential_deferred_draft
-                or getattr(copilot_ctx, "allow_untested_workflow_draft", False) is True,
                 originating_call_id=_originating_call_id(ctx),
             )
-            if credential_deferred_draft and result.get("ok"):
-                _mark_credential_deferred_draft(copilot_ctx, result)
             _record_workflow_update_result(copilot_ctx, result, prior_definition)
             record_tool_step_result_for_ctx(copilot_ctx, "update_workflow", arguments, result)
             finalize_build_test_result(
@@ -655,9 +604,6 @@ async def edit_block_and_run_tool(
     copilot_ctx = ctx.context
     await await_pending_credential_pause(copilot_ctx)
     copilot_ctx.completion_verification_result = None
-    # Cleared before any validation return, as update_and_run_blocks does, so a credential skip left by an
-    # earlier call is not reported as the reason this edit failed.
-    copilot_ctx.last_run_skipped_unbound_credentials = False
     requested_labels = list(block_labels) if block_labels else [label]
     runtime_parameters = parameters or {}
     reference_route = executed_source_reference is not None
@@ -720,7 +666,6 @@ async def edit_block_and_run_tool(
             )
 
     handler_start = time.monotonic()
-    skip_run_after_update = _update_and_run_requires_skipped_run(copilot_ctx, "edit_block_and_run")
     _clear_pending_browser_interaction_observation(copilot_ctx)
 
     async with copilot_ctx.block_edit_lock:
@@ -763,7 +708,6 @@ async def edit_block_and_run_tool(
                                 "_rebuilt_block_labels": [label],
                             },
                             copilot_ctx,
-                            allow_missing_credentials=skip_run_after_update,
                             originating_call_id=_originating_call_id(ctx),
                             block_scoped_authoring_prior_yaml=preserve_untouched_block_configuration(
                                 _stored_workflow_yaml(copilot_ctx), prior_definition, edited_label=label
@@ -789,7 +733,6 @@ async def edit_block_and_run_tool(
                             "_rebuilt_block_labels": [label],
                         },
                         copilot_ctx,
-                        allow_missing_credentials=skip_run_after_update,
                         originating_call_id=_originating_call_id(ctx),
                         block_scoped_authoring_prior_yaml=preserve_untouched_block_configuration(
                             _stored_workflow_yaml(copilot_ctx), prior_definition, edited_label=label
@@ -807,14 +750,6 @@ async def edit_block_and_run_tool(
             result=update_result,
         )
         return json.dumps(sanitize_tool_result_for_llm("update_workflow", update_result))
-
-    if skip_run_after_update:
-        return _credential_deferred_combined_tool_result(
-            copilot_ctx,
-            tool_name="edit_block_and_run",
-            arguments=arguments,
-            update_result=update_result,
-        )
 
     return await _run_updated_workflow_blocks(
         copilot_ctx,
@@ -1754,7 +1689,6 @@ def _promote_executed_sources(
     name_override=UPDATE_AND_RUN_BLOCKS_TOOL_NAME,
     timeout=RUN_BLOCKS_SAFETY_CEILING_SECONDS,
     strict_mode=False,
-    tool_input_guardrails=[_WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL],
 )
 async def update_and_run_blocks_tool(
     ctx: RunContextWrapper,
@@ -1835,13 +1769,6 @@ async def update_and_run_blocks_tool(
         "reuse_outputs_from_run_id": reuse_outputs_from_run_id,
         "run_every_loop_iteration": run_every_loop_iteration,
     }
-    skip_run_after_update = _update_and_run_requires_skipped_run(copilot_ctx, "update_and_run_blocks")
-    # Cleared unconditionally up front and only set True at the actual skip
-    # branch below — reflects "we skipped a run", not "the policy would have
-    # allowed a skip if we got that far". A stale True from an earlier call, or
-    # a premature True from a policy check ahead of an unrelated update_workflow
-    # failure, would misreport an authoring error as a credential ask.
-    copilot_ctx.last_run_skipped_unbound_credentials = False
     authority_error = _authority_tool_error(copilot_ctx, "update_and_run_blocks")
     if authority_error:
         return _diagnosis_repair_tool_error(copilot_ctx, "update_and_run_blocks", authority_error)
@@ -1871,7 +1798,6 @@ async def update_and_run_blocks_tool(
                     update_result = await _update_workflow(
                         update_params,
                         copilot_ctx,
-                        allow_missing_credentials=skip_run_after_update,
                         originating_call_id=_originating_call_id(ctx),
                     )
                     _record_workflow_update_result(copilot_ctx, update_result, prior_definition)
@@ -1889,14 +1815,6 @@ async def update_and_run_blocks_tool(
         sanitized = sanitize_tool_result_for_llm("update_workflow", update_result)
         return json.dumps(sanitized)
 
-    if skip_run_after_update:
-        return _credential_deferred_combined_tool_result(
-            copilot_ctx,
-            tool_name="update_and_run_blocks",
-            arguments=arguments,
-            update_result=update_result,
-        )
-
     return await _run_updated_workflow_blocks(
         copilot_ctx,
         tool_name="update_and_run_blocks",
@@ -1909,46 +1827,6 @@ async def update_and_run_blocks_tool(
         reuse_outputs_from_run_id=reuse_outputs_from_run_id,
         run_every_loop_iteration=run_every_loop_iteration,
     )
-
-
-def _credential_deferred_combined_tool_result(
-    copilot_ctx: CopilotContext,
-    *,
-    tool_name: str,
-    arguments: dict[str, Any],
-    update_result: dict[str, Any],
-) -> str:
-    """Record the staged draft when a combined edit/update cannot safely run yet."""
-    copilot_ctx.last_run_skipped_unbound_credentials = True
-    policy = copilot_ctx.request_policy
-    skip_result = {
-        "ok": True,
-        "message": (
-            _credential_deferred_draft_message(copilot_ctx)
-            if policy is not None and policy.raw_secret_redacted_draft
-            else "Skipped test run: required credentials are not configured."
-        ),
-        "data": {
-            "block_count": copilot_ctx.last_update_block_count,
-            "workflow_updated": True,
-            "skipped_run": True,
-            "skip_reason": "workflow_credential_inputs_unbound",
-        },
-    }
-    skip_result = carry_author_time_findings(update_result, skip_result)
-    record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, skip_result)
-    finalize_build_test_result(
-        copilot_ctx,
-        source_tool=tool_name,
-        result=skip_result,
-        workflow_updated=True,
-    )
-    LOG.info(
-        "combined workflow tool skipped run on unbound credential workflow inputs",
-        tool_name=tool_name,
-        workflow_permanent_id=copilot_ctx.workflow_permanent_id,
-    )
-    return json.dumps(sanitize_tool_result_for_llm(tool_name, skip_result))
 
 
 async def _run_updated_workflow_blocks(

@@ -71,7 +71,6 @@ from skyvern.forge.sdk.copilot.page_identity import safe_page_origin
 from skyvern.forge.sdk.copilot.pending_operation import pending_operation
 from skyvern.forge.sdk.copilot.runtime import (
     _BROWSER_BOOT_WAIT_SECONDS,
-    RAW_SECRET_BROWSER_ERROR,
     AgentContext,
     CopilotBrowserGenerationRetired,
     CopilotBrowserSessionUnavailable,
@@ -89,7 +88,6 @@ from skyvern.forge.sdk.copilot.runtime import (
     ensure_browser_session,
     mcp_browser_context,
     mcp_to_copilot,
-    raw_secret_browser_denied,
     retire_browser_session_id,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import (
@@ -1374,9 +1372,7 @@ def _log_mcp_timing(
     phases: _PhaseClock,
     raw_mcp: dict[str, Any],
     call_path: Literal["model", "internal"],
-    call_status: Literal[
-        "ok", "timeout", "error", "session_error", "cancelled", "not_connected", "raw_secret_denied"
-    ] = "ok",
+    call_status: Literal["ok", "timeout", "error", "session_error", "cancelled", "not_connected"] = "ok",
     *,
     dispatch_started: bool | None = None,
 ) -> None:
@@ -1746,8 +1742,6 @@ async def _prepare_browser_session_for_dispatch(
     observed_generation: int,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, _BrowserSessionLossDisposition | None]:
     """Verify the current session and return any error, continuity result, and fresh disposition."""
-    if raw_secret_browser_denied(ctx):
-        return {"ok": False, "error": RAW_SECRET_BROWSER_ERROR}, None, None
     targeted_session_id = current_call_browser_session_override()
     if targeted_session_id is not None and targeted_session_id != ctx.browser_session_id:
         # This call acts in a browser the chat does not own, so the chat's continuity is not its
@@ -2274,26 +2268,6 @@ class SkyvernOverlayMCPServer(MCPServer):
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, result)
             return _copilot_to_call_tool_result(result, tool_name)
 
-        if overlay.requires_browser and raw_secret_browser_denied(copilot_ctx):
-            result = {"ok": False, "error": RAW_SECRET_BROWSER_ERROR}
-            if uses_shared_browser_outcome:
-                outcome = _not_dispatched_browser_call_outcome(
-                    raw_tool_name=mcp_name,
-                    source_browser_session_id=attempt_browser_session_id,
-                    source_browser_session_generation=observed_continuity_generation,
-                    raw_result=result,
-                    ctx=copilot_ctx,
-                )
-                outcome = _scrub_browser_call_outcome(copilot_ctx, outcome)
-                _record_browser_call_outcome(copilot_ctx, outcome, call_path="model")
-                result = _project_browser_call_outcome(outcome, display_tool_name=tool_name)
-            else:
-                result = scrub_model_facing_tool_result(copilot_ctx, result, tool_name=mcp_name)
-            LOG.info("Raw-secret safety blocked MCP browser tool", tool_name=tool_name)
-            await _stamp_page_state(result)
-            record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, result)
-            return _copilot_to_call_tool_result(result, tool_name)
-
         async def _run_pre_hook() -> CallToolResult | None:
             if overlay.pre_hook is None:
                 return None
@@ -2379,7 +2353,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                     phases,
                     {},
                     "model",
-                    "raw_secret_denied" if raw_secret_browser_denied(copilot_ctx) else "session_error",
+                    "session_error",
                 )
                 if uses_shared_browser_outcome:
                     outcome = _not_dispatched_browser_call_outcome(
@@ -2952,7 +2926,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                 phases,
                 {},
                 "internal",
-                "raw_secret_denied" if raw_secret_browser_denied(ctx) else "session_error",
+                "session_error",
             )
             if uses_shared_browser_outcome:
                 outcome = _not_dispatched_browser_call_outcome(

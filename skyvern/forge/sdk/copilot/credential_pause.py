@@ -27,7 +27,7 @@ import secrets
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol
 from urllib.parse import urlparse
@@ -48,9 +48,12 @@ from skyvern.forge.sdk.copilot.credential_resolution import (
 )
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import DiagnosisFailureType, RepairNextAction
 from skyvern.forge.sdk.copilot.human_input_wait import pause_human_input
-from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, credential_binding
+from skyvern.forge.sdk.copilot.request_policy import (
+    RequestPolicy,
+    credential_binding,
+    user_provided_site_url_match,
+)
 from skyvern.forge.sdk.copilot.runtime import live_working_page
-from skyvern.forge.sdk.copilot.workflow_credential_utils import url_origin
 from skyvern.forge.sdk.credential_site_policy import LoginSite, same_release_scope
 from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.forge.sdk.schemas.workflow_copilot import (
@@ -383,7 +386,7 @@ def _validate_pending_pause(record: _ActivePauseRecord | None, resume_token: str
     # slow final poll) -- that's an infra buffer, not permission to accept a
     # response after the waiter gave up and the turn already finalized without
     # it. Enforce the actual deadline the frame told the client about.
-    if datetime.now(timezone.utc) >= record.expires_at:
+    if datetime.now(UTC) >= record.expires_at:
         raise CredentialPauseRejection(
             status_code=HTTPStatus.GONE,
             detail="Credential pause has expired",
@@ -450,7 +453,7 @@ async def pending_credential_requests(
             continue
         live_until = record.live_until()
         # A Done being saved still owns the card: if it finds no sign-in, the pause reopens for this tab.
-        saving = record.status == "resolving" and live_until is not None and datetime.now(timezone.utc) < live_until
+        saving = record.status == "resolving" and live_until is not None and datetime.now(UTC) < live_until
         if not saving:
             try:
                 _validate_pending_pause(record, record.resume_token)
@@ -479,7 +482,7 @@ async def credential_pause_is_active(organization_id: str, chat_id: str, turn_id
         LOG.warning("Failed to inspect Copilot credential pause", exc_info=True)
         return None
     live_until = record.live_until() if record is not None else None
-    return bool(live_until is not None and datetime.now(timezone.utc) < live_until)
+    return bool(live_until is not None and datetime.now(UTC) < live_until)
 
 
 async def check_credential_pause_resumable(
@@ -709,7 +712,7 @@ async def claim_credential_site_change(
         question = _bound_site_question(record, credential_id)
         if question.vault_sourced:
             raise _site_conflict("This login's sites come from a connected vault; add the site there")
-        deadline = datetime.now(timezone.utc) + timedelta(seconds=MANUAL_SIGN_IN_CLAIM_SECONDS)
+        deadline = datetime.now(UTC) + timedelta(seconds=MANUAL_SIGN_IN_CLAIM_SECONDS)
         claim_id = secrets.token_hex(16)
         claimed = replace(record, status="resolving", claim_id=claim_id, claim_deadline=deadline)
         await cache.set(active_key, _encode_record(claimed), ex=_longest_credential_pause_record_ttl())
@@ -894,7 +897,7 @@ async def start_manual_sign_in(
 
 
 def _extend_pause(record: _ActivePauseRecord, seconds: int, **card_update: bool) -> _ActivePauseRecord:
-    expires_at = max(record.expires_at, datetime.now(timezone.utc) + timedelta(seconds=seconds))
+    expires_at = max(record.expires_at, datetime.now(UTC) + timedelta(seconds=seconds))
     # The recovered card must carry the record's deadline, or pending_credential_requests drops it.
     card = record.card.model_copy(update={"expires_at": expires_at, **card_update}) if record.card else None
     return replace(record, expires_at=expires_at, card=card)
@@ -929,7 +932,7 @@ async def claim_manual_sign_in(
             record,
             status="resolving",
             claim_id=claim_id,
-            claim_deadline=datetime.now(timezone.utc) + timedelta(seconds=MANUAL_SIGN_IN_CLAIM_SECONDS),
+            claim_deadline=datetime.now(UTC) + timedelta(seconds=MANUAL_SIGN_IN_CLAIM_SECONDS),
         )
         await cache.set(active_key, _encode_record(claimed), ex=_longest_credential_pause_record_ttl())
         return ManualSignInClaim(claim_id=claim_id, resume_token=record.resume_token, sign_in=record.manual_sign_in)
@@ -998,7 +1001,7 @@ async def claim_credential_generation(
             )
         claim_id = secrets.token_hex(16)
         registration = registration.model_copy(update={"attempted": True})
-        deadline = datetime.now(timezone.utc) + timedelta(seconds=MANUAL_SIGN_IN_CLAIM_SECONDS)
+        deadline = datetime.now(UTC) + timedelta(seconds=MANUAL_SIGN_IN_CLAIM_SECONDS)
         claimed = replace(
             record, status="resolving", claim_id=claim_id, claim_deadline=deadline, registration=registration
         )
@@ -1049,17 +1052,6 @@ async def finish_credential_generation(
 
 def credential_pause_reason(ctx: Any) -> str | None:
     """Typed-signal-only detector for a run-derived credential ask; reply prose never counts."""
-    policy = getattr(ctx, "request_policy", None)
-    raw_secret_redacted_draft = (
-        isinstance(policy, RequestPolicy)
-        and policy.raw_secret_detected
-        and policy.raw_secret_handling == "redacted_draft"
-    )
-    if getattr(ctx, "last_run_skipped_unbound_credentials", False) and not raw_secret_redacted_draft:
-        # This is a concrete run result, not a policy or classifier verdict. Preserve it
-        # even when legacy context labels the request as skip_test.
-        return "workflow_credential_inputs_unbound"
-
     contract = getattr(ctx, "latest_diagnosis_repair_contract", None)
     if (
         contract is not None
@@ -1076,13 +1068,6 @@ def credential_pause_reason(ctx: Any) -> str | None:
     return None
 
 
-RAW_SECRET_CONNECTED_NEXT = (
-    "Bind this credential as the workflow's credential parameter in the draft. This turn withheld a value "
-    "that may be a secret, so do not run, test, or use the browser; the draft stays untested until a later "
-    "message asks to test it."
-)
-
-
 def raw_secret_card_origin(user_url: str) -> str:
     # A pasted URL can carry the secret in its path or query, so only its origin reaches the card; like the
     # fill seam's site check, a URL with userinfo has no admissible origin at all.
@@ -1091,6 +1076,17 @@ def raw_secret_card_origin(user_url: str) -> str:
         return ""
     scheme, separator, rest = safe_admitted_url(user_url).partition("://")
     return f"{scheme}{separator}{rest.split('/', 1)[0]}" if separator else ""
+
+
+def raw_secret_card_urls(policy: RequestPolicy, login_page_urls: list[str]) -> list[str]:
+    """The origins of the user-given sites these URLs match; a model, page or classifier URL alone reaches no card."""
+    origins: list[str] = []
+    for url in login_page_urls:
+        user_url, _ = user_provided_site_url_match(policy, url)
+        origin = raw_secret_card_origin(user_url) if user_url else ""
+        if origin and origin not in origins:
+            origins.append(origin)
+    return origins
 
 
 def credential_pause_transport_ready(ctx: CopilotContext, copilot_config: CopilotConfig | None) -> bool:
@@ -1134,16 +1130,10 @@ def _bind_connected_credential_origin(policy: RequestPolicy, credential: Credent
     return admitted_url
 
 
-def apply_connected_credential_to_policy(
-    ctx: CopilotContext, policy: RequestPolicy, credential: Credential, confirmed_site_url: str | None = None
-) -> None:
+def apply_connected_credential_to_policy(ctx: CopilotContext, policy: RequestPolicy, credential: Credential) -> None:
     """Record ``credential`` as the explicit answer to the product-owned pause, reopening the run gate
-    (and un-latching ``test_after_update_done``) so the resumed run does not re-skip and re-ask; a
-    raw-secret turn keeps its run gate closed and its draft untested for a later secret-free turn.
-    ``confirmed_site_url`` is a site the user just saved the login for, read back from its row."""
+    (and un-latching ``test_after_update_done``) so the resumed run does not re-skip and re-ask."""
     ctx.credential_pause_connected_credential_id = credential.credential_id
-    if confirmed_site_url and (confirmed_origin := url_origin(confirmed_site_url)):
-        policy.user_confirmed_site_origins.setdefault(credential.credential_id, set()).add(confirmed_origin)
     policy.credential_pause_connected_credential_ids.add(credential.credential_id)
     admitted_url = _bind_connected_credential_origin(policy, credential)
     LOG.info(
@@ -1159,14 +1149,8 @@ def apply_connected_credential_to_policy(
     policy.current_turn_named_credential_ids = {credential.credential_id}
     policy.clarification_reason = "none"
     policy.requires_user_clarification = False
-    if not policy.raw_secret_detected:
-        ctx.test_after_update_done = False
-        policy.allow_run_blocks = True
-        policy.allow_missing_credentials_in_draft = False
-    # Otherwise credential_prompt_reason() still sees the deferred-draft flag on the
-    # terminal RESPONSE and stamps credentialPrompt right next to credentialPause:
-    # connected -- a contradictory "still need a credential" signal to the FE.
-    policy.credential_draft_deferred_explicitly = False
+    ctx.test_after_update_done = False
+    policy.allow_run_blocks = True
 
 
 def _apply_signed_in_profile_to_policy(ctx: Any, policy: RequestPolicy, signed_in: SignedInProfile) -> None:
@@ -1176,7 +1160,6 @@ def _apply_signed_in_profile_to_policy(ctx: Any, policy: RequestPolicy, signed_i
     policy.credential_pause_signed_in_site = signed_in.site
     policy.clarification_reason = "none"
     policy.requires_user_clarification = False
-    policy.credential_draft_deferred_explicitly = False
     ctx.test_after_update_done = False
     policy.allow_run_blocks = True
     LOG.info(
@@ -1318,19 +1301,17 @@ async def _seconds_left_on_pause(ctx: CopilotContext, resume_token: str) -> floa
     key = credential_pause_active_key(ctx.organization_id, ctx.workflow_copilot_chat_id or "", ctx.turn_id or "")
     record = _decode_active_pause(await app.CACHE.get(key))
     live_until = record.live_until() if record is not None and record.resume_token == resume_token else None
-    return (live_until - datetime.now(timezone.utc)).total_seconds() if live_until is not None else 0.0
+    return (live_until - datetime.now(UTC)).total_seconds() if live_until is not None else 0.0
 
 
 def _manual_sign_in_offer(ctx: CopilotContext, login_page_urls: list[str]) -> ManualSignIn | None:
     """A pick or update card offers signing in yourself in the editor's live browser when there is one."""
-    policy = ctx.request_policy
     site = sign_in_site(login_page_urls)
     if (
         not ctx.browser_session_id
         or not site
         # Only the recovery's own card is "asked"; a card for another site after a declined recovery still offers it.
         or (ctx.credential_origin_recovery is not None and ctx.credential_origin_recovery.state == "asked")
-        or (isinstance(policy, RequestPolicy) and policy.raw_secret_detected)
     ):
         return None
     title = ctx.last_workflow.title if ctx.last_workflow is not None else ctx.opening_workflow_title
@@ -1383,6 +1364,11 @@ async def _run_credential_pause(
     ctx.credential_registration_outcome = None
     if not credential_pause_transport_ready(ctx, copilot_config):
         return None
+    policy = ctx.request_policy
+    if isinstance(policy, RequestPolicy) and policy.raw_secret_redacted_draft:
+        login_page_urls = raw_secret_card_urls(policy, login_page_urls)
+        if not login_page_urls:
+            return None
     # A pause no tool call raised (the end-of-turn ask) renders after the newest row instead.
     if anchor_tool_call_id is None and ctx.narrator_state is not None:
         anchor_tool_call_id = ctx.narrator_state.last_tool_call_id
@@ -1411,7 +1397,6 @@ async def _run_credential_pause(
     if not recovery_enabled and await stream.is_disconnected():
         settle("declined")
         return None
-    policy = ctx.request_policy
     if update_credential_id is not None:
         credential_refs = [update_credential_id]
     else:
@@ -1465,7 +1450,7 @@ async def _run_credential_pause(
         else None
     )
     timeout_seconds = copilot_config.credential_pause_timeout_seconds
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
 
     organization_id = ctx.organization_id
     chat_id = ctx.workflow_copilot_chat_id or ""
@@ -1543,7 +1528,7 @@ async def _run_credential_pause(
             if record is not None and record.resume_token == resume_token and record.manual_sign_in is not None:
                 sign_in_started = sign_in_started or record.manual_sign_in.started
             live_until = record.live_until() if record is not None and record.resume_token == resume_token else None
-            if keep_live and live_until is not None and datetime.now(timezone.utc) < live_until:
+            if keep_live and live_until is not None and datetime.now(UTC) < live_until:
                 return "live"
             await cache.set(
                 active_key,
@@ -1583,7 +1568,7 @@ async def _run_credential_pause(
                 site_a=site_answer.site_a if site_answer else None,
                 saved_sites=list(site_answer.saved_sites) if site_answer else None,
                 site_b=site_answer.site_b if site_answer else None,
-                timestamp=datetime.now(timezone.utc),
+                timestamp=datetime.now(UTC),
             )
         )
 
@@ -1693,7 +1678,7 @@ async def _run_credential_pause(
             return resolution
         if isinstance(policy, RequestPolicy):
             policy.refresh_credential(credential)
-            apply_connected_credential_to_policy(ctx, policy, credential, confirmed_site_url=site_answer.site_b)
+            apply_connected_credential_to_policy(ctx, policy, credential)
         settle("connected", site_answer)
         await answered("connected", credential, site_answer=site_answer)
         return resolution
@@ -1784,7 +1769,7 @@ async def await_pending_credential_pause(ctx: Any) -> None:
     bound = longest_credential_pause_seconds() + 30
     try:
         await asyncio.wait_for(settled.wait(), bound)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         LOG.warning("copilot_credential_gate_wait_timed_out")
         settled.set()
 
