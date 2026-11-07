@@ -14,12 +14,8 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { toast } from "@/components/ui/use-toast";
-import { copyText } from "@/util/copyText";
-import {
-  generateApiCommands,
-  type ApiCommandOptions,
-} from "@/util/apiCommands";
+import { CopyApiCommandMenuItems } from "@/components/CopyApiCommandDropdown";
+import { type ApiCommandOptions } from "@/util/apiCommands";
 
 type ApiWebhookActionsMenuProps = {
   getOptions: () => ApiCommandOptions;
@@ -67,36 +63,7 @@ export function ApiWebhookActionsMenu({
         <DropdownMenuLabel className="py-2 text-base">
           Re-run via API
         </DropdownMenuLabel>
-        <DropdownMenuItem
-          onSelect={() => {
-            const { curl } = generateApiCommands(getOptions());
-            copyText(curl).then(() => {
-              toast({
-                variant: "success",
-                title: "Copied to Clipboard",
-                description:
-                  "The cURL command has been copied to your clipboard.",
-              });
-            });
-          }}
-        >
-          Copy cURL (Unix/Linux/macOS)
-        </DropdownMenuItem>
-        <DropdownMenuItem
-          onSelect={() => {
-            const { powershell } = generateApiCommands(getOptions());
-            copyText(powershell).then(() => {
-              toast({
-                variant: "success",
-                title: "Copied to Clipboard",
-                description:
-                  "The PowerShell command has been copied to your clipboard.",
-              });
-            });
-          }}
-        >
-          Copy PowerShell (Windows)
-        </DropdownMenuItem>
+        <CopyApiCommandMenuItems getOptions={getOptions} />
         <DropdownMenuSeparator />
         <DropdownMenuLabel className="py-2 text-base">
           Webhooks
