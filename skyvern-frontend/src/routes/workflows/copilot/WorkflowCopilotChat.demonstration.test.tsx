@@ -351,6 +351,22 @@ describe("WorkflowCopilotChat demonstration", () => {
     expect(onRecordTask).toHaveBeenCalledTimes(1);
   });
 
+  it("starts a demonstration from the composer plus menu", async () => {
+    const onRecordTask = vi.fn();
+    await renderChat({ onRecordTask, canRecordTask: true });
+
+    fireEvent.keyDown(
+      await screen.findByRole("button", {
+        name: "Attach a file or demonstrate",
+      }),
+      { key: "Enter" },
+    );
+    fireEvent.click(
+      await screen.findByRole("menuitem", { name: /Demonstrate task/ }),
+    );
+    expect(onRecordTask).toHaveBeenCalledTimes(1);
+  });
+
   it("disables a demonstration offer once a later message follows it", async () => {
     historyResponse.data.chat_history = [
       {
@@ -465,7 +481,9 @@ describe("WorkflowCopilotChat demonstration", () => {
       name: "Done, build the workflow",
     });
     expect((doneButton as HTMLButtonElement).disabled).toBe(false);
-    const attachButton = screen.getByRole("button", { name: "Attach a file" });
+    const attachButton = screen.getByRole("button", {
+      name: "Attach a file or demonstrate",
+    });
     expect((attachButton as HTMLButtonElement).disabled).toBe(true);
     expect(attachButton.className).toContain("disabled:opacity-50");
     expect(attachButton.className).not.toContain(
@@ -633,9 +651,10 @@ describe("WorkflowCopilotChat demonstration", () => {
         .demonstrationRecordingBrowserSessionId,
     ).toBeNull();
     expect(screen.getByText("Showing you in the browser now.")).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Attach a file" }).title).toBe(
-      "Use Build before attaching a file",
-    );
+    expect(
+      screen.getByRole("button", { name: "Attach a file or demonstrate" })
+        .title,
+    ).toBe("Use Build before attaching a file");
     expect(
       (
         screen.getByRole("button", {
