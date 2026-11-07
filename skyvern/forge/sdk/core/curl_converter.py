@@ -70,20 +70,6 @@ def parse_curl_command(curl_command: str) -> dict[str, Any]:
                 )
                 result["body"] = {"data": data_str if "data_str" in locals() else parsed.data}
 
-        # Process JSON data if provided
-        if hasattr(parsed, "json") and parsed.json:
-            try:
-                result["body"] = json.loads(parsed.json)
-            except (json.JSONDecodeError, TypeError) as e:
-                LOG.warning(
-                    "Curl json is not valid JSON",
-                    json=parsed.json,
-                    error_type=type(e).__name__,
-                    error_message=str(e),
-                    curl_command=curl_command,
-                )
-                result["body"] = {"data": parsed.json}
-
         # Validate URL
         if not result["url"]:
             raise ValueError("No URL found in curl command")
