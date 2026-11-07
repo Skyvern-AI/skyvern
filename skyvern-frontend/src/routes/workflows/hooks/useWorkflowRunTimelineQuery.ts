@@ -1,10 +1,17 @@
-import { runIsLogicallyActive } from "@/routes/workflows/workflowRun/runRetryState";
+import {
+  runIsLogicallyActive,
+  runIsLogicallyFinal,
+} from "@/routes/workflows/workflowRun/runRetryState";
+import { statusIsNotFinalized } from "@/routes/tasks/types";
 import { getClient } from "@/api/AxiosClient";
 import { Status } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
-import { WorkflowRunTimelineItem } from "../types/workflowRunTypes";
+import {
+  isBlockItem,
+  WorkflowRunTimelineItem,
+} from "../types/workflowRunTypes";
 import { useWorkflowRunWithWorkflowQuery } from "./useWorkflowRunWithWorkflowQuery";
 import { useGlobalWorkflowsQuery } from "./useGlobalWorkflowsQuery";
 import { useFirstParam } from "@/hooks/useFirstParam";
@@ -17,6 +24,20 @@ import {
 // Mirrors RECORDED_ACTIONS_POLL_INTERVAL_MS in WorkflowCopilotChat, the other reader of
 // this endpoint; the two must not drift apart or their counts disagree on screen.
 const RUNNING_TIMELINE_REFETCH_INTERVAL_MS = 2500;
+// A final run's blocks, whatever its final status, can close after the run itself turns final.
+// The cap keeps a worker that never closes them from polling forever.
+const POST_FINAL_TIMELINE_POLL_CAP = 20;
+
+function timelineHasOpenBlock(items: Array<WorkflowRunTimelineItem>): boolean {
+  return items.some(
+    (item) =>
+      (isBlockItem(item) &&
+        [item.block, ...(item.task_v2_blocks ?? [])].some(
+          ({ status }) => status !== null && statusIsNotFinalized({ status }),
+        )) ||
+      timelineHasOpenBlock(item.children),
+  );
+}
 
 function useWorkflowRunTimelineQuery(options?: {
   workflowRunId: string | undefined;
@@ -36,6 +57,7 @@ function useWorkflowRunTimelineQuery(options?: {
   // Only a running run writes timeline rows. Created, queued and paused are live but idle, and a
   // paused run waits on a human for as long as that takes.
   const runIsWriting = workflowRun?.status === Status.Running;
+  const runIsFinal = !!workflowRun && runIsLogicallyFinal(workflowRun);
 
   return useQuery<Array<WorkflowRunTimelineItem>>({
     // The run's status is part of what was read: a timeline fetched while the run was still
@@ -84,17 +106,34 @@ function useWorkflowRunTimelineQuery(options?: {
       if (query.state.status === "error") {
         return false;
       }
-      return runIsWriting ? RUNNING_TIMELINE_REFETCH_INTERVAL_MS : false;
+      if (runIsWriting) {
+        return RUNNING_TIMELINE_REFETCH_INTERVAL_MS;
+      }
+      return runIsFinal &&
+        query.state.dataUpdateCount < POST_FINAL_TIMELINE_POLL_CAP &&
+        timelineHasOpenBlock(query.state.data ?? [])
+        ? RUNNING_TIMELINE_REFETCH_INTERVAL_MS
+        : false;
     },
     // The interval otherwise pauses while the window is unfocused, and a run watched from another
-    // window keeps writing blocks the whole time. Scoped to a running run so a backgrounded tab
-    // does not poll through an idle one — a paused run can sit there for hours.
-    refetchIntervalInBackground: runIsWriting,
+    // window keeps writing blocks the whole time. Scoped to a running run, or a final one closing
+    // its last blocks under the cap, so a backgrounded tab does not poll through a paused run for
+    // hours.
+    refetchIntervalInBackground: runIsWriting || runIsFinal,
     placeholderData: keepPreviousData,
-    refetchOnMount: runIsLive ? "always" : false,
+    // A final run whose cached rows are still open may have stopped at the poll cap, and staleTime
+    // would otherwise keep those rows on screen for every later visit.
+    refetchOnMount: (query) =>
+      runIsLive || (runIsFinal && timelineHasOpenBlock(query.state.data ?? []))
+        ? "always"
+        : false,
     refetchOnWindowFocus: runIsLive ? "always" : false,
     enabled: !!globalWorkflows && !!workflowPermanentId && !!workflowRunId,
   });
 }
 
-export { RUNNING_TIMELINE_REFETCH_INTERVAL_MS, useWorkflowRunTimelineQuery };
+export {
+  POST_FINAL_TIMELINE_POLL_CAP,
+  RUNNING_TIMELINE_REFETCH_INTERVAL_MS,
+  useWorkflowRunTimelineQuery,
+};
