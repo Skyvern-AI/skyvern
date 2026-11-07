@@ -4,14 +4,30 @@ import re
 from typing import Any, ClassVar, Literal
 from uuid import UUID
 
+import structlog
 from pydantic import Field, field_validator
 
 from skyvern.forge import app
+from skyvern.forge.failure_classifier import FailureCategory
 from skyvern.forge.sdk.services.powerbi_query_service import PowerBIQueryError
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import Block, get_all_blocks
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, WorkflowParameter, WorkflowParameterType
 from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType
+
+LOG = structlog.get_logger()
+
+HUMAN_RUN_REQUIRED_REASON = (
+    "Power BI queries only run when the person who connected the account starts the run from the "
+    "workflow editor. Open this workflow in the editor and run it there."
+)
+INTEGRATION_UNAVAILABLE_REASON = "Power BI queries are not currently available."
+
+NO_ACCESS_REASON = (
+    "This run wasn't given access to Power BI. Power BI queries run only when the person who connected the "
+    "account starts the run from the workflow editor, with that connection still active."
+)
+INTERNAL_ERROR_REASON = "Power BI query couldn't run because of an internal error. Retry the run."
 
 
 def normalize_powerbi_query(query: str) -> str:
@@ -118,6 +134,12 @@ class PowerBIQueryBlock(Block):
         except Exception:  # noqa: BLE001 - unverified run inputs must fail closed.
             return None
 
+    async def _powerbi_offered(self, organization_id: str) -> bool:
+        try:
+            return await app.AGENT_FUNCTION.nango_powerbi_catalog_available(organization_id)
+        except Exception:  # noqa: BLE001 - an unreadable gate keeps the generic unavailable message.
+            return False
+
     async def _failure(
         self,
         *,
@@ -127,8 +149,14 @@ class PowerBIQueryBlock(Block):
         organization_id: str | None,
         error_code: str,
         failure_reason: str,
+        category: FailureCategory | None = None,
     ) -> BlockResult:
         output: dict[str, Any] = {"error": error_code}
+        # Label only where the category's customer text fits the remedy; anything else stays UNKNOWN.
+        if category is not None:
+            output["failure_category"] = [
+                {"category": category.value, "confidence_float": 1.0, "reasoning": failure_reason}
+            ]
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, output)
         return await self.build_block_result(
             success=False,
@@ -178,13 +206,16 @@ class PowerBIQueryBlock(Block):
 
         hop_token = workflow_run_context.get_powerbi_hop_token(self.label)
         if not hop_token:
+            # Minting skips a run for several reasons (not owner-started, inactive connection, mint failure), so
+            # the wording states the rule without guessing which one applied here and records no category.
+            refused_by_design = effective_org_id is not None and await self._powerbi_offered(effective_org_id)
             return await self._failure(
                 workflow_run_context=workflow_run_context,
                 workflow_run_id=workflow_run_id,
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=effective_org_id,
-                error_code="integration_unavailable",
-                failure_reason="Power BI queries are not currently available.",
+                error_code="human_run_required" if refused_by_design else "integration_unavailable",
+                failure_reason=NO_ACCESS_REASON if refused_by_design else INTEGRATION_UNAVAILABLE_REASON,
             )
 
         if "{{" in self.connection_id or "{%" in self.connection_id:
@@ -205,6 +236,7 @@ class PowerBIQueryBlock(Block):
                 organization_id=None,
                 error_code="execution_context_unavailable",
                 failure_reason="Power BI query execution context is unavailable.",
+                category=FailureCategory.INFRASTRUCTURE_ERROR,
             )
 
         dataset_id = await self._resolve_dataset_id(workflow_run_id, effective_org_id)
@@ -250,7 +282,10 @@ class PowerBIQueryBlock(Block):
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=effective_org_id,
                     error_code="human_run_required",
-                    failure_reason="Power BI queries require a human-started run by the connection owner.",
+                    failure_reason=HUMAN_RUN_REQUIRED_REASON,
+                    # principal_unavailable also stands for a failed principal lookup, so only the event-trigger
+                    # fact is labeled.
+                    category=FailureCategory.CREDENTIAL_ERROR if exc.code == "event_trigger_run" else None,
                 )
             if exc.code == "copilot_test_run_unsupported":
                 return await self._failure(
@@ -277,7 +312,7 @@ class PowerBIQueryBlock(Block):
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=effective_org_id,
                     error_code="integration_unavailable",
-                    failure_reason="Power BI queries are not currently available.",
+                    failure_reason=INTEGRATION_UNAVAILABLE_REASON,
                 )
             if exc.code == "workflow_owner_resave_required":
                 return await self._failure(
@@ -296,6 +331,7 @@ class PowerBIQueryBlock(Block):
                     organization_id=effective_org_id,
                     error_code="trigger_chain_owner_required",
                     failure_reason="Power BI queries require every triggering workflow to be saved by the connection owner.",
+                    category=FailureCategory.CREDENTIAL_ERROR,
                 )
             if exc.code in {"trigger_parent_source_unconfirmed", "unsafe_query_input_source"}:
                 return await self._failure(
@@ -314,14 +350,19 @@ class PowerBIQueryBlock(Block):
                 error_code="query_failed",
                 failure_reason="Power BI query failed. Check the connection, dataset ID, query, and row limit.",
             )
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - any internal error must still fail the block closed.
+            # The type only: provider text can echo the query or its data.
+            LOG.warning(
+                "powerbi_query_block.internal_error", workflow_run_id=workflow_run_id, error_type=type(exc).__name__
+            )
             return await self._failure(
                 workflow_run_context=workflow_run_context,
                 workflow_run_id=workflow_run_id,
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=effective_org_id,
-                error_code="query_failed",
-                failure_reason="Power BI query failed. Check the connection, dataset ID, query, and row limit.",
+                error_code="internal_error",
+                failure_reason=INTERNAL_ERROR_REASON,
+                category=FailureCategory.INFRASTRUCTURE_ERROR,
             )
 
         if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
