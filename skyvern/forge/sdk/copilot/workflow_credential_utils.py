@@ -14,48 +14,38 @@ from skyvern.utils.yaml_loader import safe_load_no_dates
 URL_CANDIDATE_RE = re.compile(r"\b(?:https?://[^\s)>,]+|www\.[^\s)>,]+)", re.IGNORECASE)
 # The shape of every issued credential ID (see generate_credential_id).
 _ISSUED_CREDENTIAL_ID_RE = re.compile(r"cred_\d+")
-# A login in the organization's connected Bitwarden vault, named by its item id. It is never a row in the
-# credentials table, so every seam that reads one must branch on this prefix before a table or vault lookup.
-CONNECTED_VAULT_ID_PREFIX = "bwitem_"
-# The placeholders the workflow editor writes; at run time the organization's connected account is tried first.
-BITWARDEN_LOGIN_PARAMETER_SECRET_KEYS = {
-    "bitwarden_client_id_aws_secret_key": "SKYVERN_BITWARDEN_CLIENT_ID",
-    "bitwarden_client_secret_aws_secret_key": "SKYVERN_BITWARDEN_CLIENT_SECRET",
-    "bitwarden_master_password_aws_secret_key": "SKYVERN_BITWARDEN_MASTER_PASSWORD",
-}
-
-
-def connected_vault_credential_id(item_id: str) -> str:
-    return f"{CONNECTED_VAULT_ID_PREFIX}{item_id}"
-
-
-def connected_vault_item_id(credential_id: str) -> str | None:
-    if not credential_id.startswith(CONNECTED_VAULT_ID_PREFIX):
-        return None
-    return credential_id.removeprefix(CONNECTED_VAULT_ID_PREFIX)
+# The gate key for a `bitwarden_login_credential` parameter, which binds a vault item rather than a saved credential.
+LEGACY_BITWARDEN_PARAM_ID_PREFIX = "bitwarden_login_credential:"
 
 
 def bitwarden_login_parameter_credential_id(parameter: Any) -> str | None:
-    """The connected-vault id a `bitwarden_login_credential` parameter binds, else None. A missing, templated or
-    key-referencing item id still yields an id, so the binding stays visible to approval and validation."""
+    """The gate key a `bitwarden_login_credential` parameter binds, else None. A missing, templated or
+    key-referencing item id still yields a key, so the binding stays visible to approval."""
     if not isinstance(parameter, dict):
         return None
     if str(parameter.get("parameter_type") or "").lower() != ParameterType.BITWARDEN_LOGIN_CREDENTIAL:
         return None
     item_id = parameter.get("bitwarden_item_id")
-    return connected_vault_credential_id(item_id.strip() if isinstance(item_id, str) else "")
+    return f"{LEGACY_BITWARDEN_PARAM_ID_PREFIX}{item_id.strip() if isinstance(item_id, str) else ''}"
 
 
-# Bitwarden identity and card bindings. Copilot lists and approves only logins, so it never adds or edits these.
+# Copilot binds vault logins as saved credentials, so it never adds or edits a Bitwarden parameter.
 _BITWARDEN_SECRET_PARAMETER_TYPES = frozenset(
-    {ParameterType.BITWARDEN_SENSITIVE_INFORMATION.value, ParameterType.BITWARDEN_CREDIT_CARD_DATA.value}
+    {
+        ParameterType.BITWARDEN_LOGIN_CREDENTIAL.value,
+        ParameterType.BITWARDEN_SENSITIVE_INFORMATION.value,
+        ParameterType.BITWARDEN_CREDIT_CARD_DATA.value,
+    }
 )
 _BITWARDEN_SECRET_BINDING_FIELDS = (
     "bitwarden_collection_id",
     "bitwarden_item_id",
+    "url_parameter_key",
     "bitwarden_identity_key",
     "bitwarden_identity_fields",
-    *BITWARDEN_LOGIN_PARAMETER_SECRET_KEYS,
+    "bitwarden_client_id_aws_secret_key",
+    "bitwarden_client_secret_aws_secret_key",
+    "bitwarden_master_password_aws_secret_key",
 )
 
 

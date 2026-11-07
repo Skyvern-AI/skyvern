@@ -49,10 +49,13 @@ class AsyncExecutor(abc.ABC):
         block_labels: list[str] | None,
         block_outputs: dict[str, Any] | None,
         resolved_workflow: Workflow | None = None,
+        resolved_workflow_run: WorkflowRun | None = None,
+        run_parameter_values: dict[str, Any] | None = None,
         **kwargs: dict,
     ) -> None:
-        """``resolved_workflow`` is the version the caller just resolved for this run, so an executor
-        that needs it can skip re-reading it."""
+        """``resolved_workflow`` is the version the caller just resolved for this run, ``resolved_workflow_run`` the run
+        row as the caller just created it, and ``run_parameter_values`` the parameter values it just wrote, as a read
+        of them returns them, so an executor that needs any of them can skip re-reading it."""
 
     @abc.abstractmethod
     async def execute_task_v2(

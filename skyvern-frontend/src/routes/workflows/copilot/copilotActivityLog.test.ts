@@ -2,7 +2,10 @@ import { describe, expect, it } from "vitest";
 
 import {
   ActivityLog,
+  blockAttempts,
+  blockIdentity,
   callRollup,
+  condenseCalls,
   deriveActivityLog,
   kindOf,
   summarizeFinishedTurn,
@@ -11,6 +14,7 @@ import {
   ActivityEntry,
   BlockState,
   EMPTY_NARRATIVE,
+  NarrativeEvent,
   TurnNarrativeState,
   applyNarrativeEvent,
   hydrateNarrativeFromPayload,
@@ -1146,6 +1150,55 @@ describe("deriveActivityLog", () => {
     );
   });
 
+  it("keeps a block first seen already finished on its own run row as later runs start", () => {
+    const live = (["first_attempt", "second_attempt"] as const).reduce(
+      (turn, label, i) =>
+        applyNarrativeEvent(turn, {
+          type: "block_progress",
+          workflow_run_block_id: `wrb_${label}`,
+          block_label: label,
+          block_type: "code",
+          status: i === 0 ? "failed" : "completed",
+          iteration: 0,
+          timestamp: at(i === 0 ? 3 : 6),
+        }),
+      turnWith(repairLoopActivity()),
+    );
+    const reloaded = applyNarrativeEvent(
+      live,
+      terminalResponse({
+        turnId: "turn-1",
+        turnIndex: 0,
+        terminal: "response",
+        designActivity: repairLoopActivity(),
+        blocks: [
+          payloadBlock("first_attempt", {
+            workflowRunBlockId: "wrb_first_attempt",
+            state: "failed",
+            startedAt: at(3),
+          }),
+          payloadBlock("second_attempt", {
+            workflowRunBlockId: "wrb_second_attempt",
+            startedAt: at(6),
+          }),
+        ],
+      }),
+    );
+
+    expect(live.blocks.map((b) => b.startedAt)).toEqual([null, null]);
+    expect(labelsPerRow(deriveActivityLog(live))).toEqual([
+      [],
+      [],
+      ["first_attempt"],
+      [],
+      [],
+      ["second_attempt"],
+    ]);
+    expect(labelsPerRow(deriveActivityLog(reloaded))).toEqual(
+      labelsPerRow(deriveActivityLog(live)),
+    );
+  });
+
   it("drops a legacy row with no persisted evidence", () => {
     const reloaded = applyNarrativeEvent(
       twoRunTurn(),
@@ -1569,6 +1622,25 @@ describe("deriveActivityLog — append only", () => {
   });
 });
 
+describe("condenseCalls", () => {
+  it("keeps two identical-reading runs apart when they dispatched different runs", () => {
+    const run = (id: string, workflowRunId: string) =>
+      entry({
+        id,
+        kind: "tool_result",
+        toolName: "run_blocks_and_collect_debug",
+        text: "Test completed",
+        success: true,
+        workflowRunId,
+      });
+    const condensed = condenseCalls([run("r1", "wr_1"), run("r2", "wr_2")]);
+    expect(condensed.map((c) => [c.entry.workflowRunId, c.count])).toEqual([
+      ["wr_1", 1],
+      ["wr_2", 1],
+    ]);
+  });
+});
+
 describe("callRollup", () => {
   const call = (id: string, toolName: string, kind: ActivityEntry["kind"]) =>
     entry({ id, kind, toolName, success: true });
@@ -1708,6 +1780,30 @@ describe("summarizeFinishedTurn", () => {
       ranCleanOnCurrentSource: true,
     });
     expect(fixed.fixed).toBe(true);
+  });
+
+  it("does not count a run call refused before it dispatched as a failed test", () => {
+    const { rows } = deriveActivityLog(
+      turnWith(
+        [
+          entry({
+            id: "tr-1",
+            kind: "tool_result",
+            toolName: "update_and_run_blocks",
+            success: false,
+          }),
+          entry({
+            id: "tr-2",
+            kind: "tool_result",
+            toolName: "run_blocks_and_collect_debug",
+            success: false,
+            workflowRunId: "wr_1",
+          }),
+        ],
+        [],
+      ),
+    );
+    expect(summarizeFinishedTurn(rows, null).failedTests).toBe(1);
   });
 
   it("names the blocks the newest test left failing", () => {
@@ -1887,5 +1983,143 @@ describe("actor reason ownership", () => {
     expect(rows[0]!.entries[0]!.success).toBe(false);
     expect(rows[1]!.entries).toEqual([]);
     expect(rows[2]!.entries[0]!.success).toBe(true);
+  });
+});
+
+describe("blockAttempts", () => {
+  const clock = (second: number): string =>
+    new Date(Date.UTC(2026, 0, 1, 0, 0, second)).toISOString();
+
+  const call = (
+    tool: string,
+    id: string,
+    second: number,
+    success: boolean,
+  ): NarrativeEvent[] => [
+    {
+      type: "tool_call",
+      tool_name: tool,
+      tool_input: {},
+      iteration: second,
+      tool_call_id: id,
+      timestamp: clock(second),
+    },
+    {
+      type: "tool_result",
+      tool_name: tool,
+      success,
+      summary: success ? "Done" : "Couldn't complete that step.",
+      iteration: second + 1,
+      tool_call_id: id,
+      timestamp: clock(second + 3),
+    },
+  ];
+
+  const failedRun = (run: number, second: number): NarrativeEvent[] => {
+    const frame = (status: string, at: number): NarrativeEvent => ({
+      type: "block_progress",
+      workflow_run_id: `wr_${run}`,
+      workflow_run_block_id: `wrb_${run}`,
+      block_label: "open_site",
+      block_type: "code",
+      status,
+      iteration: at,
+      timestamp: clock(at),
+    });
+    const [runCall, runResult] = call(
+      "update_and_run_blocks",
+      `run-${run}`,
+      second,
+      false,
+    );
+    return [
+      runCall!,
+      frame("running", second + 1),
+      frame("failed", second + 2),
+      runResult!,
+    ];
+  };
+
+  const cappedTurn = (): TurnNarrativeState => {
+    const events: NarrativeEvent[] = [...failedRun(1, 0), ...failedRun(2, 20)];
+    for (let i = 0; i < 24; i += 1) {
+      events.push(...call("get_page_evidence", `look-${i}`, 40 + i * 5, true));
+    }
+    events.push(...failedRun(3, 200));
+    return events.reduce(applyNarrativeEvent, {
+      ...EMPTY_NARRATIVE,
+      turnId: "turn-1",
+      turnIndex: 0,
+      designStarted: true,
+    });
+  };
+
+  it("keeps each run its own attempt after the activity cap drops older run calls", () => {
+    const turn = cappedTurn();
+    const { rows } = deriveActivityLog(turn);
+    const blocks = rows.flatMap((row) => row.blocks);
+    const attempts = blockAttempts(turn);
+
+    expect(
+      turn.designActivity
+        .filter((e) => e.toolName === "update_and_run_blocks")
+        .map((e) => e.id),
+    ).toEqual(["tc-run-3", "tr-run-3"]);
+    expect(rows[rows.length - 1]!.blocks).toEqual(blocks);
+    expect(blocks.map((b) => attempts.get(blockIdentity(b))?.attempt)).toEqual([
+      1, 2, 3,
+    ]);
+    expect(
+      blocks.every((b) => attempts.get(blockIdentity(b))?.ownsRunReason),
+    ).toBe(true);
+  });
+
+  it("numbers the log's cards by the turn's block order, as the block list does, when the log orders rows differently", () => {
+    const turn = [
+      ...failedRun(1, 0),
+      ...call("get_page_evidence", "look", 10, true),
+      ...failedRun(2, 20),
+    ].reduce(applyNarrativeEvent, {
+      ...EMPTY_NARRATIVE,
+      turnId: "turn-1",
+      turnIndex: 0,
+    });
+    const reordered = { ...turn, blocks: [...turn.blocks].reverse() };
+    const fromLog = deriveActivityLog(reordered).rows.flatMap(
+      (row) => row.blocks,
+    );
+    const attempts = blockAttempts(reordered);
+    const numbered = (blocks: BlockState[]) =>
+      blocks.map((b) => [
+        b.workflowRunBlockId,
+        attempts.get(blockIdentity(b))?.attempt,
+      ]);
+
+    expect(numbered(fromLog)).toEqual([
+      ["wrb_1", 2],
+      ["wrb_2", 1],
+    ]);
+    expect(numbered(reordered.blocks)).toEqual([
+      ["wrb_2", 1],
+      ["wrb_1", 2],
+    ]);
+  });
+
+  it("never merges runs saved without a run id into one attempt", () => {
+    const turn = cappedTurn();
+    const { rows } = deriveActivityLog({
+      ...turn,
+      blocks: turn.blocks.map((b) => ({ ...b, workflowRunId: undefined })),
+    });
+    const blocks = rows.flatMap((row) => row.blocks);
+    const byBlock = blockAttempts({
+      ...turn,
+      blocks: turn.blocks.map((b) => ({ ...b, workflowRunId: undefined })),
+    });
+    const attempts = blocks.map((b) => byBlock.get(blockIdentity(b))!);
+
+    expect(attempts.map((a) => a.attempt)).toEqual([null, null, null]);
+    expect(attempts.map((a) => a.ownsRunReason)).toEqual([true, true, true]);
+    expect(attempts.map((a) => a.newest)).toEqual([false, false, true]);
   });
 });

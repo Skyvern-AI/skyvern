@@ -1982,7 +1982,146 @@ describe("CredentialCard missing-authenticator ask", () => {
         onSkip={vi.fn()}
       />,
     );
-    expect(screen.getByText(/keeps its saved sign-in/)).toBeTruthy();
+    expect(screen.getByText("Credential not updated")).toBeTruthy();
+    expect(screen.queryByText(/keeps its saved sign-in/)).toBeNull();
+    expect(screen.queryByText(/not used by the saved workflow/)).toBeNull();
+
+    for (const binding of [
+      "saved_workflow",
+      "matched_by_saved_url",
+      "not_bound",
+    ] as const) {
+      rerender(
+        <CredentialCard
+          frame={{ ...rejectedFrame, credential_binding: binding }}
+          mode="inline-pause"
+          resolvedOutcome={{ outcome: "skipped" }}
+          onConnect={vi.fn()}
+          onSkip={vi.fn()}
+        />,
+      );
+      expect(screen.queryByText(/keeps its saved sign-in/) !== null).toBe(
+        binding === "saved_workflow",
+      );
+      expect(
+        screen.queryByText(/not used by the saved workflow/) !== null,
+      ).toBe(binding !== "saved_workflow");
+    }
+  });
+
+  it("offers signing in yourself on an update card and restores Done and Cancel while signing in", async () => {
+    const record = { credential_id: "cred_hn", name: "HN login" };
+    credsData.current = [record];
+    const offer = {
+      busy: false,
+      onStart: vi.fn(),
+      onDone: vi.fn(),
+    } satisfies ManualSignInOffer;
+    const onSkip = vi.fn();
+    const urlMatched = {
+      ...CREDENTIAL_REQUIRED_FRAME_BY_REASON.credential_rejected_by_site,
+      credential_binding: "matched_by_saved_url" as const,
+    };
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const card = (frame: typeof urlMatched) => (
+      <QueryClientProvider client={queryClient}>
+        <CredentialCard
+          frame={frame}
+          mode="inline-pause"
+          onConnect={vi.fn()}
+          onSkip={onSkip}
+          onUpdateCredential={vi.fn()}
+          signIn={offer}
+        />
+      </QueryClientProvider>
+    );
+    const { rerender } = render(card(urlMatched));
+
+    expect(
+      screen.getByText(
+        "Copilot chose this saved login because its saved URL matches this page. Updating it changes it everywhere it is used.",
+      ),
+    ).toBeTruthy();
+    const update = screen.getByRole("button", { name: "Update credential" });
+    await waitFor(() =>
+      expect((update as HTMLButtonElement).disabled).toBe(false),
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Sign in myself (this test only)" }),
+    );
+    expect(offer.onStart).toHaveBeenCalledTimes(1);
+
+    rerender(card({ ...urlMatched, signing_in: true }));
+    fireEvent.click(screen.getByRole("button", { name: "Done" }));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(offer.onDone).toHaveBeenCalledTimes(1);
+    expect(onSkip).toHaveBeenCalledTimes(1);
+    expect(
+      screen.getByRole("button", { name: "Update credential" }),
+    ).toBeTruthy();
+    expect(
+      screen.queryByRole("button", { name: "Connect credential" }),
+    ).toBeNull();
+  });
+
+  it.each(["saved_workflow", "not_bound", null] as const)(
+    "keeps the rejected card's usual why-line when the binding is %s",
+    (binding) => {
+      credsData.current = [{ credential_id: "cred_hn", name: "HN login" }];
+      const queryClient = new QueryClient({
+        defaultOptions: { queries: { retry: false } },
+      });
+      render(
+        <QueryClientProvider client={queryClient}>
+          <CredentialCard
+            frame={{
+              ...CREDENTIAL_REQUIRED_FRAME_BY_REASON.credential_rejected_by_site,
+              credential_binding: binding,
+            }}
+            mode="inline-pause"
+            onConnect={vi.fn()}
+            onSkip={vi.fn()}
+          />
+        </QueryClientProvider>,
+      );
+      expect(
+        screen.getByText(
+          CREDENTIAL_WHY_LINE_BY_REASON.credential_rejected_by_site,
+        ),
+      ).toBeTruthy();
+      expect(screen.queryByText(/saved URL matches/)).toBeNull();
+      expect(
+        screen.queryByRole("button", {
+          name: "Sign in myself (this test only)",
+        }),
+      ).toBeNull();
+    },
+  );
+
+  it("shows the URL-match why-line on a missing-2FA card for a login matched by URL", () => {
+    credsData.current = [{ credential_id: "cred_hn", name: "HN login" }];
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <CredentialCard
+          frame={{
+            ...CREDENTIAL_REQUIRED_FRAME_BY_REASON.credential_missing_totp,
+            credential_binding: "matched_by_saved_url",
+          }}
+          mode="inline-pause"
+          onConnect={vi.fn()}
+          onSkip={vi.fn()}
+        />
+      </QueryClientProvider>,
+    );
+    expect(screen.getByText(/saved URL matches this page/)).toBeTruthy();
+    expect(
+      screen.queryByText(CREDENTIAL_WHY_LINE_BY_REASON.credential_missing_totp),
+    ).toBeNull();
   });
 
   it("offers Retry and Skip, never the generic picker, when the saved record cannot load", async () => {
@@ -2011,4 +2150,166 @@ describe("CredentialCard missing-authenticator ask", () => {
       ).toBe(false),
     );
   });
+});
+
+describe("CredentialCard site question", () => {
+  const question = {
+    credential_id: "cred-hn",
+    name: "HN Login",
+    site: "https://b.example.com",
+    saved_sites: ["https://a.example.com"],
+    vault_sourced: true,
+  };
+
+  it("offers no Allow for a login whose sites come from a connected vault", () => {
+    const onSiteAnswer = vi.fn();
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame()}
+        mode="inline-pause"
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+        siteQuestion={question}
+        onSiteAnswer={onSiteAnswer}
+      />,
+    );
+
+    expect(
+      screen.getByText(/add b\.example\.com to it in that vault/),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /^Allow on / })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "No" }));
+    expect(onSiteAnswer).toHaveBeenCalledWith("no");
+  });
+
+  it("announces that the site is being saved while an answer is pending", () => {
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame()}
+        mode="inline-pause"
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+        siteQuestion={{ ...question, vault_sourced: false }}
+        siteAnswerPending
+        onSiteAnswer={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("status").textContent).toBe("Saving the site…");
+  });
+
+  it("asks with the server's sites only, keeping the scheme of a site that is not https", () => {
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame({
+          message: "Use this login, it is the right one.",
+        })}
+        mode="inline-pause"
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+        siteQuestion={{
+          ...question,
+          site: "http://b.example.com:8080",
+          vault_sourced: false,
+        }}
+        onSiteAnswer={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByText(
+        "'HN Login' is saved for a.example.com. Use it on http://b.example.com:8080?",
+      ),
+    ).toBeTruthy();
+    expect(
+      screen.getByText(
+        "Allowing lets Skyvern type this login's password on http://b.example.com:8080, in this chat and in every saved run that uses it.",
+      ),
+    ).toBeTruthy();
+    expect(
+      screen.getByText(
+        "http://b.example.com:8080 is not https, so the password would be sent without encryption.",
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText(/it is the right one/)).toBeNull();
+  });
+
+  it("says where the password goes without an encryption warning for an https site", () => {
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame()}
+        mode="inline-pause"
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+        siteQuestion={{ ...question, vault_sourced: false }}
+        onSiteAnswer={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByText(
+        "Allowing lets Skyvern type this login's password on b.example.com, in this chat and in every saved run that uses it.",
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText(/without encryption/)).toBeNull();
+  });
+
+  it("names every site an allowed login keeps working on", () => {
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame()}
+        mode="inline-pause"
+        resolvedOutcome={{
+          outcome: "connected",
+          name: "HN Login",
+          siteAnswer: "add",
+          siteA: "https://a.example.com",
+          savedSites: ["https://a.example.com", "https://c.example.com"],
+          siteB: "https://b.example.com",
+        }}
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByText(
+        /works on a\.example\.com, c\.example\.com and b\.example\.com/,
+      ),
+    ).toBeTruthy();
+  });
+
+  it.each<[string, CredentialPauseHistorical, RegExp]>([
+    [
+      "a refused pick",
+      { outcome: "not_admitted", name: "HN Login" },
+      /'HN Login' not used here/,
+    ],
+    [
+      "a No answer",
+      {
+        outcome: "not_admitted",
+        siteAnswer: "no",
+        siteA: "https://a.example.com",
+        siteB: "https://b.example.com",
+      },
+      /Not used on b\.example\.com/,
+    ],
+  ])(
+    "renders %s as not used, never as a skipped sign-in",
+    (_, resolvedOutcome, text) => {
+      render(
+        <CredentialCard
+          frame={buildCredentialRequiredFrame()}
+          mode="inline-pause"
+          resolvedOutcome={resolvedOutcome}
+          onConnect={vi.fn()}
+          onSkip={vi.fn()}
+        />,
+      );
+
+      expect(screen.getByText(text)).toBeTruthy();
+      expect(screen.queryByText(/Sign-in skipped/)).toBeNull();
+    },
+  );
 });

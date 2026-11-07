@@ -24,7 +24,7 @@ RecoverableFailureKind = Literal["validation", "tool_call", "external_dep", "tim
 
 _REASON_SUMMARY_MAX_CHARS = 120
 _RECOVERABLE_ERROR_ID_PREFIX = "cpe"
-_RECORDED_FAILURE_CREDENTIAL_ID_RE = re.compile(r"\b(?:cred|bwitem)_[A-Za-z0-9][A-Za-z0-9_-]*\b")
+_RECORDED_FAILURE_CREDENTIAL_ID_RE = re.compile(r"\b(?:cred|vlogin)_[A-Za-z0-9][A-Za-z0-9_-]*\b")
 _BROWSER_SESSION_ID_RE = re.compile(r"\bpbs_[A-Za-z0-9_-]+\b")
 _BROWSER_SESSION_WITH_ID_RE = re.compile(r"\bbrowser session\s+pbs_[A-Za-z0-9_-]+\b", re.IGNORECASE)
 

@@ -1,10 +1,14 @@
 // @vitest-environment jsdom
 
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { type ReactNode } from "react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+
+import { useCopilotHeaderStore } from "@/store/useCopilotHeaderStore";
+import { useManualSignInStore } from "@/store/useManualSignInStore";
+import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 
 import { type StudioWorkspaceProps } from "./EditorTab";
 import { type StudioPaneId } from "./panes";
@@ -35,6 +39,19 @@ vi.mock("./EditorPaneHeader", () => ({
   EditorPaneBlockSearch: () => null,
   EditorPaneModeToggle: () => null,
 }));
+// Drives the Doc fold without real layout: jsdom measures every stage as 0px.
+const docFold = vi.hoisted(() => ({ folded: [] as StudioPaneId[] }));
+vi.mock("./useEditorShowsDoc", () => ({
+  useEditorShowsDoc: () => docFold.folded.length > 0,
+}));
+vi.mock("./panes", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./panes")>();
+  return {
+    ...actual,
+    panesCollapsedForDoc: (panes: readonly StudioPaneId[]) =>
+      docFold.folded.filter((id) => panes.includes(id)),
+  };
+});
 vi.mock("./BrowserTab", () => ({ BrowserTab: () => null }));
 vi.mock("./EditorTab", () => ({ EditorTab: () => null }));
 vi.mock("./RunTab", () => ({ RunTab: () => null }));
@@ -44,7 +61,26 @@ vi.mock("./runview/RunPaneHeader", () => ({
 }));
 vi.mock("./StudioBrowserStream", () => ({ StudioBrowserStream: () => null }));
 vi.mock("./StudioStageLauncher", () => ({ StudioStageLauncher: () => null }));
-vi.mock("./StudioTopBar", () => ({ StudioTopBar: () => null }));
+// Stand-ins for controls that ask to see a pane that may already be open: the
+// top bar's Past Runs pick and the Run pane's "watch live".
+vi.mock("./StudioTopBar", async () => {
+  const { useStudioPanes } = await import("./useStudioPanes");
+  return {
+    StudioTopBar: function OpenPaneRequests() {
+      const { openPane } = useStudioPanes();
+      return (
+        <>
+          <button type="button" onClick={() => openPane("overview")}>
+            Pick another run
+          </button>
+          <button type="button" onClick={() => openPane("browser")}>
+            Watch live
+          </button>
+        </>
+      );
+    },
+  };
+});
 vi.mock("./StudioWorkflowPanels", () => ({ StudioWorkflowPanels: () => null }));
 
 vi.mock("./useRunVisuals", () => ({
@@ -99,6 +135,259 @@ describe("StudioShell inspected run header", () => {
     expect(
       within(header).queryByRole("button", { name: "Copy to clipboard" }),
     ).toBeNull();
+  });
+});
+
+describe("StudioShell with a pane folded for the Doc", () => {
+  afterEach(() => {
+    docFold.folded = [];
+  });
+
+  const props = {
+    workflow: {
+      workflow_permanent_id: "wpid_synthetic",
+      organization_id: "org_synthetic",
+      deleted_at: null,
+      workflow_definition: { blocks: [] },
+    },
+    initialTitle: "Synthetic workflow",
+  } as unknown as StudioWorkspaceProps;
+  const shown = () =>
+    screen
+      .getAllByRole("region")
+      .filter((pane) => !pane.classList.contains("hidden"))
+      .map((pane) => pane.getAttribute("aria-label"));
+
+  test("asking to see a folded pane opens it over the stage", () => {
+    docFold.folded = ["browser"];
+    render(
+      <MemoryRouter
+        initialEntries={[
+          "/workflows/wpid_synthetic/studio?panes=editor,browser&wr=wr_synthetic_a",
+        ]}
+      >
+        <StudioShell {...props} />
+      </MemoryRouter>,
+    );
+    expect(shown()).not.toContain("Browser");
+    expect(
+      screen.getByRole("button", { name: /^Show Browser pane/ }),
+    ).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Watch live" }));
+
+    expect(shown()).toEqual(["Browser"]);
+  });
+
+  const renderDoc = (panes: string) =>
+    render(
+      <MemoryRouter
+        initialEntries={[
+          `/workflows/wpid_synthetic/studio?panes=${panes}&wr=wr_synthetic_a`,
+        ]}
+      >
+        <StudioShell {...props} />
+      </MemoryRouter>,
+    );
+
+  test("a closed pane that folds as it opens is shown, not left a strip", () => {
+    docFold.folded = ["browser"];
+    renderDoc("editor");
+    expect(shown()).not.toContain("Browser");
+
+    fireEvent.click(screen.getByRole("button", { name: "Watch live" }));
+
+    expect(shown()).toEqual(["Browser"]);
+  });
+
+  test("signing in yourself shows a folded Browser", () => {
+    docFold.folded = ["browser"];
+    renderDoc("editor,browser");
+    expect(shown()).not.toContain("Browser");
+    try {
+      act(() => {
+        useManualSignInStore.setState({ browserSessionId: "pbs_synthetic" });
+      });
+      expect(shown()).toEqual(["Browser"]);
+    } finally {
+      act(() => {
+        useManualSignInStore.setState({ browserSessionId: null });
+      });
+    }
+  });
+
+  test("a folded Browser's strip flags new activity", () => {
+    docFold.folded = ["browser"];
+    useStudioBrowserStore.setState({ hasUnseenActivity: true });
+    try {
+      renderDoc("editor,browser");
+      expect(
+        screen.getByRole("button", {
+          name: /^Show Browser pane .*, new activity$/,
+        }),
+      ).toBeTruthy();
+    } finally {
+      useStudioBrowserStore.setState({ hasUnseenActivity: false });
+    }
+  });
+
+  test("keyboard focus follows a folded pane as it opens and folds again", () => {
+    docFold.folded = ["browser"];
+    renderDoc("editor,browser");
+    fireEvent.click(screen.getByRole("button", { name: /^Show Browser pane/ }));
+    expect(shown()).toEqual(["Browser"]);
+    const browser = screen.getByRole("region", { name: "Browser" });
+    expect(browser.contains(document.activeElement)).toBe(true);
+
+    fireEvent.click(
+      within(browser).getByRole("button", { name: "Restore Browser pane" }),
+    );
+    expect(document.activeElement).toBe(
+      screen.getByRole("button", { name: /^Show Browser pane/ }),
+    );
+  });
+});
+
+describe("StudioShell at phone width", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const renderPhone = (path = "/workflows/wpid_synthetic/studio") => {
+    vi.stubGlobal(
+      "matchMedia",
+      vi.fn((query: string) => ({
+        matches: query === "(max-width: 719px)",
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+      })),
+    );
+    const props = {
+      workflow: {
+        workflow_permanent_id: "wpid_synthetic",
+        organization_id: "org_synthetic",
+        deleted_at: null,
+        workflow_definition: { blocks: [] },
+      },
+      initialTitle: "Synthetic workflow",
+    } as unknown as StudioWorkspaceProps;
+    render(
+      <MemoryRouter initialEntries={[path]}>
+        <StudioShell {...props} />
+      </MemoryRouter>,
+    );
+  };
+  const shown = () =>
+    screen
+      .getAllByRole("region")
+      .filter((pane) => !pane.classList.contains("hidden"))
+      .map((pane) => pane.getAttribute("aria-label"));
+  const paneSwitch = () =>
+    screen.getByRole("navigation", { name: "Pane switch" });
+
+  test("shows one pane at a time and the pane switch moves between them", () => {
+    renderPhone();
+    expect(shown()).toEqual(["Copilot"]);
+    expect(
+      within(paneSwitch())
+        .getAllByRole("button")
+        .map((button) => button.textContent),
+    ).toEqual(["Copilot", "Editor", "Browser"]);
+
+    fireEvent.click(
+      within(paneSwitch()).getByRole("button", { name: "Editor" }),
+    );
+    expect(shown()).toEqual(["Editor"]);
+
+    fireEvent.click(
+      within(paneSwitch()).getByRole("button", { name: "Browser" }),
+    );
+    expect(shown()).toEqual(["Browser"]);
+    expect(
+      within(paneSwitch())
+        .getByRole("button", { name: "Browser" })
+        .getAttribute("aria-pressed"),
+    ).toBe("true");
+  });
+
+  test("picking another run while Run is already open shows Run", () => {
+    renderPhone("/workflows/wpid_synthetic/studio?wr=wr_synthetic_a");
+    fireEvent.click(
+      within(paneSwitch()).getByRole("button", { name: "Browser" }),
+    );
+    expect(shown()).toEqual(["Browser"]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Pick another run" }));
+    expect(shown()).toEqual(["Run"]);
+  });
+
+  test("the pane switch flags Browser activity and a waiting Copilot on panes not shown", () => {
+    useStudioBrowserStore.setState({ hasUnseenActivity: true });
+    useCopilotHeaderStore.setState({ attention: "question" });
+    try {
+      renderPhone();
+      expect(
+        within(paneSwitch()).getByRole("button", {
+          name: "Browser, new activity",
+        }),
+      ).toBeTruthy();
+      // Copilot is the shown pane, so it carries no dot yet.
+      expect(
+        within(paneSwitch()).getByRole("button", { name: "Copilot" }),
+      ).toBeTruthy();
+
+      fireEvent.click(
+        within(paneSwitch()).getByRole("button", { name: "Editor" }),
+      );
+      expect(
+        within(paneSwitch()).getByRole("button", {
+          name: "Copilot, waiting for your answer",
+        }),
+      ).toBeTruthy();
+    } finally {
+      useStudioBrowserStore.setState({ hasUnseenActivity: false });
+      useCopilotHeaderStore.setState({ attention: null });
+    }
+  });
+
+  test("signing in yourself shows a Browser open behind another pane", () => {
+    renderPhone("/workflows/wpid_synthetic/studio?panes=copilot,browser");
+    expect(shown()).toEqual(["Copilot"]);
+    try {
+      act(() => {
+        useManualSignInStore.setState({ browserSessionId: "pbs_synthetic" });
+      });
+      expect(shown()).toEqual(["Browser"]);
+    } finally {
+      act(() => {
+        useManualSignInStore.setState({ browserSessionId: null });
+      });
+    }
+  });
+
+  test("watching live while Browser is open behind Run shows Browser", () => {
+    renderPhone("/workflows/wpid_synthetic/studio?wr=wr_synthetic_a");
+    fireEvent.click(
+      within(paneSwitch()).getByRole("button", { name: "Browser" }),
+    );
+    fireEvent.click(within(paneSwitch()).getByRole("button", { name: "Run" }));
+    expect(shown()).toEqual(["Run"]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Watch live" }));
+    expect(shown()).toEqual(["Browser"]);
+  });
+
+  test("closing the shown pane moves focus to the pane switch's shown item", () => {
+    renderPhone("/workflows/wpid_synthetic/studio?panes=browser,editor");
+    fireEvent.click(
+      within(paneSwitch()).getByRole("button", { name: "Editor" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Close Editor pane" }));
+
+    expect(shown()).toEqual(["Browser"]);
+    expect(document.activeElement).toBe(
+      within(paneSwitch()).getByRole("button", { name: "Browser" }),
+    );
   });
 });
 

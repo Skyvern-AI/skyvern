@@ -30,11 +30,11 @@ from skyvern.forge.sdk.copilot.request_policy import (
     _seed_prior_approved_credentials,
     _seed_proposed_credential,
     build_request_policy_trust_floor,
+    credential_prompt_reason,
 )
 from skyvern.forge.sdk.copilot.tools import credentials as credentials_module
 from skyvern.forge.sdk.copilot.tools.credential_fill import (
     _request_settled_credential,
-    _resolved_credential_intended_url,
 )
 from skyvern.forge.sdk.copilot.tools.credentials import (
     _list_credentials,
@@ -53,6 +53,7 @@ def _cred(name: str, credential_id: str, *, tested_url: str | None = None) -> Si
         name=name,
         credential_id=credential_id,
         tested_url=tested_url,
+        extra_site_urls=[],
         credential_type=CredentialType.PASSWORD,
         username="user@example.test",
         totp_type=None,
@@ -1196,7 +1197,7 @@ async def test_a_carried_approval_stays_pinned_to_the_page_that_vouched_for_it()
     await _seed_prior_approved_credentials(later, organization_id="org-1", global_llm_context=recorded)
 
     assert later.live_page_admitted_urls[credential.credential_id] == _ADMITTED_URL
-    assert _resolved_credential_intended_url(later, credential.credential_id) == _ADMITTED_URL
+    assert later.credential_intended_url(credential.credential_id) == _ADMITTED_URL
 
 
 def test_a_credential_the_user_named_carries_no_origin_into_durable_approval() -> None:
@@ -1323,7 +1324,7 @@ async def test_naming_a_carried_credential_for_another_site_releases_its_carried
         cited = await credentials_module._resolve_exact_credential(credential.name, ctx)
 
     assert cited["data"]["status"] == "resolved"
-    assert _resolved_credential_intended_url(policy, credential.credential_id) is None
+    assert policy.credential_intended_url(credential.credential_id) is None
 
 
 @pytest.mark.asyncio
@@ -1342,7 +1343,7 @@ async def test_a_live_page_origin_survives_the_user_naming_that_credential() -> 
     with patch.object(credentials_module, "load_credentials", AsyncMock(return_value=[credential])):
         await credentials_module._resolve_exact_credential(credential.name, ctx)
 
-    assert _resolved_credential_intended_url(policy, credential.credential_id) == _ADMITTED_URL
+    assert policy.credential_intended_url(credential.credential_id) == _ADMITTED_URL
 
 
 def test_the_proposal_stops_carrying_once_the_conversation_has_moved_on() -> None:
@@ -1504,3 +1505,45 @@ async def test_picked_google_account_is_reported_when_valid_and_only_a_sheets_pi
         sheets_pick = selected_scopes == [_SHEETS_SCOPE]
         assert (policy.selected_connected_account_id == "goac_picked") is sheets_pick
         assert ("goac_picked" in policy.run_approved_google_connection_ids) is sheets_pick
+
+
+def _login_credential_yaml(input_type: str, credential_param: str) -> str:
+    return (
+        "workflow_definition:\n"
+        "  parameters:\n"
+        f"    - {{parameter_type: workflow, workflow_parameter_type: {input_type}, key: login_input, "
+        "default_value: ''}\n"
+        f"    - {credential_param}\n"
+        "  blocks: []\n"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("input_type", "credential_param"),
+    [
+        (
+            "string",
+            "{parameter_type: azure_vault_credential, key: vault_login, vault_name: v, "
+            "username_key: '{{ login_input }}', password_key: '{{ login_input }}'}",
+        ),
+        ("string", "{parameter_type: onepassword, key: op_login, vault_id: v, item_id: '{{ login_input }}'}"),
+        ("string", "{parameter_type: bitwarden_login_credential, key: bw_login, bitwarden_item_id: login_input}"),
+        ("credential_id", "{parameter_type: credential, key: saved_login, credential_id: '{{ login_input }}'}"),
+    ],
+    ids=["azure", "onepassword", "bitwarden", "credential_id"],
+)
+async def test_an_empty_login_credential_input_leaves_the_test_run_to_report_it(
+    input_type: str, credential_param: str
+) -> None:
+    policy = await _build_request_policy_bootstrap(
+        user_message="continue",
+        workflow_yaml=_login_credential_yaml(input_type, credential_param),
+        chat_history=[],
+        global_llm_context="",
+        organization_id="org-1",
+    )
+
+    assert policy.clarification_reason == "none"
+    assert policy.allow_run_blocks is True
+    assert credential_prompt_reason(policy) is None

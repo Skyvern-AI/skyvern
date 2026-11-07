@@ -31,9 +31,10 @@ from collections import Counter, defaultdict, deque
 from collections.abc import Mapping, Sequence
 from contextvars import ContextVar
 from datetime import datetime
+from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal, NamedTuple, TypeVar
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import structlog
 from PIL import Image, ImageDraw
@@ -41,11 +42,17 @@ from playwright.async_api import BrowserContext, Download, Page, Request, Respon
 
 from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX
+from skyvern.exceptions import ActionDeadlineExceeded
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import resolve_run_download_id
 from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at, is_file_from_retry_attempt
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.core.skyvern_context import URL_IN_TEXT, canonical_url, opaque_url_echo_window
+from skyvern.forge.sdk.core.skyvern_context import (
+    URL_IN_TEXT,
+    canonical_url,
+    mask_opaque_urls_in_text,
+    opaque_url_echo_window,
+)
 from skyvern.forge.sdk.services.credentials import (
     is_totp_sentinel,
     is_unresolved_totp_placeholder,
@@ -82,6 +89,7 @@ from skyvern.forge.taskv3.field_commit import (
 )
 from skyvern.forge.taskv3.loop import (
     ACTION_OUTCOME_DATA_KEY,
+    BLOCKING_LAYER_DATA_KEY,
     CLICK_DISPATCHED_DATA_KEY,
     DOWNLOAD_FAILURE_MAX_LINES,
     DROP_TARGET_DATA_KEY,
@@ -94,9 +102,11 @@ from skyvern.forge.taskv3.loop import (
     TARGET_KIND_DATA_KEY,
     TARGET_LABEL_DATA_KEY,
     TARGET_LABEL_IS_PLACEHOLDER_DATA_KEY,
+    BlockingLayer,
     CoveredBranch,
     CoveredLayerKind,
     DownloadFailureFacts,
+    LayerCheck,
     SemanticCommitStats,
     ToolHandler,
     ToolRefusal,
@@ -107,12 +117,14 @@ from skyvern.forge.taskv3.loop import (
     current_tool_call_seq,
     mark_is_filler,
     record_click_dispatched,
+    record_click_path,
     record_covered_layer,
     record_entry_enter_withheld,
     record_entry_variant,
     record_hit_class,
     record_resolve_seconds,
     record_text_delta,
+    record_type_caret_held,
     record_type_reach,
     set_driver_timeout_predicate,
 )
@@ -124,7 +136,12 @@ from skyvern.forge.taskv3.run_arms import (
 from skyvern.forge.taskv3.target_label import TARGET_KIND_TOKENS, TARGET_NAME_CAP
 from skyvern.utils.contained_effects import contained_effect
 from skyvern.utils.date_values import canonical_iso_date
-from skyvern.webeye.action_deadline import cancellable_driver_call
+from skyvern.webeye.action_deadline import cancellable_driver_call, under_action_deadline
+from skyvern.webeye.actions.handler import (
+    _BLOCKED_INLINE_PDF_RECOVERY_TIMEOUT_SECONDS,
+    _collect_inline_iframe_src_candidates,
+    _recover_blocked_inline_pdf_download,
+)
 from skyvern.webeye.actions.key_names import normalize_key_chord
 from skyvern.webeye.browser_driver_errors import is_driver_error, is_driver_timeout_error
 from skyvern.webeye.browser_state import BLANK_PAGE_URLS, is_selectable_page_url
@@ -137,7 +154,11 @@ from skyvern.webeye.cdp_download_interceptor import (
 )
 from skyvern.webeye.native_downloads import NativeDownloadAttempt
 from skyvern.webeye.navigation import driver_nav_error_code, record_task_nav_error_code, redact_url_secrets
-from skyvern.webeye.utils.challenge_signature import CHALLENGE_VENDOR_FRAME_URL, CHALLENGE_VENDOR_SIGNATURE
+from skyvern.webeye.utils.challenge_signature import (
+    CHALLENGE_VENDOR_FRAME_URL,
+    CHALLENGE_VENDOR_SIGNATURE,
+    rendered_challenge_vendor_reading,
+)
 from skyvern.webeye.utils.flutter_semantics import (
     FLUTTER_STATE_JS,
     FLUTTER_TEXT_FIELD_JS,
@@ -149,8 +170,9 @@ from skyvern.webeye.utils.flutter_semantics import (
 )
 from skyvern.webeye.utils.page import (
     OTP_INPUT_PRIVACY_JS,
-    OTP_SAFE_FRAGMENT_HTML_JS,
+    OTP_SAFE_ELEMENT_HTML_JS,
     SkyvernFrame,
+    apply_secret_visual_mask_to_locator,
     mask_otp_values_in_html,
 )
 
@@ -424,6 +446,8 @@ _OPAQUE_ID_RUN_RE = re.compile(
 # that way, while a natural `[name="first name"]` keeps its single round trip.
 _TV3_QUOTED_VALUE_RE = re.compile(r'"(?:[^"\\]|\\.)*"')
 _TV3_ANCHORED_SELECTOR_RE = re.compile(r"^\S+\s+\S.*$")
+# observe never writes an engine prefix, so the space in a model's `text=Pay my bill` is part of its text.
+_ENGINE_SELECTOR_RE = re.compile(r"^(?:[A-Za-z][\w:-]*=|//)")
 
 
 # Relies on observe emitting a combinator only from hostAnchored; every natural selector is one
@@ -504,6 +528,10 @@ _SELECTOR_GUARD_TOOL_NAMES = frozenset(
 # file_upload is absent for a different reason: set_input_files drives a hidden <input type=file>,
 # which is how essentially every site ships one, so a hidden target is the normal case there.
 _INERT_DIAGNOSIS_TOOL_NAMES = frozenset({"click", "hover", "type", "select_combobox"})
+
+# Above this, a model-authored selector names a whole class of elements rather than one control the
+# page happens to duplicate, so `_rendered_target` stops paying a visibility round trip per match.
+_RENDERED_TARGET_MATCH_CAP = 12
 
 
 def _inert_target_error(selector: str) -> ToolResult:
@@ -1198,6 +1226,96 @@ def _model_text(text: object, cap: int) -> str:
     return shown[:cap]
 
 
+# The most of a covering layer's own text a covered refusal quotes.
+_LAYER_TEXT_MAX = 400
+
+
+def _without_split_hidden_tail(text: str, tidy: Callable[[str], str] | None = None) -> str:
+    """`text` less any tail that begins a hidden value (or, given `tidy`, its tidied form). A read the page script cut
+    short can end inside one, where the whole-value mask cannot see it; cutting that tail can split another value in
+    turn, so it repeats."""
+    ctx = skyvern_context.current()
+    values = [value for value in (ctx.model_hidden_values if ctx is not None else ()) if value]
+    values += [tidied for value in values if tidy is not None and (tidied := tidy(value)) and tidied != value]
+    trimmed = True
+    while trimmed:
+        trimmed = False
+        for value in values:
+            for k in range(min(len(value) - 1, len(text)), 0, -1):
+                if text.endswith(value[:k]):
+                    text, trimmed = text[:-k], True
+                    break
+    return text
+
+
+# Removed from a quoted layer's text after it is masked: the page script's label set, plus the marks below.
+# A str.translate delete table rather than a regex character class, because the same ranges inside a
+# character class trip CodeQL's py/overly-large-range check.
+_FORGEABLE_TEXT = dict.fromkeys(
+    code_point
+    for first, last in (
+        (0x00, 0x08),
+        (0x0E, 0x1F),
+        (0x7F, 0x7F),
+        (0x85, 0x85),
+        (0x2028, 0x2029),
+        (0x200B, 0x200F),
+        (0x202A, 0x202E),
+        (0x2066, 0x2069),
+        # Default-ignorable marks a page can hide inside a value: they render as nothing but split it for the mask.
+        (0xAD, 0xAD),
+        (0x34F, 0x34F),
+        (0x61C, 0x61C),
+        (0x115F, 0x1160),
+        (0x17B4, 0x17B5),
+        (0x180B, 0x180E),
+        (0x2060, 0x2060),
+        (0xFE00, 0xFE0F),
+        (0xFEFF, 0xFEFF),
+        (0xFFA0, 0xFFA0),
+        (0xE0000, 0xE007F),
+        (0xE0100, 0xE01EF),
+    )
+    for code_point in range(first, last + 1)
+)
+
+
+def _tidied_layer_text(text: str) -> str:
+    return " ".join(text.translate(_FORGEABLE_TEXT).split())
+
+
+def _layer_text_clause(occluder: dict[str, Any] | None, layer_selector: str | None) -> str:
+    """The sentence quoting what a layer named only by its own text says, or "" when the probe read none."""
+    nodes = (occluder or {}).get("text")
+    if not isinstance(nodes, list) or not all(isinstance(node, str) for node in nodes):
+        return ""
+    text = "".join(nodes)
+    if not text.strip():
+        return ""
+    cut = (occluder or {}).get("textCut") is True
+    if cut:
+        text = _without_split_hidden_tail(text)
+    # Masked as the page holds it, then again after tidying, which can join what the first pass could not match.
+    ctx = skyvern_context.current()
+    if ctx is not None:
+        text = ctx.hide_from_model(text)
+        if cut:
+            # The cut can end inside a payload signed URL, which only the cut-aware mask drops.
+            text = mask_opaque_urls_in_text(text, ctx.opaque_url_refs, cut=True)
+    text = _tidied_layer_text(text)
+    if cut:
+        # Tidying can rejoin the start of a hidden value the raw cut left broken up by a formatting character.
+        text = _without_split_hidden_tail(text, tidy=_tidied_layer_text)
+        if ctx is not None:
+            text = mask_opaque_urls_in_text(text, ctx.opaque_url_refs, cut=True)
+    shown = _model_text(text, _LAYER_TEXT_MAX + 1)
+    quoted = json.dumps(shown[:_LAYER_TEXT_MAX], ensure_ascii=False)
+    if cut or len(shown) > _LAYER_TEXT_MAX:
+        rest = f"get_html of {layer_selector}" if layer_selector else "get_html"
+        return f' It reads, cut short ({rest} with format "text" reads all of it): {quoted}.'
+    return f" It reads: {quoted}."
+
+
 def _row_value_suffix(o: dict[str, Any], rows: list[dict[str, Any]]) -> str:
     """Every present distinguishing surface for one row — value, accessible label, then any other
     declared value (data-code, data-key, ...) — each truncated to 60 chars like the row text already is,
@@ -1485,7 +1603,8 @@ _OFF_CANVAS_JS = r"""(el, r) => {
 # isHoverPointerElement, domUtils.js), recording each root and its name in `state.roots`. An element is
 # not a root when the reading already covers it: it is or is inside a control `listable` keeps, or its
 # pointer parent is itself a root or covered. One that holds such a control is a holder: at most one
-# named, control-free pointer descendant is listed for it, recorded in `state.held`.
+# named, control-free pointer descendant is listed for it, recorded in `state.held`. A named href-less <a>
+# inside a root whose centre misses it is listed beside that root, recorded in `state.extra`.
 _SCROLL_GEOMETRY_JS = r"""
   const flowNegative = (cs) => {
     const wm = cs.writingMode || 'horizontal-tb';
@@ -2298,7 +2417,7 @@ _WITH_POINTER_ROOTS_JS = (
     if (!hasSlotDescendant.has(el)) return false;
     for (const slot of qsa.call(el, 'slot')) {
       for (const a of slot.assignedElements({ flatten: true })) {
-        if (state.roots.has(a) || inListable(a) || anyListable(qsa.call(a, q))) return true;
+        if ((state.roots.has(a) && !state.extra.has(a)) || inListable(a) || anyListable(qsa.call(a, q))) return true;
       }
     }
     return false;
@@ -2405,6 +2524,86 @@ _WITH_POINTER_ROOTS_JS = (
       }
     }
   } catch (e) {}
+  // The visibility gates a pointer root must pass, shared by the scan and by a dropped control's label election.
+  const rootable = (el, r) => r.width > 0 && r.height > 0 && getComputedStyle(el).visibility === 'visible'
+    && !offCanvas(el, r) && painted(el, r) && !offRight(el, r);
+  const nameOf = (el) => {
+    let name = '';
+    if (hasTextDescendant.has(el)) {
+      try { name = String(innerTextOf.call(el) || '').trim(); } catch (e) { name = ''; }
+    }
+    if (!name) name = String(getAttr.call(el, 'aria-label') || getAttr.call(el, 'title') || '').trim();
+    // innerText stops at a <slot>, so a component's wrapper is named by the rendered text slotted in.
+    if (!name) {
+      for (const slot of qsa.call(el, 'slot')) {
+        for (const n of slot.assignedNodes({ flatten: true })) {
+          if (n.nodeType === 3) name += ' ' + String(n.textContent || '');
+          // innerText of an unrendered element falls back to its textContent, so it is skipped.
+          else if (n.nodeType === 1 && (!n.checkVisibility || n.checkVisibility())) {
+            try { name += ' ' + String(innerTextOf.call(n) || ''); } catch (e) { /* unnamed */ }
+          }
+        }
+      }
+      name = name.trim();
+    }
+    if (!name) {
+      for (const img of qsa.call(el, 'img[alt]')) {
+        name = String(getAttr.call(img, 'alt') || '').trim();
+        if (name) break;
+      }
+    }
+    return name;
+  };
+  // A pointer can land on the label: its centre hit-tests to it. A point outside the viewport cannot be tested here,
+  // and the click scrolls it in first, so it is not held against the label.
+  const hitsItself = (l, r) => {
+    const x = r.left + r.width / 2, y = r.top + r.height / 2;
+    if (x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) return true;
+    const hit = l.getRootNode().elementFromPoint(x, y);
+    return !!hit && (hit === l || l.contains(hit));
+  };
+  // An <a> with no href is not a control to `q`, so the pointer root around it is listed and the anchor covered.
+  // A click on that root lands on its centre, so this returns the root when the centre is outside an anchor that
+  // takes clicks (one with pointer-events:none passes them through to the root).
+  const upOf = (n) => {
+    const p = parentOf.call(n);
+    if (p) return p;
+    const r = Node.prototype.getRootNode.call(n);
+    return r && r.nodeType === 11 ? hostOf.call(r) : null;
+  };
+  const rootMissing = (el) => {
+    if (!state.extra || String(localNameOf.call(el) || '') !== 'a' || getAttr.call(el, 'href') !== null
+      || matches.call(el, q) || getComputedStyle(el).pointerEvents === 'none') return null;
+    for (let a = upOf(el), i = 0; a && i < 64 && isPointer(a); a = upOf(a), i++) {
+      if (state.icons.has(a) || matches.call(a, q)) return null;
+      if (!state.roots.has(a)) continue;
+      const ar = bcr.call(a), r = bcr.call(el);
+      const x = ar.left + ar.width / 2, y = ar.top + ar.height / 2;
+      return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom ? null : a;
+    }
+    return null;
+  };
+  // Every label of a dropped control performs the same click, so only its most-named label a pointer can land on is
+  // a root; the rest would spend the pointer-root cap on duplicates of one action. A box under 2px a side is unseen,
+  // as _unseen holds, so a screen-reader-only label never wins. No eligible label leaves every label to the gates.
+  const spokesmen = new WeakMap();
+  const otherLabelSpeaks = (el) => {
+    const ctl = el.control;
+    if (!spokesmen.has(ctl)) {
+      let best = null, bestLen = 0;
+      for (const l of Array.from(ctl.labels || [])) {
+        try {
+          const r = bcr.call(l);
+          if (!isPointer(l) || r.width < 2 || r.height < 2 || !rootable(l, r) || !hitsItself(l, r)) continue;
+          const len = nameOf(l).length;
+          if (len > bestLen) { best = l; bestLen = len; }
+        } catch (e) { /* not eligible */ }
+      }
+      spokesmen.set(ctl, best);
+    }
+    const best = spokesmen.get(ctl);
+    return best !== null && best !== el;
+  };
   // A failure here costs the pointer roots only, never the semantic list merged below.
   try {
     for (const el of all) {
@@ -2414,7 +2613,24 @@ _WITH_POINTER_ROOTS_JS = (
         // The cursor is inherited, so a covered parent is the target. A shadow root's top-level element
         // inherits from its host.
         const parent = parentOf.call(el) || root.host || null;
-        if (isPointer(parent) && state.covered.has(parent)) { state.covered.add(el); continue; }
+        if (isPointer(parent) && state.covered.has(parent)) {
+          state.covered.add(el);
+          // Listed beside the root, never instead of it, and under its own budget: the root's line and every
+          // other root's place stay as they were.
+          if (state.extraCount >= state.heldCap || !rootMissing(el)
+            || closest.call(el, '[aria-hidden="true"], [inert]')) continue;
+          const er = bcr.call(el);
+          if (!rootable(el, er) || !hitsItself(el, er)) continue;
+          const name = nameOf(el);
+          if (!name) continue;
+          state.roots.set(el, name.replace(/\s+/g, ' ').slice(0, retain));
+          state.extra.add(el);
+          state.extraCount++;
+          const node = { el, next: null };
+          if (tail) tail.next = node; else head = node;
+          tail = node;
+          continue;
+        }
         const tag = String(localNameOf.call(el) || '');
         // A page-wide pointer cursor says nothing about any one element under it.
         if (tag === 'html' || tag === 'body') { state.covered.add(el); continue; }
@@ -2424,8 +2640,13 @@ _WITH_POINTER_ROOTS_JS = (
         const holds = hasListableDescendant.has(el);
         if (inListable(parentOf.call(el)) || (sr && sr.nodeType === 11 && (holds || anyListable(fragQsa.call(sr, q))))
           || heldBySlot(el)
-          // A label bound to a control names that control, which is listed (or skinned) on its own.
-          || (tag === 'label' && el.control)) { state.covered.add(el); continue; }
+          // A label bound to a control the reading keeps names that control; one whose control was dropped
+          // (a display:none submit drawn by its labels) is the only thing a person can click, so it stays a root.
+          // A disabled control's label does nothing on click, as v1 holds (domUtils.js isInteractable).
+          || (tag === 'label' && el.control && (listable(el.control) || el.control.disabled || otherLabelSpeaks(el)))) {
+          state.covered.add(el);
+          continue;
+        }
         // A row or card that also carries a button is not listed (its centre may land on the button);
         // its first named control-free pointer child stands for it instead, for as many holders as the
         // cap could ever list. Past that a holder is covered, so a long list costs no more work than before.
@@ -2437,9 +2658,7 @@ _WITH_POINTER_ROOTS_JS = (
         // An icon in a pointer card is its own control (the card's trash), not a stand-in for the card, so a card
         // already represented still lists it.
         const r = bcr.call(el);
-        if (!(r.width > 0 && r.height > 0)) continue;
-        if (getComputedStyle(el).visibility !== 'visible' || offCanvas(el, r)) continue;
-        if (!painted(el, r) || offRight(el, r)) continue;
+        if (!rootable(el, r)) continue;
         const kind = iconKind(el, r);
         const directPointer = kind === 'graphic' || ownPointerCursor(el);
         const iconInCard = holder !== null && (kind === 'graphic' || (kind === 'css' && directPointer)) && !textOf(el);
@@ -2449,30 +2668,7 @@ _WITH_POINTER_ROOTS_JS = (
         }
         // A decorative child (an icon font's ligature) does not name the row.
         if (holder && closest.call(el, '[aria-hidden="true"]')) continue;
-        let name = '';
-        if (hasTextDescendant.has(el)) {
-          try { name = String(innerTextOf.call(el) || '').trim(); } catch (e) { name = ''; }
-        }
-        if (!name) name = String(getAttr.call(el, 'aria-label') || getAttr.call(el, 'title') || '').trim();
-        // innerText stops at a <slot>, so a component's wrapper is named by the rendered text slotted in.
-        if (!name) {
-          for (const slot of qsa.call(el, 'slot')) {
-            for (const n of slot.assignedNodes({ flatten: true })) {
-              if (n.nodeType === 3) name += ' ' + String(n.textContent || '');
-              // innerText of an unrendered element falls back to its textContent, so it is skipped.
-              else if (n.nodeType === 1 && (!n.checkVisibility || n.checkVisibility())) {
-                try { name += ' ' + String(innerTextOf.call(n) || ''); } catch (e) { /* unnamed */ }
-              }
-            }
-          }
-          name = name.trim();
-        }
-        if (!name) {
-          for (const img of qsa.call(el, 'img[alt]')) {
-            name = String(getAttr.call(img, 'alt') || '').trim();
-            if (name) break;
-          }
-        }
+        const name = nameOf(el);
         const iconCandidate = !name && (kind === 'graphic' || (kind === 'css' && (holder === null || directPointer)))
           && !hasNamedDescendant.has(el);
         const icon = iconCandidate && state.iconCount < state.ceiling;
@@ -3543,6 +3739,42 @@ def _shows_omitted_note(count: int) -> str:
         f"(shows= left off {count} more control(s) whose visible text differs from the label printed: "
         "this reading's budget for it ran out.)"
     )
+
+
+# Where a link goes (path on the same origin, host plus path off it, never the query or fragment), printed unless
+# the label and the path's last segment already name each other (either holds the other as whole words, or as one
+# run of letters): two links can carry labels that both fit an instruction while only the destination tells them apart.
+LINK_DESTINATION_MAX = 60
+# Per reading across every frame, framing included; what it leaves off is reported, never silent.
+LINK_DESTINATION_TOTAL_CAP = 1200
+_LINK_EXTENSION_RE = re.compile(r"\.[a-z0-9]{1,5}$", re.IGNORECASE)
+
+
+def _words(text: str) -> list[str]:
+    return re.findall(r"[^\W_]+", text.casefold())
+
+
+def _holds_words(outer: list[str], inner: list[str]) -> bool:
+    return any(outer[i : i + len(inner)] == inner for i in range(len(outer) - len(inner) + 1))
+
+
+def _link_destination_adds(destination: str, label: str) -> bool:
+    path = destination if destination.startswith("/") else destination.partition("/")[2]
+    segments = [seg for seg in path.split("/") if seg]
+    if not segments and destination.startswith("/"):
+        return False
+    last = _words(_LINK_EXTENSION_RE.sub("", unquote(segments[-1])) if segments else destination.partition("/")[0])
+    named = _words(label)
+    if not last or not named:
+        return True
+    run_last, run_named = "".join(last), "".join(named)
+    return not (
+        _holds_words(named, last) or _holds_words(last, named) or run_last in run_named or run_named in run_last
+    )
+
+
+def _link_destination_omitted_note(count: int) -> str:
+    return f"(to= left off {count} more link destination(s): this reading's budget for it ran out.)"
 
 
 _SHOWN_TEXT_JS = (
@@ -4677,6 +4909,14 @@ _SELECTOR_EXISTS_JS = (
 }"""
 )
 
+
+def _locator_never_resolved(exc: Exception) -> bool:
+    # Matched by class name to cover both Playwright's and Patchright's TimeoutError. The actionability waits
+    # all log "locator resolved to ..." first, so only a never-found element lacks it.
+    text = str(exc)
+    return type(exc).__name__ == "TimeoutError" and "waiting for locator(" in text and "resolved to" not in text
+
+
 # How many distinct elements a minted marker resolves to across open shadow roots: a re-render that
 # CLONES the marked node copies the attribute, and a non-strict click would land on the first match.
 # A root whose query throws is skipped without erasing duplicates already proven; with nothing proven
@@ -4952,6 +5192,12 @@ _ACT_SELECTOR_PREFIX = '[data-tv3-act="'
 _ACT_WRITE_HANDLE_JS = (
     "(el, t) => { try { el.setAttribute('data-tv3-act', t); } catch (e) { return false; } return el.isConnected; }"
 )
+# Whether the element holds its document's caret, through open shadow roots.
+_HOLDS_CARET_JS = r"""(el) => {
+  let a = document.activeElement;
+  while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement;
+  return a === el;
+}"""
 
 
 def _annotate_screenshot(png_bytes: bytes, elements: list[dict[str, Any]], vw: int, *, max_width: int = 1024) -> bytes:
@@ -5315,17 +5561,40 @@ _NATIVE_PROXY_JS = r"""
 """
 
 
+# Whether a visible label (or aria-labelledby proxy) of this hidden element reaches it while the rendered
+# match is not that label: click's label path would act on this element, not on the rendered one.
+_LABEL_REACHES_OTHER_THAN_JS = (
+    r"""(el, rendered) => {
+  const arg = {};
+"""
+    + _NATIVE_LABEL_JS
+    + _NATIVE_PROXY_JS
+    + r"""
+  const proxy = _nativeProxy(el);
+  return !!proxy && proxy !== rendered && !nativeLabelsOf(el).includes(rendered);
+}"""
+)
+
 # The label is a timeline nicety on the critical path of every click/type/hover, so the probe gets a
 # hard budget the ACTION never pays for: the isolated world shares the page's JS thread, and a
 # busy-looping page would otherwise stall the action behind a read nothing depends on.
 _TARGET_NAME_TIMEOUT_SECONDS = 2.0
+# The pre-dispatch layer recheck: one reach probe. Past this it proves nothing, and the type runs its own bounded path.
+_LAYER_CHECK_TIMEOUT_SECONDS = 2.0
 
 # How long a click/focus/hover/fill/type/select waits for Playwright actionability before it raises.
 _ACTION_TIMEOUT_MS = 15000
+# How long a ref or mark may take to resolve before it is reported stale. Successful resolutions stay well under it;
+# it ends an address read that never settles instead of letting it hold the tool call.
+_ADDRESS_RESOLVE_TIMEOUT_MS = 300_000
+# Whole-call ceiling for click and type: the resolve bound plus room for the action, its typing and its readback.
+_ACT_TOOL_TIMEOUT_MS = _ADDRESS_RESOLVE_TIMEOUT_MS + 180_000
 # Playwright's type() timeout covers every key. A slow rich-text editor was measured at ~80ms a key, including
 # the delay between keys, so a key gets ~3x that; the cap keeps a field that never takes keys from stalling the run.
 _PER_KEY_TIMEOUT_MS = 250
 _TYPING_TIMEOUT_CAP_MS = 120_000
+# How long a click on a matched suggestion row waits to land before the pick is reported as not clicked.
+_SUGGESTION_ROW_CLICK_TIMEOUT_MS = 3000
 # How long one box of a one-character-per-box code field may stay disabled once the box before it holds a character.
 _CODE_BOX_ENABLE_WAIT_MS = 1500
 # Fewer adjacent one-character boxes (initials, a two-box suffix) are separate fields, not one segmented field.
@@ -5862,6 +6131,7 @@ _TYPE_TARGET_PROBE_JS = (
 """
     + _TARGET_READONLY_JS
     + r"""  const RETEST_SCROLLABLE_CLIP = false;
+  const LAYER_IDENTITY = false;
   let disabled = false;
   try { disabled = !!(ctl.disabled || (ctl.matches && ctl.matches(':disabled'))); } catch (e) { /* best-effort */ }
   const out = { exists: true, disabled, readOnly };
@@ -5873,6 +6143,9 @@ _TYPE_TARGET_PROBE_JS = (
   } catch (e) { /* best-effort */ }
   let r = el.getBoundingClientRect();
   if (r.width === 0 || r.height === 0) return out;
+  // A closed <details> (any content-visibility:hidden subtree) still lays its content out but never draws it,
+  // so the hit test below can only land on whatever is drawn over that box; the browser's own verdict is the fact.
+  try { if (el.checkVisibility && !el.checkVisibility()) out.unrendered = true; } catch (e) { /* best-effort */ }
   // elementFromPoint answers about the VIEWPORT, so a field below the fold returns null and would
   // read as unoccluded -- which is most fields on a real form. Playwright scrolls before it clicks,
   // so scrolling here asks about the same layout the click is about to meet.
@@ -6522,7 +6795,36 @@ _TYPE_TARGET_PROBE_JS = (
       if (dialog) layerName = ownName(dialog) || headingNameOf(dialog);
     }
     if (!layerName) layerName = headingNameOf(layer);
-    if (!layerName) layerName = boundedClean(layer.textContent, 60);
+    // A layer named only by the start of its own text may be the page's reply to the last action, and that start
+    // can stop before the part that matters. Its raw visible text outside its controls, fields, templates, scripts and
+    // invisible boxes rides beside the name, uncleaned and unjoined so the mask in Python sees what the page holds.
+    const layerText = [];
+    let layerTextCut = false;
+    if (!layerName) {
+      layerName = boundedClean(layer.textContent, 60);
+      if (layerName && layerKind === 'qualified') {
+        const shownBy = new Map();
+        let read = 0;
+        let nodes = 0;
+        const walker = document.createTreeWalker(layer, NodeFilter.SHOW_TEXT);
+        for (let t = walker.nextNode(); t; t = walker.nextNode()) {
+          if (++nodes > 5000) { layerTextCut = true; break; }
+          const p = t.parentElement;
+          const v = t.nodeValue;
+          if (!p || !v) continue;
+          if (p.closest('script,style,template,noscript,textarea,select,option,datalist,'
+            + '[contenteditable]:not([contenteditable="false"]),button,a[href],[role="button"],[role="link"],'
+            + '[role="checkbox"],[role="radio"],[role="option"],[role="menuitem"],[role="menuitemcheckbox"],'
+            + '[role="menuitemradio"],[role="switch"],[role="tab"]')) continue;
+          let seen = shownBy.get(p);
+          if (seen === undefined) { seen = visible(p, true); shownBy.set(p, seen); }
+          if (!seen) continue;
+          if (read + v.length > 2000) { layerText.push(v.slice(0, 2000 - read)); layerTextCut = true; break; }
+          layerText.push(v);
+          read += v.length;
+        }
+      }
+    }
     if (!layerName) layerName = layer.tagName ? layer.tagName.toLowerCase() : 'layer';
     const layerSelector = idSelector(layer) || markerSelector(layer);
     const allControls = [];
@@ -6598,7 +6900,54 @@ _TYPE_TARGET_PROBE_JS = (
       .concat(onclickControls);
     try { layer.setAttribute('data-tv3-cover', '1'); } catch (e) { /* best-effort */ }
     out.occluder = { selector: layerSelector, name: layerName, controls, truncated };
+    if (layerText.join('').trim()) { out.occluder.text = layerText; out.occluder.textCut = layerTextCut; }
     out.occluder.layerKind = layerKind;
+    // Which layer node this is, and the state of its controls, kept only in a realm the page cannot read or patch
+    // (the same trust allowOwnLabel grants): a page that could reach the table could make one layer pass for another.
+    if (LAYER_IDENTITY && layerKind === 'qualified' && arg.allowOwnLabel === true) {
+      try {
+        const ids = globalThis.__tv3LayerIds || (globalThis.__tv3LayerIds = new WeakMap());
+        const idOf = (n) => {
+          let t = ids.get(n);
+          if (!t) { t = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2); ids.set(n, t); }
+          return t;
+        };
+        // What a person could read or set in the layer: its text, and each control's identity, value and state. The
+        // comparison stays in this realm; only a count of how often it changed leaves it, so no page text or value does.
+        let seen = String(layer.innerText || '');
+        const sel = 'input,select,textarea,button,[contenteditable],[role],[aria-checked],[aria-selected],[aria-pressed],[aria-expanded],[aria-disabled]';
+        // Every open shadow root in the layer, the layer's own included: innerText stops at a root, so each root's text
+        // is read too. A layer this walk cannot finish reading cannot be compared, so it throws and names no layer.
+        const controls = [];
+        const roots = [[layer, 0]];
+        if (layer.shadowRoot) roots.push([layer.shadowRoot, 1]);
+        let visited = 0;
+        while (roots.length) {
+          const [root, depth] = roots.pop();
+          if (depth > 16) throw new Error('layer too deep to compare');
+          if (root !== layer) seen += '\u0004' + String(root.textContent || '');
+          for (const n of root.querySelectorAll('*')) {
+            if (++visited > 5000) throw new Error('layer too large to compare');
+            if (n.matches(sel)) controls.push(n);
+            if (n.shadowRoot) roots.push([n.shadowRoot, depth + 1]);
+          }
+        }
+        for (const c of controls) {
+          // :disabled, not .disabled: a disabled fieldset disables its controls without touching their own property.
+          let off = c.disabled ? 1 : 0;
+          try { off = c.matches(':disabled') ? 1 : 0; } catch (e) { /* not a form control */ }
+          seen += '\u0001' + idOf(c) + '\u0002' + (c.checked ? 1 : 0) + off
+            + (c.selectedIndex === undefined ? '' : c.selectedIndex) + '\u0002' + (c.value === undefined ? '' : String(c.value))
+            + '\u0002' + ['aria-checked', 'aria-selected', 'aria-pressed', 'aria-expanded', 'aria-disabled', 'hidden']
+              .map((a) => c.getAttribute(a) || '').join('\u0003');
+        }
+        const revs = globalThis.__tv3LayerRevs || (globalThis.__tv3LayerRevs = new WeakMap());
+        let rev = revs.get(layer);
+        if (!rev || rev.seen !== seen) { rev = { seen, n: (rev ? rev.n : 0) + 1 }; revs.set(layer, rev); }
+        out.occluder.layerToken = idOf(layer);
+        out.occluder.layerState = String(rev.n);
+      } catch (e) { /* best-effort: no token, no lease */ }
+    }
     // The walk can stop on a pinned ancestor of the field itself: a sticky header whose collapsed
     // search form lays a transparent click-catcher over its own inputs. There is nothing to dismiss.
     // An interactive hit (the form's own submit button) is not a catcher: clicking it could submit.
@@ -6622,7 +6971,7 @@ _TYPE_TARGET_PROBE_JS = (
 # The typing path's probe: the same reading, except that a field which only needs its scroller scrolled is re-tested.
 _TYPING_REACH_PROBE_JS = _TYPE_TARGET_PROBE_JS.replace(
     "const RETEST_SCROLLABLE_CLIP = false;", "const RETEST_SCROLLABLE_CLIP = true;"
-)
+).replace("const LAYER_IDENTITY = false;", "const LAYER_IDENTITY = true;")
 
 # The probe's readonly reading alone. Unlike the probe it scrolls nothing and re-mints no cover markers, so it can
 # be repeated without invalidating the markers the probe's verdict names.
@@ -6635,6 +6984,23 @@ _TYPING_READONLY_JS = (
     + _NATIVE_LABEL_JS
     + _TARGET_READONLY_JS
     + r"""  return { exists: true, readOnly };
+}"""
+)
+
+# Whether the caret is in the field and the field is empty, read after the focus click: a widget can write text into
+# its input on focus, and a field that lost the caret must not be typed into without the clear's actionability wait.
+_CARET_IN_EMPTY_FIELD_JS = (
+    r"""(arg) => {
+  const _q = """
+    + _ROOT_QUERY_JS
+    + r""";
+  const el = _q.find(arg.sel);
+  if (!el) return false;
+  let root = null;
+  try { root = Node.prototype.getRootNode.call(el); } catch (e) { root = null; }
+  const active = root && root.activeElement ? root.activeElement : document.activeElement;
+  if (el.readOnly || el.disabled) return false;
+  return active === el && (el.isContentEditable ? el.textContent : el.value) === '';
 }"""
 )
 
@@ -6682,6 +7048,23 @@ _OTHER_CLICK_BLOCKERS = ("intercepts pointer events", "not visible", "not stable
 # A page that enables its submit once a tick or keystroke settles does so within this window, so the
 # click still lands as it did under Playwright's own wait; a control still disabled after it fails fast.
 _DISABLED_CLICK_GRACE_SECONDS = 2.0
+
+
+async def _disabled_click_refusal(page: Any, selector: str) -> ToolResult:
+    message = f"{selector} is disabled — it cannot be clicked until the page enables it"
+    # The model reads no pixels and observe cannot list a cross-origin widget, so a gate drawn by a challenge frame
+    # is invisible to it. Only a frame measured as rendered is named; an unmeasured one is no evidence of a challenge.
+    try:
+        vendor, _unmeasured = await rendered_challenge_vendor_reading(
+            [frame for frame in page.frames if frame.parent_frame is not None]
+        )
+    except Exception:
+        LOG.info("taskv3 disabled-click challenge probe failed", exc_info=True)
+        vendor = None
+    if vendor:
+        # An observation, not a diagnosis: the frame and the disabled control can be unrelated.
+        message += f". A challenge frame ({vendor}) is rendered on screen. solve_captcha acts on it."
+    return ToolResult.error(message, error_class="disabled")
 
 
 async def _engine_enabled(realm: input_dispatch.Realm, selector: str) -> bool:
@@ -7024,11 +7407,14 @@ _COLLATERAL_VALUES_JS = (
 )
 
 
-# How type put the caret in a field: a checked click, or focus() alone.
-_Reach = Literal["click", "focus", "press"]
+# How type put the caret in a field: a checked click, focus() alone, or a caret the field already held ("held",
+# which clicks nothing to keep it but leaves the rows it reveals as clickable as after a checked click).
+_Reach = Literal["click", "focus", "press", "held"]
 
 
 _CHANGED_VALUE_ECHO_MAX = 80
+# How long a one-time-code field is watched after a write, so a page that rewrites it a beat later is caught.
+_ONE_TIME_CODE_SETTLE_S = 0.3
 _ISO_DATE_TEXT_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 
@@ -7894,6 +8280,33 @@ async def _note_click_dispatch(page: Any, *, marker_armed: bool) -> None:
         record_click_dispatched()
 
 
+async def _act_token(handle: Any) -> str | None:
+    # Patchright 1.61's ElementHandle.get_attribute retries its ':scope' match until the frame detaches once the
+    # handle's document was replaced, while an evaluate on that handle raises at once, so the evaluate goes first.
+    # Each read runs in a task of its own, so a deadline that stops it also abandons the driver's pending reply.
+    await cancellable_driver_call(lambda: handle.evaluate("() => 0"))
+    return await cancellable_driver_call(lambda: handle.get_attribute("data-tv3-act"))
+
+
+def _with_act_deadline(tool_name: str, handler: ToolHandler) -> ToolHandler:
+    async def wrapped(args: dict[str, Any]) -> ToolResult:
+        try:
+            async with under_action_deadline(budget_ms=_ACT_TOOL_TIMEOUT_MS):
+                return await handler(args)
+        except ActionDeadlineExceeded:
+            pass
+        LOG.warning("taskv3 act tool deadline expired", tool=tool_name, deadline_ms=_ACT_TOOL_TIMEOUT_MS)
+        # A click stopped part-way may already have reached the page, so it reads as dispatched, the safe side.
+        return ToolResult.error(
+            f"{tool_name} did not finish within {_ACT_TOOL_TIMEOUT_MS // 1000} s and was stopped; it may already "
+            "have acted on the page. Observe the page before acting again.",
+            data={CLICK_DISPATCHED_DATA_KEY: True} if tool_name == "click" else None,
+            error_class="timeout_other",
+        )
+
+    return wrapped
+
+
 # Planted on window before an option click; a navigation clears window, so its absence afterwards is
 # the page saying "different document" even when the post-click probe's own JS is what failed.
 _CLICK_DOC_PLANT_JS = "() => { window.__tv3_click_doc = 1; }"
@@ -8690,6 +9103,10 @@ _POPUP_FILTER_INPUT_JS = (
 # Wall-clock cap on the virtualized-list walk: a pathological list degrades to the "cut short" error
 # instead of consuming the task's step budget in one call.
 _SCROLL_SEARCH_BUDGET_S = 20.0
+# The open-click's row poll and a popup filter box's reads run this long, and up to the hard cap while the list shows
+# an in-flight indicator.
+_LIST_POLL_SOFT_S = 2.4
+_LIST_POLL_HARD_S = 8.0
 
 # What the tagged scroller currently renders first: the first option row's text and its top in the
 # scroller's own coordinate space. A virtualiser that has re-rendered for a new scrollTop shows a
@@ -9095,6 +9512,21 @@ async (__tv3TextArgs) => {
   const _shownText = """
     + _SHOWN_TEXT_JS
     + r""";
+  // Resolved against the link's own document; http(s) only, query and fragment dropped. A link to the page it
+  // is on (href="#", "#section") names no destination.
+  const _linkDestination = (el) => {
+    try {
+      if (String(el.tagName).toUpperCase() !== 'A') return '';
+      const raw = Element.prototype.getAttribute.call(el, 'href');
+      if (!raw) return '';
+      const u = new URL(raw, el.baseURI);
+      if (u.protocol !== 'http:' && u.protocol !== 'https:') return '';
+      let own = null;
+      try { own = new URL(el.ownerDocument.URL); } catch (e) {}
+      if (!own || u.origin !== own.origin) return u.host + u.pathname;
+      return u.pathname === own.pathname ? '' : u.pathname;
+    } catch (e) { return ''; }
+  };
   // Read through the prototypes: the walk below crosses the control's <form>, whose named controls
   // shadow its own properties (<input name="matches"> makes form.matches that input).
   const _getter = (proto, name) => {
@@ -9894,12 +10326,14 @@ async (__tv3TextArgs) => {
   const _screenListable = (el) => {
     try { return _screen(el, false).why === null; } catch (e) { return false; }
   };
-  const _pointerState = { pointer: new Map(), covered: new Set(), roots: new Map(), holders: new Set(), represented: new Set(), held: new Set(), icons: new Set(), iconCount: 0, iconOverflow: 0, notIcon: 0, notIconRoots: new Set(), heldCount: 0, heldCap: """
+  const _pointerState = { pointer: new Map(), covered: new Set(), roots: new Map(), holders: new Set(), represented: new Set(), held: new Set(), extra: new Set(), extraCount: 0, icons: new Set(), iconCount: 0, iconOverflow: 0, notIcon: 0, notIconRoots: new Set(), heldCount: 0, heldCap: """
     + str(OBSERVE_POINTER_ROOT_CAP)
     + r""", count: 0, retain: _RETAIN_WIDTH, ceiling: """
     + str(_POINTER_ROOT_SCAN_CEILING)
     + r""" };
   let pointerListed = 0;
+  // Anchors listed beside the root that misses them (`extra`): a budget of their own, so none takes a root's place.
+  let extraListed = 0;
   // Pointer roots past the cap, and those past the element budget: counted apart from `truncated`,
   // which the budget spends on semantic controls only.
   let pointerCapped = 0;
@@ -10846,7 +11280,8 @@ async (__tv3TextArgs) => {
     const iconRoot = _pointerState.icons.has(el);
     if (iconRoot && iconsListed >= iconRoom) { iconsTruncated++; continue; }
     pointerRoot = _pointerState.roots.has(el) && !iconRoot;
-    if (pointerRoot && !_pointerState.held.has(el)) pointerReserved--;
+    const extraRoot = pointerRoot && _pointerState.extra.has(el);
+    if (pointerRoot && !_pointerState.held.has(el) && !extraRoot) pointerReserved--;
     const screened = _screen(el, pointerRoot);
     const { r, gr, gateEl, ownGated } = screened;
     if (screened.why === 'offCanvas') { hiddenDropped++; hiddenDroppedOffCanvas++; continue; }
@@ -10916,7 +11351,9 @@ async (__tv3TextArgs) => {
         continue;
       }
     }
-    if (pointerRoot && pointerListed + (_pointerState.held.has(el) ? pointerReserved : 0) >= _POINTER_ROOT_CAP) { pointerCapped++; continue; }
+    // Main never listed these anchors, so one past its budget is not a cut the cap note reports.
+    if (extraRoot && extraListed >= _POINTER_ROOT_CAP) continue;
+    if (!extraRoot && pointerRoot && pointerListed + (_pointerState.held.has(el) ? pointerReserved : 0) >= _POINTER_ROOT_CAP) { pointerCapped++; continue; }
     let selector = naturalSelector(el);
     let bind = '';
     if (!selector) {
@@ -10970,9 +11407,12 @@ async (__tv3TextArgs) => {
     if (pointerRoot) rec.pointerRoot = true;
     if (iconRoot) rec.icon = true;
     if (pointerRoot && _pointerState.held.has(el)) rec.pointerHeld = true;
+    if (extraRoot) rec.pointerExtra = true;
     if (placeholder && placeholder !== label) rec.placeholder = placeholder.slice(0, _RETAIN_WIDTH);
     const shows = _shownText(el, label);
     if (shows) rec.shows = shows;
+    const to = _linkDestination(el);
+    if (to) rec.to = to.slice(0, _RETAIN_WIDTH);
     if (hidden) rec.hidden = true;
     if (removedBy) rec.a11yRemoved = removedBy;
     // A widget role is what the element IS -- a <div role="switch"> renders as a bare div otherwise,
@@ -11099,7 +11539,8 @@ async (__tv3TextArgs) => {
     // _resolve_ref, which requires the element the record NAMES to be the one carrying the act token.
     rec[__OBSERVE_EL_KEY__] = el;
     out.push(rec);
-    if (pointerRoot) pointerListed++;
+    if (extraRoot) extraListed++;
+    else if (pointerRoot) pointerListed++;
     if (iconRoot) iconsListed++;
     elOfRec.set(rec, el);
     stampOfRec.set(rec, { fp: fingerprint(el), anchor: lastAnchor && lastAnchor.sel === selector ? lastAnchor : null });
@@ -11116,6 +11557,7 @@ async (__tv3TextArgs) => {
           const r2 = els[k].el.getBoundingClientRect();
           if (r2.width === 0 || r2.height === 0) continue;
           if (_pointerState.icons.has(els[k].el)) { iconsTruncated++; continue; }
+          if (_pointerState.extra.has(els[k].el)) continue;
           if (_pointerState.roots.has(els[k].el)) {
             if (pointerListed + pointerTruncated < _POINTER_ROOT_CAP) pointerTruncated++;
             else pointerCapped++;
@@ -11159,7 +11601,7 @@ async (__tv3TextArgs) => {
         const at = c.rec === null ? -1 : out.indexOf(c.rec);
         if (at !== -1) {
           out.splice(at, 1); labelOfControl.delete(c.el); boundLabelOfControl.delete(c.el);
-          if (c.rec.pointerRoot) { pointerListed--; pointerDropped++; } else dropped++;
+          if (c.rec.pointerRoot) { if (c.rec.pointerExtra) extraListed--; else pointerListed--; pointerDropped++; } else dropped++;
         }
       }
       if (lost && !rem.shared) { if (rem.fresh) markersWritten--; else markersReused--; }
@@ -11169,7 +11611,7 @@ async (__tv3TextArgs) => {
       const at = rem.rec === null ? -1 : out.indexOf(rem.rec);
       if (at !== -1) {
         out.splice(at, 1); labelOfControl.delete(rem.el); boundLabelOfControl.delete(rem.el);
-        if (rem.rec.pointerRoot) { pointerListed--; pointerDropped++; } else dropped++;
+        if (rem.rec.pointerRoot) { if (rem.rec.pointerExtra) extraListed--; else pointerListed--; pointerDropped++; } else dropped++;
       }
       if (rem.fresh) markersWritten--; else markersReused--;
     }
@@ -11229,7 +11671,7 @@ async (__tv3TextArgs) => {
       // as holding one field when it holds two.
       if (el && connected) droppedStillLive.push(el);
       labelOfControl.delete(el); boundLabelOfControl.delete(el); out.splice(k, 1);
-      if (rec.pointerRoot) { pointerListed--; pointerDropped++; } else dropped++;
+      if (rec.pointerRoot) { if (rec.pointerExtra) extraListed--; else pointerListed--; pointerDropped++; } else dropped++;
     }
     else if (el) {
       // Recomputed after the drain rather than added to the fingerprint above: a page's own observer
@@ -13167,13 +13609,15 @@ def _merge_realm(into: dict[str, Any], other: dict[str, Any]) -> list[int]:
     # page-wide, so neither limit ever costs the other kind a place.
     room = max(0, OBSERVE_MERGED_ELEMENT_MAX - sum(1 for e in elements if not (e.get("pointerRoot") or e.get("icon"))))
     pointer_room = max(
-        0, OBSERVE_POINTER_ROOT_CAP - sum(1 for e in elements if e.get("pointerRoot") and not e.get("pointerHeld"))
+        0,
+        OBSERVE_POINTER_ROOT_CAP
+        - sum(1 for e in elements if e.get("pointerRoot") and not (e.get("pointerHeld") or e.get("pointerExtra"))),
     )
     kept: list[int] = []
     pointer_over_cap = 0
     over_page_cap = 0
     for i, e in enumerate(incoming):
-        if e.get("pointerHeld") or e.get("icon"):
+        if e.get("pointerHeld") or e.get("pointerExtra") or e.get("icon"):
             pass  # Ranked page-wide by _rank_held_pointer_roots_last once every realm is merged.
         elif e.get("pointerRoot"):
             if pointer_room == 0:
@@ -13214,11 +13658,15 @@ def _merge_realm(into: dict[str, Any], other: dict[str, Any]) -> list[int]:
 
 
 def _rank_held_pointer_roots_last(data: dict[str, Any]) -> list[int]:
-    """Keep a holder's stand-in child only in the page-wide pointer cap left after every other pointer root, and an
-    icon only in the page-wide element budget left after every control. Returns the kept indices, which the caller
-    applies to its handle and owner lists."""
+    """Keep a holder's stand-in child only in the page-wide pointer cap left after every other pointer root, an
+    anchor listed beside the root that misses it only in a page-wide cap of its own, and an icon only in the
+    page-wide element budget left after every control. Returns the kept indices, which the caller applies to its
+    handle and owner lists."""
     elements = data.get("elements") or []
-    room = OBSERVE_POINTER_ROOT_CAP - sum(1 for e in elements if e.get("pointerRoot") and not e.get("pointerHeld"))
+    room = OBSERVE_POINTER_ROOT_CAP - sum(
+        1 for e in elements if e.get("pointerRoot") and not (e.get("pointerHeld") or e.get("pointerExtra"))
+    )
+    extra_room = OBSERVE_POINTER_ROOT_CAP
     icon_room = OBSERVE_MERGED_ELEMENT_MAX - sum(1 for e in elements if not (e.get("pointerRoot") or e.get("icon")))
     kept: list[int] = []
     held_over = 0
@@ -13229,6 +13677,10 @@ def _rank_held_pointer_roots_last(data: dict[str, Any]) -> list[int]:
                 held_over += 1
                 continue
             room -= 1
+        elif e.get("pointerExtra"):
+            if extra_room <= 0:
+                continue
+            extra_room -= 1
         elif e.get("icon"):
             if icon_room <= 0:
                 icons_over += 1
@@ -13477,6 +13929,17 @@ def build_browser_tools(
             await _check_credential_release(
                 resolved, operation=operation, page=page, selector=selector, url_is_target=url_is_target
             )
+            ctx = skyvern_context.current()
+            if (
+                not url_is_target
+                and selector
+                and settings.ENABLE_SECRET_VISUAL_MASKING
+                and ctx is not None
+                and app.WORKFLOW_CONTEXT_MANAGER.is_card_secret_text(ctx.workflow_run_id, text)
+            ):
+                # Every tool that writes a resolved value into a field comes through here, so this one
+                # mask covers them all. It is CSS-only and ignores the Mask Secrets opt-in for card data.
+                await apply_secret_visual_mask_to_locator(page.locator(selector).first, timeout=_ACTION_TIMEOUT_MS)
         return resolved
 
     # INVARIANT: holds at most one page, written by the preflight wrapper (or, ahead of it, the
@@ -13543,6 +14006,12 @@ def build_browser_tools(
     # concern. Threading a realm through forty call sites is how a concern gets scattered into the
     # tools, and each site becomes a place to forget it.
     _acted_realm: list[Any] = []
+    # The live element handle the ref or mark resolved to, for the same single call, so a click can fall back to it
+    # when the driver's selector engine cannot see the marker the resolver just wrote.
+    _acted_handle: list[Any] = []
+    # For a ref, the selector observe recorded for it, the tag the model was shown and the document it was read in, for
+    # the same single call.
+    _acted_rebind: list[tuple[str, str, str, dict[str, Any]]] = []
 
     async def _resolve_page() -> tuple[Any, ToolResult | None]:
         # Single-use handoff from the preflight wrapper so a preflighted call resolves the page
@@ -14110,6 +14579,8 @@ def build_browser_tools(
 
         shows_left = SHOWN_TEXT_TOTAL_CAP
         shows_omitted = 0
+        to_left = LINK_DESTINATION_TOTAL_CAP
+        to_omitted = 0
         for _render_idx, e in enumerate(elements):
             extra = ""
             if e.get("shows"):
@@ -14121,6 +14592,14 @@ def build_browser_tools(
                     extra += shows_part
                 else:
                     shows_omitted += 1
+            if e.get("to") and _link_destination_adds(str(e["to"]), str(e.get("label", ""))):
+                to_part = f" to={_field(e['to'], LINK_DESTINATION_MAX)}"
+                # As with shows=, once one is left off every later one is too, so the note's count is a tail.
+                if not to_omitted and len(to_part) <= to_left:
+                    to_left -= len(to_part)
+                    extra += to_part
+                else:
+                    to_omitted += 1
             if e.get("value"):
                 extra += f" value={_field(e['value'], OBSERVE_DISPLAY_WIDTHS['value'])}"
             if e.get("placeholder"):
@@ -14254,6 +14733,8 @@ def build_browser_tools(
             )
         if shows_omitted:
             lines.append(_shows_omitted_note(shows_omitted))
+        if to_omitted:
+            lines.append(_link_destination_omitted_note(to_omitted))
         # Counts only, for the per-call log record: every perception change that alters only what
         # this function renders is otherwise invisible to production telemetry.
         frame_census = data.get("frameCensus") or {}
@@ -14310,7 +14791,9 @@ def build_browser_tools(
             "icons_truncated": int(data.get("iconsTruncated") or 0),
             # Distinct unnamed pointer roots rejected by the icon heuristic, separate from budget and selector drops.
             "unnamed_not_icon": int(data.get("unnamedNotIcon") or 0),
-            "pointer_roots_listed": sum(1 for e in elements if e.get("pointerRoot")),
+            "pointer_roots_listed": sum(1 for e in elements if e.get("pointerRoot") and not e.get("pointerExtra")),
+            # Href-less anchors listed beside the pointer root whose click would miss them.
+            "pointer_extras_listed": sum(1 for e in elements if e.get("pointerExtra")),
             "pointer_capped": int(data.get("pointerCapped") or 0),
             "pointer_truncated": int(data.get("pointerTruncated") or 0),
             "pointer_dropped": int(data.get("pointerDropped") or 0),
@@ -15049,14 +15532,12 @@ def build_browser_tools(
             # Falling through to markup would hand back the whole-page dump the prompt forbids, on a
             # typo the model cannot see. The enum is advisory: the spec is not emitted strict.
             return ToolResult.error(f'unknown format {args.get("format")!r}: use "html" or "text"')
-        # Whether the requested element's OWN start tag is in the answer, rather than only its
-        # descendants': `inner` markup opens with a child, which is a different element.
         if selector:
             el = await page.query_selector(selector)
             if el is None:
                 return ToolResult.error(f"no element for selector {selector!r}", error_class="stale_selector")
             try:
-                html = mask_otp_values_in_html(await el.evaluate(OTP_SAFE_FRAGMENT_HTML_JS))
+                html = mask_otp_values_in_html(await el.evaluate(OTP_SAFE_ELEMENT_HTML_JS))
             except Exception:
                 # A navigation between the two reads must not turn "" into a tool error.
                 html = ""
@@ -15181,7 +15662,9 @@ def build_browser_tools(
         # recorded -- it is page text, and these names carry personal data.
         parts = _named_controls(occluder)
         branch = _covered_branch(occluder)
-        _record_covered(occluder, branch, controls=[] if branch == "own_container" else parts)
+        said = _layer_text_clause(occluder, layer_selector) if branch == "named" else ""
+        _record_covered(occluder, "quoted" if said else branch, controls=[] if branch == "own_container" else parts)
+        blocker = _blocking_layer(occluder, branch) if verb == "typed into" else None
         # The probe walks only the hit element and its ancestors, so this claims nothing about other layers.
         unqualified = (
             "That is the element drawn where the pointer lands; neither it nor anything containing it qualified "
@@ -15276,6 +15759,23 @@ def build_browser_tools(
                 f"{found} Re-observe and reach {selector} another way or act on a different control.",
                 error_class="covered",
             )
+        # A layer that is quoted is reported, not prescribed for: its text may be the page answering the last action,
+        # which closing it and retrying the same field does not address.
+        if said and not parts:
+            return ToolResult.error(
+                f"{selector} is covered by {layer_desc}, so it cannot be {verb}{also}.{said} The probe found no "
+                f"named controls on it; one without a label (an icon or an ×) would show in get_html of "
+                f"{layer_selector or 'the layer'}.",
+                data=blocker,
+                error_class="covered",
+            )
+        if said:
+            return ToolResult.error(
+                f"{selector} is covered by {layer_desc}, so it cannot be {verb}{also}.{said} Its controls: "
+                f"{controls_desc}.",
+                data=blocker,
+                error_class="covered",
+            )
         if not parts:
             # The probe names controls by tag, role and inline onclick; a close wired by a script listener is
             # none of those, so an empty list is no evidence the layer has no way out.
@@ -15283,6 +15783,7 @@ def build_browser_tools(
                 f"{selector} is covered by {layer_desc}, so it cannot be {verb}{also}. The probe found no named "
                 "controls on it, but it may still have an unlabeled close (an icon or an ×): read get_html of "
                 f"{layer_selector or 'the layer'} to find it, close the layer, then retry {selector}.",
+                data=blocker,
                 error_class="covered",
             )
         return ToolResult.error(
@@ -15292,8 +15793,18 @@ def build_browser_tools(
             # (e.g. "Delete account") is not distinguishable here from a close/cancel button.
             f"Its controls: {controls_desc}. Pick whichever one actually closes or dismisses the "
             f"layer, then retry {selector}.",
+            data=blocker,
             error_class="covered",
         )
+
+    def _blocking_layer(occluder: dict[str, Any] | None, branch: CoveredBranch) -> dict[str, Any] | None:
+        # Only a layer the walk qualified and the probe identified: a hit element, a clip, a ghost backdrop, a
+        # challenge or the field's own container is not a layer every field behind it shares.
+        occluder = occluder or {}
+        token, state = occluder.get("layerToken"), occluder.get("layerState")
+        if branch != "named" or occluder.get("layerKind") != "qualified" or not token or not state:
+            return None
+        return {BLOCKING_LAYER_DATA_KEY: BlockingLayer(str(token), str(state))}
 
     async def _probe_arg(page: Any, selector: str) -> dict[str, Any]:
         # Probes resolve per root, which cannot match a host-anchored selector whose two halves
@@ -15411,6 +15922,11 @@ def build_browser_tools(
         acted = _acted_selector.get(selector, selector)
         return _inert_target_error(acted) if await _target_is_inert(acted) else None
 
+    async def _typing_target(page: Any, selector: str) -> str:
+        """The element a type call acts on: the one its selector names, or the control a named shadow host mirrors."""
+        await _require_single_target(page, selector)
+        return await _resolve_mirrored_host_control(page, selector)
+
     async def _resolve_mirrored_host_control(page: Any, selector: str) -> str:
         # Only a single compound selector can name a host by mistake; a composed (host-anchored) one
         # already points inside a root and a marker selector names exactly what observe marked.
@@ -15483,6 +15999,84 @@ def build_browser_tools(
             return int(await page.evaluate(_MARKER_MATCH_COUNT_JS, await _probe_arg(page, selector)))
         except Exception:
             return 1
+
+    async def _rendered_target(target: Any, selector: str, *, mirrored: bool = False) -> str:
+        """For a model-written selector naming several elements, the single one the page renders.
+
+        `_require_single_target` counts only what observe minted, so a selector the model wrote reaches a
+        non-strict driver action that takes the first match in document order; when that match has no box
+        (a `display:none` row template whose submit carries the row's text as its `value`) the call spends
+        the whole actionability wait failing. The selector is returned untouched whenever the
+        choice is not forced: nothing rendered, several rendered, the rendered one already first, or a hidden
+        match a visible label of its own still reaches, which click's label path acts on.
+        """
+        if _TV3_MARKER_ANYWHERE_RE.search(selector) or (
+            _is_host_anchored_selector(selector) and not _ENGINE_SELECTOR_RE.match(selector.strip())
+        ):
+            return selector
+        handles: list[Any] = []
+        try:
+            handles = await target.locator(selector).element_handles()
+            if not 2 <= len(handles) <= _RENDERED_TARGET_MATCH_CAP:
+                return selector
+            rendered: Any = None
+            hidden: list[Any] = []
+            for handle in handles:
+                if not await handle.is_visible():
+                    hidden.append(handle)
+                elif rendered is not None:
+                    return selector
+                else:
+                    rendered = handle
+            # Rendered first is what the driver takes anyway; a token on that one node would only add a way
+            # to go stale when the page replaces it before the action lands. A selector the guard counts would
+            # be refused as ambiguous instead, so it still narrows.
+            if rendered is None or (rendered is handles[0] and not _is_host_anchored_selector(selector)):
+                return selector
+            for handle in hidden:
+                if await handle.evaluate(_LABEL_REACHES_OTHER_THAN_JS, rendered):
+                    return selector
+            # A shadow host and the control it mirrors both answer the host's `#id`, and the host is the
+            # rendered one; the handler's own rewrite has to reach the control instead.
+            if mirrored and await _resolve_mirrored_host_control(target, selector) != selector:
+                return selector
+            act_selector = await _resolve_handle_selector(target, rendered)
+        except Exception:
+            return selector
+        finally:
+            for handle in handles:
+                with contextlib.suppress(Exception):
+                    await handle.dispose()
+        if act_selector is None:
+            return selector
+        LOG.info(
+            "taskv3 narrowed a multi-match selector to the one element the page renders",
+            selector=selector,
+            matches=len(handles),
+            act_selector=act_selector,
+        )
+        return act_selector
+
+    def _with_rendered_target(handler: ToolHandler, *, mirrored: bool) -> ToolHandler:
+        # Outside the target-label probe, so the label, the action and the inert diagnosis all read the
+        # element the call lands on; the answer audit narrows the same way in `_answer_target`.
+        async def wrapped(args: dict[str, Any]) -> ToolResult:
+            selector = args.get("selector")
+            if not isinstance(selector, str) or not selector or not _prefetched_page:
+                return await handler(args)
+            realm = _acted_realm[0] if _acted_realm else _prefetched_page[0]
+            narrowed = await _rendered_target(realm, selector, mirrored=mirrored)
+            if narrowed == selector:
+                return await handler(args)
+            try:
+                return await handler({**args, "selector": narrowed})
+            except Exception:
+                # Only a raise reaches the guard's inert diagnosis, which looks the caller's selector up here;
+                # the handler's own `_resolve_page` clears this map, so it cannot be written before the call.
+                _acted_selector[selector] = _acted_selector.get(narrowed, narrowed)
+                raise
+
+        return wrapped
 
     # What the last menu-open note reported, for the click's call record; reset before each reaction read.
     menu_note_census: dict[str, Any] = {}
@@ -15733,6 +16327,35 @@ def build_browser_tools(
             # Unreadable: the click proceeds as it did before this check, through the marker path's own errors.
             return False
 
+    async def _click_marker(realm: Any, selector: str, *, force: bool) -> str:
+        """Click through the driver's locator; for an act marker it never resolved, click the resolver's live handle,
+        as v1's click chain degrades to the element itself."""
+        try:
+            await input_dispatch.click(realm, selector, timeout=_ACTION_TIMEOUT_MS, force=True if force else None)
+            return "locator"
+        except Exception as exc:
+            if not (selector.startswith(_ACT_SELECTOR_PREFIX) and _acted_handle and _locator_never_resolved(exc)):
+                raise
+        # Page.click(selector) only clicks the node that still carries the token; a handle has no such check, so
+        # a node that lost the token since the pre-check (a markup morph onto kept nodes) is stale, not clicked.
+        try:
+            held = await _act_token(_acted_handle[0])
+        except Exception:
+            held = None
+        if held is None or selector != f'{_ACT_SELECTOR_PREFIX}{held}"]':
+            return "stale"
+        try:
+            await input_dispatch.click_handle(
+                realm, _acted_handle[0], timeout=_ACTION_TIMEOUT_MS, force=True if force else None
+            )
+        except Exception as exc:
+            # The summary line only: the call log quotes the covering element's text, which can say anything.
+            if "not attached" in str(exc).split("\n", 1)[0]:
+                return "stale"
+            record_click_path("handle_failed")
+            raise
+        return "handle"
+
     async def click(args: dict[str, Any]) -> ToolResult:
         page, error = await _resolve_page()
         if error is not None:
@@ -15867,10 +16490,7 @@ def build_browser_tools(
 
         while await _gate_refuses():
             if time.monotonic() >= enable_deadline:
-                return ToolResult.error(
-                    f"{selector} is disabled — it cannot be clicked until the page enables it",
-                    error_class="disabled",
-                )
+                return await _disabled_click_refusal(_current_page(), selector)
             await asyncio.sleep(0.1)
             try:
                 reach_pre = await _probe_evaluate(
@@ -16035,14 +16655,12 @@ def build_browser_tools(
                 await page.evaluate(_CLICK_SAME_DOC_PLANT_JS)
             except Exception:
                 marker_armed = False
+            click_path = "locator"
             try:
-                if label_over_control:
-                    # The probe already answered: the only thing "over" this control is its own label
-                    # (slotted, or a sibling for=id), which the driver's containment check would wait
-                    # 15s to reject.
-                    await input_dispatch.click(page, selector, timeout=_ACTION_TIMEOUT_MS, force=True)
-                else:
-                    await input_dispatch.click(page, selector, timeout=_ACTION_TIMEOUT_MS)
+                # With label_over_control the probe already answered: the only thing "over" this control is
+                # its own label (slotted, or a sibling for=id), which the driver's containment check would
+                # wait 15s to reject.
+                click_path = await _click_marker(page, selector, force=bool(label_over_control))
             except Exception as e:
                 await _note_click_dispatch(page, marker_armed=marker_armed)
                 gone = False
@@ -16122,6 +16740,14 @@ def build_browser_tools(
                         raise e from None
                 else:
                     raise
+            record_click_path(click_path)
+            if click_path == "stale":
+                return ToolResult.error(
+                    f"click on {selector} failed: the element no longer exists on the page — it was likely "
+                    "removed by a re-render. Re-observe and act on fresh selectors.",
+                    data={"page_state_changed": True},
+                    error_class="stale_selector",
+                )
             base = f"clicked {selector} — now at {await _url(page)}"
 
         # url_after vs url_before is the real page-transition signal the shadow net-progress ledger
@@ -16378,6 +17004,8 @@ def build_browser_tools(
             probe = await _probe_evaluate(page, _TYPING_REACH_PROBE_JS, selector, await _probe_arg(page, selector))
         except Exception:
             probe = None
+        if isinstance(probe, dict) and isinstance(probe.get("occluder"), dict) and _probe_was_isolated() is not True:
+            probe["occluder"].pop("layerToken", None)
         record_type_reach(
             acted_in_frame=bool(_acted_realm) and page.parent_frame is not None,
             probe_scrolled=isinstance(probe, dict) and probe.get("scrolled") is True,
@@ -16416,6 +17044,9 @@ def build_browser_tools(
                     deadline = time.monotonic() + _ACTION_TIMEOUT_MS / 1000
         occluded = bool(isinstance(probe, dict) and probe.get("occluded"))
         occluder = probe.get("occluder") if isinstance(probe, dict) else None
+        if occluded and probe.get("unrendered"):
+            # Whatever the hit test met is drawn where the undrawn field sits, so it covers nothing.
+            raise ToolRefusal.of(await _unreachable_error(selector))
         if occluded and not probe.get("skinned"):
             await _annotate_challenge_frame(page, _current_page(), occluder)
             return False, occluded, occluder
@@ -16424,6 +17055,17 @@ def build_browser_tools(
         # name), but surfacing it here would let a force-click that then navigates or remounts the
         # field raise a false "covered by <the field's own list>" message on a field that was reachable.
         return True, occluded, None
+
+    async def _caret_held_past_invisible_layer(page: Any, selector: str, occluder: dict[str, Any] | None) -> bool:
+        # Typing needs the caret, not the pointer. A layer that paints nothing and holds no control (the probe's
+        # invisible reading) stops only clicks, so a person whose caret is already in the field types straight on;
+        # a visible layer, a challenge frame or the field's own container is something they would deal with first.
+        if _covered_branch(occluder) != "invisible":
+            return False
+        try:
+            return await page.evaluate(_ACTIVE_IS_JS, await _probe_arg(page, selector)) is True
+        except Exception:
+            return False
 
     async def _declares_a_list(page: Any, selector: str) -> bool:
         # Fail-closed toward "declares": on the focus-only path a wrong "no" would let the raw query in
@@ -16530,6 +17172,11 @@ def build_browser_tools(
         field -- nothing the page did in response to a click has been seen."""
         reachable, occluded, occluder = await _reachable_for_typing(page, selector)
         if not reachable:
+            if await _caret_held_past_invisible_layer(page, selector, occluder):
+                # Any click here lands on the layer (a list's click-outside catcher closes the list), so keep
+                # the caret where it is and type.
+                record_type_caret_held()
+                return True, None, "held"
             return False, occluder, "click"
         if focus_fallback:
             pressed = await _press_date_segment_part(page, selector)
@@ -16590,6 +17237,9 @@ def build_browser_tools(
             focused = None
         # None is "could not tell" -- a selector document.querySelector cannot parse, or a probe that
         # threw. Only an explicit False is evidence the caret went somewhere else.
+        if focused is None:
+            # A marker that matches nothing after the click: the field may have re-mounted into the caret's node.
+            await _follow_replaced_field(page, selector)
         if focused is False:
             # focus() needs no hit target, so it repairs a skin that swallowed the click without
             # forwarding it. Typing then goes to the field rather than wherever the caret was.
@@ -17229,7 +17879,7 @@ def build_browser_tools(
         # candidate scoring (word-overlap with the TYPED query) can drop a row the widget still renders.
         rows_armed = await _arm_rows_at_press(page, selector)
         try:
-            if not await _click_stamped_row(page, stamp, best_txt, 3000):
+            if not await _click_stamped_row(page, stamp, best_txt, _SUGGESTION_ROW_CLICK_TIMEOUT_MS):
                 raise RuntimeError("stamped suggestion row is no longer the matched row")
             clicked = True
         except Exception:
@@ -17264,7 +17914,9 @@ def build_browser_tools(
                         except Exception:
                             LOG.debug("taskv3 commit-event arm failed", selector=selector)
                         rows_armed = await _arm_rows_at_press(page, selector)
-                        clicked = await _click_stamped_row(page, f'[data-tv3-sugg="{idx}"]', best_txt, 3000)
+                        clicked = await _click_stamped_row(
+                            page, f'[data-tv3-sugg="{idx}"]', best_txt, _SUGGESTION_ROW_CLICK_TIMEOUT_MS
+                        )
             except Exception:
                 clicked = False
         if not clicked:
@@ -17554,9 +18206,12 @@ def build_browser_tools(
                     await _discard_live_row_offer(field)
                 return error
             selector = args.get("selector")
-            target = (
-                await _resolve_mirrored_host_control(page, selector) if isinstance(selector, str) and selector else None
-            )
+            target = None
+            if isinstance(selector, str) and selector:
+                # Narrowed as the tool's own seam narrows it, so an offer keyed by the narrowed field still matches.
+                if tool_name in _INERT_DIAGNOSIS_TOOL_NAMES:
+                    selector = await _rendered_target(page, selector, mirrored=True)
+                target = await _resolve_mirrored_host_control(page, selector)
             on_field: list[tuple[str, _LiveRowOffer]] = []
             released_input = False
             for field, offer in list(_live_row_offers.items()):
@@ -17665,6 +18320,85 @@ def build_browser_tools(
 
         return wrapped
 
+    async def _caret_in_empty_field(page: Any, selector: str) -> bool:
+        try:
+            return bool(await page.evaluate(_CARET_IN_EMPTY_FIELD_JS, {"sel": selector}))
+        except Exception:
+            return False
+
+    async def _clear_and_type(page: Any, selector: str, typed: str, *, clear: bool) -> None:
+        # An empty field has nothing to clear, and fill("") on one still sends Delete: a multi-value input drops its
+        # last chip, and a widget can re-mount its input on the key.
+        if clear:
+            await input_dispatch.clear(page, selector, timeout=_ACTION_TIMEOUT_MS)
+        await input_dispatch.type_keys(page, selector, typed, delay=15, timeout=_typing_timeout_ms(typed))
+
+    async def _follow_replaced_field(page: Any, selector: str) -> bool:
+        # A framework that re-mounts its input on focus or on a key leaves the act marker on a detached node. The
+        # replacement takes the marker over by _resolve_ref's re-resolve rule (the ref's recorded selector names
+        # exactly one element, of the tag the model was shown) and only if that element also holds the caret;
+        # anything else, a typed selector or a mark included, fails as before.
+        if not (selector.startswith(_ACT_SELECTOR_PREFIX) and _acted_rebind):
+            return False
+        remembered, expected_tag, recorded_document, entry = _acted_rebind[0]
+        token = selector[len(_ACT_SELECTOR_PREFIX) : -2]
+        realm = _acted_realm[0] if _acted_realm else page
+        original_connected = False
+        if _acted_handle:
+            # A handle in a document that is gone throws here; the document check below refuses that case.
+            with contextlib.suppress(Exception):
+                original_connected = bool(await _acted_handle[0].evaluate("(el) => el.isConnected"))
+        if original_connected:
+            return False
+        matches: list[Any] = []
+        adopted = None
+        written = False
+        try:
+            if await _holders(realm, selector) != 0:
+                return False
+            if recorded_document and (
+                _document_unidentifiable(recorded_document) or recorded_document != await _realm_document_id(realm)
+            ):
+                return False
+            matches = await realm.query_selector_all(remembered)
+            if len(matches) != 1:
+                return False
+            node = matches[0]
+            if expected_tag and str(await node.evaluate("(el) => el.tagName") or "").lower() != expected_tag:
+                return False
+            if await node.get_attribute("data-tv3-act") is not None or not await node.evaluate(_HOLDS_CARET_JS):
+                return False
+            written = True
+            if (
+                not await node.evaluate(_ACT_WRITE_HANDLE_JS, token)
+                or await node.get_attribute("data-tv3-act") != token
+                or await _holders(realm, selector) != 1
+            ):
+                return False
+            adopted = node
+        except Exception:
+            LOG.debug("taskv3 replaced-field follow failed", selector=selector, exc_info=True)
+            return False
+        finally:
+            if written and adopted is None:
+                # The page may have put the write on another element; a marker left there would take the typing.
+                with contextlib.suppress(Exception):
+                    await realm.eval_on_selector_all(
+                        selector, "(els) => els.forEach((el) => el.removeAttribute('data-tv3-act'))"
+                    )
+            for spare in matches:
+                if spare is not adopted:
+                    with contextlib.suppress(Exception):
+                        await spare.dispose()
+        for original in _acted_handle:
+            with contextlib.suppress(Exception):
+                await original.dispose()
+        _acted_handle[:] = [adopted]
+        # Held by the ref's entry, as _resolve_ref's re-resolve does, so the next observe disposes it.
+        entry["handle"] = adopted
+        LOG.info("taskv3 typing followed a re-mounted field", selector=selector)
+        return True
+
     async def _type_and_commit(
         page: Any,
         selector: str,
@@ -17716,21 +18450,27 @@ def build_browser_tools(
         typed = query or value
         if selector in _live_row_offers:
             _live_row_offers[selector].typed.extend(["", typed])
-        if collateral is not None and reach != "click":
+        if collateral is not None and reach not in ("click", "held"):
             # Only a field the click could not reach can misroute its keys, and only that path restores.
-            # A checked click leaves the page untagged and pays nothing.
+            # A checked click, or a caret the field was confirmed to hold, leaves the page untagged and pays nothing.
             collateral.extend(await _capture_collateral(page, selector))
-        # Clearing an empty multi-value input sends Delete, which removes the field's last chip.
-        if not (pre_value == "" and await _holds_own_chips(page, selector)):
-            await input_dispatch.clear(page, selector, timeout=_ACTION_TIMEOUT_MS)
-        await input_dispatch.type_keys(page, selector, typed, delay=15, timeout=_typing_timeout_ms(typed))
+        try:
+            skip_clear = pre_value == "" and (
+                await _caret_in_empty_field(page, selector) or await _holds_own_chips(page, selector)
+            )
+            await _clear_and_type(page, selector, typed, clear=not skip_clear)
+        except Exception as exc:
+            if not (_locator_never_resolved(exc) and await _follow_replaced_field(page, selector)):
+                raise
+            await _clear_and_type(page, selector, typed, clear=await _read_field_value(page, selector) != "")
         if collateral:
             collateral[:] = await _collateral_moved_while_typing(page, collateral)
-        if not presnapshot_ok or reach != "click":
+        if not presnapshot_ok or reach not in ("click", "held"):
             # Without the pre-snapshot the reaction-gate can't tell a new suggestion from static page
             # text, so don't run the finder ungated (it could click unrelated content) — leave the typed
             # value and let the caller re-observe. A field no click can reach gets no suggestion clicks
-            # either; the caller looks for reacting rows and reads its value back instead.
+            # either; the caller looks for reacting rows and reads its value back instead. A held caret
+            # is not that case: only the field sits under the layer, and each row click is hit-tested itself.
             verdict = (
                 ToolResult.error(
                     f"typed {typed!r} into {selector} but did not press Enter: its search results could not "
@@ -19099,8 +19839,7 @@ def build_browser_tools(
         selector = args.get("selector")
         if not selector:
             return ToolResult.error("type needs a selector, or mark=N from the last look().")
-        await _require_single_target(page, selector)
-        selector = await _resolve_mirrored_host_control(page, selector)
+        selector = await _typing_target(page, selector)
         text = await _resolve_text(args.get("text", ""), operation="type", page=page, selector=selector)
         # A secret source resolved the text, or it is a value a tool delivered as secret (a one-time code typed as is).
         typed_secret = text != args.get("text", "") or _is_runtime_secret(text)
@@ -19227,6 +19966,11 @@ def build_browser_tools(
         # field, check whether the page REACTED with a suggestion list and, if so, commit the best match
         # here. Detection is behavioral (no per-site rules), so this holds across ATSes; non-text inputs
         # and append/enter typing skip it and fill normally (fast path, no polling).
+        # A tel field, and a text field typed with Enter, skip the typeahead path below and take the native fill.
+        native_one_time_code = bool(
+            text and clear and not box_text and (field_type == "tel" or (press_enter and field_type == "text"))
+        ) and (await _is_one_time_code_field(page, selector, text))
+        native_release_url = await _field_release_url(page, selector) if native_one_time_code else None
         if text and clear and not press_enter and not box_text and field_type not in _NON_TYPEAHEAD_TYPES:
             # A non-typeable anchor (a button/div, not an <input>/<textarea>/contenteditable) can never
             # take page.fill()'s keystrokes — but one that declares list semantics is a click-to-open
@@ -19248,7 +19992,9 @@ def build_browser_tools(
         except _FieldNotEditable as exc:
             return _not_editable_error(exc)
         if not reachable:
-            return _covered_error(selector, occluder)
+            if not await _caret_held_past_invisible_layer(page, selector, occluder):
+                return _covered_error(selector, occluder)
+            record_type_caret_held()
         written = text
         flutter_field = bool(clear and text and not box_text) and await _is_flutter_text_field(page, selector)
         if clear:
@@ -19336,7 +20082,9 @@ def build_browser_tools(
                 error_class="text_not_held",
             )
         entry = (
-            await _entry_read_back(
+            await _one_time_code_read_back(page, selector, written, native_release_url)
+            if native_one_time_code
+            else await _entry_read_back(
                 page,
                 selector,
                 written,
@@ -19749,6 +20497,55 @@ def build_browser_tools(
         except Exception:
             return False
 
+    async def _is_one_time_code_field(page: Any, selector: str, text: str) -> bool:
+        # Only the page's own one-time-code marking on a single editable input that can hold the whole code. An
+        # eligible field is marked as a code box so observe and read-back stop echoing what it holds.
+        try:
+            return (
+                await page.locator(selector).first.evaluate(
+                    "(el, n) => { if (!(el instanceof HTMLInputElement) || el.readOnly || el.disabled"
+                    " || !(el.getAttribute('autocomplete') || '').toLowerCase().split(/\\s+/).includes('one-time-code')"
+                    " || (el.maxLength >= 0 && el.maxLength < n)) return false;"
+                    " el.setAttribute('data-skyvern-otp-box', '1'); return true; }",
+                    len(text),
+                    timeout=2000,
+                )
+                is True
+            )
+        except Exception:
+            return False
+
+    async def _one_time_code_read_back(page: Any, selector: str, text: str, release_url: str | None) -> ToolResult:
+        # Keys typed into a one-time-code field can drop while the page re-renders: a shorter value gets one atomic
+        # rewrite, on the same single field in the document the code was released to. Only a value that still
+        # matches exactly after the page settles is entered; a code is never echoed.
+        record_entry_variant("one_time_code")
+        not_entered = ToolResult.error(
+            f"typed a one-time code into {selector}, but the field does not hold it afterwards, so the code is NOT "
+            "entered. Re-observe the field before trying again.",
+            error_class="text_not_held",
+        )
+        held = await _read_field_value(page, selector)
+        if held == text:
+            await asyncio.sleep(_ONE_TIME_CODE_SETTLE_S)
+            held = await _read_field_value(page, selector)
+        if held == text:
+            return entry_outcome(selector, EntryMatch.SAME, shown=None)
+        if held is None or len(held) >= len(text):
+            return not_entered
+        await _require_single_target(page, selector)
+        if not await _is_one_time_code_field(page, selector, text) or (
+            await _field_release_url(page, selector) != release_url
+        ):
+            return not_entered
+        await input_dispatch.fill(page, selector, text, timeout=_ACTION_TIMEOUT_MS)
+        await asyncio.sleep(_ONE_TIME_CODE_SETTLE_S)
+        return (
+            entry_outcome(selector, EntryMatch.SAME, shown=None)
+            if await _read_field_value(page, selector) == text
+            else not_entered
+        )
+
     async def _entry_read_back(
         page: Any, selector: str, text: str, *, variant: str, echo: bool, before: str | None = None
     ) -> ToolResult:
@@ -19805,6 +20602,8 @@ def build_browser_tools(
     ) -> ToolResult:
         # keystroke-type (via _type_and_commit) so a widget that fetches suggestions on key events —
         # not just on a single `input` from fill — still surfaces them, then commit the best match.
+        one_time_code = await _is_one_time_code_field(page, selector, text)
+        release_url = await _field_release_url(page, selector) if one_time_code else None
         collateral: list[list[str]] = []
         try:
             pick, pre_value, pre_own, reach = await _type_and_commit(
@@ -19820,7 +20619,7 @@ def build_browser_tools(
             # Nothing was picked either way, so the typed query comes back out and its list closes.
             await _restore_pre_type_value(page, selector, pre_value, [text])
             return pick.verdict
-        if reach != "click":
+        if reach not in ("click", "held"):
             # focus() without a click cannot show the field took the keystrokes: a segmented control
             # may move the caret to a sibling segment or drop the keys. So only a read-back that holds
             # the typed text counts as filled; anything else, including an unreadable field, is an
@@ -19833,6 +20632,8 @@ def build_browser_tools(
                 # its assembled value only on blur, so a read-back taken before the Tab reads it empty.
                 await asyncio.sleep(0.3)
                 reacted = await _find_suggestion_rows(page, selector, text, any_region=True) is not None
+            if not reacted and one_time_code and date_group is None:
+                return await _one_time_code_read_back(page, selector, text, release_url)
             if not reacted:
                 if (navigated := await _commit_with_tab(page, selector)) is not None:
                     return navigated
@@ -19946,9 +20747,14 @@ def build_browser_tools(
             )
         if pick.suggestion:
             suggestion = _model_text(pick.suggestion, 60)
+            if not pick.clicked:
+                return ToolResult.error(
+                    f"typed into {selector}; matched suggestion {suggestion!r} but the click on it did not land "
+                    "— nothing was selected",
+                    error_class="click_failed",
+                )
             verdict, matches = await _typeahead_commit_verdict(page, selector, pick.committed, pick.readable)
-            if pick.clicked:
-                _log_committed_pick(pick.suggestion, text, verdict, "type", pick.tier)
+            _log_committed_pick(pick.suggestion, text, verdict, "type", pick.tier)
             if verdict is CommitStatus.OK:
                 if pick.declared:
                     closed = await _close_lingering_typeahead_list(
@@ -20000,8 +20806,6 @@ def build_browser_tools(
                 f"clicked suggestion {suggestion!r} for {selector} but it did not commit — the field is NOT "
                 "filled; re-observe and retry, do not proceed"
             )
-            if not pick.clicked:
-                return ToolResult.error(message, error_class="click_failed")
             if verdict is CommitStatus.UNVERIFIED:
                 return ToolResult.error(message, error_class="commit_unread")
             return ToolResult.error(message, error_class="did_not_commit")
@@ -20012,6 +20816,8 @@ def build_browser_tools(
             date_error, *_ = await _settle_date_group(page, selector, text.strip(), date_group, echo=not text_is_secret)
             if date_error is not None:
                 return date_error
+        if one_time_code and not date_group:
+            return await _one_time_code_read_back(page, selector, text, release_url)
         # No suggestion list surfaced. The finder pierces open shadow roots, so it can see a list
         # inside one -- but not one the widget portals elsewhere in the page or renders in a
         # closed root, so inside a component this is still not evidence of absence. Saying
@@ -20125,8 +20931,8 @@ def build_browser_tools(
             # row, a spinner) the rows are still coming, so the poll wait extends — production pods run
             # at a fraction of a vCPU and a fetch that renders instantly on a laptop lands seconds later
             # there. The extension is bounded: a permanently-busy page stops at the hard cap.
-            soft_deadline = time.monotonic() + 2.4
-            hard_deadline = time.monotonic() + 8.0
+            soft_deadline = time.monotonic() + _LIST_POLL_SOFT_S
+            hard_deadline = time.monotonic() + _LIST_POLL_HARD_S
             while True:
                 await asyncio.sleep(0.4)
                 try:
@@ -20671,8 +21477,8 @@ def build_browser_tools(
                 return first in v.casefold() and v != cleared
 
             seen = await _box_value()
-            land_soft = time.monotonic() + 2.4
-            land_hard = time.monotonic() + 8.0
+            land_soft = time.monotonic() + _LIST_POLL_SOFT_S
+            land_hard = time.monotonic() + _LIST_POLL_HARD_S
             while not _landed(seen):
                 await asyncio.sleep(0.3)
                 prev, seen = seen, await _box_value()
@@ -20706,8 +21512,8 @@ def build_browser_tools(
             rival_texts: list[str] = []
             # Same budget as the open poll: a read that misses may be a placeholder row or a filter still in
             # flight, so the wait ends only past the deadline on a settled, not-busy read.
-            soft_deadline = time.monotonic() + 2.4
-            hard_deadline = time.monotonic() + 8.0
+            soft_deadline = time.monotonic() + _LIST_POLL_SOFT_S
+            hard_deadline = time.monotonic() + _LIST_POLL_HARD_S
             while True:
                 await asyncio.sleep(0.3)
                 filtered, complete, fresh = await _read_rows()
@@ -21140,9 +21946,14 @@ def build_browser_tools(
             clicked: bool,
             tier: Tier | None = None,
         ) -> ToolResult:
+            if not clicked:
+                return ToolResult.error(
+                    f"matched suggestion {_model_text(opt_txt, 60)!r} for {selector} but the click on it did not "
+                    "land — nothing was selected",
+                    error_class="click_failed",
+                )
             verdict, matches = await _typeahead_commit_verdict(page, selector, committed, readable)
-            if clicked:
-                _log_committed_pick(opt_txt, value, verdict, "typeahead", tier)
+            _log_committed_pick(opt_txt, value, verdict, "typeahead", tier)
             opt_txt = _model_text(opt_txt, 60)
             if verdict is CommitStatus.OK:
                 if declared:
@@ -21176,8 +21987,6 @@ def build_browser_tools(
                         "re-observe to confirm the value before relying on it"
                     )
             message = f"selected suggestion {opt_txt!r} but {selector} did not commit a value"
-            if not clicked:
-                return ToolResult.error(message, error_class="click_failed")
             if verdict is CommitStatus.UNVERIFIED:
                 return ToolResult.error(message, error_class="commit_unread")
             return ToolResult.error(message, error_class="did_not_commit")
@@ -21230,12 +22039,13 @@ def build_browser_tools(
         # with that row, which is what makes a retry converge on a widget that searches something
         # other than the text it renders.
         ladder_rung: str | None = None
+        ladder_click_landed = False
 
         async def _reduced_query_ladder() -> ToolResult | list[dict[str, Any]]:
             # Walk the rungs until one renders rows. A row whose whole label IS the requested value
             # commits; anything else is reported, never guessed — the rows a looser query revealed are
             # the field's own vocabulary, which is what a caller needs to name the right label.
-            nonlocal ladder_rung
+            nonlocal ladder_rung, ladder_click_landed
             for rung in _reduced_queries():
                 typed_queries.append(rung)
                 if selector in _live_row_offers:
@@ -21261,6 +22071,7 @@ def build_browser_tools(
                     await _restore_pre_type_value(page, selector, pre_value, typed_queries)
                     return rung_pick.verdict
                 if rung_pick.suggestion is not None:
+                    ladder_click_landed = rung_pick.clicked
                     return await _typeahead_verdict_result(
                         rung_pick.suggestion,
                         rung_pick.committed,
@@ -21519,6 +22330,8 @@ def build_browser_tools(
                 ):
                     return laddered
                 await _restore_pre_type_value(page, selector, pre_value, typed_queries)
+                if isinstance(laddered, ToolResult) and ladder_click_landed:
+                    return laddered
             verdict = with_tier_note(
                 await _typeahead_verdict_result(
                     pick.suggestion,
@@ -21877,8 +22690,8 @@ def build_browser_tools(
             data["nav_revisit"] = True
         _recent_nav_canonicals.append(pre_nav_canonical)
         _recent_nav_canonicals.append(landed_canonical)
-        # A hard 404/410 landing is a dead/removed target: flag it so the loop ends the run as
-        # terminated (v1's behavior) rather than defaulting the outcome to failed. The landing URL rides
+        # A hard 404/410 landing is a dead/removed target: flag it so the loop logs it and, on the granted
+        # final turn, ends the run as terminated (v1's behavior). The landing URL rides
         # along because the loop's verdict names the dead page to the customer, and only this call knows
         # where the status came from -- after a redirect that is not the URL it was asked for.
         if response is not None and response.status in NAVIGATION_DEAD_END_STATUSES:
@@ -22299,7 +23112,7 @@ def build_browser_tools(
         # getAttribute or querySelectorAll cannot talk this into adopting a value it planted.
         token = ""
         try:
-            existing = await handle.get_attribute("data-tv3-act")
+            existing = await _act_token(handle)
         except Exception:
             existing = None
         if existing and _act_token_re.fullmatch(existing):
@@ -22326,7 +23139,7 @@ def build_browser_tools(
                 # but not sufficient -- the same trap can write it to a decoy AS WELL -- so the
                 # engine also has to agree the token has exactly one holder. This resolver must
                 # never hand back an ambiguous selector, whatever the callers downstream check.
-                if await handle.get_attribute("data-tv3-act") != minted:
+                if await _act_token(handle) != minted:
                     return None
                 if await _holders(target, f'{_ACT_SELECTOR_PREFIX}{minted}"]') != 1:
                     return None
@@ -22439,13 +23252,23 @@ def build_browser_tools(
                     return error
                 # A failed mark resolution spent real time looking; the phase guard reports it
                 # rather than hiding exactly the failure cost this field exists to price.
-                selector, mark_error = await _resolve_mark(page, mark_int)
+                try:
+                    async with under_action_deadline(budget_ms=_ADDRESS_RESOLVE_TIMEOUT_MS):
+                        selector, mark_error = await _resolve_mark(page, mark_int)
+                except ActionDeadlineExceeded:
+                    raise ToolRefusal(
+                        f"mark {mark_int} did not resolve within {_ADDRESS_RESOLVE_TIMEOUT_MS // 1000} s; the page "
+                        "may have navigated or stopped responding. Call look() again and act on a fresh number.",
+                        error_class="stale_mark",
+                    ) from None
                 if mark_error is not None:
                     raise ToolRefusal.of(mark_error)
                 # In place rather than into a copy: everything downstream reads this dict AFTER dispatch
                 # -- the persisted action's element_id, the submit watch, the repeat guard's key and the
                 # nudge's target -- and a copy leaves every one of them seeing only `mark`.
                 args["selector"] = selector
+                if (_look_manifest.get(mark_int) or {}).get("handle") is not None:
+                    _acted_handle[:] = [_look_manifest[mark_int]["handle"]]
                 # The THIRD caller with this shape, found by checking rather than by being told about it: the
                 # mark was resolved against THIS page, so letting preflight resolve again lets a popup that
                 # became the working page in between be the one acted on.
@@ -22458,6 +23281,7 @@ def build_browser_tools(
                 return await handler(args)
             finally:
                 _prefetched_page.clear()
+                _acted_handle.clear()
 
         return wrapped
 
@@ -22834,7 +23658,15 @@ def build_browser_tools(
                 if error is not None:
                     return error
                 ref = int(match.group(1))
-                resolved, ref_error = await _resolve_ref(page, ref)
+                try:
+                    async with under_action_deadline(budget_ms=_ADDRESS_RESOLVE_TIMEOUT_MS):
+                        resolved, ref_error = await _resolve_ref(page, ref)
+                except ActionDeadlineExceeded:
+                    raise ToolRefusal(
+                        f"ref={ref} did not resolve within {_ADDRESS_RESOLVE_TIMEOUT_MS // 1000} s; the page may have "
+                        "navigated or stopped responding. Call observe() again and act on a fresh ref.",
+                        error_class="stale_ref",
+                    ) from None
                 if ref_error is not None:
                     raise ToolRefusal.of(ref_error)
                 _owner = (_observe_manifest.get(ref) or {}).get("owner")
@@ -22851,6 +23683,17 @@ def build_browser_tools(
                 _prefetched_page.append(page)
                 if _owner is not None:
                     _acted_realm[:] = [_owner]
+                if _entry.get("handle") is not None:
+                    _acted_handle[:] = [_entry["handle"]]
+                if _entry.get("selector"):
+                    _acted_rebind[:] = [
+                        (
+                            str(_entry["selector"]),
+                            str(_entry.get("tag") or "").lower(),
+                            str(_entry.get("document") or ""),
+                            _entry,
+                        )
+                    ]
                 # Resolution ends here, before the act. The latch makes this the reading the phase
                 # guard below reports, so the handler's own time is never billed to resolution.
                 record()
@@ -22865,6 +23708,8 @@ def build_browser_tools(
                     return result
                 finally:
                     _acted_realm.clear()
+                    _acted_handle.clear()
+                    _acted_rebind.clear()
                     _prefetched_page.clear()
                     # ...but those readers run turns LATER, and the act token is a stamp on one node: a
                     # control the page REPLACES after the act -- a submit button swapped for its
@@ -22969,14 +23814,64 @@ def build_browser_tools(
         page, error = await _resolve_page()
         if error is not None:
             return error
-        raw = await asyncio.wait_for(
-            _evaluate_isolated(page, _TARGET_NAME_JS, str(args.get("selector") or "")), _TARGET_NAME_TIMEOUT_SECONDS
-        )
+        selector = await _rendered_target(page, str(args.get("selector") or ""), mirrored=True)
+        raw = await asyncio.wait_for(_evaluate_isolated(page, _TARGET_NAME_JS, selector), _TARGET_NAME_TIMEOUT_SECONDS)
         return ToolResult.ok("", data=raw if isinstance(raw, dict) else {})
 
     _resolve_answer_target = _with_act_by_mark(
         _with_ref_resolution("answer_probe", _with_selector_guard(_answer_target))
     )
+
+    async def _layer_target(args: dict[str, Any]) -> ToolResult:
+        page, error = await _resolve_page()
+        if error is not None:
+            return error
+        selector = await _typing_target(page, str(args.get("selector") or ""))
+        arg = await _probe_arg(page, selector)
+        try:
+            probe = await _probe_evaluate(page, _TYPING_REACH_PROBE_JS, selector, arg)
+        except Exception:
+            probe = None
+        finally:
+            if arg["el"] is not None:
+                with contextlib.suppress(Exception):
+                    await arg["el"].dispose()
+        isolated = _probe_was_isolated() is True
+        return ToolResult.ok(
+            "", data={"probe": probe if isinstance(probe, dict) else None, "isolated": isolated, "selector": selector}
+        )
+
+    _resolve_layer_target = _with_act_by_mark(_with_ref_resolution("layer_probe", _with_selector_guard(_layer_target)))
+
+    async def _type_layer_check(args: dict[str, Any], lease: BlockingLayer) -> tuple[LayerCheck, ToolResult | None]:
+        """Whether this type's own target is refused right now by the leased layer, read with the probe the full
+        typing path runs. Only a fresh reading naming the same layer node in the same state holds the call."""
+        resolved = dict(args)
+        try:
+            data = (await asyncio.wait_for(_resolve_layer_target(resolved), _LAYER_CHECK_TIMEOUT_SECONDS)).data or {}
+        except Exception:
+            return LayerCheck.OTHER, None
+        probe = data.get("probe")
+        if not data.get("isolated") or not isinstance(probe, dict) or not probe.get("exists"):
+            return LayerCheck.OTHER, None
+        if not probe.get("occluded") or probe.get("skinned"):
+            return LayerCheck.REACHABLE, None
+        occluder = probe.get("occluder")
+        if probe.get("unrendered") or probe.get("readOnly") or probe.get("disabled") or not isinstance(occluder, dict):
+            return LayerCheck.OTHER, None
+        if occluder.get("layerToken") != lease.token or occluder.get("layerState") != lease.state:
+            return LayerCheck.OTHER, None
+        refusal = _covered_error(str(data.get("selector") or ""), occluder)
+        if (refusal.data or {}).get(BLOCKING_LAYER_DATA_KEY) != lease:
+            return LayerCheck.OTHER, None
+        # A held call stands in for the full one, so it leaves the address the way the full path's ref and mark
+        # wrappers leave it: the loop's repeat guard keys the call on these args after dispatch.
+        for key in ("selector", "mark"):
+            if key in resolved:
+                args[key] = resolved[key]
+            else:
+                args.pop(key, None)
+        return LayerCheck.SAME, refusal
 
     async def _answer_field(args: dict[str, Any]) -> tuple[str, str, str, bool]:
         resolved = dict(args)
@@ -22996,7 +23891,8 @@ def build_browser_tools(
         ),
         _spec(
             "get_html",
-            "Get raw outer/inner HTML of the page or a specific element (for detail beyond observe), or "
+            "Get the raw HTML of the page, or with a selector that element's own markup: its tag and "
+            "attributes plus everything inside it (for detail beyond observe). Or "
             'with format "text" its rendered visible text instead - what a user sees, no markup. Both '
             f"are capped at {HTML_MAX_CHARS} chars per call; a cut result reports the total size and the "
             "offset that continues the read, so a page larger than one call is read in parts.",
@@ -23204,6 +24100,10 @@ def build_browser_tools(
             # Innermost of the selector wrappers: outside it the selector may still be a mark=N/ref=N
             # handle or an unnormalized `#id`, neither of which the probe can resolve.
             _tool_spec.handler = _with_target_label(_tool_spec.handler)
+        if _tool_spec.name in _INERT_DIAGNOSIS_TOOL_NAMES:
+            _tool_spec.handler = _with_rendered_target(
+                _tool_spec.handler, mirrored=_tool_spec.name in ("type", "select_combobox")
+            )
         if _tool_spec.name in PREFLIGHT_TOOL_NAMES:
             _tool_spec.handler = _with_preflight(_tool_spec.name, _tool_spec.handler, page_provider, _prefetched_page)
         if (
@@ -23234,9 +24134,13 @@ def build_browser_tools(
             _tool_spec.address_probe = _click_address
         elif _tool_spec.name == "type":
             _tool_spec.answer_probe = _answer_field
+            _tool_spec.layer_probe = _type_layer_check
+        if _tool_spec.name in ("click", "type"):
+            # Inside the text-delta and download wrappers applied below, so it never cuts a download wait short.
+            _tool_spec.handler = _with_act_deadline(_tool_spec.name, _tool_spec.handler)
     # Inside the download signal, so download lines and failures follow the page-text delta.
     _apply_text_delta(tools)
-    _apply_download_signal(tools, downloads_dir, download_failures, download_wait)
+    _apply_download_signal(tools, downloads_dir, download_failures, download_wait, page_provider)
     if unseen_text is not None:
         unseen_text.unreported = _unreported_text
     return tools
@@ -23563,6 +24467,7 @@ _DOWNLOAD_FAILURE_RESOURCE_TYPES = frozenset({"xhr", "fetch"})
 _DOWNLOAD_FAILURE_SETTLE_SECONDS = 2.5
 _SESSION_DOWNLOAD_LIST_TIMEOUT_SECONDS = 2.0
 DOWNLOAD_NO_FILE_THIS_ACTION = "No file downloaded during this action."
+_BLOCKED_INLINE_FRAME_BASELINE_TIMEOUT_SECONDS = 5.0
 DOWNLOAD_NO_SESSION_FILE_YET = "No file has reached the browser session's storage yet."
 _DOWNLOAD_FAILURE_URL_MAX = 120
 _DOWNLOAD_NAME_WAIT_SECONDS = 1.0
@@ -23809,11 +24714,15 @@ def _apply_download_signal(
     downloads_dir: str | None,
     failure_watch: DownloadFailureWatch | None = None,
     download_wait: Callable[[], Awaitable[None]] | None = None,
+    page_provider: PageProvider | None = None,
 ) -> None:
     """Wrap every tool so the next wrapped result reports files landing in `downloads_dir` and failures `failure_watch`
     saw. A billable call, or one that leaves a download in flight, first awaits `download_wait` so it names its file."""
     if not downloads_dir and failure_watch is None:
         return
+    # Only a block the engine built a download wait for: elsewhere the per-call iframe enumeration
+    # below would be paid by every click for a recovery that has no file to stand in for.
+    recover_blocked_frames = bool(downloads_dir) and download_wait is not None and page_provider is not None
 
     seen_completed: set[str] = set()
     seen_started: set[str] = set()
@@ -23877,6 +24786,60 @@ def _apply_download_signal(
             session_baselined = True
             return None
         return listed
+
+    def _landed_a_file_this_call(session_files: list[str] | None) -> bool:
+        completed, in_progress = _list_split()
+        return (
+            any(name not in seen_completed for name in completed)
+            or bool(in_progress)
+            or any(uri not in seen_session for uri in session_files or ())
+        )
+
+    async def _inline_iframe_baseline() -> tuple[Any, list[str]] | None:
+        """The page and its iframe srcs before the call, which the recovery below attributes a frame by."""
+        assert page_provider is not None
+        try:
+            page = await page_provider()
+            if page is None:
+                return None
+            # Unlike v1's once-per-download-action read, this runs before every may-submit call on a
+            # download block, so it is bounded: enumeration is one evaluate per frame, and a frame
+            # that will not answer must delay the click itself by a known amount, not by its own timeout.
+            async with asyncio.timeout(_BLOCKED_INLINE_FRAME_BASELINE_TIMEOUT_SECONDS):
+                return page, await _collect_inline_iframe_src_candidates(page)
+        except Exception:
+            LOG.info("taskv3 inline iframe baseline failed", exc_info=True)
+            return None
+
+    async def _recover_blocked_inline_pdf(baseline: tuple[Any, list[str]]) -> None:
+        """Save a PDF this call rendered in a frame the browser refused to display, so the lines below name it.
+
+        The target downloads fine; it just cannot be framed, so no download event ever fires and
+        nothing reaches `downloads_dir`. v1 recovers the bytes same-origin from the refused frame's
+        own src (SKY-12559); writing them into `downloads_dir` here rejoins the same reporting,
+        settle and finalize path a browser download takes.
+        """
+        assert page_provider is not None and downloads_dir
+        baseline_page, iframe_srcs_before = baseline
+        context = skyvern_context.current()
+        try:
+            page = await page_provider()
+            # A call that took the working page somewhere else (a popup it opened, a page it closed)
+            # leaves a baseline that belongs to a document this one no longer holds, so nothing in the
+            # page we can read now is attributable to it.
+            if page is None or page is not baseline_page:
+                return
+            # One whole-operation budget over every candidate fetch, as v1 caps it: a hung
+            # same-origin server must not out-wait the loop this recovery backstops.
+            async with asyncio.timeout(_BLOCKED_INLINE_PDF_RECOVERY_TIMEOUT_SECONDS):
+                await _recover_blocked_inline_pdf_download(
+                    page,
+                    Path(downloads_dir),
+                    workflow_run_id=context.workflow_run_id if context is not None else None,
+                    iframe_srcs_before=iframe_srcs_before,
+                )
+        except Exception:
+            LOG.warning("taskv3 blocked-inline PDF recovery failed", exc_info=True)
 
     def _with_file_lines(
         result: ToolResult, compactable: bool, page_names: Mapping[str, str], session_files: list[str]
@@ -23963,6 +24926,10 @@ def _apply_download_signal(
                     except Exception:
                         LOG.warning("taskv3 download signal baseline snapshot failed", tool=_tool_name, exc_info=True)
                     baseline["done"] = True
+            # Before the handler: a frame already on the page is not the one this call opened.
+            iframe_baseline = (
+                await _inline_iframe_baseline() if recover_blocked_frames and _may_submit(_tool_name, args) else None
+            )
             call = await failure_watch.begin() if failure_watch is not None else 0
             try:
                 result = await _handler(args)
@@ -23990,6 +24957,9 @@ def _apply_download_signal(
                 if landed:
                     page_names = await failure_watch.page_names(landed)
             session_files = await _new_session_files()
+            # Last, after every signal that a file did arrive: a recovery is for the call that got none.
+            if iframe_baseline is not None and not _landed_a_file_this_call(session_files):
+                await _recover_blocked_inline_pdf(iframe_baseline)
             reported = True
             try:
                 result, reported = _with_file_lines(result, _compactable, page_names, session_files or [])

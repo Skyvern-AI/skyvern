@@ -1,6 +1,6 @@
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, PrivateAttr
 
 from skyvern.webeye.string_util import remove_whitespace
 
@@ -22,6 +22,7 @@ class ActionResult(BaseModel):
     # when no file was received. Set only by the download flow on the no-file path, and never when a file
     # actually downloaded. Carries no URL, host, header, or body — just the integer status.
     download_failure_status: int | None = None
+    _attributed_download_failure_status: int | None = PrivateAttr(default=None)
     # None is used for old data so that we can differentiate between old and new data which only has boolean
     interacted_with_sibling: bool | None = None
     interacted_with_parent: bool | None = None
@@ -40,6 +41,13 @@ class ActionResult(BaseModel):
     # e.g. a ui-select closed template omitting an identifier the row carries). Both stay None unless a selection lands.
     committed_option: str | None = None
     committed_value: str | None = None
+
+    @property
+    def attributed_download_failure_status(self) -> int | None:
+        return self._attributed_download_failure_status
+
+    def mark_download_failure_attributed(self, status: int) -> None:
+        self._attributed_download_failure_status = status
 
     def __str__(self) -> str:
         results = [f"ActionResult(success={self.success}"]
@@ -149,7 +157,7 @@ class ActionAbort(ActionResult):
         )
 
 
-# The tool-result text a tool caller (e.g. Yutori Navigator) must see when an action was skipped
+# The tool-result text a tool caller (e.g. Anthropic CUA) must see when an action was skipped
 # because its target went stale: the action did NOT run, so the model must re-observe and re-plan
 # rather than assume it executed. Generic, carries no customer or DOM text.
 STALE_TARGET_TOOL_RESULT = (

@@ -22,6 +22,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     is_external_cdp_session_open,
     seconds_until_external_deadline,
 )
+from skyvern.forge.sdk.services.request_principal import get_request_principal
 from skyvern.schemas.browser_settings import BrowserSettings, BrowserSettingsReceipt
 
 LOG = structlog.get_logger()
@@ -57,6 +58,9 @@ class BrowserSessionResponse(BaseModel):
         None,
         description="Url for connecting to the browser",
         examples=["http://localhost:9222", "https://3.12.10.11/browser/123456"],
+    )
+    browser_address_redacted: bool = Field(
+        False, description="Whether the browser address was withheld because this caller cannot connect"
     )
     app_url: str | None = Field(
         None,
@@ -155,9 +159,12 @@ class BrowserSessionResponse(BaseModel):
         download_path = (
             f"/app/downloads/{browser_session.organization_id}/{browser_session.persistent_browser_session_id}"
         )
+        artifacts_accessible = not storage or await app.AGENT_FUNCTION.can_access_browser_session_artifacts(
+            get_request_principal(), browser_session.organization_id, browser_session.persistent_browser_session_id
+        )
         downloaded_files: list[FileInfo] = []
         recordings: list[FileInfo] = []
-        if storage:
+        if storage and artifacts_accessible:
 
             async def list_downloads() -> list[FileInfo]:
                 try:
@@ -220,16 +227,18 @@ class BrowserSessionResponse(BaseModel):
             # Treat None as "oldest".
             recordings.sort(key=lambda f: (f.modified_at is not None, f.modified_at), reverse=True)
 
-        browser_address = await app.AGENT_FUNCTION.resolve_browser_session_connect_url(
-            organization_id=browser_session.organization_id,
-            browser_session_id=browser_session.persistent_browser_session_id,
-            browser_address=browser_session.browser_address,
-            # A registered external browser is dialed only in-process, never minted a router URL.
-            upstream_cdp_url=None if is_external_cdp_session(browser_session) else browser_session.upstream_cdp_url,
-        )
+        browser_address = None
+        if artifacts_accessible:
+            browser_address = await app.AGENT_FUNCTION.resolve_browser_session_connect_url(
+                organization_id=browser_session.organization_id,
+                browser_session_id=browser_session.persistent_browser_session_id,
+                browser_address=browser_session.browser_address,
+                # A registered external browser is dialed only in-process, never minted a router URL.
+                upstream_cdp_url=None if is_external_cdp_session(browser_session) else browser_session.upstream_cdp_url,
+            )
 
         stream_transport: str | None = None
-        if include_stream_transport:
+        if include_stream_transport and artifacts_accessible:
             # The response contract admits exactly two transport words; anything else a resolver
             # produces is withheld rather than serialized to clients.
             stream_transport = await app.AGENT_FUNCTION.resolve_stream_transport(
@@ -255,7 +264,9 @@ class BrowserSessionResponse(BaseModel):
             runnable_id=browser_session.runnable_id,
             timeout=browser_session.timeout_minutes,
             browser_address=browser_address,
-            vnc_streaming_supported=bool(browser_session.ip_address or browser_session.browser_address)
+            browser_address_redacted=not artifacts_accessible,
+            vnc_streaming_supported=artifacts_accessible
+            and bool(browser_session.ip_address or browser_session.browser_address)
             and await app.AGENT_FUNCTION.supports_live_view(
                 browser_session.persistent_browser_session_id,
                 ip_address=browser_session.ip_address,
@@ -268,8 +279,8 @@ class BrowserSessionResponse(BaseModel):
             modified_at=browser_session.modified_at,
             deleted_at=browser_session.deleted_at,
             download_path=download_path,
-            downloaded_files=downloaded_files,
-            recordings=recordings,
+            downloaded_files=downloaded_files if artifacts_accessible else None,
+            recordings=recordings if artifacts_accessible else None,
             extensions=browser_session.extensions,
             browser_type=browser_session.browser_type,
             browser_profile_id=browser_session.browser_profile_id,

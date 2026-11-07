@@ -29,6 +29,7 @@ from skyvern.forge.sdk.copilot.turn_halt import (
     raise_if_turn_halt,
     stash_turn_halt_from_blocker_signal,
 )
+from skyvern.forge.sdk.integrations.catalog import listed_oauth_accounts
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.context import CopilotContext
@@ -199,17 +200,10 @@ class CopilotRunHooks(RunHooksBase):
                 if not listed and isinstance(exact, dict):
                     listed = [exact]
                 vault_logins = data.get("vault_logins") if isinstance(data, dict) else None
-                exact_vault_login = data.get("vault_login") if isinstance(data, dict) else None
-                if not isinstance(vault_logins, list):
-                    vault_logins = [exact_vault_login] if isinstance(exact_vault_login, dict) else []
                 resolved = [
                     {"credential_id": c.get("credential_id"), "name": c.get("name")}
-                    for c in listed
+                    for c in [*listed, *(vault_logins if isinstance(vault_logins, list) else [])]
                     if isinstance(c, dict) and isinstance(c.get("credential_id"), str)
-                ] + [
-                    {"credential_id": login.get("vault_login_id"), "name": login.get("title")}
-                    for login in vault_logins
-                    if isinstance(login, dict) and isinstance(login.get("vault_login_id"), str)
                 ]
                 if resolved:
                     activity_entry["credentials"] = resolved
@@ -217,21 +211,15 @@ class CopilotRunHooks(RunHooksBase):
             if tool_name == "list_integrations" and parsed.get("ok"):
                 data = parsed.get("data") or {}
                 listed = data.get("integrations", []) if isinstance(data, dict) else []
-                if not isinstance(listed, list):
-                    listed = []
                 integrations = [
                     {
-                        "connection_id": integration.get("connection_id"),
-                        "provider": integration.get("provider"),
-                        "state": integration.get("state"),
-                        "scopes_granted": integration.get("scopes_granted"),
+                        "connection_id": account["connection_id"],
+                        "provider": account["provider"],
+                        "state": account.get("state"),
+                        "scopes_granted": account.get("scopes_granted"),
                     }
-                    for integration in listed
-                    if isinstance(integration, dict)
-                    and isinstance(integration.get("connection_id"), str)
-                    and isinstance(integration.get("provider"), str)
-                    and isinstance(integration.get("state"), str)
-                    and isinstance(integration.get("scopes_granted"), list)
+                    for account in listed_oauth_accounts(listed if isinstance(listed, list) else [])
+                    if isinstance(account.get("state"), str) and isinstance(account.get("scopes_granted"), list)
                 ]
                 activity_entry["integrations"] = integrations
 

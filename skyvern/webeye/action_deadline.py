@@ -10,7 +10,7 @@ from typing import Any, TypeVar
 from skyvern.config import settings
 from skyvern.exceptions import ActionDeadlineExceeded
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.webeye.browser_health import BrowserOperation
+from skyvern.webeye.browser_health import BrowserOperation, FrameKind
 
 ACTION_DEADLINE_HEADROOM_MS = 5000
 DEADLINE_REARM_INTERVAL_SECONDS = 1.0
@@ -46,10 +46,12 @@ def raise_if_cancelled() -> None:
         raise asyncio.CancelledError
 
 
-def record_browser_timeout(operation: BrowserOperation = BrowserOperation.EVALUATE) -> None:
+def record_browser_timeout(
+    operation: BrowserOperation = BrowserOperation.EVALUATE, *, frame_kind: FrameKind | None = None
+) -> None:
     """Tally a strike for a call the caller bounded itself, so ``record_unreported_timeout`` does not
     mistake the synthesized timeout for one the engine tallied."""
-    skyvern_context.record_browser_timeout(operation)
+    skyvern_context.record_browser_timeout(operation, frame_kind=frame_kind)
 
 
 def _retrieve_outcome(call: asyncio.Task[Any]) -> None:

@@ -6,11 +6,18 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from os import PathLike, fspath
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import structlog
 
 from skyvern.config import settings
-from skyvern.forge.sdk.credential_site_policy import LoginSite, describe_release_scope, origin_of, same_release_scope
+from skyvern.forge.sdk.credential_site_policy import (
+    MAX_EXTRA_SITE_URLS,
+    LoginSite,
+    describe_release_scope,
+    origin_of,
+    same_release_scope,
+)
 
 LOG = structlog.get_logger()
 
@@ -113,6 +120,55 @@ async def _focused_frame_url(page: Any) -> str | None:
     return page.url
 
 
+def saved_site_urls(tested_url: str | None, extra_site_urls: Sequence[str] = ()) -> list[str]:
+    """The sites Skyvern holds for a login, tested URL first."""
+    return list(dict.fromkeys(url for url in (tested_url, *extra_site_urls) if url))
+
+
+def login_site_url(raw: str) -> str:
+    """An http(s) URL a login can be saved for, without query or fragment; raises ValueError otherwise."""
+    url = raw.strip()
+    parts = urlsplit(url)
+    if (
+        parts.scheme not in ("http", "https")
+        or parts.username is not None
+        or parts.password is not None
+        or describe_release_scope(url) is None
+    ):
+        raise ValueError("Not a website URL a login can be saved for")
+    return urlunsplit(parts._replace(query="", fragment=""))
+
+
+def normalize_extra_site_urls(tested_url: str | None, urls: Iterable[str]) -> list[str]:
+    """One login site URL per site, leaving out the tested URL's site; raises ValueError otherwise."""
+    kept: list[str] = []
+    for raw in urls:
+        if not tested_url:
+            raise ValueError("Save the login's tested URL before adding more sites")
+        url = login_site_url(raw)
+        if any(same_release_scope(url, other) for other in saved_site_urls(tested_url, kept)):
+            continue
+        if len(kept) == MAX_EXTRA_SITE_URLS:
+            raise ValueError(f"A login can sign in on at most {MAX_EXTRA_SITE_URLS} extra sites")
+        kept.append(url)
+    return kept
+
+
+def login_release_sites(
+    tested_url: str | None, vault_sites: Sequence[LoginSite] | None, extra_site_urls: Sequence[str] = ()
+) -> list[LoginSite] | None:
+    """Where a login's secrets may go: its vault item's readable sites, else the whole site of each URL it is saved
+    for. The item's sites come first because a tested URL saved later covers its whole site; None means unconfined."""
+    if vault_sites is not None:
+        return [site for site in vault_sites if describe_release_scope(site.url.strip()) is not None]
+    sites = [
+        LoginSite(url.strip(), whole_site=True)
+        for url in saved_site_urls(tested_url, extra_site_urls)
+        if describe_release_scope(url.strip()) is not None
+    ]
+    return sites or None
+
+
 class CodeBlockCredentialReleaseError(Exception):
     # Duck-typed marker consumed by the secure runner's transport map (same convention as
     # RecordingLocator._skyvern_brokerable_handle): a refusal must cross the protocol as a
@@ -176,20 +232,23 @@ class CredentialReleaseGuard:
         tested_url: str | None,
         vault_sites: Sequence[LoginSite] | None,
         enforce_vault_sites: bool,
+        extra_site_urls: Sequence[str] = (),
     ) -> list[ArmedSecret]:
-        """Arm a login's secrets against its tested URL, else its vault item's saved sites; returns what was armed."""
+        """Arm a login's secrets against its vault item's saved sites, else its saved URLs; returns what was armed.
+        Unenforced vault sites yield to an enforced saved URL, so only an untested login is armed log-only."""
         start = len(self._armed)
+        saved = saved_site_urls(tested_url, extra_site_urls)
+        use_vault_sites = vault_sites is not None and (enforce_vault_sites or not saved)
+        sites = login_release_sites(tested_url, vault_sites if use_vault_sites else None, extra_site_urls)
+        if sites is None:
+            return []
+        enforced = enforce_vault_sites if use_vault_sites else True
         for secret in secret_values:
-            if tested_url:
-                self.arm(secret, tested_url, parameter_key)
-            elif vault_sites is not None:
-                armed = False
-                for site in vault_sites:
-                    armed |= self.arm(
-                        secret, site.url, parameter_key, enforced=enforce_vault_sites, whole_site=site.whole_site
-                    )
-                if not armed:
-                    self.arm_siteless(secret, parameter_key, enforced=enforce_vault_sites)
+            armed = False
+            for site in sites:
+                armed |= self.arm(secret, site.url, parameter_key, enforced=enforced, whole_site=site.whole_site)
+            if not armed:
+                self.arm_siteless(secret, parameter_key, enforced=enforced)
         return self._armed[start:]
 
     @property

@@ -8,7 +8,7 @@ import re
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Any, Literal, cast, get_args
+from typing import Any, Literal, NamedTuple, cast, get_args
 
 import structlog
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -16,15 +16,14 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from skyvern.config import settings
 from skyvern.forge.log_redaction import redact_sensitive_fields
 from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
+from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler, handler_llm_key
+from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.copilot.ask_user import QuestionInteraction
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.context import ProposedCredential, StructuredContext
 from skyvern.forge.sdk.copilot.credential_resolution import (
-    ConnectedVault,
     CredentialResolution,
     CredentialResolutionTier,
-    connected_vault_login_sites,
 )
 from skyvern.forge.sdk.copilot.credential_resolution import deduplicate_credentials as _deduplicate_credentials
 from skyvern.forge.sdk.copilot.credential_resolution import (
@@ -32,12 +31,13 @@ from skyvern.forge.sdk.copilot.credential_resolution import (
 )
 from skyvern.forge.sdk.copilot.credential_resolution import load_credentials as _load_credentials
 from skyvern.forge.sdk.copilot.credential_resolution import (
-    load_credentials_by_ids,
     loggable_origin,
     resolve_by_url,
     unresolved_page_url_for_log,
 )
 from skyvern.forge.sdk.copilot.credential_resolution import url_parts as _url_parts
+from skyvern.forge.sdk.copilot.eval_llm_overrides import current_eval_llm_overrides
+from skyvern.forge.sdk.copilot.llm_config import WORKFLOW_COPILOT_RAW_SECRET_SAFETY_PROMPT_TYPE
 from skyvern.forge.sdk.copilot.reached_download_target import REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS
 from skyvern.forge.sdk.copilot.request_slots import (
     CanonicalRequestSlotV1,
@@ -47,6 +47,7 @@ from skyvern.forge.sdk.copilot.request_slots import (
     request_slot_source_text,
     request_slot_sources,
 )
+from skyvern.forge.sdk.copilot.router_fallback import router_fallback_llm_key
 from skyvern.forge.sdk.copilot.secret_redaction import (
     RAW_SECRET_PATTERNS,
     contains_email_password_pair,
@@ -54,24 +55,27 @@ from skyvern.forge.sdk.copilot.secret_redaction import (
     redact_raw_secrets_for_prompt,
 )
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
+from skyvern.forge.sdk.copilot.vault_logins import vault_login_credential, vault_login_ref
 from skyvern.forge.sdk.copilot.workflow_credential_utils import (
-    CONNECTED_VAULT_ID_PREFIX,
     URL_CANDIDATE_RE,
     bitwarden_secret_bindings,
     parse_workflow_yaml,
     workflow_credential_ids,
     workflow_credential_origins,
 )
-from skyvern.forge.sdk.credential_site_policy import LoginSite, same_release_scope
+from skyvern.forge.sdk.credential_site_policy import same_release_scope
 from skyvern.forge.sdk.schemas.credentials import Credential, TotpType
 from skyvern.forge.sdk.schemas.google_oauth import STATE_ACTIVE
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     TURN_OPENER_SENDERS,
     CopilotSteerMessage,
+    CredentialBinding,
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatSender,
 )
 from skyvern.forge.sdk.services import google_oauth_service
+from skyvern.forge.sdk.services.credential.credential_vault_service import VaultLogin, VaultLoginListing
+from skyvern.forge.sdk.workflow.models.credential_release import saved_site_urls
 from skyvern.forge.sdk.workflow.models.parameter import ParameterType
 from skyvern.schemas.google_sheets import extract_spreadsheet_id
 from skyvern.utils.strings import escape_code_fences
@@ -145,6 +149,7 @@ RawSecretSafetyFailureKind = Literal[
     "contradictory_verdict",
     "invalid_citation",
 ]
+RawSecretSafetyAnsweredBy = Literal["primary", "fallback", "none"]
 _RAW_SECRET_SAFETY_PROMPT_NAME = "workflow-copilot-raw-secret-safety"
 _RAW_SECRET_SAFETY_UNAVAILABLE_TURN = "[INPUT_UNAVAILABLE_SAFETY_SCREEN_INCOMPLETE]"
 _REDACTED_SECRET_PLACEHOLDER = "[REDACTED_SECRET]"
@@ -169,6 +174,8 @@ class _RawSecretSafetyScreen:
     exonerated_citation_count: int = 0
     failure_kind: RawSecretSafetyFailureKind = "none"
     latency_ms: float = 0.0
+    answered_by: RawSecretSafetyAnsweredBy = "none"
+    hedged: bool = False
 
 
 def _raw_secret_safety_verdict(raw: object) -> RawSecretSafetyVerdict | None:
@@ -207,6 +214,8 @@ def _validate_raw_secret_safety_verdict(
 def _screen_unavailable(
     failure_kind: RawSecretSafetyFailureKind,
     latency_ms: float = 0.0,
+    answered_by: RawSecretSafetyAnsweredBy = "none",
+    hedged: bool = False,
 ) -> _RawSecretSafetyScreen:
     return _RawSecretSafetyScreen(
         status="blocked",
@@ -214,6 +223,8 @@ def _screen_unavailable(
         handling="block",
         failure_kind=failure_kind,
         latency_ms=latency_ms,
+        answered_by=answered_by,
+        hedged=hedged,
     )
 
 
@@ -422,6 +433,101 @@ def _redact_cited_secrets(message: str, citations: list[str]) -> str:
     return "".join(pieces)
 
 
+def _raw_secret_safety_fallback_key(handler: LLMAPIHandler) -> str | None:
+    llm_key = handler_llm_key(handler)
+    overrides = current_eval_llm_overrides()
+    if (
+        not settings.COPILOT_RAW_SECRET_SAFETY_HEDGE_ENABLED
+        or llm_key is None
+        or (overrides is not None and handler is overrides.handlers.get(WORKFLOW_COPILOT_RAW_SECRET_SAFETY_PROMPT_TYPE))
+    ):
+        return None
+    fallback_key = router_fallback_llm_key(llm_key)
+    return fallback_key if fallback_key != llm_key else None
+
+
+class _RawSecretSafetyRace(NamedTuple):
+    verdict: RawSecretSafetyVerdict | None
+    failure_kind: RawSecretSafetyFailureKind
+    answered_by: RawSecretSafetyAnsweredBy
+    hedged: bool
+    latency_ms: float
+
+
+async def _race_raw_secret_safety(prompt: str, handler: LLMAPIHandler) -> _RawSecretSafetyRace:
+    started_at = time.monotonic()
+    deadline = started_at + settings.COPILOT_RAW_SECRET_SAFETY_TIMEOUT_SECONDS
+    hedge_at = started_at + settings.COPILOT_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS
+    fallback_key = _raw_secret_safety_fallback_key(handler)
+
+    async def _ask(leg_handler: LLMAPIHandler) -> object:
+        return await leg_handler(prompt=prompt, prompt_name=_RAW_SECRET_SAFETY_PROMPT_NAME)
+
+    primary = asyncio.create_task(_ask(handler))
+    legs: dict[asyncio.Task[object], RawSecretSafetyAnsweredBy] = {primary: "primary"}
+    pending: set[asyncio.Task[object]] = {primary}
+    hedged = False
+    failure_kind: RawSecretSafetyFailureKind = "timeout"
+    try:
+        while True:
+            if fallback_key is not None and (not pending or time.monotonic() >= hedge_at):
+                try:
+                    fallback_handler = LLMAPIHandlerFactory.get_llm_api_handler(fallback_key)
+                except Exception as exc:
+                    LOG.warning("raw-secret safety provider failed", exception_type=type(exc).__name__, leg="fallback")
+                    failure_kind = "provider_error"
+                else:
+                    fallback = asyncio.create_task(_ask(fallback_handler))
+                    legs[fallback] = "fallback"
+                    pending.add(fallback)
+                    hedged = True
+                fallback_key = None
+            if not pending:
+                return _RawSecretSafetyRace(None, failure_kind, "none", hedged, (time.monotonic() - started_at) * 1000)
+            wake_at = deadline if fallback_key is None else min(hedge_at, deadline)
+            done, pending = await asyncio.wait(
+                pending, timeout=max(0.0, wake_at - time.monotonic()), return_when=asyncio.FIRST_COMPLETED
+            )
+            if not done and time.monotonic() >= deadline:
+                return _RawSecretSafetyRace(None, "timeout", "none", hedged, (time.monotonic() - started_at) * 1000)
+            # A primary verdict that lands in the same wake-up as the fallback's wins.
+            for task in sorted(done, key=lambda finished: legs[finished] != "primary"):
+                leg_error = task.exception()
+                if leg_error is not None:
+                    LOG.warning(
+                        "raw-secret safety provider failed", exception_type=type(leg_error).__name__, leg=legs[task]
+                    )
+                    failure_kind = "provider_error"
+                    continue
+                verdict = _raw_secret_safety_verdict(task.result())
+                if verdict is not None:
+                    return _RawSecretSafetyRace(
+                        verdict, "none", legs[task], hedged, (time.monotonic() - started_at) * 1000
+                    )
+                failure_kind = "malformed_output"
+    finally:
+        for task in legs:
+            task.cancel()
+        await asyncio.gather(*legs, return_exceptions=True)
+
+
+def raw_secret_safety_log_fields(
+    screen: _RawSecretSafetyScreen, caller: Literal["chat_turn", "question_response", "steer"]
+) -> dict[str, str | int | float | bool]:
+    # Each caller logs these itself so the record keeps the caller's func_name.
+    return {
+        "status": screen.status,
+        "failure_kind": screen.failure_kind,
+        "citation_count": screen.citation_count,
+        "exonerated_citation_count": screen.exonerated_citation_count,
+        "handling": screen.handling,
+        "latency_ms": round(screen.latency_ms, 3),
+        "answered_by": screen.answered_by,
+        "hedged": screen.hedged,
+        "caller": caller,
+    }
+
+
 async def screen_raw_secret_safety(
     user_message: str,
     handler: LLMAPIHandler | None,
@@ -439,29 +545,17 @@ async def screen_raw_secret_safety(
     except Exception:
         return _screen_unavailable("malformed_output")
 
-    started_at = time.monotonic()
-    try:
-        raw = await asyncio.wait_for(
-            handler(prompt=prompt, prompt_name=_RAW_SECRET_SAFETY_PROMPT_NAME),
-            timeout=settings.COPILOT_RAW_SECRET_SAFETY_TIMEOUT_SECONDS,
-        )
-    except TimeoutError:
-        return _screen_unavailable("timeout", (time.monotonic() - started_at) * 1000)
-    except Exception as exc:
-        LOG.warning("raw-secret safety provider failed", exception_type=type(exc).__name__)
-        return _screen_unavailable("provider_error", (time.monotonic() - started_at) * 1000)
-
-    latency_ms = (time.monotonic() - started_at) * 1000
-    verdict = _raw_secret_safety_verdict(raw)
+    race = await _race_raw_secret_safety(prompt, handler)
+    verdict, answered_by, hedged, latency_ms = race.verdict, race.answered_by, race.hedged, race.latency_ms
     if verdict is None:
-        return _screen_unavailable("malformed_output", latency_ms)
+        return _screen_unavailable(race.failure_kind, latency_ms, answered_by, hedged)
     failure_kind = _validate_raw_secret_safety_verdict(
         verdict,
         original_user_message=user_message,
         screened_user_message=deterministic_safe_message,
     )
     if failure_kind != "none":
-        return _screen_unavailable(failure_kind, latency_ms)
+        return _screen_unavailable(failure_kind, latency_ms, answered_by, hedged)
 
     if verdict.state == "detected":
         cited = await _exonerate_saved_credential_citations(verdict.citations, organization_id)
@@ -474,6 +568,8 @@ async def screen_raw_secret_safety(
                 citation_count=len(cited),
                 exonerated_citation_count=exonerated,
                 latency_ms=latency_ms,
+                answered_by=answered_by,
+                hedged=hedged,
             )
         return _RawSecretSafetyScreen(
             status="clean",
@@ -481,6 +577,8 @@ async def screen_raw_secret_safety(
             handling="none",
             exonerated_citation_count=exonerated,
             latency_ms=latency_ms,
+            answered_by=answered_by,
+            hedged=hedged,
         )
 
     return _RawSecretSafetyScreen(
@@ -489,6 +587,8 @@ async def screen_raw_secret_safety(
         handling="none",
         citation_count=len(verdict.citations),
         latency_ms=latency_ms,
+        answered_by=answered_by,
+        hedged=hedged,
     )
 
 
@@ -547,23 +647,12 @@ _CREDENTIAL_ID_RE = re.compile(r"\bcred_[A-Za-z0-9][A-Za-z0-9_-]*\b")
 # A credential ID typed with the wrong separator (`cred 530…`, `cred-530…`). The
 # digit-only body and length floor keep this off prose like `cred and the password`.
 _MALFORMED_CREDENTIAL_ID_RE = re.compile(r"\bcred[ \t\-]+([0-9]{12,})\b")
-_JINJA_TEMPLATE_VAR_RE = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}")
-_CREDENTIAL_PARAM_METADATA_FIELDS = frozenset(
-    {
-        "parameter_type",
-        "key",
-        "description",
-        "workflow_id",
-        "created_at",
-        "modified_at",
-        "deleted_at",
-    }
-)
-_LOGIN_CREDENTIAL_REQUIRED_KEY_FIELDS = ("username_key", "password_key")
-_WORKFLOW_CREDENTIAL_INPUTS_UNBOUND_QUESTION = (
-    "I couldn't find the required credentials for the existing workflow. "
-    f"Please add them via the Credentials UI and I can try again. {_CREDENTIALS_UI_DIRECTIONS}"
-)
+# The login fields run-context init resolves as required (`_resolve_required_parameter_value` in context_manager).
+_WHOLE_FIELD_INPUT_RE = re.compile(r"\s*\{\{\s*([A-Za-z_]\w*)\s*\}\}\s*|([A-Za-z_]\w*)")
+_INIT_REQUIRED_VAULT_LOGIN_FIELDS: dict[str, tuple[str, ...]] = {
+    ParameterType.AZURE_VAULT_CREDENTIAL.value: ("vault_name", "username_key", "password_key"),
+    ParameterType.ONEPASSWORD.value: ("vault_id", "item_id"),
+}
 _INVALID_CONDITIONAL_CONTAINER_MARKERS = (
     "into the conditional",
     "inside the conditional",
@@ -964,8 +1053,8 @@ class RequestPolicy:
     completion_contract: str | None = None
     completion_criteria: list[CompletionCriterion] = field(default_factory=list)
     resolved_credentials: list[Credential] = field(default_factory=list)
-    # Credentials bound this turn without a user ask (deterministic URL/urlless resolution + live-page
-    # sole-match); read-only telemetry for the auto-bind receipt, never a run-authority source.
+    # Credentials bound this turn without a user ask (a live page's sole match, or a carried proposal
+    # seed); read-only telemetry for the auto-bind receipt, never a run-authority source.
     auto_bound_credentials: list[Credential] = field(default_factory=list)
     # credential_id -> the login page URL that granted it, so each later fill can confirm the
     # browser has not left that site and a redirect cannot inherit the grant.
@@ -976,6 +1065,8 @@ class RequestPolicy:
     # turn admitted. Without it the recorder cannot tell its own hydration from fresh evidence and
     # re-mints the carry every turn, so it never expires.
     seeded_proposal_credential_ids: set[str] = field(default_factory=set)
+    # Seeds whose saved URL matched the page; a seed from an executed fill only says a fill ran there.
+    seeded_url_matched_credential_ids: set[str] = field(default_factory=set)
     # Ids whose citation passed on the carry this turn. Whether that stands as the user's answer is
     # settled at turn end. Kept apart from current_turn_named_credential_ids, whose claim is that
     # the user wrote the identifier out themselves.
@@ -993,6 +1084,8 @@ class RequestPolicy:
     raw_secret_safety_citation_count: int = 0
     raw_secret_safety_exonerated_citation_count: int = 0
     raw_secret_safety_latency_ms: float = 0.0
+    raw_secret_safety_answered_by: RawSecretSafetyAnsweredBy = "none"
+    raw_secret_safety_hedged: bool = False
     clarification_reason: ClarificationReason = "none"
     # The validated login URLs the credential card asked the user to select a login for. The
     # connected resume falls back to classifier-authored login_page_urls when this is empty.
@@ -1013,6 +1106,9 @@ class RequestPolicy:
     # The site each approval or proposal carried in from an earlier turn recorded. Naming the credential
     # again drops it from live_page_admitted_urls, so the pick card reads it here.
     carried_credential_urls: dict[str, str] = field(default_factory=dict)
+    # credential_id -> origins the user saved the login for from a site question this turn, read back from the
+    # re-read row; an existing workflow's blocks may move onto them without broadening the login's scope.
+    user_confirmed_site_origins: dict[str, set[str]] = field(default_factory=dict)
     # Sites the user themselves provided anywhere in this chat, one URL per origin. A credential may
     # only be released onto one of these (or a vault/tested match); a site only a model produced is
     # never eligible.
@@ -1059,11 +1155,57 @@ class RequestPolicy:
     # excluded from traces and comparisons: it must describe only the latest literal user turn,
     # even when the agent input later expands terse replies with earlier context.
     canonical_user_message: str = field(default="", repr=False, compare=False)
-    # This turn's one successful read of the organization's connected Bitwarden vault; each read force-syncs it.
-    connected_vault: ConnectedVault | None = field(default=None, repr=False, compare=False)
-    # Whole-site URIs read from each vault login's own item: the only thing that places it on a site.
-    connected_vault_sites: dict[str, list[LoginSite]] = field(default_factory=dict, repr=False, compare=False)
+    # This turn's listing of the organization's vault logins, by id, and the listing that read them.
+    vault_logins: dict[str, VaultLogin] | None = field(default=None, repr=False, compare=False)
+    vault_listing: VaultLoginListing | None = field(default=None, repr=False, compare=False)
     _authoring_pending: bool = field(default=False, repr=False, compare=False)
+
+    def adopt_imported_vault_login(self, ref: str, credential_id: str) -> None:
+        """Move what this turn recorded for a listed vault login onto the saved credential it was imported as."""
+        if self.vault_logins is not None and ref in self.vault_logins:
+            login = replace(self.vault_logins[ref], credential_id=credential_id)
+            self.vault_logins[ref] = self.vault_logins[credential_id] = login
+        for credentials in (self.resolved_credentials, self.auto_bound_credentials, self.discovered_credentials):
+            for index, credential in enumerate(credentials):
+                if credential.credential_id == ref:
+                    credentials[index] = credential.model_copy(update={"credential_id": credential_id})
+        for ids in (self.current_turn_named_credential_ids, self.seeded_proposal_credential_ids):
+            if ref in ids:
+                ids.discard(ref)
+                ids.add(credential_id)
+        for urls in (self.live_page_admitted_urls, self.carried_credential_urls):
+            if ref in urls:
+                urls[credential_id] = urls.pop(ref)
+
+    def refresh_credential(self, credential: Credential) -> None:
+        """Swap in a re-read row wherever this turn holds the credential, so its saved sites are current."""
+        for credentials in (self.resolved_credentials, self.auto_bound_credentials, self.discovered_credentials):
+            for index, held in enumerate(credentials):
+                if held.credential_id == credential.credential_id:
+                    credentials[index] = credential
+
+    def credential_saved_site_urls(self, credential_id: str) -> list[str]:
+        return next(
+            (
+                saved_site_urls(credential.tested_url, credential.extra_site_urls)
+                for credential in self.resolved_credentials
+                if credential.credential_id == credential_id
+            ),
+            [],
+        )
+
+    def credential_intended_url(self, credential_id: str) -> str | None:
+        admitted_url = self.live_page_admitted_urls.get(credential_id)
+        if admitted_url:
+            return admitted_url
+        return next(
+            (
+                credential.tested_url
+                for credential in self.resolved_credentials
+                if credential.credential_id == credential_id and credential.tested_url
+            ),
+            None,
+        )
 
     def project_question_response_sites(self, interaction: QuestionInteraction) -> None:
         project_question_response_sites(self, interaction)
@@ -1154,6 +1296,8 @@ class RequestPolicy:
             "raw_secret_safety_exonerated_citation_count": self.raw_secret_safety_exonerated_citation_count,
             "named_login_not_found": self.named_login_not_found,
             "raw_secret_safety_latency_ms": round(self.raw_secret_safety_latency_ms, 3),
+            "raw_secret_safety_answered_by": self.raw_secret_safety_answered_by,
+            "raw_secret_safety_hedged": self.raw_secret_safety_hedged,
             "classifier_status": self.classifier_status,
             "classifier_failure_kind": self.classifier_failure_kind,
             "classifier_retry_count": self.classifier_retry_count,
@@ -1298,6 +1442,31 @@ def _defer_authoring_durable_fill_criterion() -> CompletionCriterion:
         method_mandated=True,
         level="run",
     )
+
+
+CREDENTIAL_BINDING_FACTS: dict[CredentialBinding, str] = {
+    "saved_workflow": "The saved workflow binds this credential.",
+    "matched_by_saved_url": (
+        "The saved workflow does not bind this credential; it was matched to this sign-in page by its saved URL."
+    ),
+    "not_bound": "The saved workflow does not bind this credential.",
+}
+
+
+def credential_binding(policy: RequestPolicy, credential_id: str) -> CredentialBinding:
+    if credential_id in policy.persisted_workflow_credential_ids:
+        return "saved_workflow"
+    chosen_by_user = policy.current_turn_named_credential_ids | policy.credential_pause_connected_credential_ids
+    if credential_id in chosen_by_user or not any(
+        credential.credential_id == credential_id for credential in policy.auto_bound_credentials
+    ):
+        return "not_bound"
+    if (
+        credential_id not in policy.seeded_proposal_credential_ids
+        or credential_id in policy.seeded_url_matched_credential_ids
+    ):
+        return "matched_by_saved_url"
+    return "not_bound"
 
 
 def credential_prompt_reason(policy: RequestPolicy | None) -> str | None:
@@ -4259,6 +4428,9 @@ def credential_candidate_label(credential: Credential) -> str:
     facts: list[str] = []
     if credential.tested_url:
         facts.append(f'tested_url: "{_account_state_atom(credential.tested_url)}"')
+    if credential.extra_site_urls:
+        extra = ", ".join(f'"{_account_state_atom(url)}"' for url in credential.extra_site_urls)
+        facts.append(f"also saved for: {extra}")
     if credential.totp_type != TotpType.NONE:
         facts.append(f"totp_type: {credential.totp_type}")
     if not facts:
@@ -4387,9 +4559,7 @@ def _prior_approved_connection_ids(global_llm_context: str) -> set[str]:
 def _prior_approved_credential_ids(global_llm_context: str) -> set[str]:
     structured = StructuredContext.from_json_str(global_llm_context)
     return {
-        record.credential_id
-        for record in structured.approved_credentials
-        if record.credential_id.startswith(("cred_", CONNECTED_VAULT_ID_PREFIX))
+        record.credential_id for record in structured.approved_credentials if record.credential_id.startswith("cred_")
     }
 
 
@@ -4411,7 +4581,7 @@ async def _seed_prior_approved_credentials(
     missing_ids = sorted(approved_ids - {credential.credential_id for credential in policy.resolved_credentials})
     if not missing_ids:
         return
-    credentials = await load_credentials_by_ids(organization_id, missing_ids)
+    credentials = await _load_credentials(organization_id, credential_ids=missing_ids)
     policy.resolved_credentials = _deduplicate_credentials(
         [
             *policy.resolved_credentials,
@@ -4422,7 +4592,7 @@ async def _seed_prior_approved_credentials(
 
 def _proposed_credential_seed(global_llm_context: str) -> ProposedCredential | None:
     seed = StructuredContext.from_json_str(global_llm_context).proposed_credential
-    if seed is None or not seed.credential_id.startswith(("cred_", CONNECTED_VAULT_ID_PREFIX)) or not seed.admitted_url:
+    if seed is None or not seed.credential_id.startswith("cred_") or not seed.admitted_url:
         return None
     return seed
 
@@ -4436,7 +4606,7 @@ async def _seed_proposed_credential(
     seed = _proposed_credential_seed(global_llm_context)
     if seed is None:
         return
-    credentials = await load_credentials_by_ids(organization_id, [seed.credential_id])
+    credentials = await _load_credentials(organization_id, credential_ids=[seed.credential_id])
     credential = next((item for item in credentials if item.credential_id == seed.credential_id), None)
     if credential is None:
         return
@@ -4446,6 +4616,8 @@ async def _seed_proposed_credential(
     policy.live_page_admitted_urls.setdefault(seed.credential_id, seed.admitted_url)
     policy.carried_credential_urls.setdefault(seed.credential_id, seed.admitted_url)
     policy.seeded_proposal_credential_ids.add(seed.credential_id)
+    if seed.origin_arm == "live_page_admitted":
+        policy.seeded_url_matched_credential_ids.add(seed.credential_id)
     # The server bound this and the user did not name it, so it enters through the auto-bound record:
     # a write to current_turn_named_credential_ids would refuse the user's own later answer.
     if seed.credential_id not in {item.credential_id for item in policy.auto_bound_credentials}:
@@ -4548,20 +4720,37 @@ async def _resolve_live_page_credentials(
         tiers=("url_exact", "url_path"),
         password_only=True,
     )
-    rivals = _connected_vault_rivals(policy, page_url)
-    if not rivals or resolution.verdict == "unresolved":
+    page_logins = _page_vault_logins(policy, page_url)
+    # An imported login with no tested URL is matched by its item sites, as a tested URL is for any other credential.
+    vouched = [
+        credential
+        for credential in credentials
+        if (login := page_logins.get(credential.credential_id)) is not None
+        and login.credential_id == credential.credential_id
+        and login.tested_url is None
+        and any(site.admits(page_url) for site in login.sites)
+    ]
+    matched = _deduplicate_credentials([*resolution.candidates, *vouched])
+    if not matched:
         return resolution
+    candidates = _deduplicate_credentials(
+        [
+            *matched,
+            *(vault_login_credential(organization_id, ref, login) for ref, login in page_logins.items()),
+        ]
+    )
     return CredentialResolution(
-        "ambiguous", tuple(_deduplicate_credentials([*resolution.candidates, *rivals])), resolution.tier
+        "resolved" if len(candidates) == 1 else "ambiguous", tuple(candidates), resolution.tier or "vault_site"
     )
 
 
-def _connected_vault_rivals(policy: RequestPolicy, page_url: str) -> list[Credential]:
-    """Vault logins listed this turn with any saved URI on the page's site. They only compete; never grant."""
-    vault = policy.connected_vault
-    if vault is None:
-        return []
-    return [login.credential for login in vault.logins if any(same_release_scope(page_url, url) for url in login.urls)]
+def _page_vault_logins(policy: RequestPolicy, page_url: str) -> dict[str, VaultLogin]:
+    """Vault logins listed this turn with any saved URI on the page's site. A raw URI only competes; never grants."""
+    return {
+        vault_login_ref(login): login
+        for login in (policy.vault_logins or {}).values()
+        if any(same_release_scope(page_url, url) for url in login.urls)
+    }
 
 
 def _record_live_page_admission(policy: RequestPolicy, candidates: Sequence[Credential], page_url: str) -> None:
@@ -4713,25 +4902,19 @@ async def admit_credential_for_live_page(
     return LiveCredentialAdmission(False)
 
 
-async def admit_connected_vault_login_for_live_page(
+async def admit_vault_login_for_live_page(
     policy: RequestPolicy,
     *,
     organization_id: str,
     credential_id: str,
+    login: VaultLogin,
     page_url: str,
     load_org_credentials: Callable[[], Awaitable[list[Credential]]],
 ) -> LiveCredentialAdmission:
-    """Grant run authority for a vault login listed this turn when it is the page's sole candidate and its own
-    whole-site URIs cover the page. The listing's first URI only picks candidates; it never grants."""
-    vault = policy.connected_vault
-    login = vault.login(credential_id) if vault is not None else None
-    if (
-        vault is None
-        or login is None
-        or not page_url
-        or _live_page_url_abstains(
-            policy, organization_id=organization_id, page_url=page_url, seam="fill", credential_id=credential_id
-        )
+    """Grant run authority for a listed vault login when it is the page's sole candidate and one of its own sites
+    covers the page. A raw URI only makes a login a candidate; it never grants."""
+    if not page_url or _live_page_url_abstains(
+        policy, organization_id=organization_id, page_url=page_url, seam="fill", credential_id=credential_id
     ):
         return LiveCredentialAdmission(False)
     resolution = await _resolve_live_page_credentials(
@@ -4744,17 +4927,20 @@ async def admit_connected_vault_login_for_live_page(
     )
     if resolution is None:
         return LiveCredentialAdmission(False)
-    candidates = _deduplicate_credentials([*resolution.candidates, *_connected_vault_rivals(policy, page_url)])
-    sites = (
-        await connected_vault_login_sites(organization_id, policy, credential_id)
-        if [candidate.credential_id for candidate in candidates] == [credential_id]
-        else None
+    candidates = _deduplicate_credentials(
+        [
+            *resolution.candidates,
+            *(
+                vault_login_credential(organization_id, ref, rival)
+                for ref, rival in _page_vault_logins(policy, page_url).items()
+            ),
+        ]
     )
-    matched = next((site for site in sites or [] if site.admits(page_url)), None)
-    admitted = matched is not None
+    sole = [candidate.credential_id for candidate in candidates] == [credential_id]
+    matched = next((site for site in login.sites if site.admits(page_url)), None) if sole else None
     LOG.info(
         "copilot credential live-page admission",
-        outcome="admitted" if admitted else ("ambiguous" if len(candidates) > 1 else "no_match"),
+        outcome="admitted" if matched else ("ambiguous" if len(candidates) > 1 else "no_match"),
         seam="fill",
         organization_id=organization_id,
         credential_id=credential_id,
@@ -4764,7 +4950,7 @@ async def admit_connected_vault_login_for_live_page(
     )
     if matched is None:
         return LiveCredentialAdmission(False)
-    _record_live_page_admission(policy, [login.credential], page_url)
+    _record_live_page_admission(policy, [vault_login_credential(organization_id, credential_id, login)], page_url)
     return LiveCredentialAdmission(True, page_url=page_url, whole_site=matched.whole_site)
 
 
@@ -4778,14 +4964,15 @@ def _is_login_credential_param(param: dict[str, Any]) -> bool:
         return False
 
 
-def _iter_login_credential_params(parsed: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+def _iter_login_credential_params(parsed: dict[str, Any]) -> list[dict[str, Any]]:
     workflow_def = parsed.get("workflow_definition")
     if not isinstance(workflow_def, dict):
         return []
-    out: list[tuple[str, dict[str, Any]]] = []
-    for param in workflow_def.get("parameters") or []:
-        if isinstance(param, dict) and _is_login_credential_param(param):
-            out.append(("workflow", param))
+    out: list[dict[str, Any]] = [
+        param
+        for param in workflow_def.get("parameters") or []
+        if isinstance(param, dict) and _is_login_credential_param(param)
+    ]
 
     def _walk(block_list: Any) -> None:
         if not isinstance(block_list, list):
@@ -4793,10 +4980,9 @@ def _iter_login_credential_params(parsed: dict[str, Any]) -> list[tuple[str, dic
         for block in block_list:
             if not isinstance(block, dict):
                 continue
-            label = str(block.get("label") or "<unlabeled>")
             for param in block.get("parameters") or []:
                 if isinstance(param, dict) and _is_login_credential_param(param):
-                    out.append((label, param))
+                    out.append(param)
             _walk(block.get("loop_blocks"))
 
     _walk(workflow_def.get("blocks"))
@@ -4811,62 +4997,44 @@ def _value_resolves_at_init(value: Any) -> bool:
     return True
 
 
-def _workflow_credential_inputs_unbound(workflow_yaml: str) -> list[dict[str, str]]:
+def _workflow_inputs_and_login_params(
+    workflow_yaml: str | None,
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
     if not workflow_yaml:
-        return []
+        return {}, []
     try:
         parsed = safe_load_no_dates(workflow_yaml)
     except Exception:
-        return []
-    if not isinstance(parsed, dict):
-        return []
+        return {}, []
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("workflow_definition"), dict):
+        return {}, []
+    inputs = {
+        param["key"]: param
+        for param in parsed["workflow_definition"].get("parameters") or []
+        if isinstance(param, dict) and param.get("parameter_type") == "workflow" and isinstance(param.get("key"), str)
+    }
+    return inputs, _iter_login_credential_params(parsed)
 
-    workflow_def = parsed.get("workflow_definition")
-    if not isinstance(workflow_def, dict):
-        return []
 
-    workflow_param_bound: dict[str, bool] = {}
-    for param in workflow_def.get("parameters") or []:
-        if isinstance(param, dict) and param.get("parameter_type") == "workflow":
-            key = param.get("key")
-            if isinstance(key, str):
-                workflow_param_bound[key] = _value_resolves_at_init(param.get("default_value"))
+def _init_required_login_fields(param: dict[str, Any]) -> tuple[str, ...]:
+    if param.get("parameter_type") == ParameterType.CREDENTIAL.value:
+        # Init selects from a non-empty credential_ids pool and ignores credential_id.
+        return () if param.get("credential_ids") else ("credential_id",)
+    return _INIT_REQUIRED_VAULT_LOGIN_FIELDS.get(str(param.get("parameter_type")), ())
 
-    findings: list[dict[str, str]] = []
-    for location, param in _iter_login_credential_params(parsed):
-        for field_name in _LOGIN_CREDENTIAL_REQUIRED_KEY_FIELDS:
+
+def login_credential_input_defaults(workflow_yaml: str | None) -> dict[str, Any]:
+    inputs, login_params = _workflow_inputs_and_login_params(workflow_yaml)
+    referenced = set()
+    for param in login_params:
+        for field_name in _init_required_login_fields(param):
             value = param.get(field_name)
-            if not isinstance(value, str) or value.strip():
-                continue
-            findings.append(
-                {"location": location, "field": field_name, "missing": "<empty>", "kind": "credential_empty"}
-            )
-        for field_name, value in param.items():
-            if field_name in _CREDENTIAL_PARAM_METADATA_FIELDS:
-                continue
-            if not isinstance(value, str):
-                continue
-            for jinja_key in _JINJA_TEMPLATE_VAR_RE.findall(value):
-                if jinja_key in workflow_param_bound:
-                    if not workflow_param_bound[jinja_key]:
-                        findings.append(
-                            {
-                                "location": location,
-                                "field": field_name,
-                                "missing": jinja_key,
-                                "kind": "credential_template_unbound",
-                            }
-                        )
-                else:
-                    findings.append(
-                        {
-                            "location": location,
-                            "field": field_name,
-                            "missing": jinja_key,
-                            "kind": "credential_template_undefined",
-                        }
-                    )
-    return findings
+            # Only a field that is exactly one input is blank whenever that input is; filters like `default` can fill it.
+            match = _WHOLE_FIELD_INPUT_RE.fullmatch(value) if isinstance(value, str) else None
+            key = match.group(1) or match.group(2) if match else None
+            if key in inputs:
+                referenced.add(key)
+    return {key: param.get("default_value") for key, param in inputs.items() if key in referenced}
 
 
 async def _build_request_policy_bootstrap(
@@ -4979,11 +5147,6 @@ async def _build_request_policy_bootstrap(
         policy.allow_missing_credentials_in_draft = redacted_draft_candidate
         policy.credential_draft_deferred_explicitly = redacted_draft_candidate
 
-    if _workflow_credential_inputs_unbound(workflow_yaml):
-        policy.clarification_reason = "workflow_credential_inputs_unbound"
-        policy.allow_run_blocks = False
-        policy.allow_missing_credentials_in_draft = True
-
     trace_data = policy.to_trace_data()
     with copilot_span("request_policy", data=trace_data):
         LOG.info("request-policy deterministic bootstrap", **trace_data)
@@ -5051,6 +5214,8 @@ async def build_request_policy_trust_floor(
         raw_secret_safety_citation_count=safety.citation_count,
         raw_secret_safety_exonerated_citation_count=safety.exonerated_citation_count,
         raw_secret_safety_latency_ms=safety.latency_ms,
+        raw_secret_safety_answered_by=safety.answered_by,
+        raw_secret_safety_hedged=safety.hedged,
         requires_user_clarification=safety_blocked,
         allow_update_workflow=not safety_blocked,
         allow_run_blocks=not safety_blocked,
@@ -5072,13 +5237,5 @@ async def build_request_policy_trust_floor(
         selected_connected_account_id=selected_connected_account_id,
         _preclassified_policy=policy,
     )
-    LOG.info(
-        "raw-secret safety screen",
-        status=policy.raw_secret_safety_status,
-        failure_kind=policy.raw_secret_safety_failure_kind,
-        citation_count=policy.raw_secret_safety_citation_count,
-        exonerated_citation_count=policy.raw_secret_safety_exonerated_citation_count,
-        handling=policy.raw_secret_handling,
-        latency_ms=round(policy.raw_secret_safety_latency_ms, 3),
-    )
+    LOG.info("raw-secret safety screen", **raw_secret_safety_log_fields(safety, "chat_turn"))
     return policy

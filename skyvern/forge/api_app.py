@@ -24,8 +24,8 @@ from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from sqlalchemy import inspect, text
 from sqlalchemy.engine import Connection
-from sqlalchemy.exc import OperationalError
-from starlette.datastructures import MutableHeaders
+from sqlalchemy.exc import DataError, OperationalError
+from starlette.datastructures import MutableHeaders, QueryParams
 from starlette.requests import ClientDisconnect, HTTPConnection, Request
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from starlette_context.middleware import RawContextMiddleware
@@ -64,18 +64,18 @@ from skyvern.forge.sdk.services.local_org_auth_token_service import (
 from skyvern.forge.sdk.services.route_authorization import ROUTE_AUTHORIZATION_DEPENDENCY
 from skyvern.services.cleanup_service import (
     start_cleanup_scheduler,
-    start_hosted_driver_sweep,
     start_temp_artifact_sweep,
     stop_cleanup_scheduler,
-    stop_hosted_driver_sweep,
     stop_temp_artifact_sweep,
 )
+from skyvern.services.hosted_driver_sweep import start_hosted_driver_sweep, stop_hosted_driver_sweep
 from skyvern.services.orphaned_run_reaper import reap_orphaned_runs_once
 from skyvern.services.workflow_run_group_service import run_workflow_run_group_recovery_loop
 from skyvern.services.workflow_schedule_service import (
     start_workflow_schedule_scheduler,
     stop_workflow_schedule_scheduler,
 )
+from skyvern.utils.frozen_module_inspect import prime_inspect_for_frozen_modules
 
 LOG = structlog.get_logger()
 
@@ -116,6 +116,24 @@ def register_db_unavailable_handlers(fastapi_app: FastAPI) -> None:
         fastapi_app.add_exception_handler(exc_type, db_unavailable_handler)
 
 
+async def invalid_data_handler(request: Request, exc: Exception) -> JSONResponse:
+    """DataError means a value could not be represented in its target type (out-of-range
+    integer, NUL byte in text), which is malformed input rather than a server fault.
+
+    A backstop for request-body fields, which the param bounds and the query-string check
+    cannot reach. `@db_operation` has already logged the traceback, so the failure stays
+    visible; `str(exc)` is withheld because it carries the raw SQL.
+    """
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        content={"detail": "A value in the request cannot be stored: out of range, or containing a NUL byte."},
+    )
+
+
+def register_invalid_data_handler(fastapi_app: FastAPI) -> None:
+    fastapi_app.add_exception_handler(DataError, invalid_data_handler)
+
+
 SECURITY_HEADERS = {
     # CSP is frame-ancestors-only: Swagger /docs pulls CDN assets that a broader policy would block.
     "X-Frame-Options": "DENY",
@@ -152,11 +170,56 @@ class SecurityHeadersMiddleware:
         await self.app(scope, receive, send_with_headers)
 
 
+class RejectNulByteQueryMiddleware:
+    """Postgres cannot store a NUL byte in text, so a `?search=%00` reaching a query raises
+    a driver error instead of being rejected. No query param has a legitimate use for one,
+    so refuse it here rather than validating every free-text param separately.
+
+    Pure ASGI (not BaseHTTPMiddleware) so streaming responses pass through unwrapped.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        raw_query: bytes = scope.get("query_string", b"")
+        # Cheap pre-check: a NUL can only arrive percent-encoded or, from a non-conforming
+        # client, raw. Skip decoding the query string for the overwhelming majority.
+        if b"%00" in raw_query.lower() or b"\x00" in raw_query:
+            offending = next(
+                (key for key, value in QueryParams(raw_query).multi_items() if "\x00" in key or "\x00" in value),
+                None,
+            )
+            if offending is not None:
+                response = JSONResponse(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    content={
+                        "detail": [
+                            {
+                                "type": "string_contains_nul",
+                                "loc": ["query", offending],
+                                "msg": "Input should not contain a NUL byte",
+                            }
+                        ]
+                    },
+                )
+                await response(scope, receive, send)
+                return
+
+        await self.app(scope, receive, send)
+
+
 def add_credentialed_cors_middleware(fastapi_app: FastAPI) -> None:
     fastapi_app.add_middleware(
         CORSMiddleware,
         **cors_middleware_kwargs(
-            settings.ALLOWED_ORIGINS, settings.ALLOWED_ORIGIN_REGEX, expose_headers=["X-Next-Cursor", "Retry-After"]
+            settings.ALLOWED_ORIGINS,
+            settings.ALLOWED_ORIGIN_REGEX,
+            expose_headers=["X-Next-Cursor", "Retry-After", "X-Has-More"],
         ),
     )
 
@@ -200,6 +263,41 @@ class ExecutionDatePlugin(Plugin):
         return datetime.now()
 
 
+def _schema_refs(node: object) -> set[str]:
+    if isinstance(node, dict):
+        ref = node.get("$ref")
+        own = {ref.rsplit("/", 1)[-1]} if isinstance(ref, str) and ref.startswith("#/components/schemas/") else set()
+        return own.union(*(_schema_refs(value) for value in node.values()))
+    if isinstance(node, list):
+        return set().union(*(_schema_refs(value) for value in node))
+    return set()
+
+
+def strip_internal_schema_properties(openapi_schema: dict) -> None:
+    """Drop components and properties marked ``x-internal`` so they stay out of the public docs and the SDK."""
+    schemas = openapi_schema.get("components", {}).get("schemas", {})
+    referenced = _schema_refs(openapi_schema)
+    for name in [name for name, schema in schemas.items() if schema.get("x-internal")]:
+        del schemas[name]
+    for schema in schemas.values():
+        properties = schema.get("properties")
+        if not properties:
+            continue
+        internal = [name for name, prop in properties.items() if isinstance(prop, dict) and prop.get("x-internal")]
+        for name in internal:
+            del properties[name]
+        if internal and "required" in schema:
+            schema["required"] = [name for name in schema["required"] if name not in internal]
+    # A component only the dropped ones used would be a dangling public schema; one never referenced stays.
+    while True:
+        used = _schema_refs(openapi_schema)
+        orphans = [name for name in schemas if name in referenced and name not in used]
+        if not orphans:
+            return
+        for name in orphans:
+            del schemas[name]
+
+
 def custom_openapi(app: FastAPI) -> dict:
     if app.openapi_schema:
         return app.openapi_schema
@@ -214,6 +312,7 @@ def custom_openapi(app: FastAPI) -> dict:
         {"url": "https://api-staging.skyvern.com", "x-fern-server-name": "Staging"},
         {"url": "http://localhost:8000", "x-fern-server-name": "Local"},
     ]
+    strip_internal_schema_properties(openapi_schema)
     app.openapi_schema = openapi_schema
     return app.openapi_schema
 
@@ -289,6 +388,8 @@ _SQLITE_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("organizations", "slug", "VARCHAR"),
     ("tasks", "attempt_number", "INTEGER"),
     ("workflow_run_blocks", "attempt_number", "INTEGER"),
+    ("workflow_run_blocks", "capped_output", "JSON"),
+    ("workflow_run_blocks", "tool_calls", "JSON"),
     ("google_oauth_credentials", "google_subject", "VARCHAR"),
     ("tasks", "task_queue", "VARCHAR"),
 )
@@ -504,7 +605,7 @@ def create_api_app() -> FastAPI:
         except Exception as e:
             LOG.warning("Failed to initialize OTEL tracer provider early", error=str(e))
 
-    forge_app_instance = start_forge_app()
+    forge_app_instance = start_forge_app(load_api_modules=True)
 
     assert_signing_key_usable()
     fastapi_app = FastAPI(lifespan=lifespan)
@@ -553,9 +654,8 @@ def create_api_app() -> FastAPI:
         include_in_schema=False,
         dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY],
     )
-    # Twilio SMS 2FA: public inbound receiver (secret-URL + signature auth inside
-    # the handler) and the org-scoped integration management routes. Same
-    # dual-prefix + include_in_schema=False pattern as the OAuth routers above.
+    # Inbound SMS uses secret-URL and signature authentication. Only the canonical
+    # organization-scoped integration routes appear in the public schema.
     fastapi_app.include_router(
         sms_inbound_router, prefix="/v1/sms", include_in_schema=False, dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY]
     )
@@ -565,7 +665,6 @@ def create_api_app() -> FastAPI:
     fastapi_app.include_router(
         twilio_integration_router,
         prefix="/v1/integrations/twilio",
-        include_in_schema=False,
         dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY],
     )
     fastapi_app.include_router(
@@ -614,6 +713,8 @@ def create_api_app() -> FastAPI:
     fastapi_app.add_exception_handler(SkyvernHTTPException, handle_skyvern_http_exception)
 
     register_db_unavailable_handlers(fastapi_app)
+
+    register_invalid_data_handler(fastapi_app)
 
     @fastapi_app.exception_handler(ValidationError)
     async def handle_pydantic_validation_error(request: Request, exc: ValidationError) -> JSONResponse:
@@ -678,6 +779,10 @@ def create_api_app() -> FastAPI:
     if forge_app_instance.setup_api_app:
         forge_app_instance.setup_api_app(fastapi_app)
 
+    # Inside RequestLoggingMiddleware (added next, so outside this one) to keep the
+    # rejections it short-circuits visible in request logs.
+    fastapi_app.add_middleware(RejectNulByteQueryMiddleware)
+
     # Register after extensions so it stays outside cloud BaseHTTPMiddleware
     # layers, whose child tasks do not propagate request ContextVars upstream.
     fastapi_app.add_middleware(RequestLoggingMiddleware)
@@ -686,4 +791,5 @@ def create_api_app() -> FastAPI:
     # preflights short-circuited by the cloud middleware registered above.
     fastapi_app.add_middleware(SecurityHeadersMiddleware)
 
+    prime_inspect_for_frozen_modules()
     return fastapi_app

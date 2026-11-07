@@ -403,7 +403,6 @@ class TestExecutionPathBinding:
         # upgrades ordinary runs to code mode must not reach an enrolled run.
         skyvern_context.ensure_context().browser_action_policy = _policy("https://example.com")
         app.AGENT_FUNCTION.should_upgrade_to_code_mode = AsyncMock(return_value=True)
-        app.AGENT_FUNCTION.should_keep_code_mode_for_workflow_run = AsyncMock(return_value=True)
 
         workflow_run = SimpleNamespace(run_with=None, retried_from_workflow_run_id=None)
         decision = await WorkflowService().should_run_script(_workflow(), cast(Any, workflow_run))
@@ -414,7 +413,6 @@ class TestExecutionPathBinding:
     @pytest.mark.asyncio
     async def test_an_unenrolled_run_still_reaches_the_code_mode_rollout(self) -> None:
         app.AGENT_FUNCTION.should_upgrade_to_code_mode = AsyncMock(return_value=True)
-        app.AGENT_FUNCTION.should_keep_code_mode_for_workflow_run = AsyncMock(return_value=True)
 
         workflow_run = SimpleNamespace(run_with=None, retried_from_workflow_run_id=None)
         assert await WorkflowService().should_run_script(_workflow(), cast(Any, workflow_run)) is True

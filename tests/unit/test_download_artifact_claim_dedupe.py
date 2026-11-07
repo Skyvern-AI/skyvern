@@ -4,7 +4,7 @@ A persistent-session download can be registered twice for one run: session-produ
 writes a DOWNLOAD row with ``browser_session_id`` set — already run-bound today, or claimed later) and
 run-scoped (the local save writes a DOWNLOAD row with ``browser_session_id`` NULL). Both are the same
 bytes, so the run-scoped read (``get_downloaded_files``) must surface one entry per distinct download.
-These tests drive the real reader on an in-memory DB (schema from the ORM), not mocks.
+These tests drive the real reader on a SQLite DB (schema from the ORM), not mocks.
 """
 
 from __future__ import annotations
@@ -24,23 +24,21 @@ from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.artifact.storage import base as base_module
 from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
 from skyvern.forge.sdk.db.agent_db import AgentDB, _build_engine
-from skyvern.forge.sdk.db.models import ArtifactModel, Base
+from skyvern.forge.sdk.db.models import ArtifactModel
+from tests.unit.conftest import SqliteEngineFactory
 
 _DUMMY_KEYRING_JSON = '{"current_kid": "k1", "keys": {"k1": {"secret": "deadbeef"}}}'
 _WINDOW_START = datetime.datetime.now(datetime.UTC).replace(tzinfo=None) - datetime.timedelta(days=1)
 
 
 @pytest_asyncio.fixture
-async def sqlite_engine() -> AsyncEngine:
-    engine = _build_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    return engine
+async def sqlite_engine(sqlite_engine_factory: SqliteEngineFactory) -> AsyncEngine:
+    return sqlite_engine_factory(build_engine=_build_engine)
 
 
 @pytest_asyncio.fixture
 async def sqlite_db(sqlite_engine: AsyncEngine) -> AgentDB:
-    return AgentDB("sqlite+aiosqlite:///:memory:", db_engine=sqlite_engine)
+    return AgentDB(str(sqlite_engine.url), db_engine=sqlite_engine)
 
 
 async def _make(
@@ -127,6 +125,26 @@ async def test_run_scoped_read_keeps_session_download_without_run_scoped_twin(
     await _make(sqlite_db, org_id, "a_session_only", run_id=run_id, browser_session_id=session_id, checksum="c1")
 
     assert await _run_scoped_ids(sqlite_db, org_id, run_id, monkeypatch) == {"a_session_only"}
+
+
+@pytest.mark.asyncio
+async def test_session_download_claim_skips_rejected_uris(sqlite_db: AgentDB, monkeypatch: pytest.MonkeyPatch) -> None:
+    org = await sqlite_db.organizations.create_organization("Test Org rejected")
+    org_id, session_id, run_id = org.organization_id, "pbs_rejected", "wr_rejected"
+    await _make(sqlite_db, org_id, "a_session_valid", run_id=None, browser_session_id=session_id, checksum="valid")
+    await _make(sqlite_db, org_id, "a_session_rejected", run_id=None, browser_session_id=session_id, checksum="bad")
+    rejected_uri = f"s3://skyvern-artifacts/v1/production/{org_id}/a_session_rejected.pdf"
+
+    claimed = await sqlite_db.artifacts.claim_session_download_artifacts_for_run(
+        run_id=run_id,
+        browser_session_id=session_id,
+        organization_id=org_id,
+        run_started_at=_WINDOW_START,
+        excluded_uris=[rejected_uri],
+    )
+
+    assert claimed == 1
+    assert await _run_scoped_ids(sqlite_db, org_id, run_id, monkeypatch) == {"a_session_valid"}
 
 
 @pytest.mark.asyncio

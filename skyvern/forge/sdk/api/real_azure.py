@@ -1,15 +1,17 @@
 """Real implementations of Azure clients (Vault and Storage) and their factories."""
 
+import os
 from datetime import datetime, timedelta, timezone
 from mimetypes import add_type, guess_type
 from typing import IO, Self
 
 import structlog
+from azure.core import MatchConditions
 from azure.core.exceptions import ResourceNotFoundError
 from azure.identity.aio import ClientSecretCredential, DefaultAzureCredential
 from azure.keyvault.secrets.aio import SecretClient
 from azure.storage.blob import BlobSasPermissions, ContentSettings, StandardBlobTier, generate_blob_sas
-from azure.storage.blob.aio import BlobServiceClient
+from azure.storage.blob.aio import BlobServiceClient, StorageStreamDownloader
 
 from skyvern.config import settings
 from skyvern.forge.sdk.api.azure import (
@@ -19,6 +21,7 @@ from skyvern.forge.sdk.api.azure import (
     AzureUri,
 )
 from skyvern.forge.sdk.schemas.organizations import AzureClientSecretCredential
+from skyvern.utils.content_disposition import build_attachment_disposition
 
 # Register custom mime types for mimetypes guessing
 add_type("application/json", ".har")
@@ -246,6 +249,13 @@ class RealAsyncAzureStorageClient(AsyncAzureStorageClient):
                 LOG.exception("Failed to download from Azure", uri=uri)
             return None
 
+    async def open_blob_download(self, uri: str, etag: str) -> StorageStreamDownloader[bytes]:
+        """A chunked download that fails once the blob is no longer the ``etag`` version."""
+        parsed = AzureUri(uri)
+        container_client = self._get_blob_service_client().get_container_client(parsed.container)
+        blob_client = container_client.get_blob_client(parsed.blob_path)
+        return await blob_client.download_blob(etag=etag, match_condition=MatchConditions.IfNotModified)
+
     async def get_blob_properties(self, uri: str) -> dict | None:
         parsed = AzureUri(uri)
         try:
@@ -306,7 +316,7 @@ class RealAsyncAzureStorageClient(AsyncAzureStorageClient):
             LOG.exception("Failed to list Azure blobs", container=container, prefix=prefix)
             return []
 
-    def create_sas_url(self, uri: str, expiry_hours: int = 24) -> str | None:
+    def create_sas_url(self, uri: str, expiry_hours: int = 24, attachment_filename: str | None = None) -> str | None:
         parsed = AzureUri(uri)
         try:
             sas_token = generate_blob_sas(
@@ -316,6 +326,10 @@ class RealAsyncAzureStorageClient(AsyncAzureStorageClient):
                 account_key=self.account_key,
                 permission=BlobSasPermissions(read=True),
                 expiry=datetime.now(timezone.utc) + timedelta(hours=expiry_hours),
+                content_disposition=(
+                    build_attachment_disposition(attachment_filename) if attachment_filename is not None else None
+                ),
+                content_type="application/octet-stream" if attachment_filename is not None else None,
             )
             return (
                 f"https://{self.account_name}.blob.core.windows.net/{parsed.container}/{parsed.blob_path}?{sas_token}"
@@ -324,11 +338,23 @@ class RealAsyncAzureStorageClient(AsyncAzureStorageClient):
             LOG.exception("Failed to create SAS URL", uri=uri)
             return None
 
-    async def create_sas_urls(self, uris: list[str], expiry_hours: int = 24) -> list[str] | None:
+    async def create_sas_urls(
+        self,
+        uris: list[str],
+        expiry_hours: int = 24,
+        attachment_filenames: list[str | None] | None = None,
+    ) -> list[str] | None:
+        """With ``attachment_filenames`` (one per uri, None for the blob basename), the URLs force an
+        attachment download as octet-stream so stored user content never renders on the storage origin."""
+        if attachment_filenames is not None and len(attachment_filenames) != len(uris):
+            raise ValueError("attachment_filenames must have one entry per uri")
         try:
             sas_urls: list[str] = []
-            for uri in uris:
-                url = self.create_sas_url(uri, expiry_hours)
+            for index, uri in enumerate(uris):
+                attachment_filename = None
+                if attachment_filenames is not None:
+                    attachment_filename = attachment_filenames[index] or os.path.basename(AzureUri(uri).blob_path)
+                url = self.create_sas_url(uri, expiry_hours, attachment_filename=attachment_filename)
                 if url is None:
                     LOG.warning("SAS URL generation failed, aborting batch", failed_uri=uri, uris=uris)
                     return None

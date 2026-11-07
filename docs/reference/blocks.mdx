@@ -33,7 +33,7 @@ If you're writing automations in code instead, the equivalent operations are Pag
 |----------|--------|
 | [Browser Automation](#browser-automation) | Browser Task, Browser Action, Extraction, Login, Go to URL, Print Page |
 | [Data and Extraction](#data-and-extraction) | Web Search, Text Prompt, File Parser |
-| [Control Flow](#control-flow) | Loop, While Loop, Conditional, AI Validation, Code, Wait, Terminate |
+| [Control Flow](#control-flow) | Loop, While Loop, Conditional, AI Validation, Code, Agent, Wait, Terminate |
 | [Files](#files) | File Download, Cloud Storage Upload |
 | [Communication](#communication) | Send Email, HTTP Request, Human Interaction, Email Inbox |
 
@@ -376,6 +376,23 @@ Execute custom Python code. Input parameters are available as global variables. 
 | **Code** | code editor | Python code to execute |
 | **Input Parameters** | select | Parameters available as globals in the code |
 
+Code can import `asyncio`, `datetime`, `html`, `json` and `re`. Each one binds the
+sandbox's own version of the module, which carries part of the standard library and
+loads nothing. The same names are already available without an import.
+
+| Module | What it provides |
+|---|---|
+| `asyncio` | `sleep` |
+| `datetime` | `datetime`, `date`, `timedelta`, `timezone`, `UTC` |
+| `html` | `escape` |
+| `json` | `dumps`, `loads` |
+| `re` | `match`, `search`, `findall`, `finditer`, `fullmatch`, `sub`, `compile`, `split`, `escape`, and the `I`, `S`, `IGNORECASE`, `MULTILINE` and `DOTALL` flags |
+
+Every other module is refused, as is `import *` from an allowed module and a name
+that starts with an underscore. Saving an agent whose new or changed code holds a
+refused import returns `422` and names the block; code that is already saved stays
+saveable. A name an import binds is left out of the block's output.
+
 Password credential input parameters expose plaintext fields such as
 `login_credential.username` and `login_credential.password`. These values are
 readable by Python code inside the runner; they are not opaque handles. Use them
@@ -401,6 +418,34 @@ or errors.
 
 <Frame>
 <img width="400" src="/images/cloud/code_block.png" alt="Code block configuration with Python code editor and Input Parameters field" />
+</Frame>
+
+### Agent
+
+The Agent block lets a model choose which tools to call until it can return the fields in its Data Schema.
+
+<Note>
+The Agent block is available to selected organizations. Contact support to enable it.
+</Note>
+
+| Field | Type | Description |
+|-------|------|-------------|
+| **Prompt** | text | What the model should find out or do. Use `{{ input_name }}` to reference an input value |
+| **Data Schema** | JSON | The answer the block returns, as a JSON object schema. Defaults to one required string field, `answer`. Later blocks read the answer as `{{ <label>_output.output }}`, and a Conditional can branch on it |
+| **Inputs** | select | Inputs and earlier block outputs this block uses. Login can sign in only with a credential listed here. The model can read every input and earlier output in the run either way, with secret values masked |
+| **Max Turns** | number | Turns the model may take, from 1 to 200. Defaults to 25. When the turns run out, the model gets one more turn in which it can only return its answer; the block fails if that turn does not produce a valid answer |
+| **Tools** | multi-select | The tools the model may call |
+
+The model can always read this run's data (`read_run_data`) and return its answer (`finish`). Without a Tools list it has no other tools. A new Agent block starts with these checked: **Browser Task**, **Download**, **File Download**, **Web Search**, **Go to URL**, **Click**, **Input Text** and **Extract Data**. The Tools checklist in the editor lists every optional tool, and checking one offers it to the model, except Login, which also needs a credential in Inputs.
+
+A tool named after a block, such as **Browser Task** or **HTTP Request**, runs that block as an ordinary block and is billed as usual. **Go to URL**, **Click**, **Input Text** and **Extract Data** act on the run's current page. **Browser Task**, **File Download** and **Login** each start a separate browser agent that uses your organization's default step limit.
+
+To sign in, check **Login** in Tools and add a credential to Inputs. Login is not checked by default. Skyvern masks the run's registered secrets in the tool results the model reads and in the recorded tool calls. The answer is saved as the model returns it, so do not ask the model to return a secret.
+
+[Copilot](/cloud/studio#build-with-copilot) can add an Agent block to your agent and choose its Tools.
+
+<Frame>
+<img width="400" src="/images/cloud/agent_block.png" alt="Agent block configuration with Prompt, Data Schema, Inputs, Max Turns and Tools fields" />
 </Frame>
 
 ### Wait

@@ -63,6 +63,62 @@ describe("UI session refresh", () => {
     );
   }
 
+  it.each([
+    [
+      "/email-forwarding/addresses",
+      "Email 2FA forwarding requires the Pro plan.",
+      false,
+    ],
+    [
+      "/email-forwarding/configs",
+      {
+        error_code: "organization_admin_required",
+        message: "Your role (Builder) can't do this.",
+      },
+      false,
+    ],
+    ["/email-forwarding/addresses", "Invalid authentication method", true],
+    ["/workflows", "Email 2FA forwarding requires the Pro plan.", true],
+  ] as const)(
+    "keeps permission and session failures distinct for %s: %s",
+    async (path, detail, authFailure) => {
+      const fetchMock = vi.fn().mockImplementation(mintedSession);
+      vi.stubGlobal("fetch", fetchMock);
+      const { getClient, initializeUiSession } = await import("./AxiosClient");
+      const { useAuthIssueStore } = await import("@/store/AuthIssueStore");
+      await initializeUiSession();
+      fetchMock.mockClear();
+      const client = await getClient(null, "sans-api-v1");
+      const adapter = vi.fn<AxiosAdapter>(async (config) => {
+        throw new AxiosError(
+          "Forbidden",
+          AxiosError.ERR_BAD_REQUEST,
+          config,
+          undefined,
+          {
+            data: { detail },
+            status: 403,
+            statusText: "Forbidden",
+            headers: {},
+            config,
+          },
+        );
+      });
+      client.defaults.adapter = adapter;
+      await expect(client.get(path)).rejects.toBeInstanceOf(AxiosError);
+      expect(adapter).toHaveBeenCalledTimes(authFailure ? 2 : 1);
+      expect(fetchMock).toHaveBeenCalledTimes(authFailure ? 1 : 0);
+      if (authFailure) {
+        expect(useAuthIssueStore.getState().issue).toMatchObject({
+          statusCode: 403,
+          detail,
+        });
+      } else {
+        expect(useAuthIssueStore.getState().issue).toBeNull();
+      }
+    },
+  );
+
   it("still mints after a single non-JSON response from an endpoint that exists", async () => {
     const fetchMock = vi
       .fn()
@@ -633,6 +689,105 @@ describe("request-scoped authentication", () => {
     const headers = adapter.mock.calls[0]?.[0].headers;
     expect(headers?.get("Authorization")).toBe("Bearer token-a");
     expect(headers?.get("X-API-Key")).toBe("api-key-a");
+  });
+
+  it("retries once with a newly minted token when a sign-out elsewhere refused the cached one", async () => {
+    const { getClient, setFreshCredentialGetter } =
+      await import("./AxiosClient");
+    const client = await getClient(async () => "cached-token");
+    vi.useFakeTimers();
+    const freshToken = vi.fn(async () => "fresh-token");
+    setFreshCredentialGetter(freshToken);
+    const adapter = vi.fn<AxiosAdapter>(async (config) => {
+      const response: AxiosResponse = {
+        data: { detail: "Session has been signed out" },
+        status: 403,
+        statusText: "Forbidden",
+        headers: {},
+        config,
+      };
+      if (config.headers.get("Authorization") === "Bearer fresh-token") {
+        return { ...response, data: { ok: true }, status: 200 };
+      }
+      throw new AxiosError(
+        "Request failed",
+        AxiosError.ERR_BAD_REQUEST,
+        config,
+        undefined,
+        response,
+      );
+    });
+    client.defaults.adapter = adapter;
+
+    const recovered = client.get("/customer");
+    await vi.advanceTimersByTimeAsync(999);
+    // A token minted within the sign-out's second would carry the same iat and be refused again.
+    expect(freshToken).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(recovered).resolves.toMatchObject({ status: 200 });
+    await getClient(async () => "cached-token");
+    freshToken.mockResolvedValue("still-signed-out");
+    const refused = expect(client.get("/customer")).rejects.toMatchObject({
+      response: { status: 403 },
+    });
+    await vi.advanceTimersByTimeAsync(1_000);
+    await refused;
+
+    expect(adapter).toHaveBeenCalledTimes(4);
+    setFreshCredentialGetter(null);
+    vi.useRealTimers();
+  });
+
+  it("does not use a re-minted token when the user signs out during the retry", async () => {
+    const { getClient, setFreshCredentialGetter } =
+      await import("./AxiosClient");
+    const client = await getClient(async () => "cached-token");
+    vi.useFakeTimers();
+    const freshToken = vi.fn(async () => "fresh-token");
+    setFreshCredentialGetter(freshToken);
+    client.defaults.adapter = vi.fn<AxiosAdapter>(async (config) => {
+      throw new AxiosError(
+        "Request failed",
+        AxiosError.ERR_BAD_REQUEST,
+        config,
+        undefined,
+        {
+          data: { detail: "Session has been signed out" },
+          status: 403,
+          statusText: "Forbidden",
+          headers: {},
+          config,
+        },
+      );
+    });
+
+    const refused = expect(client.get("/customer")).rejects.toMatchObject({
+      response: { status: 403 },
+    });
+    await vi.advanceTimersByTimeAsync(500);
+    setFreshCredentialGetter(null);
+    await vi.advanceTimersByTimeAsync(500);
+    await refused;
+    expect(freshToken).not.toHaveBeenCalled();
+
+    const mintedDuringSignOut = vi.fn(async () => {
+      setFreshCredentialGetter(null);
+      return "minted-during-sign-out";
+    });
+    setFreshCredentialGetter(mintedDuringSignOut);
+    const refusedAgain = expect(client.get("/customer")).rejects.toMatchObject({
+      response: { status: 403 },
+    });
+    await vi.advanceTimersByTimeAsync(1_000);
+    await refusedAgain;
+
+    expect(mintedDuringSignOut).toHaveBeenCalledOnce();
+    expect(
+      vi
+        .mocked(client.defaults.adapter as AxiosAdapter)
+        .mock.calls.map(([config]) => config.headers.get("Authorization")),
+    ).not.toContain("Bearer minted-during-sign-out");
+    vi.useRealTimers();
   });
 
   it("attaches the signed-in Bearer token alongside the ui_session key", async () => {

@@ -1,0 +1,52 @@
+title: Certificate handoff
+proxy_location: NONE
+persist_browser_session: false
+reuse_browser_session: false
+mask_secrets: false
+pin_saved_session_ip: false
+workflow_definition:
+  version: 2
+  parameters: []
+  blocks:
+    - block_type: goto_url
+      label: open_vendor_hub
+      next_block_label: read_certificate
+      continue_on_failure: false
+      ignore_workflow_system_prompt: false
+      next_loop_on_failure: false
+      url: http://localhost:8910/F6/
+    - block_type: code
+      label: read_certificate
+      next_block_label: upload_certificate
+      continue_on_failure: false
+      ignore_workflow_system_prompt: false
+      next_loop_on_failure: false
+      code: 'row = page.locator("tbody tr").first
+
+        certificate_id = (await row.locator("td").nth(1).inner_text()).strip()
+
+        {"certificate_id": certificate_id}
+
+'
+      steps:
+        - description: Extract certificate id
+          action_type: extract
+          line_start: 2
+          line_end: 2
+    - block_type: file_upload
+      label: upload_certificate
+      continue_on_failure: true
+      ignore_workflow_system_prompt: false
+      next_loop_on_failure: false
+      storage_type: s3
+      path: '{{ workflow_run_id }}'
+is_saved_task: false
+status: published
+run_with: agent
+ai_fallback: true
+cache_key: default
+adaptive_caching: false
+enable_self_healing: false
+code_version: 2
+generate_script_on_terminal: false
+run_sequentially: false

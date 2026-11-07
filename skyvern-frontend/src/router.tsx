@@ -97,6 +97,11 @@ const recipeComingSoonRoutes = [
     description:
       "Skyvern's Job Apps Agent allows you to automate job applications with agents",
   },
+  {
+    path: "recipes/seo",
+    title: "SEO",
+    description: "Submit your product to web directories.",
+  },
 ].map(({ path, title, description }) => ({
   path,
   element: <PageLayout />,

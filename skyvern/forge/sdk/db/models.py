@@ -20,6 +20,7 @@ from sqlalchemy import (
     desc,
     text,
 )
+from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.ext.asyncio import AsyncAttrs
 from sqlalchemy.orm import DeclarativeBase, deferred
 
@@ -42,11 +43,14 @@ from skyvern.forge.sdk.db.id import (
     generate_credential_id,
     generate_credential_parameter_id,
     generate_debug_session_id,
+    generate_email_config_id,
     generate_folder_id,
+    generate_forwarding_address_id,
     generate_gmail_send_dispatch_id,
     generate_google_oauth_credential_id,
     generate_heal_episode_id,
     generate_heal_proposal_id,
+    generate_inbound_email_id,
     generate_microsoft_oauth_credential_id,
     generate_onepassword_credential_parameter_id,
     generate_org_id,
@@ -130,6 +134,7 @@ class TaskModel(Base):
     task_id = Column(String, primary_key=True, default=generate_task_id)
     organization_id = Column(String, ForeignKey("organizations.organization_id"))
     browser_session_id = Column(String, nullable=True, index=True)
+    requested_by = Column(String, nullable=True)
     status = Column(String, index=True)
     webhook_callback_url = Column(String)
     webhook_failure_reason = Column(String, nullable=True)
@@ -889,6 +894,7 @@ class WorkflowRunGroupModel(Base):
     input_fingerprint = Column(String, nullable=False)
     status = Column(String, nullable=False, default="active")
     created_by = Column(String, nullable=True)
+    requested_by = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,
@@ -1054,7 +1060,8 @@ class WorkflowRunModel(Base):
     # classifier ran and abstained. none_as_null=True so clearing it (ORM `= None` or Core
     # `.values(...=None)`) stores SQL NULL, not the JSON token `null`: reopen/reset/timeout
     # clears must be SQL NULL for the COALESCE repair and the completed-run NULL invariant to
-    # hold at SQL/CDC/Redshift grain, not just when deserialized back to Python None.
+    # hold at the SQL level and for downstream replication, not just when deserialized back to
+    # Python None.
     failure_attribution = Column(JSON(none_as_null=True), nullable=True)
     # When True, this run was spawned by a WorkflowTriggerBlock whose
     # ignore_workflow_system_prompt flag was set, and the child must not
@@ -1495,6 +1502,97 @@ class TOTPCodeModel(Base):
     parse_status = Column(String, nullable=False, server_default=sqlalchemy.text("'parsed'"))
 
 
+class OrganizationEmailConfigModel(Base):
+    __tablename__ = "organization_email_configs"
+    __table_args__ = (Index("ix_organization_email_configs_org", "organization_id"),)
+
+    email_config_id = Column(String, primary_key=True, default=generate_email_config_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False)
+    mode = Column(String, nullable=False)
+    webhook_secret_hash = Column(String, nullable=True)
+    daily_inbound_cap = Column(Integer, nullable=False, default=500, server_default="500")
+    drop_flagged_spam = Column(Boolean, nullable=False, default=True, server_default=sqlalchemy.true())
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+    deleted_at = Column(DateTime, nullable=True)
+
+
+class OrganizationForwardingAddressModel(Base):
+    __tablename__ = "organization_forwarding_addresses"
+    __table_args__ = (
+        Index("ix_organization_forwarding_addresses_org", "organization_id"),
+        Index("ix_organization_forwarding_addresses_config", "email_config_id"),
+        Index(
+            "ix_organization_forwarding_addresses_revoked_email",
+            text("lower(email_address)"),
+            postgresql_where=text("status = 'revoked'"),
+            sqlite_where=text("status = 'revoked'"),
+        ),
+        Index(
+            "uq_organization_forwarding_addresses_email",
+            "email_address",
+            unique=True,
+            postgresql_where=text("status != 'revoked' AND deleted_at IS NULL"),
+            sqlite_where=text("status != 'revoked' AND deleted_at IS NULL"),
+        ),
+    )
+
+    forwarding_address_id = Column(String, primary_key=True, default=generate_forwarding_address_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False)
+    email_config_id = Column(String, ForeignKey("organization_email_configs.email_config_id"), nullable=False)
+    email_address = Column(String, nullable=False)
+    org_slug = Column(String, nullable=False)
+    match_mode = Column(String, nullable=False, default="dedicated")
+    credential_id = Column(String, ForeignKey("credentials.credential_id", ondelete="SET NULL"), nullable=True)
+    sender_allowlist = Column(JSON().with_variant(ARRAY(Text()), "postgresql"), nullable=True)
+    status = Column(String, nullable=False, default="pending")
+    last_received_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+    deleted_at = Column(DateTime, nullable=True)
+
+
+class OrganizationInboundEmailModel(Base):
+    __tablename__ = "organization_inbound_emails"
+    __table_args__ = (
+        Index("ix_organization_inbound_emails_address_created", "forwarding_address_id", "created_at"),
+        Index("ix_organization_inbound_emails_created_at", "created_at"),
+        UniqueConstraint(
+            "organization_id",
+            "external_message_id",
+            name="uq_organization_inbound_emails_external_message",
+        ),
+    )
+
+    inbound_email_id = Column(String, primary_key=True, default=generate_inbound_email_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False)
+    forwarding_address_id = Column(
+        String,
+        ForeignKey("organization_forwarding_addresses.forwarding_address_id"),
+        nullable=False,
+    )
+    external_message_id = Column(Text, nullable=True)
+    from_address = Column(Text, nullable=False)
+    original_recipient = Column(Text, nullable=True)
+    subject = Column(Text, nullable=False)
+    body_text = Column(Text, nullable=False)
+    links = Column(JSON, nullable=False, default=list)
+    category = Column(String, nullable=False)
+    verdicts = Column(JSON, nullable=True)
+    totp_code_id = Column(String, ForeignKey("totp_codes.totp_code_id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+
+
 class ActionModel(Base):
     __tablename__ = "actions"
     __table_args__ = (
@@ -1610,8 +1708,10 @@ class WorkflowRunBlockModel(Base):
     script_run = Column(JSON, nullable=True)
 
     # Scalar mirror of output["downloaded_files"] length: the JSON output column is
-    # not CDC-mirrored, so download success would not otherwise be queryable.
+    # not replicated downstream, so download success would not otherwise be queryable.
     downloaded_file_count = Column(Integer, nullable=True)
+    # A large display-only list, so block reads load it only when asked for.
+    tool_calls = deferred(Column(JSON, nullable=True))
     attempt_number = Column(Integer, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
@@ -1800,6 +1900,8 @@ class PersistentBrowserSessionModel(Base):
     # workflow's cancellation to ride a throttled heartbeat. Write-once: it marks the first request.
     close_requested_at = Column(DateTime, nullable=True)
     cdp_unreachable_at = Column(DateTime, nullable=True)
+    # When a Copilot pre-started browser was claimed by a test; uptime is billed from this, not started_at.
+    claimed_at = Column(DateTime, nullable=True)
     # A BrowserSessionCloseReason, write-once; NULL when the session timed out, failed, or predates the column.
     close_reason = Column(String, nullable=True)
     # Retained, unwritten column: the asynchronous-create contract that populated it was reverted,
@@ -2002,6 +2104,7 @@ class CredentialModel(Base):
     browser_profile_id = Column(String, nullable=True)
     auto_profile_disabled = Column(Boolean, nullable=True, default=False)
     tested_url = Column(String, nullable=True)
+    extra_site_urls = Column(JSON, nullable=True)
     user_context = Column(String(1000), nullable=True)
     save_browser_session_intent = Column(Boolean, nullable=True, default=False)
     pin_saved_session_ip = Column(Boolean, nullable=False, default=False, server_default=sqlalchemy.false())
@@ -2045,8 +2148,8 @@ class DebugSessionModel(Base):
 
 class BlockRunModel(Base):
     """
-    When a block is run in the debugger, it runs "as a 'workflow run'", but that
-    workflow run has just a single block in it. This table ties a block run to
+    When a block is run in the debugger, it runs "as a 'workflow run'". A run of
+    several blocks records only its last block here. This table ties a block run to
     the workflow run, and a particular output parameter id (which gets
     overwritten on each run.)
 

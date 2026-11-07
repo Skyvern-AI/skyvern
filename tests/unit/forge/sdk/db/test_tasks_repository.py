@@ -1,12 +1,14 @@
+import re
 from decimal import Decimal
+from typing import Any
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import event, select, update
 
 from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.db.enums import TaskType
-from skyvern.forge.sdk.db.models import TaskRunModel, WorkflowRunAttemptModel
+from skyvern.forge.sdk.db.models import TaskModel, TaskRunModel, WorkflowRunAttemptModel
 from skyvern.forge.sdk.models import TASK_V3_TURN_STEP_CREATED_BY, StepStatus
 from skyvern.schemas.steps import AgentStepOutput, StepToolCall
 from skyvern.webeye.actions.actions import ClickAction
@@ -218,3 +220,73 @@ async def test_compute_cost_preserves_first_attempt_assignment_and_adds_retries(
     async with agent_db.Session() as session:
         row = await session.scalar(select(TaskRunModel).where(TaskRunModel.run_id == "wr_cost"))
         assert (row.duration_ms, row.compute_cost, row.llm_cost) == (3000, Decimal("0.40"), Decimal("0.50"))
+
+
+async def _create_workflow_run_task(agent_db, organization_id: str, workflow_run_id: str, attempt_number: int | None):
+    return await agent_db.tasks.create_task(
+        url="https://example.com",
+        title=None,
+        navigation_goal=None,
+        data_extraction_goal=None,
+        navigation_payload={"attempt": attempt_number},
+        organization_id=organization_id,
+        workflow_run_id=workflow_run_id,
+        attempt_number=attempt_number,
+    )
+
+
+@pytest.mark.asyncio
+async def test_workflow_run_status_task_read_omits_only_extracted_information(agent_db) -> None:
+    organization = await agent_db.organizations.create_organization(
+        organization_name="Test organization", organization_id="o_status_tasks"
+    )
+    org_id = organization.organization_id
+    for attempt_number, extracted_information in ((None, {"rows": [{"i": 1}]}), (1, ["a"]), (2, "text")):
+        task = await _create_workflow_run_task(agent_db, org_id, "wr_status_tasks", attempt_number)
+        await agent_db.tasks.update_task(
+            task.task_id,
+            organization_id=org_id,
+            extracted_information=extracted_information,
+            errors=[{"error_code": f"E{attempt_number}", "reasoning": "r"}],
+        )
+    await _create_workflow_run_task(agent_db, org_id, "wr_other", None)
+
+    statements: list[str] = []
+
+    def capture(_conn: Any, _cursor: Any, statement: str, *_args: Any) -> None:
+        statements.append(statement)
+
+    event.listen(agent_db.engine.sync_engine, "before_cursor_execute", capture)
+    try:
+        status_tasks = await agent_db.tasks.get_tasks_for_workflow_run_status("wr_status_tasks")
+    finally:
+        event.remove(agent_db.engine.sync_engine, "before_cursor_execute", capture)
+    full_tasks = await agent_db.tasks.get_tasks_by_workflow_run_id("wr_status_tasks")
+
+    assert [task.extracted_information for task in full_tasks] == [{"rows": [{"i": 1}]}, ["a"], "text"]
+    assert status_tasks == [task.model_copy(update={"extracted_information": None}) for task in full_tasks]
+    task_selects = [statement for statement in statements if re.search(r"\bFROM tasks\b", statement)]
+    assert len(task_selects) == 1
+    assert re.search(r"\.extracted_information\b", task_selects[0]) is None
+    assert "extracted_information_schema" in task_selects[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stored_values",
+    [{"status": "not_a_status"}, {"navigation_payload": 7}, {"errors": 5}, {"cdp_connect_headers": [1]}],
+)
+async def test_workflow_run_status_task_read_keeps_retained_field_failures(agent_db, stored_values) -> None:
+    organization = await agent_db.organizations.create_organization(
+        organization_name="Test organization", organization_id="o_status_task_failures"
+    )
+    task = await _create_workflow_run_task(agent_db, organization.organization_id, "wr_status_failures", 1)
+    async with agent_db.Session() as session:
+        await session.execute(update(TaskModel).where(TaskModel.task_id == task.task_id).values(**stored_values))
+        await session.commit()
+
+    with pytest.raises(Exception) as full_read_error:
+        await agent_db.tasks.get_tasks_by_workflow_run_id("wr_status_failures")
+    with pytest.raises(type(full_read_error.value)) as status_read_error:
+        await agent_db.tasks.get_tasks_for_workflow_run_status("wr_status_failures")
+    assert str(status_read_error.value) == str(full_read_error.value)

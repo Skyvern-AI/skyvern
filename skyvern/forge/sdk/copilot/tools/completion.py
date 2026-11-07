@@ -6,6 +6,7 @@ from typing import Any, Protocol
 import structlog
 
 from skyvern.config import settings
+from skyvern.forge.sdk.copilot.agent_context import PreRunPageReference, RegisteredArtifactEvidence
 from skyvern.forge.sdk.copilot.challenge_evidence import carrier_backed_anti_bot_categories
 from skyvern.forge.sdk.copilot.completion_criteria_store import note_adjudication_on_turn_state
 from skyvern.forge.sdk.copilot.completion_output_grounding import (
@@ -66,7 +67,6 @@ from skyvern.forge.sdk.copilot.request_policy import (
     is_fallback_floor_criterion,
     is_neutral_reported_boolean_criterion,
 )
-from skyvern.forge.sdk.copilot.runtime import PreRunPageReference, RegisteredArtifactEvidence
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 
@@ -998,12 +998,17 @@ def _bind_registered_artifact_evidence(
         return
     if evidence is None or evidence.workflow_run_id != run_id:
         return
-    entries = [entry for entry in evidence.entries if entry.artifact_id not in generated]
-    if not entries:
+    # A text layer with a problem is not the document's text, so it cannot confirm a requested value.
+    bound = [
+        (entry.text, entry.file_name)
+        for entry in evidence.entries
+        if entry.text and entry.text_layer_problem is None and entry.artifact_id not in generated
+    ]
+    if not bound:
         return
     block_outputs[_REGISTERED_ARTIFACT_OBSERVATION_LABEL] = {
-        "parsed_text": " ".join(entry.parsed_text for entry in entries),
-        "file_names": [entry.file_name for entry in entries],
+        "parsed_text": " ".join(text for text, _ in bound),
+        "file_names": [file_name for _, file_name in bound],
     }
     block_output_sources[_REGISTERED_ARTIFACT_OBSERVATION_LABEL] = "registered_artifact_content"
 

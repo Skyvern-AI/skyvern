@@ -89,6 +89,7 @@ export class BridgeConnection {
     onReset,
     onEvent = async () => undefined,
     onStateChange,
+    onTransportLost = () => undefined,
     requestTimeoutMs = REQUEST_TIMEOUT_MS,
   }) {
     this.onRequest = onRequest;
@@ -96,6 +97,8 @@ export class BridgeConnection {
     this.onReset = onReset;
     this.onEvent = onEvent;
     this.onStateChange = onStateChange;
+    this.onTransportLost = onTransportLost;
+    this.transportGeneration = 0;
     this.socket = null;
     this.authenticated = false;
     this.enabled = false;
@@ -156,6 +159,15 @@ export class BridgeConnection {
     };
   }
 
+  getTransportGeneration() {
+    return this.transportGeneration;
+  }
+
+  markTransportLost() {
+    this.transportGeneration += 1;
+    this.onTransportLost();
+  }
+
   async setConfig({ bridgePort, pairingToken }) {
     const port = this.normalizePort(bridgePort);
     if (typeof pairingToken !== "string") {
@@ -195,9 +207,9 @@ export class BridgeConnection {
   async disconnect() {
     this.enabled = false;
     this.lastError = "";
+    this.closeSocket();
     await chrome.storage.local.set({ enabled: false });
     this.clearReconnectTimer();
-    this.closeSocket();
     this.notifyState();
     return {};
   }
@@ -254,6 +266,7 @@ export class BridgeConnection {
       }
       this.socket = null;
       this.authenticated = false;
+      this.markTransportLost();
       this.clearConnectTimer();
       this.stopHealthTimers();
       this.notifyState();
@@ -606,6 +619,7 @@ export class BridgeConnection {
     const socket = this.socket;
     this.socket = null;
     this.authenticated = false;
+    this.markTransportLost();
     this.clearConnectTimer();
     this.stopHealthTimers();
     if (socket !== null && socket.readyState < WebSocket.CLOSING) {

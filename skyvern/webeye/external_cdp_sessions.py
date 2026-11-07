@@ -17,7 +17,7 @@ from skyvern.forge.sdk.browser_network_egress_monitor import BrowserNetworkEgres
 from skyvern.forge.sdk.core.http_request_authorization import deny_unenrolled_redirect_hop
 from skyvern.forge.sdk.db.repositories.browser_sessions import BrowserSessionsRepository
 from skyvern.forge.sdk.encrypt import encryptor
-from skyvern.forge.sdk.encrypt.base import EncryptMethod
+from skyvern.forge.sdk.encrypt.base import DEFAULT_ENCRYPT_METHOD
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     EXTERNAL_CDP_BROWSER_VENDOR,
     PersistentBrowserSession,
@@ -196,12 +196,12 @@ async def close_expired_external_cdp_sessions(
 
 async def seal_cdp_url(cdp_url: str) -> str:
     """The stored form of a registration's address; the database, and every copy made of it, sees only this."""
-    return await encryptor.encrypt(cdp_url, EncryptMethod.AES)
+    return await encryptor.encrypt(cdp_url, DEFAULT_ENCRYPT_METHOD)
 
 
 async def attach_registered_cdp_browser(sealed_cdp_url: str) -> RealBrowserState:
     try:
-        cdp_url = await encryptor.decrypt(sealed_cdp_url, EncryptMethod.AES)
+        cdp_url = await encryptor.decrypt_unlabeled(sealed_cdp_url)
     except Exception as error:
         LOG.warning("Could not read a registered external CDP address", error_type=type(error).__name__)
         raise ExternalBrowserUnavailable("the stored address cannot be read") from None

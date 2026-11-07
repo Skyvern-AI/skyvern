@@ -10,19 +10,25 @@ OSS-synced: synthetic ids and example.* placeholders only.
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import time
 from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from PIL import Image
+from playwright.async_api import CDPSession, Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
-from playwright.sync_api import sync_playwright
 from structlog.testing import capture_logs
 
 from skyvern.config import settings
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.code_block_recorder import (
@@ -47,24 +53,23 @@ from skyvern.webeye.actions.actions import (
     SelectOption,
     SelectOptionAction,
 )
+from skyvern.webeye.browser_engine import BrowserEngineSelection
+from skyvern.webeye.utils import page as page_module
+from skyvern.webeye.utils.page import SkyvernFrame
+from tests.unit.conftest import (
+    MARKER_RGB,
+    chromium_context,
+    never_answering_origin,
+    open_marker_page,
+    png_background_colors,
+    requires_chromium,
+    screenshot_stalls_until_its_own_timeout,
+    skycdp_engine_selection,
+)
 from tests.unit.fake_workflow_run_context import FakeWorkflowRunContext
 
 _RECORDING_PATH = "skyvern.forge.sdk.workflow.models.code_block_recording.app"
 _RECORDING_MODULE = "skyvern.forge.sdk.workflow.models.code_block_recording"
-
-
-def _has_playwright_chromium() -> bool:
-    try:
-        with sync_playwright() as playwright:
-            return Path(playwright.chromium.executable_path).exists()
-    except Exception:
-        return False
-
-
-_requires_chromium = pytest.mark.skipif(
-    not _has_playwright_chromium(),
-    reason="Requires Playwright browsers installed (run: playwright install chromium)",
-)
 
 
 def _code_block() -> CodeBlock:
@@ -81,7 +86,9 @@ def _code_block() -> CodeBlock:
     return CodeBlock(label="sink_block", code="value = 'ok'", output_parameter=output_parameter)
 
 
-def _recording(page: SimpleNamespace) -> CodeBlockActionRecording:
+def _recording(
+    page: Page | SimpleNamespace, engine_selection: BrowserEngineSelection | None = None
+) -> CodeBlockActionRecording:
     recording = CodeBlockActionRecording(
         code_block=_code_block(),
         page=page,  # type: ignore[arg-type]
@@ -89,6 +96,7 @@ def _recording(page: SimpleNamespace) -> CodeBlockActionRecording:
         workflow_run_block_id="wrb_1",
         organization_id="o_1",
         workflow_run_context=FakeWorkflowRunContext(values={}, secrets={}),
+        engine_selection=engine_selection,
     )
     recording._recording_enabled = True
     recording._task = SimpleNamespace(task_id="tsk_1")
@@ -124,14 +132,19 @@ async def test_capture_uses_the_short_recording_budget_not_the_browser_default()
     # 20s of a dying page is charged to the block's execution timeout and buys nothing, so this
     # best-effort capture must not inherit BROWSER_SCREENSHOT_TIMEOUT_MS.
     screenshot = AsyncMock(return_value=b"png-bytes")
-    page = SimpleNamespace(url="https://example.com/", screenshot=screenshot, is_closed=lambda: False)
+    page = SimpleNamespace(
+        url="https://example.com/",
+        screenshot=screenshot,
+        is_closed=lambda: False,
+        viewport_size={"width": 80, "height": 60},
+        context=None,
+    )
 
-    with patch(f"{_RECORDING_PATH}.ARTIFACT_MANAGER.create_workflow_run_block_artifact", AsyncMock()):
-        await _recording(page)._recorded_action_sink(Action(action_type=ActionType.CLICK))
+    data, _, health_calls, _ = await _sink_upload(page)
 
-    timeout_ms = screenshot.call_args.kwargs["timeout"]
-    assert timeout_ms == settings.CODE_BLOCK_RECORDING_SCREENSHOT_TIMEOUT_MS
-    assert timeout_ms < settings.BROWSER_SCREENSHOT_TIMEOUT_MS
+    assert data == b"png-bytes"
+    assert screenshot.call_args.kwargs["timeout"] == settings.CODE_BLOCK_RECORDING_SCREENSHOT_TIMEOUT_MS
+    assert health_calls == []
 
 
 @pytest.mark.asyncio
@@ -373,6 +386,37 @@ async def test_a_page_whose_url_carried_a_secret_is_not_recorded_as_an_anchor() 
     assert update_block.await_args is None
 
 
+@pytest.mark.asyncio
+async def test_billing_hook_is_told_whether_a_label_already_reached_it_in_the_run() -> None:
+    page = SimpleNamespace(url="https://example.com/", is_closed=lambda: False)
+    shared_context = FakeWorkflowRunContext(values={}, secrets={})
+    other_block = _code_block().model_copy(update={"label": "other_block"})
+    billing_hook = AsyncMock()
+
+    async def finalize(code_block: CodeBlock, success: bool) -> None:
+        recording = _recording(page)
+        recording._code_block = code_block
+        recording._workflow_run_context = shared_context  # type: ignore[assignment]
+        await recording.finalize(success=success)
+
+    with (
+        patch(f"{_RECORDING_PATH}.DATABASE.tasks.update_task", AsyncMock()),
+        patch(f"{_RECORDING_PATH}.DATABASE.tasks.update_step", AsyncMock()),
+        patch(f"{_RECORDING_PATH}.DATABASE.observer.update_workflow_run_block", AsyncMock()),
+        patch(f"{_RECORDING_PATH}.AGENT_FUNCTION.post_code_block_execution", billing_hook),
+    ):
+        await finalize(_code_block(), success=False)
+        await finalize(_code_block(), success=True)
+        await finalize(_code_block(), success=True)
+        await finalize(other_block, success=True)
+
+    assert [call.kwargs["is_first_successful_execution"] for call in billing_hook.await_args_list] == [
+        True,
+        False,
+        True,
+    ]
+
+
 _PENDING_SECRET = "credential-value-never-log"
 
 _PENDING_EVENT_BASE = {
@@ -489,7 +533,7 @@ async def test_unmapped_page_call_pending_fact_carries_code_line(monkeypatch: py
 
 
 @pytest.mark.asyncio
-@_requires_chromium
+@requires_chromium
 async def test_real_playwright_stalled_calls_emit_pending_facts(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("skyvern.forge.sdk.workflow.models.code_block_recorder.PENDING_CALL_DELAY_SECONDS", 0.05)
     release_connections = asyncio.Event()
@@ -688,3 +732,380 @@ async def test_recorded_action_code_line_survives_masking_and_upsert() -> None:
     persisted = upsert.await_args.args[0]
     assert isinstance(persisted.output, dict)
     assert persisted.output.get("code_line") == 7
+
+
+async def _sink_upload(
+    page: Page | SimpleNamespace, engine_selection: BrowserEngineSelection | None = None
+) -> tuple[bytes | None, float, list[str], str | None]:
+    """Run one sink capture and the end-of-block persist; returns the uploaded bytes, the sink's own elapsed ms, any
+    browser-health calls and the screenshot artifact id on the final upsert."""
+    upload = AsyncMock(return_value="a_1")
+    upsert = AsyncMock()
+    health = MagicMock()
+    recording = _recording(page, engine_selection)
+    action = Action(action_type=ActionType.CLICK)
+    with (
+        patch(f"{_RECORDING_PATH}.ARTIFACT_MANAGER.create_workflow_run_block_artifact", upload),
+        patch(f"{_RECORDING_PATH}.DATABASE.workflow_params.upsert_recorded_action", upsert),
+        patch.object(skyvern_context, "record_browser_success", health.record_browser_success),
+        patch.object(skyvern_context, "record_browser_timeout", health.record_browser_timeout),
+        patch.object(skyvern_context, "record_browser_recovery", health.record_browser_recovery),
+        patch.object(page_module, "log_screenshot_failure", health.log_screenshot_failure),
+    ):
+        start = time.monotonic()
+        await recording._recorded_action_sink(action)
+        elapsed_ms = (time.monotonic() - start) * 1000
+        await recording.persist([action])
+    data = upload.await_args.kwargs["data"] if upload.await_args else None
+    return data, elapsed_ms, [call[0] for call in health.mock_calls], upsert.await_args.args[0].screenshot_artifact_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["firefox", "skycdp"])
+async def test_ineligible_stalled_sink_capture_gives_up_after_one_timeout(
+    monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    monkeypatch.setattr(settings, "CODE_BLOCK_RECORDING_SCREENSHOT_TIMEOUT_MS", 300)
+
+    screenshot = AsyncMock(side_effect=screenshot_stalls_until_its_own_timeout)
+    browser = SimpleNamespace(browser_type=SimpleNamespace(name=kind if kind == "firefox" else "chromium"))
+    page = SimpleNamespace(
+        url="https://example.com/",
+        screenshot=screenshot,
+        is_closed=lambda: False,
+        viewport_size={"width": 80, "height": 60},
+        context=SimpleNamespace(browser=browser, new_cdp_session=AsyncMock()),
+    )
+    selection = skycdp_engine_selection() if kind == "skycdp" else None
+
+    with capture_logs() as logs:
+        data, _, health_calls, _ = await _sink_upload(page, selection)
+
+    assert data is None
+    screenshot.assert_awaited_once()
+    assert screenshot.await_args.kwargs["timeout"] == 300
+    page.context.new_cdp_session.assert_not_awaited()
+    assert health_calls == []
+    loud = [log["event"] for log in logs if log["log_level"] not in {"debug", "info"} or log.get("exc_info")]
+    assert [event for event in loud if "screenshot" in event.lower()] == ["Code block screenshot capture failed"]
+    warning = next(log for log in logs if log["event"] == "Code block screenshot capture failed")
+    assert warning["outcome"] == "timeout"
+
+
+@pytest.mark.asyncio
+async def test_sink_capture_never_resizes_or_evaluates_on_the_user_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "BROWSER_CURSOR_VISUALIZATION", True)
+    overlay = AsyncMock()
+    monkeypatch.setattr(SkyvernFrame, "hide_cursor_overlay", overlay)
+    monkeypatch.setattr(SkyvernFrame, "show_cursor_overlay", overlay)
+    browser = SimpleNamespace(browser_type=SimpleNamespace(name="chromium"))
+    page = SimpleNamespace(
+        url="https://example.com/",
+        screenshot=AsyncMock(return_value=b"png"),
+        is_closed=lambda: False,
+        viewport_size={"width": 800, "height": 0},
+        set_viewport_size=AsyncMock(),
+        context=SimpleNamespace(browser=browser, new_cdp_session=AsyncMock()),
+    )
+
+    data, _, _, _ = await _sink_upload(page)
+
+    assert data == b"png"
+    page.set_viewport_size.assert_not_awaited()
+    overlay.assert_not_awaited()
+    assert page.screenshot.await_args.kwargs["animations"] == "allow"
+
+
+@pytest.mark.asyncio
+@requires_chromium
+async def test_real_chromium_sink_uploads_fresh_pixels_when_the_page_screenshot_stalls(
+    record_property: Callable[[str, object], None],
+) -> None:
+    async with chromium_context() as context, never_answering_origin() as origin:
+        page = await open_marker_page(context, MARKER_RGB, f"{origin}/", stall_origin=origin)
+        data, elapsed_ms, health_calls, artifact_id = await _sink_upload(page)
+    record_property("elapsed_ms", round(elapsed_ms))
+    assert data is not None
+    assert png_background_colors(data) == {MARKER_RGB}
+    assert artifact_id == "a_1"
+    assert elapsed_ms < settings.CODE_BLOCK_RECORDING_SCREENSHOT_TIMEOUT_MS
+    assert health_calls == []
+
+
+@pytest.mark.asyncio
+@requires_chromium
+async def test_real_chromium_sink_on_a_busy_renderer_gives_up_inside_its_budget_without_health_strikes(
+    record_property: Callable[[str, object], None],
+) -> None:
+    async with chromium_context() as context:
+        page = await open_marker_page(context, MARKER_RGB, "http://capture.test/")
+        await page.evaluate("setTimeout(() => { while (true) {} }, 0)")
+        data, elapsed_ms, health_calls, artifact_id = await _sink_upload(page)
+    record_property("elapsed_ms", round(elapsed_ms))
+    assert data is None
+    assert artifact_id is None
+    assert elapsed_ms < settings.CODE_BLOCK_RECORDING_SCREENSHOT_TIMEOUT_MS
+    assert health_calls == []
+
+
+@pytest.mark.asyncio
+@requires_chromium
+async def test_real_chromium_sink_capture_does_not_fast_forward_a_running_transition() -> None:
+    async with chromium_context() as context:
+        page = await open_marker_page(context, MARKER_RGB, "http://capture.test/")
+        await page.evaluate(
+            """() => {
+                const box = document.createElement("div");
+                box.style.cssText = "width:10px;height:10px;background:#000;transition:width 30s linear";
+                box.addEventListener("transitionend", () => { window.transitionEnded = true; });
+                document.body.append(box);
+                box.getBoundingClientRect();
+                box.style.width = "500px";
+            }"""
+        )
+        await page.wait_for_function("document.getAnimations().length > 0")
+        data, _, _, _ = await _sink_upload(page)
+        assert data is not None
+        assert await page.evaluate("window.transitionEnded === true") is False
+
+
+_PRE_ACTION_RGB = (30, 60, 220)
+_NEXT_ACTION_RGB = (200, 30, 160)
+_PAINT = "rgb => { document.documentElement.style.background = document.body.style.background = `rgb(${rgb})`; }"
+
+
+def _observe_rescue_returns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[list[float], list[set[asyncio.Task[Any]]]]:
+    returned: list[float] = []
+    left_running: list[set[asyncio.Task[Any]]] = []
+    rescue = page_module._cdp_rescue_screenshot
+
+    async def observed_rescue(*args: Any, **kwargs: Any) -> Any:
+        existing = asyncio.all_tasks()
+        try:
+            return await rescue(*args, **kwargs)
+        finally:
+            returned.append(time.monotonic())
+            left_running.append(asyncio.all_tasks() - existing)
+
+    monkeypatch.setattr(page_module, "_cdp_rescue_screenshot", observed_rescue)
+    return returned, left_running
+
+
+def _post_capture_ms(capture_returned: list[float], rescue_returned: list[float]) -> int | None:
+    if not capture_returned or not rescue_returned:
+        return None
+    return round((rescue_returned[-1] - capture_returned[-1]) * 1000)
+
+
+@pytest.mark.asyncio
+@requires_chromium
+@pytest.mark.parametrize(
+    ("held_ms", "kept", "detach_failures"),
+    [(2600, True, []), (2900, False, []), (None, False, [("detach", "timeout")])],
+    ids=["answers_inside_the_bound", "answers_past_the_bound", "wedged_after_geometry"],
+)
+async def test_real_chromium_sink_capture_held_after_geometry(
+    monkeypatch: pytest.MonkeyPatch,
+    record_property: Callable[[str, object], None],
+    held_ms: int | None,
+    kept: bool,
+    detach_failures: list[tuple[str, str]],
+) -> None:
+    sent: list[dict[str, str | bool]] = []
+    capture_returned: list[float] = []
+    rescue_returned, rescue_left_running = _observe_rescue_returns(monkeypatch)
+    sink_started = 0.0
+    async with chromium_context() as context:
+        page = await open_marker_page(context, _PRE_ACTION_RGB, "http://capture.test/")
+        pre_action_png = await page.screenshot()
+        await page.evaluate(_PAINT, list(MARKER_RGB))
+        new_cdp_session = context.new_cdp_session
+
+        async def held_session(target: Page) -> CDPSession:
+            session = await new_cdp_session(target)
+            send = session.send
+
+            # The browser answers with this action's pixels; the page then moves on while the answer is held back.
+            async def held_send(method: str, params: dict | None = None) -> dict:
+                if method != "Page.captureScreenshot":
+                    return await send(method, params)
+                sent.append(dict(params or {}))
+                if held_ms is None:
+                    await page.evaluate("setTimeout(() => { while (true) {} }, 0)")
+                    return await send(method, params)
+                result = await send(method, params)
+                await page.evaluate(_PAINT, list(_NEXT_ACTION_RGB))
+                await asyncio.sleep(max(0.0, sink_started + held_ms / 1000 - time.monotonic()))
+                capture_returned.append(time.monotonic())
+                return result
+
+            monkeypatch.setattr(session, "send", held_send)
+            return session
+
+        monkeypatch.setattr(context, "new_cdp_session", held_session)
+        with capture_logs() as logs:
+            sink_started = time.monotonic()
+            data, elapsed_ms, health_calls, artifact_id = await _sink_upload(page)
+        next_action_png = None if held_ms is None else await page.screenshot()
+        engine = context.browser.browser_type.name if context.browser else None
+        viewport = page.viewport_size
+    rescue_logs = [log for log in logs if log["event"].startswith("Raw CDP rescue screenshot")]
+    record_property("engine", engine)
+    record_property("viewport", viewport)
+    record_property("stage", [(log.get("screenshot.stage"), log.get("screenshot.outcome")) for log in rescue_logs])
+    record_property("elapsed_ms", round(elapsed_ms))
+    record_property("artifact_id", artifact_id)
+    record_property("capture_params", sent)
+    detached = [
+        (log["screenshot.stage"], log["screenshot.outcome"])
+        for log in rescue_logs
+        if log["event"] == "Raw CDP rescue screenshot detach failed"
+    ]
+    record_property("detach_failures", detached)
+    record_property("leftover_tasks", [len(tasks) for tasks in rescue_left_running])
+    record_property("post_capture_ms", _post_capture_ms(capture_returned, rescue_returned))
+    assert sent == [{"format": "png", "captureBeyondViewport": False, "optimizeForSpeed": True}]
+    assert detached == detach_failures
+    assert [len(tasks) for tasks in rescue_left_running] == [0]
+    assert png_background_colors(pre_action_png) == {_PRE_ACTION_RGB}
+    if next_action_png is not None:
+        assert png_background_colors(next_action_png) == {_NEXT_ACTION_RGB}
+    assert health_calls == []
+    assert elapsed_ms < settings.CODE_BLOCK_RECORDING_SCREENSHOT_TIMEOUT_MS
+    if kept:
+        assert data is not None
+        assert png_background_colors(data) == {MARKER_RGB}
+        assert artifact_id == "a_1"
+        assert [log["event"] for log in rescue_logs] == ["Raw CDP rescue screenshot captured"]
+    else:
+        assert data is None
+        assert artifact_id is None
+        failed = next(log for log in rescue_logs if log["event"] == "Raw CDP rescue screenshot failed")
+        assert (failed["screenshot.stage"], failed["screenshot.outcome"]) == ("capture", "timeout")
+        if held_ms is not None:
+            assert all(log["event"] != "Raw CDP rescue screenshot detach failed" for log in rescue_logs)
+
+
+_NOISE_CANVAS = """() => {
+    const canvas = document.createElement("canvas");
+    canvas.width = window.innerWidth - 20;
+    canvas.height = window.innerHeight;
+    canvas.style.cssText = "position:absolute;left:0;top:0";
+    const context = canvas.getContext("2d");
+    const image = context.createImageData(canvas.width, canvas.height);
+    let seed = 1;
+    for (let i = 0; i < image.data.length; i += 4) {
+        seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+        const value = ((seed >> 16) & 3) * 64;
+        image.data[i] = value;
+        image.data[i + 1] = 255 - value;
+        image.data[i + 2] = (value * 3) & 255;
+        image.data[i + 3] = 255;
+    }
+    context.putImageData(image, 0, 0);
+    document.body.append(canvas);
+}"""
+
+
+_RENDERER_GAP_PROBE = """() => {
+    window.rendererMaxGapMs = 0;
+    let last = performance.now();
+    setInterval(() => {
+        const now = performance.now();
+        window.rendererMaxGapMs = Math.max(window.rendererMaxGapMs, now - last);
+        last = now;
+    }, 20);
+}"""
+
+
+async def _timed_capture(session: CDPSession, params: dict[str, bool]) -> tuple[float, bytes]:
+    started = time.monotonic()
+    result = await session.send("Page.captureScreenshot", {"format": "png", "captureBeyondViewport": False, **params})
+    return (time.monotonic() - started) * 1000, base64.b64decode(result["data"])
+
+
+@pytest.mark.asyncio
+@requires_chromium
+async def test_real_chromium_sink_lands_a_responsive_page_whose_default_png_encode_outlasts_the_raw_window(
+    monkeypatch: pytest.MonkeyPatch, record_property: Callable[[str, object], None], tmp_path: Path
+) -> None:
+    width, height = 6400, 3600
+    sent: list[dict[str, str | bool]] = []
+    capture_returned: list[float] = []
+    rescue_returned, _ = _observe_rescue_returns(monkeypatch)
+    async with chromium_context({"width": width, "height": height}) as context:
+        page = await open_marker_page(context, MARKER_RGB, "http://capture.test/")
+        await page.evaluate(_NOISE_CANVAS)
+        calibration = await context.new_cdp_session(page)
+        default_ms, default_png = await _timed_capture(calibration, {})
+        fast_ms, fast_png = await _timed_capture(calibration, {"optimizeForSpeed": True})
+        await calibration.detach()
+        new_cdp_session = context.new_cdp_session
+
+        async def recording_session(target: Page) -> CDPSession:
+            session = await new_cdp_session(target)
+            send = session.send
+
+            async def recorded_send(method: str, params: dict | None = None) -> dict:
+                if method != "Page.captureScreenshot":
+                    return await send(method, params)
+                sent.append(dict(params or {}))
+                result = await send(method, params)
+                capture_returned.append(time.monotonic())
+                return result
+
+            monkeypatch.setattr(session, "send", recorded_send)
+            return session
+
+        monkeypatch.setattr(context, "new_cdp_session", recording_session)
+
+        # An in-page timer measures the renderer main thread; a Python round-trip would also count the event loop
+        # decoding the returned capture.
+        await page.evaluate(_RENDERER_GAP_PROBE)
+        with capture_logs() as logs:
+            data, elapsed_ms, health_calls, artifact_id = await _sink_upload(page)
+        renderer_gap_ms = await page.evaluate("window.rendererMaxGapMs")
+    rescue_logs = [log for log in logs if log["event"].startswith("Raw CDP rescue screenshot")]
+    record_property("calibrated_default_ms", round(default_ms))
+    record_property("calibrated_fast_ms", round(fast_ms))
+    record_property("elapsed_ms", round(elapsed_ms))
+    record_property("renderer_max_gap_ms", round(renderer_gap_ms))
+    record_property("post_capture_ms", _post_capture_ms(capture_returned, rescue_returned))
+    record_property(
+        "rescue_logs",
+        [
+            (log["event"], log.get("screenshot.stage"), log.get("screenshot.outcome"), log.get("screenshot.elapsed_ms"))
+            for log in rescue_logs
+        ],
+    )
+    record_property("artifact_id", artifact_id)
+    if data is not None:
+        (tmp_path / "capture.png").write_bytes(data)
+        record_property("png_sha256", hashlib.sha256(data).hexdigest())
+        record_property("png_path", str(tmp_path / "capture.png"))
+    raw_window_ms = settings.CODE_BLOCK_RECORDING_SCREENSHOT_TIMEOUT_MS - 1000 * (
+        page_module._CDP_RESCUE_DEADLINE_MARGIN_SECONDS + page_module._CDP_RESCUE_RAW_FIRST_SUCCESS_RESERVE_SECONDS
+    )
+    residual_reproduced = default_ms > raw_window_ms
+    timing_asserted = residual_reproduced and fast_ms <= 1200
+    record_property("raw_window_ms", round(raw_window_ms))
+    record_property("residual_reproduced", residual_reproduced)
+    record_property("timing_asserted", timing_asserted)
+    assert sent == [{"format": "png", "captureBeyondViewport": False, "optimizeForSpeed": True}]
+    with Image.open(BytesIO(default_png)) as default_image, Image.open(BytesIO(fast_png)) as fast_image:
+        assert default_image.tobytes() == fast_image.tobytes()
+    assert health_calls == []
+    assert elapsed_ms < settings.CODE_BLOCK_RECORDING_SCREENSHOT_TIMEOUT_MS
+    assert (data is None) == (artifact_id is None)
+    if data is not None:
+        assert png_background_colors(data) == {MARKER_RGB}
+        with Image.open(BytesIO(data)) as image:
+            assert image.size == (width, height)
+        assert artifact_id == "a_1"
+    if not timing_asserted:
+        return
+    assert data is not None
+    assert [log["event"] for log in rescue_logs] == ["Raw CDP rescue screenshot captured"]
+    assert renderer_gap_ms < 1000

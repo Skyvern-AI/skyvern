@@ -1,4 +1,5 @@
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -28,6 +29,8 @@ const {
   historyResponse,
   routeParams,
   workflowRunQueryMock,
+  watchedRunsById,
+  historySelection,
 } = vi.hoisted(() => {
   const calls: StreamCall[] = [];
   const post = vi.fn().mockResolvedValue({});
@@ -62,6 +65,8 @@ const {
     historyResponse: history,
     routeParams: params,
     workflowRunQueryMock: vi.fn(),
+    watchedRunsById: new Map<string, unknown>(),
+    historySelection: { chatId: "chat_other" },
   };
 });
 
@@ -100,6 +105,8 @@ vi.mock("react-router-dom", async (importOriginal) => {
 });
 
 vi.mock("../hooks/useWorkflowRunQuery", () => ({
+  useWorkflowRunQueries: (ids: readonly string[]) =>
+    ids.map((id) => ({ data: watchedRunsById.get(id) })),
   useWorkflowRunQuery: (options?: { workflowRunId?: string }) =>
     workflowRunQueryMock(options),
 }));
@@ -153,7 +160,9 @@ vi.mock("./WorkflowCopilotHistory", () => ({
     onSelect: (chat: { workflow_copilot_chat_id: string }) => void;
   }) => (
     <button
-      onClick={() => onSelect({ workflow_copilot_chat_id: "chat_other" })}
+      onClick={() =>
+        onSelect({ workflow_copilot_chat_id: historySelection.chatId })
+      }
     >
       mock-select-history-chat
     </button>
@@ -226,6 +235,8 @@ beforeEach(() => {
   };
   workflowRunQueryMock.mockReset();
   workflowRunQueryMock.mockReturnValue({ data: undefined });
+  watchedRunsById.clear();
+  historySelection.chatId = "chat_other";
 });
 
 afterEach(() => {
@@ -360,5 +371,194 @@ describe("WorkflowCopilotChat — run lifecycle lines", () => {
       expect(screen.getByText("An old unrelated reply.")).toBeTruthy(),
     );
     expect(screen.queryByText(/watching it now/)).toBeNull();
+  });
+});
+
+const TEST_RUN = "wr_test";
+const REPLY_AT = "2026-10-30T16:50:32.751246";
+const INSIDE_TURN = "2026-10-30T16:50:30.000000";
+const AFTER_REPLY = "2026-10-30T16:50:44.159261";
+
+function testRun(overrides: Record<string, unknown> = {}) {
+  return makeRun({
+    workflow_run_id: TEST_RUN,
+    status: Status.Paused,
+    started_at: "2026-10-30T16:50:18.670262",
+    finished_at: null,
+    ...overrides,
+  });
+}
+
+function failedTestRun(finishedAt: string) {
+  return testRun({
+    status: Status.Failed,
+    finished_at: finishedAt,
+    failure_reason: "final block failed",
+  });
+}
+
+function pausedTestNarrative() {
+  return {
+    turnId: "turn-1",
+    turnIndex: 0,
+    mode: "build",
+    designStarted: false,
+    designEnded: true,
+    draft: null,
+    blocks: [],
+    terminal: "response",
+    terminalMessage: "The test is paused at the approval step.",
+    narrativeSummary: "Paused at approval.",
+    priorBlockCount: null,
+    designActivity: [],
+    startedAt: null,
+    endedAt: null,
+    turnFacts: {
+      factsAvailable: true,
+      evaluationState: "not_evaluated",
+      runId: TEST_RUN,
+      runCompleted: false,
+      terminalCause: null,
+      blocksRunThisTurn: 1,
+      ranCleanOnCurrentSource: false,
+    },
+  };
+}
+
+async function startTurn() {
+  fireEvent.change(screen.getByRole("textbox"), {
+    target: { value: "test it end to end" },
+  });
+  await act(async () => {
+    fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
+  });
+  await waitFor(() => expect(streamCalls).toHaveLength(1));
+}
+
+async function endTurnWithoutRunOutcome() {
+  await act(async () => {
+    streamCalls[0]!.onMessage({
+      type: "response",
+      workflow_copilot_chat_id: "chat_1",
+      message: "The test is paused at the approval step.",
+      updated_workflow: null,
+      response_time: REPLY_AT,
+      proposal_disposition: "no_proposal",
+      narrative_payload: pausedTestNarrative(),
+    });
+    streamCalls[0]!.resolve();
+  });
+}
+
+async function finishTurnPausedWithoutRunOutcome() {
+  await startTurn();
+  await endTurnWithoutRunOutcome();
+}
+
+async function settle() {
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+}
+
+describe("WorkflowCopilotChat — a test left running when its turn reported no run_outcome", () => {
+  it("stays silent on both watchers when the focused test ended inside its turn", async () => {
+    watchedRunsById.set(TEST_RUN, testRun({ status: Status.Running }));
+    const props = makeDockedProps({ workflowRunId: TEST_RUN });
+    const view = await renderChat(props);
+    await startTurn();
+    workflowRunQueryMock.mockReturnValue({
+      data: testRun({ status: Status.Running }),
+    });
+    view.rerender(chatUi(props));
+    await endTurnWithoutRunOutcome();
+
+    workflowRunQueryMock.mockReturnValue({
+      data: failedTestRun(INSIDE_TURN),
+    });
+    watchedRunsById.set(TEST_RUN, failedTestRun(INSIDE_TURN));
+    view.rerender(chatUi(props));
+    await settle();
+
+    expect(screen.queryByText(/run failed after/i)).toBeNull();
+    expect(screen.queryByText(/watching it now/)).toBeNull();
+  });
+
+  it("announces once when the test ends after the reply", async () => {
+    watchedRunsById.set(TEST_RUN, testRun());
+    const props = makeDockedProps();
+    const view = await renderChat(props);
+    await finishTurnPausedWithoutRunOutcome();
+    view.rerender(chatUi(props));
+    await settle();
+    expect(screen.queryByText(/run failed after/i)).toBeNull();
+
+    watchedRunsById.set(TEST_RUN, failedTestRun(AFTER_REPLY));
+    view.rerender(chatUi(props));
+
+    await waitFor(() =>
+      expect(screen.getAllByText(/^Test run failed after 0:25/)).toHaveLength(
+        1,
+      ),
+    );
+  });
+
+  it("stays silent when the test ended while another chat was open", async () => {
+    watchedRunsById.set(TEST_RUN, testRun());
+    const props = makeDockedProps();
+    const view = await renderChat(props);
+    await finishTurnPausedWithoutRunOutcome();
+    view.rerender(chatUi(props));
+    await settle();
+
+    historyResponse.data = {
+      workflow_copilot_chat_id: "chat_other",
+      chat_history: [
+        {
+          sender: "ai",
+          content: "An old unrelated reply.",
+          created_at: "2025-01-01T00:00:00Z",
+        },
+      ],
+      proposed_workflow: null,
+      auto_accept: false,
+    };
+    fireEvent.click(
+      screen.getByRole("button", { name: "mock-select-history-chat" }),
+    );
+    await waitFor(() =>
+      expect(screen.getByText("An old unrelated reply.")).toBeTruthy(),
+    );
+
+    watchedRunsById.set(TEST_RUN, failedTestRun(AFTER_REPLY));
+    historySelection.chatId = "chat_1";
+    historyResponse.data = {
+      workflow_copilot_chat_id: "chat_1",
+      chat_history: [
+        {
+          sender: "user",
+          content: "test it end to end",
+          created_at: "2026-10-30T16:50:10.000000",
+        },
+        {
+          sender: "ai",
+          content: "The test is paused at the approval step.",
+          created_at: REPLY_AT,
+          narrative_payload: pausedTestNarrative(),
+        },
+      ],
+      proposed_workflow: null,
+      auto_accept: false,
+    };
+    fireEvent.click(
+      screen.getByRole("button", { name: "mock-select-history-chat" }),
+    );
+    await waitFor(() =>
+      expect(screen.queryByText("An old unrelated reply.")).toBeNull(),
+    );
+    view.rerender(chatUi(props));
+    await settle();
+
+    expect(screen.queryByText(/run failed after/i)).toBeNull();
   });
 });

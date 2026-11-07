@@ -1,0 +1,38 @@
+AGENT_STEP_TOOL_NAMES = frozenset(
+    {
+        "browser_task",
+        "code",
+        "data_export",
+        "download_to_s3",
+        "email_inbox",
+        "file_download",
+        "file_upload",
+        "file_url_parser",
+        "finish",
+        "google_sheets_read",
+        "google_sheets_write",
+        "http_request",
+        "human_interaction",
+        "login",
+        "page_click",
+        "page_extract",
+        "page_fill",
+        "page_goto",
+        "pdf_fill",
+        "print_page",
+        "read_run_data",
+        "send_email",
+        "split_pdf",
+        "text_prompt",
+        "upload_to_s3",
+        "wait",
+        "web_search",
+    }
+)
+# Offered whatever the step's list says: neither changes anything outside the step.
+ALWAYS_OFFERED_TOOLS = frozenset({"finish", "read_run_data"})
+LEGACY_AGENT_STEP_TOOL_NAMES = {"pdf_parser": "file_url_parser"}
+
+
+def current_tool_names(names: list[str]) -> list[str]:
+    return list(dict.fromkeys(LEGACY_AGENT_STEP_TOOL_NAMES.get(name, name) for name in names))

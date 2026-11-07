@@ -22,12 +22,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from skyvern.forge.sdk.models import StepStatus
+from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.webeye.actions import handler
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, InputOrSelectContext, InputTextAction
 from skyvern.webeye.actions.handler import handle_input_text_action
 from skyvern.webeye.actions.responses import ActionFailure, ActionResult, ActionSuccess
-from tests.unit.conftest import make_input_element_mock
+from tests.unit.conftest import CARD_SECRET_RUN_ID, make_input_element_mock
 from tests.unit.helpers import make_organization, make_step, make_task
 
 _NOW = datetime.now(UTC)
@@ -422,6 +423,9 @@ async def _run_combobox_input(
     terminal_failure: bool = False,
     nonterminal_skip: bool = False,
     nonterminal_failure_skip: bool = False,
+    secret_text: str = "{{secret_param}}",
+    task: Task = _TASK,
+    already_filled: bool = False,
 ) -> tuple[list, MagicMock, MagicMock]:
     skyvern_el = make_input_element_mock(element_id="CBX", attrs=attrs)
     skyvern_el.is_auto_completion_input = AsyncMock(return_value=auto_completion_input)
@@ -481,7 +485,7 @@ async def _run_combobox_input(
         select_result.action_result = ActionSuccess() if select_success else ActionFailure(Exception("not committed"))
 
     # A secret makes the resolved text differ from action.text, so is_secret_value becomes True.
-    action_text = "{{secret_param}}" if is_secret else _TARGET
+    action_text = secret_text if is_secret else _TARGET
     if use_base_action:
         # Production hydrates/replays INPUT_TEXT actions as base ``Action`` (see hydrate_action /
         # get_task_actions), which the dispatcher routes by action_type. Do NOT set the runtime hint here —
@@ -495,7 +499,12 @@ async def _run_combobox_input(
         action.prefilter_typeahead = prefilter_typeahead
 
     select_mock = AsyncMock(return_value=select_result)
-    input_value_mock = AsyncMock(side_effect=["", _TARGET]) if is_secret else AsyncMock(return_value="")
+    if already_filled:
+        input_value_mock = AsyncMock(return_value=_TARGET)
+    elif is_secret:
+        input_value_mock = AsyncMock(side_effect=["", _TARGET])
+    else:
+        input_value_mock = AsyncMock(return_value="")
 
     with (
         patch("skyvern.webeye.actions.handler.DomUtil", return_value=dom_instance),
@@ -510,7 +519,7 @@ async def _run_combobox_input(
         patch("skyvern.webeye.actions.handler.sequentially_select_from_dropdown", new=select_mock),
     ):
         results = await handle_input_text_action(
-            action=action, page=MagicMock(), scraped_page=scraped_page, task=_TASK, step=_STEP
+            action=action, page=MagicMock(), scraped_page=scraped_page, task=task, step=_STEP
         )
     return results, skyvern_el, select_mock
 
@@ -655,6 +664,41 @@ async def test_secret_valued_action_does_not_trigger_select() -> None:
     select_mock.assert_not_awaited()
     el.apply_secret_visual_mask.assert_awaited_once_with()
     assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fields", "already_filled", "masked"),
+    [
+        (("card_number",), False, True),
+        # One field typed from both placeholders still receives real card data.
+        (("card_number", "card_cvv"), False, True),
+        # A field that already holds the value can have lost its mask to a re-render.
+        (("card_cvv",), True, True),
+        (("card_holder_name",), False, False),
+    ],
+)
+async def test_card_secret_is_masked_without_the_mask_secrets_opt_in(
+    card_secret_run: dict[str, str], fields: tuple[str, ...], already_filled: bool, masked: bool
+) -> None:
+    """Mask Secrets defaults off, so a card number and CVV pulled from the credential vault would
+    otherwise stay legible in the run's screenshots and recording for as long as they are retained.
+    A card secret masks regardless of the opt-in; every other secret still honors it (SKY-19351)."""
+    _results, el, _select_mock = await _run_combobox_input(
+        attrs=_INVALID_BOTH,
+        options=_listbox_with_option(_TARGET),
+        select_success=True,
+        stop_flag=True,
+        is_secret=True,
+        secret_text=" ".join(card_secret_run[field] for field in fields),
+        task=_TASK.model_copy(update={"workflow_run_id": CARD_SECRET_RUN_ID}),
+        already_filled=already_filled,
+    )
+
+    if masked:
+        el.apply_secret_visual_mask.assert_awaited()
+    else:
+        el.apply_secret_visual_mask.assert_not_awaited()
 
 
 @pytest.mark.asyncio

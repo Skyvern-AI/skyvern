@@ -1,0 +1,139 @@
+from __future__ import annotations
+
+from typing import Any, ClassVar, Literal
+
+import structlog
+from pydantic import field_validator
+
+from skyvern.forge import app
+from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
+from skyvern.forge.sdk.api.llm.custom_llm_registry import is_custom_llm_key
+from skyvern.forge.sdk.workflow.models.block import Block, render_failure_reason
+from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE
+from skyvern.schemas.agent_step_tool_names import current_tool_names
+from skyvern.schemas.workflows import AGENT_STEP_LLM_FLAG, BlockResult, BlockStatus, BlockType
+
+LOG = structlog.get_logger()
+
+
+def usable_agent_llm_key(variant: str | None) -> bool:
+    if not variant:
+        return False
+    config = LLMConfigRegistry.get_config(variant) if LLMConfigRegistry.is_registered(variant) else None
+    return (
+        not is_custom_llm_key(variant)
+        and config is not None
+        and bool(config.pin_reasoning_effort and config.reasoning_effort)
+    )
+
+
+async def read_flag_llm_key(workflow_run_id: str, organization_id: str | None, workflow_permanent_id: str) -> str:
+    """Raises ValueError naming the flag unless it gives a registered platform key with a pinned effort."""
+    try:
+        variant = await app.EXPERIMENTATION_PROVIDER.get_value_cached(
+            AGENT_STEP_LLM_FLAG,
+            workflow_run_id,
+            properties={"organization_id": organization_id, "workflow_permanent_id": workflow_permanent_id},
+        )
+    except Exception as e:
+        LOG.warning("Failed to read the agent block flag", flag=AGENT_STEP_LLM_FLAG, exc_info=True)
+        raise ValueError(f"The agent block could not read {AGENT_STEP_LLM_FLAG}.") from e
+    if not isinstance(variant, str) or not variant:
+        raise ValueError(f"The agent block is not enabled for this run: {AGENT_STEP_LLM_FLAG} has no variant for it.")
+    if not usable_agent_llm_key(variant):
+        LOG.warning("Agent block flag variant is not usable", flag=AGENT_STEP_LLM_FLAG, variant=variant)
+        raise ValueError(
+            f"{AGENT_STEP_LLM_FLAG} variant {variant!r} is not a registered platform llm_key "
+            "that pins a reasoning effort."
+        )
+    return variant
+
+
+class AgentStepBlock(Block):
+    block_type: Literal[BlockType.AGENT_STEP] = BlockType.AGENT_STEP  # type: ignore
+
+    prompt: str
+    data_schema: dict[str, Any]
+    max_turns: int = 25
+    tools: list[str] | None = None
+    parameters: list[PARAMETER_TYPE] = []
+
+    TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset({"prompt"})
+
+    @field_validator("tools")
+    @classmethod
+    def map_retired_tool_names(cls, value: list[str] | None) -> list[str] | None:
+        return None if value is None else current_tool_names(value)
+
+    def get_all_parameters(self, workflow_run_id: str) -> list[PARAMETER_TYPE]:
+        return self.parameters
+
+    async def execute(
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+        **kwargs: dict,
+    ) -> BlockResult:
+        run_context = self.get_workflow_run_context(workflow_run_id)
+        try:
+            # The flag is read first because it gates access; the block's model only overrides which usable key runs.
+            llm_key = await read_flag_llm_key(workflow_run_id, organization_id, run_context.workflow_permanent_id)
+            model_name = (self.model or {}).get("model_name")
+            if isinstance(model_name, str) and (
+                block_llm_key := self.override_llm_key_for_organization(organization_id)
+            ):
+                if not usable_agent_llm_key(block_llm_key):
+                    raise ValueError(
+                        f"Agent block model {model_name!r} resolves to llm_key {block_llm_key!r}, which is not a "
+                        "registered platform key that pins a reasoning effort."
+                    )
+                llm_key = block_llm_key
+        except ValueError as e:
+            return await self.build_block_result(
+                success=False,
+                failure_reason=str(e),
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+        await app.AGENT_FUNCTION.validate_block_execution(
+            block=self,
+            workflow_run_block_id=workflow_run_block_id,
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+        )
+        block_row = await app.DATABASE.observer.update_workflow_run_block(
+            workflow_run_block_id=workflow_run_block_id, organization_id=organization_id, prompt=self.prompt
+        )
+        try:
+            run_context.reject_platform_smtp_references(self.model_dump())
+            prompt = self.render_templatable_field("prompt", self.prompt, run_context)
+            self._apply_workflow_system_prompt(run_context)
+            prompt = run_context.mask_platform_smtp_for_agent(prompt)
+            if self.workflow_system_prompt is not None:
+                self.workflow_system_prompt = run_context.mask_platform_smtp_for_agent(self.workflow_system_prompt)
+                run_context.record_block_workflow_system_prompt(self.label, self.workflow_system_prompt)
+        except Exception as e:
+            return await self._template_format_failure_result(
+                e,
+                render_failure_reason("Failed to format jinja template:", e, self.secret_redactor(run_context)),
+                run_context,
+                workflow_run_id,
+                workflow_run_block_id,
+                organization_id,
+            )
+        # openai-agents is a server-only dependency, and embedded local mode imports every block class.
+        from skyvern.forge.sdk.workflow.models.agent_step_loop import run_agent_step
+
+        return await run_agent_step(
+            self,
+            llm_key,
+            prompt,
+            workflow_run_id,
+            workflow_run_block_id,
+            organization_id,
+            browser_session_id,
+            block_row,
+        )

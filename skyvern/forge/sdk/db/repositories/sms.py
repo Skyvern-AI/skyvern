@@ -18,6 +18,7 @@ from skyvern.forge.sdk.db.base_repository import BaseRepository
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
 from skyvern.forge.sdk.db.models import CredentialModel, OrganizationPhoneNumberModel, OrganizationSMSConfigModel
 from skyvern.forge.sdk.encrypt import EncryptMethod, encryptor
+from skyvern.forge.sdk.encrypt.base import DEFAULT_ENCRYPT_METHOD
 from skyvern.forge.sdk.schemas.sms import PHONE_NUMBER_STATUSES, SMS_CONFIG_MODES, OrganizationPhoneNumber, SMSConfig
 from skyvern.forge.sdk.workflow.secret_encryption import encrypt_secret_field_value
 from skyvern.utils.phone_validation import (
@@ -222,14 +223,14 @@ class SMSRepository(BaseRepository):
     ) -> tuple[SMSConfig, str]:
         if mode not in SMS_CONFIG_MODES:
             raise InvalidSMSConfigMode("Invalid SMS config mode")
-        encrypted_webhook_secret = await encryptor.encrypt(webhook_secret, EncryptMethod.AES)
+        encrypted_webhook_secret = await encryptor.encrypt(webhook_secret, DEFAULT_ENCRYPT_METHOD)
         async with self.Session() as session:
             now = naive_utc_now()
             row = OrganizationSMSConfigModel(
                 organization_id=organization_id,
                 mode=mode,
                 encrypted_webhook_secret=encrypted_webhook_secret,
-                webhook_secret_encrypted_method=EncryptMethod.AES.value,
+                webhook_secret_encrypted_method=DEFAULT_ENCRYPT_METHOD.value,
                 daily_ingest_cap=daily_ingest_cap,
                 created_at=now,
                 modified_at=now,
@@ -322,8 +323,8 @@ class SMSRepository(BaseRepository):
             )
             if row is None:
                 return
-            row.encrypted_signing_token = await encryptor.encrypt(auth_token, EncryptMethod.AES)
-            row.signing_token_encrypted_method = EncryptMethod.AES.value
+            row.encrypted_signing_token = await encryptor.encrypt(auth_token, DEFAULT_ENCRYPT_METHOD)
+            row.signing_token_encrypted_method = DEFAULT_ENCRYPT_METHOD.value
             await session.commit()
 
     @db_operation("get_sms_config_signing_token")

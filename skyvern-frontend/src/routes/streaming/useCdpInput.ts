@@ -1,8 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useLogging } from "@/hooks/useLogging";
-import { getCredentialParam } from "@/util/env";
-import { useClientIdStore } from "@/store/useClientIdStore";
+import { getWebSocketProtocols } from "@/util/env";
 import {
   mouseButtonName,
   getModifiers,
@@ -17,6 +16,7 @@ const RECONNECTABLE_CODES = new Set([1006, 1011, 4408, 4410, 4411]);
 const MOUSE_MOVE_BUFFER_THRESHOLD = 64 * 1024;
 
 interface UseCdpInputOptions {
+  clientId: string;
   inputWsUrl: string | null;
   interactive: boolean;
   viewportWidth: number;
@@ -71,6 +71,7 @@ function isEditableTarget(target: EventTarget | null) {
 }
 
 export function useCdpInput({
+  clientId,
   inputWsUrl,
   interactive,
   viewportWidth,
@@ -86,7 +87,6 @@ export function useCdpInput({
   const [navigateError, setNavigateError] = useState<string | null>(null);
   const credentialGetter = useCredentialGetter();
   const logging = useLogging();
-  const clientId = useClientIdStore((s) => s.clientId);
 
   const inputSocketRef = useRef<WebSocket | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -162,13 +162,14 @@ export function useCdpInput({
     const browserSessionId = targetType === "browser_session" ? targetId : null;
     const workflowRunId = targetType === "workflow_run" ? targetId : null;
 
-    function connectInputWs(credentialParam: string) {
+    function connectInputWs(protocols: string[]) {
       if (inputStoppedRef.current) return;
       if (inputSocketRef.current) {
         inputSocketRef.current.close();
       }
       const ws = new WebSocket(
-        `${inputWsUrl}?client_id=${clientId}&${credentialParam}`,
+        `${inputWsUrl}?client_id=${clientId}`,
+        protocols,
       );
       inputSocketRef.current = ws;
 
@@ -254,15 +255,15 @@ export function useCdpInput({
         `[cdp-input] Reconnecting (attempt ${inputReconnectAttemptsRef.current}/5)`,
       );
       try {
-        const credentialParam = await getCredentialParam(credentialGetter);
-        connectInputWs(credentialParam);
+        const protocols = await getWebSocketProtocols(credentialGetter);
+        connectInputWs(protocols);
       } catch (e) {
         console.error("[cdp-input] Failed to get credentials for reconnect", e);
       }
     }
 
-    getCredentialParam(credentialGetter).then((credentialParam) => {
-      connectInputWs(credentialParam);
+    getWebSocketProtocols(credentialGetter).then((protocols) => {
+      connectInputWs(protocols);
     });
 
     return () => {

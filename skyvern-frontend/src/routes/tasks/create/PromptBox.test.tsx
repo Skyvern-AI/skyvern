@@ -202,7 +202,6 @@ function renderPromptBox(
   enableCopilotHandoff = false,
   ref?: Ref<PromptBoxHandle>,
   minimal = false,
-  handoffFlagLoading = false,
   siblingBusy = false,
 ) {
   const queryClient = new QueryClient({
@@ -220,7 +219,6 @@ function renderPromptBox(
           ref={ref}
           enableCopilotHandoff={enableCopilotHandoff}
           minimal={minimal}
-          handoffFlagLoading={handoffFlagLoading}
           siblingBusy={siblingBusy}
         />
       </QueryClientProvider>
@@ -263,6 +261,19 @@ async function submitPrompt(text: string) {
 }
 
 describe("PromptBox", () => {
+  test("offers Upload an SOP and Demonstrate, with no paste card", () => {
+    renderPromptBox(true);
+
+    const label = screen.getByText("Or start from");
+    expect(label.className).toContain("text-center");
+    expect(label.parentElement?.querySelector(".grid")?.className).toContain(
+      "md:grid-cols-2",
+    );
+    expect(screen.getByLabelText("Upload an SOP")).toBeTruthy();
+    expect(screen.getByLabelText("Demonstrate task")).toBeTruthy();
+    expect(screen.queryByLabelText("Paste an SOP")).toBeNull();
+  });
+
   test.each([
     ["legacy", false],
     ["redesigned", true],
@@ -579,25 +590,6 @@ describe("PromptBox", () => {
 
     renderPromptBox(false);
     expect(screen.getByLabelText("Advanced settings")).toBeTruthy();
-  });
-
-  test("holds back the legacy toolbar controls while the handoff flag loads, then falls back to flag-off", () => {
-    vi.useFakeTimers();
-    try {
-      renderPromptBox(false, undefined, false, true);
-      expect(screen.queryByLabelText("Add files and more")).toBeNull();
-      expect(screen.queryByLabelText("Dictate message")).toBeNull();
-      expect(screen.queryByLabelText(/^Advanced settings/)).toBeNull();
-      expect(screen.getByLabelText("submit-prompt")).toBeTruthy();
-
-      act(() => {
-        vi.advanceTimersByTime(3000);
-      });
-      expect(screen.getByLabelText("Dictate message")).toBeTruthy();
-      expect(screen.getByLabelText("Advanced settings")).toBeTruthy();
-    } finally {
-      vi.useRealTimers();
-    }
   });
 
   test("clears the selected legacy example once its prompt is edited", () => {
@@ -958,42 +950,50 @@ describe("PromptBox", () => {
     );
   });
 
-  test("Upload an SOP creates a blank agent and hands the PDF to the editor once", async () => {
-    mockPost.mockResolvedValue({
-      data: {
-        workflow_permanent_id: "wpid_sop",
-        workflow_definition: { blocks: [] },
-      },
-    });
-    const pdf = new File(["%PDF"], "procedure.pdf", {
-      type: "application/pdf",
-    });
+  test.each([
+    ["procedure.pdf", "application/pdf"],
+    [
+      "procedure.docx",
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ],
+  ])(
+    "Upload an SOP creates a blank agent and hands %s to the editor once",
+    async (filename, type) => {
+      mockPost.mockResolvedValue({
+        data: {
+          workflow_permanent_id: "wpid_sop",
+          workflow_definition: { blocks: [] },
+        },
+      });
+      const sop = new File(["PK"], filename, { type });
 
+      renderPromptBox(true);
+      expect(screen.queryByLabelText("Add files and more")).toBeNull();
+      expect(screen.queryByText("Paste an SOP")).toBeNull();
+      fireEvent.change(screen.getByLabelText("Choose an SOP file"), {
+        target: { files: [sop] },
+      });
+
+      await waitFor(() =>
+        expect(mockNavigate).toHaveBeenCalledWith(
+          "/agents/wpid_sop/studio?sop=1",
+        ),
+      );
+      expect(mockPost).toHaveBeenCalledTimes(1);
+      expect(mockPost.mock.calls[0]![0]).toBe("/workflows");
+      expect(mockPost.mock.calls[0]![1]).toContain("title: New Agent");
+      expect(takeSopHandoffFile("wpid_sop")).toBe(sop);
+      expect(takeSopHandoffFile("wpid_sop")).toBeNull();
+      expect(mockPostHogCapture).toHaveBeenCalledWith(
+        "home.upload_sop_selected",
+        expect.any(Object),
+      );
+    },
+  );
+
+  test("rejects an SOP that is neither a PDF nor a .docx without creating an agent", () => {
     renderPromptBox(true);
-    expect(screen.queryByLabelText("Add files and more")).toBeNull();
-    fireEvent.change(screen.getByLabelText("Choose an SOP PDF"), {
-      target: { files: [pdf] },
-    });
-
-    await waitFor(() =>
-      expect(mockNavigate).toHaveBeenCalledWith(
-        "/agents/wpid_sop/studio?sop=1",
-      ),
-    );
-    expect(mockPost).toHaveBeenCalledTimes(1);
-    expect(mockPost.mock.calls[0]![0]).toBe("/workflows");
-    expect(mockPost.mock.calls[0]![1]).toContain("title: New Agent");
-    expect(takeSopHandoffFile("wpid_sop")).toBe(pdf);
-    expect(takeSopHandoffFile("wpid_sop")).toBeNull();
-    expect(mockPostHogCapture).toHaveBeenCalledWith(
-      "home.upload_sop_selected",
-      expect.any(Object),
-    );
-  });
-
-  test("rejects a non-PDF SOP without creating an agent", () => {
-    renderPromptBox(true);
-    fireEvent.change(screen.getByLabelText("Choose an SOP PDF"), {
+    fireEvent.change(screen.getByLabelText("Choose an SOP file"), {
       target: {
         files: [new File(["steps"], "procedure.txt", { type: "text/plain" })],
       },
@@ -1007,7 +1007,7 @@ describe("PromptBox", () => {
   });
 
   test("start cards wait while the blank-canvas link is creating an agent", () => {
-    renderPromptBox(true, undefined, false, false, true);
+    renderPromptBox(true, undefined, false, true);
     expect(
       (screen.getByLabelText("Upload an SOP") as HTMLButtonElement).disabled,
     ).toBe(true);
@@ -1020,7 +1020,7 @@ describe("PromptBox", () => {
     const big = new File(["%PDF"], "huge.pdf", { type: "application/pdf" });
     Object.defineProperty(big, "size", { value: 31 * 1024 * 1024 });
     renderPromptBox(true);
-    fireEvent.change(screen.getByLabelText("Choose an SOP PDF"), {
+    fireEvent.change(screen.getByLabelText("Choose an SOP file"), {
       target: { files: [big] },
     });
 

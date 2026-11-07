@@ -1,5 +1,8 @@
 import { BridgeConnection } from "./bridge_connection.js";
-import { DebuggerRouter } from "./debugger_router.js";
+import {
+  DebuggerRouter,
+  FOREIGN_FRAME_RECOVERY_LIMITS,
+} from "./debugger_router.js";
 import {
   authorizeDomFill,
   evaluateDom,
@@ -32,6 +35,31 @@ let lastResetOk = null;
 
 const sendIndicatorMessage = (tabId, message) =>
   chrome.tabs.sendMessage(tabId, message, { frameId: 0 });
+
+async function removeForeignFrames(tabId) {
+  let timeout;
+  try {
+    const reply = await Promise.race([
+      sendIndicatorMessage(tabId, {
+        type: "skyvern.foreignFrames.remove",
+        expiresAt: Date.now() + FOREIGN_FRAME_RECOVERY_LIMITS.removalExpiryMs,
+      }),
+      new Promise((resolve) => {
+        timeout = setTimeout(
+          () => resolve(null),
+          FOREIGN_FRAME_RECOVERY_LIMITS.removalTimeoutMs,
+        );
+      }),
+    ]);
+    return Number.isInteger(reply?.removed) && reply.removed >= 0
+      ? reply.removed
+      : 0;
+  } catch {
+    return 0;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 const indicator = new IndicatorState({
   sendMessage: sendIndicatorMessage,
   getCaptureTokens: (tabId) => debuggerRouter.getCaptureTokens(tabId),
@@ -44,8 +72,10 @@ const bridge = new BridgeConnection({
     resendPendingPairingApprovals();
   },
   onReset: (epoch, generation) => enqueueReset(epoch, generation),
+  onTransportLost: () => debuggerRouter?.handleTransportLoss(),
   onEvent: (event, params) => handleBrokerEvent(event, params),
   onStateChange: (state) => {
+    if (state.connected) debuggerRouter?.handleTransportConnected();
     indicator.setConnected(state.connected);
     void updateActionState();
   },
@@ -59,6 +89,11 @@ const tabScope = new TabScope({
 debuggerRouter = new DebuggerRouter({
   isIndicatorVisible: (tabId) => indicator.isVisible(tabId),
   sendIndicatorMessage,
+  removeForeignFrames,
+  isTransportConnected: () =>
+    bridge.getStatus().connected &&
+    bridge.socket?.readyState === WebSocket.OPEN,
+  getTransportGeneration: () => bridge.getTransportGeneration(),
   tabScope,
   sendEvent: (event, params) => bridge.sendEvent(event, params),
   onAttachedChange: () => updateActionState(),
@@ -182,6 +217,7 @@ function approveBrokerClient(approvalNonce) {
 }
 
 function enqueueReset(epoch, generation) {
+  const finishRelease = debuggerRouter.beginReleaseAll();
   const reset = resetQueue
     .catch(() => undefined)
     .then(async () => {
@@ -210,7 +246,8 @@ function enqueueReset(epoch, generation) {
       } finally {
         tabScope.finishReset();
       }
-    });
+    })
+    .finally(finishRelease);
   resetQueue = reset;
   return reset;
 }

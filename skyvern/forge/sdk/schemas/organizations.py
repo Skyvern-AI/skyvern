@@ -15,6 +15,7 @@ from pydantic import (
 from pydantic_core import InitErrorDetails
 
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.forge.sdk.schemas.sms import PhoneNumberStatus
 from skyvern.utils.organization_slug import is_valid_org_slug
 
 
@@ -215,9 +216,30 @@ class TwilioCredentialSafe(_TwilioJSONModel):
 
     account_sid: str
     api_key_sid: str | None = None
+    has_api_key_secret: bool
     has_auth_token: bool
 
     _hide_validation_inputs = model_validator(mode="wrap")(_validate_twilio_without_error_inputs)
+
+
+class OrganizationPhoneNumberResponse(BaseModel):
+    """Safe phone-number metadata without provider routing or cost secrets."""
+
+    model_config = ConfigDict(from_attributes=True)
+    phone_number_id: str
+    organization_id: str
+    sms_config_id: str
+    phone_number: str
+    provider: str
+    credential_id: str | None = None
+    price_cents: int | None = None
+    billing_exempt: bool = False
+    status: PhoneNumberStatus
+    cancel_at: datetime | None = None
+    quarantined_until: datetime | None = None
+    created_at: datetime
+    modified_at: datetime
+    deleted_at: datetime | None = None
 
 
 class TwilioOrganizationAuthToken(OrganizationAuthTokenBase, _TwilioJSONModel):
@@ -239,7 +261,7 @@ class CreateTwilioCredentialRequest(_TwilioJSONModel):
 class TwilioCredentialResponse(_TwilioJSONModel):
     model_config = ConfigDict(hide_input_in_errors=True)
 
-    credential: TwilioCredentialSafe
+    credential: TwilioCredentialSafe | None = None
 
     _hide_validation_inputs = model_validator(mode="wrap")(_validate_twilio_without_error_inputs)
 

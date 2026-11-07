@@ -13,6 +13,7 @@ export type CopilotProductAction = {
 export interface WorkflowCopilotDemonstrationInsertion {
   after_label: string | null;
   before_label: string | null;
+  replace_label?: string | null;
 }
 export type ProposalDisposition =
   | "no_proposal"
@@ -200,6 +201,8 @@ export interface WorkflowCopilotChatRequest {
   workflow_yaml: string;
   mode?: "build" | null;
   code_block?: boolean | null;
+  /** Internal capability: send only when the document editor is active. */
+  doc_editor_enabled?: boolean;
   cancel_token?: string;
   idempotency_key?: string | null;
   target_block_label?: string | null;
@@ -309,12 +312,20 @@ export interface WorkflowCopilotChatHistoryMessage {
   narrative_payload?: Record<string, unknown> | null;
 }
 
+export interface CopilotInFlightTurn {
+  turn_id: string;
+  cancel_token?: string | null;
+  latest_draft?: WorkflowApiResponse | null;
+  latest_draft_at?: string | null;
+}
+
 export interface WorkflowCopilotChatHistoryResponse {
   pending_credential_requests?: WorkflowCopilotCredentialRequiredUpdate[];
   question_interactions?: QuestionInteraction[];
   pending_question_cancel_token?: string | null;
   workflow_copilot_chat_id: string | null;
   request_turn_id?: string | null;
+  in_flight_turn?: CopilotInFlightTurn | null;
   chat_history: WorkflowCopilotChatHistoryMessage[];
   accepted_turn_ids?: string[];
   proposed_workflow?: WorkflowApiResponse | null;
@@ -499,6 +510,11 @@ export interface WorkflowCopilotTitleUpdate {
   timestamp: string;
 }
 
+export type CredentialBinding =
+  | "saved_workflow"
+  | "matched_by_saved_url"
+  | "not_bound";
+
 // Mid-build pause frame: the turn stays open (SSE alive) while the client
 // surfaces a credential card. reason stays a raw string here — CredentialCard
 // tolerates unknown reason tokens, so a newer backend can't break the wiring.
@@ -520,6 +536,8 @@ export interface WorkflowCopilotCredentialRequiredUpdate {
   // The live browser the user may sign in to themselves; absent when the card does not offer it.
   sign_in_browser_session_id?: string | null;
   signing_in?: boolean;
+  // Set on update cards only: how the credential they name is bound.
+  credential_binding?: CredentialBinding | null;
   // Present on a card that offers Generate and save; never carries a password.
   registration?: {
     username: string;
@@ -527,7 +545,22 @@ export interface WorkflowCopilotCredentialRequiredUpdate {
     attempted?: boolean;
     outcome?: "rejected" | "unknown" | "created_not_connected" | null;
   } | null;
+  // The site question asked about a picked login, so a reloaded card asks it again.
+  site_question?: CredentialSiteQuestion | null;
   timestamp: string;
+}
+
+export type CredentialSiteAnswer = "add" | "no";
+
+export interface CredentialSiteQuestion {
+  credential_id: string;
+  name: string;
+  // The origin this card signs in on.
+  site: string;
+  // Origins the login is saved for.
+  saved_sites: string[];
+  // The sites come from a connected vault, so only that vault can add one.
+  vault_sourced: boolean;
 }
 
 export interface WorkflowCopilotDemonstrationStartedUpdate {
@@ -551,7 +584,9 @@ export interface WorkflowCopilotDemonstrationActionUpdate {
     | "drag"
     | "navigate_browser"
     | "upload_attached_file"
-    | "fill_credential_field";
+    | "fill_credential_field"
+    | "note"
+    | "skyvern_tab_switch";
   // Present only on an upload the recorder attached; a skipped file request has none.
   file_id?: string;
   filename?: string;
@@ -591,8 +626,15 @@ export interface WorkflowCopilotDemonstrationStoppedUpdate {
 
 export interface WorkflowCopilotDemonstrationControlRequest {
   demonstration_id: string;
-  action: "navigate" | "fill_credential" | "upload_file" | "stop" | "cancel";
+  action:
+    | "navigate"
+    | "fill_credential"
+    | "upload_file"
+    | "note"
+    | "stop"
+    | "cancel";
   url?: string | null;
+  text?: string | null;
   selector?: string | null;
   credential_id?: string | null;
   field?: "password" | "totp" | null;
@@ -624,7 +666,15 @@ export interface WorkflowCopilotActiveDemonstration {
 }
 
 export interface WorkflowCopilotCredentialResponseResult {
-  result: "accepted" | "signed_in" | "no_sign_in_found" | "save_failed";
+  result:
+    | "accepted"
+    | "signed_in"
+    | "no_sign_in_found"
+    | "save_failed"
+    | "site_question"
+    | "site_changed_not_connected"
+    | "site_change_unknown";
+  site_question?: CredentialSiteQuestion | null;
   expires_at?: string | null;
   host?: string | null;
   browser_profile_id?: string | null;
@@ -648,6 +698,10 @@ export interface WorkflowCopilotCredentialPauseResolvedUpdate {
   credential_id: string | null;
   name: string | null;
   browser_profile_id?: string | null;
+  site_answer?: CredentialSiteAnswer | null;
+  site_a?: string | null;
+  saved_sites?: string[] | null;
+  site_b?: string | null;
   timestamp: string;
 }
 
@@ -665,6 +719,9 @@ export interface WorkflowCopilotToolCallUpdate {
   iteration: number;
   tool_call_id: string;
   timestamp?: string | null;
+  // The browser this call resolved to when it was emitted; null for calls that
+  // act in no page. Not persisted, so a reloaded chat never sees it.
+  browser_session_id?: string | null;
 }
 
 // One changed code block's line delta. `patch` is absent when the server dropped
@@ -694,7 +751,23 @@ export interface WorkflowCopilotToolResultUpdate {
   // A successful run_browser_code call's operations as display phrases.
   browser_steps?: string[] | null;
   detail?: string | null;
+  workflow_run_id?: string | null;
+  // Keys and sources only; values are read from the run itself.
+  test_inputs?: CopilotTestInput[] | null;
   timestamp?: string | null;
+}
+
+export type CopilotTestInputSource =
+  | "copilot"
+  | "page"
+  | "earlier_run"
+  | "default"
+  | "placeholder";
+
+export interface CopilotTestInput {
+  key: string;
+  source: CopilotTestInputSource;
+  sourceRunId?: string;
 }
 
 export interface WorkflowCopilotCondensingUpdate {
@@ -730,6 +803,7 @@ export interface WorkflowCopilotBlockProgressUpdate {
 export interface WorkflowCopilotRunStartedUpdate {
   type: "run_started";
   workflow_run_id: string;
+  skipped_prefix?: SkippedPrefixBlock[];
   timestamp: string;
 }
 
@@ -740,6 +814,12 @@ export type WorkflowCopilotRunOutcomeVerdict =
   | "not_evaluated";
 
 export type RunOutcomeRole = "recorded" | "adjudicated" | "interim_build_test";
+
+export interface SkippedPrefixBlock {
+  label: string;
+  kind: "reused" | "not_run";
+  sourceWorkflowRunId?: string;
+}
 
 export interface WorkflowCopilotRunOutcomeUpdate {
   type: "run_outcome";

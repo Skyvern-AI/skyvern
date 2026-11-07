@@ -8,8 +8,11 @@ import {
   render,
   screen,
 } from "@testing-library/react";
+import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
+import { useDeferredLockedEdit } from "@/hooks/useDeferredLockedEdit";
+import { TSON } from "@/util/tson";
 import { WorkflowScopeContext } from "@/routes/workflows/editor/WorkflowScopeContext";
 import {
   beginCopilotAcceptance,
@@ -38,14 +41,31 @@ vi.mock("@/hooks/useCredentialGetter", () => ({
 }));
 
 vi.mock("@/routes/workflows/components/CodeEditor", () => ({
-  CodeEditor: ({ value, readOnly }: { value: string; readOnly?: boolean }) => (
-    <div
-      data-testid="schema-editor"
-      data-readonly={readOnly ? "true" : "false"}
-    >
-      {value}
-    </div>
-  ),
+  CodeEditor: ({
+    value,
+    onChange,
+    readOnly,
+  }: {
+    value: string;
+    onChange?: (value: string) => void;
+    readOnly?: boolean;
+  }) => {
+    const edit = useDeferredLockedEdit({ value, onChange });
+    return (
+      <div
+        data-testid="schema-editor"
+        data-readonly={readOnly ? "true" : "false"}
+      >
+        <textarea
+          aria-label="schema text"
+          readOnly={readOnly}
+          value={edit.value}
+          onChange={(event) => edit.onChange(event.target.value)}
+          onBlur={edit.onBlur}
+        />
+      </div>
+    );
+  },
 }));
 
 beforeEach(() => {
@@ -62,7 +82,11 @@ afterEach(() => {
   );
 });
 
-function renderGroup(readOnly: boolean, workflowId: string | null = "w") {
+function renderGroup(
+  readOnly: boolean,
+  workflowId: string | null = "w",
+  { value = '{"type":"object"}', hideEnableToggle = false } = {},
+) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
@@ -71,15 +95,60 @@ function renderGroup(readOnly: boolean, workflowId: string | null = "w") {
     <QueryClientProvider client={client}>
       <WorkflowScopeContext.Provider value={{ workflowId, readOnly }}>
         <WorkflowDataSchemaInputGroup
-          value={'{"type":"object"}'}
+          value={value}
           onChange={onChange}
           suggestionContext={{}}
           exampleValue={{}}
+          hideEnableToggle={hideEnableToggle}
         />
       </WorkflowScopeContext.Provider>
     </QueryClientProvider>,
   );
   return { ...view, onChange };
+}
+
+function StatefulGroup({
+  initialValue,
+  onChange,
+  exampleValue,
+}: {
+  initialValue: string;
+  onChange: (value: string) => void;
+  exampleValue: Record<string, unknown>;
+}) {
+  const [value, setValue] = useState(initialValue);
+  return (
+    <WorkflowDataSchemaInputGroup
+      value={value}
+      onChange={(next) => {
+        onChange(next);
+        setValue(next);
+      }}
+      suggestionContext={{}}
+      exampleValue={exampleValue}
+    />
+  );
+}
+
+function renderStatefulGroup(
+  initialValue: string,
+  exampleValue: Record<string, unknown> = {},
+) {
+  const onChange = vi.fn();
+  render(
+    <QueryClientProvider client={new QueryClient()}>
+      <WorkflowScopeContext.Provider
+        value={{ workflowId: "w", readOnly: false }}
+      >
+        <StatefulGroup
+          initialValue={initialValue}
+          onChange={onChange}
+          exampleValue={exampleValue}
+        />
+      </WorkflowScopeContext.Provider>
+    </QueryClientProvider>,
+  );
+  return { onChange };
 }
 
 function lockEditor(kind: "save" | "copilot") {
@@ -134,6 +203,15 @@ describe("WorkflowDataSchemaInputGroup in a read-only scope", () => {
     expect(
       screen.getByTestId("schema-editor").getAttribute("data-readonly"),
     ).toBe("true");
+  });
+});
+
+describe("WorkflowDataSchemaInputGroup without the enable toggle", () => {
+  test("keeps the editor and Generate with AI when the schema text is null", async () => {
+    renderGroup(false, "w", { value: "null", hideEnableToggle: true });
+    expect(screen.queryByRole("checkbox")).toBeNull();
+    expect(screen.getByTestId("schema-editor").textContent).toBe("null");
+    expect(await generateSchema()).not.toBeNull();
   });
 });
 
@@ -225,3 +303,214 @@ describe.each(["save", "copilot"] as const)(
     });
   },
 );
+
+const listedSchema = JSON.stringify(
+  { type: "object", properties: { total: { type: "number" } } },
+  null,
+  2,
+);
+
+function groupWith({ value, deferKey }: { value: string; deferKey?: string }) {
+  return (
+    <QueryClientProvider client={new QueryClient()}>
+      <WorkflowScopeContext.Provider
+        value={{ workflowId: "w", readOnly: false }}
+      >
+        <WorkflowDataSchemaInputGroup
+          deferKey={deferKey}
+          value={value}
+          onChange={vi.fn()}
+          suggestionContext={{}}
+          exampleValue={{}}
+        />
+      </WorkflowScopeContext.Provider>
+    </QueryClientProvider>
+  );
+}
+
+function editorHidden() {
+  return screen
+    .getByTestId("schema-editor")
+    .parentElement!.classList.contains("hidden");
+}
+
+describe("WorkflowDataSchemaInputGroup field list", () => {
+  test("opens as fields and switches to the mounted editor and back", () => {
+    renderGroup(false, "w", { value: listedSchema });
+    expect(screen.getByTestId("schema-field-list").textContent).toContain(
+      "total",
+    );
+    expect(editorHidden()).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "Show JSON" }));
+    expect(screen.queryByTestId("schema-field-list")).toBeNull();
+    expect(editorHidden()).toBe(false);
+
+    fireEvent.click(screen.getByRole("button", { name: "Show fields" }));
+    expect(screen.getByTestId("schema-field-list")).not.toBeNull();
+  });
+
+  test.each([
+    ["invalid JSON", '{"type": "object",'],
+    ["the default schema", '{"type":"object"}'],
+    [
+      "compact JSON that the template parser rejects",
+      '{"type":"object","properties":{"a":{"type":"string"}}}',
+    ],
+  ])("shows only the editor for %s", (_, value) => {
+    renderGroup(false, "w", { value });
+    expect(screen.queryByTestId("schema-field-list")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Show fields" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Show JSON" })).toBeNull();
+    expect(editorHidden()).toBe(false);
+  });
+
+  test("keeps the parse error ring and message on the editor for invalid JSON", () => {
+    const invalid = '{"type": "object",';
+    renderGroup(false, "w", { value: invalid });
+    expect(
+      screen.getByTestId("schema-editor").parentElement!.className,
+    ).toContain("ring-red-500");
+    const message = TSON.parse(invalid).error!;
+    expect(message).not.toBe("");
+    expect(screen.getByText(message).className).toContain("text-red-400");
+  });
+
+  test.each([
+    ["the default schema", '{"type":"object"}'],
+    ["invalid JSON", '{"type": "object",'],
+  ])(
+    "keeps the editor visible when %s is edited into a listable schema",
+    (_, value) => {
+      renderStatefulGroup(value);
+      const input = screen.getByLabelText("schema text");
+      fireEvent.change(input, { target: { value: listedSchema } });
+      fireEvent.blur(input);
+
+      expect(screen.queryByTestId("schema-field-list")).toBeNull();
+      expect(editorHidden()).toBe(false);
+      expect(
+        screen.getByRole("button", { name: "Show fields" }),
+      ).not.toBeNull();
+    },
+  );
+
+  test("opens the editor when the schema is enabled with a listable example", () => {
+    renderStatefulGroup("null", JSON.parse(listedSchema));
+    fireEvent.click(screen.getByRole("checkbox"));
+
+    expect(screen.queryByTestId("schema-field-list")).toBeNull();
+    expect(editorHidden()).toBe(false);
+    expect(screen.getByRole("button", { name: "Show fields" })).not.toBeNull();
+  });
+
+  test("follows external writes between unlistable and listable schemas", () => {
+    const { rerender } = render(groupWith({ value: '{"type":"object"}' }));
+    expect(editorHidden()).toBe(false);
+
+    rerender(groupWith({ value: listedSchema }));
+    expect(screen.getByTestId("schema-field-list")).not.toBeNull();
+    expect(editorHidden()).toBe(true);
+
+    const invalid = '{"type": "object",';
+    rerender(groupWith({ value: invalid }));
+    expect(screen.queryByTestId("schema-field-list")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Show fields" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Show JSON" })).toBeNull();
+    expect(editorHidden()).toBe(false);
+    expect(screen.getByText(TSON.parse(invalid).error!)).not.toBeNull();
+
+    rerender(groupWith({ value: listedSchema }));
+    expect(screen.getByTestId("schema-field-list")).not.toBeNull();
+  });
+
+  test("does not carry a JSON choice to another block in the same panel", () => {
+    const { rerender } = render(
+      groupWith({ value: listedSchema, deferKey: "a" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Show JSON" }));
+    expect(editorHidden()).toBe(false);
+
+    rerender(groupWith({ value: listedSchema, deferKey: "b" }));
+    expect(screen.getByTestId("schema-field-list")).not.toBeNull();
+
+    rerender(groupWith({ value: listedSchema, deferKey: "a" }));
+    expect(editorHidden()).toBe(false);
+  });
+
+  test("toggles in a read-only scope and leaves the editor read-only", () => {
+    renderGroup(true, "w", { value: listedSchema });
+    fireEvent.click(screen.getByRole("button", { name: "Show JSON" }));
+    expect(
+      screen.getByTestId("schema-editor").getAttribute("data-readonly"),
+    ).toBe("true");
+    const fields = screen.getByRole("button", { name: "Show fields" });
+    expect(fields.hasAttribute("disabled")).toBe(false);
+    fireEvent.click(fields);
+    expect(screen.getByTestId("schema-field-list")).not.toBeNull();
+  });
+
+  test("toggles while a save holds the lock and the editor still rejects edits", () => {
+    const { onChange } = renderGroup(false, "w", { value: listedSchema });
+    lockEditor("save");
+    fireEvent.click(screen.getByRole("button", { name: "Show JSON" }));
+    const input = screen.getByLabelText("schema text");
+    fireEvent.change(input, { target: { value: "{}" } });
+    fireEvent.blur(input);
+    expect(onChange).not.toHaveBeenCalled();
+
+    const fields = screen.getByRole("button", { name: "Show fields" });
+    expect(fields.hasAttribute("disabled")).toBe(false);
+    fireEvent.click(fields);
+    expect(screen.getByTestId("schema-field-list").textContent).toContain(
+      "total",
+    );
+  });
+
+  test("never calls onChange when only the view is toggled", () => {
+    const { onChange } = renderGroup(false, "w", { value: listedSchema });
+    fireEvent.click(screen.getByRole("button", { name: "Show JSON" }));
+    fireEvent.click(screen.getByRole("button", { name: "Show fields" }));
+    fireEvent.click(screen.getByRole("button", { name: "Show JSON" }));
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  test("shows a field typed in JSON when Fields is clicked before the debounce fires", () => {
+    const { onChange } = renderStatefulGroup(listedSchema);
+    fireEvent.click(screen.getByRole("button", { name: "Show JSON" }));
+    const typed = JSON.stringify(
+      {
+        type: "object",
+        properties: { total: { type: "number" }, currency: { type: "string" } },
+      },
+      null,
+      2,
+    );
+    fireEvent.change(screen.getByLabelText("schema text"), {
+      target: { value: typed },
+    });
+    expect(onChange).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Show fields" }));
+    expect(onChange).toHaveBeenLastCalledWith(typed);
+    expect(screen.getByTestId("schema-field-list").textContent).toContain(
+      "currency",
+    );
+  });
+
+  test("shows the editor, its error and no toggle once typed JSON is invalid", () => {
+    const { onChange } = renderStatefulGroup(listedSchema);
+    fireEvent.click(screen.getByRole("button", { name: "Show JSON" }));
+    const input = screen.getByLabelText("schema text");
+    fireEvent.change(input, { target: { value: '{"type": "object",' } });
+    fireEvent.blur(input);
+
+    expect(onChange).toHaveBeenLastCalledWith('{"type": "object",');
+    expect(screen.queryByRole("button", { name: "Show fields" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Show JSON" })).toBeNull();
+    expect(editorHidden()).toBe(false);
+    const frame = screen.getByTestId("schema-editor").parentElement!;
+    expect(frame.className).toContain("ring-red-500");
+    expect(frame.nextElementSibling!.className).toContain("text-red-400");
+  });
+});

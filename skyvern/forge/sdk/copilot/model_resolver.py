@@ -35,6 +35,7 @@ from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMConfigError
 from skyvern.forge.sdk.api.llm.litellm_transport import configure_litellm_transport
 from skyvern.forge.sdk.copilot.cache_envelope import ROUTER_HOP_FIELDS
 from skyvern.forge.sdk.copilot.config import DEFAULT_TOKEN_BUDGET, CopilotConfig
+from skyvern.forge.sdk.copilot.router_fallback import fallback_groups
 from skyvern.forge.sdk.copilot.session_factory import (
     copilot_session_input_callback,
     make_copilot_call_model_input_filter,
@@ -96,17 +97,9 @@ _CLAUDE_COUNTS = (1.4, 65_000)
 _CLAUDE_INPUT_LIMITS = {"claude-sonnet-5-5": 872_000}
 
 
-def _fallback_groups(config: LLMRouterConfig) -> list[str]:
-    if not config.fallback_model_group:
-        return []
-    if isinstance(config.fallback_model_group, str):
-        return [config.fallback_model_group]
-    return list(config.fallback_model_group)
-
-
 def _router_fallback_models(config: LLMRouterConfig) -> list[dict[str, Any]]:
     fallbacks: list[dict[str, Any]] = []
-    for group in _fallback_groups(config):
+    for group in fallback_groups(config):
         entry = next((m for m in config.model_list if m.model_name == group), None)
         params = entry.litellm_params if entry is not None else {}
         hop = {field: params.get(field) for field in ROUTER_HOP_FIELDS}
@@ -117,15 +110,6 @@ def _router_fallback_models(config: LLMRouterConfig) -> list[dict[str, Any]]:
         hop["timeout"] = params.get("timeout", settings.LLM_CONFIG_TIMEOUT)
         fallbacks.append(hop)
     return fallbacks
-
-
-def router_fallback_llm_key(llm_key: str) -> str | None:
-    """The registered key a router falls back to, when its fallback group is named after one."""
-    if not LLMConfigRegistry.is_registered(llm_key):
-        return None
-    config = LLMConfigRegistry.get_config(llm_key)
-    groups = _fallback_groups(config) if isinstance(config, LLMRouterConfig) else []
-    return groups[0] if groups and LLMConfigRegistry.is_registered(groups[0]) else None
 
 
 def _model_token_budget(model: str, model_info: dict[str, Any]) -> int:
@@ -167,7 +151,7 @@ def _token_budget(copilot_config: CopilotConfig | None, config: LLMConfig | LLMR
     if copilot_config is not None and copilot_config.token_budget is not None:
         return copilot_config.token_budget
     if isinstance(config, LLMRouterConfig):
-        groups = {config.main_model_group, *_fallback_groups(config)}
+        groups = {config.main_model_group, *fallback_groups(config)}
         models = [
             (
                 str(entry.litellm_params.get("model") or entry.model_name),
@@ -357,6 +341,9 @@ def resolve_model_config(
     provider = CopilotLitellmProvider(base_url=base_url, api_key=api_key)
 
     run_config = RunConfig(
+        # A model instance, unlike a bare gpt-5* name, gets no SDK default ModelSettings; those carry their own
+        # reasoning effort, which LitellmModel sends instead of the configured one in extra_args.
+        model=provider.get_model(config.model_name),
         model_provider=provider,
         model_settings=model_settings,
         tracing_disabled=not is_tracing_enabled(),

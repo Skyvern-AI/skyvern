@@ -20,6 +20,7 @@ from skyvern.forge.sdk.api.llm.exceptions import (
     InvalidLLMResponseType,
     LLMOutputTruncatedError,
 )
+from skyvern.forge.sdk.forge_log import exception_log_fields
 from skyvern.schemas.llm import LLMConfig, LLMRouterConfig
 
 LOG = structlog.get_logger()
@@ -277,6 +278,19 @@ def _reassemble_list_response(response: list[Any], allow_action_list_wrap: bool)
     return None
 
 
+def llm_prompt_log_metadata(prompt: str) -> dict[str, int]:
+    """Return content-free metadata suitable for logging an LLM prompt."""
+    return {"prompt_length": len(prompt)}
+
+
+def llm_error_log_metadata(error: BaseException) -> dict[str, str]:
+    """Return content-free metadata suitable for logging an LLM call error."""
+    metadata = exception_log_fields(error)
+    if error.__cause__ is not None:
+        metadata["cause_type"] = type(error.__cause__).__name__
+    return metadata
+
+
 def llm_response_log_metadata(response: Any) -> dict[str, str | int]:
     """Return content-free metadata suitable for logging an LLM response."""
     metadata: dict[str, str | int] = {"response_type": type(response).__name__}
@@ -331,10 +345,18 @@ def is_truncated_response(response: litellm.ModelResponse) -> bool:
     if not response.choices:
         return False
     choice = response.choices[0]
-    return (
-        getattr(choice, "finish_reason", None) == "length"
-        and getattr(getattr(choice, "message", None), "content", None) is None
-    )
+    message = getattr(choice, "message", None)
+    if getattr(message, "content", None) is not None:
+        return False
+    # A tool call is the answer, so an empty content field alongside one is complete, not truncated.
+    if getattr(message, "tool_calls", None):
+        return False
+    # A model that spent its completion budget reasoning returns no answer at all, and upstreams
+    # label that two ways: `length` where the cap is counted against the reply, `stop` where the
+    # reasoning stream reads as a normal completion. Only `length` used to be recognised, so the
+    # `stop` form skipped the retry below and failed as an unexplained JSON parse error
+    # (SKY-19198). `content_filter` is a refusal with its own recovery path and must not land here.
+    return getattr(choice, "finish_reason", None) in ("length", "stop")
 
 
 def is_content_filtered_response(response: litellm.ModelResponse) -> bool:
@@ -368,6 +390,7 @@ def parse_api_response(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             reasoning_tokens=reasoning_tokens,
+            finish_reason=getattr(response.choices[0], "finish_reason", None) if response.choices else None,
         )
 
     content = None

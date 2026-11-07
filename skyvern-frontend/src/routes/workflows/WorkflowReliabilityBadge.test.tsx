@@ -24,6 +24,15 @@ function makeReliability(
 }
 
 describe("WorkflowReliabilityBadge", () => {
+  it("shows finding attention even without a scored reliability window", () => {
+    render(
+      <WorkflowReliabilityBadge
+        reliability={makeReliability({ scored: false })}
+        actionableFindingCount={1}
+      />,
+    );
+    expect(screen.getByText("Needs a look")).toBeTruthy();
+  });
   it("renders an amber badge for scored action_needed reliability", () => {
     render(
       <WorkflowReliabilityBadge

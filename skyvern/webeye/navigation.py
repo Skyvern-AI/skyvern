@@ -13,6 +13,7 @@ from skyvern.config import settings
 from skyvern.constants import (
     EGRESS_ATTRIBUTABLE_NAV_ERRORS,
     PERMANENT_NAV_ERRORS,
+    PROXY_TRANSPORT_NAV_ERRORS,
     SKIP_INNER_NAV_RETRY_ERRORS,
 )
 from skyvern.exceptions import (
@@ -21,8 +22,10 @@ from skyvern.exceptions import (
     BlockedNavigationDestination,
     FailedToNavigateToUrl,
     InvalidUrl,
+    UnreachableNavigationHost,
     UnresolvableNavigationHost,
 )
+from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.utils.url_validators import (
     HostVerdict,
@@ -168,6 +171,16 @@ def is_permanent_navigation_error(error_message: str) -> bool:
     return any(pattern in error_message for pattern in PERMANENT_NAV_ERRORS)
 
 
+def is_proxy_transport_navigation_error(error_message: str) -> bool:
+    """Whether the proxy hop itself refused the navigation, before the target was contacted.
+
+    Narrower than ``is_egress_attributable_navigation_error``, which also answers for a name that did
+    not resolve and for an untrusted certificate issuer. Callers that redraw a proxy to recover want
+    this one: those two are not cleared by another draw.
+    """
+    return any(pattern in error_message for pattern in PROXY_TRANSPORT_NAV_ERRORS)
+
+
 def is_egress_attributable_navigation_error(error_message: str) -> bool:
     return any(pattern in error_message for pattern in EGRESS_ATTRIBUTABLE_NAV_ERRORS)
 
@@ -202,6 +215,29 @@ async def _unresolvable_navigation_host(url: str, error_message: str) -> str | N
     if not host:
         return None
     return host if await asyncio.to_thread(host_has_no_address_record, host) else None
+
+
+async def _proxy_unreachable_navigation_host(
+    url: str, error_message: str, attempt_started_at: float
+) -> tuple[str, int] | None:
+    """The host of ``url`` and the provider's status when this attempt's tunnel failure was the provider not reaching
+    it. Only a refusal recorded for this host after the attempt started counts, so an earlier attempt's answer or
+    another host's cannot move a failure of our own egress onto the site."""
+    if driver_nav_error_code(error_message) not in PROXY_TRANSPORT_NAV_ERRORS:
+        return None
+    try:
+        host = canonical_navigation_host(url)
+    except InvalidUrl:
+        return None
+    if not host:
+        return None
+    # Runs while a failure is being raised: losing the attribution is survivable, replacing the failure is not.
+    try:
+        status = await app.AGENT_FUNCTION.proxy_unreachable_target_status(host=host, since=attempt_started_at)
+    except Exception:
+        LOG.warning("Failed to read the proxy provider's answer for a failed navigation", exc_info=True)
+        return None
+    return (host, status) if status is not None else None
 
 
 async def reported_nav_error_code(error: BaseException, url: str | None) -> str | None:
@@ -369,6 +405,24 @@ async def navigate_with_retry(
                     )
                     raise UnresolvableNavigationHost(
                         url=display_url, host=dead_host, error_message=safe_error_str
+                    ) from (None if redacting else error)
+
+                unreachable = await _proxy_unreachable_navigation_host(url, error_str, start_time)
+                if unreachable is not None:
+                    unreachable_host, upstream_status = unreachable
+                    LOG.warning(
+                        "Navigation target did not accept the proxy provider's connection in time, failing immediately",
+                        url=display_url,
+                        host=unreachable_host,
+                        upstream_status=upstream_status,
+                        error=safe_error_str,
+                    )
+                    raise UnreachableNavigationHost(
+                        url=display_url,
+                        host=unreachable_host,
+                        upstream_status=upstream_status,
+                        error_message=safe_error_str,
+                        nav_error_code=driver_nav_error_code(error_str),
                     ) from (None if redacting else error)
 
                 LOG.warning(

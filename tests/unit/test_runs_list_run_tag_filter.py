@@ -16,7 +16,6 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
-from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -29,6 +28,7 @@ from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.models.tags import TagEventType, TagSource
 from skyvern.schemas.run_enums import RunType
 from tests.unit.force_stub_app import make_workflow_run_attempts_fake
+from tests.unit.shared_route_app import shared_route_app
 
 ORG_ID = "o_test"
 
@@ -290,8 +290,6 @@ async def test_parse_tag_filter_terms_caps_comma_split_terms() -> None:
 
 @pytest.fixture
 def route_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
-    from skyvern.forge.sdk.routes.routers import base_router
-
     captured: dict[str, object] = {}
 
     async def _get_all_runs_v2(*args: object, **kwargs: object) -> list[dict[str, object]]:
@@ -307,8 +305,7 @@ def route_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     app_mock.AGENT_FUNCTION.is_workflow_tagging_enabled = AsyncMock(return_value=True)
     app_mock.AGENT_FUNCTION.accessible_workflow_folder_ids = AsyncMock(return_value=None)
 
-    test_app = FastAPI()
-    test_app.include_router(base_router, prefix="/v1")
+    test_app = shared_route_app(monkeypatch)
     test_app.dependency_overrides[org_auth_service.get_current_org] = lambda: _make_org()
 
     from skyvern.forge.sdk.routes import agent_protocol as ap
@@ -341,8 +338,6 @@ def test_route_tags_enforces_workflow_tagging_gate(route_client: TestClient) -> 
 
 @pytest.fixture
 def agent_runs_route_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
-    from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
-
     captured: dict[str, object] = {}
 
     async def _get_workflow_runs_for_workflow_permanent_id(*args: object, **kwargs: object) -> list[object]:
@@ -359,10 +354,9 @@ def agent_runs_route_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     app_mock.WORKFLOW_SERVICE = workflow_service_mock
     app_mock.AGENT_FUNCTION.is_workflow_tagging_enabled = AsyncMock(return_value=True)
     app_mock.AGENT_FUNCTION.accessible_workflow_folder_ids = AsyncMock(return_value=None)
+    app_mock.AGENT_FUNCTION.should_check_browser_session_artifacts = AsyncMock(return_value=False)
 
-    test_app = FastAPI()
-    test_app.include_router(base_router, prefix="/v1")
-    test_app.include_router(legacy_base_router, prefix="/api/v1")
+    test_app = shared_route_app(monkeypatch)
     test_app.dependency_overrides[org_auth_service.get_current_org] = lambda: _make_org()
 
     from skyvern.forge.sdk.routes import agent_protocol as ap
@@ -457,8 +451,6 @@ async def test_get_run_tag_suggestions_caps_values_per_key(
 
 @pytest.fixture
 def run_tag_suggestions_route_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
-    from skyvern.forge.sdk.routes.routers import base_router
-
     tags_mock = MagicMock()
     tags_mock.get_run_tag_suggestions = AsyncMock(return_value=[])
 
@@ -467,8 +459,7 @@ def run_tag_suggestions_route_client(monkeypatch: pytest.MonkeyPatch) -> TestCli
     app_mock.AGENT_FUNCTION.is_workflow_tagging_enabled = AsyncMock(return_value=True)
     app_mock.AGENT_FUNCTION.accessible_workflow_folder_ids = AsyncMock(return_value=None)
 
-    test_app = FastAPI()
-    test_app.include_router(base_router, prefix="/v1")
+    test_app = shared_route_app(monkeypatch)
     test_app.dependency_overrides[org_auth_service.get_current_org] = lambda: _make_org()
 
     from skyvern.forge.sdk.routes import agent_protocol as ap

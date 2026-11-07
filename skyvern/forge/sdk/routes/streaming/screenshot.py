@@ -24,7 +24,8 @@ from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
-from skyvern.forge.sdk.routes.streaming.auth import folder_access_denied
+from skyvern.forge.sdk.routes.streaming.auth import credentials_from_websocket, folder_access_denied
+from skyvern.forge.sdk.routes.streaming.cdp_input import _reauthorize_stream_periodically
 from skyvern.forge.sdk.routes.streaming.client_disconnect import watch_for_client_disconnect
 from skyvern.forge.sdk.routes.streaming.run_stream_outcome import RunStreamConnection, RunStreamOutcome
 from skyvern.forge.sdk.routes.streaming.screencast import (
@@ -36,12 +37,27 @@ from skyvern.forge.sdk.routes.streaming.verify import stream_transport
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSessionStatus, is_final_status
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.services.org_auth_service import get_current_org
+from skyvern.forge.sdk.services.request_principal import get_request_principal
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.webeye.cdp_frame_publisher import stream_key_for_task, stream_key_for_workflow_run
 
 LOG = structlog.get_logger()
 STREAMING_TIMEOUT = 300
 WAIT_FOR_RUNNING_TIMEOUT = 120
+
+
+async def _run_screencast_with_reauthorization(
+    screencast: Awaitable[None], reauthorization_task: asyncio.Task[None]
+) -> None:
+    stream_task = asyncio.ensure_future(screencast)
+    try:
+        done, _ = await asyncio.wait({stream_task, reauthorization_task}, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            task.result()
+    finally:
+        stream_task.cancel()
+        reauthorization_task.cancel()
+        await asyncio.gather(stream_task, reauthorization_task, return_exceptions=True)
 
 
 @legacy_base_router.websocket("/stream/tasks/{task_id}")
@@ -51,9 +67,10 @@ async def task_stream(
     apikey: str | None = None,
     token: str | None = None,
 ) -> None:
+    credentials = credentials_from_websocket(websocket, apikey, token)
     try:
-        await websocket.accept()
-        if not token and not apikey:
+        await websocket.accept(subprotocol=credentials.subprotocol)
+        if not credentials.authorization and not credentials.apikey:
             await websocket.send_text("No valid credential provided")
             return
     except ConnectionClosedOK:
@@ -61,7 +78,7 @@ async def task_stream(
         return
 
     try:
-        organization = await get_current_org(x_api_key=apikey, authorization=token)
+        organization = await get_current_org(x_api_key=credentials.apikey, authorization=credentials.authorization)
         organization_id = organization.organization_id
     except Exception:
         LOG.exception("Error while getting organization", task_id=task_id)
@@ -199,9 +216,10 @@ async def workflow_run_streaming(
     apikey: str | None = None,
     token: str | None = None,
 ) -> None:
+    credentials = credentials_from_websocket(websocket, apikey, token)
     try:
-        await websocket.accept()
-        if not token and not apikey:
+        await websocket.accept(subprotocol=credentials.subprotocol)
+        if not credentials.authorization and not credentials.apikey:
             await websocket.send_text("No valid credential provided")
             return
     except ConnectionClosedOK:
@@ -209,13 +227,12 @@ async def workflow_run_streaming(
         return
 
     try:
-        organization = await get_current_org(x_api_key=apikey, authorization=token)
+        organization = await get_current_org(x_api_key=credentials.apikey, authorization=credentials.authorization)
         organization_id = organization.organization_id
     except HTTPException:
         LOG.warning(
             "WofklowRun Streaming: Error while getting organization",
             workflow_run_id=workflow_run_id,
-            token=token,
         )
         try:
             await websocket.send_text("Invalid credential provided")
@@ -231,8 +248,61 @@ async def workflow_run_streaming(
         organization_id=organization_id,
     )
 
+    principal = get_request_principal()
+    reauthorization_task: asyncio.Task[None] | None = None
+    try:
+        required = await app.AGENT_FUNCTION.browser_session_stream_reauthorization_required(principal, organization_id)
+        monitor = False
+        if not required:
+            monitor = await app.AGENT_FUNCTION.browser_session_stream_enforcement_monitor_required(
+                principal, organization_id
+            )
+        if required or monitor:
+
+            async def reauthorize() -> bool:
+                if principal is not None and principal.api_key_access_mode == "scoped":
+                    return await app.AGENT_FUNCTION.reauthorize_workflow_run_stream(
+                        principal,
+                        organization_id,
+                        workflow_run_id,
+                        "stream.connect",
+                        folder_action="workflow_run.read",
+                    )
+                return await app.AGENT_FUNCTION.reauthorize_workflow_run_stream(
+                    principal, organization_id, workflow_run_id, "workflow_run.read"
+                )
+
+            async def should_reauthorize() -> bool:
+                return await app.AGENT_FUNCTION.browser_session_stream_reauthorization_required(
+                    principal, organization_id
+                )
+
+            reauthorization_task = asyncio.create_task(
+                _reauthorize_stream_periodically(
+                    websocket,
+                    reauthorize,
+                    {"workflow_run_id": workflow_run_id},
+                    should_reauthorize=should_reauthorize if not required else None,
+                )
+            )
+    except Exception:
+        LOG.warning("Workflow stream authorization lookup failed", workflow_run_id=workflow_run_id, exc_info=True)
+        await websocket.close(code=1011, reason="authorization-temporarily-unavailable")
+        return
+
     if settings.BROWSER_STREAMING_MODE == "cdp":
-        await _local_screencast_for_workflow_run(websocket, workflow_run_id, organization_id)
+        try:
+            if principal is not None and principal.api_key_access_mode == "scoped" and reauthorization_task is not None:
+                await _run_screencast_with_reauthorization(
+                    _local_screencast_for_workflow_run(websocket, workflow_run_id, organization_id),
+                    reauthorization_task,
+                )
+            else:
+                await _local_screencast_for_workflow_run(websocket, workflow_run_id, organization_id)
+        finally:
+            if reauthorization_task is not None:
+                reauthorization_task.cancel()
+                await asyncio.gather(reauthorization_task, return_exceptions=True)
         return
 
     # timestamp last time when streaming activity happens
@@ -365,6 +435,9 @@ async def workflow_run_streaming(
         return
     finally:
         disconnected.cancel()
+        if reauthorization_task is not None:
+            reauthorization_task.cancel()
+            await asyncio.gather(reauthorization_task, return_exceptions=True)
         await connection.finish()
     LOG.info(
         "WofklowRun Streaming: WebSocket connection closed successfully",
@@ -382,9 +455,10 @@ async def browser_session_streaming(
     token: str | None = None,
     force_cdp: bool = False,
 ) -> None:
+    credentials = credentials_from_websocket(websocket, apikey, token)
     try:
-        await websocket.accept()
-        if not token and not apikey:
+        await websocket.accept(subprotocol=credentials.subprotocol)
+        if not credentials.authorization and not credentials.apikey:
             await websocket.send_text("No valid credential provided")
             await websocket.close()
             return
@@ -393,7 +467,7 @@ async def browser_session_streaming(
         return
 
     try:
-        organization = await get_current_org(x_api_key=apikey, authorization=token)
+        organization = await get_current_org(x_api_key=credentials.apikey, authorization=credentials.authorization)
         organization_id = organization.organization_id
     except Exception:
         LOG.exception("Error while getting organization", browser_session_id=browser_session_id)
@@ -415,7 +489,36 @@ async def browser_session_streaming(
     # proxy and API can observe a transient lookup failure independently, so re-resolving the
     # transport here must not strand that viewer on the failed RFB choice.
     if force_cdp or await stream_transport(browser_session_id, organization_id) == "cdp":
-        await _local_screencast_for_browser_session(websocket, browser_session_id, organization_id)
+        principal = get_request_principal()
+        try:
+            required = (
+                principal is not None
+                and principal.api_key_access_mode == "scoped"
+                and await app.AGENT_FUNCTION.browser_session_stream_reauthorization_required(principal, organization_id)
+            )
+        except Exception:
+            LOG.warning("Browser-session stream authorization lookup failed", exc_info=True)
+            await websocket.close(code=1011, reason="authorization-temporarily-unavailable")
+            return
+        if not required:
+            await _local_screencast_for_browser_session(websocket, browser_session_id, organization_id)
+            return
+
+        async def reauthorize() -> bool:
+            return await app.AGENT_FUNCTION.reauthorize_browser_session_stream(
+                principal,
+                organization_id,
+                browser_session_id,
+                action="stream.connect",
+                folder_action="workflow_run.read",
+            )
+
+        reauthorization_task = asyncio.create_task(
+            _reauthorize_stream_periodically(websocket, reauthorize, {"browser_session_id": browser_session_id})
+        )
+        await _run_screencast_with_reauthorization(
+            _local_screencast_for_browser_session(websocket, browser_session_id, organization_id), reauthorization_task
+        )
         return
 
     await websocket.close(code=4001, reason="use-vnc-streaming")

@@ -12,6 +12,7 @@ import {
   WorkflowCopilotChat,
   canonicalRecoveriesByWorkflow,
 } from "./WorkflowCopilotChat";
+import { toast } from "@/components/ui/use-toast";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
 import { COPILOT_WORKING_VERBS } from "./workingVerbs";
@@ -30,42 +31,46 @@ type StreamCall = {
   reject: (error: unknown) => void;
 };
 
-vi.mock("posthog-js/react", () => ({
-  useFeatureFlagEnabled: () => {
-    throw new Error("WorkflowCopilotChat must not consult PostHog");
-  },
-}));
+const {
+  streamCalls,
+  postStreaming,
+  cancelPost,
+  historyResponse,
+  featureFlags,
+} = vi.hoisted(() => {
+  const calls: StreamCall[] = [];
+  const post = vi.fn().mockResolvedValue({});
+  const streaming = vi.fn(
+    (
+      _path: string,
+      body: StreamBody,
+      onMessage: (payload: unknown) => boolean,
+    ) =>
+      new Promise<void>((resolve, reject) => {
+        calls.push({ body, onMessage, resolve, reject });
+      }),
+  );
+  const history = {
+    data: {
+      workflow_copilot_chat_id: null as string | null,
+      chat_history: [] as unknown[],
+      proposed_workflow: null as Record<string, unknown> | null,
+      auto_accept: false,
+    },
+  };
+  return {
+    streamCalls: calls,
+    postStreaming: streaming,
+    cancelPost: post,
+    historyResponse: history,
+    featureFlags: { docEditor: false },
+  };
+});
 
-const { streamCalls, postStreaming, cancelPost, historyResponse } = vi.hoisted(
-  () => {
-    const calls: StreamCall[] = [];
-    const post = vi.fn().mockResolvedValue({});
-    const streaming = vi.fn(
-      (
-        _path: string,
-        body: StreamBody,
-        onMessage: (payload: unknown) => boolean,
-      ) =>
-        new Promise<void>((resolve, reject) => {
-          calls.push({ body, onMessage, resolve, reject });
-        }),
-    );
-    const history = {
-      data: {
-        workflow_copilot_chat_id: null as string | null,
-        chat_history: [] as unknown[],
-        proposed_workflow: null as Record<string, unknown> | null,
-        auto_accept: false,
-      },
-    };
-    return {
-      streamCalls: calls,
-      postStreaming: streaming,
-      cancelPost: post,
-      historyResponse: history,
-    };
-  },
-);
+vi.mock("posthog-js/react", () => ({
+  useFeatureFlagEnabled: (name: string) =>
+    name === "WORKFLOW_DOC_EDITOR" && featureFlags.docEditor,
+}));
 
 vi.mock("@/api/sse", () => ({
   getSseClient: vi.fn().mockResolvedValue({ postStreaming }),
@@ -146,6 +151,8 @@ vi.mock("@/store/WorkflowHasChangesStore", () => {
 });
 
 vi.mock("@/routes/workflows/hooks/useWorkflowRunQuery", () => ({
+  useWorkflowRunQueries: (ids: readonly string[]) =>
+    ids.map(() => ({ data: undefined })),
   useWorkflowRunQuery: () => ({ data: undefined }),
 }));
 
@@ -239,6 +246,8 @@ beforeEach(() => {
   streamCalls.length = 0;
   postStreaming.mockClear();
   cancelPost.mockClear();
+  vi.mocked(toast).mockClear();
+  featureFlags.docEditor = false;
   useCopilotActionStore.setState({
     pendingBuild: null,
     generatingBlockLabel: null,
@@ -550,60 +559,88 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
     expect(ta.closest("[class*='focus-within']")).not.toBeNull();
   });
 
-  it("stages an SOP as an editable draft with its PDF attached and starts task demonstration from the empty state", async () => {
-    cancelPost.mockImplementation((path: string) =>
-      Promise.resolve(
-        path === "/upload_file" ? { data: { file_id: "file_sop" } } : {},
-      ),
-    );
-    const onRecordTask = vi.fn();
+  it.each(["procedure.pdf", "procedure.docx"])(
+    "stages %s as an editable SOP draft and starts task demonstration from the empty state",
+    async (filename) => {
+      cancelPost.mockImplementation((path: string) =>
+        Promise.resolve(
+          path === "/upload_file" ? { data: { file_id: "file_sop" } } : {},
+        ),
+      );
+      const onRecordTask = vi.fn();
 
+      render(
+        <FeatureFlagContext.Provider value={() => false}>
+          <WorkflowCopilotChat onRecordTask={onRecordTask} canRecordTask />
+        </FeatureFlagContext.Provider>,
+      );
+
+      await waitFor(() =>
+        expect(screen.getByText("What should this agent do?")).toBeTruthy(),
+      );
+      expect(screen.getByText("Upload an SOP")).toBeTruthy();
+      expect(screen.queryByText("Paste an SOP")).toBeNull();
+      expect(screen.getByText("Demonstrate task")).toBeTruthy();
+      const actionLayout = screen.getByRole("button", {
+        name: "Upload an SOP",
+      }).parentElement?.parentElement;
+      expect(actionLayout?.className).toContain("grid-cols-1");
+      expect(actionLayout?.className).toContain(
+        "[@container_copilot-actions_(min-width:440px)]:grid-cols-2",
+      );
+      await act(async () => {
+        fireEvent.change(screen.getByLabelText("Choose an SOP file"), {
+          target: { files: [new File(["procedure"], filename)] },
+        });
+      });
+      await waitFor(() =>
+        expect(
+          screen.getByRole("button", { name: `Remove ${filename}` }),
+        ).toBeTruthy(),
+      );
+      expect(cancelPost).toHaveBeenCalledWith(
+        "/upload_file",
+        expect.any(FormData),
+        expect.anything(),
+      );
+      expect(textarea().value).toBe(
+        "Add the steps from the attached SOP to this agent.",
+      );
+      expect(postStreaming).not.toHaveBeenCalled();
+
+      fireEvent.click(screen.getByRole("button", { name: "Demonstrate task" }));
+      expect(onRecordTask).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("offers only PDF and Word files on the SOP card and refuses a text file with a toast naming both", async () => {
     render(
       <FeatureFlagContext.Provider value={() => false}>
-        <WorkflowCopilotChat onRecordTask={onRecordTask} canRecordTask />
+        <WorkflowCopilotChat />
       </FeatureFlagContext.Provider>,
     );
-
     await waitFor(() =>
       expect(screen.getByText("What should this agent do?")).toBeTruthy(),
     );
-    expect(screen.getByText("Upload an SOP")).toBeTruthy();
-    expect(screen.getByText("Demonstrate task")).toBeTruthy();
-    const actionLayout = screen.getByRole("button", {
-      name: "Upload an SOP",
-    }).parentElement?.parentElement;
-    expect(actionLayout?.className).toContain("grid-cols-1");
-    expect(actionLayout?.className).toContain(
-      "[@container_copilot-actions_(min-width:440px)]:grid-cols-2",
-    );
+    const picker = screen.getByLabelText(
+      "Choose an SOP file",
+    ) as HTMLInputElement;
+    expect(picker.accept.split(",")).toEqual([".pdf", ".docx"]);
+
     await act(async () => {
-      fireEvent.change(screen.getByLabelText("Choose an SOP PDF"), {
-        target: {
-          files: [
-            new File(["procedure"], "procedure.pdf", {
-              type: "application/pdf",
-            }),
-          ],
-        },
+      fireEvent.change(picker, {
+        target: { files: [new File(["notes"], "notes.txt")] },
       });
     });
-    await waitFor(() =>
-      expect(
-        screen.getByRole("button", { name: "Remove procedure.pdf" }),
-      ).toBeTruthy(),
+    expect(vi.mocked(toast)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        description: expect.stringMatching(/PDF.*Word/),
+      }),
     );
-    expect(cancelPost).toHaveBeenCalledWith(
-      "/upload_file",
-      expect.any(FormData),
-      expect.anything(),
-    );
-    expect(textarea().value).toBe(
-      "Add the steps from the attached SOP to this agent.",
-    );
-    expect(postStreaming).not.toHaveBeenCalled();
-
-    fireEvent.click(screen.getByRole("button", { name: "Demonstrate task" }));
-    expect(onRecordTask).toHaveBeenCalledTimes(1);
+    expect(cancelPost).not.toHaveBeenCalled();
+    expect(
+      screen.queryByRole("button", { name: "Remove notes.txt" }),
+    ).toBeNull();
   });
 
   it.each(["yaml", "copilot"])(
@@ -626,7 +663,7 @@ describe("WorkflowCopilotChat — unflagged S4 composer", () => {
         });
       });
       await act(async () => {
-        fireEvent.change(screen.getByLabelText("Choose an SOP PDF"), {
+        fireEvent.change(screen.getByLabelText("Choose an SOP file"), {
           target: {
             files: [
               new File(["procedure"], "procedure.pdf", {

@@ -92,6 +92,7 @@ def _make_pdf_parser_block(file_url: str) -> PDFParserBlock:
 
 def _mock_workflow_run_context() -> MagicMock:
     ctx = MagicMock()
+    ctx.resolve_block_notes_section.return_value = None
     ctx.has_parameter.return_value = False
     ctx.has_value.return_value = False
     ctx.register_output_parameter_value_post_execution = AsyncMock()
@@ -744,6 +745,7 @@ class TestPDFParserSchemaValidation:
     @staticmethod
     def _patch_execute_dependencies(mp: pytest.MonkeyPatch, block: PDFParserBlock, handler: AsyncMock) -> AsyncMock:
         workflow_run_context = MagicMock()
+        workflow_run_context.resolve_block_notes_section.return_value = None
         workflow_run_context.has_parameter.return_value = False
         record_output_parameter_value = AsyncMock()
 
@@ -1566,7 +1568,7 @@ class TestForceOcrOnTheCachedScriptPath:
         assert "force_ocr" not in without_force_ocr
 
 
-BLOCKING_PARSE_SECONDS = 0.3
+BLOCKING_PARSE_SECONDS = 0.1
 TICK_INTERVAL_SECONDS = 0.01
 
 
@@ -1959,7 +1961,7 @@ class TestPdfplumberFallbackTokenLimit:
         symbols_pdf = tmp_path / "symbols.pdf"
         symbols_pdf.write_bytes(_build_letter_pdf(6, ("=" * 60,) * 3))
         monkeypatch.setattr(pdf_parser_module, "PdfReader", _RejectingPdfReader)
-        monkeypatch.setattr(pdf_parser_module, "_PAGE_TEXTS_CHAR_LIMIT", 500)
+        monkeypatch.setattr(pdf_parser_module, "_TEXT_CHAR_LIMIT", 500)
 
         with structlog.testing.capture_logs() as logs:
             text = extract_pdf_file(str(symbols_pdf), max_tokens=40)
@@ -1998,7 +2000,7 @@ class TestPdfplumberFallbackTokenLimit:
         symbols_pdf = tmp_path / "symbols.pdf"
         symbols_pdf.write_bytes(_build_letter_pdf(6, ("=" * 60,) * 3))
         monkeypatch.setattr(pdf_parser_module, "PdfReader", _RejectingPdfReader)
-        monkeypatch.setattr(pdf_parser_module, "_PAGE_TEXTS_RESULT", pdf_parser_module._ResultLimit(2048, 6))
+        monkeypatch.setattr(pdf_parser_module, "_TEXT_RESULT", pdf_parser_module._ResultLimit(2048, 6))
 
         text = extract_pdf_file(str(symbols_pdf), max_tokens=0)
 
@@ -2011,7 +2013,7 @@ class TestPdfplumberFallbackTokenLimit:
         symbols_pdf = tmp_path / "symbols.pdf"
         symbols_pdf.write_bytes(_build_letter_pdf(2, ("=" * 60,) * 3))
         monkeypatch.setattr(pdf_parser_module, "PdfReader", _RejectingPdfReader)
-        monkeypatch.setattr(pdf_parser_module, "_PAGE_TEXTS_RESULT", pdf_parser_module._ResultLimit(300, 6))
+        monkeypatch.setattr(pdf_parser_module, "_TEXT_RESULT", pdf_parser_module._ResultLimit(300, 6))
 
         with pytest.raises(PDFParsingError, match="a result may hold"):
             extract_pdf_file(str(symbols_pdf), max_tokens=0)
@@ -2181,7 +2183,7 @@ class TestFileParserTelemetryLogs:
     @staticmethod
     def _patch_extraction(mp: pytest.MonkeyPatch, handler: AsyncMock) -> None:
         # A real key, so `llm_key` assertions discriminate: an AsyncMock's auto-attribute is not a
-        # str, so `_handler_llm_key` would return None and a null assertion would prove nothing.
+        # str, so `handler_llm_key` would return None and a null assertion would prove nothing.
         handler.llm_key = "test-llm-key"
         mp.setattr(FileParserBlock, "_resolve_file_parser_handler", AsyncMock(return_value=handler))
         mp.setattr(

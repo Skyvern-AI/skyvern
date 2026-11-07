@@ -1637,6 +1637,30 @@ def test_nested_bearer_under_non_sensitive_key_is_redacted() -> None:
     assert out["headers"]["X-Trace-Note"] == "sent Bearer <redacted>"
 
 
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (
+            "wss://h/v1/stream?apikey=sk-abc.def~g+h/i==&client_id=c1",
+            "wss://h/v1/stream?apikey=<redacted>&client_id=c1",
+        ),
+        (
+            "sec-websocket-protocol: skyvern.v1, bearer.eyJhbGciOi.JIUzI1NiJ9.sig-_123",
+            "sec-websocket-protocol: skyvern.v1, bearer.<redacted>",
+        ),
+        ("protocols=['skyvern.v1', 'apikey.eyJ0eXAi.payload.sig']", "protocols=['skyvern.v1', 'apikey.<redacted>']"),
+    ],
+)
+def test_redacts_streaming_credentials_in_query_and_subprotocol(text: str, expected: str) -> None:
+    assert redact_bearer_tokens_in_text(text) == expected
+
+
+def test_sec_websocket_protocol_header_key_is_masked() -> None:
+    event = {"event": "ws handshake", "headers": {"Sec-WebSocket-Protocol": "skyvern.v1, bearer.eyJabc.def.ghi"}}
+    out = redact_sensitive_event_fields(None, "info", event)  # type: ignore[arg-type]
+    assert out["headers"]["Sec-WebSocket-Protocol"] == _REDACTED
+
+
 def test_proxy_authorization_and_set_cookie_header_keys_are_masked() -> None:
     event = {
         "event": "Executing HTTP request",

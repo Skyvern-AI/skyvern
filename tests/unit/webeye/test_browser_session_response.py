@@ -31,6 +31,7 @@ PINNED_CLIENT_FIELDS = frozenset(
         "runnable_id",
         "timeout",
         "browser_address",
+        "browser_address_redacted",
         "app_url",
         "extensions",
         "browser_type",
@@ -401,7 +402,9 @@ def s3_holding_one_file_per_prefix() -> MagicMock:
     client = MagicMock()
     client.list_files = AsyncMock(side_effect=list_files)
     client.get_object_info = AsyncMock(return_value={"Metadata": {}, "LastModified": None, "ContentLength": 10})
-    client.create_presigned_urls = AsyncMock(side_effect=lambda keys: [f"https://b.s3.amazonaws.com/{k}" for k in keys])
+    client.create_presigned_urls = AsyncMock(
+        side_effect=lambda keys, **_: [f"https://b.s3.amazonaws.com/{k}" for k in keys]
+    )
     return client
 
 

@@ -3,18 +3,25 @@ from __future__ import annotations
 import json
 import textwrap
 from collections.abc import Callable
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot.code_block_steps import derive_code_block_steps_in_yaml
 from skyvern.forge.sdk.copilot.data_write_defaults import DATA_WRITE_BLOCK_TYPES
+from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.review_gate import (
     DESTINATION_ADAPTERS,
+    NarrativeReviewProjection,
     build_review_projection,
     parse_execution_receipts,
     serialize_execution_receipts,
     workflow_block_fingerprints,
 )
+from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml, workflow_to_copilot_yaml
+from tests.unit.copilot_test_helpers import make_copilot_ctx
 
 
 def _workflow(blocks: str, *, parameters: str = "[]") -> str:
@@ -33,28 +40,28 @@ def test_projection_classifies_all_changes_and_uses_cumulative_execution_evidenc
         """    - block_type: task
       label: unchanged_step
       next_block_label: changed_step
-      prompt: Keep this
+      navigation_goal: Keep this
     - block_type: task
       label: changed_step
       next_block_label: removed_step
-      prompt: Before
+      navigation_goal: Before
     - block_type: task
       label: removed_step
-      prompt: Remove me
+      navigation_goal: Remove me
 """
     )
     staged = _workflow(
         """    - block_type: task
       label: unchanged_step
       next_block_label: changed_step
-      prompt: Keep this
+      navigation_goal: Keep this
     - block_type: task
       label: changed_step
       next_block_label: added_step
-      prompt: After
+      navigation_goal: After
     - block_type: task
       label: added_step
-      prompt: New
+      navigation_goal: New
 """
     )
 
@@ -260,6 +267,108 @@ def test_parameter_default_change_invalidates_change_and_execution_identity() ->
     }
 
 
+def test_projection_lists_each_input_change_by_key_without_its_values() -> None:
+    step = """    - block_type: task
+      label: step
+      prompt: Open the portal
+"""
+    persisted = _workflow(
+        step,
+        parameters="[{key: api_token, parameter_type: workflow, default_value: sk-old-secret}, "
+        "{key: seed_rows, parameter_type: workflow, default_value: seed-secret-rows}, "
+        "{key: region, parameter_type: workflow, default_value: east, description: Before}]",
+    )
+    staged = _workflow(
+        step,
+        parameters="[{key: api_token, parameter_type: workflow, default_value: sk-new-secret}, "
+        "{key: region, parameter_type: workflow, default_value: east, description: After}, "
+        "{key: report_key, parameter_type: workflow, default_value: rk-added-secret}]",
+    )
+
+    projection = build_review_projection(persisted, staged, set())
+
+    assert projection is not None
+    assert projection["inputs"] == [
+        {"key": "api_token", "change": "changed"},
+        {"key": "region", "change": "changed"},
+        {"key": "report_key", "change": "added"},
+        {"key": "seed_rows", "change": "removed"},
+    ]
+    wire = json.dumps(projection)
+    for value in ("sk-old-secret", "sk-new-secret", "seed-secret-rows", "rk-added-secret", "east", "Before", "After"):
+        assert value not in wire
+
+
+def test_an_input_whose_only_difference_is_an_explicit_null_is_not_changed() -> None:
+    step = """    - block_type: task
+      label: step
+      prompt: Open the portal
+"""
+    persisted = _workflow(step, parameters="[{key: region, parameter_type: workflow, default_value: null}]")
+    staged = _workflow(step, parameters="[{key: region, parameter_type: workflow}]")
+
+    projection = build_review_projection(persisted, staged, set())
+
+    assert projection is not None
+    assert projection["inputs"] == []
+
+
+def test_an_input_differing_only_in_stored_row_fields_is_not_changed() -> None:
+    step = """    - block_type: task
+      label: step
+      prompt: Open the portal
+"""
+    staged = _workflow(step, parameters="[{key: region, parameter_type: workflow, workflow_parameter_type: string}]")
+    persisted = _workflow(
+        step,
+        parameters="[{key: region, parameter_type: workflow, workflow_parameter_type: string, "
+        "workflow_parameter_id: wp_1, workflow_id: w_1, created_at: '2026-01-01T00:00:00', "
+        "modified_at: '2026-01-02T00:00:00'}]",
+    )
+
+    projection = build_review_projection(persisted, staged, set())
+
+    assert projection is not None
+    assert projection["inputs"] == []
+
+
+def test_a_json_default_changed_from_true_to_one_is_a_changed_input() -> None:
+    step = """    - block_type: task
+      label: step
+      prompt: Open the portal
+"""
+    persisted = _workflow(
+        step, parameters="[{key: flags, parameter_type: workflow, workflow_parameter_type: json, default_value: true}]"
+    )
+    staged = persisted.replace("default_value: true", "default_value: 1")
+
+    projection = build_review_projection(persisted, staged, set())
+
+    assert projection is not None
+    assert projection["inputs"] == [{"key": "flags", "change": "changed"}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("no_saved_workflow")
+async def test_inputs_saved_through_the_converter_match_the_yaml_they_came_from() -> None:
+    staged = _workflow(
+        """    - block_type: task
+      label: step
+      prompt: Open the portal
+""",
+        parameters="[{key: page_size, parameter_type: workflow, workflow_parameter_type: integer, default_value: '5'}, "
+        "{key: dry_run, parameter_type: workflow, workflow_parameter_type: boolean, default_value: 'true'}, "
+        "{key: ratio, parameter_type: workflow, workflow_parameter_type: float, default_value: 2}, "
+        """{key: seed_rows, parameter_type: workflow, workflow_parameter_type: json, default_value: '[{"id": 1}]'}]""",
+    )
+    saved = workflow_to_copilot_yaml(await _process_workflow_yaml("w", "wp", "o", staged))
+
+    projection = build_review_projection(saved, staged, set())
+
+    assert projection is not None
+    assert projection["inputs"] == []
+
+
 def test_missing_code_steps_are_canonicalized_before_execution_fingerprinting() -> None:
     without_steps = _workflow(
         """    - block_type: code
@@ -391,6 +500,43 @@ def test_projection_returns_none_when_either_workflow_cannot_be_parsed() -> None
 
 def test_destination_registry_stays_complete_for_every_data_write_type() -> None:
     assert set(DESTINATION_ADAPTERS) == DATA_WRITE_BLOCK_TYPES
+
+
+def test_a_note_change_marks_both_neighbours_changed_and_untested_but_a_description_change_does_not() -> None:
+    def workflow(note: str, description: str) -> str:
+        return _workflow(f"""    - block_type: task
+      label: above
+      prompt: First
+      description: {description}
+    - block_type: task
+      label: below
+      prompt: Second
+      notes: {note}
+    - block_type: task
+      label: elsewhere
+      prompt: Third
+""")
+
+    tested = workflow("Old note", "Opens the site")
+    receipts = workflow_block_fingerprints(tested)
+
+    note_edit = build_review_projection(tested, workflow("New note", "Opens the site"), receipts)
+    description_edit = build_review_projection(tested, workflow("Old note", "Something else"), receipts)
+
+    assert note_edit is not None and description_edit is not None
+    assert [(block["label"], block["change"], block["neverTested"]) for block in note_edit["blocks"]] == [
+        ("above", "changed", True),
+        ("below", "changed", True),
+        ("elsewhere", "unchanged", False),
+    ]
+    assert all(block["change"] == "unchanged" and not block["neverTested"] for block in description_edit["blocks"])
+
+    empty_note = workflow("Old note", "Opens the site").replace(
+        "      description:", "      notes: null\n      description:"
+    )
+    empty_note_edit = build_review_projection(tested, empty_note, receipts)
+    assert empty_note_edit is not None
+    assert all(block["change"] == "unchanged" for block in empty_note_edit["blocks"])
 
 
 def test_sheets_identity_resolves_account_and_ignores_representational_url_query() -> None:
@@ -894,3 +1040,497 @@ def test_tested_block_fingerprint_ignores_the_goal_ownership_facts() -> None:
     projection = build_review_projection(hand_edited, resubmitted, workflow_block_fingerprints(hand_edited))
     assert projection is not None
     assert [(block["change"], block["coverage"]) for block in projection["blocks"]] == [("unchanged", "current_source")]
+
+
+_CAPTURE_DIR = Path(__file__).parent / "fixtures" / "review_projection_capture"
+
+
+def _changes(projection: NarrativeReviewProjection | None) -> dict[str, str]:
+    assert projection is not None
+    return {block["label"]: block["change"] for block in projection["blocks"]}
+
+
+def test_a_canvas_spelled_proposal_marks_only_the_edited_block_changed() -> None:
+    persisted = (_CAPTURE_DIR / "persisted.yaml").read_text()
+    staged = (_CAPTURE_DIR / "staged.yaml").read_text()
+
+    projection = build_review_projection(persisted, staged, {})
+
+    assert _changes(projection) == {"read_statement_number": "unchanged", "read_amount_due": "changed"}
+
+
+def test_blank_storage_fields_from_the_canvas_leave_an_upload_block_unchanged() -> None:
+    capture = Path(__file__).parent / "fixtures" / "review_projection_capture_file_upload"
+    persisted = (capture / "persisted.yaml").read_text()
+    staged = (capture / "staged.yaml").read_text()
+
+    assert _changes(build_review_projection(persisted, staged, {})) == {
+        "open_vendor_hub": "unchanged",
+        "read_certificate": "changed",
+        "store_certificate": "unchanged",
+    }
+    credentialed = staged.replace("aws_access_key_id: ''", "aws_access_key_id: '{{ aws_key }}'")
+    assert _changes(build_review_projection(persisted, credentialed, {}))["store_certificate"] == "changed"
+    cleared = staged.replace("s3_bucket: qa-capture-bucket", "s3_bucket: ''")
+    assert _changes(build_review_projection(persisted, cleared, {}))["store_certificate"] == "changed"
+    unpinned = persisted.replace("code_version: 2\n", "")
+    assert set(_changes(build_review_projection(unpinned, staged, {})).values()) == {"changed"}
+
+
+def test_an_editor_staged_code_edit_leaves_an_unset_upload_block_unchanged() -> None:
+    capture = Path(__file__).parent / "fixtures" / "review_projection_capture_code_arm"
+    persisted = (capture / "persisted.yaml").read_text()
+    staged = (capture / "staged.yaml").read_text()
+
+    assert _changes(build_review_projection(persisted, staged, {})) == {
+        "open_vendor_hub": "unchanged",
+        "read_certificate": "changed",
+        "upload_certificate": "unchanged",
+    }
+    bucketed = staged.replace("s3_bucket: ''", "s3_bucket: qa-bucket")
+    assert _changes(build_review_projection(persisted, bucketed, {}))["upload_certificate"] == "changed"
+
+
+def test_a_blank_task_url_still_differs_from_an_unset_one() -> None:
+    task = "    - block_type: task\n      label: inherit_page\n      navigation_goal: Open the reports page\n"
+
+    projection = build_review_projection(_workflow(task), _workflow(task + "      url: ''\n"), {})
+
+    assert _changes(projection) == {"inherit_page": "changed"}
+
+
+def test_an_explicit_workflow_setting_change_still_marks_every_block_changed() -> None:
+    persisted = (_CAPTURE_DIR / "persisted.yaml").read_text()
+    staged = (
+        (_CAPTURE_DIR / "staged.yaml")
+        .read_text()
+        .replace("mask_secrets: false", "mask_secrets: false\nenable_self_healing: true")
+    )
+
+    projection = build_review_projection(persisted, staged, {})
+
+    assert set(_changes(projection).values()) == {"changed"}
+
+
+@pytest.mark.parametrize(("draft_mask_secrets", "expected"), [("false", "changed"), ("true", "unchanged")])
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("no_saved_workflow")
+async def test_a_surfaced_draft_reads_omitted_settings_from_the_draft_it_inherits(
+    draft_mask_secrets: str, expected: str
+) -> None:
+    blocks = """    - block_type: navigation
+      label: open_portal
+      next_block_label: read_total
+      url: https://example.com
+      navigation_goal: Open the portal
+    - block_type: extraction
+      label: read_total
+      data_extraction_goal: Read the total
+"""
+    proposal = _workflow(blocks)
+    saved = await _process_workflow_yaml("wf-1", "wfp-1", "org-1", proposal + "mask_secrets: true\n")
+    candidate = await _process_workflow_yaml(
+        "wf-1", "wfp-1", "org-1", proposal, settings_fallback_yaml=proposal + f"mask_secrets: {draft_mask_secrets}\n"
+    )
+    ctx = make_copilot_ctx(
+        persisted_workflow_yaml=workflow_to_copilot_yaml(saved),
+        last_workflow=candidate,
+        last_workflow_yaml=proposal,
+        request_policy=RequestPolicy(allow_update_workflow=True, allow_run_blocks=True),
+        stream=None,
+    )
+    result = SimpleNamespace(
+        final_output=json.dumps({"type": "REPLY", "user_response": "Here is the workflow."}),
+        new_items=[],
+    )
+    chat_request = SimpleNamespace(
+        workflow_id="wf-1",
+        workflow_permanent_id="wfp-1",
+        workflow_copilot_chat_id="chat-1",
+        workflow_run_id=None,
+        workflow_yaml="",
+        product_action=None,
+    )
+
+    agent_result = await agent_module._translate_to_agent_result(
+        result, ctx, global_llm_context=None, chat_request=chat_request, organization_id="org-1"
+    )
+
+    assert agent_result.narrative_payload is not None
+    assert _changes(agent_result.narrative_payload.get("review")) == {"open_portal": expected, "read_total": expected}
+
+
+_READER_AND_BYSTANDER = """    - block_type: navigation
+      label: reader
+      next_block_label: bystander
+      navigation_goal: Search for {{ account }}
+    - block_type: navigation
+      label: bystander
+      navigation_goal: Open the reports page
+"""
+_ACCOUNT = "{key: account, parameter_type: workflow, workflow_parameter_type: string, default_value: primary}"
+_OTHER = "{key: region, parameter_type: workflow, workflow_parameter_type: string, default_value: east}"
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        (f"[{_OTHER}]", f"[{_OTHER}, {_ACCOUNT}]"),
+        (f"[{_OTHER}, {_ACCOUNT}]", f"[{_OTHER}]"),
+        (f"[{_ACCOUNT}]", f"[{_ACCOUNT.replace('primary', 'backup')}]"),
+    ],
+    ids=["added", "removed", "changed"],
+)
+def test_an_input_change_marks_only_the_blocks_that_read_it(before: str, after: str) -> None:
+    persisted = _workflow(_READER_AND_BYSTANDER, parameters=before)
+    staged = _workflow(_READER_AND_BYSTANDER, parameters=after)
+
+    assert _changes(build_review_projection(persisted, staged, {})) == {"reader": "changed", "bystander": "unchanged"}
+
+
+def test_an_input_description_edit_lists_the_input_but_marks_no_block() -> None:
+    persisted = _workflow(_READER_AND_BYSTANDER, parameters=f"[{_ACCOUNT}]")
+    staged = _workflow(_READER_AND_BYSTANDER, parameters=f"[{_ACCOUNT[:-1]}, description: The account to search}}]")
+
+    projection = build_review_projection(persisted, staged, {})
+
+    assert projection is not None
+    assert projection["inputs"] == [{"key": "account", "change": "changed"}]
+    assert _changes(projection) == {"reader": "unchanged", "bystander": "unchanged"}
+
+
+def _watched(default: str) -> str:
+    return f"{{key: watched, parameter_type: workflow, workflow_parameter_type: string, default_value: {default}}}"
+
+
+_BYSTANDER = "    - block_type: navigation\n      label: bystander\n      navigation_goal: Open the reports page\n"
+
+
+@pytest.mark.parametrize(
+    ("reader", "extra_parameter"),
+    [
+        (
+            "    - block_type: login\n      label: reader\n      next_block_label: bystander\n"
+            "      navigation_goal: Sign in as {{ watched_real_username }}\n",
+            "",
+        ),
+        (
+            "    - block_type: for_loop\n      label: reader\n      next_block_label: bystander\n"
+            "      loop_over_parameter_key: watched\n      loop_blocks:\n"
+            "        - block_type: navigation\n          label: visit\n          navigation_goal: Open the row\n",
+            "",
+        ),
+        (
+            "    - block_type: goto_url\n      label: reader\n      next_block_label: bystander\n      url: watched\n",
+            "",
+        ),
+        (
+            "    - block_type: navigation\n      label: reader\n      next_block_label: bystander\n"
+            "      navigation_goal: Read {{ 'a' ~ watched | json }}\n",
+            "",
+        ),
+        (
+            "    - block_type: login\n      label: reader\n      next_block_label: bystander\n"
+            "      navigation_goal: Sign in\n      parameter_keys: [chosen_login]\n",
+            ", {key: chosen_login, parameter_type: credential, credential_id: '{{ watched }}'}",
+        ),
+        (
+            "    - block_type: conditional\n      label: reader\n      branch_conditions:\n"
+            "        - criteria: {criteria_type: prompt, expression: 'Is the page ready?'}\n"
+            "          next_block_label: bystander\n"
+            "        - is_default: true\n          next_block_label: bystander\n",
+            "",
+        ),
+    ],
+    ids=[
+        "credential-real-suffix",
+        "loop-over-key",
+        "bare-name-url",
+        "json-filter-second-operand",
+        "credential-parameter-bound-to-input",
+        "natural-language-condition",
+    ],
+)
+def test_a_block_reading_the_changed_input_is_changed(reader: str, extra_parameter: str) -> None:
+    persisted = _workflow(reader + _BYSTANDER, parameters=f"[{_watched('before')}{extra_parameter}]")
+    staged = _workflow(reader + _BYSTANDER, parameters=f"[{_watched('after')}{extra_parameter}]")
+
+    changes = _changes(build_review_projection(persisted, staged, {}))
+
+    assert changes["reader"] == "changed"
+    assert changes["bystander"] == "unchanged"
+
+
+def test_an_input_named_like_a_jinja_global_is_still_read() -> None:
+    blocks = _READER_AND_BYSTANDER.replace("{{ account }}", "{{ dict }}")
+    dict_input = "{key: dict, parameter_type: workflow, workflow_parameter_type: string, default_value: DEFAULT}"
+
+    projection = build_review_projection(
+        _workflow(blocks, parameters=f"[{dict_input.replace('DEFAULT', 'a')}]"),
+        _workflow(blocks, parameters=f"[{dict_input.replace('DEFAULT', 'b')}]"),
+        {},
+    )
+
+    assert _changes(projection) == {"reader": "changed", "bystander": "unchanged"}
+
+
+def test_a_neighbours_note_that_names_the_input_marks_both_readers_changed() -> None:
+    blocks = """    - block_type: navigation
+      label: above
+      next_block_label: below
+      navigation_goal: First
+    - block_type: navigation
+      label: below
+      next_block_label: elsewhere
+      navigation_goal: Second
+      notes: Use the {{ watched }} account
+    - block_type: navigation
+      label: elsewhere
+      navigation_goal: Third
+"""
+
+    projection = build_review_projection(
+        _workflow(blocks, parameters=f"[{_watched('before')}]"),
+        _workflow(blocks, parameters=f"[{_watched('after')}]"),
+        {},
+    )
+
+    assert _changes(projection) == {"above": "changed", "below": "changed", "elsewhere": "unchanged"}
+
+
+@pytest.mark.parametrize(
+    ("blocks", "parameters_before", "parameters_after"),
+    [
+        (
+            "    - block_type: navigation\n      label: quiet\n      navigation_goal: Open the page\n"
+            "      description: Mentions watched by name\n",
+            f"[{_watched('a')}]",
+            f"[{_watched('b')}]",
+        ),
+        (
+            "    - block_type: goto_url\n      label: quiet\n      url: https://example.com/start\n",
+            "[]",
+            "[{key: url, parameter_type: workflow, workflow_parameter_type: string}]",
+        ),
+        (
+            "    - block_type: navigation\n      label: quiet\n      navigation_goal: Find {{ customer_name }}\n",
+            "[{key: customer_name, parameter_type: workflow, workflow_parameter_type: string}]",
+            "[{key: customer_name, parameter_type: workflow, workflow_parameter_type: string}, "
+            "{key: string, parameter_type: workflow, workflow_parameter_type: string}]",
+        ),
+        (
+            "    - block_type: conditional\n      label: quiet\n      branch_conditions:\n"
+            "        - criteria: {criteria_type: jinja2_template, expression: \"{{ mode == 'fast' }}\"}\n"
+            "          next_block_label: after\n"
+            "        - is_default: true\n          next_block_label: after\n"
+            "    - block_type: navigation\n      label: after\n      navigation_goal: Continue\n",
+            f"[{{key: mode, parameter_type: workflow, workflow_parameter_type: string, default_value: fast}}, {_watched('a')}]",
+            f"[{{key: mode, parameter_type: workflow, workflow_parameter_type: string, default_value: fast}}, {_watched('b')}]",
+        ),
+    ],
+    ids=["description-only", "input-named-like-a-field", "input-named-like-a-type", "template-condition"],
+)
+def test_a_block_that_does_not_read_the_changed_input_stays_unchanged(
+    blocks: str, parameters_before: str, parameters_after: str
+) -> None:
+    projection = build_review_projection(
+        _workflow(blocks, parameters=parameters_before), _workflow(blocks, parameters=parameters_after), {}
+    )
+
+    assert projection is not None and projection["inputs"]
+    assert set(_changes(projection).values()) == {"unchanged"}
+
+
+@pytest.mark.parametrize(
+    "setting",
+    [
+        "  workflow_system_prompt: Always act for {{ watched }}\n",
+        "  error_code_mapping: {MISSING: 'The {{ watched }} record is missing'}\n",
+    ],
+    ids=["system-prompt", "error-code-mapping"],
+)
+def test_an_input_a_workflow_setting_reads_marks_every_block_changed(setting: str) -> None:
+    blocks = _READER_AND_BYSTANDER.replace("{{ account }}", "the customer")
+
+    def workflow(default: str) -> str:
+        return (
+            "title: Review fixture\nworkflow_definition:\n"
+            f"{setting}"
+            f"  parameters: [{_watched(default)}]\n  blocks:\n{blocks}"
+        )
+
+    assert set(_changes(build_review_projection(workflow("a"), workflow("b"), {})).values()) == {"changed"}
+
+
+def test_an_input_a_root_setting_reads_marks_every_block_changed() -> None:
+    blocks = _READER_AND_BYSTANDER.replace("{{ account }}", "the customer")
+
+    def workflow(default: str) -> str:
+        return (
+            "title: Review fixture\nbrowser_profile_key: '{{ watched }}'\nworkflow_definition:\n"
+            f"  parameters: [{_watched(default)}]\n  blocks:\n{blocks}"
+        )
+
+    assert set(_changes(build_review_projection(workflow("a"), workflow("b"), {})).values()) == {"changed"}
+
+
+def test_an_explicit_null_setting_inherits_like_an_omitted_one() -> None:
+    persisted = "mask_secrets: true\n" + _workflow(_READER_AND_BYSTANDER)
+    staged = "mask_secrets: null\n" + _workflow(_READER_AND_BYSTANDER)
+
+    assert set(_changes(build_review_projection(persisted, staged, {})).values()) == {"unchanged"}
+
+
+def test_binding_a_stored_code_block_to_the_input_its_code_reads_is_a_change() -> None:
+    def workflow(parameter_keys: str) -> str:
+        return _workflow(
+            "    - block_type: code\n      label: compute\n      next_block_label: bystander\n"
+            f'      code: "result = watched"\n{parameter_keys}' + _BYSTANDER,
+            parameters=f"[{_watched('a')}]",
+        )
+
+    projection = build_review_projection(workflow(""), workflow("      parameter_keys: [watched]\n"), {})
+
+    assert _changes(projection) == {"compute": "changed", "bystander": "unchanged"}
+
+
+def test_a_loop_over_the_changed_input_marks_its_children_changed() -> None:
+    blocks = (
+        "    - block_type: for_loop\n      label: each_row\n      next_block_label: bystander\n"
+        "      loop_over_parameter_key: watched\n      loop_blocks:\n"
+        "        - block_type: goto_url\n          label: visit\n          url: '{{ current_value.url }}'\n"
+        + _BYSTANDER
+    )
+
+    projection = build_review_projection(
+        _workflow(blocks, parameters=f"[{_watched('before')}]"),
+        _workflow(blocks, parameters=f"[{_watched('after')}]"),
+        {},
+    )
+
+    assert _changes(projection) == {"each_row": "changed", "visit": "changed", "bystander": "unchanged"}
+
+
+_THREE_STEPS = """    - block_type: navigation
+      label: first
+      next_block_label: middle
+      navigation_goal: First step
+    - block_type: navigation
+      label: middle
+      next_block_label: last
+      navigation_goal: Middle step
+    - block_type: navigation
+      label: last
+      navigation_goal: Last step
+"""
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("block_type: navigation\n      label: middle", "block_type: task\n      label: middle"),
+        ("navigation_goal: Middle step", "navigation_goal: Middle step\n      max_retries: 2"),
+        ("navigation_goal: Middle step", "navigation_goal: A different middle step"),
+    ],
+    ids=["type", "setting", "prompt"],
+)
+def test_a_real_edit_to_a_block_marks_only_that_block_changed(old: str, new: str) -> None:
+    persisted = _workflow(_THREE_STEPS)
+
+    projection = build_review_projection(persisted, persisted.replace(old, new), {})
+
+    assert _changes(projection) == {"first": "unchanged", "middle": "changed", "last": "unchanged"}
+
+
+def test_moving_a_block_marks_it_changed() -> None:
+    persisted = _workflow(_THREE_STEPS)
+    moved = _workflow("""    - block_type: navigation
+      label: middle
+      next_block_label: first
+      navigation_goal: Middle step
+    - block_type: navigation
+      label: first
+      next_block_label: last
+      navigation_goal: First step
+    - block_type: navigation
+      label: last
+      navigation_goal: Last step
+""")
+
+    changes = _changes(build_review_projection(persisted, moved, {}))
+
+    assert changes["middle"] == "changed" and changes["last"] == "unchanged"
+
+
+def test_a_code_edit_marks_only_the_code_block_changed() -> None:
+    persisted = _workflow("""    - block_type: goto_url
+      label: open_portal
+      next_block_label: compute
+      url: https://example.com/portal
+    - block_type: code
+      label: compute
+      next_block_label: upload
+      code: "result = 1"
+    - block_type: file_upload
+      label: upload
+      storage_type: s3
+      s3_bucket: reports
+      region_name: us-east-1
+      aws_access_key_id: key
+      aws_secret_access_key: secret
+""")
+
+    projection = build_review_projection(persisted, persisted.replace("result = 1", "result = 2"), {})
+
+    assert _changes(projection) == {"open_portal": "unchanged", "compute": "changed", "upload": "unchanged"}
+
+
+_THIRTEEN_LABELS = [
+    "open_portal",
+    "accept_terms",
+    "sign_in",
+    "find_account",
+    "open_statements",
+    "pick_period",
+    "read_balance",
+    "read_due_date",
+    "download_pdf",
+    "rename_file",
+    "summarize",
+    "notify_team",
+    "sign_out",
+]
+
+
+def _thirteen_block_yaml(goals: dict[str, str], parameters: str) -> str:
+    blocks = ""
+    for index, label in enumerate(_THIRTEEN_LABELS):
+        blocks += f"    - block_type: navigation\n      label: {label}\n"
+        if index + 1 < len(_THIRTEEN_LABELS):
+            blocks += f"      next_block_label: {_THIRTEEN_LABELS[index + 1]}\n"
+        blocks += f"      navigation_goal: {goals.get(label, f'Do the {label} step for {{{{ account }}}}')}\n"
+    return _workflow(blocks, parameters=parameters)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("no_saved_workflow")
+async def test_thirteen_saved_blocks_with_three_edits_and_an_unread_input_mark_exactly_three_changed() -> None:
+    account = "{key: account, parameter_type: workflow, workflow_parameter_type: string, default_value: primary}"
+    unread = "{key: unread_flag, parameter_type: workflow, workflow_parameter_type: string, default_value: off}"
+    edits = {
+        label: f"Redo the {label} step for {{{{ account }}}}"
+        for label in ("pick_period", "download_pdf", "notify_team")
+    }
+    before = await _process_workflow_yaml(
+        "w_before", "wpid_fixture", "o_fixture", _thirteen_block_yaml({}, f"[{account}]")
+    )
+    after = await _process_workflow_yaml(
+        "w_after", "wpid_fixture", "o_fixture", _thirteen_block_yaml(edits, f"[{account}, {unread}]")
+    )
+
+    projection = build_review_projection(workflow_to_copilot_yaml(before), workflow_to_copilot_yaml(after), {})
+
+    changes = _changes(projection)
+    assert projection is not None and projection["inputs"] == [{"key": "unread_flag", "change": "added"}]
+    assert sorted(label for label, change in changes.items() if change == "changed") == sorted(edits)
+    assert list(changes.values()).count("unchanged") == 10

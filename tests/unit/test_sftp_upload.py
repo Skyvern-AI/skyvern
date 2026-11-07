@@ -250,6 +250,37 @@ async def test_sftp_service_download_file_enforces_existing_size_cap(tmp_path, m
 
 
 @pytest.mark.asyncio
+async def test_sftp_service_download_file_rejects_truncated_transfer(tmp_path, monkeypatch):
+    monkeypatch.setattr(sftp_service.settings, "ALLOW_SFTP_INTERNAL_HOSTS", True)
+    remote_file = MagicMock()
+    remote_file.read = AsyncMock(side_effect=[b"short", b""])
+    sftp = MagicMock()
+    sftp.stat = AsyncMock(return_value=SimpleNamespace(size=100))
+    sftp.open = MagicMock(return_value=_acm(remote_file))
+    conn = MagicMock()
+    conn.start_sftp_client = MagicMock(return_value=_acm(sftp))
+    output_dir = tmp_path / "downloads"
+
+    with (
+        patch.object(sftp_service.asyncssh, "connect", return_value=_acm(conn)),
+        pytest.raises(sftp_service.SFTPDownloadError) as error,
+    ):
+        await sftp_service.download_file(
+            output_dir=str(output_dir),
+            remote_path="/report.csv",
+            host="sftp.test",
+            port=22,
+            username="user",
+            password="pw",
+            host_key="ssh-ed25519 AAAA",
+        )
+
+    assert error.value.category == sftp_service.SFTPDownloadErrorCategory.TRANSFER_FAILED
+    assert not list(output_dir.glob("report*"))
+    assert not list(output_dir.glob(".sftp-*"))
+
+
+@pytest.mark.asyncio
 async def test_sftp_service_download_file_classifies_blocked_host(tmp_path):
     with (
         patch.object(sftp_service, "resolve_fetch_host_ips", side_effect=BlockedHost(host="127.0.0.1")),

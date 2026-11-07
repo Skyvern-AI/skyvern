@@ -64,8 +64,10 @@ from skyvern.forge import app
 from skyvern.forge.agent_functions import OnePasswordTelemetryErrorClass, record_request_audit_event
 from skyvern.forge.sdk.api.files import discard_temp_working_dir
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
+from skyvern.forge.sdk.credential_site_policy import LoginSite
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowBuildSource
+from skyvern.forge.sdk.db.exceptions import CredentialSitesChangedError
 from skyvern.forge.sdk.db.models import CredentialFolderModel
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.routes.code_samples import (
@@ -84,6 +86,7 @@ from skyvern.forge.sdk.routes.code_samples import (
     UPDATE_CREDENTIAL_CODE_SAMPLE_PYTHON,
     UPDATE_CREDENTIAL_CODE_SAMPLE_TS,
 )
+from skyvern.forge.sdk.routes.pagination import MAX_PAGE, MAX_PAGE_SIZE
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
 from skyvern.forge.sdk.routes.trigger_type import workflow_run_trigger_type_from_user_agent
 from skyvern.forge.sdk.schemas.credentials import (
@@ -143,6 +146,9 @@ from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.services.bitwarden import BitwardenService
 from skyvern.forge.sdk.services.credential import credential_creation_service
 from skyvern.forge.sdk.services.credential.credential_creation_service import (
+    VaultItemImport,
+)
+from skyvern.forge.sdk.services.credential.credential_creation_service import (
     convert_to_response as _convert_to_response,
 )
 from skyvern.forge.sdk.services.credential.credential_creation_service import (
@@ -161,6 +167,9 @@ from skyvern.forge.sdk.services.credential.credential_vault_service import Crede
 from skyvern.forge.sdk.services.credential.custom_credential_vault_service import (
     CustomCredentialNotConfiguredError,
 )
+from skyvern.forge.sdk.services.credential.onepassword_credential_vault_service import (
+    onepassword_item_credential_type,
+)
 from skyvern.forge.sdk.services.credentials import (
     AuthenticatorTotpErrorCode,
     AuthenticatorTotpParseResult,
@@ -173,6 +182,7 @@ from skyvern.forge.sdk.services.onepassword_token_service import resolve_onepass
 from skyvern.forge.sdk.services.request_principal import RequestPrincipal, get_request_principal, synthetic_user_id
 from skyvern.forge.sdk.services.route_authorization import require_request_actions
 from skyvern.forge.sdk.workflow.browser_session_persistence import retrieve_persisted_workflow_browser_state_dir
+from skyvern.forge.sdk.workflow.models.credential_release import normalize_extra_site_urls
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRunStatus
 from skyvern.schemas.credential_folders import (
@@ -704,7 +714,12 @@ async def get_totp_codes(
     ),
 ) -> list[TOTPCode]:
     principal = get_request_principal()
-    workflow_restricted = await app.AGENT_FUNCTION.workflow_folders_restricted(curr_org.organization_id)
+    scoped_folder_ceiling = (
+        principal is not None and principal.api_key_access_mode == "scoped" and principal.api_key_reach == "folders"
+    )
+    workflow_restricted = scoped_folder_ceiling or await app.AGENT_FUNCTION.workflow_folders_restricted(
+        curr_org.organization_id
+    )
     credential_restricted = await app.AGENT_FUNCTION.credential_folders_restricted(curr_org.organization_id)
     if (workflow_restricted or credential_restricted) and principal is None:
         return []
@@ -747,7 +762,12 @@ async def get_totp_codes(
             accessible_references = await app.AGENT_FUNCTION.accessible_workflow_reference_ids(
                 principal, "workflow_run.read", set().union(*references_by_code.values())
             )
-            page = [code for code in page if references_by_code[code.totp_code_id] <= accessible_references]
+            page = [
+                code
+                for code in page
+                if references_by_code[code.totp_code_id] <= accessible_references
+                and (not scoped_folder_ceiling or references_by_code[code.totp_code_id])
+            ]
 
         if credential_restricted and page and not await app.AGENT_FUNCTION.credential_folder_admin_bypass(principal):
             credential_ids_by_identifier = await app.DATABASE.credentials.get_credential_ids_by_totp_identifiers(
@@ -932,6 +952,16 @@ def _build_login_test_blocks(
     return blocks
 
 
+async def vault_login_sites(credential: Credential) -> list[LoginSite] | None:
+    """The sites a connected vault names for this login, or None when Skyvern holds them."""
+    service = app.CREDENTIAL_VAULT_SERVICES.get(credential.vault_type or CredentialVaultType.BITWARDEN)
+    if service is None:
+        return None
+    item = await service.get_credential_item(credential)
+    sites = item.named_login_sites()
+    return sites if sites or item.login_sites is not None else None
+
+
 @base_router.patch(
     "/credentials/{credential_id}",
     response_model=CredentialResponse,
@@ -984,6 +1014,25 @@ async def rename_credential(
         update_kwargs["pin_saved_session_ip"] = data.pin_saved_session_ip
     if data.tested_url is not None:
         update_kwargs["tested_url"] = data.tested_url
+    if data.extra_site_urls:
+        try:
+            vault_sites = await vault_login_sites(credential)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail="Could not read this login's vault entry") from exc
+        if vault_sites is not None:
+            raise HTTPException(
+                status_code=422, detail="This login's sites come from its connected vault; add the site there"
+            )
+    if data.extra_site_urls is not None:
+        try:
+            update_kwargs["extra_site_urls"] = normalize_extra_site_urls(
+                data.tested_url or credential.tested_url, data.extra_site_urls
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+    sites_change = data.tested_url is not None or data.extra_site_urls is not None
+    if sites_change and data.expected_site_urls is not None:
+        update_kwargs["expected_site_urls"] = data.expected_site_urls
     if data.user_context is not None:
         update_kwargs["user_context"] = data.user_context
     if data.save_browser_session_intent is not None:
@@ -1016,11 +1065,16 @@ async def rename_credential(
             credential_id=credential_id,
         )
     async with write_guard:
-        updated = await _update_credential_or_profile_conflict(**update_kwargs)
+        try:
+            updated = await _update_credential_or_profile_conflict(**update_kwargs)
+        except CredentialSitesChangedError as exc:
+            raise HTTPException(
+                status_code=409, detail="This login's sites changed since it was opened. Reload it and try again."
+            ) from exc
     if not updated:
         raise HTTPException(status_code=500, detail="Failed to update credential")
 
-    changed_fields = tuple(sorted(update_kwargs.keys() - {"credential_id", "organization_id"}))
+    changed_fields = tuple(sorted(update_kwargs.keys() - {"credential_id", "organization_id", "expected_site_urls"}))
     if changed_fields:
         await record_request_audit_event(
             current_org.organization_id,
@@ -2041,6 +2095,8 @@ async def update_credential(
         raise HTTPException(status_code=404, detail=f"Credential not found, credential_id={credential_id}")
     if existing_credential.vault_type == CredentialVaultType.ONEPASSWORD:
         raise HTTPException(status_code=405, detail="Updating 1Password-backed credentials is not supported")
+    if existing_credential.vault_type == CredentialVaultType.BITWARDEN_CONNECTED:
+        raise HTTPException(status_code=405, detail="Updating Bitwarden-imported credentials is not supported")
 
     requires_write_lock = await app.AGENT_FUNCTION.should_lock_credential_write(
         credential=data.credential,
@@ -2449,8 +2505,23 @@ async def get_credential_totp_code(
         credential_id=credential_id,
         now=now,
     )
-    if cached_response is not None:
-        return cached_response
+    audit_recorded = False
+    # Keep a one-second margin beyond the audit writer's bound; this countdown is integer-valued.
+    if cached_response is not None and cached_response.seconds_remaining > 2:
+        cached_expires_at = now + cached_response.seconds_remaining
+        await record_request_audit_event(
+            current_org.organization_id,
+            "credential.totp_code.read",
+            "credential",
+            credential_id,
+        )
+        audit_recorded = True
+        now = int(time.time())
+        if now < cached_expires_at:
+            return CredentialTotpCodeResponse(
+                code=cached_response.code,
+                seconds_remaining=cached_expires_at - now,
+            )
 
     vault_type = credential.vault_type or CredentialVaultType.BITWARDEN
     credential_service = await _get_credential_vault_service(vault_type_override=vault_type)
@@ -2506,8 +2577,19 @@ async def get_credential_totp_code(
         )
         raise
 
+    now = int(time.time())
     expires_at = ((now // totp.interval) + 1) * totp.interval
     code = totp.at(now)
+    if not audit_recorded:
+        await record_request_audit_event(
+            current_org.organization_id,
+            "credential.totp_code.read",
+            "credential",
+            credential_id,
+        )
+        now = int(time.time())
+        expires_at = ((now // totp.interval) + 1) * totp.interval
+        code = totp.at(now)
     _cache_totp_code_preview(
         organization_id=current_org.organization_id,
         credential_id=credential_id,
@@ -2598,6 +2680,7 @@ async def get_credentials(
     page: int = Query(
         1,
         ge=1,
+        le=MAX_PAGE,
         description="Page number for pagination",
         examples=[1],
         openapi_extra={"x-fern-sdk-parameter-name": "page"},
@@ -2605,6 +2688,7 @@ async def get_credentials(
     page_size: int = Query(
         10,
         ge=1,
+        le=MAX_PAGE_SIZE,
         description="Number of items per page",
         examples=[10],
         openapi_extra={"x-fern-sdk-parameter-name": "page_size"},
@@ -2741,7 +2825,7 @@ async def get_credential_folder(
 )
 @base_router.get("/credential_folders/", response_model=list[CredentialFolder], include_in_schema=False)
 async def get_credential_folders(
-    page: int = Query(1, ge=1, description="Page number"),
+    page: int = Query(1, ge=1, le=MAX_PAGE, description="Page number"),
     page_size: int = Query(100, ge=1, le=500, description="Number of folders per page"),
     search: str | None = Query(None, description="Search folders by title or description"),
     current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
@@ -3177,7 +3261,7 @@ async def list_onepassword_items(
                         vault_id=vault.id,
                         vault_name=vault.title,
                         category=item.category.value,
-                        importable=_onepassword_item_credential_type(item) is not None,
+                        importable=onepassword_item_credential_type(item) is not None,
                         url=item.websites[0].url if item.websites else None,
                     )
                 )
@@ -3339,14 +3423,6 @@ async def _authorize_onepassword_folder(organization_id: str, folder_id: str | N
     )
 
 
-def _onepassword_item_credential_type(item: Item) -> CredentialType | None:
-    category = "".join(character for character in item.category.value.casefold() if character.isalnum())
-    return {
-        "login": CredentialType.PASSWORD,
-        "creditcard": CredentialType.CREDIT_CARD,
-    }.get(category)
-
-
 def _onepassword_item_url(item: Item) -> str | None:
     return item.websites[0].url if item.websites else None
 
@@ -3369,115 +3445,59 @@ async def import_onepassword_credentials(
 ) -> ImportOnePasswordCredentialsResponse:
     organization_id = current_org.organization_id
     await _authorize_onepassword_folder(organization_id, data.folder_id, "credential.create")
-    item_keys = sorted({(item.vault_id, item.item_id) for item in data.items})
-    existing = await app.DATABASE.credentials.get_onepassword_credentials(
-        organization_id,
-        item_keys=item_keys,
+    await credential_creation_service.authorize_vault_item_reimport(
+        organization_id, CredentialVaultType.ONEPASSWORD, [(item.vault_id, item.item_id) for item in data.items]
     )
-    existing_by_key = {(credential.vault_id, credential.item_id): credential for credential in existing}
-    set_folder_on_update = "folder_id" in data.model_fields_set
-    if existing:
-        await app.AGENT_FUNCTION.enforce_credential_folder_access_for_ids(
-            get_request_principal(),
-            "credential.update",
-            {("credential_id", credential.credential_id) for credential in existing},
-        )
-
     token = await _organization_onepassword_token(organization_id)
     metadata_by_vault, _ = await _onepassword_metadata_by_vault(
         token,
-        {vault_id for vault_id, _item_id in item_keys},
+        {item.vault_id for item in data.items},
         fallback_detail="Failed to import 1Password items.",
     )
     items_by_vault = {
         vault_id: {item.id: item for item in vault_items} for vault_id, vault_items in metadata_by_vault.items()
     }
 
-    async def authorize_upsert(session: AsyncSession, credential_id: str) -> None:
-        if data.folder_id is not None:
-            await app.AGENT_FUNCTION.enforce_credential_folder_access_for_ids(
-                get_request_principal(), "credential.create", {("folder_id", data.folder_id)}, session=session
-            )
-        references = {("credential_id", credential_id)}
-        if set_folder_on_update and data.folder_id is not None:
-            references.add(("folder_id", data.folder_id))
-        await app.AGENT_FUNCTION.enforce_credential_folder_access_for_ids(
-            get_request_principal(),
-            "credential.move" if set_folder_on_update else "credential.update",
-            references,
-            session=session,
-        )
-
-    indexed_selections = sorted(enumerate(data.items), key=lambda indexed: (indexed[1].vault_id, indexed[1].item_id))
     results: list[OnePasswordCredentialImportResult | None] = [None] * len(data.items)
-    pending_effects: list[tuple[str, bool, CredentialType, tuple[str, ...]]] = []
-    async with app.DATABASE.credentials.Session() as session:
-        for result_index, selection in indexed_selections:
-            item = items_by_vault.get(selection.vault_id, {}).get(selection.item_id)
-            if item is None:
-                results[result_index] = OnePasswordCredentialImportResult(
-                    vault_id=selection.vault_id,
-                    item_id=selection.item_id,
-                    status="skipped",
-                    reason="Item not found in the 1Password vault.",
-                )
-                continue
-            credential_type = _onepassword_item_credential_type(item)
-            if credential_type is None:
-                results[result_index] = OnePasswordCredentialImportResult(
-                    vault_id=selection.vault_id,
-                    item_id=selection.item_id,
-                    status="skipped",
-                    reason=f"Unsupported 1Password category: {item.category.value}",
-                )
-                continue
-
-            credential, created = await app.DATABASE.credentials.upsert_onepassword_credential_metadata(
-                organization_id=organization_id,
+    imports: list[tuple[int, VaultItemImport]] = []
+    for index, selection in enumerate(data.items):
+        item = items_by_vault.get(selection.vault_id, {}).get(selection.item_id)
+        credential_type = onepassword_item_credential_type(item) if item is not None else None
+        if item is None or credential_type is None:
+            results[index] = OnePasswordCredentialImportResult(
                 vault_id=selection.vault_id,
                 item_id=selection.item_id,
-                name=item.title,
-                credential_type=credential_type,
-                tested_url=_onepassword_item_url(item),
-                folder_id=data.folder_id,
-                created_by=current_user_id,
-                set_folder_on_update=set_folder_on_update,
-                authorize_update=authorize_upsert,
-                commit=False,
+                status="skipped",
+                reason="Item not found in the 1Password vault."
+                if item is None
+                else f"Unsupported 1Password category: {item.category.value}",
             )
-            changed_fields: tuple[str, ...] = ()
-            if not created:
-                update_fields = ["name", "credential_type"]
-                previous = existing_by_key.get((selection.vault_id, selection.item_id))
-                if set_folder_on_update and previous is not None and previous.folder_id != data.folder_id:
-                    update_fields.append("folder_id")
-                changed_fields = tuple(update_fields)
-            pending_effects.append((credential.credential_id, created, credential_type, changed_fields))
-            results[result_index] = OnePasswordCredentialImportResult(
-                vault_id=selection.vault_id,
-                item_id=selection.item_id,
-                status="imported" if created else "updated",
+            continue
+        imports.append(
+            (
+                index,
+                VaultItemImport(
+                    vault_id=selection.vault_id,
+                    item_id=selection.item_id,
+                    name=item.title,
+                    credential_type=credential_type,
+                    tested_url=_onepassword_item_url(item),
+                ),
             )
-        await session.commit()
-
-    for credential_id, created, credential_type, changed_fields in pending_effects:
-        await record_request_audit_event(
-            organization_id,
-            "credential.create" if created else "credential.update",
-            "credential",
-            credential_id,
-            changed_fields=changed_fields,
         )
-        if created:
-            background_tasks.add_task(
-                app.AGENT_FUNCTION.on_credential_saved,
-                organization_id=organization_id,
-                credential_id=credential_id,
-                credential_type=credential_type,
-                actor_user_id=current_user_id,
-                vault=CredentialVaultType.ONEPASSWORD.value,
-            )
-
+    imported = await credential_creation_service.import_vault_items(
+        organization_id,
+        CredentialVaultType.ONEPASSWORD,
+        [item for _, item in imports],
+        created_by=current_user_id,
+        folder_id=data.folder_id,
+        set_folder_on_update="folder_id" in data.model_fields_set,
+        background_tasks=background_tasks,
+    )
+    for (index, item), (_credential, created) in zip(imports, imported, strict=True):
+        results[index] = OnePasswordCredentialImportResult(
+            vault_id=item.vault_id, item_id=item.item_id, status="imported" if created else "updated"
+        )
     return ImportOnePasswordCredentialsResponse(results=[result for result in results if result is not None])
 
 
@@ -3562,7 +3582,7 @@ async def refresh_onepassword_credentials(
         if item is None:
             missing_credentials.append((credential, vault_id, item_id))
             continue
-        credential_type = _onepassword_item_credential_type(item)
+        credential_type = onepassword_item_credential_type(item)
         if credential_type is None:
             unsupported_credentials.append((credential, item, vault_id, item_id))
             continue

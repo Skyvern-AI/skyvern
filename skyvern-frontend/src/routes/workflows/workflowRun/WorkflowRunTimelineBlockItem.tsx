@@ -1,10 +1,7 @@
 import {
-  CheckCircledIcon,
   ChevronDownIcon,
   ChevronRightIcon,
   CrossCircledIcon,
-  MinusCircledIcon,
-  ReloadIcon,
 } from "@radix-ui/react-icons";
 import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 
@@ -19,12 +16,26 @@ import { Collapsible, CollapsibleContent } from "@/components/ui/collapsible";
 import { InlineMarkdown } from "@/components/AgentMarkdown";
 import { statusIsFinalized } from "@/routes/tasks/types";
 import { formatDuration, toDuration } from "@/routes/workflows/utils";
+import { getWebSearchResultSummary } from "./blockResult";
+import { StatusDot } from "./StatusDot";
 import { cn } from "@/util/utils";
 import { workflowBlockTitle } from "../editor/nodes/types";
 import { WorkflowBlockIcon } from "../editor/nodes/WorkflowBlockIcon";
+import { ToolCallIcon } from "../editor/nodes/AgentStepNode/ToolCallIcon";
+import {
+  type AgentStepTrailEntry,
+  agentStepCallActions,
+  agentStepTrail,
+  toolCallSummary,
+  toolCallTitle,
+} from "../studio/agentStepTrail";
+import {
+  useAgentStepOwnsSelectedCall,
+  useSelectAgentStepCall,
+  useSelectedAgentStepCall,
+} from "../studio/useAgentStepTrail";
 import { actionTypeIcons as timelineActionIcons } from "../components/actionTypeIcons";
 import { getActionDisplayStatus } from "../components/actionStatus";
-import { TerminatedIcon, terminatedTone } from "@/components/terminatedVisual";
 import {
   isAction,
   isBlockItem,
@@ -87,6 +98,9 @@ type Props = {
   renderThoughts?: boolean;
   finallyBlockLabel?: string | null;
   workflowRunIsFinalized?: boolean;
+  hideActionIndex?: boolean;
+  // The agent step call that ran this block: the row selects that call and carries its title.
+  agentStepCall?: { title: string; select: () => void };
 };
 
 type LoopIterationGroup = {
@@ -138,67 +152,6 @@ function IndentRails({ depth }: { depth: number }) {
   );
 }
 
-function StatusDot({
-  status,
-  isFinalized,
-}: {
-  status: Status | null;
-  isFinalized: boolean;
-}) {
-  const label = status
-    ? status.replace("_", " ")
-    : isFinalized
-      ? "did not execute"
-      : "not started";
-  const isCompleted = status === Status.Completed;
-  const isTerminated = status === Status.Terminated;
-  const isFailure =
-    status === Status.Failed ||
-    status === Status.TimedOut ||
-    status === Status.Canceled;
-  const isRunning = status === Status.Running && !isFinalized;
-
-  const glyph = (() => {
-    if (isCompleted) {
-      return <CheckCircledIcon className="size-3.5 shrink-0 text-success" />;
-    }
-    if (isTerminated) {
-      return (
-        <TerminatedIcon className={`size-3.5 shrink-0 ${terminatedTone}`} />
-      );
-    }
-    if (isFailure) {
-      return (
-        <CrossCircledIcon className="size-3.5 shrink-0 text-destructive" />
-      );
-    }
-    if (status === Status.Skipped) {
-      return (
-        <MinusCircledIcon className="size-3.5 shrink-0 text-muted-foreground" />
-      );
-    }
-    if (isRunning) {
-      return (
-        <ReloadIcon className="size-3.5 shrink-0 animate-spin text-sky-700 dark:text-sky-400" />
-      );
-    }
-    return (
-      <div className="size-2 shrink-0 rounded-full bg-muted-foreground dark:bg-slate-600" />
-    );
-  })();
-
-  return (
-    <span
-      title={label}
-      role="img"
-      aria-label={label}
-      className="flex shrink-0 items-center"
-    >
-      {glyph}
-    </span>
-  );
-}
-
 function getRecordedActionMeta(action: ActionsApiResponse): {
   codeLine: number | null;
   durationMs: number | null;
@@ -230,6 +183,7 @@ type ActionRowPresentation = {
   // Machine syntax (a Playwright call or a Task V3 tool call); shown on hover, never as the primary line.
   detail: string | null;
   tone: "default" | "error";
+  wrap: boolean;
 };
 
 // Rows for code blocks summarize recorded actions as
@@ -241,6 +195,7 @@ type ActionRowPresentation = {
 function getCodeActionRowPresentation(
   action: ActionsApiResponse,
   matchedStep: CodeBlockStep | null,
+  failureReason: string | null,
 ): ActionRowPresentation {
   const isCodeError =
     action.status === Status.Failed &&
@@ -256,24 +211,31 @@ function getCodeActionRowPresentation(
     timelineActionIcons[action.action_type]
   );
   const { codeLine, durationMs } = getRecordedActionMeta(action);
-  // An error row prints both halves of its summary: the exception that ended the block is
-  // recorded as the outcome, not the body.
+  // Without a block failure reason an error row prints both halves of its summary, since the
+  // exception is recorded as the outcome. Otherwise the full reason replaces the recorded
+  // response, which is a capped copy.
   const errorSummary = isCodeError ? getActionSummary(action) : null;
+  const fullFailureReason = isCodeError ? failureReason?.trim() || null : null;
   const parts = [
     // Every other row hides its label from sighted users, so it falls back to the readable
     // type where the chat, which always shows the label, prints nothing.
-    ...(isCodeError
-      ? [
-          normalizeInlineText(errorSummary?.body?.text),
-          errorSummary?.outcome ?? null,
-        ]
-      : [
-          describeRecordedAction(action, matchedStep) ??
-            getReadableActionType(action.action_type, {
-              nullActionLabel: "Step",
-            }),
-        ]),
-    codeLine !== null ? `line ${codeLine}` : null,
+    ...(fullFailureReason !== null
+      ? [fullFailureReason]
+      : isCodeError
+        ? [
+            normalizeInlineText(errorSummary?.body?.text),
+            errorSummary?.outcome ?? null,
+          ]
+        : [
+            describeRecordedAction(action, matchedStep) ??
+              getReadableActionType(action.action_type, {
+                nullActionLabel: "Step",
+              }),
+          ]),
+    codeLine !== null &&
+    !new RegExp(`\\bline ${codeLine}\\b`).test(fullFailureReason ?? "")
+      ? `line ${codeLine}`
+      : null,
     durationMs !== null ? formatActionDurationMs(durationMs) : null,
   ].filter((part): part is string => part !== null);
   return {
@@ -290,6 +252,7 @@ function getCodeActionRowPresentation(
         ? normalizeInlineText(action.description)
         : null,
     tone: isCodeError ? "error" : "default",
+    wrap: fullFailureReason !== null,
   };
 }
 
@@ -354,46 +317,6 @@ function getTimelineDescriptor(block: WorkflowRunBlock): string {
   }
 
   return `${workflowBlockTitle[block.block_type]} block`;
-}
-
-function getWebSearchResultSummary(block: WorkflowRunBlock): string | null {
-  const output = block.output;
-  if (
-    block.block_type !== "web_search" ||
-    block.status !== Status.Completed ||
-    !output ||
-    typeof output !== "object" ||
-    Array.isArray(output) ||
-    !("total_count" in output) ||
-    typeof output.total_count !== "number"
-  ) {
-    return null;
-  }
-
-  const count = output.total_count;
-  const summary = `${count} ${count === 1 ? "result" : "results"}`;
-  if ("prompt_output" in output && Array.isArray(output.prompt_output)) {
-    let itemCount = output.prompt_output.length;
-    const lastItem: unknown = output.prompt_output[itemCount - 1];
-    if (
-      lastItem &&
-      typeof lastItem === "object" &&
-      "truncated" in lastItem &&
-      lastItem.truncated === true &&
-      "reason" in lastItem &&
-      lastItem.reason === "exceeded_max_run_response_value_size"
-    ) {
-      if (
-        !("original_count" in lastItem) ||
-        typeof lastItem.original_count !== "number"
-      ) {
-        return summary;
-      }
-      itemCount = lastItem.original_count;
-    }
-    return `${summary} · Prompt returned ${itemCount} ${itemCount === 1 ? "item" : "items"}`;
-  }
-  return summary;
 }
 
 function getLoopIterationGroups(
@@ -581,6 +504,113 @@ function TimelineSubItems({
   );
 }
 
+function AgentStepCallRow({
+  agentStep,
+  entry,
+  depth,
+  activeItem,
+  onActionClick,
+  workflowRunIsFinalized,
+}: {
+  agentStep: WorkflowRunBlock;
+  entry: AgentStepTrailEntry;
+  depth: number;
+  activeItem: WorkflowRunOverviewActiveElement;
+  onActionClick: (action: ActionItem) => void;
+  workflowRunIsFinalized?: boolean;
+}) {
+  const selectCall = useSelectAgentStepCall();
+  const selectedCall = useSelectedAgentStepCall();
+  const isSelected =
+    selectedCall?.workflowRunBlockId === agentStep.workflow_run_block_id &&
+    selectedCall.index === entry.call.index;
+  const title = toolCallTitle(entry.call);
+  const summary = toolCallSummary(entry.call);
+  const callActions = useMemo(
+    () => agentStepCallActions(agentStep, entry.call).reverse(),
+    [agentStep, entry.call],
+  );
+  return (
+    <>
+      <div className="flex min-h-[28px] items-stretch text-xs">
+        <IndentRails depth={depth} />
+        <div
+          className={cn(
+            "flex min-w-0 flex-1 items-center gap-1.5 rounded-r py-1 pr-1.5 hover:bg-muted/60",
+            isSelected && "bg-slate-elevation4 dark:bg-slate-800",
+          )}
+          style={railHighlightStyle}
+        >
+          <div className="size-4 shrink-0" />
+          <button
+            type="button"
+            onClick={(event) => {
+              event.stopPropagation();
+              selectCall(agentStep, entry);
+            }}
+            aria-pressed={isSelected}
+            className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 rounded text-left outline-none focus-visible:ring-1 focus-visible:ring-foreground/40"
+          >
+            <StatusDot status={entry.status} isFinalized={!entry.running} />
+            <span aria-hidden className="shrink-0">
+              <ToolCallIcon
+                tool={entry.call.tool}
+                blockType={entry.call.block_type}
+                className="size-3.5 text-tertiary-foreground"
+              />
+            </span>
+            <span className="w-7 shrink-0 text-[10px] tabular-nums text-muted-foreground dark:text-slate-500">
+              #{entry.call.index}
+            </span>
+            <span className="min-w-0 max-w-[12rem] truncate text-foreground dark:text-slate-200">
+              {title}
+            </span>
+            {summary && (
+              <span className="min-w-0 flex-1 truncate text-muted-foreground dark:text-slate-500">
+                {TIMELINE_DESCRIPTOR_SEPARATOR} {summary}
+              </span>
+            )}
+          </button>
+        </div>
+      </div>
+      <TimelineActionRows
+        block={{ ...agentStep, actions: callActions }}
+        activeItem={isSelected ? null : activeItem}
+        depth={depth + 1}
+        codeSteps={[]}
+        onActionClick={onActionClick}
+        workflowRunIsFinalized={workflowRunIsFinalized}
+        hideIndex
+      />
+    </>
+  );
+}
+
+function AgentStepBlockCall({
+  agentStep,
+  entry,
+  child,
+  ...props
+}: Omit<Props, "block" | "subItems" | "agentStepCall"> & {
+  agentStep: WorkflowRunBlock;
+  entry: AgentStepTrailEntry;
+  child: NonNullable<AgentStepTrailEntry["child"]>;
+}) {
+  const selectCall = useSelectAgentStepCall();
+  return (
+    <WorkflowRunTimelineBlockItem
+      {...props}
+      block={child.block}
+      subItems={child.children}
+      hideActionIndex
+      agentStepCall={{
+        title: toolCallTitle(entry.call),
+        select: () => selectCall(agentStep, entry),
+      }}
+    />
+  );
+}
+
 type TimelineActionRowsProps = {
   block: WorkflowRunBlock;
   activeItem: WorkflowRunOverviewActiveElement;
@@ -588,6 +618,8 @@ type TimelineActionRowsProps = {
   codeSteps: Array<CodeBlockStep>;
   onActionClick: (action: ActionItem) => void;
   workflowRunIsFinalized?: boolean;
+  // Rows under an agent step's calls go unnumbered, so the calls keep the only numbered sequence.
+  hideIndex?: boolean;
 };
 
 function TimelineActionRows({
@@ -597,6 +629,7 @@ function TimelineActionRows({
   codeSteps,
   onActionClick,
   workflowRunIsFinalized,
+  hideIndex = false,
 }: TimelineActionRowsProps) {
   const actions = block.actions ?? [];
   const actionsTopDown = [...actions].reverse();
@@ -610,13 +643,14 @@ function TimelineActionRows({
         const isActive =
           isAction(activeItem) && activeItem.action_id === action.action_id;
         const displayIndex = index + 1;
-        const { icon, label, summary, detail, tone } = isCodeBlock
+        const { icon, label, summary, detail, tone, wrap } = isCodeBlock
           ? getCodeActionRowPresentation(
               action,
               findCodeStepForLine(
                 codeSteps,
                 getRecordedActionMeta(action).codeLine,
               ),
+              block.failure_reason,
             )
           : {
               icon: timelineActionIcons[action.action_type],
@@ -624,6 +658,7 @@ function TimelineActionRows({
               summary: getActionSummary(action),
               detail: taskV3CallText(action.description),
               tone: "default" as const,
+              wrap: false,
             };
 
         return (
@@ -634,7 +669,8 @@ function TimelineActionRows({
             <IndentRails depth={depth} />
             <div
               className={cn(
-                "flex min-w-0 flex-1 items-center gap-1.5 rounded-r py-0.5 pr-1.5",
+                "flex min-w-0 flex-1 gap-1.5 rounded-r py-0.5 pr-1.5",
+                wrap ? "items-start" : "items-center",
                 "hover:bg-muted/60",
                 isActive && "bg-slate-elevation4 dark:bg-slate-800",
               )}
@@ -649,7 +685,10 @@ function TimelineActionRows({
                 }}
                 aria-pressed={isActive}
                 title={detail ?? undefined}
-                className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 rounded text-left outline-none focus-visible:ring-1 focus-visible:ring-foreground/40"
+                className={cn(
+                  "flex min-w-0 flex-1 cursor-pointer gap-1.5 rounded text-left outline-none focus-visible:ring-1 focus-visible:ring-foreground/40",
+                  wrap ? "items-start" : "items-center",
+                )}
               >
                 <StatusDot
                   status={getActionDisplayStatus(action)}
@@ -662,7 +701,7 @@ function TimelineActionRows({
                   {icon}
                 </span>
                 <span className="w-7 shrink-0 text-[10px] tabular-nums text-muted-foreground dark:text-slate-500">
-                  #{displayIndex}
+                  {!hideIndex && `#${displayIndex}`}
                 </span>
                 {tone === "error" ? (
                   <span className="shrink-0 text-[10px] text-rose-700 dark:text-rose-300">
@@ -672,7 +711,12 @@ function TimelineActionRows({
                   <span className="sr-only">{label}</span>
                 )}
                 {summary?.body ? (
-                  <span className="min-w-0 truncate text-muted-foreground dark:text-slate-500">
+                  <span
+                    className={cn(
+                      "min-w-0 text-muted-foreground dark:text-slate-500",
+                      wrap ? "whitespace-pre-wrap break-words" : "truncate",
+                    )}
+                  >
                     {summary.body.isProse ? (
                       <InlineMarkdown
                         // One line: InlineMarkdown drops every paragraph break, so prose that
@@ -1103,6 +1147,8 @@ function WorkflowRunTimelineBlockItem({
   renderThoughts = false,
   finallyBlockLabel,
   workflowRunIsFinalized = false,
+  hideActionIndex = false,
+  agentStepCall,
 }: Props) {
   const isFinallyBlock = finallyBlockLabel && block.label === finallyBlockLabel;
   const isRunning = block.status === Status.Running && !workflowRunIsFinalized;
@@ -1118,7 +1164,7 @@ function WorkflowRunTimelineBlockItem({
   const definitionCodeSteps = isCodeBlock
     ? (codeStepsByLabel?.get(block.label ?? "") ?? [])
     : [];
-  const blockName = block.label ?? blockTypeTitle;
+  const blockName = agentStepCall?.title ?? block.label ?? blockTypeTitle;
   const descriptor = getTimelineDescriptor(block);
   const gmailSendOutput =
     block.block_type === WorkflowBlockTypes.SendEmail
@@ -1167,6 +1213,58 @@ function WorkflowRunTimelineBlockItem({
   const hasRenderableNestedChildren = subItems.some(
     (item) => isBlockItem(item) || (renderThoughts && isThoughtItem(item)),
   );
+  const agentTrail = useMemo(
+    () =>
+      block.block_type === WorkflowBlockTypes.AgentStep
+        ? agentStepTrail(block, subItems)
+        : [],
+    [block, subItems],
+  );
+  const hasAgentTrail = agentTrail.length > 0;
+  // Child rows no call names, such as one whose call the last trail write missed, still list after the calls.
+  const unmatchedAgentChildren = useMemo(() => {
+    const matched = new Set<WorkflowRunTimelineItem | null>(
+      agentTrail.map((entry) => entry.child),
+    );
+    return subItems.filter((item) => !matched.has(item));
+  }, [agentTrail, subItems]);
+  // With a trail, each page action sits under its call; any action outside every call's window is listed after the calls.
+  const strayAgentActions = useMemo(() => {
+    if (!hasAgentTrail) {
+      return [];
+    }
+    const nested = new Set(
+      agentTrail.flatMap((entry) =>
+        agentStepCallActions(block, entry.call).map(
+          (action) => action.action_id,
+        ),
+      ),
+    );
+    return (block.actions ?? []).filter(
+      (action) => !nested.has(action.action_id),
+    );
+  }, [agentTrail, hasAgentTrail, block]);
+  // Calls are numbered by their index in the step, the same number the canvas trail shows.
+  const childOrder = useMemo(
+    () =>
+      hasAgentTrail
+        ? new Map([
+            ...(blockOrder ?? []),
+            ...agentTrail.flatMap(
+              (entry): Array<[string, number]> =>
+                entry.child
+                  ? [
+                      [
+                        entry.child.block.workflow_run_block_id,
+                        entry.call.index,
+                      ],
+                    ]
+                  : [],
+            ),
+          ])
+        : blockOrder,
+    [agentTrail, hasAgentTrail, blockOrder],
+  );
   // Only treat as a container when there are actual children to reveal.
   // Conditionals and loops can be defined as containers structurally, but if
   // the runtime didn't model any child blocks under them (e.g. conditionals
@@ -1174,6 +1272,7 @@ function WorkflowRunTimelineBlockItem({
   // nothing is worse than no chevron at all.
   const isContainer =
     hasRenderableNestedChildren ||
+    hasAgentTrail ||
     showsActionRows ||
     hasCodeSteps ||
     hasSkippedBranchBlocks;
@@ -1190,11 +1289,16 @@ function WorkflowRunTimelineBlockItem({
   const hasResolvedActiveIteration =
     activeIteration !== null &&
     loopIterationGroups.some((group) => group.index === activeIteration);
+  // A selected call of this agent step owns the highlight, not the frame it pinned.
+  const ownsSelectedCall = useAgentStepOwnsSelectedCall(
+    block.workflow_run_block_id,
+  );
   const isActiveBlock =
     ((isWorkflowRunBlock(activeItem) &&
       activeItem.workflow_run_block_id === block.workflow_run_block_id) ||
       ownsSelectedAction) &&
-    !(isLoopBlock && hasResolvedActiveIteration);
+    !(isLoopBlock && hasResolvedActiveIteration) &&
+    !ownsSelectedCall;
   const hasActiveDescendant = useMemo(
     () => timelineItemsContainActiveElement(subItems, activeItem),
     [subItems, activeItem],
@@ -1338,7 +1442,11 @@ function WorkflowRunTimelineBlockItem({
             type="button"
             onClick={(event) => {
               event.stopPropagation();
-              onBlockItemClick(block);
+              if (agentStepCall) {
+                agentStepCall.select();
+              } else {
+                onBlockItemClick(block);
+              }
             }}
             aria-pressed={isActiveBlock}
             className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 rounded text-left outline-none focus-visible:ring-1 focus-visible:ring-foreground/40"
@@ -1415,7 +1523,7 @@ function WorkflowRunTimelineBlockItem({
       {isContainer && (
         <Collapsible open={expanded}>
           <CollapsibleContent className="overflow-hidden motion-safe:data-[state=closed]:animate-collapsible-up-fade motion-safe:data-[state=open]:animate-collapsible-down-fade">
-            {showsActionRows && (
+            {showsActionRows && !hasAgentTrail && (
               <TimelineActionRows
                 block={block}
                 activeItem={activeItem}
@@ -1423,6 +1531,7 @@ function WorkflowRunTimelineBlockItem({
                 codeSteps={definitionCodeSteps}
                 onActionClick={onActionClick}
                 workflowRunIsFinalized={workflowRunIsFinalized}
+                hideIndex={hideActionIndex}
               />
             )}
             {hasCodeSteps && (
@@ -1467,6 +1576,73 @@ function WorkflowRunTimelineBlockItem({
                 finallyBlockLabel={finallyBlockLabel}
                 workflowRunIsFinalized={workflowRunIsFinalized}
               />
+            ) : hasAgentTrail ? (
+              [
+                ...agentTrail.map((entry) =>
+                  entry.child ? (
+                    <AgentStepBlockCall
+                      key={`call-${entry.call.index}`}
+                      agentStep={block}
+                      entry={entry}
+                      child={entry.child}
+                      activeItem={activeItem}
+                      activeIteration={activeIteration}
+                      depth={depth + 1}
+                      blockOrder={childOrder}
+                      codeStepsByLabel={codeStepsByLabel}
+                      skippedBranchBlocksByConditionalId={
+                        skippedBranchBlocksByConditionalId
+                      }
+                      onActionClick={onActionClick}
+                      onBlockItemClick={onBlockItemClick}
+                      onIterationClick={onIterationClick}
+                      onThoughtClick={onThoughtClick}
+                      renderThoughts={renderThoughts}
+                      finallyBlockLabel={finallyBlockLabel}
+                      workflowRunIsFinalized={workflowRunIsFinalized}
+                    />
+                  ) : (
+                    <AgentStepCallRow
+                      key={`call-${entry.call.index}`}
+                      agentStep={block}
+                      entry={entry}
+                      depth={depth + 1}
+                      activeItem={activeItem}
+                      onActionClick={onActionClick}
+                      workflowRunIsFinalized={workflowRunIsFinalized}
+                    />
+                  ),
+                ),
+                <TimelineActionRows
+                  key="stray-actions"
+                  block={{ ...block, actions: strayAgentActions }}
+                  activeItem={activeItem}
+                  depth={depth + 1}
+                  codeSteps={[]}
+                  onActionClick={onActionClick}
+                  workflowRunIsFinalized={workflowRunIsFinalized}
+                  hideIndex
+                />,
+                <TimelineSubItems
+                  key="unmatched"
+                  items={unmatchedAgentChildren}
+                  activeItem={activeItem}
+                  activeIteration={activeIteration}
+                  depth={depth + 1}
+                  blockOrder={blockOrder}
+                  codeStepsByLabel={codeStepsByLabel}
+                  skippedBranchBlocksByConditionalId={
+                    skippedBranchBlocksByConditionalId
+                  }
+                  onActionClick={onActionClick}
+                  onBlockItemClick={onBlockItemClick}
+                  onIterationClick={onIterationClick}
+                  onThoughtClick={onThoughtClick}
+                  renderThoughts={renderThoughts}
+                  finallyBlockLabel={finallyBlockLabel}
+                  workflowRunIsFinalized={workflowRunIsFinalized}
+                />,
+              ]
             ) : (
               hasRenderableNestedChildren && (
                 <TimelineSubItems

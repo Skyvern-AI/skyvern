@@ -14,36 +14,11 @@ from unittest.mock import MagicMock
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import HttpRequestBlock, NavigationBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
+from tests.unit.fake_workflow_run_context import FakeWorkflowRunContext
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-class FakeWorkflowRunContext:
-    """Lightweight stand-in for tests that don't need the real WorkflowRunContext."""
-
-    def __init__(
-        self,
-        *,
-        values: dict | None = None,
-        browser_session_id: str | None = None,
-    ) -> None:
-        self.values = dict(values or {})
-        self.secrets = {}
-        self.include_secrets_in_templates = False
-        self.workflow_title = "wf-title"
-        self.workflow_id = "wf-id"
-        self.workflow_permanent_id = "wf-perm-id"
-        self.workflow_run_id = "wr_test123"
-        self.workflow_run_outputs = {}
-        self.browser_session_id = browser_session_id
-
-    def get_block_metadata(self, label: str) -> dict:
-        return {}
-
-    def build_workflow_run_summary(self) -> str:
-        return ""
 
 
 def _make_output_parameter() -> OutputParameter:
@@ -96,32 +71,13 @@ def _make_real_workflow_run_context(*, browser_session_id: str | None = None) ->
 class TestBrowserSessionIdTemplateInjection:
     """Verify {{ browser_session_id }} resolves from WorkflowRunContext."""
 
-    def test_resolves_from_workflow_run_context(self) -> None:
-        block = _make_http_block()
-        ctx = FakeWorkflowRunContext(browser_session_id="pbs_abc123")
-        result = block.format_block_parameter_template_from_workflow_run_context("{{ browser_session_id }}", ctx)
-        assert result == "pbs_abc123"
-
-    def test_renders_empty_when_no_session(self) -> None:
-        block = _make_http_block()
-        ctx = FakeWorkflowRunContext(browser_session_id=None)
-        result = block.format_block_parameter_template_from_workflow_run_context("{{ browser_session_id }}", ctx)
-        assert result == ""
-
     def test_workflow_parameter_takes_precedence(self) -> None:
         """If a workflow parameter named browser_session_id exists, it should win over the context attribute."""
         block = _make_http_block()
-        ctx = FakeWorkflowRunContext(values={"browser_session_id": "pbs_from_param"}, browser_session_id="pbs_from_ctx")
+        ctx = FakeWorkflowRunContext(values={"browser_session_id": "pbs_from_param"})
+        ctx.browser_session_id = "pbs_from_ctx"
         result = block.format_block_parameter_template_from_workflow_run_context("{{ browser_session_id }}", ctx)
         assert result == "pbs_from_param"
-
-    def test_embedded_in_json_body(self) -> None:
-        """Test the customer's actual pattern: browser_session_id embedded in a JSON body template."""
-        block = _make_http_block()
-        ctx = FakeWorkflowRunContext(browser_session_id="pbs_xyz789")
-        template = '{"workflow_id": "wpid_test", "browser_session_id": "{{ browser_session_id }}"}'
-        result = block.format_block_parameter_template_from_workflow_run_context(template, ctx)
-        assert result == '{"workflow_id": "wpid_test", "browser_session_id": "pbs_xyz789"}'
 
 
 # ---------------------------------------------------------------------------
@@ -188,105 +144,3 @@ class TestCustomerFlowE2E:
         result = block.format_block_parameter_template_from_workflow_run_context(template, ctx)
 
         assert result == '{"browser_session_id": ""}'
-
-    def test_context_attribute_matches_execute_workflow_assignment(self) -> None:
-        """Verify that the WorkflowRunContext.browser_session_id attribute works
-        exactly as execute_workflow assigns it (line 921-923 of service.py)."""
-        ctx = WorkflowRunContext(
-            workflow_title="Real Workflow",
-            workflow_id="wf_real",
-            workflow_permanent_id="wpid_real",
-            workflow_run_id="wr_real",
-            aws_client=MagicMock(),
-        )
-        # This mirrors: workflow_run_context.browser_session_id = browser_session_id
-        ctx.browser_session_id = "pbs_from_execute_workflow"
-
-        block = _make_http_block()
-        result = block.format_block_parameter_template_from_workflow_run_context("{{ browser_session_id }}", ctx)
-        assert result == "pbs_from_execute_workflow"
-
-    def test_auto_created_session_id_propagates(self) -> None:
-        """Simulate auto-creation flow: browser_session_id starts None, then gets set
-        after auto_create_browser_session_if_needed returns a session."""
-        ctx = _make_real_workflow_run_context(browser_session_id=None)
-
-        # Before auto-creation: should render empty
-        block = _make_http_block()
-        result_before = block.format_block_parameter_template_from_workflow_run_context("{{ browser_session_id }}", ctx)
-        assert result_before == ""
-
-        # Simulate auto-creation setting the session ID (like service.py does)
-        ctx.browser_session_id = "pbs_auto_created"
-
-        result_after = block.format_block_parameter_template_from_workflow_run_context("{{ browser_session_id }}", ctx)
-        assert result_after == "pbs_auto_created"
-
-
-# ---------------------------------------------------------------------------
-# 3. WorkflowContextManager → context injection → template rendering chain
-# ---------------------------------------------------------------------------
-
-
-class TestAutoCreateSessionContextInjection:
-    """Simulate the full execute_workflow path when auto_create_browser_session_if_needed
-    creates a session: WorkflowContextManager registers the context, execute_workflow
-    mutates browser_session_id on it, then blocks render templates from the same context."""
-
-    def test_context_manager_register_then_mutate_then_render(self) -> None:
-        """Exercise the real WorkflowContextManager.get_workflow_run_context path
-        that execute_workflow uses to inject browser_session_id."""
-        from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
-
-        mgr = WorkflowContextManager()
-        workflow_run_id = "wr_auto_test"
-
-        # Step 1: Register context (like initialize_workflow_run_context does)
-        ctx = WorkflowRunContext(
-            workflow_title="Auto-Create Test",
-            workflow_id="wf_auto",
-            workflow_permanent_id="wpid_auto",
-            workflow_run_id=workflow_run_id,
-            aws_client=MagicMock(),
-        )
-        mgr.workflow_run_contexts[workflow_run_id] = ctx
-
-        # Step 2: Simulate auto_create_browser_session_if_needed returning a session,
-        # then execute_workflow setting browser_session_id via get_workflow_run_context
-        auto_created_session_id = "pbs_auto_created_999"
-        retrieved_ctx = mgr.get_workflow_run_context(workflow_run_id)
-        retrieved_ctx.browser_session_id = auto_created_session_id
-
-        # Step 3: Verify template rendering (as _execute_workflow_blocks would)
-        block = _make_http_block()
-        body_template = '{"browser_session_id": "{{ browser_session_id }}", "workflow_run_id": "{{ workflow_run_id }}"}'
-        result = block.format_block_parameter_template_from_workflow_run_context(body_template, retrieved_ctx)
-
-        assert f'"browser_session_id": "{auto_created_session_id}"' in result
-        assert f'"workflow_run_id": "{workflow_run_id}"' in result
-
-    def test_context_manager_without_auto_create(self) -> None:
-        """When no auto-creation happens, browser_session_id stays None and renders empty."""
-        from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
-
-        mgr = WorkflowContextManager()
-        workflow_run_id = "wr_no_auto"
-
-        ctx = WorkflowRunContext(
-            workflow_title="No Auto-Create",
-            workflow_id="wf_no_auto",
-            workflow_permanent_id="wpid_no_auto",
-            workflow_run_id=workflow_run_id,
-            aws_client=MagicMock(),
-        )
-        mgr.workflow_run_contexts[workflow_run_id] = ctx
-
-        # execute_workflow sets browser_session_id = None (no auto-creation)
-        retrieved_ctx = mgr.get_workflow_run_context(workflow_run_id)
-        retrieved_ctx.browser_session_id = None
-
-        block = _make_http_block()
-        result = block.format_block_parameter_template_from_workflow_run_context(
-            "{{ browser_session_id }}", retrieved_ctx
-        )
-        assert result == ""

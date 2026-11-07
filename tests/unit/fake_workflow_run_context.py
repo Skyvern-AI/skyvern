@@ -24,6 +24,7 @@ class FakeWorkflowRunContext:
     ) -> None:
         self.values = dict(values)
         self.secrets = secrets or {}
+        self._platform_smtp_secret_ids: dict[str, str] = {}
         self.include_secrets_in_templates = include_secrets_in_templates
         self._blocks_metadata: dict[str, dict[str, Any]] = {
             label: dict(meta) for label, meta in (block_metadata or {}).items()
@@ -38,8 +39,13 @@ class FakeWorkflowRunContext:
         self.workflow_run_outputs: dict[str, Any] = dict(workflow_run_outputs or {})
         self.block_outcomes: dict[str, BlockOutcome] = {}
         self.carried_block_labels: set[str] = set()
+        self.succeeded_code_block_labels: set[str] = set()
         self.parameters: dict[str, Any] = {}
+        self._powerbi_hop_tokens: dict[str, str] = {}
         self.workflow = None
+
+    def get_powerbi_hop_token(self, block_label: str) -> str | None:
+        return self._powerbi_hop_tokens.get(block_label)
 
     def get_block_metadata(self, label: str | None) -> dict[str, Any]:
         if not label:
@@ -56,6 +62,9 @@ class FakeWorkflowRunContext:
         return None
 
     def record_block_workflow_system_prompt(self, label: str, value: str | None) -> None:
+        return None
+
+    def resolve_block_notes_section(self, label: str) -> str | None:
         return None
 
     def has_value(self, key: str) -> bool:
@@ -80,5 +89,9 @@ class FakeWorkflowRunContext:
 
     # Borrow the real implementations so scoping and outcome behavior cannot drift from production.
     credential_template_entries = WorkflowRunContext.credential_template_entries
+    platform_smtp_parameter_keys = WorkflowRunContext.platform_smtp_parameter_keys
+    platform_smtp_placeholders = WorkflowRunContext.platform_smtp_placeholders
+    agent_unmasked_platform_secret_ids = WorkflowRunContext.agent_unmasked_platform_secret_ids
+    reject_platform_smtp_template_references = WorkflowRunContext.reject_platform_smtp_template_references
     record_block_outcome = WorkflowRunContext.record_block_outcome
     get_block_outcome = WorkflowRunContext.get_block_outcome

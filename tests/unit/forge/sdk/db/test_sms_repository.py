@@ -24,18 +24,18 @@ from skyvern.forge.sdk.db.models import (
 )
 from skyvern.forge.sdk.db.repositories import organizations as organizations_repository_module
 from skyvern.forge.sdk.db.repositories import sms as sms_repository_module
-from skyvern.forge.sdk.encrypt.base import EncryptMethod
+from skyvern.forge.sdk.encrypt.base import DEFAULT_ENCRYPT_METHOD, EncryptMethod
 from skyvern.forge.sdk.schemas.organizations import TwilioCredential
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 
 
 class _FakeEncryptor:
     async def encrypt(self, plaintext: str, method: object) -> str:
-        assert getattr(method, "value", None) == "aes"
+        assert method is DEFAULT_ENCRYPT_METHOD
         return f"encrypted::{plaintext}"
 
     async def decrypt(self, ciphertext: str, method: object) -> str:
-        assert getattr(method, "value", None) == "aes"
+        assert method is DEFAULT_ENCRYPT_METHOD
         return ciphertext.removeprefix("encrypted::")
 
 
@@ -103,7 +103,7 @@ def fake_sms_encryptor(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_twilio_org_credentials_default_to_aes_and_reject_other_methods(
+async def test_twilio_org_credentials_default_to_aes_gcm_and_reject_other_methods(
     agent_db: AgentDB,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -127,10 +127,10 @@ async def test_twilio_org_credentials_default_to_aes_and_reject_other_methods(
         )
     assert row is not None
     assert row.token == ""
-    assert row.encrypted_method == EncryptMethod.AES.value
+    assert row.encrypted_method == DEFAULT_ENCRYPT_METHOD.value
     assert row.encrypted_token == f"encrypted::{credential.model_dump_json()}"
 
-    with pytest.raises(ValueError, match="AES"):
+    with pytest.raises(ValueError, match=DEFAULT_ENCRYPT_METHOD.value):
         await agent_db.organizations.replace_org_auth_token(
             "o_test",
             OrganizationAuthTokenType.twilio_credential,
@@ -283,7 +283,7 @@ async def test_sms_config_create_get_list_and_delete(agent_db: AgentDB) -> None:
         )
     assert stored is not None
     assert stored.encrypted_webhook_secret == "encrypted::secret-token"
-    assert stored.webhook_secret_encrypted_method == "aes"
+    assert stored.webhook_secret_encrypted_method == DEFAULT_ENCRYPT_METHOD.value
 
     loaded = await agent_db.sms.get_sms_config_with_secret(
         organization_id="o_test", sms_config_id=created.sms_config_id

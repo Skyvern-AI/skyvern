@@ -12,7 +12,9 @@ from playwright.async_api import async_playwright
 from structlog.testing import capture_logs
 
 from skyvern.forge.sdk.copilot import demonstration_tap as tap_module
+from skyvern.forge.sdk.copilot.composition_browser_expressions import scout_accessible_role_name_expression
 from skyvern.forge.sdk.copilot.demonstration_tap import PageTap, TapEvent
+from tests.unit.conftest import requires_full_chromium
 from tests.unit.copilot_test_helpers import skip_no_browser
 from tests.unit.scoped_asyncio import ScopedAsyncio
 
@@ -73,7 +75,7 @@ async def _wait_for_event(
     raise AssertionError(f"tap event not observed: {[event.payload for event in seen]}")
 
 
-@skip_no_browser
+@requires_full_chromium
 @pytest.mark.asyncio
 async def test_page_tap_captures_trusted_actions_navigation_and_oopif() -> None:
     main_origin = "http://main.test"
@@ -576,7 +578,7 @@ async def test_page_tap_credits_each_navigation_to_its_own_entry_when_the_url_re
             await tap.stop()
 
 
-@skip_no_browser
+@requires_full_chromium
 @pytest.mark.asyncio
 async def test_page_tap_protects_labelled_secrets_and_captures_combobox_typing() -> None:
     tap: PageTap | None = None
@@ -1118,3 +1120,435 @@ async def test_page_tap_records_element_drags_and_a_gap_per_freehand_stroke() ->
     finally:
         if tap is not None:
             await tap.stop()
+
+
+@skip_no_browser
+@pytest.mark.asyncio
+async def test_page_tap_click_name_matches_the_browser_accessible_name() -> None:
+    tap: PageTap | None = None
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        context = await browser.new_context()
+        page = await context.new_page()
+        await page.set_content(
+            """<div role="tablist">
+              <div role="tab" id="step-1"><div style="display:inline-flex">1</div>
+                <span aria-hidden="true" style="font-size:0">person</span><div>Client Info</div></div>
+              <div role="tab" id="step-2"><div style="display:inline-flex">2</div>
+                <span aria-hidden="true" style="font-size:0">assignment</span><div>Policy Info</div></div>
+            </div>
+            <button id="split">Sub<span>mit</span> order</button>
+            <button id="contents">Save<span style="display:contents">draft</span></button>
+            <span id="hidden-ref" hidden>Archive <b>item</b></span>
+            <button id="labelled" aria-labelledby="hidden-ref">x</button>
+            <button id="hidden-gap">Send<span hidden>icon</span>now</button>
+            <button id="icon-inline">Open<span aria-hidden="true">icon</span>file</button>
+            <label hidden for="account">Account <span hidden>number</span></label><input id="account">
+            <style>.shown { display: inline; }</style>
+            <button id="hidden-shown">Keep<span hidden class="shown">going</span></button>
+            <button id="child-ref">Print <span aria-labelledby="suffix"></span>
+              <span id="suffix" hidden>receipt</span></button>
+            <a href="#" id="child-label">Open <i aria-label="settings"></i></a>
+            <button id="visible-ref">Print <span aria-labelledby="visible-suffix"></span>
+              <span id="visible-suffix">slip</span></button>
+            <button id="self-labelled-ref">Copy <span aria-labelledby="named-ref">x</span></button>
+            <span id="named-ref" aria-label="link">internal</span>"""
+        )
+        try:
+            tap = PageTap(context)
+            await tap.start([page])
+            await page.click("#step-2")
+            click, _ = await _wait_for_event(tap, kind="click", selector="#step-2")
+            tab_name = click.payload["packet"]["role_name"]["accessible_name"]
+            assert "assignment" not in tab_name
+            assert await page.get_by_role("tab", name=tab_name, exact=True).count() == 1
+
+            for selector in (
+                "#split",
+                "#contents",
+                "#labelled",
+                "#hidden-gap",
+                "#icon-inline",
+                "#account",
+                "#hidden-shown",
+                "#child-ref",
+                "#child-label",
+                "#visible-ref",
+                "#self-labelled-ref",
+            ):
+                role_name = await page.evaluate(scout_accessible_role_name_expression(selector))
+                assert (
+                    await page.get_by_role(role_name["role"], name=role_name["accessible_name"], exact=True).count()
+                    == 1
+                )
+        finally:
+            if tap is not None:
+                await tap.stop()
+            await browser.close()
+
+
+@skip_no_browser
+@pytest.mark.asyncio
+async def test_page_tap_keeps_a_navigating_click_whose_document_unloads_before_it_is_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pages = {
+        "/": b'<html><body><ul><li><a href="/category">Category</a></li></ul></body></html>',
+        "/category": b'<html><body><form action="/added"><button type="submit">Add item</button></form></body></html>',
+        "/added": b'<html><body><a id="back" href="/">Home</a></body></html>',
+    }
+    # Every read after the press that could carry the click is lost, as when a slow renderer commits the next page
+    # first; a read still carrying only the press may land late.
+    reads_lost = False
+    enqueue_events = PageTap._enqueue_events
+
+    def lose_reads(self: PageTap, session_key: str, state: Any, frame_id: str, result: Any, **kwargs: Any) -> None:
+        carries_only_press = isinstance(result, dict) and result.get("press") and not result.get("events")
+        if not reads_lost or carries_only_press:
+            enqueue_events(self, session_key, state, frame_id, result, **kwargs)
+
+    monkeypatch.setattr(PageTap, "_enqueue_events", lose_reads)
+    tap: PageTap | None = None
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            context = await browser.new_context()
+
+            async def serve(route: Any) -> None:
+                body = pages.get(urlparse(route.request.url).path, b"not found")
+                await route.fulfill(status=200, content_type="text/html", body=body)
+
+            await context.route("**/*", serve)
+            page = await context.new_page()
+            await page.goto("http://main.test/")
+            tap = PageTap(context)
+            await tap.start([page])
+
+            async def click_while_reads_are_lost(selector: str, next_path: str) -> None:
+                nonlocal reads_lost
+                await page.hover(selector)
+                await page.mouse.down()
+                for _ in range(100):
+                    if any(state.get("pending_presses") for state in tap._sessions.values()):
+                        break
+                    await asyncio.sleep(0.01)
+                reads_lost = True
+                await page.mouse.up()
+                await page.wait_for_url(f"**{next_path}")
+                await page.wait_for_timeout(300)
+                reads_lost = False
+
+            await click_while_reads_are_lost("text=Category", "/category")
+            await click_while_reads_are_lost("text=Add item", "/added?")
+            await page.click("#back")
+            await page.wait_for_url("http://main.test/")
+            _, events = await _wait_for_event(tap, kind="click", selector="#back")
+            await page.wait_for_timeout(300)
+            events.extend(tap.drain_events())
+
+            clicks = [
+                (event.payload["url"], event.payload["packet"]["role_name"]["accessible_name"])
+                for event in events
+                if event.payload.get("kind") == "click"
+            ]
+            assert clicks == [
+                ("http://main.test/", "Category"),
+                ("http://main.test/category", "Add item"),
+                ("http://main.test/added?", "Home"),
+            ]
+            await browser.close()
+    finally:
+        if tap is not None:
+            await tap.stop()
+
+
+@skip_no_browser
+@pytest.mark.asyncio
+async def test_page_tap_press_on_a_submit_control_names_the_form_action() -> None:
+    page_html = (
+        b'<html><body><form action="/sent"><input id="image" type="image" alt="Send" width="40" height="40">'
+        b'<button id="override" formaction="/elsewhere">Other</button><button id="plain">Plain</button></form>'
+        b'<a id="link" href="/next#part">Next</a></body></html>'
+    )
+    tap: PageTap | None = None
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            context = await browser.new_context()
+
+            async def serve(route: Any) -> None:
+                await route.fulfill(status=200, content_type="text/html", body=page_html)
+
+            await context.route("**/*", serve)
+            page = await context.new_page()
+            await page.goto("http://main.test/")
+            tap = PageTap(context)
+            await tap.start([page])
+
+            targets: list[str] = []
+            for selector in ("#image", "#override", "#plain", "#link"):
+                await page.hover(selector)
+                await page.mouse.down()
+                pending: list[Any] = []
+                for _ in range(100):
+                    pending = [press for state in tap._sessions.values() for press in state["pending_presses"].values()]
+                    if pending:
+                        break
+                    await asyncio.sleep(0.01)
+                targets.extend(str(press["payload"]["target_url"]) for press in pending)
+                # Moving off before release cancels the press, so nothing navigates.
+                await page.mouse.move(600, 600)
+                await page.mouse.up()
+                for _ in range(100):
+                    if not any(state["pending_presses"] for state in tap._sessions.values()):
+                        break
+                    await asyncio.sleep(0.01)
+            assert targets == [
+                "http://main.test/sent",
+                "http://main.test/elsewhere",
+                "http://main.test/sent",
+                "http://main.test/next#part",
+            ]
+            await browser.close()
+    finally:
+        if tap is not None:
+            await tap.stop()
+
+
+def _tap_with_one_frame() -> tuple[PageTap, Any]:
+    tap = PageTap(SimpleNamespace())  # type: ignore[arg-type]
+    tap._sessions["tap-1"] = {
+        # Reads of the unloaded document fail the way CDP does once its context is gone.
+        "session": SimpleNamespace(send=AsyncMock(side_effect=RuntimeError("Execution context was destroyed."))),
+        "page": SimpleNamespace(),
+        "target_frame": None,
+        "is_page_session": True,
+        "script_id": None,
+        "frames": {"main": {"id": "main"}, "frame": {"id": "frame", "parentId": "main"}},
+        "main_frame_id": "main",
+        "seen_navigation_entry_ids": set(),
+        "main_frame_navigations": 0,
+        "drain_acks": {},
+        "seen_event_sequences": {},
+        "worlds": {},
+        "pending_presses": {},
+        "clicked_presses": {},
+        "click_navigations": {},
+        "recovering_documents": set(),
+        "document_activity": {},
+        "document_generations": {},
+        "inflight_drains": {},
+    }
+    return tap, tap._sessions["tap-1"]
+
+
+def _read(stream: str, events: list[dict[str, Any]], press: dict[str, Any] | None) -> dict[str, Any]:
+    return {"stream": stream, "events": events, "press": press}
+
+
+_PRESS = {
+    "id": 1,
+    "ts": 1.0,
+    "url": "http://main.test/",
+    "selector": "#link",
+    "packet": {},
+    "target_url": "http://main.test/next",
+}
+
+
+async def _navigate_after_link_click(tap: PageTap, state: Any) -> None:
+    tap._frame_requested_navigation(
+        "tap-1",
+        {"frameId": "frame", "disposition": "currentTab", "reason": "anchorClick", "url": "http://main.test/next"},
+    )
+    tap._frame_navigated("tap-1", {"frame": {"id": "frame", "parentId": "main", "url": "http://main.test/next"}})
+    await asyncio.sleep(0.05)
+
+
+@pytest.mark.asyncio
+async def test_page_tap_recovers_a_click_whose_press_read_lands_after_the_page_changed() -> None:
+    tap, state = _tap_with_one_frame()
+    # The read that carries the press is still in flight when the link navigates and the next page commits.
+    state["inflight_drains"][("frame", 0)] = 1
+    await _navigate_after_link_click(tap, state)
+    tap._enqueue_events("tap-1", state, "frame", _read("old", [], _PRESS), generation=0)
+    state["inflight_drains"].pop(("frame", 0))
+    await asyncio.sleep(0.05)
+
+    clicks = [event.payload for event in tap.drain_events() if event.payload.get("kind") == "click"]
+    assert [(click["selector"], click["url"]) for click in clicks] == [("#link", "http://main.test/")]
+    assert state["pending_presses"] == {} and state["recovering_documents"] == set()
+
+
+@pytest.mark.asyncio
+async def test_page_tap_files_a_read_under_the_page_its_world_was_created_in() -> None:
+    tap, state = _tap_with_one_frame()
+    tap._enqueue_events("tap-1", state, "frame", _read("old", [], _PRESS), generation=0)
+    next_press = {**_PRESS, "url": "http://main.test/next", "selector": "#add", "target_url": "http://main.test/added"}
+    navigated = False
+
+    async def send(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        nonlocal navigated
+        if method == "Page.createIsolatedWorld":
+            if not navigated:
+                # The poller asked for a world on the old page; Chromium answers after the next page commits.
+                navigated = True
+                await _navigate_after_link_click(tap, state)
+            return {"executionContextId": 7}
+        return {"result": {"value": _read("new", [], next_press)}}
+
+    state["session"] = SimpleNamespace(send=send)
+    assert await tap._drain_frame("tap-1", "frame", max_wait_ms=1000)
+    await asyncio.sleep(0.05)
+
+    clicks = [event.payload["selector"] for event in tap.drain_events() if event.payload.get("kind") == "click"]
+    assert clicks == ["#link"]
+    assert [press["payload"]["selector"] for press in state["pending_presses"].values()] == ["#add"]
+
+
+@pytest.mark.asyncio
+async def test_page_tap_does_not_replay_a_delivered_click_when_the_next_page_is_clicked_during_recovery() -> None:
+    tap, state = _tap_with_one_frame()
+    tap._enqueue_events("tap-1", state, "frame", _read("old", [], _PRESS), generation=0)
+    state["inflight_drains"][("frame", 0)] = 1
+    await _navigate_after_link_click(tap, state)
+    # The link's own click arrives in the old page's last read, after the next page committed.
+    link_click = {"seq": 1, "kind": "click", "ts": 2.0, "url": "http://main.test/", "selector": "#link", "press": 1}
+    tap._enqueue_events("tap-1", state, "frame", _read("old", [link_click], None), generation=0)
+    next_click = {"seq": 1, "kind": "click", "ts": 3.0, "url": "http://main.test/next", "selector": "#b", "press": 1}
+    tap._enqueue_events("tap-1", state, "frame", _read("new", [next_click], None), generation=1)
+    # The next page's click waits for the recovery, so it is never stored ahead of the link click.
+    assert tap.drain_events() == []
+    state["inflight_drains"].pop(("frame", 0))
+    await asyncio.sleep(0.05)
+
+    clicks = [event.payload["selector"] for event in tap.drain_events() if event.payload.get("kind") == "click"]
+    assert clicks == ["#link", "#b"]
+
+
+@pytest.mark.asyncio
+async def test_page_tap_does_not_recover_a_later_press_on_another_target() -> None:
+    tap, state = _tap_with_one_frame()
+    # The link's click was read; a second press on another element never became a click before the page changed.
+    tap._enqueue_events("tap-1", state, "frame", _read("old", [], _PRESS), generation=0)
+    link_click = {
+        "seq": 1,
+        "kind": "click",
+        "ts": 2.0,
+        "url": "http://main.test/",
+        "selector": "#link",
+        "press": 1,
+        "target_url": "http://main.test/next",
+    }
+    later_press = {**_PRESS, "id": 2, "ts": 3.0, "selector": "#other", "target_url": "http://main.test/elsewhere"}
+    tap._enqueue_events("tap-1", state, "frame", _read("old", [link_click], later_press), generation=0)
+    await _navigate_after_link_click(tap, state)
+
+    clicks = [event.payload["selector"] for event in tap.drain_events() if event.payload.get("kind") == "click"]
+    assert clicks == ["#link"]
+
+
+@pytest.mark.asyncio
+async def test_page_tap_stop_keeps_a_click_still_being_recovered() -> None:
+    tap, state = _tap_with_one_frame()
+    tap.context = SimpleNamespace(remove_listener=lambda *args: None)  # type: ignore[assignment]
+    tap._enqueue_events("tap-1", state, "frame", _read("old", [], _PRESS), generation=0)
+    state["inflight_drains"][("frame", 0)] = 1
+    await _navigate_after_link_click(tap, state)
+
+    async def release_old_read() -> None:
+        await asyncio.sleep(0.2)
+        state["inflight_drains"].pop(("frame", 0))
+
+    release = asyncio.create_task(release_old_read())
+    await tap.stop()
+    await release
+
+    clicks = [event.payload["selector"] for event in tap.drain_events() if event.payload.get("kind") == "click"]
+    assert clicks == ["#link"]
+
+
+@pytest.mark.asyncio
+async def test_page_tap_still_hands_over_its_last_events_when_a_link_navigates_during_stop() -> None:
+    tap, state = _tap_with_one_frame()
+    last_type = {"seq": 1, "kind": "type", "ts": 1.0, "url": "http://main.test/", "selector": "#q", "value": "x"}
+    tap._enqueue_events("tap-1", state, "frame", _read("old", [last_type], _PRESS), generation=0)
+    tap._stopped = True
+    tap._frame_requested_navigation(
+        "tap-1",
+        {"frameId": "frame", "disposition": "currentTab", "reason": "anchorClick", "url": "http://main.test/next"},
+    )
+    tap._frame_navigated("tap-1", {"frame": {"id": "frame", "parentId": "main", "url": "http://main.test/next"}})
+    for task in list(tap._background_tasks):
+        task.cancel()
+    await asyncio.gather(*tap._background_tasks, return_exceptions=True)
+
+    assert [event.payload["kind"] for event in tap.drain_events()] == ["type"]
+
+
+@pytest.mark.asyncio
+async def test_page_tap_reports_no_gap_for_a_click_navigation_no_user_press_started() -> None:
+    tap, state = _tap_with_one_frame()
+    earlier_select = {"seq": 1, "kind": "select", "ts": 5.0, "url": "http://main.test/", "selector": "#choice"}
+    tap._enqueue_events("tap-1", state, "frame", _read("old", [earlier_select], None), generation=0)
+    # A script submit or scripted link click (an SSO auto-post) reports the same reason as a user's click.
+    await _navigate_after_link_click(tap, state)
+
+    assert [event.payload["kind"] for event in tap.drain_events()] == ["select"]
+
+
+@pytest.mark.asyncio
+async def test_page_tap_reports_a_gap_when_a_pressed_link_led_elsewhere_and_its_click_was_lost() -> None:
+    tap, state = _tap_with_one_frame()
+    # The page rewrote the link after the press, so the press does not name where the page went.
+    rewritten = {**_PRESS, "target_url": "http://main.test/elsewhere"}
+    tap._enqueue_events("tap-1", state, "frame", _read("old", [], rewritten), generation=0)
+    await _navigate_after_link_click(tap, state)
+
+    events = [event.payload for event in tap.drain_events()]
+    assert [(event["kind"], event["ts"], event["url"]) for event in events] == [
+        ("click_navigation_unconfirmed", 2.0, "http://main.test/"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_page_tap_gap_sorts_before_the_next_page() -> None:
+    tap, state = _tap_with_one_frame()
+    pressed_at = time.time() * 1000
+    rewritten = {**_PRESS, "ts": pressed_at, "target_url": "http://main.test/elsewhere"}
+    tap._enqueue_events("tap-1", state, "frame", _read("old", [], rewritten), generation=0)
+    state["inflight_drains"][("frame", 0)] = 1
+    await _navigate_after_link_click(tap, state)
+    next_click = {"seq": 1, "kind": "click", "url": "http://main.test/next", "selector": "#b", "ts": pressed_at + 50}
+    tap._enqueue_events("tap-1", state, "frame", _read("new", [next_click], None), generation=1)
+    state["inflight_drains"].pop(("frame", 0))
+    await asyncio.sleep(0.05)
+
+    kinds = [event.payload["kind"] for event in tap.drain_events()]
+    assert kinds == ["click_navigation_unconfirmed", "click"]
+
+
+@pytest.mark.asyncio
+async def test_page_tap_stop_finishes_when_the_browser_holds_its_reads(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(tap_module, "CDP_READ_TIMEOUT_SECONDS", 0.05)
+    tap, state = _tap_with_one_frame()
+    tap.context = SimpleNamespace(remove_listener=lambda *args: None)  # type: ignore[assignment]
+
+    async def held(*args: Any, **kwargs: Any) -> Any:
+        await asyncio.Event().wait()
+
+    state["session"] = SimpleNamespace(send=held, detach=AsyncMock())
+
+    await asyncio.wait_for(tap.stop(), timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_page_tap_forgets_press_records_of_a_removed_frame() -> None:
+    tap, state = _tap_with_one_frame()
+    tap._enqueue_events("tap-1", state, "frame", _read("old", [], _PRESS))
+    tap._frame_requested_navigation(
+        "tap-1",
+        {"frameId": "frame", "disposition": "currentTab", "reason": "anchorClick", "url": "http://main.test/next"},
+    )
+    tap._reconcile_frames("tap-1", {"frameTree": {"frame": {"id": "main"}}})
+    assert state["pending_presses"] == {} and state["click_navigations"] == {}

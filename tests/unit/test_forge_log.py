@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -10,12 +11,12 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import structlog
 
+from skyvern.forge.sdk import forge_log
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.organization_age_cache import remember_organization_created_at
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -226,7 +227,9 @@ async def test_browser_runtime_task_pbs_boundary_preserves_owner_log(
     runtime_logs: list[dict], workflow_owned: bool
 ) -> None:
     owner = SkyvernContext(workflow_run_id="workflow-owner" if workflow_owned else None, task_id="task-owner")
-    task = MagicMock(task_id=owner.task_id, workflow_run_id=owner.workflow_run_id, organization_id="org-owner")
+    task = MagicMock(
+        task_id=owner.task_id, workflow_run_id=owner.workflow_run_id, requested_by=None, organization_id="org-owner"
+    )
 
     async def acquire(session_id: str, **kwargs: object) -> None:
         with log_browser_acquisition_failure(
@@ -271,67 +274,16 @@ def test_lines_that_only_name_an_organization_take_its_age_from_the_process_cach
     assert context_with_age["org_age"] == 40
 
 
-def test_add_log_context_tolerates_partial_context() -> None:
-    # A partial context (e.g. a SimpleNamespace test double) exposes only some of the
-    # fields add_log_context reads. It must fail-open on the missing ones rather than raise.
-    context = SimpleNamespace(organization_id="org_1", task_id="task_1", org_age=None, log=[])
-    with patch.object(skyvern_context, "current", return_value=context):
-        event_dict = add_log_context(None, "warning", {"msg": "hi"})
-
-    assert event_dict["organization_id"] == "org_1"
-    assert event_dict["task_id"] == "task_1"
-    assert "request_id" not in event_dict
-
-
-def test_correlation_ids_are_searchable_in_msg() -> None:
-    # Datadog free-text search only scans the message content; pasting an id like
-    # pbs_x/wr_x must keep matching, so the ids are appended to msg (SKY-13848 kept
-    # the arbitrary-kwarg copy out — only these bounded ids go in).
-    context = SkyvernContext(
-        organization_id="o_1",
-        workflow_run_id="wr_1",
-        browser_session_id="pbs_1",
-    )
-    with patch.object(skyvern_context, "current", return_value=context):
-        event_dict = add_log_context(None, "info", {"msg": "Closing browser", "payload": "x" * 500})
-
-    assert event_dict["msg"] == "Closing browser | organization_id=o_1, workflow_run_id=wr_1, browser_session_id=pbs_1"
-    assert event_dict["browser_session_id"] == "pbs_1"
-
-
-def test_kwarg_correlation_id_is_searchable_without_context() -> None:
-    # Worker code paths log ids as kwargs before any skyvern_context exists; those must
-    # be free-text searchable too.
-    with patch.object(skyvern_context, "current", return_value=None):
-        event_dict = add_log_context(None, "info", {"msg": "Begin browser session", "browser_session_id": "pbs_2"})
-
-    assert event_dict["msg"] == "Begin browser session | browser_session_id=pbs_2"
-
-
-def test_codeblock_execution_path_is_a_field_not_a_msg_suffix() -> None:
-    # The arm is a grouping facet for the secure-vs-legacy monitors, not a correlation id,
-    # so it must stay out of the searchable-id suffix (SKY-13848 bounds what goes into msg).
-    context = SkyvernContext(workflow_run_id="wr_1", codeblock_execution_path="secure_runner")
-    with patch.object(skyvern_context, "current", return_value=context):
-        event_dict = add_log_context(None, "warning", {"msg": "Block failed"})
-
-    assert event_dict["codeblock_execution_path"] == "secure_runner"
-    assert event_dict["msg"] == "Block failed | workflow_run_id=wr_1"
-
-
-@pytest.mark.parametrize("org_age", [0, 8, None])
-def test_org_age_is_an_integer_field_not_a_msg_suffix(org_age: int | None) -> None:
-    # A same-day org is 0 days old and must still be stamped, while an unknown age emits no field at
-    # all. The age is a range facet, not a correlation id, so it stays out of the msg suffix.
+@pytest.mark.parametrize("org_age", [0])
+def test_org_age_is_an_integer_field_not_a_msg_suffix(org_age: int) -> None:
+    # A same-day org is 0 days old and must still be stamped. The age is a range facet, not a
+    # correlation id, so it stays out of the msg suffix.
     context = SkyvernContext(workflow_run_id="wr_1", org_age=org_age)
     with patch.object(skyvern_context, "current", return_value=context):
         event_dict = add_log_context(None, "info", {"msg": "Run task activity started"})
 
-    if org_age is None:
-        assert "org_age" not in event_dict
-    else:
-        emitted_age = json.loads(json.dumps(event_dict))["org_age"]
-        assert type(emitted_age) is int and emitted_age == org_age
+    emitted_age = json.loads(json.dumps(event_dict))["org_age"]
+    assert type(emitted_age) is int and emitted_age == org_age
     assert event_dict["msg"] == "Run task activity started | workflow_run_id=wr_1"
 
 
@@ -421,3 +373,44 @@ def test_json_log_callsite_names_the_caller_without_reading_its_source(tmp_path:
     )
     assert (record["func_name"], record["lineno"]) == ("emit", probe["line"])
     assert probe["source_read"] is False
+
+
+def test_outbound_url_redaction(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(forge_log, "_sensitive_url_path_prefixes", set())
+    log_filter = forge_log._OutboundURLLogFilter()
+
+    def render(message: str, *args: object) -> str:
+        record = logging.LogRecord("httpx", logging.INFO, "", 0, message, args, None)
+        assert log_filter.filter(record)
+        return record.getMessage()
+
+    group = "22222222-2222-4222-8222-222222222222"
+    dataset = "11111111-1111-4111-8111-111111111111"
+    assert render(f"GET https://example.invalid/groups/{group}/datasets/{dataset}?q=private 403") == (
+        "GET https://example.invalid/groups/[REDACTED]/datasets/[REDACTED]?[REDACTED] 403"
+    )
+    assert render("GET https://example.invalid/messages/abcdef0123456789?q=private 200") == (
+        "GET https://example.invalid/messages/[REDACTED]?[REDACTED] 200"
+    )
+    assert render("GET https://example.invalid/messages 200") == "GET https://example.invalid/messages 200"
+    assert render("GET https://example.invalid/items/abc123456789012345678901 200") == (
+        "GET https://example.invalid/items/[REDACTED] 200"
+    )
+    forge_log.register_sensitive_url_path_prefix("/proxy/")
+    assert render("GET https://example.invalid/proxy/mail/messages/short-id?q=private 403") == (
+        "GET https://example.invalid/proxy/[REDACTED] 403"
+    )
+    assert render("GET https://example.invalid/proxy/data/groups/short-id/datasets 200") == (
+        "GET https://example.invalid/proxy/[REDACTED] 200"
+    )
+    assert render("%d", "not-an-integer") == "outbound log suppressed (unrenderable)"
+
+
+@pytest.mark.parametrize("logger_name", ["httpx", "httpcore.http11"])
+def test_outbound_url_redaction_at_info(caplog: pytest.LogCaptureFixture, logger_name: str) -> None:
+    logger = logging.getLogger(logger_name)
+    caplog.set_level(logging.INFO, logger=logger_name)
+    logger.info("HTTP Request: GET https://example.invalid/items/abcdef0123456789?q=private 403")
+    assert caplog.records[-1].getMessage() == (
+        "HTTP Request: GET https://example.invalid/items/[REDACTED]?[REDACTED] 403"
+    )

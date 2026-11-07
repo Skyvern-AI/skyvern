@@ -8,7 +8,7 @@ import re
 import textwrap
 from collections import Counter
 from copy import deepcopy
-from dataclasses import asdict, fields, replace
+from dataclasses import asdict, dataclass, fields, replace
 from typing import Any, Protocol, runtime_checkable
 from urllib.parse import urlparse
 
@@ -18,19 +18,21 @@ try:
     from bs4 import BeautifulSoup  # type: ignore[import-not-found]
 except ImportError:  # pragma: no cover — bs4 is a transitive dep but discovery degrades gracefully without it.
     BeautifulSoup = None  # type: ignore[assignment, misc]
-from jinja2 import TemplateError, meta
 from jinja2.sandbox import SandboxedEnvironment
 from pydantic import JsonValue
 
 from skyvern.constants import SCRUBBED_VALUE
 from skyvern.forge import app
+from skyvern.forge.sdk.copilot.agent_context import FrontierStartProvenance
 from skyvern.forge.sdk.copilot.block_goal_wrapping import wrap_workflow_block_goals
 from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome
+from skyvern.forge.sdk.copilot.code_block_steps import bind_referenced_parameters_in_yaml
 from skyvern.forge.sdk.copilot.code_block_synthesis import code_contains_credential_fill
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.failure_tracking import (
     _blocks_by_label,
     _canonical_block_config,
+    _execution_block_config,
     block_shape_hashes_by_label,
 )
 from skyvern.forge.sdk.copilot.frontier_provenance_dump import (
@@ -39,6 +41,8 @@ from skyvern.forge.sdk.copilot.frontier_provenance_dump import (
     trust_snapshot,
     write_packet,
 )
+from skyvern.forge.sdk.copilot.input_references import jinja_roots, keys_named_in, root_parameter_key
+from skyvern.forge.sdk.copilot.output_contracts import declared_workflow_parameter_keys
 from skyvern.forge.sdk.copilot.output_utils import INTERNAL_VALIDATION_FAILURE_PREFIX
 from skyvern.forge.sdk.copilot.repair_origin_run import (
     OriginBlockOutput,
@@ -47,17 +51,19 @@ from skyvern.forge.sdk.copilot.repair_origin_run import (
     OriginOutputRefusal,
     OriginOutputRefusalDetail,
     OriginOutputSnapshot,
+    OutputSourceKind,
+    RefusedOutputSource,
     RunOutputCarrier,
     SelectedOutputSource,
+    current_named_output_source,
+    drop_named_output_source,
     origin_snapshot,
 )
-from skyvern.forge.sdk.copilot.runtime import (
-    AgentContext,
-    FrontierStartProvenance,
-    resolve_browser_state_for_context,
-)
+from skyvern.forge.sdk.copilot.runtime import AgentContext, resolve_browser_state_for_context
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
+from skyvern.forge.sdk.copilot.workflow_block_traversal import workflow_block_locations
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml, copilot_round_trip_definition
+from skyvern.forge.sdk.workflow.block_notes import definition_step_notes
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar, ForLoopBlock, get_all_blocks
 from skyvern.forge.sdk.workflow.models.parameter import (
     RESERVED_PARAMETER_KEYS,
@@ -68,6 +74,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
 )
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
 from skyvern.schemas.workflows import BlockStatus, BlockType
+from skyvern.utils.yaml_loader import safe_load_no_dates
 
 from ._shared import (
     _block_type_name,
@@ -81,7 +88,22 @@ from ._shared import (
 LOG = structlog.get_logger()
 
 
+UnanchoredPlan = tuple[list[str], dict[str, Any], str | None]
 FrontierPlan = tuple[list[str], dict[str, Any], str | None, FrontierStartProvenance]
+
+
+@dataclass(frozen=True, slots=True)
+class FrontierRequest:
+    requested_labels: list[str]
+    old_definition: WorkflowDefinition | None
+    new_definition: WorkflowDefinition | None
+    runtime_page_url: str | None
+
+    def plan(self, ctx: AgentContext) -> FrontierPlan:
+        return _plan_frontier(
+            ctx, list(self.requested_labels), self.old_definition, self.new_definition, self.runtime_page_url
+        )
+
 
 _BLOCK_TYPES_STATE_ESTABLISHER = frozenset({"navigation", "login", "goto_url"})
 
@@ -89,11 +111,6 @@ _BLOCK_TYPES_SIGN_IN = frozenset({"login"})
 
 # Bounds the walk into nested blocks; workflows nest a few levels, not hundreds.
 _MAX_BLOCK_NESTING_DEPTH = 10
-
-_JINJA_IDENTIFIER = r"[A-Za-z_][A-Za-z0-9_]*"
-# Fallback only: this sees the identifier that opens an expression, so `{{ a ~ b }}` hides `b`.
-# _jinja_roots parses instead, and falls back to this when the text is not valid Jinja.
-_JINJA_ROOT_RE = re.compile(rf"\{{\{{\s*({_JINJA_IDENTIFIER})")
 
 _JINJA_RUNTIME_GLOBAL_ROOTS = frozenset(SandboxedEnvironment().globals)
 _JINJA_LITERAL_ROOTS = frozenset({"none", "true", "false"})
@@ -311,6 +328,8 @@ def _find_invalidated_labels(
     """
     old_by_label = _blocks_by_label(old_definition)
     new_by_label = _blocks_by_label(new_definition)
+    old_notes = definition_step_notes(old_definition) if old_definition else {}
+    new_notes = definition_step_notes(new_definition) if new_definition else {}
     invalidated: set[str] = set()
     upstream_invalidated = False
     for label in requested_labels:
@@ -323,7 +342,7 @@ def _find_invalidated_labels(
             invalidated.add(label)
             upstream_invalidated = True
             continue
-        if _canonical_block_config(old_block) != _canonical_block_config(new_block):
+        if _execution_block_config(old_block, old_notes) != _execution_block_config(new_block, new_notes):
             invalidated.add(label)
             upstream_invalidated = True
     return invalidated
@@ -353,6 +372,7 @@ def _reset_all_verified_trust(copilot_ctx: Any) -> None:
     evidence = copilot_ctx.workflow_verification_evidence
     copilot_ctx.verified_prefix_labels = []
     copilot_ctx.composition_verified_labels = []
+    copilot_ctx.untaken_branch_labels = {}
     copilot_ctx.verified_block_outputs = {}
     copilot_ctx.verified_prefix_block_end_urls = {}
     copilot_ctx.verified_prefix_block_end_session_id = None
@@ -482,7 +502,11 @@ def _apply_verified_state_invalidation(
             _reset_all_verified_trust(copilot_ctx)
         return
     prior_labels = _workflow_definition_block_labels(prior_definition)
-    trusted = set(copilot_ctx.verified_prefix_labels or []) | set(evidence.block_verified or [])
+    trusted = (
+        set(copilot_ctx.verified_prefix_labels or [])
+        | set(evidence.block_verified or [])
+        | set(copilot_ctx.untaken_branch_labels)
+    )
 
     invalidated: set[str] = set()
     if trusted:
@@ -508,6 +532,11 @@ def _apply_verified_state_invalidation(
         copilot_ctx.verified_prefix_labels = [
             label for label in copilot_ctx.verified_prefix_labels if label not in invalidated
         ]
+        copilot_ctx.untaken_branch_labels = {
+            label: conditional_label
+            for label, conditional_label in copilot_ctx.untaken_branch_labels.items()
+            if label not in invalidated and conditional_label not in invalidated
+        }
         # Composition credit is an ordered prefix, so an invalidated block ends it there: the
         # labels after it were only composed by way of the block that just changed.
         credited = list(copilot_ctx.composition_verified_labels or [])
@@ -525,14 +554,15 @@ def _apply_verified_state_invalidation(
     # a reorder or upstream insertion breaks that (set-membership trust is
     # order-blind), so fail closed when it no longer is.
     current_labels = _workflow_definition_block_labels(new_definition)
+    settled = set(copilot_ctx.untaken_branch_labels)
     remaining = list(copilot_ctx.verified_prefix_labels or [])
-    if remaining and remaining != current_labels[: len(remaining)]:
+    if remaining and remaining != [label for label in current_labels if label not in settled][: len(remaining)]:
         _reset_all_verified_trust(copilot_ctx)
         return
 
     # The end-to-end claim survives only an identical block list whose every block
     # is still verified, so append/removal/reorder/config edits all drop it.
-    verified = set(remaining) | set(evidence.block_verified or [])
+    verified = set(remaining) | set(evidence.block_verified or []) | settled
     if not (current_labels == prior_labels and all(label in verified for label in current_labels)):
         evidence.full_workflow_verified = False
         copilot_ctx.last_full_workflow_test_ok = False
@@ -740,58 +770,6 @@ def _workflow_parameter_keys(definition: object | None) -> set[str]:
     return keys
 
 
-_CREDENTIAL_REAL_VALUE_SUFFIXES = ("_real_username", "_real_password")
-
-
-def _jinja_string_leaves(serialized: str) -> list[str]:
-    """The block config's own string values. The serialized form is JSON, so a quoted Jinja literal
-    arrives escaped as ``\\"`` — which no Jinja parser accepts — and parsing the whole blob would cost
-    every reference in a block that uses one."""
-    try:
-        payload = json.loads(serialized)
-    except (json.JSONDecodeError, TypeError, ValueError):
-        return [serialized]
-    leaves: list[str] = []
-    stack: list[Any] = [payload]
-    while stack:
-        item = stack.pop()
-        if isinstance(item, str):
-            leaves.append(item)
-        elif isinstance(item, dict):
-            # Keys too: error_code_mapping is templatable on both sides, so a key can carry a reference.
-            stack.extend(item.keys())
-            stack.extend(item.values())
-        elif isinstance(item, list):
-            stack.extend(item)
-    return leaves
-
-
-def _jinja_roots(serialized: str) -> set[str]:
-    """Every identifier the config's Jinja expressions read, from Jinja's own parser. Falls back to the
-    opening-identifier regex for a leaf that does not parse, which keeps a malformed block classifiable
-    rather than silently referenceless."""
-    roots: set[str] = set()
-    for leaf in _jinja_string_leaves(serialized):
-        try:
-            roots |= meta.find_undeclared_variables(SandboxedEnvironment().parse(leaf))
-        except (TemplateError, RecursionError):
-            roots |= set(_JINJA_ROOT_RE.findall(leaf))
-    return roots
-
-
-def _root_parameter_key(root: str, parameter_keys: set[str]) -> str | None:
-    if root in parameter_keys:
-        return root
-    return next(
-        (
-            root[: -len(suffix)]
-            for suffix in _CREDENTIAL_REAL_VALUE_SUFFIXES
-            if root.endswith(suffix) and root[: -len(suffix)] in parameter_keys
-        ),
-        None,
-    )
-
-
 def _classify_frontier_jinja_refs(
     frontier_labels: list[str],
     new_definition: object | None,
@@ -813,8 +791,8 @@ def _classify_frontier_jinja_refs(
     unknown_roots: set[str] = set()
 
     for serialized in serialized_configs:
-        for root in _jinja_roots(serialized):
-            parameter_key = _root_parameter_key(root, set(output_producers))
+        for root in jinja_roots(serialized):
+            parameter_key = root_parameter_key(root, set(output_producers))
             if parameter_key is not None:
                 suffix_form_refs.add(output_producers[parameter_key])
                 continue
@@ -824,7 +802,7 @@ def _classify_frontier_jinja_refs(
                 continue
             if root in known_labels:
                 block_form_refs.add(root)
-            if root in known_roots or _root_parameter_key(root, parameter_keys) is not None:
+            if root in known_roots or root_parameter_key(root, parameter_keys) is not None:
                 continue
             unknown_roots.add(root)
 
@@ -1074,7 +1052,7 @@ def _storage_order_is_traversal_order(new_definition: object | None, before_labe
 
 def _anchored_plan(
     ctx: AgentContext,
-    plan: tuple[list[str], dict[str, Any], str | None],
+    plan: UnanchoredPlan,
     new_definition: object | None,
     runtime_page_url: str | None,
     requested_labels: list[str] | None = None,
@@ -1114,15 +1092,29 @@ def _anchored_plan(
                 labels_to_execute, frontier_start_label, new_definition
             )
         if needs_own_browser:
-            # No browser can be named for this start, and the chat's holds the page scouting left
-            # open. Run what was asked where nothing is signed in — all of what was asked, because
-            # a slice narrowed to where a previous attempt failed relies on state the earlier
-            # blocks of that same request established, and a blank browser holds none of it. The
-            # plan is restored to the request, so it still never gains a label the caller left out.
+            # No browser can be named for this start, so run the whole request in a blank one: a narrowed
+            # slice depends on browser state its earlier blocks set up. Outputs of blocks the restored
+            # request does not run are data, not browser state, so their seeds stay.
             if requested_labels:
                 labels_to_execute = list(requested_labels)
-                block_outputs_to_seed = {}
                 frontier_start_label = requested_labels[0]
+                executed = (
+                    executed_suffix_labels(labels_to_execute, new_definition)
+                    if isinstance(new_definition, WorkflowDefinition)
+                    else labels_to_execute
+                )
+                needed = _referenced_output_labels(executed, new_definition) - set(executed)
+                block_outputs_to_seed = {
+                    label: value for label, value in block_outputs_to_seed.items() if label in needed
+                }
+                ctx.frontier_selected_output_sources = {
+                    label: source
+                    for label, source in ctx.frontier_selected_output_sources.items()
+                    if label in block_outputs_to_seed
+                }
+                ctx.frontier_origin_reused_labels = [
+                    label for label in ctx.frontier_origin_reused_labels if label in block_outputs_to_seed
+                ]
             ctx.frontier_requires_own_browser = True
             LOG.info(
                 "copilot_frontier_start_requires_own_browser",
@@ -1150,6 +1142,7 @@ def _plan_frontier(
     plan = _plan_frontier_uncaptured(ctx, requested_labels, old_definition, new_definition, runtime_page_url)
     labels_to_execute, seed, frontier_start_label, start_provenance = plan
     refusal = ctx.frontier_origin_output_refusal
+    named_refusal = ctx.frontier_named_output_refusal
     write_packet(
         "frontier",
         {
@@ -1168,6 +1161,7 @@ def _plan_frontier(
                     source.as_payload() for source in ctx.frontier_selected_output_sources.values()
                 ],
                 "origin_output_refusal": refusal.as_payload() if refusal is not None else None,
+                "named_output_refusal": named_refusal.as_payload() if named_refusal is not None else None,
             },
         },
     )
@@ -1181,11 +1175,36 @@ def _plan_frontier_uncaptured(
     new_definition: WorkflowDefinition | None,
     runtime_page_url: str | None = None,
 ) -> FrontierPlan:
+    plan = _plan_frontier_from_sources(ctx, requested_labels, old_definition, new_definition, runtime_page_url)
+    if current_named_output_source() is None or any(
+        source.source == "named" for source in ctx.frontier_selected_output_sources.values()
+    ):
+        return plan
+    # A named run that supplies no producer leaves the call planned exactly as one that names no run.
+    drop_named_output_source()
+    named_refusal = ctx.frontier_named_output_refusal
+    plan = _plan_frontier_from_sources(ctx, requested_labels, old_definition, new_definition, runtime_page_url)
+    ctx.frontier_named_output_refusal = named_refusal
+    return plan
+
+
+def _plan_frontier_from_sources(
+    ctx: AgentContext,
+    requested_labels: list[str],
+    old_definition: WorkflowDefinition | None,
+    new_definition: WorkflowDefinition | None,
+    runtime_page_url: str | None,
+) -> FrontierPlan:
     ctx.frontier_origin_reused_labels = []
     ctx.frontier_origin_output_refusal = None
+    ctx.frontier_named_output_refusal = None
     ctx.frontier_selected_output_sources = {}
     carrier = ctx.repair_origin_outputs
-    if isinstance(carrier, RunOutputCarrier) and carrier.sources and new_definition is not None and requested_labels:
+    if (
+        ((isinstance(carrier, RunOutputCarrier) and carrier.sources) or current_named_output_source() is not None)
+        and new_definition is not None
+        and requested_labels
+    ):
         old_shapes = (
             _cross_version_block_shapes(old_definition, ctx.workflow_id) if old_definition is not None else None
         )
@@ -1229,35 +1248,69 @@ def _plan_frontier_uncaptured(
             if not ctx.frontier_selected_output_sources:
                 base = _plan_frontier_base(ctx, requested_labels, old_definition, new_definition, runtime_page_url)
                 return _fill_seed_from_origin(ctx, base, new_definition, requested_labels)
-            plan = _anchored_plan(
-                ctx,
-                (labels, seed, start),
-                new_definition,
-                runtime_page_url,
-                requested_labels,
-                # A failed run's completed outputs are parameter facts, not browser-position
-                # evidence. Actual verified prefix evidence still requires its matching browser.
-                include_recorded_failed_prefix=not bool(ctx.frontier_selected_output_sources),
+            return _anchor_selected_suffix(
+                ctx, (labels, seed, start), labels, new_definition, runtime_page_url, requested_labels
             )
-            if ctx.frontier_resume_session_id and ctx.frontier_origin_reused_labels:
-                ctx.frontier_resume_session_id = None
-                ctx.frontier_requires_own_browser = False
-                ctx.frontier_selected_output_sources = {}
-                ctx.frontier_origin_reused_labels = []
-                return _anchored_plan(
-                    ctx,
-                    (list(requested_labels), {}, requested_labels[0]),
-                    new_definition,
-                    runtime_page_url,
-                    requested_labels,
-                )
-            if plan[0] != labels:
-                ctx.frontier_selected_output_sources = {}
-                ctx.frontier_origin_reused_labels = []
-                return _fill_seed_from_origin(ctx, plan, new_definition, requested_labels)
-            return plan
     plan = _plan_frontier_base(ctx, requested_labels, old_definition, new_definition, runtime_page_url)
     return _fill_seed_from_origin(ctx, plan, new_definition, requested_labels)
+
+
+def _anchor_selected_suffix(
+    ctx: AgentContext,
+    resolved: UnanchoredPlan,
+    selected_for_labels: list[str],
+    definition: WorkflowDefinition,
+    runtime_page_url: str | None,
+    requested_labels: list[str],
+) -> FrontierPlan:
+    plan = _anchored_plan(
+        ctx,
+        resolved,
+        definition,
+        runtime_page_url,
+        requested_labels,
+        # A failed run's completed outputs are parameter facts, not browser-position
+        # evidence. Actual verified prefix evidence still requires its matching browser.
+        include_recorded_failed_prefix=not bool(ctx.frontier_selected_output_sources),
+    )
+    if ctx.frontier_resume_session_id and ctx.frontier_origin_reused_labels:
+        ctx.frontier_resume_session_id = None
+        ctx.frontier_requires_own_browser = False
+        ctx.frontier_selected_output_sources = {}
+        ctx.frontier_origin_reused_labels = []
+        return _anchored_plan(
+            ctx,
+            (list(requested_labels), {}, requested_labels[0]),
+            definition,
+            runtime_page_url,
+            requested_labels,
+        )
+    if plan[0] != selected_for_labels:
+        # Outputs were selected for other labels, so the anchored labels need their own.
+        ctx.frontier_selected_output_sources = {}
+        ctx.frontier_origin_reused_labels = []
+        ctx.frontier_origin_output_refusal = None
+        ctx.frontier_named_output_refusal = None
+        return _fill_seed_from_origin(ctx, (plan[0], {}, plan[2], plan[3]), definition, requested_labels)
+    return plan
+
+
+def replan_without_named_source(
+    ctx: AgentContext,
+    request: FrontierRequest | None,
+    refusal: OriginOutputRefusalDetail,
+    selected: dict[str, SelectedOutputSource],
+) -> FrontierPlan | None:
+    """When a dispatch recheck refuses an output the named run supplied, drop that run for the rest of the call and
+    plan it as a call that names no run, leaving the plan on the context for the re-entry."""
+    source = selected.get(refusal.block_label)
+    if request is None or source is None or source.source != "named":
+        return None
+    drop_named_output_source()
+    plan = request.plan(ctx)
+    ctx.frontier_named_output_refusal = refusal
+    ctx.frontier_start_provenance = plan[3]
+    return plan
 
 
 def _without_per_version_parameter_ids(value: JsonValue) -> JsonValue:
@@ -1421,13 +1474,7 @@ def _select_output_source(
     definition: WorkflowDefinition,
 ) -> SelectedOutputSource | OriginOutputRefusalDetail:
     carrier = ctx.repair_origin_outputs
-    workflow_labels = _executable_workflow_block_labels(definition)
-    if (
-        producer not in workflow_labels
-        or first_label not in workflow_labels
-        or workflow_labels.index(producer) >= workflow_labels.index(first_label)
-        or not _storage_order_is_traversal_order(definition, first_label)
-    ):
+    if not _reuse_order_provable(producer, first_label, definition):
         return OriginOutputRefusalDetail(
             OriginOutputRefusal.ORDER_UNPROVABLE, producer, ctx.repair_origin_outputs_run_id
         )
@@ -1449,29 +1496,14 @@ def _select_output_source(
             carrier.sources.values(), key=lambda source: (source.created_at, source.workflow_run_id), reverse=True
         )
         for source in sources:
-            observed = source.snapshot.outputs.get(producer)
-            if observed is None:
+            if producer not in source.snapshot.outputs:
                 continue
-            if not _storage_order_is_traversal_order(source.snapshot.definition, producer):
-                refused_reason = OriginOutputRefusal.ORDER_UNPROVABLE
-                continue
-            source_shapes = _cross_version_block_shapes(source.snapshot.definition, ctx.workflow_id)
-            if (
-                candidate_shapes is None
-                or source_shapes is None
-                or _producer_definition_changed(
-                    producer, source.snapshot.definition, definition, source_shapes, candidate_shapes
-                )
-            ):
-                refused_reason = OriginOutputRefusal.CHANGED_PRODUCER
-                continue
-            if observed.status != BlockStatus.completed:
-                refused_reason = OriginOutputRefusal.UPSTREAM_FAILED
-                continue
-            if not observed.has_value or observed.value == SCRUBBED_VALUE:
-                refused_reason = OriginOutputRefusal.OUTPUT_UNAVAILABLE
-                continue
-            return SelectedOutputSource(producer, source.workflow_run_id, "banked", source.snapshot)
+            reason = _recorded_source_refusal(
+                producer, source.snapshot, definition, candidate_shapes, ctx.workflow_id, source="banked"
+            )
+            if reason is None:
+                return SelectedOutputSource(producer, source.workflow_run_id, "banked", source.snapshot)
+            refused_reason = reason
     snapshot = origin_snapshot(carrier)
     if snapshot is not None:
         shapes = (
@@ -1486,6 +1518,74 @@ def _select_output_source(
         if isinstance(snapshot, OriginOutputSnapshot) and ctx.repair_origin_outputs_run_id is not None:
             return SelectedOutputSource(producer, ctx.repair_origin_outputs_run_id, "origin", snapshot)
     return OriginOutputRefusalDetail(refused_reason, producer, ctx.repair_origin_outputs_run_id)
+
+
+def _reuse_order_provable(producer: str, first_label: str, definition: WorkflowDefinition) -> bool:
+    workflow_labels = _executable_workflow_block_labels(definition)
+    return (
+        producer in workflow_labels
+        and first_label in workflow_labels
+        and workflow_labels.index(producer) < workflow_labels.index(first_label)
+        and _storage_order_is_traversal_order(definition, first_label)
+    )
+
+
+def _named_output_source(
+    ctx: AgentContext, producer: str, first_label: str, definition: WorkflowDefinition
+) -> SelectedOutputSource | OriginOutputRefusalDetail | None:
+    named = current_named_output_source()
+    if named is None:
+        return None
+    if isinstance(named, RefusedOutputSource):
+        owned = named.reason is not OriginOutputRefusal.FOREIGN_OR_MISMATCHED_ORIGIN
+        return OriginOutputRefusalDetail(named.reason, producer, named.workflow_run_id if owned else None)
+    if producer not in named.snapshot.outputs:
+        reason: OriginOutputRefusal | None = OriginOutputRefusal.OUTPUT_UNAVAILABLE
+    elif not _reuse_order_provable(producer, first_label, definition):
+        reason = OriginOutputRefusal.ORDER_UNPROVABLE
+    else:
+        reason = _recorded_source_refusal(
+            producer,
+            named.snapshot,
+            definition,
+            _cross_version_block_shapes(definition, ctx.workflow_id),
+            ctx.workflow_id,
+            source="named",
+        )
+    if reason is not None:
+        return OriginOutputRefusalDetail(reason, producer, named.workflow_run_id)
+    return SelectedOutputSource(producer, named.workflow_run_id, "named", named.snapshot)
+
+
+def _recorded_source_refusal(
+    producer: str,
+    snapshot: OriginOutputSnapshot,
+    definition: WorkflowDefinition,
+    candidate_shapes: dict[str, JsonValue] | None,
+    workflow_id: str,
+    *,
+    source: OutputSourceKind,
+) -> OriginOutputRefusal | None:
+    observed = snapshot.outputs[producer]
+    if not _storage_order_is_traversal_order(snapshot.definition, producer):
+        return OriginOutputRefusal.ORDER_UNPROVABLE
+    source_shapes = _cross_version_block_shapes(snapshot.definition, workflow_id)
+    if (
+        candidate_shapes is None
+        or source_shapes is None
+        or _producer_definition_changed(producer, snapshot.definition, definition, source_shapes, candidate_shapes)
+    ):
+        return OriginOutputRefusal.CHANGED_PRODUCER
+    if observed.status != BlockStatus.completed:
+        return OriginOutputRefusal.UPSTREAM_FAILED
+    if _recorded_output_unusable(observed, source):
+        return OriginOutputRefusal.OUTPUT_UNAVAILABLE
+    return None
+
+
+def _recorded_output_unusable(observed: OriginBlockOutput, source: OutputSourceKind) -> bool:
+    # A run read back from storage keeps no scrub marker on a completed run with no inputs, so its null is unproven.
+    return not observed.has_value or observed.value == SCRUBBED_VALUE or (source == "named" and observed.value is None)
 
 
 def selected_output_definition_refusal(
@@ -1503,7 +1603,7 @@ def selected_output_definition_refusal(
             producer, source.snapshot.definition, definition, source_shapes, candidate_shapes
         ):
             reason = OriginOutputRefusal.CHANGED_PRODUCER
-        elif observed is None or not observed.has_value or observed.value == SCRUBBED_VALUE:
+        elif observed is None or _recorded_output_unusable(observed, source.source):
             reason = OriginOutputRefusal.OUTPUT_UNAVAILABLE
         elif observed.status != BlockStatus.completed:
             reason = OriginOutputRefusal.UPSTREAM_FAILED
@@ -1534,6 +1634,13 @@ def resolve_suffix_outputs(
     for producer in producer_order:
         if producer not in missing:
             continue
+        named = _named_output_source(ctx, producer, labels[0], definition)
+        if isinstance(named, SelectedOutputSource):
+            selected[producer] = named
+            seed[producer] = deepcopy(named.value)
+            continue
+        if named is not None and ctx.frontier_named_output_refusal is None:
+            ctx.frontier_named_output_refusal = logged_origin_refusal(named, source="named")
         carrier = ctx.repair_origin_outputs
         if producer in (ctx.verified_block_outputs or {}) and (
             not isinstance(carrier, RunOutputCarrier) or producer not in carrier.verified_sources
@@ -1560,7 +1667,12 @@ def _fill_seed_from_origin(
     requested_labels: list[str] | None = None,
 ) -> FrontierPlan:
     labels, seed, start, provenance = plan
-    if ctx.repair_origin_outputs is None or new_definition is None or ctx.frontier_resume_session_id or not labels:
+    if (
+        (ctx.repair_origin_outputs is None and current_named_output_source() is None)
+        or new_definition is None
+        or ctx.frontier_resume_session_id
+        or not labels
+    ):
         return plan
     resolved_labels, resolved_seed, resolved_start = resolve_suffix_outputs(
         ctx, labels, new_definition, requested_labels or labels
@@ -1593,15 +1705,46 @@ def _producer_input_keys(producer: str, definition: WorkflowDefinition) -> set[s
             stack.extend(item)
     for serialized in _serialized_frontier_block_configs([producer], definition):
         referenced.update(
-            key for root in _jinja_roots(serialized) if (key := _root_parameter_key(root, input_keys)) is not None
+            key for root in jinja_roots(serialized) if (key := root_parameter_key(root, input_keys)) is not None
         )
     return referenced
 
 
 def _workflow_prompt_input_keys(definition: WorkflowDefinition) -> set[str]:
     input_keys = {parameter.key for parameter in definition.parameters if isinstance(parameter, WorkflowParameter)}
-    roots = _jinja_roots(definition.workflow_system_prompt) if definition.workflow_system_prompt else set()
-    return {key for root in roots if (key := _root_parameter_key(root, input_keys)) is not None}
+    roots = jinja_roots(definition.workflow_system_prompt) if definition.workflow_system_prompt else set()
+    return {key for root in roots if (key := root_parameter_key(root, input_keys)) is not None}
+
+
+def _deleted_block_input_keys(label: str, stored_yaml: str) -> set[str]:
+    scan = safe_load_no_dates(bind_referenced_parameters_in_yaml(stored_yaml))
+    if not isinstance(scan, dict):
+        return set()
+    declared = declared_workflow_parameter_keys(scan)
+    block = next((loc.block for loc in workflow_block_locations(scan) if loc.block.get("label") == label), None)
+    if block is None or not declared:
+        return set()
+    # Reads raw YAML rather than _producer_input_keys because a cold start has no validated prior workflow.
+    return keys_named_in(json.dumps(block, default=str), declared)
+
+
+def inputs_only_read_by_deleted_block(label: str, stored_yaml: str, saved: Workflow) -> list[str]:
+    """Inputs the deleted block read in ``stored_yaml`` that ``saved`` still declares and nothing left in it names.
+    Any exact string or template root naming a key counts as a read, so a key in doubt is left off the list."""
+    try:
+        candidates = _deleted_block_input_keys(label, stored_yaml)
+        if not candidates:
+            return []
+        scan = saved.model_dump(mode="json", include={"workflow_definition", *_CANONICAL_WORKFLOW_SETTING_FIELDS})
+        candidates &= declared_workflow_parameter_keys(scan)
+        for parameter in scan["workflow_definition"]["parameters"]:
+            if parameter.get("key") in candidates:
+                parameter.pop("key")
+        return sorted(candidates - keys_named_in(json.dumps(scan), candidates))
+    except Exception as exc:  # noqa: BLE001 - an advisory scan must never fail the write it reports on.
+        # No exc_info: a validation error quotes workflow values, which can include input defaults.
+        LOG.warning("copilot_deleted_block_input_scan_failed", error_type=type(exc).__name__)
+        return []
 
 
 def origin_input_refusal(
@@ -1611,6 +1754,7 @@ def origin_input_refusal(
     resolved_inputs: dict[str, Any],
     *,
     require_recorded_inputs: bool = False,
+    source: OutputSourceKind | None = None,
 ) -> OriginOutputRefusalDetail | None:
     """Refuse a reused origin output when the producer or a block before it would read a different input
     in this test run than in the origin run, or when the origin input cannot be proven."""
@@ -1651,7 +1795,8 @@ def origin_input_refusal(
                         block_label=producer,
                         origin_workflow_run_id=origin_run_id,
                         parameter_key=key,
-                    )
+                    ),
+                    source=source,
                 )
     return None
 
@@ -1669,7 +1814,7 @@ def selected_output_run_refusal(
     """Recheck recorded producer facts without assigning browser or composition credit."""
     refusal = selected_output_definition_refusal(selected, workflow.workflow_definition, ctx.workflow_id)
     if refusal is not None:
-        return logged_origin_refusal(refusal)
+        return logged_origin_refusal(refusal, source=selected[refusal.block_label].source)
     for producer, source in selected.items():
         source_ctx = replace(
             ctx, repair_origin_outputs=source.snapshot, repair_origin_outputs_run_id=source.workflow_run_id
@@ -1696,7 +1841,8 @@ def selected_output_run_refusal(
                         producer,
                         source.workflow_run_id,
                         changed_settings=changed,
-                    )
+                    ),
+                    source=source.source,
                 )
         refusal = origin_input_refusal(
             source_ctx,
@@ -1704,6 +1850,7 @@ def selected_output_run_refusal(
             workflow.workflow_definition,
             resolved_inputs,
             require_recorded_inputs=source.source != "origin",
+            source=source.source,
         )
         if refusal is not None:
             return refusal
@@ -1731,8 +1878,10 @@ def origin_definition_refusal(
     return None
 
 
-def logged_origin_refusal(detail: OriginOutputRefusalDetail) -> OriginOutputRefusalDetail:
-    LOG.info("copilot_frontier_origin_output_refused", **detail.as_payload())
+def logged_origin_refusal(
+    detail: OriginOutputRefusalDetail, *, source: OutputSourceKind | None = None
+) -> OriginOutputRefusalDetail:
+    LOG.info("copilot_frontier_origin_output_refused", **detail.as_payload(), **({"source": source} if source else {}))
     return detail
 
 

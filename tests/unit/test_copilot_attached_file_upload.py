@@ -1,16 +1,25 @@
 from __future__ import annotations
 
+import errno
+import functools
 import hashlib
+import io
 import json
 import struct
 import zlib
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, NoReturn
 
+import docx
 import pytest
+from docx.document import Document as DocxDocument
+from docx.oxml import parse_xml
+from docx.oxml.ns import nsdecls
+from docx.oxml.xmlchemy import BaseOxmlElement
 from playwright.async_api import Page, Route, async_playwright
 from structlog.testing import capture_logs
 
@@ -20,6 +29,9 @@ from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.tools import _shared, attached_file_upload, read_attached_pdf_tool
 from skyvern.forge.sdk.copilot.turn_context import AttachedFileContext, TranscriptContext, TurnContextPacket
 from skyvern.forge.sdk.schemas.workflow_copilot import CopilotAttachedFile
+from skyvern.forge.sdk.utils import docx_child, pdf_parser
+from skyvern.forge.sdk.utils.capped_subprocess import CappedSubprocessError, CappedSubprocessFailure
+from skyvern.forge.sdk.utils.capped_subprocess_child import ResultTooLarge
 from skyvern.services import uploaded_file_service
 from skyvern.webeye.browser_errors import BrowserCdpAcquisitionError
 from tests.unit.conftest import make_copilot_context
@@ -434,6 +446,26 @@ def _pdf(pages: list[list[str]]) -> bytes:
     return out
 
 
+def _pdf_of_lines(lines: list[str]) -> bytes:
+    return _pdf([lines[i : i + 60] for i in range(0, len(lines), 60)])
+
+
+def _docx_bytes(document: DocxDocument) -> bytes:
+    buffer = io.BytesIO()
+    document.save(buffer)
+    return buffer.getvalue()
+
+
+def _docx(lines: list[str]) -> bytes:
+    document = docx.Document()
+    for line in lines:
+        document.add_paragraph(line)
+    return _docx_bytes(document)
+
+
+EACH_DOCUMENT_FORMAT = pytest.mark.parametrize(
+    ("filename", "build"), [("procedure.pdf", _pdf_of_lines), ("procedure.docx", _docx)]
+)
 SEMANTIC_SECRET = "Zq8!vL3#pR2w"
 ScreenHandler = Callable[..., Awaitable[dict[str, Any]]] | None
 
@@ -452,17 +484,20 @@ async def _read(ctx: CopilotContext, file_id: str, offset: int = 0) -> tuple[str
 
 
 @pytest.mark.asyncio
-async def test_reading_an_attached_pdf_returns_every_line_once_with_secrets_redacted(
+@EACH_DOCUMENT_FORMAT
+async def test_reading_an_attached_document_returns_every_line_once_with_secrets_redacted(
     monkeypatch: pytest.MonkeyPatch,
     repo: FakeUploadedFilesRepository,
     storage: FakeStorage,
+    filename: str,
+    build: Callable[[list[str]], bytes],
 ) -> None:
     # Accents and quotes make the serialized text longer than the raw text, which is what the window is sized on.
     lines = [f'Étape {n}: vérifiez "Détails", réservé à l\'élève, ligne {n} terminée.' for n in range(1, 1601)]
     lines[2] = "Sign in with Password: Spring2026!"
     lines[700] = "The vault answer is RegisteredValue77"
     lines[1400] = f"Backup portal code {SEMANTIC_SECRET} when the first one fails"
-    attached = _attach(repo, storage, "procedure.pdf", _pdf([lines[i : i + 60] for i in range(0, len(lines), 60)]))
+    attached = _attach(repo, storage, filename, build(lines))
     ctx = _chat(monkeypatch, None, [attached])
     ctx.secret_scrub_values = ["RegisteredValue77"]
 
@@ -546,13 +581,16 @@ async def test_a_secret_shaped_attachment_name_stays_out_of_the_logs(
 
 
 @pytest.mark.asyncio
+@EACH_DOCUMENT_FORMAT
 async def test_each_window_is_screened_with_the_text_before_it(
     monkeypatch: pytest.MonkeyPatch,
     repo: FakeUploadedFilesRepository,
     storage: FakeStorage,
+    filename: str,
+    build: Callable[[list[str]], bytes],
 ) -> None:
     lines = [f"Step {n}: copy row {n} from the export into the matching form field." for n in range(1, 1201)]
-    attached = _attach(repo, storage, "procedure.pdf", _pdf([lines[i : i + 60] for i in range(0, len(lines), 60)]))
+    attached = _attach(repo, storage, filename, build(lines))
     ctx = _chat(monkeypatch, None, [attached])
     prompts: list[str] = []
 
@@ -594,3 +632,208 @@ async def test_an_attached_pdf_that_cannot_be_read_safely_returns_no_text(
     assert result["ok"] is False
     assert result["error"]
     assert "text" not in result
+
+
+def _moved_from(text: str) -> BaseOxmlElement:
+    return parse_xml(f"<w:moveFrom {nsdecls('w')}><w:r><w:t xml:space='preserve'>{text}</w:t></w:r></w:moveFrom>")
+
+
+def _sop_docx() -> bytes:
+    document = docx.Document()
+    document.add_paragraph("Step 1: Open the portal.")._p.append(_moved_from(" Keep the receipt."))
+    document.add_paragraph("Call 555")._p.append(
+        parse_xml(
+            f"<w:r {nsdecls('w')}><w:noBreakHyphen/><w:t>0142</w:t>"
+            "<w:ptab w:relativeTo='margin' w:alignment='right' w:leader='none'/><w:t>x</w:t></w:r>"
+        )
+    )
+    table = document.add_table(rows=2, cols=3)
+    row = table.rows[0]
+    row.cells[0].text = "Step 2"
+    row.cells[0].paragraphs[0]._p.append(_moved_from(" (optional)"))
+    merged = row.cells[1].merge(row.cells[2])
+    merged.text = "Enter the claim number"
+    table._tbl.append(
+        parse_xml(
+            f"<w:customXml {nsdecls('w')} w:element='step'><w:tr><w:tc><w:p><w:r><w:t>Step 3</w:t></w:r></w:p></w:tc>"
+            "<w:tc><w:p><w:r><w:t>Attach the receipt</w:t></w:r></w:p></w:tc></w:tr></w:customXml>"
+        )
+    )
+    submit = document.add_paragraph("Step 4: Submit ")
+    submit._p.append(
+        parse_xml(
+            f"<w:sdt {nsdecls('w')}><w:sdtPr><w:alias w:val='Form'/></w:sdtPr>"
+            "<w:sdtContent><w:r><w:t>the form</w:t></w:r></w:sdtContent></w:sdt>"
+        )
+    )
+    submit._p.append(parse_xml(f"<w:del {nsdecls('w')}><w:r><w:delText> twice</w:delText></w:r></w:del>"))
+    submit.add_run(".")
+    submit._p.append(
+        parse_xml(f"<w:moveTo {nsdecls('w')}><w:r><w:t xml:space='preserve'> Keep the receipt.</w:t></w:r></w:moveTo>")
+    )
+    document.element.body.insert_element_before(
+        parse_xml(
+            f"<w:sdt {nsdecls('w')}><w:sdtContent><w:p><w:r><w:t>Step 5: Sign out.</w:t></w:r></w:p>"
+            "</w:sdtContent></w:sdt>"
+        ),
+        "w:sectPr",
+    )
+    document.element.body.insert_element_before(
+        parse_xml(
+            f"<w:customXml {nsdecls('w')} w:element='step'><w:p><w:r><w:t>Step 6: Close the browser.</w:t></w:r></w:p>"
+            "</w:customXml>"
+        ),
+        "w:sectPr",
+    )
+    return _docx_bytes(document)
+
+
+def _empty_table_docx() -> bytes:
+    document = docx.Document()
+    document.add_table(rows=2, cols=3)
+    return _docx_bytes(document)
+
+
+@pytest.mark.asyncio
+async def test_an_attached_docx_reads_in_document_order_with_tables_and_content_controls(
+    monkeypatch: pytest.MonkeyPatch,
+    repo: FakeUploadedFilesRepository,
+    storage: FakeStorage,
+) -> None:
+    attached = _attach(repo, storage, "procedure.docx", _sop_docx())
+    ctx = _chat(monkeypatch, None, [attached])
+    monkeypatch.setattr(attached_file_upload, "resolve_raw_secret_safety_handler", _label_aware_handler)
+
+    result = await attached_file_upload.read_attached_pdf(ctx, attached.file_id)
+
+    assert result["ok"] is True
+    assert result["text"] == (
+        "Step 1: Open the portal.\nCall 555-0142\tx\nStep 2 | Enter the claim number\nStep 3 | Attach the receipt\n"
+        "Step 4: Submit the form. Keep the receipt.\nStep 5: Sign out.\nStep 6: Close the browser.\n"
+    )
+    assert "text_layer_warning" not in result
+
+
+def test_docx_block_texts_stops_at_the_char_and_byte_budgets(tmp_path: Path) -> None:
+    path = tmp_path / "procedure.docx"
+    path.write_bytes(_docx(["a" * 30] * 5))
+
+    assert docx_child.block_texts(str(path), 40, 1_000_000) == (["a" * 30] * 2, False)
+    assert docx_child.block_texts(str(path), 1_000_000, 200) == (["a" * 30] * 2, False)
+    assert docx_child.block_texts(str(path), 1_000_000, 1_000_000) == (["a" * 30] * 5, True)
+
+    path.write_bytes(_docx(["a" * 200]))
+    with pytest.raises(ResultTooLarge):
+        docx_child.block_texts(str(path), 1_000_000, 200)
+
+
+@pytest.mark.asyncio
+async def test_a_docx_read_that_cannot_start_the_parse_says_to_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    repo: FakeUploadedFilesRepository,
+    storage: FakeStorage,
+) -> None:
+    attached = _attach(repo, storage, "procedure.docx", _docx(["Step 1: Open the portal."]))
+    ctx = _chat(monkeypatch, None, [attached])
+
+    def _fork_fails(*_args: object, **_kwargs: object) -> NoReturn:
+        raise BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable")
+
+    monkeypatch.setattr(pdf_parser, "run_in_capped_subprocess", _fork_fails)
+
+    result = await attached_file_upload.read_attached_pdf(ctx, attached.file_id)
+
+    assert result["ok"] is False
+    assert "text" not in result
+    assert "Try again" in result["error"]
+    assert "Word .docx" not in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_a_docx_past_the_token_cap_returns_its_leading_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+    repo: FakeUploadedFilesRepository,
+    storage: FakeStorage,
+) -> None:
+    lines = [f"Step {n}: copy row {n} into the form." for n in range(1, 201)]
+    attached = _attach(repo, storage, "procedure.docx", _docx(lines))
+    ctx = _chat(monkeypatch, None, [attached])
+    monkeypatch.setattr(attached_file_upload, "resolve_raw_secret_safety_handler", _label_aware_handler)
+    monkeypatch.setattr(
+        attached_file_upload, "extract_docx_file", functools.partial(pdf_parser.extract_docx_file, max_tokens=100)
+    )
+
+    with capture_logs() as logs:
+        result = await attached_file_upload.read_attached_pdf(ctx, attached.file_id)
+
+    assert result["ok"] is True
+    assert result["text"].startswith("Step 1: copy row 1 into the form.\nStep 2:")
+    assert "Step 200:" not in result["text"]
+    assert any(log["event"] == "DOCX text exceeds token limit, truncating at block boundary" for log in logs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kind", "retryable"),
+    [
+        ("no_headroom", True),
+        ("timeout", True),
+        ("error", False),
+        ("crashed", False),
+        ("out_of_memory", False),
+        ("result_too_large", False),
+    ],
+)
+async def test_a_docx_read_that_could_not_run_says_to_retry_and_a_bad_file_names_the_formats(
+    monkeypatch: pytest.MonkeyPatch,
+    repo: FakeUploadedFilesRepository,
+    storage: FakeStorage,
+    kind: CappedSubprocessFailure,
+    retryable: bool,
+) -> None:
+    attached = _attach(repo, storage, "procedure.docx", _docx(["Step 1: Open the portal."]))
+    ctx = _chat(monkeypatch, None, [attached])
+
+    def _failing(*_args: Any, **_kwargs: Any) -> str:
+        raise CappedSubprocessError("the child failed", kind=kind)
+
+    monkeypatch.setattr(attached_file_upload, "extract_docx_file", _failing)
+
+    result = await attached_file_upload.read_attached_pdf(ctx, attached.file_id)
+
+    assert result["ok"] is False
+    assert "text" not in result
+    assert ("Try again" in result["error"]) is retryable
+    assert ("Word .docx" in result["error"]) is not retryable
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("filename", "data", "expected"),
+    [
+        ("procedure.docx", _png(), "PDF or a Word .docx document"),
+        ("procedure.docx", b"PK\x05\x06" + b"\x00" * 18, "PDF or a Word .docx document"),
+        ("procedure.docx", b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 504, "PDF or a Word .docx document"),
+        ("procedure.doc", b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 504, "PDF or a Word .docx document"),
+        ("procedure.docx", _docx([]), "Word document has no text"),
+        ("procedure.docx", _empty_table_docx(), "Word document has no text"),
+    ],
+    ids=["png_named_docx", "empty_zip", "ole_named_docx", "legacy_doc", "empty_docx", "empty_table_docx"],
+)
+async def test_a_document_that_is_not_readable_gets_the_formats_or_empty_message(
+    monkeypatch: pytest.MonkeyPatch,
+    repo: FakeUploadedFilesRepository,
+    storage: FakeStorage,
+    filename: str,
+    data: bytes,
+    expected: str,
+) -> None:
+    attached = _attach(repo, storage, filename, data)
+    ctx = _chat(monkeypatch, None, [attached])
+
+    result = await attached_file_upload.read_attached_pdf(ctx, attached.file_id)
+
+    assert result["ok"] is False
+    assert "text" not in result
+    assert expected in result["error"]
+    assert "Try again" not in result["error"]

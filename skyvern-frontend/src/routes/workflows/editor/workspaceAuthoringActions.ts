@@ -79,13 +79,22 @@ function sopAttachmentDraft(
   return "Add the steps from the attached SOP to this agent.";
 }
 
+const SOP_EXTENSIONS = [".pdf", ".docx"] as const;
+const SOP_ACCEPT = SOP_EXTENSIONS.join(",");
+const INVALID_SOP_FILE_TOAST = {
+  variant: "destructive",
+  title: "Invalid file type",
+  description: "Please select a PDF or Word (.docx) file",
+} as const;
+
+function isSopFile(file: File): boolean {
+  const name = file.name.toLowerCase();
+  return SOP_EXTENSIONS.some((extension) => name.endsWith(extension));
+}
+
 function stageSopFile(file: File, draft: string) {
-  if (!file.name.toLowerCase().endsWith(".pdf")) {
-    toast({
-      variant: "destructive",
-      title: "Invalid file type",
-      description: "Please select a PDF file",
-    });
+  if (!isSopFile(file)) {
+    toast(INVALID_SOP_FILE_TOAST);
     return;
   }
   // Read at pick time: Copilot may have asked a question or started finishing a recording while
@@ -141,8 +150,11 @@ function resolveWorkspaceAuthoringActionAvailability({
 }
 
 export {
+  INVALID_SOP_FILE_TOAST,
+  SOP_ACCEPT,
   blockLabelFor,
   demonstrationInsertionFromNodes,
+  isSopFile,
   resolveAppendInsertionPoint,
   resolveWorkspaceAuthoringActionAvailability,
   sopAttachmentDraft,

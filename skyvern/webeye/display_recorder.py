@@ -18,6 +18,7 @@ import platform
 import re
 import signal
 import sys
+import time
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
@@ -76,6 +77,22 @@ _PDEATHSIG_TRAMPOLINE = (
     "os.getppid()==e or os._exit(0)\n"
     "os.execvp(sys.argv[2],sys.argv[2:])\n"
 )
+
+_OTEL_AUTO_INSTRUMENTATION_DIR = ("opentelemetry", "instrumentation", "auto_instrumentation")
+
+
+def _bridge_env() -> dict[str, str]:
+    # opentelemetry-instrument puts its sitecustomize dir on PYTHONPATH, and every interpreter that inherits it re-runs
+    # auto-instrumentation (~1 s). The recorder starts two (trampoline, then bridge), neither of which needs OTel.
+    env = dict(os.environ)
+    pythonpath = env.get("PYTHONPATH")
+    if pythonpath:
+        kept = [p for p in pythonpath.split(os.pathsep) if Path(p).parts[-3:] != _OTEL_AUTO_INSTRUMENTATION_DIR]
+        if kept:
+            env["PYTHONPATH"] = os.pathsep.join(kept)
+        else:
+            del env["PYTHONPATH"]
+    return env
 
 
 @dataclass(frozen=True)
@@ -406,6 +423,8 @@ class DisplayRecorderAcquisition:
     recorder: DisplayRecorder | None
     video_artifact: VideoArtifact | None
     started: bool
+    spawn_seconds: float | None = None
+    ready_wait_seconds: float | None = None
 
 
 class DisplayRecorder:
@@ -638,12 +657,14 @@ async def acquire_display_recorder(
         # The bridge emits a directly-usable fragmented MP4 (no second transcode); the existing upload path
         # consumes .mp4 without recompression.
         prefix = [sys.executable, "-c", _PDEATHSIG_TRAMPOLINE, str(os.getpid())] if os.name == "posix" else []
+        spawn_started_at = time.monotonic()
         process = await asyncio.create_subprocess_exec(
             *prefix,
             *command,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
+            env=_bridge_env(),
             # Own process group so a force-kill reaps the bridge AND its ffmpeg child together (no orphan);
             # PDEATHSIG still binds the bridge to worker death independently of the group.
             start_new_session=(os.name == "posix"),
@@ -653,7 +674,9 @@ async def acquire_display_recorder(
         # timeout raises and the mismatch raises, both funneling through the BaseException path below (kill group,
         # cancellation-safe reap, close lock, no recorder) so Playwright's own record_video_* args survive.
         assert process.stdout is not None  # stdout=PIPE always yields a readable stream
+        spawned_at = time.monotonic()
         ack = await asyncio.wait_for(process.stdout.readline(), timeout=STARTUP_ACK_TIMEOUT)
+        ready_at = time.monotonic()
         if ack != b"READY\n" or process.returncode is not None:
             raise RuntimeError(f"whole-display recorder did not signal readiness (ack={ack!r})")
     except BaseException as exc:
@@ -683,7 +706,13 @@ async def acquire_display_recorder(
         video_artifact=video_artifact,
     )
     _REGISTRY[key] = recorder
-    return DisplayRecorderAcquisition(recorder, video_artifact, True)
+    return DisplayRecorderAcquisition(
+        recorder,
+        video_artifact,
+        True,
+        spawn_seconds=round(spawned_at - spawn_started_at, 3),
+        ready_wait_seconds=round(ready_at - spawned_at, 3),
+    )
 
 
 async def release_display_recorder(recorder: DisplayRecorder | None) -> bool:

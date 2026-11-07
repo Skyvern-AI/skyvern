@@ -17,6 +17,7 @@ except ImportError:  # pragma: no cover — bs4 is a transitive dep but discover
 
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
+from skyvern.forge.sdk.copilot.runtime import carries_browser_session_acquisition_failure
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 
 from ._shared import (
@@ -397,6 +398,8 @@ async def _discovery_walk(
         else:
             nav_result = await _discovery_navigate(ctx, current_url)
             if not nav_result.get("ok"):
+                if carries_browser_session_acquisition_failure(nav_result):
+                    return nav_result
                 evidence_trail.append(
                     {
                         "url": current_url,

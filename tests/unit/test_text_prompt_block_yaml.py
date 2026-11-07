@@ -37,7 +37,7 @@ class TestTextPromptBlockYAMLNormalization:
         monkeypatch.setattr(SettingsManager, "_SettingsManager__instance", base_settings)
 
         with patch(
-            "skyvern.schemas.workflows.LLMConfigRegistry.get_model_names",
+            "skyvern.forge.sdk.api.llm.config_registry.LLMConfigRegistry.get_model_names",
             return_value=[],
         ):
             block = TextPromptBlockYAML(
@@ -53,7 +53,7 @@ class TestTextPromptBlockYAMLNormalization:
         monkeypatch.setattr(SettingsManager, "_SettingsManager__instance", base_settings)
 
         with patch(
-            "skyvern.schemas.workflows.LLMConfigRegistry.get_model_names",
+            "skyvern.forge.sdk.api.llm.config_registry.LLMConfigRegistry.get_model_names",
             return_value=["SPECIAL_INTERNAL_KEY"],
         ):
             block = TextPromptBlockYAML(

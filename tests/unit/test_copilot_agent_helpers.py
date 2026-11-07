@@ -45,6 +45,9 @@ from agents.model_settings import ModelSettings
 from agents.result import RunResultStreaming
 from agents.run_context import RunContextWrapper
 from litellm.exceptions import NotFoundError as LiteLLMNotFoundError
+from openai.types.chat import ChatCompletionChunk
+from openai.types.chat.chat_completion_chunk import Choice as ChunkChoice
+from openai.types.chat.chat_completion_chunk import ChoiceDelta
 from openai.types.responses import Response, ResponseCompletedEvent, ResponseFunctionToolCall
 from openai.types.responses.response_prompt_param import ResponsePromptParam
 from pydantic import BaseModel
@@ -57,9 +60,8 @@ from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot import enforcement as enforcement_module
 from skyvern.forge.sdk.copilot import runtime as runtime_module
 from skyvern.forge.sdk.copilot import tools as tools_module
+from skyvern.forge.sdk.copilot import vault_logins as vault_logins_module
 from skyvern.forge.sdk.copilot.agent import (
-    _FAILURE_FOLLOW_UP,
-    _SKYVERN_EGRESS_FOLLOW_UP,
     _build_goal_satisfied_exit_result,
     _format_chat_history,
     _last_recorded_run_id,
@@ -72,6 +74,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     BROWSER_SESSION_LOST_BLOCKER_REASON_CODE,
     CopilotToolBlockerSignal,
 )
+from skyvern.forge.sdk.copilot.build_test_connect_failure import build_test_connect_failure_sentence
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     ACTION_TRACE_PER_TASK_LIMIT,
     BuildTestConnectFailure,
@@ -105,6 +108,7 @@ from skyvern.forge.sdk.copilot.context import (
     CodeAuthoringRepairContext,
     CopilotContext,
 )
+from skyvern.forge.sdk.copilot.credential_pause import SiteAnswer
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisFailureType,
     DiagnosisInput,
@@ -131,6 +135,7 @@ from skyvern.forge.sdk.copilot.interruption import (
     INTERRUPTED_TERMINAL_RETRY,
     INTERRUPTED_TERMINAL_SUPERSEDED_HEADLINE,
 )
+from skyvern.forge.sdk.copilot.model_resolver import CopilotLitellmProvider
 from skyvern.forge.sdk.copilot.model_telemetry import current_model_attempt_telemetry
 from skyvern.forge.sdk.copilot.output_policy import OutputPolicyReason, OutputPolicyVerdict, evaluate_output_policy
 from skyvern.forge.sdk.copilot.recoverable_failure import build_recoverable_failure
@@ -165,6 +170,7 @@ from skyvern.forge.sdk.copilot.tools.credentials import (
     _credential_run_approval_error,
     _extract_credential_ids_for_labels,
 )
+from skyvern.forge.sdk.copilot.tools.workflow_update import CANONICAL_WORKFLOW_UNAVAILABLE_ERROR
 from skyvern.forge.sdk.copilot.turn_context import TranscriptContext, TurnContextPacket
 from skyvern.forge.sdk.copilot.turn_halt import (
     CopilotTurnHalt,
@@ -176,9 +182,10 @@ from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.copilot.workflow_credential_utils import workflow_blocks, workflow_credential_ids
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml
+from skyvern.forge.sdk.credential_site_policy import LoginSite
 from skyvern.forge.sdk.routes.workflow_copilot import CHAT_HISTORY_CONTEXT_MESSAGES
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice, ResponseKind, TurnOutcome
-from skyvern.forge.sdk.schemas.credentials import Credential
+from skyvern.forge.sdk.schemas.credentials import Credential, CredentialVaultType
 from skyvern.forge.sdk.schemas.google_oauth import GoogleOAuthCredentialBase
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
@@ -186,8 +193,10 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatRequest,
     WorkflowCopilotChatSender,
+    WorkflowCopilotRunOutcomeUpdate,
 )
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.services.credential.credential_vault_service import VaultLogin, VaultLoginListing
 from skyvern.forge.sdk.services.google_oauth_service import GOOGLE_SHEETS_DATA_SCOPE
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition, WorkflowRunStatus
 from skyvern.schemas.proxy_location import ProxyLocation
@@ -197,7 +206,8 @@ from skyvern.utils.yaml_loader import safe_load_no_dates
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, ActionStatus
 from tests.unit._copilot_workflow_fakes import fake_workflow
-from tests.unit.copilot_route_test_support import narrative_payload_with_run
+from tests.unit.copilot_route_test_support import install_candidate_store, narrative_payload_with_run
+from tests.unit.copilot_test_helpers import FakeCopilotStream
 from tests.unit.copilot_test_helpers import make_copilot_ctx as _ctx
 from tests.unit.copilot_test_helpers import make_verified_goal_contract as _verified_goal_contract
 from tests.unit.copilot_test_helpers import origin_run_input, passing_run, stub_copilot_agent_loop
@@ -332,16 +342,6 @@ def _challenge_effects_contract() -> DiagnosisRepairContract:
             basis="run_wall", kind="captcha", solver_available=True, solver_attempted=True, solver_result="failed"
         ),
         levers=[Lever(mechanism="human_interaction", knowledge_topic="human_interaction_block")],
-    )
-
-
-def _frame_only_challenge_contract() -> DiagnosisRepairContract:
-    return DiagnosisRepairContract(
-        diagnosis_input=DiagnosisInput(source_tool="update_and_run_blocks"),
-        diagnosis_result=DiagnosisResult(),
-        repair_decision=RepairDecision(next_action=RepairNextAction.NO_CHANGE),
-        verification_result=VerificationResult(user_goal_satisfied=False, completion_contract_satisfied=False),
-        challenge=ChallengeEffects(basis="page_frames", frame_hosts=["challenges.cloudflare.com"]),
     )
 
 
@@ -498,7 +498,7 @@ async def test_interrupted_draft_turn_restoration_and_run_hydration_stay_coheren
     async def seed_run(ctx: CopilotContext, *, workflow_run_id: str | None) -> SimpleNamespace:
         seeded.append((workflow_run_id, ctx.workflow_yaml, ctx.proposal_workflow_run_id))
         ctx.repair_origin_input_values = (origin_run_input("resume", "s3://bucket/resume.pdf"),)
-        return SimpleNamespace(finished=True)
+        return SimpleNamespace(finished=True, run=None)
 
     async def hydrate_run(ctx: CopilotContext, *, workflow_run_id: str) -> dict[str, dict[str, str]]:
         hydrated.append((workflow_run_id, ctx.workflow_yaml, ctx.proposal_workflow_run_id))
@@ -594,7 +594,7 @@ async def test_a_plain_continuation_names_reusable_origin_inputs_before_any_run(
     async def seed_run(ctx: CopilotContext, *, workflow_run_id: str | None) -> SimpleNamespace:
         seeded.append(workflow_run_id)
         ctx.repair_origin_input_values = (origin_run_input("resume", "s3://bucket/resume.pdf"),)
-        return SimpleNamespace(finished=True)
+        return SimpleNamespace(finished=True, run=None)
 
     hydrate_run = AsyncMock(return_value=None)
     monkeypatch.setattr(agent_module, "restore_pending_workflow_proposal", AsyncMock(return_value=None))
@@ -674,8 +674,6 @@ async def test_demonstrate_product_action_triggers_replay(monkeypatch: pytest.Mo
 
 class TestFailedTestResponseNormalization:
     def test_paused_run_reply_is_not_rewritten_into_a_failed_test(self) -> None:
-        from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
-
         ctx = _ctx(
             last_update_block_count=2,
             last_test_ok=None,
@@ -695,8 +693,8 @@ class TestFailedTestResponseNormalization:
         rewritten = _rewrite_failed_test_response(model_reply, ctx)
 
         assert rewritten == (
-            "I created a draft workflow with 2 blocks and tested it, but the test failed. "
-            f"Failure: Verify you are human. {model_reply} Keep the draft to iterate on, or discard."
+            "I tested the draft, but the test failed: Verify you are human. "
+            f"{model_reply} Keep the draft to iterate on, or discard."
         )
         assert "proxy location?" not in rewritten
 
@@ -722,20 +720,70 @@ class TestFailedTestResponseNormalization:
             ),
         )
 
-        rewritten = _rewrite_failed_test_response("I tested the workflow, but it failed.", ctx)
+        rewritten = _rewrite_failed_test_response("Credits ran out before the run started.", ctx)
 
         assert rewritten == (
-            "I created a draft workflow with 1 block, but I couldn't start a test. "
+            "I couldn't start a test. "
             "Build test did not start because credits are exhausted. No browser or run started. "
             "Upgrade your plan in Billing. The draft is untested. "
+            "Credits ran out before the run started. "
             "Keep the draft to iterate on, or discard."
         )
-        assert "tested it" not in rewritten
-        assert "test failed" not in rewritten
+
+    def test_browser_start_capacity_refusal_reports_its_facts_and_never_claims_a_test_ran(self) -> None:
+        refusal = BuildTestConnectFailure(
+            state="browser_start_capacity",
+            starting_sessions=12,
+            max_starting_sessions=10,
+            retry_after_seconds=17,
+        )
+        ctx = _ctx(
+            last_workflow=object(),
+            last_workflow_yaml="workflow: yes",
+            last_update_block_count=1,
+            last_test_ok=False,
+            last_failure_category_top="UNRECOVERABLE_TOOL_ERROR",
+            last_test_failure_reason=build_test_connect_failure_sentence(refusal),
+            latest_recorded_build_test_outcome=RecordedBuildTestOutcome(
+                phase="persisted_block_run",
+                attempted_tool="update_and_run_blocks",
+                verdict="not_authoritative",
+                reason_code="unrecoverable_tool_error",
+                connect_failure=refusal,
+            ),
+        )
+
+        rewritten = _rewrite_failed_test_response("", ctx)
+
+        for fact in ("12", "10", "17"):
+            assert fact in rewritten
+        assert "I tested the draft" not in rewritten
+
+    def test_a_browser_lost_after_the_run_started_never_claims_the_draft_was_tested(self) -> None:
+        lost = BuildTestConnectFailure(state="provisioning_unavailable", workflow_run_id="wr_lost")
+        ctx = _ctx(
+            last_workflow=object(),
+            last_workflow_yaml="workflow: yes",
+            last_update_block_count=1,
+            last_test_ok=False,
+            last_test_run_started=True,
+            last_test_failure_reason=build_test_connect_failure_sentence(lost),
+            latest_recorded_build_test_outcome=RecordedBuildTestOutcome(
+                phase="persisted_block_run",
+                attempted_tool="update_and_run_blocks",
+                verdict="not_authoritative",
+                reason_code="unrecoverable_tool_error",
+                workflow_run_id="wr_lost",
+                connect_failure=lost,
+            ),
+        )
+
+        rewritten = _rewrite_failed_test_response("", ctx)
+
+        assert build_test_connect_failure_sentence(lost) in rewritten
+        assert "I tested the draft" not in rewritten
 
     def test_a_proxy_hop_failure_keeps_its_label_when_the_page_also_detected_a_challenge(self) -> None:
-        # The challenge path returns before the follow-up, so the label has to be on the
-        # recorded-run sentence itself or a walled page silently hides who owned the failure.
         ctx = _challenge_failure_ctx()
         ctx.effective_workflow_proxy_location = ProxyLocation.RESIDENTIAL_ES
         _record_failed_navigation_run(ctx, _PROXY_HOP_NAVIGATION_FAILURE, ["net::ERR_TUNNEL_CONNECTION_FAILED"])
@@ -759,25 +807,77 @@ class TestFailedTestResponseNormalization:
 
         assert "Skyvern proxy hop failed" not in rewritten
 
-    def test_without_challenge_effects_the_base_follow_up_template_is_unchanged(self) -> None:
-        no_contract_ctx = _challenge_failure_ctx()
-        empty_recourse_ctx = _challenge_failure_ctx()
-        empty_recourse_ctx.latest_diagnosis_repair_contract = _unverified_no_repair_contract()
-        frame_only_ctx = _challenge_failure_ctx()
-        frame_only_ctx.latest_diagnosis_repair_contract = _frame_only_challenge_contract()
+    def test_a_truncated_reason_keeps_its_ellipsis_without_a_fourth_dot(self) -> None:
+        ctx = _challenge_failure_ctx()
+        ctx.last_test_failure_reason = "Timed out " + "waiting " * 60
 
-        expected = (
-            "I created a draft workflow with 2 blocks and tested it, but the test failed. "
-            "Failure: Verify you are human. Want me to retry?"
-            " Keep the draft to iterate on, or discard."
+        rewritten = _rewrite_failed_test_response("", ctx)
+
+        assert rewritten.endswith("...")
+        assert "...." not in rewritten
+
+    def test_without_challenge_effects_the_model_reply_still_follows_the_lead(self) -> None:
+        ctx = _challenge_failure_ctx()
+        ctx.latest_diagnosis_repair_contract = _unverified_no_repair_contract()
+
+        assert _rewrite_failed_test_response("The site blocked me.", ctx) == (
+            "I tested the draft, but the test failed: Verify you are human. "
+            "The site blocked me. Keep the draft to iterate on, or discard."
         )
-        assert _rewrite_failed_test_response("The site blocked me.", no_contract_ctx) == expected
-        assert _rewrite_failed_test_response("The site blocked me.", empty_recourse_ctx) == expected
-        assert _rewrite_failed_test_response("The site blocked me.", frame_only_ctx) == expected
+
+    @pytest.mark.parametrize(
+        ("branch", "lead"),
+        [
+            (
+                "billing",
+                "I couldn't start a test. Build test did not start because credits are exhausted. "
+                "No browser or run started. Upgrade your plan in Billing. The draft is untested.",
+            ),
+            (
+                "not_started",
+                "I couldn't start a test run: Run never dispatched. Nothing was executed, so the draft is unverified.",
+            ),
+            ("failed", "I tested the draft, but the test failed: Login rejected."),
+        ],
+    )
+    @pytest.mark.parametrize("model_reply", ["", "  Block one passed; block two failed on login.  "])
+    def test_every_test_reporting_branch_puts_the_lead_before_the_model_reply(
+        self, branch: str, lead: str, model_reply: str
+    ) -> None:
+        ctx = _ctx(
+            last_workflow=object(),
+            last_workflow_yaml="workflow: yes",
+            last_update_block_count=13,
+            last_test_ok=False,
+            last_failure_category_top="AUTH_FAILURE",
+            last_test_failure_reason="Login rejected.",
+            last_test_proxy_owned_failure=True,
+        )
+        if branch == "billing":
+            ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+                phase="persisted_block_run",
+                attempted_tool="update_and_run_blocks",
+                verdict="not_authoritative",
+                reason_code="unrecoverable_tool_error",
+                connect_failure=BuildTestConnectFailure(state="billing_credit_admission_refusal", retry_action=None),
+            )
+            ctx.last_test_failure_reason = "Build test did not start because credits are exhausted."
+        elif branch == "not_started":
+            ctx.last_test_run_started = False
+            ctx.last_test_failure_reason = "Run never dispatched."
+
+        rewritten = _rewrite_failed_test_response(model_reply, ctx)
+
+        if model_reply:
+            assert rewritten == f"{lead} {model_reply.strip()} Keep the draft to iterate on, or discard."
+        else:
+            assert rewritten == lead
+        assert "I created" not in rewritten
+        assert "13" not in rewritten
+        assert "stored password" not in rewritten
+        assert "re-test" not in rewritten
 
     def test_rewrite_failed_test_response_avoids_success_language(self) -> None:
-        from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
-
         ctx = _ctx(
             last_update_block_count=2,
             last_test_ok=False,
@@ -788,9 +888,11 @@ class TestFailedTestResponseNormalization:
         )
         rewritten = _rewrite_failed_test_response("The workflow was successfully created.", ctx)
 
-        assert "successfully created" not in rewritten.lower()
-        assert "draft workflow with 2 blocks" in rewritten
-        assert "test failed" in rewritten.lower()
+        assert rewritten.startswith(
+            "I tested the draft, but the test failed: "
+            "Failed to navigate to url https://bad.example. Error: net::ERR_NAME_NOT_RESOLVED. "
+        )
+        assert "2 blocks" not in rewritten
         assert "Call log:" not in rewritten
 
     @pytest.mark.parametrize("failure_category", ["NAVIGATION_FAILURE", "PAGE_LOAD_TIMEOUT"])
@@ -813,8 +915,6 @@ class TestFailedTestResponseNormalization:
         assert "confirm the URL" not in rewritten
         assert "Can you confirm the URL is correct?" not in rewritten
         assert "Skyvern proxy hop failed (proxy_location=RESIDENTIAL_ES)" in rewritten
-        assert _SKYVERN_EGRESS_FOLLOW_UP.strip() in rewritten
-        assert _FAILURE_FOLLOW_UP["PROXY_ERROR"].strip() not in rewritten
 
     def test_failed_run_does_not_clear_last_workflow_state(self) -> None:
         sentinel_workflow = object()
@@ -925,9 +1025,7 @@ workflow_definition:
 
         assert trace["per_tool_budget_on_block_count"] == 0
 
-    def test_rewrite_includes_navigation_follow_up_when_category_matches(self) -> None:
-        from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
-
+    def test_rewrite_keeps_the_model_reply_instead_of_a_category_follow_up(self) -> None:
         ctx = _ctx(
             last_update_block_count=1,
             last_test_ok=False,
@@ -936,12 +1034,11 @@ workflow_definition:
         )
         rewritten = _rewrite_failed_test_response("done", ctx)
 
-        assert "test failed" in rewritten.lower()
-        assert "confirm the url" in rewritten.lower()
+        assert rewritten == (
+            "I tested the draft, but the test failed: Failed to navigate to url https://bad.example. done"
+        )
 
     def test_rewrite_untested_edit_preserves_model_report(self) -> None:
-        from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
-
         sentinel_workflow = object()
         ctx = _ctx(
             last_update_block_count=1,
@@ -953,15 +1050,11 @@ workflow_definition:
         assert rewritten == "Here's the updated YAML."
 
     def test_rewrite_passes_through_when_no_update_or_failure(self) -> None:
-        from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
-
         ctx = _ctx()
         original = "Let me know what you want to build."
         assert _rewrite_failed_test_response(original, ctx) == original
 
     def test_rewrite_preserves_the_models_factual_completed_run_report(self) -> None:
-        from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
-
         ctx = _ctx(
             last_workflow=object(),
             last_workflow_yaml="title: resale lookup",
@@ -987,8 +1080,6 @@ workflow_definition:
         assert _rewrite_failed_test_response(factual_report, ctx) == factual_report
 
     def test_rewrite_untested_draft_request_surfaces_explicit_unverified_copy(self) -> None:
-        from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
-
         ctx = _ctx(
             allow_untested_workflow_draft=True,
             last_workflow=object(),
@@ -1003,9 +1094,6 @@ workflow_definition:
         assert "successful" not in rewritten.lower()
 
     def test_rewrite_redacted_secret_draft_points_to_saved_credentials(self) -> None:
-        from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
-        from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
-
         ctx = _ctx(
             allow_untested_workflow_draft=True,
             last_workflow=object(),
@@ -1049,16 +1137,22 @@ workflow_definition:
         assert verdict.reason_codes == []
 
     @pytest.mark.parametrize(
-        ("card", "expected"),
+        ("card", "site_answer", "expected"),
         [
-            ("skipped", "You chose not to connect a saved credential"),
-            ("timeout", "The credential card went unanswered"),
-            ("declined", "The credential card could not be shown"),
-            ("not_admitted", "saved for a different site"),
+            ("skipped", None, "You chose not to connect a saved credential"),
+            ("timeout", None, "The credential card went unanswered"),
+            ("declined", None, "The credential card could not be shown"),
+            ("not_admitted", None, "saved for a different site"),
+            (
+                "not_admitted",
+                SiteAnswer("no", "https://a.example.com", "https://b.example.com"),
+                "You chose not to use",
+            ),
+            ("not_admitted", SiteAnswer("add", "https://a.example.com", "https://b.example.com"), "a different site"),
         ],
     )
     def test_rewrite_states_why_no_credential_connected_on_a_redacted_secret_draft(
-        self, card: str, expected: str
+        self, card: str, site_answer: SiteAnswer | None, expected: str
     ) -> None:
         ctx = _ctx(
             last_workflow=object(),
@@ -1066,6 +1160,7 @@ workflow_definition:
             last_update_block_count=2,
             last_test_ok=None,
             credential_pause_outcome=card,
+            credential_pause_site_answer=site_answer,
             request_policy=RequestPolicy(raw_secret_detected=True, raw_secret_handling="redacted_draft"),
         )
 
@@ -1126,28 +1221,6 @@ workflow_definition:
 
         assert _should_surface_untested_draft_despite_question(ctx, "ASK_QUESTION") is True
         assert _should_surface_untested_draft_despite_question(ctx, "REPLY") is False
-
-    def test_rewrite_uses_credential_framing_when_policy_flags_unbound_inputs(self) -> None:
-        from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
-        from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
-
-        ctx = _ctx(
-            last_workflow=object(),
-            last_workflow_yaml="title: drafted",
-            last_update_block_count=12,
-            last_test_ok=None,
-            request_policy=RequestPolicy(
-                clarification_reason="workflow_credential_inputs_unbound",
-                allow_run_blocks=False,
-                allow_missing_credentials_in_draft=True,
-            ),
-        )
-        rewritten = _rewrite_failed_test_response("agent text", ctx)
-
-        assert rewritten.startswith("I applied your requested change as a draft workflow with 12 blocks.")
-        assert "I couldn't find the required credentials" in rewritten
-        assert "add them via the Credentials UI" in rewritten
-        assert "Keep the draft to iterate on, or discard." in rewritten
 
     def test_runtime_repair_context_prompt_exposes_literal_page_location(self) -> None:
         repair_context = CodeAuthoringRepairContext(
@@ -1330,8 +1403,9 @@ workflow_definition:
         prompt = agent_module._recorded_build_test_outcome_prompt(ctx)
 
         assert "select_option timed out" in prompt
-        assert "browser_acquisition_failed:" in prompt
-        assert "cdp_connect_failed" in prompt
+        sentence = build_test_connect_failure_sentence(BuildTestConnectFailure(state="cdp_connect_failed"))
+        assert len(sentence) > 160
+        assert f"browser_acquisition_failed: {sentence}" in prompt
 
     def test_recorded_build_test_outcome_prompt_says_what_to_do_about_an_occupied_browser(self) -> None:
         """The bare state does not say what to do. The occupying run id stays out of prompt text, and
@@ -2568,6 +2642,78 @@ async def _run_tool_bearing_empty_completion_turn(
     return _ToolBearingEmptyCompletionTurn(result, seen_ctx[0], run_with_enforcement, drain_calls)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("delta", "finish_reason"),
+    [
+        pytest.param(ChoiceDelta(role="assistant", refusal="I can't help with that."), "stop", id="refusal"),
+        pytest.param(ChoiceDelta(role="assistant", content=""), "content_filter", id="empty_content_filter"),
+    ],
+)
+async def test_a_refusal_or_content_filter_stop_ends_the_turn_with_the_empty_completion_reply(
+    monkeypatch: pytest.MonkeyPatch, delta: ChoiceDelta, finish_reason: str
+) -> None:
+    class Manager:
+        def __init__(self, _servers: object) -> None:
+            self.active_servers: list[object] = []
+
+        async def __aenter__(self) -> Self:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    def chunk(choice_delta: ChoiceDelta, reason: str | None = None) -> ChatCompletionChunk:
+        return ChatCompletionChunk(
+            id="chatcmpl-stop",
+            created=0,
+            model="claude-sonnet-5-5",
+            object="chat.completion.chunk",
+            choices=[ChunkChoice(index=0, delta=choice_delta, finish_reason=reason)],
+        )
+
+    async def stream() -> AsyncIterator[ChatCompletionChunk]:
+        yield chunk(delta)
+        yield chunk(ChoiceDelta(), finish_reason)
+
+    async def fake_acompletion(**_kwargs: object) -> AsyncIterator[ChatCompletionChunk]:
+        return stream()
+
+    run_config = RunConfig(model_provider=CopilotLitellmProvider(), tracing_disabled=True)
+    monkeypatch.setattr("litellm.acompletion", fake_acompletion)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.model_resolver.resolve_model_config",
+        lambda _handler, **_kwargs: ("anthropic/claude-sonnet-5-5", run_config, "PRIMARY", False),
+    )
+    monkeypatch.setattr(agent_module, "_resolve_live_browser_session_id", AsyncMock(return_value=None))
+    monkeypatch.setattr(agent_module, "schedule_agent_naming", lambda *_args: None)
+    monkeypatch.setattr("agents.mcp.MCPServerManager", Manager)
+
+    result = await agent_module.run_copilot_agent(
+        stream=FakeCopilotStream(),
+        organization_id="org-1",
+        chat_request=WorkflowCopilotChatRequest(
+            message="Build a workflow that downloads my invoices.",
+            workflow_id="wf-1",
+            workflow_permanent_id="wfp-1",
+            workflow_copilot_chat_id="chat-1",
+            workflow_yaml="",
+        ),
+        chat_history=[],
+        global_llm_context=None,
+        llm_api_handler=SimpleNamespace(llm_key="PRIMARY"),
+        raw_secret_safety_handler=AsyncMock(
+            return_value={"version": "1", "state": "clean", "handling": "none", "citations": []}
+        ),
+        api_key="sk-test",
+        config=CopilotConfig(),
+    )
+
+    assert result.user_response == agent_module.EMPTY_COMPLETION_TERMINAL_MESSAGE
+    assert result.turn_outcome is not None
+    assert result.turn_outcome.terminal_reason == "empty_completion"
+
+
 def _chat_request(*, product_action: str | None = None) -> SimpleNamespace:
     return SimpleNamespace(
         workflow_id="wf-1",
@@ -2764,7 +2910,9 @@ workflow_definition:
         monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
         monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
         monkeypatch.setattr(tools_module, "_update_workflow", fake_update_workflow)
-        monkeypatch.setattr(tools_module, "_plan_frontier", lambda *args: (["submit"], {}, "submit", "initial"))
+        monkeypatch.setattr(
+            tools_module.FrontierRequest, "plan", lambda self, ctx: (["submit"], {}, "submit", "initial")
+        )
         monkeypatch.setattr(tools_module, "_run_blocks_and_collect_debug", fake_run_blocks)
         monkeypatch.setattr(tools_module, "_record_diagnosis_repair_contract", lambda *args, **kwargs: None)
         monkeypatch.setattr(tools_module, "enqueue_screenshot_from_result", lambda *args, **kwargs: None)
@@ -2831,7 +2979,9 @@ workflow_definition:
         monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
         monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
         monkeypatch.setattr(tools_module, "_update_workflow", fake_update_workflow)
-        monkeypatch.setattr(tools_module, "_plan_frontier", lambda *args: (["ｓubmit"], {}, "ｓubmit", "initial"))
+        monkeypatch.setattr(
+            tools_module.FrontierRequest, "plan", lambda self, ctx: (["ｓubmit"], {}, "ｓubmit", "initial")
+        )
         monkeypatch.setattr(tools_module, "_run_blocks_and_collect_debug", fake_run_blocks)
         monkeypatch.setattr(tools_module, "_record_diagnosis_repair_contract", lambda *args, **kwargs: None)
         monkeypatch.setattr(tools_module, "enqueue_screenshot_from_result", lambda *args, **kwargs: None)
@@ -2928,7 +3078,9 @@ workflow_definition:
         )
         monkeypatch.setattr(tools_module, "_update_workflow", fake_update_workflow)
         monkeypatch.setattr(tools_module, "_frontier_runtime_page_url", AsyncMock(return_value=None))
-        monkeypatch.setattr(tools_module, "_plan_frontier", lambda *args: (["read_total"], {}, "read_total", "initial"))
+        monkeypatch.setattr(
+            tools_module.FrontierRequest, "plan", lambda self, ctx: (["read_total"], {}, "read_total", "initial")
+        )
         monkeypatch.setattr(tools_module, "_run_blocks_and_collect_debug", fake_run_blocks)
         monkeypatch.setattr(tools_module, "_verify_and_record_run_blocks_result", AsyncMock())
         monkeypatch.setattr(tools_module, "_record_workflow_update_result", lambda *args, **kwargs: None)
@@ -2952,13 +3104,17 @@ workflow_definition:
         )
 
         expected = tools_module.sanitize_tool_result_for_llm("run_blocks_and_collect_debug", run_result)
-        assert json.loads(result) == expected
+        assert json.loads(result) == {**expected, "turn_seconds_remaining": None}
         assert captured["update_calls"] == 1
         assert captured["run_calls"] == 1
         assert isinstance(captured["persisted_yaml"], str)
         assert captured["persisted_yaml"].replace('"#amount"', '"#total"') == workflow_yaml
         assert ctx.workflow_yaml == captured["persisted_yaml"], "a failed run must retain the edited draft"
-        assert captured["run_params"] == {"block_labels": ["read_total"], "parameters": {}}
+        assert captured["run_params"] == {
+            "block_labels": ["read_total"],
+            "parameters": {},
+            "run_every_loop_iteration": False,
+        }
 
     @pytest.mark.asyncio
     async def test_unbound_credentials_persist_draft_and_skip_run(self, monkeypatch) -> None:
@@ -3169,7 +3325,9 @@ workflow_definition:
             AsyncMock(return_value=WorkflowDefinition(parameters=[], blocks=[])),
         )
         monkeypatch.setattr(tools_module, "_frontier_runtime_page_url", AsyncMock(return_value=None))
-        monkeypatch.setattr(tools_module, "_plan_frontier", lambda *args: (["read_total"], {}, "read_total", "initial"))
+        monkeypatch.setattr(
+            tools_module.FrontierRequest, "plan", lambda self, ctx: (["read_total"], {}, "read_total", "initial")
+        )
         monkeypatch.setattr(tools_module, "_update_workflow", fake_update_workflow)
         monkeypatch.setattr(tools_module, "_record_workflow_update_result", fake_record_update)
         monkeypatch.setattr(tools_module, "_run_blocks_and_collect_debug", fake_run_blocks)
@@ -3736,6 +3894,19 @@ def test_a_goal_note_names_the_block_when_the_label_is_ordinary() -> None:
     assert "export, login" in dropped_note
 
 
+def test_an_inline_replacement_that_drops_a_saved_note_tells_the_person_what_it_said() -> None:
+    saved = (
+        "workflow_definition:\n  parameters: []\n  blocks:\n"
+        "  - {block_type: navigation, label: open_page, url: 'https://example.com', navigation_goal: Go,"
+        " notes: Never click Delete.}\n"
+    )
+
+    message = agent_module._dropped_notes_message(["open_page"], None, saved)
+
+    assert "open_page" in message and "Never click Delete." in message
+    assert not agent_module.contains_internal_machinery_leak(message)
+
+
 class TestTranslateToAgentResultGating:
     """Covers the three SKY-9143 invariants that live in _translate_to_agent_result."""
 
@@ -3751,6 +3922,40 @@ class TestTranslateToAgentResultGating:
 
         assert agent_result.response_type == "ASK_QUESTION"
         assert agent_result.user_response == "Which account should I use?"
+
+    @pytest.mark.parametrize(
+        "final_output",
+        [json.dumps({"type": "REPLY", "user_response": ""}), "REPLY:", '{"type": "REPLY", "user_response": "brok'],
+        ids=["empty_reply", "label_only_reply", "unrecoverable_envelope"],
+    )
+    def test_failed_test_with_no_model_reply_returns_the_lead_alone(self, final_output: str) -> None:
+        ctx = _ctx(
+            last_update_block_count=2,
+            last_test_ok=False,
+            last_test_failure_reason="Verify you are human",
+            last_workflow=object(),
+            last_workflow_yaml="title: drafted",
+        )
+        result = SimpleNamespace(final_output=final_output, new_items=[])
+
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        assert agent_result.user_response == "I tested the draft, but the test failed: Verify you are human."
+
+    def test_empty_reply_without_a_failed_test_still_falls_back_to_done(self) -> None:
+        result = _fake_run_result({"type": "REPLY", "user_response": ""})
+
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, _ctx(), global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        assert agent_result.user_response == "Done."
 
     def test_request_policy_actuation_claim_does_not_rewrite_model_reply(self) -> None:
         ctx = _ctx(
@@ -4292,6 +4497,70 @@ class TestTranslateToAgentResultGating:
         assert ctx.last_workflow_yaml == "title: Prior"
         emit.assert_not_awaited()
 
+    @pytest.mark.parametrize("prior_test_failed", [False, True], ids=["first-attempt", "after-failed-test"])
+    def test_inline_replace_canonical_unavailable_replies_without_staging(
+        self, monkeypatch, prior_test_failed: bool
+    ) -> None:
+        prior = SimpleNamespace(name="prior")
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.tools._process_workflow_yaml",
+            AsyncMock(return_value=SimpleNamespace(name="replacement")),
+        )
+        lookup = AsyncMock(return_value=None)
+        monkeypatch.setattr(forge_app.DATABASE.workflows, "get_workflow_by_permanent_id", lookup)
+        candidate_store = install_candidate_store(monkeypatch)
+        emit = AsyncMock()
+        monkeypatch.setattr(agent_module, "emit_workflow_draft", emit)
+        ctx = _ctx(
+            workflow_copilot_chat_id="wcc-test",
+            stream=MagicMock(),
+            last_workflow=prior,
+            last_workflow_yaml="title: Prior",
+            request_policy=RequestPolicy(allow_update_workflow=True, allow_run_blocks=True),
+        )
+        if prior_test_failed:
+            ctx.last_test_ok = False
+            ctx.last_update_block_count = 2
+            ctx.last_test_failure_reason = "The page timed out."
+
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                _fake_run_result(
+                    {
+                        "type": "REPLACE_WORKFLOW",
+                        "user_response": "Here is the replacement.",
+                        "workflow_yaml": "title: Replacement",
+                    }
+                ),
+                ctx,
+                global_llm_context=None,
+                chat_request=_chat_request(),
+                organization_id="org-1",
+            )
+        )
+
+        facts = {
+            "workflow_permanent_id": "wfp-1",
+            "candidate_published": False,
+            "test_started": False,
+            "detail": CANONICAL_WORKFLOW_UNAVAILABLE_ERROR,
+        }
+        assert agent_result.response_type == "REPLY"
+        assert CANONICAL_WORKFLOW_UNAVAILABLE_ERROR in agent_result.user_response
+        assert ctx.canonical_workflow_unavailable == facts
+        assert agent_result.narrative_payload is not None
+        assert agent_result.narrative_payload["canonicalWorkflowUnavailable"] == facts
+        assert {call.kwargs["workflow_permanent_id"] for call in lookup.await_args_list} == {"wfp-1"}
+        assert (ctx.last_workflow, ctx.last_workflow_yaml, ctx.has_staged_proposal) == (prior, "title: Prior", False)
+        assert (
+            agent_result.updated_workflow,
+            agent_result.has_staged_proposal,
+            agent_result.proposal_disposition,
+            agent_result.clear_proposed_workflow,
+        ) == (None, False, "no_proposal", True)
+        candidate_store.assert_not_awaited()
+        emit.assert_not_awaited()
+
     def test_inline_replace_workflow_uses_request_policy_authority(self, monkeypatch) -> None:
         replacement = fake_workflow(name="diagnose-repair")
         process_mock = AsyncMock(return_value=replacement)
@@ -4313,6 +4582,101 @@ class TestTranslateToAgentResultGating:
         assert agent_result.response_type == "REPLACE_WORKFLOW"
         assert ctx.last_workflow is replacement
         assert agent_result.updated_workflow is None
+
+    def test_inline_replace_workflow_refuses_a_bitwarden_parameter_moved_off_its_item_sites(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.tools._process_workflow_yaml",
+            AsyncMock(return_value=fake_workflow(name="moved")),
+        )
+        monkeypatch.setattr(vault_logins_module, "list_vault_logins", AsyncMock(return_value=VaultLoginListing()))
+        legacy_id = "bitwarden_login_credential:item_1"
+        ctx = _ctx(
+            request_policy=RequestPolicy(
+                allow_update_workflow=True,
+                existing_workflow_credential_origins={legacy_id: ["https://portal.example.com"]},
+            )
+        )
+        moved = yaml.safe_dump(
+            {
+                "title": "Sign in",
+                "workflow_definition": {
+                    "parameters": [
+                        {
+                            "key": "portal_login",
+                            "parameter_type": "bitwarden_login_credential",
+                            "bitwarden_item_id": "item_1",
+                        }
+                    ],
+                    "blocks": [
+                        {
+                            "block_type": "login",
+                            "label": "sign_in",
+                            "url": "https://other.example.com/login",
+                            "parameter_keys": ["portal_login"],
+                        }
+                    ],
+                },
+            }
+        )
+        result = _fake_run_result({"type": "REPLACE_WORKFLOW", "user_response": "Moved it.", "workflow_yaml": moved})
+
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        assert agent_result.updated_workflow is None
+        assert ctx.last_workflow is None
+
+    def test_inline_replace_workflow_refuses_a_new_bitwarden_parameter_on_its_item_site(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.tools._process_workflow_yaml",
+            AsyncMock(return_value=fake_workflow(name="added")),
+        )
+        listed = VaultLogin(
+            vault_type=CredentialVaultType.BITWARDEN_CONNECTED,
+            vault_id="org_vault",
+            item_id="item_1",
+            title="Portal",
+            urls=("https://portal.example.com/login",),
+            sites=(LoginSite("https://portal.example.com", whole_site=False),),
+        )
+        monkeypatch.setattr(
+            vault_logins_module, "list_vault_logins", AsyncMock(return_value=VaultLoginListing(logins=(listed,)))
+        )
+        ctx = _ctx(request_policy=RequestPolicy(allow_update_workflow=True))
+        added = yaml.safe_dump(
+            {
+                "title": "Sign in",
+                "workflow_definition": {
+                    "parameters": [
+                        {
+                            "key": "portal_login",
+                            "parameter_type": "bitwarden_login_credential",
+                            "bitwarden_item_id": "item_1",
+                        }
+                    ],
+                    "blocks": [
+                        {
+                            "block_type": "login",
+                            "label": "sign_in",
+                            "url": "https://portal.example.com/login",
+                            "parameter_keys": ["portal_login"],
+                        }
+                    ],
+                },
+            }
+        )
+        result = _fake_run_result({"type": "REPLACE_WORKFLOW", "user_response": "Added it.", "workflow_yaml": added})
+
+        asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        assert ctx.last_workflow is None
 
     @pytest.mark.parametrize(
         "request_policy",
@@ -5017,8 +5381,10 @@ workflow_definition:
             )
         )
 
-        assert "test failed" in agent_result.user_response.lower()
-        assert "All done" not in agent_result.user_response
+        assert agent_result.user_response == (
+            "I tested the draft, but the test failed: Failed to navigate to url https://bad.example. "
+            "All done — your workflow is ready."
+        )
         assert agent_result.updated_workflow is None
         assert agent_result.proposal_disposition == "no_proposal"
 
@@ -6431,6 +6797,135 @@ class TestRunBlocksCredentialApproval:
         )
         database.organizations.get_organization.assert_awaited_once_with(organization_id="org-1")
 
+    @staticmethod
+    def _ctx_after_a_real_run(resolved_credentials: list[object]) -> CopilotContext:
+        ctx = _ctx(request_policy=RequestPolicy(resolved_credentials=resolved_credentials), stream=FakeCopilotStream())
+        ctx.last_run_outcome = RecordedRunOutcome(
+            verdict="not_evaluated", workflow_run_id="wr_prior", run_completed=True
+        )
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="run_blocks_and_collect_debug",
+            verdict="progress_observed",
+            reason_code="verified_success",
+            workflow_run_id="wr_prior",
+        )
+        ctx.last_run_blocks_workflow_run_id = "wr_prior"
+        ctx.last_run_blocks_browser_session_id = "pbs_prior"
+        return ctx
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("refusal", ["credential_approval", "google_account", "credential_not_found"])
+    async def test_refused_dispatch_records_the_attempt_but_no_run_outcome(self, monkeypatch, refusal: str) -> None:
+        if refusal == "google_account":
+            workflow = self._workflow(
+                parameters=[],
+                blocks=[{"label": "login", "block_type": "google_sheets_read", "credential_id": "goac_staged"}],
+            )
+            stored_credentials: list[object] = []
+            resolved_credentials: list[object] = []
+        else:
+            workflow = self._workflow("cred_login")
+            login = SimpleNamespace(credential_id="cred_login")
+            stored_credentials = [login] if refusal == "credential_approval" else []
+            resolved_credentials = [] if refusal == "credential_approval" else [login]
+        monkeypatch.setattr(
+            run_execution_module.app, "DATABASE", self._db(workflow=workflow, credentials=stored_credentials)
+        )
+        monkeypatch.setattr(
+            run_execution_module.app,
+            "WORKFLOW_SERVICE",
+            SimpleNamespace(
+                get_workflow_parameters=AsyncMock(return_value=[]),
+                prepare_workflow=AsyncMock(side_effect=AssertionError("prepare_workflow called")),
+                execute_workflow=AsyncMock(side_effect=AssertionError("execute_workflow called")),
+            ),
+        )
+        monkeypatch.setattr(
+            credentials_module.google_oauth_service,
+            "get_visible_credentials_for_org",
+            AsyncMock(
+                return_value=[
+                    SimpleNamespace(
+                        id="goac_choice", credential_name="Google Sheets", state="active", email_address=None
+                    )
+                ]
+            ),
+        )
+        log = MagicMock()
+        monkeypatch.setattr(run_execution_module, "LOG", log)
+        ctx = self._ctx_after_a_real_run(resolved_credentials)
+        prior_outcome = ctx.last_run_outcome
+        prior_build_outcome = ctx.latest_recorded_build_test_outcome
+
+        result = await _run_blocks_and_collect_debug({"block_labels": ["login"], "parameters": {}}, ctx)
+        recorded = await run_execution_module._verify_and_record_run_blocks_result(ctx, result, time.monotonic())
+
+        assert recorded is None
+        assert [frame for frame in ctx.stream.sent if isinstance(frame, WorkflowCopilotRunOutcomeUpdate)] == []
+        assert "copilot_run_outcome_recorded" not in [call.args[0] for call in log.info.call_args_list if call.args]
+        assert ctx.latest_recorded_build_test_outcome is prior_build_outcome
+        assert ctx.run_outcome_trace == [prior_outcome]
+        assert (ctx.last_test_ok, ctx.last_test_run_started) == (False, False)
+        ctx.last_update_block_count = 1
+        reply = _rewrite_failed_test_response("The workflow is ready.", ctx)
+        assert reply.startswith("I couldn't start a test run:")
+        if refusal != "credential_not_found":
+            assert "Reason codes" not in reply and "Ask the user" not in reply
+        assert result["ok"] is False
+        if refusal == "credential_approval":
+            assert "unapproved_credential_reference" in result["error"]
+        elif refusal == "credential_not_found":
+            assert "cred_login" in result["error"]
+        else:
+            assert ctx.blocker_signal is not None
+            assert ctx.blocker_signal.internal_reason_code == "unapproved_google_connection_reference"
+            assert [choice.connection_id for choice in ctx.connected_account_recovery_choices] == ["goac_choice"]
+
+    @pytest.mark.asyncio
+    async def test_refused_dispatch_still_reaches_the_model_as_a_credential_ask(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            run_execution_module.app,
+            "DATABASE",
+            self._db(workflow=self._workflow("cred_login"), credentials=[SimpleNamespace(credential_id="cred_login")]),
+        )
+        ctx = self._ctx_after_a_real_run([])
+        ctx.last_test_non_retriable_nav_error = "Failed to navigate to url https://typo.invalid"
+
+        result = await _run_blocks_and_collect_debug({"block_labels": ["login"], "parameters": {}}, ctx)
+        recorded = await run_execution_module._verify_and_record_run_blocks_result(ctx, result, time.monotonic())
+        run_execution_module.finalize_build_test_result(
+            ctx, source_tool="run_blocks_and_collect_debug", result=result, recorded_outcome=recorded
+        )
+
+        contract = ctx.latest_diagnosis_repair_contract
+        assert contract.repair_decision.next_action == RepairNextAction.ASK
+        assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT
+        packet = result["data"][run_execution_module.BUILD_TEST_PACKET_KEY]
+        assert packet["run"] == {}
+        assert "unapproved_credential_reference" in packet["failure"]["reason"]
+
+    @pytest.mark.asyncio
+    async def test_refused_dispatch_controls(self) -> None:
+        ctx = self._ctx_after_a_real_run([])
+        sandbox = run_execution_module._copilot_sandbox_unavailable_result(
+            organization_id="org-1", workflow_permanent_id="wfp-1"
+        )
+
+        recorded = await run_execution_module._verify_and_record_run_blocks_result(ctx, sandbox, time.monotonic())
+        run_execution_module.finalize_build_test_result(
+            ctx, source_tool="run_blocks_and_collect_debug", result=sandbox, recorded_outcome=recorded
+        )
+        assert ctx.latest_diagnosis_repair_contract.repair_decision.next_action == RepairNextAction.STOP
+
+        saved_profile_failure = run_execution_module._saved_profile_start_failure(
+            "saved_profile_unresolved", requested_block_labels=["login"]
+        )
+        await run_execution_module._verify_and_record_run_blocks_result(ctx, saved_profile_failure, time.monotonic())
+        frames = [frame for frame in ctx.stream.sent if isinstance(frame, WorkflowCopilotRunOutcomeUpdate)]
+        assert len(frames) == 2
+        assert ctx.last_run_outcome is not None and ctx.last_run_outcome.workflow_run_id != "wr_prior"
+
     @pytest.mark.asyncio
     async def test_unapproved_google_connection_halts_with_verified_account_rows(self, monkeypatch) -> None:
         from skyvern.forge.sdk.copilot.tools import credentials as credentials_module
@@ -6553,7 +7048,7 @@ class TestRunBlocksCredentialApproval:
         ctx.tool_activity.append(self._listing_activity("goac_sheet"))
         admitted = await _run_blocks_and_collect_debug({"block_labels": ["login"], "parameters": {}}, ctx)
 
-        assert admitted == {"ok": False, "error": "Organization not found"}
+        assert admitted == {"ok": False, "error": "Organization not found", "data": {"run_dispatched": False}}
         assert ctx.blocker_signal is None
         assert ctx.latest_tool_blocker_signal is None
         assert ctx.tool_blocker_signals == []
@@ -6585,7 +7080,7 @@ class TestRunBlocksCredentialApproval:
         ctx.tool_activity.append(self._listing_activity("goac_replacement"))
         admitted = await _run_blocks_and_collect_debug({"block_labels": ["login"], "parameters": {}}, ctx)
 
-        assert admitted == {"ok": False, "error": "Organization not found"}
+        assert admitted == {"ok": False, "error": "Organization not found", "data": {"run_dispatched": False}}
         assert ctx.blocker_signal is None
         assert ctx.connected_account_recovery_choices == []
 
@@ -6620,7 +7115,7 @@ class TestRunBlocksCredentialApproval:
         ctx.tool_activity.append(self._listing_activity("goac_first"))
         admitted = await _run_blocks_and_collect_debug({"block_labels": ["first_write"], "parameters": {}}, ctx)
 
-        assert admitted == {"ok": False, "error": "Organization not found"}
+        assert admitted == {"ok": False, "error": "Organization not found", "data": {"run_dispatched": False}}
         assert ctx.blocker_signal is not None
         assert ctx.blocker_signal.internal_reason_code == "unapproved_google_connection_reference"
         assert ctx.connected_account_recovery_choices
@@ -6681,7 +7176,7 @@ class TestRunBlocksCredentialApproval:
         ctx.tool_activity.append(self._listing_activity("goac_first"))
         admitted = await _run_blocks_and_collect_debug({"block_labels": ["first_write"], "parameters": {}}, ctx)
 
-        assert admitted == {"ok": False, "error": "Organization not found"}
+        assert admitted == {"ok": False, "error": "Organization not found", "data": {"run_dispatched": False}}
         assert ctx.blocker_signal is not None
         assert ctx.blocker_signal.internal_reason_code == "unapproved_google_connection_reference"
         assert ctx.tool_blocker_signals
@@ -6717,7 +7212,7 @@ class TestRunBlocksCredentialApproval:
         ctx.tool_activity.append(self._listing_activity("goac_first"))
         admitted = await _run_blocks_and_collect_debug({"block_labels": ["first_write"], "parameters": {}}, ctx)
 
-        assert admitted == {"ok": False, "error": "Organization not found"}
+        assert admitted == {"ok": False, "error": "Organization not found", "data": {"run_dispatched": False}}
         assert ctx.blocker_signal is not None
         assert ctx.blocker_signal.internal_reason_code == "unapproved_google_connection_reference"
         assert ctx.connected_account_recovery_choices
@@ -6767,7 +7262,7 @@ class TestRunBlocksCredentialApproval:
             _ctx(request_policy=policy),
         )
 
-        assert result == {"ok": False, "error": "Organization not found"}
+        assert result == {"ok": False, "error": "Organization not found", "data": {"run_dispatched": False}}
         approval.assert_awaited_once()
         assert approval.await_args.args[0] == [
             ("nested_write", "goac_nested"),
@@ -9285,15 +9780,6 @@ class TestTheModelOwnsItsClaim:
         assert agent_result.updated_workflow is wf
 
 
-def test_an_element_state_timeout_does_not_send_the_user_to_check_the_url() -> None:
-    # The page loaded; an element never reached the state the block waited for. Copilot repairs that
-    # itself, so the reply carries no follow-up rather than a misdirecting one.
-    from skyvern.forge.sdk.copilot.agent import _FAILURE_FOLLOW_UP
-
-    assert _FAILURE_FOLLOW_UP.get("ELEMENT_STATE_TIMEOUT", "") == ""
-    assert "confirm the URL" in _FAILURE_FOLLOW_UP["PAGE_LOAD_TIMEOUT"]
-
-
 def test_rewrite_names_the_sandbox_outage_when_the_runner_was_unreachable() -> None:
     ctx = _ctx(
         last_update_block_count=1,
@@ -9307,8 +9793,8 @@ def test_rewrite_names_the_sandbox_outage_when_the_runner_was_unreachable() -> N
     rewritten = _rewrite_failed_test_response("All set — the workflow is ready.", ctx)
 
     assert rewritten == (
-        "I created a draft workflow with 1 block and tested it, but the test failed. "
-        "Failure: Secure CodeBlock runner is unavailable. Please retry."
+        "I tested the draft, but the test failed: Secure CodeBlock runner is unavailable. Please retry. "
+        "All set — the workflow is ready."
     )
 
 

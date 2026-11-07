@@ -72,9 +72,17 @@ class AsyncGcsStorageClient(Protocol):
 
     async def list_files(self, uri: str) -> list[str]: ...
 
-    async def get_object_info(self, uri: str) -> dict | None: ...
+    async def get_object_info(self, uri: str, bounded: bool = False) -> dict | None: ...
 
-    async def create_signed_urls(self, uris: list[str], expiry_hours: int = 24) -> list[str] | None: ...
+    async def create_signed_urls(
+        self,
+        uris: list[str],
+        expiry_hours: int = 24,
+        attachment_filenames: list[str | None] | None = None,
+    ) -> list[str] | None:
+        """With ``attachment_filenames`` (one per uri, None for the object basename), the URLs force an
+        attachment download as octet-stream so stored user content never renders on the bucket origin."""
+        ...
 
     async def close(self) -> None: ...
 

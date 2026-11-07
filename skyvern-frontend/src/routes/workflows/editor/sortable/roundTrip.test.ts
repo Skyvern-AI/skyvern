@@ -12,6 +12,7 @@ import { yamlCommitInputs } from "../workflowVersionFromSaveData";
 
 import type { AppNode } from "../nodes";
 import {
+  createNode,
   getElements,
   convert,
   getWorkflowBlocks,
@@ -21,7 +22,9 @@ import {
   type AWSSecretParameter,
   type CodeBlock,
   type EmailInboxBlock,
+  type ForLoopBlock,
   type OutputParameter,
+  type PowerBIQueryBlock,
   type SendEmailBlock,
   type WorkflowBlock,
   type WorkflowApiResponse,
@@ -286,6 +289,26 @@ function makeEmailInboxBlock(
   };
 }
 
+function makePowerBIQueryBlock(): PowerBIQueryBlock {
+  return {
+    label: "Power BI Query",
+    block_type: "powerbi_query",
+    continue_on_failure: false,
+    model: null,
+    next_block_label: null,
+    output_parameter: makeOutputParameter("powerbi_query"),
+    connection_id: "{{ powerbi_connection_id }}",
+    dataset_id: "{{ dataset_id }}",
+    query: `EVALUATE FILTER('Orders', 'Orders'[Region] = "{{ region }}")`,
+    max_rows: 250,
+    parameters: [
+      makeWorkflowParameter("powerbi_connection_id"),
+      makeWorkflowParameter("dataset_id"),
+      makeWorkflowParameter("region"),
+    ],
+  };
+}
+
 /** Flat 5-block fixture: B1 → B2 → B3 → B4 → B5. */
 function buildFiveBlockFixture(): Array<WorkflowBlock> {
   return [
@@ -415,6 +438,205 @@ function reloadFromSavedYaml(
 }
 
 describe("round-trip reorder → save → reload (M1 top-level)", () => {
+  test("new Power BI blocks serialize with the supported Nango source", () => {
+    const node = createNode({ id: "new-powerbi" }, "powerBIQuery", "New query");
+
+    if (node.type !== "powerBIQuery") {
+      throw new Error("Expected a Power BI query node");
+    }
+    expect(node.data.credentialSource).toBe("nango");
+    expect(getWorkflowBlocks([node], [])[0]).toMatchObject({
+      block_type: "powerbi_query",
+      credential_source: "nango",
+    });
+  });
+
+  test("Power BI preserves connection, DAX, dataset, row cap, and bindings", () => {
+    const block = makePowerBIQueryBlock();
+    const { nodes, edges } = getElements([block], DEFAULT_SETTINGS, true);
+    const node = nodes.find((candidate) => candidate.type === "powerBIQuery");
+
+    expect(node?.data).toMatchObject({
+      connectionId: block.connection_id,
+      credentialSource: "native",
+      datasetId: block.dataset_id,
+      query: block.query,
+      maxRows: 250,
+      parameterKeys: ["powerbi_connection_id", "dataset_id", "region"],
+    });
+
+    const savedFromEditor = getWorkflowBlocks(nodes, edges)[0];
+    expect(savedFromEditor).toMatchObject({
+      block_type: "powerbi_query",
+      connection_id: block.connection_id,
+      credential_source: "native",
+      dataset_id: block.dataset_id,
+      query: block.query,
+      max_rows: 250,
+      parameter_keys: ["powerbi_connection_id", "dataset_id", "region"],
+    });
+    expect(savedFromEditor).not.toHaveProperty("credential_id");
+
+    const savedFromDefinition = convert({
+      workflow_definition: {
+        version: 2,
+        parameters: [],
+        blocks: [block],
+      },
+    } as unknown as WorkflowApiResponse).workflow_definition.blocks[0];
+    expect(savedFromDefinition).toMatchObject({
+      block_type: "powerbi_query",
+      connection_id: block.connection_id,
+      credential_source: "native",
+      dataset_id: block.dataset_id,
+      query: block.query,
+      max_rows: 250,
+      parameter_keys: ["powerbi_connection_id", "dataset_id", "region"],
+    });
+
+    const reloaded = getElements([block], DEFAULT_SETTINGS, true).nodes.find(
+      (candidate) => candidate.type === "powerBIQuery",
+    );
+    expect(reloaded?.data).toMatchObject({
+      connectionId: block.connection_id,
+      datasetId: block.dataset_id,
+      query: block.query,
+      maxRows: 250,
+      parameterKeys: ["powerbi_connection_id", "dataset_id", "region"],
+    });
+  });
+
+  test("Power BI defaults omitted max_rows to 1000 on API import", () => {
+    const block = {
+      ...makePowerBIQueryBlock(),
+      max_rows: undefined,
+    } as unknown as PowerBIQueryBlock;
+    const { nodes, edges } = getElements([block], DEFAULT_SETTINGS, true);
+    const node = nodes.find((candidate) => candidate.type === "powerBIQuery");
+
+    expect(node?.data).toMatchObject({
+      maxRows: 1000,
+      credentialSource: "native",
+    });
+    expect(getWorkflowBlocks(nodes, edges)[0]).toMatchObject({
+      max_rows: 1000,
+      credential_source: "native",
+    });
+
+    const exported = convert({
+      workflow_definition: { version: 2, parameters: [], blocks: [block] },
+    } as unknown as WorkflowApiResponse).workflow_definition.blocks[0];
+    expect(exported).toMatchObject({
+      max_rows: 1000,
+      credential_source: "native",
+    });
+  });
+
+  test("nested Power BI API blocks load and preserve fields through YAML save", () => {
+    const queryBlock = {
+      ...makePowerBIQueryBlock(),
+      label: "Nested Power BI Query",
+      connection_id: "nc_powerbi_test",
+      credential_source: "nango" as const,
+    };
+    const loop: ForLoopBlock = {
+      label: "For each item",
+      block_type: "for_loop",
+      continue_on_failure: false,
+      model: null,
+      next_block_label: null,
+      output_parameter: makeOutputParameter("for_each_item"),
+      loop_over: makeWorkflowParameter("items"),
+      loop_blocks: [queryBlock],
+      loop_variable_reference: "item",
+      complete_if_empty: false,
+      data_schema: null,
+    };
+    const { nodes, edges } = getElements([loop], DEFAULT_SETTINGS, true);
+    const loopNode = nodes.find(
+      (node) => node.type === "loop" && node.data.label === loop.label,
+    );
+    const queryNode = nodes.find((node) => node.type === "powerBIQuery");
+
+    expect(queryNode?.parentId).toBe(loopNode?.id);
+    expect(queryNode?.data).toMatchObject({
+      connectionId: queryBlock.connection_id,
+      credentialSource: "nango",
+      datasetId: queryBlock.dataset_id,
+      query: queryBlock.query,
+      maxRows: queryBlock.max_rows,
+      parameterKeys: ["powerbi_connection_id", "dataset_id", "region"],
+    });
+
+    const exportedFromDefinition = convert({
+      workflow_definition: {
+        version: 2,
+        parameters: [],
+        blocks: [loop],
+      },
+    } as unknown as WorkflowApiResponse).workflow_definition.blocks[0];
+    expect(exportedFromDefinition).toMatchObject({
+      block_type: "for_loop",
+      loop_blocks: [
+        {
+          block_type: "powerbi_query",
+          connection_id: queryBlock.connection_id,
+          credential_source: "nango",
+          dataset_id: queryBlock.dataset_id,
+          query: queryBlock.query,
+          max_rows: queryBlock.max_rows,
+          parameter_keys: ["powerbi_connection_id", "dataset_id", "region"],
+        },
+      ],
+    });
+
+    const savedBlocks = getWorkflowBlocks(nodes, edges);
+    const savedLoop = savedBlocks[0];
+    if (!savedLoop || savedLoop.block_type !== "for_loop") {
+      throw new Error("Nested loop did not save as a for_loop block");
+    }
+    expect(savedLoop.loop_blocks[0]).toMatchObject({
+      block_type: "powerbi_query",
+      connection_id: queryBlock.connection_id,
+      credential_source: "nango",
+      dataset_id: queryBlock.dataset_id,
+      query: queryBlock.query,
+      max_rows: queryBlock.max_rows,
+      parameter_keys: ["powerbi_connection_id", "dataset_id", "region"],
+    });
+
+    const yaml = stringify(
+      buildWorkflowYamlDocument({
+        workflow: {
+          status: "published",
+          is_saved_task: false,
+        } as WorkflowApiResponse,
+        settings: DEFAULT_SETTINGS,
+        title: "Nested Power BI query",
+        description: null,
+        blocks: savedBlocks,
+        parameters: [],
+        definitionVersion: 2,
+      }),
+    );
+    const committed = yamlCommitInputs<
+      WorkflowCreateYAMLRequest["workflow_definition"]
+    >(parse(yaml), yaml);
+    const yamlLoop = committed.definition.blocks[0];
+    if (!yamlLoop || yamlLoop.block_type !== "for_loop") {
+      throw new Error("Nested loop did not survive YAML save");
+    }
+    expect(yamlLoop.loop_blocks[0]).toMatchObject({
+      block_type: "powerbi_query",
+      connection_id: queryBlock.connection_id,
+      credential_source: "nango",
+      dataset_id: queryBlock.dataset_id,
+      query: queryBlock.query,
+      max_rows: queryBlock.max_rows,
+      parameter_keys: ["powerbi_connection_id", "dataset_id", "region"],
+    });
+  });
+
   test("email inbox preserves parameter keys across load and save", () => {
     const credentialParameter = makeWorkflowParameter(
       "microsoft_credential_id",
@@ -437,6 +659,80 @@ describe("round-trip reorder → save → reload (M1 top-level)", () => {
       block_type: "email_inbox",
       parameter_keys: ["microsoft_credential_id"],
       download_attachments: false,
+    });
+  });
+
+  test("Nango Gmail source and connection survive API, editor, YAML, and reload", () => {
+    const block: EmailInboxBlock = {
+      ...makeEmailInboxBlock("Read Gmail", []),
+      email_client: "gmail",
+      credential_id: null,
+      credential_source: "nango",
+      connection_id: "nc_synthetic_gmail",
+    };
+    const { nodes, edges } = getElements([block], DEFAULT_SETTINGS, true);
+    expect(
+      nodes.find((node) => node.type === "emailInbox")?.data,
+    ).toMatchObject({
+      credentialSource: "nango",
+      connectionId: "nc_synthetic_gmail",
+    });
+    const saved = getWorkflowBlocks(nodes, edges);
+    const fromDefinition = convert({
+      workflow_definition: { version: 2, parameters: [], blocks: [block] },
+    } as unknown as WorkflowApiResponse).workflow_definition.blocks[0];
+    expect(fromDefinition).toMatchObject({
+      credential_source: "nango",
+      connection_id: "nc_synthetic_gmail",
+    });
+    const yaml = stringify(
+      buildWorkflowYamlDocument({
+        workflow: {
+          status: "published",
+          is_saved_task: false,
+        } as WorkflowApiResponse,
+        settings: DEFAULT_SETTINGS,
+        title: "Synthetic Gmail",
+        description: null,
+        blocks: saved,
+        parameters: [],
+        definitionVersion: 2,
+      }),
+    );
+    const committed = yamlCommitInputs<
+      WorkflowCreateYAMLRequest["workflow_definition"]
+    >(parse(yaml), yaml);
+    expect(committed.definition.blocks[0]).toMatchObject({
+      credential_source: "nango",
+      connection_id: "nc_synthetic_gmail",
+    });
+    const reloaded = getElements(
+      [{ ...block, ...committed.definition.blocks[0] } as EmailInboxBlock],
+      DEFAULT_SETTINGS,
+      true,
+    );
+    expect(
+      reloaded.nodes.find((node) => node.type === "emailInbox")?.data,
+    ).toMatchObject({
+      credentialSource: "nango",
+      connectionId: "nc_synthetic_gmail",
+    });
+  });
+
+  test("saving Nango Gmail does not fall back to a retained native credential", () => {
+    const block: EmailInboxBlock = {
+      ...makeEmailInboxBlock("Read Gmail", []),
+      email_client: "gmail",
+      credential_id: "goac_synthetic",
+      credential_source: "nango",
+      connection_id: "nc_synthetic_gmail",
+    };
+    const { nodes, edges } = getElements([block], DEFAULT_SETTINGS, true);
+    const yaml = stringify(getWorkflowBlocks(nodes, edges)[0]);
+    expect(parse(yaml)).toMatchObject({
+      credential_id: "goac_synthetic",
+      credential_source: "nango",
+      connection_id: "nc_synthetic_gmail",
     });
   });
 

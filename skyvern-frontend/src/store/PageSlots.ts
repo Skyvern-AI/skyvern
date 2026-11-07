@@ -1,3 +1,4 @@
+import type { WorkflowReliability } from "@/routes/workflows/types/reliabilityTypes";
 import { createContext, useContext } from "react";
 import type { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 
@@ -18,6 +19,19 @@ export type WorkflowRunMilestoneCardProps = Readonly<{
 export type FirstRunWaitCardProps = Readonly<{
   phase: "run_provisioning" | "debug_browser_warming";
 }>;
+
+type BrokerCredentialSelectorBase = Readonly<{
+  credentialSource: "native" | "nango";
+  connectionId: string;
+  disabled: boolean;
+  onChange: (source: "native" | "nango", id: string) => void;
+}>;
+
+export type BrokerCredentialSelectorProps = BrokerCredentialSelectorBase &
+  (
+    | Readonly<{ provider: "powerbi" }>
+    | Readonly<{ provider: "gmail"; nodeId: string; credentialId: string }>
+  );
 
 export type PermissionCapability = Readonly<{
   capability: string;
@@ -47,6 +61,15 @@ export type PermissionsState =
   | Readonly<{ status: "ready"; data: PermissionsResponse }>;
 
 export type PageSlots = {
+  powerBIDatasetPicker?: React.ComponentType<
+    Readonly<{
+      connectionId: string;
+      value: string;
+      disabled: boolean;
+      onChange: (value: string) => void;
+    }>
+  >;
+  brokerCredentialSelector?: React.ComponentType<BrokerCredentialSelectorProps>;
   workflowFindingsScope?: React.ComponentType<
     Readonly<{
       workflowPermanentIds: readonly string[];
@@ -58,6 +81,7 @@ export type PageSlots = {
       workflowPermanentId: string;
       title?: string;
       surface: "list" | "editor";
+      reliability?: WorkflowReliability;
     }>
   >;
   workflowCuratorSettings?: React.ComponentType<

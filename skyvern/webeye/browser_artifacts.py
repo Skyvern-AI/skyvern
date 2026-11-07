@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
 import aiofiles
 import structlog
@@ -56,6 +57,14 @@ class DownloadBinding(str, Enum):
     SESSION_DIR = "session_dir"
 
 
+@dataclass(frozen=True)
+class CdpContextReceipt:
+    """The context a CDP attach used: reused as the browser had it, or created with exactly ``viewport``."""
+
+    source: Literal["existing", "new"]
+    viewport: tuple[int, int] | None = None
+
+
 class VideoArtifact(BaseModel):
     video_path: str | None = None
     video_artifact_id: str | None = None
@@ -92,6 +101,8 @@ class BrowserArtifacts(BaseModel):
     # None when none was requested or the chosen creator could not load one (remote/vendor browsers,
     # storage miss, corruption fallback) — consumers must treat None as "profile not applied".
     applied_browser_profile_id: str | None = None
+    # The saved profile an attached persistent session reports it loaded remotely; never read by whole-dir write-back.
+    session_loaded_browser_profile_id: str | None = None
     local_display_recording_eligible: bool = False
     # ((input_w, input_h), (output_w, output_h)) for the whole-display recorder, resolved from the final
     # launch --window-size at the configure seam and carried to the acquire seam. None → fixed full screen.
@@ -126,7 +137,12 @@ class BrowserArtifacts(BaseModel):
     _requested_graphics_flags: tuple[str, ...] | None = PrivateAttr(default=None)
     # Whether the creator started this browser's process on this host itself, rather than dialing one.
     _spawned_local_browser: bool = PrivateAttr(default=False)
+    # (context, receipt): the receipt only describes that exact context object, never a later one.
+    _cdp_context: tuple[object, CdpContextReceipt] | None = PrivateAttr(default=None)
     _native_downloads: NativeDownloads | None = PrivateAttr(default=None)
+    # Log-only provider session id for runtime events. Unlike remote_browser_session_id it must not drive
+    # page selection, downloads or any other behavior.
+    _provider_session_id: str | None = PrivateAttr(default=None)
 
     @property
     def native_downloads(self) -> NativeDownloads | None:
@@ -156,12 +172,33 @@ class BrowserArtifacts(BaseModel):
     def requested_graphics_flags(self) -> tuple[str, ...] | None:
         return self._requested_graphics_flags
 
+    def note_provider_session_id(self, session_id: str | None) -> None:
+        self._provider_session_id = session_id or None
+
+    @property
+    def provider_session_id(self) -> str | None:
+        return self._provider_session_id
+
     def note_spawned_local_browser(self) -> None:
         self._spawned_local_browser = True
 
     @property
     def spawned_local_browser(self) -> bool:
         return self._spawned_local_browser
+
+    def note_cdp_context(
+        self, browser_context: object, source: Literal["existing", "new"], viewport: object = None
+    ) -> None:
+        size = None
+        if source == "new" and isinstance(viewport, dict):
+            width, height = viewport.get("width"), viewport.get("height")
+            if isinstance(width, int) and isinstance(height, int):
+                size = (width, height)
+        self._cdp_context = (browser_context, CdpContextReceipt(source, size))
+
+    def cdp_context_for(self, browser_context: object) -> CdpContextReceipt | None:
+        noted = self._cdp_context
+        return noted[1] if noted is not None and noted[0] is browser_context else None
 
     def attach_action_download_source(self, source: ActionDownloadSource | None) -> None:
         self._action_download_source = source

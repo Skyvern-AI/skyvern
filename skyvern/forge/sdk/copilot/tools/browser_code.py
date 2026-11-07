@@ -8,7 +8,7 @@ import json
 import math
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import structlog
@@ -20,6 +20,7 @@ from skyvern.cli.core.session_manager import get_page, resolve_browser
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.browser_code_contract import (
     DEMONSTRATED_OPERATIONS,
+    DENIED_WHILE_TAINTED,
     BrowserCodeCellResult,
     BrowserCodeHost,
     BrowserCodeOperation,
@@ -88,8 +89,22 @@ MAX_CODE_CHARS = 20_000
 MAX_VALUE_CHARS = 32_000
 SESSION_LIFETIME_SECONDS = float(TOTAL_TIMEOUT_SECONDS + HARD_BACKSTOP_ALLOWANCE_SECONDS)
 
-TOOL_DESCRIPTION = (
-    f"""Run Python against the live browser in a persistent interpreter.
+
+_TAINTED_PAGE_SENTENCE = (
+    "After a test run that used a saved credential or a secret parameter in this browser, these are refused here "
+    "for the rest of the turn: "
+    + ", ".join(f"`{name}`" for name in sorted(DENIED_WHILE_TAINTED))
+    + ", `page.context.request.get` and `search_web`. Locator waits, `.count()`, `.is_visible()`, text reads, "
+    "clicks, fills and navigation still run; reading text is the way to inspect such a page."
+)
+
+
+def render_browser_code_description(pattern_calls: Sequence[str]) -> str:
+    pattern_clause = (
+        f" Compiled `re` patterns are accepted only by: {', '.join(pattern_calls)}." if pattern_calls else ""
+    )
+    return (
+        f"""Run Python against the live browser in a persistent interpreter.
 
 `target` names the browser: 'debug' (default) is the one this chat drives; 'last_run' is the one the
 most recent test run executed in, when that run minted its own. A continuation on the page a run
@@ -109,9 +124,10 @@ Browser API (async, Playwright-shaped):
   `page.keyboard.press(key)`. `.click()` and `.press(key)` wait for a navigation they start until the new
   page starts loading, not until it has loaded; the other actions, `page.keyboard.press`, and a navigation
   the page's script starts later, such as after a timer or a network request, are not waited for.
-- Waits: `page.wait_for_selector(...)`, `page.wait_for_url(...)`, `page.wait_for_load_state(...)`,
-  `locator.wait_for(...)`. `wait_for_selector` and `locator.wait_for` keep polling while a navigation
-  replaces the page, until the element matches or the timeout ends.
+- Waits: `page.wait_for_selector(...)`, `page.wait_for_url(url)`, `page.wait_for_load_state(...)`,
+  `locator.wait_for(...)`. `page.wait_for_url(url)` takes a URL string or glob.{pattern_clause}
+  `wait_for_selector` and `locator.wait_for` keep polling while a navigation replaces the page, until the
+  element matches or the timeout ends.
 - DOM reads: `.text_content()`, `.inner_text()`, `.get_attribute(name)`, `.input_value()`, `.count()`,
   `.is_visible()`, `page.content()`, `page.evaluate(js)`, `page.title()`, and `page.url`. `.count()`
   and `.is_visible()` answer once, for the page present at the call: while a navigation replaces it,
@@ -119,8 +135,7 @@ Browser API (async, Playwright-shaped):
 - Navigation: `page.goto(url)`, `page.go_back()`, `page.reload()`. Internal, private-network, and
   non-web destinations are refused.
 - Frames: `page.frames`, `page.main_frame`, `page.frame_locator(css)`.
-- After a test run that used a saved secret in this browser, screenshots, `page.evaluate` and `search_web` are
-  refused here for the rest of the turn. Reading text still works; that is the way to inspect such a page.
+- {_TAINTED_PAGE_SENTENCE}
 - Tabs and popups: each call starts on the browser's current tab.
   `await tabs()` lists open tabs; `await switch_tab(index)` makes that tab `page` for the rest of the call;
   `await click_and_wait_for_popup(selector)` clicks and returns the new tab's `index` and `url`.
@@ -143,8 +158,8 @@ Browser API (async, Playwright-shaped):
 - workbench-only, not valid in a saved block: `tabs`, `switch_tab`, `click_and_wait_for_popup`,
   `click_and_download`, and `files`. A saved block claims a download with
   `"""
-    + DownloadClaimHelperContract().call
-    + f"""`, which is not available here;
+        + DownloadClaimHelperContract().call
+        + f"""`, which is not available here;
   `get_block_schema` for block type `code` returns its parameters.
 
 Not available: imports, names starting with `_`, event listeners (`page.on`, `expect_*`), cookies,
@@ -165,7 +180,10 @@ block should read and promoted unchanged.
 Limits: code up to {MAX_CODE_CHARS:,} characters; `value` up to {MAX_VALUE_CHARS:,} characters of JSON and `stdout` up to 16 KB,
 cut beyond that, so return or print a summary; the first 50 operations are listed; a chat turn holds at
 most 32 files of 16 MB each."""
-)
+    )
+
+
+TOOL_DESCRIPTION = render_browser_code_description(())
 
 TOOL_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -634,6 +652,7 @@ async def _run_bound_cell(
                         dict(notes),
                         disposition=disposition,
                         deadline_expired=copilot_ctx.browser_session_continuity_deadline_expired,
+                        acquisition_failure=copilot_ctx.browser_session_continuity_acquisition_failure,
                     ),
                     **last_run_facts(copilot_ctx, call_browser_session_id),
                 }

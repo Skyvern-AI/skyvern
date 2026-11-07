@@ -298,6 +298,8 @@ Each mapped error looks like `{"error_code": "login_failed", "reasoning": "...",
 
 Skyvern also adds its own codes to `errors`: `REACH_MAX_STEPS`, `REACH_MAX_RETRIES`, `OTP_ERROR`, `OTP_TIMEOUT`, `OTP_EXPIRED`, and `MISSING_TOTP_SOURCE`.
 
+An error from a failed block also names it: `workflow_run_block_id`, `block_label`, `block_type`, `loop_index` (null outside a loop), and `final_url`. A failed code block adds `exception_class`, `exception_message`, `failing_line`, and `source_line`, any of which can be null.
+
 ### Failure categories
 
 Agent runs that end in `failed`, `terminated`, or `timed_out` get a `failure_category` list. Each entry has a `category`, a `confidence_float`, and `reasoning`. The first entry is the most likely cause. The app shows it as a badge on the run.
@@ -381,7 +383,7 @@ const local = await client.runTask({
 | `RESIDENTIAL_AR`, `_AU`, `_BR`, `_CA`, `_DE`, `_ES`, `_FR`, `_GB`, `_IE`, `_IN`, `_IT`, `_JP`, `_KR`, `_MX`, `_NL`, `_NZ`, `_PH`, `_SA`, `_TR`, `_ZA` | Residential IP in that country, for example `RESIDENTIAL_DE`. |
 | `NONE` | No proxy. |
 
-`US-CA`, `US-NY`, `US-TX`, `US-FL`, and `US-WA` are deprecated and route through `RESIDENTIAL_ISP`. For a US state or a city, pass a `GeoTarget` object instead: `country` (ISO code, required), `subdivision` (for example `CA`), and `city` (English name). Geo targets accept the same 21 countries: US plus the country codes above. City and state pools are smaller. If one is unavailable, widen the target from city to state to country.
+`US-CA`, `US-NY`, `US-TX`, `US-FL`, and `US-WA` are deprecated and route through `RESIDENTIAL_ISP`. For a US state or a city, pass a `GeoTarget` object instead: `country` (ISO code, required), `subdivision` (for example `CA`), and `city` (English name). Geo targets accept the same 21 countries: US plus the country codes above. City and state pools are smaller. When the proxy provider repeatedly reports that it has no exit for the requested city or state, Skyvern falls back to the country for that proxy request, so the browser starts from elsewhere in that country instead of failing. The fallback is not remembered: the next proxy request, such as a retry or relaunch, tries your city or state first again.
 
 <Note>
 A browser profile does not keep the proxy it was created with. To reach a site from the same IP on every run, pin a proxy on the profile. See [Browsers](/browsers).

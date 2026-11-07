@@ -1,4 +1,5 @@
 import asyncio
+import functools
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta, timezone, tzinfo
@@ -7,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from fastapi import FastAPI
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
@@ -14,6 +16,7 @@ from sqlalchemy.pool import StaticPool
 from skyvern.config import settings
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.api_app import create_api_app
+from skyvern.forge.forge_app_initializer import start_forge_app
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.models import Base, PersistentBrowserSessionModel
 from skyvern.forge.sdk.db.repositories.browser_sessions import BrowserSessionsRepository
@@ -30,6 +33,7 @@ from skyvern.webeye.default_persistent_sessions_manager import DefaultPersistent
 from skyvern.webeye.persistent_sessions_manager import PersistentSessionsManager
 from skyvern.webeye.real_browser_state import RealBrowserState
 from tests.unit.scoped_asyncio import ScopedAsyncio
+from tests.unit.shared_route_app import api_app_build_settings, lend_app
 
 TOKEN = "tok-9f3c1d7e5b"
 CDP_URL = f"wss://127.0.0.1:9333/devtools/browser/b1?token={TOKEN}"
@@ -88,6 +92,11 @@ def external_session_row(
     )
 
 
+@functools.cache
+def _registration_api_app() -> FastAPI:
+    return create_api_app()
+
+
 @asynccontextmanager
 async def external_cdp_stack() -> AsyncIterator[SimpleNamespace]:
     """The registration route and the OSS manager over one in-memory database, authenticated as ORG_A."""
@@ -96,7 +105,9 @@ async def external_cdp_stack() -> AsyncIterator[SimpleNamespace]:
         await conn.run_sync(Base.metadata.create_all, tables=[PersistentBrowserSessionModel.__table__])
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     repo = BrowserSessionsRepository(session_factory=session_factory)
-    http_app = create_api_app()
+    registration_app = _registration_api_app()
+    # create_api_app() installs a fresh forge app on every call, so a reused build still needs one per stack.
+    start_forge_app(load_api_modules=True)
     DefaultPersistentSessionsManager.instance = None
     DefaultPersistentSessionsManager._browser_sessions = {}
     DefaultPersistentSessionsManager._background_tasks = set()
@@ -105,13 +116,15 @@ async def external_cdp_stack() -> AsyncIterator[SimpleNamespace]:
     DefaultPersistentSessionsManager._external_deadlines = {}
     manager = DefaultPersistentSessionsManager(database=SimpleNamespace(browser_sessions=repo))
     caller = SimpleNamespace(organization_id=ORG_A)
-    http_app.dependency_overrides[org_auth_service.get_current_org] = lambda: SimpleNamespace(
-        organization_id=caller.organization_id
-    )
     route_app = SimpleNamespace(
         DATABASE=manager.database, PERSISTENT_SESSIONS_MANAGER=manager, STORAGE=None, AGENT_FUNCTION=AgentFunction()
     )
+    app_patches = pytest.MonkeyPatch()
     try:
+        http_app = lend_app(registration_app, app_patches, api_app_build_settings())
+        http_app.dependency_overrides[org_auth_service.get_current_org] = lambda: SimpleNamespace(
+            organization_id=caller.organization_id
+        )
         with (
             patch.object(routes_mod, "app", route_app),
             patch.object(settings, "LOG_RAW_API_REQUESTS", True),
@@ -127,6 +140,7 @@ async def external_cdp_stack() -> AsyncIterator[SimpleNamespace]:
         for deadline in manager._external_deadlines.values():
             deadline.cancel()
         await engine.dispose()
+        app_patches.undo()
 
 
 class DeadlineClock:

@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 from skyvern.schemas.self_heal import HealSkipReason
@@ -21,6 +22,7 @@ from skyvern.webeye.browser_artifacts import BrowserArtifacts
 class FakeBrowserState:
     def __init__(self) -> None:
         self.browser_artifacts = BrowserArtifacts()
+        self.engine_selection = None
 
     async def get_working_page(self) -> object:
         return SimpleNamespace(context=MagicMock())
@@ -38,6 +40,12 @@ class FakeWorkflowRunContext:
     browser_session_id = None
     workflow_run_outputs: list[object] = []
     workflow = None
+
+    reject_platform_smtp_template_references = WorkflowRunContext.reject_platform_smtp_template_references
+    agent_unmasked_platform_secret_ids = staticmethod(set)
+
+    def __init__(self) -> None:
+        self.parameters: dict[str, object] = {}
 
     def get_block_metadata(self, label: str | None) -> dict[str, object]:
         return {}

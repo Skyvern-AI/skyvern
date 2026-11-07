@@ -9,21 +9,23 @@ used to be swallowed by the handler's catch-all ``except Exception`` and re-wrap
 from __future__ import annotations
 
 import datetime as dt
-import importlib
+from collections.abc import Iterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from fastapi import FastAPI, Request
+from fastapi import Request
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
 from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge.sdk.db.repositories.workflows import WorkflowCreationLockTimeout
-from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.workflow.models.block import FileDownloadBlock
+from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
 from skyvern.schemas.runs import RunEngine
+from tests.unit.shared_route_app import shared_route_app
 
 ORG_ID = "o_test"
 
@@ -39,23 +41,20 @@ def _make_org() -> Organization:
 
 
 @pytest.fixture(scope="module")
-def client() -> TestClient:
-    importlib.import_module("skyvern.forge.sdk.routes.agent_protocol")
+def client() -> Iterator[TestClient]:
+    with pytest.MonkeyPatch.context() as module_patches:
+        app = shared_route_app(module_patches)
 
-    app = FastAPI()
-    app.include_router(base_router, prefix="/v1")
-    app.include_router(legacy_base_router, prefix="/v1")
+        # Mirror api_app.py so a raised SkyvernHTTPException renders as its own status code
+        # (e.g. the pre-fix FailedToUpdateWorkflow would render as 500 here, not be re-raised).
+        @app.exception_handler(SkyvernHTTPException)
+        async def _handle_skyvern_http_exception(request: Request, exc: SkyvernHTTPException) -> JSONResponse:
+            return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
 
-    # Mirror api_app.py so a raised SkyvernHTTPException renders as its own status code
-    # (e.g. the pre-fix FailedToUpdateWorkflow would render as 500 here, not be re-raised).
-    @app.exception_handler(SkyvernHTTPException)
-    async def _handle_skyvern_http_exception(request: Request, exc: SkyvernHTTPException) -> JSONResponse:
-        return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
+        app.dependency_overrides[org_auth_service.get_current_org] = _make_org
+        app.dependency_overrides[org_auth_service.get_current_user_id_or_none] = lambda: None
 
-    app.dependency_overrides[org_auth_service.get_current_org] = _make_org
-    app.dependency_overrides[org_auth_service.get_current_user_id_or_none] = lambda: None
-
-    return TestClient(app)
+        yield TestClient(app)
 
 
 def test_update_workflow_without_definition_returns_422(client: TestClient) -> None:
@@ -77,7 +76,7 @@ def test_workflow_save_lock_timeout_returns_retryable_conflict(client: TestClien
     ):
         if legacy:
             response = client.put(
-                "/v1/workflows/wpid_test",
+                "/api/v1/workflows/wpid_test",
                 content=yaml_definition,
                 headers={"Content-Type": "application/x-yaml"},
             )
@@ -102,6 +101,55 @@ def _stored_workflow() -> Workflow:
         created_at=now,
         modified_at=now,
     )
+
+
+def test_workflow_detail_masks_inline_secrets_without_mutating_stored_workflow(client: TestClient) -> None:
+    now = dt.datetime.now(dt.timezone.utc)
+    output = OutputParameter(
+        output_parameter_id="op_download",
+        workflow_id="w_test",
+        key="download_output",
+        created_at=now,
+        modified_at=now,
+    )
+    private_key = "synthetic-private-key-for-api-read"
+    workflow = Workflow(
+        workflow_id="w_test",
+        organization_id=ORG_ID,
+        title="t",
+        workflow_permanent_id="wpid_test",
+        version=1,
+        is_saved_task=False,
+        workflow_definition=WorkflowDefinition(
+            parameters=[output],
+            blocks=[
+                FileDownloadBlock(
+                    label="download",
+                    output_parameter=output,
+                    sftp_private_key=private_key,
+                    sftp_password="synthetic-password-for-api-read",
+                    sftp_host_key="public-host-key",
+                )
+            ],
+        ),
+        created_at=now,
+        modified_at=now,
+    )
+    mock_app = MagicMock()
+    mock_app.WORKFLOW_SERVICE.get_workflow_by_permanent_id = AsyncMock(return_value=workflow)
+    mock_app.DATABASE.workflows.is_workflow_copilot_authored = AsyncMock(return_value=False)
+    with (
+        patch("skyvern.forge.sdk.routes.agent_protocol.app", mock_app),
+        patch("skyvern.forge.sdk.routes.agent_protocol.effective_default_engine", AsyncMock(return_value=None)),
+    ):
+        response = client.get("/v1/workflows/wpid_test")
+
+    assert response.status_code == 200, response.text
+    visible_block = response.json()["workflow_definition"]["blocks"][0]
+    assert visible_block["sftp_private_key"] == "[REDACTED]"
+    assert visible_block["sftp_password"] == "[REDACTED]"
+    assert visible_block["sftp_host_key"] == "public-host-key"
+    assert workflow.workflow_definition.blocks[0].sftp_private_key == private_key
 
 
 @pytest.mark.parametrize("computed", [None, RunEngine.skyvern_v3])

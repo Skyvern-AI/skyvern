@@ -6,6 +6,7 @@ import io
 import os
 import shutil
 import subprocess
+import zipfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import zstandard as zstd
 from freezegun import freeze_time
+from structlog.testing import capture_logs
 
 import skyvern.forge.sdk.artifact.storage.base as base_module
 import skyvern.forge.sdk.artifact.storage.s3 as s3_module
@@ -653,7 +655,7 @@ class TestS3StorageBrowserSessionFiles:
 
         original_create = s3_storage.async_client.create_presigned_urls
 
-        async def flaky_create(uris: list[str]) -> list[str] | None:
+        async def flaky_create(uris: list[str], **_: object) -> list[str] | None:
             if len(uris) > 1:
                 return None  # simulate batch failure
             return await original_create(uris)
@@ -692,7 +694,7 @@ class TestS3StorageBrowserSessionFiles:
 
         original_create = s3_storage.async_client.create_presigned_urls
 
-        async def flaky_create(uris: list[str]) -> list[str] | None:
+        async def flaky_create(uris: list[str], **_: object) -> list[str] | None:
             if len(uris) > 1:
                 return None  # force per-key fallback
             if uris[0].endswith("f_1.csv"):
@@ -746,7 +748,7 @@ class TestS3StorageBrowserSessionFiles:
         original_create = s3_storage.async_client.create_presigned_urls
         seen_keys: list[list[str]] = []
 
-        async def tracking_create(uris: list[str]) -> list[str] | None:
+        async def tracking_create(uris: list[str], **_: object) -> list[str] | None:
             seen_keys.append(list(uris))
             return await original_create(uris)
 
@@ -1338,6 +1340,80 @@ async def test_retrieve_browser_profile_extracts_sub_buffer_size_archive(
     assert [entry.name for entry in tmp_path.iterdir()] == [Path(profile_dir).name]
 
 
+_EXTENSION_ID = "a" * 32
+_RULESET_BYTES = 4096
+
+
+@pytest.mark.asyncio
+async def test_store_browser_profile_leaves_regenerated_extension_rules_out_of_the_archive(
+    s3_storage: S3Storage, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Each run loads its extensions from a new path, so Chrome indexes a fresh DNR ruleset under a new extension
+    # id and never prunes the old ones; archiving them grew one profile to 2.7 GiB extracted.
+    profile = tmp_path / "profile"
+    (profile / "Default" / "Network").mkdir(parents=True)
+    (profile / "Default" / "Network" / "Cookies").write_bytes(b"cookies")
+    settings_dir = profile / "Default" / "Local Extension Settings" / _EXTENSION_ID
+    settings_dir.mkdir(parents=True)
+    (settings_dir / "000003.log").write_bytes(b"settings")
+    rules_dir = profile / "Default" / "DNR Extension Rules" / _EXTENSION_ID
+    rules_dir.mkdir(parents=True)
+    (rules_dir / "ruleset.bin").write_bytes(b"r" * _RULESET_BYTES)
+    monkeypatch.setattr(settings, "TEMP_PATH", str(tmp_path / "temp"))
+
+    archived: list[str] = []
+
+    async def capture_upload(uri: str, path: str, **kwargs: object) -> None:
+        with zipfile.ZipFile(path) as archive:
+            archived.extend(archive.namelist())
+
+    s3_storage.async_client = MagicMock()
+    s3_storage.async_client.upload_file_from_path = AsyncMock(side_effect=capture_upload)
+
+    with capture_logs() as events:
+        await s3_storage.store_browser_profile("o", "bp", str(profile))
+
+    assert "Default/Network/Cookies" in archived
+    assert f"Default/Local Extension Settings/{_EXTENSION_ID}/000003.log" in archived
+    assert not [name for name in archived if "DNR Extension Rules" in name]
+    # The run's live profile directory is left alone: Chrome may still be using it mid-run.
+    assert (rules_dir / "ruleset.bin").exists()
+    archived_event = next(event for event in events if event["event"] == "Archived browser profile")
+    assert archived_event["excluded_bytes"] == _RULESET_BYTES
+    assert archived_event["zip_bytes"] > 0
+    assert not list((tmp_path / "temp").glob("*.zip"))
+
+
+@pytest.mark.asyncio
+async def test_retrieve_browser_profile_skips_regenerated_extension_rules_already_in_the_archive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Archives written before the exclusion existed still carry the rules; restoring them would put gigabytes back
+    # into the pod's scratch volume on every run, so they are dropped on the way in and the next store is clean.
+    zip_bytes = _build_zip(
+        {
+            "Default/Network/Cookies": b"cookies",
+            f"Default/Local Extension Settings/{_EXTENSION_ID}/000003.log": b"settings",
+            f"Default/DNR Extension Rules/{_EXTENSION_ID}/ruleset.bin": b"r" * _RULESET_BYTES,
+        }
+    )
+    storage = S3Storage()
+    storage.async_client = MagicMock()
+    storage.async_client.download_file = AsyncMock(return_value=zip_bytes)
+    monkeypatch.setattr(settings, "TEMP_PATH", str(tmp_path))
+
+    with capture_logs() as events:
+        profile_dir = await storage.retrieve_browser_profile("o", "bp")
+
+    assert profile_dir is not None
+    assert (Path(profile_dir) / "Default" / "Network" / "Cookies").read_bytes() == b"cookies"
+    assert (Path(profile_dir) / "Default" / "Local Extension Settings" / _EXTENSION_ID / "000003.log").exists()
+    assert not (Path(profile_dir) / "Default" / "DNR Extension Rules").exists()
+    retrieved = next(event for event in events if event["event"] == "Retrieved browser profile archive")
+    assert retrieved["skipped_bytes"] == _RULESET_BYTES
+    assert [entry.name for entry in tmp_path.iterdir()] == [Path(profile_dir).name]
+
+
 @pytest.mark.asyncio
 async def test_delete_browser_profile_hard_raises_soft_swallows() -> None:
     # hard_delete must PROPAGATE an S3 failure (raise_on_error=True) so the reap can't falsely report a
@@ -1382,14 +1458,16 @@ class TestS3ShareLinkSensitiveCap:
         s3_storage.async_client.create_presigned_urls = AsyncMock(return_value=["https://s3/file"])
         artifact = _share_artifact(ArtifactType.DOWNLOAD, f"s3://{TEST_BUCKET}/file.pdf")
         assert await s3_storage.get_share_link(artifact) == "https://s3/file"
-        s3_storage.async_client.create_presigned_urls.assert_awaited_once_with([artifact.uri])
+        s3_storage.async_client.create_presigned_urls.assert_awaited_once_with(
+            [artifact.uri], attachment_filenames=[None]
+        )
 
     async def test_mixed_batch_preserves_order_and_routes_by_type(self, s3_storage: S3Storage) -> None:
         download = _share_artifact(ArtifactType.DOWNLOAD, f"s3://{TEST_BUCKET}/file.pdf")
         screenshot = _share_artifact(ArtifactType.SCREENSHOT_FINAL, f"s3://{TEST_BUCKET}/shot.png")
         recording = _share_artifact(ArtifactType.RECORDING, f"s3://{TEST_BUCKET}/rec.webm")
 
-        async def fake_presign(uris: list[str], expires_in: int | None = None) -> list[str]:
+        async def fake_presign(uris: list[str], expires_in: int | None = None, **_: object) -> list[str]:
             suffix = "capped" if expires_in is not None else "default"
             return [f"{uri}?{suffix}" for uri in uris]
 
@@ -1405,7 +1483,7 @@ class TestS3ShareLinkSensitiveCap:
         screenshot = _share_artifact(ArtifactType.SCREENSHOT_LLM, f"s3://{TEST_BUCKET}/shot.png")
         download = _share_artifact(ArtifactType.DOWNLOAD, f"s3://{TEST_BUCKET}/file.pdf")
 
-        async def fake_presign(uris: list[str], expires_in: int | None = None) -> list[str] | None:
+        async def fake_presign(uris: list[str], expires_in: int | None = None, **_: object) -> list[str] | None:
             return None if expires_in is not None else [f"{uri}?ok" for uri in uris]
 
         s3_storage.async_client.create_presigned_urls = AsyncMock(side_effect=fake_presign)

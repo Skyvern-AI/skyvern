@@ -5,11 +5,13 @@ import os
 import socket
 import time
 import uuid
+import weakref
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from datetime import timedelta
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 import structlog
 
@@ -22,29 +24,143 @@ if TYPE_CHECKING:
 
 LOG = structlog.get_logger()
 INTERVAL_SECONDS = 60
+HEARTBEAT_ERROR_RETRY_SECONDS = 1
 SHUTDOWN_DRAIN_SECONDS = 15
 _pid: int | None = None
 _owner_id: str | None = None
 _enabled = False
 _wake = asyncio.Event()
+_stop = asyncio.Event()
 _lease_write_lock = asyncio.Lock()
 _registry: dict[str, _Registration] = {}
 _kept_leases: set[str] = set()
 _held: set[str] = set()
 _tasks: set[asyncio.Task[None]] = set()
+_reaper_task: asyncio.Task[None] | None = None
 _side_effect_tasks: set[asyncio.Task[None]] = set()
 _side_effect_limit = asyncio.Semaphore(10)
+# Tasks this module already cancelled; a second cancellation would interrupt the cleanup the first one started.
+_interrupted: weakref.WeakSet[asyncio.Task[Any]] = weakref.WeakSet()
 
 
 @dataclass
 class _Registration:
     run_type: str
     attempt_number: int | None
-    count: int = 0
     task: asyncio.Task[Any] | None = None
+    # (task, binding) of every execution still registered here, in registration order. Identity is membership in
+    # this list, not the last registrant: a same-attempt sibling that departs leaves `task` at its own dead task,
+    # so the last-registrant test alone would report a live execution as superseded.
+    live: list[tuple[asyncio.Task[Any] | None, int]] = field(default_factory=list)
     acquired: bool = False
     lost: bool = False
     finalized: bool = False
+    # A different attempt replaced this registration while it was live; its executions stay displaced after exits.
+    displaced: bool = False
+    # Advanced when the same attempt rebinds to another task, so earlier task bindings stay revoked.
+    binding: int = 0
+    # Registrations open where this one was entered: an inline child's task is awaited by its parent's.
+    enclosing: tuple[_Registration, ...] = field(default=(), repr=False)
+    cancel_seen: bool = False
+    # This execution's own conditional write set the run canceled; delivery must not interrupt its cleanup.
+    internal_cancel_won: bool = False
+
+    @property
+    def count(self) -> int:
+        # How many executions hold this registration; one source of truth with the live bindings above.
+        return len(self.live)
+
+
+@dataclass(frozen=True, eq=False)
+class RunOwner:
+    """One execution's claim on a run in this process: the live registration and the task bound to it."""
+
+    registration: _Registration
+    task: asyncio.Task[Any] | None
+    binding: int = 0
+
+    def is_same(self, other: RunOwner | None) -> bool:
+        # A same-attempt re-registration keeps the entry but rebinds its task, so registration, task and binding
+        # must all match; a task that rebinds back later is a new binding.
+        return (
+            other is not None
+            and other.registration is self.registration
+            and other.task is self.task
+            and other.binding == self.binding
+        )
+
+
+# Captured when track_run registers, so a coroutine keeps its own execution's owner after a successor registers.
+_execution_owners: ContextVar[dict[str, RunOwner] | None] = ContextVar("run_execution_owners", default=None)
+
+
+def run_owner(run_id: str) -> RunOwner | None:
+    return (_execution_owners.get() or {}).get(run_id)
+
+
+def is_registered_owner(run_id: str, owner: RunOwner | None) -> bool:
+    # Current execution authority: the newest binding this registration issued, still live and never displaced.
+    # Adoption, lease hand-over and engine ownership must follow this, never mere membership — an older binding a
+    # rebind revoked, or a binding a departed sibling left behind, stays revoked.
+    if owner is None:
+        return False
+    entry = _registry.get(run_id)
+    if entry is None or entry is not owner.registration:
+        return False
+    return entry.binding == owner.binding and not entry.displaced and (owner.task, owner.binding) in entry.live
+
+
+def is_superseded_owner(run_id: str, owner: RunOwner | None) -> bool:
+    # True only when a viable successor holds the run: the newest binding this registration issued is still live and
+    # is not this owner's. A departed sibling, an older remaining binding, and a live binding that an even newer one
+    # already revoked all fail that test — none of them can adopt or claim what would be handed over.
+    if owner is None:
+        return False
+    entry = _registry.get(run_id)
+    if entry is None:
+        return False
+    # Only the newest binding this registration issued can adopt and finish the run's disposal, so a deferral may be
+    # handed over only while THAT binding is live; every other case leaves the deferral with its own execution.
+    if entry.binding not in {binding for _task, binding in entry.live}:
+        return False
+    if entry is not owner.registration:
+        return True
+    return entry.binding > owner.binding
+
+
+def is_newer_live_owner(run_id: str, owner: RunOwner | None, other: RunOwner | None) -> bool:
+    # `other` is another execution still registered in its own registration, even after a rebind revoked its
+    # authority or another attempt replaced that registration: disposal protection only, never execution authority.
+    if owner is None or other is None or other.is_same(owner):
+        return False
+    if (other.task, other.binding) not in other.registration.live:
+        return False
+    return other.registration is not owner.registration or other.binding > owner.binding
+
+
+def is_displaced_owner(owner: RunOwner | None) -> bool:
+    # Permanent for this execution's binding, unlike supersession: it stays true after the successor exits. A normal
+    # release is not displacement, and an unregistered or untracked caller (no owner) is never displaced.
+    return owner is not None and (owner.registration.displaced or owner.registration.binding != owner.binding)
+
+
+class RunExecution(NamedTuple):
+    """A registration as bound when an execution entered it; the registration itself is re-bound in place."""
+
+    entry: _Registration
+    task: asyncio.Task[Any] | None
+    attempt_number: int | None
+
+    def is_current(self, run_id: str) -> bool:
+        return (
+            self.task is not None
+            and _registry.get(run_id) is self.entry
+            and self.entry.task is self.task
+            and self.entry.attempt_number == self.attempt_number
+        )
+
+
+_open_executions: ContextVar[tuple[RunExecution, ...]] = ContextVar("run_liveness_open_executions", default=())
 
 
 def owner_id() -> str:
@@ -75,10 +191,21 @@ def _register(
     _kept_leases.discard(run_id)
     entry = _registry.get(run_id)
     if entry is None or entry.attempt_number != attempt_number:
-        entry = _Registration(run_type, attempt_number)
+        if entry is not None:
+            entry.displaced = True
+        entry = _Registration(run_type, attempt_number, enclosing=_open_entries())
         _registry[run_id] = entry
-    entry.count += 1
+    elif entry.task is not task:
+        entry.binding += 1
+    if entry.task is not task:
+        entry.cancel_seen = False
+        entry.internal_cancel_won = False
+        if task is not None:
+            # A held run's scope is where it executes: the dispatcher that held it may be another live run.
+            entry.enclosing = _open_entries()
+    binding = entry.binding
     entry.task = task
+    entry.live.append((task, binding))
     _wake.set()
     released = False
 
@@ -87,8 +214,11 @@ def _register(
         if released:
             return
         released = True
-        entry.count -= 1
-        if entry.count == 0 and _registry.get(run_id) is entry:
+        try:
+            entry.live.remove((task, binding))
+        except ValueError:
+            pass
+        if not entry.live and _registry.get(run_id) is entry:
             if cancelled:
                 _kept_leases.add(run_id)
             del _registry[run_id]
@@ -104,6 +234,15 @@ def track_run(run_id: str, run_type: str, attempt_number: int | None = None) -> 
     except RuntimeError:
         task = None
     release = _register(run_id, run_type, attempt_number, task)
+    enclosing = _open_executions.get()
+    entry = _registry.get(run_id) if _enabled else None
+    owners_token = (
+        _execution_owners.set({**(_execution_owners.get() or {}), run_id: RunOwner(entry, entry.task, entry.binding)})
+        if entry is not None
+        else None
+    )
+    if entry is not None:
+        _open_executions.set((*enclosing, RunExecution(entry, entry.task, entry.attempt_number)))
     cancelled = False
     try:
         yield
@@ -111,7 +250,30 @@ def track_run(run_id: str, run_type: str, attempt_number: int | None = None) -> 
         cancelled = True
         raise
     finally:
+        _open_executions.set(enclosing)
         release(cancelled)
+        if owners_token is not None:
+            _execution_owners.reset(owners_token)
+
+
+def _open_entries() -> tuple[_Registration, ...]:
+    return tuple(scope.entry for scope in _open_executions.get())
+
+
+def current_execution(run_id: str) -> RunExecution | None:
+    """The caller's own execution of the run, if the registration is still bound as that execution entered it."""
+    return next((scope for scope in _open_executions.get() if scope.is_current(run_id)), None)
+
+
+def note_internal_cancel_won(run_id: str, execution: RunExecution | None) -> None:
+    """Record that the execution captured before its canceled write won that write, if it is still the same one."""
+    if execution is not None and execution.is_current(run_id):
+        execution.entry.internal_cancel_won = True
+
+
+def start_independent_run_scope() -> None:
+    """Detach a fire-and-forget run from the registrations of the run that dispatched it."""
+    _open_executions.set(())
 
 
 def hold_run(run_id: str, run_type: str) -> Callable[[], None]:
@@ -121,6 +283,41 @@ def hold_run(run_id: str, run_type: str) -> Callable[[], None]:
 
 def is_run_registered(run_id: str) -> bool:
     return run_id in _registry
+
+
+@dataclass(frozen=True)
+class RunWriteAuthority:
+    owner_id: str
+    attempt_number: int | None
+    lease_acquired: bool
+
+
+def run_write_authority(run_id: str) -> RunWriteAuthority | None:
+    """This process's claim on the run for outcome writes, or None when such writes are not fenced."""
+    if not _enabled:
+        return None
+    entry = _registry.get(run_id)
+    if entry is None:
+        return None
+    return RunWriteAuthority(owner_id(), entry.attempt_number, entry.acquired or entry.lost)
+
+
+class BlockOutcomeAuthority(NamedTuple):
+    """The registered execution that may write a run's block outcomes from this process."""
+
+    owner_id: str
+    attempt_number: int | None
+    lease_acquired: bool
+
+
+def block_outcome_authority(run_id: str) -> BlockOutcomeAuthority | None:
+    """Who may write this run's block outcomes, or None when such writes are not guarded."""
+    if not _enabled:
+        return None
+    entry = _registry.get(run_id)
+    if entry is None:
+        return None
+    return BlockOutcomeAuthority(owner_id(), entry.attempt_number, entry.acquired or entry.lost)
 
 
 def note_run_finalized(run_id: str) -> None:
@@ -170,21 +367,21 @@ async def acquire_run_lease(run_id: str) -> bool:
         return _registry.get(run_id) is entry and entry.attempt_number == attempt and not entry.lost
 
 
-async def run_lease_lost(run_id: str) -> bool:
+async def run_lease_state(run_id: str) -> Literal["held", "lost", "unknown"]:
     if not _enabled:
-        return False
+        return "held"
     entry = _registry.get(run_id)
     if entry is None or (not entry.acquired and not entry.lost):
-        return False
+        return "held"
     if entry.lost:
-        return True
+        return "lost"
     try:
         renewed = await app.DATABASE.run_execution_leases.renew(owner_id(), [run_id])
     except Exception:
         LOG.warning("Run lease check failed before status write", run_id=run_id, exc_info=True)
-        return False
+        return "unknown"
     if run_id in renewed:
-        return False
+        return "held"
     LOG.warning(
         "Run lease lost before status write",
         run_id=run_id,
@@ -192,17 +389,82 @@ async def run_lease_lost(run_id: str) -> bool:
         attempt_number=entry.attempt_number,
         owner_id=owner_id(),
     )
-    return True
+    return "lost"
+
+
+async def run_lease_lost(run_id: str) -> bool:
+    return await run_lease_state(run_id) == "lost"
+
+
+async def run_lease_final_write_blocked(run_id: str) -> bool:
+    # A failed lease check must not let a final write replace a final row another server may have committed.
+    return await run_lease_state(run_id) != "held"
 
 
 def _cancel_lost_runs(entries: list[_Registration]) -> None:
     # Repeated cancellation would interrupt the cleanup started by the first cancellation.
     lost_targets = {entry.task for entry in entries if entry.task is not None and not entry.finalized}
     for target in lost_targets:
-        if not target.done() and all(
-            entry.lost and not entry.finalized for entry in _registry.values() if entry.task is target
+        if (
+            not target.done()
+            and target not in _interrupted
+            and all(entry.lost and not entry.finalized for entry in _registry.values() if entry.task is target)
         ):
+            _interrupted.add(target)
             target.cancel()
+
+
+async def _deliver_accepted_cancels() -> None:
+    """Cancel this process's execution of a run whose row an accepted cancel has set to canceled.
+
+    Unlike lease loss, a finalized registration is not exempt. A run is cancelled once, after its row was seen
+    canceled on two consecutive passes, so an execution that notices the row at its next block finishes on its own.
+    """
+    # Snapshot the task and attempt too: a registration can be re-bound to a new task while the query awaits.
+    observed = {
+        run_id: (entry, entry.task, entry.attempt_number)
+        for run_id, entry in _registry.items()
+        if entry.run_type == "workflow_run" and entry.task is not None
+    }
+    if not observed:
+        return
+    rows = await app.DATABASE.workflow_runs.get_workflow_runs_by_ids(list(observed))
+    canceled = {row.workflow_run_id for row in rows if row.status == "canceled"}
+
+    def unchanged(run_id: str, entry: _Registration) -> bool:
+        snapshot = observed.get(run_id)
+        return (
+            snapshot is not None
+            and snapshot[0] is entry
+            and _registry.get(run_id) is entry
+            and entry.task is snapshot[1]
+            and entry.attempt_number == snapshot[2]
+        )
+
+    registered = {id(entry) for entry in _registry.values()}
+    for run_id, (entry, target, _) in observed.items():
+        if not unchanged(run_id, entry):
+            continue
+        if run_id not in canceled:
+            entry.cancel_seen = False
+            continue
+        if not entry.cancel_seen:
+            entry.cancel_seen = True
+            continue
+        if target is None or target.done() or target in _interrupted:
+            continue
+        # An inline child's task is awaited by an enclosing run, which is cancelled through its own registration.
+        if any(id(outer) in registered for outer in entry.enclosing):
+            continue
+        sharing = [(other_id, other) for other_id, other in _registry.items() if other.task is target]
+        # A run that set itself canceled is finishing its own cleanup.
+        if any(other.internal_cancel_won for _, other in sharing):
+            continue
+        # Every run executing on the task must be one observed canceled in this pass.
+        if all(other_id in canceled and unchanged(other_id, other) for other_id, other in sharing):
+            _interrupted.add(target)
+            target.cancel()
+            LOG.info("Cancelled the execution of a canceled run", run_id=run_id, attempt_number=entry.attempt_number)
 
 
 async def _heartbeat(repository: RunExecutionLeasesRepository) -> None:
@@ -241,6 +503,10 @@ async def _heartbeat(repository: RunExecutionLeasesRepository) -> None:
                         owner_id=owner_id(),
                     )
                 _cancel_lost_runs(newly_lost)
+                try:
+                    await _deliver_accepted_cancels()
+                except Exception:
+                    LOG.warning("Failed to check for canceled runs", owner_id=owner_id(), exc_info=True)
             async with _lease_write_lock:
                 acquiring = {
                     key: (entry, entry.attempt_number)
@@ -275,6 +541,8 @@ async def _heartbeat(repository: RunExecutionLeasesRepository) -> None:
             _kept_leases.intersection_update(_held)
         except Exception:
             LOG.exception("Run lease heartbeat failed", owner_id=owner_id())
+            # A failing release runs before `last_renew` advances, so an overdue renewal would otherwise retry at once.
+            await asyncio.sleep(HEARTBEAT_ERROR_RETRY_SECONDS)
         try:
             remaining = max(0.0, min(INTERVAL_SECONDS, INTERVAL_SECONDS - (time.monotonic() - last_renew)))
             async with asyncio.timeout(remaining):
@@ -285,7 +553,15 @@ async def _heartbeat(repository: RunExecutionLeasesRepository) -> None:
 
 async def _reaper_loop(reap_once: Callable[[], Awaitable[None]]) -> None:
     while True:
-        await asyncio.sleep(INTERVAL_SECONDS)
+        try:
+            async with asyncio.timeout(INTERVAL_SECONDS):
+                await _stop.wait()
+            return
+        except TimeoutError:
+            pass
+        # The interval can expire in the same turn a stop is requested; no pass may start once it is.
+        if _stop.is_set():
+            return
         try:
             await reap_once()
             LOG.debug("Orphaned run reaper pass completed")
@@ -307,26 +583,32 @@ def schedule_side_effects(effect: Callable[[], Awaitable[None]]) -> None:
 
 
 def start_run_lease_tasks(reap_once: Callable[[], Awaitable[None]]) -> None:
-    global _enabled, _wake, _side_effect_limit, _lease_write_lock
+    global _enabled, _wake, _stop, _reaper_task, _side_effect_limit, _lease_write_lock
     if _enabled or settings.RUN_HEARTBEAT_TIMEOUT_MINUTES <= 0:
         return
     _enabled = True
     _wake = asyncio.Event()
+    _stop = asyncio.Event()
     _lease_write_lock = asyncio.Lock()
     _held.clear()
     _side_effect_limit = asyncio.Semaphore(10)
     _tasks.add(asyncio.create_task(_heartbeat(app.DATABASE.run_execution_leases), name="run-lease-heartbeat"))
-    _tasks.add(asyncio.create_task(_reaper_loop(reap_once), name="orphaned-run-reaper"))
+    _reaper_task = asyncio.create_task(_reaper_loop(reap_once), name="orphaned-run-reaper")
+    _tasks.add(_reaper_task)
     LOG.info("Run lease tasks started", owner_id=owner_id(), timeout_minutes=effective_timeout_minutes())
 
 
 async def stop_run_lease_tasks() -> None:
-    global _enabled
+    global _enabled, _reaper_task
     _enabled = False
-    # Stop the producers before collecting effects so a pass cannot enqueue work during shutdown.
+    _stop.set()
+    # Stop the producers before collecting effects so a pass cannot enqueue work during shutdown. An active reaper
+    # pass is awaited, not cancelled: it schedules its effects only after its lease release commits.
     for task in _tasks:
-        task.cancel()
+        if task is not _reaper_task:
+            task.cancel()
     await asyncio.gather(*_tasks, return_exceptions=True)
+    _reaper_task = None
     _tasks.clear()
     effects = list(_side_effect_tasks)
     if not effects:

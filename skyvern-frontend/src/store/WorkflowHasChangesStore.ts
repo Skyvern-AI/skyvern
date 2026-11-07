@@ -18,13 +18,15 @@ import {
 } from "./WorkflowYamlEditorStore";
 import { applyYamlCommitMetadata } from "./WorkflowTitleStore";
 import { AxiosError } from "axios";
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { create } from "zustand";
+import { useCopilotProposalStore } from "@/store/CopilotProposalStore";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { stringify as convertToYAML } from "yaml";
 import { usePostHog } from "posthog-js/react";
 
 import { getClient } from "@/api/AxiosClient";
+import { queryClient } from "@/api/QueryClient";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useLogging } from "@/hooks/useLogging";
@@ -39,6 +41,7 @@ import type {
   WorkflowApiResponse,
   WorkflowSettings,
 } from "@/routes/workflows/types/workflowTypes";
+
 type SaveData = {
   parameters: Array<ParameterYAML>;
   blocks: Array<BlockYAML>;
@@ -95,6 +98,8 @@ interface WorkflowSaveOpts {
   status?: string;
 }
 
+const PROPOSAL_SAVE_MESSAGE = "Resolve the Copilot proposal before saving.";
+
 function assertWorkflowSaveAllowed(
   yamlCommit?: YamlCommitContext,
   saveOwner?: YamlCommitOwner | null,
@@ -107,6 +112,10 @@ function assertWorkflowSaveAllowed(
       variant: "destructive",
     });
     throw new YamlCommitError("workflow", blockedReason);
+  }
+  // Every save path lands here, so a staged Copilot proposal can only become durable through Accept.
+  if (useCopilotProposalStore.getState().proposal) {
+    throw new SaveRefusedError(PROPOSAL_SAVE_MESSAGE);
   }
   const state = useWorkflowYamlEditorStore.getState();
   if (state.authoringInProgress) {
@@ -345,7 +354,11 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
             "The workflow editor changed before saving",
           );
         }
-        const requestBody = buildWorkflowSaveRequest(saveData, opts);
+        // Explicit nulls clear only annotations that were present in the loaded version.
+        const requestBody = buildWorkflowSaveRequest(saveData, {
+          ...opts,
+          explicitDocFields: true,
+        });
         const changesState = useWorkflowHasChangesStore.getState();
 
         const yaml = convertToYAML(requestBody);
@@ -416,10 +429,25 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
         } finally {
           clearTimeout(noticeTimer);
         }
-        if (!owner || owner.active)
+        const cacheSavedWorkflow = () => {
+          // Only the detail GET computes effective_default_engine; the PUT omits it.
+          queryClient.setQueryData(
+            ["workflow", saveData.workflow.workflow_permanent_id],
+            (prev?: WorkflowApiResponse) => ({
+              ...response.data,
+              effective_default_engine:
+                "effective_default_engine" in response.data
+                  ? response.data.effective_default_engine
+                  : prev?.effective_default_engine,
+            }),
+          );
+        };
+        if (!owner || owner.active) {
+          cacheSavedWorkflow();
           useWorkflowHasChangesStore
             .getState()
             .recordBaseVersion(response.data);
+        }
         if (
           !owner ||
           owner.active ||
@@ -437,17 +465,7 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
           activeOwner.workflowPermanentId === owner.workflowPermanentId &&
           hydrateWorkflowEditor(response.data)
         ) {
-          // Only the detail GET computes effective_default_engine; the PUT omits it.
-          queryClient.setQueryData(
-            ["workflow", saveData.workflow.workflow_permanent_id],
-            (prev?: WorkflowApiResponse) => ({
-              ...response.data,
-              effective_default_engine:
-                "effective_default_engine" in response.data
-                  ? response.data.effective_default_engine
-                  : prev?.effective_default_engine,
-            }),
-          );
+          cacheSavedWorkflow();
           setHasChanges(false, { fromYamlCommit: true });
         }
         if (owner && !override?.yamlCommit) {
@@ -686,7 +704,7 @@ function hydrateWorkflowEditor(workflow: WorkflowApiResponse): boolean {
 function hydrateRestoredWorkflowSave(
   workflow: WorkflowApiResponse,
   owner: YamlCommitOwner,
-): void {
+): boolean {
   const state = useWorkflowYamlEditorStore.getState();
   const pending = state.pendingSaves[owner.workflowPermanentId];
   if (
@@ -695,13 +713,14 @@ function hydrateRestoredWorkflowSave(
     workflow.workflow_permanent_id !== owner.workflowPermanentId ||
     state.editorOwner?.workflowPermanentId !== owner.workflowPermanentId
   )
-    return;
-  if (!hydrateWorkflowEditor(workflow)) return;
+    return false;
+  if (!hydrateWorkflowEditor(workflow)) return false;
   useWorkflowHasChangesStore
     .getState()
     .setHasChanges(false, { fromYamlCommit: true });
   markWorkflowSaveSettled(owner);
   finishSaveTransaction(owner);
+  return true;
 }
 
 export function discardRestoredWorkflowSave(
@@ -722,6 +741,8 @@ export function reloadConflictedWorkflow(workflow: WorkflowApiResponse): void {
 export function usePendingWorkflowSaveRecovery(
   workflow: WorkflowApiResponse,
 ): void {
+  const credentialGetter = useCredentialGetter();
+  const [recoveryTick, setRecoveryTick] = useState(0);
   const pending = useWorkflowYamlEditorStore(
     (state) => state.pendingSaves[workflow.workflow_permanent_id],
   );
@@ -730,14 +751,70 @@ export function usePendingWorkflowSaveRecovery(
   );
   useEffect(() => {
     // Only a reload loses the original PUT response. Live requests retain their reservation.
-    if (
-      !pending?.restored ||
-      !hydrate ||
-      !(workflow.version > pending.restored.baseVersion)
-    )
+    if (!pending?.restored || !hydrate) return;
+    if (workflow.version > pending.restored.baseVersion) {
+      hydrateRestoredWorkflowSave(workflow, pending.owner);
       return;
-    hydrateRestoredWorkflowSave(workflow, pending.owner);
-  }, [workflow, pending, hydrate]);
+    }
+    if (workflow.version !== pending.restored.baseVersion) return;
+    const retryIn =
+      WORKFLOW_SAVE_NOTICE_MS - (Date.now() - pending.restored.timestamp);
+    if (retryIn > 0) {
+      const retry = setTimeout(
+        () => setRecoveryTick((tick) => tick + 1),
+        retryIn,
+      );
+      return () => clearTimeout(retry);
+    }
+    let cancelled = false;
+    void (async () => {
+      try {
+        const client = await getClient(credentialGetter);
+        const { data } = await client.get<WorkflowApiResponse>(
+          `/workflows/${pending.owner.workflowPermanentId}`,
+        );
+        if (cancelled) return;
+        const currentPending =
+          useWorkflowYamlEditorStore.getState().pendingSaves[
+            pending.owner.workflowPermanentId
+          ];
+        if (!currentPending?.restored || currentPending.owner !== pending.owner)
+          return;
+        const restored = currentPending.restored;
+        if (data.version > restored.baseVersion) {
+          if (hydrateRestoredWorkflowSave(data, pending.owner)) {
+            queryClient.setQueryData(
+              ["workflow", data.workflow_permanent_id],
+              (prev?: WorkflowApiResponse) => ({
+                ...data,
+                effective_default_engine:
+                  "effective_default_engine" in data
+                    ? data.effective_default_engine
+                    : prev?.effective_default_engine,
+              }),
+            );
+          }
+          return;
+        }
+        if (
+          data.version === restored.baseVersion &&
+          hydrateRestoredWorkflowSave(data, pending.owner)
+        ) {
+          toast({
+            title: "Previous save was not saved",
+            description:
+              "The workflow was reloaded from the server. Your previous changes were not saved.",
+            variant: "destructive",
+          });
+        }
+      } catch {
+        // Keep the restored save locked until the user retries or reloads.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [workflow, pending, hydrate, recoveryTick, credentialGetter]);
 }
 
 export function reflectYamlDraftDirtiness(

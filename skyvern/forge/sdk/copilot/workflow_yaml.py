@@ -1,7 +1,7 @@
 """Copilot workflow-YAML normalization, chain repair, and Workflow conversion."""
 
 import re
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any
@@ -21,6 +21,7 @@ from skyvern.forge.sdk.copilot.code_block_steps import (
     derive_code_block_steps_in_yaml,
     is_code_block_type,
 )
+from skyvern.forge.sdk.copilot.output_contracts import declared_workflow_parameter_keys
 from skyvern.forge.sdk.copilot.workflow_block_traversal import (
     WorkflowBlockLocation,
     WorkflowBlockNodeLocation,
@@ -40,13 +41,19 @@ from skyvern.forge.sdk.workflow.private_settings import (
     resolve_totp_verification_url,
     resolve_webhook_callback_url,
 )
+from skyvern.forge.sdk.workflow.secret_encryption import (
+    definition_has_inline_secret_fields,
+    mask_workflow_definition_secrets,
+    preserve_workflow_definition_secrets,
+)
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
 from skyvern.schemas.proxy_location import GeoTarget
 from skyvern.schemas.runs import ProxyLocation, RunEngine
 from skyvern.schemas.workflows import (
+    BlockType,
     BlockYAML,
-    BranchConditionYAML,
     ConditionalBlockYAML,
+    FileUploadBlockYAML,
     ForLoopBlockYAML,
     LoginBlockYAML,
     WhileLoopBlockYAML,
@@ -71,6 +78,8 @@ _WORKFLOW_SETTINGS_WITH_RESOLVERS = (
     "mask_secrets",
     "pin_saved_session_ip",
 )
+# _process_workflow_yaml inherits these on an explicit null too; the other settings inherit only when omitted.
+_SETTINGS_NULL_INHERITS = frozenset({"enable_self_healing", "mask_secrets", "pin_saved_session_ip"})
 _WORKFLOW_SETTINGS_FIELDS = tuple(
     field_name
     for field_name in WorkflowCreateYAMLRequest.model_fields
@@ -173,7 +182,9 @@ def private_workflow_settings_from_yaml(workflow_yaml: str | None) -> dict[str, 
         return {}
     if not isinstance(data, dict):
         return {}
-    return {key: data[key] for key in _PRIVATE_WORKFLOW_SETTINGS_FIELDS if key in data}
+    settings = {key: data[key] for key in _PRIVATE_WORKFLOW_SETTINGS_FIELDS if key in data}
+    _canonicalize_copilot_proxy_location(settings)
+    return settings
 
 
 def with_private_workflow_settings(
@@ -250,7 +261,7 @@ def runner_code_block_associations(
     return associations
 
 
-def _strip_runtime_block_fields(block: dict[str, Any]) -> dict[str, Any]:
+def strip_runtime_block_fields(block: dict[str, Any]) -> dict[str, Any]:
     cleaned = deepcopy(block)
     cleaned.pop("output_parameter", None)
     cleaned.pop("workflow_system_prompt", None)
@@ -276,10 +287,42 @@ def _strip_runtime_block_fields(block: dict[str, Any]) -> dict[str, Any]:
     loop_blocks = cleaned.get("loop_blocks")
     if isinstance(loop_blocks, list):
         cleaned["loop_blocks"] = [
-            _strip_runtime_block_fields(loop_block) if isinstance(loop_block, dict) else loop_block
+            strip_runtime_block_fields(loop_block) if isinstance(loop_block, dict) else loop_block
             for loop_block in loop_blocks
         ]
     return cleaned
+
+
+def _runs_in_list_order(definition: dict[str, Any]) -> bool:
+    """Whether the top level runs in list order (version 1), deriving a missing version as the schema validator does."""
+    version = definition.get("version")
+    if version is not None:
+        return isinstance(version, int) and version < 2
+    blocks = definition.get("blocks")
+    return not (
+        isinstance(blocks, list)
+        and any(
+            isinstance(block, dict)
+            and (block.get("block_type") == BlockType.CONDITIONAL or block.get("next_block_label") is not None)
+            for block in blocks
+        )
+    )
+
+
+def _drop_list_order_chain(definition: dict[str, Any]) -> None:
+    # Legacy version 1 rows carry stitched next_block_label pointers that validation rejects at version 1.
+    blocks = definition.get("blocks")
+    if not (
+        isinstance(definition.get("version"), int)
+        and _runs_in_list_order(definition)
+        and isinstance(blocks, list)
+        and all(isinstance(block, dict) and block.get("block_type") != BlockType.CONDITIONAL for block in blocks)
+    ):
+        return
+    following = [block.get("label") for block in blocks[1:]] + [None]
+    if all(block.get("next_block_label") == label for block, label in zip(blocks, following)):
+        for block in blocks:
+            block.pop("next_block_label", None)
 
 
 def _copilot_yaml_workflow_definition(persisted_definition: dict[str, Any]) -> dict[str, Any]:
@@ -302,14 +345,16 @@ def _copilot_yaml_workflow_definition(persisted_definition: dict[str, Any]) -> d
     blocks = workflow_definition.get("blocks")
     if isinstance(blocks, list):
         workflow_definition["blocks"] = [
-            _strip_runtime_block_fields(block) if isinstance(block, dict) else block for block in blocks
+            strip_runtime_block_fields(block) if isinstance(block, dict) else block for block in blocks
         ]
+    _drop_list_order_chain(workflow_definition)
     return workflow_definition
 
 
 def workflow_to_copilot_yaml(workflow: Workflow) -> str:
     workflow_data = workflow.model_dump(mode="json", exclude_none=True)
     strip_private_workflow_settings(workflow_data)
+    mask_workflow_definition_secrets(workflow_data.get("workflow_definition"))
     workflow_definition = _copilot_yaml_workflow_definition(workflow_data.get("workflow_definition") or {})
 
     request_data = {
@@ -426,90 +471,39 @@ def _canonicalize_copilot_block_type_aliases(value: Any) -> None:
 
 
 def _collect_reachable(
-    start_label: str,
+    start_label: str | None,
     label_to_block: dict[str, BlockYAML],
     reachable: set[str],
 ) -> None:
-    """Walk the next_block_label chain from start_label, collecting all reachable labels.
-
-    For conditional blocks, also follows branch target chains recursively.
-
-    The ``current not in reachable`` loop guard means the main-chain walk
-    stops early if we hit a node already collected via a branch recursion.
-    This is correct — those downstream nodes and their successors are
-    already in ``reachable`` — but callers should be aware of the coupling.
-    """
-    current: str | None = start_label
-    while current and current in label_to_block and current not in reachable:
+    pending = [start_label]
+    while pending:
+        current = pending.pop()
+        if not current or current not in label_to_block or current in reachable:
+            continue
         reachable.add(current)
         block = label_to_block[current]
         if isinstance(block, ConditionalBlockYAML):
-            for branch in block.branch_conditions:
-                if branch.next_block_label and branch.next_block_label not in reachable:
-                    _collect_reachable(branch.next_block_label, label_to_block, reachable)
-        current = block.next_block_label
+            pending.extend(branch.next_block_label for branch in block.branch_conditions)
+        pending.append(block.next_block_label)
 
 
 def _break_cycles(
     start_label: str,
     label_to_block: dict[str, BlockYAML],
 ) -> bool:
-    """Detect and break circular references in the block chain using DFS.
-
-    Uses a recursion stack to distinguish true back-edges (cycles) from merge
-    points (two branches converging on the same block).  When a back-edge is
-    found the offending ``next_block_label`` is set to ``None``, breaking the
-    cycle.  Handles both the main chain and conditional branch chains.
-
-    Note: this function operates on a single level of blocks.  It does **not**
-    recurse into ``ForLoopBlockYAML.loop_blocks``; nested loops are handled
-    by the recursive ``_repair_next_block_label_chain`` call in Phase 3.
-
-    Returns True if at least one cycle was broken.
-    """
+    """Cut the first next_block_label edge that points back to a block already on the chain."""
     visited: set[str] = set()
-    rec_stack: set[str] = set()
-    found_cycle = False
-
-    def _follow_edge(target: str | None, edge_owner: BlockYAML | BranchConditionYAML, parent_label: str) -> None:
-        """Follow an edge to *target*.  *edge_owner* is the object whose
-        ``next_block_label`` will be set to ``None`` when the target forms a
-        back-edge.  *parent_label* is the block label that owns this edge
-        for logging."""
-        nonlocal found_cycle
-        if not target or target not in label_to_block:
-            return
-        if target in rec_stack:
-            is_branch = hasattr(edge_owner, "criteria")
-            LOG.warning(
-                "Copilot produced circular block chain, breaking cycle",
-                cycle_target=target,
-                broken_at=parent_label,
-                is_branch_condition=is_branch,
-                branch_expression=getattr(getattr(edge_owner, "criteria", None), "expression", None),
-            )
-            edge_owner.next_block_label = None
-            found_cycle = True
-            return
+    current: str | None = start_label
+    while current and current in label_to_block:
+        visited.add(current)
+        block = label_to_block[current]
+        target = block.next_block_label
         if target in visited:
-            return  # merge point — not a cycle
-        _dfs(target)
-
-    def _dfs(label: str) -> None:
-        visited.add(label)
-        rec_stack.add(label)
-        block = label_to_block[label]
-
-        if isinstance(block, ConditionalBlockYAML):
-            for branch in block.branch_conditions:
-                _follow_edge(branch.next_block_label, branch, label)
-
-        _follow_edge(block.next_block_label, block, label)
-        rec_stack.discard(label)
-
-    if start_label in label_to_block:
-        _dfs(start_label)
-    return found_cycle
+            LOG.warning("Copilot produced circular block chain, breaking cycle", cycle_target=target, broken_at=current)
+            block.next_block_label = None
+            return True
+        current = target
+    return False
 
 
 def _find_terminal_label(
@@ -595,21 +589,30 @@ def _order_orphaned_blocks(
     return ordered
 
 
-def _repair_next_block_label_chain(blocks: list[BlockYAML]) -> None:
-    """Ensure all top-level blocks form a single acyclic chain from blocks[0].
+def _chain_start_label(blocks: list[BlockYAML], label_to_block: dict[str, BlockYAML]) -> str:
+    """The first block listed, unless the list as written is one graph from another block nothing points to."""
+    targets: set[str | None] = set()
+    for block in blocks:
+        targets.add(block.next_block_label)
+        if isinstance(block, ConditionalBlockYAML):
+            targets.update(branch.next_block_label for branch in block.branch_conditions)
+    roots = [block.label for block in blocks if block.label not in targets]
+    if len(roots) == 1:
+        reachable: set[str] = set()
+        _collect_reachable(roots[0], label_to_block, reachable)
+        if reachable == set(label_to_block):
+            return roots[0]
+    return blocks[0].label
 
-    Repairs two classes of LLM mistakes:
-    1. Circular references — breaks cycles so the chain has a proper terminal block.
-    2. Disconnected paths — stitches orphaned blocks onto the end of the reachable chain.
 
-    Recursively repairs nested loop block ``loop_blocks`` at all depths.
-    Mutates *blocks* in place.
-    """
-    if len(blocks) <= 1:
-        # Still recurse into loop_blocks even for single-block lists
-        for block in blocks:
-            if isinstance(block, (ForLoopBlockYAML, WhileLoopBlockYAML)) and block.loop_blocks:
-                _repair_next_block_label_chain(block.loop_blocks)
+def _repair_next_block_label_chain(blocks: list[BlockYAML], *, list_ordered: bool = False) -> None:
+    """Stitch blocks into one acyclic chain in place, recursing into loops; branch targets keep their places.
+    A list_ordered (version 1) top level runs in list order and may not route, so only its loop bodies are stitched."""
+    for block in blocks:
+        if isinstance(block, (ForLoopBlockYAML, WhileLoopBlockYAML)) and block.loop_blocks:
+            _repair_next_block_label_chain(block.loop_blocks)
+
+    if list_ordered or len(blocks) <= 1:
         return
 
     # Warn on duplicate labels — the dict comprehension silently keeps the last
@@ -623,16 +626,26 @@ def _repair_next_block_label_chain(blocks: list[BlockYAML]) -> None:
     label_to_block: dict[str, BlockYAML] = {block.label: block for block in blocks}
     all_labels = set(label_to_block.keys())
 
-    # Phase 1: break any circular references reachable from the first block.
-    # Note: cycles among orphaned blocks (unreachable from blocks[0]) are handled
-    # implicitly by _order_orphaned_blocks via its visited set and re-linking logic.
-    _break_cycles(blocks[0].label, label_to_block)
+    start_label = _chain_start_label(blocks, label_to_block)
+    # Cycles among blocks unreachable from the start are handled by _order_orphaned_blocks's re-linking.
+    _break_cycles(start_label, label_to_block)
 
-    # Phase 2: find orphaned (unreachable) blocks and stitch them to the end.
     reachable: set[str] = set()
-    _collect_reachable(blocks[0].label, label_to_block, reachable)
+    _collect_reachable(start_label, label_to_block, reachable)
 
-    orphaned_labels = all_labels - reachable
+    # Branch targets are not in list order, so stitching them in list order chains one branch into the other.
+    # They join the chain through their conditional once it is linked; its merge point is stitched like any block.
+    branch_only: set[str] = set()
+    for block in blocks:
+        if isinstance(block, ConditionalBlockYAML):
+            in_branches: set[str] = set()
+            for branch in block.branch_conditions:
+                _collect_reachable(branch.next_block_label, label_to_block, in_branches)
+            after_merge: set[str] = set()
+            _collect_reachable(block.next_block_label, label_to_block, after_merge)
+            branch_only |= in_branches - after_merge
+
+    orphaned_labels = all_labels - reachable - branch_only
     if orphaned_labels:
         LOG.warning(
             "Copilot produced disconnected workflow blocks, repairing chain",
@@ -640,16 +653,11 @@ def _repair_next_block_label_chain(blocks: list[BlockYAML]) -> None:
             reachable_labels=sorted(reachable),
         )
 
-        terminal_label = _find_terminal_label(blocks[0].label, label_to_block, all_labels)
+        terminal_label = _find_terminal_label(start_label, label_to_block, all_labels)
         ordered_orphan_labels = _order_orphaned_blocks(orphaned_labels, label_to_block, all_labels, blocks)
 
         if terminal_label and ordered_orphan_labels:
             label_to_block[terminal_label].next_block_label = ordered_orphan_labels[0]
-
-    # Phase 3: recursively repair nested loop block ``loop_blocks``.
-    for block in blocks:
-        if isinstance(block, (ForLoopBlockYAML, WhileLoopBlockYAML)) and block.loop_blocks:
-            _repair_next_block_label_chain(block.loop_blocks)
 
 
 def _normalize_copilot_yaml(workflow_yaml: str) -> WorkflowCreateYAMLRequest:
@@ -668,6 +676,7 @@ def _normalize_copilot_yaml(workflow_yaml: str) -> WorkflowCreateYAMLRequest:
                 block["title"] = block.get("title", "")
 
     workflow_yaml_request = WorkflowCreateYAMLRequest.model_validate(parsed_yaml)
+    list_ordered = _runs_in_list_order(parsed_yaml["workflow_definition"])
 
     # Post-processing
     for block in workflow_yaml_request.workflow_definition.blocks:
@@ -678,7 +687,7 @@ def _normalize_copilot_yaml(workflow_yaml: str) -> WorkflowCreateYAMLRequest:
         p for p in workflow_yaml_request.workflow_definition.parameters if p.parameter_type != ParameterType.OUTPUT
     ]
 
-    _repair_next_block_label_chain(workflow_yaml_request.workflow_definition.blocks)
+    _repair_next_block_label_chain(workflow_yaml_request.workflow_definition.blocks, list_ordered=list_ordered)
 
     return workflow_yaml_request
 
@@ -841,7 +850,7 @@ def redact_credentials_in_workflow_yaml(
 
 
 def _copilot_definition_from_yaml(
-    workflow_yaml: str, workflow_id: str
+    workflow_yaml: str, workflow_id: str, *, bind_parameters: bool = True
 ) -> tuple[WorkflowCreateYAMLRequest, WorkflowDefinition]:
     # Single seam every copilot YAML->Workflow conversion passes through, so code
     # blocks get their plain-view steps regardless of which path produced the YAML
@@ -850,7 +859,8 @@ def _copilot_definition_from_yaml(
     workflow_yaml = derive_code_block_steps_in_yaml(workflow_yaml)
     # Same reasoning one field over: a block whose code names a declared parameter but omits it
     # from parameter_keys gets no value at runtime and dies on NameError mid-login.
-    workflow_yaml = bind_referenced_parameters_in_yaml(workflow_yaml)
+    if bind_parameters:
+        workflow_yaml = bind_referenced_parameters_in_yaml(workflow_yaml)
     workflow_yaml_request = _normalize_copilot_yaml(workflow_yaml)
     return workflow_yaml_request, convert_workflow_definition(
         workflow_definition_yaml=workflow_yaml_request.workflow_definition,
@@ -861,11 +871,43 @@ def _copilot_definition_from_yaml(
 def copilot_round_trip_definition(definition: WorkflowDefinition, *, workflow_id: str) -> WorkflowDefinition:
     """The definition as Copilot's own save path would persist it, whoever authored it."""
     workflow_definition = _copilot_yaml_workflow_definition(definition.model_dump(mode="json", exclude_none=True))
-    # The save path stitches next_block_label after validating, so a version it persisted can carry
-    # version 1 beside explicit routing; letting validation derive the version again round-trips it.
+    # Legacy rows can carry version 1 beside stitched next_block_label routing, which validation rejects;
+    # letting validation derive the version again round-trips them.
     workflow_definition.pop("version", None)
     workflow_yaml = yaml.safe_dump({"title": "", "workflow_definition": workflow_definition}, sort_keys=False)
     return _copilot_definition_from_yaml(workflow_yaml, workflow_id)[1]
+
+
+# The editor writes '' for every unset optional text field, and the upload block reads each one by truthiness or
+# `or default`, so '' means unset there. Other blocks keep '': a task's blank url skips page inheritance.
+_FILE_UPLOAD_BLANK_MEANS_UNSET = frozenset(
+    name
+    for name, field in FileUploadBlockYAML.model_fields.items()
+    if field.annotation == (str | None) and field.default is None
+)
+
+
+def canonical_copilot_workflow(
+    workflow_yaml: str, inherited: Mapping[str, Any] | None = None, *, bind_parameters: bool = True
+) -> dict[str, Any]:
+    """The workflow as ``workflow_to_copilot_yaml`` would write it once saved, so two spellings of one workflow
+    compare equal. A top-level setting the YAML omits takes its ``inherited`` value, as the save path does."""
+    request, definition = _copilot_definition_from_yaml(workflow_yaml, workflow_id="", bind_parameters=bind_parameters)
+    data = request.model_dump(mode="json", exclude_none=True)
+    data["workflow_definition"] = _copilot_yaml_workflow_definition(
+        definition.model_dump(mode="json", exclude_none=True)
+    )
+    canonical = WorkflowCreateYAMLRequest.model_validate(data).model_dump(mode="json", exclude_none=True)
+    for location in workflow_block_locations(canonical):
+        if location.block.get("block_type") == BlockType.FILE_UPLOAD.value:
+            for key in _FILE_UPLOAD_BLANK_MEANS_UNSET & {k for k, v in location.block.items() if v == ""}:
+                del location.block[key]
+    for key, value in (inherited or {}).items():
+        if key != "workflow_definition" and (
+            key not in request.model_fields_set or (key in _SETTINGS_NULL_INHERITS and key not in canonical)
+        ):
+            canonical[key] = value
+    return canonical
 
 
 async def _process_workflow_yaml(
@@ -923,6 +965,13 @@ async def _process_workflow_yaml(
         return saved_rows[0]
 
     current_workflow = settings_fallback_workflow
+    if definition_has_inline_secret_fields(workflow_yaml_request.workflow_definition):
+        current_workflow = current_workflow or await saved_workflow()
+        preserve_workflow_definition_secrets(
+            updated_workflow_definition,
+            current_workflow.workflow_definition if current_workflow is not None else None,
+            workflow_yaml_request.workflow_definition,
+        )
     if enable_self_healing is None or mask_secrets is None or pin_saved_session_ip is None:
         current_workflow = await saved_workflow()
     if enable_self_healing is None:
@@ -1072,7 +1121,7 @@ def _code_scalar_source(stored_yaml: str, label: str) -> tuple[Node, ScalarNode,
     return root, code_pair[1], int(code_pair[0].start_mark.column) + 2
 
 
-def _node_reference_count(root: Node, target: Node) -> int:
+def _node_reference_counts(root: Node) -> dict[int, int]:
     counts: dict[int, int] = {id(root): 1}
     stack = [root]
     expanded: set[int] = set()
@@ -1091,12 +1140,17 @@ def _node_reference_count(root: Node, target: Node) -> int:
         for child in children:
             counts[id(child)] = counts.get(id(child), 0) + 1
             stack.append(child)
-    return counts.get(id(target), 0)
+    return counts
+
+
+def _require_unaliased_nodes(root: Node, nodes: Iterable[Node]) -> None:
+    counts = _node_reference_counts(root)
+    if any(counts.get(id(node), 0) > 1 for node in nodes):
+        raise BlockEditError("This field is used by a YAML alias and cannot be edited without changing another field.")
 
 
 def _require_unaliased_value(root: Node, value_node: Node) -> None:
-    if _node_reference_count(root, value_node) > 1:
-        raise BlockEditError("This field is used by a YAML alias and cannot be edited without changing another field.")
+    _require_unaliased_nodes(root, [value_node])
 
 
 def _render_code_scalar(code: str, *, content_indent: int, source_style: str | None) -> str:
@@ -1309,9 +1363,10 @@ def _sequence_item_source_span(
 
 
 def _node_content_line_end(stored_yaml: str, node: Node) -> int:
-    if isinstance(node, MappingNode) and node.value:
+    # A flow collection's end mark is its closing bracket; a block collection's runs into whatever follows it.
+    if isinstance(node, MappingNode) and node.value and not node.flow_style:
         return _node_content_line_end(stored_yaml, node.value[-1][1])
-    if isinstance(node, SequenceNode) and node.value:
+    if isinstance(node, SequenceNode) and node.value and not node.flow_style:
         return _node_content_line_end(stored_yaml, node.value[-1])
     end = node.end_mark.index
     if isinstance(node, ScalarNode) and node.style in {"|", ">"} and node.end_mark.column:
@@ -1529,11 +1584,8 @@ def add_block_to_workflow(
     *,
     parameters: list[Any] | None = None,
 ) -> str:
-    """Splice one new block in after ``after_label`` and return the whole workflow.
-
-    The predecessor hands its ``next_block_label`` to the new block and points at it instead, so the
-    chain stays intact without the model retyping the blocks it is not changing.
-    """
+    """Splice one new block in after ``after_label``, handing it the predecessor's ``next_block_label`` so the chain
+    stays intact, and return the whole workflow. A version 1 workflow runs in list order, so it is only inserted."""
     try:
         parsed = safe_load_no_dates(stored_yaml)
     except Exception as exc:
@@ -1559,8 +1611,11 @@ def add_block_to_workflow(
             "Use edit_block to change it, or give the new block a different label."
         )
 
-    new_block["next_block_label"] = predecessor.get("next_block_label")
-    predecessor["next_block_label"] = new_label
+    if not _runs_in_list_order(parsed["workflow_definition"]):
+        new_block["next_block_label"] = predecessor.get("next_block_label")
+        predecessor["next_block_label"] = new_label
+    else:
+        new_block.pop("next_block_label", None)
     blocks.insert(blocks.index(predecessor) + 1, new_block)
 
     if parameters:
@@ -1568,12 +1623,56 @@ def add_block_to_workflow(
     return yaml.safe_dump(parsed, sort_keys=False)
 
 
-def delete_block_from_workflow(stored_yaml: str, label: str) -> str:
-    """Remove one block by label and return the whole workflow.
+def _node_parameter_key(node: Node) -> str | None:
+    key_pair = _mapping_node_value(node, "key")
+    return key_pair[1].value if key_pair and isinstance(key_pair[1], ScalarNode) else None
 
-    Deletion is an operation rather than an absence, so a submission that simply omits a block can
-    never be mistaken for a request to remove it.
-    """
+
+def _parameter_removal_edits(stored_yaml: str, root: Node, keys: set[str]) -> list[tuple[int, int, str]]:
+    definition_pair = _mapping_node_value(root, "workflow_definition")
+    parameters_pair = _mapping_node_value(definition_pair[1], "parameters") if definition_pair else None
+    owner = parameters_pair[1] if parameters_pair else None
+    if not isinstance(owner, SequenceNode):
+        raise BlockEditError("The stored workflow has no workflow_definition.parameters list to edit.")
+    _require_unaliased_value(root, owner)
+    removed = {
+        index: item
+        for index, item in enumerate(owner.value)
+        if isinstance(item, MappingNode) and _node_parameter_key(item) in keys
+    }
+    if unwritten := keys - {_node_parameter_key(item) for item in removed.values()}:
+        raise BlockEditError(
+            f"Workflow input {', '.join(repr(key) for key in sorted(unwritten))} is declared through a YAML "
+            "merge key, so it cannot be removed."
+        )
+    _require_unaliased_nodes(root, [node for item in removed.values() for node in _unique_nodes(item)])
+    if owner.flow_style:
+        kept = [item for index, item in enumerate(owner.value) if index not in removed]
+        if any(
+            item.start_mark.index < owner.start_mark.index or item.end_mark.index > owner.end_mark.index
+            for item in kept
+        ):
+            raise BlockEditError("A kept workflow input is a YAML alias, so the inputs list cannot be edited.")
+        kept_source = ", ".join(stored_yaml[item.start_mark.index : item.end_mark.index] for item in kept)
+        return [(owner.start_mark.index, owner.end_mark.index, f"[{kept_source}]")]
+    value_indent = _sequence_value_indent(root, owner)
+    if len(removed) == len(owner.value):
+        end = _node_content_line_end(stored_yaml, owner.value[-1])
+        trailing_newline = "\n" if stored_yaml[end - 1 : end] == "\n" else ""
+        return [(owner.start_mark.index, end, f"{' ' * (value_indent - owner.start_mark.column)}[]{trailing_newline}")]
+    return [
+        _sequence_item_source_span(
+            stored_yaml,
+            WorkflowBlockNodeLocation(item, owner, index, f"workflow_definition.parameters[{index}]"),
+            value_indent,
+        )
+        for index, item in removed.items()
+    ]
+
+
+def delete_block_from_workflow(stored_yaml: str, label: str, *, remove_parameters: list[str] | None = None) -> str:
+    """Remove one block by label, plus any named workflow inputs, and return the whole workflow.
+    Deletion is an explicit operation, so a submission that omits a block is never read as a request to remove it."""
     try:
         parsed = safe_load_no_dates(stored_yaml)
     except Exception as exc:
@@ -1581,6 +1680,15 @@ def delete_block_from_workflow(stored_yaml: str, label: str) -> str:
     if not isinstance(parsed, dict) or _top_level_workflow_blocks(parsed) is None:
         raise BlockEditError("The stored workflow has no workflow_definition.blocks to edit.")
     _block_by_label(parsed, label)
+    removed_keys = list(dict.fromkeys(remove_parameters or []))
+    if removed_keys:
+        declared = declared_workflow_parameter_keys(parsed)
+        unknown = [key for key in removed_keys if key not in declared]
+        if unknown:
+            raise BlockEditError(
+                f"No workflow input named {', '.join(repr(key) for key in unknown)}. "
+                f"The workflow declares: {', '.join(sorted(declared)) or 'none'}."
+            )
 
     root = _compose_workflow_yaml(stored_yaml)
     if root is None:
@@ -1591,9 +1699,14 @@ def delete_block_from_workflow(stored_yaml: str, label: str) -> str:
     target_start, target_end, replacement = _sequence_item_source_span(
         stored_yaml, target, _sequence_value_indent(root, target.owner)
     )
-    for node in _unique_nodes(root):
-        if target_start <= node.start_mark.index and node.end_mark.index <= target_end:
-            _require_unaliased_value(root, node)
+    _require_unaliased_nodes(
+        root,
+        [
+            node
+            for node in _unique_nodes(root)
+            if target_start <= node.start_mark.index and node.end_mark.index <= target_end
+        ],
+    )
     edits = [(target_start, target_end, replacement)]
     seen_pointer_spans: set[tuple[int, int]] = set()
     for mapping in workflow_link_node_mappings(root):
@@ -1610,4 +1723,6 @@ def delete_block_from_workflow(stored_yaml: str, label: str) -> str:
         _require_unaliased_value(root, pointer)
         seen_pointer_spans.add(span)
         edits.append((pointer.start_mark.index, pointer.end_mark.index, "null"))
+    if removed_keys:
+        edits.extend(_parameter_removal_edits(stored_yaml, root, set(removed_keys)))
     return _apply_source_edits(stored_yaml, edits)

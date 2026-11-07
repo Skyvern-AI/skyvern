@@ -28,6 +28,7 @@ from skyvern.schemas.workflows import (
     FileDownloadTarget,
     FileStorageType,
 )
+from tests.unit.helpers import make_pdf
 
 
 def _output_parameter() -> OutputParameter:
@@ -2244,3 +2245,51 @@ async def test_non_cached_script_download_threads_destination_into_single_block_
         "organization_id": "organization-id",
         "browser_session_id": "browser-session-id",
     }
+
+
+@pytest.mark.parametrize("prompt", [None, "Upload both invoices"])
+@pytest.mark.asyncio
+async def test_automatic_delivery_sends_each_pdf_content_once_and_a_prompt_selection_keeps_duplicates(
+    tmp_path: Path, prompt: str | None
+) -> None:
+    download_dir = tmp_path / "downloads"
+    names = ("invoice.pdf", "invoice (1).pdf")
+    block = _file_download_block(
+        FileDownloadTarget.SFTP, sftp_host="sftp.example.com", sftp_username="skyvern", sftp_password="p", prompt=prompt
+    )
+
+    def save_equal_pdfs() -> None:
+        download_dir.mkdir(parents=True, exist_ok=True)
+        for name in names:
+            (download_dir / name).write_bytes(make_pdf("Invoice 1001"))
+
+    execution = await _execute_file_download(
+        block,
+        _browser_result(block, downloaded_filenames=names),
+        download_dir,
+        during_execute=save_equal_pdfs,
+        selection_result=([str(download_dir / name) for name in names], "both") if prompt else None,
+    )
+
+    assert execution.upload.await_count == (2 if prompt else 1)
+    assert sorted(p.name for p in download_dir.iterdir()) == sorted(names)
+
+
+@pytest.mark.asyncio
+async def test_an_earlier_blocks_equal_pdf_does_not_take_the_new_download_s_place(tmp_path: Path) -> None:
+    download_dir = tmp_path / "downloads"
+    download_dir.mkdir(parents=True)
+    (download_dir / "invoice.pdf").write_bytes(make_pdf("Invoice 1001"))
+    block = _file_download_block(
+        FileDownloadTarget.SFTP, sftp_host="sftp.example.com", sftp_username="skyvern", sftp_password="p"
+    )
+
+    execution = await _execute_file_download(
+        block,
+        _browser_result(block, downloaded_filenames=("invoice (1).pdf",)),
+        download_dir,
+        during_execute=lambda: (download_dir / "invoice (1).pdf").write_bytes(make_pdf("Invoice 1001")),
+    )
+
+    execution.upload.assert_awaited_once()
+    assert Path(execution.upload.await_args.kwargs["file_path"]).name == "invoice (1).pdf"

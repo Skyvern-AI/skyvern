@@ -7,6 +7,7 @@ import {
   parseCredentialAutoBound,
   parseCredentialPause,
   parseCredentialPrompt,
+  parseCanonicalWorkflowUnavailable,
   parseGoogleConnectionNotices,
 } from "./narrativeState";
 import type {
@@ -65,10 +66,44 @@ describe("parseCredentialPause", () => {
     });
   });
 
-  it("keeps an answered card visible when its credential was not admitted", () => {
+  it("keeps a refused pick as refused, with the site answer a reload shows", () => {
     expect(
       parseCredentialPause({ outcome: "not_admitted", credentialId: "c1" }),
-    ).toEqual({ outcome: "skipped", credentialId: null });
+    ).toEqual({ outcome: "not_admitted", credentialId: "c1" });
+    expect(
+      parseCredentialPause({
+        outcome: "not_admitted",
+        siteAnswer: "no",
+        siteA: "https://site-a.example",
+        siteB: "https://site-b.example",
+      }),
+    ).toEqual({
+      outcome: "not_admitted",
+      credentialId: null,
+      siteAnswer: "no",
+      siteA: "https://site-a.example",
+      siteB: "https://site-b.example",
+    });
+  });
+
+  it("keeps the login name a reload shows, and drops an empty one", () => {
+    expect(
+      parseCredentialPause({
+        outcome: "connected",
+        credentialId: "c1",
+        name: "HN Login",
+        siteAnswer: "add",
+        siteA: "https://site-a.example",
+        siteB: "https://site-b.example",
+      }),
+    ).toMatchObject({ name: "HN Login", siteAnswer: "add" });
+    expect(
+      parseCredentialPause({
+        outcome: "connected",
+        credentialId: "c1",
+        name: "",
+      }),
+    ).toEqual({ outcome: "connected", credentialId: "c1" });
   });
 
   it("rejects unknown or malformed outcomes so the renderer can't crash", () => {
@@ -290,5 +325,48 @@ describe("Google connection notice hydration", () => {
         { provider: "google", connectionId: "", condition: "unusable" },
       ]),
     ).toEqual([]);
+  });
+});
+
+describe("parseCanonicalWorkflowUnavailable", () => {
+  const facts = {
+    workflow_permanent_id: "wpid_bound",
+    candidate_published: false,
+    test_started: false,
+  };
+
+  it("hydrates the typed facts and ignores anything else", () => {
+    expect(
+      hydrateNarrativeFromPayload(
+        basePayload({ canonicalWorkflowUnavailable: facts }),
+      )?.canonicalWorkflowUnavailable,
+    ).toEqual({ workflowPermanentId: "wpid_bound" });
+    expect(
+      parseCanonicalWorkflowUnavailable({
+        workflow_permanent_id: "wpid_bound",
+        test_started: false,
+      }),
+    ).toEqual({ workflowPermanentId: "wpid_bound" });
+    expect(EMPTY_NARRATIVE.canonicalWorkflowUnavailable).toBeNull();
+    expect(
+      hydrateNarrativeFromPayload(basePayload())?.canonicalWorkflowUnavailable,
+    ).toBeNull();
+    expect(
+      parseCanonicalWorkflowUnavailable({
+        ...facts,
+        candidate_published: true,
+      }),
+    ).toBeNull();
+    expect(
+      parseCanonicalWorkflowUnavailable({
+        ...facts,
+        workflow_permanent_id: "",
+      }),
+    ).toBeNull();
+    expect(
+      parseCanonicalWorkflowUnavailable(
+        "This chat's agent is not available, so this change was not saved.",
+      ),
+    ).toBeNull();
   });
 });

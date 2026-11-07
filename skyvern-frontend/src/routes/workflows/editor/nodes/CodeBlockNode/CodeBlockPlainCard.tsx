@@ -15,6 +15,7 @@ import {
 
 type Props = {
   steps: Array<CodeBlockStep>;
+  hasCode?: boolean;
   generating?: boolean;
   onStop?: () => void;
   stopBlockedReason?: string | null;
@@ -22,6 +23,7 @@ type Props = {
 
 function CodeBlockPlainCard({
   steps,
+  hasCode = false,
   generating = false,
   onStop,
   stopBlockedReason = null,
@@ -80,7 +82,9 @@ function CodeBlockPlainCard({
         </ol>
       ) : steps.length === 0 ? (
         <p className="rounded-md border border-dashed border-border/70 px-3 py-4 text-xs text-muted-foreground">
-          No steps yet. Steps appear once Skyvern generates them.
+          {hasCode
+            ? "No browser steps found in this code."
+            : "No steps yet. Steps appear once Skyvern generates them."}
         </p>
       ) : (
         <ol className="space-y-1.5">

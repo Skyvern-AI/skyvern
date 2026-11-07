@@ -35,6 +35,7 @@ from skyvern.forge.sdk.workflow.models.tags import (
     TagWriteContext,
 )
 from skyvern.forge.sdk.workflow.models.validators import TAG_COLOR_PALETTE
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
 
 ORG_ID = "o_test"
 WPID = "wpid_alpha"
@@ -572,6 +573,37 @@ async def test_apply_run_tag_changes_rejects_run_from_other_org(repo: TagsReposi
 
     with pytest.raises(RunTagWorkflowRunMismatch):
         await repo.apply_run_tag_changes(WRID, "o_other", sets={"env": "prod"}, deletes=set(), context=_ctx())
+
+    assert await repo.get_active_grouped_tags_for_run(WRID, "o_other") == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "known_run",
+    [
+        WorkflowRun.model_construct(workflow_run_id=WRID, organization_id=ORG_ID),
+        WorkflowRun.model_construct(workflow_run_id="wr_other", organization_id="o_other"),
+    ],
+    ids=["this-run-in-its-own-org", "another-run"],
+)
+@pytest.mark.parametrize("writer", ["system", "user"])
+async def test_run_tag_write_checks_the_run_unless_handed_it_in_the_target_org(
+    repo: TagsRepository, known_run: WorkflowRun, writer: str
+) -> None:
+    await _seed_workflow_run(repo, WRID, org_id=ORG_ID)
+
+    with pytest.raises(RunTagWorkflowRunMismatch):
+        if writer == "system":
+            await repo.apply_system_run_tag_changes(
+                workflow_run_id=WRID,
+                organization_id="o_other",
+                sets={"skyvern.trigger": "api"},
+                known_run=known_run,
+            )
+        else:
+            await repo.apply_run_tag_changes(
+                WRID, "o_other", sets={"env": "prod"}, deletes=set(), context=_ctx(), known_run=known_run
+            )
 
     assert await repo.get_active_grouped_tags_for_run(WRID, "o_other") == {}
 

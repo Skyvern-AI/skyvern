@@ -392,6 +392,7 @@ async def _prepare_and_execute_item(group: WorkflowRunGroup, item: WorkflowRunGr
             trigger_type=WorkflowRunTriggerType.api,
             workflow_run_id=item.workflow_run_id,
             resolved_workflow_id=group.workflow_id,
+            requested_by=group.requested_by,
             created_by=group.created_by,
         )
     except IntegrityError:

@@ -2,6 +2,7 @@ import asyncio
 import io
 import os
 import time
+import weakref
 import zipfile
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -10,6 +11,7 @@ from typing import TYPE_CHECKING
 from urllib.parse import urlencode
 
 import structlog
+from cachetools import TTLCache
 
 from skyvern.config import settings
 from skyvern.forge import app
@@ -47,6 +49,8 @@ LOG = structlog.get_logger(__name__)
 ARCHIVE_AGE_THRESHOLD = timedelta(days=90)
 # Long enough for slow storage that still progresses; bounds the archive bytes a stalled store keeps alive.
 BACKGROUND_FLUSH_TIMEOUT_SECONDS = 120.0
+ARTIFACT_URL_EXPIRY_CACHE_TTL_SECONDS = 60
+ARTIFACT_URL_EXPIRY_CACHE_MAX_ORGS = 1024
 
 
 def _ensure_aware_utc(value: datetime) -> datetime:
@@ -252,6 +256,11 @@ class ArtifactManager:
         # step_id -> accumulator for step archive artifacts
         self._step_archives: dict[str, StepArchiveAccumulator] = {}
         self._background_flushes: set[asyncio.Task[None]] = set()
+        self._url_expiry_by_org: TTLCache[str, int] = TTLCache(
+            maxsize=ARTIFACT_URL_EXPIRY_CACHE_MAX_ORGS, ttl=ARTIFACT_URL_EXPIRY_CACHE_TTL_SECONDS
+        )
+        self._url_expiry_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+        self._url_expiry_generation = 0
 
     def _track_upload_aiotask(
         self,
@@ -1447,14 +1456,33 @@ class ArtifactManager:
     async def resolve_artifact_url_expiry_seconds(self, organization_id: str | None) -> int:
         """Look up the org's artifact-URL TTL override; fall back to the global default.
 
-        One DB hit per call — typically resolved once per batch of URLs (e.g.
-        all downloads for a run) and passed into ``build_signed_content_url``.
+        Cached per org for ``ARTIFACT_URL_EXPIRY_CACHE_TTL_SECONDS``, so a change written by another process
+        reaches this one within that time. Concurrent misses for one org share a single read.
         """
         if organization_id is None:
             return ARTIFACT_URL_EXPIRY_SECONDS
-        org = await app.DATABASE.organizations.get_organization(organization_id=organization_id)
-        per_org = org.artifact_url_expiry_seconds if org else None
-        return effective_artifact_url_expiry_seconds(per_org)
+        cached = self._url_expiry_by_org.get(organization_id)
+        if cached is not None:
+            return cached
+        lock = self._url_expiry_locks.get(organization_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._url_expiry_locks[organization_id] = lock
+        async with lock:
+            cached = self._url_expiry_by_org.get(organization_id)
+            if cached is not None:
+                return cached
+            generation = self._url_expiry_generation
+            org = await app.DATABASE.organizations.get_organization(organization_id=organization_id)
+            expiry_seconds = effective_artifact_url_expiry_seconds(org.artifact_url_expiry_seconds if org else None)
+            # A read that raced an invalidation may hold the old value, so only an unraced read is cached.
+            if generation == self._url_expiry_generation:
+                self._url_expiry_by_org[organization_id] = expiry_seconds
+            return expiry_seconds
+
+    def invalidate_cached_artifact_url_expiry(self, organization_id: str) -> None:
+        self._url_expiry_generation += 1
+        self._url_expiry_by_org.pop(organization_id, None)
 
     def _bundle_content_url(
         self,

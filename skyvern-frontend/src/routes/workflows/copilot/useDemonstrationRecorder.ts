@@ -5,6 +5,7 @@ import { getClient } from "@/api/AxiosClient";
 import { getSseClient } from "@/api/sse";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { getErrorDetail } from "@/util/getErrorDetail";
 
 import type {
   CopilotAttachedFile,
@@ -75,6 +76,16 @@ export function useDemonstrationRecorder({
   const demonstrationIdRef = useRef<string | null>(null);
   const phaseRef = useRef<DemonstrationPhase>("idle");
   const insertionRef = useRef<WorkflowCopilotDemonstrationInsertion>();
+  const [insertion, setInsertionState] = useState<
+    WorkflowCopilotDemonstrationInsertion | undefined
+  >();
+  const setInsertion = useCallback(
+    (next: WorkflowCopilotDemonstrationInsertion | undefined) => {
+      insertionRef.current = next;
+      setInsertionState(next);
+    },
+    [],
+  );
   const onDoneRef = useRef(onDone);
   onDoneRef.current = onDone;
   const onStartFailedRef = useRef(onStartFailed);
@@ -116,8 +127,8 @@ export function useDemonstrationRecorder({
     setLimitReached(false);
     setBrowserRestarted(false);
     updateBusy(false);
-    insertionRef.current = undefined;
-  }, [updateBusy, updateDemonstrationId, updatePhase]);
+    setInsertion(undefined);
+  }, [setInsertion, updateBusy, updateDemonstrationId, updatePhase]);
 
   const handleStreamFrame = useCallback(
     (frame: WorkflowCopilotDemonstrationUpdate): boolean => {
@@ -136,7 +147,8 @@ export function useDemonstrationRecorder({
           ].sort((left, right) => left.seq - right.seq);
           setActions(actionsRef.current);
           setActionCount((current) => Math.max(current, frame.seq));
-          setSensitiveField(null);
+          // A note is not a browser action, so the saved-credential card stays up.
+          if (frame.tool_name !== "note") setSensitiveField(null);
           if (frame.tool_name === "upload_attached_file") {
             setAwaitingFileOutcome(false);
             if (frame.file_id) {
@@ -256,7 +268,7 @@ export function useDemonstrationRecorder({
 
   const start = useCallback(
     ({
-      insertion,
+      insertion: startInsertion,
     }: { insertion?: WorkflowCopilotDemonstrationInsertion } = {}) => {
       if (busyRef.current) return;
       actionsRef.current = [];
@@ -266,10 +278,10 @@ export function useDemonstrationRecorder({
       setCanFillCredentials(false);
       setHasSkippedSensitiveField(false);
       setLimitReached(false);
-      insertionRef.current = insertion;
+      setInsertion(startInsertion);
       void openStream();
     },
-    [openStream],
+    [openStream, setInsertion],
   );
 
   const resume = useCallback(
@@ -330,6 +342,32 @@ export function useDemonstrationRecorder({
     [runControl],
   );
 
+  // Done waits on these, so a note sent just before it is queued ahead of the stop.
+  const pendingNotesRef = useRef(new Set<Promise<unknown>>());
+  const addNote = useCallback(
+    async (text: string) => {
+      // A dictation pause or click can land after Done started; the recorder would refuse that note anyway.
+      if (phaseRef.current !== "recording") return false;
+      const request = sendControl({ action: "note", text });
+      pendingNotesRef.current.add(request);
+      try {
+        await request;
+        return true;
+      } catch (error) {
+        toast({
+          title: "Could not add the note",
+          description:
+            error instanceof Error ? error.message : "Please try again.",
+          variant: "destructive",
+        });
+        return false;
+      } finally {
+        pendingNotesRef.current.delete(request);
+      }
+    },
+    [sendControl],
+  );
+
   const fillCredential = useCallback(
     (credentialId: string) => {
       if (
@@ -386,8 +424,7 @@ export function useDemonstrationRecorder({
         setAwaitingFileOutcome(false);
         toast({
           title: "Could not upload the file",
-          description:
-            error instanceof Error ? error.message : "Please try again.",
+          description: getErrorDetail(error) ?? "Please try again.",
           variant: "destructive",
         });
       } finally {
@@ -407,6 +444,7 @@ export function useDemonstrationRecorder({
     updateBusy(true);
     try {
       if (phaseRef.current === "recording") {
+        await Promise.allSettled(pendingNotesRef.current);
         const stopped = await sendControl({ action: "stop" }, id);
         const stream = streamControllerRef.current;
         streamControllerRef.current = null;
@@ -575,7 +613,7 @@ export function useDemonstrationRecorder({
         setActions(actionsRef.current);
         setCanFillCredentials(response.data.can_fill_credentials);
         setLimitReached(!response.data.can_resume);
-        insertionRef.current = response.data.insertion ?? undefined;
+        setInsertion(response.data.insertion ?? undefined);
         updatePhase("stopped");
       } catch (error) {
         if (isAxiosError(error) && error.response?.status === 403)
@@ -591,6 +629,7 @@ export function useDemonstrationRecorder({
     clear,
     credentialGetter,
     sendControl,
+    setInsertion,
     updateBusy,
     updateDemonstrationId,
     updatePhase,
@@ -616,11 +655,13 @@ export function useDemonstrationRecorder({
     hasSkippedSensitiveField,
     limitReached,
     browserRestarted,
+    insertion,
     unavailable,
     busy,
     start,
     resume,
     navigate,
+    addNote,
     fillCredential,
     chooseFile,
     dismissSensitiveField,

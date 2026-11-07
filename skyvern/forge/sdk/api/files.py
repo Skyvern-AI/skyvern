@@ -227,8 +227,10 @@ def _determine_download_filename(
 
     file_name = ""
     file_suffix = ""
+    header_stem = ""
     try:
-        file_name, file_suffix = get_file_name_and_suffix_from_headers(response_headers)
+        header_stem, file_suffix = get_file_name_and_suffix_from_headers(response_headers)
+        file_name = header_stem
         if not file_suffix:
             LOG.warning("No extension name retrieved from HTTP headers")
     except Exception:
@@ -242,7 +244,8 @@ def _determine_download_filename(
         LOG.info("No file name retrieved from HTTP headers, using the file name from the URL")
         file_name = os.path.basename(urlparse(url).path) or "download"
 
-    if not is_valid_mime_type(file_name) and file_suffix:
+    # A Content-Disposition stem never carries its own suffix, even a lookalike ("data.csv" of "data.csv.pdf").
+    if file_suffix and ((header_stem and file_name == header_stem) or not is_valid_mime_type(file_name)):
         LOG.info("No file extension detected, adding the extension from HTTP headers")
         file_name = file_name + file_suffix
 
@@ -928,12 +931,19 @@ def zip_files(files_path: str, zip_file_path: str) -> str:
     return zip_file_path
 
 
-def unzip_files(zip_file_path: str, output_dir: str) -> None:
+def unzip_files(zip_file_path: str, output_dir: str, skip_member: Callable[[str], bool] | None = None) -> None:
     with zipfile.ZipFile(zip_file_path, "r") as zip_ref:
-        zip_ref.extractall(output_dir)
+        if skip_member is None:
+            zip_ref.extractall(output_dir)
+        else:
+            zip_ref.extractall(
+                output_dir, members=[info for info in zip_ref.infolist() if not skip_member(info.filename)]
+            )
 
 
-def unzip_bytes_to_temp_directory(zip_bytes: bytes, prefix: str) -> str:
+def unzip_bytes_to_temp_directory(
+    zip_bytes: bytes, prefix: str, skip_member: Callable[[str], bool] | None = None
+) -> str:
     """Extract a downloaded archive into a fresh temp directory and return its path.
 
     The archive must be CLOSED before ZipFile reopens it by path: a write smaller than the io buffer
@@ -944,7 +954,7 @@ def unzip_bytes_to_temp_directory(zip_bytes: bytes, prefix: str) -> str:
         temp_zip_file.write(zip_bytes)
         temp_zip_file_path = temp_zip_file.name
     try:
-        unzip_files(temp_zip_file_path, temp_dir)
+        unzip_files(temp_zip_file_path, temp_dir, skip_member)
     finally:
         # Cookie-bearing archives must not accumulate in TEMP_PATH on every retrieve.
         os.unlink(temp_zip_file_path)

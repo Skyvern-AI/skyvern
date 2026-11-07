@@ -19,12 +19,12 @@ import {
 } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
-import { GoogleOAuthCredentialSelector } from "@/routes/workflows/components/GoogleOAuthCredentialSelector";
+import { CredentialSourceSelector } from "@/routes/workflows/components/CredentialSourceSelector";
+import { useWorkflowScopeReadOnly } from "@/routes/workflows/editor/WorkflowScopeContext";
 import {
   MicrosoftOAuthCredentialSelector,
   MICROSOFT_MAIL_REQUIRED_SCOPES,
 } from "@/routes/workflows/components/MicrosoftOAuthCredentialSelector";
-import { GOOGLE_GMAIL_REQUIRED_SCOPES } from "@/util/googleScopes";
 
 import { helpTooltips } from "../../helpContent";
 import { containsJinjaReference } from "../../jinjaReferences";
@@ -89,6 +89,8 @@ function EmailInboxEditorBody({
   data: EmailInboxNodeData;
 }) {
   const { editable } = data;
+  const readOnly = useWorkflowScopeReadOnly();
+  const isNango = data.credentialSource === "nango";
   const update = useUpdate<EmailInboxNodeData>({ id: blockId, editable });
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
@@ -99,10 +101,18 @@ function EmailInboxEditorBody({
   );
 
   const updateEmailClient = (emailClient: EmailClient) => {
-    update({ emailClient, credentialId: "" });
+    update({
+      emailClient,
+      credentialId: "",
+      credentialSource: "native",
+      connectionId: "",
+    });
   };
 
-  const updateCredentialId = (credentialId: string) => {
+  const updateCredentialId = (
+    credentialId: string,
+    extra: Partial<EmailInboxNodeData> = {},
+  ) => {
     const parameterKey = getTemplateParameterKey(credentialId);
     const previousParameterKey = getTemplateParameterKey(data.credentialId);
     const previousParameterKeyIsUsedElsewhere = previousParameterKey
@@ -119,6 +129,7 @@ function EmailInboxEditorBody({
     update({
       credentialId,
       parameterKeys,
+      ...extra,
     });
   };
 
@@ -154,17 +165,35 @@ function EmailInboxEditorBody({
             field="credentialId"
             label={
               data.emailClient === "gmail"
-                ? "Google Account"
+                ? "Gmail account"
                 : "Microsoft Account"
             }
             fallback="The connected account used to read email."
           />
           {data.emailClient === "gmail" ? (
-            <GoogleOAuthCredentialSelector
+            <CredentialSourceSelector
+              provider="gmail"
               nodeId={blockId}
-              value={data.credentialId}
-              onChange={updateCredentialId}
-              requiredScopes={GOOGLE_GMAIL_REQUIRED_SCOPES}
+              credentialId={data.credentialId}
+              credentialSource={data.credentialSource ?? "native"}
+              connectionId={data.connectionId ?? ""}
+              disabled={!editable || readOnly}
+              onChange={(credentialSource, id) => {
+                if (credentialSource === "native") {
+                  updateCredentialId(
+                    id,
+                    data.credentialSource === "nango" || data.connectionId
+                      ? { credentialSource: "native", connectionId: "" }
+                      : {},
+                  );
+                } else {
+                  update({
+                    credentialSource,
+                    connectionId: id,
+                    credentialId: "",
+                  });
+                }
+              }}
             />
           ) : (
             <MicrosoftOAuthCredentialSelector
@@ -172,9 +201,18 @@ function EmailInboxEditorBody({
               value={data.credentialId}
               onChange={updateCredentialId}
               requiredScopes={MICROSOFT_MAIL_REQUIRED_SCOPES}
+              editable={data.editable}
             />
           )}
         </div>
+        {isNango ? (
+          <p className="text-xs text-muted-foreground">
+            This Gmail account requires an eligible human-initiated root run.
+            Scheduled, event, and child runs are unsupported. Folder, sender,
+            and subject must be literal; attachment downloads are unsupported.
+            Reads return at most 100 messages.
+          </p>
+        ) : null}
       </div>
 
       <Separator />
@@ -322,6 +360,7 @@ function EmailInboxEditorBody({
                 <Switch
                   aria-label="Download Attachments"
                   checked={data.downloadAttachments}
+                  disabled={isNango && !data.downloadAttachments}
                   onCheckedChange={(checked) =>
                     update({ downloadAttachments: checked })
                   }

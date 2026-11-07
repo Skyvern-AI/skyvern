@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_repository import BaseRepository
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
-from skyvern.forge.sdk.db.exceptions import NotFoundError
+from skyvern.forge.sdk.db.exceptions import CredentialSitesChangedError, NotFoundError
 from skyvern.forge.sdk.db.models import CredentialModel, OrganizationBitwardenCollectionModel, TOTPCodeModel
 from skyvern.forge.sdk.db.repositories.proxy_pin_update import apply_proxy_pin_to_model, normalize_proxy_pin_for_create
 from skyvern.forge.sdk.db.utils import serialize_proxy_location
@@ -23,6 +23,7 @@ from skyvern.forge.sdk.schemas.credentials import (
     TotpType,
 )
 from skyvern.forge.sdk.schemas.organization_bitwarden_collections import OrganizationBitwardenCollection
+from skyvern.forge.sdk.workflow.models.credential_release import normalize_extra_site_urls, saved_site_urls
 from skyvern.schemas.proxy_pinning import generate_proxy_session_id, should_generate_proxy_session_id
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
 from skyvern.utils.email_validation import (
@@ -35,6 +36,7 @@ from skyvern.utils.phone_validation import (
     normalize_identifier,
     phone_identifier_candidates,
 )
+from skyvern.utils.strings import canonical_uuid_or_original, is_uuid
 
 _UNSET = object()
 
@@ -60,8 +62,81 @@ def _totp_identifiers_match(left: str, right: str) -> bool:
     )
 
 
+def _drop_extra_sites_on_tested_site(credential: CredentialModel) -> None:
+    if credential.extra_site_urls:
+        credential.extra_site_urls = (
+            normalize_extra_site_urls(credential.tested_url, credential.extra_site_urls) or None
+        )
+
+
 class CredentialRepository(BaseRepository):
     """Database operations for credential and Bitwarden collection management."""
+
+    @db_operation("get_credential_ids_by_vault_item_ids")
+    async def get_credential_ids_by_vault_item_ids(
+        self,
+        organization_id: str,
+        vault_item_ids: set[tuple[str, str | None, str]],
+    ) -> dict[tuple[str, str | None, str], set[str]]:
+        if not vault_item_ids:
+            return {}
+        bitwarden_types = {CredentialVaultType.BITWARDEN.value, CredentialVaultType.BITWARDEN_CONNECTED.value}
+
+        def normalize_item_id(vault_type: str, item_id: str) -> str:
+            if vault_type in bitwarden_types:
+                return canonical_uuid_or_original(item_id)
+            return item_id.lower() if vault_type == CredentialVaultType.AZURE_VAULT.value else item_id
+
+        requested: dict[tuple[str, str | None, str], set[tuple[str, str | None, str]]] = {}
+        item_filters = []
+        for vault_type, vault_id, item_id in vault_item_ids:
+            canonical_id = normalize_item_id(vault_type, item_id)
+            requested.setdefault((vault_type, vault_id, canonical_id), set()).add((vault_type, vault_id, item_id))
+            vault_type_filters = [CredentialModel.vault_type == vault_type]
+            if vault_type == CredentialVaultType.BITWARDEN.value:
+                vault_type_filters.append(CredentialModel.vault_type.is_(None))
+            if vault_type in bitwarden_types and is_uuid(item_id):
+                # UUID equivalence, not spelling, determines the saved Bitwarden item.
+                stored = func.lower(CredentialModel.item_id)
+                for marker in ("-", "{", "}", "urn:uuid:"):
+                    stored = func.replace(stored, marker, "")
+                item_filter = stored == canonical_id.replace("-", "")
+            elif vault_type == CredentialVaultType.AZURE_VAULT.value:
+                item_filter = func.lower(CredentialModel.item_id) == canonical_id
+            else:
+                item_filter = CredentialModel.item_id == item_id
+            item_filters.append(
+                and_(
+                    or_(*vault_type_filters),
+                    CredentialModel.vault_id == vault_id
+                    if vault_id is not None
+                    else CredentialModel.vault_id.is_(None),
+                    item_filter,
+                )
+            )
+        async with self.Session() as session:
+            rows = (
+                await session.execute(
+                    select(
+                        CredentialModel.vault_type,
+                        CredentialModel.vault_id,
+                        CredentialModel.item_id,
+                        CredentialModel.credential_id,
+                    ).where(
+                        CredentialModel.organization_id == organization_id,
+                        CredentialModel.deleted_at.is_(None),
+                        or_(*item_filters),
+                    )
+                )
+            ).all()
+        result: dict[tuple[str, str | None, str], set[str]] = {}
+        for vault_type, vault_id, item_id, credential_id in rows:
+            if item_id and credential_id:
+                normalized_vault_type = vault_type or CredentialVaultType.BITWARDEN.value
+                canonical_id = normalize_item_id(normalized_vault_type, item_id)
+                for requested_item in requested.get((normalized_vault_type, vault_id, canonical_id), ()):
+                    result.setdefault(requested_item, set()).add(credential_id)
+        return result
 
     @db_operation("create_credential")
     async def create_credential(
@@ -128,6 +203,7 @@ class CredentialRepository(BaseRepository):
         folder_id_is_null: bool = False,
         item_keys: Sequence[tuple[str, str]] | None = None,
         limit: int | None = None,
+        vault_type: CredentialVaultType = CredentialVaultType.ONEPASSWORD,
     ) -> list[Credential]:
         if item_keys is not None and not item_keys:
             return []
@@ -136,7 +212,7 @@ class CredentialRepository(BaseRepository):
                 select(CredentialModel)
                 .where(
                     CredentialModel.organization_id == organization_id,
-                    CredentialModel.vault_type == CredentialVaultType.ONEPASSWORD.value,
+                    CredentialModel.vault_type == vault_type.value,
                     CredentialModel.vault_id.is_not(None),
                     CredentialModel.item_id.is_not(None),
                     CredentialModel.deleted_at.is_(None),
@@ -175,6 +251,7 @@ class CredentialRepository(BaseRepository):
         set_folder_on_update: bool = True,
         authorize_update: Callable[[AsyncSession, str], Awaitable[None]] | None = None,
         commit: bool = True,
+        vault_type: CredentialVaultType = CredentialVaultType.ONEPASSWORD,
     ) -> tuple[Credential, bool]:
         async with self.Session() as session:
             insert = sqlite_insert if session.get_bind().dialect.name == "sqlite" else pg_insert
@@ -182,7 +259,7 @@ class CredentialRepository(BaseRepository):
                 insert(CredentialModel)
                 .values(
                     organization_id=organization_id,
-                    vault_type=CredentialVaultType.ONEPASSWORD.value,
+                    vault_type=vault_type.value,
                     vault_id=vault_id,
                     item_id=item_id,
                     name=name,
@@ -209,7 +286,7 @@ class CredentialRepository(BaseRepository):
                 select(CredentialModel)
                 .where(
                     CredentialModel.organization_id == organization_id,
-                    CredentialModel.vault_type == CredentialVaultType.ONEPASSWORD.value,
+                    CredentialModel.vault_type == vault_type.value,
                     CredentialModel.vault_id == vault_id,
                     CredentialModel.item_id == item_id,
                     CredentialModel.deleted_at.is_(None),
@@ -548,7 +625,7 @@ class CredentialRepository(BaseRepository):
             ).all()
             return [Credential.model_validate(credential) for credential in credentials]
 
-    @db_operation("update_credential")
+    @db_operation("update_credential", expected_errors=(CredentialSitesChangedError,))
     async def update_credential(
         self,
         credential_id: str,
@@ -557,6 +634,8 @@ class CredentialRepository(BaseRepository):
         browser_profile_id: str | None | object = _UNSET,
         pin_saved_session_ip: bool | None = None,
         tested_url: str | None = None,
+        extra_site_urls: list[str] | None = None,
+        expected_site_urls: list[str] | None = None,
         user_context: str | None = None,
         save_browser_session_intent: bool | None = None,
         auto_profile_disabled: bool | None = None,
@@ -567,17 +646,23 @@ class CredentialRepository(BaseRepository):
         is_test_login_temporary: bool | None = None,
         is_passkey_setup_pending: bool | None = None,
     ) -> Credential:
+        """``expected_site_urls`` makes the write conditional on the row's saved sites, read under a row lock."""
         async with self.Session() as session:
-            credential = (
-                await session.scalars(
-                    select(CredentialModel)
-                    .filter_by(credential_id=credential_id)
-                    .filter_by(organization_id=organization_id)
-                    .filter(CredentialModel.deleted_at.is_(None))
-                )
-            ).first()
+            query = (
+                select(CredentialModel)
+                .filter_by(credential_id=credential_id)
+                .filter_by(organization_id=organization_id)
+                .filter(CredentialModel.deleted_at.is_(None))
+            )
+            if expected_site_urls is not None:
+                query = query.with_for_update()
+            credential = (await session.scalars(query)).first()
             if not credential:
                 raise NotFoundError(f"Credential {credential_id} not found")
+            if expected_site_urls is not None and expected_site_urls != saved_site_urls(
+                credential.tested_url, credential.extra_site_urls or []
+            ):
+                raise CredentialSitesChangedError(credential_id)
             if name is not None:
                 credential.name = name
             # Sentinel-gated so an explicit None unlinks (user picks Auto after attaching a profile),
@@ -588,6 +673,10 @@ class CredentialRepository(BaseRepository):
                 credential.pin_saved_session_ip = pin_saved_session_ip
             if tested_url is not None:
                 credential.tested_url = tested_url
+            if extra_site_urls is not None:
+                credential.extra_site_urls = extra_site_urls or None
+            if tested_url:
+                _drop_extra_sites_on_tested_site(credential)
             if user_context is not None:
                 credential.user_context = user_context
             if save_browser_session_intent is not None:
@@ -706,6 +795,8 @@ class CredentialRepository(BaseRepository):
             credential.secret_label = secret_label
             if tested_url is not None:
                 credential.tested_url = tested_url
+            if tested_url:
+                _drop_extra_sites_on_tested_site(credential)
             apply_proxy_pin_to_model(
                 credential,
                 entity_id=credential_id,

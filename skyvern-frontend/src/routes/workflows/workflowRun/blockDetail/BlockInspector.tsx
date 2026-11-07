@@ -557,12 +557,17 @@ function BlockInspector({
   block,
   action,
   onViewScreenshot,
+  onFix,
   statedFailureHeadline = null,
+  wrapTabs = false,
 }: {
   block: WorkflowRunBlock;
   action?: ActionsApiResponse | null;
   onViewScreenshot?: () => void;
+  onFix?: () => void;
   statedFailureHeadline?: string | null;
+  // Narrow hosts (the Doc) let the tab row wrap; the run page keeps its single row.
+  wrapTabs?: boolean;
 }) {
   const inputFields = useMemo(
     () => getInputFields(block, action),
@@ -615,7 +620,12 @@ function BlockInspector({
         onValueChange={setActiveTab}
         className="space-y-3"
       >
-        <TabsList className="h-8 gap-0.5 rounded-md bg-slate-elevation2 p-0.5">
+        <TabsList
+          className={cn(
+            "h-8 gap-0.5 rounded-md bg-slate-elevation2 p-0.5",
+            wrapTabs && "h-auto min-h-8 max-w-full flex-wrap justify-start",
+          )}
+        >
           <TabsTrigger className={triggerClassName} value="summary">
             Summary
           </TabsTrigger>
@@ -639,7 +649,9 @@ function BlockInspector({
                 action,
                 diagnosticsStepIndex,
               )}
-              title="Go to diagnostics"
+              title="Open diagnostics in a new tab"
+              target="_blank"
+              rel="noreferrer"
               onClick={(event) => event.stopPropagation()}
               className={cn(
                 triggerClassName,
@@ -661,6 +673,7 @@ function BlockInspector({
             <BlockDetailFailure
               block={block}
               onViewScreenshot={onViewScreenshot}
+              onFix={onFix}
               statedFailureHeadline={statedFailureHeadline}
             />
           )}

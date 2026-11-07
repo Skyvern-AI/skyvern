@@ -67,6 +67,49 @@ describe("OnboardingTelemetry", () => {
     );
   });
 
+  it("captures card-step views and Stripe return outcomes", () => {
+    OnboardingTelemetry.cardStepViewed("org_card_step");
+    OnboardingTelemetry.cardStepReturned("cancel", "org_card_step");
+
+    expect(posthog.capture).toHaveBeenNthCalledWith(
+      1,
+      "billing.card_step.viewed",
+      {
+        organization_id: "org_card_step",
+        $groups: { organization: "org_card_step" },
+        step_id: "billing.card_step.viewed:v1",
+      },
+    );
+    expect(posthog.capture).toHaveBeenNthCalledWith(
+      2,
+      "billing.card_step.returned",
+      {
+        outcome: "cancel",
+        organization_id: "org_card_step",
+        $groups: { organization: "org_card_step" },
+        step_id: "billing.card_step.returned:v1",
+      },
+    );
+  });
+
+  it("captures a Stripe return without organization attribution when unavailable", () => {
+    vi.mocked(posthog.getGroups).mockReturnValueOnce({});
+    OnboardingTelemetry.cardStepReturned("success");
+
+    expect(posthog.capture).toHaveBeenCalledWith(
+      "billing.card_step.returned",
+      expect.objectContaining({
+        outcome: "success",
+        organization_id: undefined,
+        step_id: "billing.card_step.returned:v1",
+      }),
+    );
+    expect(posthog.capture).not.toHaveBeenCalledWith(
+      "billing.card_step.returned",
+      expect.objectContaining({ $groups: expect.anything() }),
+    );
+  });
+
   it("reports whether PostHog accepted a questionnaire capture", () => {
     const input = {
       primaryIntent: "fill_forms",
@@ -135,7 +178,6 @@ describe("OnboardingTelemetry", () => {
       "onboarding_questionnaire_shown",
       {
         questionnaire_version: 1,
-        "$feature/onboarding_questionnaire_v1": true,
         surface: "welcome_page",
         primary_intent: null,
         prompt_reason: "initial",
@@ -148,7 +190,6 @@ describe("OnboardingTelemetry", () => {
       "onboarding_questionnaire_completed",
       {
         questionnaire_version: 1,
-        "$feature/onboarding_questionnaire_v1": true,
         surface: "welcome_page",
         response_id: "response",
         revision: 1,
@@ -171,7 +212,6 @@ describe("OnboardingTelemetry", () => {
       "onboarding_questionnaire_skipped",
       {
         questionnaire_version: 1,
-        "$feature/onboarding_questionnaire_v1": true,
         surface: "welcome_page",
         response_id: "response",
         revision: 2,
@@ -186,7 +226,6 @@ describe("OnboardingTelemetry", () => {
       "onboarding_questionnaire_updated",
       {
         questionnaire_version: 1,
-        "$feature/onboarding_questionnaire_v1": true,
         surface: "welcome_page",
         response_id: "response",
         revision: 3,

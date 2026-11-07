@@ -39,6 +39,10 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
+import {
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+} from "@/components/ui/dropdown-menu";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
@@ -65,6 +69,7 @@ import {
 import { useSaveWorkflow } from "../editor/hooks/useSaveWorkflow";
 import { PendingGoalChangesDialog } from "../editor/PendingGoalChangesDialog";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
+import { useCopilotProposalStore } from "@/store/CopilotProposalStore";
 import { useToggleHistoryPanel } from "../editor/hooks/useToggleHistoryPanel";
 import { getRunBlockingTooltipText } from "../editor/runValidation/runBlockingCopy";
 import { useRunValidationStore } from "../editor/runValidation/useRunValidationStore";
@@ -74,11 +79,14 @@ import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWork
 import { getRerunNavigationState } from "../utils";
 import { ControlTooltip } from "./ControlTooltip";
 import { PaneHeaderDivider } from "./PaneHeaderDivider";
+import { useStudioNarrow } from "./useStudioNarrow";
 import { StudioPaneToggles } from "./StudioPaneToggles";
 import { isAuthoringLayout } from "./panes";
 import { useStudioPanes } from "./useStudioPanes";
 import { useStudioRunId } from "./useStudioRunId";
 import { useStudioWorkflowDeletedAt } from "./StudioShellContext";
+import { DocRunButton } from "../editor/doc/DocRunButton";
+import { useDocRunOwnsTopBar } from "../editor/doc/useDocRunOwnsTopBar";
 
 export function TitleSection({ editable = true }: { editable?: boolean }) {
   const title = useWorkflowTitleStore((state) => state.title);
@@ -140,7 +148,11 @@ export function SaveButton() {
   const contentDirty = useWorkflowSnapshotStore((s) => s.contentDirty);
   const snapshot = useWorkflowSnapshotStore((s) => s.snapshot);
   const saveLockReason = useWorkflowYamlEditorStore(selectSaveLockReason);
-  const saveUnavailable = saveLockReason !== null;
+  const proposalPending = useCopilotProposalStore((s) => s.proposal !== null);
+  const saveUnavailable = saveLockReason !== null || proposalPending;
+  const saveUnavailableReason = proposalPending
+    ? "Resolve the Copilot proposal before saving."
+    : saveLockReason;
   const onSave = useSaveWorkflow();
   const [confirmOpen, setConfirmOpen] = useState(false);
   const pendingGoalChangeCount = useCopilotActionStore(
@@ -148,6 +160,7 @@ export function SaveButton() {
   );
   const [goalDialogOpen, setGoalDialogOpen] = useState(false);
   const saveOrConfirm = () => {
+    if (useCopilotProposalStore.getState().proposal) return;
     // Recompute dirtiness synchronously from the same source as the
     // summary (incl. the YAML draft). contentDirty is debounced and
     // canvas-only, so gating the confirmation on it would skip it for a
@@ -200,7 +213,7 @@ export function SaveButton() {
     <>
       <ControlTooltip
         content="Save workflow"
-        reason={saveBlockedReason ?? saveLockReason}
+        reason={saveBlockedReason ?? saveUnavailableReason}
         blocked={saveUnavailable}
       >
         <Button
@@ -262,8 +275,9 @@ export function SaveButton() {
               </Button>
             ) : (
               <Button
-                disabled={saving || saveLockReason !== null}
+                disabled={saving || saveUnavailable}
                 onClick={() => {
+                  if (useCopilotProposalStore.getState().proposal) return;
                   // Close only on success; a failed save (already toasted by
                   // onSave's onError) keeps the list open for retry, so swallow
                   // the rejection rather than leaving it unhandled.
@@ -307,6 +321,9 @@ function PanelToggle({
   const setState = useWorkflowPanelStore((s) => s.setWorkflowPanelState);
   const close = useWorkflowPanelStore((s) => s.closeWorkflowPanel);
   const isOpen = state.active && state.content === content;
+  // Folded into the More actions menu at phone width (PhoneTopBarItems).
+  const narrow = useStudioNarrow();
+  if (narrow) return null;
   return (
     <ControlTooltip content={label}>
       <Button
@@ -339,6 +356,8 @@ export function InputsToggle() {
   const setState = useWorkflowPanelStore((s) => s.setWorkflowPanelState);
   const count = useWorkflowParametersStore((s) => s.parameters.length);
   const isOpen = state.active && state.content === "parameters";
+  const narrow = useStudioNarrow();
+  if (narrow) return null;
   return (
     <ControlTooltip content="Placeholder values you can link in any block, and fill in before each run">
       <Button
@@ -361,6 +380,45 @@ export function InputsToggle() {
   );
 }
 
+// The top bar's secondary controls as More actions items at phone width, so
+// the title and Run keep their room.
+function PhoneTopBarItems({ triggers }: { triggers: boolean }) {
+  const narrow = useStudioNarrow();
+  const setState = useWorkflowPanelStore((s) => s.setWorkflowPanelState);
+  const count = useWorkflowParametersStore((s) => s.parameters.length);
+  if (!narrow) return null;
+  return (
+    <>
+      <DropdownMenuItem
+        onSelect={() => setState({ active: true, content: "parameters" })}
+      >
+        <InputIcon className="mr-2 size-4" aria-hidden />
+        Inputs
+        {count > 0 ? (
+          <span className="ml-auto pl-3 text-xs text-muted-foreground">
+            {count}
+          </span>
+        ) : null}
+      </DropdownMenuItem>
+      <DropdownMenuItem
+        onSelect={() => setState({ active: true, content: "schedules" })}
+      >
+        <CalendarIcon className="mr-2 size-4" aria-hidden />
+        Schedule
+      </DropdownMenuItem>
+      {triggers ? (
+        <DropdownMenuItem
+          onSelect={() => setState({ active: true, content: "triggers" })}
+        >
+          <LightningBoltIcon className="mr-2 size-4" aria-hidden />
+          Triggers
+        </DropdownMenuItem>
+      ) : null}
+      <DropdownMenuSeparator />
+    </>
+  );
+}
+
 const NO_BLOCKS_RUN_TOOLTIP =
   "Add a block or ask Copilot to build the agent before running";
 
@@ -377,6 +435,7 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
   const credentialGetter = useCredentialGetter();
   const blockingBlocks = useRunValidationStore((s) => s.blockingBlocks);
   const hasBlockingBlocks = blockingBlocks.length > 0;
+  const docProblemCount = useRunValidationStore((s) => s.docProblemCount);
   const {
     data: retainedRun,
     isError: statusUnavailable,
@@ -396,12 +455,23 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
   const hasNoBlocks = useWorkflowHasChangesStore(
     (s) => s.editorHasBlocks === false,
   );
-  const runBlocked = hasNoBlocks || hasBlockingBlocks;
+  // While the Doc lists problems Run stays normal: a click explains and jumps to the first one.
+  const docHasProblems = docProblemCount > 0;
+  const runBlocked = hasNoBlocks || (hasBlockingBlocks && !docHasProblems);
   const runBlockedReason = hasBlockingBlocks
     ? getRunBlockingTooltipText(blockingBlocks)
     : hasNoBlocks
       ? NO_BLOCKS_RUN_TOOLTIP
       : "Run workflow";
+  const showDocProblems = (event?: { preventDefault: () => void }) => {
+    if (runBlocked || !docHasProblems) return false;
+    event?.preventDefault();
+    toast({
+      title: `Fix ${docProblemCount} problem${docProblemCount === 1 ? "" : "s"} before running`,
+    });
+    useRunValidationStore.getState().docShowFirstProblem?.();
+    return true;
+  };
   const rerunEligible = Boolean(
     workflowRun &&
     runIsLogicallyFinal(workflowRun) &&
@@ -509,6 +579,7 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
                 size="default"
                 className="h-8 border border-transparent px-3 disabled:pointer-events-none"
                 disabled={runBlocked}
+                onClick={showDocProblems}
               >
                 <PlayIcon className="mr-2 size-4" /> Run
               </Button>
@@ -543,7 +614,7 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
   return (
     <ControlTooltip
       content={
-        hasBlockingBlocks || hasNoBlocks
+        runBlocked
           ? runBlockedReason
           : rerunEligible
             ? "Re-run with this run's inputs (opens the run form pre-filled)"
@@ -555,12 +626,34 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
         size="default"
         className="h-8 border border-transparent px-3 disabled:pointer-events-none"
         disabled={runBlocked}
-        onClick={startFullRun}
+        onClick={() => {
+          if (!showDocProblems()) startFullRun();
+        }}
       >
         <PlayIcon className="mr-2 size-4" />
         {rerunEligible ? "Re-run" : "Run"}
       </Button>
     </ControlTooltip>
+  );
+}
+
+// The Doc's Run only while the Doc is on screen. A live block run keeps the shared control, which
+// offers a full run next to Stop.
+export function TopBarRunControl() {
+  const docShowing = useDocRunOwnsTopBar();
+  const { panes } = useStudioPanes();
+  const [searchParams] = useSearchParams();
+  const runId = useStudioRunId();
+  const isBlockRun = searchParams.has("bl");
+  const { data: run, isPlaceholderData } = useWorkflowRunWithWorkflowQuery({
+    workflowRunId: isBlockRun ? runId : undefined,
+  });
+  const blockRunGoing =
+    isBlockRun && !isPlaceholderData && Boolean(run && runIsCancellable(run));
+  return docShowing && panes.includes("editor") && !blockRunGoing ? (
+    <DocRunButton />
+  ) : (
+    <RunStopButton />
   );
 }
 
@@ -589,7 +682,7 @@ export function StudioTopBar() {
     toggleHistoryPanel();
   };
   return (
-    <div className="flex h-14 shrink-0 items-center gap-3 border-b border-border bg-slate-elevation2 px-4">
+    <div className="flex h-14 shrink-0 items-center gap-3 border-b border-border bg-slate-elevation2 px-4 max-[719px]:gap-2 max-[719px]:px-3">
       <TitleSection editable={!isGlobalWorkflow && !workflowDeletedAt} />
       {!isGlobalWorkflow && !workflowDeletedAt && workflowPermanentId ? (
         <WorkflowFindingsButton
@@ -640,6 +733,11 @@ export function StudioTopBar() {
                       triggerClassName="h-8 w-8 rounded-md border-0 bg-transparent text-muted-foreground hover:bg-accent hover:text-accent-foreground"
                       onVersionHistory={openVersionHistory}
                       embedded
+                      leadingItems={
+                        <PhoneTopBarItems
+                          triggers={Boolean(workflowTriggersPanel)}
+                        />
+                      }
                     />
                   </>
                 ) : null}
@@ -649,7 +747,7 @@ export function StudioTopBar() {
           ) : null}
           <div className="flex items-center gap-2">
             {authoring ? <InputsToggle /> : null}
-            <RunStopButton />
+            <TopBarRunControl />
           </div>
         </div>
       )}

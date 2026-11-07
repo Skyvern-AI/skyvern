@@ -1,6 +1,8 @@
+import hmac
 import json
 import typing
-from typing import TYPE_CHECKING, Any
+from collections.abc import Iterable
+from typing import Any
 
 import pydantic
 import pydantic.json
@@ -9,6 +11,7 @@ from sqlalchemy import Column, ColumnElement, Table, func, inspect, or_
 
 from skyvern.constants import SCRUBBED_VALUE
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+from skyvern.forge.sdk.copilot.context import TurnNarrativePayload
 from skyvern.forge.sdk.core.organization_age_cache import remember_organization_created_at
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowRunTriggerType
 from skyvern.forge.sdk.db.models import (
@@ -36,9 +39,10 @@ from skyvern.forge.sdk.db.models import (
     WorkflowScheduleModel,
 )
 from skyvern.forge.sdk.encrypt import encryptor
-from skyvern.forge.sdk.encrypt.base import EncryptMethod
+from skyvern.forge.sdk.encrypt.base import EncryptMethod, TokenDecryptionError
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import TurnOutcome
+from skyvern.forge.sdk.schemas.har_evidence import without_final_har_user_match
 from skyvern.forge.sdk.schemas.organizations import (
     AzureClientSecretCredential,
     AzureOrganizationAuthToken,
@@ -54,7 +58,7 @@ from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_copilot import CopilotAttachedFile
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatMessage as WorkflowCopilotChatMessageSchema
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotMessageFeedback
-from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.schemas.workflow_runs import AgentStepToolCall, WorkflowRunBlock
 from skyvern.forge.sdk.schemas.workflow_schedules import WorkflowSchedule
 from skyvern.forge.sdk.workflow import response_value_caps
 from skyvern.forge.sdk.workflow.constants import OUTPUT_PARAMETER_MAX_VALUE_BYTES
@@ -118,12 +122,10 @@ from skyvern.webeye.actions.actions import (
     WaitAction,
 )
 
-if TYPE_CHECKING:
-    from skyvern.forge.sdk.copilot.context import TurnNarrativePayload
-
 LOG = structlog.get_logger()
 
 _MODEL_TIMESTAMP_FIELDS = frozenset({"started_at", "finished_at", "created_at", "modified_at"})
+_NARRATIVE_PAYLOAD_ADAPTER: pydantic.TypeAdapter[TurnNarrativePayload] = pydantic.TypeAdapter(TurnNarrativePayload)
 
 
 def summarize_copilot_chat_title(content: str, max_length: int = 120) -> str:
@@ -490,9 +492,11 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_p
         finished_at=task_obj.finished_at,
         max_screenshot_scrolls=task_obj.max_screenshot_scrolling_times,
         browser_session_id=task_obj.browser_session_id,
+        requested_by=task_obj.requested_by,
         browser_address=task_obj.browser_address,
         download_timeout=task_obj.download_timeout,
-        failure_category=task_obj.failure_category,
+        # The final recording match's claim is row bookkeeping, read only by the task repository's guarded writers.
+        failure_category=without_final_har_user_match(task_obj.failure_category),
     )
     return task
 
@@ -523,13 +527,24 @@ def convert_to_workflow_copilot_chat_message(
             LOG.warning(
                 "Failed to parse TurnOutcome from chat row, treating as None",
                 workflow_copilot_chat_message_id=message_model.workflow_copilot_chat_message_id,
-                exc_info=exc,
+                error=_safe_error(exc),
             )
             parsed_outcome = None
     raw_narrative = message_model.narrative_payload
-    parsed_narrative = typing.cast(
-        "TurnNarrativePayload | None", raw_narrative if isinstance(raw_narrative, dict) else None
-    )
+    narrative_payload_unreadable = False
+    if raw_narrative is not None:
+        try:
+            _NARRATIVE_PAYLOAD_ADAPTER.validate_python(raw_narrative)
+        except Exception as exc:
+            # One unreadable row must not fail the whole chat read: a payload shape change lands
+            # while every chat still holds rows written under the previous shape.
+            LOG.warning(
+                "Failed to parse the narrative payload from a chat row, treating as None",
+                workflow_copilot_chat_message_id=message_model.workflow_copilot_chat_message_id,
+                error=_safe_error(exc),
+            )
+            raw_narrative = None
+            narrative_payload_unreadable = True
     raw_attachments = message_model.attached_files
     attached_files: list[CopilotAttachedFile] = []
     if isinstance(raw_attachments, list):
@@ -540,9 +555,9 @@ def convert_to_workflow_copilot_chat_message(
                 LOG.warning(
                     "Failed to parse an attached file from a chat row, dropping it",
                     workflow_copilot_chat_message_id=message_model.workflow_copilot_chat_message_id,
-                    exc_info=exc,
+                    error=_safe_error(exc),
                 )
-    return WorkflowCopilotChatMessageSchema(
+    message = WorkflowCopilotChatMessageSchema(
         workflow_copilot_chat_message_id=message_model.workflow_copilot_chat_message_id,
         workflow_copilot_chat_id=message_model.workflow_copilot_chat_id,
         sender=message_model.sender,
@@ -551,11 +566,14 @@ def convert_to_workflow_copilot_chat_message(
         attached_files=attached_files,
         global_llm_context=message_model.global_llm_context,
         turn_outcome=parsed_outcome,
-        narrative_payload=parsed_narrative,
         feedback=_message_feedback_from_row(message_model),
         created_at=message_model.created_at,
         modified_at=message_model.modified_at,
     )
+    # Assign after construction because TypedDict validation drops additive fields from newer workers.
+    message.narrative_payload = raw_narrative
+    message._narrative_payload_unreadable = narrative_payload_unreadable
+    return message
 
 
 def _message_feedback_from_row(message_model: WorkflowCopilotChatMessageModel) -> WorkflowCopilotMessageFeedback | None:
@@ -612,6 +630,22 @@ def convert_to_organization(org_model: OrganizationModel) -> Organization:
         created_at=org_model.created_at,
         modified_at=org_model.modified_at,
     )
+
+
+async def rows_with_secret(rows: Iterable[OrganizationAuthTokenModel], secret: str) -> list[OrganizationAuthTokenModel]:
+    """The rows whose stored token, decrypted when encrypted, equals ``secret``; undecryptable rows never match."""
+    matches = []
+    for row in rows:
+        stored = row.token
+        if row.encrypted_token and row.encrypted_method:
+            try:
+                stored = await encryptor.decrypt(row.encrypted_token, EncryptMethod(row.encrypted_method))
+            except (TokenDecryptionError, ValueError):
+                LOG.debug("Skipping undecryptable organization auth token", token_id=row.id)
+                continue
+        if stored and hmac.compare_digest(stored.encode("utf-8"), secret.encode("utf-8")):
+            matches.append(row)
+    return matches
 
 
 async def convert_to_organization_auth_token(
@@ -837,6 +871,7 @@ def convert_to_workflow_run(
         browser_settings_receipt=workflow_run_model.browser_settings_receipt,
         ignore_inherited_workflow_system_prompt=workflow_run_model.ignore_inherited_workflow_system_prompt,
         copilot_session_id=workflow_run_model.copilot_session_id,
+        requested_by=workflow_run_model.requested_by,
         created_by=workflow_run_model.created_by,
         credits_used=workflow_run_model.credits_used or 0,
         cached_credits_used=workflow_run_model.cached_credits_used or 0,
@@ -1020,6 +1055,27 @@ def downloaded_file_count_from_output(output: dict | list | str | None) -> int |
     return None
 
 
+def _agent_step_tool_calls(workflow_run_block_model: WorkflowRunBlockModel) -> list[AgentStepToolCall] | None:
+    state = inspect(workflow_run_block_model, raiseerr=False)
+    if state is not None and "tool_calls" in state.unloaded:
+        return None
+    stored = workflow_run_block_model.tool_calls
+    # The jsonb size guard stores a marker dict in place of an oversized list.
+    if not isinstance(stored, list):
+        return None
+    calls: list[AgentStepToolCall] = []
+    for entry in stored:
+        try:
+            calls.append(AgentStepToolCall.model_validate(entry))
+        except pydantic.ValidationError as e:
+            LOG.warning(
+                "Dropped an invalid agent step tool call",
+                workflow_run_block_id=workflow_run_block_model.workflow_run_block_id,
+                errors=[(error["loc"], error["type"]) for error in e.errors(include_url=False, include_input=False)],
+            )
+    return calls
+
+
 def convert_to_workflow_run_block(
     workflow_run_block_model: WorkflowRunBlockModel,
     task: Task | None = None,
@@ -1064,6 +1120,7 @@ def convert_to_workflow_run_block(
         if workflow_run_block_model.script_run
         else None,
         downloaded_file_count=workflow_run_block_model.downloaded_file_count,
+        tool_calls=_agent_step_tool_calls(workflow_run_block_model),
     )
     if task:
         if task.finished_at and task.started_at:

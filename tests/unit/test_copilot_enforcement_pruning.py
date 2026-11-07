@@ -39,7 +39,13 @@ from skyvern.forge.sdk.copilot.enforcement import (
     enforcement_decision,
     is_screenshot_message,
 )
-from skyvern.forge.sdk.copilot.output_utils import MCP_RESULT_PROVENANCE_KEY, MCP_RESULT_PROVENANCE_VALUE
+from skyvern.forge.sdk.copilot.output_utils import (
+    DOWNLOADS_NOTICE_PREFIX,
+    MCP_RESULT_PROVENANCE_KEY,
+    MCP_RESULT_PROVENANCE_VALUE,
+    OUTPUT_VALUE_MAX_CHARS,
+    REGISTERED_OUTPUTS_NOTICE_PREFIX,
+)
 from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion
 from skyvern.forge.sdk.copilot.tools import (
@@ -51,6 +57,7 @@ from skyvern.forge.sdk.copilot.tools import (
 from skyvern.forge.sdk.copilot.tools._shared import TOTAL_TIMEOUT_SECONDS as shared_total_timeout_seconds
 from skyvern.forge.sdk.copilot.tools.workflow_update import _PERSISTENCE_MESSAGES
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
+from tests.unit._mcp_browser_fakes import page_crash_entry
 from tests.unit.copilot_test_helpers import make_copilot_ctx
 
 
@@ -379,11 +386,13 @@ def _fresh_ctx_for_record() -> SimpleNamespace:
     so the stub populates the interesting fields without tripping AttributeError on
     the downstream update_repeated_failure_state call.
     """
+    dispatched_run_ids: set[str] = set()
     return SimpleNamespace(
         code_artifact_metadata={},
         composition_page_evidence=None,
         block_run_calls_this_turn=0,
-        dispatched_run_ids_this_turn=set(),
+        dispatched_run_ids_this_turn=dispatched_run_ids,
+        record_dispatched_run=dispatched_run_ids.add,
         unbound_required_parameter_keys=[],
         last_test_ok=True,
         last_test_failure_reason=None,
@@ -408,6 +417,7 @@ def _fresh_ctx_for_record() -> SimpleNamespace:
         last_executed_block_labels=[],
         last_full_workflow_test_ok=False,
         last_unverified_block_labels=[],
+        untaken_branch_labels={},
         last_failure_signature=None,
         last_frontier_fingerprint=None,
         repeated_failure_streak_count=0,
@@ -418,7 +428,9 @@ def _fresh_ctx_for_record() -> SimpleNamespace:
         copilot_total_timeout_exceeded=False,
         workflow_verification_evidence=WorkflowVerificationEvidence(),
         last_run_blocks_workflow_run_id=None,
+        superseded_minted_browser_sessions=set(),
         last_run_blocks_block_ids=[],
+        last_run_outcome_block_ids=[],
         last_run_blocks_block_labels=[],
         last_run_outcome=None,
         narrative_block_attempts={},
@@ -990,6 +1002,124 @@ def test_an_evicted_build_test_packet_keeps_its_challenge_facts_and_levers() -> 
     assert packet["challenge_notices"]
 
 
+def test_an_evicted_run_packet_keeps_block_outputs_and_downloads_through_both_passes() -> None:
+    outputs = {"release_date": "2026-10-28", "age_days": 7, "is_recent": True}
+    old_output = json.dumps(
+        {
+            "ok": True,
+            "data": {
+                "build_test_packet": {
+                    "contract_version": "build_test_evidence_packet_v1",
+                    "run": {"workflow_run_id": "wr_release", "status": "completed"},
+                    "registered_outputs": [
+                        {"label": "check_release", "status": "completed", "output": outputs, "value_complete": True}
+                    ],
+                    "downloads": [
+                        {"artifact_id": "a_site", "file_name": "app_1.4.2_amd64.deb"},
+                        {"artifact_id": "a_gen", "file_name": "release_summary.json", "generated": True},
+                    ],
+                    "omission_notices": [
+                        "registered_outputs redacted 1 item(s) containing registered secret values.",
+                        "downloads omitted file names from artifact evidence belonging to another run.",
+                        "stdout shortened at 400 characters.",
+                    ],
+                },
+                "stdout": "y" * 400,
+            },
+        }
+    )
+
+    first, second = _prune_twice(old_output)
+
+    packet = first["build_test_packet"]
+    assert packet["registered_outputs"] == [
+        {"label": "check_release", "status": "completed", "output": outputs, "value_complete": True}
+    ]
+    assert packet["downloads"] == [
+        {"file_name": "app_1.4.2_amd64.deb"},
+        {"file_name": "release_summary.json", "generated": True},
+    ]
+    assert packet["omission_notices"] == [
+        "registered_outputs redacted 1 item(s) containing registered secret values.",
+        "downloads omitted file names from artifact evidence belonging to another run.",
+    ]
+    assert len(json.dumps(first, separators=(",", ":"))) > _TOOL_OUTPUT_SUMMARIZE_THRESHOLD
+    assert second == first
+
+
+def test_an_evicted_run_packet_bounds_its_outputs_downloads_and_notices_stably() -> None:
+    long_value = {"text": "x" * 400}
+    long_label = "l" * 200
+    source_notices = [f"registered_outputs shortened: {i} item(s) omitted." for i in range(5)] + [
+        "downloads shortened: 9 item(s) omitted.",
+        "registered_outputs[].output shortened at 800 characters.",
+    ]
+    old_output = json.dumps(
+        {
+            "ok": True,
+            "data": {
+                "build_test_packet": {
+                    "run": {"workflow_run_id": "wr_many", "status": "completed"},
+                    "registered_outputs": [
+                        {"label": long_label, "status": "completed", "output": long_value, "value_complete": True}
+                    ]
+                    + [{"label": f"o{i}", "output": i, "value_complete": True} for i in range(1, 8)],
+                    "downloads": [{"artifact_id": f"a{i}", "file_name": f"f{i}.pdf"} for i in range(8)],
+                    "omission_notices": source_notices,
+                }
+            },
+        }
+    )
+
+    first, second = _prune_twice(old_output)
+
+    packet = first["build_test_packet"]
+    kept_outputs = packet["registered_outputs"]
+    assert [entry["label"] for entry in kept_outputs[1:]] == ["o1", "o2", "o3", "o4", "o5"]
+    rendered = json.dumps(long_value, ensure_ascii=False, separators=(",", ":"))
+    cut = kept_outputs[0]["output"]
+    assert len(cut) <= OUTPUT_VALUE_MAX_CHARS
+    assert cut.endswith("...")
+    assert rendered.startswith(cut.removesuffix("..."))
+    assert kept_outputs[0]["value_complete"] is False
+    assert [entry["file_name"] for entry in packet["downloads"]] == [f"f{i}.pdf" for i in range(6)]
+    output_notice, download_notice = packet["omission_notices"][:2]
+    assert output_notice.startswith(REGISTERED_OUTPUTS_NOTICE_PREFIX) and "2 item(s)" in output_notice
+    assert download_notice.startswith(DOWNLOADS_NOTICE_PREFIX) and "2 item(s)" in download_notice
+    assert len(packet["omission_notices"]) == 6
+    assert not any(notice.startswith("registered_outputs[]") for notice in packet["omission_notices"])
+    assert len(json.dumps(first, separators=(",", ":"))) > _TOOL_OUTPUT_SUMMARIZE_THRESHOLD
+    assert json.dumps(second, separators=(",", ":")) == json.dumps(first, separators=(",", ":"))
+
+
+def test_an_evicted_output_already_cut_by_the_packet_is_cut_raw_without_requoting() -> None:
+    rendered = json.dumps({"rows": [{"name": f"item {i}", "url": f"https://example.com/{i}"} for i in range(40)]})
+    assert len(rendered) > 800
+    packet_cut = rendered[:797] + "..."
+    old_output = json.dumps(
+        {
+            "ok": True,
+            "data": {
+                "build_test_packet": {
+                    "run": {"workflow_run_id": "wr_cut", "status": "completed"},
+                    "registered_outputs": [
+                        {"label": "rows", "status": "completed", "output": packet_cut, "value_complete": False}
+                    ],
+                },
+                "stdout": "y" * 400,
+            },
+        }
+    )
+
+    first, second = _prune_twice(old_output)
+
+    kept = first["build_test_packet"]["registered_outputs"][0]
+    assert kept["output"] == rendered[: OUTPUT_VALUE_MAX_CHARS - 3] + "..."
+    assert '\\"' not in kept["output"]
+    assert kept["value_complete"] is False
+    assert second == first
+
+
 def test_an_evicted_frame_only_packet_gains_no_solver_facts_on_the_way_through() -> None:
     """Retention copies the challenge dict rather than re-hydrating the model, whose wall-shaped
     fields would otherwise come back as defaults without the excluded ``basis`` to disqualify them."""
@@ -1069,6 +1199,9 @@ _BOUNDED_PAGE_STATE = {
 }
 
 
+_PAGE_CRASHES = [page_crash_entry(url="https://shop.example.com/orders/new")]
+
+
 @pytest.mark.parametrize(
     ("data", "page_state", "expected"),
     [
@@ -1085,7 +1218,7 @@ _BOUNDED_PAGE_STATE = {
 def test_an_evicted_browser_result_keeps_a_bounded_page_state(
     data: dict[str, Any], page_state: dict[str, Any], expected: dict[str, Any]
 ) -> None:
-    old_output = json.dumps({"page_state": page_state, "ok": True, "data": data})
+    old_output = json.dumps({"page_state": page_state, "page_crashes": _PAGE_CRASHES, "ok": True, "data": data})
     items = [_fco("c_old", old_output), _reasoning()] + [
         _fco(f"c{i}", '{"ok":true}') for i in range(KEEP_RECENT_TOOL_OUTPUTS)
     ]
@@ -1094,6 +1227,7 @@ def test_an_evicted_browser_result_keeps_a_bounded_page_state(
 
     assert pruned[0]["output"] != old_output, "the summarizer must have run"
     assert json.loads(pruned[0]["output"])["page_state"] == expected
+    assert json.loads(pruned[0]["output"])["page_crashes"] == _PAGE_CRASHES
 
 
 def test_page_facts_alone_do_not_push_a_short_result_into_compaction() -> None:
@@ -1112,7 +1246,9 @@ def test_page_facts_alone_do_not_push_a_short_result_into_compaction() -> None:
         "challenge_vendor": None,
     }
     failures = [{"method": "POST", "resource_type": "xhr", "failure_text": "net::ERR_EMPTY_RESPONSE", "url": "/r"}]
-    old_output = json.dumps({"page_state": page_state, "page_request_failures": failures, **solved})
+    old_output = json.dumps(
+        {"page_state": page_state, "page_request_failures": failures, "page_crashes": _PAGE_CRASHES, **solved}
+    )
     assert len(json.dumps(solved)) <= 300 < len(old_output)
     items = [_fco("c_old", old_output), _reasoning()] + [
         _fco(f"c{i}", '{"ok":true}') for i in range(KEEP_RECENT_TOOL_OUTPUTS)

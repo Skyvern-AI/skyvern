@@ -30,6 +30,7 @@ from dataclasses import dataclass
 import structlog
 
 if t.TYPE_CHECKING:
+    from skyvern.forge.sdk.executor.run_liveness import RunOwner
     from skyvern.forge.sdk.routes.streaming.cdp_input import CdpInputChannel
     from skyvern.forge.sdk.routes.streaming.channels.message import MessageChannel
     from skyvern.forge.sdk.routes.streaming.channels.vnc import VncChannel
@@ -119,6 +120,9 @@ class DeferredCloseParams:
     expected_runnable_id: str | None = None
     expected_runnable_generation_id: str | None = None
     expected_browser_state: BrowserState | None = None
+    # The browser the deferring cleanup captured and that cleanup's execution, so a successor's browser is kept.
+    deferred_browser_state: BrowserState | None = None
+    owner: RunOwner | None = None
 
 
 @dataclass
@@ -153,6 +157,37 @@ def mark_stream_closing(workflow_run_id: str) -> None:
     )
 
 
+def claim_stream_closing(workflow_run_id: str) -> _ClosingStreamState | None:
+    """``mark_stream_closing`` that also returns the tombstone when this call installed it."""
+    if workflow_run_id in _closing_streams:
+        return None
+    mark_stream_closing(workflow_run_id)
+    return _closing_streams[workflow_run_id]
+
+
+def pending_deferred_close_params(workflow_run_id: str) -> DeferredCloseParams | None:
+    state = _closing_streams.get(workflow_run_id)
+    return state.params if state is not None else None
+
+
+def release_stream_closing(workflow_run_id: str, tombstone: _ClosingStreamState) -> None:
+    # Only the caller's own tombstone, and only while no deferred close finalizer owns it.
+    if _closing_streams.get(workflow_run_id) is tombstone and tombstone.params is None:
+        del _closing_streams[workflow_run_id]
+
+
+def complete_owned_stream_teardown(workflow_run_id: str, tombstone: _ClosingStreamState) -> None:
+    """``complete_stream_teardown`` for the caller's own tombstone after its close ran inline: the streams drained,
+    so the stored deferral was never armed and no finalizer runs."""
+    if (
+        _closing_streams.get(workflow_run_id) is tombstone
+        and tombstone.drained
+        and not tombstone.finalizer_started
+        and workflow_run_id not in _deferred_close_params
+    ):
+        del _closing_streams[workflow_run_id]
+
+
 def _take_ready_finalizer(workflow_run_id: str) -> DeferredCloseParams | None:
     state = _closing_streams.get(workflow_run_id)
     if state is None or state.params is None or not state.drained or state.finalizer_started:
@@ -163,11 +198,26 @@ def _take_ready_finalizer(workflow_run_id: str) -> DeferredCloseParams | None:
 
 async def _run_stream_finalizer(workflow_run_id: str, params: DeferredCloseParams) -> None:
     from skyvern.forge import app
+    from skyvern.forge.sdk.executor.run_liveness import is_superseded_owner
 
     browser_state = app.BROWSER_MANAGER.pages.get(workflow_run_id)
-    close_state = params.expected_browser_state or browser_state
+    close_state = params.deferred_browser_state or params.expected_browser_state or browser_state
+    # A successor registered since the deferral that still holds this browser adopted it: it is no longer ours to
+    # close, unpublish or release. A newer adopter keeps it even after a rebind revoked its authority.
+    handed_over = browser_state is close_state and (
+        is_superseded_owner(workflow_run_id, params.owner)
+        or (
+            params.owner is not None
+            and close_state is not None
+            and app.BROWSER_MANAGER.is_held_by_newer_adopter(workflow_run_id, params.owner, close_state)
+        )
+    )
     try:
-        if browser_state is close_state and close_state is not None:
+        # Unpublished before the close awaits, so a successor arriving meanwhile gets its own browser; a page some
+        # other execution published is left alone.
+        if not handed_over and (browser_state is None or browser_state is close_state):
+            app.BROWSER_MANAGER.evict_page(workflow_run_id)
+        if browser_state is close_state and close_state is not None and not handed_over:
             try:
                 await close_state.close(
                     close_browser_on_completion=params.close_browser_on_completion,
@@ -179,9 +229,29 @@ async def _run_stream_finalizer(workflow_run_id: str, params: DeferredCloseParam
                     workflow_run_id=workflow_run_id,
                     exc_info=True,
                 )
-        app.BROWSER_MANAGER.evict_page(workflow_run_id)
+        elif (
+            handed_over
+            and params.browser_session_id is not None
+            and params.organization_id is not None
+            and params.expected_runnable_id is not None
+            and params.expected_browser_state is not None
+        ):
+            # The successor keeps using the session, so it inherits the cleanup lease this deferral held.
+            app.BROWSER_MANAGER.inherit_deferred_session_lease(
+                workflow_run_id,
+                session_id=params.browser_session_id,
+                organization_id=params.organization_id,
+                runnable_id=params.expected_runnable_id,
+                runnable_generation_id=params.expected_runnable_generation_id,
+                browser_state=params.expected_browser_state,
+            )
+        elif params.owner is not None and close_state is not None and browser_state is not close_state:
+            # A successor replaced the page, displacing this execution's browser; its own claim settles it once.
+            claim = app.BROWSER_MANAGER.claim_superseded_run_resources(workflow_run_id, params.owner)
+            await app.BROWSER_MANAGER.release_superseded_run_resources(workflow_run_id, claim)
         if (
-            params.browser_session_id is not None
+            not handed_over
+            and params.browser_session_id is not None
             and params.organization_id is not None
             and params.expected_runnable_id is not None
             and params.expected_browser_state is not None
@@ -217,8 +287,12 @@ async def _run_stream_finalizer(workflow_run_id: str, params: DeferredCloseParam
             exc_info=True,
         )
 
-    _closing_streams.pop(workflow_run_id, None)
-    _deferred_close_params.pop(workflow_run_id, None)
+    # Only this finalizer's own deferral is completed; one a successor armed or installed meanwhile stays.
+    state = _closing_streams.get(workflow_run_id)
+    if state is not None and state.params is params:
+        del _closing_streams[workflow_run_id]
+    if _deferred_close_params.get(workflow_run_id) is params:
+        del _deferred_close_params[workflow_run_id]
 
 
 async def finalize_stream_teardown(workflow_run_id: str) -> None:
@@ -271,6 +345,8 @@ def set_deferred_close_params(
     expected_runnable_id: str | None = None,
     expected_runnable_generation_id: str | None = None,
     expected_browser_state: BrowserState | None = None,
+    deferred_browser_state: BrowserState | None = None,
+    owner: RunOwner | None = None,
 ) -> bool:
     mark_stream_closing(workflow_run_id)
     params = DeferredCloseParams(
@@ -281,6 +357,8 @@ def set_deferred_close_params(
         expected_runnable_id=expected_runnable_id,
         expected_runnable_generation_id=expected_runnable_generation_id,
         expected_browser_state=expected_browser_state,
+        deferred_browser_state=deferred_browser_state,
+        owner=owner,
     )
     _closing_streams[workflow_run_id].params = params
     active = stream_ref_active(workflow_run_id)

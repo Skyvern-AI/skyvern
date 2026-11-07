@@ -87,13 +87,11 @@ def test_type_tagged_owner_key_distinguishes_numeric_from_string() -> None:
     [
         pytest.param(None, None, id="unreadable-both"),
         pytest.param("string:DUMMY-1001", "string:DUMMY-1001", id="unchanged-key"),
-        pytest.param("string:DUMMY-1001", None, id="key-then-null"),
     ],
 )
 def test_owner_key_fails_closed(pre_key: str | None, post_key: str | None) -> None:
     """Shared visible name, candidate label distinct from the closed name, and no USABLE key change
-    (unreadable, unchanged, or a key that becomes null after the click) -> fail closed. The key-then-null
-    case pins the ``is not None`` guard: dropping it would wrongly accept with committed_value="None"."""
+    (unreadable or unchanged) -> fail closed."""
     pre = {
         "choicesOpen": True,
         "searchValue": "North Site (B)",

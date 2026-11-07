@@ -15,6 +15,7 @@ from playwright.async_api import Page
 
 from skyvern.errors.errors import UserDefinedError, filter_to_user_defined_codes
 from skyvern.forge import app
+from skyvern.forge.antibot_evidence import prompt_evidence_str
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler_factory import get_org_aware_primary_llm_api_handler
 from skyvern.forge.sdk.api.llm.utils import llm_response_log_metadata
@@ -211,6 +212,7 @@ async def _detect_errors_from_context(
             current_url="",
             action_history=json.dumps(action_history),
             error_code_mapping_str=json.dumps(task.error_code_mapping),
+            antibot_evidence_str=prompt_evidence_str(task),
             local_datetime=datetime.now(tz_info).isoformat(),
             reasoning=failure_reason,
         )

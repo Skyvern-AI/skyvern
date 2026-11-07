@@ -14,16 +14,21 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from PIL import Image
 
+from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import _consume_pending_screenshots
 from skyvern.forge.sdk.copilot.screenshot_utils import (
     COPILOT_SCREENSHOT_MAX_HEIGHT,
     COPILOT_SCREENSHOT_MAX_WIDTH,
+    PendingFrameLease,
     ScreenshotActionRelation,
     ScreenshotEntry,
     ScreenshotProvenance,
     enqueue_screenshot,
+    enqueue_screenshot_from_result,
 )
 from skyvern.forge.sdk.copilot.session_factory import copilot_call_model_input_filter
+from skyvern.forge.sdk.copilot.tools import _run_result_screenshot_provenance
+from skyvern.forge.sdk.copilot.tools.composition_capture import store_post_run_page_evidence
 from skyvern.forge.sdk.copilot.tools.run_execution import (
     NO_PERSISTED_END_URL,
     RECORDED_FAILURE_RESPONSE_MAX_CHARS,
@@ -39,6 +44,7 @@ from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerification
 from tests.unit.copilot_test_helpers import (
     captured_frame_entry,
     install_get_run_results_harness,
+    make_copilot_ctx,
     make_model_input_data,
     run_result_block_row,
     sent_image_px,
@@ -221,8 +227,6 @@ class TestEnqueueScreenshot:
 
 
 def test_run_result_screenshot_provenance_reads_nested_run_facts() -> None:
-    from skyvern.forge.sdk.copilot.tools import _run_result_screenshot_provenance
-
     provenance = _run_result_screenshot_provenance(
         {
             "ok": False,
@@ -514,6 +518,158 @@ class TestNudgeDrainAndFilterExclusivity:
 
         assert _consume_pending_screenshots(ctx) is None
         assert ctx.pending_screenshots == []
+
+
+def _png_b64(color: tuple[int, int, int]) -> str:
+    buf = io.BytesIO()
+    Image.new("RGB", (320, 200), color).save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _terminal_capture_provenance(
+    run_id: str,
+    *,
+    action_relation: ScreenshotActionRelation = ScreenshotActionRelation.WORKFLOW_RUN_RESULT,
+) -> ScreenshotProvenance:
+    return ScreenshotProvenance(
+        source_tool="dispatched_terminal_page_capture",
+        captured_url="https://example.com/done",
+        observation_step=None,
+        browser_session_id="pbs_run",
+        workflow_run_id=run_id,
+        action_relation=action_relation,
+    )
+
+
+def _store_run_evidence(ctx: CopilotContext, run_id: str, *, source_browser_session_id: str = "pbs_run") -> bool:
+    _, preserved = store_post_run_page_evidence(
+        ctx,
+        {"current_url": "https://example.com/done", "forms": [{"name": "apply"}]},
+        run_id=run_id,
+        current_url="https://example.com/done",
+        source_browser_session_id=source_browser_session_id,
+        run_browser_session_id="pbs_run",
+    )
+    return preserved
+
+
+def _sent_frame_text(ctx: CopilotContext) -> str | None:
+    result = copilot_call_model_input_filter(make_model_input_data([{"role": "user", "content": "go"}], context=ctx))
+    frames = [message for message in result.input if sent_image_px(message)]
+    return frames[-1]["content"][0]["text"] if frames else None
+
+
+class TestSupersededRunResultFrame:
+    def _ctx_with_terminal_frame(
+        self, frame_run_id: str = "wr_A", *, last_run_id: str = "wr_A"
+    ) -> tuple[CopilotContext, ScreenshotEntry]:
+        ctx = make_copilot_ctx(last_run_blocks_workflow_run_id=last_run_id)
+        assert enqueue_screenshot(ctx, _png_b64((200, 30, 30)), provenance=_terminal_capture_provenance(frame_run_id))
+        return ctx, ctx.pending_screenshots[0]
+
+    def test_a_later_run_storing_evidence_without_a_frame_stops_the_terminal_capture_frame(self) -> None:
+        ctx, frame_a = self._ctx_with_terminal_frame()
+        ctx.pending_frame_lease = PendingFrameLease(
+            capture_event_id=frame_a.capture_event_id, capture_id=frame_a.capture_id, input_fingerprint="f"
+        )
+        assert frame_a.capture_id in (_sent_frame_text(ctx) or "")
+
+        ctx.last_run_blocks_workflow_run_id = "wr_B"
+        assert _store_run_evidence(ctx, "wr_B") is False
+
+        assert _sent_frame_text(ctx) is None
+        assert ctx.pending_screenshots == []
+        assert ctx.pending_frame_lease is None
+
+    @pytest.mark.parametrize(
+        "run_data",
+        [
+            pytest.param({"workflow_run_id": "wr_A"}, id="with_run_id"),
+            pytest.param({}, id="without_run_id"),
+        ],
+    )
+    def test_a_later_run_storing_evidence_without_a_frame_stops_the_run_result_wrapper_frame(
+        self, run_data: dict[str, str]
+    ) -> None:
+        ctx = make_copilot_ctx(last_run_blocks_workflow_run_id="wr_A")
+        result = {"ok": False, "data": {**run_data, "screenshot_base64": _png_b64((200, 30, 30))}}
+        enqueue_screenshot_from_result(
+            ctx,
+            result,
+            provenance=_run_result_screenshot_provenance(result, source_tool="run_blocks_and_collect_debug"),
+        )
+        frame_a = ctx.pending_screenshots[0]
+        assert frame_a.provenance.workflow_run_id == run_data.get("workflow_run_id")
+        assert frame_a.capture_id in (_sent_frame_text(ctx) or "")
+
+        ctx.last_run_blocks_workflow_run_id = "wr_B"
+        _store_run_evidence(ctx, "wr_B")
+
+        assert _sent_frame_text(ctx) is None
+
+    def test_a_later_run_storing_evidence_keeps_a_same_page_observation_frame(self) -> None:
+        ctx = make_copilot_ctx(last_run_blocks_workflow_run_id="wr_B")
+        provenance = _terminal_capture_provenance(
+            "wr_A", action_relation=ScreenshotActionRelation.SAME_PAGE_OBSERVATION
+        )
+        assert enqueue_screenshot(ctx, _png_b64((30, 30, 200)), provenance=provenance)
+        frame = ctx.pending_screenshots[0]
+        assert frame.capture_id in (_sent_frame_text(ctx) or "")
+
+        _store_run_evidence(ctx, "wr_B")
+
+        assert frame.capture_id in (_sent_frame_text(ctx) or "")
+
+    def test_a_later_runs_own_frame_is_what_the_model_sees(self) -> None:
+        ctx, frame_a = self._ctx_with_terminal_frame()
+
+        ctx.last_run_blocks_workflow_run_id = "wr_B"
+        _store_run_evidence(ctx, "wr_B")
+        assert enqueue_screenshot(ctx, _png_b64((30, 200, 30)), provenance=_terminal_capture_provenance("wr_B"))
+        frame_b = ctx.pending_screenshots[0]
+
+        sent = _sent_frame_text(ctx) or ""
+        assert frame_b.capture_id in sent
+        assert frame_a.capture_id not in sent
+
+    @pytest.mark.parametrize(
+        ("existing_evidence", "source_browser_session_id", "frame_run_id", "preserved"),
+        [
+            pytest.param(
+                {
+                    "source_tool": "inspect_page_for_composition",
+                    "observed_after_workflow_run": True,
+                    "workflow_run_id": "wr_A",
+                    "forms": [{"name": "apply"}],
+                },
+                "pbs_other",
+                "wr_Z",
+                True,
+                id="preserve_branch",
+            ),
+            pytest.param(None, "pbs_run", "wr_A", False, id="replacing_branch"),
+        ],
+    )
+    def test_restoring_the_same_runs_evidence_keeps_the_pending_frame(
+        self,
+        existing_evidence: dict[str, Any] | None,
+        source_browser_session_id: str,
+        frame_run_id: str,
+        preserved: bool,
+    ) -> None:
+        ctx, frame = self._ctx_with_terminal_frame(frame_run_id)
+        ctx.composition_page_evidence = existing_evidence
+
+        assert _store_run_evidence(ctx, "wr_A", source_browser_session_id=source_browser_session_id) is preserved
+
+        assert frame.capture_id in (_sent_frame_text(ctx) or "")
+
+    def test_a_late_store_for_an_older_run_keeps_the_newer_runs_frame(self) -> None:
+        ctx, frame_b = self._ctx_with_terminal_frame("wr_B", last_run_id="wr_B")
+
+        _store_run_evidence(ctx, "wr_A")
+
+        assert frame_b.capture_id in (_sent_frame_text(ctx) or "")
 
 
 class TestExtractScreenshotB64:

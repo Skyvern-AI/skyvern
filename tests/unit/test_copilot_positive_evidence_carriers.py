@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 from collections.abc import Sequence
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timezone
@@ -15,7 +14,22 @@ import pytest
 
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot import tools as tools_module
-from skyvern.forge.sdk.copilot.build_test_outcome import ChallengeEffects, challenge_notices
+from skyvern.forge.sdk.copilot.agent_context import (
+    OriginRunRedactionRegistry,
+    PreRunPageReference,
+    RegisteredArtifactEntry,
+    RegisteredArtifactEvidence,
+)
+from skyvern.forge.sdk.copilot.build_test_outcome import (
+    DOWNLOAD_TEXT_AFTER_PARSE_TIMEOUT,
+    DOWNLOAD_TEXT_AFTER_TIME_LIMIT,
+    DOWNLOAD_TEXT_OVER_SIZE_LIMIT,
+    DOWNLOAD_TEXT_PAST_CHAR_LIMIT,
+    DOWNLOAD_TEXT_PAST_FILE_LIMIT,
+    DOWNLOAD_TEXT_WITHHELD,
+    ChallengeEffects,
+    challenge_notices,
+)
 from skyvern.forge.sdk.copilot.challenge_evidence import stamp_challenge_frame_fact
 from skyvern.forge.sdk.copilot.completion_output_grounding import (
     _boundary_delimited_present,
@@ -31,18 +45,12 @@ from skyvern.forge.sdk.copilot.completion_verification import (
 )
 from skyvern.forge.sdk.copilot.composition_browser_expressions import DECLARED_IFRAME_SRC_EXPRESSION
 from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.reached_download_target import GENERATED_FILE_ARTIFACT_IDS_KEY
 from skyvern.forge.sdk.copilot.request_policy import (
     _classifier_fallback_policy,
     build_classifier_fallback_floor,
 )
-from skyvern.forge.sdk.copilot.runtime import (
-    OriginRunRedactionRegistry,
-    PreRunPageReference,
-    RegisteredArtifactEntry,
-    RegisteredArtifactEvidence,
-    RunSecretsNotRegistered,
-    browser_session_turn,
-)
+from skyvern.forge.sdk.copilot.runtime import RunSecretsNotRegistered, browser_session_turn
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.tools import completion as completion_module
 from skyvern.forge.sdk.copilot.tools import composition_capture as composition_capture_module
@@ -55,7 +63,9 @@ from skyvern.forge.sdk.schemas.credentials import CredentialVaultType, PasswordC
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.workflow import runtime_secret_bridge
 from skyvern.forge.sdk.workflow.context_manager import RANDOM_SECRET_ID_PREFIX, WorkflowRunContext
+from skyvern.forge.sdk.workflow.exceptions import FileParseTimeout
 from skyvern.forge.sdk.workflow.models.block import _register_code_block_secret
+from skyvern.utils.secret_redaction import REDACTED_SECRET_PLACEHOLDER
 from tests.unit.copilot_test_helpers import (
     DISPATCHED_NAV_ONLY_HTML,
     harness_run,
@@ -67,6 +77,7 @@ from tests.unit.copilot_test_helpers import (
 from tests.unit.copilot_test_helpers import make_stub_artifact as _artifact
 from tests.unit.copilot_test_helpers import make_stub_html_artifact as _html_artifact
 from tests.unit.copilot_test_helpers import stub_artifact_app as _stub_app
+from tests.unit.workflow.test_file_parser_block import _DIGIT_REMAP, _INVOICE_LINES, _ITEMISED_INVOICE_LINES, _build_pdf
 
 _POST_RUN_LABEL = "post_run_page_observation"
 _ARTIFACT_LABEL = "registered_artifact_observation"
@@ -346,7 +357,7 @@ def test_classifier_fallback_mints_no_typed_requested_output_value(message: str)
 
 def test_registered_artifact_bind_requires_stamp_match() -> None:
     evidence = RegisteredArtifactEvidence(
-        entries=(RegisteredArtifactEntry(artifact_id="art_1", file_name="a.txt", parsed_text="INV-4820-XZ"),),
+        entries=(RegisteredArtifactEntry(artifact_id="art_1", file_name="a.txt", text="INV-4820-XZ"),),
         workflow_run_id="wr_match",
     )
     matched_outputs: dict[str, object] = {}
@@ -362,7 +373,7 @@ def test_registered_artifact_bind_requires_stamp_match() -> None:
 
 def test_registered_artifact_bind_does_not_overwrite_existing_label() -> None:
     evidence = RegisteredArtifactEvidence(
-        entries=(RegisteredArtifactEntry(artifact_id="art_1", file_name="a.txt", parsed_text="INV-4820-XZ"),),
+        entries=(RegisteredArtifactEntry(artifact_id="art_1", file_name="a.txt", text="INV-4820-XZ"),),
         workflow_run_id="wr_match",
     )
     outputs: dict[str, object] = {_ARTIFACT_LABEL: {"parsed_text": "runtime"}}
@@ -377,50 +388,15 @@ def test_pre_run_reference_text_stamp_gated() -> None:
     assert completion_module._pre_run_page_reference_text(reference, "wr_other") is None
 
 
-def test_parse_registered_artifact_text_txt_decode() -> None:
-    parsed = run_execution_module._parse_registered_artifact_text("notes.txt", b"INV-4820-XZ total")
-    assert parsed == "INV-4820-XZ total"
-
-
-def test_parse_registered_artifact_text_unsupported_extension() -> None:
-    assert run_execution_module._parse_registered_artifact_text("image.png", b"\x89PNG") is None
-
-
-def test_parse_registered_artifact_text_pdf_cleans_temp_file(monkeypatch: pytest.MonkeyPatch) -> None:
-    captured: dict[str, str] = {}
-
-    def fake_extract(path: str, *, file_identifier: str) -> str:
-        captured["path"] = path
-        assert os.path.exists(path)
-        return "extracted INV-4820-XZ"
-
-    monkeypatch.setattr(run_execution_module, "extract_pdf_file", fake_extract)
-    parsed = run_execution_module._parse_registered_artifact_text("statement.pdf", b"%PDF-1.4 bytes")
-    assert parsed == "extracted INV-4820-XZ"
-    assert not os.path.exists(captured["path"])
-
-
-def test_parse_registered_artifact_text_pdf_cleans_temp_file_on_exception(monkeypatch: pytest.MonkeyPatch) -> None:
-    captured: dict[str, str] = {}
-
-    def fake_extract(path: str, *, file_identifier: str) -> str:
-        captured["path"] = path
-        raise ValueError("bad pdf")
-
-    monkeypatch.setattr(run_execution_module, "extract_pdf_file", fake_extract)
-    assert run_execution_module._parse_registered_artifact_text("statement.pdf", b"%PDF") is None
-    assert not os.path.exists(captured["path"])
-
-
 @pytest.mark.asyncio
 async def test_artifact_producer_binds_parsed_text(monkeypatch: pytest.MonkeyPatch) -> None:
     artifacts = [_artifact("art_1", "receipt.txt", 20)]
     _stub_app(monkeypatch, artifacts, {"art_1": b"INV-4820-XZ paid"})
-    ctx = SimpleNamespace(registered_artifact_evidence=None)
+    ctx = SimpleNamespace(registered_artifact_evidence=None, copilot_total_timeout_exceeded=False)
     await run_execution_module._capture_registered_artifact_evidence(ctx, run_id="wr_1", organization_id="o_1")
     assert ctx.registered_artifact_evidence is not None
     assert ctx.registered_artifact_evidence.workflow_run_id == "wr_1"
-    assert ctx.registered_artifact_evidence.entries[0].parsed_text == "INV-4820-XZ paid"
+    assert ctx.registered_artifact_evidence.entries[0].text == "INV-4820-XZ paid"
 
 
 @pytest.mark.asyncio
@@ -428,17 +404,20 @@ async def test_artifact_producer_skips_oversize_before_retrieval(monkeypatch: py
     oversize = run_execution_module._MAX_REGISTERED_ARTIFACT_BYTES + 1
     artifacts = [_artifact("art_big", "big.csv", oversize)]
     retrieved_ids = _stub_app(monkeypatch, artifacts, {"art_big": b"x"})
-    ctx = SimpleNamespace(registered_artifact_evidence=None)
+    ctx = SimpleNamespace(registered_artifact_evidence=None, copilot_total_timeout_exceeded=False)
     await run_execution_module._capture_registered_artifact_evidence(ctx, run_id="wr_1", organization_id="o_1")
     assert retrieved_ids == []
-    assert ctx.registered_artifact_evidence is None
+    assert ctx.registered_artifact_evidence.entries == (
+        RegisteredArtifactEntry(artifact_id="art_big", file_name="big.csv"),
+    )
+    assert ctx.registered_artifact_evidence.omission_notices == (DOWNLOAD_TEXT_OVER_SIZE_LIMIT,)
 
 
 @pytest.mark.asyncio
 async def test_artifact_producer_caps_artifact_count(monkeypatch: pytest.MonkeyPatch) -> None:
     artifacts = [_artifact(f"art_{i}", f"f{i}.txt", 10) for i in range(5)]
     retrieved_ids = _stub_app(monkeypatch, artifacts, {f"art_{i}": b"INV-4820-XZ" for i in range(5)})
-    ctx = SimpleNamespace(registered_artifact_evidence=None)
+    ctx = SimpleNamespace(registered_artifact_evidence=None, copilot_total_timeout_exceeded=False)
     await run_execution_module._capture_registered_artifact_evidence(ctx, run_id="wr_1", organization_id="o_1")
     assert len(retrieved_ids) == run_execution_module._MAX_REGISTERED_ARTIFACTS
 
@@ -447,10 +426,13 @@ async def test_artifact_producer_caps_artifact_count(monkeypatch: pytest.MonkeyP
 async def test_artifact_producer_skips_unsupported_extensions(monkeypatch: pytest.MonkeyPatch) -> None:
     artifacts = [_artifact("art_png", "screenshot.png", 10)]
     retrieved_ids = _stub_app(monkeypatch, artifacts, {"art_png": b"binary"})
-    ctx = SimpleNamespace(registered_artifact_evidence=None)
+    ctx = SimpleNamespace(registered_artifact_evidence=None, copilot_total_timeout_exceeded=False)
     await run_execution_module._capture_registered_artifact_evidence(ctx, run_id="wr_1", organization_id="o_1")
     assert retrieved_ids == []
-    assert ctx.registered_artifact_evidence is None
+    assert ctx.registered_artifact_evidence.entries == (
+        RegisteredArtifactEntry(artifact_id="art_png", file_name="screenshot.png"),
+    )
+    assert ctx.registered_artifact_evidence.omission_notices == ()
 
 
 def test_collect_downloaded_artifact_ids_dedupes_across_blocks() -> None:
@@ -470,13 +452,13 @@ def test_collect_downloaded_artifact_ids_dedupes_across_blocks() -> None:
 async def test_artifact_producer_binds_from_downloaded_artifact_ids(monkeypatch: pytest.MonkeyPatch) -> None:
     graded = [_artifact("art_graded", "receipt.txt", 30)]
     _stub_app(monkeypatch, artifacts=[], retrieved={"art_graded": b"CONF-7712045 paid"}, by_ids=graded)
-    ctx = SimpleNamespace(registered_artifact_evidence=None)
+    ctx = SimpleNamespace(registered_artifact_evidence=None, copilot_total_timeout_exceeded=False)
     await run_execution_module._capture_registered_artifact_evidence(
         ctx, run_id="wr_graded", organization_id="o_1", downloaded_artifact_ids=["art_graded"]
     )
     assert ctx.registered_artifact_evidence is not None
     assert ctx.registered_artifact_evidence.workflow_run_id == "wr_graded"
-    assert ctx.registered_artifact_evidence.entries[0].parsed_text == "CONF-7712045 paid"
+    assert ctx.registered_artifact_evidence.entries[0].text == "CONF-7712045 paid"
 
 
 @pytest.mark.asyncio
@@ -491,7 +473,7 @@ async def test_artifact_producer_binds_graded_run_across_repair_iteration_ids(
         retrieved={"art_iter2": b"CONF-7712045 paid"},
         by_ids=graded,
     )
-    ctx = SimpleNamespace(registered_artifact_evidence=None)
+    ctx = SimpleNamespace(registered_artifact_evidence=None, copilot_total_timeout_exceeded=False)
     await run_execution_module._capture_registered_artifact_evidence(
         ctx, run_id="wr_iter2", organization_id="o_1", downloaded_artifact_ids=["art_iter2"]
     )
@@ -506,12 +488,14 @@ async def test_artifact_producer_id_path_filters_non_download_type(monkeypatch: 
     retrieved_ids = _stub_app(
         monkeypatch, artifacts=[], retrieved={"art_screenshot": b"CONF-7712045"}, by_ids=non_download
     )
-    ctx = SimpleNamespace(registered_artifact_evidence=None)
+    ctx = SimpleNamespace(registered_artifact_evidence=None, copilot_total_timeout_exceeded=False)
     await run_execution_module._capture_registered_artifact_evidence(
         ctx, run_id="wr_1", organization_id="o_1", downloaded_artifact_ids=["art_screenshot"]
     )
     assert retrieved_ids == []
-    assert ctx.registered_artifact_evidence is None
+    assert ctx.registered_artifact_evidence.entries == (
+        RegisteredArtifactEntry(artifact_id="art_screenshot", file_name=None, error="unavailable"),
+    )
 
 
 @pytest.mark.asyncio
@@ -519,22 +503,386 @@ async def test_artifact_producer_id_path_skips_oversize(monkeypatch: pytest.Monk
     oversize = run_execution_module._MAX_REGISTERED_ARTIFACT_BYTES + 1
     graded = [_artifact("art_big", "big.csv", oversize)]
     retrieved_ids = _stub_app(monkeypatch, artifacts=[], retrieved={"art_big": b"x"}, by_ids=graded)
-    ctx = SimpleNamespace(registered_artifact_evidence=None)
+    ctx = SimpleNamespace(registered_artifact_evidence=None, copilot_total_timeout_exceeded=False)
     await run_execution_module._capture_registered_artifact_evidence(
         ctx, run_id="wr_1", organization_id="o_1", downloaded_artifact_ids=["art_big"]
     )
     assert retrieved_ids == []
-    assert ctx.registered_artifact_evidence is None
+    assert ctx.registered_artifact_evidence.entries[0].text is None
 
 
 @pytest.mark.asyncio
 async def test_artifact_producer_falls_back_to_run_scan_without_ids(monkeypatch: pytest.MonkeyPatch) -> None:
     artifacts = [_artifact("art_1", "receipt.txt", 20)]
     _stub_app(monkeypatch, artifacts, {"art_1": b"INV-4820-XZ paid"}, by_ids=[])
-    ctx = SimpleNamespace(registered_artifact_evidence=None)
+    ctx = SimpleNamespace(registered_artifact_evidence=None, copilot_total_timeout_exceeded=False)
     await run_execution_module._capture_registered_artifact_evidence(ctx, run_id="wr_1", organization_id="o_1")
     assert ctx.registered_artifact_evidence is not None
-    assert ctx.registered_artifact_evidence.entries[0].parsed_text == "INV-4820-XZ paid"
+    assert ctx.registered_artifact_evidence.entries[0].text == "INV-4820-XZ paid"
+
+
+_TEXT_PDF = _build_pdf(_INVOICE_LINES)
+_SCRAMBLED_PDF = _build_pdf(_ITEMISED_INVOICE_LINES, remap=_DIGIT_REMAP)
+
+
+def _download_run(artifact_ids: list[str], *, generated: list[str] | None = None) -> dict[str, Any]:
+    extracted: dict[str, object] = {"downloaded_file_artifact_ids": artifact_ids}
+    if generated is not None:
+        extracted[GENERATED_FILE_ARTIFACT_IDS_KEY] = generated
+    return {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_doc",
+            "overall_status": "completed",
+            "blocks": [{"label": "download_statement", "status": "completed", "extracted_data": extracted}],
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_downloaded_documents_reach_the_packet_and_completion_from_one_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ids = ["art_text", "art_scrambled", "art_corrupt"]
+    artifacts = [
+        _artifact("art_text", "statement.pdf", len(_TEXT_PDF)),
+        _artifact("art_scrambled", "itemised.pdf", len(_SCRAMBLED_PDF)),
+        _artifact("art_corrupt", "broken.pdf", 12),
+    ]
+    retrieved_ids = _stub_app(
+        monkeypatch,
+        artifacts=[],
+        retrieved={"art_text": _TEXT_PDF, "art_scrambled": _SCRAMBLED_PDF, "art_corrupt": b"not a pdf at all"},
+        by_ids=artifacts,
+    )
+    ctx = make_copilot_ctx()
+    await run_execution_module._capture_registered_artifact_evidence(
+        ctx, run_id="wr_doc", organization_id="org-1", downloaded_artifact_ids=ids
+    )
+    result = _download_run(ids)
+
+    packet = run_execution_module.build_test_evidence_packet(ctx, result)
+    snapshot = completion_module._build_run_evidence_snapshot(ctx, result)
+
+    downloads = {download.artifact_id: download for download in packet.downloads}
+    text_pdf = downloads["art_text"]
+    assert text_pdf.text is not None and "Invoice Total: 1234.56 GBP" in text_pdf.text
+    assert (text_pdf.page_count, text_pdf.char_count, text_pdf.truncated, text_pdf.text_layer_problem) == (
+        1,
+        len(text_pdf.text),
+        False,
+        None,
+    )
+    assert downloads["art_scrambled"].text and downloads["art_scrambled"].text_layer_problem
+    assert downloads["art_corrupt"].text is None
+    assert downloads["art_corrupt"].error == "parse_failed"
+    assert snapshot.block_outputs[_ARTIFACT_LABEL] == {"parsed_text": text_pdf.text, "file_names": ["statement.pdf"]}
+    assert retrieved_ids == ids
+
+
+@pytest.mark.asyncio
+async def test_download_text_keeps_the_file_and_character_caps(monkeypatch: pytest.MonkeyPatch) -> None:
+    contents = {"art_a": b"a" * 15_000, "art_b": b"b" * 15_000, "art_c": b"c", "art_d": b"d"}
+    artifacts = [_artifact(artifact_id, f"{artifact_id}.txt", 15_000) for artifact_id in contents]
+    retrieved_ids = _stub_app(monkeypatch, artifacts=[], retrieved=contents, by_ids=artifacts)
+    ctx = make_copilot_ctx()
+    await run_execution_module._capture_registered_artifact_evidence(
+        ctx, run_id="wr_doc", organization_id="org-1", downloaded_artifact_ids=list(contents)
+    )
+
+    downloads = run_execution_module.build_test_evidence_packet(ctx, _download_run(list(contents))).downloads
+
+    facts = [(download.artifact_id, download.char_count, download.truncated) for download in downloads]
+    assert facts == [("art_a", 15_000, False), ("art_b", 15_000, True), ("art_c", None, None), ("art_d", None, None)]
+    assert sum(len(download.text or "") for download in downloads) == 20_000
+    assert retrieved_ids == ["art_a", "art_b"]
+    assert ctx.registered_artifact_evidence is not None
+    assert ctx.registered_artifact_evidence.omission_notices == (
+        DOWNLOAD_TEXT_PAST_FILE_LIMIT,
+        DOWNLOAD_TEXT_PAST_CHAR_LIMIT,
+    )
+
+
+@pytest.mark.asyncio
+async def test_downloads_that_are_not_documents_do_not_use_up_the_file_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ids = ["art_p1", "art_p2", "art_p3", "art_pdf"]
+    artifacts = [_artifact(f"art_p{i}", f"photo{i}.png", 10) for i in (1, 2, 3)]
+    artifacts.append(_artifact("art_pdf", "statement.pdf", len(_TEXT_PDF)))
+    retrieved_ids = _stub_app(monkeypatch, artifacts=[], retrieved={"art_pdf": _TEXT_PDF}, by_ids=artifacts)
+    ctx = make_copilot_ctx()
+    await run_execution_module._capture_registered_artifact_evidence(
+        ctx, run_id="wr_doc", organization_id="org-1", downloaded_artifact_ids=ids
+    )
+
+    downloads = run_execution_module.build_test_evidence_packet(ctx, _download_run(ids)).downloads
+
+    assert [(download.file_name, download.text is not None) for download in downloads] == [
+        ("photo1.png", False),
+        ("photo2.png", False),
+        ("photo3.png", False),
+        ("statement.pdf", True),
+    ]
+    assert retrieved_ids == ["art_pdf"]
+    assert ctx.registered_artifact_evidence is not None
+    assert DOWNLOAD_TEXT_PAST_FILE_LIMIT not in ctx.registered_artifact_evidence.omission_notices
+
+
+@pytest.mark.asyncio
+async def test_a_requested_download_with_no_download_row_is_reported_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ids = ["art_found", "art_missing"]
+    _stub_app(
+        monkeypatch,
+        artifacts=[],
+        retrieved={"art_found": _TEXT_PDF},
+        by_ids=[_artifact("art_found", "statement.pdf", len(_TEXT_PDF))],
+    )
+    ctx = make_copilot_ctx()
+    await run_execution_module._capture_registered_artifact_evidence(
+        ctx, run_id="wr_doc", organization_id="org-1", downloaded_artifact_ids=ids
+    )
+    result = _download_run(ids)
+
+    downloads = run_execution_module.build_test_evidence_packet(ctx, result).downloads
+    snapshot = completion_module._build_run_evidence_snapshot(ctx, result)
+
+    assert [(download.artifact_id, download.text is not None, download.error) for download in downloads] == [
+        ("art_found", True, None),
+        ("art_missing", False, "unavailable"),
+    ]
+    assert snapshot.block_outputs[_ARTIFACT_LABEL]["file_names"] == ["statement.pdf"]
+
+
+def test_generated_downloads_carry_no_text_even_when_the_record_has_some() -> None:
+    ctx = make_copilot_ctx()
+    ctx.registered_artifact_evidence = RegisteredArtifactEvidence(
+        entries=(RegisteredArtifactEntry(artifact_id="art_gen", file_name="summary.txt", text="Findings 42"),),
+        workflow_run_id="wr_doc",
+    )
+    result = _download_run(["art_gen"], generated=["art_gen"])
+
+    packet = run_execution_module.build_test_evidence_packet(ctx, result)
+    snapshot = completion_module._build_run_evidence_snapshot(ctx, result)
+
+    assert [(download.generated, download.text) for download in packet.downloads] == [(True, None)]
+    assert _ARTIFACT_LABEL not in snapshot.block_outputs
+
+
+@pytest.mark.asyncio
+async def test_a_download_found_only_by_the_run_scan_reaches_the_packet(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_app(monkeypatch, [_artifact("art_scan", "statement.pdf", len(_TEXT_PDF))], {"art_scan": _TEXT_PDF})
+    ctx = make_copilot_ctx()
+    await run_execution_module._capture_registered_artifact_evidence(ctx, run_id="wr_doc", organization_id="org-1")
+
+    downloads = run_execution_module.build_test_evidence_packet(ctx, _download_run([])).downloads
+
+    assert [(download.artifact_id, download.file_name) for download in downloads] == [("art_scan", "statement.pdf")]
+    assert downloads[0].text is not None and "1234.56" in downloads[0].text
+
+
+@pytest.mark.asyncio
+async def test_a_parse_timeout_stops_later_document_reads(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def timed_out(*args: object, **kwargs: object) -> tuple[str, str | None]:
+        raise FileParseTimeout("copilot_registered_download", "PDF text extraction", 1)
+
+    monkeypatch.setattr(run_execution_module, "read_pdf_text_layer", timed_out)
+    artifacts = [_artifact(f"art_{index}", f"bill_{index}.pdf", 10) for index in range(3)]
+    retrieved_ids = _stub_app(monkeypatch, artifacts, {artifact.artifact_id: b"%PDF" for artifact in artifacts})
+    ctx = make_copilot_ctx()
+    await run_execution_module._capture_registered_artifact_evidence(ctx, run_id="wr_doc", organization_id="org-1")
+
+    evidence = ctx.registered_artifact_evidence
+    assert evidence is not None
+    assert [(entry.error, entry.text) for entry in evidence.entries] == [
+        ("parse_timeout", None),
+        (None, None),
+        (None, None),
+    ]
+    assert evidence.omission_notices == (DOWNLOAD_TEXT_AFTER_PARSE_TIMEOUT,)
+    assert retrieved_ids == ["art_0"]
+
+
+@pytest.mark.asyncio
+async def test_an_unexpected_parser_error_becomes_an_error_kind(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def broken(*args: object, **kwargs: object) -> tuple[str, str | None]:
+        raise RuntimeError("parser bug")
+
+    monkeypatch.setattr(run_execution_module, "read_pdf_text_layer", broken)
+    _stub_app(monkeypatch, [_artifact("art_1", "bill.pdf", 10)], {"art_1": b"%PDF"})
+    ctx = make_copilot_ctx()
+    await run_execution_module._capture_registered_artifact_evidence(ctx, run_id="wr_doc", organization_id="org-1")
+
+    assert ctx.registered_artifact_evidence is not None
+    assert ctx.registered_artifact_evidence.entries[0].error == "parse_failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("withhold_text", "deadline_exceeded", "notice"),
+    [(True, False, DOWNLOAD_TEXT_WITHHELD), (False, True, DOWNLOAD_TEXT_AFTER_TIME_LIMIT)],
+)
+async def test_download_text_is_not_read_when_withheld_or_past_the_deadline(
+    monkeypatch: pytest.MonkeyPatch, withhold_text: bool, deadline_exceeded: bool, notice: str
+) -> None:
+    retrieved_ids = _stub_app(monkeypatch, [_artifact("art_1", "bill.txt", 10)], {"art_1": b"secret total 42"})
+    ctx = make_copilot_ctx()
+    ctx.copilot_total_timeout_exceeded = deadline_exceeded
+    await run_execution_module._capture_registered_artifact_evidence(
+        ctx, run_id="wr_doc", organization_id="org-1", withhold_text=withhold_text
+    )
+
+    assert ctx.registered_artifact_evidence is not None
+    assert ctx.registered_artifact_evidence.entries == (
+        RegisteredArtifactEntry(artifact_id="art_1", file_name="bill.txt"),
+    )
+    assert ctx.registered_artifact_evidence.omission_notices == (notice,)
+    assert retrieved_ids == []
+
+
+@pytest.mark.asyncio
+async def test_no_download_text_notice_names_files_that_are_not_documents(monkeypatch: pytest.MonkeyPatch) -> None:
+    artifacts = [_artifact(f"art_{index}", f"photo_{index}.png", 10) for index in range(4)]
+    retrieved_ids = _stub_app(monkeypatch, artifacts, {})
+    ctx = make_copilot_ctx()
+    await run_execution_module._capture_registered_artifact_evidence(
+        ctx, run_id="wr_doc", organization_id="org-1", withhold_text=True
+    )
+
+    assert ctx.registered_artifact_evidence is not None
+    assert ctx.registered_artifact_evidence.omission_notices == ()
+    assert retrieved_ids == []
+
+
+@pytest.mark.asyncio
+async def test_a_registered_secret_in_a_text_download_is_scrubbed_before_it_is_stored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_app(monkeypatch, [_artifact("art_1", "export.txt", 40)], {"art_1": b"account tok-58213-secret total 42"})
+    ctx = make_copilot_ctx()
+    ctx.secret_scrub_values = ["tok-58213-secret"]
+    await run_execution_module._capture_registered_artifact_evidence(ctx, run_id="wr_doc", organization_id="org-1")
+
+    assert ctx.registered_artifact_evidence is not None
+    entry = ctx.registered_artifact_evidence.entries[0]
+    assert entry.text == f"account {REDACTED_SECRET_PLACEHOLDER} total 42"
+    assert entry.char_count == len(entry.text)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_download_lookup_reports_the_run_downloads_as_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def failing_lookup(*args: object, **kwargs: object) -> list[SimpleNamespace]:
+        raise RuntimeError("database unavailable")
+
+    _stub_app(monkeypatch, [], {})
+    monkeypatch.setattr(run_execution_module.app.DATABASE.artifacts, "get_artifacts_by_ids", failing_lookup)
+    ctx = make_copilot_ctx()
+    await run_execution_module._capture_registered_artifact_evidence(
+        ctx, run_id="wr_doc", organization_id="org-1", downloaded_artifact_ids=["art_1"]
+    )
+
+    downloads = run_execution_module.build_test_evidence_packet(ctx, _download_run(["art_1"])).downloads
+    assert [(download.artifact_id, download.text, download.error) for download in downloads] == [
+        ("art_1", None, "unavailable")
+    ]
+
+
+async def _enrich_dispatched_download_run(
+    ctx: CopilotContext, *, origin_registry: OriginRunRedactionRegistry | None = None
+) -> dict[str, Any]:
+    result_data: dict[str, Any] = {}
+    await run_execution_module._attach_post_run_browser_enrichment(
+        ctx,
+        result_data,
+        workflow=None,
+        workflow_run_id="wr_doc",
+        run_block_rows=[],
+        results=[],
+        block_outputs_by_label={"download_statement": {"downloaded_file_artifact_ids": ["art_text"]}},
+        failed_block_code=None,
+        run_session_id=None,
+        dispatch_to_worker=True,
+        run_ok=True,
+        used_fresh_run_session=False,
+        run_detached_from_chat=False,
+        chat_browser_opened_for_run=False,
+        continued_earlier_test=False,
+        origin_registry=origin_registry,
+    )
+    return result_data
+
+
+@pytest.mark.asyncio
+async def test_a_dispatched_run_reads_its_downloaded_document(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_app(monkeypatch, [], {"art_text": _TEXT_PDF}, by_ids=[_artifact("art_text", "statement.pdf", 500)])
+    ctx = make_copilot_ctx()
+
+    await _enrich_dispatched_download_run(ctx)
+
+    evidence = ctx.registered_artifact_evidence
+    assert evidence is not None and evidence.workflow_run_id == "wr_doc"
+    assert evidence.entries[0].text is not None and "1234.56" in evidence.entries[0].text
+
+
+@pytest.mark.asyncio
+async def test_a_dispatched_run_with_unregistered_secrets_withholds_download_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    retrieved_ids = _stub_app(
+        monkeypatch, [], {"art_text": _TEXT_PDF}, by_ids=[_artifact("art_text", "statement.pdf", 500)]
+    )
+    ctx = make_copilot_ctx()
+    registry = OriginRunRedactionRegistry(
+        workflow_run_id="wr_doc",
+        parameters={},
+        contains_sensitive_values=True,
+        contains_all_sensitive_values=False,
+    )
+
+    await _enrich_dispatched_download_run(ctx, origin_registry=registry)
+
+    evidence = ctx.registered_artifact_evidence
+    assert evidence is not None
+    assert evidence.entries == (RegisteredArtifactEntry(artifact_id="art_text", file_name="statement.pdf"),)
+    assert evidence.omission_notices == (DOWNLOAD_TEXT_WITHHELD,)
+    assert retrieved_ids == []
+
+
+@pytest.mark.asyncio
+async def test_a_dispatched_run_past_the_copilot_deadline_reports_unread_download_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    retrieved_ids = _stub_app(
+        monkeypatch, [], {"art_text": _TEXT_PDF}, by_ids=[_artifact("art_text", "statement.pdf", 500)]
+    )
+    ctx = make_copilot_ctx()
+    ctx.copilot_total_timeout_exceeded = True
+
+    await _enrich_dispatched_download_run(ctx)
+
+    evidence = ctx.registered_artifact_evidence
+    assert evidence is not None
+    assert evidence.omission_notices == (DOWNLOAD_TEXT_AFTER_TIME_LIMIT,)
+    assert retrieved_ids == []
+
+
+@pytest.mark.asyncio
+async def test_a_parser_bug_on_a_dispatched_run_still_returns_an_error_kind(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def broken(*args: object, **kwargs: object) -> tuple[str, str | None]:
+        raise RuntimeError("parser bug")
+
+    monkeypatch.setattr(run_execution_module, "read_pdf_text_layer", broken)
+    _stub_app(monkeypatch, [], {"art_text": _TEXT_PDF}, by_ids=[_artifact("art_text", "statement.pdf", 500)])
+    ctx = make_copilot_ctx()
+
+    await _enrich_dispatched_download_run(ctx)
+
+    assert ctx.registered_artifact_evidence is not None
+    assert ctx.registered_artifact_evidence.entries[0].error == "parse_failed"
 
 
 _HTML_WITH_VALUE = (
@@ -714,7 +1062,7 @@ async def test_track_a_registry_admits_complete_run_bound_static_credential_valu
     ctx.secret_scrub_values = []
     db_credential = SimpleNamespace(vault_type=None, totp_identifier=None)
     credential = PasswordCredential(username="private-user", password="private-pass")
-    credential_item = SimpleNamespace(credential=credential)
+    credential_item = SimpleNamespace(credential=credential, login_sites=None)
     service = SimpleNamespace(get_credential_item=AsyncMock(return_value=credential_item))
     process = AsyncMock(return_value=credential_item)
     monkeypatch.setattr(
@@ -762,7 +1110,7 @@ async def test_track_a_registry_keeps_static_credential_values_when_totp_is_dyna
     ctx.secret_scrub_values = []
     db_credential = SimpleNamespace(vault_type=None, totp_identifier="totp_ref")
     credential = PasswordCredential(username="private-user", password="private-pass", totp_identifier="totp_ref")
-    credential_item = SimpleNamespace(credential=credential)
+    credential_item = SimpleNamespace(credential=credential, login_sites=None)
     service = SimpleNamespace(get_credential_item=AsyncMock(return_value=credential_item))
     monkeypatch.setattr(
         run_execution_module,
@@ -1027,7 +1375,7 @@ async def test_runtime_secret_bridge_encrypts_shared_cache_payload(monkeypatch: 
         plaintext = value
         return "opaque-ciphertext"
 
-    async def fake_decrypt(_value: str, _method: object) -> str:
+    async def fake_decrypt_unlabeled(_value: str) -> str:
         assert plaintext is not None
         return plaintext
 
@@ -1035,7 +1383,7 @@ async def test_runtime_secret_bridge_encrypts_shared_cache_payload(monkeypatch: 
     monkeypatch.setattr(
         runtime_secret_bridge,
         "encryptor",
-        SimpleNamespace(encrypt=fake_encrypt, decrypt=fake_decrypt),
+        SimpleNamespace(encrypt=fake_encrypt, decrypt_unlabeled=fake_decrypt_unlabeled),
     )
     workflow_run_context = SimpleNamespace(
         secrets={"password": "private-pass", "runtime": "654321"},
@@ -1180,6 +1528,8 @@ async def test_origin_registry_recovers_when_a_later_terminal_read_finds_the_han
         created_at=datetime(2026, 4, 21, 12, 0),
         trigger_type=None,
         workflow_definition_sha256=None,
+        credits_used=0,
+        cached_credits_used=0,
     )
     workflow = SimpleNamespace(
         workflow_id="wf_origin",

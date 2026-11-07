@@ -22,6 +22,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from playwright.async_api import Error as PlaywrightError
 from structlog.testing import capture_logs
 
 import skyvern.webeye.cdp_download_interceptor as cdp_module
@@ -38,6 +39,7 @@ from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
+from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import EnrichTreeMode, SkyvernContext
 from skyvern.forge.sdk.credential_site_policy import LoginSite
@@ -45,7 +47,7 @@ from skyvern.forge.sdk.db.enums import TaskType, WorkflowRunTriggerType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.utils import hydrate_action
 from skyvern.forge.sdk.experimentation.billing_tier import BillingTier
-from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider
+from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider, NoOpExperimentationProvider
 from skyvern.forge.sdk.experimentation.workflow_block_engine import DISABLE_TASK_V3_FLAG
 from skyvern.forge.sdk.models import TASK_V3_TURN_STEP_CREATED_BY, Step, StepStatus
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
@@ -100,9 +102,13 @@ from skyvern.forge.taskv3.loop import (
     run_agent_tool_loop,
 )
 from skyvern.forge.taskv3.run_arms import (
+    ANSWER_AUDIT_LOG_ONLY_FLAG,
+    APPLICATION_CONTEXT_FLAG,
+    CARRY_REASONING_FLAG,
     DATE_SEGMENT_AIM_FLAG,
-    DEAD_END_RETURN_FLAG,
+    LLM_ROUTE_FLAG,
     LOGIN_PACE_FLAG,
+    TURN_DOM_FLAG,
     run_arm_enabled,
 )
 from skyvern.forge.taskv3.tools import NO_ONE_TIME_CODE_SOURCE, PageProvider, _record_frame_work
@@ -134,6 +140,7 @@ from tests.unit._download_provider_fakes import (
     _StallingActionDownloadObservation,
 )
 from tests.unit._task_block_fakes import run_bound_browser_state
+from tests.unit.conftest import chromium_context, requires_chromium
 from tests.unit.helpers import (
     make_action_row,
     make_browser_state,
@@ -142,6 +149,7 @@ from tests.unit.helpers import (
     make_task,
 )
 from tests.unit.scoped_asyncio import ScopedAsyncio
+from tests.unit.scoped_time import SkewedTime
 from tests.unit.test_taskv3_loop import _ScriptedCaller
 from tests.unit.test_taskv3_tools import _FakePage
 
@@ -153,6 +161,7 @@ async def _run_execute_task_v3(
     action_rounds: list[list[RoundAction]] | None = None,
     action_round_texts: list[str | None] | None = None,
     screenshot_raises: bool = False,
+    screenshot_side_effect: Callable[..., Awaitable[bytes]] | None = None,
     # Records what the post-action capture path does, in order: "settle" per page settle,
     # "screenshot" per capture. Also stubs SkyvernFrame so the settle needs no real frame.
     capture_order: list[str] | None = None,
@@ -225,7 +234,7 @@ async def _run_execute_task_v3(
         browser_state.get_working_page = AsyncMock(side_effect=real_browser_state.get_working_page)
     browser_state.take_post_action_screenshot = AsyncMock(
         return_value=b"png-bytes",
-        side_effect=RuntimeError("screenshot boom") if screenshot_raises else None,
+        side_effect=RuntimeError("screenshot boom") if screenshot_raises else screenshot_side_effect,
     )
     if capture_order is not None:
 
@@ -464,9 +473,13 @@ async def test_execute_task_v3_buckets_the_date_segment_aim_arm_per_run(monkeypa
     )
 
     assert loop_mock.date_segment_aim_enabled_during_loop is True
-    assert loop_mock.context.run_arms[DATE_SEGMENT_AIM_FLAG] == (task.workflow_run_id, "treatment")
-    assert loop_mock.context.run_arms[DEAD_END_RETURN_FLAG] == (task.workflow_run_id, "treatment")
-    for flag in (DATE_SEGMENT_AIM_FLAG, DEAD_END_RETURN_FLAG):
+    for flag in (
+        DATE_SEGMENT_AIM_FLAG,
+        APPLICATION_CONTEXT_FLAG,
+        ANSWER_AUDIT_LOG_ONLY_FLAG,
+        CARRY_REASONING_FLAG,
+    ):
+        assert loop_mock.context.run_arms[flag] == (task.workflow_run_id, "treatment")
         provider.assert_any_await(flag, task.workflow_run_id, properties={"organization_id": task.organization_id})
 
 
@@ -1277,9 +1290,18 @@ def stub_workflow_block_engine_app(mock_wbe_app: MagicMock, *, billing_tier: Bil
     mock_wbe_app.AGENT_FUNCTION.resolve_billing_tier = AsyncMock(return_value=billing_tier)
 
 
-def _v3_task(llm_key: str | None = None, workflow_permanent_id: str | None = None) -> SimpleNamespace:
+def _v3_task(
+    llm_key: str | None = None,
+    workflow_permanent_id: str | None = None,
+    workflow_run_id: str | None = None,
+    task_id: str = "tsk_x",
+) -> SimpleNamespace:
     return SimpleNamespace(
-        llm_key=llm_key, task_id="tsk_x", organization_id="o_test", workflow_permanent_id=workflow_permanent_id
+        llm_key=llm_key,
+        task_id=task_id,
+        organization_id="o_test",
+        workflow_permanent_id=workflow_permanent_id,
+        workflow_run_id=workflow_run_id,
     )
 
 
@@ -1290,7 +1312,7 @@ async def test_resolve_v3_llm_key_prefers_explicit_task_key(monkeypatch: pytest.
         "skyvern.forge.agent.app.EXPERIMENTATION_PROVIDER.get_value_cached",
         AsyncMock(side_effect=AssertionError("flag must not be read when task.llm_key is set")),
     )
-    assert await agent_module._resolve_task_v3_llm_key(_v3_task(llm_key="EXPLICIT_KEY")) == "EXPLICIT_KEY"
+    assert await agent_module._resolve_task_v3_llm_key(_v3_task(llm_key="EXPLICIT_KEY")) == ("EXPLICIT_KEY", None)
 
 
 @pytest.mark.asyncio
@@ -1301,7 +1323,11 @@ async def test_resolve_v3_llm_key_uses_posthog_override(monkeypatch: pytest.Monk
     )
     monkeypatch.setattr(agent_module.LLMConfigRegistry, "is_registered", lambda _k: True)
     monkeypatch.setattr(agent_module, "is_custom_llm_key", lambda _k: False)
-    assert await agent_module._resolve_task_v3_llm_key(_v3_task()) == "OPENAI_GPT5_6_LUNA"
+    assert await agent_module._resolve_task_v3_llm_key(_v3_task()) == ("OPENAI_GPT5_6_LUNA", None)
+
+
+def _llm_name_properties(reader: AsyncMock) -> dict[str, Any]:
+    return [c for c in reader.call_args_list if c.args[0] == "TASK_V3_LLM_NAME"][-1].kwargs["properties"]
 
 
 @pytest.mark.asyncio
@@ -1314,14 +1340,14 @@ async def test_resolve_v3_llm_key_sends_wpid_flag_property(monkeypatch: pytest.M
     monkeypatch.setattr(agent_module, "is_custom_llm_key", lambda _k: False)
 
     resolved = await agent_module._resolve_task_v3_llm_key(_v3_task(workflow_permanent_id="wpid_123"))
-    assert resolved == "FLAG_KEY"
-    assert reader.call_args.kwargs["properties"] == {
+    assert resolved == ("FLAG_KEY", None)
+    assert _llm_name_properties(reader) == {
         "organization_id": "o_test",
         "workflow_permanent_id": "wpid_123",
     }
 
     await agent_module._resolve_task_v3_llm_key(_v3_task())
-    assert reader.call_args.kwargs["properties"] == {
+    assert _llm_name_properties(reader) == {
         "organization_id": "o_test",
         "workflow_permanent_id": "not_workflow",
     }
@@ -1333,7 +1359,7 @@ async def test_resolve_v3_llm_key_sends_wpid_flag_property(monkeypatch: pytest.M
         await agent_module._resolve_task_v3_llm_key(_v3_task())
     finally:
         skyvern_context.reset()
-    assert reader.call_args.kwargs["properties"] == {
+    assert _llm_name_properties(reader) == {
         "organization_id": "o_test",
         "workflow_permanent_id": "wpid_from_ctx",
     }
@@ -1361,7 +1387,7 @@ async def test_resolve_v3_llm_key_ignores_unusable_flag_value(
     monkeypatch.setattr(agent_module, "is_custom_llm_key", lambda _k: False)
     monkeypatch.setattr(agent_module.settings, "TASK_V3_LLM_KEY", "")
     monkeypatch.setattr(agent_module.settings, "LLM_KEY", "DEFAULT_MODEL")
-    assert await agent_module._resolve_task_v3_llm_key(_v3_task()) == "DEFAULT_MODEL"
+    assert await agent_module._resolve_task_v3_llm_key(_v3_task()) == ("DEFAULT_MODEL", None)
 
 
 @pytest.mark.asyncio
@@ -1373,7 +1399,7 @@ async def test_resolve_v3_llm_key_falls_back_when_flag_read_raises(monkeypatch: 
     monkeypatch.setattr(agent_module.settings, "TASK_V3_LLM_KEY", "V3_DIRECT")
     monkeypatch.setattr(agent_module.settings, "LLM_KEY", "DEFAULT_MODEL")
     # TASK_V3_LLM_KEY set → used ahead of LLM_KEY.
-    assert await agent_module._resolve_task_v3_llm_key(_v3_task()) == "V3_DIRECT"
+    assert await agent_module._resolve_task_v3_llm_key(_v3_task()) == ("V3_DIRECT", None)
 
 
 @pytest.mark.asyncio
@@ -1405,7 +1431,7 @@ async def test_resolve_v3_llm_key_keeps_a_ui_run_off_flex(
 
     skyvern_context.set(SkyvernContext(trigger_type=trigger_type))
     try:
-        assert await agent_module._resolve_task_v3_llm_key(_v3_task()) == expected_key
+        assert await agent_module._resolve_task_v3_llm_key(_v3_task()) == (expected_key, None)
     finally:
         skyvern_context.reset()
 
@@ -1420,9 +1446,161 @@ async def test_resolve_v3_llm_key_honors_an_explicit_flex_key_on_a_ui_run(monkey
     )
     skyvern_context.set(SkyvernContext(trigger_type=WorkflowRunTriggerType.manual))
     try:
-        assert await agent_module._resolve_task_v3_llm_key(_v3_task(llm_key="FLEX_ROUTER")) == "FLEX_ROUTER"
+        assert await agent_module._resolve_task_v3_llm_key(_v3_task(llm_key="FLEX_ROUTER")) == ("FLEX_ROUTER", None)
     finally:
         skyvern_context.reset()
+
+
+def _route_flag_reader(route_variant: str | Exception | None) -> AsyncMock:
+    """No TASK_V3_LLM_NAME variant; ``route_variant`` for the LLM route arm."""
+
+    async def read(flag: str, _distinct_id: str, properties: dict[str, Any] | None = None) -> str | None:
+        if flag != LLM_ROUTE_FLAG:
+            return None
+        if isinstance(route_variant, Exception):
+            raise route_variant
+        return route_variant
+
+    return AsyncMock(side_effect=read)
+
+
+def _stub_llm_route(monkeypatch: pytest.MonkeyPatch, reader: AsyncMock, non_flex: dict[str, str] | None = None) -> None:
+    monkeypatch.setattr("skyvern.forge.agent.app.EXPERIMENTATION_PROVIDER.get_value_cached", reader)
+    monkeypatch.setattr(agent_module.settings, "TASK_V3_LLM_KEY", "CONTROL_ROUTE")
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "get_task_v3_llm_route_treatment_key",
+        lambda key: "TREATMENT_ROUTE" if key == "CONTROL_ROUTE" else None,
+        raising=False,
+    )
+    monkeypatch.setattr(app.AGENT_FUNCTION, "get_non_flex_llm_key", lambda key: (non_flex or {}).get(key))
+    monkeypatch.setattr(agent_module.LLMConfigRegistry, "is_registered", lambda _k: True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("route_variant", "trigger_type", "expected"),
+    [
+        ("treatment", WorkflowRunTriggerType.api, ("TREATMENT_ROUTE", "treatment")),
+        ("control", WorkflowRunTriggerType.api, ("CONTROL_ROUTE", "control")),
+        (None, WorkflowRunTriggerType.api, ("CONTROL_ROUTE", None)),
+        (RuntimeError("flag service down"), WorkflowRunTriggerType.api, ("CONTROL_ROUTE", None)),
+        # A manual/MCP run still leaves flex on whichever route the arm picked, under the same label.
+        ("treatment", WorkflowRunTriggerType.manual, ("TREATMENT_STANDARD", "treatment")),
+        ("control", WorkflowRunTriggerType.manual, ("CONTROL_STANDARD", "control")),
+    ],
+)
+async def test_resolve_v3_llm_key_llm_route_arm_swaps_only_a_treatment_run(
+    monkeypatch: pytest.MonkeyPatch,
+    route_variant: str | Exception | None,
+    trigger_type: WorkflowRunTriggerType,
+    expected: tuple[str, str | None],
+) -> None:
+    _stub_llm_route(
+        monkeypatch,
+        _route_flag_reader(route_variant),
+        non_flex={"CONTROL_ROUTE": "CONTROL_STANDARD", "TREATMENT_ROUTE": "TREATMENT_STANDARD"},
+    )
+    skyvern_context.set(SkyvernContext(trigger_type=trigger_type))
+    try:
+        assert await agent_module._resolve_task_v3_llm_key(_v3_task(workflow_run_id="wr_1")) == expected
+    finally:
+        skyvern_context.reset()
+
+
+@pytest.mark.asyncio
+async def test_resolve_v3_llm_key_llm_route_arm_leaves_unmapped_and_explicit_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_llm_route(monkeypatch, _route_flag_reader("treatment"))
+    hook_keys: list[str] = []
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "get_task_v3_llm_route_treatment_key",
+        lambda key: hook_keys.append(key) or ("TREATMENT_ROUTE" if key == "CONTROL_ROUTE" else None),
+        raising=False,
+    )
+    # An arm that never applies is never resolved, so its exposure counts only runs it could change.
+    arm_resolver = AsyncMock(side_effect=AssertionError("the route arm must not be resolved"))
+    monkeypatch.setattr(agent_module, "resolve_run_arm", arm_resolver)
+    skyvern_context.set(SkyvernContext())
+    try:
+        explicit = await agent_module._resolve_task_v3_llm_key(_v3_task(llm_key="CONTROL_ROUTE"))
+        monkeypatch.setattr(agent_module.settings, "TASK_V3_LLM_KEY", "UNMAPPED_ROUTE")
+        unmapped = await agent_module._resolve_task_v3_llm_key(_v3_task())
+    finally:
+        skyvern_context.reset()
+    assert (explicit, unmapped) == (("CONTROL_ROUTE", None), ("UNMAPPED_ROUTE", None))
+    assert hook_keys == ["UNMAPPED_ROUTE"]
+    arm_resolver.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_resolve_v3_llm_key_llm_route_arm_is_unlabeled_without_a_run_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_llm_route(monkeypatch, _route_flag_reader("treatment"))
+    assert await agent_module._resolve_task_v3_llm_key(_v3_task(workflow_run_id="wr_1")) == ("CONTROL_ROUTE", None)
+
+
+@pytest.mark.asyncio
+async def test_resolve_v3_llm_key_llm_route_arm_is_pinned_across_blocks_of_one_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    variants = iter(["treatment", "control"])
+    reader = _route_flag_reader(None)
+    reader.side_effect = lambda flag, *_a, **_k: next(variants) if flag == LLM_ROUTE_FLAG else None
+    _stub_llm_route(monkeypatch, reader)
+    skyvern_context.set(SkyvernContext())
+    try:
+        first = await agent_module._resolve_task_v3_llm_key(_v3_task(workflow_run_id="wr_1", task_id="tsk_1"))
+        second = await agent_module._resolve_task_v3_llm_key(_v3_task(workflow_run_id="wr_1", task_id="tsk_2"))
+    finally:
+        skyvern_context.reset()
+    assert (first, second) == (("TREATMENT_ROUTE", "treatment"), ("TREATMENT_ROUTE", "treatment"))
+    assert [c.args[:2] for c in reader.call_args_list if c.args[0] == LLM_ROUTE_FLAG] == [(LLM_ROUTE_FLAG, "wr_1")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route_variant", ["treatment", "control"])
+async def test_resolve_v3_llm_key_labels_only_blocks_whose_key_went_through_the_arm(
+    monkeypatch: pytest.MonkeyPatch, route_variant: str
+) -> None:
+    overrides = {"tsk_2": "UNPAIRED_ROUTE"}
+
+    async def read(flag: str, distinct_id: str, properties: dict[str, Any] | None = None) -> str | None:
+        return route_variant if flag == LLM_ROUTE_FLAG else overrides.get(distinct_id)
+
+    _stub_llm_route(monkeypatch, AsyncMock(side_effect=read))
+    skyvern_context.set(SkyvernContext())
+    try:
+        labels = [
+            (await agent_module._resolve_task_v3_llm_key(task))[1]
+            for task in (
+                _v3_task(workflow_run_id="wr_1", task_id="tsk_1"),
+                _v3_task(workflow_run_id="wr_1", task_id="tsk_2"),
+                # An explicit key equal to the control key is unlabeled under either pin.
+                _v3_task(llm_key="CONTROL_ROUTE", workflow_run_id="wr_1", task_id="tsk_3"),
+            )
+        ]
+    finally:
+        skyvern_context.reset()
+    assert labels == [route_variant, None, None]
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_hands_the_loop_the_route_arm_recorded_with_the_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        agent_module, "_resolve_task_v3_llm_key", AsyncMock(return_value=("TREATMENT_ROUTE", "treatment"))
+    )
+    caller_factory = MagicMock()
+    _, _, loop_mock, _ = await _run_execute_task_v3(
+        monkeypatch, LoopOutcome(status="completed", reason="done"), llm_caller_factory=caller_factory
+    )
+    assert caller_factory.call_args.kwargs["llm_key"] == "TREATMENT_ROUTE"
+    assert loop_mock.await_args.kwargs["llm_route_arm"] == "treatment"
 
 
 @pytest.mark.asyncio
@@ -1496,6 +1674,162 @@ async def test_execute_task_v3_settles_the_page_before_each_post_action_screensh
     # The two action rounds, each settled before its own capture. The terminal decision capture that
     # follows them runs after the loop has already finished, so it is not part of this contract.
     assert capture_order[:4] == ["settle", "screenshot", "settle", "screenshot"]
+
+
+@requires_chromium
+@pytest.mark.asyncio
+async def test_execute_task_v3_recaptures_a_page_that_paints_after_the_first_screenshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with chromium_context() as context:
+        page = await context.new_page()
+        await page.route("https://example.test/**", lambda route: route.fulfill(body="<body></body>"))
+        await page.goto("https://example.test/")
+        visual_pages = {
+            "controls": "<input><button aria-label='Next'></button>",
+            "open_shadow": (
+                "<div id='host'></div><script>host.attachShadow({mode: 'open'}).innerHTML = '<button>Ready</button>'</script>"
+            ),
+            "closed_shadow": (
+                "<div id='host'></div><script>host.attachShadow({mode: 'closed'}).innerHTML = '<button>Ready</button>'</script>"
+            ),
+            "iframe": "<iframe srcdoc='<p>Ready</p>'></iframe>",
+            "canvas": "<canvas width='100' height='100'></canvas>",
+            "image": "<img width='100' height='100' src='data:image/gif;base64,R0lGODlhAQABAAAAACw='>",
+        }
+        scenarios = [
+            "delayed",
+            "ready",
+            "transient",
+            "capture_navigation",
+            "paint_during_capture",
+            "blank",
+            "blank_again",
+            "blank_navigation",
+            *visual_pages,
+            "retry_error",
+        ]
+        screenshots: dict[str, list[bytes]] = {scenario: [] for scenario in scenarios}
+        body_text: dict[str, str] = {}
+        stage = -1
+        finished = False
+        real_evaluate = page.evaluate
+        navigation_probe_failed = False
+        retry_failed = False
+
+        async def evaluate(expression: str, *args: Any, **kwargs: Any) -> Any:
+            nonlocal navigation_probe_failed
+            if (
+                expression == agent_module._V3_SCREENSHOT_PAINTED_JS
+                and scenarios[stage] == "transient"
+                and not navigation_probe_failed
+            ):
+                navigation_probe_failed = True
+                raise PlaywrightError("Execution context was destroyed during navigation")
+            return await real_evaluate(expression, *args, **kwargs)
+
+        monkeypatch.setattr(page, "evaluate", evaluate)
+
+        async def screenshot(**_kwargs: Any) -> bytes:
+            nonlocal retry_failed
+            if finished:
+                return await page.screenshot()
+            scenario = scenarios[stage]
+            if scenario == "retry_error" and screenshots[scenario]:
+                retry_failed = True
+                raise RuntimeError("recapture failed")
+            if scenario in ("capture_navigation", "paint_during_capture") and not screenshots[scenario]:
+                await page.goto(f"https://example.test/{scenario}")
+            png = await page.screenshot()
+            screenshots[scenario].append(png)
+            if scenario == "paint_during_capture" and len(screenshots[scenario]) == 1:
+                await real_evaluate("() => document.body.textContent = 'Painted'")
+            if (
+                scenario in ("delayed", "transient", "capture_navigation", "blank_navigation", "retry_error")
+                and len(screenshots[scenario]) == 1
+            ):
+                await real_evaluate("() => setTimeout(() => document.body.textContent = 'Painted', 75)")
+            return png
+
+        async def settle(**_kwargs: Any) -> None:
+            nonlocal stage
+            stage += 1
+            scenario = scenarios[stage]
+            if scenario == "blank_navigation":
+                await page.goto(page.url)
+            else:
+                ready = scenario in ("ready", "capture_navigation", "paint_during_capture")
+                await page.set_content(visual_pages.get(scenario, "<body>Ready</body>" if ready else ""))
+            if scenario in visual_pages:
+                body_text[scenario] = await real_evaluate("() => document.body.innerText.trim()")
+
+        def finish_loop(_kwargs: dict[str, Any]) -> None:
+            nonlocal finished
+            finished = True
+
+        frame = MagicMock()
+        frame.safe_wait_for_animation_end = AsyncMock(side_effect=settle)
+        monkeypatch.setattr("skyvern.forge.agent.SkyvernFrame.create_instance", AsyncMock(return_value=frame))
+        monkeypatch.setattr("skyvern.forge.agent._V3_SCREENSHOT_PAINT_TIMEOUT_SECONDS", 1.5)
+        monkeypatch.setattr("skyvern.forge.agent._V3_SCREENSHOT_PAINT_RUN_BUDGET_SECONDS", 30.0)
+        rounds = [[RoundAction("click", {"selector": "#next"}, True, billable=True)] for _ in scenarios]
+        rounds[1] = [RoundAction("navigate", {"url": "https://example.test"}, True)]
+        rounds[2] = [RoundAction("type", {"selector": "#field", "text": "value"}, True, billable=True)]
+        with capture_logs() as logs:
+            async with asyncio.timeout(45):
+                _step, task, _loop, _post = await _run_execute_task_v3(
+                    monkeypatch,
+                    LoopOutcome(status="completed", reason="done"),
+                    action_rounds=rounds,
+                    working_page=page,
+                    screenshot_side_effect=screenshot,
+                    on_loop=finish_loop,
+                    data_extraction_goal=None,
+                    extracted_information_schema=None,
+                )
+
+        saved = [call.kwargs["data"] for call in app.ARTIFACT_MANAGER.create_artifact.await_args_list]
+        for scenario in ("delayed", "transient", "capture_navigation", "paint_during_capture", "blank_navigation"):
+            first, recaptured = screenshots[scenario]
+            assert first != recaptured
+            assert saved[scenarios.index(scenario)] == recaptured
+        for scenario in ("ready", "blank", "blank_again", *visual_pages, "retry_error"):
+            (first,) = screenshots[scenario]
+            assert saved[scenarios.index(scenario)] == first
+        assert all(not text for text in body_text.values())
+        assert navigation_probe_failed
+        assert retry_failed
+        assert [
+            entry["outcome"] for entry in logs if entry["event"] == "taskv3 post-action screenshot paint retry"
+        ] == [
+            "painted",
+            "painted",
+            "painted",
+            "painted",
+            "timeout",
+            "painted",
+            "retry_failed",
+        ]
+        assert task.status == TaskStatus.completed
+
+        await page.set_content("")
+        state = agent_module._V3ScreenshotPaintState(remaining_seconds=0.25)
+        browser_state = MagicMock()
+        browser_state.get_working_page = AsyncMock(return_value=page)
+
+        async def capture_for_budget(**_kwargs: Any) -> bytes:
+            return await page.screenshot()
+
+        browser_state.take_post_action_screenshot = AsyncMock(side_effect=capture_for_budget)
+        monkeypatch.setattr(agent_module, "_settle_before_post_action_screenshot", AsyncMock())
+        with capture_logs() as budget_logs:
+            first = await agent_module._take_v3_post_action_screenshot(browser_state, state)
+            second = await agent_module._take_v3_post_action_screenshot(browser_state, state)
+        assert first == second
+        assert state.remaining_seconds == 0
+        assert [
+            entry["outcome"] for entry in budget_logs if entry["event"] == "taskv3 post-action screenshot paint retry"
+        ] == ["timeout"]
 
 
 _GOTO_OUTCOME = {
@@ -2588,6 +2922,10 @@ async def _run_execute_task_v3_download(
     loop_mock = AsyncMock(side_effect=_loop)
     monkeypatch.setattr("skyvern.forge.taskv3.engine.run_task_v3_agent_loop", loop_mock)
     monkeypatch.setattr("skyvern.forge.agent.LLMCaller", MagicMock())
+    # The provider read-back polls and admission grace run at a tenth of production; tests scale their
+    # download_timeout to match.
+    monkeypatch.setattr(taskv3_provider_downloads, "POLL_INTERVAL_SECONDS", 0.1)
+    monkeypatch.setattr(taskv3_provider_downloads, "EVENT_ADMISSION_GRACE_SECONDS", 0.025)
     # get_path_for_workflow_download_directory (imported by agent.py) resolves through this same
     # module-level name at call time, so patching it here also redirects that call.
     monkeypatch.setattr("skyvern.forge.sdk.api.files.get_download_dir", lambda *_a, **_k: str(tmp_path))
@@ -2815,6 +3153,29 @@ async def test_execute_task_v3_download_block_records_the_file_that_landed(
     assert DOWNLOAD_NO_FILE_FACT not in captured["finish_content"]
     if extraction:
         assert captured["task"].extracted_information == {"total": "12.00"}
+
+
+@pytest.mark.asyncio
+async def test_task_v3_native_finalizer_keeps_existing_file_behavior(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    error_page = b"<!DOCTYPE html><html><head><title>Error</title></head><body><h1>Session expired</h1></body></html>"
+
+    async def _download_then_finish(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
+        (tmp_path / "report.pdf").write_bytes(error_page)
+        captured["probe_reason"] = await kwargs["download_settle"](frozenset())
+        return LoopOutcome(status="completed", reason=captured["probe_reason"], billable_actions=["click"])
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=False,
+        loop_fn=_download_then_finish,
+    )
+
+    assert captured["probe_reason"] == "download completed (1 new file(s))"
+    assert captured["task"].status == TaskStatus.completed
+    assert (tmp_path / "invoice.pdf").read_bytes() == error_page
 
 
 @pytest.mark.asyncio
@@ -3842,6 +4203,37 @@ async def test_recovery_guard_refuses_the_block_credential_off_site_and_admits_i
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("extra_sites", "refused_on_added_site"),
+    [(["https://idp-example.org/login"], False), ([], True)],
+    ids=["added-site", "no-added-site"],
+)
+async def test_recovery_guard_admits_a_site_added_to_the_login_and_still_refuses_others(
+    monkeypatch: pytest.MonkeyPatch, extra_sites: list[str], refused_on_added_site: bool
+) -> None:
+    context = _stub_recovery_run_context(monkeypatch, tested_url="https://portal-example.com/login")
+    if extra_sites:
+        context.credential_extra_site_urls["portal_credential"] = extra_sites
+    task = make_task(datetime.now(UTC), make_organization(datetime.now(UTC)), workflow_run_id="wr_test")
+
+    guard = agent_module.recovery_credential_release_guard(task, ["portal_credential"], enforce_vault_sites=True)
+
+    assert guard is not None
+    armed = guard.matches("s3cret-value")
+
+    def release_to(url: str) -> None:
+        guard.check_release(armed[0], url, operation="taskv3.type", alternatives=armed[1:])
+
+    if refused_on_added_site:
+        with pytest.raises(CodeBlockCredentialReleaseError):
+            release_to("https://accounts.idp-example.org/signin")
+    else:
+        release_to("https://accounts.idp-example.org/signin")
+    with pytest.raises(CodeBlockCredentialReleaseError):
+        release_to("https://phisher-signin.net/login")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("sites", "enforced", "page_url", "refused"),
     [
         ([LoginSite("https://portal-example.com", whole_site=True)], True, "https://phisher-signin.net/login", True),
@@ -4726,7 +5118,7 @@ async def test_execute_task_v3_writes_a_step_per_turn_beside_the_billed_block_st
 
     async def fake_create_step(**kwargs: Any) -> Any:
         created.append(kwargs)
-        return SimpleNamespace(step_id=f"turn-{kwargs['order']}")
+        return SimpleNamespace(step_id=f"turn-{kwargs['order']}", order=kwargs["order"], created_at=datetime.now(UTC))
 
     monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.create_step", fake_create_step)
     finish_turn = AsyncMock()
@@ -4738,7 +5130,14 @@ async def test_execute_task_v3_writes_a_step_per_turn_beside_the_billed_block_st
         click = RoundAction("click", {"selector": "#go"}, True, billable=True)
         await kwargs["on_action_round"]([click], "clicking", round_done=True)
         await kwargs["on_turn_end"](
-            TurnRecord(turn=1, llm_seconds=1.5, tool_calls=[StepToolCall(tool="click", status="ok", billable=True)])
+            TurnRecord(
+                turn=1,
+                llm_seconds=1.5,
+                tool_calls=[
+                    StepToolCall(tool="click", status="ok", billable=True, duration_seconds=0.75),
+                    StepToolCall(tool="type", status="skipped"),
+                ],
+            )
         )
         steps_by_turn.append(await kwargs["on_turn_start"](2))
         await kwargs["on_turn_end"](
@@ -4746,13 +5145,14 @@ async def test_execute_task_v3_writes_a_step_per_turn_beside_the_billed_block_st
         )
 
     outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
-    step, _task, _loop_mock, post_step = await _run_execute_task_v3(
-        monkeypatch,
-        outcome,
-        on_loop_async=drive_turns,
-        data_extraction_goal=None,
-        extracted_information_schema=None,
-    )
+    with capture_logs() as logs:
+        step, _task, _loop_mock, post_step = await _run_execute_task_v3(
+            monkeypatch,
+            outcome,
+            on_loop_async=drive_turns,
+            data_extraction_goal=None,
+            extracted_information_schema=None,
+        )
 
     assert [(c["order"], c["retry_index"], c["status"], c["created_by"]) for c in created] == [
         (1, step.retry_index, StepStatus.running, TASK_V3_TURN_STEP_CREATED_BY),
@@ -4763,12 +5163,66 @@ async def test_execute_task_v3_writes_a_step_per_turn_beside_the_billed_block_st
         (c.kwargs["step_id"], c.kwargs["status"], [t.tool for t in c.kwargs["output"].tool_calls])
         for c in finish_turn.await_args_list
     ]
-    assert finished == [("turn-1", StepStatus.completed, ["click"]), ("turn-2", StepStatus.completed, ["finish"])]
+    assert finished == [
+        ("turn-1", StepStatus.completed, ["click", "type"]),
+        ("turn-2", StepStatus.completed, ["finish"]),
+    ]
+    # Each finished turn writes its own timing line: a call the loop never dispatched counts, but adds no time.
+    timings = [log for log in logs if log["event"] == "Task V3 turn duration metrics"]
+    assert [
+        (t["turn"], t["turn_step_id"], t["step_status"], t["llm_seconds"], t["tool_seconds"], t["tool_call_count"])
+        for t in timings
+    ] == [(1, "turn-1", StepStatus.completed, 1.5, 0.75, 2), (2, "turn-2", StepStatus.completed, None, 0, 1)]
+    assert all(t["duration_seconds"] >= 0 for t in timings)
     # The click row and the finish decision sit on their turns' steps, still stamped with the round index.
     rows = [c.kwargs["action"] for c in agent_module.app.DATABASE.workflow_params.create_action.await_args_list]
     assert [(row.step_id, row.step_order) for row in rows] == [("turn-1", 0), ("turn-2", 0)]
     assert step.step_id == "step-v3" and step.status == StepStatus.completed
     assert post_step.await_args.args[1] is step
+
+
+@pytest.mark.asyncio
+async def test_every_look_image_is_stored_on_the_block_step_before_a_later_judge_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The Copilot's at-failure frame is the block step's newest screenshot_llm, which follows member order.
+    manager = ArtifactManager()
+    monkeypatch.setattr(agent_module.app, "ARTIFACT_MANAGER", manager)
+
+    async def fake_create_step(**kwargs: Any) -> Any:
+        return SimpleNamespace(step_id=f"turn-{kwargs['order']}", task_id="tsk-looks")
+
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.create_step", fake_create_step)
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.finish_step", AsyncMock())
+    stored: dict[str, list[bytes]] = {}
+
+    async def drive_turns(kwargs: dict[str, Any]) -> None:
+        await kwargs["on_turn_start"](1)
+        kwargs["on_look_screenshots"]([b"look-1"])
+        kwargs["on_look_screenshots"]([b"look-2"])
+        manager.accumulate_screenshot_to_step_archive(
+            step=kwargs["step"], screenshots=[b"judge"], artifact_type=ArtifactType.SCREENSHOT_LLM
+        )
+        stored.update(
+            {
+                step_id: [
+                    acc.entries[name] for kind, name, _ in acc.member_types if kind == ArtifactType.SCREENSHOT_LLM
+                ]
+                for step_id, acc in manager._step_archives.items()
+            }
+        )
+
+    step, *_ = await _run_execute_task_v3(
+        monkeypatch,
+        LoopOutcome(status="completed", reason="done", billable_actions=[]),
+        on_loop_async=drive_turns,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    assert {step_id: images for step_id, images in stored.items() if images} == {
+        step.step_id: [b"look-1", b"look-2", b"judge"]
+    }
 
 
 @pytest.mark.asyncio
@@ -4904,6 +5358,87 @@ async def test_a_sampled_v3_block_saves_each_turns_page_on_that_turn_and_flushes
         ]
     else:
         assert (saved, flushed, page_doms) == ([], [], [None, None])
+
+
+async def _run_with_turn_dom_probe(
+    monkeypatch: pytest.MonkeyPatch, workflow_run_id: str, rate: float, **overrides: Any
+) -> tuple[bool, Any]:
+    created: list[bool] = []
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        LoopOutcome(status="completed", reason="done", billable_actions=[]),
+        on_loop=lambda kwargs: created.append(kwargs.get("turn_dom") is not None),
+        turn_dom_rate=rate,
+        workflow_run_id=workflow_run_id,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+        **overrides,
+    )
+    [was_created] = created
+    return was_created, loop_mock
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("variant", "arm", "rate", "workflow_run_id", "sampled"),
+    [
+        ("treatment", "treatment", 0.0, "wr_turn_dom_0", True),
+        ("control", "control", 1.0, "wr_turn_dom_3", False),
+        # Unrandomized keeps the env rate's hash bucket: wr_turn_dom_3 falls inside 0.25, wr_turn_dom_0 does not.
+        (None, "unrandomized", 0.0, "wr_turn_dom_3", False),
+        (None, "unrandomized", 0.25, "wr_turn_dom_3", True),
+        (None, "unrandomized", 0.25, "wr_turn_dom_0", False),
+        (None, "unrandomized", 1.0, "wr_turn_dom_0", True),
+    ],
+)
+async def test_execute_task_v3_turn_dom_arm_decides_the_sample_and_unrandomized_keeps_the_env_rate(
+    monkeypatch: pytest.MonkeyPatch, variant: str | None, arm: str, rate: float, workflow_run_id: str, sampled: bool
+) -> None:
+    provider = AsyncMock(side_effect=lambda flag, *_a, **_k: variant if flag == TURN_DOM_FLAG else None)
+    monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "get_value_cached", provider)
+
+    created, loop_mock = await _run_with_turn_dom_probe(monkeypatch, workflow_run_id, rate)
+
+    assert created is sampled
+    assert loop_mock.context.run_arms[TURN_DOM_FLAG] == (workflow_run_id, arm)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_kind", ["noop", "raises"])
+@pytest.mark.parametrize("rate", [0.0, 1.0])
+async def test_execute_task_v3_turn_dom_without_a_usable_provider_samples_by_the_env_rate(
+    monkeypatch: pytest.MonkeyPatch, provider_kind: str, rate: float
+) -> None:
+    if provider_kind == "noop":
+        monkeypatch.setattr(app, "EXPERIMENTATION_PROVIDER", NoOpExperimentationProvider())
+    else:
+        monkeypatch.setattr(
+            app.EXPERIMENTATION_PROVIDER, "get_value_cached", AsyncMock(side_effect=RuntimeError("posthog down"))
+        )
+
+    created, loop_mock = await _run_with_turn_dom_probe(monkeypatch, "wr_turn_dom_fallback", rate)
+
+    assert created is (rate == 1.0)
+    assert loop_mock.context.run_arms[TURN_DOM_FLAG] == ("wr_turn_dom_fallback", "unrandomized")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("variant", ["treatment", "control", None])
+async def test_execute_task_v3_page_free_validation_captures_no_turn_dom_in_any_arm(
+    monkeypatch: pytest.MonkeyPatch, variant: str | None
+) -> None:
+    monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "get_value_cached", AsyncMock(return_value=variant))
+
+    created, _loop_mock = await _run_with_turn_dom_probe(
+        monkeypatch,
+        "wr_turn_dom_page_free",
+        1.0,
+        task_block=_make_block(ValidationBlock, complete_criterion="The data is consistent"),
+        validation_without_page_information=True,
+        task_type=TaskType.validation,
+    )
+
+    assert created is False
 
 
 @pytest.mark.asyncio
@@ -5324,13 +5859,34 @@ async def test_execute_task_v3_the_models_finish_answer_replaces_the_page_guess(
 
 
 @pytest.mark.asyncio
-async def test_execute_task_v3_a_missing_code_source_and_the_models_code_are_both_stored(
+@pytest.mark.parametrize(
+    ("gate_on", "model_code", "declined", "detected", "expected"),
+    [
+        (True, "COVERAGE_NOT_ACTIVE", False, [], ["COVERAGE_NOT_ACTIVE"]),
+        (False, None, False, ["incompleteTOTP"], ["incompleteTOTP"]),
+        (True, None, True, [], ["MISSING_TOTP_SOURCE"]),
+        (False, None, False, [], ["MISSING_TOTP_SOURCE"]),
+    ],
+    ids=["model_chose_a_code", "detector_chose_a_code", "model_declined_every_code", "detector_found_nothing"],
+)
+async def test_execute_task_v3_reports_the_built_in_missing_code_source_only_without_the_blocks_own_code(
     monkeypatch: pytest.MonkeyPatch,
+    gate_on: bool,
+    model_code: str | None,
+    declined: bool,
+    detected: list[str],
+    expected: list[str],
 ) -> None:
+    # errors appends and every entry reports USER_DEFINED_ERROR, so the MISSING_TOTP_SOURCE Skyvern attaches
+    # itself is a fallback: written only when neither the model nor the detector produced the block's own code.
     monkeypatch.setattr(
-        "skyvern.forge.agent.app.AGENT_FUNCTION.task_v3_error_code_on_finish", AsyncMock(return_value=True)
+        "skyvern.forge.agent.app.AGENT_FUNCTION.task_v3_error_code_on_finish", AsyncMock(return_value=gate_on)
     )
-    detect_mock = AsyncMock(return_value=[])
+    detect_mock = AsyncMock(
+        return_value=[
+            UserDefinedError(error_code=code, reasoning="page guess", confidence_float=0.5) for code in detected
+        ]
+    )
     monkeypatch.setattr("skyvern.forge.agent.detect_user_defined_errors_for_task", detect_mock)
     errors_update = AsyncMock()
     monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", errors_update)
@@ -5338,19 +5894,26 @@ async def test_execute_task_v3_a_missing_code_source_and_the_models_code_are_bot
     def _no_source(kwargs: dict[str, Any]) -> None:
         kwargs["verification_blocker"].__self__.last_status = NO_ONE_TIME_CODE_SOURCE
 
-    await _run_execute_task_v3(
+    _step, task, _loop_mock, _post = await _run_execute_task_v3(
         monkeypatch,
-        LoopOutcome(status="terminated", reason="no code was delivered", error_code="COVERAGE_NOT_ACTIVE"),
+        LoopOutcome(
+            status="terminated",
+            reason="no code was delivered",
+            error_code=model_code,
+            error_code_declined=declined,
+        ),
         task_block=_make_block(NavigationBlock, navigation_goal="Sign in"),
         on_loop=_no_source,
-        error_code_mapping={"COVERAGE_NOT_ACTIVE": "x"},
+        error_code_mapping={"COVERAGE_NOT_ACTIVE": "x", "incompleteTOTP": "y"},
         data_extraction_goal=None,
         extracted_information_schema=None,
     )
 
     written = [error for call in errors_update.await_args_list for error in call.kwargs.get("errors") or []]
-    assert [error["error_code"] for error in written] == ["MISSING_TOTP_SOURCE", "COVERAGE_NOT_ACTIVE"]
-    assert detect_mock.await_count == 0
+    assert [error["error_code"] for error in written] == expected
+    assert detect_mock.await_count == (0 if gate_on else 1)
+    # Suppressing the code does not drop the attribution: the status stays readable on the run.
+    assert NO_ONE_TIME_CODE_SOURCE in (task.failure_reason or "")
 
 
 @pytest.mark.asyncio
@@ -7703,7 +8266,7 @@ async def test_native_quiescence_never_overrides_an_unknown_download_owner(monke
         tmp_path,
         drop_file=False,
         provider_source=source,
-        download_timeout=1.2,
+        download_timeout=0.3,
         loop_fn=run_loop,
     )
     assert waits == [(False, {str(tmp_path / "retained.crdownload")})]
@@ -7975,13 +8538,13 @@ async def test_v3_download_provider_wait_ends_at_the_block_download_timeout(
         drop_file=False,
         provider_source=source,
         download_monitor=monitor,
-        download_timeout=2.0,
+        download_timeout=0.2,
         loop_fn=_click_then_probe(tmp_path, monitor, source),
     )
 
     assert captured["probe_reason"] is None
     assert observation.poll_deadlines
-    # The block's 2 s timeout, not the 30 s default, set the read deadline; no poll started past it.
+    # The block's own timeout, not the 30 s default, set the read deadline; no poll started past it.
     assert observation.poll_deadlines[0] - captured["probe_started_at"] < (
         taskv3_provider_downloads.PROVIDER_DOWNLOAD_WAIT_SECONDS
     )
@@ -8151,7 +8714,7 @@ async def test_v3_download_still_reads_the_provider_after_the_monitor_outlasted_
         drop_file=False,
         provider_source=source,
         download_monitor=monitor,
-        download_timeout=1.0,
+        download_timeout=0.1,
         loop_fn=_probe_twice(monitor, _settle),
     )
 
@@ -8177,7 +8740,7 @@ async def test_v3_download_still_reads_the_provider_after_an_empty_first_window(
         drop_file=False,
         provider_source=source,
         download_monitor=monitor,
-        download_timeout=1.0,
+        download_timeout=0.1,
         loop_fn=_probe_twice(monitor, _list_late),
     )
 
@@ -8197,7 +8760,7 @@ async def test_v3_download_cancellation_returns_only_after_the_provider_poll_cle
 
     async def _loop(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
         monitor.browser_download_event_count += 1
-        asyncio.get_running_loop().call_later(2.0, gate.set)
+        asyncio.get_running_loop().call_later(0.4, gate.set)
         captured["probe_reason"] = await kwargs["download_settle"](frozenset())
         captured["cleanup_finished_at_return"] = observation.cleanup_finished
         return LoopOutcome(status="budget_exhausted", reason="no download detected", billable_actions=[])
@@ -8513,27 +9076,20 @@ async def test_v3_download_block_keeps_a_replacement_context_held_through_cleanu
 
 # A replay its hold admitted, in flight at finish (the original one past the 2.5 s request settle), is offered before
 # the task is written completed; one a download timeout or cancel leaves in flight blocks completion and stays running.
-class _SkewedClock:
-    skew = 0.0
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(time, name)
-
-    def monotonic(self) -> float:
-        return time.monotonic() + self.skew
-
-
 @pytest.mark.parametrize("mode", ["original-selected", "replacement-empty", "timed-out", "canceled", "fresh-window"])
 @pytest.mark.asyncio
 async def test_a_replay_in_flight_at_finish_is_settled_before_the_task_is_written(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: str
 ) -> None:
-    release_after = {"original-selected": 2.6, "replacement-empty": 0.05, "fresh-window": 0.05}.get(mode)
+    # The original replay is released after the request settle gave up, half a second apart so a slow runner cannot
+    # reorder them.
+    monkeypatch.setattr(taskv3_tools, "_DOWNLOAD_FAILURE_SETTLE_SECONDS", 0.25)
+    release_after = {"original-selected": 0.75, "replacement-empty": 0.05, "fresh-window": 0.05}.get(mode)
     selection = {"original-selected": ["c1"], "fresh-window": ["c2"]}.get(mode, [])
-    harness = {"timed-out": {"download_timeout": 0.5}, "canceled": {"cancel_after_checks": 0}}.get(mode, {})
+    harness = {"timed-out": {"download_timeout": 0.2}, "canceled": {"cancel_after_checks": 0}}.get(mode, {})
     if mode == "fresh-window":
         harness = {"download_timeout": 2.0}
-    monkeypatch.setattr(agent_module, "time", clock := _SkewedClock())
+    monkeypatch.setattr(agent_module, "time", clock := SkewedTime())
     steps = [{}, *([{}] if mode == "fresh-window" else []), {"accept_download_candidates": selection}]
     entry = _replay_interceptor(tmp_path, monkeypatch)
     released = asyncio.Event()

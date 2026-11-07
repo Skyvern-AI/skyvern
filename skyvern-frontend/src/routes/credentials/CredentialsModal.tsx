@@ -398,6 +398,7 @@ function CredentialsModal({
     values: false,
   });
   const [noPassword, setNoPassword] = useState(false);
+  const [forwardingActionPending, setForwardingActionPending] = useState(false);
   // Inline authenticator setup error returned by the backend when it rejects a
   // decoded QR value or pasted key. Cleared whenever the user edits the key.
   const [authenticatorSaveError, setAuthenticatorSaveError] =
@@ -423,6 +424,14 @@ function CredentialsModal({
     },
     [],
   );
+
+  const handleForwardingAddressChange = useCallback((identifier: string) => {
+    setPasswordCredentialValues((prev) => ({
+      ...prev,
+      totp_type: "email",
+      totp_identifier: identifier,
+    }));
+  }, []);
 
   const handleNoPasswordChange = useCallback((checked: boolean) => {
     setNoPassword(checked);
@@ -528,7 +537,17 @@ function CredentialsModal({
   const attachAgentCount = attachUsage?.workflows?.length ?? 0;
   // Test & Save Browser Profile state
   const [testAndSave, setTestAndSave] = useState(false);
+  // An already-saved profile ticks the box even without the intent flag, so both
+  // form initialization and change detection must read it from here; comparing
+  // the checkbox against the raw flag would make every bare Update on such a
+  // credential issue a no-op PATCH.
+  const savedBrowserSessionIntent = Boolean(
+    editingCredential?.save_browser_session_intent ||
+    editingCredential?.browser_profile_id,
+  );
   const [testUrl, setTestUrl] = useState("");
+  // One URL per line; each adds a site this login signs in on.
+  const [extraSitesText, setExtraSitesText] = useState("");
   const [userContext, setUserContext] = useState("");
   const [pinResidentialIspProxy, setPinResidentialIspProxy] = useState(false);
   const [rotateProxyPin, setRotateProxyPin] = useState(false);
@@ -719,10 +738,8 @@ function CredentialsModal({
       if (editingCredential.tested_url) {
         setTestUrl(editingCredential.tested_url);
       }
-      if (
-        editingCredential.save_browser_session_intent ||
-        !!editingCredential.browser_profile_id
-      ) {
+      setExtraSitesText((editingCredential.extra_site_urls ?? []).join("\n"));
+      if (savedBrowserSessionIntent) {
         setTestAndSave(true);
       }
       setBrowserProfileId(editingCredential.browser_profile_id ?? null);
@@ -821,6 +838,7 @@ function CredentialsModal({
     setRunSequentially(false);
     setTestAndSave(false);
     setTestUrl("");
+    setExtraSitesText("");
     setTestStatus("idle");
     setTestFailureReason(null);
     setTestCredentialId(null);
@@ -1191,10 +1209,14 @@ function CredentialsModal({
             `/credentials/${editingCredential.credential_id}`,
             {
               name: capturedName || editingCredential.name,
-              ...(capturedTestUrl && { tested_url: capturedTestUrl }),
+              ...(capturedTestUrl && {
+                tested_url: capturedTestUrl,
+                expected_site_urls: expectedSiteUrls,
+              }),
               user_context: capturedUserContext?.trim() || null,
               save_browser_session_intent: saveBrowserSessionIntent,
               run_sequentially: runSequentially,
+              ...extraSitesPatch,
               // The /update vault path drops these; persist them here so a
               // profile/IP change made alongside credential values isn't lost.
               // PASSWORD-only, matching the picker UI and the bmPatch guard.
@@ -1280,11 +1302,39 @@ function CredentialsModal({
     },
   });
 
+  // Connected vaults keep a login's sites in the vault item, and the server refuses extra sites when it names any.
+  const connectedVaultSites =
+    editingCredential?.vault_type === "onepassword" ||
+    editingCredential?.vault_type === "bitwarden_connected";
+  // The server refuses a sites edit made from a stale copy, so it is sent with the sites it started from.
+  const extraSiteUrls = extraSitesText
+    .split("\n")
+    .map((url) => url.trim())
+    .filter(Boolean);
+  const extraSitesChanged =
+    isEditMode &&
+    extraSiteUrls.join("\n") !==
+      (editingCredential?.extra_site_urls ?? []).join("\n");
+  // The sites this copy was loaded with: a save that changes them is refused if Copilot moved them meanwhile.
+  const expectedSiteUrls = [
+    ...new Set(
+      [
+        editingCredential?.tested_url,
+        ...(editingCredential?.extra_site_urls ?? []),
+      ].filter((url): url is string => Boolean(url)),
+    ),
+  ];
+  const extraSitesPatch = extraSitesChanged
+    ? { extra_site_urls: extraSiteUrls, expected_site_urls: expectedSiteUrls }
+    : {};
+
   const renameCredentialMutation = useMutation({
     mutationFn: async ({
       id,
       name,
       tested_url,
+      extra_site_urls,
+      expected_site_urls,
       user_context,
       save_browser_session_intent,
       proxy_location,
@@ -1298,6 +1348,8 @@ function CredentialsModal({
       id: string;
       name: string;
       tested_url?: string;
+      extra_site_urls?: string[];
+      expected_site_urls?: string[];
       user_context?: string | null;
       save_browser_session_intent?: boolean;
       proxy_location?: ProxyLocation | null;
@@ -1309,11 +1361,20 @@ function CredentialsModal({
       run_sequentially?: boolean;
     }) => {
       const client = await getClient(credentialGetter, "sans-api-v1");
-      const body: Record<string, string | boolean | ProxyLocation | null> = {
+      const body: Record<
+        string,
+        string | string[] | boolean | ProxyLocation | null
+      > = {
         name,
       };
       if (tested_url) {
         body.tested_url = tested_url;
+      }
+      if (extra_site_urls !== undefined) {
+        body.extra_site_urls = extra_site_urls;
+      }
+      if (expected_site_urls !== undefined) {
+        body.expected_site_urls = expected_site_urls;
       }
       if (user_context !== undefined) {
         body.user_context = user_context;
@@ -1416,6 +1477,20 @@ function CredentialsModal({
       isEditMode &&
       runSequentially !== (editingCredential?.run_sequentially ?? false);
 
+    // The save-session checkbox is togglable without touching the secrets, so it
+    // has to count as an edit on its own — otherwise a checkbox-only save closed
+    // the modal without sending anything.
+    const saveBrowserSessionIntentChanged =
+      isEditMode &&
+      supportsInlineTest &&
+      testAndSave !== savedBrowserSessionIntent;
+
+    const trimmedTestUrl = testUrl.trim();
+    const testUrlChanged =
+      isEditMode &&
+      trimmedTestUrl !== "" &&
+      trimmedTestUrl !== (editingCredential?.tested_url ?? "");
+
     // In edit mode, use editingGroups to determine what changed (type-agnostic)
     if (isEditMode && editingCredential) {
       if (
@@ -1423,7 +1498,10 @@ function CredentialsModal({
         !editingGroups.values &&
         !proxyPinChanged &&
         !bmChanged &&
-        !runSequentiallyChanged
+        !runSequentiallyChanged &&
+        !saveBrowserSessionIntentChanged &&
+        !extraSitesChanged &&
+        !testUrlChanged
       ) {
         // Nothing was edited — close silently
         reset();
@@ -1439,6 +1517,16 @@ function CredentialsModal({
           ...(runSequentiallyChanged
             ? { run_sequentially: runSequentially }
             : {}),
+          ...(saveBrowserSessionIntentChanged
+            ? { save_browser_session_intent: testAndSave }
+            : {}),
+          ...(testUrlChanged
+            ? {
+                tested_url: trimmedTestUrl,
+                expected_site_urls: expectedSiteUrls,
+              }
+            : {}),
+          ...extraSitesPatch,
         });
         return;
       }
@@ -2018,6 +2106,7 @@ function CredentialsModal({
   const saveDisabled =
     activeMutation.isPending ||
     renameCredentialMutation.isPending ||
+    forwardingActionPending ||
     isTestInProgress ||
     Boolean(additionalTwoFactorError);
 
@@ -2025,7 +2114,10 @@ function CredentialsModal({
     if (type === CredentialModalTypes.PASSWORD) {
       return (
         <PasswordCredentialContent
+          credentialId={editingCredential?.credential_id}
+          savedTotpType={editingPasswordCredentialData?.totp_type ?? "none"}
           values={passwordCredentialValues}
+          hasTotp={editingPasswordCredentialData?.has_totp}
           onChange={handlePasswordCredentialChange}
           url={testUrl}
           onUrlChange={setTestUrl}
@@ -2046,6 +2138,8 @@ function CredentialsModal({
           editingGroups={editingGroups}
           onEnableEditName={handleEnableEditName}
           onEnableEditValues={handleEnableEditValues}
+          onForwardingAddressChange={handleForwardingAddressChange}
+          onForwardingActionPendingChange={setForwardingActionPending}
           onPasswordEnter={saveDisabled ? undefined : handleSave}
           totpError={authenticatorKeyError}
           authenticatorSaveError={authenticatorSaveError}
@@ -2067,114 +2161,157 @@ function CredentialsModal({
             </>
           }
           afterUrl={
-            browserMemoryEnabled ? null : (
-              <div className="space-y-3">
-                <div className="flex items-center gap-3">
-                  <Checkbox
-                    id="test-and-save"
-                    checked={testAndSave}
-                    onCheckedChange={(checked) =>
-                      setTestAndSave(checked === true)
-                    }
-                    disabled={isTestInProgress || !supportsInlineTest}
-                  />
-                  <Label
-                    htmlFor="test-and-save"
-                    className="cursor-pointer text-sm font-medium"
-                  >
-                    Save browser session for future logins
-                  </Label>
-                  <HelpTooltip content="Skyvern will log in using your credentials, verify success, and save the browser session. Future agent runs will skip the login form entirely because the saved session is already authenticated." />
-                </div>
-
-                {!supportsInlineTest && (
-                  <p className="pl-7 text-sm text-muted-foreground">
-                    Inline login testing is not available for this two-factor
-                    method.
-                  </p>
-                )}
-
-                {supportsInlineTest && testAndSave && (
-                  <div className="space-y-1 pl-7">
-                    <Label
-                      htmlFor="user-context"
-                      className="text-xs text-muted-foreground"
-                    >
-                      Login instructions (optional)
-                    </Label>
-                    {/* maxLength is intentionally lower than the backend's 1000-char limit (defense-in-depth) */}
+            <>
+              {/* A backend that predates extra sites returns no list and drops them on save. */}
+              {isEditMode && editingCredential?.extra_site_urls != null ? (
+                <div className="flex items-start gap-12">
+                  <div className="w-40 shrink-0">
+                    <Label htmlFor="extra-site-urls">Also signs in on</Label>
+                  </div>
+                  <div className="w-full space-y-1">
                     <Textarea
-                      id="user-context"
-                      value={userContext}
-                      onChange={(e) => setUserContext(e.target.value)}
-                      placeholder='Describe the login flow, e.g. "Click the SSO button first, then enter Google credentials"'
-                      disabled={isTestInProgress}
-                      className="min-h-[60px] resize-y"
+                      id="extra-site-urls"
+                      value={extraSitesText}
+                      onChange={(event) =>
+                        setExtraSitesText(event.target.value)
+                      }
+                      placeholder="https://example.org/login (one per line)"
                       rows={2}
-                      maxLength={500}
+                      disabled={isTestInProgress || connectedVaultSites}
                     />
+                    {connectedVaultSites ? (
+                      <p className="text-xs text-muted-foreground">
+                        This login's sites come from its connected vault. Add
+                        sites there.
+                      </p>
+                    ) : null}
                   </div>
-                )}
+                </div>
+              ) : null}
+              {browserMemoryEnabled ? null : (
+                <div className="space-y-3">
+                  <div className="flex items-center gap-3">
+                    <Checkbox
+                      id="test-and-save"
+                      checked={testAndSave}
+                      onCheckedChange={(checked) =>
+                        setTestAndSave(checked === true)
+                      }
+                      disabled={isTestInProgress || !supportsInlineTest}
+                    />
+                    <Label
+                      htmlFor="test-and-save"
+                      className="cursor-pointer text-sm font-medium"
+                    >
+                      Save browser session for future logins
+                    </Label>
+                    <HelpTooltip content="Skyvern will log in using your credentials, verify success, and save the browser session. Future agent runs will skip the login form entirely because the saved session is already authenticated." />
+                  </div>
 
-                {supportsInlineTest && isTestInProgress && (
-                  <div className="space-y-1 pl-7">
-                    <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                      <ReloadIcon className="size-4 animate-spin" />
-                      <span>{TEST_STATUS_MESSAGES[testMessageIndex]}</span>
-                    </div>
-                    {testWorkflowRunId && (
-                      <a
-                        href={`/runs/${testWorkflowRunId}/overview`}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="flex items-center gap-1 text-xs text-blue-400 hover:text-blue-300"
-                      >
-                        <ExternalLinkIcon className="size-3" />
-                        Watch Skyvern test login live
-                      </a>
-                    )}
-                  </div>
-                )}
-                {supportsInlineTest && testStatus === "completed" && (
-                  <div className="flex items-center gap-2 pl-7 text-sm text-green-400">
-                    <CheckCircledIcon className="size-4" />
-                    <span>
-                      {`Login test passed — saved browser session available for agents using ${getHostname(testUrl) ?? testUrl}`}
-                    </span>
-                  </div>
-                )}
-                {supportsInlineTest && testStatus === "profile_failed" && (
-                  <div className="space-y-1 pl-7">
-                    <div className="flex items-center gap-2 text-sm text-destructive">
-                      <CrossCircledIcon className="size-4" />
-                      <span>Browser profile was not saved</span>
-                    </div>
-                    {testFailureReason && (
-                      <p className="text-xs text-destructive/70">
-                        {testFailureReason}
+                  {!supportsInlineTest && (
+                    <p className="pl-7 text-sm text-muted-foreground">
+                      Inline login testing is not available for this two-factor
+                      method.
+                    </p>
+                  )}
+
+                  {/* Ticking the box only records the preference; the session comes
+                  from a login test, which this path doesn't run. */}
+                  {isEditMode &&
+                    !editingGroups.values &&
+                    supportsInlineTest &&
+                    testAndSave &&
+                    !editingCredential?.browser_profile_id &&
+                    testStatus === "idle" && (
+                      <p className="pl-7 text-sm text-muted-foreground">
+                        No session is saved yet. Skyvern saves one the next time
+                        this login is tested — start a test with the retry
+                        button on this credential in the list.
                       </p>
                     )}
-                  </div>
-                )}
-                {supportsInlineTest && testStatus === "failed" && (
-                  <div className="space-y-1 pl-7">
-                    <div className="flex items-center gap-2 text-sm text-destructive">
-                      <CrossCircledIcon className="size-4" />
+
+                  {supportsInlineTest && testAndSave && (
+                    <div className="space-y-1 pl-7">
+                      <Label
+                        htmlFor="user-context"
+                        className="text-xs text-muted-foreground"
+                      >
+                        Login instructions (optional)
+                      </Label>
+                      {/* maxLength is intentionally lower than the backend's 1000-char limit (defense-in-depth) */}
+                      <Textarea
+                        id="user-context"
+                        value={userContext}
+                        onChange={(e) => setUserContext(e.target.value)}
+                        placeholder='Describe the login flow, e.g. "Click the SSO button first, then enter Google credentials"'
+                        disabled={isTestInProgress}
+                        className="min-h-[60px] resize-y"
+                        rows={2}
+                        maxLength={500}
+                      />
+                    </div>
+                  )}
+
+                  {supportsInlineTest && isTestInProgress && (
+                    <div className="space-y-1 pl-7">
+                      <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                        <ReloadIcon className="size-4 animate-spin" />
+                        <span>{TEST_STATUS_MESSAGES[testMessageIndex]}</span>
+                      </div>
+                      {testWorkflowRunId && (
+                        <a
+                          href={`/runs/${testWorkflowRunId}/overview`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="flex items-center gap-1 text-xs text-blue-400 hover:text-blue-300"
+                        >
+                          <ExternalLinkIcon className="size-3" />
+                          Watch Skyvern test login live
+                        </a>
+                      )}
+                    </div>
+                  )}
+                  {supportsInlineTest && testStatus === "completed" && (
+                    <div className="flex items-center gap-2 pl-7 text-sm text-green-400">
+                      <CheckCircledIcon className="size-4" />
                       <span>
-                        {testUrl
-                          ? `Unable to save browser session for ${getHostname(testUrl) ?? testUrl}`
-                          : "Unable to save browser session"}
+                        {`Login test passed — saved browser session available for agents using ${getHostname(testUrl) ?? testUrl}`}
                       </span>
                     </div>
-                    {testFailureReason && (
-                      <p className="text-xs text-destructive/70">
-                        {testFailureReason}
-                      </p>
-                    )}
-                  </div>
-                )}
-              </div>
-            )
+                  )}
+                  {supportsInlineTest && testStatus === "profile_failed" && (
+                    <div className="space-y-1 pl-7">
+                      <div className="flex items-center gap-2 text-sm text-destructive">
+                        <CrossCircledIcon className="size-4" />
+                        <span>Browser profile was not saved</span>
+                      </div>
+                      {testFailureReason && (
+                        <p className="text-xs text-destructive/70">
+                          {testFailureReason}
+                        </p>
+                      )}
+                    </div>
+                  )}
+                  {supportsInlineTest && testStatus === "failed" && (
+                    <div className="space-y-1 pl-7">
+                      <div className="flex items-center gap-2 text-sm text-destructive">
+                        <CrossCircledIcon className="size-4" />
+                        <span>
+                          {testUrl
+                            ? `Unable to save browser session for ${getHostname(testUrl) ?? testUrl}`
+                            : "Unable to save browser session"}
+                        </span>
+                      </div>
+                      {testFailureReason && (
+                        <p className="text-xs text-destructive/70">
+                          {testFailureReason}
+                        </p>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
+            </>
           }
         />
       );

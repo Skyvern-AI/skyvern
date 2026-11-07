@@ -143,6 +143,10 @@ class CarriesPendingFrames(CarriesPendingScreenshots, Protocol):
     pending_frame_lease: PendingFrameLease | None
 
 
+class CarriesRunResultFrames(CarriesPendingFrames, Protocol):
+    last_run_blocks_workflow_run_id: str | None
+
+
 def screenshot_result_facts(
     result: dict[str, Any],
     *,
@@ -327,9 +331,36 @@ def withdraw_frame_captured_before(ctx: CarriesPendingFrames, cutoff: float) -> 
     if not pending or pending[0].captured_at >= cutoff:
         return None
     entry = pending.pop(0)
+    _release_lease_held_by(ctx, entry)
+    return entry
+
+
+def withdraw_superseded_run_result_frame(ctx: CarriesRunResultFrames, run_id: str) -> None:
+    # Keyed on the latest committed run, not plain inequality: parallel run calls can store an older
+    # run's evidence after a newer run queued its frame.
+    if run_id != ctx.last_run_blocks_workflow_run_id:
+        return
+    pending = ctx.pending_screenshots
+    if not pending:
+        return
+    provenance = pending[0].provenance
+    if provenance.action_relation is not ScreenshotActionRelation.WORKFLOW_RUN_RESULT:
+        return
+    if provenance.workflow_run_id == run_id:
+        return
+    entry = pending.pop(0)
+    _release_lease_held_by(ctx, entry)
+    LOG.info(
+        "copilot_superseded_run_frame_withdrawn",
+        capture_event_id=entry.capture_event_id,
+        frame_workflow_run_id=provenance.workflow_run_id,
+        superseding_workflow_run_id=run_id,
+    )
+
+
+def _release_lease_held_by(ctx: CarriesPendingFrames, entry: ScreenshotEntry) -> None:
     if ctx.pending_frame_lease is not None and ctx.pending_frame_lease.capture_event_id == entry.capture_event_id:
         ctx.pending_frame_lease = None
-    return entry
 
 
 def consume_screenshot_artifact(result: dict[str, Any]) -> bytes | None:

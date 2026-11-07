@@ -38,6 +38,9 @@ if typing.TYPE_CHECKING:  # pragma: no cover - import only for type hints
 LOG = structlog.get_logger()
 
 _SENSITIVE_ENDPOINTS = {
+    # The internal Power BI hop carries a run capability and customer query/result data.
+    "POST /api/v1/internal/powerbi/query",
+    "POST /api/v1/internal/gmail/inbox",
     # Agent reports can contain credentials before route redaction.
     "POST /v1/agent_feedback",
     "GET /api/v1/users/me/onboarding",
@@ -68,8 +71,12 @@ _SENSITIVE_ENDPOINTS = {
     "POST /api/v1/stripe_webhook",
 }
 _SIGNED_TRIGGER_RECEIVER_ENDPOINT = re.compile(r"^POST /(?:api/)?v1/triggers/[^/]+/events$")
+_AD_ATTRIBUTION_WITHDRAWAL_ENDPOINT = re.compile(r"^POST /(?:api/)?v1/ad-attribution/withdraw$")
 _SENSITIVE_ENDPOINT_PATTERNS = (
+    re.compile(r"^POST /(?:api/)?v1/ad-attribution(?:/withdraw)?$"),
     re.compile(r"^(?:POST|PUT) /(?:api/)?v1/credentials(?:/.*)?$"),
+    re.compile(r"^(?:GET|POST|PUT|DELETE) /(?:api/)?v1/email-forwarding(?:/.*)?$"),
+    re.compile(r"^POST /(?:api/)?v1/email/(?:inbound/[^/]+|sns-inbound)$"),
     # Twilio credentials and inbound SMS codes must stay opaque even with malformed bodies.
     re.compile(r"^(?:POST|PUT|PATCH|DELETE) /(?:api/)?v1/(?:integrations/twilio|sms)(?:/.*)?$"),
     # MCP arguments and results can contain arbitrary secrets, including malformed JSON.
@@ -83,6 +90,7 @@ _SENSITIVE_ENDPOINT_PATTERNS = (
     # Skyplane authority calls carry runtime capabilities, tool arguments, agent feedback text and delivered files.
     re.compile(r"^[^ ]+ /api/v1/skyplane(?:/.*)?$"),
 )
+_STREAMING_REQUEST_ENDPOINT_PATTERNS = (re.compile(r"^POST /(?:api/)?v1/email/(?:inbound/[^/]+|sns-inbound)$"),)
 _MAX_BODY_LENGTH = 1000
 _READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 # 404/405 are dominated by internet scanners and MCP clients probing GET for an SSE stream;
@@ -271,6 +279,11 @@ def _is_sensitive_endpoint(request: Request) -> bool:
     )
 
 
+def _uses_streaming_request_body(request: Request) -> bool:
+    endpoint = f"{request.method.upper()} {request.url.path.rstrip('/')}"
+    return any(pattern.fullmatch(endpoint) for pattern in _STREAMING_REQUEST_ENDPOINT_PATTERNS)
+
+
 def _sanitize_body(request: Request, body: bytes, content_type: str | None) -> str:
     if _is_sensitive_endpoint(request):
         return REDACTED
@@ -444,8 +457,13 @@ async def log_raw_request_middleware(request: Request, call_next: Callable[[Requ
                         return Response(status_code=413)
                     bounded.extend(chunk)
             body_bytes = bytes(bounded)
-        elif _SIGNED_TRIGGER_RECEIVER_ENDPOINT.fullmatch(f"{request.method.upper()} {request.url.path.rstrip('/')}"):
-            # The receiver's route-level size limit must see the unconsumed request stream.
+        elif _SIGNED_TRIGGER_RECEIVER_ENDPOINT.fullmatch(
+            endpoint := f"{request.method.upper()} {request.url.path.rstrip('/')}"
+        ) or _AD_ATTRIBUTION_WITHDRAWAL_ENDPOINT.fullmatch(endpoint):
+            # Route-level body limits must see the unconsumed request stream.
+            body_bytes = b""
+            body_buffered = False
+        elif _uses_streaming_request_body(request):
             body_bytes = b""
             body_buffered = False
         else:

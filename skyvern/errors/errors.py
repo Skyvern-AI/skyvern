@@ -80,6 +80,9 @@ def resolve_error_code_mapping_key(code: object, error_code_mapping: dict[str, s
 
 
 BROWSER_DOWNLOAD_PARTIAL_FAILURE_CODE = "BROWSER_DOWNLOAD_PARTIAL_FAILURE"
+BROWSER_DOWNLOAD_LIMIT_EXCEEDED_CODE = "BROWSER_DOWNLOAD_LIMIT_EXCEEDED"
+BROWSER_DOWNLOAD_FAILED_CODE = "BROWSER_DOWNLOAD_FAILED"
+BROWSER_DOWNLOAD_FAILED_REASON = "The requested browser download could not be saved."
 
 
 def drop_unsolicited_download_errors(
@@ -94,6 +97,18 @@ def drop_unsolicited_download_errors(
     if downloaded_files is not None and not downloaded_files:
         return errors
     return [error for error in errors if error.get("error_code") != BROWSER_DOWNLOAD_PARTIAL_FAILURE_CODE]
+
+
+def drop_requested_download_failure_reasons(reasons: list[str], *, materialized_a_file: bool) -> list[str]:
+    """Keep the requested-download capture failure only while no file landed for that request.
+
+    A portal can serve an error page or session gate next to the real file, and the refused capture
+    outlives the download because the file often arrives by a route the interceptor never accounts for.
+    A cap breach keeps its own reason, and so does a file lost after it was saved.
+    """
+    if not materialized_a_file:
+        return reasons
+    return [reason for reason in reasons if reason != BROWSER_DOWNLOAD_FAILED_REASON]
 
 
 class SkyvernDefinedError(BaseModel):
@@ -155,4 +170,52 @@ class MissingTOTPSourceError(SkyvernDefinedError):
         "MFA was required but no TOTP source is configured. Configure one of: a totp_verification_url or "
         "totp_identifier on the login block (or run override), or attach a credential parameter whose "
         "credential stores a TOTP secret."
+    )
+
+
+ANTI_BOT_ERROR_CODE = "ANTI_BOT_ERROR"
+# The service-specific code reported alongside ANTI_BOT_ERROR when the qualifying evidence names that service.
+ANTI_BOT_SERVICE_ERROR_CODES: dict[str, str] = {
+    "recaptcha": "RECAPTCHA_ERROR",
+    "hcaptcha": "HCAPTCHA_ERROR",
+    "cloudflare_turnstile": "CLOUDFLARE_TURNSTILE_ERROR",
+    # Cloudflare challenged or blocked; which Cloudflare product or rule did is not known.
+    "cloudflare": "CLOUDFLARE_ERROR",
+}
+ANTI_BOT_SYSTEM_ERROR_CODES = frozenset({ANTI_BOT_ERROR_CODE, *ANTI_BOT_SERVICE_ERROR_CODES.values()})
+_ANTI_BOT_SERVICE_NAMES = {
+    "recaptcha": "reCAPTCHA",
+    "hcaptcha": "hCaptcha",
+    "cloudflare_turnstile": "Cloudflare Turnstile",
+    "cloudflare": "Cloudflare",
+}
+
+
+def anti_bot_system_errors(services: Sequence[str | None]) -> list[SkyvernDefinedError]:
+    """The general anti-bot error, then one per distinct supported service, for qualified failure evidence; empty
+    when there is none. An unrecognized or unknown service reports the general error alone."""
+    if not services:
+        return []
+    errors = [
+        SkyvernDefinedError(
+            error_code=ANTI_BOT_ERROR_CODE,
+            reasoning="A bot-protection block or unresolved challenge was recorded during this failed attempt.",
+        )
+    ]
+    for service in dict.fromkeys(s for s in services if s in ANTI_BOT_SERVICE_ERROR_CODES):
+        errors.append(
+            SkyvernDefinedError(
+                error_code=ANTI_BOT_SERVICE_ERROR_CODES[service],
+                reasoning=f"A {_ANTI_BOT_SERVICE_NAMES[service]} block or unresolved challenge was recorded during "
+                "this failed attempt.",
+            )
+        )
+    return errors
+
+
+def is_anti_bot_system_error(error: object) -> bool:
+    return (
+        isinstance(error, dict)
+        and error.get("error_type") == ErrorType.SYSTEM_DEFINED_ERROR.value
+        and error.get("error_code") in ANTI_BOT_SYSTEM_ERROR_CODES
     )

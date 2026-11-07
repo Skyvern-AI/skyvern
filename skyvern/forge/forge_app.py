@@ -1,19 +1,17 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Awaitable, Callable, Protocol
+from typing import Awaitable, Callable, Protocol
 
 import structlog
 from anthropic import AsyncAnthropic, AsyncAnthropicBedrock
 from fastapi import FastAPI
 from openai import AsyncAzureOpenAI, AsyncOpenAI
 
-if TYPE_CHECKING:
-    from yutori import AsyncYutoriClient
-
 from skyvern.config import Settings
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.forge_openai_client import ForgeAsyncHttpxClientWrapper
+from skyvern.forge.sdk.api.aws import AsyncAWSClient
 from skyvern.forge.sdk.api.azure import AzureClientFactory
 from skyvern.forge.sdk.api.custom_credential_client import CustomCredentialAPIClient
 from skyvern.forge.sdk.api.gcp import GcpClientFactory
@@ -35,8 +33,14 @@ from skyvern.forge.sdk.encrypt.bootstrap import register_aes_encryptor
 from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider, NoOpExperimentationProvider
 from skyvern.forge.sdk.schemas.credentials import CredentialVaultType
 from skyvern.forge.sdk.schemas.organizations import AzureClientSecretCredential, Organization
+from skyvern.forge.sdk.services.credential.aws_secrets_manager_credential_vault_service import (
+    AwsSecretsManagerCredentialVaultService,
+)
 from skyvern.forge.sdk.services.credential.azure_credential_vault_service import AzureCredentialVaultService
 from skyvern.forge.sdk.services.credential.bitwarden_credential_service import BitwardenCredentialVaultService
+from skyvern.forge.sdk.services.credential.connected_bitwarden_credential_vault_service import (
+    ConnectedBitwardenCredentialVaultService,
+)
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
 from skyvern.forge.sdk.services.credential.custom_credential_vault_service import CustomCredentialVaultService
 from skyvern.forge.sdk.services.credential.gcp_credential_vault_service import GcpCredentialVaultService
@@ -79,7 +83,6 @@ class ForgeApp:
     OPENAI_CUA_MODEL: str
     ANTHROPIC_CLIENT: AsyncAnthropic | AsyncAnthropicBedrock
     UI_TARS_CLIENT: AsyncOpenAI | None
-    YUTORI_CLIENT: AsyncYutoriClient | None
     AZURE_CLIENT_FACTORY: AzureClientFactory
     GCP_CLIENT_FACTORY: GcpClientFactory
     SECONDARY_LLM_API_HANDLER: LLMAPIHandler
@@ -108,6 +111,7 @@ class ForgeApp:
     BITWARDEN_CREDENTIAL_VAULT_SERVICE: BitwardenCredentialVaultService
     AZURE_CREDENTIAL_VAULT_SERVICE: AzureCredentialVaultService | None
     GCP_CREDENTIAL_VAULT_SERVICE: GcpCredentialVaultService | None
+    AWS_SECRETS_MANAGER_CREDENTIAL_VAULT_SERVICE: AwsSecretsManagerCredentialVaultService | None
     ONEPASSWORD_CREDENTIAL_VAULT_SERVICE: OnePasswordCredentialVaultService
     CUSTOM_CREDENTIAL_VAULT_SERVICE: CustomCredentialVaultService | None
     CREDENTIAL_VAULT_SERVICES: dict[str, CredentialVaultService | None]
@@ -180,15 +184,6 @@ def create_forge_app() -> ForgeApp:
             api_key=settings.VOLCENGINE_API_KEY,
             base_url=settings.VOLCENGINE_API_BASE,
             http_client=ForgeAsyncHttpxClientWrapper(),
-        )
-
-    app.YUTORI_CLIENT = None
-    if settings.ENABLE_YUTORI:
-        from yutori import AsyncYutoriClient
-
-        app.YUTORI_CLIENT = AsyncYutoriClient(
-            api_key=settings.YUTORI_API_KEY,
-            base_url=settings.YUTORI_API_BASE,
         )
 
     app.SECONDARY_LLM_API_HANDLER = LLMAPIHandlerFactory.get_llm_api_handler(
@@ -323,6 +318,15 @@ def create_forge_app() -> ForgeApp:
     else:
         app.GCP_CREDENTIAL_VAULT_SERVICE = None
 
+    if settings.AWS_CREDENTIAL_VAULT_REGION:
+        app.AWS_SECRETS_MANAGER_CREDENTIAL_VAULT_SERVICE = AwsSecretsManagerCredentialVaultService(
+            AsyncAWSClient(region_name=settings.AWS_CREDENTIAL_VAULT_REGION),
+            name_prefix=settings.AWS_CREDENTIAL_VAULT_PREFIX,
+            kms_key_id=settings.AWS_CREDENTIAL_VAULT_KMS_KEY_ID,
+        )
+    else:
+        app.AWS_SECRETS_MANAGER_CREDENTIAL_VAULT_SERVICE = None
+
     app.CUSTOM_CREDENTIAL_VAULT_SERVICE = (
         CustomCredentialVaultService(
             CustomCredentialAPIClient(
@@ -338,8 +342,10 @@ def create_forge_app() -> ForgeApp:
         CredentialVaultType.BITWARDEN: app.BITWARDEN_CREDENTIAL_VAULT_SERVICE,
         CredentialVaultType.AZURE_VAULT: app.AZURE_CREDENTIAL_VAULT_SERVICE,
         CredentialVaultType.GCP: app.GCP_CREDENTIAL_VAULT_SERVICE,
+        CredentialVaultType.AWS_SECRETS_MANAGER: app.AWS_SECRETS_MANAGER_CREDENTIAL_VAULT_SERVICE,
         CredentialVaultType.CUSTOM: app.CUSTOM_CREDENTIAL_VAULT_SERVICE,
         CredentialVaultType.ONEPASSWORD: app.ONEPASSWORD_CREDENTIAL_VAULT_SERVICE,
+        CredentialVaultType.BITWARDEN_CONNECTED: ConnectedBitwardenCredentialVaultService(),
     }
 
     app.scrape_exclude = None

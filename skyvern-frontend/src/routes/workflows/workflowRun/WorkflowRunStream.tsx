@@ -5,9 +5,10 @@ import { statusIsNotFinalized } from "@/routes/tasks/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useLogging } from "@/hooks/useLogging";
 import { useFirstParam } from "@/hooks/useFirstParam";
-import { getCredentialParam } from "@/util/env";
+import { getWebSocketProtocols } from "@/util/env";
 import { useQueryClient } from "@tanstack/react-query";
 import { useCdpInput } from "@/routes/streaming/useCdpInput";
+import { generateClientId } from "@/routes/streaming/webSocketParams";
 import { InteractiveStreamView } from "@/routes/streaming/InteractiveStreamView";
 import {
   StreamStatusPanel,
@@ -97,6 +98,7 @@ function WorkflowRunStream({
   const { data: workflowRun } = useWorkflowRunWithWorkflowQuery(
     workflowRunIdProp ? { workflowRunId: workflowRunIdProp } : undefined,
   );
+  const [clientId] = useState(generateClientId);
   const [streamImgSrc, setStreamImgSrc] = useState<string>("");
   const [streamFormat, setStreamFormat] = useState<string>("png");
   const [viewportWidth, setViewportWidth] = useState(1280);
@@ -139,6 +141,7 @@ function WorkflowRunStream({
     containerRef,
     handlers,
   } = useCdpInput({
+    clientId,
     inputWsUrl,
     interactive,
     viewportWidth,
@@ -169,14 +172,15 @@ function WorkflowRunStream({
     };
 
     async function run() {
-      const credentialParam = await getCredentialParam(credentialGetter);
+      const protocols = await getWebSocketProtocols(credentialGetter);
       if (cancelled) {
         return;
       }
 
       socketRef.current?.close();
       const socket = new WebSocket(
-        `${wssBaseUrl}/stream/workflow_runs/${workflowRunId}?${credentialParam}`,
+        `${wssBaseUrl}/stream/workflow_runs/${workflowRunId}`,
+        protocols,
       );
       socketRef.current = socket;
 

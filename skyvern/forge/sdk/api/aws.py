@@ -23,6 +23,7 @@ from boto3.s3.transfer import TransferConfig
 from botocore.exceptions import ClientError, ProfileNotFound
 
 from skyvern.config import settings
+from skyvern.utils.content_disposition import build_attachment_disposition
 
 if TYPE_CHECKING:
     from types_boto3_batch.client import BatchClient
@@ -680,11 +681,25 @@ class AsyncAWSClient:
             LOG.exception("Failed to get secret.", secret_name=secret_name, error_code=error_code)
             return None
 
-    async def create_secret(self, secret_name: str, secret_value: str) -> None:
+    async def get_secret_if_exists(self, secret_name: str) -> str | None:
+        # Unlike get_secret, only a missing secret returns None; access and throttling errors raise.
+        try:
+            async with self._secrets_manager_client() as client:
+                response = await client.get_secret_value(SecretId=secret_name)
+                return response["SecretString"]
+        except ClientError as e:
+            if self._error_code(e) == "ResourceNotFoundException":
+                return None
+            raise
+
+    async def create_secret(self, secret_name: str, secret_value: str, kms_key_id: str | None = None) -> None:
         # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/secretsmanager/client/create_secret.html
         try:
             async with self._secrets_manager_client() as client:
-                await client.create_secret(Name=secret_name, SecretString=secret_value)
+                if kms_key_id:
+                    await client.create_secret(Name=secret_name, SecretString=secret_value, KmsKeyId=kms_key_id)
+                else:
+                    await client.create_secret(Name=secret_name, SecretString=secret_value)
         except Exception as e:
             LOG.exception("Failed to create secret.", secret_name=secret_name)
             raise e
@@ -706,6 +721,15 @@ class AsyncAWSClient:
         except Exception as e:
             LOG.exception("Failed to delete secret.", secret_name=secret_name)
             raise e
+
+    async def delete_secret_permanently(self, secret_name: str) -> None:
+        # No recovery window, so the value cannot be restored; a secret that is already gone counts as deleted.
+        try:
+            async with self._secrets_manager_client() as client:
+                await client.delete_secret(SecretId=secret_name, ForceDeleteWithoutRecovery=True)
+        except ClientError as e:
+            if self._error_code(e) != "ResourceNotFoundException":
+                raise
 
     async def upload_file(
         self,
@@ -1450,18 +1474,33 @@ class AsyncAWSClient:
                 LOG.exception("S3 metadata retrieval failed", uri=uri)
             return None
 
-    async def create_presigned_urls(self, uris: list[str], expires_in: int | None = None) -> list[str] | None:
+    async def create_presigned_urls(
+        self,
+        uris: list[str],
+        expires_in: int | None = None,
+        attachment_filenames: list[str | None] | None = None,
+    ) -> list[str] | None:
+        """With ``attachment_filenames`` (one per uri, None for the key basename), the URLs force an
+        attachment download as octet-stream so stored user content never renders on the bucket origin."""
         # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/generate_presigned_url.html
         expiration = settings.PRESIGNED_URL_EXPIRATION if expires_in is None else expires_in
+        if attachment_filenames is not None and len(attachment_filenames) != len(uris):
+            raise ValueError("attachment_filenames must have one entry per uri")
 
         async def _op() -> list[str]:
             presigned_urls = []
             async with self._s3_client() as client:
-                for uri in uris:
+                for index, uri in enumerate(uris):
                     parsed_uri = S3Uri(uri)
+                    params = {"Bucket": parsed_uri.bucket, "Key": parsed_uri.key}
+                    if attachment_filenames is not None:
+                        filename = attachment_filenames[index] or os.path.basename(parsed_uri.key)
+                        # The agent's file fetcher takes the extension from this filename before Content-Type.
+                        params["ResponseContentDisposition"] = build_attachment_disposition(filename)
+                        params["ResponseContentType"] = "application/octet-stream"
                     url = await client.generate_presigned_url(
                         "get_object",
-                        Params={"Bucket": parsed_uri.bucket, "Key": parsed_uri.key},
+                        Params=params,
                         ExpiresIn=expiration,
                     )
                     presigned_urls.append(url)

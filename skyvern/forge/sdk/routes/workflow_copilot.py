@@ -3,6 +3,7 @@ import contextlib
 import contextvars
 import hashlib
 import hmac
+import io
 import json
 import re
 import time
@@ -26,13 +27,18 @@ from skyvern.constants import DEFAULT_WORKFLOW_TITLES
 from skyvern.exceptions import HttpException as VaultHttpException
 from skyvern.exceptions import SkyvernHTTPException, WorkflowNotFound, WorkflowPinnedByRunGroup
 from skyvern.forge import app
-from skyvern.forge.agent_functions import AuditEvent
+from skyvern.forge.agent_functions import AuditEvent, record_request_audit_event
 from skyvern.forge.sdk.api.files import is_uploaded_file_id
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.artifact.models import ArtifactType, LogEntityType
 from skyvern.forge.sdk.cache.base import BaseCache
-from skyvern.forge.sdk.copilot.agent import run_copilot_agent
+from skyvern.forge.sdk.copilot.agent import (
+    completed_tool_names,
+    run_copilot_agent,
+    stopped_turn_facts,
+    turn_facts_for_context,
+)
 from skyvern.forge.sdk.copilot.ask_user import (
     CREDENTIAL_DELETE_CONCURRENCY,
     CREDENTIAL_DELETE_RECORD_ATTEMPTS,
@@ -62,18 +68,23 @@ from skyvern.forge.sdk.copilot.credential_pause import (
     MANUAL_SIGN_IN_SAVE_TIMEOUT_SECONDS,
     CredentialPauseRejection,
     SignedInProfile,
+    SiteChangeClaim,
+    ask_credential_site,
     check_credential_pause_resumable,
     claim_credential_generation,
+    claim_credential_site_change,
     claim_manual_sign_in,
     credential_pause_is_active,
+    credential_pause_site_url,
     finish_credential_generation,
+    finish_credential_site_change,
     finish_manual_sign_in,
     pending_credential_requests,
     resolve_credential_pause,
     sign_in_site,
     start_manual_sign_in,
 )
-from skyvern.forge.sdk.copilot.credential_resolution import load_credentials
+from skyvern.forge.sdk.copilot.credential_resolution import load_credentials, loggable_origin
 from skyvern.forge.sdk.copilot.demonstration_recorder import (
     DemonstrationRecorder,
     DemonstrationRejection,
@@ -112,7 +123,7 @@ from skyvern.forge.sdk.copilot.recoverable_failure import (
     merge_failure_into_context,
 )
 from skyvern.forge.sdk.copilot.repair_origin_run import RepairOriginRefusal, resolve_repair_origin_binding
-from skyvern.forge.sdk.copilot.request_policy import screen_raw_secret_safety
+from skyvern.forge.sdk.copilot.request_policy import raw_secret_safety_log_fields, screen_raw_secret_safety
 from skyvern.forge.sdk.copilot.review_gate import parse_execution_receipts, serialize_execution_receipts
 from skyvern.forge.sdk.copilot.runtime import close_browser_session_quietly
 from skyvern.forge.sdk.copilot.steer import STEER_DOORBELL_TTL, copilot_steer_key
@@ -139,6 +150,7 @@ from skyvern.forge.sdk.copilot.workflow_yaml import _normalize_copilot_yaml as _
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml as _copilot_process_workflow_yaml
 from skyvern.forge.sdk.copilot.workflow_yaml import _repair_next_block_label_chain as _repair_next_block_label_chain
 from skyvern.forge.sdk.copilot.workflow_yaml import (
+    _runs_in_list_order,
     dump_workflow_yaml,
     inherited_header_settings,
     merge_private_workflow_settings,
@@ -153,6 +165,7 @@ from skyvern.forge.sdk.core.event_source_stream import EventSourceStream, FastAP
 from skyvern.forge.sdk.db.enums import WorkflowBuildSource
 from skyvern.forge.sdk.db.exceptions import (
     CopilotProposalConflictError,
+    CredentialSitesChangedError,
     DatabaseConnectionUnavailableError,
     DuplicateCopilotTurnError,
     NotFoundError,
@@ -162,7 +175,7 @@ from skyvern.forge.sdk.routes.browser_profiles import (
     _hard_delete_created_profile_after_store_failure,
     create_profile_from_running_session,
 )
-from skyvern.forge.sdk.routes.credentials import delete_organization_credential
+from skyvern.forge.sdk.routes.credentials import delete_organization_credential, vault_login_sites
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import (
     CopilotRequestBrowserAllocations,
@@ -186,6 +199,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     CopilotAttachedFile,
     CopilotCancelSource,
     CopilotFailureKind,
+    CopilotInFlightTurn,
     CopilotPendingTurn,
     CopilotProposalMetadata,
     CopilotProposalRunFacts,
@@ -235,10 +249,15 @@ from skyvern.forge.sdk.services.credential.credential_creation_service import (
     store_new_credential,
 )
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
-from skyvern.forge.sdk.services.request_principal import get_request_principal
+from skyvern.forge.sdk.services.request_principal import enforce_principal_role, get_request_principal
 from skyvern.forge.sdk.services.route_authorization import require_request_actions
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException, WorkflowVersionConflict
+from skyvern.forge.sdk.workflow.models.credential_release import normalize_extra_site_urls
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
+from skyvern.forge.sdk.workflow.secret_encryption import (
+    mask_workflow_for_api,
+    preserve_workflow_definition_secrets,
+)
 from skyvern.forge.sdk.workflow.service import workflow_changed_fields
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
@@ -330,7 +349,7 @@ DIAGNOSE_RUN_TURN_MESSAGE = "Diagnose run {run_id} and repair the workflow."
 
 # The id is interpolated into a row the transcript renders as a product utterance, so anything
 # that could read as prose is refused rather than echoed.
-_WORKFLOW_RUN_ID_RE = re.compile(r"\Awr_[A-Za-z0-9]{1,40}\Z")
+_WORKFLOW_RUN_ID_RE = re.compile(r"\Awr_(?:[A-Za-z0-9]{1,40}|sched_[0-9a-f]{20,32}|recipe_[0-9]{1,40})\Z")
 
 _UNUSABLE_DIAGNOSE_RUN_REFUSALS = frozenset(
     {
@@ -441,6 +460,9 @@ def _assistant_execution_receipts(
 ) -> dict[str, set[str]]:
     # Each turn writes a cumulative snapshot that already retracts failed runs, so the newest one wins.
     for message in reversed(chat_messages):
+        if message.sender == WorkflowCopilotChatSender.AI and message._narrative_payload_unreadable is True:
+            # Its receipts may have retracted older ones, so an unreadable snapshot is the boundary.
+            return {}
         payload = message.narrative_payload
         if (
             message.sender == WorkflowCopilotChatSender.AI
@@ -1004,11 +1026,31 @@ def _client_visible_proposal(proposal: dict[str, Any], stored: Workflow | None) 
 
 
 async def _client_visible_updated_workflow(updated_workflow: Workflow, agent_result: AgentResult) -> dict[str, Any]:
-    stored = await app.DATABASE.workflows.get_workflow_by_permanent_id(
-        workflow_permanent_id=updated_workflow.workflow_permanent_id, organization_id=updated_workflow.organization_id
+    return await _client_visible_response_proposal(
+        _build_proposed_workflow_data(updated_workflow, agent_result),
+        workflow_permanent_id=updated_workflow.workflow_permanent_id,
+        organization_id=updated_workflow.organization_id,
     )
-    visible = _client_visible_proposal(_build_proposed_workflow_data(updated_workflow, agent_result), stored)
+
+
+async def _client_visible_response_proposal(
+    proposal: dict[str, Any], *, workflow_permanent_id: str, organization_id: str
+) -> dict[str, Any]:
+    stored = await app.DATABASE.workflows.get_workflow_by_permanent_id(
+        workflow_permanent_id=workflow_permanent_id, organization_id=organization_id
+    )
+    visible = _client_visible_proposal(proposal, stored)
     return {key: value for key, value in visible.items() if not key.startswith("_copilot_")}
+
+
+async def _stored_draft_of_turn(chat: WorkflowCopilotChat, turn_id: str) -> dict[str, Any] | None:
+    current_chat = await app.DATABASE.workflow_params.get_workflow_copilot_chat_by_id(
+        organization_id=chat.organization_id,
+        workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+    )
+    proposal = current_chat.proposed_workflow if current_chat is not None else None
+    metadata = copilot_proposal_metadata(proposal)
+    return proposal if metadata is not None and metadata.owner_turn_id == turn_id else None
 
 
 def _output_policy_blocked_final_response(agent_result: AgentResult) -> bool:
@@ -1573,14 +1615,41 @@ async def _persist_cancel_turn(
     narrative_payload: TurnNarrativePayload | None
     workflow_applied = False
     canonical_rolled_back = False
+    published_draft: dict[str, Any] | None = None
+    published_disposition: ProposalDisposition | None = None
     if agent_result is None:
+        # A cancel landing in the agent's own cleanup leaves no result, but the context it built
+        # still holds what the turn's tools completed. An interrupted turn keeps its own record.
+        sink_ctx = ctx_sink[0] if ctx_sink and not record_as_interrupted else None
+        tool_calls = completed_tool_names(sink_ctx) if sink_ctx is not None else []
+        acted_ctx = (
+            sink_ctx
+            if sink_ctx is not None
+            and (tool_calls or sink_ctx.edited_block_labels_this_turn or sink_ctx.dispatched_run_ids_this_turn)
+            else None
+        )
+        # The chat row was read at turn start, so a draft this turn published mid-turn is read back from the store.
+        if (
+            sink_ctx is not None
+            and sink_ctx.has_staged_proposal
+            and turn_id is not None
+            and sink_ctx.proposal_owner_turn_id == turn_id
+        ):
+            published_draft = await asyncio.shield(_stored_draft_of_turn(chat, turn_id))
+            stored_metadata = copilot_proposal_metadata(published_draft)
+            if published_draft is not None and stored_metadata is not None:
+                chat.proposed_workflow = published_draft
+                # The stored disposition is what the review card's pill reads; a stop never auto-applies.
+                published_disposition = (
+                    "review_tested" if stored_metadata.disposition == "review_tested" else "review_untested"
+                )
         user_response = cancel_notice(
             stop_button=cancel_source == "stop_button",
-            # Only a draft that survives the clear below is still awaiting the user.
-            preserved_draft=_preserved_draft_disposition(
-                draft_present=chat.proposed_workflow is not None and keep_pending_proposal
-            ),
+            # Otherwise only a draft that survives the clear below is still awaiting the user.
+            preserved_draft=published_disposition
+            or _preserved_draft_disposition(draft_present=chat.proposed_workflow is not None and keep_pending_proposal),
             canonical_rolled_back=False,
+            stopped=stopped_turn_facts(acted_ctx) if acted_ctx is not None else None,
         )
         updated_workflow = None
         updated_global_llm_context = clear_proposed_credential(prior_global_llm_context)
@@ -1597,11 +1666,14 @@ async def _persist_cancel_turn(
             cancel_source=cancel_source,
             copilot_effective_mode=effective_mode,
             copilot_code_available=code_available or False,
+            tool_calls=tool_calls,
         )
         response_turn_id = turn_id
         narrative_summary = user_response
         narrative_payload = _make_error_narrative_payload(turn_id, None, user_response)
-        if chat.proposed_workflow is not None and not keep_pending_proposal:
+        if acted_ctx is not None:
+            narrative_payload["turnFacts"] = turn_facts_for_context(acted_ctx, None)
+        if chat.proposed_workflow is not None and not keep_pending_proposal and published_draft is None:
             await asyncio.shield(_clear_proposed_workflow(chat))
     else:
         restored = _should_restore_persisted_workflow(chat.auto_accept, agent_result)
@@ -1663,6 +1735,7 @@ async def _persist_cancel_turn(
                     agent_result, draft_present=chat.proposed_workflow is not None
                 ),
                 canonical_rolled_back=canonical_rolled_back,
+                stopped=agent_result.cancellation_stopped_facts,
             )
         # The reload leg reads the payload text, so it must name the same report the row stores.
         if narrative_payload is not None and narrative_payload.get("terminalMessage") != user_response:
@@ -1708,7 +1781,7 @@ async def _persist_cancel_turn(
     if narrative_payload is not None and receipts is not None:
         narrative_payload = {**narrative_payload, "testedBlockFingerprints": serialize_execution_receipts(receipts)}
 
-    proposal_disposition = _proposal_disposition(agent_result)
+    proposal_disposition = published_disposition or _proposal_disposition(agent_result)
     narrative_payload = _with_terminal_narrative_metadata(
         narrative_payload,
         cancelled=True,
@@ -1735,14 +1808,19 @@ async def _persist_cancel_turn(
         # Reading the run facts inside the shield keeps a cancel arriving during that read from
         # taking the terminal frame with it.
         proposed_workflow_run = await _terminal_proposal_run_facts(chat, proposed_workflow_metadata, organization_id)
+        visible_workflow: dict[str, Any] | None = None
+        if updated_workflow is not None and agent_result is not None:
+            visible_workflow = await _client_visible_updated_workflow(updated_workflow, agent_result)
+        elif published_draft is not None:
+            visible_workflow = await _client_visible_response_proposal(
+                published_draft, workflow_permanent_id=chat.workflow_permanent_id, organization_id=organization_id
+            )
         await stream.send(
             WorkflowCopilotStreamResponseUpdate(
                 type=WorkflowCopilotStreamMessageType.RESPONSE,
                 workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
                 message=user_response,
-                updated_workflow=await _client_visible_updated_workflow(updated_workflow, agent_result)
-                if updated_workflow is not None and agent_result is not None
-                else None,
+                updated_workflow=visible_workflow,
                 response_time=response_time,
                 total_tokens=total_tokens,
                 response_type=response_type,
@@ -2080,6 +2158,10 @@ async def _commit_staged_workflow(
         workflow_permanent_id=workflow_permanent_id,
         organization_id=organization_id,
     )
+    preserve_workflow_definition_secrets(
+        staged_workflow.workflow_definition,
+        canonical.workflow_definition if canonical is not None else None,
+    )
     title = _accepted_workflow_title(staged_workflow.title, canonical, metadata)
     # Auto-accept saves without the update route, so the staged definition gets the same reference check.
     await app.AGENT_FUNCTION.enforce_folder_access_for_references(
@@ -2205,6 +2287,7 @@ async def _restore_workflow_definition(original_workflow: Workflow | None, organ
         preserve_completion_contract=False,
         validate_code_block_templates=False,
         preserve_redacted_credential_references_from=original_workflow,
+        prior_definition=original_workflow.workflow_definition,
     )
     # A shielded finalizer runs in a child task with a copied context, so the marker has to be a
     # mutable object shared by reference rather than a value set through the ContextVar.
@@ -2784,6 +2867,7 @@ async def _new_copilot_chat_post(
                 if chat_request.product_action == "test_end_to_end"
                 else strip_copilot_yaml_headers(chat_request.workflow_yaml),
                 persisted_workflow_yaml=persisted_workflow_yaml,
+                saved_workflow=original_workflow,
                 browser_session_id=None,
                 stream=stream,
             )
@@ -3042,6 +3126,7 @@ async def _new_copilot_chat_post(
                         persist_browser_allocation if eval_llm_overrides is not None else None
                     ),
                     persisted_workflow_yaml=persisted_workflow_yaml,
+                    saved_workflow=original_workflow,
                     opening_workflow_title=original_workflow.title,
                     prior_executed_block_fingerprints=prior_executed_block_fingerprints,
                     eval_capture_case_id=(
@@ -3593,6 +3678,16 @@ async def _validate_copilot_audio_artifact_id(
     return audio_artifact_id
 
 
+def _has_audio_container_signature(data: bytes) -> bool:
+    """The declared content type is client-controlled, so the bytes must open as a container browsers record into."""
+    return (
+        data.startswith((b"\x1a\x45\xdf\xa3", b"OggS", b"ID3", b"fLaC"))
+        or (data[:4] == b"RIFF" and data[8:12] == b"WAVE")
+        or data[4:8] == b"ftyp"
+        or (len(data) > 1 and data[0] == 0xFF and data[1] & 0xE0 == 0xE0)
+    )
+
+
 @base_router.post("/workflow/copilot/chat-audio", include_in_schema=False)
 async def workflow_copilot_chat_audio(
     workflow_permanent_id: str = Form(...),
@@ -3624,6 +3719,14 @@ async def workflow_copilot_chat_audio(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             detail=f"Audio file exceeds the maximum allowed size ({max_upload_bytes / 1024 / 1024:.0f} MB)",
         )
+
+    if not _has_audio_container_signature(audio_bytes):
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="File content is not a supported audio format"
+        )
+    await asyncio.to_thread(
+        uploaded_file_service.validate_upload_type, UploadFile(file=io.BytesIO(audio_bytes), filename=file.filename)
+    )
 
     chat = await _get_or_create_workflow_copilot_chat(
         organization_id=organization.organization_id,
@@ -3699,7 +3802,13 @@ async def workflow_copilot_chat_post(
     request: Request,
     chat_request: WorkflowCopilotChatRequest,
     organization: Organization = Depends(org_auth_service.get_current_org),
+    current_user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
 ) -> EventSourceResponse:
+    # The client can opt out, but only the server can enable note-aware Copilot behavior.
+    server_doc_editor_enabled = await app.AGENT_FUNCTION.workflow_doc_editor_enabled(
+        organization.organization_id, current_user_id
+    )
+    chat_request.doc_editor_enabled = chat_request.doc_editor_enabled and server_doc_editor_enabled
     eval_llm_overrides = admit_eval_llm_overrides(
         request.headers.get(EVAL_LLM_OVERRIDES_HEADER), organization.organization_id
     )
@@ -3928,13 +4037,16 @@ async def _reconcile_interrupted_copilot_turns(chat: WorkflowCopilotChat, organi
             # credential wait, while an unrelated stale turn must eventually
             # reconcile even if the auxiliary cache remains unavailable.
             continue
-        claimed = await app.DATABASE.workflow_params.claim_pending_copilot_turn(
+        claim = await app.DATABASE.workflow_params.claim_pending_copilot_turn(
             organization_id=organization_id,
             workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
             turn_id=entry.turn_id,
             claim_before=abandoned_before,
         )
-        if not claimed:
+        if claim == "refused":
+            continue
+        entry.recovering_at = datetime.now(UTC)
+        if claim == "recovering":
             continue
         try:
             await _recover_interrupted_copilot_turn(chat, organization_id, entry)
@@ -4221,11 +4333,33 @@ async def workflow_copilot_chat_history(
             organization.organization_id, chat.workflow_copilot_chat_id, question_interactions
         )
     pending_ids = {item.interaction_id for item in question_interactions if item.status == "pending"}
+    answered_turn_ids = {
+        message.turn_outcome.copilot_turn_id for message in chat_messages if message.turn_outcome is not None
+    }
+    live_entry = max(
+        (
+            entry
+            for entry in (chat.pending_turns.values() if chat else [])
+            if entry.turn_id not in answered_turn_ids and entry.recovering_at is None
+        ),
+        key=lambda entry: _as_utc(entry.started_at),
+        default=None,
+    )
     return WorkflowCopilotChatHistoryResponse(
         pending_credential_requests=pending_credentials,
         workflow_copilot_chat_id=chat.workflow_copilot_chat_id if chat else None,
         request_turn_id=request_turn_id,
         request_browser_allocations=request_browser_allocations,
+        in_flight_turn=(
+            CopilotInFlightTurn(
+                turn_id=live_entry.turn_id,
+                cancel_token=live_entry.cancel_token,
+                latest_draft=live_entry.latest_draft,
+                latest_draft_at=live_entry.latest_draft_at,
+            )
+            if live_entry is not None
+            else None
+        ),
         question_interactions=question_interactions,
         pending_question_cancel_token=next(
             (
@@ -4296,6 +4430,7 @@ async def workflow_copilot_question_response(
 
             async def screen_text(text: str) -> str:
                 safety = await screen_raw_secret_safety(text, handler, organization_id=organization.organization_id)
+                LOG.info("raw-secret safety screen", **raw_secret_safety_log_fields(safety, "question_response"))
                 if safety.status == "blocked":
                     raise HTTPException(
                         status_code=503,
@@ -4497,6 +4632,7 @@ async def workflow_copilot_steer(
             safety = await screen_raw_secret_safety(
                 steer_request.message, handler, organization_id=organization.organization_id
             )
+            LOG.info("raw-secret safety screen", **raw_secret_safety_log_fields(safety, "steer"))
         cost_headers = _copilot_eval_cost_headers(ledger)
         http_response.headers.update(cost_headers)
         if safety.status == "blocked":
@@ -4677,7 +4813,8 @@ async def _resolve_manual_sign_in(
 )
 async def workflow_copilot_credential_response(
     response_request: WorkflowCopilotCredentialResponseRequest,
-    organization: Organization = Depends(org_auth_service.get_current_org),
+    # A site answer writes the login, so this route accepts only the tokens the credential routes do.
+    organization: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> WorkflowCopilotCredentialResponseResult:
     """Resume a turn paused on ``credential_required`` with the user's card response.
 
@@ -4741,6 +4878,14 @@ async def workflow_copilot_credential_response(
         )
         if not existing:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Credential {credential_id} not found")
+        if response_request.asks_site and response_request.site_answer == "add":
+            return await _change_credential_site(cache, organization.organization_id, response_request, existing[0])
+        if response_request.asks_site and response_request.site_answer is None:
+            question = await _credential_site_question(
+                cache, organization.organization_id, response_request, existing[0]
+            )
+            if question is not None:
+                return question
 
     try:
         await resolve_credential_pause(
@@ -4751,10 +4896,164 @@ async def workflow_copilot_credential_response(
             resume_token=response_request.resume_token,
             action=response_request.action,
             credential_id=credential_id,
+            declined_site=response_request.asks_site and response_request.site_answer == "no",
         )
     except CredentialPauseRejection as rejection:
         raise HTTPException(status_code=rejection.status_code, detail=rejection.detail)
     return WorkflowCopilotCredentialResponseResult(result="accepted")
+
+
+async def _credential_site_question(
+    cache: BaseCache,
+    organization_id: str,
+    response_request: WorkflowCopilotCredentialResponseRequest,
+    credential: Credential,
+) -> WorkflowCopilotCredentialResponseResult | None:
+    pause_ids = {
+        "organization_id": organization_id,
+        "workflow_copilot_chat_id": response_request.workflow_copilot_chat_id,
+        "turn_id": response_request.turn_id,
+        "resume_token": response_request.resume_token,
+    }
+    try:
+        if await credential_pause_site_url(cache, **pause_ids) is None:
+            return None
+    except CredentialPauseRejection as rejection:
+        raise HTTPException(status_code=rejection.status_code, detail=rejection.detail)
+    try:
+        await app.AGENT_FUNCTION.enforce_credential_use(
+            organization_id, credential.credential_id, principal=get_request_principal()
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You can't use this login") from exc
+    try:
+        vault_sites = await vault_login_sites(credential)
+    except Exception:
+        # An unreadable vault entry asks nothing; the pause then admits or refuses the pick by its own checks.
+        LOG.info("copilot_credential_site_question_unavailable", credential_id=credential.credential_id, exc_info=True)
+        return None
+    try:
+        question = await ask_credential_site(cache, credential=credential, vault_sites=vault_sites, **pause_ids)
+    except CredentialPauseRejection as rejection:
+        raise HTTPException(status_code=rejection.status_code, detail=rejection.detail)
+    if question is None:
+        return None
+    LOG.info(
+        "copilot_credential_site_question",
+        credential_id=credential.credential_id,
+        site=question.site,
+        saved_sites=question.saved_sites,
+        vault_sourced=question.vault_sourced,
+    )
+    return WorkflowCopilotCredentialResponseResult(result="site_question", site_question=question)
+
+
+async def _write_credential_site(
+    organization_id: str, credential: Credential, claim: SiteChangeClaim
+) -> Literal["written", "refused", "unknown"]:
+    """Save the claimed site to the login; any failure before the write is attempted reports 'refused'.
+    Raises ValueError, before writing anything, when the site cannot be saved on this login."""
+    outcome: Literal["written", "refused", "unknown"] = "refused"
+    extra_site_urls = normalize_extra_site_urls(credential.tested_url, [*credential.extra_site_urls, claim.site_url])
+    try:
+        requires_write_lock = await app.AGENT_FUNCTION.should_lock_credential_write(
+            credential=None, existing_credential=credential
+        )
+        write_guard: contextlib.AbstractAsyncContextManager[None] = (
+            app.AGENT_FUNCTION.credential_write_lock(
+                organization_id=organization_id, credential_id=credential.credential_id
+            )
+            if requires_write_lock
+            else contextlib.nullcontext()
+        )
+        async with write_guard:
+            outcome = "unknown"
+            try:
+                await app.DATABASE.credentials.update_credential(
+                    credential.credential_id,
+                    organization_id,
+                    expected_site_urls=list(claim.question.saved_site_urls),
+                    extra_site_urls=extra_site_urls,
+                )
+            except (CredentialSitesChangedError, NotFoundError):
+                outcome = "refused"
+            else:
+                outcome = "written"
+    except Exception:
+        LOG.warning("copilot_credential_site_change_write_failed", outcome=outcome, exc_info=True)
+    if outcome != "refused":
+        await record_request_audit_event(
+            organization_id,
+            "credential.update",
+            "credential",
+            credential.credential_id,
+            changed_fields=("extra_site_urls",),
+            metadata={
+                "confirmed": "true" if outcome == "written" else "false",
+                "action": claim.answer.action,
+                "site": loggable_origin(claim.site_url),
+            },
+        )
+    return outcome
+
+
+async def _change_credential_site(
+    cache: BaseCache,
+    organization_id: str,
+    response_request: WorkflowCopilotCredentialResponseRequest,
+    credential: Credential,
+) -> WorkflowCopilotCredentialResponseResult:
+    """Save the site this card signs in on to the login, as the user's Allow answer, then connect it."""
+    principal = await enforce_principal_role(get_request_principal(), "credential.update")
+    await app.AGENT_FUNCTION.enforce_credential_folder_access_for_ids(
+        principal, "credential.update", {("credential_id", credential.credential_id)}
+    )
+    pause_ids = {
+        "organization_id": organization_id,
+        "workflow_copilot_chat_id": response_request.workflow_copilot_chat_id,
+        "turn_id": response_request.turn_id,
+    }
+    try:
+        claim = await claim_credential_site_change(
+            cache,
+            resume_token=response_request.resume_token,
+            credential_id=credential.credential_id,
+            **pause_ids,
+        )
+    except CredentialPauseRejection as rejection:
+        raise HTTPException(status_code=rejection.status_code, detail=rejection.detail)
+    try:
+        outcome = await _write_credential_site(organization_id, credential, claim)
+    except ValueError as exc:
+        await finish_credential_site_change(cache, claim=claim, written=False, **pause_ids)
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+    try:
+        connected = await finish_credential_site_change(cache, claim=claim, written=outcome != "refused", **pause_ids)
+    except Exception:
+        if outcome == "refused":
+            raise
+        LOG.warning(
+            "copilot_credential_site_change_finish_failed", credential_id=credential.credential_id, exc_info=True
+        )
+        connected = False
+    if outcome == "refused":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This login's sites changed since the card asked. Pick it again.",
+        )
+    LOG.info(
+        "copilot_credential_site_changed",
+        credential_id=credential.credential_id,
+        action=claim.answer.action,
+        site_a=claim.answer.site_a or None,
+        saved_sites=list(claim.answer.saved_sites),
+        site_b=loggable_origin(claim.site_url),
+        confirmed=outcome == "written",
+        connected=connected,
+    )
+    if outcome == "unknown":
+        return WorkflowCopilotCredentialResponseResult(result="site_change_unknown")
+    return WorkflowCopilotCredentialResponseResult(result="accepted" if connected else "site_changed_not_connected")
 
 
 async def _demonstration_cache() -> BaseCache:
@@ -4834,6 +5133,10 @@ async def workflow_copilot_demonstration_control(
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="url must be http(s)") from exc
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="url must be http(s)")
+    if control_request.action == "note" and not (control_request.text or "").strip():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="text is required when action is 'note'"
+        )
     if control_request.action == "fill_credential" and not (
         control_request.credential_id and control_request.selector and control_request.field
     ):
@@ -4904,7 +5207,10 @@ async def workflow_copilot_demonstration_upload(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"A demonstration can attach at most {MAX_ATTACHED_FILES_PER_MESSAGE} files",
         )
-    await uploaded_file_service.validate_file_size(file, max_size_bytes=app.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE)
+    # Demonstrations replay the user's own file into the target site, so any type that site accepts must pass.
+    await uploaded_file_service.validate_passthrough_upload(
+        file, max_size_bytes=app.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE, purpose="copilot_demonstration"
+    )
     try:
         uploaded, _ = await uploaded_file_service.save_uploaded_file(
             file=file, organization_id=organization.organization_id
@@ -5433,7 +5739,7 @@ async def workflow_copilot_apply_proposed_workflow(
                 changed_fields=changed_fields,
             ),
         )
-    return new_workflow
+    return mask_workflow_for_api(new_workflow)
 
 
 async def _history_with_resolved_attachments(
@@ -5562,7 +5868,7 @@ async def workflow_copilot_convert_yaml_to_blocks(
         parsed_yaml = safe_load_no_dates(request.workflow_definition_yaml)
         workflow_definition_yaml = WorkflowDefinitionYAML.model_validate(parsed_yaml)
 
-        _repair_next_block_label_chain(workflow_definition_yaml.blocks)
+        _repair_next_block_label_chain(workflow_definition_yaml.blocks, list_ordered=_runs_in_list_order(parsed_yaml))
 
         workflow_definition = convert_workflow_definition(
             workflow_definition_yaml=workflow_definition_yaml,

@@ -15,7 +15,9 @@ from unittest.mock import AsyncMock
 import pytest
 import yaml
 
-from skyvern.forge.sdk.copilot import tools
+from skyvern.exceptions import TooManyStartingBrowserSessions
+from skyvern.forge.sdk.copilot import runtime, tools
+from skyvern.forge.sdk.copilot.build_test_connect_failure import BuildTestConnectFailure
 from skyvern.forge.sdk.copilot.composition_evidence import (
     composition_page_evidence_missing,
     has_bounded_page_schema,
@@ -594,7 +596,7 @@ async def test_current_page_inspect_after_schema_less_interaction_grounds_a_page
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     reached_url = "https://example.com/results"
-    ctx = make_copilot_ctx()
+    ctx = make_copilot_ctx(browser_session_id="pbs_current")
     ctx.flow_evidence = [
         _flow_entry(_bounded_packet("https://example.com/"), reached_via="navigate", step=0),
         _flow_entry(_scout_interaction_packet(reached_url), reached_via="interaction", step=1),
@@ -1168,7 +1170,7 @@ async def test_designated_read_seeds_the_screenshot_pass_when_the_turn_declared_
 @pytest.mark.asyncio
 async def test_inspect_tool_forwards_the_designated_read_into_capture(monkeypatch: pytest.MonkeyPatch) -> None:
     forwarded: list[tuple[str, ...]] = []
-    ctx = make_copilot_ctx()
+    ctx = make_copilot_ctx(browser_session_id="pbs_current")
 
     async def capture(_ctx: object, **kwargs: object) -> tuple[dict, None]:
         reads = kwargs.get("requested_reads") or ()
@@ -1202,6 +1204,97 @@ async def test_inspect_tool_forwards_the_designated_read_into_capture(monkeypatc
         assert json.loads(raw)["ok"] is True
 
     assert forwarded == [("output.sessions_started",), ("output.sessions_started",)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        (
+            runtime._start_capacity_failure(
+                TooManyStartingBrowserSessions(17, starting_sessions=10, max_starting_sessions=10)
+            ),
+            {
+                "state": "browser_start_capacity",
+                "retry_action": "test_end_to_end",
+                "starting_sessions": 10,
+                "max_starting_sessions": 10,
+                "retry_after_seconds": 17,
+            },
+        ),
+        (
+            BuildTestConnectFailure(state="billing_credit_admission_refusal", retry_action=None),
+            {"state": "billing_credit_admission_refusal", "retry_action": None},
+        ),
+    ],
+)
+@pytest.mark.parametrize("target_url", ["https://example.com/search", "current_page"])
+async def test_inspect_tool_returns_a_refused_browser_start_as_its_typed_facts(
+    monkeypatch: pytest.MonkeyPatch, failure: BuildTestConnectFailure, expected: dict[str, object], target_url: str
+) -> None:
+    refusal = runtime._browser_session_acquisition_failure_result(failure)
+
+    async def provision(_ctx: object, **_kwargs: object) -> BuildTestConnectFailure:
+        return failure
+
+    async def navigate(_ctx: object, _url: str, **_kwargs: object) -> dict[str, object]:
+        return refusal
+
+    async def page_info(_ctx: object, _session_id: str | None = None) -> tuple[str, str]:
+        return "", ""
+
+    async def no_second_acquisition(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("a refused start must not be followed by another browser read")
+
+    monkeypatch.setattr(tools, "_authority_tool_error", lambda *_args: None)
+    monkeypatch.setattr(tools.composition_capture, "_authority_tool_error", lambda *_args: None)
+    monkeypatch.setattr(tools.composition_capture, "_fallback_page_info", page_info)
+    monkeypatch.setattr(tools.composition_capture, "_discovery_navigate", navigate)
+    monkeypatch.setattr(
+        tools.composition_capture, "_composition_evidence_after_navigation_failure", no_second_acquisition
+    )
+    monkeypatch.setattr(tools.composition_capture, "_capture_composition_evidence", no_second_acquisition)
+    monkeypatch.setattr(runtime, "_provision_browser_session", provision)
+
+    raw = await tools.inspect_page_for_composition_tool.on_invoke_tool(
+        SimpleNamespace(context=make_copilot_ctx(), tool_name="inspect_page_for_composition"),
+        json.dumps({"target_url": target_url}),
+    )
+
+    result = json.loads(raw)
+    assert result["ok"] is False
+    assert result["error"] == refusal["error"]
+    assert result["data"]["browser_session_acquisition_failure"] == expected
+
+
+@pytest.mark.asyncio
+async def test_current_page_inspect_that_starts_the_browser_keeps_its_witnesses_on_the_new_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    url = "https://example.com/metrics"
+    ctx = _requested_tile_ctx()
+    recorded: list[str | None] = []
+
+    async def provision(provision_ctx: CopilotContext, **_kwargs: object) -> None:
+        provision_ctx.browser_session_id = "pbs_new"
+
+    def record(record_ctx: CopilotContext, *, expression: str, data: object, url: str, declared_output_path=None):
+        recorded.append(record_ctx.browser_session_id)
+        return {"read_expression": expression, "read_output_path": declared_output_path}
+
+    _patch_inspection_seam(
+        monkeypatch, current_url=url, packet=_bounded_packet(url) | _witness_packet(), navigations=[]
+    )
+    monkeypatch.setattr(runtime, "_provision_browser_session", provision)
+    monkeypatch.setattr(tools.composition_capture, "_record_scouted_read", record)
+
+    result = await tools.composition_capture._inspect_page_for_composition_impl(ctx, "current_page")
+
+    assert result["ok"] is True
+    evidence = ctx.composition_page_evidence
+    assert "mixed_browser_session_provenance" not in evidence.get("inspection_warnings", [])
+    assert recorded == ["pbs_new"]
+    assert tools._witnessed_output_paths(evidence) == frozenset({"output.sessions_started"})
 
 
 @pytest.mark.asyncio

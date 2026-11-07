@@ -7,15 +7,17 @@ verdict does not depend on which engine ran the blocks or how generated code des
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from skyvern.exceptions import WorkflowNotFound
 from skyvern.forge.sdk.copilot.tools.workflow_update import CodeArtifactCompletionCriterion
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.models import WorkflowRunAttemptModel
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.workflow import service as service_module
@@ -40,6 +42,7 @@ from tests.unit._external_cdp_fakes import (
     register_external,
 )
 from tests.unit.conftest import FakeWorkflowRunAttemptsRepository
+from tests.unit.helpers import StreamedDownloadObjects, make_pdf, pdf_download_rows
 
 _DOWNLOAD_CONTRACT = {
     "completion_contract": {
@@ -832,7 +835,11 @@ async def test_a_workflow_whose_registered_browser_ended_mid_run_fails_at_finali
         service = WorkflowService()
 
         async def write_status(
-            *, workflow_run_id: str, status: WorkflowRunStatus, failure_reason: str | None = None
+            *,
+            workflow_run_id: str,
+            status: WorkflowRunStatus,
+            failure_reason: str | None = None,
+            _on_terminal_write=None,
         ) -> SimpleNamespace:
             return SimpleNamespace(status=status, failure_reason=failure_reason)
 
@@ -863,3 +870,206 @@ async def test_a_workflow_whose_registered_browser_ended_mid_run_fails_at_finali
     else:
         assert finalized.status == WorkflowRunStatus.failed and expected_reason in finalized.failure_reason
     run_context.close.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("second", "satisfied"),
+    [
+        pytest.param(make_pdf("Statement 1001"), False, id="two-saves-of-one-pdf-are-one-document"),
+        pytest.param(make_pdf("Statement 2002"), True, id="two-different-pdfs-are-two-documents"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_two_document_promise_counts_each_pdf_content_once(
+    monkeypatch: pytest.MonkeyPatch, second: bytes, satisfied: bool
+) -> None:
+    first = make_pdf("Statement 1001")
+    stored = {"s_1": first, "s_2": second}
+    downloaded = [
+        FileInfo(
+            url=f"https://files.example/{artifact_id}",
+            artifact_id=artifact_id,
+            filename=f"{artifact_id}.pdf",
+            checksum=hashlib.sha256(data).hexdigest(),
+            file_size=len(data),
+            modified_at=_T0 + timedelta(minutes=index),
+        )
+        for index, (artifact_id, data) in enumerate(stored.items())
+    ]
+    contract = {"criteria": [{"id": "statements", "kind": "registered_download", "min_count": 2}]}
+    service, run, _ = _wire_finalize(monkeypatch, contract=contract, downloaded=downloaded)
+    objects = StreamedDownloadObjects(
+        {f"s3://b/{artifact_id}": data for artifact_id, data in stored.items()}, downloaded
+    )
+    monkeypatch.setattr(service_module.app, "STORAGE", objects)
+    monkeypatch.setattr(
+        service_module.app.DATABASE.artifacts,
+        "get_artifacts_by_ids",
+        AsyncMock(
+            side_effect=lambda ids, organization_id: [
+                SimpleNamespace(
+                    artifact_id=artifact_id,
+                    uri=f"s3://b/{artifact_id}",
+                    organization_id=organization_id,
+                    run_id="wr_1",
+                    created_at=_T0 + timedelta(minutes=int(artifact_id[-1])),
+                )
+                for artifact_id in ids
+            ]
+        ),
+    )
+
+    verdict = await service._grade_completion_contract(run)
+
+    assert verdict is not None
+    assert verdict.satisfied is satisfied
+
+
+@pytest.mark.parametrize(
+    ("case", "completes", "reads"),
+    [
+        ("session_only_saves", False, ["a_0", "a_1"]),
+        ("registered_and_session_saves", False, ["a_0", "a_1"]),
+        ("session_row_missing", True, []),
+        ("session_row_of_another_run", True, []),
+        ("session_row_of_another_organization", True, []),
+        ("session_checksum_unknown", True, []),
+        ("session_content_unreadable", True, None),
+    ],
+)
+@pytest.mark.asyncio
+async def test_two_saves_of_one_pdf_count_once_only_when_both_rows_are_proven_members(
+    monkeypatch: pytest.MonkeyPatch, case: str, completes: bool, reads: list[str] | None
+) -> None:
+    contract = {
+        "schema_version": 1,
+        "criteria": [{"id": "declared_download", "kind": "registered_download", "min_count": 2}],
+    }
+    service, run, statuses = _wire_finalize(monkeypatch, contract=contract, downloaded=[])
+    pdf = make_pdf("Invoice 1001")
+    owner = {"session_row_of_another_run": "wr_other"}.get(case)
+    org = "o_other" if case == "session_row_of_another_organization" else "o_1"
+    rows, files = pdf_download_rows("s3://downloads/o_1/browser_sessions/pbs_1", [pdf, pdf], org, owner)
+    listing, session_only = [], ["a_0", "a_1"]
+    if case == "registered_and_session_saves":
+        rows[0] = rows[0].model_copy(update={"run_id": "wr_1"})
+        listing, session_only = [files[0]], ["a_1"]
+    if case == "session_checksum_unknown":
+        rows = [row.model_copy(update={"checksum": None}) for row in rows]
+    stored = StreamedDownloadObjects({row.uri: pdf for row in rows}, listing)
+    if case == "session_content_unreadable":
+        stored.objects[rows[1].uri] = None
+    if case == "session_row_missing":
+        rows = rows[:1]
+    # The other-organization case models a lookup that ignores its organization argument.
+    lookups = AsyncMock(
+        side_effect=lambda ids, o: [
+            r for r in rows if r.artifact_id in ids and (r.organization_id == o or org != "o_1")
+        ]
+    )
+    monkeypatch.setattr(service, "_session_download_artifact_ids", AsyncMock(return_value={"a_0", "a_1"}))
+    monkeypatch.setattr(service_module.app.DATABASE.artifacts, "get_artifacts_by_ids", lookups)
+    monkeypatch.setattr(service_module.app, "STORAGE", stored)
+
+    await service._finalize_workflow_run_status(
+        workflow_run_id=run.workflow_run_id,
+        workflow_run=run,
+        pre_finally_status=WorkflowRunStatus.running,
+        pre_finally_failure_reason=None,
+    )
+
+    assert (statuses == [WorkflowRunStatus.completed]) is completes
+    if reads is not None:
+        assert sorted(stored.reads) == reads, "only proven members are read"
+    session_lookups = [sorted(c.args[0]) for c in lookups.await_args_list if set(c.args[0]) & set(session_only)]
+    assert session_lookups == [session_only], "session-only rows are fetched once"
+
+
+@pytest.mark.asyncio
+async def test_session_download_ids_are_scoped_to_the_current_attempt(monkeypatch: pytest.MonkeyPatch) -> None:
+    started = datetime(2026, 11, 3, 8, 10, tzinfo=timezone.utc)
+    attempts = [
+        SimpleNamespace(attempt_number=1, started_at=started - timedelta(minutes=10), finished_at=started),
+        SimpleNamespace(attempt_number=2, started_at=started, finished_at=None),
+    ]
+    listed = AsyncMock(return_value={"a_new"})
+    monkeypatch.setattr(service_module.app.DATABASE.artifacts, "list_session_download_artifact_ids_for_run", listed)
+    service = WorkflowService()
+    run = SimpleNamespace(workflow_run_id="wr_1", organization_id="o_1", created_at=started - timedelta(minutes=10))
+
+    ids = await service._session_download_artifact_ids(run, "pbs_1", "wr_1", attempt_rows=attempts, attempt_number=2)
+
+    assert ids == {"a_new"}
+    assert listed.await_args.kwargs["attempt_number"] == 2
+    assert listed.await_args.kwargs["run_started_at"] == service._attempt_started_at(attempts, 2)
+    assert (
+        await service._session_download_artifact_ids(run, "pbs_1", "wr_1", attempt_rows=attempts, attempt_number=9)
+        == set()
+    )
+    assert listed.await_count == 1, "an unknown attempt never queries the session"
+
+
+@pytest.mark.asyncio
+async def test_grading_keeps_the_run_and_session_it_started_with(monkeypatch: pytest.MonkeyPatch) -> None:
+    service, run, statuses = _wire_finalize(monkeypatch, contract=_DERIVED_CONTRACT, downloaded=[])
+    run.created_at = datetime(2026, 11, 3, 8, 0, tzinfo=timezone.utc)
+    context = skyvern_context.SkyvernContext(run_id="wr_initial", browser_session_id="pbs_initial")
+
+    async def get_attempts(_workflow_run_id: str) -> list[Any]:
+        context.run_id, context.browser_session_id = "wr_changed", "pbs_changed"
+        return []
+
+    monkeypatch.setattr(
+        service_module.app.DATABASE, "workflow_run_attempts", SimpleNamespace(get_attempts=get_attempts)
+    )
+    session_query = AsyncMock(return_value=set())
+    monkeypatch.setattr(
+        service_module.app.DATABASE.artifacts, "list_session_download_artifact_ids_for_run", session_query
+    )
+    skyvern_context.set(context)
+    try:
+        await service._finalize_workflow_run_status(
+            workflow_run_id=run.workflow_run_id,
+            workflow_run=run,
+            pre_finally_status=WorkflowRunStatus.running,
+            pre_finally_failure_reason=None,
+        )
+    finally:
+        skyvern_context.reset()
+
+    assert service_module.app.STORAGE.get_downloaded_files.await_args.kwargs["run_id"] == "wr_initial"
+    assert session_query.await_args.kwargs["run_id"] == "wr_initial"
+    assert session_query.await_args.kwargs["browser_session_id"] == "pbs_initial"
+
+
+@pytest.mark.asyncio
+async def test_grading_keeps_the_run_and_session_it_started_with_through_the_workflow_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, run, _ = _wire_finalize(monkeypatch, contract=_DERIVED_CONTRACT, downloaded=[])
+    run.created_at = datetime(2026, 11, 3, 8, 0, tzinfo=timezone.utc)
+    context = skyvern_context.SkyvernContext(run_id="wr_initial", browser_session_id="pbs_initial")
+    load_workflow = service.get_workflow
+
+    async def load_workflow_then_switch(**kwargs: Any) -> Any:
+        context.run_id, context.browser_session_id = "wr_changed", "pbs_changed"
+        return await load_workflow(**kwargs)
+
+    monkeypatch.setattr(service, "get_workflow", load_workflow_then_switch)
+    monkeypatch.setattr(
+        service_module.app.DATABASE, "workflow_run_attempts", SimpleNamespace(get_attempts=AsyncMock(return_value=[]))
+    )
+    session_query = AsyncMock(return_value=set())
+    monkeypatch.setattr(
+        service_module.app.DATABASE.artifacts, "list_session_download_artifact_ids_for_run", session_query
+    )
+    skyvern_context.set(context)
+    try:
+        verdict = await service._grade_completion_contract(run)
+    finally:
+        skyvern_context.reset()
+
+    assert verdict is not None
+    assert service_module.app.STORAGE.get_downloaded_files.await_args.kwargs["run_id"] == "wr_initial"
+    assert session_query.await_args.kwargs["run_id"] == "wr_initial"
+    assert session_query.await_args.kwargs["browser_session_id"] == "pbs_initial"

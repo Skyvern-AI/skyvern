@@ -180,6 +180,8 @@ vi.mock("@/store/WorkflowHasChangesStore", () => ({
 // Unrelated to this file's tests; the real hook needs a QueryClientProvider
 // this harness doesn't set up.
 vi.mock("@/routes/workflows/hooks/useWorkflowRunQuery", () => ({
+  useWorkflowRunQueries: (ids: readonly string[]) =>
+    ids.map(() => ({ data: undefined })),
   useWorkflowRunQuery: () => ({ data: undefined }),
 }));
 

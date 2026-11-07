@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import hashlib
 import itertools
+import json
 import logging
 import os
 import shutil
@@ -15,23 +16,33 @@ from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, 
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, TypeVar
+from typing import Any, NoReturn, Protocol, TypeVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
 import structlog
+from agents import FunctionTool
+from agents.tool_context import ToolContext
+from jinja2 import StrictUndefined
+from jinja2.sandbox import SandboxedEnvironment
 from opentelemetry import trace as otel_trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
-from playwright.async_api import Download
+from PIL import Image
+from playwright.async_api import BrowserContext, Download
 from playwright.async_api import Error as PlaywrightError
-from sqlalchemy import Engine, create_engine, func, select
+from playwright.async_api import Page
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import ViewportSize, async_playwright
+from sqlalchemy import Engine, create_engine, event, func, select
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.pool import StaticPool
 
 import skyvern._cli_bootstrap as cli_bootstrap
 from skyvern.config import settings
@@ -51,23 +62,33 @@ from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.db.models import Base, CredentialModel, WorkflowModel
 from skyvern.forge.sdk.db.utils import _custom_json_serializer
+from skyvern.forge.sdk.encrypt import encryptor
+from skyvern.forge.sdk.encrypt.bootstrap import register_aes_encryptor
 from skyvern.forge.sdk.executor.async_executor import AsyncExecutor
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
-from skyvern.forge.sdk.schemas.credentials import BitwardenItemOverview, CredentialType
+from skyvern.forge.sdk.schemas.credentials import BitwardenItemOverview, CredentialType, CredentialVaultType
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import BitwardenCredential, BitwardenOrganizationAuthToken, Organization
-from skyvern.forge.sdk.services.bitwarden import BitwardenConstants, BitwardenService
+from skyvern.forge.sdk.services.bitwarden import BitwardenConstants, BitwardenLoginSecret, BitwardenService
+from skyvern.forge.sdk.services.credential import credential_creation_service
+from skyvern.forge.sdk.services.credential.connected_bitwarden_credential_vault_service import (
+    ConnectedBitwardenCredentialVaultService,
+)
+from skyvern.forge.sdk.services.request_principal import AuthKind, RequestPrincipal
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow import web_search, web_search_client
-from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
+from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager, WorkflowRunContext
+from skyvern.forge.sdk.workflow.models import block as block_module
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar, TaskBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.services import workflow_run_group_service as group_service
+from skyvern.webeye.browser_engine import SKYCDP_ENGINE_NAME, BrowserEngineMetadata, BrowserEngineSelection
 from skyvern.webeye.utils import page as page_module
 from skyvern.webeye.utils.page import ScreenshotMode
 from tests.unit._fingerprint_expectations import FINGERPRINT_TEST_SECRET_KEY
+from tests.unit.chromium_probe import chromium_available, full_chromium_available
 from tests.unit.dns_fixtures import no_env_proxy, public_dns, unresolvable_dns  # noqa: F401
 from tests.unit.force_stub_app import start_forge_stub_app
 from tests.unit.google.conftest import mock_sheets_transport  # noqa: F401
@@ -189,6 +210,31 @@ def workflow_context_manager_factory() -> Callable[..., WorkflowContextManager]:
         return manager
 
     return _make
+
+
+CARD_SECRET_RUN_ID = "wr_card_secret"
+
+
+@pytest.fixture
+def card_secret_run(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
+    """A live run with Mask Secrets off whose vault card was registered the way the 1Password path does it.
+    Returns each field's placeholder id: card_number and card_cvv are card data, card_holder_name is not."""
+    context = WorkflowRunContext(
+        workflow_title="t",
+        workflow_id="w_card",
+        workflow_permanent_id="wpid_card",
+        workflow_run_id=CARD_SECRET_RUN_ID,
+        aws_client=MagicMock(),
+        mask_secrets=False,
+    )
+    parameter = MagicMock(key="card")
+    context.values[parameter.key] = {}
+    for key, value in (("card_number", "4111111111111111"), ("card_cvv", "587"), ("card_holder_name", "Test Holder")):
+        context._add_secret_parameter_value(parameter, key, value)
+    manager = WorkflowContextManager()
+    manager.workflow_run_contexts[CARD_SECRET_RUN_ID] = context
+    monkeypatch.setattr(app, "WORKFLOW_CONTEXT_MANAGER", manager)
+    return context.values[parameter.key]
 
 
 # Wire structlog through stdlib so caplog can capture log records in tests.
@@ -356,6 +402,19 @@ def render_agent_prompt(**overrides: str) -> str:
     return prompt_engine.load_prompt("workflow-copilot-agent", **{**_AGENT_TEMPLATE_DEFAULTS, **overrides})
 
 
+def use_templating_strictness(monkeypatch: pytest.MonkeyPatch, strictness: str) -> None:
+    """The block module picks its Jinja environment at import, so strict mode swaps in a StrictUndefined one."""
+    monkeypatch.setattr(settings, "WORKFLOW_TEMPLATING_STRICTNESS", strictness)
+    if strictness != "strict":
+        return
+    env = SandboxedEnvironment(undefined=StrictUndefined)
+    env.filters["json"] = block_module._json_type_filter
+    globals_free_env = env.overlay()
+    globals_free_env.globals = {}
+    monkeypatch.setattr(block_module, "jinja_sandbox_env", env)
+    monkeypatch.setattr(block_module, "_globals_free_jinja_env", globals_free_env)
+
+
 def make_block_output_parameter(key: str = "block_output", workflow_id: str = "workflow-id") -> OutputParameter:
     now = datetime.now(UTC)
     return OutputParameter(
@@ -363,15 +422,25 @@ def make_block_output_parameter(key: str = "block_output", workflow_id: str = "w
     )
 
 
-def make_copilot_context(workflow_yaml: str = "") -> CopilotContext:
+def make_copilot_context(
+    workflow_yaml: str = "", *, organization_id: str = "o", workflow_permanent_id: str = "wp"
+) -> CopilotContext:
     return CopilotContext(
-        organization_id="o",
+        organization_id=organization_id,
         workflow_id="w",
-        workflow_permanent_id="wp",
+        workflow_permanent_id=workflow_permanent_id,
         workflow_yaml=workflow_yaml,
         browser_session_id=None,
         stream=SimpleNamespace(),  # type: ignore[arg-type]
     )
+
+
+async def invoke_copilot_tool(tool: FunctionTool, ctx: CopilotContext, arguments: dict[str, Any]) -> dict[str, Any]:
+    raw_arguments = json.dumps(arguments)
+    tool_context = ToolContext(
+        context=ctx, tool_name=tool.name, tool_call_id=f"call_{tool.name}", tool_arguments=raw_arguments
+    )
+    return json.loads(await tool.on_invoke_tool(tool_context, raw_arguments))
 
 
 # -- shared helpers for repository unit tests --
@@ -442,13 +511,21 @@ def gpt56_litellm_models() -> Iterator[None]:
         yield
 
 
-# -- shared in-memory SQLite engine for repository/route unit tests --
+# -- shared SQLite engine for repository/route unit tests --
 #
-# ``Base.metadata.create_all`` issues DDL for every mapped table (~50) on every
+# ``Base.metadata.create_all`` issues DDL for every mapped table (~140) on every
 # call, so re-running it per test dominates the runtime of the repository suites.
 # We build the schema once per session into a template SQLite file and clone that
 # file per test — a byte copy is orders of magnitude cheaper than re-emitting the
 # DDL, and each test still gets its own isolated database.
+
+
+@pytest.fixture
+def registered_encryption() -> Iterator[None]:
+    """The real AES-CBC and AES-GCM encryptors, registered as a deployment with ENABLE_ENCRYPTION would."""
+    with patch.dict(encryptor._methods, clear=True):
+        register_aes_encryptor(secret_key="registered-encryption-test-key")
+        yield
 
 
 @pytest.fixture(scope="session")
@@ -462,28 +539,66 @@ def sqlite_schema_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return template_path
 
 
+class SqliteEngineFactory(Protocol):
+    def __call__(
+        self,
+        *,
+        template: Path | None = None,
+        build_engine: Callable[[str], AsyncEngine] | None = None,
+        single_connection: bool = False,
+    ) -> AsyncEngine: ...
+
+
+def _single_connection_engine(url: str) -> AsyncEngine:
+    engine = create_async_engine(url, json_serializer=_custom_json_serializer, poolclass=StaticPool)
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _foreign_keys_on(dbapi_connection: Any, _record: Any) -> None:
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    return engine
+
+
 @pytest_asyncio.fixture
-async def sqlite_engine_factory(
-    sqlite_schema_template: Path, tmp_path: Path
-) -> AsyncGenerator[Callable[[], AsyncEngine]]:
-    engines: list[AsyncEngine] = []
+async def sqlite_engine_factory(sqlite_schema_template: Path, tmp_path: Path) -> AsyncGenerator[SqliteEngineFactory]:
+    created: list[tuple[AsyncEngine, Path]] = []
     counter = itertools.count()
 
-    def _make() -> AsyncEngine:
+    def _make(
+        *,
+        template: Path | None = None,
+        build_engine: Callable[[str], AsyncEngine] | None = None,
+        single_connection: bool = False,
+    ) -> AsyncEngine:
+        if single_connection and build_engine is not None:
+            raise ValueError("single_connection builds its own engine, so it cannot be combined with build_engine")
         db_path = tmp_path / f"db_{next(counter)}.db"
-        shutil.copyfile(sqlite_schema_template, db_path)
-        engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}", json_serializer=_custom_json_serializer)
-        engines.append(engine)
+        shutil.copyfile(template or sqlite_schema_template, db_path)
+        url = f"sqlite+aiosqlite:///{db_path}"
+        if single_connection:
+            # One shared connection, so concurrent sessions queue on it in order; with a pool each gets its own
+            # connection and the interleaving varies from run to run.
+            engine = _single_connection_engine(url)
+        else:
+            engine = (
+                build_engine(url) if build_engine else create_async_engine(url, json_serializer=_custom_json_serializer)
+            )
+        created.append((engine, db_path))
         return engine
 
     yield _make
 
-    for engine in engines:
+    # pytest keeps tmp_path for the last three sessions, and every copy is a full schema.
+    for engine, db_path in created:
         await engine.dispose()
+        for suffix in ("", "-wal", "-shm"):
+            db_path.with_name(db_path.name + suffix).unlink(missing_ok=True)
 
 
 @pytest_asyncio.fixture
-async def sqlite_engine(sqlite_engine_factory: Callable[[], AsyncEngine]) -> AsyncEngine:
+async def sqlite_engine(sqlite_engine_factory: SqliteEngineFactory) -> AsyncEngine:
     return sqlite_engine_factory()
 
 
@@ -533,6 +648,7 @@ def make_input_element_mock(*, element_id: str = "AADC", attrs: dict[str, object
     el.has_attr = AsyncMock(return_value=False)
     el.is_spinbtn_input = AsyncMock(return_value=False)
     el.is_editable = AsyncMock(return_value=True)
+    el.accepts_text_fill = AsyncMock(return_value=True)
     el.supports_text_input = AsyncMock(return_value=True)
     el.is_visible = AsyncMock(return_value=True)
     el.is_raw_input = AsyncMock(return_value=False)
@@ -676,7 +792,7 @@ def download_destinations(monkeypatch: pytest.MonkeyPatch) -> Iterator[DownloadD
 
     server = HTTPServer(("127.0.0.1", 0), _Handler)
     port = server.server_port
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
     thread.start()
 
     holder["internal"] = f"http://{internal_host}:{port}"
@@ -1066,6 +1182,30 @@ async def settle_or_fail(coro: Awaitable[_T], wait_seconds: float = 2.0) -> tupl
     return task, elapsed
 
 
+async def cancel_once_parked(
+    coro: Awaitable[_T], parked: asyncio.Event, release: asyncio.Event, wait_seconds: float = 5.0
+) -> asyncio.Task[_T]:
+    """Run ``coro``, cancel it once it reaches a collaborator parked on ``release``, and fail if it does not finish
+    within ``wait_seconds`` of that cancel, so work re-entered after cancellation fails instead of hanging. The
+    parked collaborator is always released and the task's outcome retrieved before returning."""
+    task = asyncio.ensure_future(coro)
+    try:
+        reached = asyncio.ensure_future(parked.wait())
+        await asyncio.wait({task, reached}, timeout=wait_seconds, return_when=asyncio.FIRST_COMPLETED)
+        reached.cancel()
+        if not parked.is_set():
+            pytest.fail(f"never reached the parked collaborator within {wait_seconds}s")
+        task.cancel()
+        await settle_or_fail(task, wait_seconds)
+        return task
+    finally:
+        release.set()
+        if not task.done():
+            await asyncio.wait({task}, timeout=wait_seconds)
+        if task.done() and not task.cancelled():
+            task.exception()
+
+
 class DriverReplyProbe:
     """A driver call that keeps its protocol reply the way playwright and patchright do.
 
@@ -1230,7 +1370,6 @@ async def run_group_env(monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEng
     monkeypatch.setattr(app, "DATABASE", database)
     monkeypatch.setattr(object.__getattribute__(app, "_inst"), "RATE_LIMITER", limiter, raising=False)
     monkeypatch.setattr(app, "WORKFLOW_SERVICE", service)
-    monkeypatch.setattr(service, "_resolve_managed_browser_profile_for_run_request", AsyncMock(return_value=None))
     monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "is_feature_enabled_cached", AsyncMock(return_value=False))
     monkeypatch.setattr(app.AGENT_FUNCTION, "is_block_scoped_workflow_run", AsyncMock(return_value=False))
     monkeypatch.setattr(AsyncExecutorFactory, "get_executor", lambda: executor)
@@ -1243,10 +1382,10 @@ async def run_group_env(monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEng
 
 
 ORG_VAULT_ITEM_ID = "0f4a3a52-6f4e-4c43-9d37-8f6f2a1c9b10"
-ORG_VAULT_LOGIN_ID = f"bwitem_{ORG_VAULT_ITEM_ID}"
 ORG_VAULT_ACCOUNT_EMAIL = "vault-owner@example.com"
 ORG_VAULT_MASTER_PASSWORD = "ORG_VAULT_MASTER_SECRET"
 ORG_VAULT_LOGIN_PASSWORD = "ORG_VAULT_LOGIN_SECRET"
+ORG_VAULT_PORTAL_SITES = [LoginSite("https://portal.example.com", whole_site=False)]
 
 
 def org_vault_overview(**overrides: Any) -> BitwardenItemOverview:
@@ -1256,6 +1395,7 @@ def org_vault_overview(**overrides: Any) -> BitwardenItemOverview:
         "collection_id": "col_1",
         "credential_type": CredentialType.PASSWORD,
         "url": "https://portal.example.com/login",
+        "sites": ORG_VAULT_PORTAL_SITES,
         **overrides,
     }
     fields.setdefault("urls", [fields["url"]] if fields["url"] else [])
@@ -1265,17 +1405,21 @@ def org_vault_overview(**overrides: Any) -> BitwardenItemOverview:
 @dataclass
 class OrgVaultFake:
     listing: AsyncMock
-    sites: AsyncMock
     secret: AsyncMock
     org_token: AsyncMock
     folders_restricted: AsyncMock
     organization: Organization
+    database: AgentDB
+
+    async def imported_rows(self) -> list[CredentialModel]:
+        async with self.database.Session() as session:
+            return list((await session.scalars(select(CredentialModel))).all())
 
 
-@pytest.fixture
-def org_vault(monkeypatch: pytest.MonkeyPatch) -> OrgVaultFake:
+@pytest_asyncio.fixture
+async def org_vault(monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEngine) -> OrgVaultFake:
     """An organization with a connected Bitwarden account, faked only at the BitwardenService boundary and the
-    org-token read. It lists one login whose whole-site URI is portal.example.com."""
+    org-token read, over a real credentials table. It lists one login whose only site is portal.example.com."""
     now = datetime(2026, 1, 1, tzinfo=UTC)
     token = BitwardenOrganizationAuthToken(
         id="oat_org_vault",
@@ -1293,19 +1437,23 @@ def org_vault(monkeypatch: pytest.MonkeyPatch) -> OrgVaultFake:
         created_at=now,
         modified_at=now,
     )
+    database = AgentDB("sqlite+aiosqlite://", db_engine=sqlite_engine)
     fake = OrgVaultFake(
         listing=AsyncMock(return_value=[org_vault_overview()]),
-        sites=AsyncMock(return_value=[LoginSite("https://portal.example.com", whole_site=False)]),
         secret=AsyncMock(
-            return_value={
-                BitwardenConstants.USERNAME: "vault-user@example.com",
-                BitwardenConstants.PASSWORD: ORG_VAULT_LOGIN_PASSWORD,
-                BitwardenConstants.TOTP: "",
-            }
+            return_value=BitwardenLoginSecret(
+                {
+                    BitwardenConstants.USERNAME: "vault-user@example.com",
+                    BitwardenConstants.PASSWORD: ORG_VAULT_LOGIN_PASSWORD,
+                    BitwardenConstants.TOTP: "",
+                },
+                ORG_VAULT_PORTAL_SITES,
+            )
         ),
         org_token=AsyncMock(return_value=token),
         folders_restricted=AsyncMock(return_value=False),
         organization=organization,
+        database=database,
     )
     monkeypatch.setattr(
         app.DATABASE,
@@ -1313,8 +1461,124 @@ def org_vault(monkeypatch: pytest.MonkeyPatch) -> OrgVaultFake:
         SimpleNamespace(get_valid_org_auth_token=fake.org_token, get_organization=AsyncMock(return_value=organization)),
         raising=False,
     )
+    monkeypatch.setattr(app.DATABASE, "credentials", database.credentials, raising=False)
+    # `app` is an AppHolder proxy without __delattr__; patch the underlying instance so teardown can delete it.
+    monkeypatch.setattr(
+        object.__getattribute__(app, "_inst"),
+        "CREDENTIAL_VAULT_SERVICES",
+        {CredentialVaultType.BITWARDEN_CONNECTED: ConnectedBitwardenCredentialVaultService()},
+        raising=False,
+    )
     monkeypatch.setattr(app.AGENT_FUNCTION, "credential_folders_restricted", fake.folders_restricted)
+    monkeypatch.setattr(
+        credential_creation_service,
+        "get_request_principal",
+        lambda: RequestPrincipal("o_test_org", AuthKind.ui_session, user_id="u_org_vault"),
+    )
     monkeypatch.setattr(BitwardenService, "list_item_overviews", fake.listing)
-    monkeypatch.setattr(BitwardenService, "get_login_item_sites", fake.sites)
     monkeypatch.setattr(BitwardenService, "get_secret_value_from_url", fake.secret)
     return fake
+
+
+MARKER_RGB = (12, 200, 34)
+
+
+def requires_chromium(test: _T) -> _T:
+    return pytest.mark.skipif(
+        not chromium_available(),
+        reason="Requires Playwright browsers installed (run: playwright install chromium)",
+    )(test)
+
+
+def requires_full_chromium(test: _T) -> _T:
+    return pytest.mark.skipif(
+        not full_chromium_available(),
+        reason="Requires Playwright's full Chromium build (run: playwright install chromium)",
+    )(test)
+
+
+@asynccontextmanager
+async def chromium_context(viewport: ViewportSize | None = None) -> AsyncIterator[BrowserContext]:
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        try:
+            yield await browser.new_context(viewport=viewport)
+        finally:
+            await browser.close()
+
+
+@asynccontextmanager
+async def never_answering_origin() -> AsyncIterator[str]:
+    """An HTTP origin that accepts requests and never answers; a web font fetched from it holds ``page.screenshot``."""
+    release = asyncio.Event()
+
+    async def hold(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        await release.wait()
+        writer.close()
+
+    server = await asyncio.start_server(hold, "127.0.0.1", 0)
+    try:
+        yield f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}"
+    finally:
+        release.set()
+        server.close()
+        await server.wait_closed()
+
+
+def stalled_font_css(origin: str, color: tuple[int, int, int]) -> str:
+    rgb = "rgb({},{},{})".format(*color)
+    return (
+        f"@font-face{{font-family:Never;src:url({origin}/never.woff2)}}"
+        f"html,body{{font-family:Never !important;background:{rgb} !important}}"
+    )
+
+
+async def open_marker_page(
+    context: BrowserContext,
+    color: tuple[int, int, int],
+    url: str,
+    *,
+    stall_origin: str | None = None,
+    height_px: int = 720,
+) -> Page:
+    """Serve ``url`` to this page only as one solid ``color``; ``stall_origin`` (same origin as ``url``) leaves a
+    web font loading forever."""
+    rgb = "rgb({},{},{})".format(*color)
+    css = stalled_font_css(stall_origin, color) if stall_origin else ""
+    html = (
+        f"<html><head><style>html,body{{margin:0;background:{rgb}}}{css}</style></head>"
+        f"<body><div style='height:{height_px}px'>marker</div></body></html>"
+    )
+    page = await context.new_page()
+    await page.route(url, lambda route: route.fulfill(body=html, content_type="text/html"))
+    await page.goto(url, wait_until="domcontentloaded")
+    if stall_origin:
+        await page.wait_for_function("document.fonts.status === 'loading'")
+    return page
+
+
+def png_background_colors(png: bytes) -> set[tuple[int, int, int]]:
+    """Colors of the right-edge column every 50 px, clear of the top-left marker text."""
+    with Image.open(BytesIO(png)) as image:
+        rgb = image.convert("RGB")
+        return {rgb.getpixel((rgb.width - 5, y)) for y in range(0, rgb.height, 50)}
+
+
+async def _never_start_driver() -> NoReturn:
+    raise AssertionError("driver startup is outside this test")
+
+
+def skycdp_engine_selection() -> BrowserEngineSelection:
+    return BrowserEngineSelection(
+        name=SKYCDP_ENGINE_NAME,
+        start_driver=_never_start_driver,
+        error_type=PlaywrightError,
+        timeout_error_type=PlaywrightTimeoutError,
+        metadata=BrowserEngineMetadata(name=SKYCDP_ENGINE_NAME, version="test"),
+        selection_reason="test",
+    )
+
+
+async def screenshot_stalls_until_its_own_timeout(*, timeout: float, **_kwargs: object) -> bytes:
+    await asyncio.sleep(timeout / 1000)
+    raise PlaywrightTimeoutError("waiting for fonts to load")

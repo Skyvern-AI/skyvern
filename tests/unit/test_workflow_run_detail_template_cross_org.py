@@ -4,7 +4,6 @@ from unittest.mock import AsyncMock
 
 import httpx
 import pytest
-from fastapi import FastAPI
 
 from skyvern.forge import app
 from skyvern.forge.sdk.routes import agent_protocol
@@ -19,7 +18,8 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowStatus,
 )
 from skyvern.forge.sdk.workflow.service import WorkflowService
-from tests.unit.force_stub_app import make_workflow_run_attempts_fake
+from tests.unit.force_stub_app import make_workflow_run_attempts_fake, released_session_stub
+from tests.unit.shared_route_app import shared_route_app
 
 TEMPLATE_ORG_ID = "o_template"
 CALLER_ORG_ID = "o_caller"
@@ -72,13 +72,14 @@ def template_run_db(monkeypatch: pytest.MonkeyPatch) -> tuple[AsyncMock, AsyncMo
         app,
         "DATABASE",
         SimpleNamespace(
+            Session=released_session_stub(),
             workflows=SimpleNamespace(
                 get_workflow_for_workflow_run=get_by_run,
                 get_workflow_by_permanent_id=get_by_wpid,
             ),
             observer=SimpleNamespace(get_task_v2_by_workflow_run_id=AsyncMock(return_value=None)),
             tasks=SimpleNamespace(
-                get_tasks_by_workflow_run_id=AsyncMock(return_value=[]),
+                get_tasks_for_workflow_run_status=AsyncMock(return_value=[]),
                 get_step_counts_by_task_ids=AsyncMock(return_value=(0, 0)),
             ),
             browser_sessions=SimpleNamespace(
@@ -142,9 +143,8 @@ async def test_template_run_detail_resolves_via_run_join(
     )
     assert canonical.endpoint is agent_protocol.get_workflow_and_run_from_workflow_run_id
     assert canonical.response_model is WorkflowRunWithWorkflowResponse
-    api = FastAPI()
+    api = shared_route_app(monkeypatch)
     api.dependency_overrides[org_auth_service.get_current_org] = lambda: SimpleNamespace(organization_id=CALLER_ORG_ID)
-    api.include_router(agent_protocol.base_router, prefix="/v1")
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=api), base_url="http://test", trust_env=False
     ) as client:

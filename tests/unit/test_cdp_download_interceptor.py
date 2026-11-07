@@ -22,12 +22,15 @@ from structlog.testing import capture_logs
 
 import skyvern.webeye.cdp_download_interceptor as mod
 from skyvern.config import settings
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.http_request_authorization import RunScopedRedirectHopAuthorizer
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.webeye.cdp_download_interceptor import (
     CDPDownloadInterceptor,
     _is_stale_interception_error,
     _redacted_request_origin,
     extract_filename,
+    finish_requested_download_for_context,
     is_download_response,
 )
 
@@ -78,6 +81,8 @@ def _zip_with_unsupported_version() -> bytes:
 _ZIP_WITH_UNSUPPORTED_VERSION = _zip_with_unsupported_version()
 # A minimal valid PDF preceded by a UTF-8 BOM — a form base saved and PDFium opens.
 _BOM_PDF = b"\xef\xbb\xbf%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n"
+_SMALL_HTML_ERROR = b"<!doctype html><html><body>Download unavailable</body></html>"
+_SMALL_JSON_DOCUMENT = b'{"errors":[{"row":4,"msg":"bad date"}],"rows":120}'
 
 
 def _make_interceptor(
@@ -715,6 +720,26 @@ async def test_recovery_returns_first_page_satisfying_claim_not_first_non_html()
 
 
 @pytest.mark.asyncio
+async def test_recovery_accepts_html_table_for_legacy_xls_but_not_html_login_page() -> None:
+    interceptor = _make_interceptor()
+    page = MagicMock()
+    interceptor._browser_context = MagicMock(pages=[page])
+    table_export = b"<html><body><table><tr><td>amount</td></tr><tr><td>total</td></tr></table></body></html>"
+    with patch.object(mod.SkyvernFrame, "read_http_url_bytes", new=AsyncMock(return_value=table_export)):
+        result = await interceptor._fetch_download_bytes_in_page(
+            "https://x/export", "application/vnd.ms-excel", "report.xls"
+        )
+    assert result == table_export
+
+    login_page = b"<html><body><form>sign in</form></body></html>"
+    with patch.object(mod.SkyvernFrame, "read_http_url_bytes", new=AsyncMock(return_value=login_page)):
+        result = await interceptor._fetch_download_bytes_in_page(
+            "https://x/export", "application/vnd.ms-excel", "report.xls"
+        )
+    assert result is None
+
+
+@pytest.mark.asyncio
 async def test_response_stage_missing_or_wrong_marker_intercepts_download(tmp_path: Path) -> None:
     interceptor = _make_interceptor(output_dir=str(tmp_path))
     interceptor._recovery_marker = "TOKEN"
@@ -1239,7 +1264,7 @@ class TestConfinedDownloadWrites:
 
     def test_symlink_destination_fails_closed(self, tmp_path: Path) -> None:
         interceptor = _make_interceptor(output_dir=str(tmp_path))
-        save_path, _ = interceptor._resolve_save_path("report.pdf")
+        save_path, _ = interceptor._resolve_save_path("report.txt")
         outside = tmp_path.parent / f"{tmp_path.name}-outside.txt"
         outside.write_bytes(b"outside")
         save_path.symlink_to(outside)
@@ -1251,7 +1276,7 @@ class TestConfinedDownloadWrites:
 
     def test_hard_link_destination_fails_closed(self, tmp_path: Path) -> None:
         interceptor = _make_interceptor(output_dir=str(tmp_path))
-        save_path, _ = interceptor._resolve_save_path("report.pdf")
+        save_path, _ = interceptor._resolve_save_path("report.txt")
         outside = tmp_path.parent / f"{tmp_path.name}-hard-link-outside.txt"
         outside.write_bytes(b"outside")
         save_path.hardlink_to(outside)
@@ -1275,7 +1300,7 @@ class TestConfinedDownloadWrites:
 
     def test_collision_hard_link_race_fails_before_existing_inode_is_modified(self, tmp_path: Path) -> None:
         interceptor = _make_interceptor(output_dir=str(tmp_path))
-        save_path, _ = interceptor._resolve_save_path("report.pdf")
+        save_path, _ = interceptor._resolve_save_path("report.txt")
         save_path.write_bytes(b"existing report")
         outside = tmp_path.parent / f"{tmp_path.name}-racing-hard-link.txt"
         real_ftruncate = mod.os.ftruncate
@@ -1295,7 +1320,7 @@ class TestConfinedDownloadWrites:
 
     def test_post_check_destination_swap_fails_at_publication(self, tmp_path: Path) -> None:
         interceptor = _make_interceptor(output_dir=str(tmp_path))
-        save_path, _ = interceptor._resolve_save_path("report.pdf")
+        save_path, _ = interceptor._resolve_save_path("report.txt")
         outside = tmp_path.parent / f"{tmp_path.name}-outside.txt"
         outside.write_bytes(b"outside")
         real_link = mod.os.link
@@ -1320,7 +1345,7 @@ class TestConfinedDownloadWrites:
 
     def test_alias_on_temporary_inode_during_link_fails_at_publication(self, tmp_path: Path) -> None:
         interceptor = _make_interceptor(output_dir=str(tmp_path))
-        save_path, _ = interceptor._resolve_save_path("report.pdf")
+        save_path, _ = interceptor._resolve_save_path("report.txt")
         alias = tmp_path.parent / f"{tmp_path.name}-temporary-alias.txt"
         real_link = mod.os.link
 
@@ -2787,7 +2812,7 @@ class TestBlobDownloadCapture:
     """Browser-initiated blob: URL downloads (e.g. a page that builds the file client-side and
     triggers a blob download) must be read back via SkyvernFrame and saved, not dropped."""
 
-    _READ_BLOB = "skyvern.webeye.cdp_download_interceptor.SkyvernFrame.read_blob_url_bytes"
+    _READ_BLOB = "skyvern.webeye.cdp_download_interceptor.SkyvernFrame.read_blob_url_bytes_and_content_type"
 
     @staticmethod
     def _context(num_pages: int = 1) -> MagicMock:
@@ -2795,13 +2820,17 @@ class TestBlobDownloadCapture:
         context.pages = [MagicMock() for _ in range(num_pages)]
         return context
 
+    @staticmethod
+    def _blob_result(data: bytes, content_type: str = "") -> tuple[bytes, str]:
+        return data, content_type
+
     @pytest.mark.asyncio
     async def test_blob_download_read_and_saved(self, tmp_path: Path) -> None:
         interceptor = _make_interceptor(output_dir=str(tmp_path))
         interceptor._browser_context = self._context()
         pdf_bytes = b"%PDF-1.4 fake blob invoice bytes"
 
-        with patch(self._READ_BLOB, new=AsyncMock(return_value=pdf_bytes)):
+        with patch(self._READ_BLOB, new=AsyncMock(return_value=self._blob_result(pdf_bytes, "application/pdf"))):
             await interceptor._handle_browser_download(
                 {"url": "blob:https://example.com/abc-123", "suggestedFilename": "invoice.pdf"}
             )
@@ -2812,6 +2841,52 @@ class TestBlobDownloadCapture:
         assert saved[0].read_bytes() == pdf_bytes
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("filename", ["report.pdf", "statement"])
+    async def test_blob_download_rejects_html_error_page(self, tmp_path: Path, filename: str) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+
+        with patch(self._READ_BLOB, new=AsyncMock(return_value=self._blob_result(_SMALL_HTML_ERROR))):
+            await interceptor._handle_browser_download(
+                {"url": "blob:https://example.com/error", "suggestedFilename": filename}
+            )
+
+        assert list(tmp_path.iterdir()) == []
+        assert interceptor._captured_download_count == 0
+        assert interceptor.consume_unsolicited_download_error() is not None
+
+    @pytest.mark.asyncio
+    async def test_blob_download_saves_extensionless_html_using_blob_type(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+
+        with patch(
+            self._READ_BLOB,
+            new=AsyncMock(return_value=self._blob_result(_SMALL_HTML_ERROR, "text/html")),
+        ):
+            await interceptor._handle_browser_download(
+                {"url": "blob:https://example.com/html", "suggestedFilename": "report"}
+            )
+
+        saved = _only_file(tmp_path)
+        assert saved.name == "report"
+        assert saved.read_bytes() == _SMALL_HTML_ERROR
+
+    @pytest.mark.asyncio
+    async def test_blob_download_validates_fully_decoded_filename_extension(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+
+        with patch(self._READ_BLOB, new=AsyncMock(return_value=self._blob_result(b"not a PDF"))):
+            await interceptor._handle_browser_download(
+                {"url": "blob:https://example.com/report", "suggestedFilename": "report%252Epdf"}
+            )
+
+        assert list(tmp_path.iterdir()) == []
+        assert interceptor._captured_download_count == 0
+        assert interceptor.consume_unsolicited_download_error() is not None
+
+    @pytest.mark.asyncio
     async def test_blob_download_rejects_destination_symlink(self, tmp_path: Path) -> None:
         interceptor = _make_interceptor(output_dir=str(tmp_path))
         interceptor._browser_context = self._context()
@@ -2820,7 +2895,10 @@ class TestBlobDownloadCapture:
         outside.write_bytes(b"outside")
         save_path.symlink_to(outside)
 
-        with patch(self._READ_BLOB, new=AsyncMock(return_value=b"private blob")):
+        with patch(
+            self._READ_BLOB,
+            new=AsyncMock(return_value=self._blob_result(b"%PDF-1.4 private blob", "application/pdf")),
+        ):
             await interceptor._handle_browser_download(
                 {"url": "blob:https://example.com/confined", "suggestedFilename": "invoice.pdf"}
             )
@@ -2832,8 +2910,8 @@ class TestBlobDownloadCapture:
     async def test_blob_download_falls_through_pages_until_readable(self, tmp_path: Path) -> None:
         interceptor = _make_interceptor(output_dir=str(tmp_path))
         interceptor._browser_context = self._context(num_pages=2)
-        pdf_bytes = b"%PDF blob"
-        read = AsyncMock(side_effect=[None, pdf_bytes])
+        pdf_bytes = b"%PDF-1.4 blob"
+        read = AsyncMock(side_effect=[None, self._blob_result(pdf_bytes, "application/pdf")])
 
         with patch(self._READ_BLOB, new=read):
             await interceptor._handle_browser_download(
@@ -2849,7 +2927,9 @@ class TestBlobDownloadCapture:
     async def test_blob_download_threads_max_size_and_guards_oversize(self, tmp_path: Path) -> None:
         interceptor = _make_interceptor(output_dir=str(tmp_path))
         interceptor._browser_context = self._context()
-        read = AsyncMock(return_value=b"x" * 2048)  # exceeds the patched limit (defense-in-depth)
+        read = AsyncMock(
+            return_value=self._blob_result(b"x" * 2048, "application/pdf")
+        )  # exceeds the patched limit (defense-in-depth)
 
         with patch.object(mod, "MAX_FILE_SIZE_BYTES", 1024), patch(self._READ_BLOB, new=read):
             await interceptor._handle_browser_download(
@@ -2880,10 +2960,10 @@ class TestBlobDownloadCapture:
         # dropped just because matching bytes already exist on disk.
         interceptor = _make_interceptor(output_dir=str(tmp_path))
         interceptor._browser_context = self._context()
-        pdf_bytes = b"%PDF identical bytes, different download"
+        pdf_bytes = b"%PDF-1.4 identical bytes, different download"
         (tmp_path / "prior.pdf").write_bytes(pdf_bytes)
 
-        with patch(self._READ_BLOB, new=AsyncMock(return_value=pdf_bytes)):
+        with patch(self._READ_BLOB, new=AsyncMock(return_value=self._blob_result(pdf_bytes, "application/pdf"))):
             await interceptor._handle_browser_download(
                 {"url": "blob:https://example.com/second", "suggestedFilename": "invoice.pdf"}
             )
@@ -2901,7 +2981,13 @@ class TestBlobDownloadCapture:
         async def replay(url: str) -> None:
             await interceptor._handle_browser_download({"url": url, "suggestedFilename": "report.pdf"})
 
-        read = AsyncMock(side_effect=[payload, payload, b"a different blob, same name"])
+        read = AsyncMock(
+            side_effect=[
+                self._blob_result(payload, "application/pdf"),
+                self._blob_result(payload, "application/pdf"),
+                self._blob_result(b"a different blob, same name", "application/pdf"),
+            ]
+        )
         with patch(self._READ_BLOB, new=read):
             await replay("blob:https://example.com/one")
             assert (tmp_path / "report.pdf").read_bytes() == payload
@@ -2935,7 +3021,7 @@ class TestBlobDownloadCapture:
             "suggestedFilename": "report.pdf",
             mod._ARTIFACT_SCOPE_GENERATION_EVENT_KEY: 0,
         }
-        with patch(self._READ_BLOB, new=AsyncMock(return_value=payload)):
+        with patch(self._READ_BLOB, new=AsyncMock(return_value=self._blob_result(payload, "application/pdf"))):
             await interceptor._handle_browser_download(event)
 
         assert interceptor.consume_unsolicited_download_error() is not None
@@ -2974,7 +3060,7 @@ class TestBlobDownloadCapture:
         real_bytes = b"%PDF-1.4 real captured document bytes"
         (tmp_path / "report.pdf").write_bytes(real_bytes)
 
-        with patch(self._READ_BLOB, new=AsyncMock(return_value=b"")):
+        with patch(self._READ_BLOB, new=AsyncMock(return_value=self._blob_result(b""))):
             await interceptor._handle_browser_download(
                 {"url": "blob:https://example.com/empty", "suggestedFilename": "report.pdf"}
             )
@@ -2988,7 +3074,7 @@ class TestBlobDownloadCapture:
         interceptor = _make_interceptor(output_dir=str(tmp_path))
         interceptor._browser_context = self._context()
 
-        with patch(self._READ_BLOB, new=AsyncMock(return_value=b"")):
+        with patch(self._READ_BLOB, new=AsyncMock(return_value=self._blob_result(b""))):
             await interceptor._handle_browser_download(
                 {"url": "blob:https://example.com/empty2", "suggestedFilename": "x.pdf"}
             )
@@ -3005,9 +3091,9 @@ class TestDataUrlDownloadCapture:
             pytest.param("data:application/octet-stream;base64,%2Bw==", "report", b"\xfb", id="escaped_base64"),
             pytest.param("data:text/csv,name%2Cvalue%0Aone%2C1", "report", b"name,value\none,1", id="percent_encoded"),
             pytest.param(
-                "data:application/pdf;charset=utf-8;base64,JVBERg==",
+                "data:application/pdf;charset=utf-8;base64,JVBERi0xLjQ=",
                 "report.pdf",
-                b"%PDF",
+                b"%PDF-1.4",
                 id="media_type_parameter",
             ),
             pytest.param("data:application/x'foo*`|~;p'k*`|~=v,ok", "report", b"ok", id="rfc_token_characters"),
@@ -3031,6 +3117,62 @@ class TestDataUrlDownloadCapture:
         assert len(dedupe_key) == len("data:sha256:") + 64
 
     @pytest.mark.asyncio
+    async def test_data_url_saves_html_with_extensionless_name_and_html_type(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        url = "data:text/html;base64," + base64.b64encode(_SMALL_HTML_ERROR).decode()
+
+        await interceptor._handle_browser_download({"url": url, "suggestedFilename": "report"})
+
+        saved = _only_file(tmp_path)
+        assert saved.name == "report"
+        assert saved.read_bytes() == _SMALL_HTML_ERROR
+        assert interceptor._captured_download_count == 1
+        assert interceptor.consume_unsolicited_download_error() is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("filename", ["report.csv", "report.txt", "report.json"])
+    async def test_data_url_preserves_json_payload_under_data_extension_without_status(
+        self, tmp_path: Path, filename: str
+    ) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        url = "data:application/json;base64," + base64.b64encode(_SMALL_JSON_DOCUMENT).decode()
+
+        await interceptor._handle_browser_download({"url": url, "suggestedFilename": filename})
+
+        saved = _only_file(tmp_path)
+        assert saved.name == filename
+        assert saved.read_bytes() == _SMALL_JSON_DOCUMENT
+        assert len(interceptor._downloaded_urls) == 1
+        assert interceptor._captured_download_count == 1
+        assert interceptor.consume_unsolicited_download_error() is None
+
+    @pytest.mark.asyncio
+    async def test_data_url_rejects_json_for_extensionless_xlsx_claim(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        url = (
+            "data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,"
+            + base64.b64encode(_SMALL_JSON_DOCUMENT).decode()
+        )
+
+        await interceptor._handle_browser_download({"url": url, "suggestedFilename": "export"})
+
+        assert list(tmp_path.iterdir()) == []
+        assert interceptor._downloaded_urls == set()
+        assert interceptor._captured_download_count == 0
+        assert interceptor.consume_unsolicited_download_error() is not None
+
+    @pytest.mark.asyncio
+    async def test_data_url_validates_fully_decoded_filename_extension(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        url = "data:application/octet-stream;base64," + base64.b64encode(b"not a PDF").decode()
+
+        await interceptor._handle_browser_download({"url": url, "suggestedFilename": "report%252Epdf"})
+
+        assert list(tmp_path.iterdir()) == []
+        assert interceptor._captured_download_count == 0
+        assert interceptor.consume_unsolicited_download_error() is not None
+
+    @pytest.mark.asyncio
     async def test_data_url_rejects_non_basename_filename(self, tmp_path: Path) -> None:
         interceptor = _make_interceptor(output_dir=str(tmp_path))
 
@@ -3050,7 +3192,7 @@ class TestDataUrlDownloadCapture:
         save_path.symlink_to(outside)
 
         await interceptor._handle_browser_download(
-            {"url": "data:application/pdf;base64,JVBERg==", "suggestedFilename": "report.pdf"}
+            {"url": "data:application/pdf;base64,JVBERi0xLjQ=", "suggestedFilename": "report.pdf"}
         )
 
         assert save_path.is_symlink()
@@ -4273,6 +4415,47 @@ class TestDirectHttpDownloadAuthAndHtmlGuard:
         assert (tmp_path / "report.pdf").read_bytes() == b"%PDF-1.4 private report"
 
     @pytest.mark.asyncio
+    async def test_direct_download_rejects_error_status_and_keeps_recovery(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+        response = MagicMock(
+            body=self._JSON_ERROR,
+            content_type="application/json",
+            filename="report.json",
+            status=503,
+        )
+        guarded_fetch = AsyncMock(return_value=response)
+        recovery = AsyncMock(return_value=None)
+
+        with (
+            patch.object(mod.file_api, "fetch_file_bytes", guarded_fetch, create=True),
+            patch.object(interceptor, "_fetch_download_bytes_in_page", recovery),
+        ):
+            await interceptor._download_url_directly("https://site.example/report.json", "report.json")
+
+        assert list(tmp_path.iterdir()) == []
+        recovery.assert_awaited_once()
+        assert interceptor.consume_unsolicited_download_error() is not None
+
+    @pytest.mark.asyncio
+    async def test_direct_download_recovers_json_error_that_quotes_pdf_header(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+        url = "https://site.example/report.pdf"
+        error_body = b'{"error":"could not generate report; expected %PDF-1.7"}'
+        guarded_fetch = self._guarded_fetch(error_body, "application/pdf", "report.pdf")
+        recovery = AsyncMock(return_value=self._MINIMAL_PDF)
+
+        with (
+            patch.object(mod.file_api, "fetch_file_bytes", guarded_fetch, create=True),
+            patch.object(interceptor, "_fetch_download_bytes_in_page", recovery),
+        ):
+            await interceptor._download_url_directly(url, "report.pdf")
+
+        recovery.assert_awaited_once()
+        assert (tmp_path / "report.pdf").read_bytes() == self._MINIMAL_PDF
+
+    @pytest.mark.asyncio
     async def test_browser_native_replay_dedupes_identical_and_reports_different(self, tmp_path: Path) -> None:
         """A byte-identical browser-native replay of an already-saved file dedupes with no unsolicited failure, while a same-name different payload still fails closed and is reported."""
         interceptor = _make_interceptor(output_dir=str(tmp_path))
@@ -4308,7 +4491,7 @@ class TestDirectHttpDownloadAuthAndHtmlGuard:
         interceptor = _make_interceptor(output_dir=str(tmp_path))
         interceptor._browser_context = self._context()
         gate = self._LOGIN_HTML
-        recovered = b"%PDF-" + b"R" * (1024 * 1024 - 5)
+        recovered = b"%PDF-1.7" + b"R" * (1024 * 1024 - len(b"%PDF-1.7"))
         interceptor._run_download_bytes = mod.MAX_RUN_DOWNLOAD_BYTES - len(gate) - len(recovered)
         guarded_fetch = self._guarded_fetch(gate, "text/html", "report.pdf")
         in_page = AsyncMock(return_value=recovered)
@@ -4322,6 +4505,7 @@ class TestDirectHttpDownloadAuthAndHtmlGuard:
             "text/html",
             "report.pdf",
             recovery_allowance_bytes=len(recovered) + len(gate),
+            allow_legacy_xls_html_table=False,
         )
         assert len(list(tmp_path.iterdir())) == 1
         assert next(tmp_path.iterdir()).read_bytes() == recovered
@@ -4331,6 +4515,149 @@ class TestDirectHttpDownloadAuthAndHtmlGuard:
         assert interceptor._run_download_bytes == mod.MAX_RUN_DOWNLOAD_BYTES - len(gate) - len(recovered) + len(
             recovered
         )
+
+    @pytest.mark.asyncio
+    async def test_html_gate_direct_download_recovers_legacy_xls_table(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+        interceptor._browser_context.pages = [MagicMock()]
+        table_export = b"<html><body><table><tr><td>amount</td></tr><tr><td>total</td></tr></table></body></html>"
+        with (
+            patch.object(
+                mod.file_api,
+                "fetch_file_bytes",
+                self._guarded_fetch(self._LOGIN_HTML, "application/vnd.ms-excel", "report.xls"),
+                create=True,
+            ),
+            patch.object(mod.SkyvernFrame, "read_http_url_bytes", new=AsyncMock(return_value=table_export)),
+        ):
+            await interceptor._download_url_directly("https://site.example/report.xls", "report.xls")
+
+        saved = list(tmp_path.iterdir())
+        assert len(saved) == 1
+        assert saved[0].name == "report.xls"
+        assert saved[0].read_bytes() == table_export
+
+    @pytest.mark.asyncio
+    async def test_direct_text_html_legacy_xls_table_is_rejected(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+        interceptor._browser_context.pages = [MagicMock()]
+        table_export = b"<html><body><table><tr><td>Name</td><td>Value</td></tr><tr><td>Ada</td><td>42</td></tr></table></body></html>"
+        with (
+            patch.object(
+                mod.file_api,
+                "fetch_file_bytes",
+                self._guarded_fetch(table_export, "text/html", "report.xls"),
+                create=True,
+            ),
+            patch.object(mod.SkyvernFrame, "read_http_url_bytes", new=AsyncMock(return_value=table_export)) as recovery,
+        ):
+            await interceptor._download_url_directly("https://site.example/report.xls", "report.xls")
+
+        recovery.assert_awaited_once()
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_direct_excel_content_type_accepts_legacy_xls_html_table(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+        table_export = b"<html><body><table><tr><td>Name</td><td>Value</td></tr><tr><td>Ada</td><td>42</td></tr></table></body></html>"
+        with patch.object(
+            mod.file_api,
+            "fetch_file_bytes",
+            self._guarded_fetch(table_export, "application/vnd.ms-excel", "report.xls"),
+            create=True,
+        ):
+            await interceptor._download_url_directly("https://site.example/report.xls", "report.xls")
+
+        assert (tmp_path / "report.xls").read_bytes() == table_export
+
+    @pytest.mark.asyncio
+    async def test_form_free_password_login_table_recovers_legacy_xls_export(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+        interceptor._browser_context.pages = [MagicMock()]
+        login_table = (
+            b"<html><body><table><tr><td>Username</td><td><input name='user'></td></tr>"
+            b"<tr><td>Password</td><td><input type='password'></td></tr></table></body></html>"
+        )
+        table_export = b"Name,Value\namount,42\ntotal,42\n"
+        with (
+            patch.object(
+                mod.file_api,
+                "fetch_file_bytes",
+                self._guarded_fetch(login_table, "text/html", "report.xls"),
+                create=True,
+            ),
+            patch.object(mod.SkyvernFrame, "read_http_url_bytes", new=AsyncMock(return_value=table_export)) as recovery,
+        ):
+            await interceptor._download_url_directly("https://site.example/report.xls", "report.xls")
+
+        recovery.assert_awaited_once()
+        saved = list(tmp_path.iterdir())
+        assert len(saved) == 1
+        assert saved[0].read_bytes() == table_export
+
+    @pytest.mark.parametrize(
+        "error_body",
+        [
+            pytest.param(
+                b"<html><body><!-- <table><tr><td>A</td><td>B</td></tr></table> -->"
+                b"<h1>Session expired</h1></body></html>",
+                id="commented-table",
+            ),
+            pytest.param(
+                b'<html><body><script>const grid = "<table><tr><td>A</td><td>B</td></tr></table>";'
+                b"</script><h1>Session expired</h1></body></html>",
+                id="script-table-string",
+            ),
+            pytest.param(
+                b'<html><head><style>body::before { content: "<table><tr><td>A</td><td>B</td></tr></table>"; }'
+                b"</style></head><body><h1>Session expired</h1></body></html>",
+                id="style-table-string",
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_html_fake_tables_are_rejected_by_download_recovery(self, tmp_path: Path, error_body: bytes) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+        interceptor._browser_context.pages = [MagicMock()]
+        with (
+            patch.object(
+                mod.file_api,
+                "fetch_file_bytes",
+                self._guarded_fetch(error_body, "text/html", "report.xls"),
+                create=True,
+            ),
+            patch.object(mod.SkyvernFrame, "read_http_url_bytes", new=AsyncMock(return_value=error_body)) as recovery,
+        ):
+            await interceptor._download_url_directly("https://site.example/report.xls", "report.xls")
+
+        recovery.assert_awaited_once()
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_extensionless_html_direct_download_uses_in_page_recovery(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+        url = "https://site.example/statement"
+        recovered = b"recovered report bytes"
+        guarded_fetch = self._guarded_fetch(self._LOGIN_HTML, "text/html", "statement")
+        in_page = AsyncMock(return_value=recovered)
+
+        with (
+            patch.object(mod.file_api, "fetch_file_bytes", guarded_fetch, create=True),
+            patch.object(interceptor, "_fetch_download_bytes_in_page", in_page),
+        ):
+            await interceptor._download_url_directly(url, "statement")
+
+        in_page.assert_awaited_once()
+        saved = list(tmp_path.iterdir())
+        assert len(saved) == 1
+        assert saved[0].name == "statement"
+        assert saved[0].read_bytes() == recovered
 
     @pytest.mark.asyncio
     async def test_recovery_arm_dedupes_identical_replay_and_reports_different(self, tmp_path: Path) -> None:
@@ -4529,7 +4856,7 @@ class TestDirectHttpDownloadAuthAndHtmlGuard:
             pytest.param(_LOGIN_HTML, "text/html", "statement%252Ezip", None, id="double-encoded-binary-name"),
             pytest.param(_LOGIN_HTML, "application/octet-stream", "statement.zip", None, id="mislabelled-html"),
             pytest.param(_LOGIN_HTML, "application/octet-stream", "", None, id="nameless-binary-claim"),
-            pytest.param(_LOGIN_HTML, "text/html", "statement", None, id="extensionless-name"),
+            pytest.param(_LOGIN_HTML, "text/html", "statement", None, id="extensionless-html-name"),
             pytest.param(_LOGIN_HTML, "text/html", "report%2Ehtml", "report.html", id="encoded-html-name"),
             pytest.param(_LOGIN_HTML, "text/html", "report.html", "report.html", id="html-name"),
             pytest.param(_LOGIN_HTML, "text/html", "", "<generated>", id="nameless-html"),
@@ -4597,6 +4924,9 @@ class TestDirectHttpDownloadAuthAndHtmlGuard:
             pytest.param(_JSON_ERROR, "application/json", "statement.pdf", id="json-error-under-pdf-name"),
             pytest.param(_JSON_ERROR, "application/pdf", "statement.pdf", id="json-error-mislabeled-as-pdf"),
             pytest.param(b"Not a PDF at all", "application/pdf", "statement.pdf", id="text-under-pdf-content-type"),
+            pytest.param(
+                b"Not a PDF at all", "application/octet-stream", "report%252Epdf", id="double-encoded-pdf-extension"
+            ),
             pytest.param(_LOGIN_HTML, "application/pdf", "statement.pdf", id="login-html-under-pdf"),
             pytest.param(b"", "application/pdf", "statement.pdf", id="empty-under-pdf"),
         ],
@@ -4613,10 +4943,23 @@ class TestDirectHttpDownloadAuthAndHtmlGuard:
         with (
             patch.object(mod.file_api, "fetch_file_bytes", guarded_fetch, create=True),
             patch.object(interceptor, "_fetch_download_bytes_in_page", new=AsyncMock(return_value=body)),
+            capture_logs() as logs,
         ):
             await interceptor._download_url_directly(f"https://site.example/{filename}", filename)
         assert list(tmp_path.iterdir()) == []
         assert interceptor._active_download_attempts == {}
+        rejected = [
+            event
+            for event in logs
+            if event["event"].startswith("Direct download payload does not match its claimed type")
+        ]
+        assert len(rejected) == 1
+        assert rejected[0]["reason"] in {"html_login_masquerade", "invalid_pdf_payload"}
+        assert rejected[0]["size"] == len(body)
+        assert isinstance(rejected[0]["sniffed_type"], str)
+        assert rejected[0]["claimed_format"] == "pdf"
+        assert rejected[0]["content_type"] == content_type.split(";")[0].strip().lower()
+        assert not {"body", "content", "url", "filename"}.intersection(rejected[0])
 
     @pytest.mark.asyncio
     async def test_error_body_recovered_as_valid_pdf_is_saved(self, tmp_path: Path) -> None:
@@ -4689,7 +5032,6 @@ class TestDirectHttpDownloadAuthAndHtmlGuard:
             pytest.param(
                 _ZIP_MISSING_OOXML, "application/octet-stream", "book.xlsx", id="zip-without-ooxml-under-xlsx"
             ),
-            pytest.param(_VALID_XLS, "application/octet-stream", "book.xlsx", id="ole-under-xlsx"),
             pytest.param(_JSON_ERROR, "application/vnd.ms-excel", "book.xls", id="json-under-xls"),
             pytest.param(_VALID_ZIP, "application/octet-stream", "book.xls", id="zip-under-xls"),
             pytest.param(_JSON_ERROR, "application/zip", "archive.zip", id="json-under-zip"),
@@ -4736,6 +5078,239 @@ class TestDirectHttpDownloadAuthAndHtmlGuard:
         assert len(saved) == 1
         assert saved[0].read_bytes() == body
 
+    @pytest.mark.parametrize(
+        "body",
+        [
+            pytest.param(
+                b"<!doctype html><html><body><table><tr><th>Name</th></tr><tr><td>Ada</td></tr></table></body></html>",
+                id="html-table",
+            ),
+            pytest.param(
+                b"<html><body><form action='/logout'><input type='hidden' name='csrf' value='x'></form>"
+                b"<table><tr><td>Name</td><td>Value</td></tr><tr><td>Ada</td><td>42</td></tr></table></body></html>",
+                id="html-table-with-logout-form",
+            ),
+            pytest.param(
+                b"<html><head><script>const grid = '<table><tr><td>not data</td></tr></table>';</script>"
+                b"<style>body::before { content: '<table><tr><td>not data</td></tr></table>'; }</style></head>"
+                b"<body><table><tr><td>Name</td><td>Value</td></tr><tr><td>Ada</td><td>42</td></tr></table></body></html>",
+                id="html-table-after-script-and-style-text",
+            ),
+            pytest.param(
+                b'<?xml version="1.0"?><Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet"><Worksheet/></Workbook>',
+                id="spreadsheetml-2003",
+            ),
+            pytest.param(b"Name,Value\nAda,42\n", id="comma-delimited"),
+            pytest.param(b"Name\tValue\nAda\t42\n", id="tab-delimited"),
+        ],
+    )
+    def test_legacy_xls_text_exports_match_claimed_type(self, body: bytes) -> None:
+        assert not mod._payload_is_html_login_masquerade(body, "application/vnd.ms-excel", "export.xls")
+        assert mod._payload_contradicts_claimed_type(body, "application/vnd.ms-excel", "export.xls") is False
+        assert (
+            mod._streamed_payload_contradiction_reason(io.BytesIO(body), "application/vnd.ms-excel", "export.xls")
+            is None
+        )
+        assert mod._payload_contradicts_claimed_type(body, "application/vnd.ms-excel", "export.xlsx") is True
+
+    @pytest.mark.parametrize(
+        ("prefix", "suffix"),
+        [
+            pytest.param(b"Name,Value\nAda,42\n", b"", id="delimited-text"),
+            pytest.param(
+                b'<?xml version="1.0"?><Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet"><!--',
+                b"--></Workbook>",
+                id="spreadsheetml-xml",
+            ),
+        ],
+    )
+    def test_legacy_xls_text_sniff_handles_split_utf8_codepoint(self, prefix: bytes, suffix: bytes) -> None:
+        body = prefix + b" " * (mod._PAYLOAD_SNIFF_BYTES - len(prefix) - 1) + b"\xc3\xa9" + suffix
+
+        assert body[: mod._PAYLOAD_SNIFF_BYTES].endswith(b"\xc3")
+        assert mod._payload_contradicts_claimed_type(body, "application/vnd.ms-excel", "export.xls") is False
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            pytest.param("Name,Price\nCoffee,€2\n".encode("cp1252"), id="windows-1252-csv"),
+            pytest.param("Name,City\nAndré,Montréal\n".encode("iso-8859-1"), id="iso-8859-1-csv"),
+            pytest.param(
+                b'<?xml version="1.0" encoding="windows-1252"?><Workbook '
+                b'xmlns="urn:schemas-microsoft-com:office:spreadsheet"><Worksheet><Data>caf\xe9</Data>'
+                b"</Worksheet></Workbook>",
+                id="declared-windows-1252-spreadsheetml",
+            ),
+        ],
+    )
+    def test_legacy_xls_text_sniff_accepts_single_byte_encodings(self, body: bytes) -> None:
+        assert mod._payload_contradicts_claimed_type(body, "application/vnd.ms-excel", "export.xls") is False
+
+    @pytest.mark.parametrize(("declared_encoding", "codec"), [("UTF-16LE", "utf-16-le"), ("UTF-16BE", "utf-16-be")])
+    def test_legacy_xls_text_sniff_accepts_bomless_utf16_spreadsheetml(
+        self, declared_encoding: str, codec: str
+    ) -> None:
+        body = (
+            f'<?xml version="1.0" encoding="{declared_encoding}"?>'
+            '<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet"><Worksheet/></Workbook>'
+        ).encode(codec)
+
+        assert mod._payload_contradicts_claimed_type(body, "application/vnd.ms-excel", "export.xls") is False
+        assert (
+            mod._streamed_payload_contradiction_reason(io.BytesIO(body), "application/vnd.ms-excel", "export.xls")
+            is None
+        )
+        assert mod._sniff_payload_type(body) == "spreadsheetml_xml"
+
+    @pytest.mark.parametrize("encoding", ["hex", "base64", "rot13", "bz2"])
+    def test_legacy_xls_rejects_non_text_xml_codecs_without_raising(self, encoding: str) -> None:
+        body = (
+            f'<?xml version="1.0" encoding="{encoding}"?>'
+            '<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet"/>'
+        ).encode("ascii")
+
+        assert mod._payload_contradiction_reason(body, "application/vnd.ms-excel", "export.xls") == (
+            "invalid_xls_payload"
+        )
+        assert (
+            mod._streamed_payload_contradiction_reason(io.BytesIO(body), "application/vnd.ms-excel", "export.xls")
+            == "invalid_xls_payload"
+        )
+        assert mod._sniff_payload_type(body) == "xml"
+
+    def test_legacy_xls_delimited_sniff_keeps_rows_before_incomplete_sample_record(self) -> None:
+        prefix = b'Name,Value\nAda,42\n"'
+        body = prefix + b"x" * (mod._PAYLOAD_SNIFF_BYTES - len(prefix)) + b'complete"\n'
+
+        assert mod._payload_contradicts_claimed_type(body, "application/vnd.ms-excel", "export.xls") is False
+        assert (
+            mod._streamed_payload_contradicts_claimed_type(io.BytesIO(body), "application/vnd.ms-excel", "export.xls")
+            is False
+        )
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            pytest.param(b"Report generated Monday\nName,Value\nAda,42\n", id="csv-after-title"),
+            pytest.param(b"Report generated Monday\nName\tValue\nAda\t42\n", id="tsv-after-title"),
+        ],
+    )
+    def test_legacy_xls_delimited_sniff_scans_past_title_rows(self, body: bytes) -> None:
+        assert mod._payload_contradicts_claimed_type(body, "application/vnd.ms-excel", "export.xls") is False
+        assert (
+            mod._streamed_payload_contradicts_claimed_type(io.BytesIO(body), "application/vnd.ms-excel", "export.xls")
+            is False
+        )
+
+    def test_legacy_xls_html_without_table_is_still_rejected(self) -> None:
+        assert mod._payload_is_html_login_masquerade(_SMALL_HTML_ERROR, "application/vnd.ms-excel", "export.xls")
+        assert mod._payload_contradicts_claimed_type(_SMALL_HTML_ERROR, "application/vnd.ms-excel", "export.xls")
+
+    def test_legacy_xls_html_with_delimiter_like_css_is_still_rejected(self) -> None:
+        body = (
+            b"<html><head><style>body { font-family: Arial, sans-serif; }\n"
+            b"p { font-family: Arial, sans-serif; }</style></head><body>Sign in</body></html>"
+        )
+        assert (
+            mod._payload_contradiction_reason(body, "application/vnd.ms-excel", "export.xls") == "html_login_masquerade"
+        )
+        assert (
+            mod._streamed_payload_contradiction_reason(io.BytesIO(body), "application/vnd.ms-excel", "export.xls")
+            == "html_login_masquerade"
+        )
+
+    def test_legacy_xls_pretty_json_error_is_not_delimited_text(self) -> None:
+        body = b'{\n  "error": "download failed",\n  "message": "please retry",\n  "status": 500\n}\n'
+        assert mod._payload_contradiction_reason(body, "application/vnd.ms-excel", "export.xls") == (
+            "invalid_xls_payload"
+        )
+        assert (
+            mod._streamed_payload_contradiction_reason(io.BytesIO(body), "application/vnd.ms-excel", "export.xls")
+            == "invalid_xls_payload"
+        )
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            pytest.param(
+                b"<html><body><table><tr><td>Username</td><td><input name='user'></td></tr>"
+                b"<tr><td>Password</td><td><input type='password'></td></tr></table>"
+                b"</body></html>",
+                id="password-input-layout-table-without-form",
+            ),
+            pytest.param(
+                b"<html><body><table><tr><td>Session expired. Please sign in.</td></tr></table></body></html>",
+                id="single-cell-error-table",
+            ),
+            pytest.param(
+                b"<html><body><!-- <table><tr><td>A</td><td>B</td></tr></table> -->"
+                b"<h1>Session expired</h1></body></html>",
+                id="commented-table-login-error",
+            ),
+            pytest.param(
+                b'<html><body><script>const grid = "<table><tr><td>A</td><td>B</td></tr></table>";'
+                b"</script><h1>Session expired</h1></body></html>",
+                id="script-table-login-error",
+            ),
+            pytest.param(
+                b'<html><head><style>body::before { content: "<table><tr><td>A</td><td>B</td></tr></table>"; }'
+                b"</style></head><body><h1>Session expired</h1></body></html>",
+                id="style-table-login-error",
+            ),
+        ],
+    )
+    def test_legacy_xls_html_layout_login_page_is_still_rejected(self, body: bytes) -> None:
+        assert mod._payload_is_html_login_masquerade(body, "application/vnd.ms-excel", "export.xls")
+        assert mod._payload_contradicts_claimed_type(body, "application/vnd.ms-excel", "export.xls")
+        assert (
+            mod._streamed_payload_contradiction_reason(io.BytesIO(body), "application/vnd.ms-excel", "export.xls")
+            == "html_login_masquerade"
+        )
+
+    def test_large_delimited_legacy_xls_is_accepted_by_streamed_publish(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        body = b"Name,Value\n" + b"Ada,42\n" * 1024
+        with _stream_limits(threshold=len(body), cap=len(body) + 1):
+            saved = interceptor.publish_download_bytes(body, "export.xls", "application/vnd.ms-excel")
+
+        assert saved is not None and saved.read_bytes() == body
+
+    def test_large_html_table_legacy_xls_is_accepted_by_streamed_publish(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        body = (
+            b"<!doctype html><html><head><!--"
+            + b"x" * 8192
+            + b"--></head><body><table><tr><td>Ada</td></tr><tr><td>Grace</td></tr></table></body></html>"
+        )
+        with _stream_limits(threshold=len(body), cap=len(body) + 1):
+            saved = interceptor.publish_download_bytes(body, "export.xls", "application/vnd.ms-excel")
+
+        assert saved is not None and saved.read_bytes() == body
+
+    def test_legacy_xls_html_table_is_accepted_when_close_is_beyond_sniff_window(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        body = (
+            b"<!doctype html><html><body><table><tr><td>Ada</td></tr><tr><td>Grace</td></tr>"
+            + b"x" * mod._HTML_TABLE_SNIFF_BYTES
+            + b"</table></body></html>"
+        )
+        assert b"</table>" not in body[: mod._HTML_TABLE_SNIFF_BYTES]
+        assert mod._payload_contradicts_claimed_type(body, "application/vnd.ms-excel", "export.xls") is False
+        assert (
+            mod._streamed_payload_contradicts_claimed_type(io.BytesIO(body), "application/vnd.ms-excel", "export.xls")
+            is False
+        )
+        with _stream_limits(threshold=len(body), cap=len(body) + 1):
+            saved = interceptor.publish_download_bytes(body, "export.xls", "application/vnd.ms-excel")
+
+        assert saved is not None and saved.read_bytes() == body
+
+    @pytest.mark.parametrize("tag", [b"<table><tr>", b"<table ", b"<form "])
+    def test_legacy_xls_html_sniff_bounds_repeated_tag_starts(self, tag: bytes) -> None:
+        body = b"<html><body>" + tag * (mod._HTML_TABLE_SNIFF_BYTES // len(tag))
+
+        assert not mod._body_has_html_table(body)
+
     @pytest.mark.asyncio
     async def test_error_body_recovered_as_valid_xlsx_is_saved(self, tmp_path: Path) -> None:
         interceptor = _make_interceptor(output_dir=str(tmp_path))
@@ -4763,11 +5338,16 @@ class TestDirectHttpDownloadAuthAndHtmlGuard:
         assert zipfile.is_zipfile(io.BytesIO(payload))
         assert mod._is_valid_xlsx(payload) is False
 
-    def test_looks_like_pdf_accepts_bom_prefixed_header_but_anchors_the_marker(self) -> None:
+    def test_looks_like_pdf_accepts_bom_and_header_within_first_1024_bytes(self) -> None:
         assert mod._looks_like_pdf(_BOM_PDF) is True
         assert mod._looks_like_pdf(b"%PDF-1.7 tail") is True
+        assert mod._looks_like_pdf(b"\n%PDF-1.7 tail") is True
+        assert mod._looks_like_pdf(b"\x00" * 1017 + b"%PDF-1.7 tail") is True
+        assert mod._looks_like_pdf(b"x" * 5 + b"%PDF-1.7 tail") is False
+        assert mod._looks_like_pdf(b"x" * 1024 + b"%PDF-1.7 tail") is False
         assert mod._looks_like_pdf(b'{"error": "export unavailable"}') is False
-        # A body that merely mentions the marker later must be rejected (anchored, not a scan).
+        # A versioned marker quoted by printable error text is not a PDF preamble.
+        assert mod._looks_like_pdf(b'{"error": "export unavailable: %PDF-1.7"}') is False
         assert mod._looks_like_pdf(b'{"error": "expected a %PDF- header but got json"}') is False
 
     @pytest.mark.asyncio
@@ -5028,8 +5608,8 @@ class _StreamCDP:
 def _raw_headers(
     *,
     content_length: int | None = None,
-    content_type: str = "application/pdf",
-    content_disposition: str | None = 'attachment; filename="doc.pdf"',
+    content_type: str = "text/plain",
+    content_disposition: str | None = 'attachment; filename="doc.txt"',
     content_encoding: str | None = None,
     transfer_encoding: str | None = None,
     content_range: str | None = None,
@@ -5065,10 +5645,138 @@ async def _drive_download(
     cdp: _StreamCDP,
     raw: list[dict[str, str]],
     *,
-    url: str = "https://example.com/doc.pdf",
+    url: str = "https://example.com/doc.txt",
     status: int = 200,
 ) -> None:
     await interceptor._handle_download(cdp, "req-1", url, mod._parse_headers(raw), status, raw)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_intercepted_stream_rejects_tiny_html_error_page(tmp_path: Path) -> None:
+    interceptor = _make_interceptor(output_dir=str(tmp_path))
+    cdp = _StreamCDP(chunks=[_SMALL_HTML_ERROR])
+
+    raw = _raw_headers(
+        content_length=len(_SMALL_HTML_ERROR),
+        content_type="application/pdf",
+        content_disposition='attachment; filename="doc.pdf"',
+    )
+    with _stream_limits(threshold=16, cap=4096):
+        await _drive_download(interceptor, cdp, raw, url="https://example.com/doc.pdf")
+
+    assert list(tmp_path.iterdir()) == []
+    assert cdp.count("Fetch.failRequest") == 1
+    assert cdp.count("Fetch.fulfillRequest") == 0
+    assert interceptor._captured_download_count == 0
+    assert interceptor.consume_unsolicited_download_error() is not None
+
+
+@pytest.mark.asyncio
+async def test_intercepted_stream_saves_extensionless_html_with_html_content_type(tmp_path: Path) -> None:
+    interceptor = _make_interceptor(output_dir=str(tmp_path))
+    cdp = _StreamCDP(chunks=[_SMALL_HTML_ERROR])
+    raw = _raw_headers(
+        content_length=len(_SMALL_HTML_ERROR),
+        content_type="text/html",
+        content_disposition='attachment; filename="report"',
+    )
+
+    with _stream_limits(threshold=16, cap=4096):
+        await _drive_download(interceptor, cdp, raw)
+
+    saved = _only_file(tmp_path)
+    assert saved.name == "report"
+    assert saved.read_bytes() == _SMALL_HTML_ERROR
+    assert cdp.count("Fetch.failRequest") == 0
+    assert cdp.count("Fetch.fulfillRequest") == 1
+    assert interceptor._captured_download_count == 1
+
+
+@pytest.mark.asyncio
+async def test_intercepted_stream_validates_fully_decoded_filename_extension(tmp_path: Path) -> None:
+    interceptor = _make_interceptor(output_dir=str(tmp_path))
+    cdp = _StreamCDP(chunks=[b"not a PDF"])
+    raw = _raw_headers(
+        content_length=9,
+        content_type="application/octet-stream",
+        content_disposition='attachment; filename="report%252Epdf"',
+    )
+
+    with _stream_limits(threshold=16, cap=4096):
+        await _drive_download(interceptor, cdp, raw, url="https://example.com/report")
+
+    assert list(tmp_path.iterdir()) == []
+    assert cdp.count("Fetch.failRequest") == 1
+    assert cdp.count("Fetch.fulfillRequest") == 0
+    assert interceptor._captured_download_count == 0
+    assert interceptor.consume_unsolicited_download_error() is not None
+
+
+@pytest.mark.asyncio
+async def test_intercepted_stream_rejects_json_for_extensionless_xlsx_claim(tmp_path: Path) -> None:
+    interceptor = _make_interceptor(output_dir=str(tmp_path))
+    cdp = _StreamCDP(chunks=[_SMALL_JSON_DOCUMENT])
+
+    raw = _raw_headers(
+        content_length=len(_SMALL_JSON_DOCUMENT),
+        content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        content_disposition='attachment; filename="export"',
+    )
+    with _stream_limits(threshold=16, cap=4096):
+        await _drive_download(interceptor, cdp, raw, url="https://example.com/export")
+
+    assert list(tmp_path.iterdir()) == []
+    assert cdp.count("Fetch.failRequest") == 1
+    assert cdp.count("Fetch.fulfillRequest") == 0
+    assert interceptor._captured_download_count == 0
+    assert interceptor.consume_unsolicited_download_error() is not None
+
+
+@pytest.mark.asyncio
+async def test_intercepted_stream_checks_xlsx_signature_without_opening_container(tmp_path: Path) -> None:
+    interceptor = _make_interceptor(output_dir=str(tmp_path))
+    payload = _ZIP_MISSING_OOXML
+    cdp = _StreamCDP(chunks=[payload])
+    raw = _raw_headers(
+        content_length=len(payload),
+        content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        content_disposition='attachment; filename="book.xlsx"',
+    )
+
+    with _stream_limits(threshold=16, cap=4096):
+        await _drive_download(interceptor, cdp, raw, url="https://example.com/book.xlsx")
+
+    assert _only_file(tmp_path).read_bytes() == payload
+    assert cdp.count("Fetch.fulfillRequest") == 1
+    assert cdp.count("Fetch.failRequest") == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("status", "saved"), [(200, True), (503, False)])
+async def test_intercepted_data_payload_uses_http_error_status_not_json_shape(
+    tmp_path: Path, status: int, saved: bool
+) -> None:
+    interceptor = _make_interceptor(output_dir=str(tmp_path))
+    cdp = _StreamCDP(chunks=[_SMALL_JSON_DOCUMENT])
+    raw = _raw_headers(
+        content_length=len(_SMALL_JSON_DOCUMENT),
+        content_type="application/json",
+        content_disposition='attachment; filename="report.json"',
+    )
+    with _stream_limits(threshold=16, cap=4096):
+        await _drive_download(interceptor, cdp, raw, url="https://example.com/report.json", status=status)
+
+    if saved:
+        assert _only_file(tmp_path).read_bytes() == _SMALL_JSON_DOCUMENT
+        assert cdp.count("Fetch.fulfillRequest") == 1
+        assert cdp.count("Fetch.failRequest") == 0
+        assert interceptor.consume_unsolicited_download_error() is None
+    else:
+        assert list(tmp_path.iterdir()) == []
+        assert cdp.count("Fetch.failRequest") == 1
+        assert cdp.count("Fetch.fulfillRequest") == 0
+        assert interceptor.consume_unsolicited_download_error() is not None
+    assert interceptor._captured_download_count == int(saved)
 
 
 def _fulfill_body(cdp: _StreamCDP) -> str | None:
@@ -5126,11 +5834,11 @@ class TestTwoPathDownloadStreaming:
     @pytest.mark.asyncio
     async def test_buffered_download_rejects_destination_symlink(self, tmp_path: Path) -> None:
         interceptor = _make_interceptor(output_dir=str(tmp_path))
-        save_path, _ = interceptor._resolve_save_path("doc.pdf")
-        outside = tmp_path.parent / f"{tmp_path.name}-buffered-outside.pdf"
+        save_path, _ = interceptor._resolve_save_path("doc.txt")
+        outside = tmp_path.parent / f"{tmp_path.name}-buffered-outside.txt"
         outside.write_bytes(b"outside")
         save_path.symlink_to(outside)
-        cdp = _StreamCDP(chunks=[b"private report"])
+        cdp = _StreamCDP(chunks=[b"%PDF-1.4 private report"])
 
         with _stream_limits(threshold=1024):
             await _drive_download(interceptor, cdp, _raw_headers(content_length=14))
@@ -5180,7 +5888,7 @@ class TestTwoPathDownloadStreaming:
 
         def swap_destination_then_link(src: str, dst: str, **kwargs: Any) -> None:
             nonlocal swapped
-            if dst == "doc.pdf":
+            if dst == "doc.txt":
                 (tmp_path / dst).symlink_to(outside)
                 swapped = True
             real_link(src, dst, **kwargs)
@@ -5192,7 +5900,7 @@ class TestTwoPathDownloadStreaming:
             await _drive_download(interceptor, cdp, _raw_headers(content_length=1024))
 
         assert swapped
-        assert (tmp_path / "doc.pdf").is_symlink()
+        assert (tmp_path / "doc.txt").is_symlink()
         assert outside.read_bytes() == b"outside"
         assert cdp.count("Fetch.failRequest") == 1
         assert cdp.count("Fetch.fulfillRequest") == 0
@@ -5314,7 +6022,7 @@ class TestTwoPathDownloadStreaming:
     @pytest.mark.asyncio
     async def test_streamed_empty_fulfill_normalizes_headers(self, tmp_path: Path) -> None:
         interceptor = _make_interceptor(output_dir=str(tmp_path))
-        cdp = _StreamCDP(chunks=[b"K" * 2000])
+        cdp = _StreamCDP(chunks=[b"%PDF-1.4" + b"K" * 1992])
         raw = _raw_headers(
             content_length=2000,
             content_type="application/pdf",
@@ -5573,17 +6281,148 @@ def test_duplicate_identical_publish_is_not_reported_as_unsolicited_failure(tmp_
     assert saved.read_bytes() == payload  # original file untouched
 
     # A genuinely different file colliding on the same name is a real miss and must still surface.
-    interceptor.publish_download_bytes(b"a different file, same name", "statement.pdf", "application/pdf")
+    interceptor.publish_download_bytes(b"%PDF-1.7\nstatement-bytes-B\n", "statement.pdf", "application/pdf")
     genuine = interceptor.consume_unsolicited_download_error()
     assert genuine is not None
     assert genuine["error_code"] == "BROWSER_DOWNLOAD_PARTIAL_FAILURE"
     assert saved.read_bytes() == payload  # genuine collision fails closed; no overwrite
 
 
+def test_publish_rejects_identical_malformed_existing_artifact(tmp_path: Path) -> None:
+    interceptor = _make_interceptor(output_dir=str(tmp_path))
+    save_path, _ = interceptor._resolve_save_path("statement.pdf", "application/pdf")
+    save_path.write_bytes(_SMALL_HTML_ERROR)
+
+    result = interceptor.publish_download_bytes(_SMALL_HTML_ERROR, "statement.pdf", "application/pdf")
+
+    assert result is None
+    assert save_path.read_bytes() == _SMALL_HTML_ERROR
+    assert interceptor._captured_download_count == 0
+    assert interceptor.consume_unsolicited_download_error() is not None
+
+
+def test_publish_refuses_tiny_html_error_page_under_pdf_claim(tmp_path: Path) -> None:
+    interceptor = _make_interceptor(output_dir=str(tmp_path))
+
+    saved = interceptor.publish_download_bytes(_SMALL_HTML_ERROR, "statement.pdf", "application/pdf")
+
+    assert saved is None
+    assert list(tmp_path.iterdir()) == []
+    assert interceptor._captured_download_count == 0
+    assert interceptor.consume_unsolicited_download_error() is not None
+
+
+def test_publish_saves_extensionless_html_with_html_content_type(tmp_path: Path) -> None:
+    interceptor = _make_interceptor(output_dir=str(tmp_path))
+
+    saved = interceptor.publish_download_bytes(_SMALL_HTML_ERROR, "report", "text/html; charset=utf-8")
+
+    assert saved is not None
+    assert saved.name == "report"
+    assert saved.read_bytes() == _SMALL_HTML_ERROR
+
+
+@pytest.mark.parametrize("streamed", [False, True], ids=["buffered", "streamed"])
+def test_publish_accepts_prefixed_zip_across_streaming_threshold(tmp_path: Path, streamed: bool) -> None:
+    interceptor = _make_interceptor(output_dir=str(tmp_path))
+    archive = b"MZ" + bytes(30) + _zip_bytes({"report.bin": b"12345678"})
+    with zipfile.ZipFile(io.BytesIO(archive)) as source:
+        assert source.testzip() is None
+
+    threshold = len(archive) if streamed else len(archive) + 1
+    with _stream_limits(threshold=threshold, cap=len(archive) + 1):
+        saved = interceptor.publish_download_bytes(archive, "report.zip", "application/zip")
+
+    assert saved is not None and saved.read_bytes() == archive
+
+
+@pytest.mark.parametrize("streamed", [False, True], ids=["buffered", "streamed"])
+@pytest.mark.parametrize("filename", ["book.xls", "report"], ids=["xls-name", "extensionless-name"])
+def test_publish_accepts_xlsx_under_legacy_excel_claim(tmp_path: Path, streamed: bool, filename: str) -> None:
+    interceptor = _make_interceptor(output_dir=str(tmp_path))
+    threshold = len(_VALID_XLSX) if streamed else len(_VALID_XLSX) + 1
+    with _stream_limits(threshold=threshold, cap=len(_VALID_XLSX) + 1):
+        saved = interceptor.publish_download_bytes(_VALID_XLSX, filename, "application/vnd.ms-excel")
+
+    assert saved is not None and saved.name == filename and saved.read_bytes() == _VALID_XLSX
+
+
+@pytest.mark.parametrize("streamed", [False, True], ids=["buffered", "streamed"])
+@pytest.mark.parametrize(
+    ("payload", "saved"),
+    [
+        pytest.param(b"column one,column two\nvalue one,value two\n", True, id="ordinary-data"),
+        pytest.param(_SMALL_HTML_ERROR, False, id="html-masquerade"),
+    ],
+)
+def test_publish_extensionless_legacy_excel_mime_only_rejects_html(
+    tmp_path: Path, streamed: bool, payload: bytes, saved: bool
+) -> None:
+    interceptor = _make_interceptor(output_dir=str(tmp_path))
+    threshold = len(payload) if streamed else len(payload) + 1
+    with _stream_limits(threshold=threshold, cap=len(payload) + 1):
+        result = interceptor.publish_download_bytes(payload, "report", "application/vnd.ms-excel")
+
+    if saved:
+        assert result is not None and result.name == "report" and result.read_bytes() == payload
+    else:
+        assert result is None
+        assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("streamed", [False, True], ids=["buffered", "streamed"])
+def test_publish_accepts_bom_prefixed_xlsx_across_streaming_threshold(tmp_path: Path, streamed: bool) -> None:
+    interceptor = _make_interceptor(output_dir=str(tmp_path))
+    payload = b"\xef\xbb\xbf" + _VALID_XLSX
+    assert mod._is_valid_xlsx(payload)
+    threshold = len(payload) if streamed else len(payload) + 1
+    with _stream_limits(threshold=threshold, cap=len(payload) + 1):
+        saved = interceptor.publish_download_bytes(payload, "book.xlsx", "application/octet-stream")
+
+    assert saved is not None and saved.read_bytes() == payload
+
+
+def test_publish_accepts_pdf_header_after_leading_newline(tmp_path: Path) -> None:
+    interceptor = _make_interceptor(output_dir=str(tmp_path))
+    payload = b"\n%PDF-1.7 report"
+
+    saved = interceptor.publish_download_bytes(payload, "report.pdf", "application/pdf")
+
+    assert saved is not None and saved.read_bytes() == payload
+
+
+@pytest.mark.parametrize(
+    ("filename", "content_type"),
+    [
+        ("protected.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        ("protected.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+        ("protected.pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"),
+    ],
+)
+def test_publish_accepts_encrypted_ooxml_by_cfb_signature(tmp_path: Path, filename: str, content_type: str) -> None:
+    interceptor = _make_interceptor(output_dir=str(tmp_path))
+    payload = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1not parsed"
+
+    saved = interceptor.publish_download_bytes(payload, filename, content_type)
+
+    assert saved is not None and saved.read_bytes() == payload
+
+
+def test_publish_validates_the_fully_decoded_filename_extension(tmp_path: Path) -> None:
+    interceptor = _make_interceptor(output_dir=str(tmp_path))
+
+    saved = interceptor.publish_download_bytes(b"not a PDF", "report%252Epdf", "application/octet-stream")
+
+    assert saved is None
+    assert list(tmp_path.iterdir()) == []
+    assert interceptor._captured_download_count == 0
+    assert interceptor.consume_unsolicited_download_error() is not None
+
+
 def test_download_tally_survives_consume_and_restarts_on_accounting_reset(tmp_path: Path) -> None:
     interceptor = _make_interceptor(output_dir=str(tmp_path / "first"))
-    assert interceptor.publish_download_bytes(b"first", "statement.pdf", "application/pdf") is not None
-    assert interceptor.publish_download_bytes(b"other", "statement.pdf", "application/pdf") is None
+    assert interceptor.publish_download_bytes(b"first", "statement.txt", "text/plain") is not None
+    assert interceptor.publish_download_bytes(b"other", "statement.txt", "text/plain") is None
     before = interceptor.download_tally()
 
     consumed = interceptor.consume_unsolicited_download_error()
@@ -5615,11 +6454,217 @@ def test_requested_duplicate_is_satisfied_but_different_bytes_still_fails(tmp_pa
     assert len(list(tmp_path.glob("*.pdf"))) == 1
 
     token_different = interceptor.begin_requested_download()
-    interceptor.publish_download_bytes(b"a different requested file, same name", "statement.pdf", "application/pdf")
+    interceptor.publish_download_bytes(b"%PDF-1.7\ndifferent-requested-file\n", "statement.pdf", "application/pdf")
     outcome = interceptor.finish_requested_download(token_different)
     assert outcome is not None
     assert outcome["error_code"] == "BROWSER_DOWNLOAD_FAILED"
     assert first.read_bytes() == payload
+
+
+def test_requested_download_failure_is_recorded_for_cleanup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    interceptor = _make_interceptor(output_dir=str(tmp_path))
+    error = {
+        "error_code": "BROWSER_DOWNLOAD_FAILED",
+        "reasoning": "The requested browser download could not be saved.",
+        "error_type": "SYSTEM_DEFINED_ERROR",
+    }
+    interceptor.finish_requested_download = MagicMock(return_value=error)  # type: ignore[method-assign]
+    browser_context = MagicMock(_skyvern_cdp_download_interceptor=interceptor)
+    context = SkyvernContext(task_id="task-download")
+    monkeypatch.setattr(skyvern_context, "current", lambda: context)
+
+    assert finish_requested_download_for_context(browser_context, 1) == error
+    assert context.consume_download_failures("task-download") == [error["reasoning"]]
+    assert context.consume_download_failures("task-download") == []
+
+
+def test_requested_download_retry_resolves_only_matching_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    interceptor = _make_interceptor(output_dir=str(tmp_path))
+    browser_context = MagicMock(_skyvern_cdp_download_interceptor=interceptor)
+    context = SkyvernContext(task_id="task-download")
+    monkeypatch.setattr(skyvern_context, "current", lambda: context)
+
+    first_token = interceptor.begin_requested_download()
+    failed_key = mod._download_failure_key("report.pdf", "https://files.example/report.pdf?signature=old")
+    sibling_key = mod._download_failure_key("other.pdf", "https://files.example/other.pdf?signature=old")
+    failed_attempt = interceptor._new_download_attempt(failure_key=failed_key)
+    sibling_attempt = interceptor._new_download_attempt(failure_key=sibling_key)
+    assert failed_key is not None and sibling_key is not None
+    assert failed_attempt is not None and sibling_attempt is not None
+    interceptor._record_download_failure(failed_attempt, "capture_failed")
+    interceptor._record_download_failure(sibling_attempt, "capture_failed")
+
+    error = finish_requested_download_for_context(browser_context, first_token)
+    assert error is not None
+    assert "_failure_keys" not in error
+    assert set(context.download_failure_reasons_by_key["task-download"]) == {failed_key, sibling_key}
+
+    retry_token = interceptor.begin_requested_download()
+    retry_key = mod._download_failure_key("report.pdf", "https://files.example/report.pdf?signature=rotated")
+    retry_attempt = interceptor._new_download_attempt(failure_key=retry_key)
+    assert retry_key == failed_key
+    assert retry_attempt is not None
+    interceptor._record_download_saved(retry_attempt)
+
+    assert context.consume_download_failures("task-download") == ["The requested browser download could not be saved."]
+    assert interceptor.finish_requested_download(retry_token) is None
+
+
+@pytest.mark.parametrize(
+    ("failed_url", "rotated_url"),
+    [
+        (
+            "https://files.example/report.pdf?signature=old",
+            "https://files.example/report.pdf?signature=rotated",
+        ),
+        (
+            "https://files.example/report.pdf?Policy=A&Signature=X&Key-Pair-Id=K",
+            "https://files.example/report.pdf?Policy=B&Signature=Y&Key-Pair-Id=K",
+        ),
+    ],
+    ids=["signed-url", "cloudfront-custom-policy"],
+)
+def test_requested_download_same_key_failures_require_matching_successes_after_signed_url_rotation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failed_url: str, rotated_url: str
+) -> None:
+    interceptor = _make_interceptor(output_dir=str(tmp_path))
+    browser_context = MagicMock(_skyvern_cdp_download_interceptor=interceptor)
+    context = SkyvernContext(task_id="task-download")
+    monkeypatch.setattr(skyvern_context, "current", lambda: context)
+
+    first_token = interceptor.begin_requested_download()
+    failed_key = mod._download_failure_key("report.pdf", failed_url)
+    assert failed_key is not None
+    for _ in range(2):
+        failed_attempt = interceptor._new_download_attempt(failure_key=failed_key)
+        assert failed_attempt is not None
+        interceptor._record_download_failure(failed_attempt, "capture_failed")
+    assert finish_requested_download_for_context(browser_context, first_token) is not None
+    assert len(context.download_failure_reasons_by_key["task-download"][failed_key]) == 2
+
+    for remaining in (1, 0):
+        retry_token = interceptor.begin_requested_download()
+        rotated_key = mod._download_failure_key("report.pdf", rotated_url)
+        assert rotated_key == failed_key
+        retry_attempt = interceptor._new_download_attempt(failure_key=rotated_key)
+        assert retry_attempt is not None
+        interceptor._record_download_saved(retry_attempt)
+        assert interceptor.finish_requested_download(retry_token) is None
+        if remaining:
+            assert len(context.download_failure_reasons_by_key["task-download"][failed_key]) == remaining
+        else:
+            assert "task-download" not in context.download_failure_reasons_by_key
+
+    assert context.consume_download_failures("task-download") == []
+
+
+def test_requested_download_success_decrements_only_one_interleaved_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    interceptor = _make_interceptor(output_dir=str(tmp_path))
+    browser_context = MagicMock(_skyvern_cdp_download_interceptor=interceptor)
+    context = SkyvernContext(task_id="task-download")
+    monkeypatch.setattr(skyvern_context, "current", lambda: context)
+    failure_key = mod._download_failure_key("report.pdf", "https://files.example/report.pdf")
+    assert failure_key is not None
+
+    first_token = interceptor.begin_requested_download()
+    first_failure = interceptor._new_download_attempt(failure_key=failure_key)
+    assert first_failure is not None
+    interceptor._record_download_failure(first_failure, "capture_failed")
+    assert finish_requested_download_for_context(browser_context, first_token) is not None
+
+    second_token = interceptor.begin_requested_download()
+    second_failure = interceptor._new_download_attempt(failure_key=failure_key)
+    assert second_failure is not None
+    interceptor._record_download_failure(second_failure, "capture_failed")
+    success = interceptor._new_download_attempt(failure_key=failure_key)
+    assert success is not None
+    interceptor._record_download_saved(success)
+
+    assert interceptor.finish_requested_download(second_token) is None
+    assert context.consume_download_failures("task-download") == ["The requested browser download could not be saved."]
+
+
+def test_download_failure_key_hashes_large_urls_in_bounded_chunks(monkeypatch: pytest.MonkeyPatch) -> None:
+    update_lengths: list[int] = []
+
+    class _Digest:
+        def update(self, value: bytes) -> None:
+            update_lengths.append(len(value))
+
+        def hexdigest(self) -> str:
+            return "digest"
+
+    monkeypatch.setattr(mod.hashlib, "sha256", _Digest)
+
+    key = mod._download_failure_key("report.pdf", f"data:application/pdf;base64,{('a' * 100_000)}")
+
+    assert key == "cdp:digest"
+    assert max(update_lengths) <= 8192
+
+
+@pytest.mark.parametrize(
+    ("failed_url", "sibling_url"),
+    [
+        ("data:application/pdf;base64,first", "data:application/pdf;base64,second"),
+        (
+            "https://files.example/report.pdf?file=first",
+            "https://files.example/report.pdf?file=second",
+        ),
+        (
+            "https://files.example/report.pdf?policy=A",
+            "https://files.example/report.pdf?policy=B",
+        ),
+        (
+            "https://files.example/report.pdf?key-pair-id=A",
+            "https://files.example/report.pdf?key-pair-id=B",
+        ),
+    ],
+    ids=["data-url", "query-string", "cloudfront-policy-only", "cloudfront-key-pair-only"],
+)
+def test_same_name_different_source_success_does_not_clear_failed_download(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failed_url: str, sibling_url: str
+) -> None:
+    interceptor = _make_interceptor(output_dir=str(tmp_path))
+    browser_context = MagicMock(_skyvern_cdp_download_interceptor=interceptor)
+    context = SkyvernContext(task_id="task-download")
+    monkeypatch.setattr(skyvern_context, "current", lambda: context)
+
+    first_token = interceptor.begin_requested_download()
+    failed_key = mod._download_failure_key("report.pdf", failed_url)
+    failed_attempt = interceptor._new_download_attempt(failure_key=failed_key)
+    assert failed_key is not None and failed_attempt is not None
+    interceptor._record_download_failure(failed_attempt, "capture_failed")
+    assert finish_requested_download_for_context(browser_context, first_token) is not None
+
+    sibling_token = interceptor.begin_requested_download()
+    sibling_key = mod._download_failure_key("report.pdf", sibling_url)
+    sibling_attempt = interceptor._new_download_attempt(failure_key=sibling_key)
+    assert sibling_key is not None and sibling_key != failed_key and sibling_attempt is not None
+    interceptor._record_download_saved(sibling_attempt)
+
+    assert context.consume_download_failures("task-download") == ["The requested browser download could not be saved."]
+    assert interceptor.finish_requested_download(sibling_token) is None
+
+
+def test_unsolicited_capture_does_not_resolve_requested_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    interceptor = _make_interceptor(output_dir=str(tmp_path))
+    context = SkyvernContext(task_id="task-download")
+    monkeypatch.setattr(skyvern_context, "current", lambda: context)
+    failure_key = mod._download_failure_key("report.pdf", "https://files.example/report.pdf")
+    assert failure_key is not None
+    context.record_download_failure("task-download", "The requested browser download could not be saved.", failure_key)
+
+    unsolicited_attempt = interceptor._new_download_attempt(failure_key=failure_key)
+    assert unsolicited_attempt is not None and unsolicited_attempt.intent == "unsolicited"
+    interceptor._record_download_saved(unsolicited_attempt)
+
+    assert context.consume_download_failures("task-download") == ["The requested browser download could not be saved."]
 
 
 def test_dedupe_does_not_follow_a_destination_symlink(tmp_path: Path) -> None:

@@ -36,6 +36,7 @@ import { type AppNode } from "..";
 import { DisableCache } from "../DisableCache";
 import { IgnoreWorkflowSystemPrompt } from "../IgnoreWorkflowSystemPrompt";
 import { BlockExecutionOptions } from "../components/BlockExecutionOptions";
+import { SftpPrivateKeyField } from "../components/SftpPrivateKeyField";
 import { type FileDownloadNode, type FileDownloadNodeData } from "./types";
 import { useSelectedCredentialTotpIdentifier } from "../../hooks/useSelectedCredentialTotpIdentifier";
 import {
@@ -162,6 +163,135 @@ function FileDownloadEditorBody({
     downloadTarget !== "google_drive" &&
     (urlMayBeGoogleDrive(url) || Boolean(googleCredentialId));
 
+  // One connection serves both roles, so these fields render beside whichever
+  // role the block is using: the destination picker when SFTP is the target,
+  // otherwise next to the source path under Advanced Settings.
+  const sftpConnectionFields = (
+    <>
+      <DestinationField
+        label={
+          hasSftpSource
+            ? downloadTarget === "sftp"
+              ? "SFTP Host (Source and Destination)"
+              : "SFTP Host (Source)"
+            : "SFTP Host"
+        }
+        help={
+          hasSftpSource
+            ? downloadTarget === "sftp"
+              ? "The SFTP host used to read the source file and upload files to the destination."
+              : "The SFTP host to read files from."
+            : "The SFTP host to upload files to."
+        }
+      >
+        <WorkflowBlockInputTextarea
+          name="sftpHost"
+          nodeId={blockId}
+          onChange={(value) => update({ sftpHost: value })}
+          value={sftpHost ?? ""}
+          className="nopan text-xs"
+        />
+      </DestinationField>
+      <DestinationField
+        label="Port"
+        help="Numeric only — template values are not supported. Defaults to 22 if left blank."
+      >
+        <WorkflowBlockInputTextarea
+          name="sftpPort"
+          nodeId={blockId}
+          onChange={(value) =>
+            update({ sftpPort: value.replace(/[^0-9]/g, "") })
+          }
+          value={sftpPort ?? ""}
+          className="nopan text-xs"
+        />
+      </DestinationField>
+      <DestinationField label="Username" help="The SFTP username.">
+        <WorkflowBlockInputTextarea
+          name="sftpUsername"
+          nodeId={blockId}
+          onChange={(value) => update({ sftpUsername: value })}
+          value={sftpUsername ?? ""}
+          className="nopan text-xs"
+        />
+      </DestinationField>
+      <DestinationField
+        label="Password"
+        help="Password auth. Leave blank if using a private key. Reference a secret parameter for security."
+      >
+        <WorkflowBlockInput
+          name="sftpPassword"
+          nodeId={blockId}
+          type="password"
+          onChange={(value) => update({ sftpPassword: value })}
+          value={sftpPassword ?? ""}
+          className="nopan text-xs"
+        />
+      </DestinationField>
+      <DestinationField
+        label="Private Key"
+        help="PEM private key for key-based auth. Leave blank if using a password. Reference a secret parameter for security."
+      >
+        <SftpPrivateKeyField
+          key={blockId}
+          nodeId={blockId}
+          onChange={(value) => update({ sftpPrivateKey: value })}
+          value={sftpPrivateKey ?? ""}
+          disabled={!editable}
+          className="nopan text-xs"
+        />
+      </DestinationField>
+      <DestinationField
+        label="Private Key Passphrase (Optional)"
+        help="Optional passphrase for the private key."
+      >
+        <WorkflowBlockInput
+          name="sftpPrivateKeyPassphrase"
+          nodeId={blockId}
+          type="password"
+          onChange={(value) => update({ sftpPrivateKeyPassphrase: value })}
+          value={sftpPrivateKeyPassphrase ?? ""}
+          className="nopan text-xs"
+        />
+      </DestinationField>
+      {downloadTarget === "sftp" && (
+        <DestinationField
+          label="(Optional) Remote Directory"
+          help="Remote directory to upload into. Created if it does not exist. Defaults to the login directory."
+        >
+          <WorkflowBlockInputTextarea
+            name="sftpRemotePath"
+            nodeId={blockId}
+            onChange={(value) => update({ sftpRemotePath: value })}
+            value={sftpRemotePath ?? ""}
+            className="nopan text-xs"
+          />
+        </DestinationField>
+      )}
+      <DestinationField
+        label={
+          hasSftpSource
+            ? "Host Key (Required for SFTP source)"
+            : "(Optional) Host Key"
+        }
+        help={
+          hasSftpSource
+            ? "Required when reading from SFTP. Pin the server's host key (e.g. 'ssh-ed25519 AAAA...') so the connection can be verified."
+            : "If blank, the server's host key is NOT verified and the connection can be intercepted (MITM). Pin a host key (e.g. 'ssh-ed25519 AAAA...') for untrusted networks."
+        }
+      >
+        <WorkflowBlockInputTextarea
+          name="sftpHostKey"
+          nodeId={blockId}
+          aria-required={hasSftpSource}
+          onChange={(value) => update({ sftpHostKey: value })}
+          value={sftpHostKey ?? ""}
+          className="nopan text-xs"
+        />
+      </DestinationField>
+    </>
+  );
+
   return (
     <div data-testid="file-download-block-form" className="space-y-4">
       <div className="space-y-4">
@@ -196,9 +326,13 @@ function FileDownloadEditorBody({
             >
               {urlError}
             </p>
+          ) : hasSftpSource ? (
+            <p className="text-xs text-muted-foreground dark:text-slate-500">
+              This block reads from SFTP, configured under Advanced Settings, so
+              it does not need a URL.
+            </p>
           ) : (
             isFirstBrowserTask &&
-            !hasSftpSource &&
             !url.trim() && (
               <p className="text-xs text-amber-700 dark:text-amber-400">
                 Nothing runs before this block, so it needs a URL to start from.
@@ -206,32 +340,6 @@ function FileDownloadEditorBody({
             )
           )}
         </div>
-        <Accordion
-          type="single"
-          collapsible
-          defaultValue={hasSftpSource ? "sftp-source" : undefined}
-        >
-          <AccordionItem value="sftp-source" className="border-b-0">
-            <AccordionTrigger className="py-0">
-              Read from SFTP (Optional)
-            </AccordionTrigger>
-            <AccordionContent className="pt-2">
-              <DestinationField
-                label="SFTP Source Path"
-                help="The file path to read from the SFTP server. Setting this path uses SFTP as the source instead of a browser URL."
-              >
-                <WorkflowBlockInputTextarea
-                  name="sftpSourcePath"
-                  nodeId={blockId}
-                  onChange={(value) => update({ sftpSourcePath: value })}
-                  value={sftpSourcePath ?? ""}
-                  placeholder="/path/to/file"
-                  className="nopan text-xs"
-                />
-              </DestinationField>
-            </AccordionContent>
-          </AccordionItem>
-        </Accordion>
         {!hasSftpSource && (
           <>
             <div className="space-y-2">
@@ -481,132 +589,7 @@ function FileDownloadEditorBody({
           </>
         )}
 
-        {(downloadTarget === "sftp" || hasSftpSource) && (
-          <>
-            <DestinationField
-              label={
-                hasSftpSource
-                  ? downloadTarget === "sftp"
-                    ? "SFTP Host (Source and Destination)"
-                    : "SFTP Host (Source)"
-                  : "SFTP Host"
-              }
-              help={
-                hasSftpSource
-                  ? downloadTarget === "sftp"
-                    ? "The SFTP host used to read the source file and upload files to the destination."
-                    : "The SFTP host to read files from."
-                  : "The SFTP host to upload files to."
-              }
-            >
-              <WorkflowBlockInputTextarea
-                name="sftpHost"
-                nodeId={blockId}
-                onChange={(value) => update({ sftpHost: value })}
-                value={sftpHost ?? ""}
-                className="nopan text-xs"
-              />
-            </DestinationField>
-            <DestinationField
-              label="Port"
-              help="Numeric only — template values are not supported. Defaults to 22 if left blank."
-            >
-              <WorkflowBlockInputTextarea
-                name="sftpPort"
-                nodeId={blockId}
-                onChange={(value) =>
-                  update({ sftpPort: value.replace(/[^0-9]/g, "") })
-                }
-                value={sftpPort ?? ""}
-                className="nopan text-xs"
-              />
-            </DestinationField>
-            <DestinationField label="Username" help="The SFTP username.">
-              <WorkflowBlockInputTextarea
-                name="sftpUsername"
-                nodeId={blockId}
-                onChange={(value) => update({ sftpUsername: value })}
-                value={sftpUsername ?? ""}
-                className="nopan text-xs"
-              />
-            </DestinationField>
-            <DestinationField
-              label="Password"
-              help="Password auth. Leave blank if using a private key. Reference a secret parameter for security."
-            >
-              <WorkflowBlockInput
-                name="sftpPassword"
-                nodeId={blockId}
-                type="password"
-                onChange={(value) => update({ sftpPassword: value })}
-                value={sftpPassword ?? ""}
-                className="nopan text-xs"
-              />
-            </DestinationField>
-            <DestinationField
-              label="Private Key"
-              help="PEM private key for key-based auth. Leave blank if using a password. Reference a secret parameter for security."
-            >
-              <WorkflowBlockInputTextarea
-                name="sftpPrivateKey"
-                nodeId={blockId}
-                onChange={(value) => update({ sftpPrivateKey: value })}
-                value={sftpPrivateKey ?? ""}
-                className="nopan text-xs"
-              />
-            </DestinationField>
-            <DestinationField
-              label="Private Key Passphrase (Optional)"
-              help="Optional passphrase for the private key."
-            >
-              <WorkflowBlockInput
-                name="sftpPrivateKeyPassphrase"
-                nodeId={blockId}
-                type="password"
-                onChange={(value) =>
-                  update({ sftpPrivateKeyPassphrase: value })
-                }
-                value={sftpPrivateKeyPassphrase ?? ""}
-                className="nopan text-xs"
-              />
-            </DestinationField>
-            {downloadTarget === "sftp" && (
-              <DestinationField
-                label="(Optional) Remote Directory"
-                help="Remote directory to upload into. Created if it does not exist. Defaults to the login directory."
-              >
-                <WorkflowBlockInputTextarea
-                  name="sftpRemotePath"
-                  nodeId={blockId}
-                  onChange={(value) => update({ sftpRemotePath: value })}
-                  value={sftpRemotePath ?? ""}
-                  className="nopan text-xs"
-                />
-              </DestinationField>
-            )}
-            <DestinationField
-              label={
-                hasSftpSource
-                  ? "Host Key (Required for SFTP source)"
-                  : "(Optional) Host Key"
-              }
-              help={
-                hasSftpSource
-                  ? "Required when reading from SFTP. Pin the server's host key (e.g. 'ssh-ed25519 AAAA...') so the connection can be verified."
-                  : "If blank, the server's host key is NOT verified and the connection can be intercepted (MITM). Pin a host key (e.g. 'ssh-ed25519 AAAA...') for untrusted networks."
-              }
-            >
-              <WorkflowBlockInputTextarea
-                name="sftpHostKey"
-                nodeId={blockId}
-                aria-required={hasSftpSource}
-                onChange={(value) => update({ sftpHostKey: value })}
-                value={sftpHostKey ?? ""}
-                className="nopan text-xs"
-              />
-            </DestinationField>
-          </>
-        )}
+        {downloadTarget === "sftp" && sftpConnectionFields}
 
         {showGoogleDriveSourceAccount && (
           <DestinationField
@@ -658,6 +641,31 @@ function FileDownloadEditorBody({
           </AccordionTrigger>
           <AccordionContent className="pl-6 pr-1 pt-1">
             <div className="space-y-4">
+              <div className="space-y-4">
+                <div className="flex items-center gap-2">
+                  <Label className="text-sm font-medium text-foreground">
+                    Read from SFTP (Optional)
+                  </Label>
+                  <HelpTooltip content="Read the file from an SFTP server instead of browsing for it. A source path replaces the URL and download goal above." />
+                </div>
+                <DestinationField
+                  label="SFTP Source Path"
+                  help="The file path to read from the SFTP server. Setting this path uses SFTP as the source instead of a browser URL."
+                >
+                  <WorkflowBlockInputTextarea
+                    name="sftpSourcePath"
+                    nodeId={blockId}
+                    onChange={(value) => update({ sftpSourcePath: value })}
+                    value={sftpSourcePath ?? ""}
+                    placeholder="/path/to/file"
+                    className="nopan text-xs"
+                  />
+                </DestinationField>
+                {hasSftpSource &&
+                  downloadTarget !== "sftp" &&
+                  sftpConnectionFields}
+              </div>
+              <Separator />
               <div className="space-y-2">
                 <ModelSelector
                   className="nopan w-52 text-xs"

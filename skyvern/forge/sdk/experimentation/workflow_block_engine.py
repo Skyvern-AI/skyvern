@@ -198,14 +198,15 @@ def _born_at_or_after(born_at: datetime | None, cutoff: datetime | None) -> bool
     return born_at is not None and cutoff is not None and born_at >= _as_utc(cutoff)
 
 
-def _is_kept_workflow_run(workflow_status: WorkflowStatus, trigger_type: WorkflowRunTriggerType | None) -> bool:
-    # An auto_generated running version is a per-call workflow the login, download_files, credential
-    # test-login and SDK endpoints mint and run in one request, and enrolling those would move standing
-    # API traffic rather than the workflows a customer keeps; the birth version's status would be the
-    # wrong test, because the prompt box writes version 1 as auto_generated and the editor save that
-    # keeps it writes the next as published. The job-recipe endpoints are per-call too; their trigger
-    # kind also excludes recipe workflows created as published before recipes switched to auto_generated.
-    return workflow_status != WorkflowStatus.auto_generated and trigger_type not in PER_CALL_WORKFLOW_RUN_TRIGGER_TYPES
+def _is_kept_workflow_run(
+    workflow_status: WorkflowStatus, trigger_type: WorkflowRunTriggerType | None, *, copilot_test_copy: bool
+) -> bool:
+    # auto_generated marks the per-call workflows the login, download_files, credential test-login and SDK endpoints
+    # mint and run in one request, except Copilot's test copy, a version of a kept workflow. Job-recipe runs are
+    # per-call by trigger kind whatever their status.
+    return (
+        workflow_status != WorkflowStatus.auto_generated or copilot_test_copy
+    ) and trigger_type not in PER_CALL_WORKFLOW_RUN_TRIGGER_TYPES
 
 
 async def _ab_flag_puts_run_in_treatment(
@@ -283,6 +284,7 @@ async def resolve_workflow_block_engine_arm(
     takes_default_engine: bool | None,
     pinned_v1_blocks: int = 0,
     would_be_code: bool = False,
+    copilot_test_copy: bool = False,
 ) -> None:
     """Resolve the workflow-block engine A/B once at execution start and pin the arm on the context.
 
@@ -307,11 +309,9 @@ async def resolve_workflow_block_engine_arm(
     ``WORKFLOW_TASK_V3_AB_NEW_WORKFLOWS`` can randomize those unset blocks per run for a listed org or
     workflow: variant ``v1`` leaves the override unset, ``v3`` sets it, and anything else keeps v3.
 
-    ``workflow_status`` is the status of the version this run executes and ``trigger_type`` is how
-    the run was launched. Together they are what separates a workflow a customer keeps from the
-    per-call throwaways several endpoints mint and run in one request: those run while still
-    auto_generated, except job-recipe workflows created as published before recipes switched to
-    auto_generated, which only the trigger kind covers.
+    ``workflow_status``, ``trigger_type`` and ``copilot_test_copy`` (the run executes Copilot's test copy of a
+    workflow) separate a workflow a customer keeps from the per-call throwaways several endpoints run while still
+    auto_generated or under a job-recipe trigger; Copilot's copy counts as kept even though it is auto_generated.
 
     ``pinned_v1_blocks`` counts blocks a person pinned to skyvern-1.0 (see ``pinned_v1_block_count``);
     eligibility already keeps such a run out of the A/B, and this labels it ``pinned_v1_engine``.
@@ -346,7 +346,7 @@ async def resolve_workflow_block_engine_arm(
         chosen_engine_candidate = (
             settings.TASK_V3_CHOSEN_ENGINE_CUTOFF is not None
             and takes_default_engine is not None
-            and _is_kept_workflow_run(workflow_status, trigger_type)
+            and _is_kept_workflow_run(workflow_status, trigger_type, copilot_test_copy=copilot_test_copy)
         )
         # Both cutoff rules compare the same birth timestamp, so it is read at most once per run.
         birth_reads: list[datetime | None] = []
@@ -402,7 +402,7 @@ async def resolve_workflow_block_engine_arm(
                     takes_new_workflow_default = (
                         not would_be_code
                         and billing_tier == BillingTier.SELF_SERVE
-                        and _is_kept_workflow_run(workflow_status, trigger_type)
+                        and _is_kept_workflow_run(workflow_status, trigger_type, copilot_test_copy=copilot_test_copy)
                         and await born_at_or_after(settings.TASK_V3_DEFAULT_ENGINE_WORKFLOW_CUTOFF)
                     )
                     if takes_new_workflow_default:

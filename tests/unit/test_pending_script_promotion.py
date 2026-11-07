@@ -25,6 +25,7 @@ from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider
+from skyvern.forge.sdk.services.browser_session_artifacts import browser_session_artifact_read_scope
 from skyvern.forge.sdk.workflow.models.block import ExtractionBlock, TaskBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.forge.sdk.workflow.service import WorkflowService
@@ -154,8 +155,9 @@ class TestIsBlockTypeCacheable:
                     {"is_default": True, "next_block_label": None},
                 ],
             },
+            {"label": "query", "block_type": BlockType.POWERBI_QUERY},
         ],
-        ids=["terminate", "web_search", "conditional"],
+        ids=["terminate", "web_search", "conditional", "powerbi_query"],
     )
     def test_loop_containing_an_engine_only_block_is_not_cacheable(
         self, loop_type: BlockType, engine_only_child: dict
@@ -665,11 +667,12 @@ class TestNoScriptFromATaskV3Run:
             SimpleNamespace(get_workflow_by_permanent_id=AsyncMock(return_value=workflow)),
             raising=False,
         )
-        monkeypatch.setattr(
-            workflow_service_module,
-            "get_workflow_run_response",
-            AsyncMock(return_value=SimpleNamespace(run_request=run_request)),
-        )
+
+        async def read_run_response(*_args: Any, **_kwargs: Any) -> SimpleNamespace:
+            assert browser_session_artifact_read_scope() is None
+            return SimpleNamespace(run_request=run_request)
+
+        monkeypatch.setattr(workflow_service_module, "get_workflow_run_response", read_run_response)
         monkeypatch.setattr(workflow_script_service, "is_adaptive_caching", lambda *_: False)
         codegen = AsyncMock(side_effect=RuntimeError("stop after the generation input is accepted"))
         monkeypatch.setattr(workflow_script_service, "generate_workflow_script_python_code", codegen)

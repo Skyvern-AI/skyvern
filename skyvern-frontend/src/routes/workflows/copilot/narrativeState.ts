@@ -10,15 +10,20 @@ import {
   ConnectedAccountChoice,
   CopilotResponseType,
   CopilotSteerMessage,
+  type CredentialSiteAnswer,
+  type CopilotTestInput,
+  type CopilotTestInputSource,
   DeliveredOutputFile,
   ProposalDisposition,
   RunOutcomeRole,
+  SkippedPrefixBlock,
   WorkflowCopilotBlockProgressUpdate,
   WorkflowCopilotCodegenProgressUpdate,
   WorkflowCopilotDesignEndUpdate,
   WorkflowCopilotDesignStartUpdate,
   WorkflowCopilotNarrationUpdate,
   WorkflowCopilotRunOutcomeUpdate,
+  WorkflowCopilotRunStartedUpdate,
   WorkflowCopilotScreenshotUpdate,
   WorkflowCopilotStreamErrorUpdate,
   WorkflowCopilotStreamResponseUpdate,
@@ -123,6 +128,7 @@ export type NarrativeEvent =
   | WorkflowCopilotWorkflowDraftUpdate
   | WorkflowCopilotBlockProgressUpdate
   | WorkflowCopilotRunOutcomeUpdate
+  | WorkflowCopilotRunStartedUpdate
   | WorkflowCopilotStreamResponseUpdate
   | WorkflowCopilotStreamErrorUpdate
   | WorkflowCopilotNarrationUpdate
@@ -234,7 +240,8 @@ type BuildTestConnectFailureState =
   | "provisioning_unavailable"
   | "cdp_connect_failed"
   | "occupied"
-  | "billing_credit_admission_refusal";
+  | "billing_credit_admission_refusal"
+  | "browser_start_capacity";
 
 export function isBuildTestConnectFailureState(
   value: unknown,
@@ -244,11 +251,13 @@ export function isBuildTestConnectFailureState(
     value === "provisioning_unavailable" ||
     value === "cdp_connect_failed" ||
     value === "occupied" ||
-    value === "billing_credit_admission_refusal"
+    value === "billing_credit_admission_refusal" ||
+    value === "browser_start_capacity"
   );
 }
 
 export type ReviewChange = "added" | "changed" | "unchanged" | "removed";
+export type InputChange = "added" | "changed" | "removed";
 export type BlockCoverage =
   | "current_source"
   | "different_source"
@@ -297,10 +306,16 @@ export interface ReviewProjection {
     blockType: string;
     blockLabels: string[];
   }>;
+  inputs?: Array<{ key: string; change: InputChange }>;
+  // Blocks whose saved notes Copilot's YAML left out, so the saved notes were kept.
+  keptNotes?: string[];
+  // The same for descriptions.
+  keptDescriptions?: string[];
 }
 
 export interface BlockState {
   workflowRunBlockId: string;
+  workflowRunId?: string;
   label: string;
   blockType: string;
   state: BlockUIState;
@@ -308,6 +323,8 @@ export interface BlockState {
   outcome?: BlockOutcome;
   outcomeReason?: string;
   outcomeRole?: RunOutcomeRole;
+  // Requested blocks the run did not execute, shown before this, the run's first card.
+  skippedBefore?: SkippedPrefixBlock[];
   lastSeenIteration: number;
   // Tool calls and results emitted while this block was running are
   // appended here so the expanded card shows what the agent did.
@@ -363,6 +380,10 @@ export interface ActivityEntry {
   // A successful run_browser_code result's operations as display phrases,
   // in order. Absent on every other row.
   browserSteps?: string[];
+  // The run a block-running result dispatched, and where each of its inputs
+  // came from. Absent on every other row.
+  workflowRunId?: string;
+  testInputs?: CopilotTestInput[];
   // Stable per-event id used as React key.
   id: string;
   // Consecutive same-tool retries folded into this row by
@@ -446,6 +467,7 @@ export interface TurnNarrativeState {
     verdict: BlockOutcome;
     role?: RunOutcomeRole;
     displayReason: string | null;
+    workflowRunId?: string;
   } | null;
   // Terminal-mode credential ask, from the credentialPrompt narrative signal.
   // reason is kept as a raw string — the card tolerates unknown tokens.
@@ -453,8 +475,19 @@ export interface TurnNarrativeState {
   // Resolved pause outcome, from the credentialPause narrative signal.
   // "declined" means the pause engaged but never sent a frame, so no card.
   credentialPause: {
-    outcome: "connected" | "skipped" | "timeout" | "declined" | "signed_in";
+    outcome:
+      | "connected"
+      | "skipped"
+      | "timeout"
+      | "declined"
+      | "signed_in"
+      | "not_admitted";
     credentialId: string | null;
+    name?: string;
+    siteAnswer?: CredentialSiteAnswer;
+    siteA?: string;
+    savedSites?: string[];
+    siteB?: string;
     // The tool call whose row was newest when the card was raised. Absent on
     // turns recorded before it was stamped.
     anchorToolCallId?: string;
@@ -471,6 +504,7 @@ export interface TurnNarrativeState {
   outputFiles: DeliveredOutputFile[];
   googleConnectionNotices: GoogleConnectionNotice[];
   demonstrationOffer: boolean;
+  canonicalWorkflowUnavailable: CanonicalWorkflowUnavailable | null;
   review: ReviewProjection | null;
   turnFacts: TurnFacts | null;
   budgetExpiry: BudgetExpiryState | null;
@@ -478,6 +512,8 @@ export interface TurnNarrativeState {
   steerMessages: CopilotSteerMessage[];
   // Browser frames captured for the agent this turn, in capture order.
   screenshots: TurnScreenshot[];
+  // Live-only: a started run's skipped prefix, keyed by run id until the run's first block arrives.
+  pendingSkippedPrefix: Record<string, SkippedPrefixBlock[]>;
 }
 
 export interface TurnScreenshot {
@@ -503,6 +539,10 @@ export function googleConnectionNoticeKey(
   notice: GoogleConnectionNotice,
 ): string {
   return `${notice.scopeProfile}:${notice.connectionId ?? "unbound"}`;
+}
+
+export interface CanonicalWorkflowUnavailable {
+  workflowPermanentId: string;
 }
 
 export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
@@ -534,11 +574,13 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   outputFiles: [],
   googleConnectionNotices: [],
   demonstrationOffer: false,
+  canonicalWorkflowUnavailable: null,
   review: null,
   turnFacts: null,
   budgetExpiry: null,
   steerMessages: [],
   screenshots: [],
+  pendingSkippedPrefix: {},
 }) as TurnNarrativeState;
 
 // Caps to keep long-running narrations from unbounded growth (and to keep
@@ -600,23 +642,37 @@ export function parseCredentialPause(
     typeof o.anchorToolCallId === "string" && o.anchorToolCallId
       ? o.anchorToolCallId
       : undefined;
-  // The user answered but nothing was bound, which the card already renders as a skip.
-  if (outcome === "not_admitted") {
-    return { outcome: "skipped", credentialId: null, anchorToolCallId };
-  }
   if (
     outcome !== "connected" &&
     outcome !== "skipped" &&
     outcome !== "timeout" &&
     outcome !== "declined" &&
-    outcome !== "signed_in"
+    outcome !== "signed_in" &&
+    outcome !== "not_admitted"
   ) {
     return null;
   }
+  const siteAnswer =
+    o.siteAnswer === "add" || o.siteAnswer === "no" ? o.siteAnswer : undefined;
   return {
     outcome,
     credentialId: typeof o.credentialId === "string" ? o.credentialId : null,
     anchorToolCallId,
+    ...(typeof o.name === "string" && o.name ? { name: o.name } : {}),
+    ...(siteAnswer
+      ? {
+          siteAnswer,
+          siteA: typeof o.siteA === "string" ? o.siteA : undefined,
+          savedSites:
+            Array.isArray(o.savedSites) &&
+            o.savedSites.every(
+              (site): site is string => typeof site === "string",
+            )
+              ? o.savedSites
+              : undefined,
+          siteB: typeof o.siteB === "string" ? o.siteB : undefined,
+        }
+      : {}),
   };
 }
 
@@ -650,6 +706,32 @@ function parseTurnWorkPlan(value: unknown): TurnWorkPlan | null {
   return typeof o.toolCallId === "string" && o.toolCallId && items
     ? { toolCallId: o.toolCallId, items }
     : null;
+}
+
+const TEST_INPUT_SOURCES: ReadonlySet<string> = new Set<CopilotTestInputSource>(
+  ["copilot", "page", "earlier_run", "default", "placeholder"],
+);
+
+export function parseTestInputs(
+  value: unknown,
+): CopilotTestInput[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const inputs: CopilotTestInput[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") continue;
+    const row = item as Record<string, unknown>;
+    if (typeof row.key !== "string" || typeof row.source !== "string") {
+      continue;
+    }
+    if (!TEST_INPUT_SOURCES.has(row.source)) continue;
+    inputs.push({
+      key: row.key,
+      source: row.source as CopilotTestInputSource,
+      sourceRunId:
+        typeof row.sourceRunId === "string" ? row.sourceRunId : undefined,
+    });
+  }
+  return inputs.length > 0 ? inputs : undefined;
 }
 
 export function parseCodeDiffs(value: unknown): CodeWriteDiff[] | undefined {
@@ -726,6 +808,19 @@ export function parseCredentialAutoBound(
     typeof name === "string" &&
     name.length > 0
     ? { credentialId, name }
+    : null;
+}
+
+export function parseCanonicalWorkflowUnavailable(
+  value: unknown,
+): CanonicalWorkflowUnavailable | null {
+  if (!value || typeof value !== "object") return null;
+  const row = value as Record<string, unknown>;
+  return typeof row.workflow_permanent_id === "string" &&
+    row.workflow_permanent_id.length > 0 &&
+    row.candidate_published !== true &&
+    row.test_started === false
+    ? { workflowPermanentId: row.workflow_permanent_id }
     : null;
 }
 
@@ -840,7 +935,11 @@ const ACTIVITY_TOOL_DISPLAY_LABELS: Record<string, string> = {
   inspect_page_for_composition: "Inspecting the page",
   list_credentials: "Checking saved credentials",
   get_organization_usage_quota: "Checking account usage",
+  create_webhook_trigger: "Creating a webhook trigger",
+  test_trigger_mapping: "Testing the trigger mapping",
+  list_workflow_triggers: "Checking this workflow's triggers",
   extend_browser_session: "Extending the browser session",
+  read_chat_history: "Reading earlier messages in this chat",
   run_browser_code: "Working in the browser",
   fill_credential_field: "Entering saved credentials",
   edit_block: "Editing block",
@@ -891,7 +990,11 @@ const TOOL_CALL_KINDS: Record<string, ToolCallKind> = {
   offer_demonstration: "other",
   read_google_sheet: "other",
   read_attached_pdf: "other",
+  read_chat_history: "other",
   get_organization_usage_quota: "other",
+  create_webhook_trigger: "other",
+  test_trigger_mapping: "other",
+  list_workflow_triggers: "other",
   extend_browser_session: "other",
   search_web: "other",
   list_org_workflows: "other",
@@ -992,6 +1095,8 @@ function buildActivityFromToolResult(
     detail: event.detail || undefined,
     codeDiffs: parseCodeDiffs(event.code_diffs),
     browserSteps: parseStringList(event.browser_steps) ?? undefined,
+    workflowRunId: event.workflow_run_id || undefined,
+    testInputs: parseTestInputs(event.test_inputs),
     reason: actionReason(event.reason),
     activityBucket: parseActivityBucket(event.activity_bucket),
     activityStartedAt: event.activity_started_at ?? undefined,
@@ -1483,8 +1588,14 @@ export function applyNarrativeEvent(
       // terminal event take the latest wall clock so a retry-then-succeed
       // sequence reflects the final completion time, not the first failure.
       const endedAt = isTerminal ? eventTs : null;
+      const runId = event.workflow_run_id;
+      const pendingSkipped =
+        previousBlock === null && runId
+          ? prev.pendingSkippedPrefix[runId]
+          : undefined;
       const baseEntry: BlockState = {
         workflowRunBlockId: event.workflow_run_block_id,
+        workflowRunId: runId || previousBlock?.workflowRunId,
         label: event.block_label,
         blockType: event.block_type,
         state: incomingState,
@@ -1494,6 +1605,7 @@ export function applyNarrativeEvent(
         outcome: previousBlock?.outcome,
         outcomeReason: previousBlock?.outcomeReason,
         outcomeRole: previousBlock?.outcomeRole,
+        skippedBefore: previousBlock?.skippedBefore ?? pendingSkipped,
         recordedActions: previousBlock?.recordedActions,
         recordedActionsAt: previousBlock?.recordedActionsAt,
         lastSeenIteration: event.iteration,
@@ -1508,7 +1620,42 @@ export function applyNarrativeEvent(
       }
       return {
         ...prev,
+        pendingSkippedPrefix: pendingSkipped
+          ? Object.fromEntries(
+              Object.entries(prev.pendingSkippedPrefix).filter(
+                ([id]) => id !== runId,
+              ),
+            )
+          : prev.pendingSkippedPrefix,
         blocks: [...prev.blocks, baseEntry].slice(-MAX_BLOCK_ATTEMPTS),
+      };
+    }
+
+    case "run_started": {
+      // A pending placeholder rather than null: null lets notConfirmedOutcome fall back to an
+      // earlier run's not_demonstrated block row.
+      const lastRunOutcome =
+        prev.lastRunOutcome !== null &&
+        prev.lastRunOutcome.workflowRunId !== event.workflow_run_id
+          ? {
+              verdict: "not_evaluated" as const,
+              role: "interim_build_test" as const,
+              displayReason: null,
+              workflowRunId: event.workflow_run_id,
+            }
+          : prev.lastRunOutcome;
+      if (!event.skipped_prefix?.length) {
+        return lastRunOutcome === prev.lastRunOutcome
+          ? prev
+          : { ...prev, lastRunOutcome };
+      }
+      return {
+        ...prev,
+        lastRunOutcome,
+        pendingSkippedPrefix: {
+          ...prev.pendingSkippedPrefix,
+          [event.workflow_run_id]: event.skipped_prefix,
+        },
       };
     }
 
@@ -1535,6 +1682,7 @@ export function applyNarrativeEvent(
           verdict: event.verdict,
           role: event.role ?? "recorded",
           displayReason: event.display_reason ?? null,
+          workflowRunId: event.workflow_run_id,
         },
       };
     }
@@ -1807,6 +1955,11 @@ function normalizeActivityEntries(raw: unknown): ActivityEntry[] {
       success: typeof o.success === "boolean" ? o.success : undefined,
       codeDiffs: parseCodeDiffs(o.codeDiffs),
       browserSteps: parseStringList(o.browserSteps) ?? undefined,
+      workflowRunId:
+        typeof o.workflowRunId === "string" && o.workflowRunId
+          ? o.workflowRunId
+          : undefined,
+      testInputs: parseTestInputs(o.testInputs),
       id: o.id,
       reason: actionReason(o.reason),
       activityBucket: parseActivityBucket(o.activityBucket),
@@ -1897,7 +2050,53 @@ function parseReviewProjection(raw: unknown): ReviewProjection | null {
       blockLabels: group.blockLabels,
     });
   }
-  return { blocks, duplicateWrites };
+  const labels = (raw: unknown): string[] =>
+    Array.isArray(raw)
+      ? raw.filter((label): label is string => typeof label === "string")
+      : [];
+  // Payloads persisted before inputs were published carry none, and a malformed row drops
+  // alone rather than voiding the review.
+  const inputs: NonNullable<ReviewProjection["inputs"]> = [];
+  for (const rawInput of Array.isArray(value.inputs) ? value.inputs : []) {
+    const input = (rawInput ?? {}) as Record<string, unknown>;
+    if (
+      typeof input.key === "string" &&
+      (input.change === "added" ||
+        input.change === "changed" ||
+        input.change === "removed")
+    ) {
+      inputs.push({ key: input.key, change: input.change });
+    }
+  }
+  return {
+    blocks,
+    duplicateWrites,
+    inputs,
+    keptNotes: labels(value.keptNotes),
+    keptDescriptions: labels(value.keptDescriptions),
+  };
+}
+
+function parseSkippedPrefix(raw: unknown): SkippedPrefixBlock[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const entries = raw.flatMap((item): SkippedPrefixBlock[] => {
+    const obj = item as Record<string, unknown>;
+    if (
+      typeof obj?.label !== "string" ||
+      (obj.kind !== "reused" && obj.kind !== "not_run")
+    )
+      return [];
+    return [
+      typeof obj.sourceWorkflowRunId === "string"
+        ? {
+            label: obj.label,
+            kind: obj.kind,
+            sourceWorkflowRunId: obj.sourceWorkflowRunId,
+          }
+        : { label: obj.label, kind: obj.kind },
+    ];
+  });
+  return entries.length > 0 ? entries : undefined;
 }
 
 export function hydrateNarrativeFromPayload(
@@ -1975,12 +2174,17 @@ export function hydrateNarrativeFromPayload(
           typeof obj.workflowRunBlockId === "string"
             ? obj.workflowRunBlockId
             : "",
+        workflowRunId:
+          typeof obj.workflowRunId === "string" && obj.workflowRunId
+            ? obj.workflowRunId
+            : undefined,
         label: typeof obj.label === "string" ? obj.label : "",
         blockType: typeof obj.blockType === "string" ? obj.blockType : "task",
         outcome,
         outcomeRole,
         outcomeReason:
           typeof obj.outcomeReason === "string" ? obj.outcomeReason : undefined,
+        skippedBefore: parseSkippedPrefix(obj.skippedBefore),
         state: ((): BlockState["state"] => {
           const s = obj.state;
           if (
@@ -2101,6 +2305,9 @@ export function hydrateNarrativeFromPayload(
       payload.googleConnectionNotices,
     ),
     demonstrationOffer: payload.demonstrationOffer === true,
+    canonicalWorkflowUnavailable: parseCanonicalWorkflowUnavailable(
+      payload.canonicalWorkflowUnavailable,
+    ),
     review: parseReviewProjection(payload.review),
     turnFacts,
     budgetExpiry,
@@ -2205,6 +2412,7 @@ export function latestBlocksByLabel(blocks: BlockState[]): BlockState[] {
 export interface NotConfirmedOutcome {
   verdict: "not_demonstrated";
   displayReason: string | null;
+  workflowRunId?: string;
 }
 
 function notDemonstratedBlock(blocks: BlockState[]): BlockState | null {
@@ -2229,6 +2437,7 @@ export function notConfirmedOutcome(
       ? {
           verdict: "not_demonstrated",
           displayReason: turn.lastRunOutcome.displayReason,
+          workflowRunId: turn.lastRunOutcome.workflowRunId,
         }
       : null;
   }
@@ -2242,14 +2451,23 @@ export function notConfirmedOutcome(
         turn.turnFacts?.recordedFailure ??
         notDemonstratedBlock(turn.blocks)?.outcomeReason ??
         null,
+      workflowRunId: turn.turnFacts?.runId ?? undefined,
     };
   }
-  const block = notDemonstratedBlock(turn.blocks);
+  const anchoredRunId = turn.turnFacts?.runId;
+  const block = notDemonstratedBlock(
+    anchoredRunId
+      ? turn.blocks.filter(
+          (b) => !b.workflowRunId || b.workflowRunId === anchoredRunId,
+        )
+      : turn.blocks,
+  );
   return block === null
     ? null
     : {
         verdict: "not_demonstrated",
         displayReason: block.outcomeReason ?? null,
+        workflowRunId: block.workflowRunId,
       };
 }
 

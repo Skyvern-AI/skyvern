@@ -2,8 +2,10 @@ import copy
 import json
 import re
 import typing
+import weakref
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Awaitable, Callable, Self
 
@@ -14,6 +16,7 @@ from pydantic import BaseModel, PrivateAttr
 from skyvern.exceptions import UnknownElementTreeFormat
 from skyvern.forge.sdk.api.crypto import calculate_sha256
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.webeye.document_navigation import DocumentNavigation
 
 if typing.TYPE_CHECKING:
     from skyvern.webeye.browser_state import BrowserState
@@ -185,6 +188,27 @@ class ElementTreeBuilder(ABC):
     last_used_element_tree_html: str | None
 
 
+@dataclass(frozen=True)
+class _ScrapeOrigin:
+    page: "weakref.ref[Page]"
+    url: str
+    # The public html at binding, held only to notice it being replaced, and the html read with the tree.
+    html: str
+    source_html: str
+    element_tree: list[dict]
+    # The tree stays mutable after the scrape, so an edit in place is caught by its digest rather than its identity.
+    tree_digest: str
+    captured_at: datetime
+    navigation: DocumentNavigation | None = None
+
+
+def _tree_digest(element_tree: list[dict]) -> str | None:
+    try:
+        return calculate_sha256(json.dumps(element_tree))
+    except (TypeError, ValueError, RecursionError):
+        return None
+
+
 class ScrapedPage(BaseModel, ElementTreeBuilder):
     """
     Scraped response from a webpage, including:
@@ -221,6 +245,7 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
     _clean_up_func: CleanupElementTreeFunc = PrivateAttr()
     _scrape_exclude: ScrapeExcludeFunc | None = PrivateAttr(default=None)
     _document_loader_id: str | None = PrivateAttr(default=None)
+    _origin: "_ScrapeOrigin | None" = PrivateAttr(default=None)
 
     def __init__(self, **data: Any) -> None:
         missing_attrs = [attr for attr in ["_browser_state", "_clean_up_func"] if attr not in data]
@@ -239,6 +264,68 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
         self._clean_up_func = clean_up_func
         self._scrape_exclude = scrape_exclude
         self._document_loader_id = document_loader_id
+
+    def bind_origin(
+        self,
+        page: Page | None,
+        captured_at: datetime | None = None,
+        source_html: str | None = None,
+        navigation: DocumentNavigation | None = None,
+    ) -> None:
+        """Record the page this scrape's url and element tree were read from, the html read with them (the public html
+        unless given), when they were read (now unless given) and, when known, the request that committed their
+        document."""
+        digest = _tree_digest(self.element_tree) if page is not None else None
+        try:
+            self._origin = (
+                None
+                if page is None or digest is None
+                else _ScrapeOrigin(
+                    weakref.ref(page),
+                    self.url,
+                    self.html,
+                    self.html if source_html is None else source_html,
+                    self.element_tree,
+                    digest,
+                    captured_at or datetime.now(UTC),
+                    navigation,
+                )
+            )
+        except TypeError:
+            self._origin = None
+
+    def _live_origin(self) -> _ScrapeOrigin | None:
+        origin = self._origin
+        if (
+            origin is None
+            or origin.url != self.url
+            or origin.html is not self.html
+            or origin.element_tree is not self.element_tree
+            or _tree_digest(self.element_tree) != origin.tree_digest
+        ):
+            return None
+        return origin if origin.page() is not None else None
+
+    def origin_page(self) -> Page | None:
+        """The page that produced this url, html and element tree, or None when that can no longer be shown: the page
+        is gone, or any of them changed after the scrape without re-binding. The working page may have moved since."""
+        origin = self._live_origin()
+        return origin.page() if origin is not None else None
+
+    def origin_html(self) -> str | None:
+        """The html read with this scrape's element tree, which the public html may postdate; None like origin_page()."""
+        origin = self._live_origin()
+        return origin.source_html if origin is not None else None
+
+    def origin_captured_at(self) -> datetime | None:
+        """When this html was read from ``origin_page()``, not when the object is later used; None like it."""
+        origin = self._live_origin()
+        return origin.captured_at if origin is not None else None
+
+    def origin_navigation(self) -> DocumentNavigation | None:
+        """The request that committed the document this scrape read, when the scrape observed it; None like origin_page()."""
+        origin = self._live_origin()
+        return origin.navigation if origin is not None else None
 
     @staticmethod
     def _is_pdf_embed(element: dict) -> str | None:
@@ -501,6 +588,9 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
         self.html = refreshed_page.html
         self.extracted_text = refreshed_page.extracted_text
         self.url = refreshed_page.url
+        # The refresh read whatever page is working now, which may not be the page this object was scraped from; its
+        # origin covers exactly the url, html and tree copied above.
+        self._origin = refreshed_page._origin
         # Defensive: callers today rebuild before reading, but future direct
         # reads of this field post-refresh would otherwise see stale HTML.
         self.last_used_element_tree_html = None

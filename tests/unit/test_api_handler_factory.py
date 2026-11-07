@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import io
 import json
 from asyncio import CancelledError
@@ -1404,7 +1405,7 @@ def test_uses_only_anthropic_models_rejects_openai_claude_proxy() -> None:
 
 
 def test_normalize_llm_model_strips_provider_prefix() -> None:
-    """LiteLLM returns model names with provider prefixes; dbt expects the bare name."""
+    """LiteLLM returns model names with provider prefixes; downstream cost aggregation expects the bare name."""
     assert api_handler_factory._normalize_llm_model("vertex_ai/gemini-3-flash-preview") == "gemini-3-flash-preview"
     assert api_handler_factory._normalize_llm_model("openai/gpt-4.1-mini") == "gpt-4.1-mini"
     assert api_handler_factory._normalize_llm_model("gpt-4") == "gpt-4"
@@ -3976,3 +3977,30 @@ async def test_vertex_cache_primary_failure_log_omits_provider_error(monkeypatch
     event = next(event for event in events if event["event"] == "Vertex cache primary call failed, retrying via router")
     assert event["error_type"] == "RuntimeError"
     assert all(sentinel not in repr(event) for event in events)
+
+
+def test_router_caches_rebuild_when_the_registered_config_object_changes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Both router caches were keyed on llm_key alone, so a config replaced after its router was cached (for
+    example by a registry config transform installed after startup) kept serving the stale router."""
+    from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry  # local import
+
+    llm_key = "TEST_ROUTER_CACHE_CONFIG_IDENTITY"
+    # Builds a real litellm Router; a redis_host would make it import the redis package, which the OSS install lacks.
+    first = dataclasses.replace(_make_three_tier_router_config(fallback_groups=["fallback-group"]), redis_host=None)
+    _stub_for_router_test(monkeypatch, llm_key=llm_key, config=first)
+    api_handler_factory._LLMCALLER_ROUTER_CACHE.pop(llm_key, None)
+    try:
+        handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router(llm_key)
+        router = api_handler_factory._get_or_build_cached_router(llm_key, first)
+        assert LLMAPIHandlerFactory.get_llm_api_handler_with_router(llm_key) is handler
+        assert api_handler_factory._get_or_build_cached_router(llm_key, first) is router
+
+        second = dataclasses.replace(first)
+        LLMConfigRegistry.deregister_config(llm_key)
+        LLMConfigRegistry.register_config(llm_key, second)
+        assert LLMAPIHandlerFactory.get_llm_api_handler_with_router(llm_key) is not handler
+        assert api_handler_factory._get_or_build_cached_router(llm_key, second) is not router
+    finally:
+        LLMConfigRegistry.deregister_config(llm_key)
+        LLMAPIHandlerFactory._router_handler_cache.pop(llm_key, None)
+        api_handler_factory._LLMCALLER_ROUTER_CACHE.pop(llm_key, None)

@@ -138,26 +138,50 @@ function clearRuntimeApiKey(): void {
   notifyRuntimeCredentialChanged();
 }
 
-async function getCredentialParam(
+const STREAM_SUBPROTOCOL = "skyvern.v1";
+// RFC 6455 subprotocols must be RFC 7230 tokens; a browser throws on anything else.
+const SUBPROTOCOL_TOKEN = /^[A-Za-z0-9!#$%&'*+\-.^_`|~]+$/;
+
+/**
+ * Streaming WebSocket subprotocols carrying the credential, so it never appears in the URL.
+ * The server reads `bearer.<jwt>` / `apikey.<key>` and echoes `skyvern.v1`.
+ */
+async function getWebSocketProtocols(
   credentialGetter: (() => Promise<string | null>) | null,
-): Promise<string> {
+): Promise<string[]> {
   if (!credentialGetter) {
     await whenRuntimeCredentialReady();
   }
-  const params = new URLSearchParams();
+  const protocols = [STREAM_SUBPROTOCOL];
   const apiKey = getRuntimeApiKey();
   if (apiKey) {
-    params.set("apikey", apiKey);
+    if (SUBPROTOCOL_TOKEN.test(apiKey)) {
+      protocols.push(`apikey.${apiKey}`);
+    } else {
+      console.warn(
+        "Streaming API key is not a valid WebSocket subprotocol token; omitting it",
+      );
+    }
   }
 
   if (credentialGetter) {
     const token = await credentialGetter();
     if (token) {
-      params.set("token", `Bearer ${token}`);
+      if (SUBPROTOCOL_TOKEN.test(token)) {
+        protocols.push(`bearer.${token}`);
+      } else {
+        console.warn(
+          "Streaming auth token is not a valid WebSocket subprotocol token; omitting it",
+        );
+      }
     }
   }
 
-  return params.toString();
+  return protocols;
+}
+
+function hasWebSocketCredential(protocols: string[]): boolean {
+  return protocols.length > 1;
 }
 
 const useNewRunsUrl = true as const;
@@ -175,7 +199,8 @@ export {
   lsKeys,
   wssBaseUrl,
   newWssBaseUrl,
-  getCredentialParam,
+  getWebSocketProtocols,
+  hasWebSocketCredential,
   getRuntimeApiKey,
   getRuntimeApiKeyExpiresAt,
   persistRuntimeApiKey,

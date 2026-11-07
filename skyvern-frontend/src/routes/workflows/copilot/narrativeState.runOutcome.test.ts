@@ -201,6 +201,40 @@ describe("applyNarrativeEvent — run_outcome", () => {
     expect(notConfirmedOutcome(s)).toBeNull();
   });
 
+  it("shows a started run's skipped rows before its first block while it runs", () => {
+    const skipped = [{ label: "load_records", kind: "reused" as const }];
+    const s = reduce([
+      turnStart(),
+      blockProgress({
+        block_label: "earlier_run",
+        status: "failed",
+        workflow_run_id: "wr_0",
+      }),
+      {
+        type: "run_started",
+        workflow_run_id: "wr_1",
+        skipped_prefix: skipped,
+        timestamp: "2026-06-10T00:00:03Z",
+      },
+      blockProgress({
+        block_label: "open_search",
+        status: "running",
+        workflow_run_id: "wr_1",
+      }),
+      blockProgress({
+        block_label: "search_person",
+        status: "running",
+        workflow_run_id: "wr_1",
+      }),
+    ]);
+    expect(s.blocks.map((b) => b.skippedBefore)).toEqual([
+      undefined,
+      skipped,
+      undefined,
+    ]);
+    expect(s.pendingSkippedPrefix).toEqual({});
+  });
+
   it("evaluating hold withholds the success affordance until the final frame", () => {
     const s = reduce([...bothBlocksRan, runOutcome({ verdict: "evaluating" })]);
     for (const b of s.blocks) {
@@ -476,6 +510,75 @@ describe("hydrateNarrativeFromPayload — outcome", () => {
   });
 });
 
+describe("run_started supersedes an earlier run's verdict", () => {
+  const runStarted = (
+    workflowRunId: string,
+    skippedPrefix: { label: string; kind: "reused" }[] = [],
+  ) => ({
+    type: "run_started" as const,
+    workflow_run_id: workflowRunId,
+    skipped_prefix: skippedPrefix,
+    timestamp: "2026-06-10T00:01:30Z",
+  });
+
+  it("clears an ownerless not-confirmed verdict when a new run starts", () => {
+    const refused = [
+      turnStart(),
+      runOutcome({
+        workflow_run_id: "",
+        workflow_run_block_ids: [],
+        block_labels: [],
+        verdict: "not_demonstrated",
+        reason_code: "blocker_reported",
+        display_reason: "Credential approval blocked this run.",
+      }),
+    ];
+    expect(notConfirmedOutcome(reduce(refused))).not.toBeNull();
+
+    const s = reduce([
+      ...refused,
+      runStarted("wr_2"),
+      blockProgress({
+        block_label: "login",
+        status: "running",
+        workflow_run_id: "wr_2",
+      }),
+    ]);
+    expect(notConfirmedOutcome(s)).toBeNull();
+  });
+
+  it("does not fall back to the earlier run's block verdict while the new run runs", () => {
+    const skipped = [{ label: "open_search", kind: "reused" as const }];
+    const s = reduce([
+      ...bothBlocksRan,
+      runOutcome({
+        verdict: "not_demonstrated",
+        reason_code: "blocker_reported",
+        display_reason: "The search stayed gated by a verification challenge.",
+      }),
+      runStarted("wr_2", skipped),
+    ]);
+    expect(notConfirmedOutcome(s)).toBeNull();
+    expect(s.blocks.map((b) => b.outcome)).toEqual([
+      "not_demonstrated",
+      "not_demonstrated",
+    ]);
+    expect(s.pendingSkippedPrefix).toEqual({ wr_2: skipped });
+  });
+
+  it("keeps the verdict when run_started repeats for the same run", () => {
+    const s = reduce([
+      ...bothBlocksRan,
+      runOutcome({
+        verdict: "not_demonstrated",
+        display_reason: "The search stayed gated by a verification challenge.",
+      }),
+      runStarted("wr_1"),
+    ]);
+    expect(notConfirmedOutcome(s)?.workflowRunId).toBe("wr_1");
+  });
+});
+
 describe("notConfirmedOutcome — recorded run facts", () => {
   const base = {
     ...EMPTY_NARRATIVE,
@@ -533,7 +636,43 @@ describe("notConfirmedOutcome — recorded run facts", () => {
     expect(outcome).toEqual({
       verdict: "not_demonstrated",
       displayReason: "Browser operation timed out on line 18.",
+      workflowRunId: "wr_1",
     });
+  });
+
+  it("a reloaded turn whose anchored run never recorded does not borrow an earlier run's block verdict", () => {
+    const outcome = notConfirmedOutcome({
+      ...base,
+      lastRunOutcome: null,
+      turnFacts: {
+        factsAvailable: true,
+        authoredBlockCount: 1,
+        matchingSourceBlockCount: 1,
+        evaluationState: null,
+        runId: "wr_2",
+        runCompleted: null,
+        terminalCause: null,
+        blocksRunThisTurn: null,
+        recordedFailure: null,
+        ranCleanOnCurrentSource: false,
+      },
+      blocks: [
+        {
+          workflowRunBlockId: "wrb_1",
+          workflowRunId: "wr_1",
+          label: "checkout",
+          blockType: "code",
+          outcome: "not_demonstrated",
+          outcomeReason: "The earlier run never reached the dashboard.",
+          state: "completed",
+          lastSeenIteration: 0,
+          activity: [],
+          startedAt: null,
+          endedAt: null,
+        },
+      ],
+    });
+    expect(outcome).toBeNull();
   });
 
   it("a recorded demonstrated outcome suppresses the block-derived not-confirmed", () => {
@@ -934,6 +1073,7 @@ describe("hydrateNarrativeFromPayload -- a superseded build test", () => {
     expect(notConfirmedOutcome(withBlock!)).toEqual({
       verdict: "not_demonstrated",
       displayReason: "Cart never showed the item.",
+      workflowRunId: "wr_superseded",
     });
 
     const withoutBlocks = hydrateNarrativeFromPayload({
@@ -946,6 +1086,7 @@ describe("hydrateNarrativeFromPayload -- a superseded build test", () => {
     expect(notConfirmedOutcome(withoutBlocks!)).toEqual({
       verdict: "not_demonstrated",
       displayReason: null,
+      workflowRunId: "wr_superseded",
     });
   });
 

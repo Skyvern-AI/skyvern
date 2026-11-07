@@ -85,7 +85,6 @@ import { getOrderedRunParameters } from "./utils";
 import { buildWorkflowAnalyticsPath } from "./workflowAnalyticsPath";
 import { usePostHogFeatureFlagVariantKey as useFeatureFlagVariantKey } from "@/hooks/usePostHogFeatureFlag";
 import { EXPERIMENT, isABVariant } from "@/util/onboarding/experimentConfig";
-import { useAnalyticsDashboardFlag } from "@/hooks/useAnalyticsDashboardFlag";
 import {
   useUrlTagFilter,
   useWorkflowTaggingEnabled,
@@ -115,7 +114,6 @@ function WorkflowPage() {
   const isNewUser = onboarding?.isNewUser ?? false;
   const onboardingState = onboarding?.state ?? null;
   const onboardingFlag = useFeatureFlagVariantKey(EXPERIMENT.flagKey);
-  const analyticsEnabled = useAnalyticsDashboardFlag() === true;
   const [searchParams, setSearchParams] = useSearchParams();
   // Snapped once on mount so the window stays stable across unrelated
   // searchParams changes (page flips, search) instead of re-sampling `now`.
@@ -313,7 +311,7 @@ function WorkflowPage() {
                 onSuccessfullyDeleted={() => navigate("/agents")}
               />
             )}
-            {isCloud && analyticsEnabled ? (
+            {isCloud ? (
               <Button asChild variant="secondary">
                 <Link to={buildWorkflowAnalyticsPath(workflowPermanentId)}>
                   <BarChartIcon className="mr-2 size-4" />

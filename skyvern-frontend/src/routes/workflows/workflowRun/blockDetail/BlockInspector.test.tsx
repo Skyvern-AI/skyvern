@@ -215,7 +215,64 @@ describe("BlockInspector failure scoping", () => {
     expect(screen.getByText("Login rejected")).toBeDefined();
   });
 
-  it("leads a code block failure with its error state, line and code", () => {
+  it("leads a code block failure with the code's own message and keeps every fact under details", () => {
+    const reason =
+      "CodeBlock failed with ValueError at line 4: Could not find the expiration input.";
+    const block = buildBlock({
+      block_type: "code",
+      error_codes: ["user_code_error"],
+      failure_reason: reason,
+      final_url: "https://quote.test/step-1",
+      actions: [
+        buildAction({
+          action_type: ActionTypes.NullAction,
+          status: Status.Failed,
+          created_at: "2026-11-04T20:06:13.6Z",
+        }),
+        buildAction({ created_at: "2026-11-04T20:06:10.1Z" }),
+      ],
+      output: {
+        code_failure: {
+          exception_class: "ValueError",
+          message: "Could not find the expiration input.",
+          line: 4,
+          source_line:
+            'raise ValueError("Could not find the expiration input.")',
+        },
+      },
+    });
+    render(<BlockInspector block={block} />);
+
+    expect(
+      screen.getByText("Could not find the expiration input."),
+    ).toBeDefined();
+    expect(
+      screen.getByText("Last browser step: Click, 3.5 s before the error"),
+    ).toBeDefined();
+    expect(
+      screen
+        .getByRole("link", { name: "https://quote.test/step-1" })
+        .getAttribute("target"),
+    ).toBe("_blank");
+    expect(screen.queryByText(/open the block|fix the line/i)).toBeNull();
+    const technicalDetails = screen
+      .getByText("Technical details")
+      .closest("details");
+    expect(technicalDetails?.open).toBe(false);
+    fireEvent.click(screen.getByText("Technical details"));
+    expect(technicalDetails?.open).toBe(true);
+    for (const fact of [
+      "ValueError",
+      "4",
+      'raise ValueError("Could not find the expiration input.")',
+      "user_code_error",
+      reason,
+    ]) {
+      expect(screen.getByText(fact)).toBeDefined();
+    }
+  });
+
+  it("shows an older code failure's template title without parsing the reason", () => {
     const block = buildBlock({
       block_type: "code",
       error_codes: ["user_code_error"],
@@ -224,21 +281,9 @@ describe("BlockInspector failure scoping", () => {
     });
     render(<BlockInspector block={block} />);
 
-    expect(screen.getByText("The block's code raised NameError")).toBeDefined();
-    expect(screen.getByText("Line 6")).toBeDefined();
-    expect(screen.getByText("Error code user_code_error")).toBeDefined();
-    const technicalDetails = screen
-      .getByText("Technical details")
-      .closest("details");
-    expect(technicalDetails?.open).toBe(false);
-    fireEvent.click(screen.getByText("Technical details"));
-    expect(technicalDetails?.open).toBe(true);
-    // The raw reason stays: it carries the message the exception name cannot.
-    expect(
-      screen.getByText(
-        "CodeBlock failed with NameError at line 6: name 'min' is not defined.",
-      ),
-    ).toBeDefined();
+    expect(screen.getByText("The block's code raised an error")).toBeDefined();
+    expect(screen.queryByText(/^Page:/)).toBeNull();
+    expect(screen.queryByText(/^Last browser step/)).toBeNull();
   });
 
   it("tells the user a sandbox fault is not theirs to fix", () => {
@@ -250,7 +295,9 @@ describe("BlockInspector failure scoping", () => {
     render(<BlockInspector block={block} />);
 
     expect(screen.getByText("The code sandbox was unreachable")).toBeDefined();
-    expect(screen.getByText(/not a problem with your code/i)).toBeDefined();
+    expect(
+      screen.getByText(/not a problem with the block's code/i),
+    ).toBeDefined();
   });
 
   it("labels a workflow-declared error code as metadata", () => {
@@ -272,10 +319,11 @@ describe("BlockInspector failure scoping", () => {
     expect(
       screen.getByText('The workflow reported "inventory_unavailable"'),
     ).toBeDefined();
-    expect(screen.getByText("Error code inventory_unavailable")).toBeDefined();
+    fireEvent.click(screen.getByText("Technical details"));
+    expect(screen.getByText("inventory_unavailable")).toBeDefined();
   });
 
-  it("omits technical details when a classified failure has no raw reason", () => {
+  it("keeps the error code under technical details when there is no raw reason", () => {
     const block = buildBlock({
       block_type: "code",
       error_codes: ["runner_unavailable"],
@@ -284,7 +332,8 @@ describe("BlockInspector failure scoping", () => {
     render(<BlockInspector block={block} />);
 
     expect(screen.getByText("The code sandbox was unreachable")).toBeDefined();
-    expect(screen.queryByText("Technical details")).toBeNull();
+    fireEvent.click(screen.getByText("Technical details"));
+    expect(screen.getByText("runner_unavailable")).toBeDefined();
   });
 });
 
@@ -301,5 +350,36 @@ describe("BlockInspector Gmail send outcome", () => {
     expect(screen.getByText("Outcome unknown")).toBeDefined();
     expect(screen.getByText(reason)).toBeDefined();
     expect(screen.queryByText(/not sent|nothing was sent/i)).toBeNull();
+  });
+});
+
+describe("BlockInspector Power BI query output", () => {
+  it("renders the direct row array without a response wrapper", () => {
+    render(
+      <BlockInspector
+        block={buildBlock({
+          block_type: "powerbi_query",
+          output: [{ "Product Name": "Widget", "Net Sales": 17 }],
+        })}
+      />,
+    );
+
+    expect(screen.getByText(/Product Name: "Widget"/)).toBeDefined();
+    expect(screen.queryByText(/rows:/i)).toBeNull();
+  });
+
+  it("shows the standard safe failure reason in the summary", () => {
+    const safeFailure = "Power BI query could not be completed.";
+    render(
+      <BlockInspector
+        block={buildBlock({
+          block_type: "powerbi_query",
+          status: Status.Failed,
+          failure_reason: safeFailure,
+        })}
+      />,
+    );
+
+    expect(screen.getByText(safeFailure)).toBeDefined();
   });
 });

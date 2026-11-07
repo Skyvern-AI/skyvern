@@ -284,6 +284,7 @@ async def test_execute_workflow_cleans_up_after_enterprise_gate_failure(
         close_browser_on_completion=True,
         need_call_webhook=True,
         attempt_number=1,
+        final_diagnostic_owner=None,
     )
 
 

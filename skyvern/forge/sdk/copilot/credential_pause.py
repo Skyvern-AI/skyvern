@@ -29,7 +29,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol
 from urllib.parse import urlparse
 
 import structlog
@@ -48,15 +48,22 @@ from skyvern.forge.sdk.copilot.credential_resolution import (
 )
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import DiagnosisFailureType, RepairNextAction
 from skyvern.forge.sdk.copilot.human_input_wait import pause_human_input
-from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, credential_binding
+from skyvern.forge.sdk.copilot.runtime import live_working_page
+from skyvern.forge.sdk.copilot.workflow_credential_utils import url_origin
+from skyvern.forge.sdk.credential_site_policy import LoginSite, same_release_scope
 from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     CredentialPauseResolvedOutcome,
+    CredentialSiteAnswer,
     WorkflowCopilotCredentialPauseResolvedUpdate,
     WorkflowCopilotCredentialRegistration,
     WorkflowCopilotCredentialRequiredUpdate,
+    WorkflowCopilotCredentialSiteQuestion,
     WorkflowCopilotStreamMessageType,
 )
+from skyvern.forge.sdk.services.request_principal import get_request_principal
+from skyvern.forge.sdk.workflow.models.credential_release import login_site_url, saved_site_urls
 
 if TYPE_CHECKING:
     from agents.result import RunResultStreaming
@@ -140,6 +147,40 @@ class ManualSignIn:
     started: bool = False
 
 
+@dataclass(frozen=True)
+class SiteQuestion:
+    """The site question asked about one picked login, holding the saved sites it was asked from."""
+
+    credential_id: str
+    saved_site_urls: tuple[str, ...]
+    vault_sourced: bool
+    name: str = ""
+
+
+@dataclass(frozen=True)
+class SiteAnswer:
+    """``site_a`` is the first of ``saved_sites``, every origin the login was saved for when asked."""
+
+    action: CredentialSiteAnswer
+    site_a: str
+    site_b: str
+    name: str = ""
+    saved_sites: tuple[str, ...] = ()
+
+    @property
+    def saved_sites_text(self) -> str:
+        return ", ".join(self.saved_sites or (self.site_a,))
+
+    def receipt(self) -> dict[str, str | list[str]]:
+        return {
+            "siteAnswer": self.action,
+            "siteA": self.site_a,
+            "siteB": self.site_b,
+            "name": self.name,
+            "savedSites": list(self.saved_sites or (self.site_a,)),
+        }
+
+
 @dataclass
 class _ActivePauseRecord:
     resume_token: str
@@ -152,6 +193,8 @@ class _ActivePauseRecord:
     claim_deadline: datetime | None = None
     registration: WorkflowCopilotCredentialRegistration | None = None
     generated_credential_id: str | None = None
+    site_url: str | None = None
+    site_question: SiteQuestion | None = None
 
     def live_until(self) -> datetime | None:
         if self.status == "pending":
@@ -184,6 +227,17 @@ def _encode_record(record: _ActivePauseRecord) -> str:
             "claim_deadline": record.claim_deadline.isoformat() if record.claim_deadline else None,
             "registration": record.registration.model_dump(mode="json") if record.registration else None,
             "generated_credential_id": record.generated_credential_id,
+            "site_url": record.site_url,
+            "site_question": (
+                {
+                    "credential_id": record.site_question.credential_id,
+                    "saved_site_urls": list(record.site_question.saved_site_urls),
+                    "vault_sourced": record.site_question.vault_sourced,
+                    "name": record.site_question.name,
+                }
+                if record.site_question is not None
+                else None
+            ),
         }
     )
 
@@ -197,6 +251,8 @@ def _encode_active_pause(
     recovery_token_digest: str | None = None,
     manual_sign_in: ManualSignIn | None = None,
     registration: WorkflowCopilotCredentialRegistration | None = None,
+    site_url: str | None = None,
+    site_question: SiteQuestion | None = None,
 ) -> str:
     return _encode_record(
         _ActivePauseRecord(
@@ -207,6 +263,8 @@ def _encode_active_pause(
             recovery_token_digest=recovery_token_digest,
             manual_sign_in=manual_sign_in,
             registration=registration,
+            site_url=site_url,
+            site_question=site_question,
         )
     )
 
@@ -229,6 +287,30 @@ def _decode_manual_sign_in(data: Any) -> ManualSignIn | None:
         login_urls=login_urls,
         profile_name=profile_name,
         started=data.get("started") is True,
+    )
+
+
+def _decode_site_question(data: Any) -> SiteQuestion | None:
+    if not isinstance(data, dict):
+        return None
+    credential_id, urls, vault_sourced = (
+        data.get("credential_id"),
+        data.get("saved_site_urls"),
+        data.get("vault_sourced"),
+    )
+    if (
+        not isinstance(credential_id, str)
+        or not isinstance(urls, list)
+        or not all(isinstance(url, str) for url in urls)
+        or not isinstance(vault_sourced, bool)
+    ):
+        return None
+    name = data.get("name")
+    return SiteQuestion(
+        credential_id=credential_id,
+        saved_site_urls=tuple(urls),
+        vault_sourced=vault_sourced,
+        name=name if isinstance(name, str) else "",
     )
 
 
@@ -268,6 +350,7 @@ def _decode_active_pause(raw: Any) -> _ActivePauseRecord | None:
     digest = data.get("recovery_token_digest")
     claim_id = data.get("claim_id")
     generated_credential_id = data.get("generated_credential_id")
+    site_url = data.get("site_url")
     return _ActivePauseRecord(
         resume_token=token,
         status=record_status,
@@ -279,6 +362,8 @@ def _decode_active_pause(raw: Any) -> _ActivePauseRecord | None:
         claim_deadline=_decode_datetime(data.get("claim_deadline")),
         registration=registration,
         generated_credential_id=generated_credential_id if isinstance(generated_credential_id, str) else None,
+        site_url=site_url if isinstance(site_url, str) else None,
+        site_question=_decode_site_question(data.get("site_question")),
     )
 
 
@@ -438,6 +523,7 @@ async def resolve_credential_pause(
     resume_token: str,
     action: Literal["connected", "skip"],
     credential_id: str | None,
+    declined_site: bool = False,
 ) -> None:
     """Validate the resume token against the active pause, consume it, then store the decision.
 
@@ -454,6 +540,10 @@ async def resolve_credential_pause(
     await _record_turn_resumed(organization_id, workflow_copilot_chat_id, turn_id)
     async with cache.get_lock(lock_key):
         record = _validate_pending_pause(_decode_active_pause(await cache.get(active_key)), resume_token)
+        site_answer = None
+        if declined_site:
+            question = _bound_site_question(record, credential_id)
+            site_answer = _site_answer("no", record, question)
         ttl = _credential_pause_record_ttl(settings.WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS)
         await cache.set(
             active_key,
@@ -464,9 +554,204 @@ async def resolve_credential_pause(
         )
         await cache.set(
             credential_response_cache_key(organization_id, workflow_copilot_chat_id, turn_id),
-            encode_credential_response(action, credential_id, record.resume_token),
+            encode_credential_response(action, credential_id, record.resume_token, site_answer=site_answer),
             ex=ttl,
         )
+
+
+def _site_conflict(detail: str) -> CredentialPauseRejection:
+    return CredentialPauseRejection(status_code=HTTPStatus.CONFLICT, detail=detail)
+
+
+def _bound_site_question(record: _ActivePauseRecord, credential_id: str | None) -> SiteQuestion:
+    question = record.site_question
+    if question is None or record.site_url is None or question.credential_id != credential_id:
+        raise _site_conflict("This card did not ask about that login's site")
+    return question
+
+
+def _site_answer(action: CredentialSiteAnswer, record: _ActivePauseRecord, question: SiteQuestion) -> SiteAnswer:
+    saved_sites = tuple(dict.fromkeys(origin for url in question.saved_site_urls if (origin := loggable_origin(url))))
+    return SiteAnswer(
+        action=action,
+        site_a=saved_sites[0] if saved_sites else "",
+        site_b=loggable_origin(record.site_url or ""),
+        name=question.name,
+        saved_sites=saved_sites,
+    )
+
+
+def login_saved_for_site(credential: Credential, site_url: str) -> bool:
+    return any(
+        same_release_scope(url, site_url) for url in saved_site_urls(credential.tested_url, credential.extra_site_urls)
+    )
+
+
+async def credential_pause_site_url(
+    cache: BaseCache, *, organization_id: str, workflow_copilot_chat_id: str, turn_id: str, resume_token: str
+) -> str | None:
+    """The site a pick on this pending card could be asked about, or None when it asks none."""
+    record = _validate_pending_pause(
+        _decode_active_pause(
+            await cache.get(credential_pause_active_key(organization_id, workflow_copilot_chat_id, turn_id))
+        ),
+        resume_token,
+    )
+    return record.site_url
+
+
+def _site_question_for(
+    credential: Credential, site_url: str, vault_sites: list[LoginSite] | None
+) -> tuple[WorkflowCopilotCredentialSiteQuestion, SiteQuestion] | None:
+    if vault_sites is not None:
+        if vault_sites and any(site.admits(site_url) for site in vault_sites):
+            return None
+        saved = [site.url for site in vault_sites]
+    else:
+        # Add keeps the tested URL, so a login without one is left to the pause's own checks.
+        saved = saved_site_urls(credential.tested_url, credential.extra_site_urls)
+        if not credential.tested_url or login_saved_for_site(credential, site_url):
+            return None
+    question = WorkflowCopilotCredentialSiteQuestion(
+        credential_id=credential.credential_id,
+        name=credential.name,
+        site=loggable_origin(site_url),
+        saved_sites=list(dict.fromkeys(origin for url in saved if (origin := loggable_origin(url)))),
+        vault_sourced=vault_sites is not None,
+    )
+    return question, SiteQuestion(
+        credential_id=credential.credential_id,
+        saved_site_urls=tuple(saved),
+        vault_sourced=vault_sites is not None,
+        name=credential.name,
+    )
+
+
+async def _lead_site_question(
+    ctx: CopilotContext, credential_id: str, site_url: str
+) -> tuple[WorkflowCopilotCredentialSiteQuestion, SiteQuestion] | None:
+    """The site question a recovery card opens with for the login a fill refused, or None when none can be asked."""
+    from skyvern.forge.sdk.routes.credentials import vault_login_sites  # circular import
+
+    try:
+        await app.AGENT_FUNCTION.enforce_credential_use(
+            ctx.organization_id, credential_id, principal=get_request_principal()
+        )
+        credential = await app.DATABASE.credentials.get_credential(credential_id, organization_id=ctx.organization_id)
+        if credential is None:
+            return None
+        asked_pair = _site_question_for(credential, site_url, await vault_login_sites(credential))
+    except Exception:
+        # The card then opens as a plain picker, and a pick of this login still asks.
+        LOG.info("copilot_credential_lead_site_question_unavailable", credential_id=credential_id, exc_info=True)
+        return None
+    if asked_pair is not None:
+        question = asked_pair[0]
+        LOG.info(
+            "copilot_credential_site_question",
+            credential_id=credential_id,
+            site=question.site,
+            saved_sites=question.saved_sites,
+            vault_sourced=question.vault_sourced,
+            led=True,
+        )
+    return asked_pair
+
+
+async def ask_credential_site(
+    cache: BaseCache,
+    *,
+    organization_id: str,
+    workflow_copilot_chat_id: str,
+    turn_id: str,
+    resume_token: str,
+    credential: Credential,
+    vault_sites: list[LoginSite] | None,
+) -> WorkflowCopilotCredentialSiteQuestion | None:
+    """Record and return the site question for a picked login, or None; ``vault_sites`` is None unless a vault
+    names the login's sites."""
+    active_key = credential_pause_active_key(organization_id, workflow_copilot_chat_id, turn_id)
+    async with cache.get_lock(_credential_pause_lock_key(organization_id, workflow_copilot_chat_id, turn_id)):
+        record = _validate_pending_pause(_decode_active_pause(await cache.get(active_key)), resume_token)
+        if record.site_url is None:
+            return None
+        asked_pair = _site_question_for(credential, record.site_url, vault_sites)
+        if asked_pair is None:
+            return None
+        question, site_question = asked_pair
+        card = record.card.model_copy(update={"site_question": question}) if record.card is not None else None
+        asked = replace(record, card=card, site_question=site_question)
+        await cache.set(active_key, _encode_record(asked), ex=_longest_credential_pause_record_ttl())
+        return question
+
+
+@dataclass(frozen=True)
+class SiteChangeClaim:
+    claim_id: str
+    site_url: str
+    question: SiteQuestion
+    answer: SiteAnswer
+
+
+async def claim_credential_site_change(
+    cache: BaseCache,
+    *,
+    organization_id: str,
+    workflow_copilot_chat_id: str,
+    turn_id: str,
+    resume_token: str,
+    credential_id: str,
+) -> SiteChangeClaim:
+    """Reserve the pause for one Allow while the login's sites are saved outside the pause lock."""
+    active_key = credential_pause_active_key(organization_id, workflow_copilot_chat_id, turn_id)
+    async with cache.get_lock(_credential_pause_lock_key(organization_id, workflow_copilot_chat_id, turn_id)):
+        record = _validate_pending_pause(_decode_active_pause(await cache.get(active_key)), resume_token)
+        question = _bound_site_question(record, credential_id)
+        if question.vault_sourced:
+            raise _site_conflict("This login's sites come from a connected vault; add the site there")
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=MANUAL_SIGN_IN_CLAIM_SECONDS)
+        claim_id = secrets.token_hex(16)
+        claimed = replace(record, status="resolving", claim_id=claim_id, claim_deadline=deadline)
+        await cache.set(active_key, _encode_record(claimed), ex=_longest_credential_pause_record_ttl())
+        return SiteChangeClaim(
+            claim_id=claim_id,
+            site_url=record.site_url or "",
+            question=question,
+            answer=_site_answer("add", record, question),
+        )
+
+
+async def finish_credential_site_change(
+    cache: BaseCache,
+    *,
+    organization_id: str,
+    workflow_copilot_chat_id: str,
+    turn_id: str,
+    claim: SiteChangeClaim,
+    written: bool,
+) -> bool:
+    """Connect the login after a site change that may have saved, else reopen the card; False: the claim was lost."""
+    active_key = credential_pause_active_key(organization_id, workflow_copilot_chat_id, turn_id)
+    if written:
+        await _record_turn_resumed(organization_id, workflow_copilot_chat_id, turn_id)
+    async with cache.get_lock(_credential_pause_lock_key(organization_id, workflow_copilot_chat_id, turn_id)):
+        record = _decode_active_pause(await cache.get(active_key))
+        if record is None or record.status != "resolving" or record.claim_id != claim.claim_id:
+            return False
+        ttl = _longest_credential_pause_record_ttl()
+        if not written:
+            reopened = replace(record, status="pending", claim_id=None, claim_deadline=None)
+            await cache.set(active_key, _encode_record(reopened), ex=ttl)
+            return True
+        await cache.set(active_key, _encode_active_pause(record.resume_token, record.expires_at, consumed=True), ex=ttl)
+        await cache.set(
+            credential_response_cache_key(organization_id, workflow_copilot_chat_id, turn_id),
+            encode_credential_response(
+                "connected", claim.question.credential_id, record.resume_token, site_answer=claim.answer
+            ),
+            ex=ttl,
+        )
+        return True
 
 
 @dataclass(frozen=True)
@@ -483,6 +768,7 @@ class CredentialPauseResolution:
     credential: Credential | None = None
     signed_in: SignedInProfile | None = None
     generated: bool = False
+    site_answer: SiteAnswer | None = None
 
 
 def encode_credential_response(
@@ -490,8 +776,17 @@ def encode_credential_response(
     credential_id: str | None,
     resume_token: str,
     signed_in: SignedInProfile | None = None,
+    site_answer: SiteAnswer | None = None,
 ) -> str:
     payload: dict[str, Any] = {"action": action, "credential_id": credential_id, "resume_token": resume_token}
+    if site_answer is not None:
+        payload["site_answer"] = {
+            "action": site_answer.action,
+            "site_a": site_answer.site_a,
+            "site_b": site_answer.site_b,
+            "name": site_answer.name,
+            "saved_sites": list(site_answer.saved_sites),
+        }
     if signed_in is not None:
         payload["signed_in"] = {
             "browser_profile_id": signed_in.browser_profile_id,
@@ -516,7 +811,33 @@ def _decode_signed_in(data: Any) -> SignedInProfile | None:
     return SignedInProfile(browser_profile_id=profile_id, profile_name=name, site=site, cookie_count=count)
 
 
-def _decode_credential_response(raw: Any) -> tuple[str, str | None, str | None, SignedInProfile | None] | None:
+def _decode_site_answer(data: Any) -> SiteAnswer | None:
+    if not isinstance(data, dict):
+        return None
+    action, site_a, site_b = data.get("action"), data.get("site_a"), data.get("site_b")
+    if action not in ("add", "no") or not isinstance(site_a, str) or not isinstance(site_b, str):
+        return None
+    name, saved_sites = data.get("name"), data.get("saved_sites")
+    return SiteAnswer(
+        action=action,
+        site_a=site_a,
+        site_b=site_b,
+        name=name if isinstance(name, str) else "",
+        saved_sites=tuple(saved_sites)
+        if isinstance(saved_sites, list) and all(isinstance(site, str) for site in saved_sites)
+        else (),
+    )
+
+
+class _CredentialResponse(NamedTuple):
+    action: str
+    credential_id: str | None
+    resume_token: str | None
+    signed_in: SignedInProfile | None
+    site_answer: SiteAnswer | None
+
+
+def _decode_credential_response(raw: Any) -> _CredentialResponse | None:
     try:
         data = json.loads(raw)
     except (TypeError, ValueError):
@@ -525,11 +846,12 @@ def _decode_credential_response(raw: Any) -> tuple[str, str | None, str | None, 
         return None
     credential_id = data.get("credential_id")
     resume_token = data.get("resume_token")
-    return (
-        data["action"],
-        credential_id if isinstance(credential_id, str) else None,
-        resume_token if isinstance(resume_token, str) else None,
-        _decode_signed_in(data.get("signed_in")),
+    return _CredentialResponse(
+        action=data["action"],
+        credential_id=credential_id if isinstance(credential_id, str) else None,
+        resume_token=resume_token if isinstance(resume_token, str) else None,
+        signed_in=_decode_signed_in(data.get("signed_in")),
+        site_answer=_decode_site_answer(data.get("site_answer")),
     )
 
 
@@ -812,11 +1134,16 @@ def _bind_connected_credential_origin(policy: RequestPolicy, credential: Credent
     return admitted_url
 
 
-def apply_connected_credential_to_policy(ctx: CopilotContext, policy: RequestPolicy, credential: Credential) -> None:
+def apply_connected_credential_to_policy(
+    ctx: CopilotContext, policy: RequestPolicy, credential: Credential, confirmed_site_url: str | None = None
+) -> None:
     """Record ``credential`` as the explicit answer to the product-owned pause, reopening the run gate
     (and un-latching ``test_after_update_done``) so the resumed run does not re-skip and re-ask; a
-    raw-secret turn keeps its run gate closed and its draft untested for a later secret-free turn."""
+    raw-secret turn keeps its run gate closed and its draft untested for a later secret-free turn.
+    ``confirmed_site_url`` is a site the user just saved the login for, read back from its row."""
     ctx.credential_pause_connected_credential_id = credential.credential_id
+    if confirmed_site_url and (confirmed_origin := url_origin(confirmed_site_url)):
+        policy.user_confirmed_site_origins.setdefault(credential.credential_id, set()).add(confirmed_origin)
     policy.credential_pause_connected_credential_ids.add(credential.credential_id)
     admitted_url = _bind_connected_credential_origin(policy, credential)
     LOG.info(
@@ -860,11 +1187,12 @@ def _apply_signed_in_profile_to_policy(ctx: Any, policy: RequestPolicy, signed_i
     )
 
 
-def credential_pause_receipt(ctx: CopilotContext) -> dict[str, str] | None:
+def credential_pause_receipt(ctx: CopilotContext) -> dict[str, str | list[str]] | None:
     outcome = ctx.credential_pause_outcome
     if not outcome:
         return None
-    receipt = {"outcome": outcome}
+    site_answer = ctx.credential_pause_site_answer
+    receipt: dict[str, str | list[str]] = {"outcome": outcome, **(site_answer.receipt() if site_answer else {})}
     if outcome == "connected" and ctx.credential_pause_connected_credential_id:
         receipt["credentialId"] = ctx.credential_pause_connected_credential_id
     signed_in_profile_id = ctx.request_policy.credential_pause_signed_in_profile_id if ctx.request_policy else None
@@ -905,6 +1233,22 @@ def _connected_resume_text(credential: Credential) -> str:
     )
 
 
+def site_answer_unused_text(credential: Credential, site_answer: SiteAnswer) -> str:
+    login = f"saved credential {defang_card_text(credential.name)} ({credential.credential_id})"
+    if site_answer.action == "no":
+        return (
+            f"The user chose not to use {login} on {site_answer.site_b}; it stays saved for "
+            f"{site_answer.saved_sites_text}. "
+            f"Tell the user the sign-in on {site_answer.site_b} still needs a saved login, and keep the credential "
+            "parameter placeholder in the draft."
+        )
+    return (
+        f"The user chose to save {login} for {site_answer.site_b}, but the save could not be confirmed, so it was "
+        f"not used there. Tell the user to check the login's sites on the Credentials page, and keep the credential "
+        "parameter placeholder in the draft."
+    )
+
+
 _SKIP_RESUME_TEXT = (
     "The user chose not to connect a credential on this card. Keep the credential parameter placeholder in the "
     "draft. If you run a test, it may stop at the login step."
@@ -921,20 +1265,20 @@ async def _try_resolve_credential_response(
     decoded = _decode_credential_response(raw)
     if decoded is None:
         return "pending"
-    action, credential_id, answered_token, signed_in = decoded
     # The response key is per turn, so a card only takes an answer carrying its own token.
-    if answered_token != resume_token:
+    if decoded.resume_token != resume_token:
         return "pending"
-    if action == "skip":
+    if decoded.action == "skip":
         return CredentialPauseResolution(action="skip")
-    if action == "signed_in":
+    if decoded.action == "signed_in":
+        signed_in = decoded.signed_in
         return CredentialPauseResolution(action="signed_in", signed_in=signed_in) if signed_in else None
-    if not credential_id:
+    if not decoded.credential_id:
         return None
-    existing = await load_credentials(organization_id, credential_ids=[credential_id])
+    existing = await load_credentials(organization_id, credential_ids=[decoded.credential_id])
     if not existing:
         return None
-    return CredentialPauseResolution(action="connected", credential=existing[0])
+    return CredentialPauseResolution(action="connected", credential=existing[0], site_answer=decoded.site_answer)
 
 
 async def _wait_for_credential_response(
@@ -978,7 +1322,7 @@ async def _seconds_left_on_pause(ctx: CopilotContext, resume_token: str) -> floa
 
 
 def _manual_sign_in_offer(ctx: CopilotContext, login_page_urls: list[str]) -> ManualSignIn | None:
-    """A pick card offers signing in yourself in the editor's live browser when there is one to sign in to."""
+    """A pick or update card offers signing in yourself in the editor's live browser when there is one."""
     policy = ctx.request_policy
     site = sign_in_site(login_page_urls)
     if (
@@ -997,6 +1341,23 @@ def _manual_sign_in_offer(ctx: CopilotContext, login_page_urls: list[str]) -> Ma
     )
 
 
+async def _site_question_url(ctx: CopilotContext, login_page_url: str, *, recovery: bool) -> str | None:
+    """The site a picked login may be saved for from this card: the recovery's refused origin, or a plain card's
+    site the browser is on or the user gave, never a site only the model named."""
+    try:
+        site_url = login_site_url(login_page_url)
+    except ValueError:
+        return None
+    if recovery:
+        return site_url
+    policy = ctx.request_policy
+    observed = list(policy.user_provided_site_urls) if isinstance(policy, RequestPolicy) else []
+    page = await live_working_page(ctx)
+    if page is not None:
+        observed.append(page.url)
+    return site_url if any(same_release_scope(site_url, url) for url in observed) else None
+
+
 async def _run_credential_pause(
     ctx: CopilotContext,
     message: str,
@@ -1009,6 +1370,7 @@ async def _run_credential_pause(
     admit_connected: Callable[[Credential], Awaitable[bool]] | None = None,
     anchor_tool_call_id: str | None = None,
     registration: WorkflowCopilotCredentialRegistration | None = None,
+    lead_credential_id: str | None = None,
 ) -> CredentialPauseResolution | None:
     """Send the credential card and wait for the user's decision.
 
@@ -1028,15 +1390,18 @@ async def _run_credential_pause(
     if not update_ask:
         ctx.credential_pause_used = True
 
-    def settle(outcome: str) -> None:
-        # An update card asks to fix a credential already chosen, so the turn keeps its pick card's state.
+    def settle(outcome: str, site_answer: SiteAnswer | None = None) -> None:
+        # An update card asks to fix a credential already chosen, so the turn keeps its pick card's state
+        # unless the user signed in themselves, which answers the turn's ask the way a pick card does.
         # Outcome and anchor change together, so a card cancelled mid-wait leaves the earlier card's receipt intact.
-        if not update_ask:
-            ctx.credential_pause_outcome = outcome
-            ctx.credential_pause_anchor_tool_call_id = anchor_tool_call_id
-            receipt = credential_pause_receipt(ctx)
-            if receipt is not None:
-                ctx.credential_pause_receipts.append(receipt)
+        if update_ask and outcome != "signed_in":
+            return
+        ctx.credential_pause_outcome = outcome
+        ctx.credential_pause_anchor_tool_call_id = anchor_tool_call_id
+        ctx.credential_pause_site_answer = site_answer
+        receipt = credential_pause_receipt(ctx)
+        if receipt is not None:
+            ctx.credential_pause_receipts.append(receipt)
 
     cache = getattr(app, "CACHE", None)
     if cache is None:
@@ -1069,15 +1434,15 @@ async def _run_credential_pause(
     named_credential_id = next(iter(named)) if len(named) == 1 and plain_pick_ask and one_site else None
     if named_credential_id is not None and isinstance(policy, RequestPolicy):
         # A login already saved or confirmed for another site is left to the picker, so one click never rebinds it.
-        known_urls = [
-            policy.live_page_admitted_urls.get(named_credential_id),
-            policy.carried_credential_urls.get(named_credential_id),
-        ] + [
-            credential.tested_url
-            for credential in policy.resolved_credentials
-            if credential.credential_id == named_credential_id
-        ]
-        if any(url and (parts := url_parts(url)) is not None and parts[-1] != ask_origins[0] for url in known_urls):
+        def other_origin(url: str | None) -> bool:
+            return bool(url and (parts := url_parts(url)) is not None and parts[-1] != ask_origins[0])
+
+        saved = policy.credential_saved_site_urls(named_credential_id)
+        if (
+            other_origin(policy.live_page_admitted_urls.get(named_credential_id))
+            or other_origin(policy.carried_credential_urls.get(named_credential_id))
+            or (saved and all(other_origin(url) for url in saved))
+        ):
             named_credential_id = None
     if named_credential_id is not None:
         from skyvern.forge.sdk.copilot.tools.credential_fill import _read_vault_named_sites  # circular import
@@ -1089,6 +1454,16 @@ async def _run_credential_pause(
             vault_sites = None
         if vault_sites is None or (vault_sites and not any(site.admits(login_page_urls[0]) for site in vault_sites)):
             named_credential_id = None
+    site_url = (
+        await _site_question_url(ctx, login_page_urls[0], recovery=admit_connected is not None)
+        if login_page_urls and (admit_connected is not None or (plain_pick_ask and one_site))
+        else None
+    )
+    lead = (
+        await _lead_site_question(ctx, lead_credential_id, site_url)
+        if lead_credential_id is not None and admit_connected is not None and site_url is not None
+        else None
+    )
     timeout_seconds = copilot_config.credential_pause_timeout_seconds
     now = datetime.now(timezone.utc)
 
@@ -1097,7 +1472,7 @@ async def _run_credential_pause(
     turn_id = ctx.turn_id or ""
     resume_token = _new_resume_token()
     expires_at = now + timedelta(seconds=timeout_seconds)
-    manual_sign_in = None if update_ask or registration else _manual_sign_in_offer(ctx, login_page_urls)
+    manual_sign_in = None if registration else _manual_sign_in_offer(ctx, login_page_urls)
     if manual_sign_in is not None or registration is not None:
         # Signing in or saving a generated credential can outlast the tab, so the card must survive a reload.
         ctx.credential_recovery_armed = True
@@ -1120,7 +1495,11 @@ async def _run_credential_pause(
         expires_at=expires_at,
         anchor_tool_call_id=anchor_tool_call_id,
         sign_in_browser_session_id=manual_sign_in.browser_session_id if manual_sign_in else None,
+        credential_binding=credential_binding(policy, update_credential_id)
+        if update_credential_id is not None and isinstance(policy, RequestPolicy)
+        else None,
         registration=registration,
+        site_question=lead[0] if lead else None,
         timestamp=now,
     )
     await cache.set(
@@ -1132,6 +1511,8 @@ async def _run_credential_pause(
             recovery_token_digest=ctx.credential_recovery_token_digest if recovery_enabled else None,
             manual_sign_in=manual_sign_in,
             registration=registration,
+            site_url=site_url,
+            site_question=lead[1] if lead else None,
         ),
         ex=_longest_credential_pause_record_ttl()
         if manual_sign_in or registration
@@ -1186,6 +1567,7 @@ async def _run_credential_pause(
         outcome: CredentialPauseResolvedOutcome,
         credential: Credential | None = None,
         signed_in: SignedInProfile | None = None,
+        site_answer: SiteAnswer | None = None,
     ) -> None:
         # Reaches only the tab holding this turn's stream; a reloaded tab reads the turn-end credentialPause stamp.
         await stream.send(
@@ -1197,6 +1579,10 @@ async def _run_credential_pause(
                 credential_id=credential.credential_id if credential else None,
                 name=credential.name if credential else signed_in.profile_name if signed_in else None,
                 browser_profile_id=signed_in.browser_profile_id if signed_in else None,
+                site_answer=site_answer.action if site_answer else None,
+                site_a=site_answer.site_a if site_answer else None,
+                saved_sites=list(site_answer.saved_sites) if site_answer else None,
+                site_b=site_answer.site_b if site_answer else None,
                 timestamp=datetime.now(timezone.utc),
             )
         )
@@ -1274,9 +1660,12 @@ async def _run_credential_pause(
         return resolution
 
     if resolution.action == "signed_in":
-        if resolution.signed_in is None or update_ask:
+        if resolution.signed_in is None:
             settle("timeout")
             return None
+        if update_ask:
+            # The run-derived ask must not raise a pick card for a turn the user already signed in on.
+            ctx.credential_pause_used = True
         if isinstance(policy, RequestPolicy):
             _apply_signed_in_profile_to_policy(ctx, policy, resolution.signed_in)
         settle("signed_in")
@@ -1294,6 +1683,19 @@ async def _run_credential_pause(
             LOG.warning("copilot_credential_update_answer_names_another_credential")
             return None
         await answered("connected", credential)
+        return resolution
+    site_answer = resolution.site_answer
+    if site_answer is not None:
+        # The answer is read back from the saved row, so a site change that did not land never connects.
+        if site_answer.action == "no" or not login_saved_for_site(credential, site_answer.site_b):
+            settle("not_admitted", site_answer)
+            await answered("not_admitted", site_answer=site_answer)
+            return resolution
+        if isinstance(policy, RequestPolicy):
+            policy.refresh_credential(credential)
+            apply_connected_credential_to_policy(ctx, policy, credential, confirmed_site_url=site_answer.site_b)
+        settle("connected", site_answer)
+        await answered("connected", credential, site_answer=site_answer)
         return resolution
     # A credential this card just generated has no saved site yet; the card's own origin is its only placement.
     is_generated = credential.credential_id == generated_credential_id
@@ -1337,6 +1739,7 @@ async def request_credential_pause(
     admit_connected: Callable[[Credential], Awaitable[bool]] | None = None,
     anchor_tool_call_id: str | None = None,
     registration: WorkflowCopilotCredentialRegistration | None = None,
+    lead_credential_id: str | None = None,
 ) -> CredentialPauseResolution | None:
     """Raise the card from the model's own ``request_credential`` call and wait, inline, for the
     answer, so tool calls the model issued alongside it can await ``credential_pause_settled``."""
@@ -1361,6 +1764,7 @@ async def request_credential_pause(
             admit_connected=admit_connected,
             anchor_tool_call_id=anchor_tool_call_id,
             registration=None if update_ask else registration,
+            lead_credential_id=lead_credential_id,
         )
     finally:
         ctx.credential_ask_in_flight = False
@@ -1425,4 +1829,6 @@ async def maybe_credential_pause(
     credential = resolution.credential
     if credential is None:
         return None
+    if resolution.site_answer is not None and ctx.credential_pause_outcome == "not_admitted":
+        return _assemble_resume_messages(ctx, site_answer_unused_text(credential, resolution.site_answer))
     return _assemble_resume_messages(ctx, _connected_resume_text(credential))

@@ -36,6 +36,11 @@ export const TriggerType = {
   Mcp: "mcp",
   Api: "api",
   Scheduled: "scheduled",
+  Webhook: "webhook",
+  Event: "event",
+  JobRecipeExtract: "job_recipe_extract",
+  JobRecipeApply: "job_recipe_apply",
+  SeoRecipeSubmit: "seo_recipe_submit",
 } as const;
 
 export type TriggerType = (typeof TriggerType)[keyof typeof TriggerType];
@@ -170,6 +175,8 @@ export type FailureCategory = {
   confidence_float: number;
   reasoning: string;
   reason_code?: string | null;
+  error_code?: string | null;
+  anti_bot?: { contribution?: string | null } | null;
 };
 
 export type TaskApiResponse = {
@@ -506,10 +513,14 @@ export interface MicrosoftOAuthCredentialListResponse {
   credentials: MicrosoftOAuthCredential[];
 }
 
+export type MicrosoftOAuthScopeProfile =
+  | "outlook_mail"
+  | "powerbi_dataset_read";
+
 export interface CreateMicrosoftOAuthAuthorizeRequest {
   redirect_uri: string;
   credential_name?: string;
-  scope_profile?: "outlook_mail";
+  scope_profile?: MicrosoftOAuthScopeProfile;
   app_origin?: string;
 }
 
@@ -575,6 +586,70 @@ export interface CreateGoogleSheetTabResponse {
 export interface GoogleSheetsReconnectRequiredError {
   code: "reconnect_required";
   missing_scope: string | null;
+}
+
+export interface TwilioCredentialSafe {
+  account_sid: string;
+  api_key_sid: string | null;
+  has_api_key_secret: boolean;
+  has_auth_token: boolean;
+}
+
+export interface TwilioCredentialResponse {
+  credential: TwilioCredentialSafe | null;
+}
+
+export interface TwilioCredentialRequest {
+  account_sid: string;
+  api_key_sid?: string | null;
+  api_key_secret?: string | null;
+  auth_token: string;
+}
+
+export interface TwilioPhoneNumberInfo {
+  sid: string;
+  phone_number: string;
+  friendly_name: string;
+  sms_capable: boolean;
+  current_sms_url: string | null;
+  enabled: boolean;
+  phone_number_id: string | null;
+}
+
+export interface OrganizationPhoneNumber {
+  phone_number_id: string;
+  organization_id: string;
+  sms_config_id: string;
+  phone_number: string;
+  provider: string;
+  credential_id: string | null;
+  price_cents: number | null;
+  billing_exempt: boolean;
+  status:
+    | "active"
+    | "disabled"
+    | "provisioning"
+    | "quarantining"
+    | "reversal_pending"
+    | "quarantined"
+    | "surrendering"
+    | "releasing"
+    | "released";
+  quarantined_until: string | null;
+  cancel_at?: string | null;
+  created_at: string;
+  modified_at: string;
+  deleted_at: string | null;
+}
+
+export interface EnablePhoneNumberRequest {
+  phone_number_sid: string;
+  confirm_takeover?: boolean;
+  credential_id?: string | null;
+}
+
+export interface DisablePhoneNumberRequest {
+  phone_number_id: string;
 }
 
 export interface BitwardenCredential {
@@ -922,7 +997,6 @@ export const TaskRunType = {
   OpenaiCua: "openai_cua",
   AnthropicCua: "anthropic_cua",
   UiTars: "ui_tars",
-  YutoriNavigator: "yutori_navigator",
 } as const;
 
 export type TaskRunType = (typeof TaskRunType)[keyof typeof TaskRunType];
@@ -988,6 +1062,7 @@ export type WorkflowRunStatusApiResponse = {
   verification_code_polling_started_at?: string | null;
   retried_from_workflow_run_id?: string | null;
   retried_by_workflow_run_id?: string | null;
+  copilot_session_id?: string | null;
 } & WorkflowRunRetryFields;
 
 export type WorkflowRunStatusApiResponseWithWorkflow = {
@@ -1033,6 +1108,7 @@ export type WorkflowRunStatusApiResponseWithWorkflow = {
   verification_code_polling_started_at?: string | null;
   retried_from_workflow_run_id?: string | null;
   retried_by_workflow_run_id?: string | null;
+  copilot_session_id?: string | null;
 } & WorkflowRunRetryFields;
 
 export type TaskGenerationApiResponse = {
@@ -1060,6 +1136,7 @@ export type ActionsApiResponse = {
   created_by: string | null;
   text: string | null;
   screenshot_artifact_id?: string | null;
+  created_at?: string | null;
   // On the base Action, so it survives the timeline's `list[Action]` serialization. Subclass-only
   // fields (url, keys) do not and must not be declared here.
   file_name?: string | null;
@@ -1133,6 +1210,7 @@ export type BrowserProfileUsage = {
 
 export type PasswordCredentialApiResponse = {
   username: string;
+  has_totp?: boolean;
   totp_type: "authenticator" | "email" | "text" | "passkey" | "none";
   totp_identifier?: string | null;
 };
@@ -1164,8 +1242,10 @@ export type CredentialApiResponse = {
     | "bitwarden"
     | "azure_vault"
     | "gcp"
+    | "aws_secrets_manager"
     | "custom"
     | "onepassword"
+    | "bitwarden_connected"
     | null;
   vault_id?: string | null;
   item_id?: string | null;
@@ -1174,6 +1254,8 @@ export type CredentialApiResponse = {
   auto_profile_disabled?: boolean | null;
   pin_saved_session_ip?: boolean | null;
   tested_url?: string | null;
+  // More sites this login signs in on, each covering its whole site.
+  extra_site_urls?: string[] | null;
   user_context?: string | null;
   save_browser_session_intent?: boolean | null;
   run_sequentially?: boolean | null;
@@ -1300,7 +1382,6 @@ export const RunEngine = {
   SkyvernV3: "skyvern-3.0",
   OpenaiCua: "openai-cua",
   AnthropicCua: "anthropic-cua",
-  YutoriNavigator: "yutori-navigator",
 } as const;
 
 export type RunEngine = (typeof RunEngine)[keyof typeof RunEngine];

@@ -43,6 +43,7 @@ from skyvern.forge.sdk.artifact.storage.base import (
     resolve_download_attempt_fail_open,
 )
 from skyvern.forge.sdk.artifact.storage.bounded_file import BoundedFileReader
+from skyvern.forge.sdk.artifact.storage.browser_profile_archive import extract_profile_archive, write_profile_archive
 from skyvern.forge.sdk.artifact.storage.run_recording_clips import (
     RUN_RECORDING_CLIPS_SYNC_TIMEOUT_SECONDS,
     RUN_RECORDING_PATH_SEGMENT,
@@ -314,6 +315,9 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
             presign_sensitive=lambda uris: self.async_client.create_presigned_urls(
                 uris, expires_in=min(settings.PRESIGNED_URL_EXPIRATION, SENSITIVE_ARTIFACT_URL_EXPIRY_SECONDS)
             ),
+            presign_download=lambda uris: self.async_client.create_presigned_urls(
+                uris, attachment_filenames=[None] * len(uris)
+            ),
         )
 
     async def store_artifact_from_path(self, artifact: Artifact, path: str) -> None:
@@ -437,7 +441,9 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
         try:
             # Off the event loop: the credential living-profile engine calls this mid-run, where a
             # sync archive of a large profile dir would stall every other coroutine on the worker.
-            await asyncio.to_thread(shutil.make_archive, temp_zip_file.name, "zip", directory)
+            await asyncio.to_thread(
+                write_profile_archive, directory, zip_file_path, organization_id=organization_id, profile_id=profile_id
+            )
             LOG.debug(
                 "Storing browser profile",
                 organization_id=organization_id,
@@ -459,7 +465,7 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
         downloaded_zip_bytes = await self.async_client.download_file(profile_uri, log_exception=True)
         if not downloaded_zip_bytes:
             return None
-        return unzip_bytes_to_temp_directory(downloaded_zip_bytes, prefix="skyvern_browser_profile_")
+        return extract_profile_archive(downloaded_zip_bytes, organization_id=organization_id, profile_id=profile_id)
 
     async def browser_profile_exists(self, organization_id: str, profile_id: str) -> bool:
         """Cheap existence check (head_object) — avoids downloading the archive just to know it exists."""
@@ -623,11 +629,13 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
 
         return await asyncio.gather(*[_bounded(key) for key in keys])
 
-    async def _resilient_presign(self, keys: list[str]) -> list[str | None]:
+    async def _resilient_presign(
+        self, keys: list[str], attachment_filenames: list[str | None] | None = None
+    ) -> list[str | None]:
         """Batch presign with per-key fallback so one failure does not drop every URL."""
         if not keys:
             return []
-        batched = await self.async_client.create_presigned_urls(keys)
+        batched = await self.async_client.create_presigned_urls(keys, attachment_filenames=attachment_filenames)
         if batched is not None and len(batched) == len(keys):
             return list(batched)
 
@@ -637,15 +645,18 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
             returned=(len(batched) if batched is not None else None),
         )
 
-        async def _sign_one(uri: str) -> str | None:
+        async def _sign_one(uri: str, attachment_filename: str | None) -> str | None:
             try:
-                signed = await self.async_client.create_presigned_urls([uri])
+                signed = await self.async_client.create_presigned_urls(
+                    [uri], attachment_filenames=None if attachment_filenames is None else [attachment_filename]
+                )
                 return signed[0] if signed else None
             except Exception:
                 LOG.exception("Per-key presign failed", uri=uri)
                 return None
 
-        return await asyncio.gather(*[_sign_one(key) for key in keys])
+        names = attachment_filenames or [None] * len(keys)
+        return await asyncio.gather(*[_sign_one(key, name) for key, name in zip(keys, names)])
 
     async def _get_shared_downloaded_files_in_browser_session_via_listing(
         self, *, organization_id: str, browser_session_id: str
@@ -663,27 +674,27 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
         if len(object_keys) == 0:
             return []
 
-        object_infos, presigned_urls = await asyncio.gather(
-            self._bounded_get_object_infos(object_keys),
-            self._resilient_presign(object_keys),
-        )
+        object_infos = await self._bounded_get_object_infos(object_keys)
+        filenames = [
+            ((object_info or {}).get("Metadata") or {}).get("original_filename", os.path.basename(key))
+            for key, object_info in zip(object_keys, object_infos)
+        ]
+        presigned_urls = await self._resilient_presign(object_keys, attachment_filenames=filenames)
 
         file_infos: list[FileInfo] = []
-        for key, object_info, url in zip(object_keys, object_infos, presigned_urls):
+        for object_info, filename, url in zip(object_infos, filenames, presigned_urls):
             if url is None:
                 continue
             metadata = (object_info or {}).get("Metadata") or {}
             modified_at: datetime | None = (object_info or {}).get("LastModified")
             content_length: int | None = (object_info or {}).get("ContentLength")
-
-            filename = os.path.basename(key)
             checksum = metadata.get("sha256_checksum") if metadata else None
 
             file_infos.append(
                 FileInfo(
                     url=url,
                     checksum=checksum,
-                    filename=metadata.get("original_filename", filename) if metadata else filename,
+                    filename=filename,
                     file_size=content_length,
                     modified_at=modified_at,
                 )
@@ -1088,7 +1099,9 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
             display_name = metadata.get("original_filename", filename) if metadata else filename
             artifact = artifacts_by_uri.get(object_uri)
 
-            presigned_urls = await self.async_client.create_presigned_urls([object_uri])
+            presigned_urls = await self.async_client.create_presigned_urls(
+                [object_uri], attachment_filenames=[display_name]
+            )
             if not presigned_urls:
                 continue
 
@@ -1143,7 +1156,7 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
             uploaded_s3_uri=uploaded_s3_uri,
         )
         # Generate a presigned URL for the uploaded file
-        presigned_urls = await self.async_client.create_presigned_urls([uploaded_s3_uri])
+        presigned_urls = await self.async_client.create_presigned_urls([uploaded_s3_uri], attachment_filenames=[None])
         if not presigned_urls:
             LOG.error(
                 "Failed to create presigned URL for uploaded file",

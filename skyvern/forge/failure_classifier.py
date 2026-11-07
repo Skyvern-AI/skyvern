@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import re
 from enum import StrEnum
@@ -10,8 +12,14 @@ import structlog
 from skyvern.constants import PROXY_TRANSPORT_NAV_ERRORS
 from skyvern.exceptions import (
     NO_ADDRESS_RECORD_NAV_ERROR_MARKER,
+    UNREACHABLE_HOST_NAV_ERROR_MARKER,
     CaptchaSolveError,
     FailedToNavigateToUrl,
+    UnreachableNavigationHost,
+)
+from skyvern.forge.sdk.schemas.har_evidence import (
+    FINAL_HAR_USER_MATCH_REASON_CODE,
+    is_final_har_user_match_entry,
 )
 
 LOG = structlog.get_logger(__name__)
@@ -57,6 +65,7 @@ _SELECTOR_PAYLOAD_RE = re.compile(r"(?:locator|get_by_[a-z_]+|wait_for_selector)
 
 _PROXY_TRANSPORT_CODES_LOWER = tuple(code.lower() for code in PROXY_TRANSPORT_NAV_ERRORS)
 _NO_ADDRESS_RECORD_MARKER_LOWER = NO_ADDRESS_RECORD_NAV_ERROR_MARKER.lower()
+_UNREACHABLE_HOST_MARKER_LOWER = UNREACHABLE_HOST_NAV_ERROR_MARKER.lower()
 # Without the exception, only the driver message inside FailedToNavigateToUrl's own sentence counts: other
 # text (a model-written outcome reason, the navigated URL) can mention a transport code the proxy never raised.
 _NAV_FAILURE_DRIVER_MESSAGE_RE = re.compile(r"failed to navigate to url \S+\. error message: (.*)", re.DOTALL)
@@ -130,8 +139,21 @@ def _is_pageless_failure(reason: str) -> bool:
     return inner_reason.startswith(_PRE_TASK_FAILURE_PREFIXES)
 
 
+def _is_proxy_unreachable_target(reason: str, exception: Exception | None) -> bool:
+    """Whether the run's proxy provider reported that the navigation target's host did not accept its connection."""
+    # Same evidence split as the transport code below: the exception's type when it carries the code, else the marker
+    # only where the driver message sits, since other text (a model-written reason) can quote the marker.
+    if isinstance(exception, FailedToNavigateToUrl) and exception.nav_error_code:
+        return isinstance(exception, UnreachableNavigationHost)
+    driver_message = _NAV_FAILURE_DRIVER_MESSAGE_RE.search(reason)
+    return driver_message is not None and _UNREACHABLE_HOST_MARKER_LOWER in driver_message.group(1)
+
+
 def _proxy_transport_evidence(reason: str, exception: Exception | None) -> str | None:
     """The evidence source when a proxy transport error ended the navigation, else None."""
+    # Checked before the code, which this failure keeps as the browser reported it.
+    if _is_proxy_unreachable_target(reason, exception):
+        return None
     if isinstance(exception, FailedToNavigateToUrl) and exception.nav_error_code:
         return "code_level" if exception.nav_error_code in PROXY_TRANSPORT_NAV_ERRORS else None
     if _NO_ADDRESS_RECORD_MARKER_LOWER in reason:
@@ -317,13 +339,14 @@ def classify_from_failure_reason(
         "FailedToNavigateToUrl" in exc_name
         or any(kw in reason for kw in ["failed to navigate", "404", "redirect loop"])
     ):
-        categories.append(
-            {
-                "category": FailureCategory.NAVIGATION_FAILURE.value,
-                "confidence_float": 0.9,
-                "reasoning": f"Exception: {exc_name}" if "FailedToNavigate" in exc_name else "Keywords matched",
-            }
-        )
+        navigation_failure = {
+            "category": FailureCategory.NAVIGATION_FAILURE.value,
+            "confidence_float": 0.9,
+            "reasoning": f"Exception: {exc_name}" if "FailedToNavigate" in exc_name else "Keywords matched",
+        }
+        if _is_proxy_unreachable_target(reason, exception):
+            navigation_failure["reason_code"] = PROXY_TARGET_UNREACHABLE_REASON_CODE
+        categories.append(navigation_failure)
 
     # Infrastructure timeout — a Temporal activity / heartbeat timeout finalizes the run from
     # the worker layer (a stalled activity or worker interruption), not a site/page-load issue.
@@ -589,12 +612,12 @@ def classify_from_failure_reason(
 # ── Infra-failure attribution (SKY-16588) ─────────────────────────────────────
 # Derives one bounded internal attribution document from the typed failure_category
 # above; introduces no second classifier. Persisted to workflow_runs.failure_attribution
-# for internal warehouse analysis only — never exposed to customers, never carrying raw
+# for internal reliability analysis only — never exposed to customers, never carrying raw
 # failure text.
 
 # Bump when the taxonomy or the category->component mapping below changes, so a frozen
 # coverage baseline stays reproducible per classifier_version.
-CLASSIFIER_VERSION = 10
+CLASSIFIER_VERSION = 11
 FAILURE_ATTRIBUTION_SCHEMA_VERSION = 1
 
 # Bounded sentinels — neither is an infra component id.
@@ -653,21 +676,35 @@ BROWSER_SESSION_CLOSED_REASON_CODE = "browser_session_closed"
 BROWSER_SESSION_STARTUP_TIMEOUT_REASON_CODE = "browser_session_startup_timeout"
 BROWSER_SESSION_EXPIRED_BEFORE_RUN_REASON_CODE = "browser_session_expired_before_run"
 PROXY_TRANSPORT_FAILED_REASON_CODE = "proxy_transport_failed"
+PROXY_TARGET_UNREACHABLE_REASON_CODE = "proxy_target_unreachable"
 WORKER_CONTAINER_RESTARTED_REASON_CODE = "worker_container_restarted"
 UNSOLVED_CAPTCHA_BEFORE_BROWSER_LOSS_REASON_CODE = "unsolved_captcha_before_browser_loss"
 SITE_THROTTLE_REASON_CODE = "site_throttle"
 EXTERNAL_SERVICE_THROTTLE_REASON_CODE = "external_service_throttle"
 SIGN_IN_FORM_VISIBLE_REASON_CODE = "sign_in_form_visible"
 SAVED_PROFILE_SIGNED_OUT_REASON_CODE = "saved_profile_signed_out"
+# The user-defined errors a task v2 root's own failure summary matched, carried for the run's errors[] output.
+TASK_V2_ROOT_USER_ERRORS_REASON_CODE = "task_v2_root_user_errors"
+_MAX_ROOT_USER_ERRORS = 10
+HAR_ANTI_BOT_DIAGNOSTIC_REASON_CODE = "har_anti_bot_diagnostic"
+# Task, workflow run and task v2 statuses a final diagnostic may annotate; never completed or canceled.
+DIAGNOSABLE_FAILURE_STATUSES = frozenset({"failed", "terminated", "timed_out"})
 
 # ANTI_BOT_DETECTION entries carrying one of these are labels only: runtime consumers must treat the
 # failure exactly as they did before it was labeled anti-bot. Code that acts on a failure_category it
 # reads (or hands to a model) must go through without_output_only_labels or skip these entries.
 OUTPUT_ONLY_ANTI_BOT_REASON_CODES = frozenset(
-    {UNSOLVED_CAPTCHA_BEFORE_BROWSER_LOSS_REASON_CODE, SITE_THROTTLE_REASON_CODE}
+    {UNSOLVED_CAPTCHA_BEFORE_BROWSER_LOSS_REASON_CODE, SITE_THROTTLE_REASON_CODE, HAR_ANTI_BOT_DIAGNOSTIC_REASON_CODE}
 )
 # Entries of any category carrying one of these are labels for the run page; the same scrub hides them.
-OUTPUT_ONLY_LABEL_REASON_CODES = frozenset({SIGN_IN_FORM_VISIBLE_REASON_CODE, SAVED_PROFILE_SIGNED_OUT_REASON_CODE})
+OUTPUT_ONLY_LABEL_REASON_CODES = frozenset(
+    {
+        SIGN_IN_FORM_VISIBLE_REASON_CODE,
+        SAVED_PROFILE_SIGNED_OUT_REASON_CODE,
+        TASK_V2_ROOT_USER_ERRORS_REASON_CODE,
+        FINAL_HAR_USER_MATCH_REASON_CODE,
+    }
+)
 
 
 def with_sign_in_form_visible(categories: list[dict] | None) -> list[dict]:
@@ -706,6 +743,38 @@ def with_saved_profile_signed_out(categories: list[dict] | None) -> list[dict] |
     return tagged
 
 
+def with_diagnostic_entry(categories: list | None, entry: dict[str, Any]) -> list:
+    """``categories`` with ``entry`` replacing any earlier entry of its reason code, so a repeated cleanup leaves one;
+    appended, so the primary entry every runtime reader uses is unchanged."""
+    kept = [c for c in categories or [] if not (isinstance(c, dict) and c.get("reason_code") == entry["reason_code"])]
+    return [*kept, entry]
+
+
+def with_root_user_errors(categories: list[dict] | None, user_errors: list[dict[str, Any]]) -> list[dict] | None:
+    """``categories`` with the root's matched user errors appended after every entry. The entry repeats the primary's
+    category, so readers of the category set (credential fallback) see the same run."""
+    if not categories or not user_errors:
+        return categories
+    entry = {
+        "category": categories[0].get("category"),
+        "confidence_float": categories[0].get("confidence_float"),
+        "reason_code": TASK_V2_ROOT_USER_ERRORS_REASON_CODE,
+        "reasoning": "User-defined errors the run's failure summary matched",
+        "user_errors": user_errors[:_MAX_ROOT_USER_ERRORS],
+    }
+    return [*categories, entry]
+
+
+def has_classifier_primary(categories: object) -> bool:
+    """Whether ``categories[0]`` is a classifier entry; an output-only label there is not a primary to follow."""
+    return (
+        isinstance(categories, list)
+        and bool(categories)
+        and isinstance(categories[0], dict)
+        and not is_output_only_entry(categories[0])
+    )
+
+
 def is_output_only_entry(category: object) -> bool:
     if not isinstance(category, dict):
         return False
@@ -714,6 +783,71 @@ def is_output_only_entry(category: object) -> bool:
         category.get("category") == FailureCategory.ANTI_BOT_DETECTION.value
         and reason_code in OUTPUT_ONLY_ANTI_BOT_REASON_CODES
     )
+
+
+def final_har_user_mapping_digest(error_code_mapping: dict[str, str] | None) -> str | None:
+    """A digest of the mapping a final match read, so a write can tell the mapping it answered is still current."""
+    if not error_code_mapping:
+        return None
+    return hashlib.sha256(json.dumps(error_code_mapping, sort_keys=True).encode()).hexdigest()
+
+
+def _final_har_user_match_entry(categories: object) -> dict[str, Any] | None:
+    for category in categories if isinstance(categories, list) else []:
+        if is_final_har_user_match_entry(category):
+            return category
+    return None
+
+
+def final_har_user_match_spent(categories: object, identity: dict[str, Any]) -> bool:
+    """Whether this execution's one match was already claimed. ``identity`` names the execution only, so a later
+    change of mapping or of the row it is read from never buys the execution another request."""
+    entry = _final_har_user_match_entry(categories)
+    return entry is not None and entry.get("identity") == identity
+
+
+def final_har_user_match_claimed(categories: object, identity: dict[str, Any], source: dict[str, Any]) -> bool:
+    entry = _final_har_user_match_entry(categories)
+    return (
+        entry is not None
+        and entry.get("identity") == identity
+        and entry.get("source") == source
+        and entry.get("state") == "claimed"
+    )
+
+
+def with_final_har_user_match_claim(categories: list | None, identity: dict[str, Any], source: dict[str, Any]) -> list:
+    return with_diagnostic_entry(
+        categories,
+        {"reason_code": FINAL_HAR_USER_MATCH_REASON_CODE, "identity": identity, "source": source, "state": "claimed"},
+    )
+
+
+def with_final_har_user_match_result(
+    categories: list | None,
+    identity: dict[str, Any],
+    source: dict[str, Any],
+    inserted: list[str],
+    user_errors: list[dict[str, Any]] | None = None,
+) -> list:
+    """The claim marked done. ``inserted`` names only the task rows the match itself added, which a reset removes;
+    ``user_errors`` holds a workflow run's matched rows, which its response projects."""
+    entry: dict[str, Any] = {
+        "reason_code": FINAL_HAR_USER_MATCH_REASON_CODE,
+        "identity": identity,
+        "source": source,
+        "state": "done",
+        "inserted": inserted,
+    }
+    if user_errors is not None:
+        entry["user_errors"] = user_errors
+    return with_diagnostic_entry(categories, entry)
+
+
+def final_har_user_match_inserted(categories: object) -> list[str]:
+    entry = _final_har_user_match_entry(categories)
+    inserted = entry.get("inserted") if entry else None
+    return [code for code in inserted if isinstance(code, str)] if isinstance(inserted, list) else []
 
 
 def without_output_only_categories(categories: list) -> list:
@@ -769,12 +903,14 @@ _REASON_CODE_LITERALS = frozenset(
         BROWSER_SESSION_STARTUP_TIMEOUT_REASON_CODE,
         BROWSER_SESSION_EXPIRED_BEFORE_RUN_REASON_CODE,
         PROXY_TRANSPORT_FAILED_REASON_CODE,
+        PROXY_TARGET_UNREACHABLE_REASON_CODE,
         SITE_THROTTLE_REASON_CODE,
         EXTERNAL_SERVICE_THROTTLE_REASON_CODE,
         UNSOLVED_CAPTCHA_BEFORE_BROWSER_LOSS_REASON_CODE,
         WORKER_CONTAINER_RESTARTED_REASON_CODE,
         SIGN_IN_FORM_VISIBLE_REASON_CODE,
         SAVED_PROFILE_SIGNED_OUT_REASON_CODE,
+        HAR_ANTI_BOT_DIAGNOSTIC_REASON_CODE,
     }
 )
 

@@ -302,7 +302,7 @@ async def test_question_source_reaches_fill_boundary_without_weakening_origin_gu
 ) -> None:
     source = QuestionResponseSiteURLSource(interaction_id="interaction-1")
     policy = RequestPolicy(
-        resolved_credentials=[SimpleNamespace(credential_id="cred_1", tested_url=None)],
+        resolved_credentials=[SimpleNamespace(credential_id="cred_1", tested_url=None, extra_site_urls=[])],
         current_turn_named_credential_ids={"cred_1"},
         user_provided_site_urls=[_LOGIN_URL],
         user_site_url_sources={_LOGIN_URL: source},
@@ -314,6 +314,7 @@ async def test_question_source_reaches_fill_boundary_without_weakening_origin_gu
         org_credentials_for_turn=None,
         credential_pause_used=False,
         vault_login_uris_by_credential_id={},
+        scoped_login_sites_by_credential_id={},
         persisted_workflow_yaml="",
     )
     with (

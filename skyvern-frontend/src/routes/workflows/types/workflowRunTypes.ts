@@ -41,6 +41,7 @@ export type WorkflowRunBlock = {
   continue_on_failure: boolean;
   task_id: string | null;
   url: string | null;
+  final_url?: string | null;
   navigation_goal: string | null;
   navigation_payload: Record<string, unknown> | null;
   data_extraction_goal: string | null;
@@ -78,6 +79,23 @@ export type WorkflowRunBlock = {
   instructions?: string | null;
   positive_descriptor?: string | null;
   negative_descriptor?: string | null;
+
+  // agent step block: its calls in run order, the last one possibly still running
+  tool_calls?: Array<AgentStepToolCall> | null;
+};
+
+export type AgentStepToolCall = {
+  index: number;
+  tool: string;
+  status?: Status | "invalid_arguments" | null;
+  started_at: string;
+  finished_at?: string | null;
+  arguments: string;
+  block_type?: WorkflowBlockType | null;
+  label?: string | null;
+  // The child block's workflow YAML block, as JSON.
+  block?: string | null;
+  child_workflow_run_block_id?: string | null;
 };
 
 export function isWorkflowRunLoopContainerBlock(block: {
@@ -90,6 +108,8 @@ export type WorkflowRunTimelineBlockItem = {
   attempt?: number;
   type: "block";
   block: WorkflowRunBlock;
+  // Set on the first row that replaced a task_v2 block: the replaced blocks' own rows, innermost first.
+  task_v2_blocks?: Array<WorkflowRunBlock> | null;
   children: Array<WorkflowRunTimelineItem>;
   thought: null;
   created_at: string;

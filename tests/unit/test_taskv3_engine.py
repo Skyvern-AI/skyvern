@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import random
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -54,7 +55,7 @@ from skyvern.forge.taskv3.goal_check import (
 )
 from skyvern.forge.taskv3.goal_composition import CodeTypedValue
 from skyvern.forge.taskv3.handoff_redaction import caller_known_published_urls
-from skyvern.forge.taskv3.llm_call_params import reasoning_effort_with_summary
+from skyvern.forge.taskv3.llm_call_params import carries_reasoning, reasoning_effort_with_summary
 from skyvern.forge.taskv3.loop import (
     CODE_TOOL_NAME,
     NAV_DEAD_END_GUARD,
@@ -66,6 +67,7 @@ from skyvern.forge.taskv3.loop import (
     _ProgressEvidence,
 )
 from skyvern.forge.taskv3.opaque_refs import OpaqueUrlRefs, mask_opaque_urls
+from skyvern.forge.taskv3.run_arms import ANSWER_AUDIT_LOG_ONLY_FLAG, APPLICATION_CONTEXT_FLAG, CARRY_REASONING_FLAG
 from skyvern.forge.taskv3.tools import PAGE_UNAVAILABLE_ERROR, DownloadFailureWatch
 from skyvern.forge.taskv3.turn_dom import TurnDomCapture
 from skyvern.schemas.llm import LLMConfig, LLMRouterConfig, LLMRouterModelConfig
@@ -73,7 +75,7 @@ from skyvern.utils.prompt_engine import PROMPT_HARD_CEILING_TOKENS
 from skyvern.utils.token_counter import count_tokens
 from tests.unit.helpers import fallback_receipts
 from tests.unit.scoped_asyncio import ScopedAsyncio
-from tests.unit.test_taskv3_loop import _ScriptedCaller
+from tests.unit.test_taskv3_loop import _ReasoningCaller, _ScriptedCaller
 from tests.unit.test_taskv3_tools import (
     _SURFACE_OFF_TOOL_NAMES,
     _DownloadFakePage,
@@ -200,6 +202,20 @@ async def test_engine_exposes_browser_and_finish_tools_no_task_ecosystem() -> No
     sent = {t["function"]["name"] for t in (caller.sent_tools or [])}
     assert {"observe", "type", "click", "file_upload", "finish"} <= sent
     assert not ({"act", "extract", "validate", "run_task", "login"} & sent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("llm_route_arm", ["treatment", "control", None])
+async def test_engine_finished_line_carries_the_llm_route_arm_the_caller_recorded(llm_route_arm: str | None) -> None:
+    caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]])
+    caller.llm_key = "ANY_ROUTE"
+    with capture_logs() as logs:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()), llm_caller=caller, goal="x", llm_route_arm=llm_route_arm
+        )
+
+    finished = next(entry for entry in logs if entry["event"] == "taskv3 engine loop finished")
+    assert (finished["llm_key"], finished["llm_route_arm"]) == ("ANY_ROUTE", llm_route_arm)
 
 
 @pytest.mark.asyncio
@@ -1527,6 +1543,121 @@ def test_engine_omits_summary_when_caller_denies_the_bridge() -> None:
     assert reasoning_effort_with_summary(caller) is None
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("arm", "bridged", "primary_keys", "carries", "primary_model", "route"),
+    [
+        ("treatment", True, ("a",), True, "openai/responses/gpt-test", "carries"),
+        ("treatment", True, ("a", "b"), False, "openai/responses/gpt-test", "main_group_differs"),
+        ("treatment", False, ("a",), False, "openai/responses/gpt-test", "not_responses_bridge"),
+        ("treatment", True, ("a",), False, "azure/responses/gpt-test", "azure"),
+        ("control", True, ("a",), False, "openai/responses/gpt-test", "carries"),
+        (None, True, ("a",), False, "openai/responses/gpt-test", "carries"),
+        ("treatment", True, (), True, "openai/responses/gpt-test", "carries"),
+        ("treatment", True, (), False, "azure/responses/gpt-test", "azure"),
+    ],
+    ids=[
+        "treatment",
+        "primary_cannot_share",
+        "not_bridged",
+        "azure_primary",
+        "control",
+        "unresolved",
+        "direct",
+        "direct_azure",
+    ],
+)
+async def test_reasoning_is_carried_only_on_treatment_over_a_bridged_primary_group(
+    arm: str | None, bridged: bool, primary_keys: tuple[str, ...], carries: bool, primary_model: str, route: str
+) -> None:
+    # The other endpoint is a fallback group only, so it does not change whether the run carries; no primary keys means a
+    # direct config.
+    deployments = [
+        LLMRouterModelConfig(model_name="primary", litellm_params={"model": primary_model, "api_key": key})
+        for key in primary_keys
+    ]
+    deployments.append(
+        LLMRouterModelConfig(
+            model_name="other-endpoint",
+            litellm_params={"model": "azure/responses/gpt-test", "api_base": "https://other.example.test"},
+        )
+    )
+    caller = _ReasoningCaller([[("observe", {})], [("finish", {"status": "completed", "reason": "ok"})]])
+    caller.uses_openai_responses_bridge = lambda: bridged
+    caller.last_served_model_group = "primary" if primary_keys else None
+    caller.llm_config = (
+        LLMRouterConfig(
+            model_name="scope-router",
+            required_env_vars=[],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            model_list=deployments,
+            main_model_group="primary",
+            fallback_model_group="other-endpoint",
+        )
+        if primary_keys
+        else LLMConfig(model_name=primary_model, required_env_vars=[], supports_vision=True, add_assistant_prefix=False)
+    )
+    context = SkyvernContext(run_arms={CARRY_REASONING_FLAG: ("wr_1", arm)} if arm else {})
+    skyvern_context.set(context)
+    try:
+        with capture_logs() as logs:
+            await run_task_v3_agent_loop(page_provider=_fixed_page_provider(_FakePage()), llm_caller=caller, goal="x")
+    finally:
+        skyvern_context.reset()
+
+    finished = next(e for e in logs if e["event"] == "taskv3 engine loop finished")
+    assert finished["carry_reasoning_arm"] == (arm or "unrandomized")
+    assert finished["carry_reasoning_route"] == route
+    assert finished["carry_reasoning_stripped"] is False
+    assert finished["carried_reasoning_turns"] == (2 if carries else 0)
+    assert any(m.get("reasoning_items") for m in caller.sent[-1]) is carries
+
+
+def test_any_difference_between_main_group_deployments_stops_the_carry() -> None:
+    # Any parameter, including one no code names, can make two deployments different places; fallback groups never
+    # decide whether a run carries.
+    rng = random.Random(19364)
+    values: dict[str, list[Any]] = {
+        "model": ["openai/responses/gpt-a", "openai/gpt-a", "openai/responses/gpt-b", "azure/responses/gpt-a"],
+        "api_key": ["k1", "k2", None],
+        "api_base": [None, "https://a.example.test", "https://b.example.test"],
+        "api_version": [None, "2025-01-01"],
+        "service_tier": [None, "flex"],
+        "timeout": [60, 600],
+    }
+    for case in range(400):
+        base = {key: rng.choice(options) for key, options in values.items() if rng.random() < 0.8}
+        base.setdefault("model", rng.choice(values["model"]))
+        main = []
+        for _ in range(rng.randint(1, 3)):
+            params = dict(base)
+            if rng.random() < 0.4:
+                key = rng.choice([*values, f"unlisted_{case}"])
+                params[key] = rng.choice([*values.get(key, []), f"other_{case}"])
+            main.append(params)
+        deployments = [LLMRouterModelConfig(model_name="primary", litellm_params=params) for params in main]
+        deployments += [
+            LLMRouterModelConfig(model_name=f"fallback-{i}", litellm_params={"model": rng.choice(values["model"])})
+            for i in range(rng.randint(0, 2))
+        ]
+        caller = SimpleNamespace(
+            uses_openai_responses_bridge=lambda: True,
+            llm_config=LLMRouterConfig(
+                model_name="router",
+                required_env_vars=[],
+                supports_vision=True,
+                add_assistant_prefix=False,
+                model_list=deployments,
+                main_model_group="primary",
+                fallback_model_group=[d.model_name for d in deployments if d.model_name != "primary"] or None,
+            ),
+        )
+        identical = all(params == main[0] for params in main)
+        toward_azure = any(str(params["model"]).startswith("azure/") for params in main)
+        assert carries_reasoning(caller) is (identical and not toward_azure), (case, main)
+
+
 def test_bridge_check_mirrors_litellm_dispatched_name_only() -> None:
     # litellm decides the bridge from the DISPATCHED model string alone. A model_info label saying
     # gpt-5.6 must NOT flip the gate for an opaque deployment alias: litellm would not bridge that
@@ -1671,6 +1802,342 @@ async def test_terminal_log_carries_the_guard_class_that_ended_the_run() -> None
     assert terminal[0]["guard"] is None
 
 
+async def _run_with_application_context_arm(
+    monkeypatch: pytest.MonkeyPatch,
+    arm: str,
+    script: list[list[tuple[str, dict[str, Any]]]],
+    *,
+    hook: Any = ("TIER ONE", "AGE TEXT", "SIX TEXT"),
+    page_free: bool = False,
+    payload_check: tuple[str | None, str] = ("SIX AND TIER ONE", "rendered"),
+) -> tuple[Any, _ScriptedCaller, dict[str, Any], list[Any]]:
+    """Today's hooks qualify the payload; the audit hook records that it ran, whatever the run declares."""
+    context_calls: list[Any] = []
+    audit_calls: list[Any] = []
+    payload_hook_calls: list[str] = []
+
+    async def audit(parameters: Any, *, goal: str, organization_id: Any, step: Any, declaring: Any = "absent") -> None:
+        audit_calls.append(declaring)
+
+    def texts(parameters: Any) -> Any:
+        context_calls.append(parameters)
+        return hook
+
+    def age_hook(parameters: Any) -> tuple[str | None, str]:
+        payload_hook_calls.append("age")
+        return ("AGE TEXT", "rendered")
+
+    def defaults_hook(parameters: Any) -> tuple[str | None, str]:
+        payload_hook_calls.append("defaults")
+        return payload_check
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_age_default", age_hook)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_application_defaults", defaults_hook)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_application_context_texts", texts)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_answer_basis_audit", audit)
+    ctx = SkyvernContext()
+    ctx.run_arms = {APPLICATION_CONTEXT_FLAG: ("wr_1", arm)}
+    skyvern_context.set(ctx)
+    caller = _ScriptedCaller(script)
+    try:
+        with capture_logs() as logs:
+            outcome = await run_task_v3_agent_loop(
+                page_provider=_fixed_page_provider(_FakePage()),
+                llm_caller=caller,
+                goal="Apply.",
+                parameters={"resume": "text"},
+                page_free=page_free,
+            )
+    finally:
+        skyvern_context.reset()
+    terminal = next(e for e in logs if e.get("event") == "taskv3 engine loop finished")
+    declaring_run = arm == "treatment" and hook is not None and not page_free
+    assert audit_calls == ([] if page_free else [True if declaring_run else "absent"])
+    # A declaring run reads every log fact off its one context call.
+    assert payload_hook_calls == ([] if page_free or declaring_run else ["age", "defaults"])
+    return outcome, caller, terminal, context_calls
+
+
+def _user_texts(outcome: Any) -> list[str]:
+    return [m["content"] for m in outcome.messages if m["role"] == "user" and isinstance(m.get("content"), str)]
+
+
+def _sent_tool_names(caller: _ScriptedCaller) -> set[str]:
+    return {tool["function"]["name"] for tool in caller.sent_tools or []}
+
+
+_FINISH_ONLY = [[("finish", {"status": "completed", "reason": "ok"})]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("arm", ["control", "unrandomized"])
+async def test_application_context_arm_off_leaves_the_run_as_today(monkeypatch: pytest.MonkeyPatch, arm: str) -> None:
+    outcome, caller, terminal, context_calls = await _run_with_application_context_arm(monkeypatch, arm, _FINISH_ONLY)
+    assert context_calls == []
+    assert "declare_application_context" not in _sent_tool_names(caller)
+    users = _user_texts(outcome)
+    assert users[0].endswith("\n\nAGE TEXT\n\nSIX AND TIER ONE")
+    assert not any("declare_application_context" in text for text in users)
+    assert (terminal["age_default_rendered"], terminal["application_defaults_rendered"]) == (True, True)
+    assert (terminal["application_context_arm"], terminal["application_context"]) == (arm, None)
+    assert terminal["application_defaults_delivered"] is None
+    assert (terminal["age_default_reason"], terminal["application_defaults_reason"]) == ("rendered", "rendered")
+    assert terminal["application_payload_qualified"] is True
+    assert terminal["answer_audit_trigger"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_declared_yes_delivers_the_defaults_once_after_the_first_reply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outcome, caller, terminal, _ = await _run_with_application_context_arm(
+        monkeypatch,
+        "treatment",
+        [
+            [("declare_application_context", {"is_job_application": True})],
+            [("declare_application_context", {"is_job_application": True})],
+            [("finish", {"status": "completed", "reason": "ok"})],
+        ],
+    )
+    assert "declare_application_context" in _sent_tool_names(caller)
+    users = _user_texts(outcome)
+    assert users[0].endswith("\n\nTIER ONE")
+    assert users.count("AGE TEXT\n\nSIX TEXT") == 1
+    assert terminal["application_context"] == "yes_declared"
+    assert terminal["application_defaults_delivered"] is True
+    assert (terminal["age_default_rendered"], terminal["application_defaults_rendered"]) == (True, True)
+    assert terminal["application_payload_qualified"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "first_turn,state",
+    [
+        ([("declare_application_context", {"is_job_application": False})], "no_declared"),
+        ([], "no_implicit"),
+    ],
+)
+async def test_a_payload_qualified_run_without_a_yes_keeps_tier_one_and_the_audit_and_loses_the_defaults(
+    monkeypatch: pytest.MonkeyPatch, first_turn: list[tuple[str, dict[str, Any]]], state: str
+) -> None:
+    script = [*([first_turn] if first_turn else []), *_FINISH_ONLY, *_FINISH_ONLY]
+    outcome, _, terminal, _ = await _run_with_application_context_arm(monkeypatch, "treatment", script)
+    joined = "\n".join(_user_texts(outcome))
+    assert _user_texts(outcome)[0].endswith("\n\nTIER ONE")
+    assert "AGE TEXT" not in joined and "SIX" not in joined
+    assert terminal["application_context"] == state
+    assert terminal["application_defaults_delivered"] is False
+    assert (terminal["age_default_rendered"], terminal["application_defaults_rendered"]) == (False, False)
+    assert terminal["application_payload_qualified"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_yes_on_a_run_the_payload_check_misses_logs_the_two_apart(monkeypatch: pytest.MonkeyPatch) -> None:
+    outcome, _, terminal, _ = await _run_with_application_context_arm(
+        monkeypatch,
+        "treatment",
+        [[("declare_application_context", {"is_job_application": True})], *_FINISH_ONLY],
+        hook=(None, "AGE TEXT", "SIX TEXT"),
+    )
+    assert "AGE TEXT\n\nSIX TEXT" in _user_texts(outcome)
+    assert terminal["application_payload_qualified"] is False
+    assert terminal["application_defaults_delivered"] is True
+    assert terminal["application_defaults_reason"] == "not_job_application"
+
+
+@pytest.mark.asyncio
+async def test_a_withheld_age_text_stays_out_of_a_yes(monkeypatch: pytest.MonkeyPatch) -> None:
+    outcome, _, terminal, _ = await _run_with_application_context_arm(
+        monkeypatch,
+        "treatment",
+        [[("declare_application_context", {"is_job_application": True})], *_FINISH_ONLY],
+        hook=("TIER ONE", None, "SIX TEXT"),
+    )
+    assert "SIX TEXT" in _user_texts(outcome)
+    assert (terminal["age_default_rendered"], terminal["application_defaults_rendered"]) == (False, True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "hook,age_reason,defaults_reason,qualified",
+    [
+        (("TIER ONE", "AGE TEXT", "SIX TEXT"), "rendered", "rendered", True),
+        (("TIER ONE", None, "SIX TEXT"), "age_field_present", "rendered", True),
+        ((None, "AGE TEXT", "SIX TEXT"), "not_job_application", "not_job_application", False),
+        ((None, None, "SIX TEXT"), "not_job_application", "not_job_application", False),
+    ],
+)
+async def test_a_declaring_run_logs_the_payload_check_values_from_its_one_context_call(
+    monkeypatch: pytest.MonkeyPatch, hook: Any, age_reason: str, defaults_reason: str, qualified: bool
+) -> None:
+    _, _, terminal, context_calls = await _run_with_application_context_arm(
+        monkeypatch, "treatment", _FINISH_ONLY, hook=hook
+    )
+    assert len(context_calls) == 1
+    assert (terminal["age_default_reason"], terminal["application_defaults_reason"]) == (age_reason, defaults_reason)
+    assert terminal["application_payload_qualified"] is qualified
+
+
+async def _run_declaring_audit(
+    monkeypatch: pytest.MonkeyPatch,
+    script: list[list[tuple[str, dict[str, Any]]]],
+    *,
+    task_text: str | None,
+    audit_present: bool = True,
+    log_only_arm: str = "control",
+) -> tuple[dict[str, Any], dict[str, Any], list[bool]]:
+    """Runs a treatment run with `probe_armed` tool calls in the script, each reading the audit's armed state."""
+    applied: dict[str, Any] = {}
+    readings: list[bool] = []
+
+    async def audit_hook(parameters: Any, *, goal: str, organization_id: Any, step: Any, declaring: bool) -> Any:
+        assert declaring is True
+        return object() if audit_present else None
+
+    def spy(tools: list[Any], answer_audit: Any, **kwargs: Any) -> None:
+        applied.update(kwargs, audit=answer_audit)
+
+    async def probe(args: dict[str, Any]) -> ToolResult:
+        readings.append(applied["armed"]())
+        return ToolResult.ok("read")
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_application_context_texts", lambda p: (task_text, "AGE", "SIX"))
+    monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_answer_basis_audit", audit_hook)
+    monkeypatch.setattr(engine_mod, "apply_answer_basis_audit", spy)
+    ctx = SkyvernContext()
+    ctx.run_arms = {APPLICATION_CONTEXT_FLAG: ("wr_1", "treatment"), ANSWER_AUDIT_LOG_ONLY_FLAG: ("wr_1", log_only_arm)}
+    skyvern_context.set(ctx)
+    try:
+        with capture_logs() as logs:
+            await run_task_v3_agent_loop(
+                page_provider=_fixed_page_provider(_FakePage()),
+                llm_caller=_ScriptedCaller(script),
+                goal="Apply.",
+                parameters={"background": "text"},
+                extra_tools=[ToolSpec(name="probe_armed", description="", parameters={}, handler=probe)],
+            )
+    finally:
+        skyvern_context.reset()
+    return applied, next(e for e in logs if e.get("event") == "taskv3 engine loop finished"), readings
+
+
+_PROBE = [("probe_armed", {})]
+_DECLARE_YES = [("declare_application_context", {"is_job_application": True})]
+_DECLARE_NO = [("declare_application_context", {"is_job_application": False})]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "task_text,script,readings,trigger,active",
+    [
+        (None, [_PROBE, _DECLARE_YES, _PROBE, *_FINISH_ONLY], [False, True], "declaration", False),
+        (None, [_PROBE, _DECLARE_NO, _PROBE, *_FINISH_ONLY], [False, False], None, False),
+        (None, [_PROBE, _PROBE, *_FINISH_ONLY], [False, False], None, False),
+        ("TIER ONE", [_PROBE, _DECLARE_NO, _PROBE, *_FINISH_ONLY], [True, True], "payload", True),
+    ],
+    ids=["key-miss-yes", "key-miss-no", "key-miss-silent", "key-hit-armed-from-turn-1"],
+)
+async def test_the_audit_arms_on_the_payload_check_or_a_declared_yes(
+    monkeypatch: pytest.MonkeyPatch,
+    task_text: str | None,
+    script: Any,
+    readings: list[bool],
+    trigger: str | None,
+    active: bool,
+) -> None:
+    _, terminal, seen = await _run_declaring_audit(monkeypatch, script, task_text=task_text)
+    assert seen == readings
+    assert (terminal["answer_audit_trigger"], terminal["answer_audit_active"]) == (trigger, active)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("declared_only_log_only", [True, False], ids=["4b", "4a"])
+@pytest.mark.parametrize(
+    "task_text,log_only_arm,expected_4b,expected_4a",
+    [
+        (None, "control", True, False),
+        (None, "treatment", True, True),
+        ("TIER ONE", "control", False, False),
+        ("TIER ONE", "treatment", True, True),
+    ],
+)
+async def test_only_a_run_armed_by_its_declaration_alone_changes_mode_with_the_one_constant(
+    monkeypatch: pytest.MonkeyPatch,
+    declared_only_log_only: bool,
+    task_text: str | None,
+    log_only_arm: str,
+    expected_4b: bool,
+    expected_4a: bool,
+) -> None:
+    monkeypatch.setattr(engine_mod, "DECLARED_ONLY_AUDIT_LOG_ONLY", declared_only_log_only)
+    applied, _, _ = await _run_declaring_audit(
+        monkeypatch, _FINISH_ONLY, task_text=task_text, log_only_arm=log_only_arm
+    )
+    assert applied["log_only"] is (expected_4b if declared_only_log_only else expected_4a)
+    # The hold lines of a declaration-only run are told apart from the log-only arm's whichever mode it runs in.
+    assert ("answer_audit_trigger" in applied["log_fields"]) is (task_text is None)
+
+
+def test_the_declared_only_audit_defaults_to_log_only() -> None:
+    assert engine_mod.DECLARED_ONLY_AUDIT_LOG_ONLY is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("task_text", [None, "TIER ONE"], ids=["key-miss", "key-hit"])
+async def test_the_kill_switch_leaves_a_declared_yes_without_an_audit(
+    monkeypatch: pytest.MonkeyPatch, task_text: str | None
+) -> None:
+    applied, terminal, _ = await _run_declaring_audit(
+        monkeypatch, [_DECLARE_YES, *_FINISH_ONLY], task_text=task_text, audit_present=False
+    )
+    assert applied["audit"] is None
+    assert (terminal["answer_audit_trigger"], terminal["answer_audit_active"]) == (None, False)
+
+
+@pytest.mark.asyncio
+async def test_a_run_that_never_gets_a_turn_reads_not_asked(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_application_context_texts", lambda p: ("TIER", "AGE", "SIX"))
+    ctx = SkyvernContext()
+    ctx.run_arms = {APPLICATION_CONTEXT_FLAG: ("wr_1", "treatment")}
+    skyvern_context.set(ctx)
+    try:
+        with capture_logs() as logs:
+            outcome = await run_task_v3_agent_loop(
+                page_provider=_fixed_page_provider(_FakePage()),
+                llm_caller=_ScriptedCaller(_FINISH_ONLY),
+                goal="Apply.",
+                parameters={"resume": "text"},
+                initial_navigation_status=404,
+            )
+    finally:
+        skyvern_context.reset()
+    assert outcome.status == "terminated"
+    terminal = next(e for e in logs if e.get("event") == "taskv3 engine loop finished")
+    assert terminal["application_context"] == "not_asked"
+
+
+@pytest.mark.asyncio
+async def test_a_page_free_run_gets_no_application_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    outcome, caller, terminal, context_calls = await _run_with_application_context_arm(
+        monkeypatch, "treatment", _FINISH_ONLY, page_free=True
+    )
+    assert context_calls == []
+    assert "declare_application_context" not in _sent_tool_names(caller)
+    assert not any("declare_application_context" in text for text in _user_texts(outcome))
+    assert terminal["application_context"] is None
+
+
+@pytest.mark.asyncio
+async def test_no_hook_texts_means_no_tool_and_no_notice_even_on_treatment(monkeypatch: pytest.MonkeyPatch) -> None:
+    outcome, caller, terminal, _ = await _run_with_application_context_arm(
+        monkeypatch, "treatment", _FINISH_ONLY, hook=None
+    )
+    assert "declare_application_context" not in _sent_tool_names(caller)
+    assert not any("declare_application_context" in text for text in _user_texts(outcome))
+    assert _user_texts(outcome)[0].endswith("\n\nAGE TEXT\n\nSIX AND TIER ONE")
+    assert terminal["application_context"] is None
+
+
 @pytest.mark.asyncio
 async def test_operator_defaults_ride_the_task_message_only_and_leave_the_system_prompt_alone(
     monkeypatch: pytest.MonkeyPatch,
@@ -1722,7 +2189,7 @@ async def test_the_answer_audit_wraps_the_run_tools_and_sees_the_instructions(mo
         hook_calls.append({"parameters": parameters, "goal": goal})
         return audit
 
-    def spy(tools: list[Any], answer_audit: Any) -> None:
+    def spy(tools: list[Any], answer_audit: Any, **_kwargs: Any) -> None:
         applied.append(([t.name for t in tools], answer_audit))
 
     monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_answer_basis_audit", hook)
@@ -1746,6 +2213,45 @@ async def test_the_answer_audit_wraps_the_run_tools_and_sees_the_instructions(mo
     assert "Apply." in hook_calls[0]["goal"] and "Answer citizenship from the resume." in hook_calls[0]["goal"]
     assert "click" in applied[0][0] and applied[0][1] is audit
     assert applied[1][1] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("audit_installed", [True, False])
+@pytest.mark.parametrize("audit_arm", ["unrandomized", "control", "treatment"])
+async def test_the_log_only_arm_changes_the_run_only_on_treatment(
+    monkeypatch: pytest.MonkeyPatch, audit_arm: str, audit_installed: bool
+) -> None:
+    applied: list[dict[str, Any]] = []
+
+    async def hook(parameters: Any, *, goal: str, organization_id: Any, step: Any) -> object | None:
+        return object() if audit_installed else None
+
+    def spy(tools: list[Any], answer_audit: Any, **kwargs: Any) -> None:
+        applied.append(kwargs)
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_answer_basis_audit", hook)
+    monkeypatch.setattr(engine_mod, "apply_answer_basis_audit", spy)
+    ctx = SkyvernContext()
+    ctx.run_arms = {ANSWER_AUDIT_LOG_ONLY_FLAG: ("wr_1", audit_arm)} if audit_arm != "unrandomized" else {}
+    skyvern_context.set(ctx)
+    try:
+        with capture_logs() as logs:
+            outcome = await run_task_v3_agent_loop(
+                page_provider=_fixed_page_provider(_FakePage()),
+                llm_caller=_ScriptedCaller([[("finish", {"status": "completed", "reason": "ok"})]]),
+                goal="Apply.",
+                parameters={"resume": "text"},
+            )
+    finally:
+        skyvern_context.reset()
+
+    assert outcome.status == "completed"
+    assert applied == [
+        {"log_only": audit_arm == "treatment", "log_fields": {"audit_mode_arm": audit_arm}, "armed": None}
+    ]
+    terminal = next(e for e in logs if e.get("event") == "taskv3 engine loop finished")
+    assert (terminal["audit_mode_arm"], terminal["answer_audit_active"]) == (audit_arm, audit_installed)
+    assert terminal["answer_audit_trigger"] == ("payload" if audit_installed else None)
 
 
 @pytest.mark.asyncio
@@ -3121,11 +3627,7 @@ async def test_a_typed_value_far_past_a_page_read_reaches_the_request_whole(monk
     assert "not listed" not in request["user_prompt"]
 
 
-@pytest.mark.asyncio
-async def test_typed_values_are_withheld_only_past_the_smallest_model_input_limit(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    limit = 60_000
+def _small_fallback_caller(limit: int) -> _ScriptedCaller:
     caller = _ScriptedCaller([])
     caller.llm_config = LLMRouterConfig(
         model_name="router",
@@ -3142,6 +3644,15 @@ async def test_typed_values_are_withheld_only_past_the_smallest_model_input_limi
         ],
         main_model_group="primary",
     )
+    return caller
+
+
+@pytest.mark.asyncio
+async def test_typed_values_are_withheld_only_past_the_smallest_model_input_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    limit = 60_000
+    caller = _small_fallback_caller(limit)
     chunk = " ".join(f"word{n}" for n in range(4000))
     values = tuple(CodeTypedValue(line=n, target=f"#f{n}", value=chunk) for n in range(1, 21))
 
@@ -3158,6 +3669,32 @@ async def test_typed_values_are_withheld_only_past_the_smallest_model_input_limi
     assert 0 < len(rows) < len(values)
     assert all(row.endswith(f'into "#f{n}"') and json.dumps(chunk) in row for n, row in enumerate(rows, start=1))
     assert f"- {len(values) - len(rows)} more typed values not listed" in user_prompt
+    assert sent <= limit
+
+
+@pytest.mark.asyncio
+async def test_the_typed_value_budget_leaves_room_for_the_later_application_context_messages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    limit = 60_000
+    defaults = " ".join(f"default{n}" for n in range(10_000))
+    monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_application_context_texts", lambda p: (None, None, defaults))
+    chunk = " ".join(f"word{n}" for n in range(4000))
+    values = tuple(CodeTypedValue(line=n, target=f"#f{n}", value=chunk) for n in range(1, 21))
+    ctx = SkyvernContext()
+    ctx.run_arms = {APPLICATION_CONTEXT_FLAG: ("wr_1", "treatment")}
+    skyvern_context.set(ctx)
+    try:
+        request = await _captured_request(monkeypatch, _small_fallback_caller(limit), values)
+    finally:
+        skyvern_context.reset()
+    sent = (
+        count_tokens(request["system_prompt"])
+        + count_tokens(request["user_prompt"])
+        + count_tokens(defaults)
+        + count_tokens(json.dumps([tool.to_openai_tool() for tool in request["tools"]]))
+        + PERCEPTION_RETAIN_CHARS_HIGH // 4
+    )
     assert sent <= limit
 
 
@@ -3184,7 +3721,7 @@ async def test_engine_logs_a_dead_end_provenance_through_the_real_navigate_tool(
 
     page.goto = _goto  # type: ignore[method-assign]
     page.click = _click  # type: ignore[method-assign]
-    script = [[("navigate", {"url": task_url})], [("finish", {"status": "completed", "reason": "never"})]]
+    script = [[("navigate", {"url": task_url})], [("finish", {"status": "completed", "reason": "saw the 404"})]]
     if via_click:
         script[:0] = [[("click", {"selector": "#go"})], [("navigate", {"url": "https://example.test/other"})]]
     with capture_logs() as logs:
@@ -3195,9 +3732,10 @@ async def test_engine_logs_a_dead_end_provenance_through_the_real_navigate_tool(
             task_target_urls=frozenset() if via_click else caller_known_published_urls(task_url, keep_query=True),
         )
 
-    assert (outcome.status, outcome.guard) == ("terminated", NAV_DEAD_END_GUARD)
+    assert (outcome.status, outcome.reason) == ("completed", "saw the 404")
     (line,) = (entry for entry in logs if entry["event"] == "taskv3 loop navigation dead end")
     assert line["provenance"] == ("previously_visited" if via_click else "task_supplied")
+    assert line["returned_to_model"] is True
 
 
 _JUSTIFY_CRITERIA = ("", "the record is not listed")

@@ -1,11 +1,25 @@
-import type { ActionsApiResponse } from "@/api/types";
+import type {
+  ActionsApiResponse,
+  WorkflowRunStatusApiResponseWithWorkflow,
+} from "@/api/types";
 import { useMemo } from "react";
 import { FileIcon } from "@radix-ui/react-icons";
 import { ArtifactDownloadLink } from "@/components/ArtifactDownloadLink";
+import {
+  classifyUse,
+  codeBlockUses,
+} from "@/routes/workflows/editor/jinjaReferences";
+import type { CodeBlock } from "@/routes/workflows/types/workflowTypes";
+import {
+  findWorkflowBlockByLabel,
+  visitWorkflowBlocks,
+} from "@/routes/workflows/workflowBlockUtils";
 import { runIsLogicallyFinal } from "@/routes/workflows/workflowRun/runRetryState";
+import { isRecord } from "@/util/utils";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import {
   isAction,
+  isBlockItem,
   isObserverThought,
   isWorkflowRunBlock,
   type ObserverThought,
@@ -24,6 +38,10 @@ import {
   findRunningBlock,
   findThoughtsForBlock,
 } from "./workflowTimelineUtils";
+import {
+  CodeBlockParameters,
+  type CodeBlockRunUse,
+} from "./blockInfo/CodeBlockParameters";
 import { BlockDetailConditional } from "./blockDetail/BlockDetailConditional";
 import { BlockDetailGeneric } from "./blockDetail/BlockDetailGeneric";
 import { BlockDetailHttpRequest } from "./blockDetail/BlockDetailHttpRequest";
@@ -48,6 +66,8 @@ type Props = {
   workflowRunId: string | undefined;
   onThoughtSelect?: (thought: ObserverThought) => void;
   onViewScreenshot?: (workflowRunBlockId: string) => void;
+  // Opens Copilot on this run for the given block label; the card offers it only once the run is final.
+  onFix?: (blockLabel: string | null) => void;
   // The block the run-level line's headline is actually about, and that
   // headline's exact text. Both must match — the ID alone (a block can fail
   // with different text than the run's own failure_reason) and the text
@@ -116,11 +136,97 @@ function BlockDownloadedFiles({
   );
 }
 
+function latestEarlierRun(
+  timeline: Array<WorkflowRunTimelineItem>,
+  label: string,
+  selected: WorkflowRunBlock,
+): WorkflowRunBlock | null {
+  const cutoff = new Date(selected.created_at).getTime();
+  let latest: WorkflowRunBlock | null = null;
+  const stack = [...timeline];
+  while (stack.length > 0) {
+    const item = stack.pop()!;
+    stack.push(...item.children);
+    if (
+      !isBlockItem(item) ||
+      item.block.label !== label ||
+      item.block.workflow_run_block_id === selected.workflow_run_block_id
+    ) {
+      continue;
+    }
+    const createdAt = new Date(item.block.created_at).getTime();
+    if (
+      createdAt < cutoff &&
+      (!latest || createdAt > new Date(latest.created_at).getTime())
+    ) {
+      latest = item.block;
+    }
+  }
+  return latest;
+}
+
+// Each output is the latest earlier execution's, not the context the code saw: the backend
+// merges a bare label's value across loop iterations, which is not rebuilt here.
+function codeBlockRunUses(
+  block: WorkflowRunBlock,
+  definition: CodeBlock,
+  workflowRun: WorkflowRunStatusApiResponseWithWorkflow,
+  timeline: Array<WorkflowRunTimelineItem>,
+): Array<CodeBlockRunUse> {
+  const workflowDefinition = workflowRun.workflow.workflow_definition;
+  const inputKeys = new Set(
+    workflowDefinition.parameters
+      .filter((parameter) => parameter.parameter_type !== "output")
+      .map((parameter) => parameter.key),
+  );
+  const blockLabels = new Set<string>();
+  visitWorkflowBlocks(workflowDefinition.blocks, (definitionBlock) => {
+    blockLabels.add(definitionBlock.label);
+  });
+  const parameterKeys = (definition.parameters ?? []).map(
+    (parameter) => parameter.key,
+  );
+  return codeBlockUses(parameterKeys, definition.code).map((name) => {
+    const kind = classifyUse(name, inputKeys, blockLabels);
+    if (kind === "input") {
+      return {
+        name,
+        kind,
+        found: name in workflowRun.parameters,
+        value: workflowRun.parameters[name],
+      };
+    }
+    if (kind === "neither") {
+      return { name, kind, found: false };
+    }
+    const bareLabel = blockLabels.has(name);
+    const upstream = latestEarlierRun(
+      timeline,
+      bareLabel ? name : name.replace(/_output$/, ""),
+      block,
+    );
+    if (!upstream) {
+      return { name, kind, found: false };
+    }
+    const output = upstream.output;
+    return {
+      name,
+      kind,
+      found: true,
+      value:
+        bareLabel && isRecord(output) && "extracted_information" in output
+          ? { ...output, output: output.extracted_information }
+          : output,
+    };
+  });
+}
+
 function renderBodyForBlock(
   block: WorkflowRunBlock,
   activeItem: WorkflowRunOverviewActiveElement,
   onThoughtSelect: Props["onThoughtSelect"],
   timeline: Array<WorkflowRunTimelineItem>,
+  workflowRun: WorkflowRunStatusApiResponseWithWorkflow | null | undefined,
 ) {
   const thoughts = findThoughtsForBlock(timeline, block);
   switch (block.block_type) {
@@ -148,6 +254,30 @@ function renderBodyForBlock(
       return <BlockDetailWorkflowTrigger block={block} />;
     case "human_interaction":
       return <BlockDetailHumanInteraction block={block} />;
+    case "code": {
+      const definition =
+        workflowRun && block.label
+          ? findWorkflowBlockByLabel(
+              workflowRun.workflow.workflow_definition.blocks,
+              block.label,
+            )
+          : null;
+      if (!workflowRun || definition?.block_type !== "code") {
+        return <BlockDetailGeneric block={block} />;
+      }
+      return (
+        <CodeBlockParameters
+          key={block.workflow_run_block_id}
+          code={definition.code}
+          prompt={definition.prompt}
+          steps={definition.steps}
+          blockStatus={block.status}
+          failureReason={block.failure_reason}
+          actions={block.actions}
+          uses={codeBlockRunUses(block, definition, workflowRun, timeline)}
+        />
+      );
+    }
     default:
       return <BlockDetailGeneric block={block} />;
   }
@@ -162,6 +292,7 @@ function WorkflowRunBlockDetail({
   workflowRunId,
   onThoughtSelect,
   onViewScreenshot,
+  onFix,
   statedFailureBlockId = null,
   statedFailureHeadline = null,
 }: Props) {
@@ -173,6 +304,7 @@ function WorkflowRunBlockDetail({
   const { data: workflowRun } = useWorkflowRunWithWorkflowQuery({
     workflowRunId,
   });
+  const runFinal = Boolean(workflowRun) && runIsLogicallyFinal(workflowRun!);
 
   // Cold-start: timeline data hasn't arrived yet. Check data === undefined
   // rather than isLoading because the timeline query is gated on the
@@ -207,7 +339,13 @@ function WorkflowRunBlockDetail({
       findRunningBlock(timeline) ?? findLastExecutedBlock(timeline);
     if (target) {
       resolvedBlock = target;
-      body = renderBodyForBlock(target, activeItem, onThoughtSelect, timeline);
+      body = renderBodyForBlock(
+        target,
+        activeItem,
+        onThoughtSelect,
+        timeline,
+        workflowRun,
+      );
     } else {
       body = <EmptyState />;
     }
@@ -224,6 +362,7 @@ function WorkflowRunBlockDetail({
         activeItem,
         onThoughtSelect,
         timeline,
+        workflowRun,
       );
     } else {
       body = <EmptyState />;
@@ -239,6 +378,7 @@ function WorkflowRunBlockDetail({
       activeItem,
       onThoughtSelect,
       timeline,
+      workflowRun,
     );
   } else {
     body = <EmptyState />;
@@ -254,9 +394,7 @@ function WorkflowRunBlockDetail({
             <BlockDetailHeader
               block={resolvedBlock}
               iterationOverride={effectiveIteration}
-              runFinalized={
-                Boolean(workflowRun) && runIsLogicallyFinal(workflowRun!)
-              }
+              runFinalized={runFinal}
             />
           </>
         )}
@@ -276,6 +414,15 @@ function WorkflowRunBlockDetail({
                 resolvedBlock.workflow_run_block_id === statedFailureBlockId
                   ? statedFailureHeadline
                   : null
+              }
+              onFix={
+                onFix &&
+                runFinal &&
+                resolvedBlock.workflow_run_block_id !== statedFailureBlockId &&
+                // diagnose_run targets this run; a block from a child run would send the wrong one.
+                resolvedBlock.workflow_run_id === workflowRunId
+                  ? () => onFix(resolvedBlock!.label)
+                  : undefined
               }
             />
           )}

@@ -253,6 +253,7 @@ async def test_run_task_v2_copies_parent_loop_state_into_child_context(monkeypat
         observer_cruise_id="tsk_v2_child",
         workflow_id="wf_child",
         workflow_run_id="wr_child",
+        error_code_mapping=None,
     )
     captured_contexts: list[SkyvernContext] = []
 

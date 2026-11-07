@@ -267,6 +267,8 @@ class Settings(BaseSettings):
     LOG_SAMPLING_RATE: float = 1.0
     LOG_SAMPLING_ORG_IDS: list[str] = []
     COPILOT_RAW_SECRET_SAFETY_TIMEOUT_SECONDS: float = 12.0
+    COPILOT_RAW_SECRET_SAFETY_HEDGE_ENABLED: bool = True
+    COPILOT_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS: float = 3.0
     COPILOT_COMPLETION_JUDGE_TIMEOUT_SECONDS: float = 12.0
     COPILOT_OUTPUT_DESIGNATION_TIMEOUT_SECONDS: float = 12.0
     # A capture that runs out of time yields no page evidence at all, so the scout falls back to
@@ -318,8 +320,6 @@ class Settings(BaseSettings):
     # dispatch is unavailable, instead of failing closed. Grants nothing on its own -- see
     # AgentFunction.allow_copilot_inline_code_execution for the conditions it is ANDed with.
     COPILOT_ALLOW_INLINE_CODE_EXECUTION: bool = False
-    # Default code_only for MCP block/workflow tools. Off = permissive.
-    MCP_CODE_ONLY_MODE: bool = False
     RUN_HEARTBEAT_TIMEOUT_MINUTES: int = 30
     PORT: int = 8000
     # uvicorn answers 503 without dispatching to ASGI once *either* open connections or in-flight
@@ -390,6 +390,8 @@ class Settings(BaseSettings):
     # Most page PNG data a pdfplumber child may hand back for OCR; text, word and page-count results have smaller caps
     # in pdf_parser. The parent holds a result outside the child's memory cap, so it reserves the decoded size.
     PDFPLUMBER_MAX_RESULT_BYTES: int = Field(default=256 * 1024 * 1024, gt=0)
+    # Server kill switch for notes in PDF imports; Copilot keeps reading saved notes because they still guide runs.
+    WORKFLOW_PDF_IMPORT_NOTES_ENABLED: bool = True
     PRESIGNED_URL_EXPIRATION: int = 60 * 60 * 24  # 24 hours
     # Ceiling on the retention_days a caller may request at upload time. A cap exists so a
     # retention period cannot be used to pin storage indefinitely; omitting retention_days
@@ -577,8 +579,8 @@ class Settings(BaseSettings):
     TASK_V3_PRE_SUBMIT_CAPTURE_SAMPLE_RATE: float = 0.25
     # Kill switch: one page DOM per Task V3 block, saved after the loop as html_action (v1 saves html_scrape).
     TASK_V3_BLOCK_END_DOM: bool = True
-    # Fraction of Task V3 runs (keyed like the pre-submit sample) that store the page DOM on every turn step and
-    # flush each turn's archive as the turn ends; the rest keep one archive ZIP per block. 0 disables.
+    # Fallback only: runs are randomized per run by the flag of the same name (TURN_DOM_FLAG). This is the fraction
+    # of the runs it leaves unrandomized (keyed like the pre-submit sample) that store the page DOM every turn.
     TASK_V3_TURN_DOM_SAMPLE_RATE: float = 0.05
     # Kill switch for the tier-1 semantic commit read (SKY-15322): decisive-accept-only ARIA/value
     # probe consulted before the shape heuristics, which remain the fallback either way.
@@ -586,6 +588,9 @@ class Settings(BaseSettings):
     # Kill switch for committing a list row that names the value without being it exactly (its main label, a
     # singular/plural, a unique word prefix on a click-opened list) (SKY-18017). Off: typeaheads commit exact rows only.
     TASK_V3_CHOICE_NONEXACT_COMMIT: bool = True
+    # Kill switch: hold a Task V3 typing call whose field is still refused by the same live layer that refused an earlier
+    # one, instead of re-running the full typing path for it (SKY-19408). Off: every call runs its full path as before.
+    TASK_V3_SAME_LAYER_TYPE_HOLD: bool = True
     # Press a sub-pixel date segment through the layer painted over it, and route month/year and
     # year-only segment groups to the segment path (SKY-17013). Force-on term only: runs are randomized per
     # run by the flag of the same name, read through run_arm_enabled(DATE_SEGMENT_AIM_FLAG, ...).
@@ -593,11 +598,12 @@ class Settings(BaseSettings):
     # Hold the first click or Enter after a password fill until 45 s after Task V3 started the block. Force-on term
     # only: runs are randomized per run by the flag of the same name, read through run_arm_enabled(LOGIN_PACE_FLAG, ...).
     TASK_V3_LOGIN_PACE: bool = False
-    # Return an in-loop navigate's 404/410 to the model as the navigate result instead of ending the run (SKY-16206).
-    # Force-on term only: runs are randomized per run by the flag of the same name (DEAD_END_RETURN_FLAG).
-    TASK_V3_DEAD_END_RETURN: bool = False
+    # The acting model declares whether a run is a job application, and only a yes delivers the application defaults.
+    # Force-on term only: runs are randomized per run by the flag of the same name (APPLICATION_CONTEXT_FLAG).
+    TASK_V3_APPLICATION_CONTEXT: bool = False
     # Store the error code v3's model chose on finish instead of the post-run page guess. Off: the guess is stored
-    # as before. Retry policies match on stored codes, so turning this on can change which runs retry.
+    # as before. Force-on term only: where it is off, organizations are gated by the flag of the same name.
+    # Retry policies match on stored codes, so turning this on can change which runs retry.
     TASK_V3_ERROR_CODE_ON_FINISH: bool = False
     # Kill switch for the hold on a Task V3 run's first terminated verdict that asks for what prevents the task.
     # On: every terminated verdict stands as the model gave it.
@@ -634,18 +640,11 @@ class Settings(BaseSettings):
     VOLCENGINE_API_BASE: str = "https://ark.cn-beijing.volces.com/api/v3"
     VOLCENGINE_CUA_LLM_KEY: str = "VOLCENGINE_DOUBAO_1_5_THINKING_VISION_PRO"
 
-    # Yutori Navigator
-    ENABLE_YUTORI: bool = False
-    YUTORI_API_KEY: str | None = None
     SERPAPI_API_KEY: str | None = Field(default=None, repr=False)
     EXA_API_KEY: str | None = Field(default=None, repr=False)
     # Lets the search_web helper and Copilot tool spend the Search block's keys above. Off by default so
     # keys set only for the Search block are not spent by code blocks and the Copilot.
     ENABLE_SEARCH_WEB: bool = False
-    YUTORI_API_BASE: str = "https://api.yutori.com/v1"
-    YUTORI_MODEL: str = "n1.5-latest"
-    YUTORI_LLM_KEY: str = "YUTORI_NAVIGATOR"
-    YUTORI_TOOL_SET: str = ""
 
     # OPENAI COMPATIBLE
     OPENAI_COMPATIBLE_MODEL_NAME: str | None = None
@@ -776,6 +775,12 @@ class Settings(BaseSettings):
     AZURE_GPT6_1_SOL_API_BASE: str | None = None
     AZURE_GPT6_1_SOL_API_VERSION: str = "2025-04-01-preview"
 
+    ENABLE_AZURE_GPT6_1_TERRA: bool = False
+    AZURE_GPT6_1_TERRA_DEPLOYMENT: str = "gpt-6.1-terra"
+    AZURE_GPT6_1_TERRA_API_KEY: str | None = None
+    AZURE_GPT6_1_TERRA_API_BASE: str | None = None
+    AZURE_GPT6_1_TERRA_API_VERSION: str = "2025-04-01-preview"
+
     ENABLE_AZURE_GPT6_LUNA: bool = False
     AZURE_GPT6_LUNA_DEPLOYMENT: str = "gpt-6-luna"
     AZURE_GPT6_LUNA_API_KEY: str | None = None
@@ -872,6 +877,11 @@ class Settings(BaseSettings):
     # GCP Secret Manager credential vault settings
     GCP_CREDENTIAL_VAULT_PROJECT_ID: str | None = None  # project hosting the Secret Manager secrets
     GCP_CREDENTIAL_VAULT_PREFIX: str = "skyvern-cred-"  # secret-id prefix; must be unique per deployment
+
+    # AWS Secrets Manager credential vault settings
+    AWS_CREDENTIAL_VAULT_REGION: str | None = None  # region holding the secrets; setting it enables the vault
+    AWS_CREDENTIAL_VAULT_PREFIX: str = "skyvern-credentials/"  # secret-name prefix; must be unique per deployment
+    AWS_CREDENTIAL_VAULT_KMS_KEY_ID: str | None = None  # KMS key for new secrets; unset uses aws/secretsmanager
 
     # Azure Setting
     AZURE_TENANT_ID: str | None = None
@@ -1353,6 +1363,14 @@ class Settings(BaseSettings):
                 else "ANTHROPIC_CLAUDE5.5_OPUS"
             ),
             "label": "Anthropic Claude Opus 5.5",
+        }
+        mapping["claude-haiku-5-5"] = {
+            "llm_key": (
+                "BEDROCK_ANTHROPIC_CLAUDE5_5_HAIKU_INFERENCE_PROFILE"
+                if self.ENABLE_BEDROCK_ANTHROPIC
+                else "ANTHROPIC_CLAUDE5_5_HAIKU"
+            ),
+            "label": "Anthropic Claude Haiku 5.5",
         }
 
         try:

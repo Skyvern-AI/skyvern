@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from dataclasses import replace
@@ -15,6 +15,11 @@ import structlog
 from skyvern.cli.core.session_manager import get_page
 from skyvern.forge import app
 from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
+from skyvern.forge.sdk.copilot.agent_context import (
+    CredentialOriginDeclineStatus,
+    CredentialOriginRecovery,
+    ScoutedSelectorCandidate,
+)
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CREDENTIAL_ORIGIN_RECOVERY_DECLINED_REASON_CODE,
     CREDENTIAL_ORIGIN_RECOVERY_PENDING_REASON_CODE,
@@ -32,38 +37,37 @@ from skyvern.forge.sdk.copilot.credential_generation import (
 from skyvern.forge.sdk.copilot.credential_pause import (
     RAW_SECRET_CONNECTED_NEXT,
     CredentialPauseResolution,
+    SignedInProfile,
     credential_pause_transport_ready,
     defang_card_text,
+    login_saved_for_site,
     raw_secret_card_origin,
     request_credential_pause,
     signed_in_facts,
+    site_answer_unused_text,
 )
 from skyvern.forge.sdk.copilot.credential_resolution import (
-    connected_vault_login_sites,
     is_resolved_page_url,
-    load_connected_vault,
-    load_connected_vault_item,
     load_credentials,
     url_parts,
 )
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
 from skyvern.forge.sdk.copilot.page_identity import safe_page_origin
 from skyvern.forge.sdk.copilot.request_policy import (
+    CREDENTIAL_BINDING_FACTS,
     DemonstrationNavigationSiteURLSource,
     QuestionResponseSiteURLSource,
     RequestPolicy,
     SiteURLSource,
     SteerMessageSiteURLSource,
     UserMessageSiteURLSource,
-    admit_connected_vault_login_for_live_page,
     admit_credential_for_live_page,
+    admit_vault_login_for_live_page,
+    credential_binding,
     loggable_origin,
 )
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
-    CredentialOriginDeclineStatus,
-    CredentialOriginRecovery,
-    ScoutedSelectorCandidate,
     browser_evidence_commit_lock,
     browser_session_turn,
     effective_browser_session_id,
@@ -75,13 +79,13 @@ from skyvern.forge.sdk.copilot.secret_scrub import (
     register_secret_scrub_value,
     scrub_secrets_from_text,
 )
+from skyvern.forge.sdk.copilot.vault_logins import VAULT_LOGIN_REF_PREFIX, load_vault_logins
 from skyvern.forge.sdk.copilot.workflow_credential_utils import (
-    CONNECTED_VAULT_ID_PREFIX,
     saved_credential_ids,
     workflow_credential_ids,
     workflow_credential_origins,
 )
-from skyvern.forge.sdk.credential_site_policy import LoginSite, same_release_scope, same_site
+from skyvern.forge.sdk.credential_site_policy import LoginSite, describe_login_sites, same_release_scope, same_site
 from skyvern.forge.sdk.schemas.credentials import (
     Credential,
     CredentialItem,
@@ -93,11 +97,12 @@ from skyvern.forge.sdk.schemas.credentials import (
 from skyvern.forge.sdk.schemas.workflow_copilot import CredentialRegistration, WorkflowCopilotCredentialRegistration
 from skyvern.forge.sdk.services.credentials import generate_totp_code, normalize_totp_config
 from skyvern.forge.sdk.services.request_principal import get_request_principal
+from skyvern.forge.sdk.workflow.models.credential_release import saved_site_urls
 from skyvern.webeye.utils.dom import is_post_dispatch_click_timeout
 
 from ._shared import _emit_tool_blocker_signal
 from .banned_blocks import _copilot_authoring_capability
-from .credentials import _missing_credential_reference_tool_error
+from .credentials import _missing_credential_reference_tool_error, import_vault_login
 from .guardrails import _authority_tool_error
 from .mcp_hooks import (
     _TYPE_READBACK_SETTLE_SECONDS,
@@ -286,11 +291,15 @@ def _decline_credential_origin_recovery(
     return {"ok": True, "status": status, "next": _credential_origin_declined_text(origin)}
 
 
+def _refused_login_recovery_card_text(origin: str) -> str:
+    return f"The login tried on {origin} is saved for a different site. Pick the login to use on {origin}."
+
+
 async def _credential_evidence_admits_origin(
     copilot_ctx: AgentContext, recovery: CredentialOriginRecovery, credential: Credential
 ) -> bool:
-    """Whether the credential itself places it on the recovery origin, and nowhere else, and no fill on that site
-    refused it this turn."""
+    """Whether a site the credential is saved for and every site its vault entry names cover the recovery origin,
+    and no standing fill refusal on that site names it."""
     refused_on_site = {recovery.refused_credential_id} | {
         refused_id
         for origin, refused_id in copilot_ctx.credential_origin_refusals
@@ -304,9 +313,9 @@ async def _credential_evidence_admits_origin(
         return False
     if vault_sites is None:
         return False
-    tested = [credential.tested_url] if credential.tested_url else []
-    return bool(tested or vault_sites) and (
-        all(same_release_scope(url, recovery.origin) for url in tested)
+    saved = saved_site_urls(credential.tested_url, credential.extra_site_urls)
+    return bool(saved or vault_sites) and (
+        (not saved or login_saved_for_site(credential, recovery.origin))
         and all(site.admits(recovery.origin) for site in vault_sites)
     )
 
@@ -398,38 +407,24 @@ def _credential_fill_authority_error(copilot_ctx: AgentContext, credential_id: s
     return None
 
 
-def _resolved_credential_intended_url(policy: RequestPolicy, credential_id: str) -> str | None:
-    admitted_url = policy.live_page_admitted_urls.get(credential_id)
-    if admitted_url:
-        return admitted_url
-    return next(
-        (
-            credential.tested_url
-            for credential in policy.resolved_credentials
-            if credential.credential_id == credential_id and credential.tested_url
-        ),
-        None,
-    )
-
-
 async def _vault_named_sites(copilot_ctx: AgentContext, credential_id: str) -> list[LoginSite]:
     return await _read_vault_named_sites(copilot_ctx, credential_id) or []
 
 
 async def _read_vault_named_sites(copilot_ctx: AgentContext, credential_id: str) -> list[LoginSite] | None:
-    """Sites the credential's own vault entry names (only Bitwarden items carry any), or None when the read failed."""
-    if credential_id.startswith(CONNECTED_VAULT_ID_PREFIX):
-        policy = copilot_ctx.request_policy
-        return await connected_vault_login_sites(copilot_ctx.organization_id, policy, credential_id) if policy else None
+    """Sites the credential's own vault entry names, or None when the read failed."""
     await app.AGENT_FUNCTION.enforce_credential_use(
         copilot_ctx.organization_id,
         credential_id,
         principal=get_request_principal(),
     )
+    scoped = copilot_ctx.scoped_login_sites_by_credential_id.get(credential_id)
+    if scoped is not None:
+        return scoped
     cached = copilot_ctx.vault_login_uris_by_credential_id.get(credential_id)
     if cached is not None:
         return [LoginSite(uri, whole_site=True) for uri in cached]
-    uris: list[str] = []
+    item: CredentialItem | None = None
     try:
         db_credential = await app.DATABASE.credentials.get_credential(
             credential_id, organization_id=copilot_ctx.organization_id
@@ -437,14 +432,20 @@ async def _read_vault_named_sites(copilot_ctx: AgentContext, credential_id: str)
         if db_credential is not None:
             service = app.CREDENTIAL_VAULT_SERVICES.get(db_credential.vault_type or CredentialVaultType.BITWARDEN)
             if service is not None:
-                uris = list((await service.get_credential_item(db_credential)).login_uris)
+                item = await service.get_credential_item(db_credential)
     except Exception:
         # Not cached: a vault read that failed once says nothing about where the credential belongs,
         # and caching the empty answer would refuse every later fill this turn for a transient fault.
         LOG.info("copilot could not read the vault entry's sites", credential_id=credential_id, exc_info=True)
         return None
-    copilot_ctx.vault_login_uris_by_credential_id[credential_id] = uris
-    return [LoginSite(uri, whole_site=True) for uri in uris]
+    if item is None:
+        copilot_ctx.vault_login_uris_by_credential_id[credential_id] = []
+        return []
+    if item.login_sites is not None:
+        copilot_ctx.scoped_login_sites_by_credential_id[credential_id] = item.login_sites
+    else:
+        copilot_ctx.vault_login_uris_by_credential_id[credential_id] = list(item.login_uris)
+    return item.named_login_sites()
 
 
 def _missing_credential_origin_error(credential_id: str, page_url: str | None, *, user_named: bool = False) -> str:
@@ -469,12 +470,10 @@ def _missing_credential_origin_error(credential_id: str, page_url: str | None, *
     )
 
 
-def _connected_vault_login_off_site_error(credential_id: str, page_url: str) -> str:
-    origin = loggable_origin(page_url)
+def _vault_login_off_site_error(credential_id: str, page_url: str, sites: Iterable[LoginSite]) -> str:
     return (
-        f"`{credential_id}` is a login in the connected Bitwarden vault, and none of its saved websites covers "
-        f"{origin}, so it is not filled here. The user can add {origin} to that login's websites in Bitwarden, "
-        "or set an existing website's match detection to Base domain so it covers that site's other hosts."
+        f"`{credential_id}` is not filled on {loggable_origin(page_url)}: as saved in its vault, it fills only on "
+        f"{describe_login_sites(sites)}."
     )
 
 
@@ -590,14 +589,6 @@ async def _update_ask_target(
 
     A missing-authenticator ask needs a credential with no one-time-code method at all. A site-rejected
     one asks whatever methods it has, since the saved values themselves were turned away."""
-    if credential_id.startswith(CONNECTED_VAULT_ID_PREFIX):
-        return None, {
-            "ok": False,
-            "error": (
-                f"`{credential_id}` is a login in the connected Bitwarden vault, which the credential card cannot "
-                "edit. The user updates it in Bitwarden."
-            ),
-        }
     policy = copilot_ctx.request_policy
     # A saved workflow's own binding, read from its row at turn start, is authority to edit that record
     # even when the chat never named it; the card grants no origin, so no fill grant is needed.
@@ -607,7 +598,7 @@ async def _update_ask_target(
     authority_error = None if bound_by_saved_workflow else _credential_fill_authority_error(copilot_ctx, credential_id)
     if authority_error:
         return None, {"ok": False, "error": authority_error}
-    credential_item, load_error = await _load_vault_credential_item(copilot_ctx, credential_id)
+    credential_item, load_error = await _load_vault_credential_item(copilot_ctx, credential_id, for_update_card=True)
     if credential_item is None:
         return None, {"ok": False, "error": load_error}
     credential = credential_item.credential
@@ -720,27 +711,29 @@ async def _request_credential(
             }
 
     recovery_open = copilot_ctx.credential_origin_recovery
+    refused_here = [
+        earlier
+        for earlier in (
+            recovery_open,
+            *(
+                CredentialOriginRecovery(origin, "declined", refused_id)
+                for origin, refused_id in sorted(copilot_ctx.credential_origin_refusals)
+            ),
+        )
+        if earlier is not None and same_release_scope(login_page_url, earlier.origin)
+    ]
+    # An update ask for the login a fill refused on this site cannot help, so it opens the recovery pick card instead.
+    update_ask_replaced = bool(credential_id) and any(
+        earlier.refused_credential_id == credential_id for earlier in refused_here
+    )
+    if update_ask_replaced:
+        credential_id = None
+        rejected_by_site = False
+        reason = _refused_login_recovery_card_text(ask_origin.canonical)
     # The authenticator update card grants no origin, so it has its own latch and never spends the recovery's.
     # Any pick ask on a site where a fill was refused this turn gets a recovery card, so a plain card cannot bind a
     # refused login there.
-    on_recovery_site = (
-        None
-        if credential_id
-        else next(
-            (
-                earlier
-                for earlier in (
-                    recovery_open,
-                    *(
-                        CredentialOriginRecovery(origin, "declined", refused_id)
-                        for origin, refused_id in sorted(copilot_ctx.credential_origin_refusals)
-                    ),
-                )
-                if earlier is not None and same_release_scope(login_page_url, earlier.origin)
-            ),
-            None,
-        )
-    )
+    on_recovery_site = None if credential_id else next(iter(refused_here), None)
     recovery: CredentialOriginRecovery | None = None
     if on_recovery_site is not None:
         if recovery_open is not None and recovery_open.state == "pending" and on_recovery_site is not recovery_open:
@@ -767,7 +760,11 @@ async def _request_credential(
             "next": "A credential card is already open; its answer returns on the call that opened it.",
         }
     if update_ask and copilot_ctx.credential_totp_update_asked:
-        return {"ok": True, "status": "already_asked", "next": "Continue without re-asking this turn."}
+        return {
+            "ok": True,
+            "status": "already_asked",
+            "detail": "An update card was already shown this turn; another one cannot open until the next turn.",
+        }
 
     config = copilot_ctx.copilot_config
     if config is None or not credential_pause_transport_ready(copilot_ctx, config):
@@ -808,16 +805,24 @@ async def _request_credential(
             admit_connected=admit_connected,
             anchor_tool_call_id=anchor_tool_call_id,
             registration=card_registration,
+            lead_credential_id=recovery.refused_credential_id if recovery is not None else None,
         )
     except BaseException:
         if recovery is not None:
             _decline_credential_origin_recovery(copilot_ctx, recovery, "error")
         raise
     credential = resolution.credential if resolution is not None else None
-    if update_name is not None and site_rejected:
-        return _rejected_credential_ask_outcome(credential, update_name, answered=resolution)
-    if update_name is not None:
-        return await _missing_totp_ask_outcome(copilot_ctx, credential, update_name, answered=resolution)
+    if update_name is not None and credential_id:
+        if resolution is not None and resolution.signed_in is not None:
+            signed_in = _signed_in_result(resolution.signed_in)
+            binding = CREDENTIAL_BINDING_FACTS[credential_binding(policy, credential_id)]
+            signed_in["detail"] += f" {defang_card_text(update_name)} was not updated. {binding}"
+            return signed_in
+        if site_rejected:
+            return _rejected_credential_ask_outcome(credential, update_name, credential_id, policy, answered=resolution)
+        return await _missing_totp_ask_outcome(
+            copilot_ctx, credential, update_name, credential_id, policy, answered=resolution
+        )
     if recovery is not None:
         bound_origin = (
             canonicalize_origin(policy.live_page_admitted_urls.get(credential.credential_id))
@@ -836,6 +841,13 @@ async def _request_credential(
                 status = "connected_other_site"
             return _decline_credential_origin_recovery(copilot_ctx, recovery, status)
         copilot_ctx.credential_origin_recovery = None
+        if credential is not None and resolution is not None and resolution.site_answer is not None:
+            # The user saved this login for the site, so its earlier refusals there no longer stand.
+            copilot_ctx.credential_origin_refusals -= {
+                (origin, refused_id)
+                for origin, refused_id in copilot_ctx.credential_origin_refusals
+                if refused_id == credential.credential_id and same_release_scope(origin, recovery.origin)
+            }
         policy.origin_recovery_kept_named_credential_ids |= named_before_ask & {recovery.refused_credential_id}
         clear_tool_blocker_signals_for_reason_codes(
             copilot_ctx,
@@ -859,16 +871,7 @@ async def _request_credential(
             )
         return unanswered
     if resolution.signed_in is not None:
-        return {
-            "ok": True,
-            "status": "signed_in",
-            "site": resolution.signed_in.site,
-            "browser_profile_id": resolution.signed_in.browser_profile_id,
-            "browser_profile_name": defang_card_text(resolution.signed_in.profile_name),
-            "cookie_count": resolution.signed_in.cookie_count,
-            "credential_provided": False,
-            "detail": signed_in_facts(resolution.signed_in),
-        }
+        return _signed_in_result(resolution.signed_in)
     if resolution.action == "connected" and credential is None:
         return {
             "ok": True,
@@ -886,12 +889,27 @@ async def _request_credential(
                 "in the draft, and say a test run may stop at the login step."
             )
         return skipped
+    site_answer = resolution.site_answer
+    if site_answer is not None and copilot_ctx.credential_pause_outcome == "not_admitted":
+        return {
+            "ok": True,
+            "status": "declined_site" if site_answer.action == "no" else "site_change_unconfirmed",
+            "next": site_answer_unused_text(credential, site_answer),
+        }
     connected: dict[str, Any] = {
         "ok": True,
         "status": "connected",
         "credential_id": credential.credential_id,
         "credential_name": credential.name,
     }
+    if update_ask_replaced:
+        connected["update_card"] = (
+            "not shown: a fill on this site refused the login it named, so the card asked the user to pick a login"
+        )
+    if site_answer is not None:
+        connected["saved_site_change"] = (
+            f"The user allowed this login on {site_answer.site_b}; it still signs in on {site_answer.saved_sites_text}."
+        )
     if policy.raw_secret_redacted_draft:
         connected["next"] = RAW_SECRET_CONNECTED_NEXT
     elif card_registration is not None:
@@ -906,21 +924,37 @@ async def _request_credential(
     return connected
 
 
+def _signed_in_result(signed_in: SignedInProfile) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "status": "signed_in",
+        "site": signed_in.site,
+        "browser_profile_id": signed_in.browser_profile_id,
+        "browser_profile_name": defang_card_text(signed_in.profile_name),
+        "cookie_count": signed_in.cookie_count,
+        "credential_provided": False,
+        "detail": signed_in_facts(signed_in),
+    }
+
+
 async def _missing_totp_ask_outcome(
     copilot_ctx: CopilotContext,
     credential: Credential | None,
     credential_name: str,
+    credential_id: str,
+    policy: RequestPolicy,
     *,
     answered: CredentialPauseResolution | None,
 ) -> dict[str, Any]:
     """Report the update card from the saved record, never from the answer alone: a save can leave 2FA unset."""
-    not_added_next = (
-        f"{defang_card_text(credential_name)} still has no authenticator. Keep it as the workflow's credential "
-        "and do not ask again this turn. The verification step needs an authenticator on that credential "
-        "before a run can pass it."
-    )
+    name = defang_card_text(credential_name)
+    binding = CREDENTIAL_BINDING_FACTS[credential_binding(policy, credential_id)]
     if credential is None:
-        return {"ok": True, "status": "unanswered" if answered is None else "skipped", "next": not_added_next}
+        return {
+            "ok": True,
+            "status": "unanswered" if answered is None else "skipped",
+            "detail": f"{name} was not updated. It still has no authenticator. {binding}",
+        }
     still_missing_name, rechecked = await _update_ask_target(copilot_ctx, credential.credential_id)
     if rechecked is None:
         return {
@@ -928,37 +962,40 @@ async def _missing_totp_ask_outcome(
             "status": "saved_without_authenticator",
             "credential_id": credential.credential_id,
             "credential_name": still_missing_name,
-            "next": not_added_next,
+            "detail": f"{name} was saved but still has no authenticator. {binding}",
         }
     if rechecked.get("status") != "has_code_method":
         return rechecked
     return {
         **rechecked,
         "status": "authenticator_added",
-        "detail": "The saved credential now has a one-time-code method.",
+        "detail": f"The saved credential now has a one-time-code method. {binding}",
         "credential_id": credential.credential_id,
         "credential_name": credential.name,
     }
 
 
 def _rejected_credential_ask_outcome(
-    credential: Credential | None, credential_name: str, *, answered: CredentialPauseResolution | None
+    credential: Credential | None,
+    credential_name: str,
+    credential_id: str,
+    policy: RequestPolicy,
+    *,
+    answered: CredentialPauseResolution | None,
 ) -> dict[str, Any]:
+    binding = CREDENTIAL_BINDING_FACTS[credential_binding(policy, credential_id)]
     if credential is None:
         return {
             "ok": True,
             "status": "unanswered" if answered is None else "skipped",
-            "next": (
-                f"{defang_card_text(credential_name)} was not updated. Keep it as the workflow's credential and "
-                "do not ask again this turn. The workflow keeps its saved sign-in."
-            ),
+            "detail": f"{defang_card_text(credential_name)} was not updated. {binding}",
         }
     return {
         "ok": True,
         "status": "updated",
         "credential_id": credential.credential_id,
         "credential_name": credential.name,
-        "next": "The user saved this credential. Re-run the sign-in block to test the updated values.",
+        "detail": f"The user saved new values for {defang_card_text(credential.name)}. {binding}",
     }
 
 
@@ -1011,8 +1048,6 @@ async def _credential_fill_origin_grant(
             copilot_ctx.org_credentials_for_turn = await load_credentials(copilot_ctx.organization_id)
         return copilot_ctx.org_credentials_for_turn
 
-    if isinstance(policy, RequestPolicy) and credential_id.startswith(CONNECTED_VAULT_ID_PREFIX):
-        return await _connected_vault_login_fill_grant(copilot_ctx, policy, credential_id, load_once)
     if (
         isinstance(policy, RequestPolicy)
         and credential_id in policy.persisted_workflow_credential_ids
@@ -1026,7 +1061,15 @@ async def _credential_fill_origin_grant(
     if not authority_error:
         if not isinstance(policy, RequestPolicy):
             return None, _missing_credential_origin_error(credential_id, None)
-        intended_url = _resolved_credential_intended_url(policy, credential_id)
+        saved_sites = policy.credential_saved_site_urls(credential_id)
+        if len(saved_sites) > 1:
+            # A login saved for several sites fills on the one this page is on, scoped to that saved origin.
+            page_url = await _live_working_page_url(copilot_ctx) or ""
+            saved_on_page = next((url for url in saved_sites if _still_on_admitted_site(page_url, url)), None)
+            if saved_on_page is not None:
+                _log_fill_grant("saved_site", page_url, credential_id)
+                return _CredentialFillOriginGrant(saved_on_page), None
+        intended_url = policy.credential_intended_url(credential_id)
         if intended_url:
             _log_fill_grant("admitted_or_tested", intended_url, credential_id)
             return _CredentialFillOriginGrant(intended_url), None
@@ -1096,66 +1139,65 @@ async def _credential_fill_origin_grant(
     return None, admission.steer or authority_error
 
 
-async def _connected_vault_login_fill_grant(
-    copilot_ctx: AgentContext,
-    policy: RequestPolicy,
-    credential_id: str,
-    load_org_credentials: Callable[[], Awaitable[list[Credential]]],
-) -> tuple[_CredentialFillOriginGrant | None, str | None]:
-    """A vault login is placed on a site only by its own whole-site URIs: no tested URL, saved-workflow origin,
-    admitted page or chat URL stands in for them, whichever route vouches for the login itself."""
+async def _import_vault_login_for_fill(
+    copilot_ctx: AgentContext, credential_id: str
+) -> tuple[str, _CredentialFillOriginGrant | None, str | None] | None:
+    """A listed vault login not yet imported is imported only once its own sites cover the live page, with nothing
+    else standing in for them; one already imported takes the saved path. None for any other credential id."""
+    policy = copilot_ctx.request_policy
+    if not isinstance(policy, RequestPolicy):
+        return None
+    logins = policy.vault_logins
+    if credential_id.startswith(VAULT_LOGIN_REF_PREFIX):
+        logins, _ = await load_vault_logins(copilot_ctx.organization_id, policy)
+    login = (logins or {}).get(credential_id)
+    if login is None:
+        return None
+    if login.credential_id is not None:
+        return login.credential_id, *await _credential_fill_origin_grant(copilot_ctx, login.credential_id)
+    if prerequisite_error := _credential_fill_prerequisite_error(copilot_ctx, credential_id):
+        return credential_id, None, prerequisite_error
     page_url = await _live_working_page_url(copilot_ctx) or ""
-    vouched = credential_id in policy.persisted_workflow_credential_ids or credential_id in {
-        credential.credential_id for credential in policy.resolved_credentials
-    }
-    if not vouched:
-        admission = await admit_connected_vault_login_for_live_page(
+    if not page_url:
+        return credential_id, None, _missing_credential_origin_error(credential_id, None)
+    if credential_id in {credential.credential_id for credential in policy.resolved_credentials}:
+        site = next((site for site in login.sites if site.admits(page_url)), None)
+        if site is None:
+            return credential_id, None, _vault_login_off_site_error(credential_id, page_url, login.sites)
+        whole_site = site.whole_site
+    else:
+
+        async def load_once() -> list[Credential]:
+            if copilot_ctx.org_credentials_for_turn is None:
+                copilot_ctx.org_credentials_for_turn = await load_credentials(copilot_ctx.organization_id)
+            return copilot_ctx.org_credentials_for_turn
+
+        admission = await admit_vault_login_for_live_page(
             policy,
             organization_id=copilot_ctx.organization_id,
             credential_id=credential_id,
+            login=login,
             page_url=page_url,
-            load_org_credentials=load_org_credentials,
+            load_org_credentials=load_once,
         )
-        if not (admission.admitted and admission.page_url):
-            return None, _credential_fill_authority_error(copilot_ctx, credential_id)
-        _log_fill_grant("live_page_admission", admission.page_url, credential_id)
-        return _CredentialFillOriginGrant(admission.page_url, whole_site=admission.whole_site), None
-    if not page_url:
-        return None, _missing_credential_origin_error(credential_id, None)
-    sites = await connected_vault_login_sites(copilot_ctx.organization_id, policy, credential_id)
-    matched = next((site for site in sites or [] if site.admits(page_url)), None)
-    if matched is None:
-        return None, _connected_vault_login_off_site_error(credential_id, page_url)
-    _log_fill_grant("vault_site", page_url, credential_id)
-    return _CredentialFillOriginGrant(page_url, whole_site=matched.whole_site), None
+        if not admission.admitted:
+            return credential_id, None, _credential_fill_authority_error(copilot_ctx, credential_id)
+        whole_site = admission.whole_site
+    imported_id = await import_vault_login(copilot_ctx.organization_id, login)
+    policy.adopt_imported_vault_login(credential_id, imported_id)
+    _log_fill_grant("vault_site", page_url, imported_id)
+    return imported_id, _CredentialFillOriginGrant(page_url, whole_site=whole_site), None
 
 
-async def _load_connected_vault_item(
-    copilot_ctx: AgentContext, credential_id: str
-) -> tuple[CredentialItem | None, str]:
-    vault = await load_connected_vault(copilot_ctx.organization_id, copilot_ctx.request_policy)
-    login = vault.login(credential_id)
-    if login is None:
-        return None, (
-            f"`{credential_id}` is not a login the connected Bitwarden vault lists (vault status: {vault.status})."
-        )
-    try:
-        return await load_connected_vault_item(copilot_ctx.organization_id, login), ""
-    except Exception as exc:
-        # Bitwarden errors can quote the account email, so only the type reaches the log and the result.
-        LOG.warning(
-            "fill_credential_field could not fetch the login from the connected vault",
-            credential_id=credential_id,
-            error_type=type(exc).__name__,
-        )
-        return None, f"Could not fetch `{credential_id}` from the connected Bitwarden vault: {type(exc).__name__}."
+_READ_ONLY_VAULT_NAMES = {
+    CredentialVaultType.ONEPASSWORD: "1Password",
+    CredentialVaultType.BITWARDEN_CONNECTED: "the connected Bitwarden vault",
+}
 
 
 async def _load_vault_credential_item(
-    copilot_ctx: AgentContext, credential_id: str
+    copilot_ctx: AgentContext, credential_id: str, *, for_update_card: bool = False
 ) -> tuple[CredentialItem | None, str]:
-    if credential_id.startswith(CONNECTED_VAULT_ID_PREFIX):
-        return await _load_connected_vault_item(copilot_ctx, credential_id)
     try:
         await app.AGENT_FUNCTION.enforce_credential_use(
             copilot_ctx.organization_id,
@@ -1180,11 +1222,16 @@ async def _load_vault_credential_item(
         return None, _missing_credential_reference_tool_error([credential_id])
 
     vault_type = db_credential.vault_type or CredentialVaultType.BITWARDEN
+    if for_update_card and (vault_name := _READ_ONLY_VAULT_NAMES.get(vault_type)):
+        return None, (
+            f"`{credential_id}` is a login imported from {vault_name}, which the credential card cannot edit. "
+            f"The user updates it in {vault_name}."
+        )
     credential_service = app.CREDENTIAL_VAULT_SERVICES.get(vault_type)
     if credential_service is None:
         return None, f"The credential vault for `{credential_id}` is not configured on this deployment."
     try:
-        return await credential_service.get_credential_item(db_credential), ""
+        credential_item = await credential_service.get_credential_item(db_credential)
     except Exception as exc:
         LOG.warning(
             "fill_credential_field could not fetch the credential from the vault",
@@ -1193,6 +1240,9 @@ async def _load_vault_credential_item(
             exc_info=True,
         )
         return None, f"Could not fetch credential `{credential_id}` from the vault: {type(exc).__name__}."
+    if credential_item.login_sites is not None:
+        copilot_ctx.scoped_login_sites_by_credential_id[credential_id] = credential_item.login_sites
+    return credential_item, ""
 
 
 MISSING_AUTHENTICATOR = "missing_authenticator"
@@ -1209,8 +1259,8 @@ def _missing_authenticator_fill_error(
     already_asked = isinstance(copilot_ctx, CopilotContext) and copilot_ctx.credential_totp_update_asked
     if already_asked:
         next_step = (
-            "The user was already asked this turn to update this credential. Do not call "
-            "`request_credential` again; say the verification step needs an authenticator on it."
+            "The user was already shown an update card for this credential this turn; another one cannot open "
+            "until the next turn."
         )
     else:
         next_step = (
@@ -1461,13 +1511,16 @@ async def fill_credential_field(
     credential_id: str,
     field: str,
     submit_selector: str | None = None,
+    frame: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     lock = getattr(copilot_ctx, "credential_fill_lock", None)
     if not isinstance(lock, asyncio.Lock):
         lock = asyncio.Lock()
         copilot_ctx.credential_fill_lock = lock
     async with lock, browser_session_turn(copilot_ctx), browser_evidence_commit_lock(copilot_ctx):
-        return await _fill_credential_field_impl_serial(copilot_ctx, selector, credential_id, field, submit_selector)
+        return await _fill_credential_field_impl_serial(
+            copilot_ctx, selector, credential_id, field, submit_selector, frame
+        )
 
 
 async def _fill_credential_field_impl_serial(
@@ -1476,6 +1529,7 @@ async def _fill_credential_field_impl_serial(
     credential_id: str,
     field: str,
     submit_selector: str | None = None,
+    frame: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     arguments: dict[str, Any] = {"selector": selector, "credential_id": credential_id, "field": field}
     if submit_selector:
@@ -1503,7 +1557,11 @@ async def _fill_credential_field_impl_serial(
             }
         )
     try:
-        origin_grant, policy_error = await _credential_fill_origin_grant(copilot_ctx, credential_id)
+        imported = await _import_vault_login_for_fill(copilot_ctx, credential_id)
+        if imported is None:
+            origin_grant, policy_error = await _credential_fill_origin_grant(copilot_ctx, credential_id)
+        else:
+            credential_id, origin_grant, policy_error = imported
     except PermissionError:
         return finish({"ok": False, "error": "Credential not accessible."})
     if policy_error or origin_grant is None:
@@ -1550,11 +1608,30 @@ async def _fill_credential_field_impl_serial(
                 "credential_field": field,
             }
         return finish(error_result)
+    # A vault item that scopes its sites holds the fill to them, whichever route granted it.
+    scoped_sites = copilot_ctx.scoped_login_sites_by_credential_id.get(credential_id)
+    if scoped_sites is not None:
+        site = next((site for site in scoped_sites if site.admits(origin_grant.intended_url)), None)
+        if site is None:
+            return finish(
+                {
+                    "ok": False,
+                    "error": _vault_login_off_site_error(credential_id, origin_grant.intended_url, scoped_sites),
+                }
+            )
+        origin_grant = _CredentialFillOriginGrant(
+            origin_grant.intended_url, whole_site=origin_grant.whole_site and site.whole_site
+        )
     fill_outcome: ScoutReadbackOutcome | None = None
     try:
         session_id = effective_browser_session_id(copilot_ctx)
         async with mcp_browser_context(copilot_ctx, session_id_override=session_id):
             page, _ = await get_page(session_id=session_id)
+            # The page wrapper is per call, so this scopes only this fill and its readback.
+            if frame and frame.get("name"):
+                await page.frame_switch(name=frame["name"])
+            elif frame and frame.get("owner_selector"):
+                await page.frame_switch(selector=frame["owner_selector"])
             await page.fill(
                 selector,
                 value,

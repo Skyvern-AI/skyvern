@@ -43,6 +43,7 @@ from skyvern.forge.sdk.workflow.code_block_authorized_files import (
     bind_inline_attach_authorized_file,
     capture_authorized_file,
     capture_claimed_download,
+    capture_registered_download,
     pin_file_chooser,
     read_authorized_file,
 )
@@ -1539,6 +1540,53 @@ async def test_a_collision_equivalent_download_started_while_polling_is_refused(
 
     assert page.attached == []
     assert _decisions(logs) == ["refused_same_name_download_during_capture"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("log_state", "decision"),
+    [
+        ("clean", "authorized_registered_name"),
+        ("missing", "refused_no_download_log"),
+        ("sibling_before", "refused_same_name_download_in_block"),
+        ("sibling_during", "refused_same_name_download_during_capture"),
+    ],
+)
+async def test_a_claim_without_a_download_event_is_refused_when_a_same_name_download_could_own_its_row(
+    log_state: str, decision: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir = tmp_path / "downloads" / "wr_session"
+    registered = _registered_downloads(monkeypatch, [], [_registered_row()])
+    log, started = _browser_download_log()
+
+    def sibling() -> None:
+        started(
+            make_claimed_download_mock(path=None, suggested_filename="certificate (1).pdf", path_error=RuntimeError())
+        )
+
+    if log_state == "sibling_before":
+        sibling()
+    read = registered.probe
+
+    async def read_then_start_sibling() -> tuple[list[FileInfo] | None, set[str]]:
+        rows = await read()
+        if rows and log_state == "sibling_during":
+            sibling()
+        return rows
+
+    with capture_logs() as logs, suppress(AuthorizedFileAccessError):
+        await capture_registered_download(
+            "certificate.pdf",
+            registered=replace(registered, probe=read_then_start_sibling),
+            download_root=run_dir.parent,
+            download_run_id=run_dir.name,
+            organization_id="org_authorized",
+            max_bytes=1024,
+            download_log=None if log_state == "missing" else log,
+        )
+
+    assert _decisions(logs) == [decision]
+    assert len(list(run_dir.glob(".authorized-*"))) == (1 if log_state == "clean" else 0)
 
 
 @pytest.mark.asyncio

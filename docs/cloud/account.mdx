@@ -38,7 +38,7 @@ Everything in Skyvern (agents, runs, credentials, API keys, credits) belongs to 
 
 ## API keys
 
-Your API key authenticates every API, SDK, CLI and MCP request for your organization.
+Your API key authenticates every API, SDK, CLI and MCP request for your organization. Every Admin and Member can open this page, unless your organization enables [role-based access control](#roles) and withholds `api_key.list` from their role.
 
 <Steps>
   <Step title="Open API keys">
@@ -123,14 +123,38 @@ Access tokens expire and can be refreshed when you request `offline_access`. A r
 
 ### Permissions
 
-The organization is the only permission boundary.
+#### The organization boundary
 
-- An API key can call every endpoint your organization can reach. There are no read-only, per-endpoint or per-agent keys.
-- An OAuth token acts as the organization of the person who signed in, with the same reach as an API key. Its OAuth scopes (`profile`, `email` and the like) describe who signed in. They don't limit what the token can do.
+Every credential belongs to one organization and reaches only that organization's agents, runs, credentials and data. A request can't read or change another organization's resources.
+
+- The organization API key can call every endpoint your organization can reach. There are no read-only, per-endpoint or per-agent keys.
+- An OAuth token acts as the person who signed in, in their organization, with their [role](#roles). Its OAuth scopes (`profile`, `email` and the like) describe who signed in. They don't limit what the token can do.
 - MCP tool scopes (`operate`, `build`, `browser`, `lean`, `all`) only change which tools a client sees. They are not a security boundary.
 - Usage from any credential is billed to the organization.
 
 To keep production and staging apart, or one team or customer from another, use separate organizations, each with its own key.
+
+#### Roles
+
+Each person in an organization is an **Admin** or a **Member**, set on [Members](#members).
+
+| Role | What it can do |
+|---|---|
+| **Admin** | Everything in the organization, and the only role that can manage member roles and turn role-based access control on. |
+| **Member** | Everything else in the organization: build, run and edit agents, manage credentials, view runs and results, and reach Billing and API keys. |
+
+**Role-based access control is opt-in.** Until an Admin turns it on, a Member's role never refuses a request, and the app hides nothing from Members. Managing member roles stays Admin-only either way, so a Member can't grant themselves more access or switch role-based access control on.
+
+Once an Admin enables it, each person's role decides what they can do and requests outside their role are refused with `403`. That covers event triggers, additional organization API keys, the 1Password connection, the [audit log](#audit-log) export and the rest of the organization's actions.
+
+Two limits apply whether or not you enable role-based access control:
+
+- An API key can't manage API keys, event triggers or member roles, so a leaked key can't create a replacement for itself.
+- A browser session alone can't perform admin-only actions; those need a signed-in session.
+
+<Warning>
+Every Admin and Member can get the organization API key: an Admin from **Settings → API keys**, a Member by signing in to the CLI. The key can do everything an Admin can except manage API keys, event triggers and member roles. Treat every Admin and Member as able to use the API with full access, and use separate organizations where people must be kept apart.
+</Warning>
 
 ### API versions and deprecations
 
@@ -217,7 +241,7 @@ No `/v1` endpoint is deprecated today, so these headers are not present on any c
 
 - Pin the version prefix (`/v1/`), not a specific SDK patch release.
 - Parse responses leniently: ignore unknown fields, default unknown enum values to a safe branch.
-- Log any response carrying a `Deprecation` or `Sunset` header, and alert on it — that header is the earliest programmatic signal you will get.
+- Log any response carrying a `Deprecation` or `Sunset` header, and alert on it. That header is the earliest programmatic signal you will get.
 - Watch the [changelog](/changelog) for announcements, and diff the [OpenAPI specification](/api-reference/openapi.json) in CI if you generate your own client.
 
 #### Where changes are announced
@@ -232,9 +256,9 @@ Questions about a migration: [support@skyvern.com](mailto:support@skyvern.com).
 
 ## Billing and credits
 
-Open **Settings → Billing**. On the Free and Hobby plans, the **Upgrade plan** link at the bottom of the sidebar opens the same page; on other plans it reads **Plan & usage**.
+Open **Settings → Billing**. On the Trial and Hobby plans, the **Upgrade plan** link at the bottom of the sidebar opens the same page; on other plans it reads **Plan & usage**. Every Admin and Member can reach Billing, unless your organization enables [role-based access control](#roles) and withholds the billing actions from their role.
 
-<img src="/images/cloud/settings-billing-overview.png" alt="Billing page with the Choose a Plan cards for Free, Hobby, Pro and Enterprise, and the Credit Usage meter" />
+<img src="/images/cloud/settings-billing-overview.png" alt="Billing page with a current Free plan card, Hobby, Pro, and Enterprise plan cards, and a Credit Usage meter showing 3,948 of 5,000 one-time credits used" />
 
 ### How credits are used
 
@@ -246,8 +270,11 @@ One credit is $0.001. Credits are charged for what the browser does:
 | Cached action, replayed from code without the AI | 15 ($0.015) |
 | Browser uptime | 200 per hour ($0.20) |
 | One-time code read from an email or text message | 10 ($0.01) |
+| Agent block tool call, including reads of the run's data (not counting `finish`) | 30 ($0.03) |
 
-A short login takes a few actions; a long multi-page run takes many more. Two job recipes have their own prices: applying to a job costs 200 credits per application (400 when it signs in with a saved login), and extracting a job posting costs 50 credits per attempt. Other recipes are billed like any other run.
+A short login takes a few actions; a long multi-page run takes many more. Two job recipes have their own prices: applying to a job costs 200 credits per application (400 when it signs in with a saved login), and extracting a job posting costs 50 credits per attempt. Other recipes are billed like any other run. The blocks an Agent block runs are billed as usual.
+
+A Code block that performs no browser actions is charged one cached action (15 credits) the first time it runs successfully in a workflow run. Later executions of the same block in that workflow run, such as loop iterations, that perform no browser actions are free. A retried run can be charged this minimum again.
 
 Under **Credit Usage** you see credits used and remaining for the current period, your daily burn rate, and when your balance will run out at that rate. Expand **Usage Breakdown** to split usage into **Regular Actions**, **Cached Actions**, **Browser Uptime** and **OTP Parses**.
 
@@ -255,16 +282,20 @@ Under **Credit Usage** you see credits used and remaining for the current period
 Specific prompts use fewer actions. "Extract the monthly price from the pricing table on /pricing" goes straight there; "Find information about pricing" makes the AI explore.
 </Tip>
 
+### Your 14-day trial
+
+New accounts start with a 14-day trial: 30,000 credits and Hobby plan limits. When you sign up, pick the plan you want after the trial, Hobby ($29/month) or Pro ($149/month), and add a card. Nothing is charged during the trial. On day 14 we charge the plan you picked and it renews monthly. To switch plans, start your plan early, or cancel, open Settings → Billing. Cancelling turns off the day-14 charge: you keep the trial until day 14 and are not charged. You can resume the trial any time before then, or pick a plan to keep running agents after it ends.
+
 ### Plans
 
 | Plan | Price | Credits | Concurrent runs |
 |---|---|---|---|
-| **Free** | $0 | 5,000 one time (about 165 actions) | 1 |
+| **Trial** | $0 for 14 days | 30,000 for the trial (about 1,000 actions) | 10 |
 | **Hobby** | $29/month | 30,000/month (about 1,000 actions) | 10 |
 | **Pro** | $149/month | 150,000/month (about 5,000 actions) | 25 |
 | **Enterprise** | Custom | Unlimited | Unlimited |
 
-Free credits are a one-time grant and don't reset. Click **Subscribe** on the Hobby or Pro card to start a plan. Once you're subscribed, the cards read **Upgrade** or **Downgrade** and the page shows your current plan, with **Manage Subscription** to change or cancel it. For Enterprise, click **Book a Demo**. For a full feature comparison, see [skyvern.com/pricing](https://www.skyvern.com/pricing).
+Trial credits don't reset and end with the trial. Click **Subscribe** on the Hobby or Pro card to start a plan. Once you're subscribed, the cards read **Upgrade** or **Downgrade** and the page shows your current plan, with **Manage Subscription** to change or cancel it. For Enterprise, click **Book a Demo**. For a full feature comparison, see [skyvern.com/pricing](https://www.skyvern.com/pricing).
 
 ### Extra credits and payment
 
@@ -284,7 +315,9 @@ Skyvern checks credits before it starts a run and returns `402` if they don't co
 
 Go to **Settings → Members** to invite teammates by email and manage their roles. **Invite teammates** in the organization menu at the top of the sidebar opens the same page. Members share the organization's agents, runs, credentials, API key and credits.
 
-**Your role in this organization** at the top of the page shows the role Skyvern recognizes for your session, **Admin** or **Member**. It reads **Role information unavailable** when no role comes back. The role is shown for reference only; it doesn't change what you can do in the app, because the organization is still the only [permission boundary](#permissions).
+Pick a role when you invite someone, and change it later from the member list: **Admin** or **Member**. [Roles](#roles) explains what each one can do.
+
+**Your role in this organization** at the top of the page shows the role Skyvern recognizes for your session. It reads **Role information unavailable** when no role comes back.
 
 <img src="/images/cloud/cloud-settings-members.png" alt="Settings, Members page showing No organization yet and the Create organization button" />
 
@@ -301,14 +334,40 @@ When someone leaves, remove them here and [rotate the API key](#rotate-your-key)
 
   | Setting | What it does | Range |
   |---|---|---|
-  | **Max Steps Per Block** | Steps Skyvern takes inside one task or navigation block before stopping it | 1–150 |
-  | **Max Steps Per Run** | Total steps across all blocks in an agent run. Blank means no run-level cap. | 1–1,000 |
-  | **Artifact URL Expiry (minutes)** | How long download links for PDFs and exported files stay valid. Blank means 720 minutes (12 hours). Screenshot and recording links always expire after 1 hour. | 60–10,080 (7 days) |
+  | **Max Steps Per Block** | Steps Skyvern takes inside one task or navigation block before stopping it | 1-150 |
+  | **Max Steps Per Run** | Total steps across all blocks in an agent run. Blank means no run-level cap. | 1-1,000 |
+  | **Artifact URL Expiry (minutes)** | How long download links for PDFs and exported files stay valid. Blank means 720 minutes (12 hours). Screenshot and recording links always expire after 1 hour. | 60-10,080 (7 days) |
 
 - **Models** has two cards. **Custom LLMs** adds your own OpenAI-compatible, Ollama or OpenRouter models. **Default Models** picks the **Smart LLM** and **Fast LLM** your runs use, or **Skyvern Default**.
 - **Labels** appears when labels are turned on for your organization.
 
 Vault connections (1Password, Bitwarden, Azure Key Vault, Custom Credential Service) are on [Integrations](/cloud/integrations#password-vaults), not in Settings.
+
+## Audit log
+
+Go to **Settings → Audit log**. Every Admin and Member can open it. Once your organization enables [role-based access control](#roles), access requires the `audit.export` grant, so only roles that hold it can open the page or export.
+
+- **Changes** lists organization configuration and membership activity, including who acted, the action, the resource and the time.
+- **Runs** lists top-level workflow runs, including when they were created, who started them and their trigger.
+
+Many change events are best effort: a successful change can lack a row if the audit store fails or times out. RBAC role, grant and RBAC settings changes write their audit events in the same transaction as the change. Ordinary workflow and credential reads are not audited, so a missing entry is not proof that no activity occurred.
+
+Rows show who, what and when, where available. They are designed not to include request payloads, workflow parameter values or credential secrets; resource identifiers can include tag keys and values. Open **Details** on a row for more information.
+
+Choose **Date range** to view the last 24 hours, 7 days, 30 days or 90 days, or a **Custom range** within the last 90 days. The default is 30 days. On **Changes**, you can also filter by **Person**, **Action** and **Resource**; these filters aren't available on **Runs**. Use **Load more** to see further results.
+
+Click **Export CSV** to download the filtered tab. Downloads stop at 25,000 rows; narrow the date range or use the [paginated API](#export-with-the-api) for larger exports.
+
+### Export with the API
+
+Use a signed-in session, a role granted `audit.export`, or your organization API key:
+
+- `GET /v1/audit-events/export` exports changes.
+- `GET /v1/audit-events/runs/export` exports runs.
+
+Both return JSON by default, or CSV with `format=csv`, newest first. The default window is the last 90 days. Both endpoints clamp an earlier `since` to the 90-day cutoff; a range entirely before it returns no rows. Change events are purged after 90 days, so export them before they age out. Set timezone-aware `since` and `until` to filter by time; the changes endpoint also accepts `actor_user_id`, `action` and `resource_type`.
+
+Pages default to 100 rows and contain at most 500 (`limit`). For the next page, pass the JSON `next` value or CSV `X-Next-Cursor` header as `cursor`. Keep the same filters and time bounds while paging.
 
 ## Your account
 

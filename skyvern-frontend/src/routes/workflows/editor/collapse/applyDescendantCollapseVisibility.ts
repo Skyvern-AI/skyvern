@@ -54,7 +54,7 @@ export function applyDescendantCollapseVisibility(
   const result = [...nodes];
   // descendants() returns nodes parent-first, so any descendant whose parent
   // is itself a descendant has already been written to `resolved` by the time
-  // we read it here. See descendants() in workflowEditorUtils.ts.
+  // we read it here. See descendants() in jinjaReferences.ts.
   const resolved = new Map<string, boolean>();
 
   for (const desc of descs) {

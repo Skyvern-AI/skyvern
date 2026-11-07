@@ -1,11 +1,14 @@
+import asyncio
 import hashlib
 import os
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import google.api_core.exceptions as gcs_exceptions
 import pytest
 
 import skyvern.forge.sdk.api.real_gcp as real_gcp_module
@@ -22,6 +25,7 @@ from skyvern.forge.sdk.artifact.storage.recording_test_helpers import fake_prepa
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from tests.unit.conftest import FakeWorkflowRunAttemptsRepository
+from tests.unit.helpers import PINNED_READ_CASES, make_pdf, unique_stored_pdf_ids
 
 TEST_BUCKET = "test-gcs-bucket"
 TEST_ORGANIZATION_ID = "test-org-123"
@@ -320,7 +324,7 @@ async def test_get_downloaded_files_legacy_listing_attributes_and_scopes_attempt
     gcs_storage.async_client.list_files = AsyncMock(return_value=[old_key, current_key])
     gcs_storage.async_client.get_object_info = AsyncMock(side_effect=get_object_info)
     gcs_storage.async_client.create_signed_urls = AsyncMock(
-        side_effect=lambda uris: [f"https://signed.test/{uri.rsplit('/', 1)[-1]}" for uri in uris]
+        side_effect=lambda uris, **_: [f"https://signed.test/{uri.rsplit('/', 1)[-1]}" for uri in uris]
     )
     rows = AsyncMock(return_value=[old_artifact])
     monkeypatch.setattr(
@@ -446,6 +450,30 @@ class TestGcsStorageClientSigning:
             fake_creds.refresh.assert_called_once()
             assert mock_blob.generate_signed_url.call_count == 3
 
+    @pytest.mark.asyncio
+    async def test_download_urls_force_an_octet_stream_attachment(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(settings, "GCS_SIGNER_SA_EMAIL", None)
+        with patch.object(RealAsyncGcsStorageClient, "_get_blob") as mock_get_blob:
+            mock_blob = MagicMock()
+            mock_blob.generate_signed_url.return_value = "https://signed"
+            mock_get_blob.return_value = mock_blob
+            client = RealAsyncGcsStorageClient(project_id="test")
+
+            await client.create_signed_urls(
+                ["gs://b/dir/page.html", "gs://b/dir/x.svg"], attachment_filenames=[None, "logo.svg"]
+            )
+            forced = [call.kwargs for call in mock_blob.generate_signed_url.call_args_list]
+            mock_blob.generate_signed_url.reset_mock()
+            await client.create_signed_urls(["gs://b/dir/shot.png"])
+            inline = mock_blob.generate_signed_url.call_args.kwargs
+
+        assert [kwargs["response_disposition"] for kwargs in forced] == [
+            "attachment; filename=\"page.html\"; filename*=UTF-8''page.html",
+            "attachment; filename=\"logo.svg\"; filename*=UTF-8''logo.svg",
+        ]
+        assert {kwargs["response_type"] for kwargs in forced} == {"application/octet-stream"}
+        assert "response_disposition" not in inline and "response_type" not in inline
+
 
 @pytest.mark.asyncio
 class TestGcsShareLinkSensitiveCap:
@@ -457,14 +485,17 @@ class TestGcsShareLinkSensitiveCap:
             f"gs://{TEST_BUCKET}/file.pdf", artifact_id="a_file", artifact_type=ArtifactType.DOWNLOAD
         )
 
-        async def fake_sign(uris: list[str], expiry_hours: int = 24) -> list[str]:
-            return [f"{uri}?h={expiry_hours}" for uri in uris]
+        async def fake_sign(
+            uris: list[str], expiry_hours: int = 24, attachment_filenames: list[str | None] | None = None
+        ) -> list[str]:
+            suffix = "&attachment" if attachment_filenames is not None else ""
+            return [f"{uri}?h={expiry_hours}{suffix}" for uri in uris]
 
         gcs_storage.async_client.create_signed_urls = AsyncMock(side_effect=fake_sign)
         urls = await gcs_storage.get_share_links([screenshot, download])
         assert urls == [
             f"{screenshot.uri}?h={SENSITIVE_SHARE_URL_EXPIRY_HOURS}",
-            f"{download.uri}?h=24",
+            f"{download.uri}?h=24&attachment",
         ]
 
 
@@ -575,3 +606,107 @@ async def test_save_downloaded_files_retry_skips_stale_files_and_versions_fresh_
     assert registered == [fresh_file.name]
     attempt_two_listing = [row.uri.rsplit("/", 1)[-1] for row in rows if row.modified_at >= attempt_started_at]
     assert attempt_two_listing == [fresh_file.name]
+
+
+class _GcsObjects:
+    """google-cloud-storage fake: object generations, and ranged downloads that fail once the generation changes."""
+
+    def __init__(self, contents: list[bytes]) -> None:
+        self.objects = {f"b/o_1/a_{i}.pdf": (data, 100 + i) for i, data in enumerate(contents)}
+        self.replaced_after_stat: set[str] = set()
+        self.request_policies: list[dict[str, Any]] = []
+
+    def bucket(self, name: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            get_blob=lambda path, **policy: self._stat(f"{name}/{path}", policy),
+            blob=lambda path: self._blob(f"{name}/{path}"),
+        )
+
+    def _stat(self, key: str, policy: dict[str, Any]) -> SimpleNamespace | None:
+        self.request_policies.append(policy)
+        if key not in self.objects:
+            return None
+        data, generation = self.objects[key]
+        if key in self.replaced_after_stat:
+            self.objects[key] = (data, generation + 1)
+        return SimpleNamespace(size=len(data), generation=generation, metadata={}, updated=None)
+
+    def _blob(self, key: str) -> SimpleNamespace:
+        def download_as_bytes(
+            *, start: int, end: int, if_generation_match: int, raw_download: bool, **policy: Any
+        ) -> bytes:
+            self.request_policies.append(policy)
+            data, generation = self.objects[key]
+            if if_generation_match != generation or not raw_download:
+                raise gcs_exceptions.PreconditionFailed("generation changed")
+            return data[start : end + 1]
+
+        return SimpleNamespace(download_as_bytes=download_as_bytes)
+
+
+@pytest.mark.parametrize("case, expected", PINNED_READ_CASES)
+@pytest.mark.asyncio
+async def test_gcs_downloads_list_each_pdf_content_once_only_from_generation_pinned_reads(
+    monkeypatch: pytest.MonkeyPatch, case: str, expected: list[str]
+) -> None:
+    pdf = make_pdf("Invoice 1001")
+    objects = _GcsObjects([pdf, make_pdf("Invoice 1002") if case == "differs" else pdf, make_pdf("Statement 2002")])
+    if case == "replaced":
+        objects.replaced_after_stat.add("b/o_1/a_1.pdf")
+    elif case == "missing":
+        del objects.objects["b/o_1/a_1.pdf"]
+    elif case == "oversize":
+        monkeypatch.setattr(settings, "BROWSER_DOWNLOAD_MAX_FILE_SIZE_BYTES", len(pdf) - 1)
+    storage = GcsStorageForTests(bucket="b")
+    storage.async_client = RealAsyncGcsStorageClient(project_id="test")
+    monkeypatch.setattr(storage.async_client, "_get_client", lambda: objects)
+    claimed = [pdf, pdf, make_pdf("Statement 2002")]
+
+    assert await unique_stored_pdf_ids(monkeypatch, storage, "gs://b/o_1", claimed) == expected
+    # Each comparison request must end within the comparison budget: bounded waits and no SDK retries.
+    assert len(objects.request_policies) >= (0 if case == "oversize" else 2), "stat and ranged read both recorded"
+    assert all(
+        p.get("retry", "default") is None and max(p.get("timeout", (60,))) < 30 for p in objects.request_policies
+    )
+
+
+@pytest.mark.parametrize(("cancels", "fails"), [(1, False), (2, False), (2, True)])
+@pytest.mark.parametrize("held", ["stat", "open", "ranged_read"])
+@pytest.mark.asyncio
+async def test_cancelling_a_gcs_comparison_waits_for_its_storage_thread_to_finish(
+    held: str, cancels: int, fails: bool
+) -> None:
+    reading, release, finished = threading.Event(), threading.Event(), threading.Event()
+
+    def hold(*_: Any, **__: Any) -> Any:
+        reading.set()
+        release.wait(5)
+        finished.set()
+        if fails:
+            raise RuntimeError("storage call failed")
+        return b"x" if held == "ranged_read" else SimpleNamespace(size=1, generation=100, metadata={}, updated=None)
+
+    storage = GcsStorageForTests(bucket="b")
+    storage.async_client = client = RealAsyncGcsStorageClient(project_id="test")
+    client._get_client = lambda: SimpleNamespace(bucket=lambda _name: SimpleNamespace(get_blob=hold))  # type: ignore[method-assign]
+    client._get_blob = lambda _uri: SimpleNamespace(download_as_bytes=hold)  # type: ignore[method-assign]
+    artifact = make_artifact("gs://b/o_1/a_0.pdf")
+    work = {
+        "stat": lambda: storage.stat_artifact(artifact),
+        "open": lambda: storage.open_artifact_stream(artifact, etag="100"),
+        "ranged_read": lambda: gcs_module._GcsObjectStream(client, artifact.uri, 1, 100).iter_chunks(1).__anext__(),
+    }[held]
+    read = asyncio.ensure_future(work())
+    try:
+        await asyncio.to_thread(reading.wait, 5)
+        # The first cancellation is the comparison budget; a later one is the caller's.
+        for _ in range(cancels):
+            read.cancel()
+            for _ in range(5):
+                await asyncio.sleep(0)
+            assert not read.done(), "the storage thread is still running"
+    finally:
+        threading.Timer(0.2, release.set).start()
+    with pytest.raises(asyncio.CancelledError):
+        await read
+    assert finished.is_set()

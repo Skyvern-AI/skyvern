@@ -24,6 +24,7 @@ from skyvern.forge.sdk.db.enums import (
     WorkflowRunTriggerType,
 )
 from skyvern.forge.sdk.schemas.files import FileInfo
+from skyvern.forge.sdk.schemas.har_evidence import without_final_har_user_match
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2
 from skyvern.forge.sdk.workflow.exceptions import (
     InvalidFinallyBlockLabel,
@@ -38,6 +39,7 @@ from skyvern.forge.sdk.workflow.models.run_limits import (
     reject_bool_max_elapsed_time_minutes,
 )
 from skyvern.forge.sdk.workflow.models.validators import (
+    normalize_blank_totp_identifier,
     normalize_run_metadata,
     normalize_run_with,
 )
@@ -80,6 +82,8 @@ class WorkflowRequestBody(BaseModel):
     browser_type: str | None = None
     ai_fallback: bool | None = None
     run_metadata: dict[str, str] | None = None
+
+    _normalize_totp_identifier = field_validator("totp_identifier")(normalize_blank_totp_identifier)
 
     @field_validator("max_elapsed_time_minutes", mode="before")
     @classmethod
@@ -410,9 +414,14 @@ class WorkflowRun(BaseModel):
     workflow_schedule_id: str | None = None
     ignore_inherited_workflow_system_prompt: bool = False
     copilot_session_id: str | None = None
+    # Internal actor marker used to recheck scoped-key grants before runtime secret access.
+    requested_by: str | None = Field(default=None, exclude=True)
     created_by: str | None = Field(default=None, description="ID of the user who started the run")
     credits_used: int = 0
     cached_credits_used: int = 0
+    # Set when a write to this run's row failed and the caller carried on, so a commit may have landed that this
+    # object does not show. A model re-read from the row after the failure no longer carries it.
+    _row_write_unconfirmed: bool = PrivateAttr(default=False)
 
     @field_validator("run_with", mode="before")
     @classmethod
@@ -426,6 +435,12 @@ class WorkflowRun(BaseModel):
     def _mask_cdp_connect_headers(self, headers: dict[str, str] | None) -> dict[str, str] | None:
         return mask_header_values(headers)
 
+    # Every JSON payload of a run (list and detail routes, webhooks) omits the final match's bookkeeping; in-process
+    # readers keep the raw carrier, which the errors[] projection reads.
+    @field_serializer("failure_category", when_used="json")
+    def _public_failure_category(self, categories: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+        return without_final_har_user_match(categories)
+
     queued_at: datetime | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
@@ -435,6 +450,13 @@ class WorkflowRun(BaseModel):
     @property
     def is_debug_session(self) -> bool:
         return self.debug_session_id is not None
+
+    @property
+    def row_write_unconfirmed(self) -> bool:
+        return self._row_write_unconfirmed
+
+    def mark_row_write_unconfirmed(self) -> None:
+        self._row_write_unconfirmed = True
 
 
 # Stored when attempts of one run executed different definitions; it never equals a real digest.

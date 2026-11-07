@@ -33,7 +33,7 @@ Mappings use [JSON Pointer (RFC 6901)](https://www.rfc-editor.org/rfc/rfc6901). 
 }
 ```
 
-map `order_id` to `/order/id` and `customer_email` to `/order/customer/email`. Pointers must start with `/`; in a key name, encode `~` as `~0` and `/` as `~1`.
+map `order_id` to `/order/id` and `customer_email` to `/order/customer/email`. Pointers must start with `/`; in a key name, encode `~` as `~0` and `/` as `~1`. A numeric segment indexes into an array, so `/items/0/sku` reads the first item's `sku`. A pointer that does not resolve against the body rejects the delivery with the reason `mapping_path_missing`.
 
 ## Send a signed request
 
@@ -150,12 +150,12 @@ console.log(response.status, await response.text());
 | `202` | New event accepted and queued for asynchronous dispatch. The response includes `delivery_id` and `status`; it does not include a run ID. | Check the delivery log for dispatch status and the run link. |
 | `200` | This event ID and body were already received. The response has the current delivery status and `run_id` (null until a run starts). | Treat as an idempotent duplicate; check the delivery log. |
 | `409` | The event ID was previously used with a different body. | Do not blindly retry with a new ID; verify the source event and its ID. |
-| `422` | The payload was rejected by the current mapping. A rejected delivery is recorded. | Fix the mapping in Studio, then have an admin replay the delivery. |
+| `422` | The mapping or inputs were rejected, or the trigger owner lacks access to a required credential (`owner_not_authorized`). A rejected delivery is recorded. | Correct the mapping, inputs, or credential access, then have an admin replay the delivery. |
 | `401` | The signature is invalid, the timestamp is malformed, or it is outside the 300-second window. | Check the secret and system clock, then sign again. |
 | `400` | The event ID is invalid or the body is not a JSON object. | Correct the ID or body before retrying. |
 | `413` | The raw body exceeds 256 KB. | Send a smaller JSON object. |
 | `404` | The trigger is unknown or disabled. | Check the endpoint URL and enable the trigger in Studio. |
-| `503` | The receiver is temporarily unable to accept the event. | Retry with the same event ID and body, and a fresh timestamp and signature. |
+| `503` | The receiver is temporarily unable to accept the event. The `detail` is `encryption_unavailable` or `receiver_unavailable` (for example, it cannot check the owner’s role for a restricted credential). No delivery is stored. | Retry with the same event ID and body, and a fresh timestamp and signature. |
 
 If a request times out or you do not receive a response, retry with the **same event ID and exact same body**. This lets Skyvern return the existing delivery instead of creating a second one. Refresh the timestamp and signature on every attempt. Do not retry a `422` unchanged; use Studio replay after correcting the mapping.
 

@@ -20,6 +20,7 @@ from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, Wo
 from skyvern.schemas.runs import RunStatus, WorkflowRunAttempt
 from skyvern.schemas.workflows import WorkflowRetryPolicy
 from skyvern.services.webhook_delivery import (
+    WEBHOOK_DELIVERY_BUDGET_SECONDS,
     WEBHOOK_DELIVERY_MAX_ATTEMPTS,
     WEBHOOK_DELIVERY_MAX_RETRY_AFTER_SECONDS,
     WEBHOOK_DELIVERY_RETRY_BASE_DELAY_SECONDS,
@@ -52,6 +53,7 @@ WEBHOOK_FALLBACK_GRACE_SECONDS = (
     )
     + WEBHOOK_FALLBACK_GRACE_MARGIN_SECONDS
 )
+assert WEBHOOK_DELIVERY_BUDGET_SECONDS + WEBHOOK_FALLBACK_GRACE_MARGIN_SECONDS <= WEBHOOK_FALLBACK_GRACE_SECONDS
 # The policy terminal release owns these effects serially before the final webhook. Keep this
 # geometry in one replay-stable OSS constant so Temporal's activity deadline, lease recovery, and
 # webhook-only fallback cannot drift apart.

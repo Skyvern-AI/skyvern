@@ -8,6 +8,7 @@ import type { StreamState } from "@/routes/streaming/streamState";
 import { usePageSlots } from "@/store/PageSlots";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 
+import { runStartupPlaceholder } from "./browserPaneView";
 import { HeroRecording } from "./runview/HeroRecording";
 import { HeroScreenshot } from "./runview/HeroScreenshot";
 import { RunLiveStream } from "./runview/RunLiveStream";
@@ -86,15 +87,11 @@ export function BrowserTab() {
                 pending: true,
               }}
             />
-          ) : provisioning ? (
+          ) : provisioning && workflowRun ? (
             // Mounting the stream while the run is still queued opens a
             // socket the backend never feeds; wait until it actually runs.
             <StreamStatusPanel
-              diagnostic={{
-                title: "Starting the browser",
-                detail: "Getting your run's browser ready…",
-                pending: true,
-              }}
+              diagnostic={runStartupPlaceholder(workflowRun)}
               footer={
                 FirstRunWaitCard ? (
                   <FirstRunWaitCard phase="run_provisioning" />

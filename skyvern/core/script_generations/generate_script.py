@@ -435,9 +435,17 @@ def _has_multi_field_totp_action(actions: list[dict[str, Any]]) -> bool:
     )
 
 
+def _has_unsupported_close_page_action(actions: list[dict[str, Any]]) -> bool:
+    return any(
+        action.get("action_type") == ActionType.CLOSE_PAGE and not action.get("is_internal_recovery")
+        for action in actions
+    )
+
+
 def _actions_support_cached_scripts(actions: list[dict[str, Any]]) -> bool:
     return not (
         _has_multi_field_totp_action(actions)
+        or _has_unsupported_close_page_action(actions)
         or any(action.get("action_type") == ActionType.PASTE_TEXT for action in actions)
     )
 
@@ -446,6 +454,8 @@ def _ensure_actions_support_cached_scripts(actions: list[dict[str, Any]]) -> Non
     if not _actions_support_cached_scripts(actions):
         if _has_multi_field_totp_action(actions):
             raise ValueError("Multi-field TOTP has no cached-script representation")
+        if _has_unsupported_close_page_action(actions):
+            raise ValueError("CLOSE_PAGE has no cached-script representation")
         raise ValueError("PASTE_TEXT has no cached-script representation")
 
 
@@ -1574,17 +1584,15 @@ def _build_block_fn(
         )
     else:
         for act in actions:
-            # Internal-recovery closes are runtime-synthesized and have no ACTION_MAP entry; skip
-            # only the marked ones so user-authored close_page semantics are left untouched.
-            if act.get("is_internal_recovery"):
-                continue
             if act["action_type"] in [
                 ActionType.COMPLETE,
                 ActionType.TERMINATE,
                 ActionType.NULL_ACTION,
-                # These actions have no ACTION_MAP representation in cached scripts.
+                # Tab management has no ACTION_MAP representation. Ordinary closes are rejected
+                # by the support check above; only internal-recovery closes are skipped here.
                 ActionType.NEW_TAB,
                 ActionType.SWITCH_TAB,
+                ActionType.CLOSE_PAGE,
             ]:
                 continue
 

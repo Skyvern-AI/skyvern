@@ -41,8 +41,12 @@ async def _run_task_v2_wiring_case(
     organization = SimpleNamespace(organization_id="org_test", max_steps_per_run=None)
     task_v2 = MagicMock(observer_cruise_id="t", status=TaskV2Status.queued, prompt="goal")
     task_v2.url, task_v2.workflow_run_id = "https://example.test", "wr_test"
-    queued_run = MagicMock(workflow_run_id="wr_test", workflow_id="wf_test", status=WorkflowRunStatus.queued)
-    running_run = MagicMock(workflow_run_id="wr_test", workflow_id="wf_test", status=WorkflowRunStatus.running)
+    queued_run = MagicMock(
+        workflow_run_id="wr_test", workflow_id="wf_test", status=WorkflowRunStatus.queued, parent_workflow_run_id=None
+    )
+    running_run = MagicMock(
+        workflow_run_id="wr_test", workflow_id="wf_test", status=WorkflowRunStatus.running, parent_workflow_run_id=None
+    )
     workflow = MagicMock(
         workflow_id="wf_test",
         workflow_permanent_id="wp_test",
@@ -60,7 +64,7 @@ async def _run_task_v2_wiring_case(
     test_app.scrape_exclude = []
     test_app.WORKFLOW_SERVICE.get_workflow_run = AsyncMock(side_effect=[queued_run, *[running_run for _ in iterations]])
     test_app.WORKFLOW_SERVICE.get_workflow = AsyncMock(return_value=workflow)
-    test_app.WORKFLOW_SERVICE.mark_workflow_run_as_running = AsyncMock()
+    test_app.WORKFLOW_SERVICE.mark_workflow_run_as_running = AsyncMock(return_value=running_run)
     test_app.WORKFLOW_SERVICE.create_workflow_from_request = AsyncMock(return_value=workflow)
     test_app.BROWSER_MANAGER.get_or_create_for_workflow_run = AsyncMock(return_value=browser_state)
     test_app.AGENT_FUNCTION.has_code_block_access = AsyncMock(return_value=False)
@@ -212,12 +216,14 @@ async def test_first_iteration_goto_url_has_no_completion_criterion(
         workflow_run_id="workflow_run_test",
         workflow_id="workflow_test",
         status=WorkflowRunStatus.queued,
+        parent_workflow_run_id=None,
         browser_profile_id=None,
     )
     running_run = SimpleNamespace(
         workflow_run_id="workflow_run_test",
         workflow_id="workflow_test",
         status=WorkflowRunStatus.running,
+        parent_workflow_run_id=None,
         extra_http_headers={"X-Run-Only": "synthetic-run-value"},
         browser_profile_id=None,
     )
@@ -242,7 +248,7 @@ async def test_first_iteration_goto_url_has_no_completion_criterion(
     workflow_service = SimpleNamespace(
         get_workflow_run=AsyncMock(side_effect=[queued_run, running_run]),
         get_workflow=AsyncMock(return_value=workflow),
-        mark_workflow_run_as_running=AsyncMock(),
+        mark_workflow_run_as_running=AsyncMock(return_value=running_run),
         setup_workflow_run=AsyncMock(return_value=queued_run),
     )
     persisted_requests = []
@@ -348,12 +354,14 @@ async def test_missing_task_type_failure_finalizes_with_organization_scope(
         workflow_run_id="workflow_run_test",
         workflow_id="workflow_test",
         status=WorkflowRunStatus.queued,
+        parent_workflow_run_id=None,
         browser_profile_id=None,
     )
     running_run = SimpleNamespace(
         workflow_run_id="workflow_run_test",
         workflow_id="workflow_test",
         status=WorkflowRunStatus.running,
+        parent_workflow_run_id=None,
         browser_profile_id=None,
     )
     workflow = SimpleNamespace(
@@ -374,7 +382,7 @@ async def test_missing_task_type_failure_finalizes_with_organization_scope(
     workflow_service = SimpleNamespace(
         get_workflow_run=AsyncMock(side_effect=[queued_run, running_run]),
         get_workflow=AsyncMock(return_value=workflow),
-        mark_workflow_run_as_running=AsyncMock(),
+        mark_workflow_run_as_running=AsyncMock(return_value=running_run),
         mark_workflow_run_as_failed=AsyncMock(),
     )
 
@@ -601,7 +609,7 @@ async def test_task_v2_cannot_complete_after_its_browser_was_lost(
     test_app.BROWSER_MANAGER = manager
     test_app.WORKFLOW_SERVICE.get_workflow_run = AsyncMock(side_effect=get_workflow_run)
     test_app.WORKFLOW_SERVICE.get_workflow = AsyncMock(return_value=workflow)
-    test_app.WORKFLOW_SERVICE.mark_workflow_run_as_running = AsyncMock()
+    test_app.WORKFLOW_SERVICE.mark_workflow_run_as_running = AsyncMock(return_value=runs[WorkflowRunStatus.running])
     test_app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final = mark_failed
     test_app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled = AsyncMock(side_effect=cancel_run)
     test_app.WORKFLOW_SERVICE.mark_workflow_run_as_completed = mark_completed = AsyncMock()

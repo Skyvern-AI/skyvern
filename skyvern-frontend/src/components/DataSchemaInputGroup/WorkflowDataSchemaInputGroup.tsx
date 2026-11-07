@@ -19,6 +19,7 @@ import {
 import { useMutation } from "@tanstack/react-query";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { getClient } from "@/api/AxiosClient";
+import { flushBufferedEditorEdits } from "@/hooks/useDeferredLockedEdit";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { helpTooltips } from "@/routes/workflows/editor/helpContent";
 import {
@@ -36,6 +37,8 @@ import { AxiosError } from "axios";
 import { toast } from "../ui/use-toast";
 import { TSON } from "@/util/tson";
 import { cn } from "@/util/utils";
+import { describeSchema, type SchemaView } from "./describeSchema";
+import { SchemaFieldList, SchemaViewButton } from "./SchemaFieldList";
 
 type Props = {
   deferKey?: string;
@@ -44,6 +47,7 @@ type Props = {
   suggestionContext: Record<string, unknown>;
   exampleValue: Record<string, unknown>;
   helpTooltip?: string;
+  hideEnableToggle?: boolean;
 };
 
 function WorkflowDataSchemaInputGroup({
@@ -53,6 +57,7 @@ function WorkflowDataSchemaInputGroup({
   suggestionContext,
   exampleValue,
   helpTooltip,
+  hideEnableToggle = false,
 }: Props) {
   const credentialGetter = useCredentialGetter();
   const workflowId = useWorkflowScopeId();
@@ -65,6 +70,27 @@ function WorkflowDataSchemaInputGroup({
   const [generateWithAIActive, setGenerateWithAIActive] = useState(false);
   const [generateWithAIPrompt, setGenerateWithAIPrompt] = useState("");
   const [pendingSchema, setPendingSchema] = useState<string | null>(null);
+  const tsonResult = useMemo(() => {
+    if (value === "null") return null;
+    return TSON.parse(value);
+  }, [value]);
+  // Save validation uses TSON, so a value TSON rejects must stay in the editor where its error is visible.
+  const outline = useMemo(
+    () =>
+      tsonResult !== null && !tsonResult.success ? null : describeSchema(value),
+    [tsonResult, value],
+  );
+  // Scoped to deferKey because the studio sidebar reuses this component across blocks without remounting it.
+  const [userChoice, setUserChoice] = useState<{
+    owner: string | undefined;
+    view: SchemaView;
+  } | null>(null);
+  const view: SchemaView =
+    userChoice !== null && userChoice.owner === deferKey
+      ? userChoice.view
+      : "fields";
+  // Without the toggle nothing can bring the editor back, so a typed "null" must not hide it.
+  const schemaEnabled = hideEnableToggle || value !== "null";
 
   const resetAIState = useCallback(() => {
     setPendingSchema(null);
@@ -72,10 +98,13 @@ function WorkflowDataSchemaInputGroup({
     setGenerateWithAIPrompt("");
   }, []);
 
-  const tsonResult = useMemo(() => {
-    if (value === "null") return null;
-    return TSON.parse(value);
-  }, [value]);
+  const showFields = view === "fields" && outline !== null;
+  const onEditorChange = (next: string) => {
+    if (!showFields) {
+      setUserChoice({ owner: deferKey, view: "json" });
+    }
+    onChange(next);
+  };
 
   const getDataSchemaSuggestionMutation = useMutation({
     mutationFn: async () => {
@@ -89,7 +118,7 @@ function WorkflowDataSchemaInputGroup({
       );
     },
     onSuccess: (response) => {
-      if (value === "null") {
+      if (!schemaEnabled) {
         return;
       }
       setPendingSchema(JSON.stringify(response.data.output, null, 2));
@@ -114,34 +143,53 @@ function WorkflowDataSchemaInputGroup({
               content={helpTooltip ?? helpTooltips["task"]["dataSchema"]}
             />
           </div>
-          <Checkbox
-            checked={value !== "null"}
-            disabled={locked}
-            onCheckedChange={(checked) => {
-              if (!checked) {
-                resetAIState();
-              }
-              onChange(
-                checked ? JSON.stringify(exampleValue, null, 2) : "null",
-              );
-            }}
-          />
+          {!hideEnableToggle && (
+            <Checkbox
+              checked={value !== "null"}
+              disabled={locked}
+              onCheckedChange={(checked) => {
+                if (checked) {
+                  setUserChoice({ owner: deferKey, view: "json" });
+                } else {
+                  resetAIState();
+                }
+                onChange(
+                  checked ? JSON.stringify(exampleValue, null, 2) : "null",
+                );
+              }}
+            />
+          )}
         </div>
-        {value !== "null" && !generateWithAIActive && !locked && (
-          <Button
-            variant="tertiary"
-            className="h-7 text-xs"
-            onClick={() => {
-              setGenerateWithAIActive(true);
-            }}
-          >
-            <MagicWandIcon className="mr-2 size-4" />
-            Generate with AI
-          </Button>
-        )}
+        <div className="flex shrink-0 items-center gap-2">
+          {schemaEnabled && outline !== null && (
+            <SchemaViewButton
+              view={showFields ? "fields" : "json"}
+              onClick={() => {
+                if (showFields) {
+                  setUserChoice({ owner: deferKey, view: "json" });
+                  return;
+                }
+                flushBufferedEditorEdits();
+                setUserChoice({ owner: deferKey, view: "fields" });
+              }}
+            />
+          )}
+          {schemaEnabled && !generateWithAIActive && !locked && (
+            <Button
+              variant="tertiary"
+              className="h-7 text-xs"
+              onClick={() => {
+                setGenerateWithAIActive(true);
+              }}
+            >
+              <MagicWandIcon className="mr-2 size-4" />
+              Generate with AI
+            </Button>
+          )}
+        </div>
       </div>
 
-      {value !== "null" && (
+      {schemaEnabled && (
         <div className="space-y-2">
           {generateWithAIActive ? (
             <div className="flex w-full items-center rounded-xl border px-4">
@@ -187,30 +235,35 @@ function WorkflowDataSchemaInputGroup({
               )}
             </div>
           ) : null}
+          {showFields && <SchemaFieldList outline={outline} />}
           <div
             className={cn(
               "rounded-md",
               tsonResult && !tsonResult.success
                 ? "ring-1 ring-red-500"
                 : undefined,
+              showFields && "hidden",
             )}
           >
             <CodeEditor
               deferKey={deferKey}
               language="json"
               value={value}
-              onChange={onChange}
+              onChange={onEditorChange}
               readOnly={scopeReadOnly}
               className="nopan"
               fontSize={8}
             />
           </div>
-          {tsonResult !== null && !tsonResult.success && tsonResult.error && (
-            <div className="text-xs text-red-400">{tsonResult.error}</div>
-          )}
+          {!showFields &&
+            tsonResult !== null &&
+            !tsonResult.success &&
+            tsonResult.error && (
+              <div className="text-xs text-red-400">{tsonResult.error}</div>
+            )}
         </div>
       )}
-      {value !== "null" && (
+      {schemaEnabled && (
         <Dialog
           open={pendingSchema !== null}
           onOpenChange={(open) => {

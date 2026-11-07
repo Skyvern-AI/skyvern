@@ -12,10 +12,31 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
+from agents import FunctionTool
+
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.utils.strings import join_phrases
 
 BROWSER_TARGET_PARAM_NAME = "target"
+
+# Native tools that act in a live page through this resolver; tools.BROWSER_BOUND_TOOL_NAMES cannot be imported
+# here or from the stream adapter without a cycle, so a unit test pins it to the page-state tool set.
+DEBUG_BROWSER_TOOL_NAMES = frozenset(
+    {
+        "run_browser_code",
+        "inspect_page_for_composition",
+        "inspect_locator_matches",
+        "fill_credential_field",
+        "solve_page_challenge",
+        "upload_attached_file",
+        "discover_workflow_entrypoint",
+    }
+)
+
+
+def tool_accepts_target(tool: FunctionTool) -> bool:
+    properties = tool.params_json_schema.get("properties")
+    return isinstance(properties, dict) and BROWSER_TARGET_PARAM_NAME in properties
 
 
 class BrowserTarget(StrEnum):

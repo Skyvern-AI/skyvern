@@ -13,7 +13,7 @@ from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from pydantic import ValidationError
+from pydantic import JsonValue, ValidationError
 from sqlalchemy.ext.asyncio import AsyncEngine
 from structlog.testing import capture_logs
 
@@ -32,10 +32,18 @@ from skyvern.forge.sdk.copilot.agent import (
     _review_projection_for,
     _translate_to_agent_result,
 )
-from skyvern.forge.sdk.copilot.build_test_connect_failure import build_test_connect_failure_sentence
+from skyvern.forge.sdk.copilot.agent_context import RegisteredArtifactEntry, RegisteredArtifactEvidence
+from skyvern.forge.sdk.copilot.build_test_connect_failure import (
+    BROWSER_TOOLS_UNAVAILABLE_ERROR,
+    RAW_SECRET_BROWSER_ERROR,
+    BuildTestConnectFailureState,
+    build_test_connect_failure_sentence,
+)
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     BLOCK_FACT_SCREEN_NOTICE_MAX_CHARS,
     BLOCK_FACT_URL_MAX_CHARS,
+    DOWNLOAD_TEXT_OVER_PACKET_LIMIT,
+    DOWNLOAD_TEXT_PAST_CHAR_LIMIT,
     OBSERVED_BLOCK_END_URLS_EMPTY,
     OBSERVED_BLOCK_END_URLS_UNREPORTABLE,
     OBSERVED_BLOCK_END_URLS_WITHHELD,
@@ -76,6 +84,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
     _BUILD_TEST_PACKET_MAX_CHARS,
     _INTERNAL_RUN_OUTCOME_RECORDED_KEY,
     BUILD_TEST_PACKET_KEY,
+    OUTPUT_VALUE_MAX_CHARS,
     _compact_block_fact_maps,
     _compact_packet_for_aggregate_limit,
     _compacted_newest_labelled,
@@ -106,6 +115,7 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
     _recorded_run_block_result,
     _run_blocks_and_collect_debug,
     _verify_and_record_run_blocks_result,
+    blank_login_credential_input_keys,
     build_test_evidence_packet,
     finalize_build_test_result,
     loop_definition_facts,
@@ -131,7 +141,8 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
 )
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
-from skyvern.forge.sdk.workflow.models.block import CodeBlock, ForLoopBlock
+from skyvern.forge.sdk.workflow.exceptions import FailedToFormatJinjaStyleParameter
+from skyvern.forge.sdk.workflow.models.block import CodeBlock, ForLoopBlock, render_failure_reason
 from skyvern.forge.sdk.workflow.models.google_sheets_blocks import GoogleSheetsWriteBlock
 from skyvern.forge.sdk.workflow.models.parameter import (
     OutputParameter,
@@ -223,29 +234,148 @@ def test_run_blocks_outcome_records_requested_labels_and_shape_hashes() -> None:
     assert outcome.block_shape_hashes == {"open": "h1", "search": "h2", "extract": "h3"}
 
 
-def test_registered_block_download_reaches_packet_without_parseable_artifact_evidence() -> None:
+def _evidence_naming(run_id: str, file_name: str) -> RegisteredArtifactEvidence:
+    entry = RegisteredArtifactEntry(artifact_id="a_dl_9", file_name=file_name, text="text")
+    return RegisteredArtifactEvidence(entries=(entry,), workflow_run_id=run_id)
+
+
+@pytest.mark.parametrize(
+    ("block_file_names", "evidence", "expected_name", "expect_other_run_notice"),
+    [
+        ([None], None, None, False),
+        (["tool_1.0_amd64.deb"], None, "tool_1.0_amd64.deb", False),
+        ([7], None, None, False),
+        ([""], None, None, False),
+        (["tool_1.0_amd64.deb"], _evidence_naming("wr_1", "release_notes.pdf"), "release_notes.pdf", False),
+        (["tool_1.0_amd64.deb"], _evidence_naming("wr_1", ""), "tool_1.0_amd64.deb", False),
+        (["tool_1.0_amd64.deb"], _evidence_naming("wr_other", "release_notes.pdf"), "tool_1.0_amd64.deb", False),
+        ([None], _evidence_naming("wr_other", "release_notes.pdf"), None, True),
+        (["tool_1.0_amd64.deb", ""], _evidence_naming("wr_other", "release_notes.pdf"), "tool_1.0_amd64.deb", False),
+    ],
+)
+def test_registered_block_download_reaches_packet_with_its_best_known_name(
+    block_file_names: list[str | int | None],
+    evidence: RegisteredArtifactEvidence | None,
+    expected_name: str | None,
+    expect_other_run_notice: bool,
+) -> None:
     ctx = make_copilot_ctx()
-    ctx.registered_artifact_evidence = None
+    ctx.registered_artifact_evidence = evidence
+    blocks: list[dict[str, JsonValue]] = []
+    for index, block_file_name in enumerate(block_file_names):
+        extracted: dict[str, JsonValue] = {"downloaded_file_artifact_ids": ["a_dl_9"]}
+        if block_file_name is not None:
+            extracted["downloaded_files"] = [{"artifact_id": "a_dl_9", "filename": block_file_name}]
+        blocks.append({"label": f"download_{index}", "status": "completed", "extracted_data": extracted})
+    labels = [block["label"] for block in blocks]
     result = {
         "ok": True,
         "data": {
             "workflow_run_id": "wr_1",
             "overall_status": "completed",
-            "requested_block_labels": ["download_statement"],
-            "executed_block_labels": ["download_statement"],
-            "blocks": [
-                {
-                    "label": "download_statement",
-                    "status": "completed",
-                    "extracted_data": {"downloaded_file_artifact_ids": ["a_dl_9"]},
-                }
-            ],
+            "requested_block_labels": labels,
+            "executed_block_labels": labels,
+            "blocks": blocks,
         },
     }
 
     packet = build_test_evidence_packet(ctx, result)
 
-    assert [(download.artifact_id, download.file_name) for download in packet.downloads] == [("a_dl_9", None)]
+    assert [(d.artifact_id, d.file_name, d.generated) for d in packet.downloads] == [("a_dl_9", expected_name, None)]
+    assert any("another run" in notice for notice in packet.omission_notices) is expect_other_run_notice
+
+
+def _statement_download(index: int) -> BuildTestPacketDownload:
+    return BuildTestPacketDownload(
+        artifact_id=f"a_dl_{index}",
+        file_name=f"statement_{index}.pdf",
+        text="Amount due 89.68 " * 1_000,
+        page_count=2,
+        char_count=17_000,
+        truncated=False,
+    )
+
+
+def test_an_over_budget_packet_shortens_download_text_before_the_workflow_readback() -> None:
+    packet = build_test_evidence_packet(make_copilot_ctx(), {"ok": True, "data": {"workflow_run_id": "wr_1"}})
+    statement = BuildTestPacketDownload(
+        artifact_id="a_dl_1",
+        file_name="statement.pdf",
+        text="Amount due 89.68 " * 1_200,
+        page_count=2,
+        char_count=20_400,
+        truncated=False,
+    )
+    oversized = packet.model_copy(
+        update={
+            "canonical_workflow_yaml": "w" * 29_000,
+            "canonical_workflow_yaml_complete": True,
+            "downloads": [statement],
+        }
+    )
+
+    projected = project_build_test_packet_for_llm(oversized)
+
+    assert projected.canonical_workflow_yaml == "w" * 29_000
+    assert projected.canonical_workflow_yaml_complete is True
+    shortened = projected.downloads[0]
+    assert shortened.text is not None and statement.text is not None
+    assert 0 < len(shortened.text) < len(statement.text)
+    assert statement.text.startswith(shortened.text)
+    assert (shortened.page_count, shortened.char_count, shortened.truncated) == (2, 20_400, True)
+    assert DOWNLOAD_TEXT_OVER_PACKET_LIMIT in projected.omission_notices
+    assert len(json.dumps(projected.model_dump(mode="json", exclude_none=True), ensure_ascii=False)) <= 47_000
+
+
+def test_the_direct_test_handoff_keeps_download_text_omission_notices() -> None:
+    packet = build_test_evidence_packet(make_copilot_ctx(), {"ok": True, "data": {"workflow_run_id": "wr_1"}})
+    recorded = packet.model_copy(
+        update={
+            "downloads": [_statement_download(1)],
+            "omission_notices": [DOWNLOAD_TEXT_PAST_CHAR_LIMIT, "run-supplied prose that must not be relayed"],
+        }
+    )
+
+    handoff = project_direct_test_handoff_packet_for_llm(recorded)
+
+    assert DOWNLOAD_TEXT_PAST_CHAR_LIMIT in handoff.omission_notices
+    assert "run-supplied prose that must not be relayed" not in handoff.omission_notices
+    assert handoff.downloads[0].text == _statement_download(1).text
+
+
+def test_packet_workflow_readback_hides_saved_notes_with_doc_editor_off() -> None:
+    ctx = make_copilot_ctx(doc_editor_enabled=False)
+    ctx.last_workflow_yaml = (
+        "title: Notes draft\n"
+        "workflow_definition:\n"
+        "  parameters: []\n"
+        "  blocks:\n"
+        "    - block_type: navigation\n"
+        "      label: open\n"
+        "      url: https://example.com\n"
+        "      navigation_goal: Open the page\n"
+        "      notes: SAVED_NOTE_TEXT\n"
+        "      trailing_notes: SAVED_TRAILING_TEXT\n"
+        "      description: SAVED_DESCRIPTION_TEXT\n"
+    )
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_1",
+            "overall_status": "completed",
+            "requested_block_labels": ["open"],
+            "executed_block_labels": ["open"],
+            "blocks": [{"label": "open", "status": "completed"}],
+        },
+    }
+
+    packet = build_test_evidence_packet(ctx, result)
+
+    assert packet.canonical_workflow_yaml is not None
+    assert "label: open" in packet.canonical_workflow_yaml
+    for hidden in ("SAVED_NOTE_TEXT", "SAVED_TRAILING_TEXT", "SAVED_DESCRIPTION_TEXT"):
+        assert hidden not in packet.canonical_workflow_yaml
+    assert "SAVED_NOTE_TEXT" in ctx.last_workflow_yaml
 
 
 def test_packet_projects_every_recorded_block_output_in_row_order_and_scrubs_secrets() -> None:
@@ -336,15 +466,16 @@ async def test_packet_surfaces_available_keys_from_a_sheets_render_failure() -> 
         "output": {"failure_rate": "25.65%"},
     }
 
-    with pytest.raises(ValueError) as excinfo:
+    with pytest.raises(FailedToFormatJinjaStyleParameter) as excinfo:
         write_block._render_values_or_raise(run_context)
+    reason = render_failure_reason("Failed to format jinja template:", excinfo.value, lambda value: value)
 
     with (
         patch.object(GoogleSheetsWriteBlock, "record_output_parameter_value", AsyncMock()) as record_output,
         patch.object(GoogleSheetsWriteBlock, "build_block_result", AsyncMock()),
     ):
         await write_block._template_format_failure_result(
-            excinfo.value, str(excinfo.value), run_context, "wr_sheets_available_keys", None, None
+            excinfo.value, reason, run_context, "wr_sheets_available_keys", None, None
         )
         recorded_output = record_output.await_args.args[2]
 
@@ -366,10 +497,8 @@ async def test_packet_surfaces_available_keys_from_a_sheets_render_failure() -> 
 def test_projection_keeps_available_keys_when_the_output_exceeds_the_per_output_cap() -> None:
     failure_output = {
         "failure_reason": (
-            "Failed to format jinja template: block `write_row` field `values` references a value no "
-            "upstream block produced: 'dict object' has no attribute 'extracted_information'. Return "
-            "that key from the producing block, or write an explicit default (e.g. "
-            "{{ block_label.field | default('') }}) if an empty cell is intended."
+            "Failed to format jinja template: Missing key or attribute in "
+            "`extract_metrics.output.extracted_information` (field values, line 1)."
         ),
         "available_keys": [
             *[f"extract_metrics.output.metric_{index:02d}" for index in range(25)],
@@ -468,7 +597,7 @@ def test_connect_failure_projects_through_recorded_outcome_and_packet() -> None:
     )
     result = {
         "ok": False,
-        "error": "Build-test browser acquisition stopped: cdp_connect_failed.",
+        "error": build_test_connect_failure_sentence(failure),
         "data": {
             "workflow_run_id": "wr_1",
             "overall_status": "setup_failed",
@@ -490,6 +619,77 @@ def test_connect_failure_projects_through_recorded_outcome_and_packet() -> None:
     assert packet.canonical_workflow_yaml == "title: preserved draft"
 
 
+_BROWSER_LOST_AFTER_RUN_START = (
+    "The test run started, but its browser was lost before any block ran, so nothing was tested. "
+    "Trying again in a fresh browser may work."
+)
+
+
+@pytest.mark.parametrize(
+    ("state", "workflow_run_id", "sentence"),
+    [
+        (
+            "provisioning_unavailable",
+            None,
+            "Build test did not start: no test browser was ready in time. This was a problem on Skyvern's side, "
+            "not with the workflow or the account's credits. No run started. Trying again may work.",
+        ),
+        (
+            "cdp_connect_failed",
+            None,
+            "Build test did not start: Skyvern could not connect to the test browser. This was a problem on "
+            "Skyvern's side, not with the workflow or the account's credits. No run started. Trying again may work.",
+        ),
+        (
+            "already_closed",
+            None,
+            "Build test did not start: the test browser had already closed. No run started. "
+            "Trying again in a fresh browser may work.",
+        ),
+        ("provisioning_unavailable", "wr_1", _BROWSER_LOST_AFTER_RUN_START),
+        ("cdp_connect_failed", "wr_1", _BROWSER_LOST_AFTER_RUN_START),
+        ("already_closed", "wr_1", _BROWSER_LOST_AFTER_RUN_START),
+    ],
+)
+def test_a_browser_start_failure_reads_as_a_plain_sentence_and_keeps_its_typed_state(
+    state: BuildTestConnectFailureState, workflow_run_id: str | None, sentence: str
+) -> None:
+    failure = BuildTestConnectFailure(state=state, workflow_run_id=workflow_run_id)
+
+    result = runtime._build_test_connect_failure_result(failure)
+
+    assert build_test_connect_failure_sentence(failure) == sentence
+    assert state not in sentence
+    assert result["error"] == sentence
+    assert result["data"]["build_test_connect_failure"]["state"] == state
+
+
+@pytest.mark.parametrize("diagnostic", [BROWSER_TOOLS_UNAVAILABLE_ERROR, RAW_SECRET_BROWSER_ERROR])
+def test_a_denied_browser_keeps_its_denial_instead_of_a_retry_invitation(diagnostic: str) -> None:
+    failure = BuildTestConnectFailure(state="provisioning_unavailable", diagnostic=diagnostic)
+
+    assert build_test_connect_failure_sentence(failure) == diagnostic
+
+
+@pytest.mark.asyncio
+async def test_a_finished_run_hands_its_recorded_live_and_cached_credits_to_the_packet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_get_run_results_harness(
+        monkeypatch,
+        run_status="completed",
+        blocks=[run_result_block_row("open_site", "completed", "https://fixture.test/")],
+        run_credits=(40, 15),
+    )
+
+    hydrated = await run_execution_module.hydrate_prior_run_packet(
+        make_copilot_ctx(workflow_permanent_id="wpid-1"), workflow_run_id="wr-1"
+    )
+
+    assert hydrated is not None
+    assert hydrated["run"]["credits_used"] == 55
+
+
 def test_billing_credit_refusal_schema_requires_no_retry_or_new_identity() -> None:
     failure = BuildTestConnectFailure(
         state="billing_credit_admission_refusal",
@@ -507,7 +707,7 @@ def test_billing_credit_refusal_schema_requires_no_retry_or_new_identity() -> No
         "retry_action": None,
     }
     with pytest.raises(ValidationError):
-        BuildTestConnectFailure(state="billing_credit_admission_refusal")
+        BuildTestConnectFailure(state="billing_credit_admission_refusal", retry_action="test_end_to_end")
     with pytest.raises(ValidationError):
         BuildTestConnectFailure(
             state="billing_credit_admission_refusal",
@@ -516,6 +716,24 @@ def test_billing_credit_refusal_schema_requires_no_retry_or_new_identity() -> No
         )
     with pytest.raises(ValidationError):
         BuildTestConnectFailure(state="already_closed", retry_action=None)
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        "billing_credit_admission_refusal",
+        "saved_profile_unresolved",
+        "saved_profile_not_applied",
+        "unsaved_browser_profile_pick",
+    ],
+)
+def test_no_retry_connect_failure_survives_an_exclude_none_round_trip(state: BuildTestConnectFailureState) -> None:
+    failure = BuildTestConnectFailure(state=state, retry_action=None)
+
+    dumped = failure.model_dump(mode="json", exclude_none=True)
+
+    assert "retry_action" not in dumped
+    assert BuildTestConnectFailure.model_validate(dumped) == failure
 
 
 def test_billing_refusal_preserves_prior_run_evidence_and_repair_context() -> None:
@@ -710,7 +928,10 @@ def test_a_post_run_connect_failure_keeps_the_block_failures_diagnostic_evidence
             reason_code="unrecoverable_tool_error",
             workflow_run_id="wr_1",
             structural_failure_identity="build_test_connect:cdp_connect_failed",
-            observed_evidence_summary="Build-test browser acquisition stopped: cdp_connect_failed.",
+            observed_evidence_summary=(
+                "Build test did not start: Skyvern could not connect to the test browser. This was a problem on "
+                "Skyvern's side, not with the workflow or the account's credits. No run started. Trying again may work."
+            ),
             connect_failure=BuildTestConnectFailure(
                 state="cdp_connect_failed",
                 browser_session_id="pbs_stale",
@@ -757,7 +978,10 @@ def test_a_block_that_died_on_a_plain_exception_is_preserved_like_a_browser_fail
             verdict="not_authoritative",
             reason_code="unrecoverable_tool_error",
             workflow_run_id="wr_1",
-            observed_evidence_summary="Build-test browser acquisition stopped: cdp_connect_failed.",
+            observed_evidence_summary=(
+                "Build test did not start: Skyvern could not connect to the test browser. This was a problem on "
+                "Skyvern's side, not with the workflow or the account's credits. No run started. Trying again may work."
+            ),
             connect_failure=BuildTestConnectFailure(
                 state="cdp_connect_failed",
                 browser_session_id="pbs_stale",
@@ -2104,6 +2328,8 @@ async def test_failed_run_complete_fact_packet_reaches_ordinary_repair_input(
         created_at=datetime(2026, 4, 21, 12, 0),
         trigger_type=None,
         workflow_definition_sha256=None,
+        credits_used=0,
+        cached_credits_used=0,
     )
     block = SimpleNamespace(
         workflow_run_block_id="wrb_failed_complete_packet",
@@ -3095,6 +3321,174 @@ def test_required_input_unbound_outcome_preserves_the_typed_capture_fact() -> No
     assert outcome.reason_code == "required_input_unbound"
     assert outcome.page_capture is not None
     assert outcome.page_capture.model_dump() == {"status": "unavailable", "omission": "page_capture_unavailable"}
+
+
+_VAULT_KEY_INPUTS_YAML = """
+workflow_definition:
+  parameters:
+    - {parameter_type: workflow, workflow_parameter_type: string, key: vault_input, default_value: team-vault}
+    - {parameter_type: workflow, workflow_parameter_type: string, key: username_secret_name, default_value: ""}
+    - {parameter_type: workflow, workflow_parameter_type: string, key: password_secret_name, default_value: ""}
+    - parameter_type: azure_vault_credential
+      key: vault_login
+      vault_name: vault_input
+      username_key: "{{ username_secret_name }}"
+      password_key: "{{ password_secret_name | default('p-fallback', true) }}"
+  blocks:
+    - {block_type: login, label: login, parameter_keys: [vault_login]}
+"""
+_BLANK_KEY_NAMES = ["username_secret_name", "password_secret_name"]
+_BOUND_KEY_NAMES = {"username_secret_name": "u-item", "password_secret_name": "p-item"}
+_NAMED_BLANK_KEY_NAMES = ["username_secret_name"]
+
+
+@pytest.mark.parametrize(
+    ("run_shape", "unbound", "dispatched", "expected_named"),
+    [
+        ("init_failure", _BLANK_KEY_NAMES, {}, _NAMED_BLANK_KEY_NAMES),
+        ("init_failure", [], {"username_secret_name": "", "password_secret_name": ""}, _NAMED_BLANK_KEY_NAMES),
+        ("init_failure", [], {**_BOUND_KEY_NAMES, "username_secret_name": "  "}, []),
+        ("init_failure", [], {"username_secret_name": None, "password_secret_name": None}, _NAMED_BLANK_KEY_NAMES),
+        ("init_failure", [], {**_BOUND_KEY_NAMES, "vault_input": None}, []),
+        ("init_failure", [], {**_BOUND_KEY_NAMES, "vault_input": ""}, ["vault_input"]),
+        ("init_failure", [], _BOUND_KEY_NAMES, []),
+        ("later_block_failure", _BLANK_KEY_NAMES, {}, []),
+        ("watchdog_no_blocks", _BLANK_KEY_NAMES, {}, []),
+        ("success", _BLANK_KEY_NAMES, {}, []),
+    ],
+    ids=[
+        "unbound",
+        "explicit_blank",
+        "whitespace",
+        "none_with_empty_default",
+        "none_with_default",
+        "vault_name_blank",
+        "bound",
+        "later_block_failure",
+        "watchdog_no_blocks",
+        "success",
+    ],
+)
+def test_a_run_names_the_blank_inputs_its_login_credential_key_names_template(
+    run_shape: str, unbound: list[str], dispatched: dict[str, str | None], expected_named: list[str]
+) -> None:
+    ok = run_shape == "success"
+    blocks = (
+        [{"label": "login", "status": "failed", "failure_reason": "Login rejected."}]
+        if run_shape == "later_block_failure"
+        else []
+    )
+    result: dict[str, Any] = {
+        "ok": ok,
+        "data": {
+            "workflow_run_id": "wr_vault",
+            "overall_status": "completed" if ok else "failed",
+            "failure_reason": None if ok else "Failed to initialize workflow run context.",
+            "failure_type": "runtime_error" if blocks else None,
+            "blocks": blocks,
+        },
+    }
+    if run_shape == "watchdog_no_blocks":
+        result["data"]["control_signal"] = {"kind": "watchdog_timeout", "user_facing_summary": "Stopped."}
+    recorded_run_outcome = (
+        RecordedRunOutcome(verdict="demonstrated", workflow_run_id="wr_vault")
+        if ok
+        else RecordedRunOutcome(
+            verdict="not_demonstrated",
+            reason_code="blocker_reported",
+            display_reason="Failed to initialize workflow run context.",
+            workflow_run_id="wr_vault",
+            run_completed=False,
+        )
+    )
+
+    outcome = recorded_outcome_from_run_blocks_result(
+        result,
+        recorded_run_outcome=recorded_run_outcome,
+        unbound_required_parameter_keys=unbound,
+        block_parameter_keys={},
+        blank_login_credential_input_keys=blank_login_credential_input_keys(
+            _VAULT_KEY_INPUTS_YAML, unbound, dispatched
+        ),
+    )
+
+    assert outcome is not None
+    expected_reason = {"success": "verified_success", "later_block_failure": "runtime_block_failure"}.get(
+        run_shape, "required_input_unbound" if expected_named else "blocker_reported"
+    )
+    assert outcome.reason_code == expected_reason
+    if expected_named:
+        assert outcome.observed_evidence_summary == "unbound required inputs: " + ", ".join(expected_named)
+
+
+@pytest.mark.parametrize(
+    ("credential_param", "named"),
+    [
+        pytest.param(
+            "{parameter_type: azure_vault_credential, key: c, vault_name: v, username_key: '{{ key_input }}', "
+            "password_key: p}",
+            True,
+            id="azure_vault_required_key",
+        ),
+        pytest.param(
+            "{parameter_type: onepassword, key: c, vault_id: v, item_id: '{{ key_input }}'}",
+            True,
+            id="onepassword_required_item",
+        ),
+        pytest.param("{parameter_type: credential, key: c, credential_id: key_input}", True, id="credential_id"),
+        pytest.param(
+            "{parameter_type: azure_vault_credential, key: c, vault_name: v, username_key: u, password_key: p, "
+            "totp_secret_key: '{{ key_input }}'}",
+            False,
+            id="azure_optional_totp",
+        ),
+        pytest.param(
+            "{parameter_type: bitwarden_login_credential, key: c, bitwarden_item_id: '{{ key_input }}'}",
+            False,
+            id="bitwarden_item",
+        ),
+        pytest.param(
+            "{parameter_type: bitwarden_login_credential, key: c, bitwarden_collection_id: key_input}",
+            False,
+            id="bitwarden_collection",
+        ),
+        pytest.param(
+            "{parameter_type: credential, key: c, credential_id: key_input, credential_ids: [cred_a]}",
+            False,
+            id="credential_id_behind_pool",
+        ),
+    ],
+)
+def test_an_init_failure_names_only_inputs_a_login_credential_requires(credential_param: str, named: bool) -> None:
+    workflow_yaml = (
+        "workflow_definition:\n"
+        "  parameters:\n"
+        "    - {parameter_type: workflow, workflow_parameter_type: string, key: key_input, default_value: ''}\n"
+        f"    - {credential_param}\n"
+        "  blocks: []\n"
+    )
+    result = {
+        "ok": False,
+        "data": {"workflow_run_id": "wr_init", "overall_status": "failed", "failure_reason": "Init.", "blocks": []},
+    }
+    recorded_run_outcome = RecordedRunOutcome(
+        verdict="not_demonstrated",
+        reason_code="blocker_reported",
+        display_reason="Init.",
+        workflow_run_id="wr_init",
+        run_completed=False,
+    )
+
+    outcome = recorded_outcome_from_run_blocks_result(
+        result,
+        recorded_run_outcome=recorded_run_outcome,
+        unbound_required_parameter_keys=["key_input"],
+        block_parameter_keys={},
+        blank_login_credential_input_keys=blank_login_credential_input_keys(workflow_yaml, ["key_input"], {}),
+    )
+
+    assert outcome is not None
+    assert (outcome.reason_code == "required_input_unbound") is named
 
 
 @pytest.mark.parametrize(
@@ -4359,9 +4753,9 @@ workflow_definition:
     monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
     monkeypatch.setattr(tools_module, "_frontier_runtime_page_url", AsyncMock(return_value=None))
     monkeypatch.setattr(
-        tools_module,
-        "_plan_frontier",
-        lambda *args: (["collect_failure_rate"], {}, "collect_failure_rate", "initial"),
+        tools_module.FrontierRequest,
+        "plan",
+        lambda self, ctx: (["collect_failure_rate"], {}, "collect_failure_rate", "initial"),
     )
     monkeypatch.setattr(tools_module, "_update_workflow", persist_workflow)
     monkeypatch.setattr(tools_module, "_run_blocks_and_collect_debug", test_persisted_workflow)
@@ -5376,6 +5770,7 @@ async def _execute_code_block(monkeypatch: pytest.MonkeyPatch, code: str) -> dic
     class FakeBrowserState:
         def __init__(self) -> None:
             self.browser_artifacts = BrowserArtifacts()
+            self.engine_selection = None
 
         async def get_working_page(self) -> object:
             return _CheckoutPage()
@@ -5392,6 +5787,12 @@ async def _execute_code_block(monkeypatch: pytest.MonkeyPatch, code: str) -> dic
         browser_session_id = None
         workflow_run_outputs: list[object] = []
         workflow = None
+
+        reject_platform_smtp_template_references = WorkflowRunContext.reject_platform_smtp_template_references
+        agent_unmasked_platform_secret_ids = staticmethod(set)
+
+        def __init__(self) -> None:
+            self.parameters: dict[str, object] = {}
 
         def get_block_metadata(self, label: str | None) -> dict[str, object]:
             return {}
@@ -5721,7 +6122,9 @@ async def test_candidate_run_bind_after_a_rejected_restore_dispatches_only_the_s
         assert forge_app.WORKFLOW_SERVICE.execute_workflow.call_count == 0
     elif case == "other_settings":
         second = await _run_extract_heading(ctx)
-        assert [first, second] == [{"ok": False, "error": COPILOT_PROPOSAL_SETTINGS_CHANGED_ERROR}] * 2
+        assert [first, second] == [
+            {"ok": False, "error": COPILOT_PROPOSAL_SETTINGS_CHANGED_ERROR, "data": {"run_dispatched": False}}
+        ] * 2
         workflow_service_module.prepare_workflow.assert_not_awaited()
         assert ctx.private_workflow_settings == settings_before
         assert (ctx.proposal_owner_turn_id, ctx.proposal_revision, ctx.staged_workflow) == ("turn-one", 1, None)
@@ -5748,7 +6151,7 @@ async def test_candidate_run_bind_and_publish_stay_refused_while_an_accept_claim
     monkeypatch.setattr(run_execution_module, "_authority_tool_error", lambda *_args: None)
     monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
     monkeypatch.setattr(
-        tools_module, "_plan_frontier", lambda *_args: (["extract_heading"], {}, "extract_heading", "initial")
+        tools_module.FrontierRequest, "plan", lambda self, ctx: (["extract_heading"], {}, "extract_heading", "initial")
     )
     workflow_service_module.prepare_workflow.return_value = SimpleNamespace(
         workflow_run_id="wr_refused",
@@ -5799,6 +6202,7 @@ async def test_candidate_run_bind_refusal_logs_its_reason_and_dispatches_nothing
     assert (result["ok"], result.get("conflict_reason")) == (False, reason if reason == "bytes_changed" else None)
     assert result["data"] == {"run_dispatched": False, "proposal_bind_refused": True}
     assert forge_app.WORKFLOW_SERVICE.execute_workflow.call_count == 0
+    assert ctx.pending_test_inputs == {}
     bind_logs = [entry for entry in logs if entry["event"].startswith("copilot candidate run bind")]
     assert [(entry["event"], entry["reason"]) for entry in bind_logs] == [(event, reason)]
     assert (await _stored_candidate(repo, chat_id))[1].workflow_run_id is None
@@ -7099,6 +7503,11 @@ def test_every_packet_rendering_keeps_the_newest_per_block_facts_and_says_what_i
             "per_block_action_observations": {
                 f"block_{index}": [f"click completed code_line={line}" for line in range(20)] for index in range(30)
             },
+            "registered_outputs": [
+                BuildTestPacketRegisteredOutput(
+                    label="collect_rows", status="completed", output={"rows": [f'row "{i}"' for i in range(100)]}
+                )
+            ],
         }
     )
 
@@ -7120,6 +7529,11 @@ def test_every_packet_rendering_keeps_the_newest_per_block_facts_and_says_what_i
     assert list(compacted.observed_block_end_urls) == ["block_28", "block_29"]
     assert compacted.per_block_action_observations["block_29"] == ["click completed code_line=19"]
     assert any("observed_block_end_urls shortened at the aggregate packet limit" in n for n in compact_notices)
+    projected_cut = projected.registered_outputs[0].output
+    assert projected.registered_outputs[0].value_complete is False
+    recompacted = _compact_packet_for_aggregate_limit(projected, []).registered_outputs[0]
+    assert recompacted.output == projected_cut[: OUTPUT_VALUE_MAX_CHARS - 3] + "..."
+    assert recompacted.value_complete is False
 
 
 def test_an_over_long_page_state_url_is_refused_rather_than_cut() -> None:

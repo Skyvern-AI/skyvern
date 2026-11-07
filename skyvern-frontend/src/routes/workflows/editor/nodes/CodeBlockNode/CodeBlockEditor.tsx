@@ -3,6 +3,14 @@ import { useNodes, useReactFlow } from "@xyflow/react";
 import { useMemo, useState } from "react";
 import type { Extension } from "@uiw/react-codemirror";
 
+import {
+  describeSchema,
+  type SchemaView,
+} from "@/components/DataSchemaInputGroup/describeSchema";
+import {
+  SchemaFieldList,
+  SchemaViewButton,
+} from "@/components/DataSchemaInputGroup/SchemaFieldList";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { WorkflowBlockInputSet } from "@/components/WorkflowBlockInputSet";
@@ -15,6 +23,11 @@ import {
 import { jinjaHighlight } from "@/routes/workflows/components/jinjaHighlight";
 import { lineHighlight } from "@/routes/workflows/components/lineHighlight";
 import { analyzeCodeBlockErrorCodes } from "@/routes/workflows/editor/codeBlockErrorCodeDiagnostics";
+import {
+  classifyUse,
+  codeBlockUses,
+  stripPythonComments,
+} from "@/routes/workflows/editor/jinjaReferences";
 import { ErrorCodeMappingEditor } from "@/routes/workflows/editor/ErrorCodeMappingEditor";
 import { pythonSyntaxExtensions } from "@/routes/workflows/editor/pythonSyntaxLinter";
 import { useWorkflowScopeReadOnly } from "@/routes/workflows/editor/WorkflowScopeContext";
@@ -24,6 +37,7 @@ import {
   freshGoalSuggestion,
   goalChangeIsPending,
   goalChangeUndoPatch,
+  goalTextEditPatch,
   keepCodeWithGoalPatch,
 } from "@/routes/workflows/editor/workflowEditorUtils";
 import { getCodeStepPlainText } from "@/routes/workflows/workflowBlockUtils";
@@ -31,6 +45,7 @@ import {
   goalActionIsLocked,
   useCopilotActionStore,
 } from "@/store/useCopilotActionStore";
+import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import {
   selectEditorMutationLocked,
   useWorkflowYamlEditorStore,
@@ -132,7 +147,7 @@ function CodeBlockEditorBody({
     editable &&
     !scopeReadOnly &&
     !mutationLocked;
-  const hasGenerated = steps.length > 0;
+  const hasCode = stripPythonComments(data.code ?? "").trim().length > 0;
   const isQueued = useCopilotActionStore((state) =>
     state.queuedBuilds.some((queued) => queued.blockLabel === data.label),
   );
@@ -189,6 +204,20 @@ function CodeBlockEditorBody({
     () => analyzeCodeBlockErrorCodes(data.code, effectiveManifest),
     [data.code, effectiveManifest],
   );
+  const workflowParameters = useWorkflowParametersStore(
+    (state) => state.parameters,
+  );
+  const uses = useMemo(() => {
+    const inputKeys = new Set(
+      workflowParameters.map((parameter) => parameter.key),
+    );
+    const blockLabels = new Set(
+      nodes.filter(isWorkflowBlockNode).map((other) => other.data.label),
+    );
+    return codeBlockUses(data.parameterKeys ?? [], data.code ?? "").map(
+      (name) => ({ name, kind: classifyUse(name, inputKeys, blockLabels) }),
+    );
+  }, [workflowParameters, nodes, data.parameterKeys, data.code]);
 
   const goalField = (
     <div className="space-y-2">
@@ -198,7 +227,7 @@ function CodeBlockEditorBody({
           <button
             type="button"
             disabled={!canGenerate}
-            aria-label={hasGenerated ? "Regenerate block" : "Generate block"}
+            aria-label={hasCode ? "Regenerate block" : "Generate block"}
             onClick={() =>
               requestBuild({
                 blockLabel: data.label,
@@ -213,11 +242,7 @@ function CodeBlockEditorBody({
             )}
           >
             <MagicWandIcon className="size-3" />
-            {isGenerating
-              ? "Generating…"
-              : hasGenerated
-                ? "Regenerate"
-                : "Generate"}
+            {isGenerating ? "Generating…" : hasCode ? "Regenerate" : "Generate"}
           </button>
         )}
       </div>
@@ -225,59 +250,91 @@ function CodeBlockEditorBody({
         name="prompt"
         nodeId={blockId}
         onChange={(value) => {
-          if (value === (data.prompt ?? "")) {
-            return;
+          const patch = goalTextEditPatch(data, value);
+          if (patch) {
+            update(patch);
           }
-          if (undoPatch && value === (data.goalBeforeEdit?.prompt ?? "")) {
-            update(undoPatch);
-            return;
-          }
-          if (value.trim().length > 0) {
-            update({
-              prompt: value,
-              userOwnedGoal: true,
-              goalNeedsRegeneration: true,
-              ...(!goalChangePending && {
-                goalBeforeEdit: {
-                  prompt: data.prompt,
-                  userOwnedGoal: data.userOwnedGoal,
-                  goalNeedsRegeneration: data.goalNeedsRegeneration,
-                },
-              }),
-            });
-            return;
-          }
-          update({
-            prompt: value,
-            ...(data.userOwnedGoal === true && { userOwnedGoal: false }),
-            ...(goalChangePending && {
-              goalNeedsRegeneration: false,
-              goalBeforeEdit: null,
-            }),
-          });
         }}
         value={data.prompt ?? ""}
         // The build in flight carries the Goal it was started with; a later edit would be lost to it.
         disabled={isGenerating || isQueued}
         className="nopan text-xs"
       />
+      {uses.length > 0 && (
+        <div className="flex min-w-0 flex-wrap items-center gap-1 text-xs">
+          <span aria-hidden="true" className="text-muted-foreground">
+            Uses
+          </span>
+          <ul
+            aria-label="Names this code reads"
+            className="flex min-w-0 flex-wrap gap-1"
+          >
+            {uses.map(({ name, kind }) => (
+              <li
+                key={name}
+                data-kind={kind}
+                title={`${name} (${kind})`}
+                className="max-w-full truncate rounded border border-border bg-slate-elevation1 px-1.5 py-0.5 font-mono text-[10px] text-tertiary-foreground"
+              >
+                {name}
+                <span className="ml-1 font-sans text-muted-foreground">
+                  {kind}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
     </div>
   );
 
   const dataSchemaText = data.dataSchema?.trim() ?? "";
+  const schemaOutline = useMemo(
+    () => describeSchema(dataSchemaText),
+    [dataSchemaText],
+  );
+  // Scoped to blockId because the studio sidebar reuses this component across blocks without remounting it.
+  const [schemaChoice, setSchemaChoice] = useState<{
+    owner: string;
+    view: SchemaView;
+  } | null>(null);
+  const schemaView: SchemaView =
+    schemaOutline === null
+      ? "json"
+      : schemaChoice?.owner === blockId
+        ? schemaChoice.view
+        : "fields";
+  const showSchemaFields = schemaView === "fields" && schemaOutline !== null;
   const dataSchemaField =
     dataSchemaText === "" || dataSchemaText === "null" ? null : (
       <div className="space-y-2">
-        <Label className="text-xs text-tertiary-foreground">
-          Returned data schema
-        </Label>
-        <pre
-          data-testid="code-block-data-schema"
-          tabIndex={0}
-          className="nopan nowheel max-h-48 overflow-auto whitespace-pre-wrap break-words rounded bg-slate-elevation1 p-2 text-xs text-tertiary-foreground"
-        >
-          {dataSchemaText}
-        </pre>
+        <div className="flex items-center justify-between gap-2">
+          <Label className="text-xs text-tertiary-foreground">
+            Returned data schema
+          </Label>
+          {schemaOutline !== null && (
+            <SchemaViewButton
+              view={schemaView}
+              onClick={() =>
+                setSchemaChoice({
+                  owner: blockId,
+                  view: schemaView === "fields" ? "json" : "fields",
+                })
+              }
+            />
+          )}
+        </div>
+        {showSchemaFields ? (
+          <SchemaFieldList outline={schemaOutline} />
+        ) : (
+          <pre
+            data-testid="code-block-data-schema"
+            tabIndex={0}
+            className="nopan nowheel max-h-48 overflow-auto whitespace-pre-wrap break-words rounded bg-slate-elevation1 p-2 text-xs text-tertiary-foreground"
+          >
+            {dataSchemaText}
+          </pre>
+        )}
       </div>
     );
 
@@ -620,6 +677,7 @@ function CodeBlockEditorBody({
           >
             <CodeBlockPlainCard
               steps={steps}
+              hasCode={hasCode}
               generating={isGenerating}
               onStop={requestCancel}
               stopBlockedReason={stopBlockedReason}

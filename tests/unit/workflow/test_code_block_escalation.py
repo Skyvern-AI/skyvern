@@ -7,7 +7,9 @@ selector heals even when no step covers the failing line (the common case).
 from __future__ import annotations
 
 import asyncio
+import html
 import json
+import urllib.parse
 from collections.abc import Callable
 from datetime import datetime, timezone
 from enum import Enum, auto
@@ -41,7 +43,11 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.repositories.workflow_runs import WorkflowRunsRepository
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
-from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager, WorkflowRunContext
+from skyvern.forge.sdk.workflow.context_manager import (
+    RANDOM_SECRET_ID_PREFIX,
+    WorkflowContextManager,
+    WorkflowRunContext,
+)
 from skyvern.forge.sdk.workflow.models.block import (
     _OPERATION_ATTRIBUTION_ALLOWLIST,
     BlockResult,
@@ -50,6 +56,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     CodeBlock,
     CodeBlockStep,
     ErrorCode,
+    code_failure_source_line,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
     BitwardenCreditCardDataParameter,
@@ -61,7 +68,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameterType,
 )
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
-from skyvern.forge.sdk.workflow.service import WorkflowService, _merge_workflow_run_errors
+from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.forge.taskv3.goal_composition import (
     CodeProgressRecord,
     GoalDirectives,
@@ -71,12 +78,14 @@ from skyvern.forge.taskv3.goal_composition import (
 )
 from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.self_heal import HealClassification, HealSkipReason, HealStatus
+from skyvern.services import otp_service
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from skyvern.webeye.browser_runtime_events import BrowserRuntimeLogContext
 from skyvern.webeye.navigation import clear_task_nav_error_code, record_task_nav_error_code
 from skyvern.webeye.real_browser_state import RealBrowserState
+from tests.unit.helpers import merge_block_error_reasons
 
 SECRET_VALUE = "hunter2-super-secret"
 SHORT_SECRET_VALUE = "abc"
@@ -505,7 +514,7 @@ def test_workflow_error_merge_does_not_replace_cross_provenance_task_error() -> 
         "error_type": "USER_DEFINED_ERROR",
     }
     malformed = {**typed, "error_code": "extra", "unexpected": True}
-    result = _merge_workflow_run_errors(
+    result = merge_block_error_reasons(
         [{"error_code": "same", "reasoning": "legacy", "confidence_float": 1.0}],
         [("wrb_code", ["same", "diagnostic"], "failure", {"errors": [typed, malformed]}, "code")],
     )
@@ -525,7 +534,7 @@ def test_workflow_error_merge_upgrades_only_same_block_legacy_entry() -> None:
     }
     second = {**first, "reasoning": "second typed"}
 
-    assert _merge_workflow_run_errors(
+    assert merge_block_error_reasons(
         [],
         [
             ("wrb_1", ["same"], "first legacy", {"errors": [first]}, "code"),
@@ -543,7 +552,7 @@ def test_workflow_error_merge_dedupes_only_within_provenance_and_kind() -> None:
     }
     task = dict(typed)
 
-    assert _merge_workflow_run_errors(
+    assert merge_block_error_reasons(
         [
             {"error_code": "task_same", "reasoning": "first", "confidence_float": 1.0},
             {"error_code": "task_same", "reasoning": "second", "confidence_float": 1.0},
@@ -573,7 +582,7 @@ def test_workflow_error_merge_at_cap_skips_appends_but_allows_later_same_block_u
     }
     task_errors = [{"error_code": f"task_{index}", "reasoning": "task", "confidence_float": 1.0} for index in range(99)]
 
-    errors = _merge_workflow_run_errors(
+    errors = merge_block_error_reasons(
         task_errors,
         [
             ("wrb_upgrade", ["upgrade"], "legacy", None, "code"),
@@ -588,7 +597,7 @@ def test_workflow_error_merge_at_cap_skips_appends_but_allows_later_same_block_u
 
 
 def test_workflow_error_merge_caps_duplicate_legacy_entries_per_row_and_processes_later_blocks() -> None:
-    errors = _merge_workflow_run_errors(
+    errors = merge_block_error_reasons(
         [],
         [
             ("wrb_duplicates", ["duplicate"] * 1000, "first", None, "code"),
@@ -606,7 +615,7 @@ def test_workflow_error_merge_ignores_typed_payload_beyond_per_row_candidate_cap
         "confidence_float": 1.0,
         "error_type": "USER_DEFINED_ERROR",
     }
-    errors = _merge_workflow_run_errors(
+    errors = merge_block_error_reasons(
         [],
         [("wrb_code", ["declared"], "legacy", {"errors": [None] * 150 + [typed]}, "code")],
     )
@@ -621,7 +630,7 @@ def test_workflow_error_merge_upgrades_from_early_typed_payload_after_invalid_ca
         "confidence_float": 1.0,
         "error_type": "USER_DEFINED_ERROR",
     }
-    errors = _merge_workflow_run_errors(
+    errors = merge_block_error_reasons(
         [],
         [("wrb_code", ["declared"], "legacy", {"errors": [None, {"bad": "shape"}, typed]}, "code")],
     )
@@ -630,7 +639,7 @@ def test_workflow_error_merge_upgrades_from_early_typed_payload_after_invalid_ca
 
 
 def test_workflow_error_merge_preserves_ordinary_and_file_parser_failures() -> None:
-    result = _merge_workflow_run_errors(
+    result = merge_block_error_reasons(
         [],
         [
             ("wrb_code", ["code_failed"], "code reason", None, "code"),
@@ -651,7 +660,7 @@ def test_workflow_error_merge_matches_status_and_webhook_top_level_shape() -> No
         "error_type": "USER_DEFINED_ERROR",
     }
     context = _make_context(with_secret=True)
-    errors = _merge_workflow_run_errors(
+    errors = merge_block_error_reasons(
         [],
         [("wrb_code", ["diagnostic", "declared"], "failure", {"errors": [typed]}, "code")],
         mask_reasoning=context.mask_secrets_in_data,
@@ -672,7 +681,7 @@ def test_workflow_error_merge_skips_typed_secret_code_when_masker_is_available()
     }
     context = _make_context(with_secret=True)
 
-    errors = _merge_workflow_run_errors(
+    errors = merge_block_error_reasons(
         [],
         [("wrb_code", [], "generic failure", {"errors": [typed]}, "code")],
         mask_reasoning=context.mask_secrets_in_data,
@@ -684,7 +693,7 @@ def test_workflow_error_merge_skips_typed_secret_code_when_masker_is_available()
 def test_workflow_error_merge_skips_legacy_secret_code_when_masker_is_available() -> None:
     context = _make_context(with_secret=True)
 
-    errors = _merge_workflow_run_errors(
+    errors = merge_block_error_reasons(
         [],
         [("wrb_code", ["first", SECRET_VALUE, "last"], "generic failure", None, "code")],
         mask_reasoning=context.mask_secrets_in_data,
@@ -701,7 +710,7 @@ def test_workflow_error_merge_without_masker_preserves_legacy_and_typed_codes() 
         "error_type": "USER_DEFINED_ERROR",
     }
 
-    errors = _merge_workflow_run_errors(
+    errors = merge_block_error_reasons(
         [],
         [("wrb_legacy", [SECRET_VALUE], "legacy", None, "code"), ("wrb_typed", [], None, {"errors": [typed]}, "code")],
         mask_reasoning=None,
@@ -720,7 +729,7 @@ def test_workflow_error_merge_only_promotes_typed_payloads_from_code_blocks() ->
         "confidence_float": 1.0,
         "error_type": "USER_DEFINED_ERROR",
     }
-    assert _merge_workflow_run_errors(
+    assert merge_block_error_reasons(
         [],
         [("wrb_parser", ["diagnostic"], "failure", {"errors": [typed]}, "file_url_parser")],
     ) == [{"error_code": "diagnostic", "reasoning": "failure", "confidence_float": 1.0}]
@@ -738,7 +747,7 @@ def test_workflow_error_merge_without_context_preserves_masked_content_with_boun
         ]
     )
 
-    errors = _merge_workflow_run_errors(task_errors, [], mask_reasoning=None)
+    errors = merge_block_error_reasons(task_errors, [], mask_reasoning=None)
 
     assert len(errors) == 100
     assert errors[0]["error_code"] == "task_0"
@@ -756,6 +765,9 @@ async def test_workflow_run_block_errors_query_has_stable_multi_block_order() ->
             failure_reason="first reason",
             output=None,
             block_type="code",
+            label="first_block",
+            current_index=0,
+            final_url="https://x.test/first",
         ),
         SimpleNamespace(
             workflow_run_block_id="wrb_2",
@@ -763,6 +775,9 @@ async def test_workflow_run_block_errors_query_has_stable_multi_block_order() ->
             failure_reason="second reason",
             output=None,
             block_type="code",
+            label="second_block",
+            current_index=None,
+            final_url=None,
         ),
     ]
     result = MagicMock()
@@ -773,8 +788,8 @@ async def test_workflow_run_block_errors_query_has_stable_multi_block_order() ->
     repository = WorkflowRunsRepository(session_factory)
 
     assert await repository.get_workflow_run_block_errors("wr_test") == [
-        ("wrb_1", ["first"], "first reason", None, "code"),
-        ("wrb_2", ["second"], "second reason", None, "code"),
+        ("wrb_1", ["first"], "first reason", None, "code", "first_block", 0, "https://x.test/first"),
+        ("wrb_2", ["second"], "second reason", None, "code", "second_block", None, None),
     ]
     query = session.execute.await_args.args[0]
     assert [clause.name for clause in query._order_by_clauses] == ["created_at", "workflow_run_block_id"]
@@ -1061,9 +1076,10 @@ async def _execute_inline_failure_with_download_output(
     context: WorkflowRunContext | None = None,
     format_templates: bool = False,
     capture_failure_output: bool = False,
+    code: str | None = None,
 ) -> tuple[BlockResult, AsyncMock | None, AsyncMock]:
     _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
-    code = (
+    code = code or (
         f"raise ErrorCode({exception.error_code!r}, {exception.reasoning!r})"
         if type(exception) is ErrorCode
         else "raise RuntimeError('processing failed')"
@@ -1072,7 +1088,7 @@ async def _execute_inline_failure_with_download_output(
     context = context or _make_context()
     fake_page = MagicMock()
     fake_browser_state = SimpleNamespace(
-        get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
+        get_working_page=AsyncMock(return_value=fake_page), engine_selection=None, browser_artifacts=BrowserArtifacts()
     )
     _patch_execute_chokepoint_environment(
         monkeypatch,
@@ -1125,7 +1141,7 @@ async def test_rendered_error_code_misuse_returns_and_records_failed_result(monk
     context.values["arguments"] = "code='A', reasoning='why'"
     fake_page = MagicMock()
     fake_browser_state = SimpleNamespace(
-        get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
+        get_working_page=AsyncMock(return_value=fake_page), engine_selection=None, browser_artifacts=BrowserArtifacts()
     )
     _patch_execute_chokepoint_environment(
         monkeypatch,
@@ -1153,7 +1169,7 @@ async def test_rendered_error_code_misuse_returns_and_records_failed_result(monk
     assert result.success is False
     recorded_output = record_output.await_args.args[2]
     assert recorded_output["status"] == "failed"
-    record_output.assert_awaited_once_with(context, "wr_test", recorded_output)
+    assert all(call.args[:2] == (context, "wr_test") for call in record_output.await_args_list)
 
 
 @pytest.mark.asyncio
@@ -1355,8 +1371,12 @@ async def test_inline_ordinary_exception_failure_still_preserves_download_metada
         download_output=download_output,
     )
 
-    assert result.output_parameter_value == download_output
-    assert failure_output_with_downloads.await_args.kwargs.get("result") is None
+    assert result.output_parameter_value == {
+        **download_output,
+        "code_failure": {"exception_class": "RuntimeError", "message": "processing failed", "line": None},
+    }
+    # What later blocks read is recorded from this result, and it is unchanged by code_failure.
+    assert failure_output_with_downloads.await_args.kwargs["result"] is None
 
 
 @pytest.mark.asyncio
@@ -1768,6 +1788,7 @@ async def test_executed_block_lists_its_literal_fill_but_never_a_rendered_parame
     context.values["contact_name"] = "Grace Param"
     fake_browser_state = SimpleNamespace(
         get_working_page=AsyncMock(return_value=MagicMock()),
+        engine_selection=None,
         browser_artifacts=BrowserArtifacts(),
         navigate_to_url=AsyncMock(return_value=None),
     )
@@ -1817,6 +1838,354 @@ async def test_executed_block_lists_its_literal_fill_but_never_a_rendered_parame
         (1, "#contact-email", "ada@example.test")
     ]
     assert "Grace Param" not in render_code_progress_section(record)
+
+
+async def _fallback_payload_after_failing_execute(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    code: str,
+    context: WorkflowRunContext,
+    parameters: list[Parameter] | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.failed)
+    block = _make_code_block(code=code)
+    block.parameters = parameters or []
+    fake_browser_state = SimpleNamespace(
+        get_working_page=AsyncMock(return_value=MagicMock()),
+        engine_selection=None,
+        browser_artifacts=BrowserArtifacts(),
+        navigate_to_url=AsyncMock(return_value=None),
+    )
+    _patch_execute_chokepoint_environment(
+        monkeypatch,
+        context=context,
+        fake_browser_state=fake_browser_state,
+        use_codeblock_runner=False,
+        format_templates=True,
+    )
+    monkeypatch.setattr(app.AGENT_FUNCTION, "execute_code_block_override", AsyncMock(return_value=None))
+    monkeypatch.setattr(CodeBlock, "_is_healable_page_failure", MagicMock(return_value=True))
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    FakeRecorder.reset(last_recorded_exception=None)
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block.CodeBlockActionRecording", FakeRecorder)
+
+    with capture_logs() as logs:
+        with skyvern_context.scoped(SkyvernContext(organization_id="o_test", workflow_run_id="wr_test")):
+            await block.execute(
+                workflow_run_id="wr_test",
+                workflow_run_block_id="wrb_test",
+                organization_id="o_test",
+                browser_session_id="pbs_test",
+            )
+
+    assert state["create_task_kwargs"] is not None
+    return state["create_task_kwargs"], logs
+
+
+@pytest.mark.asyncio
+async def test_fallback_receives_the_upstream_value_the_code_reads_without_declaring_it(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    context = _make_context()
+    context.register_block_reference_variable("Upstream", {"id": "row-17", "status": "open"})
+
+    create_kwargs, _ = await _fallback_payload_after_failing_execute(
+        monkeypatch,
+        code="row_id = '{{ Upstream.id }}'\nawait page.click(f'#row-{row_id}')\n",
+        context=context,
+    )
+
+    assert create_kwargs["navigation_payload"] == {"Upstream": {"id": "row-17", "status": "open"}}
+
+
+@pytest.mark.asyncio
+async def test_fallback_never_receives_an_input_read_only_inside_template_tags(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    tax_id = WorkflowParameter(
+        workflow_parameter_id="wp_tax_id",
+        workflow_id="w_test",
+        key="tax_id",
+        workflow_parameter_type=WorkflowParameterType.STRING,
+        created_at=datetime.now(timezone.utc),
+        modified_at=datetime.now(timezone.utc),
+    )
+    context = _make_context()
+    context.parameters[tax_id.key] = tax_id
+    context.values[tax_id.key] = "12-3456789"
+    context.register_block_reference_variable("Upstream", {"id": "row-17"})
+
+    create_kwargs, _ = await _fallback_payload_after_failing_execute(
+        monkeypatch,
+        code=(
+            "{% if tax_id %}flagged = True{% endif %}\n"
+            "{% for tax_id in [1] %}n = {{ tax_id }}\n{% endfor %}"
+            "row_id = '{{ Upstream.id }}'\nawait page.click(f'#row-{row_id}')\n"
+        ),
+        context=context,
+    )
+
+    assert create_kwargs["navigation_payload"] == {"Upstream": {"id": "row-17"}}
+
+
+@pytest.mark.asyncio
+async def test_fallback_inside_a_loop_receives_the_current_item_the_code_reads(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    context = _make_context()
+    context.update_block_metadata("code_1", {"current_item": {"x": "item-3"}, "current_index": 2})
+
+    create_kwargs, _ = await _fallback_payload_after_failing_execute(
+        monkeypatch,
+        code="await page.fill('#search', '{{ current_item.x }}')\n",
+        context=context,
+    )
+
+    assert create_kwargs["navigation_payload"] == {"current_item": {"x": "item-3"}}
+
+
+@pytest.mark.asyncio
+async def test_declared_inputs_keep_their_payload_and_win_over_a_referenced_name(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    region = WorkflowParameter(
+        workflow_parameter_id="wp_region",
+        workflow_id="w_test",
+        key="region",
+        workflow_parameter_type=WorkflowParameterType.STRING,
+        created_at=datetime.now(timezone.utc),
+        modified_at=datetime.now(timezone.utc),
+    )
+    context = _make_context()
+    context.parameters[region.key] = region
+    context.values[region.key] = "eu-west"
+
+    create_kwargs, _ = await _fallback_payload_after_failing_execute(
+        monkeypatch,
+        code="await page.fill('#region', '{{ region }}')\n",
+        context=context,
+        parameters=[region],
+    )
+
+    assert json.dumps(create_kwargs["navigation_payload"]) == json.dumps({"region": "eu-west"})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "secret",
+    [
+        pytest.param(f"{RANDOM_SECRET_ID_PREFIX}ab12", id="placeholder_token"),
+        pytest.param("4821", id="four_digit_pin"),
+        pytest.param('pa"ss-word', id="quote"),
+        pytest.param("c:\\vault\\key", id="backslash"),
+        pytest.param("pässwörd-ü", id="non_ascii"),
+    ],
+)
+async def test_fallback_never_receives_a_referenced_value_carrying_a_secret(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None], secret: str
+) -> None:
+    # Keep the unrelated screenshot duration deterministic without weakening the log scan.
+    monkeypatch.setattr("skyvern.webeye.utils.page._monotonic", lambda: 0.0)
+    ai_fallback_flag("o_test")
+    context = _make_context()
+    if secret.startswith(RANDOM_SECRET_ID_PREFIX):
+        context.secrets[secret] = SECRET_VALUE
+    else:
+        context.secrets["k_secret"] = secret
+    context.register_block_reference_variable("Upstream", {"id": "row-17", "note": f"code {secret} on file"})
+    context.register_block_reference_variable("Other", {"id": "row-18"})
+
+    create_kwargs, logs = await _fallback_payload_after_failing_execute(
+        monkeypatch,
+        code="row_id = '{{ Upstream.id }}'\nother = '{{ Other.id }}'\nawait page.click(f'#row-{row_id}')\n",
+        context=context,
+    )
+
+    assert create_kwargs["navigation_payload"] == {"Other": {"id": "row-18"}}
+    assert any(log.get("event") == "Screenshot request failed" and log.get("elapsed_ms") == 0.0 for log in logs)
+    assert secret not in json.dumps(create_kwargs, default=str, ensure_ascii=False)
+    assert secret not in json.dumps(logs, default=str, ensure_ascii=False)
+
+
+_URL_SECRET = "pa ss/w&rd"
+_HTML_SECRET = 'pa<ss>&"rd'
+_QUOTE_BACKSLASH_SECRET = 'pa"ss\\wd'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("secret", "upstream_value"),
+    [
+        pytest.param(_URL_SECRET, {"link": f"/login?pw={urllib.parse.quote(_URL_SECRET, safe='')}"}, id="url_quoted"),
+        pytest.param(_HTML_SECRET, {"cell": f"<td>{html.escape(_HTML_SECRET)}</td>"}, id="html_escaped"),
+        pytest.param(
+            _QUOTE_BACKSLASH_SECRET,
+            {"raw": json.dumps({"pw": _QUOTE_BACKSLASH_SECRET})},
+            id="double_escaped_in_json_string",
+        ),
+    ],
+)
+async def test_fallback_never_receives_a_referenced_value_carrying_an_encoded_secret(
+    monkeypatch: pytest.MonkeyPatch,
+    ai_fallback_flag: Callable[[str | None], None],
+    secret: str,
+    upstream_value: dict[str, str],
+) -> None:
+    ai_fallback_flag("o_test")
+    context = _make_context()
+    context.secrets["k_secret"] = secret
+    context.register_block_reference_variable("Upstream", {"id": "row-17", **upstream_value})
+    context.register_block_reference_variable("Other", {"id": "row-18"})
+
+    create_kwargs, _ = await _fallback_payload_after_failing_execute(
+        monkeypatch,
+        code="row = '{{ Upstream.id }}'\nother = '{{ Other.id }}'\nawait page.click('#go')\n",
+        context=context,
+    )
+
+    assert create_kwargs["navigation_payload"] == {"Other": {"id": "row-18"}}
+
+
+@pytest.mark.asyncio
+async def test_fallback_never_receives_an_undeclared_credential_parameter(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    credential = _credential_parameter()
+    context = _make_context()
+    context.parameters[credential.key] = credential
+    context.values[credential.key] = {"username": "login_name", "password": "login_pass"}
+
+    create_kwargs, _ = await _fallback_payload_after_failing_execute(
+        monkeypatch,
+        code="await page.fill('#user', '{{ portal_credential.username }}')\n",
+        context=context,
+    )
+
+    assert create_kwargs["navigation_payload"] == {}
+
+
+@pytest.mark.asyncio
+async def test_fallback_leaves_out_an_oversized_referenced_value_instead_of_cutting_it(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    context = _make_context()
+    context.register_block_reference_variable("Upstream", {"id": "row-17", "rows": ["r" * 100] * 1000})
+    context.register_block_reference_variable("Other", {"id": "row-18"})
+
+    create_kwargs, _ = await _fallback_payload_after_failing_execute(
+        monkeypatch,
+        code="row_id = '{{ Upstream.id }}'\nother = '{{ Other.id }}'\nawait page.click(f'#row-{row_id}')\n",
+        context=context,
+    )
+
+    assert create_kwargs["navigation_payload"] == {"Other": {"id": "row-18"}}
+
+
+@pytest.mark.asyncio
+async def test_fallback_drops_referenced_values_past_the_total_budget_and_logs_only_their_names(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    context = _make_context()
+    for label in ("Alpha", "Bravo", "Charlie"):
+        context.register_block_reference_variable(label, {"rows": [f"{label}-row-value"] * 800})
+
+    create_kwargs, logs = await _fallback_payload_after_failing_execute(
+        monkeypatch,
+        code="a = '{{ Alpha.rows }}'\nb = '{{ Bravo.rows }}'\nc = '{{ Charlie.rows }}'\nawait page.click('#go')\n",
+        context=context,
+    )
+
+    payload = create_kwargs["navigation_payload"]
+    assert payload == {label: {"rows": [f"{label}-row-value"] * 800} for label in ("Alpha", "Bravo")}
+    over_budget = [entry for entry in logs if entry.get("roots") == ["Charlie"]]
+    assert over_budget
+    assert "Charlie-row-value" not in json.dumps(logs, default=str)
+
+
+@pytest.mark.asyncio
+async def test_self_heal_payload_carries_the_undeclared_upstream_value_but_no_secret_or_inline_code(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    context = _make_context()
+    context.secrets["k_secret"] = SECRET_VALUE
+    context.register_block_reference_variable("Upstream", {"x": "row-17"})
+    context.register_block_reference_variable("Vault_Note", {"note": f"pw {SECRET_VALUE}"})
+    login_output = {"result": {"otp_code": "123456"}}
+    context.register_block_reference_variable("Login_Step", login_output)
+    monkeypatch.setattr(otp_service, "try_generate_totp_from_credential", lambda *_args, **_kwargs: None)
+
+    def task_with(payload: dict[str, Any]) -> SimpleNamespace:
+        return SimpleNamespace(
+            task_id="tsk_escalation",
+            workflow_run_id="wr_test",
+            organization_id="o_test",
+            navigation_payload=payload,
+            totp_verification_url=None,
+            totp_identifier=None,
+        )
+
+    assert await otp_service.resolve_otp_value(task_with({"Login_Step": login_output}))
+
+    create_kwargs, _ = await _fallback_payload_after_failing_execute(
+        monkeypatch,
+        code=(
+            "row_id = '{{ Upstream.x }}'\nnote = '{{ Vault_Note.note }}'\nlogin = '{{ Login_Step.result }}'\n"
+            "await page.click(f'#row-{row_id}')\n"
+        ),
+        context=context,
+    )
+
+    payload = create_kwargs["navigation_payload"]
+    assert payload == {"Upstream": {"x": "row-17"}}
+    assert await otp_service.resolve_otp_value(task_with(payload)) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("referenced", [False, True], ids=["unreferenced", "referenced"])
+async def test_referenced_values_build_the_run_summary_only_when_the_code_reads_it(
+    monkeypatch: pytest.MonkeyPatch, referenced: bool
+) -> None:
+    summary = MagicMock(return_value={"blocks": []})
+    monkeypatch.setattr(WorkflowRunContext, "build_workflow_run_summary", summary)
+    context = _make_context()
+    context.register_block_reference_variable("Upstream", {"x": "row-17"})
+    block = _make_code_block(code="")
+    block._template_roots = frozenset({"Upstream", "workflow_run_summary"} if referenced else {"Upstream"})
+
+    values = block._referenced_fallback_values(context, [])
+
+    assert summary.called is referenced
+    assert ("workflow_run_summary" in values) is referenced
+
+
+@pytest.mark.asyncio
+async def test_fallback_never_receives_a_real_credential_template_entry(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None]
+) -> None:
+    ai_fallback_flag("o_test")
+    context = _make_context()
+    context.include_secrets_in_templates = True
+    monkeypatch.setattr(
+        WorkflowRunContext,
+        "credential_template_entries",
+        lambda *_args, **_kwargs: {"portal_real_password": "unregistered-raw-value"},
+    )
+
+    create_kwargs, _ = await _fallback_payload_after_failing_execute(
+        monkeypatch,
+        code="await page.fill('#password', '{{ portal_real_password }}')\n",
+        context=context,
+    )
+
+    assert create_kwargs["navigation_payload"] == {}
 
 
 @pytest.mark.parametrize("prompt", [None, ""], ids=["absent_goal", "empty_goal"])
@@ -3791,7 +4160,7 @@ async def test_legacy_heal_success_skips_failed_write_and_ends_completed(
     context = _make_context()
     fake_page = MagicMock()
     fake_browser_state = SimpleNamespace(
-        get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
+        get_working_page=AsyncMock(return_value=fake_page), engine_selection=None, browser_artifacts=BrowserArtifacts()
     )
     _patch_execute_chokepoint_environment(
         monkeypatch,
@@ -3965,7 +4334,7 @@ async def test_heal_output_write_failure_does_not_finalize_completed(
     context = _make_context()
     fake_page = MagicMock()
     fake_browser_state = SimpleNamespace(
-        get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
+        get_working_page=AsyncMock(return_value=fake_page), engine_selection=None, browser_artifacts=BrowserArtifacts()
     )
     _patch_execute_chokepoint_environment(
         monkeypatch,
@@ -4018,7 +4387,7 @@ async def test_secure_heal_success_skips_failed_write_and_ends_completed(
     context = _make_context()
     fake_page = MagicMock()
     fake_browser_state = SimpleNamespace(
-        get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
+        get_working_page=AsyncMock(return_value=fake_page), engine_selection=None, browser_artifacts=BrowserArtifacts()
     )
     _patch_execute_chokepoint_environment(
         monkeypatch,
@@ -4090,7 +4459,7 @@ async def test_legacy_heal_declined_writes_failed_once(
     context = _make_context()
     fake_page = MagicMock()
     fake_browser_state = SimpleNamespace(
-        get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
+        get_working_page=AsyncMock(return_value=fake_page), engine_selection=None, browser_artifacts=BrowserArtifacts()
     )
     _patch_execute_chokepoint_environment(
         monkeypatch,
@@ -4130,7 +4499,7 @@ async def test_secure_heal_declined_writes_failed_once(
     context = _make_context()
     fake_page = MagicMock()
     fake_browser_state = SimpleNamespace(
-        get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
+        get_working_page=AsyncMock(return_value=fake_page), engine_selection=None, browser_artifacts=BrowserArtifacts()
     )
     _patch_execute_chokepoint_environment(
         monkeypatch,
@@ -4202,7 +4571,7 @@ async def test_secure_failure_records_a_sign_in_form_only_on_the_page_it_failed_
     fake_page = MagicMock()
     fake_page.evaluate = AsyncMock(return_value=True)
     fake_browser_state = SimpleNamespace(
-        get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
+        get_working_page=AsyncMock(return_value=fake_page), engine_selection=None, browser_artifacts=BrowserArtifacts()
     )
     _patch_execute_chokepoint_environment(
         monkeypatch, context=_make_context(), fake_browser_state=fake_browser_state, use_codeblock_runner=True
@@ -4303,7 +4672,9 @@ async def test_secure_proxy_transport_failure_skips_the_ai_fallback(
     block = _make_code_block()
     context = _make_context()
     fake_browser_state = SimpleNamespace(
-        get_working_page=AsyncMock(return_value=MagicMock()), browser_artifacts=BrowserArtifacts()
+        get_working_page=AsyncMock(return_value=MagicMock()),
+        engine_selection=None,
+        browser_artifacts=BrowserArtifacts(),
     )
     _patch_execute_chokepoint_environment(
         monkeypatch,
@@ -4370,7 +4741,9 @@ async def test_secure_failure_emits_operation_attribution(
     block = _make_code_block()
     context = _make_context()
     fake_browser_state = SimpleNamespace(
-        get_working_page=AsyncMock(return_value=MagicMock()), browser_artifacts=BrowserArtifacts()
+        get_working_page=AsyncMock(return_value=MagicMock()),
+        engine_selection=None,
+        browser_artifacts=BrowserArtifacts(),
     )
     _patch_execute_chokepoint_environment(
         monkeypatch,
@@ -4439,7 +4812,7 @@ async def test_secure_accepted_typed_failure_preserves_adapter_block_result(monk
     context = _make_context()
     fake_page = MagicMock()
     fake_browser_state = SimpleNamespace(
-        get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
+        get_working_page=AsyncMock(return_value=fake_page), engine_selection=None, browser_artifacts=BrowserArtifacts()
     )
     _patch_execute_chokepoint_environment(
         monkeypatch,
@@ -4519,7 +4892,7 @@ async def test_secure_runner_missing_block_result_returns_generic_failure(
     context = _make_context()
     fake_page = MagicMock()
     fake_browser_state = SimpleNamespace(
-        get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
+        get_working_page=AsyncMock(return_value=fake_page), engine_selection=None, browser_artifacts=BrowserArtifacts()
     )
     _patch_execute_chokepoint_environment(
         monkeypatch,
@@ -4562,7 +4935,7 @@ async def test_secure_infra_failure_without_metadata_finalizes_failed_and_record
     context = _make_context()
     fake_page = MagicMock()
     fake_browser_state = SimpleNamespace(
-        get_working_page=AsyncMock(return_value=fake_page), browser_artifacts=BrowserArtifacts()
+        get_working_page=AsyncMock(return_value=fake_page), engine_selection=None, browser_artifacts=BrowserArtifacts()
     )
     _patch_execute_chokepoint_environment(
         monkeypatch,
@@ -4883,6 +5256,7 @@ async def test_executed_block_keeps_its_screened_driver_nav_code_through_a_faile
     context = _make_context(with_secret=True)
     fake_browser_state = SimpleNamespace(
         get_working_page=AsyncMock(return_value=MagicMock()),
+        engine_selection=None,
         browser_artifacts=BrowserArtifacts(),
         navigate_to_url=AsyncMock(return_value=None),
     )
@@ -4935,6 +5309,144 @@ async def test_executed_block_keeps_its_screened_driver_nav_code_through_a_faile
     assert [code for code in result.error_codes if code != "user_code_error"] == expected_codes
 
 
+def _session_browser_state() -> SimpleNamespace:
+    return SimpleNamespace(
+        get_working_page=AsyncMock(return_value=MagicMock()),
+        engine_selection=None,
+        browser_artifacts=BrowserArtifacts(),
+        navigate_to_url=AsyncMock(return_value=None),
+    )
+
+
+def _install_secure_runner_failure(monkeypatch: pytest.MonkeyPatch, failure: CodeBlockEngineFailure) -> None:
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "execute_code_block_override",
+        AsyncMock(return_value=CodeBlockEngineResult(block_result=None, failure=failure)),
+    )
+
+
+_SITE_PARAMETER_VALUE = "tenant-4471.example.com"
+
+
+def _install_parameter_redaction(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+    monkeypatch.setattr(app.AGENT_FUNCTION, "serialize_codeblock_parameters", lambda parameters: {"site": value})
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "redact_codeblock_parameter_values",
+        lambda item, parameters: (
+            [entry.replace(value, "[redacted]") for entry in item]
+            if isinstance(item, list)
+            else item.replace(value, "[redacted]")
+            if isinstance(item, str)
+            else item
+        ),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("runner_code", "recovery_nav_code", "final_status", "expected_codes"),
+    [
+        pytest.param(
+            "browser_operation_failed",
+            None,
+            TaskStatus.failed,
+            ["account_locked", "browser_operation_failed"],
+            id="failed_fallback_keeps_the_code_own_code_last",
+        ),
+        pytest.param(
+            "browser_operation_failed",
+            "net::ERR_TUNNEL_CONNECTION_FAILED",
+            TaskStatus.failed,
+            ["account_locked", "net::ERR_TUNNEL_CONNECTION_FAILED", "browser_operation_failed"],
+            id="recovery_nav_code_stays_before_the_code_own_code",
+        ),
+        pytest.param(
+            f"browser_operation_failed:{_SITE_PARAMETER_VALUE}",
+            None,
+            TaskStatus.failed,
+            ["account_locked", "browser_operation_failed:[redacted]"],
+            id="code_own_code_is_redacted",
+        ),
+        pytest.param(
+            "browser_operation_failed", None, TaskStatus.completed, [], id="completed_fallback_reports_no_codes"
+        ),
+        pytest.param(None, None, TaskStatus.failed, ["account_locked"], id="no_code_of_its_own"),
+    ],
+)
+async def test_secure_failed_fallback_keeps_the_block_error_code_on_the_row_and_run_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    ai_fallback_flag: Callable[[str | None], None],
+    runner_code: str | None,
+    recovery_nav_code: str | None,
+    final_status: TaskStatus,
+    expected_codes: list[str],
+) -> None:
+    ai_fallback_flag("o_test")
+    state = _install_db_fakes(monkeypatch, final_status=final_status)
+    state["updated_task"].errors = [{"error_code": "account_locked", "reasoning": "x", "confidence_float": 1.0}]
+    block = _make_code_block(error_code_mapping={"account_locked": "The account is locked"})
+    _patch_execute_chokepoint_environment(
+        monkeypatch, context=_make_context(), fake_browser_state=_session_browser_state(), use_codeblock_runner=True
+    )
+    _install_parameter_redaction(monkeypatch, _SITE_PARAMETER_VALUE)
+    runner_reason = "CodeBlock failed because a browser operation failed at line 2: Timeout 3000ms exceeded."
+    _install_secure_runner_failure(
+        monkeypatch,
+        CodeBlockEngineFailure(
+            error_code=runner_code,
+            safe_message=None,
+            failure_reason=runner_reason,
+            exception_class="playwright._impl._errors.TimeoutError",
+            failing_line=2,
+            healability_hint=True,
+            sign_in_form_visible=False,
+        ),
+    )
+    if recovery_nav_code is not None:
+
+        async def _recovery_navigation_fails(*args: object, task: Task, **kwargs: object) -> None:
+            context = skyvern_context.current()
+            assert context is not None
+            context.task_nav_error_codes[task.task_id] = recovery_nav_code
+
+        monkeypatch.setattr(app.agent, "execute_step", AsyncMock(side_effect=_recovery_navigation_fails))
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    FakeRecorder.reset(last_recorded_exception=None)
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block.CodeBlockActionRecording", FakeRecorder)
+
+    with skyvern_context.scoped(SkyvernContext(organization_id="o_test", workflow_run_id="wr_test")):
+        result = await block.execute(
+            workflow_run_id="wr_test",
+            workflow_run_block_id="wrb_test",
+            organization_id="o_test",
+            browser_session_id="pbs_test",
+        )
+
+    assert result.success is (final_status == TaskStatus.completed)
+    assert result.error_codes == expected_codes
+    row: dict[str, Any] = {}
+    for update in state["workflow_run_block_updates"]:
+        if update.get("workflow_run_block_id") == "wrb_test":
+            row.update({key: value for key, value in update.items() if value is not None})
+    assert (row.get("error_codes") or []) == expected_codes
+    assert all(
+        _SITE_PARAMETER_VALUE not in code
+        for update in state["workflow_run_block_updates"]
+        for code in update.get("error_codes") or []
+    )
+    assert "browser_operation_failed" not in (state["recovery_block_updates"][-1].get("error_codes") or [])
+    if "browser_operation_failed" in expected_codes:
+        assert row["failure_reason"].startswith(runner_reason)
+        errors = merge_block_error_reasons(
+            [], [("wrb_test", row["error_codes"], row["failure_reason"], row.get("output"), "code")]
+        )
+        assert [error for error in errors if error["error_code"] == "browser_operation_failed"] == [
+            {"error_code": "browser_operation_failed", "reasoning": row["failure_reason"], "confidence_float": 1.0}
+        ]
+
+
 _SIGNED_OUT_FAILURE_PAGE = (
     f"Final URL: https://example.com/notauthenticated?session={SECRET_VALUE}\nPage title: Not Authenticated"
 )
@@ -4954,6 +5466,7 @@ async def _execute_signed_out_block(
     )
     fake_browser_state = SimpleNamespace(
         get_working_page=AsyncMock(return_value=MagicMock()),
+        engine_selection=None,
         browser_artifacts=BrowserArtifacts(),
         navigate_to_url=AsyncMock(return_value=None),
     )
@@ -5079,6 +5592,7 @@ async def test_no_persisted_block_row_keeps_a_nav_code_that_is_a_parameter_value
     block = _make_code_block(code="raise RuntimeError('navigation failed')")
     fake_browser_state = SimpleNamespace(
         get_working_page=AsyncMock(return_value=MagicMock()),
+        engine_selection=None,
         browser_artifacts=BrowserArtifacts(),
         navigate_to_url=AsyncMock(return_value=None),
     )
@@ -5088,20 +5602,7 @@ async def test_no_persisted_block_row_keeps_a_nav_code_that_is_a_parameter_value
         fake_browser_state=fake_browser_state,
         use_codeblock_runner=engine == "secure",
     )
-    monkeypatch.setattr(
-        app.AGENT_FUNCTION, "serialize_codeblock_parameters", lambda parameters: {"site": parameter_code}
-    )
-    monkeypatch.setattr(
-        app.AGENT_FUNCTION,
-        "redact_codeblock_parameter_values",
-        lambda value, parameters: (
-            [item.replace(parameter_code, "[redacted]") for item in value]
-            if isinstance(value, list)
-            else value.replace(parameter_code, "[redacted]")
-            if isinstance(value, str)
-            else value
-        ),
-    )
+    _install_parameter_redaction(monkeypatch, parameter_code)
     monkeypatch.setattr(
         app.AGENT_FUNCTION,
         "execute_code_block_override",
@@ -5447,3 +5948,133 @@ async def test_heal_episode_persistence_failure_does_not_change_heal_outcome(
 
     assert result.success is True
     assert any(entry.get("event") == "self-heal episode persistence failed; continuing" for entry in logs)
+
+
+@pytest.mark.asyncio
+async def test_inline_user_exception_records_code_failure_from_the_authored_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _make_context(with_secret=True)
+    context.values["step"] = "Policy Info"
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block.user_code_line_from_exception", lambda _: 2)
+
+    result, _, _ = await _execute_inline_failure_with_download_output(
+        monkeypatch,
+        exception=ValueError(f"Could not find the Policy Info input for {SECRET_VALUE}."),
+        download_output=None,
+        context=context,
+        format_templates=True,
+        code=f'step = "{{{{ step }}}}"\nraise ValueError(f"Could not find the {{step}} input for {SECRET_VALUE}.")',
+    )
+
+    assert result.failure_reason is not None
+    code_failure = result.output_parameter_value["code_failure"]
+    assert code_failure == {
+        "exception_class": "ValueError",
+        "message": "Could not find the Policy Info input for *****.",
+        "line": 2,
+        "source_line": 'raise ValueError(f"Could not find the {step} input for *****.")',
+    }
+    assert code_failure["message"] in result.failure_reason
+    assert SECRET_VALUE not in str(result.output_parameter_value)
+
+
+@pytest.mark.asyncio
+async def test_inline_error_code_raise_records_no_code_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    result, _, _ = await _execute_inline_failure_with_download_output(
+        monkeypatch, exception=ErrorCode("UNDECLARED", "the author's withheld text"), download_output=None
+    )
+
+    assert result.success is False
+    assert "code_failure" not in (result.output_parameter_value or {})
+    assert "withheld text" not in str(result.output_parameter_value)
+
+
+@pytest.mark.asyncio
+async def test_secure_deferred_failure_writes_code_failure_and_receives_authored_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block(prompt=None, code='step = "{{ step }}"\nraise ValueError("missing")')
+    context = _make_context()
+    context.values["step"] = "Policy Info"
+    fake_browser_state = SimpleNamespace(
+        get_working_page=AsyncMock(return_value=MagicMock()),
+        engine_selection=None,
+        browser_artifacts=BrowserArtifacts(),
+    )
+    _patch_execute_chokepoint_environment(
+        monkeypatch, context=context, fake_browser_state=fake_browser_state, use_codeblock_runner=True
+    )
+    code_failure = {"exception_class": "ValueError", "message": "missing", "line": 2, "source_line": "raise"}
+    override = AsyncMock(
+        return_value=CodeBlockEngineResult(
+            block_result=None,
+            failure=CodeBlockEngineFailure(
+                error_code="user_code_error",
+                safe_message=None,
+                failure_reason="CodeBlock failed with ValueError at line 2: missing.",
+                exception_class="builtins.ValueError",
+                failing_line=2,
+                healability_hint=False,
+                code_failure=code_failure,
+            ),
+        )
+    )
+    monkeypatch.setattr(app.AGENT_FUNCTION, "execute_code_block_override", override)
+    FakeRecorder.reset(last_recorded_exception=None)
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block.CodeBlockActionRecording", FakeRecorder)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+
+    result = await block.execute(
+        workflow_run_id="wr_test",
+        workflow_run_block_id="wrb_test",
+        organization_id="o_test",
+        browser_session_id="pbs_test",
+    )
+
+    assert result.success is False
+    assert result.output_parameter_value["code_failure"] == code_failure
+    assert override.await_args.kwargs["authored_code"] == 'step = "__skyvern_slot__0"\nraise ValueError("missing")'
+
+
+def test_code_failure_source_line_masks_a_secret_crossing_the_cap() -> None:
+    context = _make_context(with_secret=True)
+    line = "note = '" + "a" * 290 + SECRET_VALUE + "'"
+
+    source_line = code_failure_source_line(
+        authored_code=f"x = 1\n    {line}  ",
+        executed_code="x = 1\nrendered",
+        line=2,
+        workflow_run_context=context,
+        redaction_parameters={},
+    )
+
+    assert source_line is not None and len(source_line) <= 300
+    assert source_line.startswith("note = 'aaa")
+    assert SECRET_VALUE[:4] not in source_line
+
+
+@pytest.mark.parametrize(
+    ("authored_code", "executed_code", "line"),
+    [
+        pytest.param(None, "x = 1", 1, id="no_authored_code"),
+        pytest.param("x = 1", "x = 1\ny = 2", 1, id="line_counts_differ"),
+        pytest.param("x = 1", "x = 1", 2, id="line_out_of_range"),
+        pytest.param("x = 1", "x = 1", None, id="no_line"),
+        pytest.param('step = "__skyvern_slot__0"', 'step = "Policy Info"', 1, id="line_holds_a_slot"),
+    ],
+)
+def test_code_failure_source_line_is_omitted_without_a_matching_authored_line(
+    authored_code: str | None, executed_code: str, line: int | None
+) -> None:
+    assert (
+        code_failure_source_line(
+            authored_code=authored_code,
+            executed_code=executed_code,
+            line=line,
+            workflow_run_context=_make_context(),
+            redaction_parameters={},
+        )
+        is None
+    )

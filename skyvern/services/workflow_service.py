@@ -172,6 +172,7 @@ async def _prepare_workflow(
     refuse_unusable_parameters_before_create: bool = False,
     post_dispatch_effects: list[Callable[[], Awaitable[None]]] | None = None,
     integration_platform: str | None = None,
+    run_parameter_values: dict[str, dict[str, t.Any]] | None = None,
 ) -> tuple[WorkflowRun, Workflow]:
     if template and workflow_id not in await app.STORAGE.retrieve_global_workflows():
         raise InvalidTemplateWorkflowPermanentId(workflow_permanent_id=workflow_id)
@@ -214,6 +215,7 @@ async def _prepare_workflow(
             refuse_unusable_parameters_before_create=refuse_unusable_parameters_before_create,
             workflow=workflow,
             post_dispatch_effects=post_dispatch_effects,
+            run_parameter_values=run_parameter_values,
         )
         await app.DATABASE.tasks.create_task_run(
             task_run_type=RunType.workflow_run,
@@ -317,6 +319,7 @@ async def run_workflow_returning_owned_workflow(
     # Best-effort bookkeeping that no dispatch gate reads is written after the Temporal submit, off the
     # created-to-queued path; it still runs if the submit fails, as it did when it ran before the submit.
     post_dispatch_effects: list[Callable[[], Awaitable[None]]] = []
+    run_parameter_values: dict[str, dict[str, t.Any]] = {}
     request_identity = get_request_principal_state()
     try:
         workflow: Workflow | None = None
@@ -357,6 +360,7 @@ async def run_workflow_returning_owned_workflow(
                 created_by=created_by,
                 refuse_unusable_parameters_before_create=refuse_unusable_parameters_before_create,
                 post_dispatch_effects=post_dispatch_effects,
+                run_parameter_values=run_parameter_values,
             )
         if workflow_run_id is not None:
             if (
@@ -440,7 +444,13 @@ async def run_workflow_returning_owned_workflow(
             WorkflowRunStatus(workflow_run.status) in {WorkflowRunStatus.running, WorkflowRunStatus.paused}
             or (workflow_run.job_id is not None and workflow_run.job_id != temporal_workflow_id)
         )
+        # An existing run may have been written since its read, and a run whose setup swallowed a failed write may
+        # not show it. In both cases the executor reads the row itself.
+        hand_off_run = not existing_workflow_run and not workflow_run.row_write_unconfirmed
         if not skip_executor:
+            if workflow is not None:
+                await app.AGENT_FUNCTION.prepare_powerbi_query_hop_tokens(workflow_run=workflow_run, workflow=workflow)
+                await app.AGENT_FUNCTION.prepare_gmail_hop_tokens(workflow_run=workflow_run, workflow=workflow)
             await AsyncExecutorFactory.get_executor().execute_workflow(
                 request=request,
                 background_tasks=background_tasks,
@@ -454,6 +464,8 @@ async def run_workflow_returning_owned_workflow(
                 block_labels=block_labels,
                 block_outputs=block_outputs,
                 resolved_workflow=owned_workflow,
+                resolved_workflow_run=workflow_run if hand_off_run else None,
+                run_parameter_values=run_parameter_values.get(workflow_run.workflow_run_id),
             )
     finally:
         for effect in post_dispatch_effects:
@@ -480,6 +492,10 @@ async def get_workflow_run_response(
     # A fresh run reads/writes no saved memory; its run_request echoes start_fresh_browser and drops the
     # session/profile so it stays valid (the mutually-exclusive validators) and reflects what was asked.
     fresh_browser = bool(workflow_run.start_fresh_browser)
+    browser_type = read_browser_type(workflow_run)
+    # Ingress rejects browser_type with a caller-supplied browser, so a typed run's session/address was server
+    # assigned; the echo drops it because WorkflowRunResponse re-runs the conflict check without server context.
+    echo_attachment = browser_type is None
     return WorkflowRunResponse(
         run_id=workflow_run_id,
         run_type=RunType.workflow_run,
@@ -519,11 +535,13 @@ async def get_workflow_run_response(
                 "totp_url": workflow_run.totp_verification_url or None,
                 "totp_identifier": workflow_run.totp_identifier,
                 "max_screenshot_scrolls": workflow_run.max_screenshot_scrolls,
-                "browser_address": workflow_run.browser_address,
+                "browser_address": workflow_run.browser_address if echo_attachment else None,
                 "browser_profile_id": None if fresh_browser else workflow_run.browser_profile_id,
-                "browser_session_id": None if fresh_browser else workflow_run.browser_session_id,
+                "browser_session_id": workflow_run.browser_session_id
+                if echo_attachment and not fresh_browser
+                else None,
                 "start_fresh_browser": fresh_browser,
-                "browser_type": read_browser_type(workflow_run),
+                "browser_type": browser_type,
             },
             context=_SERVER_ASSIGNED_BROWSER_ATTACHMENT_CONTEXT,
         ),

@@ -6,9 +6,12 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from agents import Agent, Runner
+from litellm.types.utils import ModelResponse
 from structlog.testing import capture_logs
 
 from skyvern.forge.sdk.copilot.model_resolver import CopilotLitellmProvider, resolve_model_config
+from skyvern.schemas.llm import LLMConfig
 
 
 def _install_config(monkeypatch: pytest.MonkeyPatch, config: Any, llm_key: str) -> MagicMock:
@@ -536,6 +539,34 @@ def test_resolve_model_config_raises_for_unregistered_registry_alias(alias: str)
     handler.llm_key = alias
     with pytest.raises(InvalidLLMConfigError):
         resolve_model_config(handler)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_name", ["gpt-5.4", "gpt-5", "azure/gpt-5.6-terra"])
+async def test_a_copilot_turn_sends_the_configured_reasoning_effort(
+    monkeypatch: pytest.MonkeyPatch, model_name: str
+) -> None:
+    sent: list[dict[str, object]] = []
+
+    async def fake_acompletion(**kwargs: object) -> ModelResponse:
+        sent.append(kwargs)
+        return ModelResponse(choices=[{"index": 0, "message": {"role": "assistant", "content": "ok"}}])
+
+    monkeypatch.setattr("litellm.acompletion", fake_acompletion)
+    config = LLMConfig(
+        model_name=model_name,
+        required_env_vars=[],
+        supports_vision=True,
+        add_assistant_prefix=False,
+        reasoning_effort="high",
+    )
+    resolved_model_name, run_config, _, _ = resolve_model_config(_install_config(monkeypatch, config, "GPT5_TEST"))
+
+    await Runner.run(Agent(name="workflow-copilot", model=resolved_model_name), "hello", run_config=run_config)
+
+    (request,) = sent
+    assert request["reasoning_effort"] == "high"
+    assert "verbosity" not in request
 
 
 @pytest.mark.parametrize("model_name", ["gpt-4o", "azure/gpt-4.1"])

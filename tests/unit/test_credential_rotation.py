@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import random
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -24,7 +23,6 @@ from skyvern.forge.sdk.copilot.output_policy import OutputPolicyReason, evaluate
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.db.agent_db import AgentDB, _build_engine
 from skyvern.forge.sdk.db.models import (
-    Base,
     CredentialModel,
     CredentialParameterModel,
     WorkflowModel,
@@ -56,6 +54,7 @@ from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition, Workf
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
 from skyvern.schemas.workflows import CredentialParameterYAML, WorkflowDefinitionYAML
+from tests.unit.conftest import SqliteEngineFactory
 
 
 def _credential_parameter(
@@ -180,19 +179,13 @@ class _SelectionRepo:
 
 
 @pytest_asyncio.fixture
-async def sqlite_engine() -> AsyncEngine:
-    engine = _build_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    try:
-        yield engine
-    finally:
-        await engine.dispose()
+async def sqlite_engine(sqlite_engine_factory: SqliteEngineFactory) -> AsyncEngine:
+    return sqlite_engine_factory(build_engine=_build_engine)
 
 
 @pytest_asyncio.fixture
 async def sqlite_db(sqlite_engine: AsyncEngine) -> AgentDB:
-    return AgentDB("sqlite+aiosqlite:///:memory:", db_engine=sqlite_engine)
+    return AgentDB(str(sqlite_engine.url), db_engine=sqlite_engine)
 
 
 async def _select(repo: _SelectionRepo, credential_ids: list[str], strategy: str | None = None) -> str:
@@ -572,6 +565,7 @@ async def test_workflow_save_validation_rejects_unknown_credential_id() -> None:
         mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.DATABASE.credentials.get_credentials_by_ids = AsyncMock(return_value=[])
         mock_app.AGENT_FUNCTION.enforce_credential_use = AsyncMock()
+        mock_app.AGENT_FUNCTION.enforce_workflow_context_credential_use = AsyncMock()
         with pytest.raises(InvalidCredentialId):
             await service._validate_and_normalize_credential_rotation_parameters([parameter], org)
 
@@ -597,6 +591,7 @@ async def test_workflow_save_validation_normalizes_credential_id_to_first_rotati
         mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.DATABASE.credentials.get_credentials_by_ids = AsyncMock(return_value=existing)
         mock_app.AGENT_FUNCTION.enforce_credential_use = AsyncMock()
+        mock_app.AGENT_FUNCTION.enforce_workflow_context_credential_use = AsyncMock()
         await service._validate_and_normalize_credential_rotation_parameters([parameter], org)
 
     assert parameter.credential_id == "cred_a"
@@ -620,6 +615,7 @@ async def test_workflow_save_validation_dedupes_credential_ids_preserving_order(
         mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_get_credentials = AsyncMock(return_value=existing)
         mock_app.AGENT_FUNCTION.enforce_credential_use = AsyncMock()
+        mock_app.AGENT_FUNCTION.enforce_workflow_context_credential_use = AsyncMock()
         mock_app.DATABASE.credentials.get_credentials_by_ids = mock_get_credentials
         await service._validate_and_normalize_credential_rotation_parameters([parameter], org)
 
@@ -648,8 +644,12 @@ workflow_definition:
 """
     request_policy = RequestPolicy(
         resolved_credentials=[
-            SimpleNamespace(credential_id="cred_first", tested_url="https://portal.example.com/login"),
-            SimpleNamespace(credential_id="cred_second", tested_url="https://other.example.com/login"),
+            SimpleNamespace(
+                credential_id="cred_first", tested_url="https://portal.example.com/login", extra_site_urls=[]
+            ),
+            SimpleNamespace(
+                credential_id="cred_second", tested_url="https://other.example.com/login", extra_site_urls=[]
+            ),
         ]
     )
 
@@ -794,6 +794,7 @@ async def _attempt_setup_rotation_profile_run(
         mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
         mock_app.AGENT_FUNCTION.enforce_credential_use = AsyncMock()
+        mock_app.AGENT_FUNCTION.enforce_workflow_context_credential_use = AsyncMock()
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
         mock_app.AGENT_FUNCTION.is_browser_memory_engine_enabled = AsyncMock(return_value=False)
         mock_app.DATABASE.browser_sessions.get_or_create_managed_browser_profile = AsyncMock(
@@ -878,6 +879,7 @@ async def _setup_bound_credentials(
     ):
         mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
         mock_app.AGENT_FUNCTION.enforce_credential_use = AsyncMock()
+        mock_app.AGENT_FUNCTION.enforce_workflow_context_credential_use = AsyncMock()
         mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
         mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.DATABASE.workflow_runs.update_workflow_run = AsyncMock(side_effect=update_workflow_run)
@@ -917,6 +919,7 @@ async def test_direct_bindings_snapshot_only_opted_in_credentials_and_runtime_re
     assert workflow_run.sequential_credential_id == "cred_serial"
     with patch("skyvern.forge.sdk.workflow.context_manager.app") as context_app:
         context_app.AGENT_FUNCTION.enforce_credential_use = AsyncMock()
+        context_app.AGENT_FUNCTION.enforce_workflow_context_credential_use = AsyncMock()
         context_app.DATABASE.workflow_run_credential_selections = _SelectionRepo()
         assert await sequential_context.resolve_credential_parameter_id(sequential, "org_test") == "cred_serial"
         assert await parallel_context.resolve_credential_parameter_id(parallel, "org_test") == "cred_parallel"
@@ -950,6 +953,7 @@ async def test_plain_indirect_binding_snapshots_and_runtime_resolves_bound_param
     assert workflow_run.sequential_credential_id == "cred_runtime"
     with patch("skyvern.forge.sdk.workflow.context_manager.app") as context_app:
         context_app.AGENT_FUNCTION.enforce_credential_use = AsyncMock()
+        context_app.AGENT_FUNCTION.enforce_workflow_context_credential_use = AsyncMock()
         context_app.DATABASE.workflow_run_credential_selections = _SelectionRepo()
         assert await context.resolve_credential_parameter_id(login, "org_test") == "cred_runtime"
     assert context.get_resolved_credential_parameter_id(login.key) == "cred_runtime"
@@ -1009,6 +1013,7 @@ async def test_runtime_only_indirect_binding_fails_closed_if_resolved_credential
 
     with patch("skyvern.forge.sdk.workflow.context_manager.app") as mock_app:
         mock_app.AGENT_FUNCTION.enforce_credential_use = AsyncMock()
+        mock_app.AGENT_FUNCTION.enforce_workflow_context_credential_use = AsyncMock()
         mock_app.DATABASE.workflow_run_credential_selections = _SelectionRepo()
         mock_app.DATABASE.credentials.get_credential = AsyncMock(
             return_value=SimpleNamespace(credential_id="cred_runtime", run_sequentially=True)
@@ -1046,16 +1051,20 @@ async def test_runtime_credential_registration_proceeds_when_lane_is_safe(
         credential_id="cred_runtime",
         run_sequentially=run_sequentially,
         tested_url=None,
+        extra_site_urls=[],
         vault_type=None,
         totp_identifier=None,
     )
     credential = MagicMock()
     credential.model_dump.return_value = {}
     credential_service = MagicMock()
-    credential_service.get_credential_item = AsyncMock(return_value=SimpleNamespace(credential=credential))
+    credential_service.get_credential_item = AsyncMock(
+        return_value=SimpleNamespace(credential=credential, login_sites=None)
+    )
 
     with patch("skyvern.forge.sdk.workflow.context_manager.app") as mock_app:
         mock_app.AGENT_FUNCTION.enforce_credential_use = AsyncMock()
+        mock_app.AGENT_FUNCTION.enforce_workflow_context_credential_use = AsyncMock()
         mock_app.DATABASE.workflow_run_credential_selections = _SelectionRepo()
         mock_app.DATABASE.credentials.get_credential = AsyncMock(return_value=db_credential)
         mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(
@@ -1094,6 +1103,7 @@ async def test_keyed_rotation_snapshot_and_runtime_reuse_one_persisted_selection
     ):
         selection_app.DATABASE.workflow_run_credential_selections = repo
         context_app.AGENT_FUNCTION.enforce_credential_use = AsyncMock()
+        context_app.AGENT_FUNCTION.enforce_workflow_context_credential_use = AsyncMock()
         context_app.DATABASE.workflow_run_credential_selections = repo
         runtime_credential_id = await context.resolve_credential_parameter_id(login, "org_test")
 
@@ -1220,6 +1230,7 @@ async def _select_render_with_failed_rotation(
         patch("skyvern.forge.sdk.workflow.service.select_credential_for_run", select_mock),
     ):
         mock_app.AGENT_FUNCTION.enforce_credential_use = AsyncMock()
+        mock_app.AGENT_FUNCTION.enforce_workflow_context_credential_use = AsyncMock()
         mock_app.DATABASE.organizations.get_organization = AsyncMock(
             return_value=SimpleNamespace(organization_id="org_test")
         )
@@ -1405,15 +1416,12 @@ async def test_retry_rebinds_only_its_run_and_organization_selections(sqlite_db)
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure_statement", ["UPDATE", "INSERT INTO"])
 async def test_next_attempt_preparation_atomically_clears_and_reselects_credentials(
-    tmp_path: Path,
+    sqlite_engine_factory: SqliteEngineFactory,
     monkeypatch: pytest.MonkeyPatch,
     failure_statement: str,
 ) -> None:
-    url = f"sqlite+aiosqlite:///{tmp_path / 'credentials.db'}"
-    engine = _build_engine(url)
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    database = AgentDB(url, db_engine=engine)
+    engine = sqlite_engine_factory(build_engine=_build_engine)
+    database = AgentDB(str(engine.url), db_engine=engine)
     stub = SimpleNamespace(
         DATABASE=database, WORKFLOW_CONTEXT_MANAGER=SimpleNamespace(remove_workflow_run_context=lambda _run: None)
     )
@@ -1653,10 +1661,13 @@ async def test_retry_retains_credential_pool_binding_when_new_lane_cannot_be_adm
     credential = MagicMock()
     credential.model_dump.return_value = {}
     credential_service = MagicMock()
-    credential_service.get_credential_item = AsyncMock(return_value=SimpleNamespace(credential=credential))
+    credential_service.get_credential_item = AsyncMock(
+        return_value=SimpleNamespace(credential=credential, login_sites=None)
+    )
     with patch("skyvern.forge.sdk.workflow.context_manager.app") as context_app:
         context_app.DATABASE = sqlite_db
         context_app.AGENT_FUNCTION.enforce_credential_use = AsyncMock()
+        context_app.AGENT_FUNCTION.enforce_workflow_context_credential_use = AsyncMock()
         context_app.CREDENTIAL_VAULT_SERVICES.get.return_value = credential_service
         context_app.AGENT_FUNCTION.process_registered_credential_item = AsyncMock(
             side_effect=lambda *, workflow_run_id, db_credential, credential_item: credential_item
@@ -1775,10 +1786,13 @@ async def test_retry_registers_prepared_binding_after_definition_edit(retry_rota
     credential = MagicMock()
     credential.model_dump.return_value = {}
     credential_service = MagicMock()
-    credential_service.get_credential_item = AsyncMock(return_value=SimpleNamespace(credential=credential))
+    credential_service.get_credential_item = AsyncMock(
+        return_value=SimpleNamespace(credential=credential, login_sites=None)
+    )
     with patch("skyvern.forge.sdk.workflow.context_manager.app") as context_app:
         context_app.DATABASE = database
         context_app.AGENT_FUNCTION.enforce_credential_use = AsyncMock()
+        context_app.AGENT_FUNCTION.enforce_workflow_context_credential_use = AsyncMock()
         context_app.CREDENTIAL_VAULT_SERVICES.get.return_value = credential_service
         context_app.AGENT_FUNCTION.process_registered_credential_item = AsyncMock(
             side_effect=lambda *, workflow_run_id, db_credential, credential_item: credential_item
@@ -2050,19 +2064,23 @@ async def test_retry_runtime_registration_with_single_credential_definition(
     credential = MagicMock()
     credential.model_dump.return_value = {}
     credential_service = MagicMock()
-    credential_service.get_credential_item = AsyncMock(return_value=SimpleNamespace(credential=credential))
+    credential_service.get_credential_item = AsyncMock(
+        return_value=SimpleNamespace(credential=credential, login_sites=None)
+    )
     with (
         patch("skyvern.forge.sdk.workflow.context_manager.app") as context_app,
         patch("skyvern.forge.sdk.workflow.service.app") as service_app,
     ):
         context_app.DATABASE = database
         context_app.AGENT_FUNCTION.enforce_credential_use = AsyncMock()
+        context_app.AGENT_FUNCTION.enforce_workflow_context_credential_use = AsyncMock()
         context_app.CREDENTIAL_VAULT_SERVICES.get.return_value = credential_service
         context_app.AGENT_FUNCTION.process_registered_credential_item = AsyncMock(
             side_effect=lambda *, workflow_run_id, db_credential, credential_item: credential_item
         )
         service_app.DATABASE = database
         service_app.AGENT_FUNCTION.enforce_credential_use = AsyncMock()
+        service_app.AGENT_FUNCTION.enforce_workflow_context_credential_use = AsyncMock()
         service_app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts = {}
         context = _runtime_context()
         context.attempt_number = 2

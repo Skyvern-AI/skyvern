@@ -22,6 +22,7 @@ from skyvern.constants import SKYVERN_ID_ATTR
 from skyvern.exceptions import (
     ElementIsNotLabel,
     ElementOutOfCurrentViewport,
+    FailToOpenLink,
     FrameChainLoop,
     InteractWithDisabledElement,
     InvalidElementForTextInput,
@@ -43,6 +44,7 @@ from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.browser_driver_errors import is_driver_error, is_driver_timeout_error
 from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.dom_inspection import (
+    read_locator_accepts_text_fill,
     read_locator_is_content_editable,
     read_locator_tag_name,
     read_resolved_anchor_href,
@@ -575,6 +577,21 @@ class SkyvernElement:
                 element_id=self.get_id(),
             )
             return False
+
+    async def accepts_text_fill(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> bool | None:
+        """Whether a fill/clear on this node can land text, or None when the live node was unreadable.
+        Stronger than is_editable(): that follows a <label> to its control and answers for the control's
+        readonly/disabled state, so a label for a radio, checkbox or file input reports editable even
+        though every fill routed through it is rejected by type."""
+        try:
+            return await read_locator_accepts_text_fill(self.get_locator(), timeout=timeout)
+        except Exception:
+            LOG.info(
+                "Failed to check whether the element accepts text input",
+                exc_info=True,
+                element_id=self.get_id(),
+            )
+            return None
 
     async def supports_text_input(self) -> bool:
         if self.get_tag_name().lower() in COMMON_INPUT_TAGS:
@@ -1660,10 +1677,11 @@ class SkyvernElement:
 
         href = await asyncio.to_thread(validate_fetch_url, href)
 
+        origin_url = page.url
         LOG.info(
             "Trying to navigate to the <a> href link instead of clicking",
             href=href,
-            current_url=page.url,
+            current_url=origin_url,
         )
         try:
             response = await page.goto(href, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
@@ -1679,7 +1697,7 @@ class SkyvernElement:
                 return href
 
             LOG.warning("Failed to navigate to the <a> href link", exc_info=True, href=href, current_url=page.url)
-            raise
+            raise FailToOpenLink(page_moved=page.url != origin_url) from e
 
         await revalidate_redirect_chain(response, validate_fetch_url, page.goto)
         return href

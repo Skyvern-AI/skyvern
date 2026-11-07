@@ -21,11 +21,13 @@ from skyvern.config import settings
 from skyvern.forge import app as forge_app
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+from skyvern.forge.sdk.artifact.storage.azure import AzureStorage
+from skyvern.forge.sdk.artifact.storage.gcs import GcsStorage
 from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
 from skyvern.forge.sdk.routes import agent_protocol
-from skyvern.forge.sdk.routes import routers as routers_module
 from skyvern.forge.sdk.routes.agent_protocol import _parse_range_header
 from tests.unit.forge.sdk.artifact.storage.test_s3_storage_moto import moto_server  # noqa: F401
+from tests.unit.shared_route_app import shared_route_app
 
 CONTENT = b"0123456789" * 100  # 1000 bytes for predictable slicing
 
@@ -59,9 +61,7 @@ def _build_client(monkeypatch: pytest.MonkeyPatch, *, content: bytes = CONTENT) 
 
     monkeypatch.setattr(agent_protocol.org_auth_service, "get_current_org", _fake_org)
 
-    fastapi_app = FastAPI()
-    fastapi_app.include_router(routers_module.base_router, prefix="/v1")
-    return TestClient(fastapi_app)
+    return TestClient(shared_route_app(monkeypatch))
 
 
 class TestParseRangeHeader:
@@ -178,6 +178,22 @@ class TestArtifactContentRangeRequests:
         assert response.status_code == 416
         assert response.headers["content-range"] == f"bytes */{len(CONTENT)}"
 
+    @pytest.mark.parametrize("backend", ["azure", "gcs"])
+    @pytest.mark.parametrize(
+        ("range_header", "status", "body"),
+        [(None, 200, CONTENT), ("bytes=10-19", 206, CONTENT[10:20]), ("bytes=5000-6000", 416, b"")],
+    )
+    def test_azure_and_gcs_serve_whole_and_range_content(
+        self, monkeypatch: pytest.MonkeyPatch, backend: str, range_header: str | None, status: int, body: bytes
+    ) -> None:
+        client = _build_client(monkeypatch)
+        storage = AzureStorage("c", "acct", "a2V5") if backend == "azure" else GcsStorage("b", "project")
+        storage.async_client = None  # type: ignore[assignment]  # the route must not reach the provider SDK
+        monkeypatch.setattr(forge_app, "STORAGE", storage)
+        response = client.get("/v1/artifacts/a_42/content", headers={"Range": range_header} if range_header else {})
+
+        assert (response.status_code, response.content) == (status, body)
+
     def test_invalid_range_falls_through_to_200(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Per RFC 7233 §3.1, unparseable Range headers MUST be ignored.
         client = _build_client(monkeypatch)
@@ -271,9 +287,7 @@ def _artifact_route_app(monkeypatch: pytest.MonkeyPatch, artifact: Artifact) -> 
     artifacts_db.get_artifact_by_id = AsyncMock(return_value=artifact)
     monkeypatch.setattr(forge_app.DATABASE, "artifacts", artifacts_db)
     monkeypatch.setattr(agent_protocol.org_auth_service, "get_current_org", _fake_org)
-    fastapi_app = FastAPI()
-    fastapi_app.include_router(routers_module.base_router, prefix="/v1")
-    return fastapi_app
+    return shared_route_app(monkeypatch)
 
 
 def _asgi_get_scope(path: str) -> dict[str, Any]:

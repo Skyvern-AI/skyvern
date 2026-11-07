@@ -11,7 +11,7 @@ from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, Literal
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import httpx
 import pytest
@@ -31,9 +31,16 @@ from skyvern.forge.sdk.db.repositories.workflow_run_attempts import WorkflowRunA
 from skyvern.forge.sdk.db.repositories.workflow_runs import WorkflowRunsRepository
 from skyvern.forge.sdk.db.repositories.workflows import WorkflowsRepository
 from skyvern.forge.sdk.executor.background_task_executor import BackgroundTaskExecutor
+from skyvern.forge.sdk.services.request_principal import AuthKind, RequestPrincipal
 from skyvern.forge.sdk.workflow import response_value_caps
 from skyvern.forge.sdk.workflow import service as service_module
-from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition, WorkflowRun, WorkflowRunStatus
+from skyvern.forge.sdk.workflow.models.workflow import (
+    Workflow,
+    WorkflowDefinition,
+    WorkflowRun,
+    WorkflowRunResponseBase,
+    WorkflowRunStatus,
+)
 from skyvern.forge.sdk.workflow.retry_policy import (
     LEASE_SAFETY_MARGIN_SECONDS,
     LEASE_TAKEOVER_SECONDS,
@@ -53,6 +60,7 @@ from skyvern.schemas.workflows import WorkflowRetryPolicy
 from skyvern.services import run_service
 from skyvern.services import webhook_delivery as webhook_delivery_module
 from skyvern.services import webhook_service as replay_service
+from tests.unit.force_stub_app import released_session_stub
 from tests.unit.forge_log_capture import capture_runtime_logs
 from tests.unit.scoped_asyncio import ScopedAsyncio
 
@@ -2015,12 +2023,13 @@ async def test_attempt_failure_reason_uses_response_text_cap(
         service_module.app,
         "DATABASE",
         SimpleNamespace(
+            Session=released_session_stub(),
             workflows=SimpleNamespace(get_workflow_for_workflow_run=AsyncMock(return_value=workflow)),
             observer=SimpleNamespace(
                 get_task_v2_by_workflow_run_id=AsyncMock(return_value=None),
                 get_workflow_run_blocks=AsyncMock(return_value=[]),
             ),
-            tasks=SimpleNamespace(get_tasks_by_workflow_run_id=AsyncMock(return_value=[])),
+            tasks=SimpleNamespace(get_tasks_for_workflow_run_status=AsyncMock(return_value=[])),
             workflow_runs=SimpleNamespace(
                 get_workflow_run_parameters=AsyncMock(return_value=[]),
                 get_workflow_run_block_errors=AsyncMock(return_value=[]),
@@ -2196,9 +2205,9 @@ async def test_interim_recovery_skips_delivery_once_a_later_attempt_finished(
 
 
 def _delivery_projection_call(update_run: AsyncMock) -> Any | None:
-    for call in update_run.await_args_list:
-        if "webhook_delivery_status" in call.kwargs:
-            return call
+    for mock_call in update_run.await_args_list:
+        if "webhook_delivery_status" in mock_call.kwargs:
+            return mock_call
     return None
 
 
@@ -2573,6 +2582,7 @@ async def test_final_delivery_outcome_logs_exactly_one_bounded_line(
         "delivery_outcome",
         "http_status_class",
         "attempts",
+        "proxy_hop_retries",
         "delivery_seconds",
         "replay",
     }
@@ -2587,8 +2597,19 @@ DEFAULT_URL = "https://example.com/webhook"
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["final", "interim"])
 @pytest.mark.parametrize("callback_url", [DEFAULT_URL, "not-a-valid-url"])
-@pytest.mark.parametrize("current,stale_claim", [(None, False), (DELIVERED, False), (None, True)])
-@pytest.mark.parametrize("execution_change", ["matching", "reset", "refinished"])
+# `current` is read only when the execution matches; a reset or refinished run seeds and asserts the same as with None.
+@pytest.mark.parametrize(
+    "execution_change,current,stale_claim",
+    [
+        ("matching", None, False),
+        ("matching", DELIVERED, False),
+        ("matching", None, True),
+        ("reset", None, False),
+        ("reset", None, True),
+        ("refinished", None, False),
+        ("refinished", None, True),
+    ],
+)
 async def test_webhook_reservation_recovery_projects_only_final_exhaustion(
     webhook_service: tuple[WorkflowService, AsyncMock, AsyncMock],
     sqlite_engine: AsyncEngine,
@@ -3190,6 +3211,93 @@ async def test_replay_projection_write_failure_preserves_http_result(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_webhook_preview_and_override_replay_redact_browser_address(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization_id = "org_webhook_redaction"
+    workflow_run_id = "wr_webhook_redaction"
+    session_id = "pbs_webhook_redaction"
+    address = f"wss://router.test/{session_id}?token=secret"
+    now = datetime.now(UTC)
+    workflow_run = WorkflowRun(
+        workflow_run_id=workflow_run_id,
+        workflow_id="w_webhook_redaction",
+        workflow_permanent_id="wpid_webhook_redaction",
+        organization_id=organization_id,
+        status=WorkflowRunStatus.completed,
+        finished_at=now,
+        created_at=now,
+        modified_at=now,
+        webhook_callback_url="https://example.test/hook",
+    )
+    status_response = WorkflowRunResponseBase(
+        workflow_id=workflow_run.workflow_permanent_id,
+        workflow_run_id=workflow_run_id,
+        status=WorkflowRunStatus.completed,
+        created_at=now,
+        modified_at=now,
+        parameters={},
+        browser_session_id=session_id,
+        browser_address=address,
+    )
+    principal = RequestPrincipal(
+        organization_id=organization_id,
+        auth_kind=AuthKind.member_api_key,
+        api_key_access_mode="member",
+    )
+    authorize_connect = AsyncMock(return_value=set())
+    monkeypatch.setattr(
+        replay_service.app,
+        "AGENT_FUNCTION",
+        SimpleNamespace(browser_session_ids_authorized_for_connect=authorize_connect),
+    )
+    monkeypatch.setattr(replay_service.app.DATABASE.tasks, "get_run", AsyncMock(return_value=None))
+    monkeypatch.setattr(replay_service.app.DATABASE.observer, "get_task_v2", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        replay_service.app.DATABASE.workflow_runs,
+        "get_workflow_run",
+        AsyncMock(return_value=workflow_run),
+    )
+    monkeypatch.setattr(replay_service.app.DATABASE.workflow_run_attempts, "get_attempts", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        replay_service.app.WORKFLOW_SERVICE,
+        "build_workflow_run_status_response",
+        AsyncMock(side_effect=lambda **_: status_response.model_copy(deep=True)),
+    )
+    monkeypatch.setattr(replay_service, "_get_api_key", AsyncMock(return_value="test-key"))
+    monkeypatch.setattr(
+        replay_service,
+        "generate_skyvern_webhook_signature",
+        lambda payload, api_key: SimpleNamespace(headers={}, signed_payload=json.dumps(payload)),
+    )
+    monkeypatch.setattr(
+        replay_service,
+        "_validate_target_url",
+        AsyncMock(return_value=("https://example.test/override", ("93.184.216.34",))),
+    )
+    deliver = AsyncMock(return_value=(200, 1, "ok", None))
+    monkeypatch.setattr(replay_service, "_deliver_webhook", deliver)
+
+    preview = await replay_service.build_run_preview(organization_id, workflow_run_id, principal)
+    replay = await replay_service.replay_run_webhook(
+        organization_id,
+        workflow_run_id,
+        "https://example.test/override",
+        api_key="test-key",
+        principal=principal,
+    )
+
+    assert json.loads(preview.payload)["browser_address"] is None
+    assert json.loads(replay.payload)["browser_address"] is None
+    assert "secret" not in preview.payload
+    assert "secret" not in replay.payload
+    delivered_payload = json.loads(deliver.await_args.kwargs["payload"])
+    assert delivered_payload["browser_address"] is None
+    assert authorize_connect.await_args_list == [
+        call(principal, organization_id, {session_id}),
+        call(principal, organization_id, {session_id}),
+    ]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("delivery_path", ["replay", "automatic", "fallback"])
 @pytest.mark.parametrize("lifecycle_change", ["matching", "reset", "refinished", "status_changed", "missing_finished"])
 @pytest.mark.parametrize("status_code", [200, 400])
@@ -3541,7 +3649,8 @@ async def test_canceled_run_gets_one_final_webhook_from_a_sender_that_is_sure_to
 
     monkeypatch.setattr(service_module.app.AGENT_FUNCTION, "deliver_webhook", AsyncMock(side_effect=endpoint))
 
-    async def cancel_row(workflow_run_id: str) -> WorkflowRun:
+    async def cancel_row(workflow_run_id: str, *, requested_externally: bool = False) -> WorkflowRun:
+        assert requested_externally is True
         if finishes_before_cancel:
             await runs.update_workflow_run_if_not_final(workflow_run_id, WorkflowRunStatus.completed)
         canceled = await runs.update_workflow_run_if_not_final(workflow_run_id, WorkflowRunStatus.canceled)

@@ -48,6 +48,7 @@ from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_a
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.utils import ACTION_TYPE_TO_CLASS
+from skyvern.forge.sdk.executor.run_liveness import run_write_authority
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.services.credentials import generate_totp_code
 from skyvern.schemas.steps import AgentStepOutput
@@ -981,6 +982,10 @@ class ScriptSkyvernPage(SkyvernPage):
         workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(context.workflow_run_id)
         return bool(workflow_run_context and workflow_run_context.get_original_secret_value_or_none(value) is not None)
 
+    def _is_card_secret_reference(self, value: str) -> bool:
+        context = skyvern_context.current()
+        return context is not None and app.WORKFLOW_CONTEXT_MANAGER.is_card_secret_text(context.workflow_run_id, value)
+
     # Class-level cache for TOTP codes to ensure all digits in a sequence use the same code
     # Key: (workflow_run_id, credential_key), Value: totp_code
     # Uses TTLCache with 30-second expiry (aligned with TOTP rotation period)
@@ -1184,6 +1189,13 @@ class ScriptSkyvernPage(SkyvernPage):
         if not totp_identifier and not totp_url:
             raise RuntimeError("A sign-in link is unavailable: this step has no email/SMS identifier to receive it on.")
 
+        task = (
+            await app.DATABASE.tasks.get_task(context.task_id, organization_id=organization_id)
+            if context and context.task_id
+            else None
+        )
+        task_url = task.url if task else None
+
         polled = await poll_otp_value(
             organization_id=organization_id,
             task_id=context.task_id if context else None,
@@ -1192,6 +1204,7 @@ class ScriptSkyvernPage(SkyvernPage):
             totp_identifier=totp_identifier,
             created_after=naive_utc_now() - MAGIC_LINK_ANCHOR_GRACE,
             expected_otp_type=OTPType.MAGIC_LINK,
+            task_url=task_url,
         )
         if polled is None:
             raise RuntimeError("A sign-in link could not be retrieved for this step.")
@@ -1377,6 +1390,7 @@ class ScriptSkyvernPage(SkyvernPage):
             task_id=context.task_id,
             organization_id=context.organization_id,
             output=step_output,
+            write_authority_for_run=run_write_authority,
         )
         LOG.info(
             "Updated step output with cached actions before complete validation",

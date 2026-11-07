@@ -14,6 +14,7 @@ import structlog
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError, field_validator, model_validator
 
+from skyvern.forge.sdk.copilot.agent_context import RegisteredDownloadTextError
 from skyvern.forge.sdk.copilot.build_test_connect_failure import (
     BuildTestConnectFailure,
     build_test_connect_failure_sentence,
@@ -34,10 +35,10 @@ from skyvern.forge.sdk.copilot.request_policy import redact_raw_secrets_for_prom
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_all_registered_from_text
 from skyvern.forge.sdk.copilot.workflow_credential_utils import (
-    CONNECTED_VAULT_ID_PREFIX,
     block_credential_ids,
     credential_param_ids,
     parse_workflow_yaml,
+    saved_credential_ids,
     workflow_blocks,
 )
 from skyvern.schemas.workflows import BlockStatus, BlockType
@@ -112,6 +113,8 @@ TerminalCause = Literal[
     "billing_credit_admission_refusal",
     "saved_profile_unresolved",
     "saved_profile_not_applied",
+    "unsaved_browser_profile_pick",
+    "browser_start_capacity",
 ]
 BuildTestPacketLocatorUnobservedReason = Literal[
     "worker_owned_run",
@@ -248,6 +251,7 @@ class BuildTestPacketRun(BaseModel):
     execution_source: dict[str, Any] | None = None
     browser_start: dict[str, Any] | None = None
     loop_inputs: LoopInputs | LoopInputsUnavailable | None = None
+    credits_used: int | None = None
 
 
 class BuildTestPacketPageState(BaseModel):
@@ -337,7 +341,7 @@ class BuildTestFailedOperation(BaseModel):
     @field_validator("block_label")
     @classmethod
     def redact_block_label(cls, value: str | None) -> str | None:
-        return _redacted_terminal_text(value)
+        return redacted_terminal_text(value)
 
 
 class BuildTestPacketFailure(BaseModel):
@@ -415,6 +419,36 @@ class BuildTestPacketDownload(BaseModel):
     file_name: str | None = None
     # Rendered by the run's own code, so it is not evidence that a site delivered a file.
     generated: Literal[True] | None = None
+    text: str | None = None
+    page_count: int | None = None
+    char_count: int | None = None
+    truncated: bool | None = None
+    text_layer_problem: str | None = None
+    error: RegisteredDownloadTextError | None = None
+
+
+DOWNLOAD_TEXT_PAST_FILE_LIMIT = "downloads[].text omitted for registered downloads past the per-run file limit."
+DOWNLOAD_TEXT_OVER_SIZE_LIMIT = "downloads[].text omitted for a registered download over the per-file size limit."
+DOWNLOAD_TEXT_PAST_CHAR_LIMIT = "downloads[].text omitted past the per-run download text limit."
+DOWNLOAD_TEXT_AFTER_PARSE_TIMEOUT = (
+    "downloads[].text omitted for registered downloads read after one exceeded its parse time limit."
+)
+DOWNLOAD_TEXT_AFTER_TIME_LIMIT = (
+    "downloads[].text omitted for registered downloads not read before the copilot time limit."
+)
+DOWNLOAD_TEXT_WITHHELD = "downloads[].text withheld: this run's secret values are not registered for redaction yet."
+DOWNLOAD_TEXT_OVER_PACKET_LIMIT = "downloads[].text shortened to keep the packet under its character limit."
+DOWNLOAD_TEXT_OMISSION_NOTICES = frozenset(
+    {
+        DOWNLOAD_TEXT_PAST_FILE_LIMIT,
+        DOWNLOAD_TEXT_OVER_SIZE_LIMIT,
+        DOWNLOAD_TEXT_PAST_CHAR_LIMIT,
+        DOWNLOAD_TEXT_AFTER_PARSE_TIMEOUT,
+        DOWNLOAD_TEXT_AFTER_TIME_LIMIT,
+        DOWNLOAD_TEXT_WITHHELD,
+        DOWNLOAD_TEXT_OVER_PACKET_LIMIT,
+    }
+)
 
 
 class BuildTestPacketScreenshot(BaseModel):
@@ -1574,6 +1608,8 @@ def _required_input_unbound_outcome(
         key_provenance={
             "structural_failure_identity": (
                 "resolution-seam unbound required parameter keys referenced by the failed block"
+                if failed_block is not None
+                else "blank inputs that run-context init resolves as required login credential fields"
             )
         },
     )
@@ -1594,6 +1630,7 @@ def recorded_outcome_from_run_blocks_result(
     block_shape_hashes: Mapping[str, str] | None = None,
     block_associations_by_label: Mapping[str, str] | None = None,
     runtime_failure_class: str | None = None,
+    blank_login_credential_input_keys: Sequence[str] = (),
 ) -> RecordedBuildTestOutcome | None:
     outcome = _recorded_outcome_from_run_blocks_result(
         result,
@@ -1609,6 +1646,7 @@ def recorded_outcome_from_run_blocks_result(
         block_shape_hashes=block_shape_hashes,
         block_associations_by_label=block_associations_by_label,
         runtime_failure_class=runtime_failure_class,
+        blank_login_credential_input_keys=blank_login_credential_input_keys,
     )
     if outcome is None:
         return None
@@ -1635,6 +1673,7 @@ def _recorded_outcome_from_run_blocks_result(
     block_shape_hashes: Mapping[str, str] | None = None,
     block_associations_by_label: Mapping[str, str] | None = None,
     runtime_failure_class: str | None = None,
+    blank_login_credential_input_keys: Sequence[str] = (),
 ) -> RecordedBuildTestOutcome | None:
     data = _dict(result.get("data"))
     workflow_run_id = _safe_str(data.get("workflow_run_id"))
@@ -1644,12 +1683,12 @@ def _recorded_outcome_from_run_blocks_result(
         result, block_associations_by_label=block_associations_by_label
     )
     block_labels = [
-        label for block in blocks if (label := _redacted_terminal_text(_safe_str(block.get("label")))) is not None
+        label for block in blocks if (label := redacted_terminal_text(_safe_str(block.get("label")))) is not None
     ]
     requested = data.get("requested_block_labels")
     requested_block_labels = (
         _clean_list(
-            [redacted for label in requested if isinstance(label, str) if (redacted := _redacted_terminal_text(label))]
+            [redacted for label in requested if isinstance(label, str) if (redacted := redacted_terminal_text(label))]
         )
         if isinstance(requested, list)
         else []
@@ -1673,7 +1712,7 @@ def _recorded_outcome_from_run_blocks_result(
             redacted
             for block in blocks
             if _safe_str(block.get("status")) in _EXECUTED_BLOCK_STATUSES
-            if (redacted := _redacted_terminal_text(_safe_str(block.get("label"))))
+            if (redacted := redacted_terminal_text(_safe_str(block.get("label"))))
         ]
     )
     executed_block_associations = _block_associations(blocks, block_associations_by_label, _EXECUTED_BLOCK_STATUSES)
@@ -1684,6 +1723,7 @@ def _recorded_outcome_from_run_blocks_result(
         failed_block,
         unbound_required_parameter_keys or [],
         block_parameter_keys or {},
+        blank_login_credential_input_keys,
     )
     graded_page_evidence = page_evidence if _post_run_page_evidence_matches_result(data, page_evidence) else None
     page_refs = _page_evidence_refs(graded_page_evidence)
@@ -1999,7 +2039,7 @@ def _recorded_outcome_from_run_blocks_result(
     return RecordedBuildTestOutcome(
         phase="persisted_block_run",
         attempted_tool="update_and_run_blocks",
-        attempted_block_label=_redacted_terminal_text(_safe_str(failed_block.get("label"))) or ""
+        attempted_block_label=redacted_terminal_text(_safe_str(failed_block.get("label"))) or ""
         if failed_block is not None
         else "",
         verdict=verdict,
@@ -2009,7 +2049,7 @@ def _recorded_outcome_from_run_blocks_result(
         requested_block_labels=requested_block_labels,
         executed_block_labels=executed_block_labels,
         failed_block_labels=_clean_list(
-            [redacted for label in _failed_block_labels(blocks) if (redacted := _redacted_terminal_text(label))]
+            [redacted for label in _failed_block_labels(blocks) if (redacted := redacted_terminal_text(label))]
         ),
         block_shape_hashes=block_shape_hashes,
         structural_failure_identity=structural_identity,
@@ -2112,11 +2152,8 @@ def failed_block_bound_credential_ids(
         return set()
     credential_ids = block_credential_ids(code_blocks[0], credential_params_by_key)
     # A rotation pool or a fallback list picks its credential per run, out of reach here, so naming any
-    # member could send the user to edit a credential the site never saw. A connected Bitwarden login is
-    # edited in Bitwarden, not on the credential card.
-    if len(credential_ids) != 1 or any(item.startswith(CONNECTED_VAULT_ID_PREFIX) for item in credential_ids):
-        return set()
-    return credential_ids
+    # member could send the user to edit a credential the site never saw. A vault-item binding has no card.
+    return credential_ids if len(credential_ids) == 1 and saved_credential_ids(credential_ids) else set()
 
 
 def connect_failure_from_run_blocks_result(result: Mapping[str, object]) -> BuildTestConnectFailure | None:
@@ -2298,7 +2335,7 @@ def _bounded_text(value: object, max_chars: int = _TEXT_MAX) -> str:
     return text[:max_chars]
 
 
-def _redacted_terminal_text(value: str | None) -> str | None:
+def redacted_terminal_text(value: str | None) -> str | None:
     if not isinstance(value, str):
         return None
     redacted = redact_raw_secrets_for_prompt(scrub_all_registered_from_text(value))
@@ -2307,7 +2344,7 @@ def _redacted_terminal_text(value: str | None) -> str | None:
 
 def _recorded_output_field_text(value: object) -> str:
     text = value if isinstance(value, str) else json.dumps(value, default=str, separators=(",", ":"))
-    return (_redacted_terminal_text(text) or "")[:_TEXT_MAX]
+    return (redacted_terminal_text(text) or "")[:_TEXT_MAX]
 
 
 def scrubbed_slice(text: str, limit: int) -> str:
@@ -2353,7 +2390,7 @@ def _recorded_block_outcome_facts(
     """
     executed: list[_ExecutedRow] = []
     for block in blocks:
-        label = _redacted_terminal_text(_safe_str(block.get("label")))
+        label = redacted_terminal_text(_safe_str(block.get("label")))
         status = _safe_str(block.get("status"))
         if not label or status not in _EXECUTED_BLOCK_STATUSES:
             continue
@@ -2371,7 +2408,7 @@ def _recorded_block_outcome_facts(
                 # A key is as free-form as a value, so it gets both passes its value gets before it is
                 # bounded — a generic secret shape cut at 96 characters is no longer a shape — and two keys
                 # that come out alike keep both rows rather than one replacing the other.
-                screened_key = _bounded_ref(_redacted_terminal_text(str(key)) or "")
+                screened_key = _bounded_ref(redacted_terminal_text(str(key)) or "")
                 fields[_disambiguated(screened_key, fields)] = _recorded_output_field_text(value)
         elif output is not None:
             output_text = _recorded_output_field_text(output)
@@ -2435,8 +2472,15 @@ def _referenced_unbound_input_keys(
     failed_block: Mapping[str, object] | None,
     unbound_required_parameter_keys: Sequence[str],
     block_parameter_keys: Mapping[str, Sequence[str]],
+    blank_login_credential_input_keys: Sequence[str],
 ) -> list[str]:
-    if bool(result.get("ok")) is not False or failed_block is None:
+    if bool(result.get("ok")) is not False:
+        return []
+    if failed_block is None:
+        data = _dict(result.get("data"))
+        # Login credentials resolve at run-context init, which fails before any block runs or a watchdog acts.
+        if data.get("blocks") == [] and data.get("control_signal") is None:
+            return list(dict.fromkeys(blank_login_credential_input_keys))
         return []
     label = _safe_str(failed_block.get("label"))
     referenced = block_parameter_keys.get(label) if label else None

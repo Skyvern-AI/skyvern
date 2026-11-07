@@ -5,19 +5,25 @@ OSS-synced: RFC-2606 example.* only.
 
 from __future__ import annotations
 
+import re
 from types import SimpleNamespace
 
 import pytest
 import yaml
 
+from skyvern.forge.sdk.copilot.review_gate import build_review_projection, workflow_block_fingerprints
+from skyvern.forge.sdk.copilot.tools.frontier import inputs_only_read_by_deleted_block
 from skyvern.forge.sdk.copilot.tools.workflow_update import _code_block_safety_errors
 from skyvern.forge.sdk.copilot.workflow_yaml import (
     BlockEditError,
+    _normalize_copilot_yaml,
+    _process_workflow_yaml,
     add_block_to_workflow,
     apply_block_edit,
     delete_block_from_workflow,
     stored_block_code,
     stored_workflow_yaml,
+    workflow_to_copilot_yaml,
 )
 
 _WORKFLOW = """title: Lookup
@@ -592,6 +598,118 @@ class TestAddBlock:
         with pytest.raises(BlockEditError):
             add_block_to_workflow(_WORKFLOW, "open_portal", block_yaml)
 
+    def test_a_version_1_workflow_gets_the_block_in_list_order_and_stays_version_1(self) -> None:
+        workflow = _WORKFLOW.replace(
+            "workflow_definition:\n", "workflow_definition:\n  version: 1\n  parameters: []\n", 1
+        )
+        workflow = re.sub(r"\n *next_block_label: \w+", "", workflow)
+
+        out = add_block_to_workflow(workflow, "open_portal", _NEW_BLOCK + "next_block_label: read_total\n")
+
+        definition = _normalize_copilot_yaml(out).workflow_definition
+        assert definition.version == 1
+        assert [(block.label, block.next_block_label) for block in definition.blocks] == [
+            ("open_portal", None),
+            ("check_pages", None),
+            ("read_total", None),
+        ]
+
+    def test_an_unversioned_workflow_without_routing_gets_the_block_in_list_order(self) -> None:
+        workflow = re.sub(r"\n *next_block_label: \w+", "", _WORKFLOW).replace(
+            "workflow_definition:\n", "workflow_definition:\n  parameters: []\n", 1
+        )
+
+        out = add_block_to_workflow(workflow, "open_portal", _NEW_BLOCK)
+
+        definition = _normalize_copilot_yaml(out).workflow_definition
+        assert definition.version == 1
+        assert [(block.label, block.next_block_label) for block in definition.blocks] == [
+            ("open_portal", None),
+            ("check_pages", None),
+            ("read_total", None),
+        ]
+
+
+_ROUTED_WORKFLOW = """title: Routed lookup
+workflow_definition:
+  version: 2
+  parameters:
+    - key: page_size
+      parameter_type: workflow
+      workflow_parameter_type: integer
+      default_value: 5
+  blocks:
+    - block_type: code
+      label: open_portal
+      parameter_keys: [page_size]
+      code: |
+        await page.goto("https://example.test/")
+      next_block_label: list_rows
+    - block_type: code
+      label: list_rows
+      code: |
+        rows = await page.inner_text("#rows")
+      next_block_label: read_total
+    - block_type: code
+      label: read_total
+      code: |
+        return {"total": await page.inner_text("#total")}
+"""
+
+
+@pytest.mark.usefixtures("no_saved_workflow")
+class TestLegacyListOrderedRows:
+    @staticmethod
+    async def _saved_row(workflow: str, *, version: int, pointers: dict[str, str | None] | None = None):
+        saved = await _process_workflow_yaml("w", "wp", "o", workflow)
+        saved.workflow_definition.version = version
+        for block in saved.workflow_definition.blocks:
+            if pointers is not None:
+                block.next_block_label = pointers[block.label]
+        return saved
+
+    @pytest.mark.asyncio
+    async def test_a_version_1_row_chained_in_list_order_reads_as_list_order(self) -> None:
+        saved = await self._saved_row(_ROUTED_WORKFLOW, version=1)
+
+        baseline = workflow_to_copilot_yaml(saved)
+
+        definition = _normalize_copilot_yaml(baseline).workflow_definition
+        assert definition.version == 1
+        assert [block.next_block_label for block in definition.blocks] == [None, None, None]
+        assert yaml.safe_load(baseline)["workflow_definition"]["parameters"] == [
+            {"key": "page_size", "parameter_type": "workflow", "workflow_parameter_type": "integer", "default_value": 5}
+        ]
+        unchained = await self._saved_row(
+            _ROUTED_WORKFLOW, version=1, pointers={"open_portal": None, "list_rows": None, "read_total": None}
+        )
+        proposal = workflow_to_copilot_yaml(unchained)
+        projection = build_review_projection(baseline, proposal, workflow_block_fingerprints(baseline))
+        assert projection is not None
+        assert {(row["change"], row.get("coverage")) for row in projection["blocks"]} == {
+            ("unchanged", "current_source")
+        }
+        assert projection["inputs"] == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("version", "pointers"),
+        [
+            (1, {"open_portal": "read_total", "list_rows": None, "read_total": "list_rows"}),
+            (2, None),
+        ],
+    )
+    async def test_other_routing_comes_through_unchanged(
+        self, version: int, pointers: dict[str, str | None] | None
+    ) -> None:
+        saved = await self._saved_row(_ROUTED_WORKFLOW, version=version, pointers=pointers)
+        expected = [block.next_block_label for block in saved.workflow_definition.blocks]
+
+        blocks = yaml.safe_load(workflow_to_copilot_yaml(saved))["workflow_definition"]["blocks"]
+
+        assert [block.get("next_block_label") for block in blocks] == expected
+        assert any(expected)
+
 
 class TestAddBlockParameters:
     """A new block and the parameter it reads have to land in one write, or the saved workflow cannot run."""
@@ -841,3 +959,203 @@ workflow_definition:
         parsed = yaml.safe_load(out)
         remaining = parsed["workflow_definition"]["blocks"]
         assert remaining[0]["loop_blocks"] == [] if nested else remaining == []
+
+
+_SEED_PARAMETER = """    - parameter_type: workflow
+      key: seed_rows
+      workflow_parameter_type: json
+      default_value: '[{"id": 1}]'
+"""
+_SEED_BLOCK = """    - block_type: code
+      label: Seed_Rows
+      parameter_keys: [seed_rows]
+      code: |
+        return {"output": seed_rows}
+"""
+_SEEDED_WORKFLOW = (
+    """title: Seeded export
+workflow_definition:
+  parameters:
+    - parameter_type: workflow
+      key: account_id
+      workflow_parameter_type: string
+"""
+    + _SEED_PARAMETER
+    + """  blocks:
+    - block_type: code
+      label: Read_Account
+      parameter_keys: [account_id] # keep inline comment
+      code: |
+        await page.goto("https://example.test/" + account_id)
+      next_block_label: Seed_Rows
+"""
+    + _SEED_BLOCK
+)
+
+_SEEDED_PARAMETERS = (
+    "  parameters:\n    - parameter_type: workflow\n      key: account_id\n      workflow_parameter_type: string\n"
+    + _SEED_PARAMETER
+)
+
+
+_REPORT_PARAMETER = """    - parameter_type: workflow
+      key: report_title
+      workflow_parameter_type: string
+"""
+_REPORT_BLOCK = """    - block_type: code
+      label: Write_Report
+      parameter_keys: [report_title]
+      code: |
+        return {"output": report_title}
+      next_block_label: Seed_Rows
+"""
+_THREE_BLOCK_WORKFLOW = _SEEDED_WORKFLOW.replace("  blocks:\n", _REPORT_PARAMETER + "  blocks:\n").replace(
+    "      next_block_label: Seed_Rows\n", "      next_block_label: Write_Report\n" + _REPORT_BLOCK
+)
+
+
+class TestDeleteRemovesParameters:
+    def test_removes_the_block_and_its_input_leaving_every_other_byte_identical(self) -> None:
+        out = delete_block_from_workflow(_THREE_BLOCK_WORKFLOW, "Seed_Rows", remove_parameters=["seed_rows"])
+
+        assert out == (
+            _THREE_BLOCK_WORKFLOW.replace(_SEED_PARAMETER, "")
+            .replace(_SEED_BLOCK, "")
+            .replace("next_block_label: Seed_Rows", "next_block_label: null")
+        )
+        definition = yaml.safe_load(out)["workflow_definition"]
+        assert [p["key"] for p in definition["parameters"]] == ["account_id", "report_title"]
+        assert [b["label"] for b in definition["blocks"]] == ["Read_Account", "Write_Report"]
+
+    def test_without_remove_parameters_the_input_stays(self) -> None:
+        out = delete_block_from_workflow(_SEEDED_WORKFLOW, "Seed_Rows")
+
+        assert [p["key"] for p in yaml.safe_load(out)["workflow_definition"]["parameters"]] == [
+            "account_id",
+            "seed_rows",
+        ]
+
+    def test_an_undeclared_key_is_an_error_naming_the_declared_keys(self) -> None:
+        with pytest.raises(BlockEditError, match="account_id, seed_rows"):
+            delete_block_from_workflow(_SEEDED_WORKFLOW, "Seed_Rows", remove_parameters=["seed_row"])
+
+    def test_removing_every_input_before_the_blocks_still_parses(self) -> None:
+        out = delete_block_from_workflow(
+            _SEEDED_WORKFLOW, "Seed_Rows", remove_parameters=["seed_rows", "account_id", "seed_rows"]
+        )
+
+        definition = yaml.safe_load(out)["workflow_definition"]
+        assert definition["parameters"] == []
+        assert [block["label"] for block in definition["blocks"]] == ["Read_Account"]
+
+    @pytest.mark.parametrize("opening, item, closing", [("{", '"id": 1', "}"), ("[", "1", "]")])
+    @pytest.mark.parametrize("removed, kept", [(["seed_rows"], ["account_id"]), (["seed_rows", "account_id"], [])])
+    def test_multiline_flow_values_are_removed_through_their_closing_bracket(
+        self, opening: str, item: str, closing: str, removed: list[str], kept: list[str]
+    ) -> None:
+        workflow = _SEEDED_WORKFLOW.replace(
+            "default_value: '[{\"id\": 1}]'", f"default_value: {opening}\n        {item}\n      {closing}"
+        ).replace(
+            '      parameter_keys: [seed_rows]\n      code: |\n        return {"output": seed_rows}\n',
+            '      code: |\n        return {"output": seed_rows}\n      parameter_keys: [\n        seed_rows\n      ]\n',
+        )
+
+        out = delete_block_from_workflow(workflow, "Seed_Rows", remove_parameters=removed)
+
+        definition = yaml.safe_load(out)["workflow_definition"]
+        assert [p["key"] for p in definition["parameters"]] == kept
+        assert [b["label"] for b in definition["blocks"]] == ["Read_Account"]
+
+    def test_refuses_an_input_whose_anchor_a_kept_input_uses(self) -> None:
+        workflow = _SEEDED_WORKFLOW.replace(
+            "default_value: '[{\"id\": 1}]'", "default_value: &rows '[{\"id\": 1}]'"
+        ).replace("      key: account_id\n", "      key: account_id\n      description: *rows\n")
+
+        with pytest.raises(BlockEditError, match="alias"):
+            delete_block_from_workflow(workflow, "Seed_Rows", remove_parameters=["seed_rows"])
+
+    def test_flow_style_inputs_keep_the_untouched_entries_as_written(self) -> None:
+        workflow = _SEEDED_WORKFLOW.replace(
+            _SEEDED_PARAMETERS,
+            "  parameters: [{key: a, parameter_type: workflow,  workflow_parameter_type: string}, "
+            "{key: b, parameter_type: workflow, workflow_parameter_type: string}, "
+            "{key: c, parameter_type: workflow, workflow_parameter_type: string}]\n",
+        )
+
+        out = delete_block_from_workflow(workflow, "Seed_Rows", remove_parameters=["b", "c"])
+
+        assert "  parameters: [{key: a, parameter_type: workflow,  workflow_parameter_type: string}]\n" in out
+
+    def test_refuses_a_flow_list_whose_kept_entry_is_an_alias(self) -> None:
+        workflow = "shared: &a {key: a, parameter_type: workflow, workflow_parameter_type: string}\n" + (
+            _SEEDED_WORKFLOW.replace(
+                _SEEDED_PARAMETERS,
+                "  parameters: [*a, {key: b, parameter_type: workflow, workflow_parameter_type: string}]\n",
+            )
+        )
+
+        with pytest.raises(BlockEditError, match="alias"):
+            delete_block_from_workflow(workflow, "Seed_Rows", remove_parameters=["b"])
+
+    def test_refuses_an_input_written_through_a_merge_key(self) -> None:
+        workflow = "base: &seed\n  parameter_type: workflow\n  key: seed_rows\n" + _SEEDED_WORKFLOW.replace(
+            _SEED_PARAMETER, "    - <<: *seed\n      workflow_parameter_type: json\n"
+        )
+
+        with pytest.raises(BlockEditError, match="seed_rows"):
+            delete_block_from_workflow(workflow, "Seed_Rows", remove_parameters=["seed_rows"])
+
+
+async def _unread_after_delete(workflow: str, label: str) -> list[str]:
+    saved = await _process_workflow_yaml("w", "wp", "o", delete_block_from_workflow(workflow, label))
+    return inputs_only_read_by_deleted_block(label, workflow, saved)
+
+
+@pytest.mark.usefixtures("no_saved_workflow")
+class TestInputsOnlyReadByDeletedBlock:
+    @pytest.mark.asyncio
+    async def test_names_the_input_a_deleted_loop_iterated(self) -> None:
+        workflow = _SEEDED_WORKFLOW.replace(
+            _SEED_BLOCK,
+            """    - block_type: for_loop
+      label: Seed_Rows
+      loop_over_parameter_key: seed_rows
+      loop_blocks:
+        - block_type: code
+          label: Use_Row
+          code: |
+            return {"output": 1}
+""",
+        )
+
+        assert await _unread_after_delete(workflow, "Seed_Rows") == ["seed_rows"]
+
+    @pytest.mark.asyncio
+    async def test_an_input_the_workflow_prompt_still_reads_is_not_named(self) -> None:
+        workflow = _SEEDED_WORKFLOW.replace(
+            "  blocks:\n", "  workflow_system_prompt: 'Rows to export: {{ seed_rows }}'\n  blocks:\n"
+        )
+
+        assert await _unread_after_delete(workflow, "Seed_Rows") == []
+
+    @pytest.mark.asyncio
+    async def test_a_credential_a_kept_input_depends_on_is_not_named(self) -> None:
+        workflow = (
+            _SEEDED_WORKFLOW.replace(
+                _SEED_PARAMETER,
+                """    - parameter_type: workflow
+      key: chosen_credential
+      workflow_parameter_type: string
+    - parameter_type: credential
+      key: portal_login
+      credential_id: chosen_credential
+""",
+            )
+            .replace(
+                'parameter_keys: [seed_rows]\n      code: |\n        return {"output": seed_rows}',
+                'parameter_keys: [chosen_credential, portal_login]\n      code: |\n        return {"output": 1}',
+            )
+            .replace("parameter_keys: [account_id]", "parameter_keys: [account_id, portal_login]")
+        )
+
+        assert await _unread_after_delete(workflow, "Seed_Rows") == []

@@ -9,6 +9,7 @@ import { useWebSocketParams } from "./webSocketParams";
 export type RecordingClipboardMode = "vnc" | "message" | "none";
 
 export interface UseRecordingMessageChannelOptions {
+  clientId: string;
   browserSessionId: string | null;
   /** socket lifecycle gate: open the message WS while true */
   enabled: boolean;
@@ -201,8 +202,9 @@ function handleMessage(
     case "copied-text": {
       const text = message.text;
       // Copying with nothing selected must leave the local clipboard alone, as a
-      // native Cmd/Ctrl+C does.
-      if (clipboard === "none" || !text) {
+      // native Cmd/Ctrl+C does. VNC streams copy through the VNC server's own
+      // clipboard instead.
+      if (clipboard !== "message" || !text) {
         break;
       }
 
@@ -259,7 +261,7 @@ export function useRecordingMessageChannel(
   const [messageSocket, setMessageSocket] = useState<WebSocket | null>(null);
   const [isMessageConnected, setIsMessageConnected] = useState(false);
   const messageSocketRef = useRef<WebSocket | null>(null);
-  const getWebSocketParams = useWebSocketParams();
+  const getWebSocketParams = useWebSocketParams(options.clientId);
   const optionsRef = useRef(options);
   optionsRef.current = options;
 
@@ -293,11 +295,11 @@ export function useRecordingMessageChannel(
     };
 
     const connect = async () => {
-      const wsParams = await getWebSocketParams();
+      const { params, protocols } = await getWebSocketParams();
       if (cancelled) return;
-      const messageUrl = `${socketUrl ?? `${newWssBaseUrl}/stream/messages/browser_session/${browserSessionId}`}?${wsParams}`;
+      const messageUrl = `${socketUrl ?? `${newWssBaseUrl}/stream/messages/browser_session/${browserSessionId}`}?${params}`;
 
-      ws = new WebSocket(messageUrl);
+      ws = new WebSocket(messageUrl, protocols);
 
       ws.onopen = () => {
         if (cancelled) return;
@@ -349,7 +351,13 @@ export function useRecordingMessageChannel(
     // NOTE: adding getWebSocketParams causes constant reconnects of message channel when,
     // for instance, take-control or cede-control is clicked
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [browserSessionId, enabled, reconnectTrigger, socketUrl]);
+  }, [
+    browserSessionId,
+    enabled,
+    reconnectTrigger,
+    socketUrl,
+    options.clientId,
+  ]);
 
   const sendCommand = useCallback((command: Command) => {
     const socket = messageSocketRef.current;

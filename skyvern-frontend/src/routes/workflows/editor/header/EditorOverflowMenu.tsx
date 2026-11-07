@@ -6,7 +6,7 @@ import {
 } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { type AxiosError } from "axios";
-import { useId } from "react";
+import { type ReactNode, useId } from "react";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import { getClient } from "@/api/AxiosClient";
@@ -29,6 +29,7 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
+import { useCopilotProposalStore } from "@/store/CopilotProposalStore";
 import { useProductTourStore } from "@/store/ProductTourStore";
 import {
   SaveRefusedError,
@@ -49,6 +50,7 @@ export function EditorOverflowMenu({
   triggerClassName = "size-10 min-w-[2.5rem]",
   onVersionHistory,
   embedded = false,
+  leadingItems,
 }: {
   triggerClassName?: string;
   // Studio override: the shell collapses to an editor-only layout before
@@ -57,6 +59,8 @@ export function EditorOverflowMenu({
   // Embedded (studio) hosts provide their own TooltipProvider with the shell's
   // fast timing; standalone (legacy header) brings a local one.
   embedded?: boolean;
+  // Host controls folded into this menu (the studio top bar at phone width).
+  leadingItems?: ReactNode;
 } = {}) {
   const workflowPermanentId = useWorkflowPermanentId();
   const { data: workflow } = useWorkflowQuery({ workflowPermanentId });
@@ -67,7 +71,11 @@ export function EditorOverflowMenu({
     (s) => s.saveBlockedReason,
   );
   const saveLockReason = useWorkflowYamlEditorStore(selectSaveLockReason);
-  const templateSaveReason = saveBlockedReason ?? saveLockReason;
+  const proposalPending = useCopilotProposalStore((s) => s.proposal !== null);
+  // Saving here would make a staged Copilot proposal durable without Accept.
+  const templateSaveReason = proposalPending
+    ? "Resolve the Copilot proposal before saving."
+    : (saveBlockedReason ?? saveLockReason);
   const templateReasonId = useId();
   const requestTour = useProductTourStore((s) => s.requestTour);
   const onSave = useSaveWorkflow();
@@ -120,6 +128,7 @@ export function EditorOverflowMenu({
   const handleTemplateToggle = async () => {
     const newIsTemplate = !isTemplate;
     if (newIsTemplate) {
+      if (useCopilotProposalStore.getState().proposal) return;
       await onSave();
     }
     templateMutation.mutate(newIsTemplate);
@@ -151,6 +160,7 @@ export function EditorOverflowMenu({
     <DropdownMenu modal={false}>
       {embedded ? trigger : <TooltipProvider>{trigger}</TooltipProvider>}
       <DropdownMenuContent align="end" className="min-w-[12rem]">
+        {leadingItems}
         {!embedded && enterYamlMode && (
           <DropdownMenuItem onSelect={() => enterYamlMode()}>
             <FileTextIcon className="mr-2 size-4" />
@@ -158,7 +168,8 @@ export function EditorOverflowMenu({
           </DropdownMenuItem>
         )}
         <CodeSubmenu />
-        {!workflowRunIsRunningOrQueued && (
+        {/* Restoring a version would replace the canvas a Copilot proposal is staged on. */}
+        {!workflowRunIsRunningOrQueued && !proposalPending && (
           <DropdownMenuItem
             onSelect={() => (onVersionHistory ?? toggleHistoryPanel)()}
           >

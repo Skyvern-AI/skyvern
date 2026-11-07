@@ -9,9 +9,7 @@ import json
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime, timedelta
-from functools import cache
 from itertools import count
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Protocol, TypeVar
 from unittest.mock import AsyncMock, MagicMock
@@ -19,9 +17,10 @@ from urllib.parse import urlparse
 
 import pytest
 from agents import Agent, FunctionTool, OutputGuardrail, RunConfig, SQLiteSession
-from agents.items import ModelResponse, TResponseInputItem
+from agents.items import ModelResponse, RunItem, TResponseInputItem
 from agents.models.interface import Model, ModelProvider
 from agents.result import RunResultStreaming
+from agents.stream_events import RunItemStreamEvent
 from openai.types.responses import (
     ResponseCompletedEvent,
     ResponseOutputItemDoneEvent,
@@ -32,7 +31,6 @@ from openai.types.responses.response import Response
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
 from PIL import Image
 from playwright.async_api import Page, Route, async_playwright
-from playwright.sync_api import sync_playwright
 
 from skyvern.forge import app as forge_app
 from skyvern.forge.sdk.api.llm import api_handler_factory
@@ -41,6 +39,7 @@ from skyvern.forge.sdk.copilot import agent as copilot_agent
 from skyvern.forge.sdk.copilot import runtime as copilot_runtime
 from skyvern.forge.sdk.copilot.active_run_session import ActiveRunSessionAssociation
 from skyvern.forge.sdk.copilot.agent import _run_agent_loop_with_surface, run_copilot_agent
+from skyvern.forge.sdk.copilot.agent_context import OriginRunRedactionRegistry
 from skyvern.forge.sdk.copilot.browser_ablation import CopilotEvalMode
 from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome
 from skyvern.forge.sdk.copilot.config import CopilotConfig
@@ -59,13 +58,18 @@ from skyvern.forge.sdk.copilot.enforcement import (
     run_with_enforcement,
 )
 from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
-from skyvern.forge.sdk.copilot.repair_origin_run import RepairOriginBinding
+from skyvern.forge.sdk.copilot.repair_origin_run import (
+    OriginBlockOutput,
+    OriginExecutionSettings,
+    OriginOutputRefusal,
+    OriginOutputRefusalDetail,
+    OriginOutputSnapshot,
+    RepairOriginBinding,
+    SelectedOutputSource,
+)
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion
 from skyvern.forge.sdk.copilot.review_gate import build_review_projection, workflow_block_fingerprints
-from skyvern.forge.sdk.copilot.runtime import (
-    AgentContext,
-    OriginRunRedactionRegistry,
-)
+from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.screenshot_utils import (
     ScreenshotActionRelation,
     ScreenshotEntry,
@@ -108,10 +112,13 @@ from skyvern.forge.sdk.workflow.models.workflow import (
 from skyvern.schemas.proxy_location import ProxyLocationInput
 from skyvern.schemas.runs import ProxyLocation
 from skyvern.schemas.self_heal import HealEpisode
-from skyvern.schemas.workflows import BlockType
+from skyvern.schemas.workflows import BlockStatus, BlockType
 from skyvern.services import workflow_service as workflow_service_module
+from skyvern.webeye import real_browser_manager
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import ActionStatus
+from skyvern.webeye.real_browser_manager import RealBrowserManager
+from tests.unit.conftest import requires_chromium
 
 DISPATCHED_LOGIN_GATE_HTML = (
     "<html><head><title>Sign in</title></head><body><main>"
@@ -146,6 +153,7 @@ def wire_credential_vault(
     *,
     credential_id: str = "cred_1",
     name: str = "authtest simple",
+    vault_type: CredentialVaultType = CredentialVaultType.SKYVERN,
 ) -> Credential:
     """Serve one saved credential from the org database and ``secrets`` from its vault."""
     now = datetime(2026, 1, 1, tzinfo=UTC)
@@ -153,7 +161,7 @@ def wire_credential_vault(
         credential_id=credential_id,
         organization_id="org-1",
         name=name,
-        vault_type=CredentialVaultType.SKYVERN,
+        vault_type=vault_type,
         item_id="item_1",
         credential_type=CredentialType.PASSWORD,
         username=secrets.username,
@@ -171,12 +179,14 @@ def wire_credential_vault(
         ),
         raising=False,
     )
-    vault = SimpleNamespace(get_credential_item=AsyncMock(return_value=SimpleNamespace(name=name, credential=secrets)))
+    vault = SimpleNamespace(
+        get_credential_item=AsyncMock(return_value=SimpleNamespace(name=name, credential=secrets, login_sites=None))
+    )
     # `app` is an AppHolder proxy without __delattr__; patch the underlying instance so teardown can delete it.
     monkeypatch.setattr(
         object.__getattribute__(forge_app, "_inst"),
         "CREDENTIAL_VAULT_SERVICES",
-        {CredentialVaultType.SKYVERN: vault},
+        {vault_type: vault},
         raising=False,
     )
     return credential
@@ -278,6 +288,8 @@ def harness_run(
     workflow_permanent_id: str = "wpid-1",
     organization_id: str = "org-1",
     workflow_definition_sha256: str | None = None,
+    credits_used: int = 0,
+    cached_credits_used: int = 0,
 ) -> SimpleNamespace:
     """Naive-UTC created_at, as the database returns it."""
     return SimpleNamespace(
@@ -292,6 +304,8 @@ def harness_run(
         failure_reason=None,
         browser_session_id="pbs-1",
         workflow_definition_sha256=workflow_definition_sha256,
+        credits_used=credits_used,
+        cached_credits_used=cached_credits_used,
     )
 
 
@@ -310,11 +324,18 @@ def install_get_run_results_harness(
     carried_run_id: str | None = None,
     heal_episodes: list[HealEpisode] | None = None,
     run_definition_sha256: str | None = None,
+    run_credits: tuple[int, int] = (0, 0),
 ) -> SimpleNamespace:
     """Stub the collaborators ``_get_run_results`` reaches and return the ctx to call it with; the run pool is
     ``wr-1`` plus ``other_runs``, and run lookup and history listing honor their arguments."""
     pool = [
-        harness_run("wr-1", status=run_status, workflow_definition_sha256=run_definition_sha256),
+        harness_run(
+            "wr-1",
+            status=run_status,
+            workflow_definition_sha256=run_definition_sha256,
+            credits_used=run_credits[0],
+            cached_credits_used=run_credits[1],
+        ),
         *(other_runs or []),
     ]
     workflow = SimpleNamespace(
@@ -735,6 +756,50 @@ def make_build_test_ctx(
     return ctx
 
 
+def install_fresh_run_browser(monkeypatch: pytest.MonkeyPatch, session_id: str) -> None:
+    async def _acquire(acquisition_ctx: CopilotContext, **_kwargs: object) -> None:
+        acquisition_ctx.browser_session_id = session_id
+
+    monkeypatch.setattr(run_execution_module, "acquire_build_test_browser_session", _acquire)
+    monkeypatch.setattr(forge_app.WORKFLOW_SERVICE, "preview_run_seed", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        forge_app.AGENT_FUNCTION, "is_browser_memory_engine_enabled_for_org", AsyncMock(return_value=False)
+    )
+
+
+def refuse_seeded_origin_output_once(
+    monkeypatch: pytest.MonkeyPatch, ctx: CopilotContext, *, on_settings_check: bool = True
+) -> list[OriginOutputRefusalDetail]:
+    workflow = ctx.staged_workflow
+    assert workflow is not None
+    refusals = [
+        OriginOutputRefusalDetail(
+            reason=OriginOutputRefusal.CHANGED_PRODUCER, block_label="run_search", origin_workflow_run_id="wr_origin"
+        )
+    ]
+
+    def _refuse_once(
+        *_args: object, check_settings: bool = True, **_kwargs: object
+    ) -> OriginOutputRefusalDetail | None:
+        return refusals.pop() if check_settings == on_settings_check and refusals else None
+
+    monkeypatch.setattr(run_execution_module, "selected_output_run_refusal", _refuse_once)
+    origin = OriginOutputSnapshot(
+        definition=workflow.workflow_definition,
+        outputs={
+            "run_search": OriginBlockOutput(
+                status=BlockStatus.completed, has_value=True, created_at=datetime.now(UTC), value={"results": []}
+            )
+        },
+        settings=OriginExecutionSettings.of(workflow),
+    )
+    ctx.repair_origin_outputs = origin
+    ctx.frontier_selected_output_sources = {
+        "run_search": SelectedOutputSource("run_search", "wr_origin", "origin", origin)
+    }
+    return refusals
+
+
 def install_secret_carrying_run_registry(monkeypatch: pytest.MonkeyPatch, *, all_registered: bool = False) -> None:
     async def _secret_carrying_registry(
         _ctx: CopilotContext, *, workflow_run_id: str, **_kwargs: object
@@ -1001,20 +1066,7 @@ def page_with_unprobeable_vendor_embedder() -> SimpleNamespace:
     )
 
 
-@cache
-def _has_playwright_browser() -> bool:
-    try:
-        with sync_playwright() as playwright:
-            return Path(playwright.chromium.executable_path).exists()
-    except Exception:
-        return False
-
-
-def skip_no_browser(test: T) -> T:
-    return pytest.mark.skipif(
-        not _has_playwright_browser(),
-        reason="Requires Playwright browsers installed (run: playwright install chromium)",
-    )(test)
+skip_no_browser = requires_chromium
 
 
 async def _fulfill_challenge(route: Route) -> None:
@@ -1233,6 +1285,76 @@ def install_origin_run(
     )
 
 
+def recorded_session(
+    session_id: str,
+    *,
+    organization_id: str = "org-1",
+    proxy_location: ProxyLocationInput = None,
+    browser_profile_id: str | None = None,
+    browser_profile_loaded: bool = False,
+) -> PersistentBrowserSession:
+    return PersistentBrowserSession(
+        persistent_browser_session_id=session_id,
+        organization_id=organization_id,
+        created_at=ORIGIN_RUN_CREATED_AT,
+        modified_at=ORIGIN_RUN_CREATED_AT,
+        proxy_location=proxy_location,
+        browser_profile_id=browser_profile_id,
+        browser_profile_loaded=browser_profile_loaded,
+    )
+
+
+def install_named_runs(
+    monkeypatch: pytest.MonkeyPatch,
+    runs: Sequence[tuple[WorkflowRun, Workflow, tuple[list[WorkflowRunBlock], list[WorkflowRunOutputParameter]]]],
+    *,
+    parameters: Mapping[str, list[tuple[WorkflowParameter, WorkflowRunParameter]]] | None = None,
+    sessions: Sequence[PersistentBrowserSession] = (),
+) -> None:
+    """Serve each run, its version (deleted or not) and its rows by run id."""
+    by_id = {run.workflow_run_id: (run, workflow, rows) for run, workflow, rows in runs}
+    sessions_by_id = {session.persistent_browser_session_id: session for session in sessions}
+
+    async def get_workflow_run(*, workflow_run_id: str, organization_id: str | None = None) -> WorkflowRun | None:
+        return by_id[workflow_run_id][0] if workflow_run_id in by_id else None
+
+    async def get_workflow_for_workflow_run(
+        *, workflow_run_id: str, organization_id: str | None = None, filter_deleted: bool = True
+    ) -> Workflow | None:
+        workflow = by_id[workflow_run_id][1] if workflow_run_id in by_id else None
+        return None if workflow is None or (filter_deleted and workflow.deleted_at is not None) else workflow
+
+    monkeypatch.setattr(forge_app.WORKFLOW_SERVICE, "get_workflow_run", get_workflow_run)
+    monkeypatch.setattr(forge_app.DATABASE.workflows, "get_workflow_for_workflow_run", get_workflow_for_workflow_run)
+    monkeypatch.setattr(
+        forge_app.DATABASE.workflow_runs,
+        "get_workflow_run_parameters",
+        AsyncMock(side_effect=lambda *, workflow_run_id: list((parameters or {}).get(workflow_run_id, []))),
+    )
+    monkeypatch.setattr(
+        forge_app.DATABASE.observer,
+        "get_workflow_run_blocks",
+        AsyncMock(side_effect=lambda *, workflow_run_id, organization_id=None: list(by_id[workflow_run_id][2][0])),
+    )
+    monkeypatch.setattr(
+        forge_app.DATABASE.workflow_runs,
+        "get_workflow_run_output_parameters",
+        AsyncMock(side_effect=lambda *, workflow_run_id: list(by_id[workflow_run_id][2][1])),
+    )
+    monkeypatch.setattr(
+        forge_app.PERSISTENT_SESSIONS_MANAGER,
+        "get_session",
+        AsyncMock(side_effect=lambda session_id, organization_id: sessions_by_id.get(session_id)),
+        raising=False,
+    )
+
+
+def fake_tool(name: str) -> MagicMock:
+    tool = MagicMock()
+    tool.name = name
+    return tool
+
+
 def make_copilot_ctx(**overrides: object) -> CopilotContext:
     defaults: dict[str, object] = dict(
         organization_id="org-1",
@@ -1431,6 +1553,25 @@ def stub_copilot_agent_loop(
     monkeypatch.setattr("skyvern.forge.sdk.copilot.model_resolver.resolve_model_config", fake_resolve_model_config)
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.run_with_enforcement", run_with_enforcement)
     monkeypatch.setattr(copilot_agent, "schedule_agent_naming", lambda *_args: None)
+
+
+def stamping_browser_manager(monkeypatch: pytest.MonkeyPatch, touch: AsyncMock | None = None) -> RealBrowserManager:
+    """A real activity renewer whose stamps land on a mock, so tests read renewal off the manager itself."""
+    monkeypatch.setattr(
+        real_browser_manager,
+        "app",
+        SimpleNamespace(
+            DATABASE=SimpleNamespace(browser_sessions=SimpleNamespace(touch_last_activity=touch or AsyncMock()))
+        ),
+    )
+    return RealBrowserManager()
+
+
+async def stop_activity_renewer(manager: RealBrowserManager) -> None:
+    renewer = manager._session_activity_renewer
+    if renewer is not None:
+        renewer.cancel()
+        await asyncio.gather(renewer, return_exceptions=True)
 
 
 TURN_EXIT_PATHS = ("normal", "model_error", "deadline", "cancel")
@@ -1667,6 +1808,22 @@ def install_org_secondary_llm_override(monkeypatch: pytest.MonkeyPatch, handler:
     monkeypatch.setattr(api_handler_factory.LLMAPIHandlerFactory, "get_llm_api_handler", lambda _key: handler)
 
 
+def tool_called_event(
+    call_id: str, name: str, arguments: str = "{}", agent: Agent[Any] | None = None
+) -> RunItemStreamEvent:
+    call_item = MagicMock(spec=RunItem)
+    call_item.raw_item = {"call_id": call_id, "name": name, "arguments": arguments}
+    call_item.agent = agent or Agent(name="no-tools")
+    return RunItemStreamEvent(name="tool_called", item=call_item)
+
+
+def tool_output_event(call_id: str, payload: dict[str, Any]) -> RunItemStreamEvent:
+    out_item = MagicMock(spec=RunItem)
+    out_item.raw_item = {"call_id": call_id}
+    out_item.output = [{"type": "text", "text": json.dumps(payload)}]
+    return RunItemStreamEvent(name="tool_output", item=out_item)
+
+
 class FakeCopilotStream:
     """EventSourceStream stand-in recording what was sent and whether the send was accepted."""
 
@@ -1871,7 +2028,11 @@ workflow_definition:
 
 
 def receipt_message(narrative_payload: dict[str, Any]) -> MagicMock:
-    return MagicMock(sender=WorkflowCopilotChatSender.AI, narrative_payload=narrative_payload)
+    return MagicMock(
+        sender=WorkflowCopilotChatSender.AI,
+        narrative_payload=narrative_payload,
+        _narrative_payload_unreadable=False,
+    )
 
 
 def all_blocks_tested_message() -> MagicMock:

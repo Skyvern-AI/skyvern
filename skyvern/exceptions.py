@@ -375,7 +375,7 @@ class CardNumberInputMismatch(SkyvernException):
 class SecretInputMismatch(SkyvernException):
     def __init__(self) -> None:
         # No secret material in the message: not the value, its length, or its character classes.
-        super().__init__("Secret input read-back mismatch after atomic re-entry.")
+        super().__init__("Secret input read-back mismatch after re-entry.")
 
 
 class FreeTextInputMismatch(SkyvernException):
@@ -938,6 +938,29 @@ class UnresolvableNavigationHost(FailedToNavigateToUrl):
         )
 
 
+# Leads the error_message below for the same reason NO_ADDRESS_RECORD_NAV_ERROR_MARKER leads its own.
+UNREACHABLE_HOST_NAV_ERROR_MARKER = "did not accept a connection in time"
+
+
+class UnreachableNavigationHost(FailedToNavigateToUrl):
+    """The run's proxy provider reported that its connection to the target host timed out in this attempt, so the
+    tunnel failure the browser reports is recorded as the site's. It keeps the browser's own code, so every retry and
+    recovery path that reads codes still treats it as that tunnel failure; only the recorded category moves.
+    """
+
+    def __init__(
+        self, url: str, host: str, upstream_status: int, error_message: str, nav_error_code: str | None
+    ) -> None:
+        self.host = host
+        # Kept off the message: it reaches the run's failure_reason, and the status is one provider's private code.
+        self.upstream_status = upstream_status
+        super().__init__(
+            url=url,
+            error_message=f"{host} {UNREACHABLE_HOST_NAV_ERROR_MARKER}: {error_message}",
+            nav_error_code=nav_error_code,
+        )
+
+
 class FailedToReloadPage(SkyvernException):
     def __init__(self, url: str, error_message: str) -> None:
         self.url = url
@@ -1099,6 +1122,12 @@ class ScreenshotTargetClosed(FailedToTakeScreenshot):
     pass
 
 
+class ScreenshotPageHasNoDrawnArea(FailedToTakeScreenshot):
+    """The viewport collapsed to zero in one axis, so there was nothing to capture. Distinct from its
+    parent because the parent also wraps renderer crashes and protocol errors, which are ours, not the
+    page's."""
+
+
 class EmptyScrapePage(SkyvernException):
     def __init__(self) -> None:
         super().__init__("Failed to scrape the page, returned an NONE result")
@@ -1250,7 +1279,8 @@ class BitwardenGetItemError(BitwardenBaseError):
 
 
 class BitwardenListItemsError(BitwardenBaseError):
-    def __init__(self, message: str) -> None:
+    def __init__(self, message: str, *, missing_item: bool = False) -> None:
+        self.missing_item = missing_item
         super().__init__(f"Error listing items in Bitwarden: {message}")
 
 
@@ -1413,6 +1443,15 @@ class InvalidElementForTextInput(SkyvernException):
         super().__init__(message)
 
 
+class InputElementCoveredByUntypeableElement(SkyvernException):
+    def __init__(self, element_id: str, blocking_element_id: str, blocking_tag_name: str):
+        super().__init__(
+            f"The element with id={element_id} is covered by the {blocking_tag_name} element with "
+            f"id={blocking_element_id}, which doesn't support text input. Dismiss or answer the pop-up "
+            f"that owns id={blocking_element_id} first, then type into id={element_id} again."
+        )
+
+
 class FailedToClearInputField(SkyvernException):
     def __init__(self, element_id: str, tag_name: str):
         super().__init__(
@@ -1457,6 +1496,24 @@ class FailToClick(SkyvernException):
         super().__init__(f"Failed to click({anchor}). element_id={element_id}, error_msg={msg}")
 
 
+class FailToOpenLink(SkyvernException):
+    """A cross-origin link followed as a same-tab navigation that failed.
+
+    Withholds the driver's error, which names a third-party URL the planner never asked to visit and
+    so reads in the action history as the agent having left the site its goal told it to stay on.
+    """
+
+    def __init__(self, page_moved: bool) -> None:
+        # Every clause here is either true by construction (the destination is cross-origin) or
+        # measured (page_moved); a failed goto can still commit an error page, so it is never assumed.
+        landed = (
+            "The browser is no longer on the page it was on before this action."
+            if page_moved
+            else "The current page is unchanged."
+        )
+        super().__init__(f"Failed to open the link: its destination is on another site. {landed}")
+
+
 class FailToHover(SkyvernException):
     def __init__(self, element_id: str, msg: str):
         super().__init__(f"Failed to hover. element_id={element_id}, error_msg={msg}")
@@ -1492,6 +1549,15 @@ class EmptySelect(SkyvernException):
         super().__init__(
             f"nothing is selected, try to select again. element_id={element_id}",
         )
+
+
+RUN_FINALIZED_ELSEWHERE_REASON = "Another server already finalized this run"
+
+
+class ChildStartRefusedAfterLeaseLoss(SkyvernException):
+    def __init__(self, task_id: str) -> None:
+        self.task_id = task_id
+        super().__init__(RUN_FINALIZED_ELSEWHERE_REASON)
 
 
 class TaskAlreadyCanceled(SkyvernHTTPException):
@@ -1638,6 +1704,8 @@ class InvalidUrl(SkyvernHTTPException):
     def __init__(
         self, url: str, *, field_name: str = "url", reason: Literal["malformed", "unsupported scheme"] = "malformed"
     ) -> None:
+        self.field_name = field_name
+        self.reason = reason
         super().__init__(f"Invalid {field_name}: {reason}. Use an HTTP or HTTPS URL with at most 2083 characters.")
 
 
@@ -2036,7 +2104,10 @@ class BrowserSessionStartupTimeout(SkyvernHTTPException):
 
 
 class TooManyStartingBrowserSessions(SkyvernHTTPException):
-    def __init__(self, retry_after_seconds: int) -> None:
+    def __init__(self, retry_after_seconds: int, *, starting_sessions: int, max_starting_sessions: int) -> None:
+        self.retry_after_seconds = retry_after_seconds
+        self.starting_sessions = starting_sessions
+        self.max_starting_sessions = max_starting_sessions
         super().__init__(
             "Too many browser sessions are starting for this organization at once. "
             f"Retry in {retry_after_seconds} seconds.",
@@ -2179,6 +2250,19 @@ class PDFParsingError(SkyvernException):
         self.pdfplumber_error = pdfplumber_error
         super().__init__(
             f"Failed to parse PDF '{file_identifier}'. pypdf error: {pypdf_error}; pdfplumber error: {pdfplumber_error}"
+        )
+
+
+class SplitPdfTooManyPages(SkyvernException):
+    """Raised when a PDF has more pages than the split planner can excerpt within its input budget."""
+
+    def __init__(self, total_pages: int, max_pages: int, min_per_page_tokens: int) -> None:
+        self.total_pages = total_pages
+        self.max_pages = max_pages
+        super().__init__(
+            f"Cannot plan a split of a {total_pages}-page PDF: the planner reads at most {max_pages} pages, so that "
+            f"every page keeps the {min_per_page_tokens} tokens of text it needs to be assigned to a document. "
+            "Split the source PDF into smaller files first."
         )
 
 

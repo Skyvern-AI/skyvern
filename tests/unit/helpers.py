@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import secrets
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -15,14 +18,26 @@ from pytest import MonkeyPatch  # type: ignore[import-not-found]
 from skyvern.exceptions import MissingBrowserStatePage, get_user_facing_exception_message
 from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent
+from skyvern.forge.async_operations import AgentPhase, AsyncOperation, AsyncOperationPool
 from skyvern.forge.failure_classifier import classify_from_failure_reason
 from skyvern.forge.sdk.api.llm import api_handler_factory
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.models import LLMRouterConfig, LLMRouterModelConfig
+from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+from skyvern.forge.sdk.artifact.storage.base import (
+    StoredObjectChangedError,
+    StoredObjectVersion,
+    StreamingArtifactStorage,
+)
+from skyvern.forge.sdk.artifact.storage.unique_pdfs import unique_pdf_file_infos
 from skyvern.forge.sdk.db.enums import TaskType
+from skyvern.forge.sdk.db.repositories.workflow_runs import WorkflowRunBlockErrorRow
+from skyvern.forge.sdk.executor.run_liveness import RunWriteAuthority
 from skyvern.forge.sdk.models import Step, StepStatus
+from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
+from skyvern.forge.sdk.workflow.service import _merge_workflow_run_errors
 from skyvern.forge.taskv3.loop import JUSTIFY_HOLD_MESSAGE
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.utils.action_redaction import REDACTED_INPUT_VALUE, REDACTED_OTP_VALUE
@@ -282,6 +297,53 @@ def make_step(
     return Step(**base)
 
 
+class ParkedOperation(AsyncOperation):
+    """A pooled operation that runs until cancelled and, like the cloud mouse movement, swallows that cancellation."""
+
+    def __init__(self, task_id: str, *, unwind_steps: int = 0) -> None:
+        super().__init__(task_id, "PARKED", AgentPhase.scrape, page=MagicMock())
+        self.started = asyncio.Event()
+        self.settled = asyncio.Event()
+        self.handled_cancellation = False
+        self.on_cancel: Callable[[], object] | None = None
+        # Event-loop passes the operation takes to finish after its cancellation, so ending is observably later.
+        self.unwind_steps = unwind_steps
+
+    async def execute(self) -> None:
+        self.started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.handled_cancellation = True
+            if self.on_cancel is not None:
+                self.on_cancel()
+            for _ in range(self.unwind_steps):
+                await asyncio.sleep(0)
+        finally:
+            self.settled.set()
+
+
+async def start_pooled_operation(pool: AsyncOperationPool, operation: ParkedOperation) -> asyncio.Task:
+    pool.add_operations(operation.task_id, [operation])
+    pool.run_operation(operation.task_id, operation.agent_phase)
+    aio_task = pool.get_aio_task(operation.task_id, operation.type)
+    assert aio_task is not None
+    await asyncio.wait_for(operation.started.wait(), timeout=2)
+    return aio_task
+
+
+async def stop_pooled_operations(pool: AsyncOperationPool, *task_ids: str) -> None:
+    """Test teardown: reap whatever these tasks left in the process-wide pool, so no test leaks a running operation."""
+    running = [aio_task for task_id in task_ids for aio_task in pool.get_aio_tasks(task_id)]
+    for aio_task in running:
+        aio_task.cancel()
+    if running:
+        await asyncio.wait(running, timeout=2)
+    for task_id in task_ids:
+        pool._remove_aio_tasks(task_id)
+        pool._remove_operations(task_id)
+
+
 @dataclass
 class ParallelVerificationMocks:
     create_step: AsyncMock
@@ -446,7 +508,44 @@ class InMemoryTaskStepRepo:
                 setattr(task, key, value)
         return task, finish_claimed
 
-    async def update_step(self, task_id: str, step_id: str, organization_id: str | None = None, **updates: Any) -> Step:
+    async def update_task_and_claim_finish_for_cancel(
+        self,
+        task_id: str,
+        organization_id: str | None,
+        audit_actor: Any = None,
+        failure_reason: str | None = None,
+        errors: list[dict[str, Any]] | None = None,
+        extracted_information: dict[str, Any] | list | str | None = None,
+        webhook_failure_reason: str | None = None,
+    ) -> tuple[Task, bool, bool]:
+        task = self.task
+        assert task is not None and task.task_id == task_id, f"no task {task_id}"
+        if task.status.is_final():
+            return task, False, False
+
+        finish_claimed = task.finished_at is None
+        task.status = TaskStatus.canceled
+        if finish_claimed:
+            task.finished_at = datetime.now(UTC)
+        if failure_reason is not None:
+            task.failure_reason = failure_reason
+        if errors is not None:
+            task.errors = [*(task.errors or []), *errors]
+        if extracted_information is not None:
+            task.extracted_information = extracted_information
+        if webhook_failure_reason is not None:
+            task.webhook_failure_reason = webhook_failure_reason
+        return task, finish_claimed, True
+
+    async def update_step(
+        self,
+        task_id: str,
+        step_id: str,
+        organization_id: str | None = None,
+        *,
+        write_authority_for_run: Callable[[str], RunWriteAuthority | None] | None = None,
+        **updates: Any,
+    ) -> Step:
         assert self.step is not None and self.step.step_id == step_id, f"no step {step_id}"
         for key, value in updates.items():
             if key in _STEP_COUNTER_COLUMNS:
@@ -477,6 +576,7 @@ class InMemoryTaskStepRepo:
             "get_task",
             "update_task",
             "update_task_and_claim_finish",
+            "update_task_and_claim_finish_for_cancel",
             "update_step",
             "get_first_step",
             "get_task_steps",
@@ -823,3 +923,154 @@ def make_session_factory_yielding(rows: list[Any]) -> Any:
             return _Result()
 
     return staticmethod(lambda *_args: _Session())
+
+
+def make_pdf(text: str) -> bytes:
+    """A complete one-page PDF whose page text is ``text``."""
+    stream = f"BT /F1 18 Tf 20 100 Td ({text}) Tj ET".encode()
+    objects = [
+        b"<</Type/Catalog/Pages 2 0 R>>",
+        b"<</Type/Pages/Kids[3 0 R]/Count 1>>",
+        b"<</Type/Page/Parent 2 0 R/MediaBox[0 0 300 200]/Resources<</Font<</F1 4 0 R>>>>/Contents 5 0 R>>",
+        b"<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>",
+        b"<</Length %d>>stream\n" % len(stream) + stream + b"\nendstream",
+    ]
+    body, offsets = b"%PDF-1.4\n", []
+    for number, content in enumerate(objects, 1):
+        offsets.append(len(body))
+        body += b"%d 0 obj\n" % number + content + b"\nendobj\n"
+    xref = len(body)
+    body += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1)
+    body += b"".join(b"%010d 00000 n \n" % offset for offset in offsets)
+    return body + b"trailer<</Size %d/Root 1 0 R>>\nstartxref\n%d\n%%%%EOF\n" % (len(objects) + 1, xref)
+
+
+class StreamedDownloadObjects(StreamingArtifactStorage):
+    """Object-store fake serving each artifact URI's bytes only through the bounded streaming read.
+
+    ``replaced`` URIs change version once opened; ``endless`` URIs keep streaming past their stated size; ``stalled``
+    URIs never deliver a chunk.
+    """
+
+    def __init__(self, objects: dict[str, bytes | None], listing: Sequence[Any] = ()) -> None:
+        self.objects = objects
+        self.listing = list(listing)
+        self.replaced: set[str] = set()
+        self.endless: set[str] = set()
+        self.stalled: set[str] = set()
+        self.reads: list[str] = []
+        self.closed: list[str] = []
+
+    async def get_downloaded_files(self, **_: Any) -> list[Any]:
+        return list(self.listing)
+
+    def manages_local_file_uri(self, uri: str, organization_id: str) -> bool:
+        return False
+
+    def can_stream_artifact(self, artifact: Any) -> bool:
+        return True
+
+    async def stat_artifact(self, artifact: Any) -> StoredObjectVersion | None:
+        data = self.objects.get(artifact.uri)
+        return None if data is None else StoredObjectVersion(size=len(data), etag="v1")
+
+    async def open_artifact_stream(
+        self, artifact: Any, *, byte_range: tuple[int, int] | None = None, etag: str | None = None
+    ) -> Any:
+        self.reads.append(artifact.artifact_id)
+        stored = self.objects.get(artifact.uri)
+        if stored is None:
+            return None
+        data: bytes = stored
+        objects = self
+
+        class _Stream:
+            content_length = len(data)
+
+            async def iter_chunks(self, chunk_size: int) -> Any:
+                if artifact.uri in objects.replaced:
+                    raise StoredObjectChangedError(artifact.uri)
+                if artifact.uri in objects.stalled:
+                    await asyncio.Event().wait()
+                for start in range(0, len(data), chunk_size):
+                    yield data[start : start + chunk_size]
+                while artifact.uri in objects.endless:
+                    yield b"0" * chunk_size
+
+            async def aclose(self) -> None:
+                objects.closed.append(artifact.artifact_id)
+
+        return _Stream()
+
+    async def retrieve_artifact(self, artifact: Any) -> bytes | None:
+        raise AssertionError("a whole-object read is not bounded")
+
+
+def pdf_download_rows(
+    prefix: str, claimed: list[bytes], organization_id: str = "o_1", run_id: str = "wr_1"
+) -> tuple[list[Artifact], list[FileInfo]]:
+    rows = [
+        Artifact(
+            artifact_id=f"a_{i}",
+            artifact_type=ArtifactType.DOWNLOAD,
+            uri=f"{prefix}/a_{i}.pdf",
+            organization_id=organization_id,
+            run_id=run_id,
+            checksum=hashlib.sha256(data).hexdigest(),
+            file_size=len(data),
+            created_at=datetime(2026, 11, 3, i, tzinfo=UTC),
+            modified_at=datetime(2026, 11, 3, i, tzinfo=UTC),
+        )
+        for i, data in enumerate(claimed)
+    ]
+    files = [
+        FileInfo(
+            url=f"https://files.example/{row.artifact_id}",
+            checksum=row.checksum,
+            filename=f"{row.artifact_id}.pdf",
+            file_size=row.file_size,
+            artifact_id=row.artifact_id,
+        )
+        for row in rows
+    ]
+    return rows, files
+
+
+# A stored backend lists one copy only when both pinned reads prove equal content.
+PINNED_READ_CASES = [
+    ("equal", ["a_0", "a_2"]),
+    ("replaced", ["a_0", "a_1", "a_2"]),
+    ("differs", ["a_0", "a_1", "a_2"]),
+    ("oversize", ["a_0", "a_1", "a_2"]),
+    ("missing", ["a_0", "a_1", "a_2"]),
+]
+
+
+async def unique_stored_pdf_ids(monkeypatch: Any, storage: Any, prefix: str, claimed: list[bytes]) -> list[str]:
+    rows, files = pdf_download_rows(prefix, claimed)
+    monkeypatch.setattr(app, "STORAGE", storage)
+    monkeypatch.setattr(app.DATABASE.artifacts, "get_artifacts_by_ids", AsyncMock(return_value=rows))
+    return [file_info.artifact_id or "" for file_info in await unique_pdf_file_infos(files, "o_1", ["wr_1"])]
+
+
+BLOCK_ERROR_FACT_KEYS = frozenset(
+    {
+        "workflow_run_block_id",
+        "block_label",
+        "block_type",
+        "loop_index",
+        "final_url",
+        "exception_class",
+        "exception_message",
+        "failing_line",
+        "source_line",
+    }
+)
+
+
+def merge_block_error_reasons(
+    task_errors: list[dict[str, Any]], rows: list[tuple[Any, ...]], **kwargs: Any
+) -> list[dict[str, Any]]:
+    """The merged errors rows without the per-block facts, for tests that pin codes and reasoning."""
+    errors = _merge_workflow_run_errors(task_errors, [WorkflowRunBlockErrorRow(*row) for row in rows], **kwargs)
+    return [{key: value for key, value in error.items() if key not in BLOCK_ERROR_FACT_KEYS} for error in errors]

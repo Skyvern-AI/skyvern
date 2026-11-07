@@ -53,7 +53,7 @@ from skyvern.schemas.runs import RunType
 from skyvern.schemas.workflows import BlockType
 from skyvern.services import run_service, task_v2_service
 from skyvern.webeye.actions.actions import Action, InputTextAction
-from tests.unit.force_stub_app import make_workflow_run_attempts_fake
+from tests.unit.force_stub_app import make_workflow_run_attempts_fake, released_session_stub
 
 # ---------- Layer 1: truncate_oversized_jsonb_value ----------
 
@@ -364,6 +364,8 @@ async def _build_status_response(
     refresh_output_urls: Any = None,
     failure_reason: str | None = None,
     precomputed_extracted_information: list[Any] | None = None,
+    failure_category: list[dict[str, Any]] | None = None,
+    task_v2: Any = None,
 ) -> WorkflowRunResponseBase:
     now = datetime.now(timezone.utc)
     workflow = Workflow(
@@ -385,6 +387,7 @@ async def _build_status_response(
         organization_id="o_1",
         status=WorkflowRunStatus.failed if failure_reason else WorkflowRunStatus.completed,
         failure_reason=failure_reason,
+        failure_category=failure_category,
         created_at=now,
         modified_at=now,
     )
@@ -401,9 +404,10 @@ async def _build_status_response(
         workflow_service_module.app,
         "DATABASE",
         SimpleNamespace(
+            Session=released_session_stub(),
             workflows=SimpleNamespace(get_workflow_for_workflow_run=AsyncMock(return_value=workflow)),
-            observer=SimpleNamespace(get_task_v2_by_workflow_run_id=AsyncMock(return_value=None)),
-            tasks=SimpleNamespace(get_tasks_by_workflow_run_id=AsyncMock(return_value=[])),
+            observer=SimpleNamespace(get_task_v2_by_workflow_run_id=AsyncMock(return_value=task_v2)),
+            tasks=SimpleNamespace(get_tasks_for_workflow_run_status=AsyncMock(return_value=[])),
             workflow_runs=SimpleNamespace(
                 get_workflow_run_parameters=AsyncMock(return_value=[]),
                 get_workflow_run_block_errors=AsyncMock(return_value=[]),
@@ -493,7 +497,7 @@ async def test_task_run_response_caps_failure_reason_only_when_opted_in(monkeypa
     monkeypatch.setattr(
         run_service.app,
         "DATABASE",
-        SimpleNamespace(tasks=SimpleNamespace(get_run=AsyncMock(return_value=run))),
+        SimpleNamespace(Session=released_session_stub(), tasks=SimpleNamespace(get_run=AsyncMock(return_value=run))),
     )
     monkeypatch.setattr(run_service.task_v1_service, "get_task_v1_response", AsyncMock(return_value=task_v1_response))
     monkeypatch.setattr(run_service, "TaskRunResponse", lambda **kwargs: SimpleNamespace(**kwargs))
@@ -1044,9 +1048,15 @@ async def test_get_task_v2_caps_output_for_the_app_only(monkeypatch: pytest.Monk
     stored_output = {"rows": ["x" * 1024 for _ in range(200)]}
     task_v2 = SimpleNamespace(
         observer_cruise_id="tsk_v2_1",
+        browser_session_id=None,
+        workflow_run_id=None,
+        browser_address=None,
         output=stored_output,
         model_copy=lambda update: SimpleNamespace(
             observer_cruise_id="tsk_v2_1",
+            browser_session_id=None,
+            workflow_run_id=None,
+            browser_address=None,
             output=update["output"],
             model_dump=lambda by_alias: {"output": update["output"]},
         ),
@@ -1075,12 +1085,16 @@ async def test_get_task_v1_caps_extracted_information_for_the_app_only(monkeypat
     def model_copy(update: dict[str, Any]) -> SimpleNamespace:
         return SimpleNamespace(
             task_id="tsk_1",
+            browser_session_id=None,
+            browser_address=None,
             extracted_information=update["extracted_information"],
             failure_reason=update["failure_reason"],
         )
 
     task_response = SimpleNamespace(
         task_id="tsk_1",
+        browser_session_id=None,
+        browser_address=None,
         extracted_information=stored_output,
         failure_reason="f" * (cap * 2),
         model_copy=model_copy,
@@ -1123,6 +1137,7 @@ _EXEMPT_BLOCK_FIELDS = {
     "loop_values",  # capped separately, count-preserving
     "actions",  # capped per-action as they are hydrated
     "script_run",  # fixed-shape record
+    "tool_calls",  # trimmed to 512 KiB when written, oldest calls first
 }
 
 
@@ -1324,7 +1339,11 @@ async def test_get_thought_timelines_caps_text_fields_when_opted_in(monkeypatch:
     monkeypatch.setattr(
         task_v2_service.app,
         "DATABASE",
-        SimpleNamespace(observer=SimpleNamespace(get_thoughts=AsyncMock(return_value=[thought]))),
+        SimpleNamespace(
+            observer=SimpleNamespace(
+                get_thoughts=AsyncMock(return_value=[thought]), get_task_v2=AsyncMock(return_value=None)
+            )
+        ),
     )
     monkeypatch.setattr(response_value_caps, "RUN_RESPONSE_MAX_VALUE_BYTES", cap)
 
@@ -1387,6 +1406,9 @@ class _NoTasks:
         return None
 
     async def get_tasks_by_workflow_run_id(self, workflow_run_id: str) -> list[Any]:
+        return []
+
+    async def get_tasks_for_workflow_run_status(self, workflow_run_id: str) -> list[Any]:
         return []
 
 
@@ -1567,13 +1589,14 @@ async def test_run_detail_services_pass_capped_reads_to_real_repositories(
         workflow_service_module.app,
         "DATABASE",
         SimpleNamespace(
+            Session=released_session_stub(),
             workflows=SimpleNamespace(get_workflow_for_workflow_run=AsyncMock(return_value=workflow)),
             workflow_runs=workflow_runs,
             workflow_params=SimpleNamespace(get_workflow_output_parameters_by_ids=AsyncMock(return_value=[])),
             workflow_run_attempts=make_workflow_run_attempts_fake(),
             observer=observer,
             tasks=SimpleNamespace(
-                get_tasks_by_workflow_run_id=AsyncMock(return_value=[]),
+                get_tasks_for_workflow_run_status=AsyncMock(return_value=[]),
                 get_tasks_actions=AsyncMock(return_value=[]),
             ),
         ),
