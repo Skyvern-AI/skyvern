@@ -17,6 +17,7 @@ async function copyText(text: string): Promise<boolean> {
   }
 
   // Fallback for HTTP or when clipboard API fails
+  const previousFocus = document.activeElement;
   const textArea = document.createElement("textarea");
   textArea.value = text;
   textArea.style.position = "fixed";
@@ -33,6 +34,9 @@ async function copyText(text: string): Promise<boolean> {
     return success;
   } finally {
     document.body.removeChild(textArea);
+    if (previousFocus instanceof HTMLElement && previousFocus.isConnected) {
+      previousFocus.focus({ preventScroll: true });
+    }
   }
 }
 
