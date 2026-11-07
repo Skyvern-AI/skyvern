@@ -131,6 +131,37 @@ describe("Integrations reconnect", () => {
     );
   });
 
+  it("confirms and sets an account for a connection without one recorded", async () => {
+    installHook([
+      {
+        ...credential("goac_expired", "Sheets Bot", "error"),
+        account_recorded: false,
+      },
+    ]);
+    render(<Integrations />);
+
+    fireEvent.click(screen.getByRole("button", { name: /reconnect/i }));
+    expect(mocks.startAuthorize).not.toHaveBeenCalled();
+    expect(
+      screen.getByText(
+        "This connection has no recorded Google account. Sign in with the account it should use. Workflows using this connection will use that account.",
+      ),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(mocks.startAuthorize).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: /reconnect/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    await waitFor(() =>
+      expect(mocks.startAuthorize).toHaveBeenCalledWith(
+        expect.objectContaining({
+          credential_id: "goac_expired",
+          set_account: true,
+        }),
+      ),
+    );
+  });
+
   it("offers reconnect on an active connection too", () => {
     installHook([credential("goac_active", "Sheets Bot", "active")]);
     render(<Integrations />);
