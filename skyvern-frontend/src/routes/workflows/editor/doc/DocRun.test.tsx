@@ -209,6 +209,118 @@ describe("DocStepResult", () => {
     expect(screen.queryByTestId("doc-step-result")).toBeNull();
   });
 
+  describe("after a one-step run", () => {
+    const fullRun = (status: Status, ...blocks: WorkflowRunBlock[]) => ({
+      runId: "wr_full",
+      run: { status, downloaded_file_urls: [] },
+      blocksByLabel: new Map(blocks.map((b) => [b.label as string, b])),
+      loopsByLabel: new Map(),
+      runsByLabel: new Map(),
+      unknownLabels: new Set<string>(),
+      ranLabels: null,
+      live: false,
+      rowsLoaded: true,
+      blockRun: false,
+    });
+    const earlier = (overrides: Partial<WorkflowRunBlock> = {}) =>
+      block({
+        workflow_run_id: "wr_full",
+        modified_at: new Date(Date.now() - 2 * 60_000).toISOString(),
+        ...overrides,
+      });
+    const show = (
+      previous: ReturnType<typeof fullRun>,
+      stepRun: Record<string, unknown> = {},
+    ) => {
+      docRun.current = {
+        runId: "wr_step",
+        run: { status: Status.Completed, downloaded_file_urls: [] },
+        blocksByLabel: new Map([
+          [
+            "just_run",
+            block({ label: "just_run", workflow_run_id: "wr_step" }),
+          ],
+        ]),
+        live: false,
+        blockRun: true,
+        blockRunTarget: "just_run",
+        previous,
+        ...stepRun,
+      };
+      return render(
+        <QueryClientProvider client={new QueryClient()}>
+          <MemoryRouter initialEntries={["/studio?wr=wr_step&bl=just_run"]}>
+            <DocStepResult label="get_invoices" />
+            <DocStepResult label="just_run" />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    };
+    const lines = () => screen.getAllByTestId("doc-step-result");
+    const age = (line: HTMLElement) =>
+      line.querySelector("[data-doc-result-age]");
+
+    it("keeps the other steps' results from the full run with a muted age; the step just run has none", () => {
+      show(fullRun(Status.Completed, earlier()));
+      expect(lines()).toHaveLength(2);
+      expect(lines()[0]!.textContent).toMatch(/^Found 3 items/);
+      expect(age(lines()[0]!)?.textContent).toBe(" · 2 min ago");
+      expect(age(lines()[0]!)?.className).toContain("text-muted-foreground");
+      expect(age(lines()[1]!)).toBeNull();
+      expect(
+        screen
+          .getAllByRole("link", { name: /open run/i })[0]!
+          .getAttribute("href"),
+      ).toContain("wr_full");
+    });
+
+    it.each([
+      [
+        Status.Failed,
+        { status: Status.Failed, failure_reason: "The page never loaded." },
+        /^Failed/,
+      ],
+      [Status.Canceled, { status: Status.Running }, /^Canceled/],
+    ] as const)(
+      "shows the result of a %s full run with its age",
+      (status, overrides, text) => {
+        show(fullRun(status, earlier(overrides)));
+        expect(lines()[0]!.textContent).toMatch(text);
+        expect(age(lines()[0]!)?.textContent).toBe(" · 2 min ago");
+      },
+    );
+
+    it.each([
+      ["still running", { status: Status.Running }, null],
+      [
+        "failed before its row",
+        {
+          status: Status.Failed,
+          failure_reason: "block 'just_run' has no starting URL set.",
+        },
+        /^Failed: /,
+      ],
+    ] as const)(
+      "the step it ran keeps its own state, not the earlier result, while it has no row (%s)",
+      (_, run, own) => {
+        show(
+          fullRun(Status.Completed, earlier(), earlier({ label: "just_run" })),
+          {
+            run: { ...run, downloaded_file_urls: [] },
+            blocksByLabel: new Map(),
+            live: run.status === Status.Running,
+          },
+        );
+        expect(age(lines()[0]!)?.textContent).toBe(" · 2 min ago");
+        expect(lines()).toHaveLength(own ? 2 : 1);
+        if (own) {
+          expect(lines()[1]!.textContent).toMatch(own);
+          expect(lines()[1]!.hasAttribute("data-doc-run-failed")).toBe(true);
+        }
+      },
+    );
+  });
+
   it("shows nothing for a step an earlier run cannot speak for, even if that run failed it", () => {
     renderResult(block({ status: Status.Failed, failure_reason: "old error" }));
     expect(screen.getByTestId("doc-step-result")).toBeTruthy();
@@ -762,7 +874,11 @@ describe("DocConditional on a run", () => {
   const renderConditional = (
     executed: string | null | undefined,
     openBranch?: string,
-    opts: { skippedSteps?: number; edited?: boolean } = {},
+    opts: {
+      skippedSteps?: number;
+      edited?: boolean;
+      afterStepRun?: boolean;
+    } = {},
   ) => {
     const shown = {
       ...item,
@@ -782,12 +898,30 @@ describe("DocConditional on a run", () => {
                   label: "check_box",
                   block_type: "conditional",
                   executed_branch_id: executed,
+                  modified_at: new Date(Date.now() - 2 * 60_000).toISOString(),
                 }),
               ],
             ]),
       live: false,
       unknownLabels: new Set(opts.edited ? ["check_box"] : []),
     };
+    if (opts.afterStepRun)
+      docRun.current = {
+        runId: "wr_step",
+        run: { status: Status.Completed, downloaded_file_urls: [] },
+        blocksByLabel: new Map(),
+        live: false,
+        blockRun: true,
+        blockRunTarget: "other_step",
+        previous: {
+          ...docRun.current,
+          loopsByLabel: new Map(),
+          runsByLabel: new Map(),
+          ranLabels: null,
+          rowsLoaded: true,
+          blockRun: false,
+        },
+      };
     return render(
       <QueryClientProvider client={new QueryClient()}>
         <MemoryRouter>
@@ -826,6 +960,16 @@ describe("DocConditional on a run", () => {
     );
     expect(screen.getByTestId("doc-branch-skipped").textContent).toBe(
       "No, so these steps were skipped",
+    );
+  });
+
+  it("keeps the branch the full run took, with its age, after a one-step run of another step", () => {
+    renderConditional("b_else", undefined, { afterStepRun: true });
+    expect(tab(/otherwise/i).textContent).toMatch(/ran/);
+    const line = screen.getByTestId("doc-step-result");
+    expect(line.textContent).toMatch(/^Took Otherwise/);
+    expect(line.querySelector("[data-doc-result-age]")?.textContent).toBe(
+      " · 2 min ago",
     );
   });
 

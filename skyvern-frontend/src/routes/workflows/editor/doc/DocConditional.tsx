@@ -26,7 +26,7 @@ import { runStepByKey, type LineSplit } from "./docKeys";
 import type { DocScopeRef } from "./docGraphEdits";
 import { DocText } from "./DocText";
 import { DocDeleteConfirm, DocEditableLine } from "./DocEditing";
-import { useDocRun } from "./useDocRun";
+import { useDocRunFor } from "./useDocRunFor";
 import { docBranchSelection, selectedStepIds } from "./docBranchSelection";
 
 const MAX_VISIBLE_CONDITIONS = 3;
@@ -174,7 +174,7 @@ export function DocConditional({
   const open = actions.conditionalOpen(node.id);
   const conditions = item.branches.filter((b) => b.kind !== "otherwise");
   const otherwise = item.branches.find((b) => b.kind === "otherwise");
-  const { blocksByLabel, unknownLabels } = useDocRun();
+  const { blocksByLabel, unknownLabels } = useDocRunFor(node.data.label);
   const {
     selected,
     ranBranch: ranOnRun,

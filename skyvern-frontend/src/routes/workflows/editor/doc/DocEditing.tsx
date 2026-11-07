@@ -737,7 +737,7 @@ export function DocEditableLine({
                     className="flex items-baseline gap-2"
                   >
                     <span className="rounded bg-muted px-[5px] text-[13px] font-medium">
-                      {item.key}
+                      {item.label ?? item.key}
                     </span>
                     <span className="min-w-0 truncate text-xs text-muted-foreground">
                       {item.hint}

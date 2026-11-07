@@ -33,6 +33,7 @@ import {
 } from "../workflowEditorUtils";
 import { extractSpreadsheetIdFromUrl } from "@/util/googleSheetsUrl";
 import type { CodeBlockNodeData } from "../nodes/CodeBlockNode/types";
+import { recordListFields, stepResultIsRecord } from "./docProblems";
 import { docMainIsSetting, getDocProseFields } from "./docStepRegistry";
 
 export type DocScopeRef = SortableBlockScopeDescriptor;
@@ -1068,7 +1069,8 @@ export function toNote(
 
 export type DocReferenceGroup = {
   name: string;
-  items: Array<{ key: string; hint: string }>;
+  // `label` is shown in place of the key when the key is a path.
+  items: Array<{ key: string; hint: string; label?: string }>;
 };
 
 const ancestorsOf = (byId: Map<string, AppNode>, id: string): AppNode[] => {
@@ -1114,11 +1116,25 @@ export function referencesAt(
     (other) =>
       !ancestorIds.has(other) && !onlySometimesRunsBefore(byId, other, id),
   );
+  const self = byId.get(id);
+  const forEachLoop = self?.type === "loop" && self.data.loopKind !== "while";
   const outputs = earlier.flatMap((other) => {
     const node = byId.get(other);
-    return node && isWorkflowBlockNode(node)
-      ? [{ key: outputKey(node.data.label), hint: "Saved by an earlier step" }]
+    if (!node || !isWorkflowBlockNode(node)) return [];
+    const key = outputKey(node.data.label);
+    // A loop goes through a list, so it also gets the lists inside an earlier result.
+    const lists = forEachLoop
+      ? recordListFields(node).map((name) => ({
+          key: `${key}.extracted_information.${name}`,
+          label: name,
+          hint: `List in ${key}`,
+        }))
       : [];
+    const hint =
+      forEachLoop && stepResultIsRecord(node.type)
+        ? "Whole result, not a list"
+        : "Saved by an earlier step";
+    return [{ key, hint }, ...lists];
   });
   if (outputs.length) groups.push({ name: "Earlier steps", items: outputs });
   return groups;
