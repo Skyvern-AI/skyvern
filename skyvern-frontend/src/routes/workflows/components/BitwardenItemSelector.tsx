@@ -8,6 +8,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
+import { isAxiosError } from "axios";
 import { useBitwardenItemsQuery } from "../hooks/useBitwardenItemsQuery";
 
 type Props = {
@@ -21,7 +22,7 @@ function BitwardenItemSelector({
   onSelect,
   credentialDataType,
 }: Props) {
-  const { data, isLoading, isError } = useBitwardenItemsQuery();
+  const { data, isLoading, isError, error } = useBitwardenItemsQuery();
   const bitwardenItems = data?.items ?? [];
   const items = bitwardenItems.filter((item) =>
     credentialDataType === "password"
@@ -41,8 +42,14 @@ function BitwardenItemSelector({
   const selectedValue = items.some((item) => item.item_id === itemId)
     ? itemId
     : "";
+  const errorDetail =
+    isAxiosError<{ detail?: unknown }>(error) && error.response?.status === 400
+      ? error.response.data?.detail
+      : undefined;
   const message = isError
-    ? "Couldn't load Bitwarden items. Enter a value manually instead."
+    ? typeof errorDetail === "string"
+      ? errorDetail
+      : "Couldn't load Bitwarden items. Enter a value manually instead."
     : !data?.configured
       ? "Connect Bitwarden in Settings to list items"
       : items.length === 0

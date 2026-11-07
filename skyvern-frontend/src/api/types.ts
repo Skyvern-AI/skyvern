@@ -655,10 +655,13 @@ export interface DisablePhoneNumberRequest {
 export interface BitwardenCredential {
   email: string;
   master_password: string;
+  client_id?: string;
+  client_secret?: string;
 }
 
 export interface BitwardenCredentialSafe {
   email: string;
+  client_id?: string | null;
 }
 
 export interface BitwardenOrganizationAuthToken {
