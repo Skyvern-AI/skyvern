@@ -38,11 +38,18 @@ def _release_later(gate: asyncio.Event, delay: float) -> None:
     asyncio.get_running_loop().call_later(delay, gate.set)
 
 
+async def _skip_sleep(delay: float) -> None:
+    return None
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("should_cancel", [_never_cancel, _always_cancel], ids=["deadline", "should_cancel"])
 async def test_recover_returns_only_after_its_cancelled_poll_finished_cleanup(
-    tmp_path: Path, should_cancel: Callable[[], Awaitable[bool]]
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, should_cancel: Callable[[], Awaitable[bool]]
 ) -> None:
+    # A real admission grace spends the probe budget before the first poll, so a runner stalled during it reaches
+    # the deadline before the poll this test is about ever starts.
+    monkeypatch.setattr(provider_downloads, "asyncio", ScopedAsyncio(sleep=_skip_sleep))
     gate = asyncio.Event()
     observation = _GatedCleanupObservation(gate)
     recovery, _monitor = _recovery(tmp_path, observation)
