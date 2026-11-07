@@ -141,13 +141,13 @@ Each person in an organization is an **Admin** or a **Member**, set on [Members]
 | Role | What it can do |
 |---|---|
 | **Admin** | Everything in the organization, and the only role that can manage member roles and turn role-based access control on. |
-| **Member** | Everything else in the organization: build, run and edit agents, manage credentials, view runs and results, and reach Billing and API keys. |
+| **Member** | Build, run and edit agents, manage credentials, view runs and results, and reach Billing and API keys, subject to the limits below. |
 
-**Role-based access control is opt-in.** Until an Admin turns it on, a Member's role never refuses a request, and the app hides nothing from Members. Managing member roles stays Admin-only either way, so a Member can't grant themselves more access or switch role-based access control on.
+**Role-based access control is opt-in.** Until an Admin turns it on, a Member can access most organization actions. Managing member roles and SFTP and Concord fax adapter configuration remain Admin-only either way, including configuration reads and writes. A Member can't grant themselves more access or switch role-based access control on.
 
 Once an Admin enables it, each person's role decides what they can do and requests outside their role are refused with `403`. That covers event triggers, additional organization API keys, the 1Password connection, the [audit log](#audit-log) export and the rest of the organization's actions.
 
-Two limits apply whether or not you enable role-based access control:
+These limits also apply whether or not you enable role-based access control:
 
 - An API key can't manage API keys, event triggers or member roles, so a leaked key can't create a replacement for itself.
 - A browser session alone can't perform admin-only actions; those need a signed-in session.
