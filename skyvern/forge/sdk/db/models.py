@@ -2244,7 +2244,7 @@ class WorkflowScriptModel(Base):
     workflow_id = Column(String, nullable=True)
     workflow_run_id = Column(String, nullable=True)
     cache_key = Column(String, nullable=False)  # e.g. "test-{{ website_url }}-cache"
-    cache_key_value = Column(String, nullable=False)  # e.g. "test-greenhouse.io/job/1-cache"
+    cache_key_value = Column(String, nullable=False)  # e.g. "jobs.example.com/job/1-cache"
     status = Column(String, nullable=True, default="published")
 
     # Script pinning
