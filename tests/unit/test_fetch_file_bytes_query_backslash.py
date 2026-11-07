@@ -216,3 +216,18 @@ async def test_ordinary_no_backslash_default_saves(local_server: Any) -> None:
         url, authorize_request_hop=_authz(), download_scope=_SCOPE, approved_initial_url=url
     )
     assert response.body == _SAMPLE_BODY
+
+
+@pytest.mark.asyncio
+async def test_guarded_fetch_sends_query_plus_and_sub_delims_unchanged(local_server: Any) -> None:
+    base, handler = local_server
+    # The raw query a browser sends for a form-encoded download link: "+" is a space and ";" "," ":"
+    # are part of the value. Re-encoding them would make the server read a different file name.
+    query = "name=Annual+Report.pdf&range=a:b,c;d"
+    url = f"{base}/dl.aspx?{query}"
+    response = await fetch_file_bytes(
+        url, authorize_request_hop=_authz(), download_scope=_SCOPE, approved_initial_url=url
+    )
+    assert response.body == _SAMPLE_BODY
+    assert handler.received_raw_query[-1] == query
+    assert urllib.parse.parse_qs(handler.received_raw_query[-1])["name"] == ["Annual Report.pdf"]
