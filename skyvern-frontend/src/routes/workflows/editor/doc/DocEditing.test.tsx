@@ -22,7 +22,7 @@ import {
 } from "@/store/WorkflowYamlEditorStore";
 import { useWorkflowSnapshotStore } from "@/store/WorkflowSnapshotStore";
 
-import { DocEditBar, DocStepPicker } from "./DocEditing";
+import { DocEditableLine, DocEditBar, DocStepPicker } from "./DocEditing";
 import { useDocSaveFailureStore } from "./docSaveState";
 import { caretOnEdge } from "./docCaret";
 import { DocStepHeader } from "./DocStep";
@@ -32,7 +32,8 @@ import { clearDocAnnouncement, docAnnouncement } from "./docAnnounce";
 import type { DocGraph } from "./docGraphEdits";
 import { getElements } from "../workflowEditorUtils";
 import { isWorkflowBlockNode } from "../nodes";
-import { block, settings } from "./docTestBlocks";
+import { block, code, forLoop, settings } from "./docTestBlocks";
+import { docStepProblems } from "./docProblems";
 
 const save = vi.hoisted(() => vi.fn(async () => undefined));
 const catalogState = vi.hoisted(() => ({
@@ -559,5 +560,114 @@ describe("caretOnEdge", () => {
       [proto.getClientRects, proto.getBoundingClientRect] = saved;
       el.remove();
     }
+  });
+});
+
+describe("@ in a loop's list", () => {
+  beforeEach(() => {
+    globalThis.ResizeObserver ??= class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    } as unknown as typeof ResizeObserver;
+    Element.prototype.scrollIntoView ??= () => {};
+  });
+  afterEach(() => {
+    Reflect.deleteProperty(document, "execCommand");
+  });
+
+  test("Enter on the array field fills the slot with its list, not a new input, and the loop can run", () => {
+    let current = getElements(
+      [
+        block("extraction", "extraction_1", "books", {
+          data_extraction_goal: "List the titles",
+          data_schema: {
+            type: "object",
+            properties: { titles: { type: "array" } },
+          },
+        }),
+        forLoop("books", null, [code("inner", null)], {
+          loop_over: null,
+          loop_variable_reference: null,
+        }),
+      ],
+      settings(),
+      true,
+    ) as DocGraph;
+    const edit = createDocEditApi({
+      ...current,
+      edits: {
+        apply: (next) => {
+          current = next;
+        },
+        update: (change) => {
+          current = { ...current, nodes: change(current.nodes) };
+        },
+        addStep: () => null,
+        duplicate: () => {},
+      },
+      finallyId: null,
+      workflowId: "wpid_test",
+      selectBranch: () => {},
+      selectedBranch: () => undefined,
+      inputKeys: [],
+      credentialKeys: new Set(),
+    });
+    const loopId = current.nodes.find((n) => n.type === "loop")!.id;
+    const created: string[] = [];
+    function Line() {
+      const actions = useContext(WorkflowDocActionsContext);
+      return (
+        <WorkflowDocActionsContext.Provider
+          value={{
+            ...actions,
+            createInput: (key) => {
+              created.push(key);
+              return true;
+            },
+          }}
+        >
+          <DocEditableLine
+            value=""
+            editable
+            autoFocus
+            label="books description"
+            references={() => edit.references(loopId, false)}
+            onChange={(v) => edit.setText(loopId, "description", v)}
+          />
+        </WorkflowDocActionsContext.Provider>
+      );
+    }
+    render(<Line />);
+    const line = screen.getByRole("textbox", { name: "books description" });
+    // jsdom has neither execCommand nor innerText: type the text the way the browser would.
+    Object.assign(document, {
+      execCommand: (_command: string, _ui: boolean, text: string) => {
+        Object.defineProperty(line, "innerText", {
+          value: text,
+          configurable: true,
+        });
+        fireEvent.input(line);
+        return true;
+      },
+    });
+    fireEvent.keyDown(line, { key: "@" });
+    expect(
+      screen.getByRole("option", {
+        name: "titlesList in extraction_1_output",
+      }),
+    ).toBeTruthy();
+    const search = screen.getByPlaceholderText("Insert a reference…");
+    fireEvent.change(search, { target: { value: "titles" } });
+    fireEvent.keyDown(search, { key: "Enter" });
+
+    expect(screen.queryByRole("option")).toBeNull();
+    expect(created).toEqual([]);
+    const loop = current.nodes.find((n) => n.id === loopId)!;
+    expect(loop.data).toMatchObject({
+      loopVariableReference:
+        "{{ extraction_1_output.extracted_information.titles }}",
+    });
+    expect(docStepProblems(current.nodes).has(loopId)).toBe(false);
   });
 });

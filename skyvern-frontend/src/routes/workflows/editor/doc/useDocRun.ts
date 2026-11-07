@@ -3,7 +3,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSearchParams } from "react-router-dom";
 import { AxiosError } from "axios";
 import { getClient } from "@/api/AxiosClient";
-import type { WorkflowRunApiResponse } from "@/api/types";
+import type { RunEngine, WorkflowRunApiResponse } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useCopilotProposalStore } from "@/store/CopilotProposalStore";
 import {
@@ -32,12 +32,20 @@ import {
   type DocBlockRuns,
   docRunRowsSettled,
   ranAnotherVersion,
+  type SavedVersion,
   settleRowsOfEndedRun,
   stepLabelsOf,
   stepsUnknownToRun,
   type DocLoopProgress,
 } from "./docRunState";
 import { useWorkflowQuery } from "../../hooks/useWorkflowQuery";
+import type { WorkflowApiResponse } from "../../types/workflowTypes";
+import { apiWorkflowToSettings } from "../apiWorkflowToSettings";
+import {
+  getElements,
+  getWorkflowBlocks,
+  workflowEffectiveDefaultEngine,
+} from "../workflowEditorUtils";
 import { docProduced } from "./docStepProduced";
 import {
   useDismissedDocRunId,
@@ -114,6 +122,69 @@ function blocksFor(
   return projection;
 }
 
+// An editor save rewrites fields of steps it did not change (the title, an empty URL, the schema's form, a loop's
+// source), so both versions are compared as the editor would save them: only a real edit hides a step's result.
+type DefaultEngine = RunEngine | null | undefined;
+const savedForm = new WeakMap<
+  WorkflowApiResponse,
+  Map<DefaultEngine, SavedVersion>
+>();
+function asEditorSaves(
+  workflow: WorkflowApiResponse,
+  effectiveDefaultEngine: DefaultEngine,
+): SavedVersion {
+  let byEngine = savedForm.get(workflow);
+  if (!byEngine) savedForm.set(workflow, (byEngine = new Map()));
+  let saved = byEngine.get(effectiveDefaultEngine);
+  if (saved) return saved;
+  saved = workflow;
+  try {
+    const { nodes, edges } = getElements(
+      JSON.parse(JSON.stringify(workflow.workflow_definition.blocks)),
+      apiWorkflowToSettings(workflow),
+      false,
+      effectiveDefaultEngine,
+    );
+    saved = {
+      ...workflow,
+      workflow_definition: {
+        ...workflow.workflow_definition,
+        blocks: getWorkflowBlocks(nodes, edges),
+      },
+    };
+  } catch (error) {
+    // A definition the editor cannot load is compared as stored.
+    console.warn("Doc: comparing a version as stored", error);
+  }
+  byEngine.set(effectiveDefaultEngine, saved);
+  return saved;
+}
+
+type RunWithWorkflow = NonNullable<DocRunData>;
+
+/** The steps a run cannot speak for in the current version: added or edited since. */
+function unknownToRun(
+  run: RunWithWorkflow | undefined,
+  current: WorkflowApiResponse | undefined,
+  proposalPending: boolean,
+  effectiveDefaultEngine: DefaultEngine,
+): { earlierVersion: boolean; unknownLabels: Set<string> } {
+  if (!run || !current)
+    return { earlierVersion: false, unknownLabels: NO_LABELS };
+  const ran = asEditorSaves(run.workflow, effectiveDefaultEngine);
+  const now = asEditorSaves(current, effectiveDefaultEngine);
+  const earlierVersion = ranAnotherVersion(ran, now, {
+    copilotTest: Boolean(run.copilot_session_id),
+    proposalPending,
+  });
+  return {
+    earlierVersion,
+    unknownLabels: earlierVersion
+      ? stepsUnknownToRun(ran.workflow_definition, now.workflow_definition)
+      : NO_LABELS,
+  };
+}
+
 export const docLatestRunKey = (
   orgId: string | undefined,
   workflowPermanentId: string | undefined,
@@ -178,12 +249,33 @@ function useLatestRun(workflowPermanentId: string | undefined) {
   });
 }
 
+type DocRunLayer = {
+  runId: string | undefined;
+  run: DocRunData;
+  blocksByLabel: Map<string, WorkflowRunBlock>;
+  loopsByLabel: Map<string, DocLoopProgress>;
+  runsByLabel: Map<string, DocBlockRuns>;
+  unknownLabels: Set<string>;
+  ranLabels: Set<string> | null;
+  earlierVersion: boolean;
+  live: boolean;
+  rowsLoaded: boolean;
+  rowsSettled: boolean;
+  owned: boolean;
+  blockRun: boolean;
+};
+
 /**
  * The studio's inspected run, or else the agent's latest run, projected onto
  * the Doc: the latest block row per step label (a looped step keeps its last
  * iteration), each loop's per-item progress, and whether the run is live.
  */
-export function useDocRun() {
+export function useDocRun(): DocRunLayer & {
+  sharedRunId: string | null;
+  blockRunTarget: string | null;
+  currentDefinition: unknown;
+  previous: DocRunLayer | null;
+} {
   const urlRunId = useStudioRunId();
   const orgId = useActiveOrgId();
   const workflowPermanentId = useWorkflowPermanentId();
@@ -209,6 +301,7 @@ export function useDocRun() {
   // A one-step run (?bl=) says nothing about the steps it was never meant to run.
   const [searchParams] = useSearchParams();
   const blockRun = Boolean(urlRunId && searchParams.has("bl"));
+  const blockRunTarget = blockRun ? searchParams.get("bl") : null;
   useEffect(() => {
     if (urlRunId && blockRun) markStepRun(urlRunId);
   }, [urlRunId, blockRun]);
@@ -249,52 +342,106 @@ export function useDocRun() {
     [timeline, run, runId],
   );
   const { data: current } = useWorkflowQuery({ workflowPermanentId });
+  const queryClient = useQueryClient();
+  // A property of the workflow, not the version: the run's version is read with the current one's.
+  const effectiveDefaultEngine = current
+    ? workflowEffectiveDefaultEngine(current, queryClient)
+    : undefined;
   const proposal = useCopilotProposalStore((s) => s.proposal);
   const proposalPending = Boolean(
     proposal &&
     (!workflowPermanentId ||
       proposal.proposed.workflow_permanent_id === workflowPermanentId),
   );
-  const earlierVersion = Boolean(
-    run &&
-    current &&
-    ranAnotherVersion(run.workflow, current, {
-      copilotTest: Boolean(run.copilot_session_id),
-      proposalPending,
-    }),
+  const { earlierVersion, unknownLabels } = useMemo(
+    () => unknownToRun(run, current, proposalPending, effectiveDefaultEngine),
+    [run, current, proposalPending, effectiveDefaultEngine],
   );
-  const unknownLabels = useMemo(
-    () =>
-      run && current && earlierVersion
-        ? stepsUnknownToRun(
-            run.workflow.workflow_definition,
-            current.workflow_definition,
-          )
-        : NO_LABELS,
-    [run, current, earlierVersion],
-  );
+  // After a one-step run, the steps it did not run keep their result from the agent's latest full run.
+  const previousRunId =
+    blockRun && sharedRunId && sharedRunId !== runId ? sharedRunId : undefined;
+  const { data: previousTimeline } = useWorkflowRunTimelineQuery({
+    workflowRunId: previousRunId,
+  });
+  const { data: previousRun } = useWorkflowRunWithWorkflowQuery({
+    workflowRunId: previousRunId,
+  });
+  const previous = useMemo((): DocRunLayer | null => {
+    if (!previousRunId || !previousTimeline || !previousRun) return null;
+    const projection = blocksFor(previousTimeline, previousRun, previousRunId);
+    return {
+      runId: previousRunId,
+      run: previousRun,
+      blocksByLabel: projection.blocks,
+      loopsByLabel: projection.loops,
+      runsByLabel: projection.runs,
+      ...unknownToRun(
+        previousRun,
+        current,
+        proposalPending,
+        effectiveDefaultEngine,
+      ),
+      ranLabels: stepLabelsOf(previousRun.workflow.workflow_definition),
+      live: runIsLogicallyActive(previousRun),
+      rowsLoaded: true,
+      rowsSettled: projection.rowsSettled,
+      owned: previousRunId === storedRunId,
+      blockRun: false,
+    };
+  }, [
+    previousRunId,
+    previousTimeline,
+    previousRun,
+    current,
+    proposalPending,
+    effectiveDefaultEngine,
+    storedRunId,
+  ]);
   // A step added since the run (even unsaved) was not in it, so it cannot be "not reached".
   const ranLabels = useMemo(
     () => (run ? stepLabelsOf(run.workflow.workflow_definition) : null),
     [run],
   );
-  return {
-    ranLabels,
-    earlierVersion,
-    unknownLabels,
-    sharedRunId: storedGone ? null : sharedRunId,
-    runId: storedGone ? undefined : runId,
-    run: storedGone ? undefined : run,
-    blocksByLabel: projection?.blocks ?? EMPTY,
-    loopsByLabel: projection?.loops ?? NO_LOOPS,
-    runsByLabel: projection?.runs ?? NO_RUNS,
-    live: Boolean(run && runIsLogicallyActive(run)),
-    // Until the run's step rows arrive, a missing row means "not loaded", not "not reached".
-    rowsLoaded: Boolean(projection),
-    rowsSettled: projection?.rowsSettled ?? false,
-    // Whether this browser started the run (or opened it by URL). Only an owned run locks the Doc,
-    // offers Stop and ends with a toast; a run from elsewhere is drawn the same but read-only.
-    owned: Boolean(urlRunId || (runId && runId === storedRunId)),
-    blockRun,
-  };
+  const currentDefinition = current?.workflow_definition;
+  // One object per change, so a memo keyed on the whole run does not recompute on every render.
+  return useMemo(
+    () => ({
+      ranLabels,
+      earlierVersion,
+      unknownLabels,
+      sharedRunId: storedGone ? null : sharedRunId,
+      runId: storedGone ? undefined : runId,
+      run: storedGone ? undefined : run,
+      blocksByLabel: projection?.blocks ?? EMPTY,
+      loopsByLabel: projection?.loops ?? NO_LOOPS,
+      runsByLabel: projection?.runs ?? NO_RUNS,
+      live: Boolean(run && runIsLogicallyActive(run)),
+      // Until the run's step rows arrive, a missing row means "not loaded", not "not reached".
+      rowsLoaded: Boolean(projection),
+      rowsSettled: projection?.rowsSettled ?? false,
+      // Whether this browser started the run (or opened it by URL). Only an owned run locks the Doc,
+      // offers Stop and ends with a toast; a run from elsewhere is drawn the same but read-only.
+      owned: Boolean(urlRunId || (runId && runId === storedRunId)),
+      blockRun,
+      blockRunTarget,
+      currentDefinition,
+      previous,
+    }),
+    [
+      ranLabels,
+      earlierVersion,
+      unknownLabels,
+      storedGone,
+      sharedRunId,
+      runId,
+      run,
+      projection,
+      urlRunId,
+      storedRunId,
+      blockRun,
+      blockRunTarget,
+      currentDefinition,
+      previous,
+    ],
+  );
 }

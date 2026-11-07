@@ -54,7 +54,7 @@ import {
 import { DocRunStepButton } from "./DocRunStepButton";
 import { useBlockPlayRegistry } from "@/store/BlockPlayRegistryStore";
 import { docTagState, type DocTagState } from "./docRunState";
-import { useDocRun } from "./useDocRun";
+import { useDocRunFor } from "./useDocRunFor";
 import { DocText } from "./DocText";
 import type { DocPlace } from "./docEditApi";
 import {
@@ -118,7 +118,7 @@ function useDocTagState(label: string): DocTagState | null {
     unknownLabels,
     ranLabels,
     rowsLoaded,
-  } = useDocRun();
+  } = useDocRunFor(label);
   const block = blocksByLabel.get(label);
   if (unknownLabels.has(label) || !rowsLoaded) return null;
   if (blockRun && !block) return null;

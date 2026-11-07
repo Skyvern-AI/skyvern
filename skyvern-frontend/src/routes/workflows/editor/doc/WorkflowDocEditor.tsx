@@ -63,6 +63,7 @@ import {
 } from "./WorkflowDocActionsContext";
 import { docBranchSelection } from "./docBranchSelection";
 import { useDocRun } from "./useDocRun";
+import { docRunFor } from "./useDocRunFor";
 import { useDocRunStore, type DocRunInput } from "./docRunStore";
 import { DocLiveIndicator } from "./DocLiveIndicator";
 import { DocOutline } from "./DocOutline";
@@ -213,7 +214,6 @@ export function WorkflowDocEditor({
   const nodes = proposal?.nodes ?? liveNodes;
   const edges = proposal?.edges ?? liveEdges;
   const docRun = useDocRun();
-  const { blocksByLabel } = docRun;
   const [searchParams] = useSearchParams();
   // A full run from the Doc holds the doc still (no adding or inserting); a one-step run doesn't.
   const fullRunGoing = docRun.live && docRun.owned && !searchParams.has("bl");
@@ -403,7 +403,7 @@ export function WorkflowDocEditor({
               node.data.label,
               branches[item.nodeId],
               byId,
-              blocksByLabel,
+              docRunFor(docRun, node.data.label).blocksByLabel,
             ).selected.branchId,
           );
         item.branches.forEach((branch) => visit(branch.children));
@@ -411,7 +411,7 @@ export function WorkflowDocEditor({
     };
     visit(tree.items);
     return selected;
-  }, [tree, byId, blocksByLabel, branches]);
+  }, [tree, byId, docRun, branches]);
   const selectBranch = (conditionalId: string, branchId: string) =>
     setBranches((current) => ({ ...current, [conditionalId]: branchId }));
   const startDemonstration = useRecordingLauncherStore(

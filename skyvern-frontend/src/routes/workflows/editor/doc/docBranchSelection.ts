@@ -51,8 +51,10 @@ export function docBranchSelection(
         ? item.branches.find((b) => b.kind === "otherwise" && !b.synthetic)
         : undefined;
   };
-  const ranBranch =
-    runBlock?.status === Status.Completed
+  // A one-step run of a branch step has no row for the conditional; the step's own row names its branch.
+  const ranBranch = !runBlock
+    ? item.branches.find(stepRan)
+    : runBlock.status === Status.Completed
       ? (item.branches.find(
           (b) => b.branchId === runBlock.executed_branch_id,
         ) ??

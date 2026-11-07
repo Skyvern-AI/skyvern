@@ -28,7 +28,7 @@ import { useHeroScreenshot } from "../../studio/runview/useHeroScreenshot";
 import { useBlockScreenshot } from "../../workflowRun/useBlockScreenshot";
 import type { WorkflowRunBlock } from "../../types/workflowRunTypes";
 import { useBlockRunTarget } from "../hooks/useBlockRunTarget";
-import { useDocRun } from "./useDocRun";
+import { useDocRunFor } from "./useDocRunFor";
 import {
   docFailureDetail,
   docFailureGuidance,
@@ -39,6 +39,7 @@ import {
 import {
   blockFailureHeadline,
   docLoopProgressText,
+  docResultAge,
   docRunStoppedByStep,
   runFailureHeadline,
   stoppedOnPurpose,
@@ -382,7 +383,8 @@ export function DocStepResult({
     unknownLabels,
     ranLabels,
     rowsLoaded,
-  } = useDocRun();
+    older,
+  } = useDocRunFor(label);
   const [openBlockId, setOpenBlockId] = useState<string | null>(null);
   const [loadedScreenId, setLoadedScreenId] = useState<string | null>(null);
   const { blockLabel: targetLabel } = useBlockRunTarget();
@@ -470,6 +472,7 @@ export function DocStepResult({
       block.status === Status.Terminated ||
       block.status === Status.Canceled);
   const duration = running || ranManyTimes ? null : formatBlockDuration(block);
+  const age = older ? docResultAge(block.modified_at, Date.now()) : null;
   const baseText = resultText(block, live, runCanceled, completedText);
   const allFiles = getBlockDownloadedFileUrls(
     block.output,
@@ -577,6 +580,11 @@ export function DocStepResult({
         )}
         {duration && ` · ${duration}`}
         {returnedNothing && " · returned nothing"}
+        {age && (
+          <span className="text-muted-foreground" data-doc-result-age>
+            {` · ${age}`}
+          </span>
+        )}
       </span>
     </>
   );

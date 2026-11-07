@@ -182,6 +182,7 @@ export function DocRunButton() {
     owned,
     blockRun,
     rowsSettled,
+    previous,
   } = useDocRun();
   const inputs = useDocRunStore((s) => s.inputs);
   const blockingBlocks = useRunValidationStore((s) => s.blockingBlocks);
@@ -444,9 +445,12 @@ export function DocRunButton() {
       </Button>
     );
 
+  const hasResults =
+    Boolean(runId) &&
+    (blocksByLabel.size > 0 || (previous?.blocksByLabel.size ?? 0) > 0);
   return (
     <div className="flex items-center gap-2">
-      {runId && blocksByLabel.size > 0 && (
+      {hasResults && (
         <Button
           variant="outline"
           className="h-8 px-3 text-xs"

@@ -6,6 +6,14 @@ import {
 } from "../../types/workflowRunTypes";
 import { describeCodeBlockFailure } from "../../workflowRun/codeBlockFailure";
 import { formatFailureReason } from "../../workflowRun/failureReasonFormat";
+import { normalizeUtcTimestamp } from "@/util/timeFormat";
+import type {
+  WorkflowApiResponse,
+  WorkflowBlock,
+} from "../../types/workflowTypes";
+import { apiWorkflowToSettings } from "../apiWorkflowToSettings";
+import { isWorkflowBlockNode } from "../nodes";
+import { getElements } from "../workflowEditorUtils";
 import { failureHeadlineInPlainWords } from "./docFailureText";
 
 export type DocTagState =
@@ -430,7 +438,7 @@ export function sameSteps(
   );
 }
 
-type SavedVersion = {
+export type SavedVersion = {
   version: number;
   workflow_definition: unknown;
   deleted_at?: string | null;
@@ -504,4 +512,109 @@ export function collectBlockRuns(
     if (hasOutput(block)) runs.withOutput += 1;
     into.set(label, runs);
   }
+}
+
+type DocRunLayer = {
+  blocksByLabel: Map<string, WorkflowRunBlock>;
+  unknownLabels: Set<string>;
+};
+
+function findStep(node: unknown, label: string): unknown {
+  if (!node || typeof node !== "object") return undefined;
+  if (isStep(node) && node.label === label) return node;
+  for (const value of Object.values(node)) {
+    const found = findStep(value, label);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+// A conditional's branch steps are not nested under it in the saved blocks, so the editor's graph says what holds the target.
+function containersOf(definition: object, target: string): string[] {
+  const blocks = (definition as { blocks?: unknown }).blocks;
+  if (!Array.isArray(blocks)) return [];
+  try {
+    const { nodes } = getElements(
+      JSON.parse(JSON.stringify(blocks)) as WorkflowBlock[],
+      apiWorkflowToSettings({
+        workflow_definition: definition,
+      } as WorkflowApiResponse),
+      false,
+    );
+    const byId = new Map(nodes.map((node) => [node.id, node]));
+    const labels: string[] = [];
+    const seen = new Set<string>();
+    let node = nodes.find(
+      (n) => isWorkflowBlockNode(n) && n.data.label === target,
+    );
+    while (node?.parentId && !seen.has(node.parentId)) {
+      seen.add(node.parentId);
+      node = byId.get(node.parentId);
+      if (node && isWorkflowBlockNode(node)) labels.push(node.data.label);
+    }
+    return labels;
+  } catch {
+    return [];
+  }
+}
+
+const runScopes = new WeakMap<object, Map<string, Set<string>>>();
+
+function stepsInRunScope(definition: unknown, target: string): Set<string> {
+  if (!definition || typeof definition !== "object") return new Set([target]);
+  let byTarget = runScopes.get(definition);
+  if (!byTarget) runScopes.set(definition, (byTarget = new Map()));
+  let scope = byTarget.get(target);
+  if (!scope) {
+    scope = new Set([
+      target,
+      ...stepLabelsOf(findStep(definition, target)),
+      ...containersOf(definition, target),
+    ]);
+    byTarget.set(target, scope);
+  }
+  return scope;
+}
+
+/**
+ * Whether a step shows the latest full run's result: a one-step run speaks only for the step it ran, the
+ * steps inside it and the containers holding it, even before their rows exist.
+ */
+export function stepShowsEarlierRun(
+  docRun: DocRunLayer & {
+    blockRun: boolean;
+    blockRunTarget?: string | null;
+    run?: { workflow?: { workflow_definition?: unknown } } | null;
+    currentDefinition?: unknown;
+    previous?: DocRunLayer | null;
+  },
+  label: string,
+): boolean {
+  const { previous, blockRunTarget } = docRun;
+  // Until the run's own definition loads (or if it fails), the current one says which steps the target holds.
+  const definition =
+    docRun.run?.workflow?.workflow_definition ?? docRun.currentDefinition;
+  const inRunScope =
+    typeof blockRunTarget === "string" &&
+    stepsInRunScope(definition, blockRunTarget).has(label);
+  return Boolean(
+    docRun.blockRun &&
+    !inRunScope &&
+    !docRun.blocksByLabel.has(label) &&
+    previous?.blocksByLabel.has(label) &&
+    !previous.unknownLabels.has(label),
+  );
+}
+
+/** How long ago an earlier run's result was produced, in a few words. */
+export function docResultAge(at: string, now: number): string | null {
+  const produced = Date.parse(normalizeUtcTimestamp(at));
+  if (Number.isNaN(produced)) return null;
+  const minutes = Math.floor((now - produced) / 60_000);
+  if (!(minutes >= 1)) return "just now";
+  if (minutes < 60) return `${minutes} min ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} hr ago`;
+  const days = Math.floor(hours / 24);
+  return `${days} day${days === 1 ? "" : "s"} ago`;
 }

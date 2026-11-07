@@ -2,7 +2,11 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import * as toastModule from "@/components/ui/use-toast";
 
 import { isWorkflowBlockNode, type AppNode } from "../nodes";
-import { createNode, getElements } from "../workflowEditorUtils";
+import {
+  createNode,
+  getElements,
+  getWorkflowBlocks,
+} from "../workflowEditorUtils";
 import { createDocEditApi, docDestinations, TOP_SCOPE } from "./docEditApi";
 import { docStepChoices } from "./docStepChoices";
 import type { DocGraph } from "./docGraphEdits";
@@ -448,6 +452,140 @@ describe("building from scratch in the doc", () => {
     expect(loopProblems(graph)).toEqual([
       "Pick the list inside titles_output_output, for example titles_output_output.extracted_information.<field>, with <field> listed in titles_output's data schema. Use titles_output_output.extracted_information only if that data schema is an array.",
     ]);
+  });
+
+  const titlesSchema = {
+    type: "object",
+    properties: {
+      titles: { type: "array", items: { type: "string" } },
+      total: { type: "integer" },
+    },
+  };
+  const loopListItems = (graph: DocGraph) => {
+    const { api } = editing(graph);
+    return api
+      .references(byLabel(graph, "books").id, false)
+      .flatMap((group) => group.items);
+  };
+  const savedLoop = (graph: DocGraph) =>
+    getWorkflowBlocks(graph.nodes, graph.edges).find(
+      (b) => b.label === "books",
+    );
+
+  test("@ on a loop's list offers an earlier extraction's array field by its plain name, and picking it saves the hand-typed path", () => {
+    const graph = loopAfter(extraction(titlesSchema), {
+      loop_variable_reference: null,
+    });
+    const offered = loopListItems(graph).find(
+      (item) => item.label === "titles",
+    );
+    expect(offered).toBeDefined();
+    expect(loopListItems(graph).map((item) => item.label)).not.toContain(
+      "total",
+    );
+
+    // The menu inserts `{{ key }}` at the caret, as for any reference.
+    const picked = editing(graph);
+    const loopId = byLabel(graph, "books").id;
+    picked.api.setText(loopId, "description", `{{ ${offered!.key} }}`);
+    const typed = editing(graph);
+    typed.api.setText(
+      loopId,
+      "description",
+      "{{ extraction_1_output.extracted_information.titles }}",
+    );
+    expect(savedLoop(picked.latest())).toEqual(savedLoop(typed.latest()));
+    expect(savedLoop(picked.latest())).toMatchObject({
+      loop_variable_reference:
+        "{{ extraction_1_output.extracted_information.titles }}",
+    });
+    expect(loopProblems(picked.latest())).toBeUndefined();
+  });
+
+  test("an extraction without an array field offers no list, and its bare result still holds Run", () => {
+    const graph = loopAfter(
+      extraction({
+        type: "object",
+        properties: { total: { type: "integer" } },
+      }),
+      { loop_variable_reference: "{{ extraction_1_output }}" },
+    );
+    expect(loopListItems(graph).map((item) => item.key)).toEqual([
+      "extraction_1_output",
+    ]);
+    expect(loopProblems(graph)).toEqual([extractionHint]);
+  });
+
+  test("a Unicode list field is offered and saves its dotted path; a name with a space or a dash is not", () => {
+    const graph = loopAfter(
+      extraction({
+        type: "object",
+        properties: {
+          éléments: { type: "array" },
+          "two words": { type: "array" },
+          "with-dash": { type: "array" },
+        },
+      }),
+      { loop_variable_reference: null },
+    );
+    expect(
+      loopListItems(graph)
+        .map((item) => item.label)
+        .filter(Boolean),
+    ).toEqual(["éléments"]);
+    const offered = loopListItems(graph).find(
+      (item) => item.label === "éléments",
+    );
+    const { api, latest } = editing(graph);
+    api.setText(
+      byLabel(graph, "books").id,
+      "description",
+      `{{ ${offered!.key} }}`,
+    );
+    expect(savedLoop(latest())).toMatchObject({
+      loop_variable_reference:
+        "{{ extraction_1_output.extracted_information.éléments }}",
+    });
+    expect(loopProblems(latest())).toBeUndefined();
+  });
+
+  test("a list field named like a dict method or a keyword is not offered and holds Run when typed, and a note on the loop gets no list", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        items: { type: "array" },
+        keys: { type: "array" },
+        class: { type: "array" },
+        titles: { type: "array" },
+      },
+    };
+    const graph = loopAfter(extraction(schema), {
+      loop_variable_reference: null,
+    });
+    expect(loopListItems(graph)).toEqual([
+      {
+        key: "extraction_1_output",
+        hint: "Whole result, not a list",
+      },
+      {
+        key: "extraction_1_output.extracted_information.titles",
+        label: "titles",
+        hint: "List in extraction_1_output",
+      },
+    ]);
+    const loopId = byLabel(graph, "books").id;
+    expect(editing(graph).api.references(loopId, true)).toEqual([]);
+
+    const typed = (field: string) =>
+      loopProblems(
+        loopAfter(extraction(schema), {
+          loop_variable_reference: `{{ extraction_1_output.extracted_information.${field} }}`,
+        }),
+      );
+    expect(typed("items")).toEqual([
+      `Rename the list field "items" in the earlier step's data schema. A loop can't go through a field with that name.`,
+    ]);
+    expect(typed("titles")).toBeUndefined();
   });
 
   test("a while loop or a loop read only from its loop value is not flagged", () => {

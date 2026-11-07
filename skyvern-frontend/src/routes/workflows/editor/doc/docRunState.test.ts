@@ -11,6 +11,7 @@ import {
   collectLoopProgress,
   type DocBlockRuns,
   docLoopProgressText,
+  docResultAge,
   docRunEndMessage,
   docRunRowsSettled,
   docTagState,
@@ -553,5 +554,13 @@ describe("ranAnotherVersion", () => {
     expect(ranAnotherVersion(at(3, "saved"), at(3, "saved"), plain)).toBe(
       false,
     );
+  });
+});
+
+describe("docResultAge", () => {
+  it("gives no age for a time it cannot read", () => {
+    const now = Date.parse("2026-11-07T04:00:00Z");
+    expect(docResultAge("2026-11-07T03:55:00", now)).toBe("5 min ago");
+    expect(docResultAge("not a time", now)).toBeNull();
   });
 });
