@@ -2895,7 +2895,7 @@ _PIERCED_QUERY_JS = (
   // The text a row renders, read through the flat tree: innerText stops at a shadow host, so an option
   // component that draws its label in its own root would read as ''. A row declared inside the row is its
   // own row, so a category's text is its own label, not its children's.
-  const composedRowText = (top, skip) => {
+  const composedRowText = (top) => {
     let out = '';
     let budget = 2000;
     const walk = (n, depth) => {
@@ -2923,7 +2923,7 @@ _PIERCED_QUERY_JS = (
         if (name === 'script' || name === 'style' || name === 'template' || name === 'noscript') continue;
         if (name === 'br') { out += ' '; continue; }
         try {
-          if (c.matches(DECLARED_ROW_SEL) || (skip && c.matches(skip))) continue;
+          if (c.matches(DECLARED_ROW_SEL)) continue;
         } catch (e) { /* unmatchable: read it */ }
         let display = '';
         try { display = getComputedStyle(c).display; } catch (e) { display = ''; }
@@ -2943,39 +2943,81 @@ _PIERCED_QUERY_JS = (
     if (!m || m === row) return false;
     return flatContains(row, m);
   };
-  // What a click on `target` picks among a menu's tagged `leaves`. A leaf that is or holds the target is the pick, the
-  // innermost when tags nest. Else the innermost declared row holding the target, named by its label leaf (a link of
-  // the row, else its first leaf outside a control). A target inside a control of the row that does not hold its label
-  // (a favourite star, a remove icon, a checkbox) picks nothing; neither does a target outside every row.
-  const menuPickOf = (leaves, target, after) => {
+  // A row's label: the own leaf that is all the text the row renders, so a row whose text also sits in a link, a badge,
+  // a description or untagged text claims nothing. A leaf holding another own leaf with text is not that label.
+  const rowLabelOf = (row, leaves) => {
+    const whole = composedRowText(row);
+    if (!whole) return null;
+    const own = leaves.filter((l) => l === row || declaredRowOf(l) === row);
+    return own.find((l) => composedRowText(l) === whole
+      && !own.some((m) => m !== l && flatContains(l, m) && composedRowText(m))) || null;
+  };
+  // The innermost leaf holding the target is the pick, unless the target is a control not holding the label (a star).
+  // A target in a declared row outside its leaves picks the row's label (for a parent row, the child under `landing`),
+  // which `landing` can only withhold; `held` is the pair read before the click, whose label the commit may rewrite.
+  const menuPickOf = (leaves, target, landing, held = null) => {
     if (!target) return null;
     let leaf = null;
     for (const l of leaves) if (flatContains(l, target) && (!leaf || flatContains(leaf, l))) leaf = l;
-    let row = leaf ? (declaredRowOf(leaf) || leaf) : null;
-    if (!leaf) {
-      for (const l of leaves) {
-        const r = declaredRowOf(l);
-        if (r && flatContains(r, target) && (!row || flatContains(row, r))) row = r;
+    if (leaf) {
+      const row = declaredRowOf(leaf) || leaf;
+      const own = leaves.filter((l) => l === row || declaredRowOf(l) === row);
+      const label = own.find((l) => {
+        const a = flatClosest(l, 'a[href]');
+        return a ? a !== row && flatContains(row, a) : false;
+      }) || own.find((l) => !separateControl(l, row)) || null;
+      const ctl = flatClosest(target, CONTROL_SEL);
+      if (label && ctl && ctl !== row && flatContains(row, ctl) && !flatMatches(ctl, 'a[href]') && !flatContains(ctl, label)) {
+        return null;
       }
-      if (!row) return null;
-      // A row holding other rows is a parent: a click on it lands on whichever child its centre covers.
-      if (leaves.some((l) => { const r = declaredRowOf(l); return r && r !== row && flatContains(row, r); })) return null;
-      // So does a row of several links, or of a link beside text outside every control: which it lands on is not
-      // known. The text is read before the click only, since a pick may draw its mark into the row.
-      const links = flatQueryAll(row, 'a[href]').filter((a) => a !== row);
-      if (links.length > 1 || (links.length === 1 && !after && composedRowText(row, CONTROL_SEL) !== '')) return null;
+      return { leaf, row, level: 'leaf' };
     }
-    const own = leaves.filter((l) => l === row || declaredRowOf(l) === row);
-    const label = own.find((l) => {
-      const a = flatClosest(l, 'a[href]');
-      return a ? a !== row && flatContains(row, a) : false;
-    }) || own.find((l) => !separateControl(l, row)) || null;
-    const ctl = flatClosest(target, CONTROL_SEL);
-    if (label && ctl && ctl !== row && flatContains(row, ctl) && !flatMatches(ctl, 'a[href]') && !flatContains(ctl, label)) {
-      return null;
-    }
-    if (leaf) return { leaf, row, level: 'leaf' };
-    return { leaf: label || own[0], row, level: 'row' };
+    const top = declaredRowOf(target);
+    if (!top || landing === LANDING_OUTSIDE) return null;
+    if (landing) for (const l of leaves) if (flatContains(l, landing) && (!leaf || flatContains(leaf, l))) leaf = l;
+    const nested = (l) => { const r = declaredRowOf(l) || l; return r !== top && flatContains(top, r); };
+    let row = top;
+    if (leaf && nested(leaf)) row = declaredRowOf(leaf) || leaf;
+    else if (leaves.some(nested)) return null;
+    const label = held && held.row === row ? held.leaf : rowLabelOf(row, leaves);
+    if (!label) return null;
+    const ctl = landing ? flatClosest(landing, CONTROL_SEL) : null;
+    if (ctl && ctl !== row && flatContains(row, ctl) && !flatContains(ctl, label)) return null;
+    return { leaf: label, row, level: 'row' };
+  };
+  // The element a recorded click reached, or LANDING_OUTSIDE when it is outside `target` (an overlay, a frame).
+  const LANDING_OUTSIDE = { outside: true };
+  const _nameOf = _getterOf(Element.prototype, 'localName');
+  const landingOf = (hit, target) => {
+    try {
+      if (!hit || /^(iframe|frame|object|embed)$/.test(String(_nameOf.call(hit)))) return LANDING_OUTSIDE;
+      return flatContains(target, hit) ? hit : LANDING_OUTSIDE;
+    } catch (e) { return LANDING_OUTSIDE; }
+  };
+  // The element at the centre of `target`, where the driver clicks only when the box is whole and in view. Null
+  // (unreadable) with no box, a box not wholly in the viewport or with several rects, or a hit outside the target.
+  const _efpDoc = Document.prototype.elementFromPoint;
+  const _efpRoot = ShadowRoot.prototype.elementFromPoint;
+  const _rectOf = Element.prototype.getBoundingClientRect;
+  const _rectsOf = Element.prototype.getClientRects;
+  const landingIn = (target) => {
+    try {
+      const r = _rectOf.call(target);
+      if (!(r.width > 0 && r.height > 0)) return null;
+      if (r.left < 0 || r.top < 0 || r.right > window.innerWidth || r.bottom > window.innerHeight) return null;
+      if (_rectsOf.call(target).length > 1) return null;
+      const x = r.left + r.width / 2;
+      const y = r.top + r.height / 2;
+      let hit = _efpDoc.call(document, x, y);
+      for (let hops = 0; hit && hops < 32; hops++) {
+        const root = _openRootOf(hit);
+        const inner = root ? _efpRoot.call(root, x, y) : null;
+        if (!inner || inner === hit) break;
+        hit = inner;
+      }
+      const at = landingOf(hit, target);
+      return at === LANDING_OUTSIDE ? null : at;
+    } catch (e) { return null; }
   };
   // The nearest ancestor matching `sel`, across shadow boundaries: closest() covers the whole chain
   // within one root, then the walk hops to that root's host and repeats. Bounded by shadow depth --
@@ -8373,6 +8415,7 @@ _CLICK_PRECHECK_JS = (
   try { target = pQS(clicked) || (arg.el && arg.el.isConnected ? arg.el : null); } catch (e) { target = (arg.el && arg.el.isConnected ? arg.el : null); }
   let isOption = false;
   let containsMenu = false;
+  let rowClick = false;
   let optText = '';
   let optState = '';
   let optSel = '';
@@ -8383,23 +8426,50 @@ _CLICK_PRECHECK_JS = (
     + _VIS_ROWS_JS
     + r"""
   let optLevel = '';
+  let optUnsure = false;
+  // Reset by every precheck so a pair held for another click never matches, and kept for a settle re-read. The landing
+  // is the first trusted pointerdown's target (a menu hidden on mousedown sends the click to the root), else a click's.
+  window.__tv3_pick = null;
+  window.__tv3_down = null;
+  window.__tv3_land = null;
+  if (!window.__tv3_land_hook) {
+    window.__tv3_land_hook = 1;
+    const record = (key) => (event) => {
+      if (!event.isTrusted || window[key]) return;
+      try { window[key] = event.composedPath()[0] || null; } catch (e) { window[key] = null; }
+    };
+    window.addEventListener('pointerdown', record('__tv3_down'), true);
+    window.addEventListener('click', record('__tv3_land'), true);
+  }
   if (target && openRows.length) {
     // A pick reads its declared row, which a component may draw in its own root. The target merely CONTAINING rows
     // (the card around the menu) is not a pick, and since a center-point click on the card can land on an arbitrary
     // row, that case is flagged so the handler makes no claims about it at all.
-    const pick = menuPickOf(openRows, target);
+    const est = landingIn(target);
+    let pick = menuPickOf(openRows, target, est);
+    const text = pick ? (pick.leaf.innerText || '').trim() || composedRowText(pick.leaf) : '';
+    if (pick && pick.level === 'row' && !text) pick = null;
     if (pick) {
       isOption = true;
       optLevel = pick.level;
-      optText = (pick.leaf.innerText || '').trim() || composedRowText(pick.leaf);
+      optText = text;
       ({ optState, optSel, optKids, optH, optVis } = pickState(pick));
-    } else if (openRows.some((el) => flatContains(target, el))) {
+      optUnsure = pick.level === 'row' && !est;
+      window.__tv3_pick = {
+        sel: clicked, leaf: pick.leaf, row: pick.row, level: pick.level, target, leaves: openRows, est: !!est,
+      };
+    } else if (openRows.some((el) => flatContains(target, el) && (declaredRowOf(el) || el) !== target)) {
       containsMenu = true;
+    } else if (openRows.some((el) => flatContains(target, el))) {
+      rowClick = true;
     }
   }
   preReset();
   pScopeEach((el, inShadow) => { if (vis(el)) preMark(el, inShadow); });
-  return { menuOpen: openRows.length > 0, isOption, containsMenu, optLevel, optText, optState, optSel, optKids, optH, optVis };
+  return {
+    menuOpen: openRows.length > 0, isOption, containsMenu, rowClick, optLevel, optUnsure, optText, optState, optSel,
+    optKids, optH, optVis,
+  };
 }"""
 )
 
@@ -8493,10 +8563,21 @@ _MENU_AFTER_JS = (
   let optKids = -1;
   let optH = -1;
   let optVis = -1;
-  // The same rule, so this reads the row the pre-click probe read.
-  const pick = menuPickOf(rows, target, true);
+  // Read the pair held before the click while both are drawn, since the click may move what lies under its point.
+  const held = window.__tv3_pick;
+  const pick = held && held.sel === clicked && held.leaf.isConnected && held.row.isConnected && vis(held.leaf)
+    && vis(held.row)
+    ? { leaf: held.leaf, row: held.row }
+    : menuPickOf(rows, target, LANDING_OUTSIDE);
   if (pick) ({ optState, optSel, optKids, optH, optVis } = pickState(pick));
-  return { stillOpen, optState, optSel, optKids, optH, optVis };
+  // With no recorded click, an unreadable estimate cannot confirm the name.
+  let withheld = false;
+  if (held && held.sel === clicked && held.level === 'row') {
+    const real = window.__tv3_down || window.__tv3_land;
+    const again = real ? menuPickOf(held.leaves, held.target, landingOf(real, held.target), held) : null;
+    withheld = real ? !again || again.leaf !== held.leaf : !held.est;
+  }
+  return { stillOpen, optState, optSel, optKids, optH, optVis, withheld };
 }"""
 )
 
@@ -8581,7 +8662,7 @@ _TAG_SUGG_SCROLLER_JS = (
 # _FIND_SUGGESTION_JS. Unlike the typeahead finder this only REPORTS (the model does the clicking), so
 # navigational rows are listed too. Tags rows data-tv3-menu="1..N" (top-to-bottom) — in-DOM tags that
 # stay valid until the menu re-renders, so the model can pick an option without a re-observe re-minting
-# ids (the staging trace's staleness trap). Existing tags are cleared only when a new menu is tagged.
+# ids (the staging trace's staleness trap). Every scan clears the existing tags before it looks.
 _FIND_MENU_JS = (
     r"""(arg) => {
   // `keepOpenTags`: the scan follows a click inside a menu that stayed open (a pick that grew its row, a control
@@ -16248,6 +16329,54 @@ def build_browser_tools(
             menu_pick[PICKED_OPTION_DATA_KEY] = text
             return f"Selected option {text!r}"
 
+        def _navigated_pick() -> str | None:
+            # A row click whose landing was never read cannot be confirmed once the page has gone.
+            return None if pre.get("optUnsure") else f"{_selected(opt)} — {_navigated_phrase()}."
+
+        async def _cascade_child_note() -> str | None:
+            # The clicked row DETACHED: a cascading category replaces the whole list with its
+            # children, which reads as "the menu closed" off the row alone — a false verdict
+            # exactly when the model must keep drilling. New rows in a floating container are those
+            # children. A real commit that closed the menu pays one probe; the wait extends only
+            # while the widget shows a busy indicator for the children it is still fetching.
+            baseline = time.monotonic() + 0.8
+            deadline = time.monotonic() + 2.4
+            while True:
+                try:
+                    found = await _click_menu_scan(page, {"sel": selector, "el": None, "cascade": True})
+                except Exception:
+                    return None
+                if isinstance(found, dict) and found.get("count"):
+                    return _menu_note(found, selector, clicked_row=True)
+                now = time.monotonic()
+                if now < baseline:
+                    # Children scheduled on a timer may announce nothing (no busy row) for a beat:
+                    # a short unconditional settling window before the busy signal is required.
+                    await asyncio.sleep(0.25)
+                    continue
+                try:
+                    busy = bool(await page.evaluate(_MENU_BUSY_JS, await _probe_arg(page, selector)))
+                except Exception:
+                    busy = False
+                if not busy or now >= deadline:
+                    return None
+                await asyncio.sleep(0.3)
+
+        async def _unnamed_click_note(after_raw: Any, *, row_click: bool) -> tuple[str | None, str | None]:
+            still_open = isinstance(after_raw, dict) and bool(after_raw.get("stillOpen"))
+            found = await _click_menu_scan(page, await _probe_arg(page, selector), keep_open_tags=still_open)
+            if isinstance(found, dict) and found.get("count"):
+                return _menu_note(found, selector), None
+            if isinstance(after_raw, dict) and not still_open:
+                child = await _cascade_child_note() if row_click else None
+                if child:
+                    return child, None
+                return (
+                    "Note: this click CLOSED the open menu; the field's value in the next observe shows whether "
+                    'an option was chosen. While the menu is open, an option\'s [data-tv3-menu="N"] selector picks it.'
+                ), None
+            return None, None
+
         if pre.get("isOption"):
             # Commit evidence, any one suffices: navigation, the menu closing, the option's own state
             # changing vs the post-hover baseline (multi-select menus commit WITHOUT closing), or a
@@ -16335,35 +16464,6 @@ def build_browser_tools(
                     return _menu_note(found, selector, clicked_row=True)
                 return None
 
-            async def _cascade_child_note() -> str | None:
-                # The clicked row DETACHED: a cascading category replaces the whole list with its
-                # children, which reads as "the menu closed" off the row alone — a false verdict
-                # exactly when the model must keep drilling. New rows in a floating container are those
-                # children. A real commit that closed the menu pays one probe; the wait extends only
-                # while the widget shows a busy indicator for the children it is still fetching.
-                baseline = time.monotonic() + 0.8
-                deadline = time.monotonic() + 2.4
-                while True:
-                    try:
-                        found = await _click_menu_scan(page, {"sel": selector, "el": None, "cascade": True})
-                    except Exception:
-                        return None
-                    if isinstance(found, dict) and found.get("count"):
-                        return _menu_note(found, selector, clicked_row=True)
-                    now = time.monotonic()
-                    if now < baseline:
-                        # Children scheduled on a timer may announce nothing (no busy row) for a beat:
-                        # a short unconditional settling window before the busy signal is required.
-                        await asyncio.sleep(0.25)
-                        continue
-                    try:
-                        busy = bool(await page.evaluate(_MENU_BUSY_JS, await _probe_arg(page, selector)))
-                    except Exception:
-                        busy = False
-                    if not busy or now >= deadline:
-                        return None
-                    await asyncio.sleep(0.3)
-
             async def _state_change_note(opt_text: str, after: dict[str, Any]) -> str:
                 # A row that did not grow cannot have expanded into itself, so nothing competes with
                 # the commit reading and the probe is not worth its page walk -- which is the
@@ -16393,10 +16493,12 @@ def build_browser_tools(
             if url_before and url_now and url_now != url_before and await _same_document() is not True:
                 # A moved URL is a navigation unless the page says it is the same document --
                 # a menu that syncs its selection into the query string never left.
-                return f"{_selected(opt)} — {_navigated_phrase()}.", None
+                return _navigated_pick(), None
             after, navigated = await _after_read()
             if after is None and navigated:
-                return f"{_selected(opt)} — {_navigated_phrase()}.", None
+                return _navigated_pick(), None
+            if after is not None and after.get("withheld"):
+                return await _unnamed_click_note(after, row_click=True)
             if after is not None and not after.get("stillOpen"):
                 child = await _cascade_child_note()
                 if child:
@@ -16405,15 +16507,14 @@ def build_browser_tools(
             if after is not None and _committed_state(after):
                 held, failure = await _state_holds(after.get("optState") or "")
                 if failure == "navigated":
-                    return f"{_selected(opt)} — {_navigated_phrase()}.", None
+                    return _navigated_pick(), None
                 if failure == "unreadable":
                     return _unverified("state-hold")
                 if held is not None:
                     return await _state_change_note(opt, held), None
             if pre.get("optLevel") == "row":
-                # The click landed on a row outside its tagged leaves (its padding, a wrapper): only a closed menu or
-                # a changed row is reported, since a pick shown on a part of the row the state does not read is not
-                # evidence that it failed.
+                # A row click is named by its label wherever it lands, unless withheld: only a closed menu or a changed
+                # row is reported, since a pick shown on a part the state does not read is not evidence that it failed.
                 return None, None
             # Menus routinely close through a fade or an async server ack; declaring "did not commit"
             # off the instantaneous read would turn those healthy commits into false errors. One
@@ -16422,7 +16523,7 @@ def build_browser_tools(
             settled, navigated = await _after_read()
             if settled is None:
                 if navigated:
-                    return f"{_selected(opt)} — {_navigated_phrase()}.", None
+                    return _navigated_pick(), None
                 return _unverified("post-click" if after is None else "settle")
             if not settled.get("stillOpen"):
                 child = await _cascade_child_note()
@@ -16432,7 +16533,7 @@ def build_browser_tools(
             if _committed_state(settled):
                 held, failure = await _state_holds(settled.get("optState") or "")
                 if failure == "navigated":
-                    return f"{_selected(opt)} — {_navigated_phrase()}.", None
+                    return _navigated_pick(), None
                 if failure == "unreadable":
                     return _unverified("state-hold")
                 if held is not None:
@@ -16457,16 +16558,7 @@ def build_browser_tools(
                 after_raw = await page.evaluate(_MENU_AFTER_JS, await _probe_arg(page, selector))
             except Exception:
                 return None, None
-            still_open = isinstance(after_raw, dict) and bool(after_raw.get("stillOpen"))
-            found = await _click_menu_scan(page, await _probe_arg(page, selector), keep_open_tags=still_open)
-            if isinstance(found, dict) and found.get("count"):
-                return _menu_note(found, selector), None
-            if isinstance(after_raw, dict) and not still_open:
-                return (
-                    "Note: this click CLOSED the open menu; the field's value in the next observe shows whether "
-                    'an option was chosen. While the menu is open, an option\'s [data-tv3-menu="N"] selector picks it.'
-                ), None
-            return None, None
+            return await _unnamed_click_note(after_raw, row_click=bool(pre.get("rowClick")))
         found = await _click_menu_scan(page, await _probe_arg(page, selector))
         if isinstance(found, dict) and found.get("count"):
             return _menu_note(found, selector), None
