@@ -6,7 +6,7 @@ workers cascade, tracks execution contexts per frame, and tears a session's stat
 target detaches.
 
 Execution contexts come from ``Runtime.enable``. That domain is enabled deliberately: the repo's own
-three-arm probe (``tests/cloud/cdp_proxy_probe/BASELINE.md``) measured no page-observable difference
+three-arm probe (the CDP proxy probe baseline in the cloud tests) measured no page-observable difference
 from an attached client, and suppressing the domain is a documented deadlock — so there is nothing to
 buy by withholding it, and frame-scoped evaluation is far simpler with it on.
 """
