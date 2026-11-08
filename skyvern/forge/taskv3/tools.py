@@ -127,6 +127,7 @@ from skyvern.forge.taskv3.loop import (
     record_type_caret_held,
     record_type_reach,
     set_driver_timeout_predicate,
+    telemetry_hash,
 )
 from skyvern.forge.taskv3.preflight import PREFLIGHT_TOOL_NAMES, preflight_tool_action
 from skyvern.forge.taskv3.run_arms import (
@@ -456,6 +457,74 @@ def _is_host_anchored_selector(selector: str) -> bool:
     return bool(_TV3_ANCHORED_SELECTOR_RE.match(_TV3_QUOTED_VALUE_RE.sub('""', selector.strip())))
 
 
+_ANY_QUOTED_RE = re.compile(r"\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*'")
+_XPATH_TRAILING_POSITION_RE = re.compile(
+    r"^(?P<base>.*\S)\s*\[\s*(?:\d+|position\(\)\s*=\s*\d+|last\(\)(?:\s*-\s*\d+)?)\s*\]$", re.DOTALL
+)
+_CSS_TRAILING_POSITION_RE = re.compile(
+    r"^(?P<base>.*?)(?::(?:nth-child|nth-last-child|nth-of-type|nth-last-of-type)\([^()]*\)|:(?:first|last)-(?:child|of-type))$",
+    re.DOTALL,
+)
+# A position on these axes picks the NEAREST element to an anchor, not one of several lookalikes.
+_XPATH_NEAREST_AXIS_RE = re.compile(
+    r"\b(?:following|preceding|following-sibling|preceding-sibling|ancestor(?:-or-self)?)::"
+)
+_POSITIONAL_LISTING_CAP = 8
+_POSITIONAL_SELECTED_CAP = 3
+
+
+def _blank_quotes(text: str) -> str:
+    """`text` with every quoted string's contents masked, same length, so structure scans skip literal text."""
+    return _ANY_QUOTED_RE.sub(lambda m: m.group(0)[0] + "_" * (len(m.group(0)) - 2) + m.group(0)[-1], text)
+
+
+def _balanced(masked: str, *, commas: bool = True) -> bool:
+    depth = 0
+    for ch in masked:
+        depth += (ch in "([") - (ch in ")]")
+        if depth < 0 or (not commas and depth == 0 and ch == ","):
+            return False
+    return depth == 0
+
+
+def _unpositioned_selector(selector: str) -> str | None:
+    """The typed selector without its trailing positional pick, or None when it has none or cannot be read
+    (None means no note, so a form this does not parse fails open)."""
+    stripped = selector.strip()
+    if not stripped or _TV3_MARKER_ANYWHERE_RE.search(stripped) or ">>" in _blank_quotes(stripped):
+        return None
+    prefix, body = "", stripped
+    engine = re.match(r"^(xpath|css)=", stripped)
+    if engine:
+        prefix, body = engine.group(0), stripped[engine.end() :]
+    elif _ENGINE_SELECTOR_RE.match(stripped) and not stripped.startswith("//"):
+        return None
+    masked = _blank_quotes(body)
+    xpath = prefix == "xpath=" or (not prefix and body.startswith(("/", "(", "..")))
+    if xpath:
+        m = _XPATH_TRAILING_POSITION_RE.match(masked)
+        if m is None or _XPATH_NEAREST_AXIS_RE.search(masked):
+            return None
+        base, masked_base = body[: m.end("base")], m.group("base")
+        if masked_base.startswith("(") and masked_base.endswith(")") and _balanced(masked_base[1:-1]):
+            base, masked_base = base[1:-1].strip(), masked_base[1:-1].strip()
+        elif "|" in masked_base:
+            # `//a | //b[1]` positions only the last branch of the union.
+            return None
+    else:
+        m = _CSS_TRAILING_POSITION_RE.match(masked)
+        # `:nth-child(An+B of S)` counts only siblings matching S, so dropping it would list unrelated elements.
+        if m is None or re.search(r"\(.*\sof\s", masked[m.end("base") :]):
+            return None
+        base, masked_base = body[: m.end("base")], m.group("base")
+        if not masked_base.strip() or masked_base[-1:] in " \t\n>+~":
+            base, masked_base = base + "*", masked_base + "*"
+    # A CSS list (`a, b:first-child`) positions only its last member.
+    if not masked_base.strip() or not _balanced(masked_base, commas=xpath):
+        return None
+    return prefix + base
+
+
 # A plain bare `#<id>`: no combinator/pseudo/attribute part, and no char that would need escaping
 # inside `[id="<id>"]` (quotes, backslash, and whitespace are excluded, so the rewrite is always safe).
 _BARE_ID_SELECTOR_RE = re.compile(r"""^#([^\s#.>+~\[\]()=,:*|^$'"\\]+)$""")
@@ -517,6 +586,12 @@ _SELECTOR_GUARD_TOOL_NAMES = frozenset(
     }
 )
 
+# The acting tools whose OK result notes what a typed positional selector chose between. The layer, toggle and
+# address probes pass through the same wrapper under their own names and never carry it.
+_POSITIONAL_NOTE_TOOL_NAMES = frozenset(_SELECTOR_GUARD_TOOL_NAMES - {"get_html", "scroll", "wait"})
+# The whole note read is bounded, so a slow page costs the action at most this.
+_POSITIONAL_NOTE_TIMEOUT_SECONDS = 1.0
+
 # The tools whose driver timeout actually propagates to the guard AND whose action needs its target
 # rendered. Measured per ANCHOR SHAPE, not per tool -- one shape answering does not mean the tool
 # does. On a display:none template: select_option on a native <select> and a click on a native
@@ -532,6 +607,140 @@ _INERT_DIAGNOSIS_TOOL_NAMES = frozenset({"click", "hover", "type", "select_combo
 # Above this, a model-authored selector names a whole class of elements rather than one control the
 # page happens to duplicate, so `_rendered_target` stops paying a visibility round trip per match.
 _RENDERED_TARGET_MATCH_CAP = 12
+
+# One element's facts for a positional-selector note: tag, accessible name, current value or selection, and
+# whether it is one of `picks`. Returned uncut so Python masks hidden values before the display cut; a
+# password's or a one-time-code box's value is never read, as in observe and get_html.
+_POSITIONAL_ROW_JS = (
+    "(el, picks) => {"
+    + OTP_INPUT_PRIVACY_JS
+    + r"""
+  let cut = false;
+  const raw = (v) => {
+    const t = String(v == null ? '' : v).replace(/\s+/g, ' ').trim();
+    if (t.length > 2000) cut = true;
+    return t.slice(0, 2000);
+  };
+  const otp = isOtpInputValueSecret(el);
+  const attr = (name) => {
+    const v = otp ? otpSafeInputAttribute(el, name, el.getAttribute(name)) : el.getAttribute(name);
+    return v && String(v).trim() ? v : '';
+  };
+  const nameOf = () => {
+    if (attr('aria-label')) return attr('aria-label');
+    const by = el.getAttribute('aria-labelledby');
+    if (by && by.trim()) {
+      const root = el.getRootNode();
+      const t = by.split(/\s+/).map((id) => {
+        const n = root.getElementById ? root.getElementById(id) : null;
+        return n ? n.textContent : '';
+      }).join(' ');
+      if (t.trim()) return t;
+    }
+    const labels = el.labels ? Array.from(el.labels).map((l) => l.innerText || l.textContent || '').join(' ') : '';
+    if (labels.trim()) return labels;
+    for (const a of ['title', 'placeholder', 'name']) { if (attr(a)) return attr(a); }
+    return /^(select|input|textarea)$/.test(el.localName) ? '' : (el.innerText || el.textContent || '');
+  };
+  const tag = el.localName;
+  const type = String(el.type || '').toLowerCase();
+  let kind = '', value = [];
+  if (tag === 'select') { kind = 'selected'; value = Array.from(el.selectedOptions || []).map((o) => raw(o.text)); }
+  else if (tag === 'input' && (type === 'checkbox' || type === 'radio')) kind = el.checked ? 'checked' : 'unchecked';
+  else if (tag === 'input' && (type === 'password' || otp)) kind = el.value ? 'hidden' : 'empty';
+  else if (tag === 'input' || tag === 'textarea') { kind = el.value ? 'value' : 'empty'; value = el.value ? [raw(el.value)] : []; }
+  const name = raw(nameOf());
+  return { tag, name, kind, value, picked: (picks || []).includes(el), cut };
+}"""
+)
+
+
+async def _positional_note(
+    page: Any, selector: str, mask_refs: Callable[[str], str] = str, *, before: str = "before this action"
+) -> tuple[str, dict[str, int]] | None:
+    """What a typed positional selector chooses between, read BEFORE the action so the values are the ones
+    the pick was made over, with counts for the log. None (no note, the action unchanged) when the selector
+    carries no position this reads, when its unpositioned form names at most one element, or on any error."""
+    base = _unpositioned_selector(selector)
+    if base is None:
+        return None
+    handles: list[Any] = []
+
+    # Only count, nth, element_handles and evaluate: the calls both browser engines' locators have.
+    async def read() -> tuple[int, int, list[dict[str, Any]]] | None:
+        base_locator = page.locator(base)
+        matches = await base_locator.count()
+        if matches <= 1:
+            return None
+        pick_locator = page.locator(selector)
+        picks = await pick_locator.count()
+        if picks == 0:
+            return None
+        if picks <= _POSITIONAL_LISTING_CAP:
+            handles.extend(await pick_locator.element_handles())
+        rows = []
+        for index in range(min(matches, _POSITIONAL_LISTING_CAP)):
+            row = await base_locator.nth(index).evaluate(_POSITIONAL_ROW_JS, handles)
+            rows.append(row if isinstance(row, dict) else {})
+        return matches, picks, rows
+
+    try:
+        found = await asyncio.wait_for(read(), _POSITIONAL_NOTE_TIMEOUT_SECONDS)
+    except Exception as exc:
+        LOG.info(
+            "taskv3 positional selector note unavailable",
+            reason="timeout" if isinstance(exc, TimeoutError) else type(exc).__name__,
+            tool_call_seq=current_tool_call_seq(),
+        )
+        found = None
+    finally:
+        if handles:
+            # Bounded like the read: on a slow engine a dispose must not hold the action.
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(
+                    asyncio.gather(*(handle.dispose() for handle in handles), return_exceptions=True),
+                    _POSITIONAL_NOTE_TIMEOUT_SECONDS,
+                )
+    if found is None:
+        return None
+    matches, picks, rows = found
+
+    def shown(text: object, page_cut: bool) -> str:
+        # Stripped of zero-width and line-forging characters first (so a split secret still matches its mask), then
+        # masked, then cut, then quoted with escaping, so page text cannot close the quote and fake the pick marker.
+        # The split-tail trim only applies where the page script cut the text: elsewhere it eats real characters.
+        clean = mask_refs(_DOWNLOAD_NOTICE_SANITIZE_RE.sub("", str(text)))
+        masked = _model_text(_without_split_hidden_tail(clean) if page_cut else clean, _MENU_ROW_TEXT_MAX * 4)
+        return repr(masked if len(masked) <= 60 else masked[:60] + "…")
+
+    marked = picks <= _POSITIONAL_LISTING_CAP
+    head = "picks by position" if marked else f"picks {picks} elements"
+    lines = [f"note: {selector} {head}; read {before}, without the position {base} matches {matches} elements:"]
+    for index, row in enumerate(rows, start=1):
+        page_cut = row.get("cut") is True
+        facts = [f"{index}. {_digest_token(row.get('tag') or 'element', 40)}"]
+        if row.get("name"):
+            facts.append(shown(row["name"], page_cut))
+        kind = row.get("kind")
+        values = [v for v in row.get("value") or [] if isinstance(v, str)]
+        if kind == "selected":
+            listed = ", ".join(shown(v, page_cut) for v in values[:_POSITIONAL_SELECTED_CAP])
+            more = f" ({len(values) - _POSITIONAL_SELECTED_CAP} more)" if len(values) > _POSITIONAL_SELECTED_CAP else ""
+            facts.append(f"selected {listed}{more}" if values else "nothing selected")
+        elif kind == "value":
+            facts.append("value " + shown(values[0] if values else "", page_cut))
+        elif kind == "hidden":
+            facts.append("value (hidden)")
+        elif kind in ("checked", "unchecked", "empty"):
+            facts.append(str(kind))
+        if marked and row.get("picked") is True:
+            facts.append("<- this selector's pick")
+        lines.append(" ".join(facts))
+    if matches > len(rows):
+        lines.append(f"({matches - len(rows)} more)")
+    if marked and not any(row.get("picked") is True for row in rows):
+        lines.append("(the pick is not among the listed rows)")
+    return "\n".join(lines), {"matches": matches, "listed": len(rows), "picks": picks}
 
 
 def _inert_target_error(selector: str) -> ToolResult:
@@ -14232,6 +14441,8 @@ def build_browser_tools(
     # concern. Threading a realm through forty call sites is how a concern gets scattered into the
     # tools, and each site becomes a place to forget it.
     _acted_realm: list[Any] = []
+    # Salts the selector hash on the positional-note log line: joinable within this run, not enumerable across runs.
+    _telemetry_salt = secrets.token_hex(16)
     # The live element handle the ref or mark resolved to, for the same single call, so a click can fall back to it
     # when the driver's selector engine cannot see the marker the resolver just wrote.
     _acted_handle: list[Any] = []
@@ -14761,15 +14972,17 @@ def build_browser_tools(
         truncated = data.get("truncated") or 0
         if truncated:
             # A page of components can spend the whole budget before reaching its submit control, and
-            # a list that stops silently reads as the complete set of what the page offers. No remedy
-            # is suggested because none exists: the list comes from querySelectorAll, so it is
-            # viewport-independent and scrolling returns the identical list and the identical count.
+            # a list that stops silently reads as the complete set of what the page offers. Scrolling is
+            # not offered: the list comes from querySelectorAll, so it is viewport-independent and
+            # scrolling returns the identical list and the identical count. The unlisted elements are
+            # still in the markup and still take a typed selector, which is the route the note names.
             note = f"note: {truncated} more element(s) matched but exceeded the element budget and are not listed"
             in_components = data.get("truncatedInComponents") or 0
             if in_components:
                 # The budget is spent light-DOM-first so the page's own submit control survives a
                 # page of components — which means component internals are what it starves.
                 note += f", {in_components} of them inside components"
+            note += "; get_html shows them, and click, type and select_option take a selector"
             lines.append(note)
         pointer_capped = int(data.get("pointerCapped") or 0)
         pointer_truncated = int(data.get("pointerTruncated") or 0)
@@ -15753,7 +15966,9 @@ def build_browser_tools(
         offset = int(args.get("offset") or 0)
         fmt = str(args.get("format") or "html").strip().lower()
         if fmt == "text":
-            return await _rendered_text_result(page, selector, offset)
+            return await _noting_other_matches(
+                page, selector, offset, await _rendered_text_result(page, selector, offset)
+            )
         if fmt != "html":
             # Falling through to markup would hand back the whole-page dump the prompt forbids, on a
             # typo the model cannot see. The enum is advisory: the spec is not emitted strict.
@@ -15793,7 +16008,45 @@ def build_browser_tools(
             report["head_fragment_len"] = head
         if notice_at is not None:
             report["notice_at"] = notice_at
-        return ToolResult.ok(markup, data=report or None)
+        return await _noting_other_matches(page, selector, offset, ToolResult.ok(markup, data=report or None))
+
+    async def _noting_other_matches(page: Any, selector: str | None, offset: int, result: ToolResult) -> ToolResult:
+        # A scoped read answers with the first match only; a selector the agent took for unique reads as
+        # the whole answer unless the count is said. The head window carries it, ahead of the content.
+        if not selector or offset or result.status != "ok":
+            return result
+        # A positional selector gets the candidate listing here, read-only, so it can be read before any action.
+        listing = (
+            await _positional_note(page, selector, _mask_refs, before="now")
+            if _unpositioned_selector(selector)
+            else None
+        )
+        if listing is not None:
+            LOG.info(
+                "taskv3 positional selector note",
+                tool="get_html",
+                tool_call_seq=current_tool_call_seq(),
+                selector_hash=telemetry_hash(_telemetry_salt, selector),
+                **listing[1],
+            )
+            line = listing[0] + "\n"
+        else:
+            try:
+                matches = await page.locator(selector).count()
+            except Exception as exc:
+                LOG.info(
+                    "taskv3 get_html match count unavailable",
+                    reason=type(exc).__name__,
+                    tool_call_seq=current_tool_call_seq(),
+                )
+                return result
+            if matches <= 1:
+                return result
+            line = f"({matches} elements match {selector}; this is the first of them.)\n"
+        data = result.data
+        if data and data.get("notice_at") is not None:
+            data = {**data, "notice_at": data["notice_at"] + len(line)}
+        return dataclasses.replace(result, content=line + result.content, data=data)
 
     async def _unreachable_error(selector: str) -> ToolResult:
         # A native checkbox or <select> inside a hidden template is refused HERE, by a visibility
@@ -23892,8 +24145,24 @@ def build_browser_tools(
                     # guard below reports, so the handler's own time is never billed to resolution.
                     record()
                     try:
+                        # Inside the try: a deadline landing in this read must still clear the realm and page slots.
+                        note = None
+                        if tool_name in _POSITIONAL_NOTE_TOOL_NAMES:
+                            note = await _positional_note(realm, selector, _mask_refs)
                         result = await handler(args)
                         await _note_frame_work(tool_name, realm, args.get("selector"), result)
+                        if note is not None and result.status == "ok":
+                            LOG.info(
+                                "taskv3 positional selector note",
+                                tool=tool_name,
+                                tool_call_seq=current_tool_call_seq(),
+                                selector_hash=telemetry_hash(_telemetry_salt, selector),
+                                **note[1],
+                            )
+                            # After the action's own sentence: goal_check reads a click's landing URL from the head
+                            # of its result.
+                            content = f"{result.content}\n{note[0]}" if result.content else note[0]
+                            result = dataclasses.replace(result, content=content)
                         return result
                     finally:
                         _acted_realm.clear()
