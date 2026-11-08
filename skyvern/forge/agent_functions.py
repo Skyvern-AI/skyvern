@@ -1058,6 +1058,10 @@ class AgentFunction:
     async def nango_powerbi_catalog_available(self, organization_id: str) -> bool:
         return False
 
+    async def powerbi_plan_allows(self, organization_id: str) -> bool | None:
+        """None when the plan could not be read."""
+        return True
+
     async def prepare_powerbi_query_hop_tokens(self, *, workflow_run: WorkflowRun, workflow: Workflow) -> None:
         return None
 
