@@ -620,7 +620,11 @@ async def skyvern_bitwarden_config_get() -> dict[str, Any]:
 async def skyvern_bitwarden_config_set(
     email: Annotated[str, Field(description="Bitwarden account email")],
 ) -> dict[str, Any]:
-    """Store the Bitwarden credential using BITWARDEN_MASTER_PASSWORD from the MCP server environment."""
+    """Store the Bitwarden credential using BITWARDEN_MASTER_PASSWORD from the MCP server environment.
+
+    Saving replaces the whole Bitwarden credential and removes any saved personal API key; to keep or add a key,
+    save it in Skyvern's Bitwarden settings.
+    """
     if has_api_key_override():
         return _request_scoped_provider_config_error("skyvern_bitwarden_config_set")
 
@@ -651,7 +655,15 @@ async def skyvern_bitwarden_config_set(
                 ),
             )
 
-    return make_result("skyvern_bitwarden_config_set", data=_safe_config_payload(data), timing_ms=timer.timing_ms)
+    return make_result(
+        "skyvern_bitwarden_config_set",
+        data=_safe_config_payload(data),
+        timing_ms=timer.timing_ms,
+        warnings=[
+            "Saving replaces the whole Bitwarden credential and removes any saved personal API key; to keep or add a key, "
+            "save it in Skyvern's Bitwarden settings."
+        ],
+    )
 
 
 async def skyvern_bitwarden_config_clear() -> dict[str, Any]:

@@ -18,6 +18,7 @@ class CredentialVaultType(StrEnum):
     BITWARDEN = "bitwarden"
     AZURE_VAULT = "azure_vault"
     GCP = "gcp"
+    AWS_SECRETS_MANAGER = "aws_secrets_manager"
     CUSTOM = "custom"
     ONEPASSWORD = "onepassword"
     BITWARDEN_CONNECTED = "bitwarden_connected"

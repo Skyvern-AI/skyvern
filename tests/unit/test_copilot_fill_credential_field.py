@@ -45,6 +45,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     admit_credential_for_live_page,
     admit_vault_login_for_live_page,
     resolve_credential_for_live_page,
+    still_on_admitted_site,
 )
 from skyvern.forge.sdk.copilot.runtime import AgentContext, browser_session_recovery
 from skyvern.forge.sdk.copilot.secret_scrub import (
@@ -161,19 +162,19 @@ def _ctx(**overrides: Any) -> SimpleNamespace:
 
 class TestCredentialFillPolicyGate:
     def test_origin_comparison_uses_browser_origin_semantics(self) -> None:
-        assert credential_fill_module._still_on_admitted_site(
+        assert still_on_admitted_site(
             "https://example.com/account",
             "https://example.com:443/login",
         )
-        assert credential_fill_module._still_on_admitted_site(
+        assert still_on_admitted_site(
             "https://example.com/account",
             "example.com/login",
         )
-        assert not credential_fill_module._still_on_admitted_site(
+        assert not still_on_admitted_site(
             "http://example.com/account",
             "https://example.com/login",
         )
-        assert not credential_fill_module._still_on_admitted_site(
+        assert not still_on_admitted_site(
             "https://example.com:8443/account",
             "https://example.com/login",
         )
@@ -192,9 +193,9 @@ class TestCredentialFillPolicyGate:
         ctx = _ctx(request_policy=_policy(allow_run_blocks=False))
         assert tools_module._credential_fill_prerequisite_error(ctx, "cred_123") is None
 
-    def test_rejects_raw_secret_turn_at_credential_fill_boundary(self) -> None:
-        ctx = _ctx(request_policy=_policy(raw_secret_detected=True))
-        assert tools_module._credential_fill_prerequisite_error(ctx, "cred_123") is not None
+    def test_allows_a_redacted_secret_turn_at_credential_fill_boundary(self) -> None:
+        ctx = _ctx(request_policy=_policy(raw_secret_detected=True, raw_secret_handling="redacted_draft"))
+        assert tools_module._credential_fill_prerequisite_error(ctx, "cred_123") is None
 
     def test_rejects_credential_outside_resolved_set(self) -> None:
         ctx = _ctx()

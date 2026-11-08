@@ -106,6 +106,10 @@ async def get_credential_vault_service(
         if not app.GCP_CREDENTIAL_VAULT_SERVICE:
             raise HTTPException(status_code=400, detail="GCP credential vault is not supported")
         service = app.GCP_CREDENTIAL_VAULT_SERVICE
+    elif vault_type == CredentialVaultType.AWS_SECRETS_MANAGER:
+        if not app.AWS_SECRETS_MANAGER_CREDENTIAL_VAULT_SERVICE:
+            raise HTTPException(status_code=400, detail="AWS Secrets Manager credential vault is not configured")
+        service = app.AWS_SECRETS_MANAGER_CREDENTIAL_VAULT_SERVICE
     elif vault_type == CredentialVaultType.CUSTOM:
         if not app.CUSTOM_CREDENTIAL_VAULT_SERVICE:
             raise HTTPException(status_code=400, detail="Custom credential vault is not configured")

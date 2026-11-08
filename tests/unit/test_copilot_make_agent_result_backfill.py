@@ -31,7 +31,7 @@ from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoic
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatMessage, WorkflowCopilotChatSender
 from tests.unit.copilot_test_helpers import failed_second_factor_run
 from tests.unit.copilot_test_helpers import make_copilot_ctx as _ctx
-from tests.unit.copilot_test_helpers import passing_run, two_page_login_yaml
+from tests.unit.copilot_test_helpers import make_missing_credential_ask_contract, passing_run, two_page_login_yaml
 
 
 def _outcome(kind: ResponseKind) -> TurnOutcome:
@@ -381,7 +381,7 @@ def test_backfill_adds_credential_prompt_for_typed_clarification_reason() -> Non
 
 
 def test_blocker_override_path_adds_credential_prompt_from_request_policy() -> None:
-    ctx = _ctx(request_policy=RequestPolicy(clarification_reason="workflow_credential_inputs_unbound"))
+    ctx = _ctx(request_policy=RequestPolicy(clarification_reason="credential_name_unresolved"))
     ctx.blocker_signal = CopilotToolBlockerSignal(
         blocker_kind="authority_denied",
         agent_steering_text="Reply to the user without updating the workflow.",
@@ -395,7 +395,7 @@ def test_blocker_override_path_adds_credential_prompt_from_request_policy() -> N
     overridden = _finalize_result_with_blocker_override(ctx, pre_override)
 
     assert overridden.narrative_payload is not None
-    assert overridden.narrative_payload["credentialPrompt"] == {"reason": "workflow_credential_inputs_unbound"}
+    assert overridden.narrative_payload["credentialPrompt"] == {"reason": "credential_name_unresolved"}
 
 
 def test_backfill_omits_credential_prompt_for_prose_link_without_policy_signal() -> None:
@@ -408,22 +408,22 @@ def test_backfill_omits_credential_prompt_for_prose_link_without_policy_signal()
     assert "credentialPrompt" not in result.narrative_payload
 
 
-def test_backfill_adds_credential_prompt_from_unbound_run_without_clarification_or_pause() -> None:
+def test_backfill_adds_credential_prompt_from_a_run_derived_ask_without_clarification_or_pause() -> None:
     ctx = _ctx(request_policy=RequestPolicy())
-    ctx.last_run_skipped_unbound_credentials = True
+    ctx.latest_diagnosis_repair_contract = make_missing_credential_ask_contract()
     result = _result(
         ctx,
         user_response="Add a credential at [Credentials](/credentials) so I can test the sign-in.",
         narrative_payload=_payload(),
     )
     assert result.narrative_payload is not None
-    assert result.narrative_payload["credentialPrompt"] == {"reason": "workflow_credential_inputs_unbound"}
+    assert result.narrative_payload["credentialPrompt"] == {"reason": "missing_credential_run_failure"}
     assert "credentialPause" not in result.narrative_payload
 
 
 def test_backfill_omits_credential_prompt_once_the_run_derived_ask_was_answered() -> None:
     ctx = _ctx(request_policy=RequestPolicy())
-    ctx.last_run_skipped_unbound_credentials = True
+    ctx.latest_diagnosis_repair_contract = make_missing_credential_ask_contract()
     ctx.credential_pause_outcome = "connected"
     result = _result(ctx, narrative_payload=_payload())
     assert result.narrative_payload is not None
@@ -432,7 +432,7 @@ def test_backfill_omits_credential_prompt_once_the_run_derived_ask_was_answered(
 
 def test_backfill_omits_run_derived_credential_prompt_while_origin_recovery_is_pending() -> None:
     ctx = _ctx(request_policy=RequestPolicy())
-    ctx.last_run_skipped_unbound_credentials = True
+    ctx.latest_diagnosis_repair_contract = make_missing_credential_ask_contract()
     ctx.credential_origin_recovery = CredentialOriginRecovery("https://idp.example.test", "pending", "cred_service")
     result = _result(ctx, narrative_payload=_payload())
     assert result.narrative_payload is not None

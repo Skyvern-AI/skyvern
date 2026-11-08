@@ -119,10 +119,14 @@ export function useStoredDocRunId(
 const stepRunKey = (runId: string) => `skyvern.docStepRun.${runId}`;
 
 /** A one-step (Play) run started in this browser; the Doc does not treat it as the agent's latest run. */
+// Blocked storage cannot remember a step run, so this visit keeps its own record.
+const stepRunsThisVisit = new Set<string>();
+
 export function markStepRun(runId: string) {
+  stepRunsThisVisit.add(runId);
   writeStored(stepRunKey(runId), "1");
 }
 
 export function isStepRun(runId: string): boolean {
-  return readStored(stepRunKey(runId)) !== null;
+  return stepRunsThisVisit.has(runId) || readStored(stepRunKey(runId)) !== null;
 }

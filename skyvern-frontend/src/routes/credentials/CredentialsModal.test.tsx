@@ -1623,6 +1623,35 @@ describe("CredentialsModal run-sequentially toggle", () => {
     });
   }, 10_000);
 
+  it("saves a login page URL change made on its own", async () => {
+    patchMock.mockResolvedValueOnce({
+      data: { credential_id: "real-cred-id", name: "Acme Login" },
+    });
+    renderEditModalFor({
+      ...editingPasswordCredential,
+      tested_url: "https://a.example.com/login",
+      extra_site_urls: ["https://b.example.com/login"],
+    });
+    fireEvent.change(
+      await screen.findByDisplayValue("https://a.example.com/login"),
+      { target: { value: "https://c.example.com/login" } },
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Update" }));
+
+    await waitFor(() => {
+      expect(patchMock).toHaveBeenCalledWith(
+        "/credentials/real-cred-id",
+        expect.objectContaining({
+          tested_url: "https://c.example.com/login",
+          expected_site_urls: [
+            "https://a.example.com/login",
+            "https://b.example.com/login",
+          ],
+        }),
+      );
+    });
+  }, 10_000);
+
   it("leaves the extra sites of a connected-vault login to that vault", async () => {
     renderEditModalFor({
       ...editingPasswordCredential,

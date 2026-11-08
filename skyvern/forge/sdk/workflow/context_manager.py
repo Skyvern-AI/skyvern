@@ -25,6 +25,7 @@ from skyvern.exceptions import (
     AzureConfigurationError,
     BitwardenBaseError,
     BitwardenListItemsError,
+    BitwardenVerificationRequiredError,
     CredentialItemNotFoundError,
     CredentialParameterNotFoundError,
     CredentialSourceNotConfiguredError,
@@ -1646,7 +1647,15 @@ class WorkflowRunContext:
             unresolved_vault_item=not item_id,
         )
         scoped = False
-        email = app.AGENT_FUNCTION.bitwarden_refetch_email(self._bitwarden_email)
+        email: str | None
+        if (
+            self.secrets[BitwardenConstants.CLIENT_ID]
+            and self.secrets[BitwardenConstants.CLIENT_SECRET]
+            and self._bitwarden_email
+        ):
+            email = self._bitwarden_email
+        else:
+            email = app.AGENT_FUNCTION.bitwarden_refetch_email(self._bitwarden_email)
         if email is None and (self._bitwarden_email is None or settings.BITWARDEN_EMAIL):
             scoped = await app.AGENT_FUNCTION.enforce_platform_bitwarden_item_ownership(
                 self.organization_id,
@@ -2283,8 +2292,8 @@ class WorkflowRunContext:
 
         candidates: list[BitwardenCredentials] = [
             (
-                None,
-                None,
+                org_bw_token.credential.client_id,
+                org_bw_token.credential.client_secret,
                 org_bw_token.credential.master_password,
                 org_bw_token.credential.email,
             )
@@ -2320,6 +2329,8 @@ class WorkflowRunContext:
 
     @staticmethod
     def _bitwarden_global_retry_reason(error: BitwardenBaseError) -> Literal["timeout", "device_verification"] | None:
+        if isinstance(error, BitwardenVerificationRequiredError):
+            return None
         error_message = str(error).lower()
         if "timeouterror" in error_message or "timed out" in error_message:
             return "timeout"

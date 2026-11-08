@@ -1,5 +1,6 @@
 import { type ComponentProps, type CSSProperties } from "react";
 
+import { AgentStepCallPanel } from "@/routes/workflows/editor/nodes/AgentStepNode/AgentStepCallPanel";
 import { Workspace } from "@/routes/workflows/editor/Workspace";
 import {
   RUN_BLOCKING_SURFACE_TOP_VAR,
@@ -25,6 +26,7 @@ export function EditorTab(props: StudioWorkspaceProps) {
     >
       <Workspace {...props} showBrowser={false} embedded />
       {showComparison ? null : <RunBlockingSurface />}
+      {showComparison ? null : <AgentStepCallPanel />}
     </div>
   );
 }

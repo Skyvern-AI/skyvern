@@ -145,6 +145,7 @@ async def google_oauth_authorize(
             app_origin=request.app_origin,
             credential_id=request.credential_id,
             initiator_id=current_user_id,
+            set_account=request.set_account,
         )
     except google_oauth_service.CredentialNotReauthorizableError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
@@ -212,13 +213,11 @@ async def google_oauth_callback(
     except ValueError as exc:
         LOG.exception("Google OAuth client credentials not configured")
         raise HTTPException(status_code=503, detail=str(exc))
-    except InvalidGrantError as exc:
-        LOG.warning("Google OAuth invalid_grant on code exchange", error=str(exc))
+    except InvalidGrantError:
+        LOG.warning("Google OAuth invalid_grant on code exchange")
         raise HTTPException(status_code=400, detail="Invalid or expired authorization code")
-    except OAuth2Error:
-        # Don't echo the exception string — OAuth2Error messages can carry the
-        # short-lived auth code or token-endpoint URLs. The full trace is in LOG.exception.
-        LOG.exception("Google OAuth protocol error on code exchange")
+    except OAuth2Error as exc:
+        LOG.warning("Google OAuth protocol error on code exchange", error_type=type(exc).__name__)
         raise HTTPException(status_code=502, detail="Google OAuth exchange failed")
     except (httpx.HTTPError, requests.RequestException, GoogleAuthError):
         LOG.exception("Transport failure exchanging Google OAuth code")
@@ -236,37 +235,46 @@ async def google_oauth_callback(
     scopes_granted = _require_scopes_from_token(token_data)
 
     identity = None
-    if google_oauth_service.GOOGLE_GMAIL_SEND_SCOPE in context.scopes_requested:
+    requested_gmail_send = (
+        google_oauth_service.GOOGLE_GMAIL_SEND_SCOPE in context.scopes_requested
+        and google_oauth_service.GOOGLE_GMAIL_SEND_SCOPE not in context.scopes_granted
+    )
+    is_reconnect = context.state in {google_oauth_service.STATE_ACTIVE, google_oauth_service.STATE_ERROR}
+    if requested_gmail_send or is_reconnect:
         try:
             identity = await google_oauth_service.verify_gmail_send_consent(
                 context,
                 scopes_granted,
                 token_data.get("id_token"),
                 resolved.config.client_id if resolved.config else "",
+                gmail_send=requested_gmail_send,
             )
         except google_oauth_service.GmailSendConsentRejectedError as exc:
             LOG.info(
-                "Rejected a Google consent that asked for send permission",
+                "Rejected Google OAuth consent",
                 organization_id=current_org.organization_id,
                 credential_id=context.credential_id,
                 rejection=exc.rejection.value,
             )
             raise HTTPException(status_code=409, detail=str(exc))
+    if identity is None:
+        identity = await google_oauth_service.verify_google_identity(
+            token_data.get("id_token"),
+            resolved.config.client_id if resolved.config else "",
+        )
+        if identity is None:
+            if is_reconnect:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Google did not return a verified account. Try again. The previous connection is unchanged.",
+                )
+            LOG.warning(
+                "Google connection stored without a verified account; it cannot be reconnected in place",
+                organization_id=current_org.organization_id,
+                credential_id=context.credential_id,
+            )
 
-    prior_state = None
-    prior_state_known = False
-    try:
-        prior_state = await app.DATABASE.google_oauth.get_credential_state(
-            current_org.organization_id, context.credential_id
-        )
-        prior_state_known = True
-    except Exception:
-        LOG.warning(
-            "Failed to read Google OAuth credential state before promotion",
-            organization_id=current_org.organization_id,
-            credential_id=context.credential_id,
-            exc_info=True,
-        )
+    prior_state = context.state
     try:
         credential = await google_oauth_service.promote_pending_credential(
             organization_id=current_org.organization_id,
@@ -281,7 +289,7 @@ async def google_oauth_callback(
     except google_oauth_service.EncryptionNotConfiguredError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
 
-    if not prior_state_known or prior_state in {google_oauth_service.STATE_ACTIVE, google_oauth_service.STATE_ERROR}:
+    if prior_state in {google_oauth_service.STATE_ACTIVE, google_oauth_service.STATE_ERROR}:
         await record_request_audit_event(
             current_org.organization_id,
             "google_oauth.update",
@@ -296,29 +304,22 @@ async def google_oauth_callback(
             credential.id,
         )
 
-    if not prior_state_known:
+    try:
+        await app.AGENT_FUNCTION.on_integration_connected(
+            organization_id=current_org.organization_id,
+            provider="google",
+            credential_id=credential.id,
+            is_reconnect=is_reconnect,
+            actor_user_id=current_user_id,
+            connected_at=credential.modified_at,
+        )
+    except Exception:
         LOG.warning(
-            "Skipping Google integration lifecycle analytics because prior credential state is unknown",
+            "Google integration lifecycle analytics hook failed",
             organization_id=current_org.organization_id,
             credential_id=credential.id,
+            exc_info=True,
         )
-    else:
-        try:
-            await app.AGENT_FUNCTION.on_integration_connected(
-                organization_id=current_org.organization_id,
-                provider="google",
-                credential_id=credential.id,
-                is_reconnect=prior_state in {google_oauth_service.STATE_ACTIVE, google_oauth_service.STATE_ERROR},
-                actor_user_id=current_user_id,
-                connected_at=credential.modified_at,
-            )
-        except Exception:
-            LOG.warning(
-                "Google integration lifecycle analytics hook failed",
-                organization_id=current_org.organization_id,
-                credential_id=credential.id,
-                exc_info=True,
-            )
 
     try:
         # A send connection's address comes from the verified ID token and is never replaced by a profile lookup.

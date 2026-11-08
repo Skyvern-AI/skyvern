@@ -85,9 +85,13 @@ from skyvern.forge.taskv3.run_arms import LOGIN_PACE_FLAG
 # Captured at import (before the _fast_upload_settle autouse fixture rebinds the module attr) so the
 # delay-specific test can exercise the real function while other upload tests skip the sleep.
 from skyvern.forge.taskv3.tools import (
+    _CLICK_PRECHECK_JS,
+    _FIND_MENU_JS,
+    _MENU_AFTER_JS,
     _MENU_OPTION_TEXTS_JS,
     _NO_QUESTION_MARKER,
     _OPAQUE_ID_RUN_RE,
+    _PIERCED_QUERY_JS,
     _SEMANTIC_COMMIT_STATE_JS,
     _TYPE_TARGET_PROBE_JS,
     _TYPING_REACH_PROBE_JS,
@@ -10955,9 +10959,10 @@ async def test_click_option_opening_submenu_is_not_a_false_error(monkeypatch: py
 
 
 @pytest.mark.asyncio
-async def test_click_trigger_reclick_reports_menu_closed_no_selection() -> None:
+async def test_click_trigger_reclick_reports_menu_closed_as_an_observation() -> None:
     # The staging loop's core move: re-clicking the trigger toggles the menu closed. That must be
-    # named — 17 byte-identical bare oks are what kept the model looping.
+    # named — 17 byte-identical bare oks are what kept the model looping. The note says what was seen
+    # (the menu closed) and not whether an option was chosen, which the field's next read shows.
     page = _ClickFakePage(
         menu_open=True, is_option=False, after_states=[{"stillOpen": 0, "optState": ""}], found_menu=None
     )
@@ -10965,7 +10970,8 @@ async def test_click_trigger_reclick_reports_menu_closed_no_selection() -> None:
     r = await _tool(tools, "click").handler({"selector": '[data-tv3="t82"]'})
     assert r.status == "ok"
     assert "CLOSED the open menu" in r.content
-    assert "no option was selected" in r.content
+    assert "no option was selected" not in r.content
+    assert "the field's value in the next observe" in r.content
 
 
 # A dropdown whose rows are a RADIOGROUP: role="radio" per row, no cursor:pointer, no
@@ -23160,7 +23166,7 @@ _PAIRING_ATTACKS = {
 # TOGETHER keeps them consistent: the check compares Beta-selector against Beta-element, agrees, and
 # passes, while the digest (which renders neither) still reads Alpha. Closing it needs an operand the
 # record never carried, which means running observe in an isolated world; see the residual note in
-# `_names_the_holder` and cloud_docs/task-v3/GOTCHAS.md.
+# `_names_the_holder` and the Task V3 gotchas doc.
 _COUPLED_TRANSPOSITION = """
   const realPush = Array.prototype.push;
   let held = null;
@@ -48414,3 +48420,1859 @@ async def test_a_dropped_controls_label_is_one_a_pointer_can_land_on() -> None:
         clicked, _ = await _dispatch(tools, "click", {"selector": f"ref={names[0][0]}"})
         assert clicked.status == "ok", clicked.content
         assert await page.evaluate("window.opened") == ["40001"]
+
+
+# A screening form whose fields live entirely inside open shadow roots: the page holds one form host with no children,
+# each dropdown host carries its question as `aria-label="Select <question>"` and as a slotted label span, the input sits
+# two roots deeper beside an empty `label[for]`, and the menu exists only while open. Each option's text is a light child
+# of its option host; the declared `role=option` row sits in nested shadow roots and receives the text through slots.
+# The radio group beside the dropdowns names its question the same way. Synthetic words throughout.
+_SHADOW_SCREENING_FORM_HTML = """<!doctype html><html><body style="margin:0;font:14px sans-serif">
+<h2 style="margin:8px 16px">Questions for the lantern crew</h2>
+<demo-form id="questions"></demo-form>
+<demo-check id="consent" style="display:block;margin:8px 16px"><div slot="label-content">I confirm these answers are my own.</div></demo-check>
+<div style="margin:8px 16px"><button id="back">Back</button> <button id="submit">Submit</button></div>
+<script>
+window.__committed = {};
+const DEFINITION = {questions: [
+  {id: 'orbit', uid: '3f9c2a71-5b0e-4d2a-9c61-0e7d4b18a2f5', type: 'select', label: 'Which orbit does the lantern keep?', multipleChoice: false, required: true,
+   values: ['Lower ring', 'Middle ring', 'Upper ring', 'Outer ring']},
+  {id: 'tools', uid: 'a81d07e4-2c3f-4b9a-8e15-6f2b9d0c7a43', type: 'select', label: 'Which instruments can you tune?', multipleChoice: true, required: true,
+   values: ['Copper bell', 'Glass harp', 'Reed pipe', 'Tin drum', 'Brass horn']},
+  {id: 'watch', uid: '5e2b8c19-7a4d-4f03-b6e2-1d9a0c3f8b77', type: 'info', label: 'The next answers help us plan the night watch.'},
+  {id: 'ferry', uid: 'c04f6a2d-91b8-4e7c-a3d5-82e1f0b6c9a4', type: 'radio', label: 'Will you ride the night ferry?', required: true, values: ['Yes', 'No']},
+  {id: 'meadow', uid: '9b7e3d50-4c1a-4a8f-9e26-3a5c8f1d0e62', type: 'select', label: 'How many meadows have you mapped?', multipleChoice: false, required: true,
+   values: ['None yet', 'One or two', 'Three or more']},
+  {id: 'remarks', uid: 'e6a1c9f2-08d3-4b5e-8f7a-c2d4e9b1a305', type: 'text', label: 'Anything else about the lantern?', required: false},
+]};
+document.getElementById('questions').setAttribute('definition', JSON.stringify(DEFINITION));
+const shadow = (el, html) => { const r = el.attachShadow({mode: 'open'}); r.innerHTML = html; return r; };
+const plain = (tag, html, display) => customElements.define(tag, class extends HTMLElement {
+  connectedCallback() { if (this.shadowRoot) return; this.style.display = display || 'block'; shadow(this, html); }
+});
+plain('demo-clamp', '<div style="display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden"><slot></slot></div>');
+plain('demo-text', '<p style="margin:0"><slot></slot></p>');
+plain('demo-option-item', '<div role="option" aria-disabled="false" aria-selected="false" tabindex="-1" '
+  + 'style="cursor:pointer;padding:8px 12px;line-height:21px"><demo-text><slot></slot></demo-text></div>');
+plain('demo-option', '<demo-option-item><slot></slot></demo-option-item>');
+plain('demo-popover', '<div style="position:relative;width:360px"><slot></slot>'
+  + '<div style="position:absolute;left:0;top:100%;z-index:5"><slot name="menu"></slot></div></div>');
+plain('demo-icon', '<svg aria-hidden="true" width="14" height="14"><circle cx="7" cy="7" r="5" fill="none" stroke="#555"></circle></svg>',
+  'inline-block');
+plain('demo-info', '<div style="margin:14px 0;color:#444"><slot name="label-content"></slot></div>');
+plain('demo-wrap', '<slot></slot>');
+plain('demo-check', '<label style="cursor:pointer"><input type="checkbox" required><slot name="label-content"></slot></label>');
+customElements.define('demo-text-input', class extends HTMLElement {
+  connectedCallback() {
+    if (this.shadowRoot) return;
+    this.style.display = 'block';
+    const fid = this.id;
+    shadow(this, '<label for="' + fid + '" id="' + fid + '-label"><span><span aria-hidden="true">*</span></span></label>'
+      + '<div><input id="' + fid + '" type="text" autocomplete="off" role="combobox" aria-controls="menu-' + fid + '" '
+      + 'aria-autocomplete="list" aria-haspopup="listbox" aria-expanded="false" aria-required="true" aria-invalid="false" '
+      + 'style="width:360px;height:28px;padding-right:40px;box-sizing:border-box"></div>');
+  }
+  get input() { return this.shadowRoot.querySelector('input'); }
+});
+customElements.define('demo-chip', class extends HTMLElement {
+  connectedCallback() {
+    if (this.shadowRoot) return;
+    this.style.display = 'inline-block';
+    const r = shadow(this, '<div role="option" aria-selected="false" aria-description="Deletable" '
+      + 'style="border:1px solid #888;border-radius:10px;padding:1px 6px;margin:2px"><div style="display:inline"></div>'
+      + '<button role="presentation" style="border:0;background:none;cursor:pointer">&#10005;</button></div>');
+    const label = this.getAttribute('label');
+    r.querySelector('[role=option]').setAttribute('aria-label', label);
+    r.querySelector('[role=option] > div').textContent = label;
+    r.querySelector('button').addEventListener('click', (e) => { e.stopPropagation(); this.__onRemove(); });
+  }
+});
+customElements.define('demo-chip-list', class extends HTMLElement {
+  connectedCallback() {
+    if (this.shadowRoot) return;
+    this.style.display = 'block';
+    shadow(this, '<div><div role="listbox" aria-label="Tags list" style="display:flex;flex-wrap:wrap"></div><slot></slot></div>');
+  }
+  setChips(values, onRemove) {
+    const box = this.shadowRoot.querySelector('[role=listbox]');
+    box.textContent = '';
+    for (const v of values) {
+      const chip = document.createElement('demo-chip');
+      chip.setAttribute('role', 'presentation');
+      chip.setAttribute('deletable', '');
+      chip.setAttribute('label', v);
+      chip.__onRemove = () => onRemove(v);
+      box.appendChild(chip);
+    }
+  }
+});
+class DemoCombo extends HTMLElement {
+  get multi() { return false; }
+  connectedCallback() {
+    if (this.shadowRoot) return;
+    this.style.display = 'block';
+    const fid = this.id;
+    const field = '<demo-text-input id="' + fid + '"></demo-text-input>';
+    const root = shadow(this, '<div style="margin:14px 0;position:relative"><div style="margin-bottom:4px"><slot name="label-content"></slot></div>'
+      + '<demo-popover>' + (this.multi ? '<demo-chip-list>' + field + '</demo-chip-list>' : field)
+      + '<demo-icon aria-hidden="true" style="position:absolute;right:8px;top:7px"></demo-icon></demo-popover>'
+      + '<div class="error" style="color:#b00;font-size:12px"></div>'
+      + '<div aria-live="polite" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)"></div></div>');
+    this.__values = [];
+    this.__typed = '';
+    this.__pop = root.querySelector('demo-popover');
+    this.__live = root.querySelector('[aria-live]');
+    this.__input = root.querySelector('demo-text-input').input;
+    this.__input.addEventListener('click', () => this.open());
+    this.__input.addEventListener('input', () => { this.__typed = this.__input.value; this.open(); this.render(); });
+    this.__input.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') this.close();
+      if (e.key === 'ArrowDown') this.open();
+      if (e.key === 'Enter' && this.__open) { const first = this.shown()[0]; if (first) { e.preventDefault(); this.pick(first); } }
+    });
+    document.addEventListener('pointerdown', (e) => { if (this.__open && !e.composedPath().includes(this)) this.close(); }, true);
+  }
+  shown() { const f = this.__typed.toLowerCase(); return this.__q.values.filter((v) => v.toLowerCase().includes(f)); }
+  open() {
+    if (this.__open) return;
+    this.__open = true;
+    this.__input.setAttribute('aria-expanded', 'true');
+    this.render();
+  }
+  render() {
+    if (!this.__open) return;
+    const old = this.__pop.querySelector('[slot=menu]');
+    if (old) old.remove();
+    const list = document.createElement('div');
+    list.slot = 'menu';
+    list.id = 'menu-' + this.id;
+    list.setAttribute('role', 'listbox');
+    list.setAttribute('aria-labelledby', this.id + '-label');
+    list.style.cssText = 'display:block;max-height:259px;overflow-y:auto;width:360px;background:#fff;border:1px solid #888';
+    this.__pop.appendChild(list);
+    const rows = this.shown();
+    if (!rows.length) {
+      const none = document.createElement('div');
+      none.style.padding = '8px 12px';
+      none.textContent = 'No matches';
+      list.appendChild(none);
+    }
+    rows.forEach((v, i) => {
+      const opt = document.createElement('demo-option');
+      opt.setAttribute('value', 'opt-' + this.__q.values.indexOf(v));
+      const clamp = document.createElement('demo-clamp');
+      clamp.setAttribute('multiline', '');
+      clamp.setAttribute('title', v);
+      clamp.textContent = v;
+      const body = document.createElement('demo-text');
+      body.appendChild(clamp);
+      const inner = document.createElement('div');
+      inner.appendChild(body);
+      const outer = document.createElement('div');
+      outer.appendChild(inner);
+      opt.appendChild(outer);
+      opt.addEventListener('click', () => this.pick(v));
+      list.appendChild(opt);
+      const row = opt.shadowRoot.querySelector('demo-option-item').shadowRoot.querySelector('[role=option]');
+      row.setAttribute('aria-selected', String(this.__values.includes(v)));
+      if (i === 0) { row.classList.add('active'); row.tabIndex = 0; }
+    });
+    this.__live.textContent = rows.length ? rows.length + ' suggestions available. Use up and down arrows to browse.' : '';
+  }
+  close() {
+    if (!this.__open) return;
+    this.__open = false;
+    const menu = this.__pop.querySelector('[slot=menu]');
+    if (menu) menu.remove();
+    this.__input.setAttribute('aria-expanded', 'false');
+    this.__live.textContent = '';
+    this.__typed = '';
+    this.__input.value = this.multi ? '' : (this.__values[0] || '');
+  }
+  commit(values) {
+    this.__values = values;
+    window.__committed[this.__q.id] = values.slice();
+    if (values.length) this.setAttribute('value', values.map((v) => 'opt-' + this.__q.values.indexOf(v)).join(','));
+    else this.removeAttribute('value');
+    this.__input.setAttribute('aria-invalid', 'false');
+    this.shadowRoot.querySelector('.error').textContent = '';
+    queueMicrotask(() => this.paint());
+  }
+  pick(v) {
+    if (this.multi) this.commit(this.__values.includes(v) ? this.__values.filter((x) => x !== v) : this.__values.concat([v]));
+    else this.commit([v]);
+    this.close();
+  }
+  paint() {
+    const icon = this.__pop.querySelector('demo-icon');
+    if (this.multi) {
+      this.__pop.querySelector('demo-chip-list').setChips(this.__values, (v) => this.commit(this.__values.filter((x) => x !== v)));
+    } else {
+      this.__input.value = this.__values[0] || '';
+    }
+    if (this.__values.length) {
+      icon.removeAttribute('aria-hidden');
+      icon.setAttribute('role', 'button');
+      icon.setAttribute('tabindex', '0');
+      icon.setAttribute('aria-label', this.multi ? 'Unselect all values' : 'Clear value');
+      icon.style.cursor = 'pointer';
+      icon.onclick = (e) => { e.stopPropagation(); this.commit([]); };
+    } else {
+      icon.setAttribute('aria-hidden', 'true');
+      for (const a of ['role', 'tabindex', 'aria-label']) icon.removeAttribute(a);
+      icon.style.cursor = '';
+      icon.onclick = null;
+    }
+  }
+  validate() {
+    if (this.__values.length) return;
+    this.__input.setAttribute('aria-invalid', 'true');
+    this.shadowRoot.querySelector('.error').textContent = 'This field is required.';
+  }
+}
+customElements.define('demo-combo', DemoCombo);
+customElements.define('demo-multi-combo', class extends DemoCombo { get multi() { return true; } });
+customElements.define('demo-radio', class extends HTMLElement {
+  connectedCallback() {
+    if (this.shadowRoot) return;
+    this.style.cssText = 'display:block;cursor:pointer;margin:2px 0';
+    const r = shadow(this, '<label><span style="display:inline-block;width:12px;height:12px;border:1px solid #333;'
+      + 'border-radius:50%;margin-right:6px"></span><span></span></label>');
+    r.querySelector('label > span:last-child').textContent = this.getAttribute('label');
+    this.addEventListener('click', () => {
+      for (const s of this.parentNode.querySelectorAll('demo-radio')) s.setAttribute('aria-checked', String(s === this));
+      window.__committed[this.parentNode.__q.id] = [this.getAttribute('label')];
+    });
+  }
+});
+plain('demo-radio-group', '<div><slot name="label-content"></slot> <span>*</span></div><div><slot></slot></div>');
+customElements.define('demo-textfield', class extends HTMLElement {
+  connectedCallback() {
+    if (this.shadowRoot) return;
+    this.style.cssText = 'display:block;margin:14px 0';
+    const fid = this.id;
+    const r = shadow(this, '<div><slot name="label-content"></slot></div><label for="' + fid + '"></label>'
+      + '<input id="' + fid + '" type="text" maxlength="200" style="width:360px;height:28px;box-sizing:border-box"><div>0/200</div>');
+    const input = r.querySelector('input');
+    input.addEventListener('input', () => { r.querySelector('input + div').textContent = input.value.length + '/200'; });
+  }
+});
+customElements.define('demo-form', class extends HTMLElement {
+  connectedCallback() {
+    if (this.shadowRoot) return;
+    this.style.display = 'block';
+    const r = shadow(this, '<demo-wrap><div style="padding:0 16px;width:480px"></div></demo-wrap>');
+    const form = r.querySelector('demo-wrap > div');
+    const tags = {select: null, radio: 'demo-radio-group', text: 'demo-textfield', info: 'demo-info'};
+    for (const q of JSON.parse(this.getAttribute('definition')).questions) {
+      const host = document.createElement(q.type === 'select' ? (q.multipleChoice ? 'demo-multi-combo' : 'demo-combo') : tags[q.type]);
+      host.id = 'qf-' + q.uid;
+      host.__q = q;
+      if (q.type === 'select') host.setAttribute('aria-label', 'Select ' + q.label);
+      if (q.required) host.setAttribute('required', '');
+      const label = document.createElement('span');
+      label.slot = 'label-content';
+      label.textContent = q.label;
+      host.appendChild(label);
+      (q.values && q.type === 'radio' ? q.values : []).forEach((v, i) => {
+        const radio = document.createElement('demo-radio');
+        radio.setAttribute('role', 'radio');
+        radio.setAttribute('label', v);
+        radio.setAttribute('value', String(1 - i));
+        radio.setAttribute('aria-checked', 'false');
+        host.appendChild(radio);
+      });
+      form.appendChild(host);
+    }
+  }
+});
+document.getElementById('submit').addEventListener('click', () => {
+  for (const host of document.getElementById('questions').shadowRoot.querySelectorAll('demo-combo, demo-multi-combo')) host.validate();
+});
+</script></body></html>"""
+
+_SHADOW_FORM_COMBOBOX_LINE_RE = re.compile(r"^ref=(\d+) input/text '\*'.*\[autocomplete→use select_combobox\]", re.M)
+
+
+async def _shadow_form_combobox_refs(tools: Any) -> list[str]:
+    # The three dropdown inputs print one identical line each, in form order: orbit, tools (multiple choice), meadow.
+    digest = (await _tool(tools, "observe").handler({})).content
+    refs = [f"ref={n}" for n in _SHADOW_FORM_COMBOBOX_LINE_RE.findall(digest)]
+    assert len(refs) == 3, digest
+    return refs
+
+
+async def _shadow_form_committed(page: Any, question: str) -> list[str]:
+    return await page.evaluate("(q) => window.__committed[q] || []", question)
+
+
+# Known residual, pinned as today's output because the browser gate fails on an xfail: the dropdown's
+# question sits on its host (aria-label and a slotted label span) two shadow roots above the input, and the question
+# walk for text fields stops at the first shadow boundary, while the radio group's walk crosses it. Invert when the
+# question walk crosses component roots.
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_dropdown_inside_a_component_is_listed_without_the_question_its_radio_neighbour_gets() -> None:
+    async with _content_page(_SHADOW_SCREENING_FORM_HTML) as page:
+        digest = (await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})).content
+    assert "group='Will you ride the night ferry?'" in digest, digest
+    assert len(_SHADOW_FORM_COMBOBOX_LINE_RE.findall(digest)) == 3, digest
+    for question in ("Which orbit", "Which instruments", "How many meadows"):
+        assert question not in digest, digest
+
+
+# Each option's text is slotted into its declared row from the option host's light children, so the leaf reaches its
+# row only over the flat tree. The click note lists every row whole, a click on a row by its observe ref makes no
+# claim the page contradicts, and a numbered pick commits.
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("nth", "question", "options", "value", "second"),
+    [
+        (0, "orbit", ["Lower ring", "Middle ring", "Upper ring", "Outer ring"], "Middle ring", "Outer ring"),
+        (1, "tools", ["Copper bell", "Glass harp", "Reed pipe", "Tin drum", "Brass horn"], "Glass harp", "Tin drum"),
+    ],
+)
+async def test_a_slotted_option_menu_is_listed_whole_and_its_selecting_click_is_not_called_a_close(
+    nth: int, question: str, options: list[str], value: str, second: str
+) -> None:
+    async with _content_page(_SHADOW_SCREENING_FORM_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        click = _tool(tools, "click").handler
+        field = (await _shadow_form_combobox_refs(tools))[nth]
+        opened = await click({"selector": field})
+        assert (opened.data or {}).get("menu_note") == "listed", opened.content
+        assert opened.data["menu_rows"] == len(options), opened.data
+        assert [text for _, text in _menu_note_entries(opened.content)] == options, opened.content
+        while_open = (await _tool(tools, "observe").handler({})).content
+        field = f"ref={_SHADOW_FORM_COMBOBOX_LINE_RE.findall(while_open)[nth]}"
+
+        picked = await click({"selector": _ref_line(while_open, f"div/option '{value}'")})
+        assert picked.status == "ok", picked.content
+        assert "CLOSED the open menu" not in picked.content, picked.content
+        assert await _shadow_form_committed(page, question) == [value]
+
+        reopened = await click({"selector": field})
+        tag = {text: n for n, text in _menu_note_entries(reopened.content)}[second]
+        numbered = await click({"selector": f'[data-tv3-menu="{tag}"]'})
+        assert numbered.status == "ok", numbered.content
+        assert await _shadow_form_committed(page, question) == ([value, second] if nth else [second])
+
+        await click({"selector": field})
+        closed = await click({"selector": "h2"})
+        assert "CLOSED the open menu" in closed.content and "no option was selected" not in closed.content, (
+            closed.content
+        )
+        assert await _shadow_form_committed(page, question) == ([value, second] if nth else [second])
+
+
+# select_combobox commits both variants. The single-choice read-back sees the value in the input; the multiple-choice
+# chip sits in a tag list inside the field's own shadow tree, and the read-back reports no commit while it is there.
+# That half is a known residual, pinned as today's output; invert it when the chip read-back closes.
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_commits_shadow_form_dropdowns_and_misreads_the_multiple_choice_chip() -> None:
+    async with _content_page(_SHADOW_SCREENING_FORM_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        orbit, instruments, _ = await _shadow_form_combobox_refs(tools)
+        single = await _tool(tools, "select_combobox").handler({"selector": orbit, "value": "Middle ring"})
+        assert single.status == "ok" and "committed value: 'Middle ring'" in single.content, single.content
+        assert await _shadow_form_committed(page, "orbit") == ["Middle ring"]
+
+        multiple = await _tool(tools, "select_combobox").handler({"selector": instruments, "value": "Glass harp"})
+        assert await _shadow_form_committed(page, "tools") == ["Glass harp"]
+        assert multiple.status == "error" and multiple.error_class == "did_not_commit", multiple.content
+
+
+# A menu row that holds its own list: the list's rows declare no role, so each belongs to the inner list, not to the
+# declared row around it. Grouping them under that row would merge three options into one entry.
+_NESTED_LIST_MENU_HTML = """<!doctype html><html><body style="font:14px sans-serif">
+<button id="trigger" aria-haspopup="listbox" aria-controls="pop">Choose a size</button>
+<script>
+window.__picked = null;
+document.getElementById('trigger').addEventListener('click', () => {
+  if (document.getElementById('pop')) return;
+  const pop = document.createElement('div');
+  pop.id = 'pop';
+  pop.setAttribute('role', 'menu');
+  pop.style.cssText = 'position:absolute;left:8px;top:40px;width:220px;background:#fff;border:1px solid #ccc';
+  pop.innerHTML = '<div role="menuitem" style="padding:4px 8px">Sizes<div role="listbox">'
+    + ['Small', 'Medium', 'Large'].map((v) => '<div style="cursor:pointer;padding:6px 8px">' + v + '</div>').join('')
+    + '</div></div>';
+  pop.querySelectorAll('[role=listbox] > div').forEach((row) => row.addEventListener('click', (e) => {
+    e.stopPropagation();
+    window.__picked = row.textContent;
+    pop.remove();
+  }));
+  document.body.appendChild(pop);
+});
+</script></body></html>"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_a_list_inside_a_declared_row_lists_its_own_rows() -> None:
+    async with _content_page(_NESTED_LIST_MENU_HTML) as page:
+        click = _tool(build_browser_tools(_fixed_page_provider(page)), "click").handler
+        opened = await click({"selector": "#trigger"})
+        assert (opened.data or {}).get("menu_note") == "listed", opened.content
+        entries = _menu_note_entries(opened.content)
+        assert [text for _, text in entries] == ["Small", "Medium", "Large"], opened.content
+        picked = await click({"selector": f'[data-tv3-menu="{entries[1][0]}"]'})
+        assert picked.status == "ok", picked.content
+        assert await page.evaluate("() => window.__picked") == "Medium"
+
+
+_SR_ONLY_CSS = "position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap"
+
+# Row markups whose row-role element holds more text than its label: (label, extra) pairs render as one row each.
+# `target` names the row by its primary label part. No row may be committed for a label two "twin" rows share, or
+# for a value that only a row's secondary part holds.
+_ROW_PART_MARKUPS: dict[str, tuple[str, str | None, list[tuple[str, str]]]] = {
+    "badge": ("Canada", "Canada", [("Canada", "(12)"), ("Canada Goose", "(3)"), ("Chile", "(4)")]),
+    "primary_after_icon": ("Dark", "Dark", [("Light", "light_mode"), ("Dark", "dark_mode"), ("System", "computer")]),
+    "primary_after_hidden_icon": ("Dark", "Dark", [("Light", "sun"), ("Dark", "moon"), ("System", "screen")]),
+    "shortcut": ("Copy", "Copy", [("Copy", "Ctrl+C"), ("Copy link", "Ctrl+L"), ("Paste", "Ctrl+V")]),
+    "sr_only": ("Canada", "Canada", [("Canada", ", 12 results"), ("Canada Goose", ", 3 results"), ("Chile", "")]),
+    "description": ("Pro", "Pro", [("Basic", "Free forever"), ("Pro", "For teams"), ("Pro Plus", "For larger teams")]),
+    "check": ("Medium", "Medium", [("Small", ""), ("Medium", "✓"), ("Medium-large", ""), ("Large", "")]),
+    "inner_handler": ("Chile", "Chile", [("Canada", ""), ("Chile", ""), ("Peru", "")]),
+    "inner_button": ("Chile", "Chile", [("Canada", ""), ("Chile", ""), ("Peru", "")]),
+    "twin": ("Springfield", None, [("Springfield", "IL"), ("Springfield", "MO"), ("Salem", "OR")]),
+    "secondary_part_only": ("Texas", None, [("Austin", "Texas"), ("Dallas", ""), ("Houston", "")]),
+}
+
+
+# Known residual, pinned as today's output because the browser gate fails on an xfail: a row whose label is a bare
+# text node beside a styled badge is matched by the badge only, and a value only a row's secondary part holds commits
+# that row and then reports no commit. Remove a shape from this set when its case passes.
+_ROW_PART_KNOWN_RESIDUALS = {
+    ("badge", "option"),
+    ("badge", "menuitemradio"),
+    ("secondary_part_only", "option"),
+    ("secondary_part_only", "menuitemradio"),
+}
+
+
+def _row_part_widget_html(markup: str, role: str) -> str:
+    _, _, rows = _ROW_PART_MARKUPS[markup]
+    list_role = "listbox" if role == "option" else "menu"
+    items = []
+    for i, (label, extra) in enumerate(rows):
+        key = f"{label} {extra}" if markup == "twin" else label
+        pad = "cursor:pointer;padding:4px 8px;min-height:22px"
+        if markup == "badge":
+            inner = f'{label} <span style="color:#888">{extra}</span>'
+        elif markup == "primary_after_icon":
+            inner = f'<span class="material-icons">{extra}</span> <span>{label}</span>'
+        elif markup == "primary_after_hidden_icon":
+            inner = f'<i aria-hidden="true">{extra}</i> <span>{label}</span>'
+        elif markup == "secondary_part_only":
+            inner = f"{label} <small>{extra}</small>" if extra else label
+        elif markup == "shortcut":
+            inner = f'<span>{label}</span> <kbd style="float:right">{extra}</kbd>'
+        elif markup == "sr_only":
+            inner = f'<span>{label}</span><span style="{_SR_ONLY_CSS}">{extra}</span>'
+        elif markup == "description":
+            inner = f'<div>{label}</div><div style="font-size:11px;color:#666">{extra}</div>'
+        elif markup == "check":
+            inner = f"<span>{label}</span>" + (f" <span>{extra}</span>" if extra else "")
+        elif markup == "inner_handler":
+            inner = f'<span data-k="{html.escape(key)}">{label}</span>'
+        elif markup == "inner_button":
+            inner = f'<button type="button" data-k="{html.escape(key)}">{label}</button>'
+        else:
+            inner = f"<span>{label}</span> <span>{extra}</span>"
+        on_row = "" if markup.startswith("inner_") else f' data-k="{html.escape(key)}"'
+        items.append(f'<li role="{role}" id="r{i}"{on_row} style="{pad}">{inner}</li>')
+    return f"""<!doctype html><html><body style="font:14px sans-serif"><div style="height:40px"></div>
+<div id="cb" role="combobox" aria-haspopup="listbox" aria-controls="lb" aria-expanded="false" tabindex="0"
+ style="display:inline-block;width:250px;height:28px;border:1px solid #999;cursor:pointer"><span id="shown">Choose</span></div>
+<script>
+var ITEMS = {json.dumps("".join(items))}, pop = null;
+function commit(v) {{
+  document.body.setAttribute('data-committed', v);
+  document.getElementById('shown').textContent = v;
+  pop.remove(); pop = null;
+  document.getElementById('cb').setAttribute('aria-expanded', 'false');
+}}
+document.getElementById('cb').addEventListener('click', function () {{
+  if (pop) {{ pop.remove(); pop = null; return; }}
+  var r = this.getBoundingClientRect();
+  pop = document.createElement('div');
+  pop.style.cssText = 'position:absolute;left:' + r.left + 'px;top:' + (r.bottom + window.scrollY) + 'px;'
+    + 'width:300px;background:#fff;border:1px solid #ccc;z-index:5';
+  pop.innerHTML = '<ul id="lb" role="{list_role}" style="list-style:none;margin:0;padding:0">' + ITEMS + '</ul>';
+  document.body.appendChild(pop);
+  this.setAttribute('aria-expanded', 'true');
+  pop.querySelectorAll('[data-k]').forEach(function (el) {{
+    el.addEventListener('click', function (ev) {{ ev.stopPropagation(); commit(el.getAttribute('data-k')); }});
+  }});
+}});
+</script></body></html>"""
+
+
+def _generated_row_part_shapes() -> list[dict[str, str]]:
+    return [
+        {"family": "row_part", "markup": m, "role": role}
+        for m in _ROW_PART_MARKUPS
+        for role in ("option", "menuitemradio")
+    ]
+
+
+async def _run_generated_row_part_shape(browser: Any, shape: dict[str, str]) -> list[str]:
+    """A row named by its primary label part commits that row, and the result says what the field holds; a label
+    two rows share, or a value only a secondary part holds, commits nothing."""
+    target, expected, _ = _ROW_PART_MARKUPS[shape["markup"]]
+    context = await browser.new_context(viewport={"width": 1024, "height": 900})
+    try:
+        page = await context.new_page()
+        await page.set_content(_row_part_widget_html(shape["markup"], shape["role"]))
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#cb", "value": target})
+        committed = await page.evaluate("() => document.body.getAttribute('data-committed') || ''")
+    finally:
+        await context.close()
+    failures = []
+    if expected is None and committed:
+        failures.append(f"(p) {target!r} is no one row's primary label, yet {committed!r} was committed")
+    if expected is not None and committed != expected:
+        failures.append(f"coverage: expected {expected!r} committed, got {committed!r}")
+    if committed and r.status != "ok":
+        failures.append(f"(d) the field holds {committed!r} but the result is {r.status}")
+    return [f"{shape}: {f} -- {r.content[:300]}" for f in failures]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_commits_a_row_named_by_its_label_part_over_generated_row_markups() -> None:
+    shapes = _generated_row_part_shapes()
+    gate = asyncio.Semaphore(6)
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True, args=["--use-mock-keychain", "--password-store=basic"])
+        try:
+
+            async def _one(shape: dict[str, str]) -> list[str]:
+                async with gate:
+                    return await _run_generated_row_part_shape(browser, shape)
+
+            results = await asyncio.gather(*(_one(s) for s in shapes))
+        finally:
+            await browser.close()
+    failures = [f for r in results for f in r]
+    assert len(shapes) == 2 * len(_ROW_PART_MARKUPS)
+    failing = {(s["markup"], s["role"]) for s, r in zip(shapes, results) if r}
+    assert failing == _ROW_PART_KNOWN_RESIDUALS, "\n".join(failures)
+
+
+# One menu per spec, drawn twice: as light DOM rows, and as option hosts whose shadow root holds the declared row and
+# projects the same light children (label, controls, links, detail, nested rows) through slots. Synthetic words
+# throughout. A multi-select stays open and shows a pick by `sign`: the row's aria-selected, a native checkbox in the
+# row, an inner role=checkbox, or text added to the row. `clobber` wraps the widget in a form whose inputs named
+# `matches` and `host` shadow those members on the form. `commitOn` names the event a row commits on, `hide` closes a
+# single-select by hiding the list, and `linkPass` lets a click on a row's link through to the link.
+_TWIN_MENU_TEMPLATE = """<!doctype html><html><body style="margin:0;font:14px sans-serif">
+<h2 style="margin:8px 16px">Pick a tree</h2>
+<div id="mount" style="margin:8px 16px"></div>
+<script>
+const CFG = __CFG__;
+const ROW_CSS = 'cursor:pointer;padding:6px 8px;min-height:20px;' + (CFG.rowStyle || '');
+window.__committed = [];
+window.__starred = [];
+customElements.define('twin-option', class extends HTMLElement {
+  connectedCallback() {
+    if (this.shadowRoot) return;
+    this.style.display = 'block';
+    this.attachShadow({mode: 'open'}).innerHTML = '<div role="' + this.dataset.role + '" aria-selected="false" '
+      + 'data-row="' + this.dataset.rowname + '" style="' + ROW_CSS + '"><slot name="lead"></slot><slot></slot></div>';
+  }
+  get row() { return this.shadowRoot.querySelector('[role]'); }
+});
+let wrap = document.getElementById('mount');
+if (CFG.dialog) {
+  const d = document.createElement('div');
+  d.setAttribute('role', 'dialog');
+  d.setAttribute('aria-modal', 'true');
+  d.setAttribute('aria-label', 'Tree picker');
+  d.style.cssText = 'border:1px solid #444;padding:8px;width:420px';
+  wrap.appendChild(d);
+  wrap = d;
+}
+if (CFG.clobber) {
+  const f = document.createElement('form');
+  f.innerHTML = '<input type="hidden" name="matches"><input type="hidden" name="host">';
+  f.addEventListener('submit', (e) => e.preventDefault());
+  wrap.appendChild(f);
+  wrap = f;
+}
+wrap.insertAdjacentHTML('beforeend', '<button type="button" id="trigger" aria-haspopup="listbox" aria-controls="lb">'
+  + 'Choose a tree</button><div id="summary"></div><div id="anchor" style="position:relative"></div>');
+let pop = null;
+const close = () => {
+  if (!pop) return;
+  if (CFG.hide) pop.style.display = 'none';
+  else pop.remove();
+  pop = null;
+};
+const rowOf = (item) => (CFG.slotted ? item.row : item);
+const show = (item, on) => {
+  if (CFG.sign === 'checkbox') item.querySelector('input[type=checkbox]').checked = on;
+  else if (CFG.sign === 'ariacheck') item.querySelector('[role=checkbox]').setAttribute('aria-checked', String(on));
+  else if (CFG.sign === 'outside') document.getElementById('summary').textContent = window.__committed.join(', ');
+  else if (CFG.sign === 'text') {
+    const tick = item.querySelector(':scope > .tick');
+    if (on && !tick) item.insertAdjacentHTML('beforeend', '<span class="tick"> (chosen)</span>');
+    if (!on && tick) tick.remove();
+  } else if (CFG.sign.startsWith('leaf')) {
+    const leaf = item.querySelector('span');
+    if (CFG.sign === 'leafclass') leaf.classList.toggle('on', on);
+    else if (CFG.sign === 'leafstyle') leaf.style.fontWeight = on ? 'bold' : '';
+    else if (CFG.sign === 'leafaria') leaf.setAttribute('aria-selected', String(on));
+    else if (on) leaf.appendChild(document.createElement('i'));
+    else if (leaf.querySelector('i')) leaf.querySelector('i').remove();
+  } else rowOf(item).setAttribute('aria-selected', String(on));
+};
+const pick = (item, v) => {
+  if (!CFG.multi) { window.__committed = [v]; close(); return; }
+  const on = !window.__committed.includes(v);
+  window.__committed = on ? window.__committed.concat([v]) : window.__committed.filter((x) => x !== v);
+  show(item, on);
+};
+const build = (spec, parent, made) => {
+  const item = document.createElement(CFG.slotted ? 'twin-option' : 'div');
+  if (CFG.slotted) Object.assign(item.dataset, {role: spec.role, rowname: spec.v});
+  else {
+    item.setAttribute('data-row', spec.v);
+    item.setAttribute('role', spec.role);
+    item.setAttribute('aria-selected', 'false');
+    item.style.cssText = ROW_CSS;
+  }
+  item.innerHTML = CFG.slotted ? spec.inner.replace(/ data-lead/g, ' slot="lead"') : spec.inner.replace(/ data-lead/g, '');
+  if (spec.kids.length && !CFG.cascade) {
+    const group = document.createElement('div');
+    group.setAttribute('role', 'group');
+    spec.kids.forEach((k) => build(k, group, made));
+    item.appendChild(group);
+  }
+  item.addEventListener(CFG.commitOn || 'click', (e) => {
+    if (CFG.linkPass && e.composedPath().some((n) => n.localName === 'a')) return;
+    e.stopPropagation();
+    e.preventDefault();
+    const path = e.composedPath();
+    if (path.some((n) => n.classList && n.classList.contains('fav'))) { window.__starred.push(spec.v); return; }
+    if (path.some((n) => n.classList && n.classList.contains('rm'))) { if (!CFG.multi) close(); return; }
+    if (CFG.cascade && spec.kids.length) { pop.replaceChildren(); spec.kids.forEach((k) => build(k, pop, [])); return; }
+    pick(item, spec.v);
+  });
+  parent.appendChild(item);
+  made.push([item, spec.v]);
+};
+document.getElementById('trigger').addEventListener('click', () => {
+  if (pop) { close(); return; }
+  document.getElementById('lb')?.remove();
+  pop = document.createElement('div');
+  pop.id = 'lb';
+  pop.setAttribute('role', CFG.listRole);
+  if (CFG.multi) pop.setAttribute('aria-multiselectable', 'true');
+  pop.style.cssText = 'position:absolute;left:' + (CFG.popLeft || 0) + 'px;top:4px;width:' + (CFG.popWidth || 320)
+    + 'px;background:#fff;border:1px solid #888;z-index:5;' + (CFG.popStyle || '');
+  if (CFG.header) pop.insertAdjacentHTML('beforeend', CFG.header);
+  const made = [];
+  CFG.rows.forEach((spec) => build(spec, pop, made));
+  document.getElementById('anchor').appendChild(pop);
+  if (CFG.scrollTo) pop.scrollTop = made[CFG.scrollTo][0].offsetTop;
+  for (const [item, v] of made) {
+    const on = window.__committed.includes(v);
+    if (CFG.sign === 'aria' || !CFG.multi) rowOf(item).setAttribute('aria-selected', String(on));
+    else show(item, on);
+  }
+});
+</script></body></html>"""
+
+# What the numbered tag of an entry points at: the row's label leaf, its link, its detail part, or a control beside it.
+_TWIN_POINTS_AT_JS = """(n) => {
+  const find = (root) => {
+    const hit = root.querySelector('[data-tv3-menu="' + n + '"]');
+    if (hit) return hit;
+    for (const h of root.querySelectorAll('*')) if (h.shadowRoot) { const f = find(h.shadowRoot); if (f) return f; }
+    return null;
+  };
+  const el = find(document);
+  if (!el) return 'missing';
+  if (el.closest('.fav, .rm')) return 'control';
+  if (el.closest('a')) return 'link';
+  if (el.closest('small')) return 'detail';
+  return 'label';
+}"""
+
+_TWIN_MENU_AXES = ("star", "link", "two", "twin")
+_TWIN_MENU_BATCH_AXES = ("multi", "dialog", "clobber", "sign")
+_TWIN_MENU_SIGNS = ("aria", "checkbox", "text")
+
+
+def _twin_row(v: str, inner: str, role: str = "option", kids: list[dict[str, Any]] | None = None) -> dict:
+    return {"v": v, "role": role, "inner": inner, "kids": kids or []}
+
+
+def _twin_menu_rows(shape: dict[str, Any]) -> list[dict[str, Any]]:
+    labels = ["Alder", "Alder" if shape["twin"] else "Aspen", "Birch", "Cedar"]
+    rows = []
+    for i, label in enumerate(labels):
+        inner = ""
+        if shape["sign"] == "checkbox":
+            inner += '<input type="checkbox" tabindex="-1" data-lead> '
+        if shape["star"]:
+            inner += f'<button type="button" class="fav" data-lead aria-label="Favourite {label}">&#9734;</button> '
+        inner += f'<a href="#{label}-{i}">{label}</a>' if shape["link"] else f"<span>{label}</span>"
+        if shape["two"]:
+            inner += f' <small style="color:#666">zone {i + 1}</small>'
+        if shape["star"]:
+            inner += (
+                f' <button type="button" class="rm" aria-label="Remove {label}" style="width:16px;height:16px;float:right">'
+                '<svg width="10" height="10"><path d="M1 1L9 9M9 1L1 9" stroke="#333"></path></svg></button>'
+            )
+        rows.append(_twin_row(f"{label}-{i}", inner))
+    return rows
+
+
+def _twin_menu_html(cfg: dict[str, Any], slotted: bool) -> str:
+    return _TWIN_MENU_TEMPLATE.replace("__CFG__", json.dumps({"listRole": "listbox", **cfg, "slotted": slotted}))
+
+
+def _click_note_kind(r: Any) -> str:
+    if r.status != "ok":
+        return f"error:{r.error_class}"
+    for needle, kind in (
+        ("its state changed", "state_changed"),
+        ("the menu closed", "menu_closed"),
+        ("CLOSED the open menu", "closed_note"),
+        ("opened a menu", "menu_note"),
+    ):
+        if needle in r.content:
+            return kind
+    return "bare"
+
+
+def _twin_row_ref(digest: str, label: str) -> str | None:
+    # The row whose accessible name holds `label`, the shortest such name: a parent row's name holds its children's.
+    hits = []
+    for line in digest.splitlines():
+        m = re.match(r"^ref=(\d+) \S*(?:option|treeitem) '([^']*)'", line)
+        if m and label in m.group(2):
+            hits.append((len(m.group(2)), f"ref={m.group(1)}"))
+    return min(hits)[1] if hits else None
+
+
+async def _run_twin_steps(
+    browser: Any, cfg: dict[str, Any], slotted: bool, steps: list[tuple[str, str, str, str | None]]
+) -> tuple[dict[str, Any], list[str]]:
+    """Run `steps` (name, how, target, expected pick) on one rendering. `how` is `open` (the trigger), `numbered` (the
+    note entry holding `target`), `ref` (the observe row holding `target`) or `css`. An expected pick must commit and
+    be named by exactly that label (or by none, when `~` prefixes it); a step expecting none (a control) must commit
+    nothing and name nothing; a step expecting `!` must make no claim and give no note; a step expecting `?kind` must
+    name nothing and give that kind of note, and `?*` must commit and name nothing. A committed pick is never an
+    error."""
+    context = await browser.new_context(viewport={"width": 1024, "height": 900})
+    failures: list[str] = []
+    out: dict[str, Any] = {}
+    try:
+        page = await context.new_page()
+        if cfg.get("routed"):
+            html_doc = _twin_menu_html(cfg, slotted)
+
+            async def _serve(route: Any) -> None:
+                menu = route.request.url.endswith("/menu.html")
+                body = html_doc if menu else "<!doctype html><title>other</title><p>other page</p>"
+                await route.fulfill(status=200, content_type="text/html", body=body)
+
+            await page.route("http://twin.test/**", _serve)
+            await page.goto("http://twin.test/menu.html")
+        else:
+            await page.set_content(_twin_menu_html(cfg, slotted))
+        tools = build_browser_tools(_fixed_page_provider(page))
+        click = _tool(tools, "click").handler
+        entries: list[tuple[str, str]] = []
+
+        async def held() -> list[str]:
+            return await page.evaluate("() => (window.__committed || []).slice()")
+
+        for name, how, target, want in steps:
+            if how == "open":
+                if await page.evaluate("() => !!document.getElementById('lb')"):
+                    continue
+                r = await click({"selector": "#trigger"})
+                entries = _menu_note_entries(r.content)
+                out[name] = ((r.data or {}).get("menu_note"), [text for _, text in entries])
+                out[name + ":points_at"] = [await page.evaluate(_TWIN_POINTS_AT_JS, n) for n, _ in entries]
+                continue
+            if how == "numbered":
+                tag = next((n for n, text in entries if target in text), None)
+                selector = f'[data-tv3-menu="{tag}"]' if tag else None
+            elif how == "ref":
+                selector = _twin_row_ref((await _tool(tools, "observe").handler({})).content, target)
+            else:
+                selector = target
+            if selector is None:
+                failures.append(f"{name}: no {how} selector for {target!r}")
+                continue
+            before = await held()
+            r = await click({"selector": selector})
+            after = await held()
+            picked = (r.data or {}).get(PICKED_OPTION_DATA_KEY)
+            out[name] = (_click_note_kind(r), picked, after)
+            gained = [v for v in after if v not in before]
+            if want == "!":
+                if picked is not None or _click_note_kind(r) != "bare":
+                    failures.append(f"{name}: expected no claim, got {picked!r} -- {r.content[:300]}")
+                continue
+            if want == "?*":
+                if picked is not None or "Selected option" in r.content or not (set(after) ^ set(before)):
+                    failures.append(
+                        f"{name}: expected a commit and no name, got {picked!r}, {after} -- {r.content[:300]}"
+                    )
+                continue
+            if want is not None and want.startswith("?"):
+                if picked is not None or _click_note_kind(r) != want[1:] or "Selected option" in r.content:
+                    failures.append(
+                        f"{name}: expected no name and a {want[1:]} note, got {picked!r} -- {r.content[:300]}"
+                    )
+                continue
+            if want is None:
+                if after != before or picked is not None:
+                    failures.append(f"{name}: a control click picked {picked!r}, field {before} -> {after}")
+            elif not (set(after) ^ set(before)):
+                failures.append(f"{name}: {want!r} was not committed ({after}) -- {r.content[:300]}")
+            elif want.startswith("~"):
+                if picked not in (None, want[1:]):
+                    failures.append(f"{name}: picked {picked!r}, expected {want[1:]!r} or no name -- {r.content[:300]}")
+            elif picked != want:
+                failures.append(f"{name}: picked {picked!r}, expected {want!r} -- {r.content[:300]}")
+            if after != before and r.status != "ok":
+                failures.append(f"{name}: the field moved to {after} but the click is an error -- {r.content[:300]}")
+            on_row = how != "css" or target.startswith("[data-row=")
+            if gained and want is not None and on_row and not gained[0].startswith(want.lstrip("~").split()[0]):
+                failures.append(f"{name}: committed {gained}, expected {want!r}")
+    finally:
+        await context.close()
+    return out, failures
+
+
+def _twin_menu_steps(shape: dict[str, Any]) -> list[tuple[str, str, str, str | None]]:
+    steps: list[tuple[str, str, str, str | None]] = [("open", "open", "", None)]
+    if shape["star"]:
+        steps += [
+            ("star", "css", '[aria-label="Favourite Alder"]', None),
+            ("remove", "css", '[aria-label="Remove Alder"]', None),
+            ("reopen0", "open", "", None),
+        ]
+    steps += [
+        ("numbered", "numbered", "Birch", "Birch"),
+        ("reopen", "open", "", None),
+        # A row is named only when its label is all the text it renders: a star glyph or a detail line claims nothing.
+        ("ref", "ref", "Cedar", "?*" if shape["star"] or shape["two"] else "Cedar"),
+    ]
+    return steps
+
+
+async def _twin_pair(
+    cfg: dict[str, Any], steps: list[tuple[str, str, str, str | None]], browser: Any, gate: asyncio.Semaphore, on: str
+) -> list[str]:
+    async def _one(slotted: bool) -> tuple[dict[str, Any], list[str]]:
+        async with gate:
+            return await _run_twin_steps(browser, cfg, slotted, steps)
+
+    (light, light_bad), (slot, slot_bad) = await asyncio.gather(_one(False), _one(True))
+    failures = [f"{on} light: {f}" for f in light_bad] + [f"{on} slotted: {f}" for f in slot_bad]
+    if light != slot:
+        failures.append(f"{on}: light {light} != slotted {slot}")
+    return failures
+
+
+async def _twin_pairs(pairs: list[tuple[dict[str, Any], list[Any], str]]) -> list[str]:
+    gate = asyncio.Semaphore(8)
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True, args=["--use-mock-keychain", "--password-store=basic"])
+        try:
+            results = await asyncio.gather(*(_twin_pair(cfg, steps, browser, gate, on) for cfg, steps, on in pairs))
+        finally:
+            await browser.close()
+    return [f for r in results for f in r]
+
+
+def _twin_menu_batches() -> list[dict[str, Any]]:
+    return [
+        {"multi": multi, "dialog": dialog, "clobber": clobber, "sign": sign}
+        for multi, dialog, clobber in itertools.product((False, True), repeat=3)
+        for sign in (_TWIN_MENU_SIGNS if multi else ("aria",))
+    ]
+
+
+# The property the flat-tree row relation owes: a menu whose rows a component draws in its own root behaves, through
+# the whole click path, exactly as the same rows written as light DOM. In both, a pick by its numbered tag or by its
+# row's observe ref commits and is named by its label, a click on a control beside the label picks nothing, and a
+# pick that committed never reads as an error. Each batch fixes the axes that change the page around the rows and
+# generates the 16 row shapes; a failure names its shape.
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "batch",
+    _twin_menu_batches(),
+    ids=lambda b: "+".join([a for a in ("multi", "dialog", "clobber") if b[a]] + [b["sign"]]),
+)
+async def test_dom_a_slotted_menu_clicks_exactly_as_its_light_dom_twin_over_generated_shapes(
+    batch: dict[str, Any],
+) -> None:
+    pairs = []
+    for values in itertools.product((False, True), repeat=len(_TWIN_MENU_AXES)):
+        shape = {**batch, **dict(zip(_TWIN_MENU_AXES, values))}
+        on = "+".join(a for a in _TWIN_MENU_AXES if shape[a]) or "plain"
+        pairs.append(({**shape, "rows": _twin_menu_rows(shape)}, _twin_menu_steps(shape), on))
+    assert len(pairs) == 16
+    failures = await _twin_pairs(pairs)
+    assert not failures, f"{len(failures)} breaches:\n" + "\n".join(failures)
+
+
+def _twin_tree_rows() -> list[dict[str, Any]]:
+    return [
+        _twin_row(
+            "Europe",
+            "<span>Europe</span>",
+            "treeitem",
+            [
+                _twin_row("Spain", "<span>Spain</span>", "treeitem"),
+                _twin_row("France", "<span>France</span>", "treeitem"),
+            ],
+        ),
+        _twin_row(
+            "Asia",
+            "<span>Asia</span>",
+            "treeitem",
+            [_twin_row("Japan", "<span>Japan</span>", "treeitem")],
+        ),
+    ]
+
+
+def _twin_case_specs() -> dict[str, tuple[dict[str, Any], list[tuple[str, str, str, str | None]]]]:
+    tree = _twin_tree_rows()
+    links = [
+        _twin_row(n, f'<span>{n}</span> <a href="#{n}-overview">Overview</a> <a href="#{n}-docs">Docs</a>')
+        for n in ("Alpha", "Beta", "Gamma")
+    ]
+    badges = [
+        _twin_row(name, f'<span class="badge">{short}</span> <a href="#{short}">{name}</a>')
+        for short, name in (("JD", "Jo Dunn"), ("AK", "Ann Kim"), ("LM", "Lee Moss"))
+    ]
+    checks = [
+        _twin_row(
+            n,
+            f'<span role="checkbox" aria-checked="false" data-lead style="display:inline-block;width:10px;'
+            f'height:10px;border:1px solid #333"></span> <span>{n}</span>',
+        )
+        for n in ("Pear", "Plum", "Quince")
+    ]
+    base = {"dialog": False, "clobber": False}
+    return {
+        "nested_tree": (
+            {**base, "multi": False, "sign": "aria", "listRole": "tree", "rows": tree},
+            [
+                ("open", "open", "", None),
+                ("numbered", "numbered", "Spain", "Spain"),
+                ("reopen", "open", "", None),
+                ("france", "numbered", "France", "France"),
+                ("reopen2", "open", "", None),
+                ("row", "css", '[data-row="Japan"]', "Japan"),
+                ("reopen3", "open", "", None),
+                ("parent", "css", '[data-row="Europe"]', "!"),
+                ("reopen4", "open", "", None),
+                ("france_row", "css", '[data-row="France"]', "France"),
+            ],
+        ),
+        "row_of_links": (
+            {**base, "multi": False, "sign": "aria", "rows": links},
+            [("open", "open", "", None), ("docs", "css", 'a[href="#Beta-docs"]', "Docs")],
+        ),
+        "badge_before_link": (
+            {**base, "multi": False, "sign": "aria", "rows": badges},
+            [
+                ("open", "open", "", None),
+                ("numbered", "numbered", "Ann Kim", "Ann Kim"),
+                ("reopen", "open", "", None),
+                # The row's text is the badge and the link, so no leaf is its label and its click claims nothing.
+                ("ref", "css", '[data-row="Lee Moss"]', "?closed_note"),
+            ],
+        ),
+        "inner_role_checkbox": (
+            {**base, "multi": True, "sign": "ariacheck", "rows": checks},
+            [("open", "open", "", None), ("numbered", "numbered", "Plum", "Plum"), ("ref", "ref", "Quince", "Quince")],
+        ),
+        "pick_shown_outside_row": (
+            {
+                **base,
+                "multi": True,
+                "sign": "outside",
+                "rows": [_twin_row(n, f"<span>{n}</span>") for n in ("Pear", "Plum", "Quince")],
+            },
+            [("open", "open", "", None), ("ref", "ref", "Plum", "~Plum")],
+        ),
+    }
+
+
+# Row shapes the leaf-first rule decides: a nested row names its own leaf, not its parent's; a row of several links
+# names the link clicked; a click on a row with a badge before its link claims nothing; a pick shown only on an inner
+# checkbox is evidence; a click on a row whose pick shows nowhere in the row is never called a failure. Each runs as light DOM and
+# as its slotted twin.
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", list(_twin_case_specs()))
+async def test_dom_a_menu_pick_is_named_by_the_leaf_clicked_in_light_and_slotted_rows(case: str) -> None:
+    cfg, steps = _twin_case_specs()[case]
+    failures = await _twin_pairs([(cfg, steps, case)])
+    assert not failures, "\n".join(failures)
+
+
+# The flat-tree helpers read the DOM through its prototypes: a form named `host` is what `document.host` returns, and
+# a form's inputs named `parentNode`, `matches` and `host` shadow those members on the form. Each helper still
+# answers with the real tree and terminates.
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_flat_tree_helpers_read_the_real_tree_inside_clobbering_forms() -> None:
+    html_doc = """<!doctype html><html><body><form name="host"></form>
+<div id="box"><form id="f"><input name="parentNode"><input name="matches"><input name="host"><span id="leaf">x</span>
+</form></div></body></html>"""
+    probe = (
+        "() => {"
+        + _PIERCED_QUERY_JS
+        + """
+  const f = document.getElementById('f'), leaf = document.getElementById('leaf');
+  const box = document.getElementById('box');
+  return {
+    formParent: composedParent(f) === box,
+    flatFormParent: flatParentNode(f) === box,
+    docParent: composedParent(document) === null && flatParentNode(document) === null,
+    closestBox: flatClosest(leaf, '#box') === box,
+    closestForm: flatClosest(leaf, 'form') === f,
+    closestNone: flatClosest(leaf, '.absent') === null,
+    contains: flatContains(box, leaf) && !flatContains(leaf, box),
+    containsDoc: !flatContains(f, document.body),
+  };
+}"""
+    )
+    async with _content_page(html_doc) as page:
+        got = await asyncio.wait_for(page.evaluate(probe), timeout=10)
+    assert got == {k: True for k in got} and len(got) == 8, got
+
+
+async def _twin_one(cfg: dict[str, Any], slotted: bool, steps: list[tuple[str, str, str, str | None]]) -> list[str]:
+    assert _shared_browser is not None
+    _, failures = await _run_twin_steps(_shared_browser, cfg, slotted, steps)
+    return failures
+
+
+# A click on a parent row lands on the child row its centre covers, here on that row's padding, so it makes no claim;
+# a click on a child row still commits. Observe lists no tree rows, so the row element is clicked directly.
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("slotted", [False, True], ids=["light", "slotted"])
+async def test_dom_a_click_on_a_parent_row_makes_no_claim(slotted: bool) -> None:
+    cfg = {"dialog": False, "clobber": False, "multi": False, "sign": "aria", "listRole": "tree"}
+    steps = [
+        ("open", "open", "", None),
+        ("parent", "css", '[data-row="Europe"]', "!"),
+        ("reopen", "open", "", None),
+        ("france_row", "css", '[data-row="France"]', "France"),
+    ]
+    failures = await _twin_one({**cfg, "rows": _twin_tree_rows()}, slotted, steps)
+    assert not failures, "\n".join(failures)
+
+
+# A click on a row of two links claims nothing, since neither link is all the text the row renders; a click on either
+# link names that link. The light row and its slotted twin answer alike.
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_a_click_on_a_row_of_two_links_landing_on_the_second_names_nothing() -> None:
+    rows = [
+        _twin_row(
+            n,
+            f'<span style="display:flex"><a href="#{n}-overview" style="flex:0 0 40%">Overview</a>'
+            f'<a href="#{n}-docs" style="flex:0 0 60%">Docs</a></span>',
+        )
+        for n in ("Alpha", "Beta", "Gamma")
+    ]
+    cfg = {"dialog": False, "clobber": False, "multi": False, "sign": "aria", "rows": rows}
+    steps = [
+        ("open", "open", "", None),
+        ("row", "css", '[data-row="Alpha"]', "?closed_note"),
+        ("reopen", "open", "", None),
+        ("overview", "css", 'a[href="#Beta-overview"]', "Overview"),
+        ("reopen2", "open", "", None),
+        ("docs", "css", 'a[href="#Gamma-docs"]', "Docs"),
+    ]
+    assert _shared_browser is not None
+    (light, light_bad), (slot, slot_bad) = [
+        await _run_twin_steps(_shared_browser, cfg, slotted, steps) for slotted in (False, True)
+    ]
+    assert not light_bad + slot_bad, "\n".join(light_bad + slot_bad)
+    assert light == slot, (light, slot)
+
+
+# A click on a row whose label sits beside one help link claims nothing, since the link's text is part of the row's;
+# a click on the label part names the label, a click on the link names the link.
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("slotted", [False, True], ids=["light", "slotted"])
+async def test_dom_a_click_on_a_row_of_a_label_and_one_link_claims_nothing_from_padding(slotted: bool) -> None:
+    rows = [
+        _twin_row(f"Option {n}", f'<span id="{n}-label">Option {n}</span> <a href="#{n}-help">Learn more</a>')
+        for n in ("A", "B", "C")
+    ]
+    cfg = {"dialog": False, "clobber": False, "multi": False, "sign": "aria", "rows": rows}
+    steps = [
+        ("open", "open", "", None),
+        ("row", "css", '[data-row="Option A"]', "?closed_note"),
+        ("reopen", "open", "", None),
+        ("label", "css", "#B-label", "Option B"),
+        ("reopen2", "open", "", None),
+        ("link", "css", 'a[href="#C-help"]', "Learn more"),
+    ]
+    failures = await _twin_one(cfg, slotted, steps)
+    assert not failures, "\n".join(failures)
+
+
+# A row whose label is its only link, drawn across the row, is named by that link when the row itself is clicked.
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("slotted", [False, True], ids=["light", "slotted"])
+async def test_dom_a_click_on_a_row_whose_label_is_its_only_link_names_the_link(slotted: bool) -> None:
+    rows = [_twin_row(n, f'<a href="#{n}" style="display:block">{n}</a>') for n in ("Alpha", "Beta", "Gamma")]
+    cfg = {"dialog": False, "clobber": False, "multi": False, "sign": "aria", "rows": rows}
+    steps = [("open", "open", "", None), ("row", "css", '[data-row="Beta"]', "Beta")]
+    failures = await _twin_one(cfg, slotted, steps)
+    assert not failures, "\n".join(failures)
+
+
+def _landing_case_table() -> dict[str, tuple[dict[str, Any], list[tuple[str, str, str, str | None]]]]:
+    block = "display:block"
+    wide = "display:inline-block;width:60%"
+    widest = "display:inline-block;width:70%"
+    full = "display:block;padding:6px 0;margin:-6px 0"
+    tree = [
+        _twin_row(
+            "Europe",
+            f'<span style="{block}">Europe</span>',
+            "treeitem",
+            [
+                _twin_row("Spain", f'<span style="{full}">Spain</span>', "treeitem"),
+                _twin_row("France", f'<span style="{full}">France</span>', "treeitem"),
+            ],
+        ),
+    ]
+    one = {"dialog": False, "clobber": False, "multi": False, "sign": "aria"}
+    opened = [("open", "open", "", None)]
+
+    def rows(inner: Any, names: tuple[str, ...] = ("Alder", "Birch")) -> list[dict[str, Any]]:
+        return [_twin_row(n, inner(n)) for n in names]
+
+    def star(toggle: str) -> Any:
+        return lambda n: (
+            f'<span>{n}</span> <button type="button" class="fav" onclick="{toggle}" style="{widest}">&#9733;</button>'
+        )
+
+    def row_click(name: str, want: str) -> list[tuple[str, str, str, str | None]]:
+        return opened + [("row", "css", f'[data-row="{name}"]', want)]
+
+    options = ("Option A", "Option B")
+
+    def pointer(n: str) -> str:
+        return f'<span style="cursor:pointer">{n}</span>'
+
+    def textless_star(n: str) -> str:
+        return (
+            f'<span style="cursor:pointer">{n}</span> <button type="button" class="fav" aria-label="Favourite {n}"'
+            f' style="{widest};height:20px"></button>'
+        )
+
+    ten = ("Alder", "Birch", "Cedar", "Dogwood", "Elm", "Fir", "Ginkgo", "Hazel", "Ivy", "Juniper")
+    scrolling = "max-height:90px;overflow-y:auto"
+    off_left = {"popLeft": -500, "popWidth": 1400, "linkPass": True}
+
+    def label_then(link: str) -> Any:
+        return lambda n: (
+            f'<span style="display:flex"><span style="flex:0 0 55%">{n}</span>'
+            f'<a href="{link}" aria-label="Help" style="flex:0 0 45%;height:20px"></a></span>'
+        )
+
+    cascade = [
+        _twin_row(
+            "Fruit",
+            "<span>Fruit</span>",
+            "menuitem",
+            [_twin_row(n, f"<span>{n}</span>", "menuitem") for n in ("Apple", "Pear", "Plum")],
+        ),
+        _twin_row("Grain", "<span>Grain</span>", "menuitem"),
+    ]
+    return {
+        "flat_label_under_the_point": (
+            {**one, "rows": rows(lambda n: f'<span style="{block}">{n}</span>')},
+            row_click("Birch", "Birch"),
+        ),
+        "flat_padding_under_the_point": (
+            {**one, "rows": rows(lambda n: f"<span>{n}</span>")},
+            row_click("Birch", "Birch"),
+        ),
+        "checkbox_then_label_padding_under_the_point": (
+            {**one, "rows": rows(lambda n: f'<input type="checkbox" tabindex="-1"> <span>{n}</span>')},
+            row_click("Birch", "Birch"),
+        ),
+        "description_under_the_point": (
+            {**one, "rows": rows(lambda n: f'<span>{n}</span> <small style="{widest}">wet soil, zone 1</small>')},
+            row_click("Birch", "?closed_note"),
+        ),
+        "taller_description_under_a_title": (
+            {
+                **one,
+                "rows": rows(
+                    lambda n: (
+                        f'<span style="{block}">{n}</span><small style="{block};line-height:30px">wet soil</small>'
+                    )
+                ),
+            },
+            row_click("Birch", "?closed_note"),
+        ),
+        "star_toggling_a_class_under_the_point": (
+            {**one, "rows": rows(star("this.classList.toggle('on')"))},
+            row_click("Birch", "?bare"),
+        ),
+        "star_toggling_aria_pressed_under_the_point": (
+            {
+                **one,
+                "rows": rows(
+                    star("this.setAttribute('aria-pressed', String(this.getAttribute('aria-pressed') !== 'true'))")
+                ),
+            },
+            row_click("Birch", "?bare"),
+        ),
+        "trailing_text_button_under_the_point": (
+            {
+                **one,
+                "rows": rows(lambda n: f'<span>{n}</span> <button type="button" style="{widest}">details</button>'),
+            },
+            row_click("Birch", "?closed_note"),
+        ),
+        "help_link_under_the_point": (
+            {
+                **one,
+                "rows": rows(
+                    lambda n: f'<span>{n}</span> <a href="#{n}-help" style="{widest}">Learn more</a>', options
+                ),
+            },
+            row_click("Option B", "?closed_note"),
+        ),
+        "help_link_label_under_the_point": (
+            {
+                **one,
+                "rows": rows(
+                    lambda n: f'<span style="{wide}">{n}</span> <a href="#{n[-1]}-help">Learn more</a>', options
+                ),
+            },
+            row_click("Option A", "?closed_note"),
+        ),
+        "parent_row_child_under_the_point": ({**one, "listRole": "tree", "rows": tree}, row_click("Europe", "Spain")),
+        "badge_and_link_link_under_the_point": (
+            {
+                **one,
+                "rows": rows(
+                    lambda n: f'<span class="badge">{n[:2].upper()}</span> <a href="#{n[:2]}" style="{wide}">{n}</a>',
+                    ("Jo Dunn", "Lee Moss"),
+                ),
+            },
+            row_click("Lee Moss", "?closed_note"),
+        ),
+        "role_button_label_beside_a_help_link": (
+            {
+                **one,
+                "rows": rows(
+                    lambda n: f'<span role="button" style="{wide}">{n}</span> <a href="#{n[-1]}-help">Learn more</a>',
+                    options,
+                ),
+            },
+            row_click("Option B", "?closed_note"),
+        ),
+        "button_label_beside_a_help_link": (
+            {
+                **one,
+                "rows": rows(
+                    lambda n: (
+                        f'<button type="button" style="width:60%">{n}</button> <a href="#{n[-1]}-help">Learn more</a>'
+                    ),
+                    options,
+                ),
+            },
+            row_click("Option B", "?closed_note"),
+        ),
+        "button_label_padding_under_the_point": (
+            {
+                **one,
+                "rows": rows(
+                    lambda n: f'<button type="button">{n}</button> <a href="#{n[-1]}-help">Learn more</a>', options
+                ),
+            },
+            row_click("Option B", "?closed_note"),
+        ),
+        "help_link_beside_a_button_label_under_the_point": (
+            {
+                **one,
+                "rows": rows(
+                    lambda n: (
+                        f'<button type="button">{n}</button> <a href="#{n[-1]}-help" style="{widest}">Learn more</a>'
+                    ),
+                    options,
+                ),
+            },
+            row_click("Option B", "?closed_note"),
+        ),
+        "first_of_two_links_under_the_point": (
+            {
+                **one,
+                "rows": rows(
+                    lambda n: (
+                        f'<span style="display:flex"><a href="#{n}-o" style="flex:0 0 60%">Overview</a>'
+                        f'<a href="#{n}-d" style="flex:0 0 40%">Docs</a></span>'
+                    )
+                ),
+            },
+            row_click("Birch", "?closed_note"),
+        ),
+        "padding_beside_two_links_under_the_point": (
+            {**one, "rows": rows(lambda n: f'<a href="#{n}-o">Overview</a> <a href="#{n}-d">Docs</a>')},
+            row_click("Birch", "?closed_note"),
+        ),
+        "only_link_padding_under_the_point": (
+            {**one, "rows": rows(lambda n: f'<a href="#{n}">{n}</a>')},
+            row_click("Birch", "Birch"),
+        ),
+        "cascading_row_padding_under_the_point": (
+            {**one, "listRole": "menu", "cascade": True, "rows": cascade},
+            row_click("Fruit", "?menu_note"),
+        ),
+        "row_scrolled_out_of_its_list": (
+            {**one, "popStyle": scrolling, "rows": rows(lambda n: f"<span>{n}</span>", ten)},
+            opened + [("row", "ref", "Hazel", "Hazel")],
+        ),
+        "row_half_visible_at_its_list_edge": (
+            {**one, "popStyle": "max-height:75px;overflow-y:auto", "rows": rows(lambda n: f"<span>{n}</span>", ten)},
+            row_click("Cedar", "Cedar"),
+        ),
+        "sticky_list_header_over_the_row_centre": (
+            {
+                **one,
+                "popStyle": "max-height:120px;overflow-y:auto",
+                "header": '<div style="position:sticky;top:0;height:40px;background:#eee;z-index:1">Trees</div>',
+                "scrollTo": 4,
+                "rows": rows(lambda n: f"<span>{n}</span>", ten),
+            },
+            row_click("Elm", "Elm"),
+        ),
+        "frame_under_the_point": (
+            {
+                **one,
+                "rows": rows(
+                    lambda n: f'<span>{n}</span><iframe style="display:block;width:100%;height:40px;border:0"></iframe>'
+                ),
+            },
+            row_click("Birch", "!"),
+        ),
+        "row_partly_off_the_viewport_whose_link_navigates": (
+            {**one, **off_left, "routed": True, "rows": rows(label_then("/help"))},
+            row_click("Birch", "!"),
+        ),
+        "row_partly_off_the_viewport_whose_link_stays": (
+            {**one, **off_left, "rows": rows(label_then("#help"))},
+            row_click("Birch", "!"),
+        ),
+        "wrapped_inline_row": (
+            {
+                **one,
+                "popWidth": 120,
+                "rowStyle": "display:inline",
+                "rows": rows(lambda n: f"<span>{n} grows in wet soil and partial shade</span>"),
+            },
+            row_click("Birch", "Birch grows in wet soil and partial shade"),
+        ),
+        "link_before_the_label_label_under_the_point": (
+            {**one, "rows": rows(lambda n: f'<a href="#{n}-i">Info</a> <span style="{wide}">{n}</span>')},
+            row_click("Birch", "?closed_note"),
+        ),
+        "link_before_the_label_padding_under_the_point": (
+            {**one, "rows": rows(lambda n: f'<a href="#{n}-i">Info</a> <span>{n}</span>')},
+            row_click("Birch", "?closed_note"),
+        ),
+        "link_before_the_label_link_under_the_point": (
+            {**one, "rows": rows(lambda n: f'<a href="#{n}-i" style="{widest}">Info</a> <span>{n}</span>')},
+            row_click("Birch", "?closed_note"),
+        ),
+        "link_before_the_label_navigates": (
+            {
+                **one,
+                "routed": True,
+                "linkPass": True,
+                "rows": rows(lambda n: f'<a href="/help" style="{widest}">Info</a> <span>{n}</span>'),
+            },
+            row_click("Birch", "?closed_note"),
+        ),
+        "icon_link_before_the_label_padding_under_the_point": (
+            {**one, "rows": rows(lambda n: f'<a href="#{n}-i" aria-label="About {n}">&#9432;</a> <span>{n}</span>')},
+            row_click("Birch", "?closed_note"),
+        ),
+        "title_link_before_its_detail": (
+            {**one, "rows": rows(lambda n: f'<a href="#{n}">{n}</a> <small>wet soil</small>')},
+            row_click("Birch", "?closed_note"),
+        ),
+        **{
+            f"pointer_label_committed_and_hidden_on_{event}": (
+                {**one, "commitOn": event, "hide": True, "rows": rows(pointer)},
+                row_click("Birch", "Birch"),
+            )
+            for event in ("mousedown", "pointerdown", "mouseup", "click")
+        },
+        **{
+            f"textless_star_under_the_point_on_{event}": (
+                {**one, "commitOn": event, "hide": True, "rows": rows(textless_star)},
+                row_click("Birch", "?bare"),
+            )
+            for event in ("mousedown", "pointerdown", "mouseup", "click")
+        },
+        "multi_pick_shown_on_the_leaf_under_the_point": (
+            {
+                **one,
+                "multi": True,
+                "sign": "leafclass",
+                "rows": rows(lambda n: f'<span style="{block}">{n}</span>'),
+            },
+            row_click("Birch", "Birch"),
+        ),
+    }
+
+
+_LANDING_CASES = _landing_case_table()
+
+
+# A row wider than the view is clicked at the centre of its visible part, which the driver scrolls differently for a
+# row drawn in a shadow root, so each rendering is named by its label when its recorded click reached the label, and
+# by nothing when it reached the row's help icon.
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("slotted", [False, True], ids=["light", "slotted"])
+async def test_dom_a_row_wider_than_the_viewport_is_named_by_its_recorded_click(slotted: bool) -> None:
+    rows = [
+        _twin_row(
+            n,
+            f'<span style="display:flex"><span class="label" style="flex:0 0 50%">{n}</span>'
+            f'<a href="#{n}-r" aria-label="Help" style="flex:0 0 50%;height:20px"></a></span>',
+        )
+        for n in ("Alder", "Birch")
+    ]
+    cfg = {"dialog": False, "clobber": False, "multi": False, "sign": "aria", "popWidth": 1600, "rows": rows}
+    assert _shared_browser is not None
+    context = await _shared_browser.new_context(viewport={"width": 1024, "height": 900})
+    try:
+        page = await context.new_page()
+        await page.set_content(_twin_menu_html(cfg, slotted))
+        await page.evaluate(
+            "() => document.addEventListener('click', (e) => { window.__reached = e.composedPath()[0].localName; }, true)"
+        )
+        click = _tool(build_browser_tools(_fixed_page_provider(page)), "click").handler
+        await click({"selector": "#trigger"})
+        r = await click({"selector": '[data-row="Birch"]'})
+        reached = await page.evaluate("() => window.__reached")
+        committed = await page.evaluate("() => window.__committed")
+    finally:
+        await context.close()
+    assert committed == ["Birch"] and reached in ("span", "a"), (committed, reached)
+    assert (r.data or {}).get(PICKED_OPTION_DATA_KEY) == ("Birch" if reached == "span" else None), r.content
+
+
+# A click on a row outside its tagged leaves is named only when one leaf is all the text the row renders, wherever the
+# click lands in the row, and by nothing when it lands on a control that does not hold the label (a text-less star, a
+# help icon), outside the row, or off a parent row's children. A row with a link, badge or description beside its label
+# claims nothing; an unnamed click still reports the menu closing or its child rows. Each runs light and slotted.
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", list(_LANDING_CASES))
+async def test_dom_a_row_click_is_named_by_its_label_unless_the_landing_withholds_it(case: str) -> None:
+    cfg, steps = _LANDING_CASES[case]
+    failures = await _twin_pairs([(cfg, steps, case)])
+    assert not failures, "\n".join(failures)
+
+
+_ORDER_LABELS = {
+    "pointer_label": '<span style="cursor:pointer">Option A</span>',
+    "link_label": '<a href="#a">Option A</a>',
+    "text_label": "Option A",
+    "span_label": "<span>Option A</span>",
+}
+_ORDER_TEXT = {"text_label": "Option A", "span_label": "Option A", "description": "wet soil"}
+_ORDER_PIECES = {
+    "help_link": '<a href="#h">Learn more</a>',
+    "badge": '<span class="badge" style="cursor:pointer">OA</span>',
+    "icon": '<button type="button" aria-label="Info" style="width:16px;height:16px"></button>',
+    "description": "<small>wet soil</small>",
+}
+
+
+def _order_rows() -> list[tuple[str, str, str, bool, str | None]]:
+    # (id, inner, row style, must be named, the row's own text): every order of a label and up to two other pieces in
+    # a pointer-cursor row, and up to one in a row without its own pointer cursor. The row's own text is set when no
+    # piece is tagged, so the row is its only leaf and the click a leaf pick, named by all of its text as on main.
+    out = []
+    for label, label_html in _ORDER_LABELS.items():
+        for k, row_style in ((2, ""), (1, "cursor:default")):
+            for n in range(k + 1):
+                for others in itertools.combinations(_ORDER_PIECES, n):
+                    for order in itertools.permutations([label, *others]):
+                        inner = " ".join(_ORDER_LABELS[x] if x == label else _ORDER_PIECES[x] for x in order)
+                        named = not row_style and set(others) <= {"icon"}
+                        untagged = row_style and set(order) <= set(_ORDER_TEXT)
+                        own = " ".join(_ORDER_TEXT[x] for x in order) if untagged else None
+                        out.append(
+                            ("+".join(order) + ("+plain_row" if row_style else ""), inner, row_style, named, own)
+                        )
+    return out
+
+
+# The invariant a row-level name owes the answer audit: over every order of a row's pieces (a label tagged or not, a
+# help link, a badge, a text-less icon, a description), a click on a row the page commits as `Option A` names exactly
+# `Option A` or nothing, never another string; a label alone or beside a text-less icon is named. Two cases keep main's
+# answer: a row that is its only leaf is named by its own text, and a slotted row whose label is bare text is unnamed.
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("how", ["ref", "css"])
+@pytest.mark.parametrize("slotted", [False, True], ids=["light", "slotted"])
+async def test_dom_a_row_click_names_its_committed_label_or_nothing_over_every_order_of_its_pieces(
+    slotted: bool, how: str
+) -> None:
+    assert _shared_browser is not None
+    gate = asyncio.Semaphore(8)
+
+    async def _one(row_id: str, inner: str, row_style: str, named: bool, own: str | None) -> str | None:
+        cfg = {"dialog": False, "clobber": False, "multi": False, "sign": "aria", "rowStyle": row_style}
+        cfg["rows"] = [_twin_row("Option A", inner), _twin_row("Option B", "<span>Option B</span>")]
+        async with gate:
+            context = await _shared_browser.new_context(viewport={"width": 1024, "height": 900})
+            try:
+                page = await context.new_page()
+                await page.set_content(_twin_menu_html(cfg, slotted))
+                tools = build_browser_tools(_fixed_page_provider(page))
+                click = _tool(tools, "click").handler
+                await click({"selector": "#trigger"})
+                selector = '[data-row="Option A"]'
+                if how == "ref":
+                    found = _twin_row_ref((await _tool(tools, "observe").handler({})).content, "Option A")
+                    if found is None:
+                        return f"{row_id}: no observe ref"
+                    selector = found
+                r = await click({"selector": selector})
+                committed = await page.evaluate("() => window.__committed")
+            finally:
+                await context.close()
+        picked = (r.data or {}).get(PICKED_OPTION_DATA_KEY)
+        if committed != ["Option A"] or r.status != "ok":
+            return f"{row_id}: committed {committed}, status {r.status} -- {r.content[:200]}"
+        if picked not in (None, "Option A", own) or ("Selected option" in r.content and picked is None):
+            return f"{row_id}: named {picked!r} -- {r.content[:200]}"
+        if named and picked != "Option A" and not (slotted and "text_label" in row_id.split("+")):
+            return f"{row_id}: expected 'Option A', got {picked!r} -- {r.content[:200]}"
+        return None
+
+    rows = _order_rows()
+    results = await asyncio.gather(*(_one(*row) for row in rows))
+    failures = [f for f in results if f]
+    assert len(rows) == 216 and not failures, f"{len(failures)} of {len(rows)}:\n" + "\n".join(failures)
+
+
+_LANDING_PROBE_HTML = """<!doctype html><html><body style="margin:0;font:14px sans-serif">
+<div id="lb" role="listbox" style="position:absolute;left:16px;top:__TOP__px;width:300px;background:#fff">
+<div id="r1" role="option" style="padding:6px 8px;__R1__">__LEAF__</div>
+<div id="r2" role="option" style="padding:6px 8px"><span data-tv3-menu="2" style="display:block">Birch</span></div>
+</div>__AFTER__
+<script>
+customElements.define('x-label', class extends HTMLElement {
+  connectedCallback() {
+    if (this.shadowRoot) return;
+    this.style.display = 'block';
+    this.attachShadow({mode: 'open'}).innerHTML = '<span data-tv3-menu="1" style="display:block">Alder</span>';
+  }
+});
+customElements.define('x-help', class extends HTMLElement {
+  connectedCallback() {
+    if (this.shadowRoot) return;
+    this.style.display = 'block';
+    this.attachShadow({mode: 'open'}).innerHTML = '<a href="#help" data-tv3-menu="3" style="display:block">Learn more</a>';
+  }
+});
+</script></body></html>"""
+
+_LANDING_LEAF = '<span data-tv3-menu="1" style="display:block">Alder</span>'
+
+
+def _landing_probe_html(top: int = 40, leaf: str = _LANDING_LEAF, after: str = "", r1: str = "") -> str:
+    html_doc = _LANDING_PROBE_HTML.replace("__TOP__", str(top)).replace("__LEAF__", leaf)
+    return html_doc.replace("__AFTER__", after).replace("__R1__", r1)
+
+
+# The pre-click probe names a row click by its label unless the element at the row's centre withholds it (a link
+# inside a component). A centre the driver may not click (out of view, partly off the viewport, over several rects,
+# under an overlay or in a frame) names the row only provisionally, for the click the page receives to confirm.
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("top", "leaf", "after", "r1", "want"),
+    [
+        (40, _LANDING_LEAF, "", "", "Alder"),
+        (2400, _LANDING_LEAF, "", "", "unsure"),
+        (40, _LANDING_LEAF, "", "margin-left:-60px", "unsure"),
+        (40, '<span data-tv3-menu="1">Alder</span><br>&nbsp;', "", "display:inline", "unsure"),
+        (40, _LANDING_LEAF, '<div style="position:fixed;inset:0;background:rgba(0,0,0,.2)"></div>', "", "unsure"),
+        (
+            40,
+            '<span data-tv3-menu="1">Alder</span><iframe style="display:block;width:100%;height:40px;border:0"></iframe>',
+            "",
+            "",
+            "unsure",
+        ),
+        (40, "<x-label></x-label>", "", "", "Alder"),
+        (40, '<span data-tv3-menu="1">Alder</span><x-help></x-help>', "", "", None),
+    ],
+    ids=[
+        "in_view",
+        "out_of_view",
+        "partly_off_the_viewport",
+        "several_rects",
+        "overlay",
+        "frame",
+        "shadow_root",
+        "link_in_a_component",
+    ],
+)
+async def test_precheck_withholds_a_row_click_only_from_its_landing_element(
+    top: int, leaf: str, after: str, r1: str, want: str | None
+) -> None:
+    async with _content_page(_landing_probe_html(top, leaf, after, r1)) as page:
+        pre = await page.evaluate(_CLICK_PRECHECK_JS, {"sel": "#r1", "el": None})
+    if want is None:
+        assert not pre["isOption"] and pre["optText"] == "" and pre["rowClick"], pre
+    else:
+        assert pre["isOption"] and pre["optLevel"] == "row" and pre["optText"] == "Alder", pre
+        assert pre["optUnsure"] == (want == "unsure"), pre
+
+
+# The after probe reads the leaf and row the pre-click probe held only for the same selector and while both are drawn;
+# otherwise it reads the target alone, which holds no row-level pick. The element the page's click really reached
+# withholds the pick when it is a control that does not hold the label.
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("change", "sel", "held", "withheld"),
+    [
+        ("", "#r1", True, False),
+        ("", "div#r1", False, False),
+        ("leaf.replaceWith(leaf.cloneNode(true))", "#r1", False, False),
+        ("leaf.style.visibility = 'hidden'", "#r1", False, False),
+        ("click:#r1 a", "#r1", True, True),
+        ("click:#r1 span", "#r1", True, False),
+    ],
+    ids=["held", "other_selector", "disconnected", "hidden", "real_landing_on_the_link", "real_landing_on_the_label"],
+)
+async def test_after_probe_reads_the_held_pick_and_the_real_landing(
+    change: str, sel: str, held: bool, withheld: bool
+) -> None:
+    row = (
+        '<span data-tv3-menu="1">Alder</span> <a href="#help" data-tv3-menu="3" aria-label="Help"'
+        ' style="display:inline-block;width:40px;height:14px"></a>'
+    )
+    async with _content_page(_landing_probe_html(leaf=row)) as page:
+        pre = await page.evaluate(_CLICK_PRECHECK_JS, {"sel": "#r1", "el": None})
+        assert pre["isOption"] and pre["optText"] == "Alder", pre
+        if change.startswith("click:"):
+            box = await page.locator(change[len("click:") :]).bounding_box()
+            assert box is not None
+            await page.evaluate("() => document.addEventListener('click', (e) => e.preventDefault())")
+            await page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+        elif change:
+            await page.evaluate(f"() => {{ const leaf = document.querySelector('#r1 span'); {change}; }}")
+        after = await page.evaluate(_MENU_AFTER_JS, {"sel": sel, "el": None})
+    assert bool(after["optState"]) == held, after
+    assert after["withheld"] == withheld, after
+
+
+# A multi-select whose pick shows only on the label leaf clicked (its class, its style, its own aria-selected, a child
+# it gains) while the row and the menu stay as they were reads as a change, never as a pick that did not commit.
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("slotted", [False, True], ids=["light", "slotted"])
+@pytest.mark.parametrize("sign", ["leafclass", "leafstyle", "leafaria", "leafkid"])
+async def test_dom_a_pick_shown_only_on_the_leaf_clicked_reads_as_a_change(sign: str, slotted: bool) -> None:
+    rows = [_twin_row(n, f"<span>{n}</span>") for n in ("Alder", "Birch", "Cedar")]
+    cfg = {"dialog": False, "clobber": False, "multi": True, "sign": sign, "rows": rows}
+    failures = await _twin_one(cfg, slotted, [("open", "open", "", None), ("numbered", "numbered", "Birch", "Birch")])
+    assert not failures, "\n".join(failures)
+
+
+_HIDDEN_ROWS_MENU_HTML = """<!doctype html><html><body style="margin:0;font:14px sans-serif">
+<h2 style="margin:8px 16px">Pick a fruit</h2>
+<div style="margin:8px 16px;position:relative">
+<button type="button" id="trigger" aria-haspopup="listbox" aria-controls="lb">Choose a fruit</button>
+<button type="button" id="fewer">Show fewer</button>
+<div id="lb" role="listbox" style="position:absolute;left:0;top:28px;width:240px;background:#fff;border:1px solid #888">
+<div role="option" style="padding:6px 8px"><span>Apple</span></div>
+<div role="option" style="padding:6px 8px"><span>Mango</span></div>
+<div role="option" style="padding:6px 8px" class="more"><span>Peach</span></div>
+<div role="option" style="padding:6px 8px" class="more"><span>Quince</span></div>
+</div></div>
+<script>
+const MODE = __MODE__;
+const DELAY = __DELAY__;
+const lb = document.getElementById('lb');
+const shown = (on) => {
+  if (on) { lb.style.display = 'block'; lb.style.visibility = 'visible'; lb.style.opacity = '1'; }
+  else if (MODE === 'visibility') lb.style.visibility = 'hidden';
+  else if (MODE === 'opacity') lb.style.opacity = '0';
+  else lb.style.display = 'none';
+};
+if (MODE === 'opacity') lb.style.display = 'none';
+else shown(false);
+let open = false;
+document.getElementById('trigger').addEventListener('click', () => {
+  open = !open;
+  if (open || !DELAY) shown(open);
+  else setTimeout(() => shown(false), DELAY);
+});
+document.getElementById('fewer').addEventListener('click', () => {
+  for (const r of document.querySelectorAll('.more')) {
+    if (MODE === 'visibility') r.style.visibility = 'hidden';
+    else r.style.display = 'none';
+  }
+});
+</script></body></html>"""
+
+
+# A menu whose rows the page hides rather than removes leaves no numbered tag on a hidden row: not after a trigger click
+# closes it (by display or by visibility), and not after a control beside it hides some of its rows.
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["display", "visibility", "collapse", "collapse_visibility"])
+async def test_dom_a_menu_that_hides_its_rows_leaves_no_numbered_tag_on_a_hidden_row(mode: str) -> None:
+    collapse = mode.startswith("collapse")
+    page_mode = "visibility" if mode == "collapse_visibility" else "display" if collapse else mode
+    html_doc = _HIDDEN_ROWS_MENU_HTML.replace("__MODE__", json.dumps(page_mode)).replace("__DELAY__", "0")
+    async with _content_page(html_doc) as page:
+        click = _tool(build_browser_tools(_fixed_page_provider(page)), "click").handler
+        opened = await click({"selector": "#trigger"})
+        assert [text for _, text in _menu_note_entries(opened.content)] == ["Apple", "Mango", "Peach", "Quince"], (
+            opened.content
+        )
+        second = await click({"selector": "#fewer" if collapse else "#trigger"})
+        if not collapse:
+            assert "CLOSED the open menu" in second.content, second.content
+        tags = await page.evaluate(
+            """() => [...document.querySelectorAll('[data-tv3-menu]')].map((e) => [
+              e.textContent.trim(), e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden'])"""
+        )
+    assert all(shown for _, shown in tags), tags
+
+
+# A menu that fades out a beat after the closing click still reads open when the click is read back, so its rows may
+# keep their numbers; once hidden, by display, visibility or opacity, a numbered click on one is refused as stale at
+# once rather than after the driver's whole visibility wait.
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["display", "visibility", "opacity"])
+async def test_dom_a_numbered_click_into_a_menu_hidden_after_its_closing_click_is_refused_as_stale(mode: str) -> None:
+    html_doc = _HIDDEN_ROWS_MENU_HTML.replace("__MODE__", json.dumps(mode)).replace("__DELAY__", "400")
+    async with _content_page(html_doc) as page:
+        click = _tool(build_browser_tools(_fixed_page_provider(page)), "click").handler
+        opened = await click({"selector": "#trigger"})
+        tag = {text: n for n, text in _menu_note_entries(opened.content)}["Mango"]
+        closed = await click({"selector": "#trigger"})
+        assert closed.status == "ok", closed.content
+        await asyncio.sleep(1)
+        started = time.monotonic()
+        stale = await click({"selector": f'[data-tv3-menu="{tag}"]'})
+        elapsed = time.monotonic() - started
+    assert stale.error_class == "stale_selector" and "no longer exists on the page" in stale.content, stale.content
+    assert elapsed < 5, elapsed
+
+
+# A host-declared row whose checkbox sits in its own shadow root: a pick that only flips that checkbox is a change.
+# Main misses it too, so this is not a regression.
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_a_pick_that_only_flips_a_checkbox_in_the_rows_own_root_reads_as_a_change() -> None:
+    html_doc = """<!doctype html><html><body style="margin:0;font:14px sans-serif">
+<h2 style="margin:8px 16px">Pick sports</h2>
+<div style="margin:8px 16px;position:relative">
+<button type="button" id="trigger" aria-haspopup="listbox">Choose sports</button><div id="anchor"></div></div>
+<script>
+window.__committed = [];
+customElements.define('check-row', class extends HTMLElement {
+  connectedCallback() {
+    if (this.shadowRoot) return;
+    this.style.cssText = 'display:block;padding:6px 8px;cursor:pointer';
+    this.attachShadow({mode: 'open'}).innerHTML = '<input type="checkbox" tabindex="-1"> <slot></slot>';
+    this.addEventListener('click', () => {
+      const box = this.shadowRoot.querySelector('input');
+      box.checked = !box.checked;
+      const v = this.textContent.trim();
+      window.__committed = box.checked ? window.__committed.concat([v]) : window.__committed.filter((x) => x !== v);
+    });
+  }
+});
+let pop = null;
+document.getElementById('trigger').addEventListener('click', () => {
+  if (pop) { pop.remove(); pop = null; return; }
+  pop = document.createElement('div');
+  pop.setAttribute('role', 'listbox');
+  pop.setAttribute('aria-multiselectable', 'true');
+  pop.style.cssText = 'position:absolute;left:0;top:28px;width:240px;background:#fff;border:1px solid #888';
+  pop.innerHTML = ['Rowing', 'Fencing', 'Archery']
+    .map((n) => '<check-row role="option"><span>' + n + '</span></check-row>').join('');
+  document.getElementById('anchor').appendChild(pop);
+});
+</script></body></html>"""
+    async with _content_page(html_doc) as page:
+        click = _tool(build_browser_tools(_fixed_page_provider(page)), "click").handler
+        opened = await click({"selector": "#trigger"})
+        tag = {text: n for n, text in _menu_note_entries(opened.content)}["Fencing"]
+        picked = await click({"selector": f'[data-tv3-menu="{tag}"]'})
+        committed = await page.evaluate("() => window.__committed")
+    assert committed == ["Fencing"]
+    assert picked.status == "ok" and "its state changed" in picked.content, picked.content
+    assert (picked.data or {}).get(PICKED_OPTION_DATA_KEY) == "Fencing", picked.data
+
+
+# The finder keeps an open menu's numbered tags drawn in a component's root when a form earlier on the page makes
+# `shadowRoot` read as its two inputs of that name. Called directly: that form also stops Playwright's own selectors.
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_dom_an_open_menus_tags_in_a_component_root_survive_a_form_that_shadows_shadow_root() -> None:
+    html_doc = """<!doctype html><html><body style="margin:0;font:14px sans-serif">
+<form><input type="hidden" name="shadowRoot"><input type="hidden" name="shadowRoot"></form>
+<h2 style="margin:8px 16px">Pick a colour</h2>
+<colour-pick style="display:block;margin:8px 16px"></colour-pick>
+<script>
+customElements.define('colour-pick', class extends HTMLElement {
+  connectedCallback() {
+    if (this.shadowRoot) return;
+    this.attachShadow({mode: 'open'}).innerHTML = '<div role="listbox" style="width:240px;border:1px solid #888">'
+      + ['Ochre', 'Teal', 'Umber'].map((n, i) => '<div role="option" style="padding:6px 8px" data-tv3-menu="'
+        + (i + 1) + '"><span>' + n + '</span></div>').join('') + '</div>';
+  }
+});
+</script></body></html>"""
+    count_tags = """() => document.querySelector('colour-pick').shadowRoot.querySelectorAll('[data-tv3-menu]').length"""
+    async with _content_page(html_doc) as page:
+        assert await page.evaluate(count_tags) == 3
+        await page.evaluate(_FIND_MENU_JS, {"sel": "h2", "el": None, "keepOpenTags": True})
+        kept = await page.evaluate(count_tags)
+        await page.evaluate(_FIND_MENU_JS, {"sel": "h2", "el": None, "keepOpenTags": False})
+        cleared = await page.evaluate(count_tags)
+    assert (kept, cleared) == (3, 0)

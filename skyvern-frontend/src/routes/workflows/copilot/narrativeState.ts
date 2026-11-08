@@ -653,9 +653,7 @@ export function parseCredentialPause(
     return null;
   }
   const siteAnswer =
-    o.siteAnswer === "add" || o.siteAnswer === "move" || o.siteAnswer === "no"
-      ? o.siteAnswer
-      : undefined;
+    o.siteAnswer === "add" || o.siteAnswer === "no" ? o.siteAnswer : undefined;
   return {
     outcome,
     credentialId: typeof o.credentialId === "string" ? o.credentialId : null,
@@ -1633,15 +1631,33 @@ export function applyNarrativeEvent(
       };
     }
 
-    case "run_started":
-      if (!event.skipped_prefix?.length) return prev;
+    case "run_started": {
+      // A pending placeholder rather than null: null lets notConfirmedOutcome fall back to an
+      // earlier run's not_demonstrated block row.
+      const lastRunOutcome =
+        prev.lastRunOutcome !== null &&
+        prev.lastRunOutcome.workflowRunId !== event.workflow_run_id
+          ? {
+              verdict: "not_evaluated" as const,
+              role: "interim_build_test" as const,
+              displayReason: null,
+              workflowRunId: event.workflow_run_id,
+            }
+          : prev.lastRunOutcome;
+      if (!event.skipped_prefix?.length) {
+        return lastRunOutcome === prev.lastRunOutcome
+          ? prev
+          : { ...prev, lastRunOutcome };
+      }
       return {
         ...prev,
+        lastRunOutcome,
         pendingSkippedPrefix: {
           ...prev.pendingSkippedPrefix,
           [event.workflow_run_id]: event.skipped_prefix,
         },
       };
+    }
 
     case "run_outcome": {
       // Apply the recorded verdict by run-block id only — no label fallback, so
@@ -2438,7 +2454,14 @@ export function notConfirmedOutcome(
       workflowRunId: turn.turnFacts?.runId ?? undefined,
     };
   }
-  const block = notDemonstratedBlock(turn.blocks);
+  const anchoredRunId = turn.turnFacts?.runId;
+  const block = notDemonstratedBlock(
+    anchoredRunId
+      ? turn.blocks.filter(
+          (b) => !b.workflowRunId || b.workflowRunId === anchoredRunId,
+        )
+      : turn.blocks,
+  );
   return block === null
     ? null
     : {

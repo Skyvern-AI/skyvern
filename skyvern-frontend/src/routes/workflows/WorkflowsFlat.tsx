@@ -10,14 +10,7 @@ import {
 } from "@/components/SelectionCheckbox";
 import { useRowSelection } from "@/hooks/useRowSelection";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
-import {
-  Pagination,
-  PaginationContent,
-  PaginationItem,
-  PaginationLink,
-  PaginationNext,
-  PaginationPrevious,
-} from "@/components/ui/pagination";
+import { SimplePagination } from "@/components/ui/pagination";
 import {
   Table,
   TableBody,
@@ -44,7 +37,6 @@ import {
   runWithConcurrency,
 } from "@/util/runWithConcurrency";
 import { bulkResultToast } from "@/util/bulkResultToast";
-import { cn } from "@/util/utils";
 import {
   BookmarkFilledIcon,
   ChevronDownIcon,
@@ -498,16 +490,6 @@ function WorkflowsFlat() {
       }
     });
     setSearchParams(params, { replace: true });
-  }
-
-  function handlePreviousPage() {
-    if (page === 1) return;
-    setParamPatch({ page: String(page - 1) });
-  }
-
-  function handleNextPage() {
-    if (isNextDisabled) return;
-    setParamPatch({ page: String(page + 1) });
   }
 
   // Show importing agents from polling hook (only on page 1)
@@ -1304,29 +1286,14 @@ function WorkflowsFlat() {
                 </SelectContent>
               </Select>
             </div>
-            <Pagination className="pt-0">
-              <PaginationContent>
-                <PaginationItem>
-                  <PaginationPrevious
-                    className={cn({
-                      "cursor-not-allowed opacity-50": page === 1,
-                    })}
-                    onClick={handlePreviousPage}
-                  />
-                </PaginationItem>
-                <PaginationItem>
-                  <PaginationLink>{page}</PaginationLink>
-                </PaginationItem>
-                <PaginationItem>
-                  <PaginationNext
-                    className={cn({
-                      "cursor-not-allowed opacity-50": isNextDisabled,
-                    })}
-                    onClick={handleNextPage}
-                  />
-                </PaginationItem>
-              </PaginationContent>
-            </Pagination>
+            <SimplePagination
+              className="pt-0"
+              page={page}
+              hasNext={!isNextDisabled}
+              onPageChange={(nextPage) =>
+                setParamPatch({ page: String(nextPage) })
+              }
+            />
           </div>
         </div>
 

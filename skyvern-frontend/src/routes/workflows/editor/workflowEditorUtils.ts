@@ -5235,6 +5235,7 @@ function convertBlocksToBlockYAML(
           prompt: block.prompt,
           data_schema: block.data_schema,
           max_turns: block.max_turns,
+          model: blockModelOverride(block.model),
           tools: block.tools ?? null,
           parameter_keys: (block.parameters ?? []).map((p) => p.key),
         };

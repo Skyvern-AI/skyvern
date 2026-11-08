@@ -128,7 +128,7 @@ class TestVideoListenerGating:
         assert attach_only.is_enforcing() is False
 
 
-# The startup probe for the attach image lives in tests/cloud/test_attach_only_worker_image.py:
+# The startup probe for the attach image lives in the cloud test suite:
 # it imports the cloud-only worker entrypoint, which does not exist in the OSS checkout.
 def test_playwright_is_not_claimed_strippable() -> None:
     """Pins the reasoning, so nobody re-adds it to the list and breaks startup again."""
@@ -144,8 +144,7 @@ def test_playwright_is_not_claimed_strippable() -> None:
 def test_the_startup_check_admits_the_dispatch_alias_but_not_a_launching_type() -> None:
     """Startup only. is_attach_only_browser_type is consulted against settings.BROWSER_TYPE at boot
     and by no runtime path, so this pins which BROWSER_TYPE may start a worker -- not what happens
-    when a dispatch alias later resolves to a launching leaf. That is
-    tests/cloud/test_cloud_browser_factory_vendor_lane_guard.py.
+    when a dispatch alias later resolves to a launching leaf. The cloud test suite covers that.
     """
     from skyvern.webeye.attach_only import is_attach_only_browser_type
 

@@ -677,9 +677,12 @@ async def run_task_v3_agent_loop(
         intercepted_submissions=block_submissions,
         justify_stops=justify_on,
     )
+    # An extraction block cannot enter input, so a yes has nothing to act on there and offering the tool cost a turn.
     context_texts = (
         app.AGENT_FUNCTION.task_v3_application_context_texts(parameters)
-        if not page_free and run_arm_enabled(APPLICATION_CONTEXT_FLAG, settings.TASK_V3_APPLICATION_CONTEXT)
+        if not page_free
+        and run_arm_enabled(APPLICATION_CONTEXT_FLAG, settings.TASK_V3_APPLICATION_CONTEXT)
+        and not refuse_input_entry
         else None
     )
     context_task_text, context_age_text, context_defaults_text = context_texts or (None, None, "")

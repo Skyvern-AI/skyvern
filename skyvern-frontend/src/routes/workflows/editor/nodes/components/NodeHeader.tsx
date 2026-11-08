@@ -339,7 +339,10 @@ function NodeHeader({
     runStateIsLive &&
     workflowRun &&
     (statusIsRunningOrQueued(workflowRun) || runIsRetryWaiting(workflowRun));
-  useRunCompletionToast(runStateIsLive && !headless ? workflowRun : undefined);
+  // The Doc states a step run's outcome on the step's own line; this header stays mounted behind it.
+  useRunCompletionToast(
+    runStateIsLive && !headless && !docShowing ? workflowRun : undefined,
+  );
   const { isRateLimited } = useBrowserSessionRateLimit(workflowPermanentId);
   const { data: debugSession } = useDebugSessionQuery({
     workflowPermanentId,
@@ -1203,6 +1206,7 @@ function NodeHeader({
         open={showParamsDialog}
         onOpenChange={setShowParamsDialog}
         blockLabel={blockLabel}
+        inDoc={headless}
         parameters={parametersToPrompt}
         initialValues={currentParamValues}
         onSubmit={(values) => {

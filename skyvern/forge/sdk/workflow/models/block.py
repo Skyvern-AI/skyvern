@@ -9020,7 +9020,7 @@ async def wrapper({default_args}):
                 organization_id=organization_id,
                 task_id=escalation_task.task_id,
                 attempt_number=workflow_run_context.attempt_number,
-                label="Self-heal recovery",
+                label="Fallback to AI",
                 block_type=BlockType.TASK,
                 # Dispatched on v3 below; script generation reads this column to keep v3 actions out.
                 engine=RunEngine.skyvern_v3,

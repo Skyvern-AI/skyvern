@@ -624,7 +624,7 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     expect(
       (
         screen.getByRole("button", {
-          name: "Attach a file",
+          name: "Attach a file or demonstrate",
         }) as HTMLButtonElement
       ).disabled,
     ).toBe(false);

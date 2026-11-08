@@ -8,6 +8,14 @@ import {
 } from "@tanstack/react-query";
 import { renderHook, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { Status } from "@/api/types";
+import { agentStepTrail } from "../studio/agentStepTrail";
+import type {
+  AgentStepToolCall,
+  WorkflowRunBlock,
+  WorkflowRunTimelineBlockItem,
+  WorkflowRunTimelineItem,
+} from "../types/workflowRunTypes";
 
 const { mockGet, mockGetClient, runState } = vi.hoisted(() => ({
   mockGet: vi.fn(),
@@ -38,6 +46,7 @@ vi.mock("./useWorkflowRunWithWorkflowQuery", () => ({
 }));
 
 import {
+  POST_FINAL_TIMELINE_POLL_CAP,
   RUNNING_TIMELINE_REFETCH_INTERVAL_MS,
   useWorkflowRunTimelineQuery,
 } from "./useWorkflowRunTimelineQuery";
@@ -49,6 +58,57 @@ function wrapper({ children }: { children: ReactNode }) {
   return (
     <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
   );
+}
+
+function stableWrapper() {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  return ({ children }: { children: ReactNode }) => (
+    <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+  );
+}
+
+function row(
+  label: string,
+  status: Status,
+  children: Array<WorkflowRunTimelineItem> = [],
+  extra: Partial<WorkflowRunTimelineBlockItem> = {},
+  toolCalls?: Array<AgentStepToolCall>,
+): WorkflowRunTimelineBlockItem {
+  return {
+    type: "block",
+    thought: null,
+    children,
+    created_at: "2026-01-01T00:00:00Z",
+    modified_at: "2026-01-01T00:00:00Z",
+    block: {
+      workflow_run_block_id: `wrb_${label}`,
+      label,
+      status,
+      block_type: toolCalls ? "agent_step" : "task",
+      tool_calls: toolCalls,
+      created_at: "2026-01-01T00:00:00Z",
+    } as WorkflowRunBlock,
+    ...extra,
+  };
+}
+
+function agentStep(
+  status: Status,
+  childStatus: Status,
+  extra: Partial<WorkflowRunTimelineBlockItem> = {},
+): WorkflowRunTimelineBlockItem {
+  return row("agent", status, [row("agent_task_1", childStatus)], extra, [
+    {
+      index: 0,
+      tool: "run_task",
+      status: Status.Running,
+      started_at: "2026-01-01T00:00:01Z",
+      arguments: "{}",
+      label: "agent_task_1",
+    },
+  ]);
 }
 
 afterEach(() => {
@@ -184,5 +244,94 @@ describe("useWorkflowRunTimelineQuery", () => {
     await vi.advanceTimersByTimeAsync(3 * RUNNING_TIMELINE_REFETCH_INTERVAL_MS);
 
     expect(mockGet.mock.calls.length > readsWhileFocused).toBe(expectedToPoll);
+  });
+
+  it("keeps reading a canceled run until every row has closed", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    focusManager.setFocused(true);
+    runState.status = "running";
+    mockGet.mockResolvedValue({
+      data: [agentStep(Status.Running, Status.Running)],
+    });
+    mockGetClient.mockResolvedValue({ get: mockGet });
+
+    const wrapper = stableWrapper();
+    const { result, rerender, unmount } = renderHook(
+      () => useWorkflowRunTimelineQuery(),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.data).toHaveLength(1));
+    const readsWhileLive = mockGet.mock.calls.length;
+
+    const settled = [agentStep(Status.Canceled, Status.Canceled)];
+    mockGet
+      .mockResolvedValueOnce({
+        data: [agentStep(Status.Running, Status.Running)],
+      })
+      .mockResolvedValueOnce({
+        data: [agentStep(Status.Canceled, Status.Running)],
+      })
+      .mockResolvedValueOnce({
+        data: [
+          agentStep(Status.Canceled, Status.Canceled, {
+            task_v2_blocks: [row("task_v2", Status.Running).block],
+          }),
+        ],
+      })
+      .mockResolvedValue({ data: settled });
+    runState.status = "canceled";
+    rerender();
+
+    await waitFor(() =>
+      expect(mockGet).toHaveBeenCalledTimes(readsWhileLive + 1),
+    );
+    for (const readsAfterTick of [2, 3, 4]) {
+      await vi.advanceTimersByTimeAsync(RUNNING_TIMELINE_REFETCH_INTERVAL_MS);
+      expect(mockGet).toHaveBeenCalledTimes(readsWhileLive + readsAfterTick);
+    }
+    await waitFor(() => expect(result.current.data).toEqual(settled));
+    await vi.advanceTimersByTimeAsync(4 * RUNNING_TIMELINE_REFETCH_INTERVAL_MS);
+    expect(mockGet).toHaveBeenCalledTimes(readsWhileLive + 4);
+
+    const step = result.current.data![0] as WorkflowRunTimelineBlockItem;
+    expect(agentStepTrail(step.block, step.children)[0]?.running).toBe(false);
+
+    unmount();
+    const remounted = renderHook(() => useWorkflowRunTimelineQuery(), {
+      wrapper,
+    });
+    expect(remounted.result.current.data).toEqual(settled);
+    await vi.advanceTimersByTimeAsync(2 * RUNNING_TIMELINE_REFETCH_INTERVAL_MS);
+    expect(mockGet).toHaveBeenCalledTimes(readsWhileLive + 4);
+  });
+
+  it("stops reading a final run at the cap and re-reads it once per mount", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    focusManager.setFocused(true);
+    runState.status = "canceled";
+    mockGet.mockResolvedValue({
+      data: [agentStep(Status.Canceled, Status.Running)],
+    });
+    mockGetClient.mockResolvedValue({ get: mockGet });
+    const wrapper = stableWrapper();
+
+    const first = renderHook(() => useWorkflowRunTimelineQuery(), { wrapper });
+    await waitFor(() => expect(first.result.current.isSuccess).toBe(true));
+    await vi.advanceTimersByTimeAsync(
+      (POST_FINAL_TIMELINE_POLL_CAP + 5) * RUNNING_TIMELINE_REFETCH_INTERVAL_MS,
+    );
+    expect(mockGet).toHaveBeenCalledTimes(POST_FINAL_TIMELINE_POLL_CAP);
+    const readsAtCap = mockGet.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(5 * RUNNING_TIMELINE_REFETCH_INTERVAL_MS);
+    expect(mockGet).toHaveBeenCalledTimes(readsAtCap);
+    first.unmount();
+
+    const second = renderHook(() => useWorkflowRunTimelineQuery(), {
+      wrapper,
+    });
+    await waitFor(() => expect(mockGet).toHaveBeenCalledTimes(readsAtCap + 1));
+    await waitFor(() => expect(second.result.current.isFetching).toBe(false));
+    await vi.advanceTimersByTimeAsync(5 * RUNNING_TIMELINE_REFETCH_INTERVAL_MS);
+    expect(mockGet).toHaveBeenCalledTimes(readsAtCap + 1);
   });
 });

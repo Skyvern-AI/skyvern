@@ -6,6 +6,14 @@ import {
 } from "../../types/workflowRunTypes";
 import { describeCodeBlockFailure } from "../../workflowRun/codeBlockFailure";
 import { formatFailureReason } from "../../workflowRun/failureReasonFormat";
+import { normalizeUtcTimestamp } from "@/util/timeFormat";
+import type {
+  WorkflowApiResponse,
+  WorkflowBlock,
+} from "../../types/workflowTypes";
+import { apiWorkflowToSettings } from "../apiWorkflowToSettings";
+import { isWorkflowBlockNode } from "../nodes";
+import { getElements } from "../workflowEditorUtils";
 import { failureHeadlineInPlainWords } from "./docFailureText";
 
 export type DocTagState =
@@ -32,6 +40,18 @@ export function blockFailureHeadline(block: WorkflowRunBlock): string | null {
       block.failure_reason,
       (raw) => formatFailureReason(raw).headline,
     )
+  );
+}
+
+/** The plain-words headline for a run that failed before any step row exists. */
+export function runFailureHeadline(run: {
+  status: string;
+  failure_reason?: string | null;
+}): string | null {
+  if (!FAILED.has(run.status) || !run.failure_reason?.trim()) return null;
+  return failureHeadlineInPlainWords(
+    run.failure_reason,
+    (raw) => formatFailureReason(raw).headline,
   );
 }
 
@@ -75,12 +95,54 @@ export function docRunStoppedByStep(
 
 export type DocLoopItem = {
   index: number;
-  value: string | null;
-  state: "running" | "succeeded" | "failed" | "waiting";
+  // A few plain words naming the item; null when it has no readable name.
+  title: string | null;
+  // The item's full value, for a disclosure under the line.
+  detail: string | null;
+  state: "running" | "succeeded" | "failed" | "waiting" | "canceled";
   failureHeadline: string | null;
 };
 
 export type DocLoopProgress = { total: number | null; items: DocLoopItem[] };
+
+/**
+ * The timeline as the ended run left it: a row the backend has not yet moved off Running ended with
+ * the run, so it reads as the run's failure or cancel, not as still running. A terminated run is left
+ * alone: its lagging rows read "Stopped", and its Stop step must keep its own status.
+ */
+export function settleRowsOfEndedRun(
+  timeline: WorkflowRunTimelineItem[],
+  run: { status: string; failure_reason?: string | null },
+): WorkflowRunTimelineItem[] {
+  const canceled = run.status === Status.Canceled;
+  const failed = run.status === Status.Failed || run.status === Status.TimedOut;
+  if (!canceled && !failed) return timeline;
+  const settle = (block: WorkflowRunBlock): WorkflowRunBlock => {
+    const lagging =
+      block.status === Status.Running || block.status === Status.Paused;
+    if (canceled)
+      return lagging ? { ...block, status: Status.Canceled } : block;
+    return lagging && block.block_type !== "terminate"
+      ? {
+          ...block,
+          status: run.status as Status,
+          failure_reason: block.failure_reason || run.failure_reason || null,
+        }
+      : block;
+  };
+  const walk = (items: WorkflowRunTimelineItem[]): WorkflowRunTimelineItem[] =>
+    items.map((item) =>
+      isBlockItem(item)
+        ? {
+            ...item,
+            block: settle(item.block),
+            task_v2_blocks: item.task_v2_blocks?.map(settle),
+            children: walk(item.children),
+          }
+        : { ...item, children: walk(item.children) },
+    );
+  return walk(timeline);
+}
 
 function itemState(blocks: WorkflowRunBlock[]): DocLoopItem["state"] {
   if (blocks.some((b) => FAILED.has(b.status))) return "failed";
@@ -94,19 +156,64 @@ function itemState(blocks: WorkflowRunBlock[]): DocLoopItem["state"] {
     )
   )
     return "running";
+  if (blocks.some((b) => b.status === Status.Canceled)) return "canceled";
   return "succeeded";
 }
 
-function descendants(items: WorkflowRunTimelineItem[]): WorkflowRunBlock[] {
+function descendants(
+  items: WorkflowRunTimelineItem[],
+  withReplaced = false,
+): WorkflowRunBlock[] {
   const out: WorkflowRunBlock[] = [];
   const walk = (list: WorkflowRunTimelineItem[]) => {
     for (const item of list) {
-      if (isBlockItem(item)) out.push(item.block);
+      if (isBlockItem(item)) {
+        out.push(item.block);
+        // A Task V2 step's own row is replaced by the rows it ran; only task_v2_blocks still holds it.
+        if (withReplaced && item.task_v2_blocks)
+          out.push(...item.task_v2_blocks);
+      }
       walk(item.children);
     }
   };
   walk(items);
   return out;
+}
+
+const TITLE_KEYS = ["title", "name", "label", "heading", "subject"];
+const SHORT = 60;
+
+function shortText(value: unknown): string | null {
+  if (typeof value === "number" || typeof value === "boolean")
+    return String(value);
+  if (typeof value !== "string") return null;
+  const text = value.trim().replace(/\s+/g, " ");
+  if (!text) return null;
+  return text.length > SHORT ? `${text.slice(0, SHORT - 1)}…` : text;
+}
+
+/** A loop item's name in a few words and its full value; raw objects never go on the line. */
+export function loopItemText(
+  value: unknown,
+  currentValue: string | null,
+): Pick<DocLoopItem, "title" | "detail"> {
+  if (value !== undefined && value !== null && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    const key = Array.isArray(value)
+      ? undefined
+      : TITLE_KEYS.find((k) => shortText(record[k]));
+    return {
+      title: key ? shortText(record[key]) : null,
+      detail: JSON.stringify(value, null, 2),
+    };
+  }
+  const text = value ?? currentValue;
+  if (text === undefined || text === null) return { title: null, detail: null };
+  const raw = String(text);
+  // The run row stores objects as their Python text; it is not a name.
+  if (/^\s*[[{(]/.test(raw)) return { title: null, detail: raw };
+  const title = shortText(raw);
+  return { title, detail: title === raw.trim() ? null : raw };
 }
 
 /** Per-item progress of each loop in the run, keyed by the loop's label. */
@@ -142,7 +249,12 @@ export function collectLoopProgress(
             const failed = blocks.find((b) => FAILED.has(b.status));
             return {
               index,
-              value: blocks.find((b) => b.current_value)?.current_value ?? null,
+              ...loopItemText(
+                Array.isArray(block.loop_values)
+                  ? block.loop_values[index]
+                  : undefined,
+                blocks.find((b) => b.current_value)?.current_value ?? null,
+              ),
               state: itemState(blocks),
               failureHeadline: failed ? blockFailureHeadline(failed) : null,
             };
@@ -212,16 +324,51 @@ export function docRunEndMessage(
     : "Run finished";
 }
 
-// Every saved version stamps its own ids and times on each step, so only the authored fields compare.
+// Every saved version stamps its own ids and times on each step and input, so only the authored fields compare.
 const STAMPED_KEYS = new Set([
   "output_parameter",
+  "workflow_id",
   "created_at",
   "modified_at",
   "deleted_at",
 ]);
-// A save writes defaults as null where the author left a field out, so null reads as absent.
-const stamped = (key: string, value: unknown) =>
-  STAMPED_KEYS.has(key) || value === null ? undefined : value;
+const isStamped = (key: string) =>
+  STAMPED_KEYS.has(key) || key.endsWith("_parameter_id");
+const isStep = (
+  value: unknown,
+): value is Record<string, unknown> & { label: string } =>
+  Boolean(value) &&
+  typeof value === "object" &&
+  typeof (value as Record<string, unknown>).label === "string" &&
+  typeof (value as Record<string, unknown>).block_type === "string";
+// A conditional branch's "id" is minted again on every save; an "id" anywhere else is authored.
+const isBranch = (holder: Record<string, unknown>) =>
+  "is_default" in holder || "next_block_label" in holder;
+
+// The editor's first save fills defaults an agent made elsewhere left empty (null or "" fields,
+// the title as the label, the unused export schema), so those read as absent. A step inside
+// another counts by its label only: editing it changes that step, not the one around it.
+function authored(step: Record<string, unknown>): string {
+  return JSON.stringify(
+    step,
+    function (this: Record<string, unknown>, key: string, value: unknown) {
+      if (key === "") return value;
+      if (value === null) return undefined;
+      // Only a step's or an input's own keys; the same names inside an authored schema or body are edits.
+      const own = isStep(this) || typeof this.parameter_type === "string";
+      if (own && (isStamped(key) || value === "")) return undefined;
+      if (key === "id" && isBranch(this)) return undefined;
+      if (isStep(this)) {
+        // The editor's first save fills this in along the implicit chain; it routes, it does not change the step.
+        if (key === "next_block_label") return undefined;
+        if (key === "title" && value === this.label) return undefined;
+        if (key === "export_data_schema" && !this.export_enabled)
+          return undefined;
+      }
+      return isStep(value) ? `step:${value.label}` : value;
+    },
+  );
+}
 
 function stepsByLabel(node: unknown, into: Map<string, string>) {
   if (Array.isArray(node)) {
@@ -230,8 +377,7 @@ function stepsByLabel(node: unknown, into: Map<string, string>) {
   }
   if (!node || typeof node !== "object") return;
   const record = node as Record<string, unknown>;
-  if (typeof record.label === "string" && typeof record.block_type === "string")
-    into.set(record.label, JSON.stringify(record, stamped));
+  if (isStep(record)) into.set(record.label, authored(record));
   for (const value of Object.values(record)) stepsByLabel(value, into);
 }
 
@@ -251,6 +397,13 @@ export function stepsUnknownToRun(
   for (const [label, definition] of current)
     if (ran.get(label) !== definition) unknown.add(label);
   return unknown;
+}
+
+/** The labels of the steps a run's saved version had. */
+export function stepLabelsOf(definition: unknown): Set<string> {
+  const labels = new Map<string, string>();
+  stepsByLabel(definition, labels);
+  return new Set(labels.keys());
 }
 
 function inputsOf(definition: unknown): string {
@@ -283,4 +436,185 @@ export function sameSteps(
     [...ran.keys()].join("\0") === [...current.keys()].join("\0") &&
     [...current].every(([label, definition]) => ran.get(label) === definition)
   );
+}
+
+export type SavedVersion = {
+  version: number;
+  workflow_definition: unknown;
+  deleted_at?: string | null;
+};
+
+/** Whether a run's results belong to a version other than the agent's saved one. */
+export function ranAnotherVersion(
+  ran: SavedVersion,
+  current: SavedVersion,
+  newer: { copilotTest: boolean; proposalPending: boolean },
+): boolean {
+  // Accepting a tested proposal saves a newer version with the same steps; its test run still speaks for it.
+  // A newer Copilot test with no proposal left under review was rejected (its draft version is deleted once
+  // the run ends). Any other newer version is a save this tab has not loaded yet, so its run is the agent's.
+  const discarded =
+    ran.version < current.version ||
+    (ran.version > current.version &&
+      !newer.proposalPending &&
+      (newer.copilotTest || Boolean(ran.deleted_at)));
+  return (
+    discarded &&
+    !sameSteps(ran.workflow_definition, current.workflow_definition)
+  );
+}
+
+export type DocBlockRuns = {
+  count: number;
+  failed: number;
+  canceled: number;
+  withOutput: number;
+};
+
+/** How many times each step ran in the run (once per loop item), how many failed, and how many returned a value. */
+export function collectBlockRuns(
+  timeline: WorkflowRunTimelineItem[],
+  workflowRunId: string,
+  into: Map<string, DocBlockRuns>,
+  hasOutput: (block: WorkflowRunBlock) => boolean,
+) {
+  // A script that falls back to the agent leaves two rows for one execution: one per loop item and parent.
+  const executions = new Map<string, WorkflowRunBlock>();
+  for (const block of descendants(timeline, true)) {
+    if (!block.label || block.workflow_run_id !== workflowRunId) continue;
+    // A row that never started (skipped branch, not reached) is not a run.
+    if (
+      block.status === Status.Skipped ||
+      block.status === Status.Queued ||
+      block.status === Status.Created
+    )
+      continue;
+    executions.set(
+      [
+        block.label,
+        block.parent_workflow_run_block_id,
+        block.current_index ?? "",
+      ].join("\0"),
+      block,
+    );
+  }
+  for (const block of executions.values()) {
+    const label = block.label as string;
+    const runs = into.get(label) ?? {
+      count: 0,
+      failed: 0,
+      canceled: 0,
+      withOutput: 0,
+    };
+    runs.count += 1;
+    if (FAILED.has(block.status)) runs.failed += 1;
+    if (block.status === Status.Canceled) runs.canceled += 1;
+    if (hasOutput(block)) runs.withOutput += 1;
+    into.set(label, runs);
+  }
+}
+
+type DocRunLayer = {
+  blocksByLabel: Map<string, WorkflowRunBlock>;
+  unknownLabels: Set<string>;
+};
+
+function findStep(node: unknown, label: string): unknown {
+  if (!node || typeof node !== "object") return undefined;
+  if (isStep(node) && node.label === label) return node;
+  for (const value of Object.values(node)) {
+    const found = findStep(value, label);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+// A conditional's branch steps are not nested under it in the saved blocks, so the editor's graph says what holds the target.
+function containersOf(definition: object, target: string): string[] {
+  const blocks = (definition as { blocks?: unknown }).blocks;
+  if (!Array.isArray(blocks)) return [];
+  try {
+    const { nodes } = getElements(
+      JSON.parse(JSON.stringify(blocks)) as WorkflowBlock[],
+      apiWorkflowToSettings({
+        workflow_definition: definition,
+      } as WorkflowApiResponse),
+      false,
+    );
+    const byId = new Map(nodes.map((node) => [node.id, node]));
+    const labels: string[] = [];
+    const seen = new Set<string>();
+    let node = nodes.find(
+      (n) => isWorkflowBlockNode(n) && n.data.label === target,
+    );
+    while (node?.parentId && !seen.has(node.parentId)) {
+      seen.add(node.parentId);
+      node = byId.get(node.parentId);
+      if (node && isWorkflowBlockNode(node)) labels.push(node.data.label);
+    }
+    return labels;
+  } catch {
+    return [];
+  }
+}
+
+const runScopes = new WeakMap<object, Map<string, Set<string>>>();
+
+function stepsInRunScope(definition: unknown, target: string): Set<string> {
+  if (!definition || typeof definition !== "object") return new Set([target]);
+  let byTarget = runScopes.get(definition);
+  if (!byTarget) runScopes.set(definition, (byTarget = new Map()));
+  let scope = byTarget.get(target);
+  if (!scope) {
+    scope = new Set([
+      target,
+      ...stepLabelsOf(findStep(definition, target)),
+      ...containersOf(definition, target),
+    ]);
+    byTarget.set(target, scope);
+  }
+  return scope;
+}
+
+/**
+ * Whether a step shows the latest full run's result: a one-step run speaks only for the step it ran, the
+ * steps inside it and the containers holding it, even before their rows exist.
+ */
+export function stepShowsEarlierRun(
+  docRun: DocRunLayer & {
+    blockRun: boolean;
+    blockRunTarget?: string | null;
+    run?: { workflow?: { workflow_definition?: unknown } } | null;
+    currentDefinition?: unknown;
+    previous?: DocRunLayer | null;
+  },
+  label: string,
+): boolean {
+  const { previous, blockRunTarget } = docRun;
+  // Until the run's own definition loads (or if it fails), the current one says which steps the target holds.
+  const definition =
+    docRun.run?.workflow?.workflow_definition ?? docRun.currentDefinition;
+  const inRunScope =
+    typeof blockRunTarget === "string" &&
+    stepsInRunScope(definition, blockRunTarget).has(label);
+  return Boolean(
+    docRun.blockRun &&
+    !inRunScope &&
+    !docRun.blocksByLabel.has(label) &&
+    previous?.blocksByLabel.has(label) &&
+    !previous.unknownLabels.has(label),
+  );
+}
+
+/** How long ago an earlier run's result was produced, in a few words. */
+export function docResultAge(at: string, now: number): string | null {
+  const produced = Date.parse(normalizeUtcTimestamp(at));
+  if (Number.isNaN(produced)) return null;
+  const minutes = Math.floor((now - produced) / 60_000);
+  if (!(minutes >= 1)) return "just now";
+  if (minutes < 60) return `${minutes} min ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} hr ago`;
+  const days = Math.floor(hours / 24);
+  return `${days} day${days === 1 ? "" : "s"} ago`;
 }

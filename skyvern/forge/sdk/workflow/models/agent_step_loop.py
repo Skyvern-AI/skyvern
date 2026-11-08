@@ -7,7 +7,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import pydantic_core
 import structlog
@@ -30,7 +30,7 @@ from agents.models.interface import Model
 from agents.tool_context import ToolContext
 from openai.types.responses import ResponseFunctionToolCall, ResponseOutputMessage, ResponseOutputRefusal
 from openai.types.shared import Reasoning
-from pydantic import ValidationError
+from pydantic import JsonValue, ValidationError
 
 from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
@@ -47,7 +47,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.executor.run_liveness import run_write_authority
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
-from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.schemas.workflow_runs import AgentStepToolCall, WorkflowRunBlock
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext, _is_platform_smtp_aws_key
 from skyvern.forge.sdk.workflow.exceptions import InvalidWorkflowDefinition
 from skyvern.forge.sdk.workflow.models.agent_step_block import AgentStepBlock
@@ -72,17 +72,26 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     is_sensitive_workflow_parameter,
 )
 from skyvern.forge.sdk.workflow.workflow_definition_converter import block_yaml_to_block
+from skyvern.forge.taskv3.handoff_redaction import sanitize_handoff_url, string_leaves
+from skyvern.forge.taskv3.opaque_refs import _TOKEN_PREFIX, mask_opaque_urls
 from skyvern.schemas.agent_step_tool_names import ALWAYS_OFFERED_TOOLS
 from skyvern.schemas.run_enums import RunEngine
 from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType
+from skyvern.utils.contained_effects import contained_effect
 from skyvern.utils.secret_redaction import redact_secrets_from_text
+from skyvern.webeye.actions.actions import UploadFileAction
 
 if TYPE_CHECKING:
     from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
 
 LOG = structlog.get_logger()
 _MAX_TOOL_RESULT_CHARS = 20_000
+_MAX_TRAIL_ARGUMENT_CHARS = 4_000
+_MAX_TRAIL_BLOCK_CHARS = 64_000
+_MAX_TRAIL_BYTES = 512 * 1024
+_TRAIL_WRITE_SECONDS = 2
 _MASK = "*****"
+_Fact = str | list[dict[str, str]]
 
 _INSTRUCTIONS = (
     "You are one step of an unattended workflow run; nobody can answer questions. "
@@ -130,6 +139,59 @@ class _RunState:
     page: ScriptSkyvernPage | None = None
     task: Task | None = None
     step: Step | None = None
+    # The tool_calls column holds every call, including ones no tool recorded in calls, so only calls feeds billing.
+    # One background task writes the newest snapshot, so a tool never waits on that write.
+    trail: list[AgentStepToolCall] = field(default_factory=list)
+    running: AgentStepToolCall | None = None
+    pending_trail: list[AgentStepToolCall] | None = None
+    trail_writer: asyncio.Task[None] | None = None
+
+
+def _capped(text: str) -> str:
+    if len(text) <= _MAX_TRAIL_ARGUMENT_CHARS:
+        return text
+    return f"{text[:_MAX_TRAIL_ARGUMENT_CHARS]}...[truncated]"
+
+
+def _child_label(state: _RunState, block_type: BlockType) -> str:
+    return f"{state.label}_{block_type.value}_{len(state.trail) + 1}"
+
+
+def _publish_trail(state: _RunState) -> asyncio.Task[None]:
+    state.pending_trail = [*state.trail, *([state.running] if state.running else [])]
+    if state.trail_writer is None or state.trail_writer.done():
+        state.trail_writer = asyncio.create_task(_write_trail(state))
+    return state.trail_writer
+
+
+def _stored_size(entry: AgentStepToolCall) -> int:
+    # The column's json.dumps escapes non-ASCII, and the ", " between list items makes the sum exact.
+    return len(json.dumps(entry.model_dump(mode="json", exclude_none=True))) + 2
+
+
+async def _write_trail(state: _RunState) -> None:
+    while (trail := state.pending_trail) is not None:
+        state.pending_trail = None
+        try:
+            stored = list(trail)
+            sizes = [_stored_size(entry) for entry in stored]
+            for i, entry in enumerate(stored):
+                if sum(sizes) <= _MAX_TRAIL_BYTES:
+                    break
+                stored[i] = entry.model_copy(update={"block": None, "arguments": ""})
+                sizes[i] = _stored_size(stored[i])
+            async with asyncio.timeout(_TRAIL_WRITE_SECONDS):
+                await app.DATABASE.observer.update_workflow_run_block_tool_calls(
+                    workflow_run_block_id=state.workflow_run_block_id,
+                    organization_id=state.organization_id,
+                    tool_calls=stored,
+                )
+        except Exception:
+            LOG.warning(
+                "Failed to write the agent step's tool calls",
+                workflow_run_block_id=state.workflow_run_block_id,
+                exc_info=True,
+            )
 
 
 async def _raise_if_run_ended(state: _RunState) -> None:
@@ -140,22 +202,82 @@ async def _raise_if_run_ended(state: _RunState) -> None:
         raise _RunEnded(BlockStatus(run.status.value))
 
 
+def _running_entry(
+    state: _RunState,
+    tool: str,
+    arguments: str,
+    describe: Callable[[JsonValue], tuple[BlockType | None, JsonValue]] | None,
+) -> AgentStepToolCall:
+    block_type: BlockType | None = None
+    try:
+        shown = json.loads(arguments or "{}")
+        if describe is not None:
+            block_type, shown = describe(shown)
+        displayed = _redacted_json(state, shown)
+    except Exception:
+        # Redacted before encoding: a secret the model already escaped would not match once escaped again.
+        block_type, displayed = None, json.dumps(_scrubbed(state, arguments))
+    return AgentStepToolCall(
+        index=len(state.trail) + 1,
+        tool=tool,
+        status=BlockStatus.running,
+        arguments=_capped(displayed),
+        block_type=block_type,
+        label=_child_label(state, block_type) if block_type else None,
+        started_at=datetime.now(UTC),
+    )
+
+
 def _in_turn(
-    state: _RunState, invoke: Callable[[str], Awaitable[str]]
+    state: _RunState,
+    invoke: Callable[[str], Awaitable[str]],
+    describe: Callable[[JsonValue], tuple[BlockType | None, JsonValue]] | None = None,
 ) -> Callable[[ToolContext[Any], str], Awaitable[str]]:
     async def ordered(ctx: ToolContext[Any], arguments: str) -> str:
         call_id = ctx.tool_call_id
         async with state.turn:
             await state.turn.wait_for(lambda: call_id not in state.call_order or state.call_order[0] == call_id)
+            started = False
+            status: BlockStatus | Literal["invalid_arguments"] = "invalid_arguments"
             try:
                 await _raise_if_run_ended(state)
+                try:
+                    state.running = _running_entry(state, ctx.tool_name, arguments, describe)
+                    started = True
+                    _publish_trail(state)
+                except Exception:
+                    LOG.warning(
+                        "Failed to show an agent step call",
+                        workflow_run_block_id=state.workflow_run_block_id,
+                        exc_info=True,
+                    )
                 if state.answer is not None:
+                    status = BlockStatus.skipped
                     return "finish already returned this step's answer, so this call did not run."
                 # The drain keeps every tool listed because Anthropic rejects replayed thinking once the tool list changes.
                 if state.drained and ctx.tool_name != "finish":
+                    status = BlockStatus.skipped
                     return _FINISH_ONLY
                 return await invoke(arguments)
+            except (asyncio.CancelledError, _RunEnded):
+                status = BlockStatus.canceled
+                raise
+            except Exception:
+                status = BlockStatus.failed
+                raise
             finally:
+                # A call no tool recorded (bad arguments, refused, or cut off by an exception) is shown but never billed.
+                if started:
+                    with contained_effect(
+                        "agent step tool call entry", workflow_run_block_id=state.workflow_run_block_id
+                    ):
+                        if state.running is not None:
+                            ended = state.running.model_copy(
+                                update={"status": status, "finished_at": datetime.now(UTC)}
+                            )
+                            state.running = None
+                            state.trail.append(ended)
+                        _publish_trail(state)
                 if call_id in state.call_order:
                     state.call_order.remove(call_id)
                 state.turn.notify_all()
@@ -221,15 +343,66 @@ class _LoopHooks(RunHooks[Any]):
             )
 
 
-def _record_call(state: _RunState, written: object, **call: str) -> None:
-    arguments = redact_secrets_from_text(
+def _scrubbed(state: _RunState, text: str) -> str:
+    return redact_secrets_from_text(
+        state.run_context.mask_platform_smtp_for_agent(text), state.run_context.agent_redactable_secret_values()
+    )
+
+
+def _redacted_json(state: _RunState, value: JsonValue) -> str:
+    return redact_secrets_from_text(
         json.dumps(
-            state.run_context.mask_platform_smtp_for_agent(written),
-            default=lambda value: state.run_context.mask_platform_smtp_for_agent(str(value)),
+            state.run_context.mask_platform_smtp_for_agent(value),
+            default=lambda item: state.run_context.mask_platform_smtp_for_agent(str(item)),
         ),
         state.run_context.agent_redactable_secret_values(),
     )
-    state.calls.append({**call, "arguments": arguments})
+
+
+def _record_call(
+    state: _RunState,
+    written: JsonValue,
+    facts: dict[str, _Fact] | None = None,
+    *,
+    block: str | None = None,
+    child_workflow_run_block_id: str | None = None,
+    **call: str,
+) -> None:
+    arguments = _redacted_json(state, written)
+    redacted = {
+        key: _scrubbed(state, fact)
+        if isinstance(fact, str)
+        else [{k: _scrubbed(state, v) for k, v in row.items()} for row in fact]
+        for key, fact in (facts or {}).items()
+    }
+    state.calls.append({**call, "arguments": arguments, **redacted})
+    finished_at = datetime.now(UTC)
+    try:
+        state.trail.append(
+            AgentStepToolCall.model_validate(
+                {
+                    **state.calls[-1],
+                    "index": len(state.trail) + 1,
+                    "arguments": _capped(arguments),
+                    "started_at": state.running.started_at if state.running else finished_at,
+                    "finished_at": finished_at,
+                    "block": block if block is not None and len(block) <= _MAX_TRAIL_BLOCK_CHARS else None,
+                    "child_workflow_run_block_id": child_workflow_run_block_id,
+                }
+            )
+        )
+    except Exception:
+        LOG.warning(
+            "Failed to show an agent step call", workflow_run_block_id=state.workflow_run_block_id, exc_info=True
+        )
+        # Keeping the started entry keeps the trail's length, which numbers the next child label.
+        if state.running is not None:
+            status = call.get("status")
+            known = status in {*BlockStatus, "invalid_arguments"}
+            state.trail.append(
+                state.running.model_copy(update={"status": status if known else None, "finished_at": finished_at})
+            )
+    state.running = None
 
 
 def resolve_agent_model(llm_key: str) -> tuple[str | Model, RunConfig]:
@@ -338,7 +511,7 @@ def _dedicated_tool(block_type: BlockType, tool: BlockTool, state: _RunState) ->
         name=name,
         description=block_description(block_type, tool),
         params_json_schema=_arguments_schema(tool, state),
-        on_invoke_tool=_in_turn(state, invoke),
+        on_invoke_tool=_in_turn(state, invoke, lambda written: (block_type, written)),
         strict_json_schema=False,
     )
 
@@ -354,6 +527,11 @@ def _run_block_tool(state: _RunState, block_types: list[str]) -> FunctionTool:
         block_type, tool = RUN_BLOCK_TYPES[call["block_type"]]
         return await _run_child_block("run_block", block_type, tool, call.get("arguments") or {}, state)
 
+    def describe(call: JsonValue) -> tuple[BlockType | None, JsonValue]:
+        if isinstance(call, dict) and call.get("block_type") in block_types:
+            return RUN_BLOCK_TYPES[call["block_type"]][0], call.get("arguments") or {}
+        return None, call
+
     return FunctionTool(
         name="run_block",
         description=run_block_description(block_types),
@@ -366,7 +544,7 @@ def _run_block_tool(state: _RunState, block_types: list[str]) -> FunctionTool:
             "required": ["block_type", "arguments"],
             "additionalProperties": False,
         },
-        on_invoke_tool=_in_turn(state, invoke),
+        on_invoke_tool=_in_turn(state, invoke, describe),
         strict_json_schema=False,
     )
 
@@ -597,9 +775,9 @@ def _tools(state: _RunState) -> list[FunctionTool]:
 
 
 async def _run_child_block(
-    tool_name: str, block_type: BlockType, tool: BlockTool, written: object, state: _RunState
+    tool_name: str, block_type: BlockType, tool: BlockTool, written: JsonValue, state: _RunState
 ) -> str:
-    label = f"{state.label}_{block_type.value}_{len(state.calls) + 1}"
+    label = _child_label(state, block_type)
     now = datetime.now(UTC)
     output_parameter = OutputParameter(
         output_parameter_id=str(uuid.uuid4()),
@@ -609,6 +787,9 @@ async def _run_child_block(
         modified_at=now,
     )
     report: dict[str, Any]
+    facts: dict[str, _Fact] = {}
+    block: str | None = None
+    child_block_id: str | None = None
     try:
         if not isinstance(written, dict):
             raise ValueError("arguments must be a JSON object.")
@@ -637,6 +818,7 @@ async def _run_child_block(
             "argument_schema": _arguments_schema(tool, state),
         }
     else:
+        block = _redacted_json(state, block_yaml.model_dump(mode="json", exclude_none=True))
         # A run resolves its secret parameters when it starts, before the converter added these.
         temporary_smtp_keys = [
             parameter.key
@@ -658,7 +840,16 @@ async def _run_child_block(
                         )
                 elif not state.run_context.has_parameter(parameter.key):
                     await state.run_context.register_aws_secret_parameter_value(parameter, platform_smtp_block=child)
-            report = await _execute_child(child, written, state)
+            page_url = await _page_url_at_start(state) if tool.nested_agent else None
+            report, child_block_id = await _execute_child(child, written, state)
+            if page_url is not None:
+                facts["page_url_at_start"] = page_url
+            if "files" in tool.fields:
+                attempts = await _upload_attempts(state, child_block_id, written.get("files") or [])
+                if attempts is not None:
+                    facts["upload_attempts"] = attempts
+            # Ahead of output, so the window that cuts a long output keeps them.
+            report = {"status": report["status"], **facts, **report}
             if (
                 report["status"] == BlockStatus.completed
                 and state.run_context.has_value(output_parameter.key)
@@ -670,12 +861,22 @@ async def _run_child_block(
             for key in temporary_smtp_keys:
                 state.run_context.parameters.pop(key, None)
                 state.run_context.values.pop(key, None)
-    _record_call(state, written, tool=tool_name, block_type=block_type.value, label=label, status=report["status"])
+    _record_call(
+        state,
+        written,
+        facts,
+        block=block,
+        child_workflow_run_block_id=child_block_id,
+        tool=tool_name,
+        block_type=block_type.value,
+        label=label,
+        status=report["status"],
+    )
     state.results[label] = report
     return _window(_masked_text(report, state.run_context), 0, label)
 
 
-async def _execute_child(child: Block, written: dict[str, Any], state: _RunState) -> dict[str, Any]:
+async def _execute_child(child: Block, written: dict[str, Any], state: _RunState) -> tuple[dict[str, Any], str | None]:
     child._agent_smtp_isolation = True
     child.mark_fields_prerendered(written)
     # Children write their own LLM cost to their own rows.
@@ -686,7 +887,60 @@ async def _execute_child(child: Block, written: dict[str, Any], state: _RunState
             organization_id=state.organization_id,
             browser_session_id=state.browser_session_id,
         )
-    return {"status": result.status, "output": result.output_parameter_value, "error": result.failure_reason}
+    report = {"status": result.status, "output": result.output_parameter_value, "error": result.failure_reason}
+    return report, result.workflow_run_block_id
+
+
+def _url_fact(url: str) -> str:
+    if url == "about:blank" or url.startswith(_TOKEN_PREFIX):
+        return url
+    return sanitize_handoff_url(url) or "unparseable url"
+
+
+async def _page_url_at_start(state: _RunState) -> str | None:
+    try:
+        browser_state = app.BROWSER_MANAGER.get_for_workflow_run(state.workflow_run_id)
+        page = await browser_state.get_working_page(prune_excess_pages=False) if browser_state else None
+        return _url_fact(page.url) if page else None
+    except Exception:
+        LOG.warning("Could not read the page url before a nested agent", label=state.label, exc_info=True)
+        return None
+
+
+async def _upload_attempts(
+    state: _RunState, workflow_run_block_id: str | None, files: list[str]
+) -> list[dict[str, str]] | None:
+    try:
+        if workflow_run_block_id is None:
+            return None
+        run_block = await app.DATABASE.observer.get_workflow_run_block(
+            workflow_run_block_id, organization_id=state.organization_id
+        )
+        if run_block.task_id is None:
+            return None
+        actions = await app.DATABASE.tasks.get_task_actions_hydrated(
+            run_block.task_id, organization_id=state.organization_id
+        )
+        handed = {key: state.run_context.values.get(key) for key in files}
+        attempts = []
+        for action in actions:
+            if not isinstance(action, UploadFileAction):
+                continue
+            # Task V3 stores the file argument as its model wrote it, so a handed signed URL is its opaque_url_ token.
+            parameter = next(
+                (
+                    key
+                    for key, value in handed.items()
+                    if mask_opaque_urls({key: value}).resolve(action.file_url) in string_leaves(value)
+                ),
+                None,
+            )
+            named = {"parameter": parameter} if parameter else {"source": _url_fact(action.file_url)}
+            attempts.append({**named, "status": action.status.value})
+        return attempts
+    except Exception:
+        LOG.warning("Could not read a nested agent's uploads", label=state.label, exc_info=True)
+        return None
 
 
 def _credential_keys(parameters: list[PARAMETER_TYPE]) -> list[str]:
@@ -803,12 +1057,19 @@ async def run_agent_step(
                     exc_info=True,
                 )
         finally:
-            await app.AGENT_FUNCTION.post_agent_step_execution(
-                organization_id,
-                workflow_run_id,
-                workflow_run_block_id,
-                decisions=sum(1 for call in state.calls if call["tool"] != "finish"),
-            )
+            try:
+                await app.AGENT_FUNCTION.post_agent_step_execution(
+                    organization_id,
+                    workflow_run_id,
+                    workflow_run_block_id,
+                    decisions=sum(1 for call in state.calls if call["tool"] != "finish"),
+                )
+            finally:
+                # The display-only trail goes last, so cost, output and billing never wait on it.
+                with contained_effect("agent step final tool calls", workflow_run_block_id=workflow_run_block_id):
+                    # One write may be in flight ahead of this final one.
+                    async with asyncio.timeout(2 * _TRAIL_WRITE_SECONDS):
+                        await asyncio.shield(_publish_trail(state))
 
     try:
         with copilot_usage_observer(lambda event: costs.append(event.cost or 0.0)), model_attempt_telemetry_scope():

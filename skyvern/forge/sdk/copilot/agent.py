@@ -34,7 +34,6 @@ import structlog
 import yaml
 from agents.items import ToolCallItem
 from agents.run_config import RunConfig
-from litellm.exceptions import NotFoundError as LiteLLMNotFoundError
 from openai.types.responses import ResponseFunctionToolCall
 from pydantic import JsonValue, TypeAdapter, ValidationError
 
@@ -179,7 +178,6 @@ from skyvern.forge.sdk.copilot.output_policy import (
     OutputPolicyReason,
     OutputPolicyVerdict,
     build_output_policy_diagnostics,
-    demote_author_time_steer_reasons,
     derive_output_kind,
     evaluate_output_policy,
     hard_block_output_policy_verdict,
@@ -269,13 +267,11 @@ from skyvern.forge.sdk.copilot.tools import reply_ends_turn
 from skyvern.forge.sdk.copilot.tools._shared import _copilot_seconds_remaining
 from skyvern.forge.sdk.copilot.tools.blockers import _goal_value_paths_for_code_block
 from skyvern.forge.sdk.copilot.tools.browser_code import close_browser_code_session
-from skyvern.forge.sdk.copilot.tools.credential_fill import raw_secret_connected_credential
 from skyvern.forge.sdk.copilot.tools.credentials import (
     _server_verified_google_account_choices,
     bitwarden_binding_change_error,
     import_bound_vault_logins,
 )
-from skyvern.forge.sdk.copilot.tools.guardrails import _record_output_policy_guardrail_outcome
 from skyvern.forge.sdk.copilot.tools.run_execution import (
     WatchdogExitReason,
     finalize_build_test_result,
@@ -963,7 +959,6 @@ def _store_request_policy_on_context(
     if reconcile_completion_criteria:
         _reconcile_completion_criteria_on_context(ctx, policy, policy_inputs)
     ctx.request_policy = policy
-    ctx.allow_untested_workflow_draft = policy.raw_secret_redacted_draft
     ctx.user_message = agent_user_message
     ctx.block_goal_main_goal = _build_block_goal_main_goal(
         user_message=agent_user_message,
@@ -990,8 +985,6 @@ def _apply_raw_secret_turn_transition(
         policy.clarification_question = RAW_SECRET_QUESTION
         policy.allow_update_workflow = False
         policy.allow_run_blocks = False
-        policy.allow_missing_credentials_in_draft = False
-        policy.credential_draft_deferred_explicitly = False
 
 
 def _raw_secret_input_blocked(policy: RequestPolicy) -> bool:
@@ -1817,15 +1810,6 @@ def _sentence_end(reason: str) -> str:
     return reason if reason.endswith("...") else reason.rstrip(".") + "."
 
 
-_RAW_SECRET_CARD_NOT_CONNECTED = {
-    "skipped": "You chose not to connect a saved credential in the card. ",
-    "timeout": "The credential card went unanswered. ",
-    "declined": "The credential card could not be shown. ",
-    "not_admitted": "The credential you connected is saved for a different site, so it was not used. ",
-}
-_RAW_SECRET_CARD_DECLINED_SITE = "You chose not to use the saved credential on this site. "
-
-
 def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> str:
     has_keepable_draft = (
         ctx.last_workflow is not None
@@ -1840,7 +1824,6 @@ def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> st
     def lead_then_reply(lead: str) -> str:
         return f"{lead} {reply}{keep_draft_affordance}" if reply else lead
 
-    policy = ctx.request_policy if isinstance(ctx.request_policy, RequestPolicy) else None
     if ctx.last_test_ok is False and block_count is not None:
         connect_failure = _terminal_connect_failure(ctx)
         if connect_failure is not None and connect_failure.state == "billing_credit_admission_refusal":
@@ -1860,42 +1843,6 @@ def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> st
 
         failure_summary = _sentence_end(_normalize_failure_reason(ctx.last_test_failure_reason))
         return lead_then_reply(f"I tested the draft, but the test failed: {failure_summary}")
-
-    if ctx.last_test_ok is None and block_count is not None and ctx.last_workflow is not None:
-        if policy is not None and policy.raw_secret_redacted_draft:
-            connected = raw_secret_connected_credential(ctx)
-            if connected is not None:
-                name, bound = connected
-                binding = (
-                    f"bound your saved credential {name} as its credential parameter"
-                    if bound
-                    else f"connected your saved credential {name}, which the draft does not bind yet"
-                )
-                return (
-                    f"I drafted the workflow, withheld a value that may be a secret, and {binding}. "
-                    "This draft is untested; ask me to test it in a later message."
-                )
-            site_answer = ctx.credential_pause_site_answer
-            if site_answer is not None and site_answer.action == "no":
-                return (
-                    "I drafted the workflow and withheld a value that may be a secret. "
-                    f"{_RAW_SECRET_CARD_DECLINED_SITE}Store the value as a saved credential before testing. "
-                    "This draft has not been verified end-to-end."
-                )
-            not_connected = _RAW_SECRET_CARD_NOT_CONNECTED.get(ctx.credential_pause_outcome or "", "")
-            return (
-                f"I drafted the workflow and withheld a value that may be a secret. {not_connected}"
-                "If it was a saved login's name, choose that login; otherwise store the value as a saved "
-                "credential before testing. This draft has not been verified end-to-end."
-            )
-        if ctx.allow_untested_workflow_draft:
-            return (
-                "I drafted the workflow without testing it, as requested. "
-                "You can accept it to save, but it has not been verified end-to-end."
-            )
-        # No generic grader-owned template exists in interactive authoring. The
-        # model's reply and the append-only run record own the explanation when
-        # an actual run fact is available.
 
     return user_response
 
@@ -2551,7 +2498,6 @@ def _build_exit_result(
         response_type="REPLY",
         user_response=final_text,
         global_llm_context=global_llm_context,
-        workflow_yaml=verified_yaml,
         has_workflow_proposal=verified_workflow is not None,
         workflow_was_persisted=ctx.workflow_persisted,
         workflow_attempted=workflow_attempted,
@@ -2568,7 +2514,7 @@ def _build_exit_result(
             output_policy_diagnostics=build_output_policy_diagnostics(
                 raw_verdict=raw_verdict,
                 final_verdict=raw_verdict,
-                final_output_kind=_blocked_final_output_kind(raw_verdict),
+                final_output_kind=CopilotOutputKind.REFUSAL,
                 hard_block_reason_codes=list(hard_block_verdict.reason_codes),
             ),
         )
@@ -2795,7 +2741,6 @@ async def _build_goal_satisfied_exit_result(
         response_type="REPLY",
         user_response=final_text,
         global_llm_context=enriched_context,
-        workflow_yaml=verified_yaml,
         has_workflow_proposal=verified_workflow is not None,
         workflow_was_persisted=ctx.workflow_persisted,
         workflow_attempted=True,
@@ -2812,7 +2757,7 @@ async def _build_goal_satisfied_exit_result(
             output_policy_diagnostics=build_output_policy_diagnostics(
                 raw_verdict=raw_verdict,
                 final_verdict=raw_verdict,
-                final_output_kind=_blocked_final_output_kind(raw_verdict),
+                final_output_kind=CopilotOutputKind.REFUSAL,
                 hard_block_reason_codes=list(hard_block_verdict.reason_codes),
             ),
         )
@@ -3000,7 +2945,6 @@ def _verified_terminal_preserve_result(
         response_type="REPLY",
         user_response=final_text,
         global_llm_context=None,
-        workflow_yaml=verified_yaml,
         has_workflow_proposal=True,
         workflow_was_persisted=ctx.workflow_persisted,
         workflow_attempted=True,
@@ -3076,7 +3020,6 @@ def _finalize_result_with_blocker_override(
         response_type=rendered_resp_type,
         user_response=rendered_reply,
         global_llm_context=None,
-        workflow_yaml=preserved_workflow_yaml,
         has_workflow_proposal=preserved_proposal,
         workflow_was_persisted=False,
         workflow_attempted=False,
@@ -3098,7 +3041,6 @@ def _finalize_result_with_blocker_override(
             response_type=rendered_resp_type,
             user_response=rendered_reply,
             global_llm_context=None,
-            workflow_yaml=None,
             has_workflow_proposal=False,
             workflow_was_persisted=False,
             workflow_attempted=False,
@@ -3792,38 +3734,6 @@ async def _resolve_wrapped_exception_exit_result(
     return _build_unexpected_error_exit_result(ctx, global_llm_context, error=error)
 
 
-def _inline_replace_workflow_credential_verdict(
-    ctx: CopilotContext, action_data: dict[str, Any], resp_type: str, user_response: str
-) -> tuple[str, OutputPolicyVerdict, OutputPolicyVerdict]:
-    """Evaluate inline REPLACE_WORKFLOW bytes without rewriting model-authored workflow YAML."""
-    workflow_yaml = action_data.get("workflow_yaml", "")
-    raw_verdict = evaluate_output_policy(
-        request_policy=ctx.request_policy,
-        response_type=resp_type,
-        user_response=str(user_response),
-        workflow_yaml=workflow_yaml,
-        has_workflow_proposal=True,
-        output_kind=CopilotOutputKind.WORKFLOW_DRAFT_PROPOSAL,
-    )
-    # This surface persists a draft, so it is graded like the update_workflow tool body rather than
-    # like a final reply: only what a later test-run cannot undo refuses here, and every other reason
-    # steers the next authoring attempt.
-    author_time_verdict = OutputPolicyVerdict(
-        allowed=raw_verdict.allowed,
-        output_kind=raw_verdict.output_kind,
-        reason_codes=list(raw_verdict.reason_codes),
-    )
-    steered_reasons = demote_author_time_steer_reasons(author_time_verdict)
-    if steered_reasons:
-        LOG.info(
-            "copilot inline REPLACE_WORKFLOW output policy reasons demoted to steering",
-            steered_reason_codes=[reason.value for reason in steered_reasons],
-        )
-    if not author_time_verdict.allowed:
-        _record_output_policy_guardrail_outcome(ctx, "replace_workflow_inline", workflow_yaml, author_time_verdict)
-    return workflow_yaml, raw_verdict, author_time_verdict
-
-
 async def _verified_connected_account_choices(
     action_data: dict[str, Any],
     *,
@@ -4003,27 +3913,8 @@ async def _translate_to_agent_result(
         LOG.warning("Agent used inline REPLACE_WORKFLOW instead of update_workflow tool")
         workflow_yaml = action_data.get("workflow_yaml", "")
         if workflow_yaml:
-            workflow_yaml, inline_raw_verdict, inline_policy_verdict = _inline_replace_workflow_credential_verdict(
-                ctx, action_data, resp_type, str(user_response)
-            )
-            if not inline_policy_verdict.allowed:
-                inline_diagnostics = build_output_policy_diagnostics(
-                    raw_verdict=inline_raw_verdict,
-                    final_verdict=inline_policy_verdict,
-                    final_output_kind=_blocked_final_output_kind(inline_policy_verdict),
-                    hard_block_reason_codes=list(inline_policy_verdict.reason_codes),
-                )
-                return _build_output_policy_blocked_result(
-                    ctx,
-                    inline_policy_verdict,
-                    prior_global_llm_context=global_llm_context,
-                    prior_workflow_yaml=chat_request.workflow_yaml,
-                    output_policy_diagnostics=inline_diagnostics,
-                    require_full_workflow_test=chat_request.product_action == "test_end_to_end",
-                    evaluated_reason_codes=list(inline_raw_verdict.reason_codes),
-                )
-            # REPLACE_WORKFLOW bypasses the update_workflow tool guardrail, so
-            # policy and post-emission rejects run here before YAML processing.
+            # REPLACE_WORKFLOW bypasses the update_workflow tool body, so
+            # post-emission rejects run here before YAML processing.
             # The final-output policy pass still runs below; leave last_workflow
             # / last_workflow_yaml unchanged until this candidate survives the
             # inline checks.
@@ -4222,19 +4113,6 @@ async def _translate_to_agent_result(
         and not _is_saved_workflow(ctx, ctx.last_good_workflow)
     )
 
-    # ASK_QUESTION replies carry a specific clarifying question — often the
-    # "stop and ask" unblocker the system prompt now requires when the agent
-    # cannot test. The generic rewrite would replace it with a vague
-    # "Could you share more context", so skip it for ASK_QUESTION (and for
-    # salvaged replies, which already describe the verified prefix).
-    if _should_surface_untested_draft_despite_question(ctx, resp_type) and not blocker_active:
-        LOG.info(
-            "Converting copilot clarification into untested draft proposal",
-            workflow_permanent_id=ctx.workflow_permanent_id,
-            block_count=ctx.last_update_block_count,
-        )
-        resp_type = "REPLY"
-
     # ``blocker_active`` short-circuits the salvage/failure rewrites — the
     # renderer owns the final reply, so reshaping the agent's prose first
     # would be wasted work the finalization shim discards.
@@ -4293,7 +4171,6 @@ async def _translate_to_agent_result(
         response_type=resp_type,
         user_response=str(user_response),
         global_llm_context=enriched_context,
-        workflow_yaml=last_workflow_yaml,
         has_workflow_proposal=last_workflow is not None,
         workflow_was_persisted=ctx.workflow_persisted,
         workflow_attempted=workflow_attempted,
@@ -4301,9 +4178,7 @@ async def _translate_to_agent_result(
         output_kind=output_kind,
     )
     final_output_kind = (
-        _blocked_final_output_kind(output_policy_verdict)
-        if not output_policy_verdict.allowed
-        else output_policy_verdict.output_kind
+        CopilotOutputKind.REFUSAL if not output_policy_verdict.allowed else output_policy_verdict.output_kind
     )
     output_policy_diagnostics = build_output_policy_diagnostics(
         raw_verdict=output_policy_verdict,
@@ -4591,7 +4466,6 @@ async def _run_agent_loop_with_surface(
     output_guardrails: list[Any],
     recorded_alias_map: dict[str, str] | None = None,
     recorded_overlays: dict[str, Any] | None = None,
-    allow_untested_retry: bool = False,
     is_fallback: bool = False,
     session: Session | None = None,
     final_reply: bool = False,
@@ -4665,43 +4539,30 @@ async def _run_agent_loop_with_surface(
                             ordered_mcp_names=tuple(tool.name for tool in advertised_mcp_tools),
                             identity=ctx.tool_surface_identity or CopilotToolSurfaceIdentity.OPTIONAL,
                         ).advertised_sha256(advertised_mcp_tools)
-                    attempts = 2 if allow_untested_retry and not final_reply else 1
-                    for attempt in range(attempts):
-                        try:
-                            ctx.resolved_model = model_name
-                            if final_reply:
-                                result = await run_final_reply_drain(
-                                    agent,
-                                    ctx,
-                                    stream,
-                                    session=session,
-                                    hooks=FinalReplyRunHooks(ctx),
-                                    run_config=run_config,
-                                    observation=final_reply_observation,
-                                )
-                            else:
-                                result = await run_with_enforcement(
-                                    agent=agent,
-                                    initial_input=initial_input,
-                                    ctx=ctx,
-                                    stream=stream,
-                                    max_turns=copilot_config.max_turns,
-                                    hooks=CopilotRunHooks(ctx),
-                                    run_config=run_config,
-                                    session=session,
-                                    copilot_config=copilot_config,
-                                    token_budget=copilot_token_budget(copilot_config, llm_key),
-                                )
-                            break
-                        except Exception as exc:
-                            if (
-                                attempt + 1 < attempts
-                                and getattr(ctx, "last_workflow", None) is None
-                                and isinstance(exc, LiteLLMNotFoundError)
-                            ):
-                                LOG.warning("Retrying untested draft agent loop after model lookup failure")
-                                continue
-                            raise
+                    ctx.resolved_model = model_name
+                    if final_reply:
+                        result = await run_final_reply_drain(
+                            agent,
+                            ctx,
+                            stream,
+                            session=session,
+                            hooks=FinalReplyRunHooks(ctx),
+                            run_config=run_config,
+                            observation=final_reply_observation,
+                        )
+                    else:
+                        result = await run_with_enforcement(
+                            agent=agent,
+                            initial_input=initial_input,
+                            ctx=ctx,
+                            stream=stream,
+                            max_turns=copilot_config.max_turns,
+                            hooks=CopilotRunHooks(ctx),
+                            run_config=run_config,
+                            session=session,
+                            copilot_config=copilot_config,
+                            token_budget=copilot_token_budget(copilot_config, llm_key),
+                        )
                 stop_metadata = attempt_telemetry.latest_stop_metadata
                 empty_error = _empty_completion_error(
                     result,
@@ -4881,32 +4742,12 @@ def _agent_output_to_text(agent_output: Any) -> str:
         return str(agent_output)
 
 
-def _should_surface_untested_draft_despite_question(ctx: CopilotContext, response_type: str) -> bool:
-    if (
-        response_type != "ASK_QUESTION"
-        or ctx.last_workflow is None
-        or not ctx.last_workflow_yaml
-        or _is_saved_workflow(ctx, ctx.last_workflow)
-    ):
-        return False
-    return ctx.last_test_ok is None and ctx.last_run_skipped_unbound_credentials
-
-
 def _copy_output_policy_verdict(verdict: OutputPolicyVerdict) -> OutputPolicyVerdict:
     return OutputPolicyVerdict(
         allowed=verdict.allowed,
         output_kind=verdict.output_kind,
         reason_codes=list(verdict.reason_codes),
     )
-
-
-def _blocked_final_output_kind(verdict: OutputPolicyVerdict) -> CopilotOutputKind:
-    clarification_reasons = {
-        OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED,
-    }
-    if any(reason in clarification_reasons for reason in verdict.reason_codes):
-        return CopilotOutputKind.CLARIFICATION_REQUEST
-    return CopilotOutputKind.REFUSAL
 
 
 def _final_output_policy_reply(agent_output: Any) -> tuple[dict[str, Any], str, str]:
@@ -4940,35 +4781,22 @@ def _evaluate_copilot_final_output_policy(
         has_workflow_proposal=bool(workflow_yaml or candidate_workflow is not None),
         workflow_attempted=workflow_attempted,
     )
-    surface_untested_draft = _should_surface_untested_draft_despite_question(ctx, response_type)
-    policy_response_type = "REPLY" if surface_untested_draft else response_type
-    if surface_untested_draft:
-        policy_user_response = _rewrite_failed_test_response(policy_user_response, ctx)
-    policy_user_response = policy_user_response or "Done."
     updated_workflow_for_kind = (
         candidate_workflow if candidate_workflow is not None else WORKFLOW_PRESENT_SENTINEL if workflow_yaml else None
     )
-    if surface_untested_draft:
-        output_kind = (
-            CopilotOutputKind.WORKFLOW_UPDATE_PROPOSAL
-            if ctx.workflow_persisted
-            else CopilotOutputKind.WORKFLOW_DRAFT_PROPOSAL
-        )
-    else:
-        output_kind = derive_output_kind(
-            response_type=response_type,
-            request_policy=ctx.request_policy,
-            updated_workflow=updated_workflow_for_kind,
-            workflow_was_persisted=ctx.workflow_persisted,
-            workflow_attempted=workflow_attempted,
-            unvalidated=False,
-        )
+    output_kind = derive_output_kind(
+        response_type=response_type,
+        request_policy=ctx.request_policy,
+        updated_workflow=updated_workflow_for_kind,
+        workflow_was_persisted=ctx.workflow_persisted,
+        workflow_attempted=workflow_attempted,
+        unvalidated=False,
+    )
     raw_verdict = evaluate_output_policy(
         request_policy=ctx.request_policy,
-        response_type=policy_response_type,
-        user_response=policy_user_response,
+        response_type=response_type,
+        user_response=policy_user_response or "Done.",
         global_llm_context=action_data.get("global_llm_context"),
-        workflow_yaml=workflow_yaml,
         has_workflow_proposal=bool(workflow_yaml or candidate_workflow is not None),
         workflow_was_persisted=ctx.workflow_persisted,
         workflow_attempted=workflow_attempted,
@@ -4978,9 +4806,7 @@ def _evaluate_copilot_final_output_policy(
     diagnostics = build_output_policy_diagnostics(
         raw_verdict=raw_verdict,
         final_verdict=hard_verdict,
-        final_output_kind=_blocked_final_output_kind(hard_verdict)
-        if not hard_verdict.allowed
-        else hard_verdict.output_kind,
+        final_output_kind=CopilotOutputKind.REFUSAL if not hard_verdict.allowed else hard_verdict.output_kind,
         hard_block_reason_codes=list(hard_verdict.reason_codes),
     )
     return hard_verdict, response_type, diagnostics
@@ -5057,7 +4883,7 @@ def _build_copilot_output_guardrails(
             diagnostics = build_output_policy_diagnostics(
                 raw_verdict=verdict,
                 final_verdict=verdict,
-                final_output_kind=_blocked_final_output_kind(verdict),
+                final_output_kind=CopilotOutputKind.REFUSAL,
                 hard_block_reason_codes=list(verdict.reason_codes),
             )
         else:
@@ -5163,14 +4989,6 @@ def _build_output_policy_blocked_result(
     if OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes:
         user_response = _RAW_SECRET_LEAK_REFUSAL
         add_saved_draft_copy = True
-    elif OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED in verdict.reason_codes:
-        user_response = (
-            "The selected credential is not approved for one of the URLs in this workflow. "
-            "Please use a saved credential tested for that URL, update the block URL to match the credential's "
-            "tested site, or adjust the workflow to avoid using credentials. If the credential was already in this "
-            "workflow without a tracked URL, re-select it so Copilot can confirm its URL scope."
-        )
-        add_saved_draft_copy = True
     elif preserved_workflow is not None:
         user_response = (
             "I could not safely return that chat reply, but the workflow draft is still saved. "
@@ -5216,7 +5034,6 @@ def _build_output_policy_blocked_result(
             response_type="ASK_QUESTION",
             user_response=final_user_response,
             global_llm_context=None,
-            workflow_yaml=preserved_workflow_yaml or prior_workflow_yaml,
             has_workflow_proposal=preserved_workflow is not None,
             workflow_was_persisted=ctx.workflow_persisted,
             workflow_attempted=ctx.has_genuine_workflow_attempt(),
@@ -5270,7 +5087,7 @@ def _build_output_policy_blocked_result(
         or build_output_policy_diagnostics(
             raw_verdict=verdict,
             final_verdict=verdict,
-            final_output_kind=_blocked_final_output_kind(verdict),
+            final_output_kind=CopilotOutputKind.REFUSAL,
             hard_block_reason_codes=list(verdict.reason_codes),
         ),
         turn_outcome=output_policy_outcome,
@@ -6169,7 +5986,6 @@ async def _run_copilot_turn_impl(
             output_guardrails=output_guardrails,
             recorded_alias_map=full_alias_map,
             recorded_overlays=full_overlays,
-            allow_untested_retry=ctx.allow_untested_workflow_draft,
             is_fallback=is_fallback,
             session=model_session,
             final_reply=final_reply,

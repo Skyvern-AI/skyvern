@@ -57,8 +57,8 @@ class ConnectedBitwardenCredentialVaultService(CredentialVaultService):
             return None
         token, organization = access
         overviews = await BitwardenService.list_item_overviews(
-            client_id=None,
-            client_secret=None,
+            client_id=token.credential.client_id,
+            client_secret=token.credential.client_secret,
             master_password=token.credential.master_password,
             bw_organization_id=organization.bw_organization_id,
             bw_collection_ids=organization.bw_collection_ids,
@@ -87,8 +87,8 @@ class ConnectedBitwardenCredentialVaultService(CredentialVaultService):
         token, organization = access
         collection_ids = organization.bw_collection_ids
         secret = await BitwardenService.get_secret_value_from_url(
-            None,
-            None,
+            token.credential.client_id,
+            token.credential.client_secret,
             token.credential.master_password,
             organization.bw_organization_id,
             collection_ids,

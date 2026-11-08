@@ -12,7 +12,6 @@ import pytest
 from agents import Agent, ModelSettings, RunContextWrapper, SQLiteSession, function_tool
 from agents.exceptions import MaxTurnsExceeded
 from agents.run_config import RunConfig
-from litellm.exceptions import NotFoundError as LiteLLMNotFoundError
 from litellm.exceptions import RateLimitError as LiteLLMRateLimitError
 from litellm.exceptions import Timeout as LiteLLMTimeout
 
@@ -761,19 +760,12 @@ async def test_budget_drain_offers_no_tool_that_changes_or_runs_the_workflow(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("provider_error", "fallback_llm_key", "untested_retry"),
+    ("provider_error", "fallback_llm_key"),
     [
         pytest.param(
             LiteLLMRateLimitError(message="rate limit", llm_provider="openai", model="m"),
             "SECONDARY",
-            False,
             id="fallback_model",
-        ),
-        pytest.param(
-            LiteLLMNotFoundError(message="missing model", llm_provider="azure", model="m"),
-            None,
-            True,
-            id="model_lookup_retry",
         ),
     ],
 )
@@ -781,7 +773,6 @@ async def test_provider_error_inside_the_budget_drain_never_reruns_with_write_to
     monkeypatch: pytest.MonkeyPatch,
     provider_error: Exception,
     fallback_llm_key: str | None,
-    untested_retry: bool,
 ) -> None:
     offered: list[tuple[bool, set[str]]] = []
     contexts: list[CopilotContext] = []
@@ -799,13 +790,7 @@ async def test_provider_error_inside_the_budget_drain_never_reruns_with_write_to
             raise MaxTurnsExceeded("cap")
         return _result(json.dumps({"type": "REPLY", "user_response": "Nothing was saved or tested this turn."}))
 
-    surface_loop = agent_module._run_agent_loop_with_surface
-
-    async def loop_with_untested_retry(**kwargs: Any) -> Any:
-        return await surface_loop(**{**kwargs, "allow_untested_retry": untested_retry})
-
     stub_copilot_agent_loop(monkeypatch, run_with_enforcement)
-    monkeypatch.setattr(agent_module, "_run_agent_loop_with_surface", loop_with_untested_retry)
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.Runner.run_streamed", run_streamed)
     monkeypatch.setattr("skyvern.forge.sdk.copilot.streaming_adapter.stream_to_sse", AsyncMock(return_value=None))
 

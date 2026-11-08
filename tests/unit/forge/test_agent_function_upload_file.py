@@ -1,7 +1,6 @@
 """Cover the OSS ``AgentFunction.upload_file_to_customer_storage`` base path.
 
-The cloud override (NAT proxy routing) is tested in
-``tests/cloud/test_nat_egress_proxy_uploads.py``. This file pins down the
+The cloud override is tested in the cloud test suite. This file pins down the
 direct (SDK) path: S3 via aioboto3 and Azure via the AZURE_CLIENT_FACTORY,
 plus the shared 1 GB size cap.
 """

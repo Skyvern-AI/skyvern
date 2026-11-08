@@ -73,3 +73,30 @@ export function caretOnEdge(el: HTMLElement, edge: "first" | "last"): boolean {
     ? rect.top - box.top < rect.height * 0.75
     : box.bottom - rect.bottom < rect.height * 0.75;
 }
+
+/** Puts the caret `offset` characters into the line's text (a line break counts as one), or at the end. */
+export function placeCaretAt(el: HTMLElement, offset: number) {
+  const range = document.createRange();
+  range.selectNodeContents(el);
+  range.collapse(false);
+  let left = offset;
+  const walker = document.createTreeWalker(
+    el,
+    NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT,
+  );
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    if (node.nodeType === Node.TEXT_NODE) {
+      const length = (node as Text).length;
+      if (left <= length) {
+        range.setStart(node, left);
+        range.collapse(true);
+        break;
+      }
+      left -= length;
+    } else if (node.nodeName === "BR") {
+      left -= 1;
+    }
+  }
+  window.getSelection()?.removeAllRanges();
+  window.getSelection()?.addRange(range);
+}

@@ -131,13 +131,25 @@ async def test_malformed_or_ambiguous_results_fail_closed(
 async def test_row_limits_fail_instead_of_returning_a_subset(
     monkeypatch: pytest.MonkeyPatch, principal: RequestPrincipal, audit_writer: Any
 ) -> None:
-    reader = AsyncMock(return_value=json.dumps(_rows([{"a": 1}, {"a": 2}])).encode())
-    with pytest.raises(powerbi.PowerBIQueryError, match="row_limit_exceeded"):
-        await _execute(principal=principal, audit_writer=audit_writer, response_reader=reader, max_rows=2)
+    rows = [{"a": 1}, {"a": 2}]
+    reader = AsyncMock(return_value=json.dumps(_rows(rows)).encode())
+    hop_body = json.dumps(rows).encode()
 
-    monkeypatch.setattr(powerbi, "MAX_PROVIDER_VALUES", 2)
+    assert await _execute(principal=principal, audit_writer=audit_writer, response_reader=reader, max_rows=2) == rows
+    assert powerbi.parse_powerbi_hop_rows(hop_body, 2) == rows
+
     with pytest.raises(powerbi.PowerBIQueryError, match="row_limit_exceeded"):
-        await _execute(principal=principal, audit_writer=audit_writer, response_reader=reader, max_rows=10)
+        await _execute(principal=principal, audit_writer=audit_writer, response_reader=reader, max_rows=1)
+    with pytest.raises(powerbi.PowerBIQueryError, match="row_limit_exceeded"):
+        powerbi.parse_powerbi_hop_rows(hop_body, 1)
+
+    for cap in ("MAX_PROVIDER_ROWS", "MAX_PROVIDER_VALUES"):
+        with monkeypatch.context() as patch:
+            patch.setattr(powerbi, cap, 2)
+            with pytest.raises(powerbi.PowerBIQueryError, match="row_limit_exceeded"):
+                await _execute(principal=principal, audit_writer=audit_writer, response_reader=reader, max_rows=2)
+            with pytest.raises(powerbi.PowerBIQueryError, match="row_limit_exceeded"):
+                powerbi.parse_powerbi_hop_rows(hop_body, 2)
 
 
 @pytest.mark.asyncio

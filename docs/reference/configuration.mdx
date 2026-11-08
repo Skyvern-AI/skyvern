@@ -711,6 +711,7 @@ Check a classic endpoint with `curl http://localhost:9222/json/version`. It retu
 | `bitwarden` | A Bitwarden or Vaultwarden organization, through a `bw serve` CLI server | See [Bitwarden and Vaultwarden](#bitwarden-and-vaultwarden) |
 | `azure_vault` | Azure Key Vault | `AZURE_CREDENTIAL_VAULT` (vault name). `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`, or leave the secret unset to use Workload Identity. |
 | `gcp` | Google Secret Manager | `GCP_CREDENTIAL_VAULT_PROJECT_ID`, `GCP_CREDENTIAL_VAULT_PREFIX` (default `skyvern-cred-`, unique per deployment) |
+| `aws_secrets_manager` | AWS Secrets Manager, one secret per credential | `AWS_CREDENTIAL_VAULT_REGION` (setting it turns the store on), `AWS_CREDENTIAL_VAULT_PREFIX` (default `skyvern-credentials/`, unique per deployment), `AWS_CREDENTIAL_VAULT_KMS_KEY_ID` (optional; unset uses the `aws/secretsmanager` key). Credentials come from the default AWS chain, such as the ECS task role. The server creates, reads, updates and deletes secrets under the prefix; workers only read them. Deleting a credential deletes its secret with no recovery window. |
 | `custom` | Your own HTTP service | `CUSTOM_CREDENTIAL_API_BASE_URL`, `CUSTOM_CREDENTIAL_API_TOKEN`. The API it must implement is on [Credentials](/credentials). |
 
 ### Bitwarden and Vaultwarden

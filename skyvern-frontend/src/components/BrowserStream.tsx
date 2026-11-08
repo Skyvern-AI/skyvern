@@ -90,8 +90,10 @@ type BrowserSessionLiveness = Pick<
   "browser_address" | "started_at" | "completed_at"
 >;
 
-// x11vnc polls the X clipboard, so a real copy can take a moment to come back.
-const VNC_COPY_FALLBACK_MS = 1500;
+// x11vnc polls CLIPBOARD only about every 1.8 s and also sends the X PRIMARY
+// selection, which a plain mouse selection sets: only the first update this soon
+// after the user's own copy counts as that copy, and a selection made in the window still can.
+const VNC_COPY_WINDOW_MS = 3000;
 
 function copyRemoteClipboardText(text: string, rfb: RFB) {
   void copyText(text).then((copied) => {
@@ -286,6 +288,7 @@ function BrowserStream({
   });
   const leftCmdSentAsSuperRef = useRef(false);
   const lastRemoteClipboardRef = useRef("");
+  const copyEventDeadlineRef = useRef(0);
   const copyFallbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
     null,
   );
@@ -643,13 +646,19 @@ function BrowserStream({
           if (!text) {
             return;
           }
+          if (!userCanSendVncInputRef.current) {
+            lastRemoteClipboardRef.current = "";
+            copyEventDeadlineRef.current = 0;
+            return;
+          }
+          // Not a copy; a pending repeat-copy fallback stays armed.
+          if (performance.now() > copyEventDeadlineRef.current) {
+            return;
+          }
+          copyEventDeadlineRef.current = 0;
           if (copyFallbackTimerRef.current) {
             clearTimeout(copyFallbackTimerRef.current);
             copyFallbackTimerRef.current = null;
-          }
-          if (!userCanSendVncInputRef.current) {
-            lastRemoteClipboardRef.current = "";
-            return;
           }
           lastRemoteClipboardRef.current = text;
           copyRemoteClipboardText(text, rfb);
@@ -919,11 +928,13 @@ function BrowserStream({
         // The VNC server only sends the remote clipboard when it changes, so
         // copying the same text twice brings nothing back: rewrite the last one.
         // A copy with nothing selected also rewrites it.
+        copyEventDeadlineRef.current = performance.now() + VNC_COPY_WINDOW_MS;
         if (copyFallbackTimerRef.current) {
           clearTimeout(copyFallbackTimerRef.current);
         }
         copyFallbackTimerRef.current = setTimeout(() => {
           copyFallbackTimerRef.current = null;
+          copyEventDeadlineRef.current = 0;
           const rfb = rfbRef.current;
           if (
             rfb &&
@@ -932,7 +943,7 @@ function BrowserStream({
           ) {
             copyRemoteClipboardText(lastRemoteClipboardRef.current, rfb);
           }
-        }, VNC_COPY_FALLBACK_MS);
+        }, VNC_COPY_WINDOW_MS);
       }
 
       if (
@@ -1002,6 +1013,7 @@ function BrowserStream({
         clearTimeout(copyFallbackTimerRef.current);
         copyFallbackTimerRef.current = null;
       }
+      copyEventDeadlineRef.current = 0;
       canvasContainer.removeEventListener("keydown", handleKeyDown, true);
       canvasContainer.removeEventListener("paste", handlePaste);
       window.removeEventListener("keyup", handleKeyUp, true);

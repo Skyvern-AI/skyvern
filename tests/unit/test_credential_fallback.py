@@ -335,11 +335,13 @@ async def _run_fallback_retry(
                     status=status,
                     failure_reason=failure_reason,
                     output=output,
-                    block_type=BlockType.WORKFLOW_TRIGGER
+                    block_type=block_type[0]
+                    if block_type
+                    else BlockType.WORKFLOW_TRIGGER
                     if isinstance(output, dict) and "workflow_run_id" in output
                     else BlockType.CODE,
                 )
-                for status, failure_reason, output in rows
+                for status, failure_reason, output, *block_type in rows
             ]
 
         children = {run.workflow_run_id: (run, rows) for run, rows in child_runs or []}
@@ -441,6 +443,39 @@ async def test_credential_failures_fallback_ignores_the_render_failure_that_ende
 
     result, run_workflow_mock, _ = await _run_fallback_retry(
         workflow_run=workflow_run, parameters=[login], block_rows=block_rows
+    )
+
+    assert (result is not None) is fallback_starts
+    assert run_workflow_mock.await_count == (1 if fallback_starts else 0)
+
+
+_POWERBI_TEXT = "Power BI queries require every triggering workflow to be saved by the connection owner."
+_POWERBI_OUTPUT = {
+    "error": "trigger_chain_owner_required",
+    "failure_category": [{"category": "CREDENTIAL_ERROR", "confidence_float": 1.0, "reasoning": _POWERBI_TEXT}],
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("ending_block_type", "fallback_starts"),
+    [(BlockType.CODE, True), (BlockType.POWERBI_QUERY, False)],
+    ids=["same-label-on-another-block", "powerbi-refusal"],
+)
+async def test_credential_failures_fallback_ignores_a_powerbi_refusal_labeled_credential_error(
+    ending_block_type: BlockType, fallback_starts: bool
+) -> None:
+    workflow_run = _workflow_run(
+        failure_category=_POWERBI_OUTPUT["failure_category"],
+        failure_reason=f"powerbi block failed. failure reason: {_POWERBI_TEXT}",
+    )
+    login = _credential_parameter(fallback_credential_ids=["cred_fb1"])
+    assert _trigger_matches(workflow_run, login.fallback_trigger) is True
+
+    result, run_workflow_mock, _ = await _run_fallback_retry(
+        workflow_run=workflow_run,
+        parameters=[login],
+        block_rows=[("failed", _POWERBI_TEXT, _POWERBI_OUTPUT, ending_block_type)],
     )
 
     assert (result is not None) is fallback_starts

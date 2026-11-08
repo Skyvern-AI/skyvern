@@ -23,8 +23,28 @@ const BitwardenCredentialSchema = z
       .min(1, "Email is required")
       .email("Must be a valid email"),
     master_password: z.string().min(1, "Master password is required"),
+    client_id: z.string().trim().optional(),
+    client_secret: z.string().trim().optional(),
   })
-  .strict();
+  .strict()
+  .superRefine(({ client_id, client_secret }, ctx) => {
+    if (Boolean(client_id) !== Boolean(client_secret)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "Enter both the client ID and the client secret of your Bitwarden personal API key, or neither.",
+        path: [client_id ? "client_secret" : "client_id"],
+      });
+    }
+    if (client_id && !client_id.startsWith("user.")) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "Use a Bitwarden personal API key. Its client ID starts with 'user.'.",
+        path: ["client_id"],
+      });
+    }
+  });
 
 const formSchema = z
   .object({
@@ -40,6 +60,7 @@ type Props = {
 
 export function BitwardenCredentialForm({ onSuccess }: Props = {}) {
   const [showMasterPassword, setShowMasterPassword] = useState(false);
+  const [showClientSecret, setShowClientSecret] = useState(false);
   const {
     bitwardenOrganizationAuthToken,
     isLoading,
@@ -55,15 +76,36 @@ export function BitwardenCredentialForm({ onSuccess }: Props = {}) {
       credential: {
         email: bitwardenOrganizationAuthToken?.credential?.email || "",
         master_password: "",
+        client_id: bitwardenOrganizationAuthToken?.credential?.client_id || "",
+        client_secret: "",
       },
     },
   });
   const isMutating = isUpdating || isClearing;
 
   const onSubmit = (data: FormData) => {
-    createOrUpdateToken(data, {
-      onSuccess: () => onSuccess?.(),
-    });
+    const { client_id, client_secret, ...credential } = data.credential;
+    createOrUpdateToken(
+      {
+        credential: {
+          ...credential,
+          ...(client_id && client_secret ? { client_id, client_secret } : {}),
+        },
+      },
+      {
+        onSuccess: () => {
+          form.reset({
+            credential: {
+              email: credential.email,
+              master_password: "",
+              client_id: client_id && client_secret ? client_id : "",
+              client_secret: "",
+            },
+          });
+          onSuccess?.();
+        },
+      },
+    );
   };
 
   useEffect(() => {
@@ -71,9 +113,15 @@ export function BitwardenCredentialForm({ onSuccess }: Props = {}) {
       credential: {
         email: bitwardenOrganizationAuthToken?.credential?.email || "",
         master_password: "",
+        client_id: bitwardenOrganizationAuthToken?.credential?.client_id || "",
+        client_secret: "",
       },
     });
-  }, [bitwardenOrganizationAuthToken?.credential?.email, form]);
+  }, [
+    bitwardenOrganizationAuthToken?.credential?.email,
+    bitwardenOrganizationAuthToken?.credential?.client_id,
+    form,
+  ]);
 
   return (
     <div className="space-y-4">
@@ -159,6 +207,78 @@ export function BitwardenCredentialForm({ onSuccess }: Props = {}) {
               </FormItem>
             )}
           />
+
+          <section className="space-y-4">
+            <div>
+              <h4 className="text-sm font-medium">
+                Personal API key (optional)
+              </h4>
+              <p className="text-sm text-muted-foreground">
+                Use this if Bitwarden asks Skyvern for a verification code (a
+                new-device check or two-step login). Find the key in the
+                Bitwarden web app under Settings &gt; Security &gt; Keys &gt;
+                View API key. Skyvern still uses your master password to unlock
+                the vault.
+              </p>
+            </div>
+            <FormField
+              control={form.control}
+              name="credential.client_id"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>Client ID</FormLabel>
+                  <FormControl>
+                    <Input
+                      {...field}
+                      type="text"
+                      placeholder="user.…"
+                      disabled={isLoading || isMutating}
+                    />
+                  </FormControl>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+            <FormField
+              control={form.control}
+              name="credential.client_secret"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>Client secret</FormLabel>
+                  <div className="relative">
+                    <FormControl>
+                      <Input
+                        {...field}
+                        type={showClientSecret ? "text" : "password"}
+                        disabled={isLoading || isMutating}
+                      />
+                    </FormControl>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      className="absolute right-0 top-0 h-full px-3 py-2 hover:bg-transparent"
+                      onClick={() => setShowClientSecret((v) => !v)}
+                      disabled={isLoading || isMutating}
+                    >
+                      {showClientSecret ? (
+                        <EyeClosedIcon className="h-4 w-4" />
+                      ) : (
+                        <EyeOpenIcon className="h-4 w-4" />
+                      )}
+                    </Button>
+                  </div>
+                  <FormMessage />
+                  {bitwardenOrganizationAuthToken?.credential?.client_id && (
+                    <p className="text-xs text-muted-foreground">
+                      Client secret is not displayed for security. Enter it
+                      again to keep using the API key.
+                    </p>
+                  )}
+                </FormItem>
+              )}
+            />
+          </section>
 
           <div className="flex items-center gap-4">
             <Button type="submit" disabled={isLoading || isMutating}>

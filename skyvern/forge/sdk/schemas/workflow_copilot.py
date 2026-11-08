@@ -593,7 +593,7 @@ class WorkflowCopilotCredentialDeletionRequest(BaseModel):
     credential_ids: list[str] = Field(min_length=1)
 
 
-CredentialSiteAnswer = Literal["add", "move", "no"]
+CredentialSiteAnswer = Literal["add", "no"]
 
 
 class WorkflowCopilotCredentialSiteQuestion(BaseModel):

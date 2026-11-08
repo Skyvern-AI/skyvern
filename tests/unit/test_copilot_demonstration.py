@@ -1295,7 +1295,7 @@ async def test_notes_merge_until_an_action_and_replay_as_the_users_screened_word
     assert "start on https://shop.example.test/home" in policy.canonical_user_message
     assert "swordfish" not in policy.canonical_user_message
     assert any("shop.example.test" in url for url in policy.user_provided_site_urls)
-    assert policy.raw_secret_redacted_draft and ctx.allow_untested_workflow_draft
+    assert policy.raw_secret_redacted_draft and policy.allow_run_blocks and policy.testing_intent != "skip_test"
     navigate_index = next(i for i, item in enumerate(history) if "example.test/next" in json.dumps(item))
     first_index = next(
         i for i, item in enumerate(history) if item.get("content") == "start on https://shop.example.test/home"
@@ -2167,18 +2167,21 @@ async def test_recorder_persists_each_capture_gap_kind() -> None:
             "child",
             {"kind": "drag", "ts": 4, "selector": "#card", "target_selector": "#done"},
         ),
+        TapEvent(page, "tap", "main", True, "", {"kind": "click_navigation_unconfirmed", "ts": 5, "url": page.url}),
     ]
 
     for event in events:
         await recorder._record_tap_event(event)
 
-    stored = [json.loads(cache.store[demonstration_event_key("org-1", "demo-1", seq)]) for seq in range(1, 5)]
+    stored = [json.loads(cache.store[demonstration_event_key("org-1", "demo-1", seq)]) for seq in range(1, 6)]
     assert [event["reason"] for event in stored] == [
         "nested_frame",
         "frame_navigation",
         "unsupported_event:unsupported_input",
         "freeform_drag",
+        "click_navigation_unconfirmed",
     ]
+    assert stored[-1]["label"] == "Click not recorded"
 
 
 @pytest.mark.asyncio

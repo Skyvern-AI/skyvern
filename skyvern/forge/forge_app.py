@@ -11,6 +11,7 @@ from skyvern.config import Settings
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.forge_openai_client import ForgeAsyncHttpxClientWrapper
+from skyvern.forge.sdk.api.aws import AsyncAWSClient
 from skyvern.forge.sdk.api.azure import AzureClientFactory
 from skyvern.forge.sdk.api.custom_credential_client import CustomCredentialAPIClient
 from skyvern.forge.sdk.api.gcp import GcpClientFactory
@@ -37,6 +38,9 @@ from skyvern.forge.sdk.encrypt.bootstrap import register_aes_encryptor
 from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider, NoOpExperimentationProvider
 from skyvern.forge.sdk.schemas.credentials import CredentialVaultType
 from skyvern.forge.sdk.schemas.organizations import AzureClientSecretCredential, Organization
+from skyvern.forge.sdk.services.credential.aws_secrets_manager_credential_vault_service import (
+    AwsSecretsManagerCredentialVaultService,
+)
 from skyvern.forge.sdk.services.credential.azure_credential_vault_service import AzureCredentialVaultService
 from skyvern.forge.sdk.services.credential.bitwarden_credential_service import BitwardenCredentialVaultService
 from skyvern.forge.sdk.services.credential.connected_bitwarden_credential_vault_service import (
@@ -114,6 +118,7 @@ class ForgeApp:
     BITWARDEN_CREDENTIAL_VAULT_SERVICE: BitwardenCredentialVaultService
     AZURE_CREDENTIAL_VAULT_SERVICE: AzureCredentialVaultService | None
     GCP_CREDENTIAL_VAULT_SERVICE: GcpCredentialVaultService | None
+    AWS_SECRETS_MANAGER_CREDENTIAL_VAULT_SERVICE: AwsSecretsManagerCredentialVaultService | None
     ONEPASSWORD_CREDENTIAL_VAULT_SERVICE: OnePasswordCredentialVaultService
     CUSTOM_CREDENTIAL_VAULT_SERVICE: CustomCredentialVaultService | None
     CREDENTIAL_VAULT_SERVICES: dict[str, CredentialVaultService | None]
@@ -337,6 +342,15 @@ def create_forge_app() -> ForgeApp:
     else:
         app.GCP_CREDENTIAL_VAULT_SERVICE = None
 
+    if settings.AWS_CREDENTIAL_VAULT_REGION:
+        app.AWS_SECRETS_MANAGER_CREDENTIAL_VAULT_SERVICE = AwsSecretsManagerCredentialVaultService(
+            AsyncAWSClient(region_name=settings.AWS_CREDENTIAL_VAULT_REGION),
+            name_prefix=settings.AWS_CREDENTIAL_VAULT_PREFIX,
+            kms_key_id=settings.AWS_CREDENTIAL_VAULT_KMS_KEY_ID,
+        )
+    else:
+        app.AWS_SECRETS_MANAGER_CREDENTIAL_VAULT_SERVICE = None
+
     app.CUSTOM_CREDENTIAL_VAULT_SERVICE = (
         CustomCredentialVaultService(
             CustomCredentialAPIClient(
@@ -352,6 +366,7 @@ def create_forge_app() -> ForgeApp:
         CredentialVaultType.BITWARDEN: app.BITWARDEN_CREDENTIAL_VAULT_SERVICE,
         CredentialVaultType.AZURE_VAULT: app.AZURE_CREDENTIAL_VAULT_SERVICE,
         CredentialVaultType.GCP: app.GCP_CREDENTIAL_VAULT_SERVICE,
+        CredentialVaultType.AWS_SECRETS_MANAGER: app.AWS_SECRETS_MANAGER_CREDENTIAL_VAULT_SERVICE,
         CredentialVaultType.CUSTOM: app.CUSTOM_CREDENTIAL_VAULT_SERVICE,
         CredentialVaultType.ONEPASSWORD: app.ONEPASSWORD_CREDENTIAL_VAULT_SERVICE,
         CredentialVaultType.BITWARDEN_CONNECTED: ConnectedBitwardenCredentialVaultService(),

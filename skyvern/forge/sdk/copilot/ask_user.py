@@ -581,7 +581,6 @@ async def ask_user(ctx: CopilotContext, arguments: AskUserArguments, tool_call_i
     recorded = await wait_for_interaction(ctx, interaction)
     if ctx.request_policy is not None:
         ctx.request_policy.project_question_response_sites(recorded)
-        ctx.allow_untested_workflow_draft = ctx.request_policy.raw_secret_redacted_draft
     if recorded.response is not None and not recorded.response.skipped:
         ctx.credential_recovery_armed = True
     return recorded.tool_result()

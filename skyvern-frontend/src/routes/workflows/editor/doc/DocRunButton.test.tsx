@@ -10,7 +10,7 @@ import {
   waitFor,
 } from "@testing-library/react";
 import { AxiosError } from "axios";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { Status } from "@/api/types";
@@ -28,7 +28,10 @@ vi.mock("@/api/AxiosClient", () => ({ getClient: vi.fn() }));
 vi.mock("@/hooks/useCredentialGetter", () => ({
   useCredentialGetter: () => vi.fn(),
 }));
-vi.mock("./useDocRun", () => ({ useDocRun: () => docRunState.current }));
+vi.mock("./useDocRun", () => ({
+  useDocRun: () => docRunState.current,
+  docLatestRunKey: () => ["docLatest"],
+}));
 vi.mock("../hooks/useSaveWorkflow", () => ({ useSaveWorkflow: () => vi.fn() }));
 vi.mock("@/store/WorkflowHasChangesStore", async (importOriginal) => ({
   ...(await importOriginal<object>()),
@@ -65,7 +68,14 @@ function setRun(status: Status, extra: Record<string, unknown> = {}) {
     live,
     owned: true,
     blockRun: false,
+    rowsSettled: !live,
   };
+}
+
+let shownSearch = "";
+function SearchProbe() {
+  shownSearch = useLocation().search;
+  return null;
 }
 
 function renderAt(path: string) {
@@ -79,7 +89,12 @@ function renderAt(path: string) {
           <Routes>
             <Route
               path="/workflows/:workflowPermanentId/studio"
-              element={<DocRunButton />}
+              element={
+                <>
+                  <DocRunButton />
+                  <SearchProbe />
+                </>
+              }
             />
           </Routes>
         </MemoryRouter>
@@ -122,6 +137,27 @@ describe("DocRunButton end-of-run toast", () => {
     // Copilot reports its own test runs in the chat card.
     endRun("/workflows/wpid_1/studio", { copilot_session_id: "cs_1" });
     expect(toastSpy).not.toHaveBeenCalled();
+  });
+
+  it("waits for a failed run's rows to land before naming its ending", () => {
+    seq += 1;
+    const id = `wr_${seq}`;
+    setRun(Status.Running);
+    docRunState.current.runId = id;
+    const rerender = renderAt("/workflows/wpid_1/studio");
+    // The run has failed but its step row is still catching up; the Doc already draws it settled.
+    setRun(Status.Failed);
+    docRunState.current.runId = id;
+    docRunState.current.rowsSettled = false;
+    act(() => rerender());
+    expect(toastSpy).not.toHaveBeenCalled();
+    setRun(Status.Failed);
+    docRunState.current.runId = id;
+    act(() => rerender());
+    expect(toastSpy).toHaveBeenCalledTimes(1);
+    expect(toastSpy.mock.calls[0]![0]).toMatchObject({
+      title: "Run failed. See the red step.",
+    });
   });
 
   it("offers no Stop and no end toast for a run from elsewhere that is still going", () => {
@@ -305,5 +341,42 @@ describe("DocRunButton pre-save", () => {
 
     await waitFor(() => expect(saveSpy).toHaveBeenCalled());
     expect(useDocSaveFailureStore.getState().failures).toEqual({});
+  });
+});
+
+describe("DocRunButton starting a run while ?wr= names an older run", () => {
+  afterEach(cleanup);
+
+  async function startRunAt(path: string) {
+    vi.mocked(getClient).mockResolvedValue({
+      get: vi.fn().mockResolvedValue({
+        data: { workflow_definition: { parameters: [] } },
+      }),
+      post: vi.fn().mockResolvedValue({ data: { workflow_run_id: "wr_new" } }),
+    } as never);
+    setRun(Status.Completed);
+    docRunState.current.runId = "wr_old";
+    useDocRunStore.setState({ stepCount: 1, inputs: [] });
+    renderAt(path);
+    fireEvent.click(screen.getByRole("button", { name: "Run" }));
+    const runs = await screen.findAllByRole("button", { name: "Run" });
+    fireEvent.click(runs[runs.length - 1]!);
+    await waitFor(() => expect(shownSearch).not.toContain("wr_old"));
+    return new URLSearchParams(shownSearch);
+  }
+
+  it("names the new run when the Run pane is open, so the pane cannot refill the old one", async () => {
+    const params = await startRunAt(
+      "/workflows/wpid_1/studio?wr=wr_old&active=wrb_1&panes=overview,editor",
+    );
+    expect(params.get("wr")).toBe("wr_new");
+    expect(params.has("active")).toBe(false);
+  });
+
+  it("drops the run from the URL when only the editor is open", async () => {
+    const params = await startRunAt(
+      "/workflows/wpid_1/studio?wr=wr_old&panes=editor",
+    );
+    expect(params.has("wr")).toBe(false);
   });
 });

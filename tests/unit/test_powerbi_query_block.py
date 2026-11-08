@@ -9,9 +9,18 @@ from pydantic import ValidationError
 
 from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
+from skyvern.forge.failure_classifier import FailureCategory, classify_from_failure_reason
 from skyvern.forge.sdk.services.powerbi_query_service import PowerBIQueryError
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType, WorkflowParameter
-from skyvern.forge.sdk.workflow.models.powerbi_query_block import PowerBIQueryBlock
+from skyvern.forge.sdk.workflow.models.powerbi_query_block import (
+    HUMAN_RUN_REQUIRED_REASON,
+    INTEGRATION_UNAVAILABLE_REASON,
+    INTERNAL_ERROR_REASON,
+    NO_ACCESS_REASON,
+    PowerBIQueryBlock,
+)
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.forge.sdk.workflow.workflow_definition_converter import block_yaml_to_block
 from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType, PowerBIQueryBlockYAML, WorkflowDefinitionYAML
 from skyvern.utils.templating import get_jinja_template_variable_roots
@@ -74,6 +83,7 @@ async def _execute(
     *,
     context: FakeWorkflowRunContext | None = None,
     with_hop_token: bool = True,
+    powerbi_offered: bool = False,
 ) -> BlockResult:
     context = context or FakeWorkflowRunContext(values={})
     context.organization_id = "org_test"
@@ -83,16 +93,32 @@ async def _execute(
     async def build_result(self: PowerBIQueryBlock, **kwargs: object) -> BlockResult:
         return _block_result(self, **kwargs)
 
+    async def offered(self: PowerBIQueryBlock, _organization_id: str) -> bool:
+        return powerbi_offered
+
     with (
         patch.object(PowerBIQueryBlock, "get_workflow_run_context", staticmethod(lambda _run_id: context)),
         patch.object(PowerBIQueryBlock, "record_output_parameter_value", new=AsyncMock()),
         patch.object(PowerBIQueryBlock, "build_block_result", new=build_result),
+        patch.object(PowerBIQueryBlock, "_powerbi_offered", new=offered),
     ):
         return await block.execute(
             workflow_run_id="wr_test",
             workflow_run_block_id="wfrb_test",
             organization_id="org_test",
         )
+
+
+def _assert_safe_denial(result: BlockResult, error_code: str, category: FailureCategory | None = None) -> None:
+    """The failure output carries the safe error code and its label, if any, and nothing else."""
+    output = result.output_parameter_value
+    assert isinstance(output, dict)
+    if category is None:
+        assert output == {"error": error_code}
+        return
+    assert set(output) == {"error", "failure_category"}
+    assert output["error"] == error_code
+    assert [entry["category"] for entry in output["failure_category"]] == [category.value]
 
 
 def _install_persisted_inputs(
@@ -366,7 +392,7 @@ async def test_powerbi_rejects_repeated_editor_output_interpolations_without_ren
     with patch("jinja2.Environment.compile", side_effect=AssertionError("must not render repeated interpolation")):
         result = await _execute(_block(dataset_id="{{p_output}}" * 170), context=context)
 
-    assert result.output_parameter_value == {"error": "unsafe_query_input_source"}
+    _assert_safe_denial(result, "unsafe_query_input_source")
     read_workflow.assert_not_awaited()
     run_query.assert_not_awaited()
 
@@ -381,7 +407,7 @@ async def test_powerbi_rejects_dataset_input_named_after_saved_block_output(monk
 
     result = await _execute(block)
 
-    assert result.output_parameter_value == {"error": "unsafe_query_input_source"}
+    _assert_safe_denial(result, "unsafe_query_input_source")
     run_query.assert_not_awaited()
     app.DATABASE.workflow_runs.get_workflow_run_parameters.assert_not_awaited()
 
@@ -403,7 +429,7 @@ async def test_powerbi_rejects_unverified_dataset_inputs(monkeypatch: pytest.Mon
 
     result = await _execute(block)
 
-    assert result.output_parameter_value == {"error": "unsafe_query_input_source"}
+    _assert_safe_denial(result, "unsafe_query_input_source")
     run_query.assert_not_awaited()
 
 
@@ -420,7 +446,7 @@ async def test_powerbi_rejects_resolved_dataset_that_is_not_a_uuid(
 
     result = await _execute(block)
 
-    assert result.output_parameter_value == {"error": "unsafe_query_input_source"}
+    _assert_safe_denial(result, "unsafe_query_input_source")
     assert result.failure_reason == "Power BI dataset_id must resolve to a UUID from a workflow input or literal."
     run_query.assert_not_awaited()
 
@@ -449,7 +475,7 @@ async def test_powerbi_runtime_rejects_block_output_templates_before_facade(
     result = await _execute(_block(query="{{ prior_step_output.query }}"), context=context)
 
     assert result.success is False
-    assert result.output_parameter_value == {"error": "unsafe_query_input_source"}
+    _assert_safe_denial(result, "unsafe_query_input_source")
     run_query.assert_not_awaited()
 
 
@@ -465,7 +491,7 @@ async def test_powerbi_runtime_rejects_caller_input_shadowed_by_block_output(
     result = await _execute(_block(query="{{ q }}"), context=context)
 
     assert result.success is False
-    assert result.output_parameter_value == {"error": "unsafe_query_input_source"}
+    _assert_safe_denial(result, "unsafe_query_input_source")
     run_query.assert_not_awaited()
 
 
@@ -484,7 +510,7 @@ async def test_powerbi_runtime_rejects_caller_input_shadowed_by_loop_metadata(
     result = await _execute(_block(query="{{ current_item }}"), context=context)
 
     assert result.success is False
-    assert result.output_parameter_value == {"error": "unsafe_query_input_source"}
+    _assert_safe_denial(result, "unsafe_query_input_source")
     run_query.assert_not_awaited()
 
 
@@ -500,7 +526,7 @@ async def test_powerbi_runtime_rejects_global_name_shadowed_by_block_output(
     result = await _execute(_block(query="{{ dict.output }}"), context=context)
 
     assert result.success is False
-    assert result.output_parameter_value == {"error": "unsafe_query_input_source"}
+    _assert_safe_denial(result, "unsafe_query_input_source")
     run_query.assert_not_awaited()
 
 
@@ -515,7 +541,7 @@ async def test_powerbi_runtime_reports_malformed_template_as_safe_block_failure(
     result = await _execute(_block(query="{{"), context=context)
 
     assert result.success is False
-    assert result.output_parameter_value == {"error": "unsafe_query_input_source"}
+    _assert_safe_denial(result, "unsafe_query_input_source")
     run_query.assert_not_awaited()
 
 
@@ -528,7 +554,7 @@ async def test_powerbi_rejects_templated_query_without_rendering(monkeypatch: py
 
     result = await _execute(_block(query="{{ dax_query + 1 }}", parameters=[_workflow_parameter()]), context=context)
 
-    assert result.output_parameter_value == {"error": "unsafe_query_input_source"}
+    _assert_safe_denial(result, "unsafe_query_input_source")
     run_query.assert_not_awaited()
 
 
@@ -559,16 +585,69 @@ async def test_powerbi_input_shape_is_checked_before_missing_capability(
     result = await _execute(_block(**values), with_hop_token=False)
 
     if invalid_shape:
-        assert result.output_parameter_value == {"error": "unsafe_query_input_source"}
+        _assert_safe_denial(result, "unsafe_query_input_source")
         assert (
             result.failure_reason == "Power BI dataset_id and query may use only workflow input parameters or literals."
         )
     else:
-        assert result.output_parameter_value == {"error": "integration_unavailable"}
-        assert result.failure_reason == "Power BI queries are not currently available."
+        _assert_safe_denial(result, "integration_unavailable")
+        assert result.failure_reason == INTEGRATION_UNAVAILABLE_REASON
     read_workflow.assert_not_awaited()
     read_parameters.assert_not_awaited()
     run_query.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_run_without_a_capability_on_a_live_deployment_names_the_editor_remedy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_query = AsyncMock()
+    monkeypatch.setattr(app, "AGENT_FUNCTION", SimpleNamespace(execute_powerbi_query_for_run=run_query))
+
+    result = await _execute(_block(), with_hop_token=False, powerbi_offered=True)
+
+    assert result.success is False
+    _assert_safe_denial(result, "human_run_required")
+    assert result.failure_reason == NO_ACCESS_REASON
+    run_query.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gate", [AgentFunction(), SimpleNamespace()])
+async def test_powerbi_offered_is_false_without_a_working_cloud_gate(
+    monkeypatch: pytest.MonkeyPatch, gate: object
+) -> None:
+    monkeypatch.setattr(app, "AGENT_FUNCTION", gate)
+
+    assert await _block()._powerbi_offered("org_test") is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("code", "expected_category"),
+    [
+        ("event_trigger_run", FailureCategory.CREDENTIAL_ERROR),
+        ("trigger_parent_owner_mismatch", FailureCategory.CREDENTIAL_ERROR),
+    ],
+)
+async def test_refused_run_is_labeled_by_the_block_not_by_its_wording(
+    monkeypatch: pytest.MonkeyPatch, code: str, expected_category: FailureCategory
+) -> None:
+    async def denied(**_: object) -> list[dict[str, object]]:
+        raise PowerBIQueryError(code)
+
+    monkeypatch.setattr(app, "AGENT_FUNCTION", SimpleNamespace(execute_powerbi_query_for_run=denied))
+    block = _block()
+
+    result = await _execute(block)
+
+    run_status, run_failure_reason, run_category = WorkflowService._resolve_block_terminal_outcome(
+        block=block, block_result=result
+    )
+    assert run_status == WorkflowRunStatus.failed
+    assert run_category is not None and [entry["category"] for entry in run_category] == [expected_category.value]
+    wording_alone = classify_from_failure_reason(run_failure_reason, fallback_to_unknown=True) or []
+    assert expected_category.value not in {entry["category"] for entry in wording_alone}
 
 
 @pytest.mark.asyncio
@@ -583,7 +662,7 @@ async def test_powerbi_runtime_rejects_runtime_output_hidden_in_parameter_defaul
     result = await _execute(_block(query="{{ dax_query }}"), context=context)
 
     assert result.success is False
-    assert result.output_parameter_value == {"error": "unsafe_query_input_source"}
+    _assert_safe_denial(result, "unsafe_query_input_source")
     run_query.assert_not_awaited()
 
 
@@ -594,7 +673,7 @@ async def test_powerbi_query_failures_are_safe_and_oss_hook_fails_closed(monkeyp
     result = await _execute(_block())
 
     assert result.success is False
-    assert result.output_parameter_value == {"error": "unsupported_runtime"}
+    _assert_safe_denial(result, "unsupported_runtime")
     assert "Cloud" not in (result.failure_reason or "")
 
     async def provider_failure(**_: object) -> list[dict[str, object]]:
@@ -603,41 +682,66 @@ async def test_powerbi_query_failures_are_safe_and_oss_hook_fails_closed(monkeyp
     monkeypatch.setattr(app, "AGENT_FUNCTION", SimpleNamespace(execute_powerbi_query_for_run=provider_failure))
     result = await _execute(_block())
     assert result.success is False
-    assert result.output_parameter_value == {"error": "query_failed"}
+    _assert_safe_denial(result, "internal_error", FailureCategory.INFRASTRUCTURE_ERROR)
+    assert result.failure_reason == INTERNAL_ERROR_REASON
     assert "raw provider" not in str(result.output_parameter_value)
     assert "private_table" not in (result.failure_reason or "")
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("code", "expected_error", "expected_reason"),
+    ("code", "expected_error", "expected_reason", "expected_category"),
     [
         (
             "principal_unavailable",
             "human_run_required",
-            "Power BI queries require a human-started run by the connection owner.",
+            HUMAN_RUN_REQUIRED_REASON,
+            None,
         ),
         (
             "event_trigger_run",
             "human_run_required",
-            "Power BI queries require a human-started run by the connection owner.",
+            HUMAN_RUN_REQUIRED_REASON,
+            FailureCategory.CREDENTIAL_ERROR,
         ),
         (
             "trigger_parent_owner_mismatch",
             "trigger_chain_owner_required",
             "Power BI queries require every triggering workflow to be saved by the connection owner.",
+            FailureCategory.CREDENTIAL_ERROR,
         ),
-        ("row_limit_exceeded", "row_limit_exceeded", "Power BI query exceeded the row limit."),
-        ("integration_unavailable", "integration_unavailable", "Power BI queries are not currently available."),
+        (
+            "row_limit_exceeded",
+            "row_limit_exceeded",
+            "Power BI query exceeded the row limit.",
+            None,
+        ),
+        (
+            "integration_unavailable",
+            "integration_unavailable",
+            INTEGRATION_UNAVAILABLE_REASON,
+            None,
+        ),
+        (
+            "provider_rejected_query",
+            "query_failed",
+            "Power BI query failed. Check the connection, dataset ID, query, and row limit.",
+            None,
+        ),
         (
             "workflow_owner_resave_required",
             "workflow_owner_resave_required",
             "Re-save this workflow as the Power BI connection owner before running it.",
+            None,
         ),
     ],
 )
 async def test_powerbi_query_surfaces_safe_runtime_denials(
-    monkeypatch: pytest.MonkeyPatch, code: str, expected_error: str, expected_reason: str
+    monkeypatch: pytest.MonkeyPatch,
+    code: str,
+    expected_error: str,
+    expected_reason: str,
+    expected_category: FailureCategory | None,
 ) -> None:
     async def denied(**_: object) -> list[dict[str, object]]:
         raise PowerBIQueryError(code)
@@ -647,7 +751,7 @@ async def test_powerbi_query_surfaces_safe_runtime_denials(
     result = await _execute(_block())
 
     assert result.success is False
-    assert result.output_parameter_value == {"error": expected_error}
+    _assert_safe_denial(result, expected_error, expected_category)
     assert result.failure_reason == expected_reason
 
 
@@ -662,7 +766,7 @@ async def test_powerbi_runtime_rejects_templated_connection_even_if_model_was_mu
 
     result = await _execute(block)
 
-    assert result.output_parameter_value == {"error": "connection_id_must_be_literal"}
+    _assert_safe_denial(result, "connection_id_must_be_literal")
     run_query.assert_not_awaited()
 
 

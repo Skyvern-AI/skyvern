@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, type MouseEvent } from "react";
 import { CheckIcon, CopyIcon } from "@radix-ui/react-icons";
 
 import { Button } from "@/components/ui/button";
@@ -25,13 +25,16 @@ function CopyButton({
 }) {
   const [copied, setCopied] = useState(false);
 
-  const handleCopy = async () => {
+  const handleCopy = async (e: MouseEvent<HTMLButtonElement>) => {
+    // Copy buttons often sit inside clickable rows; copying must not also navigate.
+    e.stopPropagation();
     if (copied) {
       return;
     }
-    await copyText(typeof value === "function" ? value() : value);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1500);
+    if (await copyText(typeof value === "function" ? value() : value)) {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    }
   };
 
   return (
