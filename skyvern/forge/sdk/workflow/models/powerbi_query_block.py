@@ -23,6 +23,8 @@ HUMAN_RUN_REQUIRED_REASON = (
 )
 INTEGRATION_UNAVAILABLE_REASON = "Power BI queries are not currently available."
 
+PLAN_REQUIRED_REASON = "Power BI is available on Enterprise plans."
+
 NO_ACCESS_REASON = (
     "This run wasn't given access to Power BI. Power BI queries run only when the person who connected the "
     "account starts the run from the workflow editor, with that connection still active."
@@ -140,6 +142,12 @@ class PowerBIQueryBlock(Block):
         except Exception:  # noqa: BLE001 - an unreadable gate keeps the generic unavailable message.
             return False
 
+    async def _powerbi_plan_allows(self, organization_id: str) -> bool | None:
+        try:
+            return await app.AGENT_FUNCTION.powerbi_plan_allows(organization_id)
+        except Exception:  # noqa: BLE001 - an unknown plan keeps the existing message.
+            return None
+
     async def _failure(
         self,
         *,
@@ -209,6 +217,16 @@ class PowerBIQueryBlock(Block):
             # Minting skips a run for several reasons (not owner-started, inactive connection, mint failure), so
             # the wording states the rule without guessing which one applied here and records no category.
             refused_by_design = effective_org_id is not None and await self._powerbi_offered(effective_org_id)
+            # Only a confirmed non-Enterprise plan gets the plan message; an unreadable plan keeps the generic one.
+            if refused_by_design and effective_org_id and await self._powerbi_plan_allows(effective_org_id) is False:
+                return await self._failure(
+                    workflow_run_context=workflow_run_context,
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=effective_org_id,
+                    error_code="plan_required",
+                    failure_reason=PLAN_REQUIRED_REASON,
+                )
             return await self._failure(
                 workflow_run_context=workflow_run_context,
                 workflow_run_id=workflow_run_id,
