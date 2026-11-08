@@ -33,6 +33,7 @@ import {
 } from "../workflowEditorUtils";
 import { extractSpreadsheetIdFromUrl } from "@/util/googleSheetsUrl";
 import type { CodeBlockNodeData } from "../nodes/CodeBlockNode/types";
+import { recordListFields, stepResultIsRecord } from "./docProblems";
 import { docMainIsSetting, getDocProseFields } from "./docStepRegistry";
 
 export type DocScopeRef = SortableBlockScopeDescriptor;
@@ -585,19 +586,25 @@ export function checkLabel(
   return null;
 }
 
+/** The name stem for a step type: "Go to URL Block" gives go_to_url. */
+export function labelStem(title: string): string {
+  return (
+    title
+      .replace(/ Block$/, "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "_")
+      .replace(/^_+|_+$/g, "")
+      .replace(/^(?=\d)/, "step_") || "step"
+  );
+}
+
 /** A free name read from the step type: "Go to URL Block" gives go_to_url_1. */
 export function newStepLabel(
   nodes: AppNode[],
   title: string,
   parameterKeys: readonly string[] = [],
 ): string {
-  const base =
-    title
-      .replace(/ Block$/, "")
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "_")
-      .replace(/^_+|_+$/g, "")
-      .replace(/^(?=\d)/, "step_") || "step";
+  const base = labelStem(title);
   const taken = new Set(
     nodes.filter(isWorkflowBlockNode).map((n) => n.data.label),
   );
@@ -979,9 +986,22 @@ export function hasSettingsBeyondText(node: AppNode): boolean {
       !key.startsWith("_") &&
       // Where the step sits in a conditional is not a setting.
       !key.startsWith("conditional") &&
-      !blank(value) &&
+      // A switch turned off from an on-by-default setting is a choice, not an empty field.
+      (!blank(value) || (value === false && defaults[key] === true)) &&
       JSON.stringify(value) !== JSON.stringify(defaults[key]),
   );
+}
+
+/** A step with nothing written in it yet, like the empty line Enter leaves. */
+export function isBlankStep(node: AppNode): boolean {
+  if (!isWorkflowBlockNode(node) || hasSettingsBeyondText(node)) return false;
+  const data = node.data as Record<string, unknown>;
+  return [
+    ...getDocProseFields(node).map((f) => f.key),
+    "description",
+    "notes",
+    "trailingNotes",
+  ].every((key) => blank(data[key]) || String(data[key]).trim() === "");
 }
 
 // The backend's BLOCK_NOTE_MAX_LENGTH: a longer note fails the save.
@@ -1024,7 +1044,6 @@ export function toNote(
   );
   const removed = removeBlock(graph, id, finallyId);
   if (!removed) return null;
-  if (!text) return { graph: removed, note: null };
   const next = ids[at + 1];
   const previous = ids[at - 1];
   const note: DocNoteRef | null = next
@@ -1032,6 +1051,8 @@ export function toNote(
     : previous
       ? { ownerNodeId: previous, placement: "trailing" }
       : null;
+  // An empty step leaves an empty note where it stood, for the caret to land in.
+  if (!text) return { graph: removed, note };
   if (!note) return null;
   const key = note.placement === "above" ? "notes" : "trailingNotes";
   const nodes = removed.nodes.map((n) => {
@@ -1048,7 +1069,8 @@ export function toNote(
 
 export type DocReferenceGroup = {
   name: string;
-  items: Array<{ key: string; hint: string }>;
+  // `label` is shown in place of the key when the key is a path.
+  items: Array<{ key: string; hint: string; label?: string }>;
 };
 
 const ancestorsOf = (byId: Map<string, AppNode>, id: string): AppNode[] => {
@@ -1094,11 +1116,25 @@ export function referencesAt(
     (other) =>
       !ancestorIds.has(other) && !onlySometimesRunsBefore(byId, other, id),
   );
+  const self = byId.get(id);
+  const forEachLoop = self?.type === "loop" && self.data.loopKind !== "while";
   const outputs = earlier.flatMap((other) => {
     const node = byId.get(other);
-    return node && isWorkflowBlockNode(node)
-      ? [{ key: outputKey(node.data.label), hint: "Saved by an earlier step" }]
+    if (!node || !isWorkflowBlockNode(node)) return [];
+    const key = outputKey(node.data.label);
+    // A loop goes through a list, so it also gets the lists inside an earlier result.
+    const lists = forEachLoop
+      ? recordListFields(node).map((name) => ({
+          key: `${key}.extracted_information.${name}`,
+          label: name,
+          hint: `List in ${key}`,
+        }))
       : [];
+    const hint =
+      forEachLoop && stepResultIsRecord(node.type)
+        ? "Whole result, not a list"
+        : "Saved by an earlier step";
+    return [{ key, hint }, ...lists];
   });
   if (outputs.length) groups.push({ name: "Earlier steps", items: outputs });
   return groups;

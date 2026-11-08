@@ -506,6 +506,11 @@
   let clickPointer = null;
   let pointerUp = false;
   let press = null;
+  // The press a navigating click may not outlive: published at pointerdown so the backend can still record the click
+  // when the page unloads before the click event is drained.
+  let pendingPress = null;
+  let pressStart = null;
+  let pressSeq = 0;
   let nativeDrag = null;
   let suppressClick = false;
   let labelControl = null;
@@ -632,6 +637,30 @@
     suppressClick = true;
     emitDragGap(current.start);
   };
+  // Where activating the element would navigate, so a recovered press is only the one that caused the navigation.
+  const navigationTarget = (element) => {
+    try {
+      const link = element.closest && element.closest("a[href],area[href]");
+      if (link) return String(link.href || "");
+      const tag = String(element.tagName || "").toLowerCase();
+      const type = String(element.type || "").toLowerCase();
+      if (
+        (tag === "button" || tag === "input") &&
+        (type === "submit" || (tag === "input" && type === "image")) &&
+        element.form
+      ) {
+        // formAction falls back to the page URL, not the form's action, when the button has no attribute.
+        return String(
+          element.hasAttribute("formaction")
+            ? element.formAction
+            : element.form.action,
+        );
+      }
+    } catch (_error) {
+      // A page-locked element has no target to compare.
+    }
+    return "";
+  };
   const labelTextField = (element) =>
     element && element.matches && element.matches("label")
       ? textField(element.control)
@@ -664,8 +693,12 @@
     waiter = null;
     current(events);
   };
-  const drained = () => ({ stream, events: queue.slice() });
-  const empty = () => ({ stream, events: [] });
+  const drained = () => ({
+    stream,
+    events: queue.slice(),
+    press: pendingPress,
+  });
+  const empty = () => ({ stream, events: [], press: pendingPress });
   const wakeNow = () => {
     if (waiter && !holding && queue.length) finishWaiter(drained());
   };
@@ -702,6 +735,8 @@
   const cancelClick = () => {
     clickStart = null;
     clickPointer = null;
+    pendingPress = null;
+    pressStart = null;
     pointerUp = false;
     endHold();
     wake();
@@ -719,6 +754,12 @@
     if (start.selector) {
       payload.selector = start.selector;
       payload.packet = start.packet;
+    }
+    if (pendingPress && start === pressStart) {
+      payload.press = pendingPress.id;
+      if (pendingPress.target_url) payload.target_url = pendingPress.target_url;
+      pendingPress = null;
+      pressStart = null;
     }
     if (kind.startsWith("secret") && start.element) {
       recordedSecretElements.add(start.element);
@@ -944,6 +985,16 @@
         y: event.clientY,
       };
       beginHold();
+      pressStart = clickStart;
+      pendingPress = {
+        id: ++pressSeq,
+        ts: Date.now(),
+        url: location.href,
+        selector: clickStart.selector,
+        packet: clickStart.packet,
+        target_url: navigationTarget(target),
+      };
+      finishWaiter(empty());
     }
   });
   add(globalThis, "pointermove", (event) => {

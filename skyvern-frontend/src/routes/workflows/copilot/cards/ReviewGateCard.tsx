@@ -254,10 +254,15 @@ function changeRows(
   }));
 }
 
-function blockCountLabel(rows: ChangeRow[], inputCount: number): string | null {
+function blockCountLabel(
+  rows: ChangeRow[],
+  inputCount: number,
+  docEditorEnabled: boolean,
+): string | null {
+  const noun = docEditorEnabled ? "step" : "block";
   const count = rows.filter((row) => !row.muted).length;
   const parts = [
-    count > 0 ? `${count} ${count === 1 ? "block" : "blocks"}` : null,
+    count > 0 ? `${count} ${count === 1 ? noun : `${noun}s`}` : null,
     inputCount > 0
       ? `${inputCount} ${inputCount === 1 ? "input" : "inputs"}`
       : null,
@@ -437,7 +442,7 @@ function ResolvedReviewCard({
         (inputCount > 0
           ? ` · ${inputCount} ${inputCount === 1 ? "input" : "inputs"}`
           : "")
-      : blockCountLabel(rows, inputCount);
+      : blockCountLabel(rows, inputCount, docEditorEnabled);
   const hasDetail =
     rows.length > 0 ||
     inputCount > 0 ||
@@ -472,7 +477,7 @@ function ResolvedReviewCard({
             {accepted || rejected ? (
               <span className="sr-only">
                 {rejected
-                  ? "Discarded, canvas reverted to the previous version"
+                  ? "Discarded, back to the previous version"
                   : "Accepted and saved to the workflow"}
               </span>
             ) : null}
@@ -490,7 +495,7 @@ function ResolvedReviewCard({
         right={
           rejected ? (
             <span className="text-[11px] text-muted-foreground">
-              Canvas reverted
+              Back to the previous version
             </span>
           ) : (
             appliedNotesPill(turn, rows)
@@ -747,7 +752,11 @@ export function ReviewGateCard({
       <CardHeader
         icon={<MagicWandIcon className="h-3.5 w-3.5 text-muted-foreground" />}
         title={title}
-        meta={blockCountLabel(rows, turn?.review?.inputs?.length ?? 0)}
+        meta={blockCountLabel(
+          rows,
+          turn?.review?.inputs?.length ?? 0,
+          docEditorEnabled,
+        )}
         wrapTitle
         right={
           !verdict ? null : testFailed ? (

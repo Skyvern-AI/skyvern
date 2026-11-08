@@ -262,8 +262,8 @@ def test_contract_shapes_for_failed_suspicious_and_missing_credential_cases() ->
         source_tool="update_and_run_blocks",
         result={
             "ok": False,
-            "error": "Skipped test run: required credentials are not configured.",
-            "data": {"workflow_updated": True, "skip_reason": "workflow_credential_inputs_unbound"},
+            "error": "Credential binding failed before the run started.",
+            "data": {"workflow_updated": True, "failure_categories": [{"category": "CREDENTIAL_ERROR"}]},
         },
         ctx=_ctx(),
         workflow_updated=True,
@@ -1395,10 +1395,6 @@ def test_direct_runtime_authoring_repair_finalization_suppresses_stop_class_stat
             "failure_reason": "Browser session not found while taking screenshot.",
             "ctx_attr": None,
         },
-        {
-            "failure_reason": "Skipped test run: required credentials are not configured.",
-            "ctx_attr": None,
-        },
     ]
     for case in cases:
         ctx = _ctx()
@@ -1918,21 +1914,7 @@ def test_failed_auth_run_repairs_frontier_block_without_authoring_judge_authorit
     assert contract.verification_result.completion_contract_satisfied is False
 
 
-def test_unbound_credential_skip_and_parameter_binding_errors_still_ask() -> None:
-    unbound = build_diagnosis_repair_contract(
-        source_tool="update_and_run_blocks",
-        result={
-            "ok": True,
-            "message": "Skipped test run: required credentials are not configured.",
-            "data": {
-                "workflow_updated": True,
-                "skipped_run": True,
-                "skip_reason": "workflow_credential_inputs_unbound",
-            },
-        },
-        ctx=_ctx(),
-        workflow_updated=True,
-    )
+def test_parameter_binding_errors_still_ask() -> None:
     binding_error = build_diagnosis_repair_contract(
         source_tool="update_and_run_blocks",
         result={
@@ -1948,22 +1930,9 @@ def test_unbound_credential_skip_and_parameter_binding_errors_still_ask() -> Non
     )
 
     assert (
-        unbound.diagnosis_result.suspected_failure_type,
-        unbound.repair_decision.next_action,
-        unbound.verification_result.user_goal_satisfied,
-        unbound.verification_result.completion_contract_satisfied,
-        unbound.verification_result.remaining_blocker,
         binding_error.diagnosis_result.suspected_failure_type,
         binding_error.repair_decision.next_action,
-    ) == (
-        DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT,
-        RepairNextAction.ASK,
-        False,
-        False,
-        "Skipped test run: required credentials are not configured.",
-        DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT,
-        RepairNextAction.ASK,
-    )
+    ) == (DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT, RepairNextAction.ASK)
 
 
 def test_result_runtime_repair_context_prefers_repair_over_credential_ask() -> None:
@@ -4504,9 +4473,9 @@ def test_an_unstamped_packet_still_keeps_the_wall_without_a_solver() -> None:
     assert runtime_authoring_repair.run_challenge_is_runtime_clearable(ctx, "wr_standard_policy") is False
 
 
-def test_unbound_credentials_still_ask_even_beside_a_clearable_captcha(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_missing_credential_still_asks_even_beside_a_clearable_captcha(monkeypatch: pytest.MonkeyPatch) -> None:
     ctx = _precedence_ctx(monkeypatch)
-    data = {"workflow_run_id": "wr_mixed", "skip_reason": "workflow_credential_inputs_unbound"}
+    data = {"workflow_run_id": "wr_mixed", "failure_type": "missing_credential_or_init"}
 
     assert runtime_authoring_repair._result_has_terminal_or_ask_precedence(ctx, data, {"ok": False}) is True
 
@@ -5076,7 +5045,7 @@ def test_missing_credential_contract_carries_credential_and_pause_levers_without
             "data": {
                 "workflow_run_id": "wr_credential",
                 "overall_status": "failed",
-                "skip_reason": "workflow_credential_inputs_unbound",
+                "failure_categories": [{"category": "CREDENTIAL_ERROR"}],
             },
         },
         ctx=_ctx(),

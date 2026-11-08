@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import {
   hasGoogleOAuthCredentialScopes,
   isGoogleOAuthCredentialActive,
@@ -79,6 +80,7 @@ export function GoogleReconnectCard({
   });
   const canAuthorize = useHasCapability("google_oauth.authorize");
   const [isStarting, setIsStarting] = useState(false);
+  const [confirmSetAccount, setConfirmSetAccount] = useState(false);
   const [attempt, setAttempt] = useState<AttemptState>("idle");
   const popupRef = useRef<Window | null>(null);
   const requiredScopes = PROFILE_SCOPES[notice.scopeProfile];
@@ -197,7 +199,11 @@ export function GoogleReconnectCard({
     );
   }
 
-  const reconnect = async () => {
+  const reconnect = async (setAccount = false) => {
+    if (!setAccount && exactCredential?.account_recorded === false) {
+      setConfirmSetAccount(true);
+      return;
+    }
     // One named window per card, so starting a sibling card's consent cannot take over this card's popup.
     const authTab = window.open(
       "",
@@ -219,6 +225,7 @@ export function GoogleReconnectCard({
         app_origin: getGoogleOAuthAppOrigin(),
         ...(notice.connectionId ? { credential_id: notice.connectionId } : {}),
         scope_profile: notice.scopeProfile,
+        ...(setAccount ? { set_account: true } : {}),
       });
       storeGoogleOAuthIntegrationIdForState(
         response.state,
@@ -272,7 +279,11 @@ export function GoogleReconnectCard({
       <button
         type="button"
         className="mt-3 rounded bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground disabled:opacity-60"
-        disabled={isStarting || !canAuthorize}
+        disabled={
+          isStarting ||
+          !canAuthorize ||
+          (Boolean(notice.connectionId) && isLoading)
+        }
         title={
           canAuthorize ? undefined : "Organization admin access is required."
         }
@@ -288,6 +299,19 @@ export function GoogleReconnectCard({
                 ? `${connectLabel} again`
                 : connectLabel}
       </button>
+      <ConfirmDialog
+        open={confirmSetAccount}
+        onOpenChange={setConfirmSetAccount}
+        title="Set Google account?"
+        description="This connection has no recorded Google account. Sign in with the account it should use. Workflows using this connection will use that account."
+        reversible
+        confirmLabel="Continue"
+        confirmVariant="default"
+        onConfirm={() => {
+          setConfirmSetAccount(false);
+          void reconnect(true);
+        }}
+      />
     </div>
   );
 }

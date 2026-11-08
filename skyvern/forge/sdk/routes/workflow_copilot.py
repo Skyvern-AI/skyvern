@@ -252,7 +252,7 @@ from skyvern.forge.sdk.services.credential.credential_vault_service import Crede
 from skyvern.forge.sdk.services.request_principal import enforce_principal_role, get_request_principal
 from skyvern.forge.sdk.services.route_authorization import require_request_actions
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException, WorkflowVersionConflict
-from skyvern.forge.sdk.workflow.models.credential_release import login_site_url, normalize_extra_site_urls
+from skyvern.forge.sdk.workflow.models.credential_release import normalize_extra_site_urls
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
 from skyvern.forge.sdk.workflow.secret_encryption import (
     mask_workflow_for_api,
@@ -4878,7 +4878,7 @@ async def workflow_copilot_credential_response(
         )
         if not existing:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Credential {credential_id} not found")
-        if response_request.asks_site and response_request.site_answer in ("add", "move"):
+        if response_request.asks_site and response_request.site_answer == "add":
             return await _change_credential_site(cache, organization.organization_id, response_request, existing[0])
         if response_request.asks_site and response_request.site_answer is None:
             question = await _credential_site_question(
@@ -4954,14 +4954,7 @@ async def _write_credential_site(
     """Save the claimed site to the login; any failure before the write is attempted reports 'refused'.
     Raises ValueError, before writing anything, when the site cannot be saved on this login."""
     outcome: Literal["written", "refused", "unknown"] = "refused"
-    tested_url: str | None = None
-    extra_site_urls: list[str] = []
-    if claim.answer.action == "move":
-        tested_url = login_site_url(claim.site_url)
-    else:
-        extra_site_urls = normalize_extra_site_urls(
-            credential.tested_url, [*credential.extra_site_urls, claim.site_url]
-        )
+    extra_site_urls = normalize_extra_site_urls(credential.tested_url, [*credential.extra_site_urls, claim.site_url])
     try:
         requires_write_lock = await app.AGENT_FUNCTION.should_lock_credential_write(
             credential=None, existing_credential=credential
@@ -4980,7 +4973,6 @@ async def _write_credential_site(
                     credential.credential_id,
                     organization_id,
                     expected_site_urls=list(claim.question.saved_site_urls),
-                    tested_url=tested_url,
                     extra_site_urls=extra_site_urls,
                 )
             except (CredentialSitesChangedError, NotFoundError):
@@ -4995,7 +4987,7 @@ async def _write_credential_site(
             "credential.update",
             "credential",
             credential.credential_id,
-            changed_fields=("extra_site_urls", "tested_url") if tested_url else ("extra_site_urls",),
+            changed_fields=("extra_site_urls",),
             metadata={
                 "confirmed": "true" if outcome == "written" else "false",
                 "action": claim.answer.action,
@@ -5011,8 +5003,7 @@ async def _change_credential_site(
     response_request: WorkflowCopilotCredentialResponseRequest,
     credential: Credential,
 ) -> WorkflowCopilotCredentialResponseResult:
-    """Save the site this card signs in on to the login, as the user's Add or Move answer, then connect it."""
-    action: Literal["add", "move"] = "move" if response_request.site_answer == "move" else "add"
+    """Save the site this card signs in on to the login, as the user's Allow answer, then connect it."""
     principal = await enforce_principal_role(get_request_principal(), "credential.update")
     await app.AGENT_FUNCTION.enforce_credential_folder_access_for_ids(
         principal, "credential.update", {("credential_id", credential.credential_id)}
@@ -5027,7 +5018,6 @@ async def _change_credential_site(
             cache,
             resume_token=response_request.resume_token,
             credential_id=credential.credential_id,
-            action=action,
             **pause_ids,
         )
     except CredentialPauseRejection as rejection:
@@ -5054,7 +5044,7 @@ async def _change_credential_site(
     LOG.info(
         "copilot_credential_site_changed",
         credential_id=credential.credential_id,
-        action=action,
+        action=claim.answer.action,
         site_a=claim.answer.site_a or None,
         saved_sites=list(claim.answer.saved_sites),
         site_b=loggable_origin(claim.site_url),

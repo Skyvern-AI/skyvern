@@ -201,10 +201,24 @@ GMAIL_SEND_CONSENT_REJECTION_MESSAGES: dict[GmailSendConsentRejection, str] = {
     ),
 }
 
+GOOGLE_RECONNECT_CONSENT_REJECTION_MESSAGES: dict[GmailSendConsentRejection, str] = {
+    GmailSendConsentRejection.IDENTITY_UNVERIFIED: (
+        "Google did not return a verified account identity. Reconnect with the same account and try again. "
+        "The previous connection is unchanged."
+    ),
+    GmailSendConsentRejection.SCOPES_NOT_GRANTED: (
+        "Grant every requested Google permission and try again. The previous connection is unchanged."
+    ),
+    GmailSendConsentRejection.ACCOUNT_MISMATCH: (
+        "Reconnect with the same Google account. The previous connection is unchanged."
+    ),
+}
+
 
 class GmailSendConsentRejectedError(ValueError):
-    def __init__(self, rejection: GmailSendConsentRejection) -> None:
-        super().__init__(GMAIL_SEND_CONSENT_REJECTION_MESSAGES[rejection])
+    def __init__(self, rejection: GmailSendConsentRejection, *, gmail_send: bool = True) -> None:
+        messages = GMAIL_SEND_CONSENT_REJECTION_MESSAGES if gmail_send else GOOGLE_RECONNECT_CONSENT_REJECTION_MESSAGES
+        super().__init__(messages[rejection])
         self.rejection = rejection
 
 
@@ -592,11 +606,11 @@ async def start_authorization(
     organization_id: str,
     redirect_uri: str,
     credential_name: str = "Default",
-    scopes_requested: str | list[str] | tuple[str, ...] | None = None,
     scope_profile: str | None = None,
     app_origin: str | None = None,
     credential_id: str | None = None,
     initiator_id: str | None = None,
+    set_account: bool = False,
 ) -> GoogleAuthorizationStart:
     """Start the consent flow, build the authorize URL, and persist the PKCE verifier.
 
@@ -623,33 +637,38 @@ async def start_authorization(
     consent_expires_at = now + datetime.timedelta(seconds=CONSENT_TTL_SECONDS)
 
     if credential_id is not None:
-        # Re-request the scopes originally granted to this connection unless the caller overrides,
-        # so the reconnected credential stays usable by the same workflow blocks.
-        if scope_profile is not None:
-            requested_scopes_override = scopes_for_profile(scope_profile)
-        elif scopes_requested is not None:
-            requested_scopes_override = _coerce_scopes(scopes_requested)
-        else:
-            requested_scopes_override = None
+        # Re-request the scopes already granted (plus any profile) so the same workflow blocks keep working.
+        requested_scopes_override = scopes_for_profile(scope_profile) if scope_profile is not None else None
         is_send_upgrade = scope_profile in _SEND_UPGRADE_SCOPE_PROFILES
         is_plain_reconnect = requested_scopes_override is None
 
         def adjust_scopes(row: GoogleOAuthCredentialBase, scopes: list[str]) -> list[str]:
-            if is_send_upgrade:
-                if not (row.google_subject or row.email_address):
+            # Without a recorded account the callback cannot prove the same account signed in again, so the user
+            # must explicitly choose which account the connection uses (set_account); the callback records it.
+            if not (row.google_subject or row.email_address or set_account):
+                if is_send_upgrade:
                     raise GmailSendUpgradeUnavailableError(
                         "This connection has no recorded Google account, so sending cannot be added to it. "
                         "Create a new Gmail connection for sending."
                     )
-                return _merge_scopes(row.scopes_granted, scopes)
-            if GOOGLE_GMAIL_SEND_SCOPE in row.scopes_granted:
-                return _merge_scopes(scopes, GOOGLE_GMAIL_SEND_SCOPES)
+                raise GmailSendUpgradeUnavailableError(
+                    "This connection has no recorded Google account, so it cannot be reconnected in place. "
+                    "Create a new connection instead."
+                )
             if is_plain_reconnect:
-                # A cancelled send upgrade leaves its scopes in scopes_requested; a reconnect must not ask for them.
-                ungranted = _normalized_scopes(GOOGLE_GMAIL_SEND_SCOPES) - _normalized_scopes(row.scopes_granted)
-                kept = [scope for scope in scopes if not _normalized_scopes([scope]) & ungranted]
-                return kept or list(row.scopes_granted)
-            return scopes
+                merged = list(row.scopes_granted) or scopes
+            else:
+                merged = (
+                    _merge_scopes(row.scopes_granted, scopes)
+                    if is_send_upgrade
+                    else _merge_scopes(scopes, row.scopes_granted)
+                )
+            if GOOGLE_GMAIL_SEND_SCOPE in row.scopes_granted:
+                merged = _merge_scopes(merged, GOOGLE_GMAIL_SEND_SCOPES)
+            normalized_email_scope = _normalized_scopes(["email"])
+            merged = [scope for scope in merged if _normalized_scopes([scope]) != normalized_email_scope]
+            merged = _merge_scopes(merged, ("openid", "email"))
+            return merged
 
         reauth = await app.DATABASE.google_oauth.begin_reauthorization(
             credential_id=credential_id,
@@ -670,9 +689,7 @@ async def start_authorization(
         requested_scopes = _coerce_scopes(reauth.scopes_requested or reauth.scopes_granted)
     else:
         credential_id = generate_google_oauth_credential_id()
-        requested_scopes = (
-            scopes_for_profile(scope_profile) if scopes_requested is None else _coerce_scopes(scopes_requested)
-        )
+        requested_scopes = _merge_scopes(scopes_for_profile(scope_profile), ("openid", "email"))
         await app.DATABASE.google_oauth.insert_pending_credential(
             credential_id=credential_id,
             organization_id=organization_id,
@@ -857,13 +874,28 @@ async def verify_gmail_send_consent(
     scopes_granted: Sequence[str],
     id_token: str | None,
     client_id: str,
-) -> GoogleIdentity:
-    """Check a consent that asked for gmail.send before anything is written to the connection."""
-    identity = await verify_google_identity(id_token, client_id)
-    if identity is None:
-        raise GmailSendConsentRejectedError(GmailSendConsentRejection.IDENTITY_UNVERIFIED)
+    *,
+    gmail_send: bool = True,
+) -> GoogleIdentity | None:
+    """Check reconnect consent before anything is written to the connection."""
+    if gmail_send:
+        identity = await verify_google_identity(id_token, client_id)
+        if identity is None:
+            raise GmailSendConsentRejectedError(GmailSendConsentRejection.IDENTITY_UNVERIFIED)
+    else:
+        identity = None
     if not _normalized_scopes(context.scopes_requested) <= _normalized_scopes(scopes_granted):
-        raise GmailSendConsentRejectedError(GmailSendConsentRejection.SCOPES_NOT_GRANTED)
+        raise GmailSendConsentRejectedError(GmailSendConsentRejection.SCOPES_NOT_GRANTED, gmail_send=gmail_send)
+    identity_required = gmail_send or bool(context.google_subject or context.email_address)
+    if not identity_required:
+        return None
+    if identity is None:
+        identity = await verify_google_identity(id_token, client_id)
+        if identity is None:
+            raise GmailSendConsentRejectedError(
+                GmailSendConsentRejection.IDENTITY_UNVERIFIED,
+                gmail_send=gmail_send,
+            )
     if context.google_subject:
         same_account = identity.subject == context.google_subject
     elif context.email_address:
@@ -871,7 +903,7 @@ async def verify_gmail_send_consent(
     else:
         same_account = True
     if not same_account:
-        raise GmailSendConsentRejectedError(GmailSendConsentRejection.ACCOUNT_MISMATCH)
+        raise GmailSendConsentRejectedError(GmailSendConsentRejection.ACCOUNT_MISMATCH, gmail_send=gmail_send)
     return identity
 
 

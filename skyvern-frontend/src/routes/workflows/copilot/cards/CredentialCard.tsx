@@ -804,18 +804,10 @@ function resolvedSiteCopy(outcome: CredentialPauseHistorical): {
     ? savedSites.map(siteHost).join(", ")
     : "its saved site";
   const siteB = outcome.siteB ? siteHost(outcome.siteB) : "this site";
-  if (outcome.outcome === "connected" && outcome.siteAnswer === "move") {
-    return {
-      tone: "done",
-      title: `Moved ${name} to ${siteB}`,
-      meta: `no longer used on ${siteA}`,
-      detail: `${name} now signs in on ${siteB} only. Workflows that sign in on ${siteA} with it stop working there.`,
-    };
-  }
   if (outcome.outcome === "connected") {
     return {
       tone: "done",
-      title: `Added ${siteB} to ${name}`,
+      title: `Allowed ${name} on ${siteB}`,
       meta: `works on ${siteA} and ${siteB}`,
     };
   }
@@ -885,7 +877,7 @@ function SiteQuestionAsk({
       ]
     : [
         <span key="consent" className="text-[11px] font-medium leading-relaxed">
-          Add or Move lets Skyvern type this login&apos;s password on {site}, in
+          Allowing lets Skyvern type this login&apos;s password on {site}, in
           this chat and in every saved run that uses it.
         </span>,
         ...(unencrypted
@@ -900,11 +892,10 @@ function SiteQuestionAsk({
             ]
           : []),
         <span
-          key="move"
+          key="kept"
           className="text-[11px] leading-relaxed text-muted-foreground"
         >
-          Add keeps it working on {savedFor}. Move means workflows that sign in
-          on {savedFor} with it stop working there.
+          It keeps working on {savedFor}.
         </span>,
       ];
   if (pending) {
@@ -924,26 +915,15 @@ function SiteQuestionAsk({
       footer={
         <>
           {question.vault_sourced ? null : (
-            <>
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                disabled={off}
-                onClick={() => onAnswer("add")}
-              >
-                Add {site}
-              </Button>
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                disabled={off}
-                onClick={() => onAnswer("move")}
-              >
-                Move to {site}
-              </Button>
-            </>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              disabled={off}
+              onClick={() => onAnswer("add")}
+            >
+              Allow on {site}
+            </Button>
           )}
           <Button
             type="button"

@@ -6912,7 +6912,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
 
     expect(screen.queryByRole("button", { name: "Accept" })).toBeNull();
     expect(
-      screen.getByText("Discarded, canvas reverted to the previous version"),
+      screen.getByText("Discarded, back to the previous version"),
     ).toBeTruthy();
     expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
   });
@@ -9593,7 +9593,7 @@ describe("WorkflowCopilotChat — g2 review gate", () => {
       ),
     );
     expect(
-      screen.getByText("Discarded, canvas reverted to the previous version"),
+      screen.getByText("Discarded, back to the previous version"),
     ).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Reject" })).toBeNull();
   });

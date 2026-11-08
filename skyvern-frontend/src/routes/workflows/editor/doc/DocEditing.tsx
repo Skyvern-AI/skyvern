@@ -11,7 +11,7 @@ import {
 } from "react";
 import { ResetIcon } from "@radix-ui/react-icons";
 import { Button } from "@/components/ui/button";
-import { caretOnEdge, splitAtCaret } from "./docCaret";
+import { caretOnEdge, placeCaretAt, splitAtCaret } from "./docCaret";
 import {
   Command,
   CommandDialog,
@@ -35,6 +35,7 @@ import { useWorkflowSnapshotStore } from "@/store/WorkflowSnapshotStore";
 import { AGENT_BLOCK_FLAG } from "@/util/featureFlags";
 import { useWorkflowHistoryAccessStore } from "@/store/WorkflowHistoryAccessStore";
 import { cn } from "@/util/utils";
+import { DocKeyLabel, DocKeyTooltip } from "./DocKeyLabel";
 import { useSaveWorkflow } from "../hooks/useSaveWorkflow";
 import { PendingGoalChangesDialog } from "../PendingGoalChangesDialog";
 import { useUndoRedoShortcutLabels } from "../controls/useUndoRedoShortcutLabels";
@@ -46,7 +47,9 @@ import { docStepFilter } from "./docStepRegistry";
 import {
   DOC_RUN_AGENT_EVENT,
   armNextCaretAtStart,
+  docShortcut,
   rememberReferenceLine,
+  takeNextCaretOffset,
   takeNextCaretAtStart,
   type LineSplit,
   type PickerOpener,
@@ -82,10 +85,13 @@ function useDocBoundary() {
 /** The "Add a step…" list, also used by "Turn into…". */
 export function DocStepPicker({
   onPick,
+  onDemonstrate,
   exclude = [],
   placeholder = "Add a step…",
 }: {
   onPick: (nodeType: NodeType) => void;
+  // Offers "Demonstrate task" (first while nothing is typed); left out where a demonstration can't start.
+  onDemonstrate?: () => void;
   exclude?: string[];
   placeholder?: string;
 }) {
@@ -108,6 +114,29 @@ export function DocStepPicker({
       );
     return [...choices].sort((a, b) => best(b) - best(a));
   }, [choices, search]);
+  const query = search.trim();
+  // cmdk highlights the first visible item, so a typed query lists this after the steps.
+  // One or two letters would match only its keywords, so it waits for three.
+  const demonstrate = onDemonstrate && (!query || query.length >= 3) && (
+    <CommandGroup heading="Copilot">
+      <CommandItem
+        value="Demonstrate task"
+        keywords={["demonstrate", "record", "teach"]}
+        onSelect={onDemonstrate}
+        className="gap-2.5"
+      >
+        <span className="grid size-7 shrink-0 place-items-center rounded-md border border-border">
+          <span aria-hidden className="h-2.5 w-2.5 rounded-full bg-red-500" />
+        </span>
+        <span className="min-w-0">
+          <span className="block text-sm leading-tight">Demonstrate task</span>
+          <span className="block text-xs leading-tight text-muted-foreground">
+            Show Copilot how in the browser
+          </span>
+        </span>
+      </CommandItem>
+    </CommandGroup>
+  );
   return (
     <Command loop filter={docStepFilter} className="min-h-0">
       <CommandInput
@@ -118,6 +147,7 @@ export function DocStepPicker({
       />
       <CommandList className="max-h-[min(340px,50vh)]">
         <CommandEmpty>No step matches.</CommandEmpty>
+        {!query && demonstrate}
         {groups.map((group) => (
           <CommandGroup key={group.name} heading={group.name}>
             {group.items
@@ -150,6 +180,7 @@ export function DocStepPicker({
               ))}
           </CommandGroup>
         ))}
+        {query && demonstrate}
       </CommandList>
     </Command>
   );
@@ -160,14 +191,19 @@ export function DocInsertPopover({
   open,
   onOpenChange,
   onPick,
+  onDemonstrate,
   onDismiss,
+  onEscape,
   children,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onPick: (nodeType: NodeType) => void;
+  onDemonstrate?: (() => void) | null;
   // Closed without picking a step.
   onDismiss?: () => void;
+  // Escape closed it, so focus has nowhere to return to unless the caller puts it back.
+  onEscape?: () => void;
   children: ReactNode;
 }) {
   const { anchorRef, padding } = useDocBoundary();
@@ -188,12 +224,21 @@ export function DocInsertPopover({
         sticky="always"
         className={cn("w-[min(320px,calc(100vw-32px))] p-0", docMenuClass)}
         onCloseAutoFocus={(e) => e.preventDefault()}
+        onEscapeKeyDown={onEscape}
       >
         <DocStepPicker
           onPick={(type) => {
             onOpenChange(false);
             onPick(type);
           }}
+          onDemonstrate={
+            onDemonstrate
+              ? () => {
+                  onOpenChange(false);
+                  onDemonstrate();
+                }
+              : undefined
+          }
         />
       </PopoverContent>
     </Popover>
@@ -246,6 +291,7 @@ export function DocEditableLine({
   value,
   editable,
   placeholder,
+  editingPlaceholder = placeholder,
   className,
   autoFocus = false,
   multiline = false,
@@ -261,11 +307,14 @@ export function DocEditableLine({
   onSettings,
   onRunStep,
   caretAtStart,
+  pickerOnStart,
   maxLength,
 }: {
   value: string;
   editable: boolean;
   placeholder?: string;
+  // Shown in place of `placeholder` while the empty line has the caret.
+  editingPlaceholder?: string;
   className?: string;
   autoFocus?: boolean;
   multiline?: boolean;
@@ -278,8 +327,8 @@ export function DocEditableLine({
   onDone?: (value: string) => void;
   // What "@" offers here; no "@" menu without it.
   references?: () => DocReferenceGroup[];
-  // Both return false when they did nothing, so the key keeps its usual meaning. Tab can instead ask for the step picker.
-  onTab?: (outdent: boolean) => boolean | PickerOpener;
+  // Both return false when they did nothing, so the key keeps its usual meaning.
+  onTab?: (outdent: boolean) => boolean;
   onBackspaceAtStart?: () => boolean;
   // Moves the step this line belongs to up (-1) or down (1).
   onMove?: (delta: -1 | 1) => boolean;
@@ -287,6 +336,8 @@ export function DocEditableLine({
   onRunStep?: () => void;
   // True when entering the line should put the caret at its start.
   caretAtStart?: () => boolean;
+  // True when entering the line should open the step picker on it, as "/" would.
+  pickerOnStart?: () => boolean;
   maxLength?: number;
 }) {
   const [editing, setEditing] = useState(autoFocus);
@@ -333,7 +384,15 @@ export function DocEditableLine({
       el.closest(IN_DOC)?.querySelectorAll<HTMLElement>("[data-doc-line]") ??
         [],
     ).filter((line) => line.getAttribute("aria-label") === label);
-    rememberReferenceLine(label ? { label, index: same.indexOf(el) } : null);
+    rememberReferenceLine(
+      label
+        ? {
+            label,
+            index: same.indexOf(el),
+            offset: splitAtCaret(el)?.[0].length ?? el.innerText.length,
+          }
+        : null,
+    );
   };
   useLayoutEffect(() => {
     const el = ref.current;
@@ -382,6 +441,10 @@ export function DocEditableLine({
     }
     window.getSelection()?.removeAllRanges();
     window.getSelection()?.addRange(range);
+    const offset = takeNextCaretOffset();
+    if (offset !== null) placeCaretAt(el, offset);
+    if (!resuming && onSlash && pickerOnStart?.())
+      openPicker(onSlash, [value, ""]);
     // Only on entering edit mode, or coming back to it after a read-only spell.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editing, editable]);
@@ -484,7 +547,12 @@ export function DocEditableLine({
     if (event.key === "Escape") {
       event.preventDefault();
       event.stopPropagation();
+      // Focus stays on the step: its type label, not the page.
+      const tag = ref.current
+        ?.closest("[data-doc-node-id]")
+        ?.querySelector<HTMLElement>("[data-doc-tag]");
       ref.current?.blur();
+      tag?.focus();
       return;
     }
     if (event.key === "Enter" && mod) {
@@ -557,11 +625,9 @@ export function DocEditableLine({
       setReferenceGroups(references());
       return;
     }
-    if (event.key === "Tab" && onTab && !mod && !event.altKey) {
-      const handled = onTab(event.shiftKey);
-      if (handled) event.preventDefault();
-      if (typeof handled === "function")
-        openPicker(handled, split ?? [ref.current?.innerText ?? "", ""]);
+    if (event.key === "Tab" && !mod && !event.altKey) {
+      // Only a Tab that nests (or a Shift+Tab that outdents) is taken; otherwise focus moves on, so Tab is no keyboard trap.
+      if (onTab?.(event.shiftKey)) event.preventDefault();
       return;
     }
     if (event.key === "Backspace" && onBackspaceAtStart && !mod) {
@@ -601,7 +667,8 @@ export function DocEditableLine({
           aria-multiline={multiline}
           contentEditable="plaintext-only"
           suppressContentEditableWarning
-          data-placeholder={placeholder}
+          data-placeholder={editingPlaceholder}
+          aria-placeholder={editingPlaceholder}
           onInput={() => {
             const el = ref.current;
             let next = el?.innerText ?? "";
@@ -670,7 +737,7 @@ export function DocEditableLine({
                     className="flex items-baseline gap-2"
                   >
                     <span className="rounded bg-muted px-[5px] text-[13px] font-medium">
-                      {item.key}
+                      {item.label ?? item.key}
                     </span>
                     <span className="min-w-0 truncate text-xs text-muted-foreground">
                       {item.hint}
@@ -795,6 +862,7 @@ export function DocDeleteConfirm({
   confirmLabel = "Delete",
   users: givenUsers,
   remove,
+  onRemoved,
 }: {
   id: string | null;
   onClose: () => void;
@@ -803,6 +871,8 @@ export function DocDeleteConfirm({
   confirmLabel?: string;
   users?: Array<{ id: string; label: string; text: string }>;
   remove?: () => void;
+  // After the step itself is deleted, not after `remove`.
+  onRemoved?: () => void;
 }) {
   const actions = useContext(WorkflowDocActionsContext);
   const users = givenUsers ?? (id ? actions.outputUsers(id) : []);
@@ -851,7 +921,7 @@ export function DocDeleteConfirm({
             variant="destructive"
             onClick={() => {
               if (remove) remove();
-              else if (id) actions.edit?.remove(id);
+              else if (id && actions.edit?.remove(id)) onRemoved?.();
               onClose();
             }}
           >
@@ -1031,14 +1101,23 @@ export function DocEditBar({
         </Button>
       )}
       {hasChanges && (
-        <Button
-          size="sm"
-          className="h-7 shrink-0 px-3"
-          disabled={saving}
-          onClick={saveNow}
+        <DocKeyTooltip
+          content={
+            <>
+              <DocKeyLabel label="Save" keys="S" />
+            </>
+          }
         >
-          {saving ? "Saving…" : saveFailure ? "Try again" : "Save"}
-        </Button>
+          <Button
+            size="sm"
+            className="h-7 shrink-0 px-3"
+            disabled={saving}
+            aria-keyshortcuts={docShortcut("S").aria}
+            onClick={saveNow}
+          >
+            {saving ? "Saving…" : saveFailure ? "Try again" : "Save"}
+          </Button>
+        </DocKeyTooltip>
       )}
       <PendingGoalChangesDialog
         open={goalDialogOpen}

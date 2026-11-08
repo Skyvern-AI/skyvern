@@ -49,7 +49,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from skyvern.config import settings
 from skyvern.exceptions import (
+    BITWARDEN_VERIFICATION_REQUIRED_MESSAGE,
     BitwardenCredentialsRejectedError,
+    BitwardenUnlockError,
+    BitwardenVerificationRequiredError,
     BrowserProfileNotFound,
     CredentialSourceNotConfiguredError,
 )
@@ -3688,8 +3691,8 @@ async def list_bitwarden_items(
 
     try:
         items = await BitwardenService.list_item_overviews(
-            client_id=None,
-            client_secret=None,
+            client_id=org_auth_token.credential.client_id,
+            client_secret=org_auth_token.credential.client_secret,
             master_password=org_auth_token.credential.master_password,
             bw_organization_id=current_org.bw_organization_id,
             bw_collection_ids=current_org.bw_collection_ids,
@@ -3703,7 +3706,12 @@ async def list_bitwarden_items(
             error=str(e),
             exc_info=True,
         )
-        if isinstance(e, BitwardenCredentialsRejectedError):
+        if isinstance(e, BitwardenVerificationRequiredError):
+            raise HTTPException(
+                status_code=400,
+                detail=BITWARDEN_VERIFICATION_REQUIRED_MESSAGE,
+            ) from e
+        if isinstance(e, (BitwardenCredentialsRejectedError, BitwardenUnlockError)):
             raise HTTPException(
                 status_code=400,
                 detail="Bitwarden rejected the credentials; check your Bitwarden credentials in Settings",
@@ -3879,7 +3887,7 @@ async def clear_org_auth_credential(
 
 
 def _to_safe_bitwarden_response(auth_token: BitwardenOrganizationAuthToken) -> BitwardenCredentialResponse:
-    """Strip master_password from the response for security."""
+    """Strip master_password and client_secret from the response for security."""
     safe_token = BitwardenOrganizationAuthTokenSafe(
         id=auth_token.id,
         organization_id=auth_token.organization_id,
@@ -3887,7 +3895,9 @@ def _to_safe_bitwarden_response(auth_token: BitwardenOrganizationAuthToken) -> B
         valid=auth_token.valid,
         created_at=auth_token.created_at,
         modified_at=auth_token.modified_at,
-        credential=BitwardenCredentialSafe(email=auth_token.credential.email),
+        credential=BitwardenCredentialSafe(
+            email=auth_token.credential.email, client_id=auth_token.credential.client_id
+        ),
     )
     return BitwardenCredentialResponse(token=safe_token)
 
@@ -3972,6 +3982,16 @@ async def update_bitwarden_credential(
     If a valid credential already exists, it will be invalidated before creating the new one.
     """
     try:
+        if bool(request.credential.client_id) != bool(request.credential.client_secret):
+            raise HTTPException(
+                status_code=422,
+                detail="Enter both the client ID and the client secret of your Bitwarden personal API key, or neither.",
+            )
+        if request.credential.client_id and not request.credential.client_id.startswith("user."):
+            raise HTTPException(
+                status_code=422,
+                detail="Use a Bitwarden personal API key. Its client ID starts with 'user.'.",
+            )
         # Atomically invalidate old + create new in a single transaction
         auth_token = await app.DATABASE.organizations.replace_org_auth_token(
             organization_id=current_org.organization_id,

@@ -3,15 +3,7 @@ import { useRowSelection } from "@/hooks/useRowSelection";
 import { CredentialItem } from "./CredentialItem";
 import { CredentialsBulkBar } from "./CredentialsBulkBar";
 import { useCredentialsQuery } from "@/routes/workflows/hooks/useCredentialsQuery";
-import {
-  Pagination,
-  PaginationContent,
-  PaginationItem,
-  PaginationLink,
-  PaginationNext,
-  PaginationPrevious,
-} from "@/components/ui/pagination";
-import { cn } from "@/util/utils";
+import { SimplePagination } from "@/components/ui/pagination";
 import { useState } from "react";
 
 type CredentialFilter = "password" | "credit_card" | "secret";
@@ -125,33 +117,11 @@ function CredentialsList({
         ))}
       </div>
       {(page > 1 || hasNextPage) && (
-        <Pagination>
-          <PaginationContent>
-            <PaginationItem>
-              <PaginationPrevious
-                className={cn({ "cursor-not-allowed": page === 1 })}
-                onClick={() => {
-                  if (page > 1) {
-                    setPage((prev) => Math.max(1, prev - 1));
-                  }
-                }}
-              />
-            </PaginationItem>
-            <PaginationItem>
-              <PaginationLink>{page}</PaginationLink>
-            </PaginationItem>
-            <PaginationItem>
-              <PaginationNext
-                className={cn({ "cursor-not-allowed": !hasNextPage })}
-                onClick={() => {
-                  if (hasNextPage) {
-                    setPage((prev) => prev + 1);
-                  }
-                }}
-              />
-            </PaginationItem>
-          </PaginationContent>
-        </Pagination>
+        <SimplePagination
+          page={page}
+          hasNext={hasNextPage}
+          onPageChange={setPage}
+        />
       )}
       {selectedCredentials.length > 0 && (
         <CredentialsBulkBar

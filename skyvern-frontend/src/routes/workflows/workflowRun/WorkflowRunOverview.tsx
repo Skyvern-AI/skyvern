@@ -205,6 +205,7 @@ function WorkflowRunOverviewAttempt() {
             browserSessionId={browserSessionId!}
             interactive={isPaused}
             showControlButtons={isPaused}
+            forceCdp={vncFailed}
             centered
           />
         )}

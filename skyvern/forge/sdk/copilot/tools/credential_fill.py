@@ -35,13 +35,12 @@ from skyvern.forge.sdk.copilot.credential_generation import (
     REGISTRATION_PASSWORD_MIN_LENGTH,
 )
 from skyvern.forge.sdk.copilot.credential_pause import (
-    RAW_SECRET_CONNECTED_NEXT,
     CredentialPauseResolution,
     SignedInProfile,
     credential_pause_transport_ready,
     defang_card_text,
     login_saved_for_site,
-    raw_secret_card_origin,
+    raw_secret_card_urls,
     request_credential_pause,
     signed_in_facts,
     site_answer_unused_text,
@@ -65,6 +64,8 @@ from skyvern.forge.sdk.copilot.request_policy import (
     admit_vault_login_for_live_page,
     credential_binding,
     loggable_origin,
+    still_on_admitted_site,
+    user_provided_site_url_match,
 )
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
@@ -81,11 +82,9 @@ from skyvern.forge.sdk.copilot.secret_scrub import (
 )
 from skyvern.forge.sdk.copilot.vault_logins import VAULT_LOGIN_REF_PREFIX, load_vault_logins
 from skyvern.forge.sdk.copilot.workflow_credential_utils import (
-    saved_credential_ids,
-    workflow_credential_ids,
     workflow_credential_origins,
 )
-from skyvern.forge.sdk.credential_site_policy import LoginSite, describe_login_sites, same_release_scope, same_site
+from skyvern.forge.sdk.credential_site_policy import LoginSite, describe_login_sites, same_release_scope
 from skyvern.forge.sdk.schemas.credentials import (
     Credential,
     CredentialItem,
@@ -180,29 +179,15 @@ def _credential_fill_prerequisite_error(copilot_ctx: AgentContext, credential_id
             "Author a `login` block bound to the credential parameter instead."
         )
     policy = getattr(copilot_ctx, "request_policy", None)
-    if not isinstance(policy, RequestPolicy) or policy.raw_secret_detected:
+    if not isinstance(policy, RequestPolicy):
         return "Saved-credential scouting is unavailable because this turn has no safe credential provenance."
     return None
-
-
-def _still_on_admitted_site(current_url: str | None, admitted_url: str) -> bool:
-    """Whether the browser is still on the origin whose login page granted this credential.
-
-    Compared at origin, not at the tier that granted it: a real sign-in walks email -> password ->
-    one-time code across several paths of the same site, and refusing those would refuse the login
-    the grant exists for. What it still stops is the secret following a redirect off the site.
-    """
-    admitted_parts = url_parts(admitted_url)
-    current_parts = url_parts(current_url or "")
-    admitted_origin = canonicalize_origin(admitted_parts[2]) if admitted_parts else None
-    current_origin = canonicalize_origin(current_parts[2]) if current_parts else None
-    return bool(current_origin and admitted_origin and current_origin == admitted_origin)
 
 
 def _within_grant(current_url: str | None, grant: _CredentialFillOriginGrant) -> bool:
     if grant.whole_site:
         return same_release_scope(current_url, grant.intended_url)
-    return _still_on_admitted_site(current_url, grant.intended_url)
+    return still_on_admitted_site(current_url, grant.intended_url)
 
 
 class _CredentialFillOriginMismatchError(Exception):
@@ -501,19 +486,6 @@ def _log_fill_grant(
     )
 
 
-def _user_provided_site_url_match(policy: RequestPolicy, page_url: str) -> tuple[str | None, bool]:
-    """Match the live page against a site the user pasted, reporting whether the match was
-    site-level. Hosts outside the public suffix list (internal domains, localhost) have no
-    registrable site to compare, so they fall back to an exact-origin match.
-    """
-    for url in policy.user_provided_site_urls:
-        if same_site(page_url, url):
-            return url, True
-        if _still_on_admitted_site(page_url, url):
-            return url, False
-    return None, False
-
-
 _CREDENTIAL_CARD_FALLBACK = (
     "Ask the user in prose to add the login on the Credentials page and reply with its exact saved name."
 )
@@ -640,19 +612,6 @@ def _log_credential_card_unavailable(copilot_ctx: CopilotContext, config: Copilo
     )
 
 
-def raw_secret_connected_credential(copilot_ctx: CopilotContext) -> tuple[str, bool] | None:
-    """The card-connected credential's display name and whether the staged draft binds it."""
-    policy = copilot_ctx.request_policy
-    if policy is None or not policy.raw_secret_redacted_draft:
-        return None
-    connected_id = copilot_ctx.credential_pause_connected_credential_id
-    name = next((c.name for c in policy.resolved_credentials if c.credential_id == connected_id), None)
-    if name is None or connected_id is None:
-        return None
-    bound = connected_id in saved_credential_ids(workflow_credential_ids(copilot_ctx.last_workflow_yaml or ""))
-    return defang_card_text(name), bound
-
-
 async def _request_credential(
     login_page_url: str,
     reason: str,
@@ -698,8 +657,7 @@ async def _request_credential(
                 "error": "Updating a saved credential (authenticator or rejected values) is unavailable on a raw-secret turn.",
             }
         # Only the user's own site may reach the card on a raw-secret turn: a model or page URL can point elsewhere.
-        user_url, _ = _user_provided_site_url_match(policy, login_page_url)
-        login_page_url = raw_secret_card_origin(user_url) if user_url else ""
+        login_page_url = next(iter(raw_secret_card_urls(policy, [login_page_url])), "")
         if not login_page_url:
             return {
                 "ok": False,
@@ -908,15 +866,9 @@ async def _request_credential(
         )
     if site_answer is not None:
         connected["saved_site_change"] = (
-            f"The user moved this login to {site_answer.site_b}; it no longer signs in on "
-            f"{site_answer.saved_sites_text}."
-            if site_answer.action == "move"
-            else f"The user added {site_answer.site_b} to this login's sites; it still signs in on "
-            f"{site_answer.saved_sites_text}."
+            f"The user allowed this login on {site_answer.site_b}; it still signs in on {site_answer.saved_sites_text}."
         )
-    if policy.raw_secret_redacted_draft:
-        connected["next"] = RAW_SECRET_CONNECTED_NEXT
-    elif card_registration is not None:
+    if card_registration is not None:
         if resolution.generated:
             connected["generated"] = True
             connected["site_effect"] = "none"
@@ -1069,7 +1021,7 @@ async def _credential_fill_origin_grant(
         if len(saved_sites) > 1:
             # A login saved for several sites fills on the one this page is on, scoped to that saved origin.
             page_url = await _live_working_page_url(copilot_ctx) or ""
-            saved_on_page = next((url for url in saved_sites if _still_on_admitted_site(page_url, url)), None)
+            saved_on_page = next((url for url in saved_sites if still_on_admitted_site(page_url, url)), None)
             if saved_on_page is not None:
                 _log_fill_grant("saved_site", page_url, credential_id)
                 return _CredentialFillOriginGrant(saved_on_page), None
@@ -1079,7 +1031,7 @@ async def _credential_fill_origin_grant(
             return _CredentialFillOriginGrant(intended_url), None
         page_url = await _live_working_page_url(copilot_ctx) or ""
         if page_url and any(
-            _still_on_admitted_site(page_url, origin)
+            still_on_admitted_site(page_url, origin)
             for origin in workflow_credential_origins(
                 copilot_ctx.persisted_workflow_yaml or "", require_canonical_origin=True
             ).get(credential_id, [])
@@ -1095,7 +1047,7 @@ async def _credential_fill_origin_grant(
             _log_fill_grant("vault_site", page_url, credential_id)
             return _CredentialFillOriginGrant(page_url, whole_site=vault_site.whole_site), None
         if page_url:
-            matched_url, site_level = _user_provided_site_url_match(policy, page_url)
+            matched_url, site_level = user_provided_site_url_match(policy, page_url)
             if matched_url is not None:
                 settled = _request_settled_credential(policy, credential_id)
                 if not settled and credential_id in policy.persisted_workflow_credential_ids:

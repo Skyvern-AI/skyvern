@@ -72,7 +72,7 @@ function describeCopiedCommand(kind: string): string {
   const expiry = new Date(expiresAt * 1000).toLocaleTimeString();
   return (
     `The ${kind} command has been copied to your clipboard. It embeds a short-lived session ` +
-    `token that expires at ${expiry} — for scheduled or long-lived use, substitute an ` +
+    `token that expires at ${expiry}. For scheduled or long-lived use, substitute an ` +
     `organization API key from your server configuration.`
   );
 }

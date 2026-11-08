@@ -2161,7 +2161,7 @@ describe("CredentialCard site question", () => {
     vault_sourced: true,
   };
 
-  it("offers no Add or Move for a login whose sites come from a connected vault", () => {
+  it("offers no Allow for a login whose sites come from a connected vault", () => {
     const onSiteAnswer = vi.fn();
     render(
       <CredentialCard
@@ -2177,8 +2177,7 @@ describe("CredentialCard site question", () => {
     expect(
       screen.getByText(/add b\.example\.com to it in that vault/),
     ).toBeTruthy();
-    expect(screen.queryByRole("button", { name: /^Add / })).toBeNull();
-    expect(screen.queryByRole("button", { name: /^Move to / })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^Allow on / })).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "No" }));
     expect(onSiteAnswer).toHaveBeenCalledWith("no");
   });
@@ -2224,7 +2223,7 @@ describe("CredentialCard site question", () => {
     ).toBeTruthy();
     expect(
       screen.getByText(
-        "Add or Move lets Skyvern type this login's password on http://b.example.com:8080, in this chat and in every saved run that uses it.",
+        "Allowing lets Skyvern type this login's password on http://b.example.com:8080, in this chat and in every saved run that uses it.",
       ),
     ).toBeTruthy();
     expect(
@@ -2249,13 +2248,13 @@ describe("CredentialCard site question", () => {
 
     expect(
       screen.getByText(
-        "Add or Move lets Skyvern type this login's password on b.example.com, in this chat and in every saved run that uses it.",
+        "Allowing lets Skyvern type this login's password on b.example.com, in this chat and in every saved run that uses it.",
       ),
     ).toBeTruthy();
     expect(screen.queryByText(/without encryption/)).toBeNull();
   });
 
-  it("names every site a moved login left", () => {
+  it("names every site an allowed login keeps working on", () => {
     render(
       <CredentialCard
         frame={buildCredentialRequiredFrame()}
@@ -2263,7 +2262,7 @@ describe("CredentialCard site question", () => {
         resolvedOutcome={{
           outcome: "connected",
           name: "HN Login",
-          siteAnswer: "move",
+          siteAnswer: "add",
           siteA: "https://a.example.com",
           savedSites: ["https://a.example.com", "https://c.example.com"],
           siteB: "https://b.example.com",
@@ -2274,7 +2273,9 @@ describe("CredentialCard site question", () => {
     );
 
     expect(
-      screen.getByText(/no longer used on a\.example\.com, c\.example\.com/),
+      screen.getByText(
+        /works on a\.example\.com, c\.example\.com and b\.example\.com/,
+      ),
     ).toBeTruthy();
   });
 

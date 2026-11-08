@@ -211,7 +211,13 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
                     rerender.bump();
                   }}
                 >
-                  <AccordionItem value="settings" className="mt-1 border-b-0">
+                  {/* Open accordion regions inside the transformed React Flow node must not
+                      clip: Chrome stops painting nested form controls (selects, switches,
+                      inputs) under overflow-hidden here. */}
+                  <AccordionItem
+                    value="settings"
+                    className="mt-1 border-b-0 [&_[role=region][data-state=open]]:overflow-visible"
+                  >
                     <AccordionTrigger className="py-2">
                       {/* Wrapped so the open-state chevron rotation targets
                           only the trigger's own direct svg. */}

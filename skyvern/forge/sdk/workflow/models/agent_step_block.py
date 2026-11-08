@@ -78,7 +78,18 @@ class AgentStepBlock(Block):
     ) -> BlockResult:
         run_context = self.get_workflow_run_context(workflow_run_id)
         try:
+            # The flag is read first because it gates access; the block's model only overrides which usable key runs.
             llm_key = await read_flag_llm_key(workflow_run_id, organization_id, run_context.workflow_permanent_id)
+            model_name = (self.model or {}).get("model_name")
+            if isinstance(model_name, str) and (
+                block_llm_key := self.override_llm_key_for_organization(organization_id)
+            ):
+                if not usable_agent_llm_key(block_llm_key):
+                    raise ValueError(
+                        f"Agent block model {model_name!r} resolves to llm_key {block_llm_key!r}, which is not a "
+                        "registered platform key that pins a reasoning effort."
+                    )
+                llm_key = block_llm_key
         except ValueError as e:
             return await self.build_block_result(
                 success=False,

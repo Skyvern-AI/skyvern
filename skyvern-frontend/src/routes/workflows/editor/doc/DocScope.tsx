@@ -1,18 +1,26 @@
 import {
   Fragment,
   useContext,
+  useLayoutEffect,
   useRef,
   useState,
+  type ContextType,
+  type RefObject,
   type DragEvent,
+  type MutableRefObject,
   type ReactNode,
 } from "react";
 import { cn } from "@/util/utils";
-import { LockClosedIcon } from "@radix-ui/react-icons";
+import { LockClosedIcon, PlusIcon } from "@radix-ui/react-icons";
 import { isWorkflowBlockNode, type AppNode } from "../nodes";
 import { workflowBlockTitle } from "../nodes/types";
 import { countDocSteps, type DocItem, type DocNoteItem } from "./buildDocTree";
 import { WorkflowDocActionsContext } from "./WorkflowDocActionsContext";
-import { docBlockType } from "./docStepRegistry";
+import {
+  docBlockType,
+  getDocMissingSettings,
+  getDocProseFields,
+} from "./docStepRegistry";
 import { DocConditional } from "./DocConditional";
 import { DocStepBody, DocStepHeader, type DocStepPlace } from "./DocStep";
 import {
@@ -25,15 +33,73 @@ import { DocEditableLine, DocInsertPopover } from "./DocEditing";
 import { NOTE_MAX_LENGTH, type DocScopeRef } from "./docGraphEdits";
 import { TOP_SCOPE, type DocPlace } from "./docEditApi";
 import { DocStepResult } from "./DocStepResult";
+import { DocDemonstrationLine } from "./DocDemonstrationLine";
+import { demonstrationLineIndex } from "./docDemonstration";
+import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
 import {
+  armNextCaretAtStart,
   requestCaretAtStart,
+  requestPickerOnLine,
   runStepByKey,
+  takePickerOnLine,
+  useDocTouch,
   type LineSplit,
   type PickerOpener,
 } from "./docKeys";
 import { DocOneActionHint } from "./DocOneActionHint";
+import {
+  announceAdded,
+  announceMoved,
+  announceNest,
+  announceNestReady,
+} from "./docAnnounce";
 
 type PlacedItem = Exclude<DocItem, DocNoteItem>;
+
+const NOTE_PLACEHOLDER = "Write a note, or type / for a step";
+// Phones have no Tab key, so the placeholder doesn't offer it there.
+const noTabKey = () =>
+  window.matchMedia?.("(hover: none), (max-width: 719px)").matches ?? false;
+
+// The text a note keeps on its owner step.
+function noteTextOfNode(
+  byId: Map<string, AppNode>,
+  note: { ownerNodeId: string; placement: "above" | "trailing" },
+) {
+  const data = byId.get(note.ownerNodeId)?.data as
+    | Record<string, unknown>
+    | undefined;
+  const text = data?.[note.placement === "above" ? "notes" : "trailingNotes"];
+  return typeof text === "string" ? text : "";
+}
+
+// Whether `text` fits the line on one row in the line's own font. Null text always fits.
+function useFitsOneRow(ref: RefObject<HTMLElement>, text: string | null) {
+  const [fits, setFits] = useState(true);
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el || !text) return;
+    const context = document.createElement("canvas").getContext("2d");
+    if (!context) return;
+    const measure = () => {
+      context.font = getComputedStyle(el).font;
+      setFits(context.measureText(text).width <= el.clientWidth);
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [ref, text]);
+  return fits;
+}
+
+const sameScope = (a: DocScopeRef | undefined, b: DocScopeRef | undefined) =>
+  Boolean(
+    a &&
+    b &&
+    a.parentId === b.parentId &&
+    a.conditionalBranchId === b.conditionalBranchId,
+  );
 export type DocNoteProblem = {
   code: string;
   message: string;
@@ -229,6 +295,18 @@ function DocNode({
           open={inserting}
           onOpenChange={setInserting}
           onDismiss={() => finishSlash.current?.(true)}
+          onDemonstrate={
+            place &&
+            item.kind === "step" &&
+            !place.isFinally &&
+            actions.edit?.canReplaceBlankStep(node.id)
+              ? demonstrateFrom(actions, place, finishSlash, node.id)
+              : demonstrateFrom(
+                  actions,
+                  place && { scope: place.scope, index: place.index + 1 },
+                  finishSlash,
+                )
+          }
           onPick={(type) => {
             finishSlash.current?.(false);
             if (!place || !actions.edit) return;
@@ -246,12 +324,18 @@ function DocNode({
               requestAnimationFrame(() => actions.setFocusId(node.id));
               return;
             }
-            actions.setFocusId(
-              actions.edit.insertStep(
-                { scope: place.scope, index: place.index + 1 },
-                type,
-              ),
-            );
+            // "/" on an empty step replaces it, whatever the type picked.
+            const added =
+              item.kind === "step" &&
+              !place.isFinally &&
+              actions.edit.isEmptyStep(node.id)
+                ? actions.edit.replaceStep(node.id, type)
+                : actions.edit.insertStep(
+                    { scope: place.scope, index: place.index + 1 },
+                    type,
+                  );
+            actions.setFocusId(added);
+            if (added) announceAdded(type);
           }}
         >
           <div>
@@ -269,10 +353,12 @@ function DocNode({
                         index: to,
                       });
                       // The moved line remounts, so refocus after it.
-                      if (moved)
+                      if (moved) {
                         requestAnimationFrame(() =>
                           actions.setFocusId(node.id),
                         );
+                        announceMoved(delta < 0 ? "up" : "down");
+                      }
                       return true;
                     }
                   : undefined
@@ -289,13 +375,12 @@ function DocNode({
               onTab={
                 place && actions.edit
                   ? (outdent) => {
-                      const nested = actions.edit!.nest(node.id, outdent);
+                      const kind = actions.edit!.nest(node.id, outdent);
+                      if (!kind) return false;
+                      announceNest(kind, outdent);
                       // The moved line remounts and the old one's blur clears the focus, so refocus after it.
-                      if (nested)
-                        requestAnimationFrame(() =>
-                          actions.setFocusId(node.id),
-                        );
-                      return nested;
+                      requestAnimationFrame(() => actions.setFocusId(node.id));
+                      return true;
                     }
                   : undefined
               }
@@ -336,6 +421,22 @@ function DocNode({
   );
 }
 
+// The menu's "Demonstrate task" for a place; a "/" line closes without typing the slash first.
+function demonstrateFrom(
+  actions: ContextType<typeof WorkflowDocActionsContext>,
+  place: DocPlace | undefined,
+  finishSlash?: MutableRefObject<((keepSlash: boolean) => void) | null>,
+  replacing?: string,
+) {
+  const start = place ? actions.demonstrateAt(place, replacing) : null;
+  return start
+    ? () => {
+        finishSlash?.current?.(false);
+        start();
+      }
+    : null;
+}
+
 // Drop target handlers: the target highlights while a step is over it.
 function useDropTarget(onDrop: (() => void) | undefined) {
   const [over, setOver] = useState(false);
@@ -373,6 +474,69 @@ function DocDropZone({ onDrop }: { onDrop: () => void }) {
   );
 }
 
+// The line with a round "+" in the gap above a step. It opens an empty line there with the step picker on it; when a
+// note already sits above that step, the picker opens on the line itself.
+function DocInsertLine({
+  place,
+  ownerNodeId,
+  noteFree,
+  label,
+}: {
+  place: DocPlace;
+  ownerNodeId: string;
+  noteFree: boolean;
+  label: string;
+}) {
+  const actions = useContext(WorkflowDocActionsContext);
+  const [open, setOpen] = useState(false);
+  const plusRef = useRef<HTMLButtonElement>(null);
+  // Hidden until hovered, so on touch it would be an invisible tap target; phones add with Enter, "/" and "+ Add step".
+  const touch = useDocTouch();
+  if (touch) return null;
+  return (
+    <DocInsertPopover
+      open={open}
+      onOpenChange={setOpen}
+      onEscape={() => requestAnimationFrame(() => plusRef.current?.focus())}
+      onPick={(type) => {
+        const added = actions.edit?.insertStep(place, type) ?? null;
+        actions.setFocusId(added);
+        if (added) announceAdded(type);
+      }}
+    >
+      {/* Its negative margins cancel the gap it sits in, so nothing shifts. */}
+      <div
+        data-doc-insert-line={ownerNodeId}
+        className="group/ins relative -my-3 h-3"
+      >
+        <div
+          aria-hidden
+          className={cn(
+            "pointer-events-none absolute inset-x-0 top-1/2 border-t-[1.5px] border-border opacity-0 transition-opacity group-focus-within/ins:opacity-100 group-hover/ins:opacity-100",
+            open && "opacity-100",
+          )}
+        />
+        <button
+          ref={plusRef}
+          type="button"
+          aria-label={label}
+          onClick={() => {
+            if (!noteFree) return setOpen(true);
+            requestPickerOnLine(`${ownerNodeId}:above`);
+            actions.setPendingNote({ ownerNodeId, placement: "above" });
+          }}
+          className={cn(
+            "absolute -left-[30px] top-1/2 grid size-5 -translate-y-1/2 place-items-center rounded-full border-[1.5px] border-muted-foreground/40 bg-background text-muted-foreground opacity-0 outline-none transition-opacity hover:border-muted-foreground hover:text-foreground focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-ring group-hover/ins:opacity-100",
+            open && "opacity-100",
+          )}
+        >
+          <PlusIcon className="size-3" />
+        </button>
+      </div>
+    </DocInsertPopover>
+  );
+}
+
 /** "+ Add a step" for an empty loop or branch, or the end of the doc. */
 export function DocAddStep({
   place,
@@ -389,6 +553,7 @@ export function DocAddStep({
   const actions = useContext(WorkflowDocActionsContext);
   const [open, setOpen] = useState(false);
   const drop = useDropTarget(onDrop);
+  const addRef = useRef<HTMLButtonElement>(null);
   if (!actions.edit)
     return emptyText ? (
       <p className="my-1 text-[13px] text-muted-foreground">{emptyText}.</p>
@@ -397,9 +562,13 @@ export function DocAddStep({
     <DocInsertPopover
       open={open}
       onOpenChange={setOpen}
-      onPick={(type) =>
-        actions.setFocusId(actions.edit?.insertStep(place, type) ?? null)
-      }
+      onDemonstrate={demonstrateFrom(actions, place)}
+      onEscape={() => requestAnimationFrame(() => addRef.current?.focus())}
+      onPick={(type) => {
+        const added = actions.edit?.insertStep(place, type) ?? null;
+        actions.setFocusId(added);
+        if (added) announceAdded(type);
+      }}
     >
       <p
         {...drop.handlers}
@@ -413,6 +582,7 @@ export function DocAddStep({
         <button
           type="button"
           data-doc-add-step
+          ref={addRef}
           onClick={() => setOpen(true)}
           className="rounded-md px-2 py-1 text-sm text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
         >
@@ -430,6 +600,8 @@ function DocNote({
   title,
   editable,
   place,
+  nestsInto,
+  into,
 }: {
   ownerNodeId: string;
   placement: "above" | "trailing";
@@ -437,12 +609,25 @@ function DocNote({
   title?: string;
   editable: boolean;
   place?: DocPlace;
+  // What Tab would put this line in, for the placeholder to say so.
+  nestsInto?: "loop" | "branch";
+  // Set when Tab put this line in an empty loop or branch: the picked step goes in there, holding the line's text.
+  into?: DocScopeRef;
 }) {
   const actions = useContext(WorkflowDocActionsContext);
   const [inserting, setInserting] = useState(false);
   const finishSlash = useRef<Parameters<PickerOpener>[0] | null>(null);
-  // Set when Tab nested this note into an empty loop or branch: the picked step goes in there, holding the note's text.
-  const pickInto = useRef<DocScopeRef | null>(null);
+  // The picker the insert line opened: closing it leaves the empty line with its caret, typing no "/".
+  const fromInsertLine = useRef(false);
+  // Escape leaves an empty line the insert line opened back on its "+", not on the page.
+  const openedByInsertLine = useRef(false);
+  // The Tab clause shows only where there is a Tab key and it fits on one row, so the line never grows a row.
+  const lineBox = useRef<HTMLDivElement>(null);
+  const tabPlaceholder =
+    nestsInto && !noTabKey()
+      ? `Write a note, type / for a step, or Tab to put it in the ${nestsInto}`
+      : null;
+  const tabFits = useFitsOneRow(lineBox, tabPlaceholder);
   const key = placement === "above" ? "notes" : "trailingNotes";
   const pending =
     actions.pendingNote?.ownerNodeId === ownerNodeId &&
@@ -451,23 +636,32 @@ function DocNote({
     <DocInsertPopover
       open={inserting}
       onOpenChange={setInserting}
+      onDemonstrate={
+        // Tab on a note under an empty loop or branch picks a step for that scope, which has no demonstration insertion.
+        // The "+" between steps offers the same rows whether or not a note sits above the step: no demonstration.
+        into || fromInsertLine.current
+          ? null
+          : demonstrateFrom(actions, place, finishSlash)
+      }
       onDismiss={() => {
-        // Closing the Tab menu leaves the note where it was; closing the "/" menu types the "/".
-        finishSlash.current?.(true, !pickInto.current);
-        pickInto.current = null;
+        // The picker can report closing more than once; only the first finishes the line.
+        const finish = finishSlash.current;
+        finishSlash.current = null;
+        finish?.(true, !fromInsertLine.current);
+        fromInsertLine.current = false;
       }}
       onPick={(type) => {
         finishSlash.current?.(false);
-        const target = pickInto.current;
-        pickInto.current = null;
-        if (target && actions.edit) {
+        fromInsertLine.current = false;
+        if (into && actions.edit) {
           const adopted = actions.edit.adoptNote(
             { ownerNodeId, placement },
-            target,
+            into,
             type,
           );
           actions.setPendingNote(null);
           actions.setFocusId(adopted);
+          if (adopted) announceAdded(type);
           return;
         }
         if (!place || !actions.edit) return;
@@ -477,9 +671,11 @@ function DocNote({
           actions.edit.setText(ownerNodeId, key, "");
         actions.setPendingNote(null);
         actions.setFocusId(added);
+        if (added) announceAdded(type);
       }}
     >
       <div
+        ref={lineBox}
         title={title}
         className="text-base leading-[1.55] text-muted-foreground"
       >
@@ -488,7 +684,10 @@ function DocNote({
           editable={editable && Boolean(actions.edit)}
           multiline
           autoFocus={pending}
-          placeholder="Write a note, or type / for a step"
+          placeholder={NOTE_PLACEHOLDER}
+          editingPlaceholder={
+            tabPlaceholder && tabFits ? tabPlaceholder : NOTE_PLACEHOLDER
+          }
           label="Note"
           maxLength={NOTE_MAX_LENGTH}
           references={
@@ -504,29 +703,86 @@ function DocNote({
             actions.edit?.setText(ownerNodeId, key, v);
           }}
           onSlash={
-            place
+            place || into
               ? (keep) => {
                   finishSlash.current = keep;
                   setInserting(true);
                 }
               : undefined
           }
-          onDone={() => pending && actions.setPendingNote(null)}
+          pickerOnStart={() => {
+            // Asked once per line; a later call must not clear the mark the first one set.
+            const asked = takePickerOnLine(`${ownerNodeId}:${placement}`);
+            if (asked)
+              fromInsertLine.current = openedByInsertLine.current = true;
+            return asked;
+          }}
+          onDone={() => {
+            if (!pending) return;
+            actions.setPendingNote(null);
+            if (!openedByInsertLine.current) return;
+            openedByInsertLine.current = false;
+            requestAnimationFrame(() => {
+              if (
+                document.activeElement &&
+                document.activeElement !== document.body
+              )
+                return;
+              Array.from(
+                document.querySelectorAll<HTMLElement>(
+                  "[data-doc-insert-line]",
+                ),
+              )
+                .find((line) => line.dataset.docInsertLine === ownerNodeId)
+                ?.querySelector("button")
+                ?.focus();
+            });
+          }}
           onTab={
             actions.edit
               ? (outdent) => {
-                  const moved = actions.edit!.nestNote(
-                    { ownerNodeId, placement },
-                    outdent,
-                  );
-                  if (moved && "pickIn" in moved)
-                    return (finish) => {
-                      finishSlash.current = finish;
-                      pickInto.current = moved.pickIn;
-                      setInserting(true);
-                    };
+                  const note = { ownerNodeId, placement };
+                  // The line moves on, so its blur must not send focus back to the insert line.
+                  openedByInsertLine.current = false;
+                  // The line only shows inside; Shift+Tab shows it back where its text is kept.
+                  const edit = actions.edit!;
+                  if (into) {
+                    if (!outdent) return false;
+                    const kind = edit.nestKind(into.parentId);
+                    if (kind) announceNest(kind, true);
+                    requestAnimationFrame(() => actions.setPendingNote(note));
+                    return true;
+                  }
+                  const moved = edit.nestNote(note, outdent);
                   if (!moved) return false;
-                  requestAnimationFrame(() => actions.setPendingNote(moved));
+                  const kind =
+                    "pickIn" in moved
+                      ? edit.nestKind(moved.pickIn.parentId)
+                      : edit.nestKind(moved.ownerNodeId, !outdent);
+                  if ("pickIn" in moved) {
+                    // Nothing is saved yet: show the empty loop or branch the line goes in, with the caret at the
+                    // line's start so "/" opens the picker, and say so instead of claiming a move.
+                    const { parentId, conditionalBranchId } = moved.pickIn;
+                    if (
+                      parentId &&
+                      kind === "loop" &&
+                      !actions.loopOpen(parentId)
+                    )
+                      actions.toggleLoop(parentId);
+                    if (parentId && kind === "branch") {
+                      if (!actions.conditionalOpen(parentId))
+                        actions.toggleConditional(parentId);
+                      if (conditionalBranchId)
+                        actions.selectBranch(parentId, conditionalBranchId);
+                    }
+                    armNextCaretAtStart();
+                    if (kind) announceNestReady(kind);
+                  } else if (kind) announceNest(kind, outdent);
+                  // Tab only nests: an empty loop or branch takes the line itself, and "/" then picks its step.
+                  const next =
+                    "pickIn" in moved ? { ...note, into: moved.pickIn } : moved;
+                  // The line remounts in its new place and the old one's blur clears the pending note, so set it after.
+                  requestAnimationFrame(() => actions.setPendingNote(next));
                   return true;
                 }
               : undefined
@@ -591,8 +847,9 @@ export function DocScope({
       : { ownerNodeId: nodeId, placement: "trailing" as const };
     actions.setPendingNote(note);
   };
-  // Enter on a step makes a step of the same type below, splitting its text at the caret. Enter on an empty step
-  // turns it back into a note, as Enter leaves an empty list item. Loops and Ifs start the note under them.
+  // Enter on a step makes a step of the same type below, splitting its text at the caret. Enter on an empty step that
+  // needs text turns it back into a note, as Enter leaves an empty list item. Loops, Ifs and steps that need no text
+  // (Print Page, a Wait with its amount) keep the step and open an empty line below.
   const enterAfter = (
     nodeId: string,
     split: LineSplit | null,
@@ -612,6 +869,10 @@ export function DocScope({
       node.type === "conditional"
     )
       return noteBelow(nodeId);
+    const needsText =
+      getDocProseFields(node).length > 0 ||
+      getDocMissingSettings(node).length > 0;
+    if (!needsText) return noteBelow(nodeId);
     if (
       split &&
       !split.before.trim() &&
@@ -630,10 +891,31 @@ export function DocScope({
     if (split?.after.trim()) requestCaretAtStart(added);
     actions.setFocusId(added);
   };
+  const pending = actions.pendingNote;
   const pendingFor = (owner: string, placement: "above" | "trailing") =>
-    actions.pendingNote?.ownerNodeId === owner &&
-    actions.pendingNote.placement === placement &&
+    pending?.ownerNodeId === owner &&
+    pending.placement === placement &&
+    !pending.into &&
     !notePresent(owner, placement);
+  // Shown inside the empty loop or branch Tab put it in, not where its text is kept.
+  const shownElsewhere = (owner: string, placement: "above" | "trailing") =>
+    pending?.ownerNodeId === owner &&
+    pending.placement === placement &&
+    Boolean(pending.into);
+  const pendingInto =
+    pending?.into && sameScope(pending.into, scope) ? pending : null;
+  // The loop or If that Tab would put a line in: the one it trails, or the step just above it.
+  const nestsInto = (owner: string, placement: "above" | "trailing") => {
+    const container =
+      placement === "trailing"
+        ? byId.get(owner)
+        : byId.get(
+            steps[steps.findIndex((s) => s.nodeId === owner) - 1]?.nodeId ?? "",
+          );
+    if (container?.type === "loop") return "loop" as const;
+    if (container?.type === "conditional") return "branch" as const;
+    return undefined;
+  };
   const editable = !readOnly && Boolean(actions.edit);
   // A dragged container can't be dropped inside itself, so its own scopes offer no drop targets.
   const dragInside = (() => {
@@ -654,10 +936,21 @@ export function DocScope({
     if (!id || !scope || !actions.edit) return;
     // The index counts the dragged step while it is still in place.
     const from = movable.findIndex((s) => s.nodeId === id);
-    actions.edit.move(id, {
-      scope,
-      index: from !== -1 && from < index ? index - 1 : index,
-    });
+    const to = from !== -1 && from < index ? index - 1 : index;
+    if (!actions.edit.move(id, { scope, index: to })) return;
+    // Within its own list the step went up or down; only a step that came from elsewhere reads out the list's name.
+    if (from !== -1) {
+      if (to !== from) announceMoved(to < from ? "up" : "down");
+      return;
+    }
+    const place = actions
+      .destinations()
+      .find(
+        (d) =>
+          d.scope.parentId === scope.parentId &&
+          d.scope.conditionalBranchId === scope.conditionalBranchId,
+      )?.label;
+    if (place) announceMoved({ place });
   };
   // The drop line before a step goes above its note, which belongs to it.
   const zoneBefore = (index: number) => {
@@ -683,9 +976,76 @@ export function DocScope({
     const place = placeOf(owner);
     return place ? <DocDropZone onDrop={dropAt(place.index)} /> : null;
   };
+  // The insert line above a step goes above its note too, as the drop line does. The doc's first step has none:
+  // the top of the doc is not between steps.
+  const insertBefore = (index: number) => {
+    if (dropping || actions.runGoing || !structural || !editable || !scope)
+      return null;
+    const item = items[index]!;
+    const owner =
+      item.kind === "note"
+        ? item.placement === "above"
+          ? item.ownerNodeId
+          : null
+        : item.kind === "unplaced"
+          ? null
+          : item.nodeId;
+    if (!owner) return null;
+    const previous = items[index - 1];
+    if (
+      item.kind !== "note" &&
+      previous?.kind === "note" &&
+      previous.placement === "above" &&
+      previous.ownerNodeId === owner
+    )
+      return null;
+    const place = placeOf(owner);
+    if (!place || (sameScope(scope, TOP_SCOPE) && place.index === 0))
+      return null;
+    // A new step can't go between two steps that always run at the end, so only the first of them gets a line.
+    if (
+      place.isFinally &&
+      steps.findIndex((s) => s.finally) !==
+        steps.findIndex((s) => s.nodeId === owner)
+    )
+      return null;
+    const first = place.index === 0;
+    return (
+      <DocInsertLine
+        place={{ scope: place.scope, index: place.index }}
+        ownerNodeId={owner}
+        noteFree={!notePresent(owner, "above") && !pendingFor(owner, "above")}
+        label={
+          first
+            ? `Add a step at the start of this ${scope.conditionalBranchId ? "branch" : "loop"}`
+            : "Add a step here"
+        }
+      />
+    );
+  };
   const hasFinally = steps.some((s) => s.finally);
+  const demonstration = useRecordingLauncherStore((s) => s.demonstration);
+  const lineAt =
+    demonstration && scope && !scope.parentId && !scope.conditionalBranchId
+      ? demonstrationLineIndex(
+          items,
+          (id) => {
+            const node = byId.get(id);
+            return node && isWorkflowBlockNode(node)
+              ? node.data.label
+              : undefined;
+          },
+          demonstration.insertion,
+        )
+      : -1;
   return (
-    <div className="flex min-w-0 flex-col gap-3 py-[3px]">
+    <div
+      className={cn(
+        "flex min-w-0 flex-col gap-3",
+        // Inside a loop or branch the first step is as far below the header as steps are from each other, so its "+" covers no header text.
+        scope && items.length ? "pb-[3px] pt-3" : "py-[3px]",
+      )}
+    >
       {items.map((item, index) => (
         // Same key with or without a drop line, so starting a drag never remounts the dragged step.
         <Fragment
@@ -697,12 +1057,28 @@ export function DocScope({
                 : item.nodeId
           }
         >
+          {lineAt === index && demonstration && (
+            <DocDemonstrationLine status={demonstration} />
+          )}
           {zoneBefore(index)}
+          {insertBefore(index)}
           {renderItem(item, index)}
         </Fragment>
       ))}
+      {lineAt === items.length && demonstration && (
+        <DocDemonstrationLine status={demonstration} />
+      )}
       {dropping && !hasFinally && steps.length > 0 && (
         <DocDropZone onDrop={dropAt(movable.length)} />
+      )}
+      {steps.length === 0 && pendingInto && scope && (
+        <DocNote
+          ownerNodeId={pendingInto.ownerNodeId}
+          placement={pendingInto.placement}
+          text={noteTextOfNode(byId, pendingInto)}
+          editable={editable}
+          into={scope}
+        />
       )}
       {steps.length === 0 &&
         scope &&
@@ -720,6 +1096,7 @@ export function DocScope({
 
   function renderItem(item: DocItem, index: number) {
     if (item.kind === "note") {
+      if (shownElsewhere(item.ownerNodeId, item.placement)) return null;
       const ownerPlace = placeOf(item.ownerNodeId);
       const problem = noteProblems.get(`${item.ownerNodeId}:${item.placement}`);
       return (
@@ -733,6 +1110,7 @@ export function DocScope({
               placement={item.placement}
               text={item.text}
               title={noteReaders(item, byId, actions.previousNoteReader)}
+              nestsInto={nestsInto(item.ownerNodeId, item.placement)}
               editable={editable && !previousReason(items, index + 1)}
               place={
                 ownerPlace && {
@@ -796,6 +1174,7 @@ export function DocScope({
               placement="above"
               text=""
               editable={editable}
+              nestsInto={nestsInto(item.nodeId, "above")}
               place={placeOf(item.nodeId)}
             />
           </div>
@@ -823,6 +1202,7 @@ export function DocScope({
               placement="trailing"
               text=""
               editable={editable}
+              nestsInto={nestsInto(item.nodeId, "trailing")}
               place={(() => {
                 const p = placeOf(item.nodeId);
                 return p && { scope: p.scope, index: p.index + 1 };

@@ -6,15 +6,16 @@ import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { useLocateBlockStore } from "../runValidation/useLocateBlockStore";
 import { stripJinjaReferences } from "./docTextUtils";
-import { showDropBlockedToast } from "../sortable/dropBlockedToast";
 import { useNodeCollapseStore } from "../collapse/useNodeCollapseStore";
 import {
   isWorkflowBlockNode,
   type AppNode,
   type WorkflowBlockNode,
 } from "../nodes";
-import { availableNodeLibraryItems } from "../panels/nodeLibraryItems";
+import { nodeLibraryTitle } from "./docStepChoices";
 import type { AddNodeProps } from "../Workspace";
+import { demonstrationInsertionFromNodes } from "../workspaceAuthoringActions";
+import type { WorkflowCopilotDemonstrationInsertion } from "../../copilot/workflowCopilotTypes";
 import {
   getUpdatedParametersAfterLabelUpdateForSourceParameterKey,
   inferBranchCriteriaTypeFromExpression,
@@ -26,6 +27,7 @@ import {
   getDocProseFields,
 } from "./docStepRegistry";
 import { withLineSetting } from "./docLineSettings";
+import { useDocUnfinishedStore } from "./docUnfinished";
 import {
   addBranch,
   checkLabel,
@@ -34,10 +36,12 @@ import {
   moveBlock,
   moveBranch,
   newStepLabel,
+  labelStem,
   branchMembers,
   contextInputsFedBy,
   findOutputUsers,
   hasSettingsBeyondText,
+  isBlankStep,
   NOTE_MAX_LENGTH,
   removeBlock,
   readChain,
@@ -252,27 +256,80 @@ export function createDocEditApi({
     }
     return to;
   };
-  const insertStep = (place: DocPlace, nodeType: NodeType): string | null => {
-    const point = insertionPoint(graph, place.scope, place.index, finallyId);
+  const insertStep = (
+    place: DocPlace,
+    nodeType: NodeType,
+    replacing?: string,
+  ): string | null => {
+    // A replaced step leaves the graph in the same pass that adds its successor: one layout, one undo step.
+    const base = replacing ? removeBlock(graph, replacing, finallyId) : null;
+    const point = insertionPoint(
+      base ?? graph,
+      place.scope,
+      place.index,
+      finallyId,
+    );
     if (!point) return null;
     const added = edits.addStep({
       nodeType,
       ...point,
+      replacing: base ? replacing : undefined,
       label: newStepLabel(
         nodes,
-        availableNodeLibraryItems().find((i) => i.nodeType === nodeType)
-          ?.title ?? nodeType,
+        nodeLibraryTitle(nodeType),
         useWorkflowParametersStore
           .getState()
           .parameters.map((parameter) => parameter.key),
       ),
       select: false,
     });
-    if (added) edits.update((current) => clearLongDefaultText(current, added));
+    if (added) {
+      useDocUnfinishedStore.getState().add(added);
+      edits.update((current) => clearLongDefaultText(current, added));
+    }
     return added;
   };
 
+  // A recording starts only in the top-level sequence; inside a loop or branch there is no insertion.
+  const demonstrationInsertion = (
+    place: DocPlace,
+    replacing?: string,
+  ): WorkflowCopilotDemonstrationInsertion | null => {
+    if (place.scope.parentId || place.scope.conditionalBranchId) return null;
+    // The empty step being replaced is not a neighbour: the recording goes where it stood.
+    const without =
+      replacing && canReplaceBlankStep(replacing)
+        ? removeBlock(graph, replacing, finallyId)
+        : null;
+    const base = without ?? graph;
+    const point = insertionPoint(base, place.scope, place.index, finallyId);
+    return point ? demonstrationInsertionFromNodes(base.nodes, point) : null;
+  };
+
+  // Drops an empty step so a demonstration can take its place; false when it holds anything.
+  const canReplaceBlankStep = (id: string): boolean => {
+    const node = nodes.find((n) => n.id === id);
+    if (!node || !isBlankStep(node)) return false;
+    const { parameters } = useWorkflowParametersStore.getState();
+    // Removing the step would strip the {{ step_output }} references other steps hold.
+    return (
+      !contextInputsFedBy(nodes, parameters, id).length &&
+      !findOutputUsers(nodes, id).length
+    );
+  };
+
+  const removeBlankStep = (id: string): boolean => {
+    if (!canReplaceBlankStep(id)) return false;
+    const next = removeBlock(graph, id, finallyId);
+    if (!next) return false;
+    edits.apply(next);
+    return true;
+  };
+
   return {
+    demonstrationInsertion,
+    removeBlankStep,
+    canReplaceBlankStep,
     setText: (id: string, key: string, value: string) =>
       edits.update((current) => {
         const before = current.find((n) => n.id === id)?.data as
@@ -459,15 +516,37 @@ export function createDocEditApi({
       return added;
     },
     insertStep,
+    // The empty step `id` becomes a step of `nodeType` in the same place.
+    replaceStep: (id: string, nodeType: NodeType): string | null => {
+      const node = nodes.find((n) => n.id === id);
+      if (!node || id === finallyId) return null;
+      const scope = scopeOfNode(node);
+      const index = readChain(graph, scope, finallyId)?.ids.indexOf(id) ?? -1;
+      return index < 0 ? null : insertStep({ scope, index }, nodeType, id);
+    },
     duplicate: (id: string) => edits.duplicate(id),
-    remove: (id: string) => {
-      if (refuseIfFeedsInputs([id])) return;
+    // The step that keyboard focus moves to once `id` is deleted: the one above, else below, else its loop or If.
+    neighbourOf: (id: string): string | null => {
+      const node = nodes.find((n) => n.id === id);
+      if (!node) return null;
+      // The finally step is left out of a chain that pins it, so its own chain is read without the pin.
+      const chain =
+        readChain(graph, scopeOfNode(node), id === finallyId ? null : finallyId)
+          ?.ids ?? [];
+      const at = chain.indexOf(id);
+      if (at < 0) return node.parentId ?? null;
+      const pinned = !node.parentId && id !== finallyId ? finallyId : null;
+      return chain[at - 1] ?? chain[at + 1] ?? node.parentId ?? pinned ?? null;
+    },
+    // False when the step stays.
+    remove: (id: string): boolean => {
+      if (refuseIfFeedsInputs([id])) return false;
       const removed = nodes.find((n) => n.id === id);
       const next = removeBlock(graph, id, finallyId);
-      if (!next)
-        return refuse(
-          "This step can't be deleted here. Open Visual to edit it.",
-        );
+      if (!next) {
+        refuse("This step can't be deleted here. Open Visual to edit it.");
+        return false;
+      }
       // The save refuses a finally label that names no step.
       edits.apply(
         id === finallyId
@@ -480,24 +559,68 @@ export function createDocEditApi({
             ? `Deleted ${removed.data.label}`
             : "Deleted",
       });
+      return true;
     },
+    // A step still named for its old type, with nothing using its output, is renamed for the new type.
     turnInto: (id: string, nodeType: NodeType) => {
       const next = turnInto(graph, id, nodeType);
-      if (next) edits.apply(next);
+      if (!next) return;
+      const node = nodes.find((n) => n.id === id);
+      const titleOf = nodeLibraryTitle;
+      const old = node && isWorkflowBlockNode(node) ? node : null;
+      const autoNamed =
+        old &&
+        new RegExp(
+          `^${labelStem(titleOf(old.type)).replace(/[^a-z0-9_]/g, "")}_\\d+$`,
+        ).test(old.data.label);
+      if (
+        !old ||
+        !autoNamed ||
+        id === finallyId ||
+        findOutputUsers(nodes, id).length
+      )
+        return edits.apply(next);
+      const parameterKeys = useWorkflowParametersStore
+        .getState()
+        .parameters.map((parameter) => parameter.key);
+      const label = newStepLabel(
+        next.nodes.filter((n) => n.id !== id),
+        titleOf(nodeType),
+        parameterKeys,
+      );
+      if (checkLabel(next.nodes, id, label, parameterKeys))
+        return edits.apply(next);
+      const parameters = useWorkflowParametersStore.getState();
+      parameters.setParameters(
+        getUpdatedParametersAfterLabelUpdateForSourceParameterKey(
+          id,
+          label,
+          next.nodes,
+          parameters.parameters,
+        ),
+      );
+      useNodeCollapseStore
+        .getState()
+        .renameBlock(workflowId, old.data.label, label);
+      edits.apply({
+        nodes: renameStep(next.nodes, id, label).nodes,
+        edges: next.edges,
+      });
     },
     move,
     // Tab nests a step in the loop or branch just above it; Shift+Tab puts it after the step that holds it.
-    // False when there is nowhere to go, so the key keeps its usual meaning.
-    nest: (id: string, outdent: boolean): boolean => {
+    // Says what it moved through, or null when there is nowhere to go, so the key keeps its usual meaning.
+    nest: (id: string, outdent: boolean): DocNestKind | null => {
       const node = nodes.find((n) => n.id === id);
-      if (!node || id === finallyId) return false;
+      if (!node || id === finallyId) return null;
       if (outdent) {
         const parent = nodes.find((n) => n.id === node.parentId);
-        if (!parent) return false;
+        const kind = nestKindOf(parent);
+        if (!parent || !kind) return null;
         const scope = scopeOfNode(parent);
         const at = readChain(graph, scope, finallyId)?.ids.indexOf(parent.id);
-        if (at === undefined || at < 0) return false;
-        return move(id, { scope, index: at + 1 });
+        if (at === undefined || at < 0) return null;
+        return move(id, { scope, index: at + 1 }) ? kind : null;
       }
       const chain = readChain(graph, scopeOfNode(node), finallyId);
       const at = chain?.ids.indexOf(id) ?? -1;
@@ -507,18 +630,55 @@ export function createDocEditApi({
         return move(id, {
           scope: { parentId: above.id, conditionalBranchId: null },
           index: Number.MAX_SAFE_INTEGER,
-        });
+        })
+          ? "loop"
+          : null;
       }
       if (above?.type === "conditional") {
         const branchId =
           selectedBranch(above.id) ?? above.data.branches[0]?.id ?? null;
-        if (!branchId) return false;
+        if (!branchId) return null;
         return move(id, {
           scope: { parentId: above.id, conditionalBranchId: branchId },
           index: Number.MAX_SAFE_INTEGER,
-        });
+        })
+          ? "branch"
+          : null;
       }
-      return false;
+      return null;
+    },
+    // What a line moving in or out of `id` is moving through; with `holder`, of the loop or If that holds `id`.
+    nestKind: (id: string | null, holder = false): DocNestKind | null => {
+      const node = nodes.find((n) => n.id === id);
+      return nestKindOf(
+        holder ? nodes.find((n) => n.id === node?.parentId) : node,
+      );
+    },
+    // A step with no text, no note and no setting: "/" can replace it outright.
+    isEmptyStep: (id: string) => {
+      const node = nodes.find((n) => n.id === id);
+      if (
+        !node ||
+        !isWorkflowBlockNode(node) ||
+        hasSettingsBeyondText(node) ||
+        findOutputUsers(nodes, id).length ||
+        contextInputsFedBy(
+          nodes,
+          useWorkflowParametersStore.getState().parameters,
+          id,
+        ).length
+      )
+        return false;
+      const data = node.data as Record<string, unknown>;
+      return [
+        ...getDocProseFields(node).map((f) => f.key),
+        "description",
+        "notes",
+        "trailingNotes",
+      ].every((key) => {
+        const value = data[key];
+        return typeof value !== "string" || !value.trim();
+      });
     },
     // Only a step whose whole content is text can become text without losing anything.
     canBePlainText: (id: string) => {
@@ -600,12 +760,12 @@ export function createDocEditApi({
         TOP_SCOPE,
         Number.MAX_SAFE_INTEGER,
       );
-      if (end.kind === "forward-reference")
-        return showDropBlockedToast({
-          kind: "forward-reference",
-          movedBlockLabel: end.movedLabel,
-          referrerLabels: end.referrerLabels,
-        });
+      if (end.kind === "forward-reference") {
+        const users = Array.from(new Set(end.referrerLabels));
+        return refuse(
+          `${end.movedLabel} can't run at the end: ${users.join(", ")} ${users.length === 1 ? "uses" : "use"} its output.`,
+        );
+      }
       edits.apply(end.kind === "ok" ? end.graph : { nodes: next, edges });
     },
     rename: (id: string, label: string): string | null => {
@@ -681,3 +841,11 @@ export function createDocEditApi({
 }
 
 export type DocEditApi = ReturnType<typeof createDocEditApi>;
+
+export type DocNestKind = "loop" | "branch";
+
+function nestKindOf(node: AppNode | undefined): DocNestKind | null {
+  if (node?.type === "loop") return "loop";
+  if (node?.type === "conditional") return "branch";
+  return null;
+}

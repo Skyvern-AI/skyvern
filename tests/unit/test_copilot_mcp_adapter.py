@@ -3,8 +3,10 @@ import base64
 import copy
 import io
 import json
+import struct
+import zlib
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
-from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from contextlib import AbstractAsyncContextManager, asynccontextmanager, nullcontext
 from dataclasses import replace
 from functools import partial
 from types import SimpleNamespace
@@ -68,7 +70,11 @@ from skyvern.forge.sdk.copilot.mcp_adapter import (
     resolve_browser_session_binding,
 )
 from skyvern.forge.sdk.copilot.model_input_capture import serialize_tool_surface
-from skyvern.forge.sdk.copilot.output_utils import _RECENT_TOOL_OUTPUT_CHAR_CAP, MCP_RESULT_PROVENANCE_KEY
+from skyvern.forge.sdk.copilot.output_utils import (
+    _BASE64_IMAGE_OMITTED_MESSAGE,
+    _RECENT_TOOL_OUTPUT_CHAR_CAP,
+    MCP_RESULT_PROVENANCE_KEY,
+)
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
@@ -114,6 +120,7 @@ from skyvern.webeye.persistent_sessions_manager import (
     BrowserRetirementReason,
 )
 from tests.unit._mcp_browser_fakes import (
+    failing_post_hook,
     logged_request_failures,
     make_request_failure,
     make_session_state,
@@ -345,6 +352,124 @@ def test_the_model_facing_scrub_reads_the_run_parameters_before_restoring_a_code
 
     assert (scrubbed.get("nav_error_code") == code) is survives
     assert (parameter_value in str(scrubbed)) is survives
+
+
+def _screenshot_field(kind: str) -> str:
+    if kind in ("oversize", "decompression_bomb"):
+        side = 7000 if kind == "oversize" else 20000
+        chunks = [
+            (b"IHDR", struct.pack(">IIBBBBB", side, side, 8, 2, 0, 0, 0)),
+            (b"IDAT", zlib.compress(b"")),
+            (b"IEND", b""),
+        ]
+        raw = b"\x89PNG\r\n\x1a\n" + b"".join(
+            struct.pack(">I", len(body)) + tag + body + struct.pack(">I", zlib.crc32(tag + body))
+            for tag, body in chunks
+        )
+        return base64.b64encode(raw).decode()
+    if kind == "header_then_secret":
+        header = base64.b64encode(b"\x89PNG\r\n\x1a\n" + bytes(10)).decode()[:24]
+        return header + "A" * 80 + "hunter2-screenshot"
+    if kind == "secret":
+        return "hunter2-screenshot"
+    buffer = io.BytesIO()
+    Image.new("RGB", (48, 30), (200, 40, 40)).save(buffer, format="PNG" if kind.startswith("PNG_") else kind)
+    trailer = {"PNG_trailing": b"after-iend", "PNG_twice": buffer.getvalue()}.get(kind, b"")
+    return base64.b64encode(buffer.getvalue() + trailer).decode()
+
+
+_SCREENSHOT_FIELDS: dict[str, Callable[[str], dict[str, str | bool]]] = {
+    "data": lambda image: {"data": image, "mime": "image/png", "inline": True},
+    "data_not_inline": lambda image: {"data": image, "mime": "image/png", "inline": False},
+    "data_jpeg_mime": lambda image: {"data": image, "mime": "image/jpeg", "inline": True},
+    "screenshot_base64": lambda image: {"screenshot_base64": image},
+}
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "carry_inline", "field", "kind", "expected"),
+    [
+        pytest.param("skyvern_screenshot", True, "data", "PNG", "carried", id="screenshot-png"),
+        pytest.param("skyvern_screenshot", False, "data", "PNG", "note", id="screenshot-inline-after-post-hook"),
+        pytest.param(
+            "skyvern_screenshot", False, "screenshot_base64", "PNG", "carried", id="screenshot-after-post-hook"
+        ),
+        pytest.param("skyvern_screenshot", True, "screenshot_base64", "PNG", "carried", id="screenshot-base64-pre"),
+        pytest.param("skyvern_screenshot", True, "data_not_inline", "PNG", "blank", id="screenshot-not-inline"),
+        pytest.param("skyvern_screenshot", True, "data_jpeg_mime", "PNG", "blank", id="screenshot-jpeg-mime"),
+        pytest.param("skyvern_screenshot", True, "data", "JPEG", "blank", id="screenshot-jpeg"),
+        pytest.param("skyvern_screenshot", True, "data", "header_then_secret", "blank", id="screenshot-malformed"),
+        pytest.param(
+            "skyvern_screenshot",
+            True,
+            "screenshot_base64",
+            "header_then_secret",
+            "removed",
+            id="screenshot-base64-malformed",
+        ),
+        pytest.param(
+            "skyvern_screenshot",
+            False,
+            "screenshot_base64",
+            "header_then_secret",
+            "removed",
+            id="screenshot-base64-malformed-after-post-hook",
+        ),
+        pytest.param("skyvern_screenshot", True, "data", "PNG_trailing", "blank", id="screenshot-trailing-bytes"),
+        pytest.param("skyvern_screenshot", True, "data", "PNG_twice", "blank", id="screenshot-two-pngs"),
+        pytest.param(
+            "skyvern_screenshot",
+            False,
+            "screenshot_base64",
+            "PNG_trailing",
+            "removed",
+            id="screenshot-base64-trailing-bytes",
+        ),
+        pytest.param("skyvern_screenshot", True, "data", "oversize", "as_main", id="screenshot-over-pixel-cap"),
+        pytest.param("skyvern_screenshot", True, "data", "over_char_cap", "as_main", id="screenshot-over-char-cap"),
+        pytest.param(
+            "skyvern_screenshot", True, "data", "decompression_bomb", "as_main", id="screenshot-decompression-bomb"
+        ),
+        pytest.param("skyvern_evaluate", True, "data", "PNG", "as_main", id="evaluate-valid-png"),
+        pytest.param(None, True, "data", "PNG", "as_main", id="no-tool-valid-png"),
+        pytest.param("skyvern_evaluate", True, "data", "secret", "as_main", id="evaluate-inline-image-shape"),
+        pytest.param(
+            "skyvern_evaluate", True, "data", "header_then_secret", "as_main", id="evaluate-header-then-secret"
+        ),
+        pytest.param(None, True, "data", "header_then_secret", "as_main", id="no-tool-header-then-secret"),
+    ],
+)
+def test_only_a_validated_screenshot_image_is_set_aside_from_the_model_facing_scrub(
+    monkeypatch: pytest.MonkeyPatch, tool_name: str | None, carry_inline: bool, field: str, kind: str, expected: str
+) -> None:
+    ctx = make_copilot_ctx()
+    image = _screenshot_field("PNG" if kind == "over_char_cap" else kind)
+    if kind == "over_char_cap":
+        monkeypatch.setattr(mcp_adapter, "_SCREENSHOT_IMAGE_MAX_CHARS", len(image) - 1)
+    embedded = image[40:64] if kind not in ("secret", "header_then_secret") else None
+    redact_parameter_values(
+        monkeypatch, ctx, {"secret": "hunter2-screenshot", **({"embedded": embedded} if embedded else {})}
+    )
+    register_secret_scrub_value(ctx, "hunter2-screenshot")
+    fields = _SCREENSHOT_FIELDS[field](image)
+    image_key = next(iter(fields))
+    raw: dict[str, Any] = {"ok": True, "data": {**fields, "path": "/hunter2-screenshot"}}
+
+    scrubbed = mcp_adapter.scrub_model_facing_tool_result(ctx, raw, tool_name=tool_name, carry_inline=carry_inline)
+    as_main = mcp_adapter._scrub_model_facing_text(ctx, raw)
+
+    assert raw["data"][image_key] == image and "hunter2" not in json.dumps(scrubbed)
+    assert isinstance(as_main, dict) and "hunter2" not in json.dumps(as_main)
+    if expected == "as_main":
+        assert scrubbed == as_main
+    elif expected == "removed":
+        kept = {key: value for key, value in as_main["data"].items() if key != image_key}
+        assert scrubbed == {**as_main, "data": {**kept, "data": mcp_adapter._SCREENSHOT_IMAGE_OMITTED_NOTE}}
+    else:
+        image_field = {"carried": image, "note": mcp_adapter._SCREENSHOT_IMAGE_OMITTED_NOTE, "blank": ""}[expected]
+        assert scrubbed == {**as_main, "data": {**as_main["data"], image_key: image_field}}
+    if embedded and expected != "carried":
+        assert embedded not in json.dumps(scrubbed)
 
 
 class TestRequestedOutputPathChoices:
@@ -1372,10 +1497,10 @@ class TestSharedBrowserCallOutcome:
         assert records[0]["cancelled"] is True
 
     @pytest.mark.asyncio
-    async def test_raw_secret_and_pre_hook_rejections_are_not_dispatched(self) -> None:
+    async def test_a_redacted_secret_call_dispatches_and_a_pre_hook_rejection_does_not(self) -> None:
         raw_secret_ctx = make_copilot_ctx(
             browser_session_id="pbs_1",
-            request_policy=RequestPolicy(raw_secret_detected=True),
+            request_policy=RequestPolicy(raw_secret_detected=True, raw_secret_handling="redacted_draft"),
         )
         raw_secret_ctx.browser_session_continuity_disposition = "reestablished"
         raw_secret_server = _make_server(
@@ -1403,13 +1528,12 @@ class TestSharedBrowserCallOutcome:
             raw_secret_result = await raw_secret_server.call_tool("evaluate", {})
             await screenshot_server.call_tool("get_browser_screenshot", {})
 
-        assert copilot_runtime.RAW_SECRET_BROWSER_ERROR in raw_secret_result.content[0].text
+        assert raw_secret_result.isError is False
         records = _browser_outcome_records(captured)
-        assert len(records) == 2
-        assert all(record["dispatched"] is False for record in records)
+        assert [record["dispatched"] for record in records] == [True, False]
 
     @pytest.mark.asyncio
-    async def test_raw_secret_refuses_an_internal_browser_call_on_an_already_open_session(self) -> None:
+    async def test_a_redacted_secret_turn_dispatches_an_internal_browser_call(self) -> None:
         ctx = make_copilot_ctx(
             browser_session_id="pbs_1",
             request_policy=RequestPolicy(raw_secret_detected=True, raw_secret_handling="redacted_draft"),
@@ -1420,10 +1544,10 @@ class TestSharedBrowserCallOutcome:
         with capture_logs() as captured:
             result = await server.call_internal_tool("skyvern_navigate", {"url": "https://portal.example.com/login"})
 
-        assert result["ok"] is False
-        dispatched.assert_not_called()
+        assert result["ok"] is True
+        dispatched.assert_called_once()
         timing = [entry for entry in captured if entry["event"] == "MCP tool timing"]
-        assert [entry["call_status"] for entry in timing] == ["raw_secret_denied"]
+        assert [entry["call_status"] for entry in timing] == ["ok"]
 
     def test_a_protocol_failure_reports_the_model_surface_tool_and_both_session_identities(self) -> None:
         """A bare 'evaluate failed' leaves the model no way to tell where it now is, so the failed
@@ -2994,6 +3118,39 @@ async def test_internal_browser_call_refuses_during_demonstration_replay() -> No
     assert result.result == {"ok": False, "error": "Browser access is unavailable while replaying a demonstration."}
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replayed", [True, False], ids=["replay-post-hook-fails", "model-malformed-image"])
+async def test_a_screenshot_the_model_cannot_get_says_the_image_was_left_out(
+    _stub_browser_session: None, replayed: bool
+) -> None:
+    ctx = make_copilot_ctx(browser_session_id="pbs_1")
+    image = _screenshot_field("PNG" if replayed else "header_then_secret")
+    payload = {
+        "ok": True,
+        "data": {"data": image, "mime": "image/png", "inline": True},
+        "browser_context": {"url": "https://example.test/settings", "title": "Settings"},
+    }
+    overlay = SchemaOverlay(
+        requires_browser=True, post_hook=failing_post_hook if replayed else mcp_hooks._screenshot_post_hook
+    )
+    server = _make_server(
+        ctx, {"ok": False} if replayed else payload, overlay, alias_map={"get_browser_screenshot": "skyvern_screenshot"}
+    )
+    server._overlays = {"get_browser_screenshot": overlay}
+    action = DemonstratedAction(
+        selector="body", source_url="https://example.test/settings", packet=None, synthesized_result=payload
+    )
+
+    with staged_demonstrated_action(action) if replayed else nullcontext():
+        result = await server.call_tool("get_browser_screenshot", {})
+
+    text = result.content[0].text
+    body = json.loads(text)
+    assert body["data"]["data"] == mcp_adapter._SCREENSHOT_IMAGE_OMITTED_NOTE
+    assert _BASE64_IMAGE_OMITTED_MESSAGE not in str(body) and image[:64] not in text
+    assert ctx.pending_screenshots == []
+
+
 def _real_action_overlay(overlay_id: str) -> tuple[str, SchemaOverlay]:
     if overlay_id == "click_no_browser":
         return "click", replace(_build_skyvern_mcp_overlays()["click"], requires_browser=False)
@@ -3706,9 +3863,6 @@ class TestPageStateOnBrowserResults:
         ("ctx_overrides", "arguments", "prepared"),
         [
             pytest.param({}, {"expression": "1", "target": "elsewhere"}, None, id="unknown-target"),
-            pytest.param(
-                {"request_policy": RequestPolicy(raw_secret_detected=True)}, {"expression": "1"}, None, id="raw-secret"
-            ),
             pytest.param(
                 {},
                 {"expression": "1"},
@@ -4466,23 +4620,19 @@ class TestPageCrashes:
     @pytest.mark.usefixtures("_stub_browser_session")
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        ("raw_result", "raw_secret"),
+        "raw_result",
         [
-            pytest.param({"ok": True}, True, id="raw-secret-denied"),
-            pytest.param(TimeoutError(), False, id="timed-out-without-a-read"),
-            pytest.param(CopilotBrowserSessionUnavailable("pbs_failures"), False, id="session-unavailable"),
+            pytest.param(TimeoutError(), id="timed-out-without-a-read"),
+            pytest.param(CopilotBrowserSessionUnavailable("pbs_failures"), id="session-unavailable"),
         ],
     )
     async def test_a_result_whose_page_was_not_read_still_carries_the_crash(
-        self, monkeypatch: pytest.MonkeyPatch, raw_result: dict[str, Any] | Exception, raw_secret: bool
+        self, monkeypatch: pytest.MonkeyPatch, raw_result: Exception
     ) -> None:
         ctx = make_copilot_ctx(browser_session_id="pbs_failures")
         _form_tab_with_crash(monkeypatch, ctx)
         monkeypatch.setattr(mcp_adapter, "_browser_session_error_disposition", AsyncMock(return_value="failed"))
-        ctx.request_policy = RequestPolicy(raw_secret_detected=True) if raw_secret else None
-
         unread = await _evaluate_result(_evaluate_browser_server(ctx, raw_result))
-        ctx.request_policy = None
         read = await _evaluate_result(_evaluate_browser_server(ctx, {"ok": True}))
 
         assert unread["page_state"]["read"] == "failed"

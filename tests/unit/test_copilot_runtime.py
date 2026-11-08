@@ -53,7 +53,6 @@ from skyvern.forge.sdk.copilot.mcp_adapter import (
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import (
     BROWSER_TOOLS_UNAVAILABLE_ERROR,
-    RAW_SECRET_BROWSER_ERROR,
     AgentContext,
     BrowserProbeOutcome,
     BrowserSessionReplacement,
@@ -235,16 +234,17 @@ async def test_a_turn_without_browser_authority_is_told_so_not_that_creation_fai
 
 
 @pytest.mark.asyncio
-async def test_a_raw_secret_turn_never_creates_a_browser_session(monkeypatch: pytest.MonkeyPatch) -> None:
-    mock_app = MagicMock()
-    mock_app.PERSISTENT_SESSIONS_MANAGER.create_session = AsyncMock()
-    monkeypatch.setattr(runtime, "app", mock_app)
+async def test_a_redacted_secret_turn_creates_a_browser_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = _manager_reporting_fixed_deadline(None)
+    monkeypatch.setattr(
+        runtime, "app", SimpleNamespace(AGENT_FUNCTION=AgentFunction(), PERSISTENT_SESSIONS_MANAGER=manager)
+    )
     ctx = _make_ctx()
     ctx.request_policy = RequestPolicy(raw_secret_detected=True, raw_secret_handling="redacted_draft")
 
-    assert await ensure_browser_session(ctx) == {"ok": False, "error": RAW_SECRET_BROWSER_ERROR}
-    assert ctx.browser_session_id is None
-    mock_app.PERSISTENT_SESSIONS_MANAGER.create_session.assert_not_awaited()
+    assert await ensure_browser_session(ctx) is None
+    assert ctx.browser_session_id == "pbs_fresh"
+    manager.create_session.assert_awaited_once()
 
 
 def _admit_mock_browser_operations(manager: MagicMock) -> None:

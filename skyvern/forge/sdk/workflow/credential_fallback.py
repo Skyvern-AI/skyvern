@@ -77,7 +77,7 @@ def _failure_category_names(workflow_run: WorkflowRun) -> set[str]:
     }
 
 
-def _trigger_matches(workflow_run: WorkflowRun, trigger: str | None, *, template_render_failed: bool = False) -> bool:
+def _trigger_matches(workflow_run: WorkflowRun, trigger: str | None, *, no_credential_can_fix: bool = False) -> bool:
     effective_trigger = trigger or CREDENTIAL_FAILURES
     if effective_trigger == ANY_FAILURE:
         return workflow_run.status in RETRYABLE_STATUSES
@@ -86,8 +86,9 @@ def _trigger_matches(workflow_run: WorkflowRun, trigger: str | None, *, template
     # A timeout is not a credential failure, so credential_failures keeps rejecting timed_out.
     if workflow_run.status not in {WorkflowRunStatus.failed, WorkflowRunStatus.terminated}:
         return False
-    # A template that failed to render is not a credential failure, whatever words its failure text holds (ADR 0028).
-    if template_render_failed:
+    # A template render failure or a Power BI query block ended the run: typed state says no credential is at fault,
+    # whatever its failure text or category (ADR 0028).
+    if no_credential_can_fix:
         return False
     return bool(_failure_category_names(workflow_run) & CREDENTIAL_FAILURE_CATEGORIES)
 
@@ -111,7 +112,7 @@ def _block_that_ended_the_run(
     )
 
 
-async def _ended_by_template_render_failure(
+async def _ended_by_a_block_no_credential_can_fix(
     run_blocks: list[WorkflowRunBlock], run_failure_reason: str | None, organization_id: str
 ) -> bool:
     """A workflow-trigger block that ended the run reports its child run's failure as its own, so the lookup continues
@@ -121,7 +122,8 @@ async def _ended_by_template_render_failure(
         ending_block = _block_that_ended_the_run(run_blocks, run_failure_reason)
         if ending_block is None:
             return False
-        if has_render_failure_record(ending_block.output):
+        # A Power BI query block reads no credential parameter, so a fallback credential can't change its outcome.
+        if has_render_failure_record(ending_block.output) or ending_block.block_type == BlockType.POWERBI_QUERY:
             return True
         output = ending_block.output if isinstance(ending_block.output, dict) else {}
         child_run_id = output.get("workflow_run_id") if ending_block.block_type == BlockType.WORKFLOW_TRIGGER else None
@@ -238,13 +240,13 @@ async def _maybe_start_credential_fallback_retry(workflow_run: WorkflowRun, orga
     run_blocks = await app.DATABASE.observer.get_workflow_run_blocks(
         workflow_run_id=workflow_run.workflow_run_id, organization_id=organization_id
     )
-    template_render_failed = await _ended_by_template_render_failure(
+    no_credential_can_fix = await _ended_by_a_block_no_credential_can_fix(
         run_blocks, workflow_run.failure_reason, organization_id
     )
     triggered_parameters = [
         parameter
         for parameter in credential_parameters
-        if _trigger_matches(workflow_run, parameter.fallback_trigger, template_render_failed=template_render_failed)
+        if _trigger_matches(workflow_run, parameter.fallback_trigger, no_credential_can_fix=no_credential_can_fix)
     ]
     if not triggered_parameters:
         return None

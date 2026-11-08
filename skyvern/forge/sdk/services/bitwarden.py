@@ -43,6 +43,7 @@ from skyvern.exceptions import (
     BitwardenSecretError,
     BitwardenSyncError,
     BitwardenUnlockError,
+    BitwardenVerificationRequiredError,
 )
 from skyvern.forge.sdk.api.aws import get_aws_client
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_delete, aiohttp_get_json, aiohttp_post
@@ -138,6 +139,15 @@ _REJECTED_CREDENTIALS_MARKERS = (
 
 def _login_failure(stderr: str) -> BitwardenLoginError:
     lowered = stderr.lower()
+    if any(
+        marker in lowered
+        for marker in (
+            "code is required.",
+            "login failed. no provider selected.",
+            "no providers available for this client.",
+        )
+    ):
+        return BitwardenVerificationRequiredError()
     error_class = (
         BitwardenCredentialsRejectedError
         if any(marker in lowered for marker in _REJECTED_CREDENTIALS_MARKERS)
@@ -244,6 +254,14 @@ class _VaultIdentity:
         email: str | None,
         master_password: str | None,
     ) -> "_VaultIdentity":
+        # Only org credentials pass their own key pair with an email; global candidates pass email=None.
+        if client_id and client_secret and email:
+            return _VaultIdentity(
+                client_id=client_id,
+                client_secret=client_secret,
+                email=None,
+                master_password=master_password or "",
+            )
         # Mirror the fallbacks `login` applies, so the fingerprint names the login that will happen.
         return _VaultIdentity(
             client_id=client_id,
@@ -922,11 +940,10 @@ class BitwardenService:
         for key in [name for name in env if name.startswith("BW_")]:
             del env[key]
         env["NODE_NO_WARNINGS"] = "1"
-        # Without it, a read of a locked vault prompts for the master password and exits 0 with no output
-        # instead of failing with "Vault is locked.". Login stays interactive so a new-device challenge
-        # still says "New device verification", which the global-credentials fallback keys on.
-        if command[1:2] != ["login"]:
-            env["BW_NOINTERACTION"] = "true"
+        # Without this, a locked-vault read prompts for the master password and exits 0 with no output
+        # instead of failing with "Vault is locked."; a login code prompt waits until the timeout
+        # instead of failing at once.
+        env["BW_NOINTERACTION"] = "true"
         if additional_env:
             env.update(additional_env)  # Update with any additional environment variables
 
@@ -1009,6 +1026,7 @@ class BitwardenService:
                 master_password=identity.master_password,
                 timeout=login_timeout or timeout,
                 appdata_dir=session.appdata_dir,
+                use_api_key=not identity.uses_email_auth,
             )
         finally:
             if usage is not None:
@@ -1410,6 +1428,8 @@ class BitwardenService:
                     )
             except BitwardenAccessDeniedError as e:
                 raise e
+            except BitwardenVerificationRequiredError:
+                raise
             except Exception as e:
                 LOG.info("Failed to get secret value from Bitwarden", reason=_bitwarden_failure_reason(e))
                 fail_reasons.append(f"{type(e).__name__}: {str(e)}")
@@ -1635,6 +1655,8 @@ class BitwardenService:
                 )
         except BitwardenAccessDeniedError as e:
             raise e
+        except BitwardenVerificationRequiredError:
+            raise
         except Exception as e:
             LOG.info("Failed to get sensitive information from Bitwarden", reason=_bitwarden_failure_reason(e))
             if remaining_retries <= 0:
@@ -1751,12 +1773,13 @@ class BitwardenService:
         master_password: str | None = None,
         timeout: int = settings.BITWARDEN_TIMEOUT_SECONDS,
         appdata_dir: str | None = None,
+        use_api_key: bool = False,
     ) -> str | None:
         """
         Log in to the Bitwarden CLI, returning the session key the login printed, if any.
 
         Supports two auth modes:
-        1. Email + master_password (preferred when available), which also unlocks the vault
+        1. Email + master_password (preferred unless use_api_key is set), which also unlocks the vault
         2. API key (client_id + client_secret) via --apikey flag, which leaves it locked
         """
         bw_email = email or settings.BITWARDEN_EMAIL
@@ -1768,7 +1791,7 @@ class BitwardenService:
         }
         if appdata_dir:
             env[_BITWARDEN_APPDATA_ENV_VAR] = appdata_dir
-        if bw_email and bw_master_password:
+        if not use_api_key and bw_email and bw_master_password:
             login_command = ["bw", "login", bw_email, "--passwordenv", "BW_PASSWORD"]
         else:
             login_command = ["bw", "login", "--apikey"]
@@ -1963,6 +1986,8 @@ class BitwardenService:
                 )
         except BitwardenAccessDeniedError as e:
             raise e
+        except BitwardenVerificationRequiredError:
+            raise
         except Exception as e:
             LOG.info("Failed to get credit card data from Bitwarden", reason=_bitwarden_failure_reason(e))
             if remaining_retries <= 0:

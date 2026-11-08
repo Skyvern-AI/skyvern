@@ -100,6 +100,11 @@ class GoogleOAuthCredentialBase(BaseModel):
             and bool(self.email_address)
         )
 
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def account_recorded(self) -> bool:
+        return bool(self.google_subject or self.email_address)
+
 
 class GoogleOAuthCredentialResponse(BaseModel):
     credential: GoogleOAuthCredentialBase
@@ -131,6 +136,7 @@ class CreateGoogleOAuthAuthorizeRequest(BaseModel):
         description="Existing credential to re-authenticate in place. When set, the connection keeps "
         "its identity so workflows referencing it continue to work without edits.",
     )
+    set_account: bool = False
 
 
 class GoogleOAuthAuthorizeResponse(BaseModel):

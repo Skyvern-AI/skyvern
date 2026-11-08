@@ -34,7 +34,6 @@ from skyvern.forge.sdk.copilot.failure_tracking import (
     RepairRootCauseIdentity,
     compute_repair_root_cause_signature,
 )
-from skyvern.forge.sdk.copilot.output_policy import url_origin
 from skyvern.forge.sdk.copilot.request_policy import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.run_outcome import trusted_terminal_challenge_category_name
 from skyvern.forge.sdk.copilot.runtime import AgentContext
@@ -44,7 +43,7 @@ from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     run_id_from_result_data,
     same_run_typed_challenge_kind,
 )
-from skyvern.forge.sdk.copilot.workflow_credential_utils import URL_CANDIDATE_RE
+from skyvern.forge.sdk.copilot.workflow_credential_utils import URL_CANDIDATE_RE, url_origin
 from skyvern.schemas.proxy_location import GeoTarget, ProxyLocationInput
 from skyvern.schemas.workflows import BlockType
 from skyvern.webeye.actions.action_types import ActionType
@@ -60,7 +59,6 @@ _MAX_ITEMS = 20
 # early still names it without the row list growing with the failure count.
 _EARLY_FAILURE_MAX_ITEMS = 5
 _FAILED_STATUSES = {"failed", "terminated", "canceled", "timed_out"}
-_CREDENTIAL_INPUT_MISSING_SKIP_REASONS = {"workflow_credential_inputs_unbound", "credential_name_unresolved"}
 _PRE_RUN_CREDENTIAL_FAILURE_CATEGORIES = {"CREDENTIAL_ERROR", "PARAMETER_BINDING_ERROR"}
 _REPAIRABLE_RUNTIME_CATEGORIES = {"AUTH_FAILURE"}
 _AUTHORING_REPAIR_SIGNATURE_VERSION = "authoring_repair_context:v1"
@@ -451,8 +449,8 @@ def _levers(
     bound_credential_ids: set[str] | None = None,
 ) -> list[Lever]:
     """Every product lever that exists for this wall, unordered, with availability read from existing state."""
-    credential_shaped = failure_type == DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT and (
-        _safe_str(data.get("skip_reason")) in _CREDENTIAL_INPUT_MISSING_SKIP_REASONS or "CREDENTIAL_ERROR" in categories
+    credential_shaped = (
+        failure_type == DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT and "CREDENTIAL_ERROR" in categories
     )
     update_levers = [
         Lever(
@@ -752,19 +750,12 @@ def _failure_type(
     # model to repair a workflow whose only problem is that nobody has approved it yet.
     if (data.get("control_signal") or {}).get("kind") == "watchdog_paused":
         return DiagnosisFailureType.NO_FAILURE
-    skip_reason = _safe_str(data.get("skip_reason"))
-    if skip_reason in _CREDENTIAL_INPUT_MISSING_SKIP_REASONS:
-        return DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT
     # Trusted challenge categories win over a clean-looking run status because
     # verified challenge evidence means the apparent success is not usable.
     if terminal_challenge_categories and not challenge_runtime_clearable:
         return DiagnosisFailureType.TERMINAL_CHALLENGE_BLOCKER
     category_set = set(categories)
-    error_text = " ".join(
-        str(value).lower()
-        for value in (result.get("error"), data.get("failure_reason"), data.get("skip_reason"))
-        if value
-    )
+    error_text = " ".join(str(value).lower() for value in (result.get("error"), data.get("failure_reason")) if value)
     if (
         "UNRECOVERABLE_TOOL_ERROR" in categories
         or "browser session not found" in error_text
@@ -824,10 +815,7 @@ def _next_action(
         return RepairNextAction.STOP
     if repair_context is not None:
         return RepairNextAction.REPAIR
-    if (
-        data.get("skip_reason") == "workflow_credential_inputs_unbound"
-        or failure_type == DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT
-    ):
+    if failure_type == DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT:
         return RepairNextAction.ASK
     if failure_type in {
         DiagnosisFailureType.REPAIRABLE_BLOCK_FAILURE,

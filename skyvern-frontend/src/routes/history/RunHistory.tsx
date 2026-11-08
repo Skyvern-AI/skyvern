@@ -29,14 +29,7 @@ import {
   runTypeGroupToRunTypes,
 } from "@/components/RunTypeFilterDropdown";
 import { TriggerTypeBadge } from "@/components/TriggerTypeBadge";
-import {
-  Pagination,
-  PaginationContent,
-  PaginationItem,
-  PaginationLink,
-  PaginationNext,
-  PaginationPrevious,
-} from "@/components/ui/pagination";
+import { SimplePagination } from "@/components/ui/pagination";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
   Table,
@@ -362,16 +355,6 @@ function RunHistory() {
     const params = new URLSearchParams(searchParams);
     Object.entries(patch).forEach(([k, v]) => params.set(k, v));
     setSearchParams(params, { replace: true });
-  }
-
-  function handlePreviousPage() {
-    if (page === 1) return;
-    setParamPatch({ page: String(page - 1) });
-  }
-
-  function handleNextPage() {
-    if (isNextDisabled) return;
-    setParamPatch({ page: String(page + 1) });
   }
 
   const displayTableBody = () => {
@@ -787,29 +770,14 @@ function RunHistory() {
                   </SelectContent>
                 </Select>
               </div>
-              <Pagination className="pt-0">
-                <PaginationContent>
-                  <PaginationItem>
-                    <PaginationPrevious
-                      className={cn({
-                        "cursor-not-allowed opacity-50": page === 1,
-                      })}
-                      onClick={handlePreviousPage}
-                    />
-                  </PaginationItem>
-                  <PaginationItem>
-                    <PaginationLink>{page}</PaginationLink>
-                  </PaginationItem>
-                  <PaginationItem>
-                    <PaginationNext
-                      className={cn({
-                        "cursor-not-allowed opacity-50": isNextDisabled,
-                      })}
-                      onClick={handleNextPage}
-                    />
-                  </PaginationItem>
-                </PaginationContent>
-              </Pagination>
+              <SimplePagination
+                className="pt-0"
+                page={page}
+                hasNext={!isNextDisabled}
+                onPageChange={(nextPage) =>
+                  setParamPatch({ page: String(nextPage) })
+                }
+              />
             </div>
           </div>
         </>

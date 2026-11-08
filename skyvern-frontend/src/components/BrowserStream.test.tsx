@@ -150,9 +150,6 @@ vi.mock(
     }),
   }),
 );
-vi.mock("@/routes/workflows/editor/Workspace", () => ({
-  CopyText: () => null,
-}));
 vi.mock("@/components/ui/toaster", () => ({ Toaster: () => null }));
 vi.mock("@/routes/browserProfiles/SaveSessionAsBrowserProfileDialog", () => ({
   SaveSessionAsBrowserProfileDialog: () => null,
@@ -306,6 +303,7 @@ describe("BrowserStream", () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     cleanup();
     vi.restoreAllMocks();
     vi.clearAllMocks();
@@ -420,6 +418,10 @@ describe("BrowserStream", () => {
     expect(mocks.copyText).not.toHaveBeenCalled();
 
     fireEvent.click(takeControlButton);
+    // A mouse selection alone also reaches the stream (X PRIMARY); it is not a copy.
+    emit("clipboard", { text: "selected only" });
+    expect(mocks.copyText).not.toHaveBeenCalled();
+
     fireEvent.keyDown(canvas!, { key: "Meta", code: "MetaLeft" });
     fireEvent.keyDown(stream!, { key: "c", metaKey: true });
 
@@ -446,13 +448,15 @@ describe("BrowserStream", () => {
     // Copying the same text again changes nothing remotely, so no clipboard
     // event comes back; the last remote text is written again.
     mocks.copyText.mockClear();
+    vi.useFakeTimers();
     fireEvent.keyDown(stream!, { key: "c", metaKey: true });
-    await waitFor(
-      () => {
-        expect(mocks.copyText).toHaveBeenCalledWith("CONF-12345 \u00e9");
-      },
-      { timeout: 3000 },
-    );
+    vi.advanceTimersByTime(3000);
+    expect(mocks.copyText).toHaveBeenCalledWith("CONF-12345 \u00e9");
+    // The fallback finished that copy, so a selection right after is not one.
+    mocks.copyText.mockClear();
+    emit("clipboard", { text: "selected after fallback" });
+    expect(mocks.copyText).not.toHaveBeenCalled();
+    vi.useRealTimers();
 
     // A paste sets the remote clipboard silently; copying that text back must
     // return it, not the earlier copy.
@@ -463,13 +467,11 @@ describe("BrowserStream", () => {
       );
     });
     mocks.copyText.mockClear();
+    vi.useFakeTimers();
     fireEvent.keyDown(stream!, { key: "c", metaKey: true });
-    await waitFor(
-      () => {
-        expect(mocks.copyText).toHaveBeenCalledWith("https://example.test");
-      },
-      { timeout: 3000 },
-    );
+    vi.advanceTimersByTime(3000);
+    expect(mocks.copyText).toHaveBeenCalledWith("https://example.test");
+    vi.useRealTimers();
   });
 
   it("sends Apple left Cmd as Super_L so the remote page sees Meta, not Alt", async () => {
