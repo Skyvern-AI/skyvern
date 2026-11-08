@@ -3103,12 +3103,14 @@ _PIERCED_QUERY_JS = (
   const declaredRowOf = (el) => flatClosest(el, DECLARED_ROW_SEL, LIST_SEL);
   // The text a row renders, read through the flat tree: innerText stops at a shadow host, so an option
   // component that draws its label in its own root would read as ''. A row declared inside the row is its
-  // own row, so a category's text is its own label, not its children's.
-  const composedRowText = (top) => {
+  // own row, so a category's text is its own label, not its children's. `forName` drops zero-width characters and
+  // reads a walk cut short by its budget or depth as no text; aria-hidden text is text (an icon's ligature).
+  const composedRowText = (top, forName = false) => {
     let out = '';
     let budget = 2000;
+    let cut = false;
     const walk = (n, depth) => {
-      if (depth > 32) return;
+      if (depth > 32) { cut = true; return; }
       let kids = null;
       if (String(n.localName || '') === 'slot') {
         try { kids = n.assignedNodes({ flatten: true }); } catch (e) { kids = null; }
@@ -3119,7 +3121,7 @@ _PIERCED_QUERY_JS = (
         kids = sr && sr.nodeType === 11 ? sr.childNodes : n.childNodes;
       }
       for (const c of kids) {
-        if (budget-- <= 0) return;
+        if (budget-- <= 0) { cut = true; return; }
         if (c.nodeType === 3) {
           const p = c.parentElement || (c.parentNode && c.parentNode.host) || null;
           let shown = true;
@@ -3143,7 +3145,8 @@ _PIERCED_QUERY_JS = (
         if (block) out += ' ';
       }
     };
-    try { walk(top, 0); } catch (e) { /* a partial read is still the row's text so far */ }
+    try { walk(top, 0); } catch (e) { cut = true; /* a partial read is still the row's text so far */ }
+    if (forName) return cut ? '' : out.replace(/[\u200b-\u200d\ufeff]/g, '').replace(/\s+/g, ' ').trim();
     return out.replace(/\s+/g, ' ').trim();
   };
   const CONTROL_SEL = 'button,a[href],input,[role="button"],[role="checkbox"],[role="switch"],[role="radio"]';
@@ -3155,12 +3158,13 @@ _PIERCED_QUERY_JS = (
   // A row's label: the own leaf that is all the text the row renders, so a row whose text also sits in a link, a badge,
   // a description or untagged text claims nothing. A leaf holding another own leaf with text is not that label.
   const rowLabelOf = (row, leaves) => {
-    const whole = composedRowText(row);
+    const whole = composedRowText(row, true);
     if (!whole) return null;
     const own = leaves.filter((l) => l === row || declaredRowOf(l) === row);
-    return own.find((l) => composedRowText(l) === whole
-      && !own.some((m) => m !== l && flatContains(l, m) && composedRowText(m))) || null;
+    return own.find((l) => composedRowText(l, true) === whole
+      && !own.some((m) => m !== l && flatContains(l, m) && composedRowText(m, true))) || null;
   };
+  const LANDING_OUTSIDE = { outside: true };
   // The innermost leaf holding the target is the pick, unless the target is a control not holding the label (a star).
   // A target in a declared row outside its leaves picks the row's label (for a parent row, the child under `landing`),
   // which `landing` can only withhold; `held` is the pair read before the click, whose label the commit may rewrite.
@@ -3194,9 +3198,8 @@ _PIERCED_QUERY_JS = (
     if (ctl && ctl !== row && flatContains(row, ctl) && !flatContains(ctl, label)) return null;
     return { leaf: label, row, level: 'row' };
   };
-  // The element a recorded click reached, or LANDING_OUTSIDE when it is outside `target` (an overlay, a frame).
-  const LANDING_OUTSIDE = { outside: true };
   const _nameOf = _getterOf(Element.prototype, 'localName');
+  // The element a recorded click reached, or LANDING_OUTSIDE when it is outside `target` (an overlay, a frame).
   const landingOf = (hit, target) => {
     try {
       if (!hit || /^(iframe|frame|object|embed)$/.test(String(_nameOf.call(hit)))) return LANDING_OUTSIDE;
@@ -8656,8 +8659,16 @@ _CLICK_PRECHECK_JS = (
     // row, that case is flagged so the handler makes no claims about it at all.
     const est = landingIn(target);
     let pick = menuPickOf(openRows, target, est);
-    const text = pick ? (pick.leaf.innerText || '').trim() || composedRowText(pick.leaf) : '';
+    const text = !pick ? '' : pick.level === 'row' ? composedRowText(pick.leaf, true)
+      : (pick.leaf.innerText || '').replace(/\s+/g, ' ').trim() || composedRowText(pick.leaf);
     if (pick && pick.level === 'row' && !text) pick = null;
+    // A leaf inside a link that is not all the row's text may be the only tag the note lists for the row.
+    const link = pick && pick.level === 'leaf' ? flatClosest(pick.leaf, 'a[href]') : null;
+    if (link && link !== pick.row && flatContains(pick.row, link)
+      && composedRowText(link, true) !== composedRowText(pick.row, true)) {
+      pick = null;
+      rowClick = true;
+    }
     if (pick) {
       isOption = true;
       optLevel = pick.level;
@@ -8667,7 +8678,7 @@ _CLICK_PRECHECK_JS = (
       window.__tv3_pick = {
         sel: clicked, leaf: pick.leaf, row: pick.row, level: pick.level, target, leaves: openRows, est: !!est,
       };
-    } else if (openRows.some((el) => flatContains(target, el) && (declaredRowOf(el) || el) !== target)) {
+    } else if (!rowClick && openRows.some((el) => flatContains(target, el) && (declaredRowOf(el) || el) !== target)) {
       containsMenu = true;
     } else if (openRows.some((el) => flatContains(target, el))) {
       rowClick = true;
@@ -8737,7 +8748,7 @@ def _with_act_deadline(tool_name: str, handler: ToolHandler) -> ToolHandler:
     return wrapped
 
 
-# Planted on window before an option click; a navigation clears window, so its absence afterwards is
+# Planted on window before a click on an open menu; a navigation clears window, so its absence afterwards is
 # the page saying "different document" even when the post-click probe's own JS is what failed.
 _CLICK_DOC_PLANT_JS = "() => { window.__tv3_click_doc = 1; }"
 _CLICK_DOC_CHECK_JS = "() => window.__tv3_click_doc === 1"
@@ -8781,12 +8792,18 @@ _MENU_AFTER_JS = (
   if (pick) ({ optState, optSel, optKids, optH, optVis } = pickState(pick));
   // With no recorded click, an unreadable estimate cannot confirm the name.
   let withheld = false;
+  let estUnsure = false;
   if (held && held.sel === clicked && held.level === 'row') {
     const real = window.__tv3_down || window.__tv3_land;
     const again = real ? menuPickOf(held.leaves, held.target, landingOf(real, held.target), held) : null;
     withheld = real ? !again || again.leaf !== held.leaf : !held.est;
+    // Read after the hover, the label is re-derived without the held pair, so a control the hover put under the point
+    // or text it revealed in the row leaves a navigation unconfirmed.
+    const estNow = landingIn(held.target);
+    const now = estNow ? menuPickOf(held.leaves, held.target, estNow) : null;
+    estUnsure = !now || now.leaf !== held.leaf;
   }
-  return { stillOpen, optState, optSel, optKids, optH, optVis, withheld };
+  return { stillOpen, optState, optSel, optKids, optH, optVis, withheld, estUnsure };
 }"""
 )
 
@@ -16582,9 +16599,27 @@ def build_browser_tools(
             menu_pick[PICKED_OPTION_DATA_KEY] = text
             return f"Selected option {text!r}"
 
-        def _navigated_pick() -> str | None:
+        def _navigated_pick() -> str:
             # A row click whose landing was never read cannot be confirmed once the page has gone.
-            return None if pre.get("optUnsure") else f"{_selected(opt)} — {_navigated_phrase()}."
+            if pre.get("optUnsure"):
+                return f"{_navigated_phrase().capitalize()}."
+            return f"{_selected(opt)} — {_navigated_phrase()}."
+
+        async def _same_document() -> bool | None:
+            # The page's own answer, or None when it cannot be asked.
+            if not doc_planted:
+                return None
+            try:
+                answer = await page.evaluate(_CLICK_DOC_CHECK_JS)
+            except Exception:
+                return None
+            return answer if isinstance(answer, bool) else None
+
+        async def _url_navigated() -> bool:
+            # A moved URL is a navigation unless the page says it is the same document --
+            # a menu that syncs its selection into the query string never left.
+            url_now = await _url(page)
+            return bool(url_before and url_now and url_now != url_before) and await _same_document() is not True
 
         async def _cascade_child_note() -> str | None:
             # The clicked row DETACHED: a cascading category replaces the whole list with its
@@ -16732,20 +16767,7 @@ def build_browser_tools(
                     return f"{_selected(opt_text)} — its state changed.\n{child}"
                 return child
 
-            async def _same_document() -> bool | None:
-                # The page's own answer, or None when it cannot be asked.
-                if not doc_planted:
-                    return None
-                try:
-                    answer = await page.evaluate(_CLICK_DOC_CHECK_JS)
-                except Exception:
-                    return None
-                return answer if isinstance(answer, bool) else None
-
-            url_now = await _url(page)
-            if url_before and url_now and url_now != url_before and await _same_document() is not True:
-                # A moved URL is a navigation unless the page says it is the same document --
-                # a menu that syncs its selection into the query string never left.
+            if await _url_navigated():
                 return _navigated_pick(), None
             after, navigated = await _after_read()
             if after is None and navigated:
@@ -16807,6 +16829,9 @@ def build_browser_tools(
                 # Clicked the card AROUND the menu: the center-point click may have landed on an
                 # arbitrary row, so any open/closed/selected claim could be false. Say nothing.
                 return None, None
+            if await _url_navigated():
+                # The menu read below would run on the page the click reached, where every menu reads as closed.
+                return f"{_navigated_phrase().capitalize()}.", None
             try:
                 after_raw = await page.evaluate(_MENU_AFTER_JS, await _probe_arg(page, selector))
             except Exception:
@@ -16916,6 +16941,8 @@ def build_browser_tools(
             try:
                 await input_dispatch.hover(page, selector, timeout=2000)
                 hovered = await page.evaluate(_MENU_AFTER_JS, await _probe_arg(page, selector))
+                if isinstance(hovered, dict) and hovered.get("estUnsure"):
+                    pre["optUnsure"] = True
                 if isinstance(hovered, dict) and hovered.get("optState"):
                     pre["optState"] = hovered["optState"]
                     # Every baseline the commit checks read, not some of them: whichever is left
@@ -16935,7 +16962,7 @@ def build_browser_tools(
         # the page having moved.
         page_url_before = await _url(_current_page())
         doc_planted = False
-        if pre is not None and pre.get("isOption"):
+        if pre is not None and (pre.get("isOption") or (pre.get("menuOpen") and not pre.get("containsMenu"))):
             try:
                 await page.evaluate(_CLICK_DOC_PLANT_JS)
                 doc_planted = True
