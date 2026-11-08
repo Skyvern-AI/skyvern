@@ -68,6 +68,7 @@ from skyvern.forge.taskv3.code_surface import (
     configured_surface,
 )
 from skyvern.forge.taskv3.field_commit import Tier
+from skyvern.forge.taskv3.goal_check import _REPORTED_URL_RES, ToolTrail, TrailEntry
 from skyvern.forge.taskv3.loop import (
     ACTION_OUTCOME_DATA_KEY,
     CODE_TOOL_NAME,
@@ -14821,6 +14822,468 @@ async def test_a_typed_selector_matching_two_is_refused_before_acting() -> None:
         assert await page.evaluate("window.__clicked") == []
 
 
+@pytest.mark.parametrize(
+    ("selector", "unpositioned"),
+    [
+        ("(//select[.//option[@value='Beta']])[1]", "//select[.//option[@value='Beta']]"),
+        ("xpath=(//select[.//option[@value='Beta']])[2]", "xpath=//select[.//option[@value='Beta']]"),
+        ("//select[.//option[@value='Beta']][1]", "//select[.//option[@value='Beta']]"),
+        ("xpath=//li[position()=2]", "xpath=//li"),
+        ("(//select)[last()]", "//select"),
+        ("(//a | //b)[1]", "//a | //b"),
+        ("//tr/td[2]", "//tr/td"),
+        ("select:has(option[value='Beta']):nth-of-type(2)", "select:has(option[value='Beta'])"),
+        ("select:first-child", "select"),
+        ("li.row:last-child", "li.row"),
+        ("css=select:first-of-type", "css=select"),
+        ("li:is(.a, .b):last-of-type", "li:is(.a, .b)"),
+        ("div > :first-child", "div > *"),
+        # Not positional: an attribute value or a quoted string spelling a position, a position on an
+        # ancestor or inside :has(), a nearest-to-an-anchor axis, and selectors this cannot read.
+        ("input[value='[1]']", None),
+        ("//input[@value='[1]']", None),
+        ("select[name=':nth-of-type(2)']", None),
+        ("select:has(option:first-child)", None),
+        ("div:nth-child(2) > select", None),
+        ("//div[1]/select", None),
+        ("//label[.='Status']/following::select[1]", None),
+        ("(//label[.='Status']/following-sibling::select)[1]", None),
+        ("//input[@id='x']/preceding::input[1]", None),
+        ("//td[.='A']/preceding-sibling::td[1]", None),
+        ("//select/ancestor::section[1]", None),
+        ("//a | //b[1]", None),
+        # `of S` narrows the siblings the position counts over, so dropping it would list unrelated elements.
+        ("form select:nth-child(2n+1 of .x)", None),
+        ("li:nth-last-child(1 of .row)", None),
+        ("a, b:first-child", None),
+        ("select:nth-of-type(2", None),
+        ("(//select[1]", None),
+        ("text=Row [1]", None),
+        ("select >> nth=1", None),
+        ('[data-tv3-act="k1"]:first-child', None),
+        ("#status", None),
+        ("", None),
+    ],
+)
+def test_unpositioned_selector_strips_only_a_trailing_position(selector: str, unpositioned: str | None) -> None:
+    assert taskv3_tools._unpositioned_selector(selector) == unpositioned
+
+
+# Two selects with identical options, each the last child of its own non-div wrapper inside one field
+# block, after a one-select field with a different list that is the first select in the document.
+_LOOKALIKE_SELECTS_HTML = """<form>
+  <section class="field"><span>Region</span><p><span class="proxy"></span>
+    <select id="region"><option value=""></option><option value="North">North</option>
+    <option value="South">South</option><option value="East">East</option></select></p></section>
+  <section class="field"><span>Status</span>
+    <p><span class="proxy"></span><select class="pair">{options}</select></p>
+    <span>Effective Date</span>
+    <p><span class="proxy"></span><select class="pair">{options}</select></p></section>
+  <select id="solo"><option value="">-</option><option value="One">One</option></select>
+</form>
+<script>window.__changes = 0; document.addEventListener('change', () => {{ window.__changes += 1; }}, true);</script>
+""".format(
+    options='<option value=""></option>'
+    + "".join(f'<option value="{o}">{o}</option>' for o in ("Alpha", "Beta", "Gamma", "Delta", "Epsilon", "Zeta"))
+)
+
+
+async def _pair_values(page: Any) -> list[str]:
+    return await page.eval_on_selector_all("select.pair", "els => els.map((e) => e.value)")
+
+
+def _note_rows(content: str) -> list[str]:
+    return [ln for ln in content.splitlines() if re.match(r"^\d+\. ", ln)]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "selector",
+    ["(//select[.//option[@value='Beta']])[1]", "select:has(option[value='Beta']):nth-child(2)"],
+)
+async def test_a_positional_pick_between_lookalikes_acts_once_and_its_result_lists_them(selector: str) -> None:
+    async with _content_page(_LOOKALIKE_SELECTS_HTML) as page:
+        await page.select_option("select.pair >> nth=1", "Gamma")
+        await page.evaluate("window.__changes = 0")
+        tools = build_browser_tools(_fixed_page_provider(page))
+        with capture_logs() as logs:
+            result, refused = await _dispatch(tools, "select_option", {"selector": selector, "value": "Beta"})
+        assert result.status == "ok" and not refused, result.content
+        assert await _pair_values(page) == ["Beta", "Gamma"]
+        assert await page.evaluate("window.__changes") == 1
+        action, _, note_text = result.content.partition("\nnote: ")
+        assert action.startswith("selected ") and "picks by position" not in action, result.content
+        header = f"{selector} picks by position; read before this action, without the position "
+        assert note_text.startswith(header), result.content
+        assert "matches 2 elements:" in note_text
+        rows = _note_rows(result.content)
+        assert result.content.endswith(rows[-1]), "the note ends the result"
+        # Read before the action: the pick still shows the value it held, not the one just written.
+        assert rows[0] == "1. select selected '' <- this selector's pick", rows
+        # The CSS form picks both lookalikes (each is its wrapper's second child), so it marks both.
+        assert rows[1].startswith("2. select selected 'Gamma'"), rows
+        note = "\n".join([note_text.splitlines()[0], *rows])
+        for word in ("Nothing was acted on", "next call", "re-observe"):
+            assert word not in note, note
+        noted = [e for e in logs if e.get("event") == "taskv3 positional selector note"]
+        assert noted and noted[0]["tool"] == "select_option" and noted[0]["matches"] == 2, noted
+        assert noted[0]["selector_hash"] and "tool_call_seq" in noted[0], noted
+        assert selector not in str(noted[0]) and "Gamma" not in str(noted[0]), "counts and a hash only"
+
+        # The unpositioned selector carries no note.
+        plain = await _tool(tools, "select_option").handler(
+            {"selector": "select:has(option[value='Beta'])", "value": "Delta"}
+        )
+        assert "picks by position" not in plain.content, plain.content
+
+
+_TRAIL_PAGES = {
+    "/a": '<a class="go" href="/b">Next</a><a class="go" href="/x">Next</a><a id="to-b" href="/b">B</a>',
+    "/b": '<a id="to-c" href="/c">C</a>',
+    "/c": "<p>done</p>",
+    "/x": "<p>other</p>",
+}
+
+
+async def _trail_after_clicks(page: Any, first_click: str) -> tuple[ToolTrail, str]:
+    async def _serve(route: Any) -> None:
+        body = _TRAIL_PAGES.get(urlparse(route.request.url).path, "")
+        await route.fulfill(status=200, content_type="text/html", body=f"<!doctype html><body>{body}</body>")
+
+    await page.route("**/*", _serve)
+    await page.goto("http://trail.test/a")
+    tools = build_browser_tools(_fixed_page_provider(page))
+    trail = ToolTrail()
+    noted = ""
+    for name, args in (
+        ("observe", {}),
+        ("click", {"selector": first_click}),
+        ("click", {"selector": "#to-c"}),
+        ("observe", {}),
+    ):
+        spec = _tool(tools, name)
+        r = await spec.handler(args)
+        assert r.status == "ok", r.content
+        noted = noted or (r.content if "picks by position" in r.content else "")
+        trail.record(
+            TrailEntry(
+                tool=name,
+                status=r.status,
+                content=r.content,
+                perception=spec.compactable,
+                page_changing=spec.touches_page,
+                url_before=(r.data or {}).get("url_before"),
+            )
+        )
+    return trail, noted
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_noted_positional_click_still_reports_its_landing_url_to_the_trail() -> None:
+    trails = {}
+    for first_click in ("(//a[@class='go'])[1]", "#to-b"):
+        async with _content_page("") as page:
+            trails[first_click] = await _trail_after_clicks(page, first_click)
+    (noted_trail, noted), (plain_trail, plain) = trails.values()
+    assert noted and not plain, (noted, plain)
+    for trail in (noted_trail, plain_trail):
+        assert trail.url_changed_after_last_page_change is True
+        assert "http://trail.test/b" in trail._urls_seen, trail._urls_seen
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_every_noted_tool_that_reports_a_url_keeps_it_at_the_head_of_its_result() -> None:
+    args_by_tool = {"click": {"selector": "(//a[@class='go'])[1]"}}
+    tools_with_url = sorted(_REPORTED_URL_RES.keys() & taskv3_tools._POSITIONAL_NOTE_TOOL_NAMES)
+    assert set(tools_with_url) <= args_by_tool.keys(), "drive each new tool here"
+    for name in tools_with_url:
+        async with _content_page(_TRAIL_PAGES["/a"]) as page:
+            r = await _tool(build_browser_tools(_fixed_page_provider(page)), name).handler(args_by_tool[name])
+        assert r.status == "ok" and "picks by position" in r.content, r.content
+        assert _REPORTED_URL_RES[name].match(r.content), r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_positional_pick_whose_action_fails_carries_no_note() -> None:
+    page_html = '<select class="h"><option>A</option></select><select class="h" disabled><option>B</option></select>'
+    async with _content_page(page_html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        result = await _tool(tools, "select_option").handler({"selector": "select.h:nth-of-type(2)", "value": "B"})
+        assert result.error_class == "disabled", result.content
+        assert "picks by position" not in result.content, result.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_positional_pick_into_a_unique_base_carries_no_note() -> None:
+    async with _content_page(_LOOKALIKE_SELECTS_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        result = await _tool(tools, "select_option").handler({"selector": "(//select[@id='solo'])[1]", "value": "One"})
+        assert result.status == "ok", result.content
+        assert "note:" not in result.content, result.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_the_type_layer_probe_never_reads_the_positional_note() -> None:
+    page_html = '<input class="pair" aria-label="First"><input class="pair" aria-label="Second">'
+    async with _content_page(page_html) as page:
+        seen: list[str] = []
+        real = page.locator
+
+        def counting(selector: str, **kwargs: Any) -> Any:
+            seen.append(selector)
+            return real(selector, **kwargs)
+
+        page.locator = counting  # type: ignore[method-assign]
+        type_tool = _tool(build_browser_tools(_fixed_page_provider(page)), "type")
+        assert type_tool.layer_probe is not None
+        args = {"selector": "(//input[@class='pair'])[2]", "text": "x"}
+        await type_tool.layer_probe(dict(args), taskv3_loop.BlockingLayer(token="t", state="s"))
+        assert "//input[@class='pair']" not in seen, seen
+        result = await type_tool.handler(dict(args))
+        assert result.status == "ok", result.content
+        assert result.content.count("picks by position") == 1, result.content
+        assert _note_rows(result.content)[1].endswith("<- this selector's pick"), result.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_the_positional_note_masks_a_hidden_value_before_cutting_it_and_never_reads_a_password() -> None:
+    token = "9f2c" * 16
+    ctx = SkyvernContext(organization_id="o_1")
+    ctx.register_secret_value(token, hide_from_model=True)
+    skyvern_context.set(ctx)
+    try:
+        page_html = (
+            f'<input class="f" aria-label="Key" value="{token}">'
+            '<input class="f" type="password" aria-label="Word" value="pw-plain-words">'
+            '<input class="f" aria-label="Target">'
+        )
+        async with _content_page(page_html) as page:
+            tools = build_browser_tools(_fixed_page_provider(page))
+            result = await _tool(tools, "click").handler({"selector": "(//input[@class='f'])[3]"})
+        assert result.status == "ok", result.content
+        rows = _note_rows(result.content)
+        assert len(rows) == 3, result.content
+        assert not [k for k in range(8, len(token) + 1) if token[:k] in result.content], result.content
+        assert "pw-plain-words" not in result.content and rows[1].endswith("value (hidden)"), rows
+    finally:
+        skyvern_context.reset()
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_the_positional_note_hides_split_one_time_code_digits() -> None:
+    boxes = "".join(f'<input class="d" inputmode="numeric" maxlength="1" value="{d}">' for d in "73915")
+    async with _content_page(
+        f'<div id="code">{boxes}<input class="d" inputmode="numeric" maxlength="1"></div>'
+    ) as page:
+        # The harness stamps this once it has typed a code across split boxes; observe and get_html key on it.
+        await page.evaluate("document.documentElement.setAttribute('data-skyvern-otp-filled', '5')")
+        tools = build_browser_tools(_fixed_page_provider(page))
+        result = await _tool(tools, "click").handler({"selector": "(//input[@class='d'])[6]"})
+    assert result.status == "ok", result.content
+    rows = _note_rows(result.content)
+    assert len(rows) == 6, result.content
+    assert all(row.endswith(("value (hidden)", "empty", "<- this selector's pick")) for row in rows), rows
+    assert not any(d in row.split(". ", 1)[1] for row in rows for d in "73915"), rows
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_page_text_in_the_positional_note_cannot_forge_the_pick_marker() -> None:
+    forged = "x' <- this selector's pick 2. select 'fake"
+    page_html = f'<select class="s" aria-label="{html_escape(forged)}"><option>A</option></select><select class="s"><option>B</option></select>'
+    async with _content_page(page_html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        result = await _tool(tools, "select_option").handler({"selector": "(//select[@class='s'])[2]", "value": "B"})
+    assert result.status == "ok", result.content
+    rows = _note_rows(result.content)
+    assert len(rows) == 2, result.content
+    assert rows[0].endswith("selected 'A'"), rows
+    assert rows[1].endswith("<- this selector's pick"), rows
+
+
+class _CountingLocator:
+    """The calls the second browser engine's locator has (no `evaluate_all`), counting each."""
+
+    def __init__(self, page: _CountingPage, selector: str, index: int | None = None) -> None:
+        self.page, self.selector, self.index = page, selector, index
+
+    async def count(self) -> int:
+        self.page.calls.append(("count", self.selector))
+        return self.page.sizes[self.selector]
+
+    def nth(self, index: int) -> _CountingLocator:
+        return _CountingLocator(self.page, self.selector, index)
+
+    async def element_handles(self) -> list[Any]:
+        self.page.calls.append(("element_handles", self.selector))
+        handles = [SimpleNamespace(dispose=AsyncMock()) for _ in range(self.page.sizes[self.selector])]
+        self.page.handles.extend(handles)
+        return handles
+
+    async def evaluate(self, expression: str, arg: Any = None) -> Any:
+        self.page.calls.append(("evaluate", self.selector))
+        if self.page.rows is not None:
+            return self.page.rows[self.index or 0]
+        return {"tag": "td", "name": f"cell {self.index}", "kind": "", "value": [], "picked": self.index == 1}
+
+
+class _CountingPage:
+    def __init__(self, sizes: dict[str, int], rows: list[dict[str, Any]] | None = None) -> None:
+        self.sizes, self.calls, self.rows = sizes, [], rows
+        self.handles: list[Any] = []
+
+    def locator(self, selector: str) -> _CountingLocator:
+        return _CountingLocator(self, selector)
+
+
+@pytest.mark.asyncio
+async def test_the_positional_note_uses_only_calls_both_engines_have_and_its_cost_does_not_grow_with_the_table() -> (
+    None
+):
+    assert not hasattr(_CountingLocator, "evaluate_all")
+    few = _CountingPage({"(//tr/td)[2]": 1, "//tr/td": 3})
+    note = await taskv3_tools._positional_note(few, "(//tr/td)[2]")
+    assert note is not None
+    assert _note_rows(note[0])[1] == "2. td 'cell 1' <- this selector's pick", note[0]
+    assert note[1] == {"matches": 3, "listed": 3, "picks": 1}
+    assert few.handles and all(h.dispose.await_count == 1 for h in few.handles), "every pick handle is released"
+
+    table = _CountingPage({"//tr/td[2]": 2000, "//tr/td": 4000})
+    note = await taskv3_tools._positional_note(table, "//tr/td[2]")
+    assert note is not None
+    text, counts = note
+    assert text.startswith(
+        "note: //tr/td[2] picks 2000 elements; read before this action, without the position //tr/td matches 4000"
+    ), text
+    assert "this selector's pick" not in text and text.endswith("(3992 more)"), text
+    assert counts == {"matches": 4000, "listed": 8, "picks": 2000}
+    # Two counts and one read per listed row, whatever the table's size; no handle is fetched past the cap.
+    assert len(table.calls) == 2 + taskv3_tools._POSITIONAL_LISTING_CAP, table.calls
+    assert ("element_handles", "//tr/td[2]") not in table.calls
+
+
+def _row(name: str = "", kind: str = "", value: list[str] | None = None, picked: bool = False) -> dict[str, Any]:
+    return {"tag": "input", "name": name, "kind": kind, "value": value or [], "picked": picked, "cut": False}
+
+
+@pytest.mark.asyncio
+async def test_the_positional_note_keeps_text_that_merely_starts_like_a_hidden_value() -> None:
+    # The split-tail trim is for text the page script cut; applied to whole names it ate their last character.
+    ctx = SkyvernContext(organization_id="o_1")
+    ctx.register_secret_value("5Hq2Wv8Ln4Rt", hide_from_model=True)
+    ctx.register_secret_value("Zq8Lm4Px9Tr2", hide_from_model=True)
+    skyvern_context.set(ctx)
+    try:
+        page = _CountingPage(
+            {"(//input)[2]": 1, "//input": 3},
+            [_row("Gate 5"), _row("Room 5", picked=True), _row("Code", "value", ["Zq8Lm4\u200bPx9Tr2"])],
+        )
+        note = await taskv3_tools._positional_note(page, "(//input)[2]")
+    finally:
+        skyvern_context.reset()
+    assert note is not None
+    rows = _note_rows(note[0])
+    assert rows[0] == "1. input 'Gate 5'" and rows[1] == "2. input 'Room 5' <- this selector's pick", rows
+    # A secret split by a zero-width character is stripped first, so the mask still recognises it.
+    assert "Zq8Lm4" not in note[0] and "Px9Tr2" not in note[0], note[0]
+
+
+@pytest.mark.asyncio
+async def test_the_positional_note_masks_minted_urls_and_caps_selected_options() -> None:
+    signed = "https://files.invalid/doc?sig=abc123"
+    page = _CountingPage(
+        {"(//select)[1]": 1, "//select": 2},
+        [
+            {**_row(f"Attach {signed}", "selected", [f"o{i}" for i in range(200)]), "tag": "select", "picked": True},
+            {**_row(), "tag": "select", "kind": "selected"},
+        ],
+    )
+    note = await taskv3_tools._positional_note(page, "(//select)[1]", lambda t: t.replace(signed, "[file 1]"))
+    assert note is not None
+    rows = _note_rows(note[0])
+    assert signed not in note[0] and "[file 1]" in rows[0], rows
+    assert rows[0].endswith("selected 'o0', 'o1', 'o2' (197 more) <- this selector's pick"), rows
+    assert rows[1] == "2. select nothing selected", rows
+
+
+@pytest.mark.asyncio
+async def test_the_positional_note_says_when_the_pick_is_past_the_listed_rows() -> None:
+    rows = [{**_row(f"Item {i}"), "tag": "button", "picked": i == 11} for i in range(12)]
+    page = _CountingPage({"(//button)[last()]": 1, "//button": 12}, rows)
+    note = await taskv3_tools._positional_note(page, "(//button)[last()]")
+    assert note is not None
+    assert note[0].endswith("(4 more)\n(the pick is not among the listed rows)"), note[0]
+    assert "this selector's pick" not in note[0]
+
+
+@pytest.mark.asyncio
+async def test_the_positional_note_is_absent_when_the_positional_selector_matches_nothing() -> None:
+    page = _CountingPage({"(//a)[5]": 0, "//a": 2}, [_row("A"), _row("B")])
+    assert await taskv3_tools._positional_note(page, "(//a)[5]") is None
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_get_html_lists_what_a_positional_selector_chooses_between_before_any_action() -> None:
+    async with _content_page(_LOOKALIKE_SELECTS_HTML) as page:
+        await page.select_option("select.pair >> nth=1", "Gamma")
+        get_html = _tool(build_browser_tools(_fixed_page_provider(page)), "get_html").handler
+        selector = "(//select[.//option[@value='Beta']])[1]"
+        r = await get_html({"selector": selector})
+        assert r.status == "ok", r.content
+        assert r.content.startswith(f"note: {selector} picks by position; read now, without the position "), r.content
+        assert _note_rows(r.content)[:2] == [
+            "1. select selected '' <- this selector's pick",
+            "2. select selected 'Gamma'",
+        ]
+        assert "<select" in r.content
+        assert await _pair_values(page) == ["", "Gamma"], "a read changes nothing"
+
+
+@pytest.mark.asyncio
+async def test_the_positional_note_fails_open_when_the_engine_lacks_a_call() -> None:
+    class _NoNth(_CountingLocator):
+        nth = None  # type: ignore[assignment]
+
+    page = _CountingPage({"(//a)[1]": 1, "//a": 2})
+    page.locator = lambda selector: _NoNth(page, selector)  # type: ignore[method-assign]
+    assert await taskv3_tools._positional_note(page, "(//a)[1]") is None
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_get_html_says_when_its_selector_matches_more_than_the_element_it_returns() -> None:
+    async with _content_page(_LOOKALIKE_SELECTS_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        get_html = _tool(tools, "get_html").handler
+        for fmt in ("html", "text"):
+            r = await get_html({"selector": "select.pair", "format": fmt})
+            assert r.status == "ok", r.content
+            assert r.content.splitlines()[0] == "(2 elements match select.pair; this is the first of them.)", r.content
+        solo = await get_html({"selector": "#solo"})
+        assert "elements match" not in solo.content, solo.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_get_html_multi_match_line_keeps_the_cut_notice_index_exact() -> None:
+    long_text = "w " * taskv3_tools.HTML_MAX_CHARS
+    async with _content_page(f'<div class="b">{long_text}</div><div class="b">tail</div>') as page:
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "get_html").handler({"selector": "div.b"})
+    assert r.status == "ok", r.content[:200]
+    assert r.content.startswith("(2 elements match div.b; this is the first of them.)\n"), r.content[:200]
+    at = (r.data or {}).get("notice_at")
+    assert isinstance(at, int) and r.content[at:].startswith("…["), r.content[at - 20 : at + 40] if at else r.data
+
+
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_a_typed_selector_that_matches_nothing_says_so_without_claiming_a_rerender() -> None:
@@ -21436,6 +21899,8 @@ async def test_budget_note_counts_only_what_it_actually_cost_and_offers_no_false
         # 260 visible, 251 listed, 40 hidden: the overflow is the 9 visible ones, not 49. Anchored at
         # the start of the count, because "49 more element(s)" CONTAINS "9 more element(s)".
         assert note.startswith("note: 9 more element(s)"), note
+        # The route that does reach them: the markup read and a typed selector.
+        assert note.endswith("; get_html shows them, and click, type and select_option take a selector"), note
         # SKY-16136. Pinned to the note's own number rather than to ">0": a counter that can disagree
         # with what the model was told cannot be used to reason about what the model saw.
         assert r.data is not None
