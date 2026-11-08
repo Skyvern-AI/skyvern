@@ -1634,6 +1634,11 @@ class AsyncAWSClient:
         async with self._ecs_client() as client:
             return await client.describe_tasks(cluster=cluster, tasks=tasks)
 
+    async def describe_services(self, cluster: str, services: list[str]) -> dict:
+        # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/ecs/client/describe_services.html
+        async with self._ecs_client() as client:
+            return await client.describe_services(cluster=cluster, services=services)
+
     async def list_tasks(self, cluster: str) -> dict:
         # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/ecs/client/list_tasks.html
         async with self._ecs_client() as client:
