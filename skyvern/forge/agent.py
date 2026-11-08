@@ -10322,8 +10322,8 @@ class ForgeAgent:
                                 for file in exc.skipped_files
                             )
                         # Reconcile session-scoped DOWNLOAD rows the watcher left unbound, so
-                        # GET /v1/runs/{id} surfaces them (see
-                        # cloud_docs/BROWSER_SESSION_DOWNLOAD_ARTIFACTS.md).
+                        # GET /v1/runs/{id} surfaces them (see the browser session download
+                        # artifacts doc).
                         browser_session_id = context.browser_session_id if context else None
                         if browser_session_id and task.organization_id and finalization_run_id:
                             try:

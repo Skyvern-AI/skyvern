@@ -17331,8 +17331,8 @@ class WorkflowService:
                             workflow_run_id=workflow_run.workflow_run_id,
                             skipped_file_count=len(exc.skipped_files),
                         )
-                    # Reconcile session-scoped DOWNLOAD rows the watcher left unbound (see
-                    # cloud_docs/BROWSER_SESSION_DOWNLOAD_ARTIFACTS.md).
+                    # Reconcile session-scoped DOWNLOAD rows the watcher left unbound (see the
+                    # browser session download artifacts doc).
                     browser_session_id = context.browser_session_id if context else None
                     if browser_session_id and finalization_run_id:
                         run_started_at: datetime | None = workflow_run.created_at

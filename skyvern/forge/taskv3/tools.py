@@ -17006,7 +17006,7 @@ def build_browser_tools(
             """Whether the driver would refuse this target as not enabled, right now.
 
             Asked of the driver rather than re-derived: its rule is wider than `:disabled` and the
-            remainder is version-dependent (see cloud_docs/task-v3/README.md).
+            remainder is version-dependent (see the Task V3 README).
             """
             if isinstance(reach_pre, dict) and reach_pre.get("exists") and reach_pre.get("disabled"):
                 return True
