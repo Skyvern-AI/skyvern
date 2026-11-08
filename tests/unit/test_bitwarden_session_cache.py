@@ -205,8 +205,8 @@ async def _fetch(
     max_retries: int = bitwarden_module.settings.BITWARDEN_MAX_RETRIES,
 ) -> dict[str, str]:
     return await BitwardenService.get_secret_value_from_url(
-        client_id="client-id",
-        client_secret="client-secret",
+        client_id=None if email else "client-id",
+        client_secret=None if email else "client-secret",
         master_password=master_password,
         bw_organization_id="org-id",
         bw_collection_ids=None,
@@ -909,8 +909,8 @@ async def test_concurrent_cli_commands_are_bounded(monkeypatch: pytest.MonkeyPat
 
 async def _fetch_by_url(master_password: str = "master-password", email: str | None = None) -> dict[str, str]:
     return await BitwardenService.get_secret_value_from_url(
-        client_id="client-id",
-        client_secret="client-secret",
+        client_id=None if email else "client-id",
+        client_secret=None if email else "client-secret",
         master_password=master_password,
         bw_organization_id="org-id",
         bw_collection_ids=None,

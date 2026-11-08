@@ -11,6 +11,7 @@ import {
   MinusCircledIcon,
 } from "@radix-ui/react-icons";
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -18,10 +19,12 @@ import {
   within,
 } from "@testing-library/react";
 import type { ReactElement } from "react";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { ActionTypes, Status } from "@/api/types";
+import { type ActionsApiResponse, ActionTypes, Status } from "@/api/types";
 import { TerminatedIcon, terminatedTone } from "@/components/terminatedVisual";
+import { useRunViewStore } from "@/store/RunViewStore";
 import type {
   WorkflowRunBlock,
   WorkflowRunTimelineBlockItem as TimelineBlockItem,
@@ -138,6 +141,7 @@ const statusDotCases: Array<[Status | null, boolean]> = [
 
 afterEach(() => {
   cleanup();
+  useRunViewStore.getState().reset();
 });
 
 describe("WorkflowRunTimelineBlockItem", () => {
@@ -1790,5 +1794,210 @@ describe("WorkflowRunTimelineBlockItem", () => {
     expect(
       screen.getByRole("button", { name: /Click/ }).getAttribute("title"),
     ).toBe("click #sign-in");
+  });
+
+  describe("agent step with a tool call trail", () => {
+    const agentStep = buildBlock({
+      workflow_run_block_id: "wrb_agent",
+      block_type: "agent_step",
+      label: "agent",
+      actions: [
+        {
+          action_id: "act_stray",
+          action_type: ActionTypes.Click,
+          status: Status.Completed,
+          text: "Click before any call",
+          created_at: "2026-01-01T00:00:00.500000",
+        },
+        {
+          action_id: "act_click",
+          action_type: ActionTypes.Click,
+          status: Status.Completed,
+          text: "Click the go button",
+          created_at: "2026-01-01T00:00:01.500000",
+        },
+        {
+          action_id: "act_edge",
+          action_type: ActionTypes.Click,
+          status: Status.Completed,
+          text: "Click on the shared edge",
+          created_at: "2026-01-01T00:00:02",
+        },
+      ] as unknown as WorkflowRunBlock["actions"],
+      tool_calls: [
+        {
+          index: 1,
+          tool: "page_goto",
+          status: Status.Completed,
+          started_at: "2026-01-01T00:00:01+00:00",
+          finished_at: "2026-01-01T00:00:02+00:00",
+          arguments: '{"url": "https://example.com/"}',
+        },
+        {
+          index: 2,
+          tool: "page_fill",
+          status: Status.Completed,
+          started_at: "2026-01-01T00:00:02+00:00",
+          finished_at: "2026-01-01T00:00:02.900000+00:00",
+          arguments: '{"text": "hello"}',
+        },
+        {
+          index: 3,
+          tool: "browser_task",
+          block_type: "task",
+          label: "agent_task_3",
+          status: Status.Completed,
+          started_at: "2026-01-01T00:00:03+00:00",
+          finished_at: "2026-01-01T00:00:03.500000+00:00",
+          arguments: '{"url": "https://example.org/"}',
+        },
+        {
+          index: 4,
+          tool: "finish",
+          status: Status.Completed,
+          started_at: "2026-01-01T00:00:04+00:00",
+          finished_at: "2026-01-01T00:00:05+00:00",
+          arguments: "{}",
+        },
+      ],
+    });
+    const taskChild = buildBlockItem(
+      buildBlock({
+        workflow_run_block_id: "wrb_task",
+        parent_workflow_run_block_id: "wrb_agent",
+        block_type: "task",
+        label: "agent_task_3",
+        actions: [
+          {
+            action_id: "act_task",
+            action_type: ActionTypes.Click,
+            status: Status.Completed,
+            text: "Click inside the browser task",
+            created_at: "2026-01-01T00:00:03.200000",
+          },
+        ] as unknown as WorkflowRunBlock["actions"],
+      }),
+    );
+
+    function renderStep(
+      runId: string,
+      activeItem: ActionsApiResponse | null = null,
+    ) {
+      render(
+        <MemoryRouter initialEntries={[`/?wr=${runId}`]}>
+          <WorkflowRunTimelineBlockItem
+            activeItem={activeItem}
+            block={agentStep}
+            subItems={[taskChild]}
+            onActionClick={noop}
+            onBlockItemClick={noop}
+          />
+        </MemoryRouter>,
+      );
+    }
+
+    const following = (a: Node, b: Node) =>
+      Boolean(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+
+    it("lists each page action once, under the call that made it, with only the calls numbered", () => {
+      renderStep("wr_1");
+      const row = (text: string) => {
+        expect(screen.getAllByText(text)).toHaveLength(1);
+        return screen.getByText(text);
+      };
+
+      expect(following(row("Go to URL"), row("Click the go button"))).toBe(
+        true,
+      );
+      expect(following(row("Click the go button"), row("Input Text"))).toBe(
+        true,
+      );
+      expect(
+        following(row("Input Text"), row("Click on the shared edge")),
+      ).toBe(true);
+      expect(
+        following(row("Click on the shared edge"), row("Browser Task")),
+      ).toBe(true);
+      expect(
+        following(row("Browser Task"), row("Click inside the browser task")),
+      ).toBe(true);
+      expect(
+        following(row("Click inside the browser task"), row("Finish")),
+      ).toBe(true);
+      expect(following(row("Finish"), row("Click before any call"))).toBe(true);
+      expect(
+        screen.getAllByText(/^#\d+$/).map((index) => index.textContent),
+      ).toEqual(["#1", "#2", "#3", "#4"]);
+    });
+
+    it("marks the selected call, and drops a selection made on another run", () => {
+      useRunViewStore.getState().pinFrame("wrb_agent", null, {
+        runId: "wr_0",
+        workflowRunBlockId: "wrb_agent",
+        index: 2,
+      });
+      renderStep("wr_1");
+      const callButton = (title: string) =>
+        screen.getByText(title).closest("button");
+
+      expect(callButton("Input Text")?.getAttribute("aria-pressed")).toBe(
+        "false",
+      );
+
+      fireEvent.click(screen.getByText("Go to URL"));
+
+      expect(callButton("Go to URL")?.getAttribute("aria-pressed")).toBe(
+        "true",
+      );
+      expect(callButton("Finish")?.getAttribute("aria-pressed")).toBe("false");
+
+      act(() => useRunViewStore.getState().jumpToLive());
+
+      expect(callButton("Go to URL")?.getAttribute("aria-pressed")).toBe(
+        "false",
+      );
+      expect(useRunViewStore.getState().selectedAgentStepCall).toBeNull();
+    });
+
+    it("selects a block call from its row, titled and numbered as on the canvas", () => {
+      renderStep("wr_1");
+
+      fireEvent.click(screen.getByText("Browser Task"));
+
+      expect(useRunViewStore.getState().selectedAgentStepCall).toEqual({
+        runId: "wr_1",
+        workflowRunBlockId: "wrb_agent",
+        index: 3,
+      });
+      expect(useRunViewStore.getState().pinnedFrameId).toBe("wrb_task");
+      expect(
+        screen.getByText("Browser Task").closest("button")?.textContent,
+      ).toContain("#3");
+    });
+
+    it("highlights only the selected call, not the action it pinned", () => {
+      const pinned = agentStep.actions?.find(
+        (action) => action.action_id === "act_click",
+      );
+      useRunViewStore.getState().pinFrame("act_click", null, {
+        runId: "wr_1",
+        workflowRunBlockId: "wrb_agent",
+        index: 1,
+      });
+      renderStep("wr_1", pinned ?? null);
+
+      expect(
+        screen
+          .getByText("Go to URL")
+          .closest("button")
+          ?.getAttribute("aria-pressed"),
+      ).toBe("true");
+      expect(
+        screen
+          .getByText("Click the go button")
+          .closest("button")
+          ?.getAttribute("aria-pressed"),
+      ).toBe("false");
+    });
   });
 });

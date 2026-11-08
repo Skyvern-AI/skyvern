@@ -1,10 +1,21 @@
 import type { Node } from "@xyflow/react";
 
+import { ReadableActionTypes } from "@/api/types";
 import { debuggableWorkflowBlockTypes } from "@/routes/workflows/types/workflowTypes";
 
-import { NodeBaseData } from "../types";
+import { NodeBaseData, workflowBlockTitle } from "../types";
 
 export const AGENT_STEP_MAX_TURNS_LIMIT = 200;
+
+// Titles of the tools that run no workflow block; a block-backed tool takes its block's title.
+export const agentStepToolTitles: Record<string, string> = {
+  page_goto: workflowBlockTitle.goto_url,
+  page_click: ReadableActionTypes.click,
+  page_fill: ReadableActionTypes.input_text,
+  page_extract: ReadableActionTypes.extract,
+  read_run_data: "Read run data",
+  finish: "Finish",
+};
 
 export type AgentStepNodeData = NodeBaseData & {
   prompt: string;

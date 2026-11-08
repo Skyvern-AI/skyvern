@@ -1,14 +1,20 @@
+import type { DocScopeRef } from "./docGraphEdits";
 import { createContext } from "react";
-import type { DocEditApi, DocDestination } from "./docEditApi";
+import type { DocEditApi, DocDestination, DocPlace } from "./docEditApi";
 
 export type DocPendingNote = {
   ownerNodeId: string;
   placement: "above" | "trailing";
+  // Tab put the line in this empty loop or branch. Nothing holds a note there, so the text stays with its owner
+  // until "/" picks the step that takes it.
+  into?: DocScopeRef;
 };
 
 export const WorkflowDocActionsContext = createContext<{
   editable: boolean;
   runControlsVisible: boolean;
+  // A run this browser started is going, a one-step run too: the insert lines between steps are hidden meanwhile.
+  runGoing: boolean;
   openSettings: (id: string) => void;
   openVisual: () => void;
   goTo: (id: string) => void;
@@ -23,6 +29,9 @@ export const WorkflowDocActionsContext = createContext<{
   // Null when the doc is read-only (flag on but locked, a run going, or a read-only scope).
   edit: DocEditApi | null;
   destinations: () => DocDestination[];
+  // Starts a demonstration at this place; null where one can't start, so the menu leaves the item out.
+  // `replacing` is an empty step the recording takes the place of.
+  demonstrateAt: (place: DocPlace, replacing?: string) => (() => void) | null;
   outputUsers: (
     id: string,
   ) => Array<{ id: string; label: string; text: string }>;
@@ -39,6 +48,7 @@ export const WorkflowDocActionsContext = createContext<{
 }>({
   editable: false,
   runControlsVisible: false,
+  runGoing: false,
   openSettings: () => {},
   openVisual: () => {},
   goTo: () => {},
@@ -51,6 +61,7 @@ export const WorkflowDocActionsContext = createContext<{
   toggleConditional: () => {},
   edit: null,
   destinations: () => [],
+  demonstrateAt: () => null,
   outputUsers: () => [],
   missingReference: () => false,
   createInput: null,

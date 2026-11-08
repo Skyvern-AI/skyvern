@@ -4,10 +4,9 @@ The vendored Fern SDK at ``skyvern/client/`` is regenerated manually. When a
 new block type is added to ``skyvern/schemas/workflows.BlockType`` without
 regenerating the SDK, MCP read paths that still deserialize through the Fern
 ``Workflow`` type break (see ``test_mcp_workflow_list_drift``). Even though the
-MCP tools now bypass Fern for Workflow reads (see SKY-9227 and
-the Skyvern Cloud-only ``cloud_docs/fern-sdk/README.md`` runbook), we still
-want an early warning so downstream clients that use the Fern SDK directly stay
-in sync.
+MCP tools now bypass Fern for Workflow reads (see SKY-9227 and the Skyvern
+Cloud-only Fern SDK runbook), we still want an early warning so downstream
+clients that use the Fern SDK directly stay in sync.
 
 This test introspects both Fern discriminated unions and diffs them against
 the backend enum. Known-drifted values are tolerated via an explicit allowlist
@@ -27,7 +26,7 @@ from skyvern.client.types.workflow_definition_blocks_item import WorkflowDefinit
 from skyvern.client.types.workflow_definition_yaml_blocks_item import WorkflowDefinitionYamlBlocksItem
 from skyvern.schemas.workflows import BlockType
 
-_DOC_POINTER = "Skyvern Cloud-only runbook: cloud_docs/fern-sdk/README.md (not part of OSS sync)"
+_DOC_POINTER = "the Skyvern Cloud-only Fern SDK runbook (not part of OSS sync)"
 
 # The failure message for drift checks IS the new-block-type checklist. That
 # way the guidance only surfaces to devs whose work actually triggers it — no

@@ -37,7 +37,6 @@ from skyvern.forge.sdk.copilot.browser_code_contract import (
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import pending_screenshot_message
-from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import (
     CopilotBrowserGenerationRetired,
     browser_session_recovery,
@@ -1117,7 +1116,6 @@ async def test_unavailable_workbench_does_not_remove_anchored_edit_and_run(
     )
     monkeypatch.setattr("skyvern.forge.sdk.copilot.tools.await_pending_credential_pause", AsyncMock())
     monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._authority_tool_error", lambda *_args: None)
-    monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._update_and_run_requires_skipped_run", lambda *_args: False)
     monkeypatch.setattr(
         "skyvern.forge.sdk.copilot.tools._clear_pending_browser_interaction_observation", lambda *_args: None
     )
@@ -1353,7 +1351,6 @@ async def test_edit_block_and_run_promotes_the_complete_executed_source_without_
 
     monkeypatch.setattr("skyvern.forge.sdk.copilot.tools.await_pending_credential_pause", AsyncMock())
     monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._authority_tool_error", lambda *_args: None)
-    monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._update_and_run_requires_skipped_run", lambda *_args: False)
     monkeypatch.setattr(
         "skyvern.forge.sdk.copilot.tools._clear_pending_browser_interaction_observation", lambda *_args: None
     )
@@ -1422,7 +1419,6 @@ async def test_promotion_blocks_concurrent_browser_recovery_until_source_is_pers
     monkeypatch.setattr(mcp_adapter, "_get_continuity_outcome", AsyncMock(return_value=outcome))
     monkeypatch.setattr("skyvern.forge.sdk.copilot.tools.await_pending_credential_pause", AsyncMock())
     monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._authority_tool_error", lambda *_args: None)
-    monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._update_and_run_requires_skipped_run", lambda *_args: False)
     monkeypatch.setattr(
         "skyvern.forge.sdk.copilot.tools._clear_pending_browser_interaction_observation", lambda *_args: None
     )
@@ -1559,8 +1555,6 @@ async def test_invalid_executed_source_reference_cannot_persist_or_start_a_run(
         (expired, expired_reference, "expired"),
     ]
     for ctx, reference, expected_status in cases:
-        # A credential skip left by an earlier call must not be reported as the reason this edit failed.
-        ctx.last_run_skipped_unbound_credentials = True
         result = await edit_block_and_run_tool.on_invoke_tool(
             SimpleNamespace(context=ctx, tool_name="edit_block_and_run"),
             json.dumps(
@@ -1576,7 +1570,6 @@ async def test_invalid_executed_source_reference_cannot_persist_or_start_a_run(
         assert parsed["ok"] is False
         assert parsed["error_code"] == "invalid_executed_source_reference"
         assert parsed["reference_status"] == expected_status
-        assert ctx.last_run_skipped_unbound_credentials is False
     persist.assert_not_awaited()
     run_updated.assert_not_awaited()
 
@@ -1605,7 +1598,6 @@ await candidate()
 """
     persist = AsyncMock(return_value={"ok": True, "data": {"block_count": 1}})
     run_updated = AsyncMock(return_value=json.dumps({"ok": False, "error": "NameError: tabs is not defined"}))
-    monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._update_and_run_requires_skipped_run", lambda *_args: False)
     monkeypatch.setattr(
         "skyvern.forge.sdk.copilot.tools._clear_pending_browser_interaction_observation", lambda *_args: None
     )
@@ -1669,7 +1661,6 @@ async def test_update_and_run_blocks_fills_a_new_block_from_the_executed_source(
 
     monkeypatch.setattr("skyvern.forge.sdk.copilot.tools.await_pending_credential_pause", AsyncMock())
     monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._authority_tool_error", lambda *_args: None)
-    monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._update_and_run_requires_skipped_run", lambda *_args: False)
     monkeypatch.setattr(
         "skyvern.forge.sdk.copilot.tools._clear_pending_browser_interaction_observation", lambda *_args: None
     )
@@ -1800,10 +1791,6 @@ async def test_a_browser_code_result_states_the_page_it_left(
     assert resolved == ["pbs_1"]
 
 
-def _deny_raw_secrets(ctx: CopilotContext) -> None:
-    ctx.request_policy = RequestPolicy(raw_secret_detected=True)
-
-
 _UNREAD = {"read": "failed", "url": None, "title": None, "challenge_vendor": None}
 
 
@@ -1830,7 +1817,6 @@ _UNREAD = {"read": "failed", "url": None, "title": None, "challenge_vendor": Non
             _UNREAD,
             id="browser-session-unavailable",
         ),
-        pytest.param({"code": "1"}, {}, _deny_raw_secrets, _UNREAD, id="raw-secret"),
     ],
 )
 async def test_a_browser_code_call_that_may_not_read_the_page_is_reported_unread_without_a_read(

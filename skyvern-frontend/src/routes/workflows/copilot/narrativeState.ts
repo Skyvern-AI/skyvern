@@ -653,9 +653,7 @@ export function parseCredentialPause(
     return null;
   }
   const siteAnswer =
-    o.siteAnswer === "add" || o.siteAnswer === "move" || o.siteAnswer === "no"
-      ? o.siteAnswer
-      : undefined;
+    o.siteAnswer === "add" || o.siteAnswer === "no" ? o.siteAnswer : undefined;
   return {
     outcome,
     credentialId: typeof o.credentialId === "string" ? o.credentialId : null,

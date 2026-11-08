@@ -1,5 +1,6 @@
 import {
   useCallback,
+  useContext,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -33,6 +34,7 @@ import { useSearchParams } from "react-router-dom";
 import { FolderIcon } from "@/components/icons/FolderIcon";
 import { getUniqueSlugForFolder } from "@/util/folderSlug";
 import { cn } from "@/util/utils";
+import CloudContext from "@/store/CloudContext";
 import { useCredentialFoldersQuery } from "./hooks/useCredentialFoldersQuery";
 import { CredentialFolderCard } from "./CredentialFolderCard";
 import { CreateCredentialFolderDialog } from "./CreateCredentialFolderDialog";
@@ -55,6 +57,7 @@ const DEFAULT_TAB: TabValue = "passwords";
 function CredentialsPageContent() {
   const { openModal } = useCredentialModalState();
   const { startBackgroundTest } = useBackgroundCredentialTest();
+  const isCloud = useContext(CloudContext);
   const [search, setSearch] = useState("");
   const [debouncedSearch] = useDebounce(search, 250);
   const [searchParams, setSearchParams] = useSearchParams();
@@ -489,41 +492,22 @@ function CredentialsPageContent() {
         onFolderSelect={setSelectedFolderId}
       />
 
-      {/* Footer note - only for Passwords and Credit Cards tabs */}
-      {!isIncomingCodesTab && (
+      {/* Self-hosted only: the vault depends on the server's configuration. */}
+      {!isIncomingCodesTab && !isCloud && (
         <div className="mt-8 border-t border-slate-700 pt-4">
           <div className="text-sm italic text-neutral-600 dark:text-slate-400">
-            <strong>Note:</strong> This feature requires a Bitwarden-compatible
-            server ({" "}
+            <strong>Note:</strong> Credentials are stored in the vault that your
+            Skyvern server&apos;s <code>CREDENTIAL_VAULT_TYPE</code> selects:
+            encrypted files on the server by default. See{" "}
             <a
-              href="https://bitwarden.com/help/self-host-an-organization/"
+              href="https://docs.skyvern.com/reference/configuration#credentials-and-encryption"
               target="_blank"
               rel="noopener noreferrer"
               className="text-blue-400 underline hover:text-blue-300"
             >
-              self-hosted Bitwarden
+              Credentials and encryption
             </a>{" "}
-            ) or{" "}
-            <a
-              href="https://github.com/dani-garcia/vaultwarden"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-blue-400 underline hover:text-blue-300"
-            >
-              this community version
-            </a>{" "}
-            or a paid Bitwarden account. Make sure the relevant
-            `SKYVERN_AUTH_BITWARDEN_*` environment variables are configured. See
-            details{" "}
-            <a
-              href="https://docs.skyvern.com/credentials/bitwarden"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-blue-400 underline hover:text-blue-300"
-            >
-              here
-            </a>
-            .
+            for the other options.
           </div>
         </div>
       )}

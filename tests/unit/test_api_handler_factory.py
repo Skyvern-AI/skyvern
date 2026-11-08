@@ -1405,7 +1405,7 @@ def test_uses_only_anthropic_models_rejects_openai_claude_proxy() -> None:
 
 
 def test_normalize_llm_model_strips_provider_prefix() -> None:
-    """LiteLLM returns model names with provider prefixes; dbt expects the bare name."""
+    """LiteLLM returns model names with provider prefixes; downstream cost aggregation expects the bare name."""
     assert api_handler_factory._normalize_llm_model("vertex_ai/gemini-3-flash-preview") == "gemini-3-flash-preview"
     assert api_handler_factory._normalize_llm_model("openai/gpt-4.1-mini") == "gpt-4.1-mini"
     assert api_handler_factory._normalize_llm_model("gpt-4") == "gpt-4"
@@ -1990,9 +1990,9 @@ class TestThinkingBudgetOptimization:
 
 
 # SKY-10200 — runtime tests for the router timeout-precedence fix and per-hop
-# fallback chain expansion. These complement the config-shape tests in
-# tests/cloud/test_llm_router_fallback.py by pinning the api_handler_factory
-# wiring: that the router is constructed with a default timeout, the call
+# fallback chain expansion. These complement the router config-shape tests in
+# the cloud test suite by pinning the api_handler_factory wiring: that the
+# router is constructed with a default timeout, the call
 # sites don't pass a per-call timeout kwarg (which would clobber per-deployment
 # values), and the fallbacks list expands into per-hop entries.
 

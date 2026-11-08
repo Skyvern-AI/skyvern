@@ -1,9 +1,8 @@
 """Driver, browser, and context -- the attach-only entry point.
 
 There is no ``launch``. The engine's whole premise is that something else provisions the browser: a
-persistent-session pod, a vendor, or a local Chrome someone already started. That is what keeps every
-stealth property -- the patched binary, the launch switches, the side-loaded captcha extension,
-headful under Xvfb -- owned by the provisioner, where it already lives, and out of reach of this code.
+persistent-session pod, a vendor, or a local Chrome someone already started. That keeps every launch-time
+property of the browser owned by the provisioner, where it already lives, and out of reach of this code.
 """
 
 from __future__ import annotations

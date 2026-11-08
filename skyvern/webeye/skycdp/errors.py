@@ -80,5 +80,5 @@ class CdpUnsupportedOperation(CdpError):
     """A Playwright capability this engine deliberately does not provide (launching, recording).
 
     Raised rather than silently ignored: a driver that logs a capability it dropped has already cost
-    this codebase a fleet-wide stealth regression once.
+    this codebase a fleet-wide regression once.
     """

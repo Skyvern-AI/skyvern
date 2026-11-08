@@ -681,11 +681,25 @@ class AsyncAWSClient:
             LOG.exception("Failed to get secret.", secret_name=secret_name, error_code=error_code)
             return None
 
-    async def create_secret(self, secret_name: str, secret_value: str) -> None:
+    async def get_secret_if_exists(self, secret_name: str) -> str | None:
+        # Unlike get_secret, only a missing secret returns None; access and throttling errors raise.
+        try:
+            async with self._secrets_manager_client() as client:
+                response = await client.get_secret_value(SecretId=secret_name)
+                return response["SecretString"]
+        except ClientError as e:
+            if self._error_code(e) == "ResourceNotFoundException":
+                return None
+            raise
+
+    async def create_secret(self, secret_name: str, secret_value: str, kms_key_id: str | None = None) -> None:
         # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/secretsmanager/client/create_secret.html
         try:
             async with self._secrets_manager_client() as client:
-                await client.create_secret(Name=secret_name, SecretString=secret_value)
+                if kms_key_id:
+                    await client.create_secret(Name=secret_name, SecretString=secret_value, KmsKeyId=kms_key_id)
+                else:
+                    await client.create_secret(Name=secret_name, SecretString=secret_value)
         except Exception as e:
             LOG.exception("Failed to create secret.", secret_name=secret_name)
             raise e
@@ -707,6 +721,15 @@ class AsyncAWSClient:
         except Exception as e:
             LOG.exception("Failed to delete secret.", secret_name=secret_name)
             raise e
+
+    async def delete_secret_permanently(self, secret_name: str) -> None:
+        # No recovery window, so the value cannot be restored; a secret that is already gone counts as deleted.
+        try:
+            async with self._secrets_manager_client() as client:
+                await client.delete_secret(SecretId=secret_name, ForceDeleteWithoutRecovery=True)
+        except ClientError as e:
+            if self._error_code(e) != "ResourceNotFoundException":
+                raise
 
     async def upload_file(
         self,
@@ -1610,6 +1633,11 @@ class AsyncAWSClient:
         # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/ecs/client/describe_tasks.html
         async with self._ecs_client() as client:
             return await client.describe_tasks(cluster=cluster, tasks=tasks)
+
+    async def describe_services(self, cluster: str, services: list[str]) -> dict:
+        # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/ecs/client/describe_services.html
+        async with self._ecs_client() as client:
+            return await client.describe_services(cluster=cluster, services=services)
 
     async def list_tasks(self, cluster: str) -> dict:
         # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/ecs/client/list_tasks.html

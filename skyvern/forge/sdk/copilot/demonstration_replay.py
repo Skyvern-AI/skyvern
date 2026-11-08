@@ -197,8 +197,6 @@ async def _replay_events(
                             delivered_at=now,
                         )
                     )
-                    if screen.status == "detected":
-                        ctx.allow_untested_workflow_draft = ctx.request_policy.raw_secret_redacted_draft
             else:
                 history.append(_gap_fact(event, "the secret check was unavailable"))
             continue

@@ -2220,11 +2220,10 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
 
   it.each([
     [
-      "move",
-      /^Move to b\.example\.com$/,
-      /Moved 'HN Login' to b\.example\.com/,
+      "add",
+      /^Allow on b\.example\.com$/,
+      /Allowed 'HN Login' on b\.example\.com/,
     ],
-    ["add", /^Add b\.example\.com$/, /Added b\.example\.com to 'HN Login'/],
     ["no", /^No$/, /Not used on b\.example\.com/],
   ])(
     "a pick saved for another site asks first, and %s is sent and shown with both sites after a reload",
@@ -2267,7 +2266,7 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
           "'HN Login' is saved for a.example.com. Use it on b.example.com?",
         ),
       ).toBeTruthy();
-      for (const name of [/^Add /, /^Move to /, /^No$/]) {
+      for (const name of [/^Allow on /, /^No$/]) {
         const { className } = screen.getByRole("button", { name });
         expect(className).toMatch(/\bborder-input\b/);
         expect(className).not.toMatch(/\bbg-cta\b/);
@@ -2386,7 +2385,7 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
     expect(await screen.findByText(question)).toBeTruthy();
 
     await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: /^Move to / }));
+      fireEvent.click(screen.getByRole("button", { name: /^Allow on / }));
     });
 
     await waitFor(() => expect(screen.queryByText(question)).toBeNull());
@@ -2440,7 +2439,7 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
     expect(await screen.findByText(question)).toBeTruthy();
 
     await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: /^Add / }));
+      fireEvent.click(screen.getByRole("button", { name: /^Allow on / }));
     });
 
     await waitFor(() =>
@@ -2454,8 +2453,7 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
   });
 
   it.each([
-    ["move", /Moved 'HN Login' to b\.example\.com/],
-    ["add", /Added b\.example\.com to 'HN Login'/],
+    ["add", /Allowed 'HN Login' on b\.example\.com/],
     ["no", /'HN Login' stays saved for a\.example\.com/],
   ])(
     "a reloaded chat names the login on a resolved %s answer",

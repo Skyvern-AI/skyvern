@@ -75,7 +75,6 @@ BuildTestOutcomeReasonCode = Literal[
     "missing_structural_evidence",
     "unchanged_after_recorded_outcome",
     "metadata_reject",
-    "output_policy_reject",
     "scout_act_observe_hollow_after_interaction",
     "required_input_unbound",
     "definition_contract_unsatisfied",

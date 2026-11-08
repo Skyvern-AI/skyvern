@@ -2,14 +2,7 @@ import { useEffect } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 
 import { StatusBadge } from "@/components/StatusBadge";
-import {
-  Pagination,
-  PaginationContent,
-  PaginationItem,
-  PaginationLink,
-  PaginationNext,
-  PaginationPrevious,
-} from "@/components/ui/pagination";
+import { SimplePagination } from "@/components/ui/pagination";
 import {
   Table,
   TableBody,
@@ -19,7 +12,6 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
-import { cn } from "@/util/utils";
 
 import { useBrowserSessionWorkflowRunsQuery } from "./hooks/useBrowserSessionWorkflowRunsQuery";
 
@@ -141,41 +133,15 @@ function BrowserSessionWorkflowRuns() {
           </TableBody>
         </Table>
       </div>
-      <Pagination>
-        <PaginationContent>
-          <PaginationItem>
-            <PaginationPrevious
-              className={cn({ "cursor-not-allowed": page === 1 })}
-              onClick={() => {
-                if (page === 1) {
-                  return;
-                }
-                const params = new URLSearchParams(searchParams);
-                params.set("runs_page", String(Math.max(1, page - 1)));
-                setSearchParams(params, { replace: true });
-              }}
-            />
-          </PaginationItem>
-          <PaginationItem>
-            <PaginationLink>{page}</PaginationLink>
-          </PaginationItem>
-          <PaginationItem>
-            <PaginationNext
-              className={cn({
-                "cursor-not-allowed": runs.length < PAGE_SIZE,
-              })}
-              onClick={() => {
-                if (runs.length < PAGE_SIZE) {
-                  return;
-                }
-                const params = new URLSearchParams(searchParams);
-                params.set("runs_page", String(page + 1));
-                setSearchParams(params, { replace: true });
-              }}
-            />
-          </PaginationItem>
-        </PaginationContent>
-      </Pagination>
+      <SimplePagination
+        page={page}
+        hasNext={runs.length >= PAGE_SIZE}
+        onPageChange={(nextPage) => {
+          const params = new URLSearchParams(searchParams);
+          params.set("runs_page", String(nextPage));
+          setSearchParams(params, { replace: true });
+        }}
+      />
     </div>
   );
 }

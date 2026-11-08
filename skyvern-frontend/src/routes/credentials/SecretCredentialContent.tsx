@@ -40,8 +40,8 @@ function SecretCredentialContent({
 
   return (
     <div className="space-y-4">
-      <div className="flex">
-        <div className="w-72 shrink-0 space-y-1">
+      <div className="flex flex-col gap-2 sm:flex-row">
+        <div className="shrink-0 space-y-1 sm:w-72">
           <Label>Name</Label>
           <div className="text-sm text-slate-400">
             The name of the credential

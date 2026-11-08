@@ -28,6 +28,10 @@ class MicrosoftOAuthCredentialListResponse(BaseModel):
 class CreateMicrosoftOAuthAuthorizeRequest(BaseModel):
     redirect_uri: str = Field(..., description="Redirect URI the consent flow will return to")
     credential_name: str = Field(default="Default", description="Human-readable name for this credential")
+    credential_id: str | None = Field(
+        default=None,
+        description="Existing Microsoft OAuth credential to reconnect in place.",
+    )
     scope_profile: Literal["outlook_mail", "powerbi_dataset_read"] | None = Field(
         default=None,
         description="Allowed Microsoft OAuth scope profile to request. Defaults to outlook_mail.",

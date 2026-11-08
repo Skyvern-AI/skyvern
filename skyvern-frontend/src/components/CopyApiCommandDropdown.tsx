@@ -18,6 +18,37 @@ interface Props {
   getOptions: () => ApiCommandOptions;
 }
 
+function CopyApiCommandMenuItems({ getOptions }: Props) {
+  async function copyCommand(kind: "cURL" | "PowerShell") {
+    const { curl, powershell } = generateApiCommands(getOptions());
+    const copied = await copyText(kind === "cURL" ? curl : powershell);
+    toast(
+      copied
+        ? {
+            variant: "success",
+            title: "Copied to Clipboard",
+            description: describeCopiedCommand(kind),
+          }
+        : {
+            variant: "destructive",
+            title: "Copy failed",
+            description: `Could not copy the ${kind} command. Check your browser's clipboard permissions.`,
+          },
+    );
+  }
+
+  return (
+    <>
+      <DropdownMenuItem onSelect={() => void copyCommand("cURL")}>
+        Copy cURL (Unix/Linux/macOS)
+      </DropdownMenuItem>
+      <DropdownMenuItem onSelect={() => void copyCommand("PowerShell")}>
+        Copy PowerShell (Windows)
+      </DropdownMenuItem>
+    </>
+  );
+}
+
 function CopyApiCommandDropdown({ getOptions }: Props) {
   return (
     <DropdownMenu>
@@ -28,37 +59,10 @@ function CopyApiCommandDropdown({ getOptions }: Props) {
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent>
-        <DropdownMenuItem
-          onSelect={() => {
-            const { curl } = generateApiCommands(getOptions());
-            copyText(curl).then(() => {
-              toast({
-                variant: "success",
-                title: "Copied to Clipboard",
-                description: describeCopiedCommand("cURL"),
-              });
-            });
-          }}
-        >
-          Copy cURL (Unix/Linux/macOS)
-        </DropdownMenuItem>
-        <DropdownMenuItem
-          onSelect={() => {
-            const { powershell } = generateApiCommands(getOptions());
-            copyText(powershell).then(() => {
-              toast({
-                variant: "success",
-                title: "Copied to Clipboard",
-                description: describeCopiedCommand("PowerShell"),
-              });
-            });
-          }}
-        >
-          Copy PowerShell (Windows)
-        </DropdownMenuItem>
+        <CopyApiCommandMenuItems getOptions={getOptions} />
       </DropdownMenuContent>
     </DropdownMenu>
   );
 }
 
-export { CopyApiCommandDropdown };
+export { CopyApiCommandDropdown, CopyApiCommandMenuItems };

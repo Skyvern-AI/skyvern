@@ -26,6 +26,12 @@ import {
 } from "@/store/WorkflowYamlEditorStore";
 import { ArtifactDownloadLink } from "@/components/ArtifactDownloadLink";
 import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { StartFromCards } from "@/components/StartFromCards";
 import { useWorkflowDocEditorFlag } from "@/hooks/useWorkflowDocEditorFlag";
 import {
@@ -74,7 +80,11 @@ import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { useManualSignInStore } from "@/store/useManualSignInStore";
-import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
+import {
+  noteDemonstrationStartFailed,
+  useRecordingLauncherStore,
+  type StartDemonstrationOptions,
+} from "@/store/useRecordingLauncherStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 import {
   type CopilotAttention,
@@ -134,7 +144,6 @@ import {
   WorkflowCopilotCredentialPauseResolvedUpdate,
   CredentialSiteAnswer,
   CredentialSiteQuestion,
-  WorkflowCopilotDemonstrationInsertion,
   WorkflowCopilotTitleUpdate,
   WorkflowCopilotChatSender,
   WorkflowCopilotChatRequest,
@@ -234,6 +243,7 @@ import {
   getReviewGateVerdict,
 } from "./cards/ReviewGateCard";
 import { TURN_ROW_INSET } from "./cards/cardLayout";
+import { CardFooter, CardHeader, CopilotCard } from "./cards/cardChrome";
 import { type AttentionTrayPresentation } from "./cards/AttentionTray";
 import { TestRunOutputCard } from "./cards/TestRunOutputCard";
 import { GoogleReconnectCard } from "./cards/GoogleReconnectCard";
@@ -1541,48 +1551,50 @@ const constrainPosition = (
   };
 };
 
-function DemonstrateTaskButton({
-  label = "Demonstrate task",
+function DemonstrationOfferCard({
   disabled,
   disabledReason,
-  onClick,
+  onStart,
 }: {
-  label?: string;
   disabled: boolean;
   disabledReason: string;
-  onClick: () => void;
+  onStart: () => void;
 }) {
   return (
-    <TooltipProvider>
-      <ControlTooltip
-        content={
-          disabled
-            ? disabledReason
-            : "Skyvern records your clicks, typing, and navigation, then turns them into workflow steps"
+    <CopilotCard>
+      <CardHeader
+        icon={
+          <span
+            aria-hidden="true"
+            className="h-2.5 w-2.5 rounded-full bg-red-500"
+          />
         }
-        blocked={disabled}
-        side="top"
-        wrapperClassName="min-w-0 w-full"
-      >
-        <button
-          type="button"
-          aria-label={label}
-          className="flex w-full min-w-0 items-center gap-3 rounded-lg border border-border bg-slate-elevation3 p-3 text-left transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50"
-          disabled={disabled}
-          onClick={onClick}
-        >
-          <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-border bg-slate-elevation2">
-            <span className="h-2.5 w-2.5 rounded-full bg-red-500" />
-          </span>
-          <span className="min-w-0">
-            <span className="block font-medium text-foreground">{label}</span>
-            <span className="mt-0.5 block text-xs leading-snug text-muted-foreground">
-              Show Copilot how in the browser
-            </span>
-          </span>
-        </button>
-      </ControlTooltip>
-    </TooltipProvider>
+        wrapTitle
+        title="Show Copilot how in the browser"
+      />
+      <CardFooter className="flex items-center">
+        <TooltipProvider>
+          <ControlTooltip
+            content={
+              disabled
+                ? disabledReason
+                : "Skyvern records your clicks, typing, and navigation, then turns them into workflow steps"
+            }
+            blocked={disabled}
+            side="top"
+          >
+            <Button
+              type="button"
+              size="sm"
+              disabled={disabled}
+              onClick={onStart}
+            >
+              Start demonstration
+            </Button>
+          </ControlTooltip>
+        </TooltipProvider>
+      </CardFooter>
+    </CopilotCard>
   );
 }
 
@@ -6905,6 +6917,7 @@ export function WorkflowCopilotChat({
       return sent;
     },
     onStartFailed: () => {
+      noteDemonstrationStartFailed();
       const messageId = demonstrationMessageIdRef.current;
       demonstrationMessageIdRef.current = null;
       setMessages((prev) => prev.filter((message) => message.id !== messageId));
@@ -7422,15 +7435,28 @@ export function WorkflowCopilotChat({
         demonstrationRecorder.phase === "recording"
           ? navigateDemonstration
           : null,
+      demonstration:
+        demonstrationRecorder.phase === "idle"
+          ? null
+          : {
+              phase: demonstrationRecorder.phase,
+              actionCount: demonstrationRecorder.actionCount,
+              interrupted: demonstrationRecorder.browserRestarted,
+              insertion: demonstrationRecorder.insertion ?? null,
+            },
     });
     return () =>
       useRecordingLauncherStore.setState({
         demonstrationBrowserSessionId: null,
         demonstrationRecordingBrowserSessionId: null,
         navigateDemonstration: null,
+        demonstration: null,
       });
   }, [
     demonstrationRecorder.phase,
+    demonstrationRecorder.actionCount,
+    demonstrationRecorder.browserRestarted,
+    demonstrationRecorder.insertion,
     isDemonstrating,
     liveBrowserSessionId,
     navigateDemonstration,
@@ -9417,16 +9443,16 @@ export function WorkflowCopilotChat({
   const panesRef = useRef({ openPane, setOpenPanes, resolveLivePanes });
   panesRef.current = { openPane, setOpenPanes, resolveLivePanes };
   const handleStartDemonstration = useCallback(
-    ({
-      insertion,
-    }: { insertion?: WorkflowCopilotDemonstrationInsertion } = {}) => {
+    ({ insertion, keepEditor = false }: StartDemonstrationOptions = {}) => {
       if (!liveBrowserSessionId) return;
       if (historyLoadedForRef.current !== workflowPermanentId) {
         toast({ title: "Wait for Copilot to finish loading" });
+        noteDemonstrationStartFailed();
         return;
       }
       if (hasPendingQuestion) {
         toast({ title: "Answer Copilot's question first" });
+        noteDemonstrationStartFailed();
         return;
       }
       if (
@@ -9436,6 +9462,7 @@ export function WorkflowCopilotChat({
         isDemonstrating
       ) {
         toast({ title: "Wait for Copilot to finish" });
+        noteDemonstrationStartFailed();
         return;
       }
       void stopSpeech();
@@ -9444,11 +9471,12 @@ export function WorkflowCopilotChat({
       // steps aside for the browser and returns when the recording ends.
       // Copilot holds Done and Discard, so it opens too.
       const panes = panesRef.current;
-      panes.openPane("browser");
+      // showPane keeps one pending request, so the Browser opens last to be the one a folded Doc layout expands.
       if (!panes.resolveLivePanes().includes("copilot"))
         panes.openPane("copilot");
+      panes.openPane("browser");
       const live = panes.resolveLivePanes();
-      if (live.includes("editor")) {
+      if (live.includes("editor") && !keepEditor) {
         editorHiddenForDemonstrationRef.current = true;
         panes.setOpenPanes(live.filter((id) => id !== "editor"));
       }
@@ -10741,6 +10769,15 @@ export function WorkflowCopilotChat({
     if (refuseMutationDuringYamlCommit()) return;
     onRecordTask?.();
   };
+  const composerDemonstrateDisabledReason = recordTaskDisabled
+    ? recordTaskUnavailableReason
+    : isDemonstrating
+      ? "A demonstration is already open"
+      : hasPendingQuestion
+        ? "Answer Copilot's question first"
+        : isLoading
+          ? "Wait for Copilot to finish"
+          : null;
   const content = (
     <div
       className={
@@ -11205,26 +11242,23 @@ export function WorkflowCopilotChat({
                         ),
                       )}
                       {message.narrative.demonstrationOffer ? (
-                        <div className="max-w-sm">
-                          <DemonstrateTaskButton
-                            label="Start demonstration"
-                            disabled={
-                              !isLastMessage ||
-                              isLoading ||
-                              hasPendingQuestion ||
-                              isDemonstrating ||
-                              recordTaskDisabled
-                            }
-                            disabledReason={
-                              recordTaskDisabled
-                                ? recordTaskUnavailableReason
-                                : !isLastMessage
-                                  ? "Only the latest message can start a demonstration"
-                                  : "Demonstrate task is unavailable right now"
-                            }
-                            onClick={startRecordTask}
-                          />
-                        </div>
+                        <DemonstrationOfferCard
+                          disabled={
+                            !isLastMessage ||
+                            isLoading ||
+                            hasPendingQuestion ||
+                            isDemonstrating ||
+                            recordTaskDisabled
+                          }
+                          disabledReason={
+                            recordTaskDisabled
+                              ? recordTaskUnavailableReason
+                              : !isLastMessage
+                                ? "Only the latest message can start a demonstration"
+                                : "Demonstrate task is unavailable right now"
+                          }
+                          onStart={startRecordTask}
+                        />
                       ) : null}
                       {showReviewGate ? (
                         <div className="space-y-2">
@@ -12100,16 +12134,59 @@ export function WorkflowCopilotChat({
             />
             {/* As tall as one textarea line box, so the controls center on the last line as the textarea grows. */}
             <div className="flex h-10 shrink-0 items-center gap-1.5">
-              <button
-                type="button"
-                onClick={() => attachmentInputRef.current?.click()}
-                disabled={attachDisabledReason !== null}
-                title={attachDisabledReason ?? "Attach a file"}
-                aria-label="Attach a file"
-                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-muted-foreground transition hover:bg-accent hover:text-accent-foreground disabled:opacity-50"
-              >
-                <PlusIcon className="h-4 w-4" />
-              </button>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <button
+                    type="button"
+                    disabled={
+                      attachDisabledReason !== null &&
+                      composerDemonstrateDisabledReason !== null
+                    }
+                    title={
+                      attachDisabledReason !== null &&
+                      composerDemonstrateDisabledReason !== null
+                        ? attachDisabledReason
+                        : "Attach a file or demonstrate"
+                    }
+                    aria-label="Attach a file or demonstrate"
+                    className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-muted-foreground transition hover:bg-accent hover:text-accent-foreground disabled:opacity-50"
+                  >
+                    <PlusIcon className="h-4 w-4" />
+                  </button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent side="top" align="start" className="w-64">
+                  <DropdownMenuItem
+                    disabled={attachDisabledReason !== null}
+                    onSelect={() => attachmentInputRef.current?.click()}
+                    className="items-start gap-2 p-2"
+                  >
+                    <FileIcon className="mt-0.5 h-4 w-4 shrink-0" />
+                    <span className="min-w-0">
+                      <span className="block">Attach a file</span>
+                      <span className="block text-xs text-muted-foreground">
+                        {attachDisabledReason ??
+                          "A document, spreadsheet, or SOP for Copilot"}
+                      </span>
+                    </span>
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    disabled={composerDemonstrateDisabledReason !== null}
+                    onSelect={startRecordTask}
+                    className="items-start gap-2 p-2"
+                  >
+                    <span className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center">
+                      <span className="h-2.5 w-2.5 rounded-full bg-red-500" />
+                    </span>
+                    <span className="min-w-0">
+                      <span className="block">Demonstrate task</span>
+                      <span className="block text-xs text-muted-foreground">
+                        {composerDemonstrateDisabledReason ??
+                          "Show Copilot how in the browser"}
+                      </span>
+                    </span>
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
               <SpeechInputButton
                 isSupported={isSpeechSupported}
                 isListening={isSpeechListening}

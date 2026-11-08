@@ -38,7 +38,7 @@ import { useCloseBrowserSessionMutation } from "@/routes/browserSessions/hooks/u
 import { SaveSessionAsBrowserProfileDialog } from "@/routes/browserProfiles/SaveSessionAsBrowserProfileDialog";
 import { useBackgroundBrowserProfileCreate } from "@/routes/browserProfiles/hooks/useBackgroundBrowserProfileCreate";
 import { useBrowserProfileCreateStore } from "@/store/useBrowserProfileCreateStore";
-import { CopyText } from "@/routes/workflows/editor/Workspace";
+import { CopyButton } from "@/components/CopyButton";
 import { type BrowserSession as BrowserSessionType } from "@/routes/workflows/types/browserSessionTypes";
 import {
   resolveStreamTransport,
@@ -240,9 +240,10 @@ function BrowserSession() {
                   <div className="max-w-[20rem] truncate font-mono text-xs opacity-75">
                     {browserSession.browser_session_id}
                   </div>
-                  <CopyText
+                  <CopyButton
                     className="opacity-75 hover:opacity-100"
-                    text={browserSession.browser_session_id}
+                    value={browserSession.browser_session_id}
+                    ariaLabel="Copy session ID"
                   />
                 </div>
                 {browserSession.browser_address && (
@@ -250,9 +251,10 @@ function BrowserSession() {
                     <div className="max-w-[20rem] truncate font-mono text-xs opacity-75">
                       {browserSession.browser_address}
                     </div>
-                    <CopyText
+                    <CopyButton
                       className="opacity-75 hover:opacity-100"
-                      text={browserSession.browser_address}
+                      value={browserSession.browser_address}
+                      ariaLabel="Copy browser address"
                     />
                   </div>
                 )}

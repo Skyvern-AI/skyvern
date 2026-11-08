@@ -14,40 +14,22 @@ import { ModelsResponse } from "@/api/types";
 import { WorkflowModel } from "@/routes/workflows/types/workflowTypes";
 import { useWorkflowScopeReadOnly } from "@/routes/workflows/editor/WorkflowScopeContext";
 import { BadgeLabel } from "@/components/BadgeLabel";
+import {
+  deprecatedModelNames,
+  SKYVERN_OPTIMIZED_LABEL,
+  withDeprecationSuffix,
+} from "@/components/modelLabels";
 
 type Props = {
   className?: string;
   clearable?: boolean;
+  hideLabel?: boolean;
   value: WorkflowModel | null;
   // --
   onChange: (value: WorkflowModel | null) => void;
 };
 
-const constants = {
-  SkyvernOptimized: "Skyvern Optimized",
-} as const;
-
-const deprecatedModelNames = new Set<string>([
-  "gemini-3-pro-preview",
-  "gemini-3.0-flash",
-  "gemini-3.5-flash",
-  "azure/gpt-4.1",
-  "azure/gpt-5",
-  "azure/gpt-5-mini",
-  "azure/gpt-5.2",
-  "azure/gpt-5.4",
-  "azure/gpt-5.6-sol",
-  "azure/gpt-5.6-terra",
-  "azure/gpt-5.6-luna",
-  "azure/o3",
-  "claude-haiku-4-5-20251001",
-  "claude-opus-4-5-20251101",
-  "claude-sonnet-4-5-20250929",
-  "claude-opus-4-6",
-  "claude-opus-5",
-  "claude-fable-5",
-  "mercury-2",
-]);
+const constants = { SkyvernOptimized: SKYVERN_OPTIMIZED_LABEL } as const;
 
 const enterpriseModelNames = new Set<string>([
   "us.anthropic.claude-opus-4-20250514-v1:0",
@@ -61,6 +43,7 @@ const enterpriseModelNames = new Set<string>([
 
 function ModelSelector({
   clearable = true,
+  hideLabel = false,
   value,
   onChange,
   className,
@@ -81,7 +64,7 @@ function ModelSelector({
   const models = Object.fromEntries(
     Object.entries(rawModels).map(([modelName, label]) => [
       modelName,
-      deprecatedModelNames.has(modelName) ? `${label} (deprecated)` : label,
+      withDeprecationSuffix(modelName, label),
     ]),
   );
 
@@ -108,10 +91,12 @@ function ModelSelector({
   if (scopeReadOnly) {
     return (
       <div className="flex items-center justify-between">
-        <div className="flex gap-2">
-          <Label className="text-xs font-normal text-slate-300">Model</Label>
-          <HelpTooltip content="The LLM model to use for this block" />
-        </div>
+        {!hideLabel && (
+          <div className="flex gap-2">
+            <Label className="text-xs font-normal text-slate-300">Model</Label>
+            <HelpTooltip content="The LLM model to use for this block" />
+          </div>
+        )}
         <div
           data-testid="model-selector-readonly"
           className={
@@ -127,10 +112,12 @@ function ModelSelector({
 
   return (
     <div className="flex items-center justify-between">
-      <div className="flex gap-2">
-        <Label className="text-xs font-normal text-slate-300">Model</Label>
-        <HelpTooltip content="The LLM model to use for this block" />
-      </div>
+      {!hideLabel && (
+        <div className="flex gap-2">
+          <Label className="text-xs font-normal text-slate-300">Model</Label>
+          <HelpTooltip content="The LLM model to use for this block" />
+        </div>
+      )}
       <div className="relative flex items-center">
         <Select
           value={chosen}

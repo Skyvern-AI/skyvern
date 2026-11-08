@@ -459,7 +459,6 @@ class AgentContext:
     # Prior turn's uncommitted draft; carries blocks even when the request body and canonical row are empty.
     prior_copilot_workflow_yaml: str | None = None
     canonical_was_persisted_due_to_param_change: bool = False
-    allow_untested_workflow_draft: bool = False
     request_policy: RequestPolicy | None = None
     copilot_config: CopilotConfig | None = None
     # Wire and persisted-metadata spelling of authoring_capability; authoring surfaces read the

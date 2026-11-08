@@ -20,7 +20,6 @@ from skyvern.forge.sdk.copilot.tools.credential_fill import _request_settled_cre
 from skyvern.forge.sdk.copilot.tools.credentials import (
     _credential_run_approval_error,
     _list_credentials,
-    _resolve_exact_credential,
     _serialize_credential,
     import_bound_vault_logins,
 )
@@ -40,7 +39,11 @@ from tests.unit.conftest import (
     OrgVaultFake,
     org_vault_overview,
 )
-from tests.unit.copilot_test_helpers import install_run_blocks_harness, make_copilot_ctx
+from tests.unit.copilot_test_helpers import (
+    install_run_blocks_harness,
+    make_copilot_ctx,
+    resolve_exact_credential_data,
+)
 
 SECRET_MARKER = "SECRET_VALUE"
 
@@ -165,13 +168,6 @@ def test_a_secret_credential_advertises_only_secret_value_and_never_its_value() 
         assert guessed not in serialized
 
 
-async def _resolve(reference: str, policy: RequestPolicy, inventory: list[Credential]) -> dict[str, object]:
-    ctx = SimpleNamespace(organization_id="o_test_org", request_policy=policy)
-    with patch.object(credentials_module, "load_credentials", AsyncMock(return_value=inventory)):
-        result = await _resolve_exact_credential(reference, ctx)
-    return result["data"]
-
-
 def _proposal_hydrated_policy(proposed: Credential, message: str) -> RequestPolicy:
     policy = RequestPolicy(canonical_user_message=message)
     policy.resolved_credentials = [proposed]
@@ -184,7 +180,7 @@ async def test_a_credential_the_server_proposed_resolves_on_a_reply_that_never_n
     proposed = _password_credential(credential_id="cred_proposed", name="portal-login")
     policy = _proposal_hydrated_policy(proposed, "yep, that one works for me")
 
-    data = await _resolve("cred_proposed", policy, [proposed])
+    data = await resolve_exact_credential_data("cred_proposed", policy, [proposed])
 
     assert data["status"] == "resolved"
     assert policy.current_turn_named_credential_ids == set()
@@ -196,7 +192,7 @@ async def test_a_credential_other_than_the_recorded_proposal_is_denied_with_the_
     other = _password_credential(credential_id="cred_other", name="billing-login")
     policy = _proposal_hydrated_policy(proposed, "yep, that one works for me")
 
-    data = await _resolve("cred_other", policy, [proposed, other])
+    data = await resolve_exact_credential_data("cred_other", policy, [proposed, other])
 
     assert data["status"] == "denied"
     assert data["reason"] == "reference_not_literal_in_current_user_turn"
@@ -209,7 +205,7 @@ async def test_the_user_naming_another_credential_settles_the_fill_on_that_one()
     other = _password_credential(credential_id="cred_other", name="billing-login")
     policy = _proposal_hydrated_policy(proposed, "actually use cred_other")
 
-    data = await _resolve("cred_other", policy, [proposed, other])
+    data = await resolve_exact_credential_data("cred_other", policy, [proposed, other])
 
     assert data["status"] == "resolved"
     assert policy.current_turn_named_credential_ids == {"cred_other"}
@@ -240,7 +236,7 @@ async def test_a_named_login_that_is_not_saved_leaves_no_unnamed_login_bound(bou
         # The model citing the carry is not the user naming it.
         policy.carry_cited_credential_ids = {unnamed.credential_id}
     bound_before_lookup = list(policy.resolved_credentials)
-    data = await _resolve("my other login", policy, [unnamed])
+    data = await resolve_exact_credential_data("my other login", policy, [unnamed])
     if bound_by == "page_after_lookup":
         await observe_page()
 
@@ -261,7 +257,7 @@ async def test_a_lookup_that_lands_while_the_page_is_loading_logins_still_stops_
     policy = RequestPolicy(canonical_user_message='log in to https://a.example/login with "my other login"')
 
     async def load_while_the_lookup_lands() -> list[Credential]:
-        await _resolve("my other login", policy, [page_login])
+        await resolve_exact_credential_data("my other login", policy, [page_login])
         return [page_login]
 
     await resolve_credential_for_live_page(
@@ -287,13 +283,13 @@ async def test_a_login_that_is_the_users_survives_another_name_that_is_not_saved
         load_org_credentials=AsyncMock(return_value=[theirs]),
     )
     if settled_by == "named_this_turn":
-        await _resolve("cred_theirs", policy, [theirs])
+        await resolve_exact_credential_data("cred_theirs", policy, [theirs])
     elif settled_by == "approved_earlier":
         policy.prior_approved_credential_ids = {"cred_theirs"}
     else:
         policy.persisted_workflow_credential_ids = ["cred_theirs"]
 
-    data = await _resolve("my other login", policy, [theirs])
+    data = await resolve_exact_credential_data("my other login", policy, [theirs])
 
     assert data["withdrawn_credential_ids"] == []
     assert policy.resolved_credentials == [theirs]
@@ -316,7 +312,7 @@ async def test_a_lookup_that_is_ambiguous_or_denied_leaves_the_page_free_to_bind
     ]
     policy = RequestPolicy(canonical_user_message='log in to https://a.example/login with "dup login"')
 
-    data = await _resolve(reference, policy, inventory)
+    data = await resolve_exact_credential_data(reference, policy, inventory)
     await resolve_credential_for_live_page(
         policy,
         organization_id="o_test_org",
@@ -340,7 +336,7 @@ async def test_citing_a_shorter_saved_name_inside_the_one_the_user_typed_is_not_
     policy.seeded_proposal_credential_ids = {approved.credential_id}
     policy.live_page_admitted_urls = {approved.credential_id: "https://a.example/login"}
 
-    data = await _resolve("portal", policy, [approved, longer])
+    data = await resolve_exact_credential_data("portal", policy, [approved, longer])
 
     assert data["status"] == "resolved"
     assert policy.current_turn_named_credential_ids == set()
@@ -361,7 +357,7 @@ async def test_an_approval_from_an_earlier_turn_resolves_without_the_user_naming
     policy.resolved_credentials = [approved]
 
     reference = approved.credential_id if reference_is_approved else other.credential_id
-    data = await _resolve(reference, policy, [approved, other])
+    data = await resolve_exact_credential_data(reference, policy, [approved, other])
 
     assert data["status"] == ("resolved" if reference_is_approved else "denied")
     # The approval answers which credential; it never claims the user named one this turn.
@@ -386,7 +382,7 @@ async def test_no_resume_arm_transfers_authority_to_whichever_credential_now_car
         policy.prior_approved_credential_ids = {recorded.credential_id}
         policy.resolved_credentials = [recorded]
 
-    data = await _resolve("Portal login", policy, [recorded_now, renamed_onto_the_old_name])
+    data = await resolve_exact_credential_data("Portal login", policy, [recorded_now, renamed_onto_the_old_name])
 
     assert data["status"] == "denied"
     assert renamed_onto_the_old_name.credential_id not in {
@@ -403,7 +399,7 @@ async def test_saved_workflow_selection_resolves_but_a_canvas_proposal_does_not(
         persisted_workflow_credential_ids=[credential.credential_id] if saved else [],
         existing_workflow_credential_ids=[credential.credential_id],
     )
-    data = await _resolve(credential.name, policy, [credential])
+    data = await resolve_exact_credential_data(credential.name, policy, [credential])
     assert data["status"] == ("resolved" if saved else "denied")
     assert policy.current_turn_named_credential_ids == set()
 
@@ -607,7 +603,7 @@ async def test_a_named_login_not_found_says_which_vault_logins_went_unseen(
         org_vault.folders_restricted.return_value = True
     policy = RequestPolicy(canonical_user_message='sign in with "my portal login"')
 
-    data = await _resolve("my portal login", policy, [])
+    data = await resolve_exact_credential_data("my portal login", policy, [])
 
     assert data["status"] == "not_found"
     assert {key: data[key] for key in ("unreadable_vaults", "vault_logins_hidden_by_folder_access") if key in data} == (
@@ -620,7 +616,7 @@ async def test_a_vault_login_the_user_names_by_title_resolves_to_its_listed_id(o
     policy = RequestPolicy(canonical_user_message="sign in with my Bitwarden login Example portal")
     ref = await _listed_ref(RequestPolicy())
 
-    result = await _resolve("Example portal", policy, [])
+    result = await resolve_exact_credential_data("Example portal", policy, [])
 
     assert result["status"] == "resolved"
     assert result["credential"]["credential_id"] == ref

@@ -26,7 +26,7 @@ import { runStepByKey, type LineSplit } from "./docKeys";
 import type { DocScopeRef } from "./docGraphEdits";
 import { DocText } from "./DocText";
 import { DocDeleteConfirm, DocEditableLine } from "./DocEditing";
-import { useDocRun } from "./useDocRun";
+import { useDocRunFor } from "./useDocRunFor";
 import { docBranchSelection, selectedStepIds } from "./docBranchSelection";
 
 const MAX_VISIBLE_CONDITIONS = 3;
@@ -174,8 +174,12 @@ export function DocConditional({
   const open = actions.conditionalOpen(node.id);
   const conditions = item.branches.filter((b) => b.kind !== "otherwise");
   const otherwise = item.branches.find((b) => b.kind === "otherwise");
-  const { blocksByLabel, unknownLabels } = useDocRun();
-  const { selected, ranBranch: ranOnRun } = docBranchSelection(
+  const { blocksByLabel, unknownLabels } = useDocRunFor(node.data.label);
+  const {
+    selected,
+    ranBranch: ranOnRun,
+    selectedRan,
+  } = docBranchSelection(
     item,
     node.data.label,
     actions.selectedBranch(node.id),
@@ -223,8 +227,9 @@ export function DocConditional({
     else branchEdits.removeBranch(node.id, selected.branchId);
   };
   return (
-    <div className="group/line rounded py-[3px]">
-      <div className="relative flex min-h-[26px] flex-wrap items-center gap-2">
+    <div className="rounded py-[3px]">
+      {/* The hover group is the header only: the steps inside a branch show their own controls. */}
+      <div className="group/line relative flex min-h-[26px] flex-wrap items-center gap-2">
         <DocTag node={node} place={editable ? place : undefined} />
         <button
           type="button"
@@ -453,6 +458,7 @@ export function DocConditional({
             <div className="mb-1 ml-[11px] mt-0.5 border-l border-border pl-4">
               {ranBranch &&
                 selected !== ranBranch &&
+                !selectedRan &&
                 selected.stepCount > 0 && (
                   <p
                     className="my-1 text-[13px] text-muted-foreground"

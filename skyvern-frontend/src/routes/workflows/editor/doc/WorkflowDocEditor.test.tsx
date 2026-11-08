@@ -1,11 +1,13 @@
 // @vitest-environment jsdom
 import { useRunValidationStore } from "../runValidation/useRunValidationStore";
+import { clearDocAnnouncement, docAnnouncement } from "./docAnnounce";
 import {
   act,
   cleanup,
   fireEvent,
   render,
   screen,
+  waitFor,
   within,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
@@ -25,16 +27,25 @@ import {
 import { isWorkflowBlockNode } from "../nodes";
 import { getElements } from "../workflowEditorUtils";
 import { useLocateBlockStore } from "../runValidation/useLocateBlockStore";
+import { useDocRunStore } from "./docRunStore";
 import { WorkflowDocEditor } from "./WorkflowDocEditor";
 import { useDocUnfinishedStore } from "./docUnfinished";
 import { splitAtCaret } from "./docCaret";
 import { block, conditional, forLoop, settings } from "./docTestBlocks";
 import type { DocGraphEdits } from "./docEditApi";
 import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
+import {
+  noteDemonstrationStartFailed,
+  useRecordingLauncherStore,
+} from "@/store/useRecordingLauncherStore";
 
 const docRun = vi.hoisted(() => ({ current: {} as Record<string, unknown> }));
 vi.mock("./useDocRun", () => ({
-  useDocRun: () => ({ unknownLabels: new Set(), ...docRun.current }),
+  useDocRun: () => ({
+    unknownLabels: new Set(),
+    rowsLoaded: true,
+    ...docRun.current,
+  }),
 }));
 import type { DocGraph } from "./docGraphEdits";
 import * as axiosClientModule from "@/api/AxiosClient";
@@ -79,7 +90,11 @@ const loop = {
   complete_if_empty: false,
 } as unknown as WorkflowBlock;
 
-function renderDoc(blocks: WorkflowBlock[] = [loop], edits?: DocGraphEdits) {
+function renderDoc(
+  blocks: WorkflowBlock[] = [loop],
+  edits?: DocGraphEdits,
+  url = "/",
+) {
   const { nodes, edges } = getElements(
     blocks,
     {
@@ -90,7 +105,7 @@ function renderDoc(blocks: WorkflowBlock[] = [loop], edits?: DocGraphEdits) {
   );
   render(
     <QueryClientProvider client={new QueryClient()}>
-      <MemoryRouter>
+      <MemoryRouter initialEntries={[url]}>
         <ReactFlowProvider>
           <WorkflowDocEditor nodes={nodes} edges={edges} edits={edits} />
         </ReactFlowProvider>
@@ -155,6 +170,105 @@ describe("WorkflowDocEditor navigation", () => {
     const prompt = () =>
       block("text_prompt", "write_it", null, { prompt: "Do the next thing" });
 
+    test("the insert line between steps is not rendered on a touch screen, whatever the width", () => {
+      const steps = () => [
+        block("goto_url", "open_site", "write_it", { url: "https://a.test" }),
+        prompt(),
+      ];
+      const stubPointer = (touch: boolean) =>
+        vi.stubGlobal("matchMedia", (query: string) => ({
+          matches: query === "(hover: none), (pointer: coarse)" ? touch : false,
+          addEventListener: () => {},
+          removeEventListener: () => {},
+        }));
+
+      stubPointer(false);
+      renderDoc(steps(), editsWithAdd());
+      expect(
+        screen.getByRole("button", { name: "Add a step here" }),
+      ).toBeTruthy();
+      cleanup();
+
+      stubPointer(true);
+      renderDoc(steps(), editsWithAdd());
+      expect(
+        screen.queryByRole("button", { name: "Add a step here" }),
+      ).toBeNull();
+      expect(document.querySelector("[data-doc-insert-line]")).toBeNull();
+      expect(screen.getByRole("button", { name: /Add step/ })).toBeTruthy();
+    });
+
+    test("Escape out of a step's text leaves focus on that step's type label", () => {
+      renderDoc([prompt()], editsWithAdd());
+      const box = openLine("write_it prompt", "Do the next thing", 17);
+      box.focus();
+      fireEvent.keyDown(box, { key: "Escape" });
+      expect(document.activeElement).toBe(
+        document.querySelector("[data-doc-tag]"),
+      );
+    });
+
+    test("Search shows its ⌘K key only where there is a keyboard", () => {
+      const stubPointer = (touch: boolean) =>
+        vi.stubGlobal("matchMedia", (query: string) => ({
+          matches: query === "(hover: none), (pointer: coarse)" ? touch : false,
+          addEventListener: () => {},
+          removeEventListener: () => {},
+        }));
+      stubPointer(false);
+      renderDoc([prompt()], editsWithAdd());
+      expect(
+        screen.getByRole("button", { name: /^Search/ }).textContent,
+      ).toContain("⌘K");
+      cleanup();
+      stubPointer(true);
+      renderDoc([prompt()], editsWithAdd());
+      expect(
+        screen.getByRole("button", { name: /^Search/ }).textContent,
+      ).not.toContain("⌘K");
+    });
+
+    test("adding a step with / announces it", () => {
+      clearDocAnnouncement();
+      renderDoc(
+        [block("goto_url", "empty_one", null, { url: "" }), prompt()],
+        editsWithAdd(),
+      );
+      fireEvent.keyDown(openLine("empty_one url", "", 0), { key: "/" });
+      fireEvent.click(screen.getByText(/^Loop/));
+      expect(docAnnouncement()).toBe("Added Loop step");
+    });
+
+    test("a one-step run leaves the text editable but shows no insert line until it ends", () => {
+      const steps = () => [
+        block("goto_url", "open_site", "write_it", { url: "https://a.test" }),
+        prompt(),
+      ];
+      docRun.current = {
+        runId: "wr_1",
+        blocksByLabel: new Map(),
+        live: true,
+        owned: true,
+      };
+      renderDoc(steps(), editsWithAdd(), "/?bl=open_site");
+      expect(
+        screen.queryByRole("button", { name: "Add a step here" }),
+      ).toBeNull();
+      fireEvent.focus(screen.getByRole("textbox", { name: "write_it prompt" }));
+      expect(
+        screen
+          .getByRole("textbox", { name: "write_it prompt" })
+          .getAttribute("contenteditable"),
+      ).toBe("plaintext-only");
+      cleanup();
+
+      docRun.current = { ...docRun.current, live: false };
+      renderDoc(steps(), editsWithAdd(), "/?bl=open_site");
+      expect(
+        screen.getByRole("button", { name: "Add a step here" }),
+      ).toBeTruthy();
+    });
+
     test("Enter at the end of a step adds a step of the same type below", () => {
       const edits = editsWithAdd();
       const nodes = renderDoc([prompt()], edits);
@@ -181,6 +295,81 @@ describe("WorkflowDocEditor navigation", () => {
         unknown
       >;
       expect(first.prompt).toBe("Do the");
+    });
+
+    test("Enter on an empty step turns it into a note instead of adding another step", () => {
+      const edits = editsWithAdd();
+      renderDoc(
+        [
+          block("goto_url", "open_site", "empty_one", {
+            url: "https://a.test",
+          }),
+          block("goto_url", "empty_one", null, { url: "" }),
+        ],
+        edits,
+      );
+      const box = openLine("empty_one url", "", 0);
+      fireEvent.keyDown(box, { key: "Enter" });
+
+      expect(edits.addStep).not.toHaveBeenCalled();
+      const applied = vi.mocked(edits.apply).mock.calls[0]![0].nodes;
+      expect(
+        applied.filter(isWorkflowBlockNode).map((n) => n.data.label),
+      ).toEqual(["open_site"]);
+    });
+
+    test.each([
+      ["print_page", "printed", { include_timestamp: true }],
+      ["wait", "pause", { wait_sec: 1 }],
+    ])(
+      "Enter on a %s step that needs no text keeps it and opens an empty line below",
+      (type, label, extra) => {
+        const edits = editsWithAdd();
+        renderDoc(
+          [
+            block("goto_url", "open_site", label, { url: "https://a.test" }),
+            block(type, label, null, extra),
+          ],
+          edits,
+        );
+        const box = openLine(`${label} description`, "", 0);
+        fireEvent.keyDown(box, { key: "Enter" });
+
+        expect(edits.addStep).not.toHaveBeenCalled();
+        expect(edits.apply).not.toHaveBeenCalled();
+        expect(screen.getByRole("textbox", { name: "Note" })).toBeTruthy();
+      },
+    );
+
+    test("Enter on an empty step that needs text still turns it into a note (text prompt)", () => {
+      const edits = editsWithAdd();
+      renderDoc(
+        [
+          block("goto_url", "open_site", "empty_one", {
+            url: "https://a.test",
+          }),
+          block("text_prompt", "empty_one", null, { prompt: "" }),
+        ],
+        edits,
+      );
+      const box = openLine("empty_one prompt", "", 0);
+      fireEvent.keyDown(box, { key: "Enter" });
+
+      expect(edits.addStep).not.toHaveBeenCalled();
+      expect(edits.apply).toHaveBeenCalled();
+    });
+
+    test("Picking a loop with / on an empty step replaces the step", () => {
+      const edits = editsWithAdd();
+      renderDoc(
+        [block("goto_url", "empty_one", null, { url: "" }), prompt()],
+        edits,
+      );
+      const box = openLine("empty_one url", "", 0);
+      fireEvent.keyDown(box, { key: "/" });
+      fireEvent.click(screen.getByText(/^Loop/));
+
+      expect(vi.mocked(edits.addStep).mock.calls[0]![0].nodeType).toBe("loop");
     });
 
     test("Shift+Enter is a line break inside the step, not a new step", () => {
@@ -259,7 +448,67 @@ describe("WorkflowDocEditor navigation", () => {
       }
     });
 
-    test("Tab on a note under an empty loop opens the step menu and picks no type", () => {
+    test("Tab and Shift+Tab say out loud where the step moved, for a loop and for a branch", () => {
+      const status = () => screen.getByRole("status").textContent?.trim();
+      const tab = (name: string, shiftKey: boolean) => {
+        fireEvent.focus(screen.getByRole("textbox", { name }));
+        return fireEvent.keyDown(screen.getByRole("textbox", { name }), {
+          key: "Tab",
+          shiftKey,
+        });
+      };
+
+      renderDoc(
+        [
+          forLoop("each_book", "after", [code("inside", null)]),
+          block("text_prompt", "after", null, { prompt: "Sum it" }),
+        ],
+        editsWithAdd(),
+      );
+      expect(status()).toBe("");
+      expect(tab("after prompt", false)).toBe(false);
+      expect(status()).toBe("Moved into the loop");
+      cleanup();
+
+      renderDoc(
+        [
+          forLoop("each_book", null, [
+            block("text_prompt", "inner", null, { prompt: "Read it" }),
+          ]),
+        ],
+        editsWithAdd(),
+      );
+      expect(tab("inner prompt", true)).toBe(false);
+      expect(status()).toBe("Moved out of the loop");
+      cleanup();
+
+      renderDoc(
+        [
+          conditional("route", "after", [
+            { id: "yes", next: "if_step", when: "Check the condition" },
+            { id: "no", next: null },
+          ]),
+          code("if_step", "after"),
+          block("text_prompt", "after", null, { prompt: "Sum it" }),
+        ],
+        editsWithAdd(),
+      );
+      expect(tab("after prompt", false)).toBe(false);
+      expect(status()).toBe("Moved into the branch");
+    });
+
+    test("Tab on a line with nothing to nest is not prevented, so focus can move on", () => {
+      renderDoc([block("extraction", "find_it", null, {})], editsWithAdd());
+      const name = "find_it dataExtractionGoal";
+      fireEvent.focus(screen.getByRole("textbox", { name }));
+      const line = screen.getByRole("textbox", { name });
+      expect(fireEvent.keyDown(line, { key: "Tab" })).toBe(true);
+      expect(fireEvent.keyDown(line, { key: "Tab", shiftKey: true })).toBe(
+        true,
+      );
+    });
+
+    test("Tab on a note under an empty loop nests the line, opens no menu, and / then picks its step", async () => {
       const edits = editsWithAdd();
       renderDoc(
         [
@@ -271,9 +520,34 @@ describe("WorkflowDocEditor navigation", () => {
       );
       const box = openLine("Note", "Open each book page", 19);
       fireEvent.keyDown(box, { key: "Tab" });
+      await act(() => new Promise((r) => requestAnimationFrame(r)));
 
-      expect(screen.getByPlaceholderText("Add a step…")).toBeTruthy();
+      expect(screen.queryByPlaceholderText("Add a step…")).toBeNull();
       expect(edits.addStep).not.toHaveBeenCalled();
+      const nested = screen.getByRole("textbox", { name: "Note" });
+      expect(nested.closest(".border-l")).toBeTruthy();
+
+      fireEvent.keyDown(nested, { key: "/" });
+      expect(screen.getByPlaceholderText("Add a step…")).toBeTruthy();
+    });
+
+    test("Tab into a collapsed empty loop opens it, says nothing moved yet, and puts the caret at the line's start", async () => {
+      renderDoc(
+        [
+          forLoop("books", null, [], {
+            trailing_notes: "Open each book page",
+          }),
+        ],
+        editsWithAdd(),
+      );
+      fireEvent.click(screen.getByRole("button", { name: /^Collapse/ }));
+      const box = openLine("Note", "Open each book page", 19);
+      fireEvent.keyDown(box, { key: "Tab" });
+      await act(() => new Promise((r) => requestAnimationFrame(r)));
+
+      expect(docAnnouncement()).toBe("In the loop. Type / to pick its step");
+      const nested = screen.getByRole("textbox", { name: "Note" });
+      expect(nested.closest(".border-l")).toBeTruthy();
     });
   });
 
@@ -857,6 +1131,20 @@ describe("a step that was just added", () => {
     expect(screen.queryByText(/need.* fixing/)).toBeNull();
   });
 
+  test("a new Go to URL step shows no URL-required chip until the user leaves it", () => {
+    const nodes = renderDoc([
+      block("goto_url", "open_site", null, { url: "" }),
+    ]);
+    act(() =>
+      useDocUnfinishedStore.getState().add(nodes.find(isWorkflowBlockNode)!.id),
+    );
+    expect(document.querySelector("[data-doc-missing]")).toBeNull();
+
+    fireEvent.pointerDown(document.body);
+
+    expect(document.querySelector('[data-doc-missing="URL"]')).toBeTruthy();
+  });
+
   test("a loop over a whole extraction result holds Run; the typed list path does not", () => {
     const steps = (reference: string) => [
       block("extraction", "extraction_1", "books", {
@@ -1003,6 +1291,24 @@ describe("Doc inputs", () => {
     vi.unstubAllGlobals();
   });
 
+  test("a credential input no step uses, with no saved credential, is not needed to run", () => {
+    useWorkflowParametersStore.setState({
+      parameters: [
+        {
+          key: "site_login",
+          parameterType: "credential",
+          dataType: WorkflowParameterValueType.CredentialId,
+          credentialId: "",
+          description: null,
+        } as never,
+      ],
+    });
+    renderDoc([code("tidy_up", null)]);
+    expect(
+      useDocRunStore.getState().inputs.map((input) => input.key),
+    ).not.toContain("site_login");
+  });
+
   test("an input added, renamed and deleted in the Doc is the workflow's parameter and its mentions follow", () => {
     let graph = getElements(
       [
@@ -1121,5 +1427,292 @@ describe("Doc inputs", () => {
     expect(prompt().parameterKeys).toEqual([]);
     rendered.rerender(view());
     expect(screen.getByTitle("{{ search }}: missing reference")).toBeTruthy();
+  });
+});
+
+describe("Demonstrate task in the step menu", () => {
+  const edits: DocGraphEdits = {
+    apply: vi.fn(),
+    update: vi.fn(),
+    addStep: vi.fn(() => null),
+    duplicate: vi.fn(),
+  };
+  const start = vi.fn();
+  const twoSteps = [
+    code("first_step", "second_step"),
+    code("second_step", null),
+  ];
+  const emptyLoop = {
+    ...loop,
+    loop_blocks: [],
+  } as unknown as WorkflowBlock;
+
+  beforeEach(() => {
+    docRun.current = { runId: null, blocksByLabel: new Map(), live: false };
+    useWorkflowYamlEditorStore.setState(
+      useWorkflowYamlEditorStore.getInitialState(),
+    );
+    useWorkflowParametersStore.setState({ parameters: [] });
+    useRecordingLauncherStore.setState({
+      startDemonstration: start,
+      demonstration: null,
+    });
+    start.mockClear();
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      },
+    );
+    vi.stubGlobal("requestAnimationFrame", (cb: () => void) => {
+      cb();
+      return 0;
+    });
+    Element.prototype.scrollIntoView = vi.fn();
+  });
+  afterEach(() => {
+    cleanup();
+    useRecordingLauncherStore.setState({
+      startDemonstration: null,
+      demonstration: null,
+    });
+    vi.unstubAllGlobals();
+  });
+
+  test("dragging a step above its neighbour says it moved up, not the list's name", () => {
+    clearDocAnnouncement();
+    const edits: DocGraphEdits = {
+      apply: vi.fn(),
+      update: vi.fn(),
+      addStep: vi.fn(() => null),
+      duplicate: vi.fn(),
+    };
+    renderDoc(twoSteps, edits);
+    const grip = screen.getByRole("button", {
+      name: "Actions for second_step",
+    });
+    fireEvent.dragStart(grip, {
+      dataTransfer: {
+        setData: () => {},
+        setDragImage: () => {},
+        effectAllowed: "",
+      },
+    });
+    const zone = document.querySelector<HTMLElement>(
+      "div[aria-hidden].h-3.-my-3",
+    );
+    expect(zone).toBeTruthy();
+    fireEvent.drop(zone!, { dataTransfer: {} });
+    expect(docAnnouncement()).toBe("Moved up");
+  });
+
+  test("the + between steps offers no Demonstrate task, with or without a note above the step", async () => {
+    renderDoc(twoSteps, edits);
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "Add a step here" })[0]!,
+    );
+    expect(await screen.findByPlaceholderText("Add a step…")).toBeTruthy();
+    expect(screen.queryByText("Demonstrate task")).toBe(null);
+  });
+
+  test("Escape on the + between steps, with a note above the step, puts focus back on that +", async () => {
+    renderDoc(
+      [
+        code("first_step", "second_step"),
+        { ...code("second_step", null), notes: "Check the totals" },
+      ],
+      edits,
+    );
+    const plus = screen.getAllByRole("button", { name: "Add a step here" })[0]!;
+    fireEvent.click(plus);
+    const search = await screen.findByPlaceholderText("Add a step…");
+    fireEvent.keyDown(search, { key: "Escape" });
+    await waitFor(() => expect(document.activeElement).toBe(plus));
+  });
+
+  test("Add step records after the last step, keeps the Doc open, and the item is searchable", () => {
+    renderDoc(twoSteps, edits);
+    fireEvent.click(screen.getByRole("button", { name: "+ Add step" }));
+
+    expect(screen.getByText("Copilot")).toBeTruthy();
+    expect(screen.getByText("Show Copilot how in the browser")).toBeTruthy();
+    fireEvent.change(screen.getByPlaceholderText("Add a step…"), {
+      target: { value: "demo" },
+    });
+    expect(screen.queryByText("No step matches.")).toBe(null);
+
+    fireEvent.click(screen.getByText("Demonstrate task"));
+    expect(start).toHaveBeenCalledWith({
+      insertion: { after_label: "second_step", before_label: null },
+      keepEditor: true,
+    });
+  });
+
+  test("the item is left out without a live browser and inside a loop", () => {
+    useRecordingLauncherStore.setState({ startDemonstration: null });
+    renderDoc(twoSteps, edits);
+    fireEvent.click(screen.getByRole("button", { name: "+ Add step" }));
+    expect(screen.queryByText("Demonstrate task")).toBe(null);
+    cleanup();
+
+    useRecordingLauncherStore.setState({ startDemonstration: start });
+    renderDoc([emptyLoop], edits);
+    fireEvent.click(screen.getByRole("button", { name: "+ Add a step" }));
+    expect(screen.queryByText("Demonstrate task")).toBe(null);
+  });
+
+  test("the Doc holds still while a recording runs, so its anchor steps cannot move", () => {
+    useRecordingLauncherStore.setState({
+      demonstration: {
+        phase: "recording",
+        actionCount: 1,
+        interrupted: false,
+        insertion: { after_label: "first_step", before_label: "second_step" },
+      },
+    });
+    renderDoc(twoSteps, edits);
+
+    expect(screen.queryByRole("button", { name: "+ Add step" })).toBe(null);
+  });
+
+  test("a running recording shows one status line between the steps it will land between", () => {
+    useRecordingLauncherStore.setState({
+      demonstration: {
+        phase: "recording",
+        actionCount: 2,
+        interrupted: false,
+        insertion: { after_label: "first_step", before_label: "second_step" },
+      },
+    });
+    renderDoc(twoSteps, edits);
+
+    const line = screen.getByText(/^Demonstrating · 2 actions$/);
+    expect(line.textContent).toBe("Demonstrating · 2 actions");
+    const first = screen.getByText(/first_step|first step/i);
+    const second = screen.getByText(/second_step|second step/i);
+    expect(
+      first.compareDocumentPosition(line) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      second.compareDocumentPosition(line) & Node.DOCUMENT_POSITION_PRECEDING,
+    ).toBeTruthy();
+  });
+  describe("from an empty step", () => {
+    const blankBetween = [
+      block("goto_url", "first_step", "blank_step", { url: "https://a.test" }),
+      block("goto_url", "blank_step", "second_step", { url: "" }),
+      code("second_step", null),
+    ];
+    const recording = (phase: "recording" | "stopped") => ({
+      phase,
+      actionCount: 0,
+      interrupted: false,
+      insertion: { after_label: "first_step", before_label: "second_step" },
+    });
+    beforeEach(() => {
+      vi.stubGlobal("CSS", { escape: (value: string) => value });
+    });
+    // jsdom has no innerText; the line reads its text through it.
+    const openLine = (name: string, text: string, at: number) => {
+      fireEvent.focus(screen.getByRole("textbox", { name }));
+      const box = screen.getByRole("textbox", { name });
+      Object.defineProperty(box, "innerText", {
+        value: text,
+        configurable: true,
+      });
+      box.textContent = text;
+      const range = document.createRange();
+      if (box.firstChild) range.setStart(box.firstChild, at);
+      else range.setStart(box, 0);
+      range.collapse(true);
+      window.getSelection()?.removeAllRanges();
+      window.getSelection()?.addRange(range);
+      return box;
+    };
+    const startFromBlank = () => {
+      const applied = {
+        apply: vi.fn(),
+        update: vi.fn(),
+        addStep: vi.fn(() => null),
+        duplicate: vi.fn(),
+      } as DocGraphEdits;
+      renderDoc(blankBetween, applied);
+      fireEvent.keyDown(openLine("blank_step url", "", 0), { key: "/" });
+      fireEvent.click(screen.getByText("Demonstrate task"));
+      return applied;
+    };
+
+    test("records between its neighbours and drops the step only once the recording is open", () => {
+      const applied = startFromBlank();
+
+      expect(start).toHaveBeenCalledWith({
+        insertion: { after_label: "first_step", before_label: "second_step" },
+        keepEditor: true,
+      });
+      expect(applied.apply).not.toHaveBeenCalled();
+
+      act(() =>
+        useRecordingLauncherStore.setState({
+          demonstration: recording("recording"),
+        }),
+      );
+      const kept = vi.mocked(applied.apply).mock.calls[0]![0].nodes;
+      expect(kept.filter(isWorkflowBlockNode).map((n) => n.data.label)).toEqual(
+        ["first_step", "second_step"],
+      );
+    });
+
+    test("a start that fails or is refused leaves the step, even for a later recording in the same place", () => {
+      const applied = startFromBlank();
+
+      act(() => noteDemonstrationStartFailed());
+      act(() =>
+        useRecordingLauncherStore.setState({
+          demonstration: recording("recording"),
+        }),
+      );
+      expect(applied.apply).not.toHaveBeenCalled();
+    });
+
+    test("a slow start that opens after 25 seconds still replaces the step", () => {
+      vi.useFakeTimers();
+      try {
+        const applied = startFromBlank();
+
+        act(() => {
+          vi.advanceTimersByTime(25_000);
+        });
+        expect(applied.apply).not.toHaveBeenCalled();
+        act(() =>
+          useRecordingLauncherStore.setState({
+            demonstration: recording("recording"),
+          }),
+        );
+        const kept = vi.mocked(applied.apply).mock.calls[0]![0].nodes;
+        expect(
+          kept.filter(isWorkflowBlockNode).map((n) => n.data.label),
+        ).toEqual(["first_step", "second_step"]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    test("a recording that stops before it is open leaves the step in place", () => {
+      const applied = startFromBlank();
+
+      act(() =>
+        useRecordingLauncherStore.setState({
+          demonstration: recording("stopped"),
+        }),
+      );
+      act(() =>
+        useRecordingLauncherStore.setState({
+          demonstration: recording("recording"),
+        }),
+      );
+      expect(applied.apply).not.toHaveBeenCalled();
+    });
   });
 });

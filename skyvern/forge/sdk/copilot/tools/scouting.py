@@ -83,7 +83,6 @@ from skyvern.forge.sdk.copilot.runtime import (
     current_demonstrated_action,
     effective_browser_session_id,
     live_working_page,
-    raw_secret_browser_denied,
     resolve_browser_state_for_context,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import (
@@ -2318,13 +2317,9 @@ def unread_page_state(ctx: AgentContext) -> PageState:
 _PAGE_UNREADABLE_ERROR_CODES = BROWSER_SESSION_LOSS_ERROR_CODES | {BROWSER_SESSION_UNAVAILABLE_ERROR_CODE}
 
 
-def page_state_probe_allowed(
-    ctx: AgentContext, result: Mapping[str, Any], *, binding: BrowserSessionBinding | None
-) -> bool:
+def page_state_probe_allowed(result: Mapping[str, Any], *, binding: BrowserSessionBinding | None) -> bool:
     return not (
-        (binding is not None and binding.unavailable_reason)
-        or raw_secret_browser_denied(ctx)
-        or result.get("error_code") in _PAGE_UNREADABLE_ERROR_CODES
+        (binding is not None and binding.unavailable_reason) or result.get("error_code") in _PAGE_UNREADABLE_ERROR_CODES
     )
 
 
@@ -2340,7 +2335,7 @@ async def read_page_state_on_page(
 ) -> tuple[PageState, Page | None]:
     """What the call's browser shows now, scrubbed for the model, and the page read, or the unread state and None
     without touching a browser the call may not probe. An unmeasured vendor frame fails the read, not "no challenge"."""
-    if not (probe and page_state_probe_allowed(ctx, result, binding=binding)):
+    if not (probe and page_state_probe_allowed(result, binding=binding)):
         return unread_page_state(ctx), None
     deadline = _PAGE_STATE_READ_TIMEOUT_SECONDS
     if settle:

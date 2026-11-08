@@ -8704,6 +8704,7 @@ async def test_a_request_without_an_eval_entrypoint_url_reaches_the_agent_path_u
     assert new_copilot_mock.await_args.kwargs["eval_entrypoint_url"] is None
 
 
+@pytest.mark.boundary
 def test_the_client_recovery_budget_still_outlasts_the_server_abandon_threshold() -> None:
     """The client's poll budget is a literal in WorkflowCopilotChat.tsx, while the threshold it has to
     outlast is derived from two env-configurable settings. Raising either without raising the literal

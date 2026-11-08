@@ -13,6 +13,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { StudioPaneDefaultsProvider } from "@/routes/workflows/studio/StudioPaneDefaults";
+import { StudioShellContext } from "@/routes/workflows/studio/StudioShellContext";
 import { useStudioPanes } from "@/routes/workflows/studio/useStudioPanes";
 import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
 import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
@@ -207,8 +208,12 @@ async function renderChat(
     );
 }
 
+const showPaneCalls: string[] = [];
+let closeCopilotPane: (() => void) | null = null;
+
 function StudioPanesProbe() {
-  const { panes } = useStudioPanes();
+  const { panes, closePane } = useStudioPanes();
+  closeCopilotPane = () => closePane("copilot");
   return <output data-testid="studio-panes">{panes.join(",")}</output>;
 }
 
@@ -223,10 +228,21 @@ async function renderStudioChat(
   });
   render(
     <QueryClientProvider client={queryClient}>
-      <StudioPaneDefaultsProvider hasBlocks>
-        <StudioPanesProbe />
-        <WorkflowCopilotChat docked portalTarget={portalTarget} {...props} />
-      </StudioPaneDefaultsProvider>
+      <StudioShellContext.Provider
+        value={{
+          copilotPortalEl: null,
+          panelPortalEl: null,
+          setEditorStreamSlot: () => {},
+          setBrowserStreamSlot: () => {},
+          setRunStreamSlot: () => {},
+          showPane: (id) => showPaneCalls.push(id),
+        }}
+      >
+        <StudioPaneDefaultsProvider hasBlocks>
+          <StudioPanesProbe />
+          <WorkflowCopilotChat docked portalTarget={portalTarget} {...props} />
+        </StudioPaneDefaultsProvider>
+      </StudioShellContext.Provider>
     </QueryClientProvider>,
   );
   await waitFor(() =>
@@ -335,6 +351,22 @@ describe("WorkflowCopilotChat demonstration", () => {
     expect(onRecordTask).toHaveBeenCalledTimes(1);
   });
 
+  it("starts a demonstration from the composer plus menu", async () => {
+    const onRecordTask = vi.fn();
+    await renderChat({ onRecordTask, canRecordTask: true });
+
+    fireEvent.keyDown(
+      await screen.findByRole("button", {
+        name: "Attach a file or demonstrate",
+      }),
+      { key: "Enter" },
+    );
+    fireEvent.click(
+      await screen.findByRole("menuitem", { name: /Demonstrate task/ }),
+    );
+    expect(onRecordTask).toHaveBeenCalledTimes(1);
+  });
+
   it("disables a demonstration offer once a later message follows it", async () => {
     historyResponse.data.chat_history = [
       {
@@ -360,6 +392,31 @@ describe("WorkflowCopilotChat demonstration", () => {
       name: "Start demonstration",
     })) as HTMLButtonElement;
     expect(offer.disabled).toBe(true);
+  });
+
+  it("keeping the Editor open still asks to show the Browser last, so a folded Browser expands", async () => {
+    const removePortalTarget = await renderStudioChat({
+      liveBrowserSessionId: "browser-1",
+    });
+    try {
+      act(() => closeCopilotPane?.());
+      await waitFor(() =>
+        expect(screen.getByTestId("studio-panes").textContent).toBe("editor"),
+      );
+      showPaneCalls.length = 0;
+      act(() => {
+        useRecordingLauncherStore.getState().startDemonstration?.({
+          insertion: { after_label: "open_form", before_label: "finish" },
+          keepEditor: true,
+        });
+      });
+      expect(showPaneCalls[showPaneCalls.length - 1]).toBe("browser");
+      expect(screen.getByTestId("studio-panes").textContent).toContain(
+        "editor",
+      );
+    } finally {
+      removePortalTarget();
+    }
   });
 
   it("swaps Editor for the Browser pane while demonstrating and brings Editor back for the build", async () => {
@@ -424,7 +481,9 @@ describe("WorkflowCopilotChat demonstration", () => {
       name: "Done, build the workflow",
     });
     expect((doneButton as HTMLButtonElement).disabled).toBe(false);
-    const attachButton = screen.getByRole("button", { name: "Attach a file" });
+    const attachButton = screen.getByRole("button", {
+      name: "Attach a file or demonstrate",
+    });
     expect((attachButton as HTMLButtonElement).disabled).toBe(true);
     expect(attachButton.className).toContain("disabled:opacity-50");
     expect(attachButton.className).not.toContain(
@@ -592,9 +651,10 @@ describe("WorkflowCopilotChat demonstration", () => {
         .demonstrationRecordingBrowserSessionId,
     ).toBeNull();
     expect(screen.getByText("Showing you in the browser now.")).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Attach a file" }).title).toBe(
-      "Use Build before attaching a file",
-    );
+    expect(
+      screen.getByRole("button", { name: "Attach a file or demonstrate" })
+        .title,
+    ).toBe("Use Build before attaching a file");
     expect(
       (
         screen.getByRole("button", {

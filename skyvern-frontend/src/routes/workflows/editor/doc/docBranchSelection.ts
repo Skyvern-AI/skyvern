@@ -36,15 +36,35 @@ export function docBranchSelection(
         step && isWorkflowBlockNode(step) && blocksByLabel.has(step.data.label),
       );
     });
-  const ranBranch =
-    runBlock?.status === Status.Completed
+  // A save mints new branch IDs on the server, so until a reload the run's ID may match none;
+  // the condition it recorded (none for Otherwise) still names the branch.
+  const byRecordedCondition = (block: WorkflowRunBlock) => {
+    if (!block.executed_branch_id) return undefined;
+    const expression = block.executed_branch_expression?.trim();
+    return expression
+      ? item.branches.find(
+          (b) => b.kind !== "otherwise" && b.condition === expression,
+        )
+      : // The backend records Otherwise as null (never false); a field the run did not record at all is undefined.
+        block.executed_branch_result === false ||
+          block.executed_branch_result === null
+        ? item.branches.find((b) => b.kind === "otherwise" && !b.synthetic)
+        : undefined;
+  };
+  // A one-step run of a branch step has no row for the conditional; the step's own row names its branch.
+  const ranBranch = !runBlock
+    ? item.branches.find(stepRan)
+    : runBlock.status === Status.Completed
       ? (item.branches.find(
           (b) => b.branchId === runBlock.executed_branch_id,
-        ) ?? item.branches.find(stepRan))
+        ) ??
+        byRecordedCondition(runBlock) ??
+        item.branches.find(stepRan))
       : undefined;
   const selected =
     item.branches.find((b) => b.branchId === selectedId) ??
     ranBranch ??
     item.branches[0]!;
-  return { selected, ranBranch };
+  // Inside a loop the conditional's row is the last item's; steps of another branch may have run on an earlier item.
+  return { selected, ranBranch, selectedRan: stepRan(selected) };
 }

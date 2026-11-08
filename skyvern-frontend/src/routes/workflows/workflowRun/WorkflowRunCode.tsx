@@ -31,7 +31,8 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useToast } from "@/components/ui/use-toast";
 import { Pencil1Icon } from "@radix-ui/react-icons";
 
-import { CopyAndExplainCode, CopyText } from "../editor/Workspace";
+import { CopyAndExplainCode } from "../editor/Workspace";
+import { CopyButton } from "@/components/CopyButton";
 import { ScriptFixInput, ScriptFixTriggerButton } from "./ScriptFixInput";
 
 const enableCodeBlock =
@@ -636,7 +637,7 @@ function WorkflowRunCode(props?: Props) {
         />
         {!isEditing && code.length > 0 ? (
           <div className="absolute right-3 top-3 z-10 rounded bg-slate-elevation2/80 backdrop-blur-sm">
-            <CopyText text={code} />
+            <CopyButton value={code} ariaLabel="Copy code" />
           </div>
         ) : null}
       </div>

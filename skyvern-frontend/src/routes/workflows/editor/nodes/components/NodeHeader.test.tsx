@@ -44,6 +44,13 @@ import {
   type BlockReviewAnnotation,
 } from "../../review/reviewAnnotation";
 
+import { useWorkflowPresentationStore } from "@/store/WorkflowPresentationStore";
+import { useRunCompletionToast } from "@/routes/workflows/workflowRun/useRunCompletionToast";
+import { useDocRunStore } from "../../doc/docRunStore";
+
+vi.mock("@/routes/workflows/workflowRun/useRunCompletionToast", () => ({
+  useRunCompletionToast: vi.fn(),
+}));
 vi.mock("@/components/ui/use-toast", () => ({ toast: vi.fn() }));
 
 afterEach(() => {
@@ -298,6 +305,39 @@ describe("NodeHeader block controls vs a retained run payload (SKY-15507)", () =
     });
     renderNodeHeader({ blockLabel: "block_1" });
     expect(blockActionsAreInert()).toBe(false);
+  });
+});
+
+describe("the run-completion toast from a step header", () => {
+  function lastToastedRun() {
+    queryClient.setQueryData(["workflowRun", "wr_step"], {
+      workflow_run_id: "wr_step",
+      status: Status.Failed,
+      failure_reason: "block has no starting URL set",
+    });
+    renderNodeHeader(
+      { blockLabel: "block_1" },
+      undefined,
+      "/agents/wf-test/build?wr=wr_step&bl=block_1",
+    );
+    return vi.mocked(useRunCompletionToast).mock.lastCall?.[0];
+  }
+
+  test("watches the run in the Visual editor", () => {
+    expect(lastToastedRun()).toMatchObject({ workflow_run_id: "wr_step" });
+  });
+
+  test("stays silent while the Doc is showing, which states a step run's outcome on its own line", () => {
+    useWorkflowPresentationStore.setState({
+      enabled: true,
+      presentation: "doc",
+    });
+    useDocRunStore.setState({ mounted: true });
+    expect(lastToastedRun()).toBeUndefined();
+    useWorkflowPresentationStore.setState(
+      useWorkflowPresentationStore.getInitialState(),
+    );
+    useDocRunStore.setState({ mounted: false });
   });
 });
 

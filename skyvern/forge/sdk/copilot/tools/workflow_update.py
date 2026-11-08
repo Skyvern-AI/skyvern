@@ -52,6 +52,7 @@ from skyvern.forge.sdk.copilot.code_block_security import CodeBlockSecurityError
 from skyvern.forge.sdk.copilot.code_block_steps import (
     bind_referenced_parameters_in_yaml,
     carry_user_owned_goals_in_yaml,
+    fill_missing_code_block_goals_in_yaml,
     user_owned_goal_carry_disclosure,
 )
 from skyvern.forge.sdk.copilot.code_block_synthesis import wrapped_code_ast as _wrapped_code_ast
@@ -78,12 +79,6 @@ from skyvern.forge.sdk.copilot.narration import CODE_REPAIR_PROGRESS_SURFACE_KIN
 from skyvern.forge.sdk.copilot.output_contracts import (
     code_block_available_contracts_by_label,
     declared_workflow_parameter_keys,
-)
-from skyvern.forge.sdk.copilot.output_policy import (
-    demote_author_time_steer_reasons,
-    evaluate_output_policy,
-    format_output_policy_tool_error,
-    output_policy_verdict_to_trace_data,
 )
 from skyvern.forge.sdk.copilot.output_utils import (
     _BUILD_TEST_WORKFLOW_MAX_CHARS,
@@ -354,11 +349,16 @@ class CodeArtifactMetadata(BaseModel):
     declared_goal: str = Field(
         default="",
         description=(
-            "The durable goal this block accomplishes; model-owned. First name only the visible page state a person "
-            "sees once the block has succeeded, showing every value it returns, with no actions, 'after' or 'returns' "
-            "clauses, then the route that reaches it: page, controls by visible label or role, action order, inputs "
-            "by workflow parameter name (never a value), and what the block returns, naming only page content the "
-            "first sentence already shows, never a data structure."
+            "The durable goal this block accomplishes; model-owned. First one sentence stating the outcome once the "
+            "block has succeeded as a fact, never as a task ('Determine whether ...'), with no actions, conditions or "
+            "'after' clauses: for a block that acts on the page, only the visible page state a person sees, showing "
+            "every value it returns as it appears there, with no 'returns' clause; for a block that makes no page "
+            "call, starting with the keys of the values it returns and what each holds, not what it computes; any "
+            "other value the page never shows (a computed value, a downloaded or attached file's name) also by its "
+            "returned key. Never say what the block does not do. Then the route that reaches it: for a block that acts "
+            "on the page, page, controls by visible label or role and action order, never a data structure; for every "
+            "block, inputs by workflow parameter name or an earlier block's `<label>_output` (never a value) and what "
+            "it computes from them."
         ),
     )
     claimed_outcomes: list[CodeArtifactClaimedOutcome] = Field(
@@ -1434,6 +1434,20 @@ def code_artifact_metadata_block_labels(raw_metadata: object) -> set[str]:
         if label:
             labels.add(label)
     return labels
+
+
+def code_artifact_metadata_declared_goals(raw_metadata: object) -> dict[str, str]:
+    """Non-empty declared goals by block label, read from the raw rows whether or not normalization accepts them."""
+    goals: dict[str, str] = {}
+    for raw_item in _code_artifact_metadata_items(raw_metadata):
+        item = _raw_metadata_item_mapping(raw_item)
+        if item is None:
+            continue
+        label = str(item.get("block_label") or "").strip()
+        goal = item.get("declared_goal")
+        if label and isinstance(goal, str) and goal.strip():
+            goals.setdefault(label, goal.strip())
+    return goals
 
 
 def _metadata_item_for_block_label(raw_metadata: object, block_label: str) -> Mapping[str, Any] | None:
@@ -4379,7 +4393,6 @@ async def _update_workflow(
     params: dict[str, Any],
     ctx: AgentContext,
     *,
-    allow_missing_credentials: bool | None = None,
     originating_call_id: str | None = None,
     block_scoped_authoring_prior_yaml: str | None = None,
 ) -> dict[str, Any]:
@@ -4500,12 +4513,9 @@ async def _update_workflow(
     if vault_login_error is not None:
         return _blocked(AuthorTimeBlock(block_id=CREDENTIAL_SCOUT_BLOCK_ID, error=vault_login_error))
     params["workflow_yaml"] = workflow_yaml
-    if allow_missing_credentials is None:
-        allow_missing_credentials = ctx.allow_untested_workflow_draft is True
-    if not allow_missing_credentials:
-        credential_error = await _credential_reference_validation_error(workflow_yaml, ctx)
-        if credential_error is not None:
-            return _blocked(AuthorTimeBlock(block_id=CREDENTIAL_SCOUT_BLOCK_ID, error=credential_error))
+    credential_error = await _credential_reference_validation_error(workflow_yaml, ctx)
+    if credential_error is not None:
+        return _blocked(AuthorTimeBlock(block_id=CREDENTIAL_SCOUT_BLOCK_ID, error=credential_error))
 
     misbinding_findings = _credential_id_misbinding_findings(workflow_yaml)
     if misbinding_findings:
@@ -4515,35 +4525,6 @@ async def _update_workflow(
             workflow_id=ctx.workflow_id,
             findings=misbinding_findings,
         )
-
-    output_policy_verdict = evaluate_output_policy(
-        request_policy=ctx.request_policy,
-        workflow_yaml=workflow_yaml,
-    )
-    output_policy_steered_reasons = demote_author_time_steer_reasons(output_policy_verdict)
-    if not output_policy_verdict.allowed:
-        output_policy_trace_data = output_policy_verdict_to_trace_data(
-            output_policy_verdict,
-            surface="tool_body",
-            tool_name="update_workflow",
-        )
-        if output_policy_steered_reasons:
-            output_policy_trace_data = {
-                **output_policy_trace_data,
-                "steered_reason_codes": [reason.value for reason in output_policy_steered_reasons],
-            }
-        output_policy_error = format_output_policy_tool_error(output_policy_verdict)
-        LOG.info(
-            "copilot output policy tool body verdict",
-            **output_policy_trace_data,
-        )
-        _record_author_time_reject_outcome(
-            ctx,
-            reason_code="output_policy_reject",
-            summary=output_policy_error,
-            structural_payload=output_policy_trace_data,
-        )
-        return _blocked(AuthorTimeBlock(block_id=CREDENTIAL_SCOUT_BLOCK_ID, error=output_policy_error))
 
     prior_yaml = _latest_draft_yaml(ctx)
 
@@ -4567,6 +4548,9 @@ async def _update_workflow(
         # Ahead of redaction: this copies stored Goal bytes into the candidate, so they have to
         # pass the scrub seam like any other submitted text.
         goal_rewritten_labels = code_artifact_metadata_block_labels(ctx.submitted_code_artifact_metadata_snapshot)
+        workflow_yaml = fill_missing_code_block_goals_in_yaml(
+            workflow_yaml, code_artifact_metadata_declared_goals(ctx.submitted_code_artifact_metadata_snapshot)
+        )
         goal_carry = carry_user_owned_goals_in_yaml(
             workflow_yaml,
             prior_yaml=prior_yaml,

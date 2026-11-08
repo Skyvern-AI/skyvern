@@ -5,7 +5,7 @@ from typing import Any
 
 # ADR-0011: unsafe code in a persisted block outlives the turn and runs with the org's browser.
 CODE_SAFETY_BLOCK_ID = "code_safety"
-# ADR-0002: a raw or broadened credential in a persisted draft is an irreversible disclosure.
+# ADR-0002: a raw secret or an unchecked credential binding in a persisted draft is an irreversible disclosure.
 CREDENTIAL_SCOUT_BLOCK_ID = "credential_scout"
 # ADR-0010: a persisted block outside the code-native ladder escapes the migration it forces.
 BANNED_BLOCKS_BLOCK_ID = "banned_blocks"

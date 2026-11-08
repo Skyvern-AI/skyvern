@@ -100,6 +100,10 @@ def page_crash_entry(*, url: str = "https://app.test/form", reopened: bool = Tru
     )
 
 
+async def failing_post_hook(*_args: object) -> dict[str, Any]:
+    raise RuntimeError("display preparation failed")
+
+
 def crash_free_browser_state(**attrs: Any) -> SimpleNamespace:
     return SimpleNamespace(page_crash_records=(), **attrs)
 
