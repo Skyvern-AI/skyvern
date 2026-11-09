@@ -1525,6 +1525,13 @@ def captured_frame_entry(width: int = 1920, height: int = 947) -> ScreenshotEntr
     )
 
 
+def image_parts(item: Any) -> list[Any]:
+    content = item.get("content") if isinstance(item, dict) else None
+    if not isinstance(content, list):
+        return []
+    return [part for part in content if part.get("type") == "input_image"]
+
+
 def sent_image_px(message: Any) -> list[tuple[int, int]]:
     content = message.get("content") if isinstance(message, dict) else None
     return [

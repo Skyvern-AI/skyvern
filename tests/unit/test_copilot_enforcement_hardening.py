@@ -14,12 +14,15 @@ from skyvern.forge.sdk.copilot.agent import _build_copilot_output_guardrails
 from skyvern.forge.sdk.copilot.blocker_signal import clear_active_run_evidence_on_workflow_edit
 from skyvern.forge.sdk.copilot.context import adopt_model_authored_context
 from skyvern.forge.sdk.copilot.enforcement import (
+    IMAGE_REMOVED_PLACEHOLDER,
     SCREENSHOT_PLACEHOLDER,
+    SCREENSHOT_SENTINEL,
     _is_context_window_error,
     _prune_input_list,
     _recover_from_context_overflow,
     _strip_input_images,
     enforcement_decision,
+    is_screenshot_message,
 )
 from skyvern.forge.sdk.copilot.llm_errors import CopilotEmptyCompletionError
 from skyvern.forge.sdk.copilot.output_utils import extract_final_text, parse_final_response
@@ -106,7 +109,7 @@ def test_strip_input_images_replaces_image_parts_with_placeholder() -> None:
         {
             "role": "user",
             "content": [
-                {"type": "input_text", "text": "see this:"},
+                {"type": "input_text", "text": SCREENSHOT_SENTINEL + "see this:"},
                 {"type": "input_image", "image_url": "data:image/png;base64,AAAA" * 1000},
             ],
         }
@@ -115,7 +118,7 @@ def test_strip_input_images_replaces_image_parts_with_placeholder() -> None:
     assert did_strip is True
     assert isinstance(stripped, list)
     content = stripped[0]["content"]
-    assert content[0] == {"type": "input_text", "text": "see this:"}
+    assert content[0] == {"type": "input_text", "text": SCREENSHOT_SENTINEL + "see this:"}
     assert content[1] == {"type": "input_text", "text": SCREENSHOT_PLACEHOLDER}
 
 
@@ -127,19 +130,19 @@ def test_strip_input_images_no_images_reports_false() -> None:
 
 
 @pytest.mark.asyncio
-async def test_recover_from_context_overflow_strips_images_without_session() -> None:
+async def test_recover_from_context_overflow_strips_an_attached_image_without_reporting_a_dropped_screenshot() -> None:
+    label = {"type": "input_text", "text": "Attached image Capture.PNG (file_id=file_1):"}
     current_input: list[Any] = [
         {
             "role": "user",
-            "content": [
-                {"type": "input_image", "image_url": "data:image/png;base64,AAAA" * 1000},
-            ],
+            "content": [label, {"type": "input_image", "image_url": "data:image/png;base64,AAAA" * 1000}],
         }
     ]
     recovered, stripped = await _recover_from_context_overflow(session=None, current_input=current_input)
-    assert stripped is True
+    assert stripped is False
     assert isinstance(recovered, list)
-    assert recovered[0]["content"][0]["type"] == "input_text"
+    assert recovered[0]["content"] == [label, {"type": "input_text", "text": IMAGE_REMOVED_PLACEHOLDER}]
+    assert not is_screenshot_message(recovered[0])
 
 
 class _FakeSession:
@@ -168,6 +171,7 @@ async def test_recover_from_context_overflow_with_session_strips_current_input()
         {
             "role": "user",
             "content": [
+                {"type": "input_text", "text": SCREENSHOT_SENTINEL + "page"},
                 {"type": "input_image", "image_url": "data:image/png;base64,AAAA" * 1000},
             ],
         }
@@ -175,7 +179,7 @@ async def test_recover_from_context_overflow_with_session_strips_current_input()
     recovered, stripped = await _recover_from_context_overflow(session=session, current_input=current_input)
     assert stripped is True
     assert isinstance(recovered, list)
-    assert recovered[0]["content"][0]["type"] == "input_text"
+    assert recovered[0]["content"][1] == {"type": "input_text", "text": SCREENSHOT_PLACEHOLDER}
     assert session.cleared is True
 
 

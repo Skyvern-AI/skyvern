@@ -8,6 +8,7 @@ import hashlib
 import json
 import random
 from collections.abc import AsyncIterator
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -23,6 +24,7 @@ from openai.types.chat.chat_completion_chunk import (
     ChoiceDeltaToolCall,
     ChoiceDeltaToolCallFunction,
 )
+from PIL import Image
 from structlog.testing import capture_logs
 
 from skyvern.forge.sdk.copilot.ask_user import (
@@ -33,7 +35,13 @@ from skyvern.forge.sdk.copilot.ask_user import (
     QuestionResponse,
 )
 from skyvern.forge.sdk.copilot.config import SCREENSHOT_DROPPED_NUDGE, BlockAuthoringPolicy
-from skyvern.forge.sdk.copilot.enforcement import NUDGE_SENTINEL, estimate_tokens, pending_screenshot_message
+from skyvern.forge.sdk.copilot.enforcement import (
+    IMAGE_REMOVED_PLACEHOLDER,
+    NUDGE_SENTINEL,
+    estimate_tokens,
+    is_screenshot_message,
+    pending_screenshot_message,
+)
 from skyvern.forge.sdk.copilot.model_resolver import CopilotLitellmProvider
 from skyvern.forge.sdk.copilot.screenshot_utils import (
     ScreenshotActionRelation,
@@ -45,7 +53,9 @@ from skyvern.forge.sdk.copilot.session_factory import (
     copilot_session_input_callback,
     make_copilot_call_model_input_filter,
 )
-from tests.unit.copilot_test_helpers import captured_frame_entry, make_copilot_ctx
+from skyvern.forge.sdk.copilot.video_attachment import VideoAttachmentFrame, build_image_attachment_message
+from skyvern.forge.sdk.schemas.workflow_copilot import CopilotAttachedFile
+from tests.unit.copilot_test_helpers import captured_frame_entry, image_parts, make_copilot_ctx
 from tests.unit.copilot_test_helpers import make_model_input_data as _mk_input_data
 from tests.unit.copilot_test_helpers import sent_image_px
 
@@ -64,13 +74,6 @@ def _unread_run_results_batch() -> list[dict[str, Any]]:
         for cid in call_ids
     ]
     return [{"type": "reasoning", "summary": []}, *calls, *outputs]
-
-
-def _image_parts(item: Any) -> list[Any]:
-    content = item.get("content") if isinstance(item, dict) else None
-    if not isinstance(content, list):
-        return []
-    return [part for part in content if part.get("type") == "input_image"]
 
 
 def _ctx_with_staged_frame(*, supports_vision: bool = True) -> SimpleNamespace:
@@ -249,6 +252,36 @@ class TestFirstTurnCompaction:
         emergency = [entry for entry in logs if entry["event"] == "copilot_tool_output_emergency_truncated"]
         assert [entry["cap"] for entry in emergency] == [2000, 300]
         assert all(entry["truncated_count"] >= 2 for entry in emergency)
+
+    def test_attached_images_are_dropped_before_any_tool_output_is_cut(self) -> None:
+        jpeg = BytesIO()
+        Image.new("RGB", (1600, 1200), "white").save(jpeg, format="JPEG")
+        files = [CopilotAttachedFile(file_id=f"file_{index}", filename=f"shot{index}.png") for index in range(2)]
+        frames = [
+            VideoAttachmentFrame(
+                file_id=attached.file_id,
+                filename=attached.filename,
+                timestamp_seconds=0.0,
+                jpeg_base64=base64.b64encode(jpeg.getvalue()).decode(),
+            )
+            for attached in files
+        ]
+        outputs = [{"type": "function_call_output", "call_id": f"call-{i}", "output": "x" * 5000} for i in range(3)]
+        items: list[Any] = [
+            {"role": "user", "content": "what do these show?"},
+            build_image_attachment_message(files, frames, {}),
+            *outputs,
+        ]
+        budget = estimate_tokens([items[0], *outputs]) + 200
+
+        ctx = make_copilot_ctx(supports_vision=True)
+        result = make_copilot_call_model_input_filter(token_budget=budget)(_mk_input_data(items, context=ctx))
+
+        assert not image_parts(result.input[1])
+        serialized = json.dumps(result.input[1])
+        assert "Attached image shot0.png (file_id=file_0)" in serialized
+        assert IMAGE_REMOVED_PLACEHOLDER in serialized
+        assert [item for item in result.input if item.get("type") == "function_call_output"] == outputs
 
     def test_soft_emergency_rung_spares_code_when_it_fits(self) -> None:
         import structlog.testing
@@ -642,7 +675,7 @@ class TestStagedScreenshotBinding:
         with capture_logs() as logs:
             result = copilot_call_model_input_filter(_mk_input_data(items, context=ctx))
 
-        assert [len(_image_parts(item)) for item in result.input] == [0, 1]
+        assert [len(image_parts(item)) for item in result.input] == [0, 1]
         assert any(log["event"] == "Injecting screenshot user message" for log in logs)
 
     def test_linked_structural_result_precedes_the_frame_and_its_provenance(self) -> None:
@@ -666,7 +699,7 @@ class TestStagedScreenshotBinding:
         result = copilot_call_model_input_filter(_mk_input_data(items, context=ctx))
 
         assert result.input[-2] == items[-1]
-        assert len(_image_parts(result.input[-1])) == 1
+        assert len(image_parts(result.input[-1])) == 1
         provenance_text = result.input[-1]["content"][0]["text"]
         assert "source_tool=inspect_page_for_composition" in provenance_text
         assert "observation_step=2" in provenance_text
@@ -678,8 +711,8 @@ class TestStagedScreenshotBinding:
         first = copilot_call_model_input_filter(_mk_input_data(items, context=ctx))
         second = copilot_call_model_input_filter(_mk_input_data(items, context=ctx))
 
-        assert len(_image_parts(first.input[-1])) == 1
-        assert len(_image_parts(second.input[-1])) == 1
+        assert len(image_parts(first.input[-1])) == 1
+        assert len(image_parts(second.input[-1])) == 1
         assert len(ctx.pending_screenshots) == 1
 
     def test_paired_frame_is_not_redelivered_after_model_input_advances(self) -> None:
@@ -694,8 +727,8 @@ class TestStagedScreenshotBinding:
         ]
         second = copilot_call_model_input_filter(_mk_input_data(advanced, context=ctx))
 
-        assert len(_image_parts(first.input[-1])) == 1
-        assert not any(_image_parts(item) for item in second.input)
+        assert len(image_parts(first.input[-1])) == 1
+        assert not any(image_parts(item) for item in second.input)
         assert ctx.pending_screenshots == []
         assert ctx.pending_frame_lease is None
 
@@ -712,7 +745,7 @@ class TestStagedScreenshotBinding:
             _mk_input_data([*initial, {"role": "assistant", "content": "acted"}], context=ctx)
         )
 
-        assert len(_image_parts(delivered.input[-1])) == 1
+        assert len(image_parts(delivered.input[-1])) == 1
         assert ctx.pending_frame_lease.capture_id == "sha256:frame-123"
 
     def test_same_pixels_from_a_new_capture_event_get_a_fresh_lease(self) -> None:
@@ -729,15 +762,13 @@ class TestStagedScreenshotBinding:
 
         delivered = copilot_call_model_input_filter(_mk_input_data(advanced, context=ctx))
 
-        assert len(_image_parts(delivered.input[-1])) == 1
+        assert len(image_parts(delivered.input[-1])) == 1
         assert ctx.pending_frame_lease.capture_event_id == recaptured.capture_event_id
 
     def test_a_sharp_frame_over_budget_costs_older_screenshots_first_and_then_falls_back_to_the_small_copy(
         self,
     ) -> None:
-        older_frame = pending_screenshot_message(
-            SimpleNamespace(pending_screenshots=[captured_frame_entry()], supports_vision=True)
-        )
+        older_frame = pending_screenshot_message(make_copilot_ctx(pending_screenshots=[captured_frame_entry()]))
         items = [
             {"role": "user", "content": "what does the page say"},
             older_frame,
@@ -746,13 +777,36 @@ class TestStagedScreenshotBinding:
         ]
 
         def call(token_budget: int) -> ModelInputData:
-            ctx = SimpleNamespace(pending_screenshots=[captured_frame_entry()], supports_vision=True)
+            ctx = make_copilot_ctx(pending_screenshots=[captured_frame_entry()])
             return make_copilot_call_model_input_filter(token_budget=token_budget)(_mk_input_data(items, context=ctx))
 
         for token_budget, new_frame_px in ((2_200, (1600, 789)), (1_200, (1024, 505))):
             result = call(token_budget)
             assert [sent_image_px(item) for item in result.input] == [[], [], [], [], [new_frame_px]]
             assert result.input[2:4] == items[2:4]
+
+    def test_attached_images_do_not_cost_the_pending_frame_its_sharp_copy(self) -> None:
+        jpeg = BytesIO()
+        Image.new("RGB", (1600, 1200), "white").save(jpeg, format="JPEG")
+        files = [CopilotAttachedFile(file_id=f"file_{index}", filename=f"shot{index}.png") for index in range(3)]
+        frames = [
+            VideoAttachmentFrame(
+                file_id=attached.file_id,
+                filename=attached.filename,
+                timestamp_seconds=0.0,
+                jpeg_base64=base64.b64encode(jpeg.getvalue()).decode(),
+            )
+            for attached in files
+        ]
+        items = [
+            {"role": "user", "content": "what does the page say"},
+            build_image_attachment_message(files, frames, {}),
+        ]
+        ctx = make_copilot_ctx(pending_screenshots=[captured_frame_entry()], supports_vision=True)
+
+        result = make_copilot_call_model_input_filter(token_budget=2_600)(_mk_input_data(items, context=ctx))
+
+        assert [sent_image_px(item) for item in result.input] == [[], [], [(1600, 789)]]
 
     def test_the_pending_frame_is_sent_sharp_on_every_call_that_carries_it(self) -> None:
         ctx = SimpleNamespace(pending_screenshots=[captured_frame_entry()], supports_vision=True)
@@ -786,8 +840,29 @@ class TestStagedScreenshotBinding:
 
         result = copilot_call_model_input_filter(_mk_input_data(items, context=ctx))
 
-        assert not any(_image_parts(item) for item in result.input)
+        assert not any(image_parts(item) for item in result.input)
         assert len(ctx.pending_screenshots) == 1
+
+    @pytest.mark.parametrize("supports_vision", [True, False])
+    def test_images_already_in_history_reach_only_a_vision_model(self, supports_vision: bool) -> None:
+        attached = {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "Attached image Capture.PNG (file_id=file_1):"},
+                {"type": "input_image", "image_url": "data:image/jpeg;base64,dGVzdA==", "detail": "high"},
+            ],
+        }
+        items = [{"role": "user", "content": "what does this show?"}, attached]
+
+        result = copilot_call_model_input_filter(
+            _mk_input_data(items, context=make_copilot_ctx(supports_vision=supports_vision))
+        )
+
+        assert [len(image_parts(item)) for item in result.input] == [0, 1 if supports_vision else 0]
+        assert result.input[1]["content"][0] == attached["content"][0]
+        assert not is_screenshot_message(result.input[1])
+        if not supports_vision:
+            assert result.input[1]["content"][1] == {"type": "input_text", "text": IMAGE_REMOVED_PLACEHOLDER}
 
     def test_call_with_nothing_staged_carries_no_image(self) -> None:
         ctx = SimpleNamespace(pending_screenshots=[])
@@ -797,13 +872,13 @@ class TestStagedScreenshotBinding:
             result = copilot_call_model_input_filter(_mk_input_data(items, context=ctx))
 
         assert result.input == items
-        assert not any(_image_parts(item) for item in result.input)
+        assert not any(image_parts(item) for item in result.input)
         assert not any(log["event"] == "Injecting screenshot user message" for log in logs)
 
     def test_last_resort_prune_keeps_the_bound_frame_and_asks_for_a_retake_only_without_one(self) -> None:
         retake_note = NUDGE_SENTINEL + SCREENSHOT_DROPPED_NUDGE
         frame_older_than_the_kept_steps = pending_screenshot_message(
-            SimpleNamespace(pending_screenshots=[captured_frame_entry()], supports_vision=True)
+            make_copilot_ctx(pending_screenshots=[captured_frame_entry()])
         )
         items: list[dict[str, Any]] = [
             {"role": "user", "content": "build me a workflow"},
@@ -816,16 +891,17 @@ class TestStagedScreenshotBinding:
         over_budget_after_every_trim = make_copilot_call_model_input_filter(1)
 
         with_frame = over_budget_after_every_trim(
-            _mk_input_data(retake_note_from_an_earlier_recovery, context=_ctx_with_staged_frame())
+            _mk_input_data(
+                retake_note_from_an_earlier_recovery,
+                context=make_copilot_ctx(pending_screenshots=_ctx_with_staged_frame().pending_screenshots),
+            )
         )
-        without_frame = over_budget_after_every_trim(
-            _mk_input_data(items, context=SimpleNamespace(pending_screenshots=[]))
-        )
+        without_frame = over_budget_after_every_trim(_mk_input_data(items, context=make_copilot_ctx()))
 
-        assert [len(_image_parts(item)) for item in with_frame.input if _image_parts(item)] == [1]
-        assert len(_image_parts(with_frame.input[-1])) == 1
+        assert [len(image_parts(item)) for item in with_frame.input if image_parts(item)] == [1]
+        assert len(image_parts(with_frame.input[-1])) == 1
         assert not any(item.get("content") == retake_note for item in with_frame.input)
-        assert not any(_image_parts(item) for item in without_frame.input)
+        assert not any(image_parts(item) for item in without_frame.input)
         assert [item.get("content") for item in without_frame.input].count(retake_note) == 1
 
     def test_aggressive_prune_reports_omitted_demonstration_fact_packets(self) -> None:
