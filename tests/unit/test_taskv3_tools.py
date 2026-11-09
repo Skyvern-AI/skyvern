@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import dataclasses
 import decimal
+import gc
 import html
 import html as html_lib
 import inspect
@@ -21,6 +22,7 @@ import random
 import re
 import time
 import unicodedata
+import weakref
 from collections import Counter
 from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime
@@ -52092,3 +52094,40 @@ customElements.define('colour-pick', class extends HTMLElement {
         await page.evaluate(_FIND_MENU_JS, {"sel": "h2", "el": None, "keepOpenTags": False})
         cleared = await page.evaluate(count_tags)
     assert (kept, cleared) == (3, 0)
+
+
+@pytest.mark.asyncio
+async def test_a_page_is_freed_after_a_cdp_probe_and_recorded_frame_work() -> None:
+    # A real CDP session reaches its page through the driver connection, modelled here by a direct reference.
+    class Session:
+        def __init__(self, page: Any) -> None:
+            self.page = page
+
+        async def send(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+            if method == "Page.getFrameTree":
+                return {"frameTree": {"frame": {"id": "main", "url": "https://main.test/"}}}
+            if method == "Page.createIsolatedWorld":
+                return {"executionContextId": 1}
+            return {"result": {"value": 1}}
+
+    class Context:
+        async def new_cdp_session(self, page: Any) -> Session:
+            return Session(page)
+
+    class Page:
+        context = Context()
+
+    class Frame:
+        def __init__(self, page: Page) -> None:
+            self.page = page
+
+    page = Page()
+    frame = Frame(page)
+    assert await taskv3_tools._evaluate_isolated(page, "(arg) => 1", "#t") == 1
+    await taskv3_tools._record_frame_work(page, frame, "#t", "filled", "document-1")
+
+    released = weakref.ref(page)
+    del page, frame
+    gc.collect()
+
+    assert released() is None

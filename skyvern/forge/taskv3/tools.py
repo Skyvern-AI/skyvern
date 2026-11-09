@@ -13518,23 +13518,38 @@ def _readiness_note(reached: str | None, waited_seconds: float) -> str:
     )
 
 
-# A probe that reads the DOM from the page's own JS realm can be answered by the page: prototype
-# methods and instance properties are both replaceable there, so a forged label earns a forced click
-# through a real cover. These probes run in a per-page isolated world instead, a realm the page has
-# no handle on, rebuilt whenever the document it was created against is gone.
-_ISOLATED_WORLDS: weakref.WeakKeyDictionary[Any, dict[str, Any]] = weakref.WeakKeyDictionary()
-# One CDP session per PAGE, shared by every realm probed on it. Keyed per realm instead, a run that
-# probes many child frames -- an SPA or an ad-heavy page that churns iframes -- opens a session per
-# frame and never detaches any: the frame goes away, its worlds entry is collected, and the session is
-# left orphaned but still attached. A page is long-lived and bounded; the set of frames on it is not.
-_PAGE_CDP_SESSIONS: weakref.WeakKeyDictionary[Any, Any] = weakref.WeakKeyDictionary()
+# Kept on the page, so the collector frees it with the page. A CDP session and a child frame both reach
+# their page, so a module-level weak-key map holding either never clears and pins every finished run.
+@dataclasses.dataclass
+class _PageState:
+    # A probe that reads the DOM from the page's own JS realm can be answered by the page: prototype
+    # methods and instance properties are both replaceable there, so a forged label earns a forced click
+    # through a real cover. These probes run in a per-page isolated world instead, a realm the page has
+    # no handle on, rebuilt whenever the document it was created against is gone.
+    worlds: weakref.WeakKeyDictionary[Any, dict[str, Any]] = dataclasses.field(
+        default_factory=weakref.WeakKeyDictionary
+    )
+    # One CDP session per PAGE, shared by every realm probed on it. Keyed per realm instead, a run that
+    # probes many child frames -- an SPA or an ad-heavy page that churns iframes -- opens a session per
+    # frame and never detaches any: the frame goes away, its worlds entry is collected, and the session is
+    # left orphaned but still attached.
+    cdp_session: Any = None
+    frame_work: dict[str, Any] = dataclasses.field(
+        default_factory=lambda: {"filled": {}, "submitted": {}, "documents": {}}
+    )
+
+
+def _page_state(page: Any) -> _PageState:
+    state: _PageState = vars(page).setdefault("_skyvern_taskv3_state", _PageState())
+    return state
 
 
 async def _page_cdp_session(page: Any) -> Any:
-    session = _PAGE_CDP_SESSIONS.get(page)
+    state = _page_state(page)
+    session = state.cdp_session
     if session is None:
         session = await page.context.new_cdp_session(page)
-        _PAGE_CDP_SESSIONS[page] = session
+        state.cdp_session = session
     return session
 
 
@@ -13617,12 +13632,13 @@ async def _realm_frame_record(target: Any, session: Any) -> dict[str, Any] | Non
 
 
 async def _isolated_world(page: Any, *, fresh: bool = False) -> tuple[Any, int] | None:
-    state = _ISOLATED_WORLDS.get(page)
+    page_state = _page_state(_realm_page(page))
+    state = page_state.worlds.get(page)
     if state is None:
         # The miss is cached too: a page with no CDP session (a non-Chromium engine) would otherwise
         # pay a failed handshake on every probe for the rest of the run.
         state = {"session": None, "context_id": None}
-        _ISOLATED_WORLDS[page] = state
+        page_state.worlds[page] = state
         try:
             # Always the PAGE's session, never the realm's. `new_cdp_session` accepts a Frame per its
             # signature, but it RAISES for a frame that shares its parent's renderer -- "this frame does
@@ -13668,10 +13684,10 @@ async def _isolated_world(page: Any, *, fresh: bool = False) -> tuple[Any, int] 
             # page while the worlds are keyed per realm, so evicting only the observing realm left every
             # sibling frame holding a detached session and a context id that looks usable -- and their
             # next probe answered from the realm the page can patch, permanently.
-            for realm, other in list(_ISOLATED_WORLDS.items()):
+            for realm, other in list(page_state.worlds.items()):
                 if other.get("session") is dead:
-                    _ISOLATED_WORLDS.pop(realm, None)
-            _PAGE_CDP_SESSIONS.pop(_realm_page(page), None)
+                    page_state.worlds.pop(realm, None)
+            page_state.cdp_session = None
             raise
     return state["session"], int(state["context_id"])
 
@@ -13865,18 +13881,11 @@ def _frame_depth(frame: Any, main_frame: Any) -> int:
 # at the action removes the walk entirely -- and it is more accurate as well as bounded, because the
 # guards care about the model's own unsubmitted work rather than about every field on every document.
 #
-# Page-keyed and weak, like _ISOLATED_WORLDS: a closure writes it and module-level `pending_marker`
+# Held on the page, like the isolated worlds: a closure writes it and module-level `pending_marker`
 # reads it. Entries are per realm, and a realm whose document identity has changed has had its work
 # discarded WITH that document, so its entries are dropped on read rather than trusted.
-_FRAME_WORK: weakref.WeakKeyDictionary[Any, dict[str, Any]] = weakref.WeakKeyDictionary()
-
-
 def _frame_work(page: Any) -> dict[str, Any]:
-    state = _FRAME_WORK.get(page)
-    if state is None:
-        state = {"filled": {}, "submitted": {}, "documents": {}}
-        _FRAME_WORK[page] = state
-    return state
+    return _page_state(page).frame_work
 
 
 async def _record_frame_work(page: Any, realm: Any, selector: str, kind: str, document_id: str) -> None:
@@ -13915,10 +13924,7 @@ def _recorded_work_frames(page: Any) -> list[Any]:
     the sample it leaves behind is STABLE, which reads as settled. Bounded by the actions the model took
     rather than by the page's frame count, which is why this is a ledger read and not another walk.
     """
-    state = _FRAME_WORK.get(page)
-    if state is None:
-        return []
-    return list(state["documents"])
+    return list(_frame_work(page)["documents"])
 
 
 def _safe_url(target: Any) -> str:
