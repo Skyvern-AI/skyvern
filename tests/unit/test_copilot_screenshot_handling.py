@@ -497,7 +497,7 @@ class TestNudgeDrainAndFilterExclusivity:
         assert result.input == items
 
     def test_a_frame_sent_sharp_is_saved_small_with_a_nudge(self) -> None:
-        ctx = SimpleNamespace(pending_screenshots=[captured_frame_entry()], supports_vision=True)
+        ctx = make_copilot_ctx(pending_screenshots=[captured_frame_entry()])
         items = [{"role": "user", "content": "read the reference code"}]
         seen = copilot_call_model_input_filter(make_model_input_data(items, context=ctx))
         saved = _consume_pending_screenshots(ctx)
