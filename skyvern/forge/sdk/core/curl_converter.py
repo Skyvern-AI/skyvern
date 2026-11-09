@@ -1,3 +1,4 @@
+import base64
 import json
 from typing import Any
 
@@ -46,6 +47,11 @@ def parse_curl_command(curl_command: str) -> dict[str, Any]:
         # Process headers - curlparser returns headers as an OrderedDict
         if parsed.header:
             result["headers"] = {k: v.strip() for k, v in parsed.header.items()}
+
+        if parsed.auth and "Authorization" not in result["headers"]:
+            credentials = ":".join(parsed.auth).encode("utf-8")
+            encoded_credentials = base64.b64encode(credentials).decode("ascii")
+            result["headers"]["Authorization"] = f"Basic {encoded_credentials}"
 
         # Process body/data
         if parsed.data:
