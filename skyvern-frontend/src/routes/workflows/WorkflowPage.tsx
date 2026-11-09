@@ -23,6 +23,8 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Status404 } from "@/components/Status404";
+import { isAxiosError } from "axios";
 import {
   Table,
   TableBody,
@@ -148,6 +150,28 @@ function WorkflowPage() {
   const { tags: urlTags, hold: holdForTaggingFlag } =
     useUrlTagFilter(tagsParam);
 
+  const {
+    data: workflow,
+    isLoading: workflowIsLoading,
+    isError: workflowIsError,
+    error: workflowError,
+  } = useWorkflowQuery({
+    workflowPermanentId,
+  });
+  // useWorkflowQuery stays disabled (never loading, never errored) when this one fails.
+  const { isError: globalWorkflowsIsError } = useGlobalWorkflowsQuery();
+  // A soft-deleted agent also 404s, but its run history is still listed, so
+  // only an agent without any runs (ignoring filters) gets the 404 page.
+  const workflowNotFound =
+    isAxiosError(workflowError) && workflowError.response?.status === 404;
+  const { data: latestRuns, isLoading: latestRunsIsLoading } =
+    useWorkflowRunsQuery({
+      workflowPermanentId,
+      page: 1,
+      pageSize: 1,
+      enabled: workflowNotFound,
+    });
+
   const { data: workflowRuns, isLoading: isRunsQueryLoading } =
     useWorkflowRunsQuery({
       workflowPermanentId,
@@ -170,16 +194,6 @@ function WorkflowPage() {
       setSearchParams(params, { replace: true });
     }
   }, [workflowRuns, isLoading, page, searchParams, setSearchParams]);
-
-  const {
-    data: workflow,
-    isLoading: workflowIsLoading,
-    isError: workflowIsError,
-  } = useWorkflowQuery({
-    workflowPermanentId,
-  });
-  // useWorkflowQuery stays disabled (never loading, never errored) when this one fails.
-  const { isError: globalWorkflowsIsError } = useGlobalWorkflowsQuery();
 
   const { data: workflowTagsMap = {} } = useWorkflowTagsBatchQuery(
     workflowPermanentId ? [workflowPermanentId] : [],
@@ -257,6 +271,16 @@ function WorkflowPage() {
     return null; // this should never happen
   }
 
+  // Only a lookup that succeeded with zero runs proves the agent is gone.
+  if (workflowNotFound && latestRuns?.length === 0) {
+    return <Status404 />;
+  }
+  if (workflowNotFound && latestRunsIsLoading) {
+    return null;
+  }
+  const deletedWorkflowTitle = (latestRuns ?? workflowRuns)?.[0]
+    ?.workflow_title;
+
   const analyticsWorkflow =
     workflow?.workflow_permanent_id === workflowPermanentId
       ? workflow
@@ -278,7 +302,12 @@ function WorkflowPage() {
                 </>
               ) : (
                 <>
-                  <h1 className="text-lg font-semibold">{workflow?.title}</h1>
+                  <h1 className="text-lg font-semibold">
+                    {workflowNotFound
+                      ? deletedWorkflowTitle &&
+                        `${deletedWorkflowTitle} (deleted)`
+                      : workflow?.title}
+                  </h1>
                   <h2 className="text-sm text-muted-foreground">
                     {workflowPermanentId}
                   </h2>
@@ -312,27 +341,31 @@ function WorkflowPage() {
                 </Link>
               </Button>
             ) : null}
-            <Button asChild variant="secondary">
-              <Link to={`/agents/${workflowPermanentId}/scripts`}>
-                <CodeIcon className="mr-2 size-4" />
-                Scripts
-              </Link>
-            </Button>
-            <Button asChild variant="secondary">
-              <Link
-                to={workflowEditorPath(workflowPermanentId, studioEnabled)}
-                data-testid="workflow-open-editor-link"
-              >
-                <Pencil2Icon className="mr-2 size-4" />
-                Edit
-              </Link>
-            </Button>
-            <Button asChild>
-              <Link to={`/agents/${workflowPermanentId}/run`}>
-                <PlayIcon className="mr-2 size-4" />
-                Run
-              </Link>
-            </Button>
+            {workflowNotFound ? null : (
+              <>
+                <Button asChild variant="secondary">
+                  <Link to={`/agents/${workflowPermanentId}/scripts`}>
+                    <CodeIcon className="mr-2 size-4" />
+                    Scripts
+                  </Link>
+                </Button>
+                <Button asChild variant="secondary">
+                  <Link
+                    to={workflowEditorPath(workflowPermanentId, studioEnabled)}
+                    data-testid="workflow-open-editor-link"
+                  >
+                    <Pencil2Icon className="mr-2 size-4" />
+                    Edit
+                  </Link>
+                </Button>
+                <Button asChild>
+                  <Link to={`/agents/${workflowPermanentId}/run`}>
+                    <PlayIcon className="mr-2 size-4" />
+                    Run
+                  </Link>
+                </Button>
+              </>
+            )}
           </div>
         </div>
         {WorkflowAnalyticsPanel ? (
