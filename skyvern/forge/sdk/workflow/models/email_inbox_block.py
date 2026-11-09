@@ -2,6 +2,7 @@ import asyncio
 import os
 from pathlib import Path
 from typing import Any, ClassVar, Literal
+from urllib.parse import quote
 
 import httpx
 import structlog
@@ -24,6 +25,8 @@ from skyvern.forge.sdk.workflow.models.block import (
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE
 from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType
 from skyvern.services import email
+from skyvern.services.email.gmail import _message_from_gmail
+from skyvern.services.email.gmail_client import GMAIL_API_BASE, get_json
 
 LOG = structlog.get_logger()
 
@@ -35,6 +38,7 @@ class EmailInboxBlock(Block):
     credential_source: Literal["native", "nango"] = "native"
     connection_id: str | None = None
     credential_id: str | None = None
+    message_id: str | None = None
     folder: str | None = None
     prompt: str | None = None
     sender: str | None = None
@@ -45,7 +49,9 @@ class EmailInboxBlock(Block):
     download_attachments: bool = False
     parameters: list[PARAMETER_TYPE] = []
 
-    TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset({"credential_id", "folder", "prompt", "sender", "subject"})
+    TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset(
+        {"credential_id", "folder", "prompt", "sender", "subject", "message_id"}
+    )
 
     def get_all_parameters(self, workflow_run_id: str) -> list[PARAMETER_TYPE]:
         return self.parameters
@@ -55,6 +61,8 @@ class EmailInboxBlock(Block):
             self.credential_id = self.render_templatable_field(
                 "credential_id", self.credential_id, workflow_run_context
             )
+        if self.message_id:
+            self.message_id = self.render_templatable_field("message_id", self.message_id, workflow_run_context).strip()
         if self.folder:
             self.folder = self.render_templatable_field("folder", self.folder, workflow_run_context)
         if self.prompt:
@@ -297,6 +305,12 @@ class EmailInboxBlock(Block):
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
             )
+        if self.message_id and (self.email_client != "gmail" or self.credential_source != "native"):
+            return await self._failure(
+                failure_reason="Fetching by message ID requires a native Gmail connection",
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
         if self.credential_source == "native" and not self.credential_id:
             return await self._failure(
                 failure_reason="credential_id is required",
@@ -313,7 +327,7 @@ class EmailInboxBlock(Block):
             )
 
         access_token: str | None = None
-        folder_used = self.folder or ("INBOX" if self.email_client == "gmail" else "inbox")
+        folder_used = None if self.message_id else self.folder or ("INBOX" if self.email_client == "gmail" else "inbox")
         try:
             if self.credential_source == "nango":
                 if (
@@ -325,6 +339,7 @@ class EmailInboxBlock(Block):
                     raise email.GmailAPIError(
                         status=404, code="integration_unavailable", message="Gmail integration unavailable"
                     )
+                assert folder_used is not None
                 data = await app.AGENT_FUNCTION.execute_gmail_inbox_for_run(
                     organization_id=effective_org_id,
                     workflow_run_id=workflow_run_id,
@@ -367,17 +382,31 @@ class EmailInboxBlock(Block):
                         workflow_run_block_id=workflow_run_block_id,
                         organization_id=organization_id,
                     )
-                candidates = await email.list_folder_messages(
-                    email_client=self.email_client,
-                    access_token=access_token,
-                    folder=folder_used,
-                    sender=self.sender,
-                    subject=self.subject,
-                    newer_than_days=self.newer_than_days,
-                    max_results=self.max_results,
-                    include_body=self.include_body,
-                    include_attachments=self.download_attachments,
-                )
+                if self.message_id:
+                    async with httpx.AsyncClient() as client:
+                        raw = await get_json(
+                            client,
+                            f"{GMAIL_API_BASE}/users/me/messages/{quote(self.message_id, safe='')}",
+                            access_token=access_token,
+                            params={"format": "full" if self.include_body or self.download_attachments else "metadata"},
+                        )
+                    message = _message_from_gmail(raw, self.include_body, include_attachments=self.download_attachments)
+                    if message is None:
+                        raise email.GmailAPIError(status=502, code=None, message="Invalid Gmail response")
+                    candidates = [message]
+                else:
+                    assert folder_used is not None
+                    candidates = await email.list_folder_messages(
+                        email_client=self.email_client,
+                        access_token=access_token,
+                        folder=folder_used,
+                        sender=self.sender,
+                        subject=self.subject,
+                        newer_than_days=self.newer_than_days,
+                        max_results=self.max_results,
+                        include_body=self.include_body,
+                        include_attachments=self.download_attachments,
+                    )
         except email.GmailAPIError as e:
             return await self._api_failure(
                 provider="Gmail",
