@@ -49185,7 +49185,7 @@ async def test_a_dropdown_inside_a_component_is_listed_with_its_own_question() -
 
 # Generated component chains: each root may hold a projecting slot, a decoration, plain text, a choice, a grid or a
 # sibling holding a control. The oracle is the structure: the question as near=[q:...] when a slot projects it
-# before the field with no stop between, else no near, and never a group.
+# before the field with no stop between, else no near, and never a group; own-root text is compared apart.
 def _near_of(e: dict[str, Any]) -> tuple[tuple[str, str], ...] | None:
     near = e.get("near")
     return tuple((n["slot"], n["text"]) for n in near) if near else None
@@ -49205,7 +49205,6 @@ _PL_DECOS = (
     '<pl-c t="pl-deco"></pl-c>',
     "<div><span>Static intro text</span><slot></slot></div>",
 )
-_PL_TEXT_DECOS = ("<span>Plain text beside the field</span>", "<div><span>Static intro text</span><slot></slot></div>")
 _PL_STOPS = ('<button type="button">Help</button>', '<pl-c t="pl-btn"></pl-c>')
 _PL_SCRIPT = """<template id="pl-btn"><button type="button">Help</button></template>
 <template id="pl-deco"><span style="display:inline-block;width:16px;height:16px"></span></template>
@@ -49269,9 +49268,6 @@ def _pl_page(seed: int) -> tuple[str, dict[str, tuple[tuple[str, str], ...] | No
             if rng.random() < 0.6:
                 deco = rng.choice(_PL_DECOS)
                 before.append(deco)
-                # Visible text at the top level of the control's own root ends the walk before an outer level.
-                if lv == depth and level < depth and deco in _PL_TEXT_DECOS:
-                    bound = False
             stop = rng.random() < 0.15
             if lv == level and place in ("before", "wrapped"):
                 slot = (
@@ -49309,7 +49305,6 @@ def _pl_page(seed: int) -> tuple[str, dict[str, tuple[tuple[str, str], ...] | No
                 affix = True
             if lv == depth and rng.random() < 0.1:
                 before.append("<span>Note near the field</span>")
-                bound = False
             tid = f"pl{seed}t{ci}l{lv}"
             templates.append(f'<template id="{tid}">{"".join(before)}{body}{after}</template>')
             inner_light = (light if lv == level else "") + (own_light if lv == depth else "")
@@ -49341,7 +49336,9 @@ async def test_observe_group_text_reads_only_the_label_a_component_chain_project
             for e in data["elements"]:
                 found = re.findall(r"\bpl\d+x\d+\b", json.dumps({k: e.get(k) for k in ("selector", "name", "id")}))
                 if found and e.get("tag") == "input":
-                    got[found[0]] = (e.get("group"), _near_of(e))
+                    # Own-root text is a candidate of its own, pinned by the exact and light-twin tests.
+                    slots = tuple(n for n in _near_of(e) or () if n[0] != "(own text)")
+                    got[found[0]] = (e.get("group"), slots or None)
             for name, entries in expected.items():
                 want = (None, entries)
                 if got.get(name, "<unlisted>") != want:
@@ -49349,8 +49346,8 @@ async def test_observe_group_text_reads_only_the_label_a_component_chain_project
     assert not wrong, wrong
 
 
-# Main's stops hold in the projected walk too: a choice's caption, a grid cell's neighbour, text at the top level of
-# the control's own root (main's walk never scans it), and a slot that receives only whitespace or an empty element.
+# Main's stops hold in the projected walk too: a choice's caption, a grid cell's neighbour, and a slot that receives
+# only whitespace or an empty element.
 @_skip_no_browser
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -49387,23 +49384,10 @@ async def test_observe_group_text_reads_only_the_label_a_component_chain_project
         ),
         (
             {
-                "a": '<div><slot name="title"></slot></div><p>What is your phone number?</p><div><input name="pin"></div>'
-            },
-            '<pl-c t="a"><span slot="title">Contact details</span></pl-c>',
-        ),
-        (
-            {
                 "in": '<input name="pin">',
                 "a": '<div><p>Please answer every question below.</p><slot></slot></div><pl-c t="in"></pl-c>',
             },
             '<pl-c t="a">\n</pl-c>',
-        ),
-        (
-            {
-                "a": '<div><slot name="q"></slot></div><div><p>All prices include tax.</p><slot name="x"></slot></div>'
-                '<input name="pin">'
-            },
-            '<pl-c t="a"><span slot="q">Contact details</span><span slot="x"></span></pl-c>',
         ),
     ],
     ids=[
@@ -49411,9 +49395,7 @@ async def test_observe_group_text_reads_only_the_label_a_component_chain_project
         "choice_component_caption",
         "grid_cell",
         "grid_cell_component",
-        "own_root_top_level_text",
         "whitespace_default_slot",
-        "empty_element_slotted",
     ],
 )
 async def test_observe_group_text_projected_label_keeps_mains_stops(templates: dict[str, str], page: str) -> None:
@@ -49423,6 +49405,298 @@ async def test_observe_group_text_projected_label_keeps_mains_stops(templates: d
             (e.get("group"), e.get("near")) for e in (await _observe_data(p))["elements"] if '"pin"' in json.dumps(e)
         ]
     assert reads == [(None, None)], reads
+
+
+# A forwarded slot projects only what its own slot is assigned, never its fallback, and only while it is drawn itself.
+# The inner root's own question is a candidate beside it, and the walk goes on to the outer title.
+_M_TITLE_QUESTION = (("title", "Contact details"), ("(own text)", "What is your phone number?"))
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("forwarded", "light", "printed"),
+    [
+        ('<slot name="hint" slot="hint"></slot>', "", _M_TITLE_QUESTION),
+        ('<slot name="hint" slot="hint">Ten digits</slot>', "", _M_TITLE_QUESTION),
+        ("", "", _M_TITLE_QUESTION),
+        (
+            '<slot name="hint" slot="hint"></slot>',
+            '<span slot="hint">Ten digits</span>',
+            (*_M_TITLE_QUESTION, ("hint", "Ten digits")),
+        ),
+        (
+            '<slot name="hint" slot="hint" style="display:block;opacity:0"></slot>',
+            '<span slot="hint">Ten digits</span>',
+            _M_TITLE_QUESTION,
+        ),
+        (
+            '<slot name="hint" slot="hint" aria-hidden="true"></slot>',
+            '<span slot="hint">Ten digits</span>',
+            _M_TITLE_QUESTION,
+        ),
+    ],
+    ids=["empty", "fallback_only", "not_forwarded", "assigned", "transparent", "aria_hidden"],
+)
+async def test_observe_near_counts_a_forwarded_slot_by_its_own_assignment(
+    forwarded: str, light: str, printed: tuple[tuple[str, str], ...] | None
+) -> None:
+    templates = {
+        "in": '<div><p>What is your phone number?</p><slot name="hint"></slot></div><input name="pin">',
+        "a": f'<h3><slot name="title"></slot></h3><pl-c t="in">{forwarded}</pl-c>',
+    }
+    tpl = "".join(f'<template id="{k}">{v}</template>' for k, v in templates.items())
+    page = f'<pl-c t="a"><span slot="title">Contact details</span>{light}</pl-c>'
+    async with _content_page(f"<!doctype html><html><body>{page}{tpl}{_PL_SCRIPT}</body></html>") as p:
+        reads = [
+            (e.get("group"), _near_of(e)) for e in (await _observe_data(p))["elements"] if '"pin"' in json.dumps(e)
+        ]
+    assert reads == [(None, printed)], reads
+
+
+# A drawn slider, textbox, searchbox or iframe ends the projected walk; one that is not drawn does not.
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stop", "printed"),
+    [
+        ('<div role="slider" tabindex="0" aria-valuenow="5" style="width:80px;height:10px"></div>', None),
+        ('<div role="textbox" tabindex="0" style="width:80px;height:10px"></div>', None),
+        ('<div role="searchbox" tabindex="0" style="width:80px;height:10px"></div>', None),
+        ('<iframe style="width:80px;height:20px"></iframe>', None),
+        ('<iframe style="display:none"></iframe>', (("q", "Volume"),)),
+        ('<div role="textbox" tabindex="0" style="display:none"></div>', (("q", "Volume"),)),
+    ],
+    ids=["slider", "textbox", "searchbox", "iframe", "hidden_iframe", "hidden_textbox"],
+)
+async def test_observe_near_stops_at_a_drawn_widget_main_does_not_list_as_a_control(
+    stop: str, printed: tuple[tuple[str, str], ...] | None
+) -> None:
+    tpl = f'<template id="a"><div><slot name="q"></slot></div>{stop}<input name="pin"></template>'
+    page = '<pl-c t="a"><span slot="q">Volume</span></pl-c>'
+    async with _content_page(f"<!doctype html><html><body>{page}{tpl}{_PL_SCRIPT}</body></html>") as p:
+        reads = [
+            (e.get("group"), _near_of(e)) for e in (await _observe_data(p))["elements"] if '"pin"' in json.dumps(e)
+        ]
+    assert reads == [(None, printed)], reads
+
+
+# A component holding options before the slotted label is their caption host only when its root reads under two
+# characters through the flat tree: its text, bare or in an element, and what it draws through its slots, forwarded or
+# not. Light text it never draws is no caption.
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("q_root", "q_light", "outer_light", "printed"),
+    [
+        ('<span>*</span><input type="radio" name="e">', "", "", None),
+        ('<span>OK</span><input type="radio" name="e">', "", "", (("label", "If yes, which car?"),)),
+        ('OK<input type="radio" name="e">', "", "", (("label", "If yes, which car?"),)),
+        ('<label><input type="radio" name="e"><slot></slot></label>', "Yes", "", (("label", "If yes, which car?"),)),
+        ('<label><input type="radio" name="e"><slot></slot></label>', "", "", None),
+        (
+            '<label><input type="radio" name="e"><slot></slot></label>',
+            '<slot name="cap"></slot>',
+            '<span slot="cap">Yes</span>',
+            (("label", "If yes, which car?"),),
+        ),
+        ('<label><input type="radio" name="e"></label>', "Hidden words nobody sees", "", None),
+        ('<style>:host{display:inline-block}</style><label><input type="radio" name="e"></label>', "", "", None),
+        ('<label><input type="radio" name="e"></label><style>:host{display:inline-block}</style>', "", "", None),
+        (
+            '<script type="text/x-config">var caption = 1;</script><label><input type="radio" name="e"></label>',
+            "",
+            "",
+            None,
+        ),
+        ('<template><p>Unused row</p></template><label><input type="radio" name="e"></label>', "", "", None),
+    ],
+    ids=[
+        "one_character",
+        "two_characters",
+        "bare_text",
+        "slotted_caption",
+        "nothing",
+        "caption_forwarded_through_an_outer_slot",
+        "undrawn_host_text",
+        "style_before_the_radio",
+        "style_after_the_radio",
+        "script_beside_the_radio",
+        "template_beside_the_radio",
+    ],
+)
+async def test_observe_near_reads_a_choice_component_as_a_caption_host_by_its_text(
+    q_root: str, q_light: str, outer_light: str, printed: tuple[tuple[str, str], ...] | None
+) -> None:
+    templates = {
+        "q": q_root,
+        "a": f'<pl-c t="q" style="display:inline-block">{q_light}</pl-c><slot name="label"></slot><input name="pin">',
+    }
+    tpl = "".join(f'<template id="{k}">{v}</template>' for k, v in templates.items())
+    page = f'<pl-c t="a"><span slot="label">If yes, which car?</span>{outer_light}</pl-c>'
+    async with _content_page(f"<!doctype html><html><body>{page}{tpl}{_PL_SCRIPT}</body></html>") as p:
+        reads = [
+            (e.get("group"), _near_of(e)) for e in (await _observe_data(p))["elements"] if '"pin"' in json.dumps(e)
+        ]
+    assert reads == [(None, printed)], reads
+
+
+# Text drawn in the control's own root prints as `(own text)` and never ends the walk: a paragraph between the slotted
+# title and the field, a wrapper's text beside an empty slotted element, and an unassigned slot's default text.
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("root", "light", "printed"),
+    [
+        (
+            '<div><slot name="title"></slot></div><p>What is your phone number?</p><div><input name="pin"></div>',
+            '<span slot="title">Contact details</span>',
+            (("title", "Contact details"), ("(own text)", "What is your phone number?")),
+        ),
+        (
+            '<div><slot name="q"></slot></div><div><p>All prices include tax.</p><slot name="x"></slot></div>'
+            '<input name="pin">',
+            '<span slot="q">Contact details</span><span slot="x"></span>',
+            (("q", "Contact details"), ("(own text)", "All prices include tax.")),
+        ),
+        (
+            '<div><slot name="q">Default helper text</slot></div><div><input type="text" name="pin"></div>',
+            "",
+            (("(own text)", "Default helper text"),),
+        ),
+    ],
+    ids=["paragraph_before_the_field", "wrapper_beside_an_empty_slotted_element", "unassigned_slot_default_text"],
+)
+async def test_observe_near_prints_own_root_text_as_a_candidate(
+    root: str, light: str, printed: tuple[tuple[str, str], ...]
+) -> None:
+    tpl = f'<template id="a">{root}</template>'
+    async with _content_page(
+        f'<!doctype html><html><body><pl-c t="a">{light}</pl-c>{tpl}{_PL_SCRIPT}</body></html>'
+    ) as p:
+        reads = [
+            (e.get("group"), _near_of(e)) for e in (await _observe_data(p))["elements"] if '"pin"' in json.dumps(e)
+        ]
+    assert reads == [(None, printed)], reads
+
+
+# A slot with anything assigned, whitespace included, draws that and never its default text, so it carries no own text.
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("root", "light", "printed"),
+    [
+        (
+            '<slot name="label"></slot><slot name="help">Optional</slot><input name="pin">',
+            '<span slot="label">Which car?</span><span slot="help">Your main car</span>',
+            (("label", "Which car?"), ("help", "Your main car")),
+        ),
+        (
+            '<slot name="label"></slot><slot>Optional</slot><input name="pin">',
+            '\n<span slot="label">Which car?</span>\n',
+            (("label", "Which car?"),),
+        ),
+    ],
+    ids=["assigned_text", "assigned_whitespace"],
+)
+async def test_observe_near_reads_no_own_text_from_an_assigned_slot_sibling(
+    root: str, light: str, printed: tuple[tuple[str, str], ...]
+) -> None:
+    tpl = f'<template id="a">{root}</template>'
+    page = f'<pl-c t="a">{light}</pl-c>'
+    async with _content_page(f"<!doctype html><html><body>{page}{tpl}{_PL_SCRIPT}</body></html>") as p:
+        reads = [
+            (e.get("group"), _near_of(e)) for e in (await _observe_data(p))["elements"] if '"pin"' in json.dumps(e)
+        ]
+    assert reads == [(None, printed)], reads
+
+
+# Generated pages, each a component and its light twin: the same texts before the field, slotted into the component or
+# drawn in its root, and written out in the twin. Every word main prints as the twin's group= is among the near texts.
+def _twin_pages(seeds: range) -> tuple[str, list[int]]:
+    defs, hosts, twins = [], [], []
+    for seed in seeds:
+        rng = random.Random(seed)
+        root, light, twin = [], [], []
+        for k in range(rng.randint(1, 3)):
+            text = f"Question {seed} part {k}"
+            kind = rng.choice(("slot", "own", "both", "bare"))
+            if kind == "slot":
+                root.append(f'<div><slot name="s{k}"></slot></div>')
+                light.append(f'<span slot="s{k}">{text}</span>')
+                twin.append(f"<div><span>{text}</span></div>")
+            elif kind == "own":
+                root.append(f"<div>{text}</div>")
+                twin.append(f"<div>{text}</div>")
+            elif kind == "both":
+                root.append(f'<div><span>{text} own</span><slot name="s{k}"></slot></div>')
+                light.append(f'<span slot="s{k}">{text} slotted</span>')
+                twin.append(f"<div><span>{text} own</span> <span>{text} slotted</span></div>")
+            else:
+                root.append(text)
+                twin.append(text)
+        root_html = json.dumps("".join(root) + f'<input type="text" name="c{seed}">')
+        defs.append(
+            f"customElements.define('x-t{seed}', class extends HTMLElement {{ connectedCallback() {{"
+            f" this.attachShadow({{mode: 'open'}}).innerHTML = {root_html}; }} }});"
+        )
+        hosts.append(f"<x-t{seed}>{''.join(light)}</x-t{seed}>")
+        twins.append(f"<form>{''.join(twin)}<input type='text' name='t{seed}'></form>")
+    html = f"<!doctype html><html><body>{''.join(twins)}{''.join(hosts)}<script>{''.join(defs)}</script></body></html>"
+    return html, list(seeds)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_near_carries_every_word_of_the_light_twins_group() -> None:
+    html, seeds = _twin_pages(range(40))
+    async with _content_page(html) as page:
+        elements = (await _observe_data(page))["elements"]
+    by_name = {}
+    for e in elements:
+        found = re.findall(r"\b[ct]\d+\b", json.dumps({k: e.get(k) for k in ("selector", "name")}))
+        if found:
+            by_name[found[0]] = e
+    wrong = []
+    for seed in seeds:
+        twin, comp = by_name.get(f"t{seed}"), by_name.get(f"c{seed}")
+        words = set(" ".join(text for _, text in _near_of(comp) or ()).split()) if comp else set()
+        group = (twin or {}).get("group") or ""
+        if not group or comp is None or comp.get("group") or not set(group.split()) <= words:
+            wrong.append((seed, group, _near_of(comp) if comp else "<unlisted>"))
+    assert not wrong, wrong
+
+
+# near is computed only for a field main's walk leaves without a group: a one-word root text keeps it alone.
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_near_is_not_read_beside_mains_group() -> None:
+    templates = {"a": '<div><span>Required field</span><div><slot name="q"></slot></div><input name="pin"></div>'}
+    tpl = "".join(f'<template id="{k}">{v}</template>' for k, v in templates.items())
+    page = '<pl-c t="a"><span slot="q">Which city do you live in?</span></pl-c>'
+    async with _content_page(f"<!doctype html><html><body>{page}{tpl}{_PL_SCRIPT}</body></html>") as p:
+        reads = [
+            (e.get("group"), e.get("near")) for e in (await _observe_data(p))["elements"] if '"pin"' in json.dumps(e)
+        ]
+    assert reads == [("Required field", None)], reads
+
+
+# Lines that read the same until near= tells them apart are not counted as reading the same; the duplicate telemetry
+# keeps counting the lines main prints.
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_same_line_note_counts_near() -> None:
+    hosts = '<x-c><span slot="label">Home phone</span></x-c><x-c><span slot="label">Work phone</span></x-c>'
+    script = (
+        "<script>customElements.define('x-c', class extends HTMLElement { connectedCallback() {"
+        " this.attachShadow({mode: 'open'}).innerHTML = '<div><slot name=\"label\"></slot></div><input>'; } });</script>"
+    )
+    async with _content_page(f"<!doctype html><html><body>{hosts}{script}</body></html>") as page:
+        result = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    lines = [line for line in result.content.splitlines() if line.startswith("ref=")]
+    assert [line.rsplit(" near=", 1)[1] for line in lines] == ["[label:'Home phone']", "[label:'Work phone']"], lines
+    assert "read the same as another line" not in result.content, result.content
+    assert result.data is not None and result.data["summary"]["duplicate_digest_lines"] == 2, result.data
 
 
 # Plain text in an outer root is never read and does not end the walk: the slotted text before it is still printed.
@@ -49553,12 +49827,37 @@ async def test_observe_near_leaves_the_qualifiers_of_twin_fields_as_on_main(
             '<div><slot name="label"></slot></div><div><div><input type="text" name="pin"></div></div>',
             '<span slot="label">Expected salary</span>',
         ),
+        (
+            "<fieldset><p>Do you drive?</p><label><input type='radio' name='d'>Yes</label>"
+            "<label><input type='radio' name='d'>No</label></fieldset><span>If yes, which car?</span>"
+            "<input type='text' name='pin'>",
+            '<x-q></x-q><slot name="label"></slot><input type="text" name="pin">',
+            '<span slot="label">If yes, which car?</span>',
+        ),
+        (
+            "<label><input type='radio' name='r'>Yes</label><span>If yes, which car?</span>"
+            "<input type='text' name='pin'>",
+            '<x-r>Yes</x-r><slot name="label"></slot><input type="text" name="pin">',
+            '<span slot="label">If yes, which car?</span>',
+        ),
     ],
-    ids=["text_before", "label_element", "label_and_helper", "two_levels_up"],
+    ids=[
+        "text_before",
+        "label_element",
+        "label_and_helper",
+        "two_levels_up",
+        "after_a_question_with_options",
+        "after_a_radio_with_a_slotted_caption",
+    ],
 )
 async def test_observe_near_reads_what_main_reads_for_the_light_twin(light_twin: str, root: str, slotted: str) -> None:
     script = (
-        "<script>customElements.define('x-c', class extends HTMLElement { connectedCallback() {"
+        "<script>customElements.define('x-q', class extends HTMLElement { connectedCallback() {"
+        ' this.attachShadow({mode: \'open\'}).innerHTML = \'<p>Do you drive?</p><label><input type="radio" name="e">'
+        'Yes</label><label><input type="radio" name="e">No</label>\'; } });'
+        "customElements.define('x-r', class extends HTMLElement { connectedCallback() {"
+        " this.attachShadow({mode: 'open'}).innerHTML = '<label><input type=\"radio\" name=\"f\"><slot></slot></label>'; } });"
+        "customElements.define('x-c', class extends HTMLElement { connectedCallback() {"
         f" this.attachShadow({{mode: 'open'}}).innerHTML = {json.dumps(root)}; }} }});</script>"
     )
     page_html = f"<!doctype html><html><body><form>{light_twin}</form><x-c>{slotted}</x-c>{script}</body></html>"
@@ -49568,7 +49867,7 @@ async def test_observe_near_reads_what_main_reads_for_the_light_twin(light_twin:
     assert " ".join(text for _, text in _near_of(pins[1]) or ()) == pins[0]["group"], pins
 
 
-# Lit renders `${label}<input>`: bare text at the top level of the control's own root ends the walk like an element.
+# Lit renders `${label}<input>`: bare text at the top level of the control's own root is an own-text candidate.
 # A checkbox and a radio in a root take no near (their question is the group's), and the climb reads the control and
 # its first 5 ancestors only.
 @_skip_no_browser
@@ -49576,7 +49875,10 @@ async def test_observe_near_reads_what_main_reads_for_the_light_twin(light_twin:
 @pytest.mark.parametrize(
     ("root", "printed"),
     [
-        ('<div><slot name="label"></slot></div>What is your phone number?<input type="text" name="pin">', None),
+        (
+            '<div><slot name="label"></slot></div>What is your phone number?<input type="text" name="pin">',
+            (("label", "Contact details"), ("(own text)", "What is your phone number?")),
+        ),
         ('<div><slot name="label"></slot></div><input type="checkbox" name="pin">', None),
         ('<div><slot name="label"></slot></div><input type="radio" name="pin">', None),
         (
@@ -49584,8 +49886,24 @@ async def test_observe_near_reads_what_main_reads_for_the_light_twin(light_twin:
             (("label", "Contact details"),),
         ),
         ('<div><slot name="label"></slot></div>' + "<div>" * 6 + '<input type="text" name="pin">' + "</div>" * 6, None),
+        (
+            '<div><slot name="label"></slot></div>' + "<div>" * 25 + "</div>" * 25 + '<input type="text" name="pin">',
+            (("label", "Contact details"),),
+        ),
+        (
+            '<div><slot name="label"></slot></div>' + "<div>" * 26 + "</div>" * 26 + '<input type="text" name="pin">',
+            None,
+        ),
     ],
-    ids=["bare_text_node", "checkbox", "radio", "five_ancestors_up", "six_ancestors_up"],
+    ids=[
+        "bare_text_node",
+        "checkbox",
+        "radio",
+        "five_ancestors_up",
+        "six_ancestors_up",
+        "sibling_25_levels_deep",
+        "sibling_past_the_24_level_cap",
+    ],
 )
 async def test_observe_near_edges(root: str, printed: tuple[tuple[str, str], ...] | None) -> None:
     script = (
@@ -49649,13 +49967,11 @@ async def test_observe_near_prints_a_repeated_label_on_every_field() -> None:
             ),
             "Which city do you live in?",
         ),
-        ("", '<div><slot name="q">Default helper text</slot></div><div><input type="text" name="pin"></div>', None),
     ],
     ids=[
         "slotted_listbox_before",
         "slotted_listbox_beside_a_label",
         "unslotted_button_in_a_decoration",
-        "fallback_label_text_only",
     ],
 )
 async def test_observe_group_text_projected_label_stops_only_at_a_drawn_control(
@@ -49694,7 +50010,7 @@ async def test_observe_group_text_projected_label_stops_only_at_a_drawn_control(
         (
             '<span slot="q">Which city do you live in?</span>',
             '<div><slot name="q"></slot><span>(required)</span></div><div><input type="text" name="pin"></div>',
-            "near=[q:'Which city do you live in?']",
+            "near=[(own text):'(required)', q:'Which city do you live in?']",
         ),
         (
             '<svg slot="icon" width="16" height="16"><rect width="16" height="16"></rect></svg>'
@@ -49737,11 +50053,17 @@ async def test_observe_group_text_projected_label_stops_only_at_a_drawn_control(
             '<div><slot></slot></div><div><input type="text" name="pin"></div>',
             "near=[default:'Which city do you live in?']",
         ),
+        (
+            '<span slot="vol">Volume</span><span slot="name">Display name</span>',
+            '<slot name="vol"></slot><div role="slider" tabindex="0" aria-valuenow="5" style="width:80px;height:10px"></div><slot name="name"></slot>'
+            '<input type="text" name="pin">',
+            "near=[name:'Display name']",
+        ),
     ],
     ids=[
         "affix_with_letters",
         "helper_slot_before_the_input",
-        "wrapper_static_text_unread",
+        "wrapper_static_text_as_own_text",
         "icon_slot_before_the_label",
         "label_and_helper_in_one_wrapper",
         "label_and_usd_prefix",
@@ -49750,6 +50072,7 @@ async def test_observe_group_text_projected_label_stops_only_at_a_drawn_control(
         "hostile_slot_name",
         "five_slots_keep_the_nearest_four",
         "default_slot",
+        "slider_between_two_slots",
     ],
 )
 async def test_observe_near_prints_the_projected_text_with_its_slot_name(light: str, root: str, printed: str) -> None:
