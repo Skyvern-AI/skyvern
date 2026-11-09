@@ -94,6 +94,7 @@ from skyvern.forge.taskv3.tools import (
     _MENU_OPTION_TEXTS_JS,
     _NO_QUESTION_MARKER,
     _OPAQUE_ID_RUN_RE,
+    _OWN_CHIPS_JS,
     _PIERCED_QUERY_JS,
     _SEMANTIC_COMMIT_STATE_JS,
     _TYPE_TARGET_PROBE_JS,
@@ -50168,11 +50169,11 @@ async def test_a_slotted_option_menu_is_listed_whole_and_its_selecting_click_is_
 
 
 # select_combobox commits both variants. The single-choice read-back sees the value in the input; the multiple-choice
-# chip sits in a tag list inside the field's own shadow tree, and the read-back reports no commit while it is there.
-# That half is a known residual, pinned as today's output; invert it when the chip read-back closes.
+# pick shows as a tag row (an option nesting its remove button) in a tag list inside the field's own shadow tree. That
+# shape is also how a list of recent picks can look, so the tool reports the row it saw without calling it a commit.
 @_skip_no_browser
 @pytest.mark.asyncio
-async def test_select_combobox_commits_shadow_form_dropdowns_and_misreads_the_multiple_choice_chip() -> None:
+async def test_select_combobox_commits_shadow_form_dropdowns_and_reports_the_multiple_choice_tag_row() -> None:
     async with _content_page(_SHADOW_SCREENING_FORM_HTML) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         orbit, instruments, _ = await _shadow_form_combobox_refs(tools)
@@ -50182,7 +50183,370 @@ async def test_select_combobox_commits_shadow_form_dropdowns_and_misreads_the_mu
 
         multiple = await _tool(tools, "select_combobox").handler({"selector": instruments, "value": "Glass harp"})
         assert await _shadow_form_committed(page, "tools") == ["Glass harp"]
-        assert multiple.status == "error" and multiple.error_class == "did_not_commit", multiple.content
+        assert _reports_observed_row(multiple, "Glass harp"), multiple.content
+
+
+def _reports_observed_row(r: ToolResult, label: str) -> bool:
+    return (
+        r.status == "ok"
+        and r.ok_class == "unverified"
+        and f"'{label.lower()}'" in r.content.lower()
+        and "cannot tell" in r.content
+    )
+
+
+# A field's picks shown as tag rows, generated over where the field and its tag list live (light DOM, one shadow root,
+# nested roots), how a row carries its text (direct or slotted, beside a remove button) and what the pick did. A
+# page-level tag list, a captioned list of recent picks (plain, or a component with a slotted caption) and two other
+# fields hold every label too. A tag row is never a commit: the one this field's own list gained with the pick is
+# reported as an observed row, and a row that was already there, another field's row, another label and a pick that did
+# nothing leave the pick refused.
+_CR_FIELDS_HTML = """<!doctype html><html><body style="font:14px sans-serif">
+<div role="listbox" aria-label="Saved tags" id="saved"></div>
+<form id="crf"></form>
+<script>
+const CR = __CONFIG__;
+const VALUES = ['Copper bell', 'Glass harp', 'Glass harp case', 'Reed pipe'];
+window.__chips = {};
+const chipNode = (label, kind, loose) => {
+  const shown = loose ? '  ' + label.toUpperCase().replace(/ /g, '   ') + ' ' : label;
+  const css = 'display:inline-block;border:1px solid #888;padding:1px 6px;margin:2px';
+  if (kind === 'slotted') {
+    const host = document.createElement('cr-chip');
+    host.textContent = shown;
+    host.attachShadow({mode: 'open'}).innerHTML = '<div role="option" aria-selected="false" style="' + css
+      + '"><slot></slot><button type="button">x</button></div>';
+    return host;
+  }
+  const d = document.createElement('div');
+  d.setAttribute('role', 'option');
+  d.setAttribute('aria-selected', 'false');
+  d.style.cssText = css;
+  d.appendChild(document.createTextNode(shown));
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.textContent = kind === 'remove' ? 'Remove' : '\\u2715';
+  d.appendChild(b);
+  return d;
+};
+const fields = [];
+const paint = (f) => {
+  f.tags.textContent = '';
+  for (const v of f.chips) f.tags.appendChild(chipNode(v, f.cfg.chip, f.cfg.loose));
+  window.__chips[f.i] = f.chips.slice();
+};
+const shadowHost = (tag, parent) => {
+  const h = document.createElement(tag);
+  h.style.display = 'block';
+  parent.appendChild(h);
+  return h.attachShadow({mode: 'open'});
+};
+CR.forEach((cfg, i) => {
+  const card = document.createElement('div');
+  card.style.margin = '8px 0';
+  document.getElementById('crf').appendChild(card);
+  const root = cfg.dom === 'light' ? card : shadowHost('cr-wrap', card);
+  const cap = document.createElement('div');
+  cap.textContent = 'Instruments ' + i;
+  root.appendChild(cap);
+  const inputRoot = cfg.dom === 'nested' ? shadowHost('cr-in', root) : root;
+  const wrap = document.createElement('div');
+  inputRoot.appendChild(wrap);
+  const input = document.createElement('input');
+  input.id = 'cr' + i;
+  input.type = 'text';
+  input.style.width = '300px';
+  input.setAttribute('role', 'combobox');
+  input.setAttribute('aria-label', 'Instruments ' + i);
+  input.setAttribute('aria-autocomplete', 'list');
+  input.setAttribute('aria-expanded', 'false');
+  input.setAttribute('aria-controls', 'crm' + i);
+  wrap.appendChild(input);
+  const tagsRoot = cfg.dom === 'nested' ? shadowHost('cr-tags', root) : root;
+  const tags = document.createElement('div');
+  tags.setAttribute('role', 'listbox');
+  tags.setAttribute('aria-label', 'Selected values');
+  tagsRoot.appendChild(tags);
+  // A captioned list of recent picks beside the field's own tags is not its selection.
+  const recents = document.createElement('div');
+  recents.setAttribute('role', 'listbox');
+  const recentsBox = document.createElement('div');
+  recentsBox.textContent = 'Recently used:';
+  recentsBox.appendChild(recents);
+  root.appendChild(recentsBox);
+  // The same list as a component of its own: its caption is slotted text, its list in its root.
+  const recentsHost = document.createElement('cr-recents');
+  recentsHost.innerHTML = '<span>Recently used:</span>';
+  const recentsRoot = recentsHost.attachShadow({mode: 'open'});
+  recentsRoot.innerHTML = '<div><slot></slot><div role="listbox"></div></div>';
+  if (cfg.effect === 'recents-component-wrapped') {
+    const w = document.createElement('div');
+    w.appendChild(recentsHost);
+    root.appendChild(w);
+  } else root.appendChild(recentsHost);
+  // Another field beside this one in its card, a component named by its aria-label alone: no caption to see.
+  let sibTags = null;
+  if (cfg.effect === 'other-unlabelled-component') {
+    const sib = shadowHost('cr-sib', card);
+    const sibInput = document.createElement('input');
+    sibInput.setAttribute('aria-label', 'Other instrument ' + i);
+    sibInput.style.width = '200px';
+    sib.appendChild(sibInput);
+    sibTags = document.createElement('div');
+    sibTags.setAttribute('role', 'listbox');
+    sib.appendChild(sibTags);
+  }
+  const f = {i, cfg, tags, chips: cfg.pre ? [cfg.pick] : []};
+  fields.push(f);
+  paint(f);
+  const close = () => {
+    const m = inputRoot.querySelector('#crm' + i);
+    if (m) m.remove();
+    input.setAttribute('aria-expanded', 'false');
+  };
+  const add = (g, v) => { if (!g.chips.includes(v)) { g.chips.push(v); paint(g); } };
+  const pick = (v) => {
+    const sink = fields[fields.length - 1];
+    const otherComponent = fields[fields.length - 2];
+    if (cfg.effect === 'add') add(f, v);
+    else if (cfg.effect === 'toggle') { f.chips = f.chips.includes(v) ? f.chips.filter((x) => x !== v) : f.chips.concat([v]); paint(f); }
+    else if (cfg.effect === 'other-field') add(sink, v);
+    else if (cfg.effect === 'other-component') add(otherComponent, v);
+    else if (cfg.effect === 'other-unlabelled-component') sibTags.appendChild(chipNode(v, cfg.chip, cfg.loose));
+    else if (cfg.effect === 'recents') recents.appendChild(chipNode(v, cfg.chip, cfg.loose));
+    else if (cfg.effect.startsWith('recents-component')) {
+      recentsRoot.querySelector('[role=listbox]').appendChild(chipNode(v, cfg.chip, cfg.loose));
+    }
+    else if (cfg.effect === 'other-label') add(f, v + ' case');
+    close();
+    input.value = '';
+  };
+  const open = () => {
+    close();
+    const m = document.createElement('div');
+    m.id = 'crm' + i;
+    m.setAttribute('role', 'listbox');
+    m.style.cssText = 'border:1px solid #888;width:300px;background:#fff';
+    const typed = input.value.toLowerCase();
+    for (const v of VALUES.filter((x) => x.toLowerCase().includes(typed))) {
+      const o = document.createElement('div');
+      o.setAttribute('role', 'option');
+      o.textContent = v;
+      o.style.cssText = 'padding:4px;cursor:pointer';
+      o.addEventListener('mousedown', (e) => e.preventDefault());
+      o.addEventListener('click', () => pick(v));
+      m.appendChild(o);
+    }
+    wrap.after(m);
+    input.setAttribute('aria-expanded', 'true');
+  };
+  input.addEventListener('click', open);
+  input.addEventListener('input', open);
+  input.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); });
+});
+for (const v of VALUES) document.getElementById('saved').appendChild(chipNode(v, 'direct', false));
+</script></body></html>"""
+
+# effect: what the pick does to the chips; pre: the picked label is a chip of this field before the pick.
+_CR_OUTCOMES = (
+    ("add", False),
+    ("none", False),
+    ("other-field", False),
+    ("other-label", False),
+    ("other-component", False),
+    ("other-unlabelled-component", False),
+    ("recents", False),
+    ("recents-component", False),
+    ("recents-component-wrapped", False),
+    ("toggle", True),
+    ("none", True),
+)
+
+
+def _cr_configs() -> list[dict[str, Any]]:
+    # Every outcome once, the place and the row shape rotating, and the gaining pick in all nine of them.
+    shapes = list(itertools.product(("light", "shadow", "nested"), ("direct", "remove", "slotted")))
+    picks = [(shapes[k % 9], outcome) for k, outcome in enumerate(_CR_OUTCOMES)]
+    picks += [(shape, ("add", False)) for shape in shapes if shape != shapes[0]]
+    configs: list[dict[str, Any]] = []
+    for (dom, chip), (effect, pre) in picks:
+        # Main reads a slotted chip in a captioned recents list as a commit too; that limit predates the chip read.
+        if effect == "recents" and chip == "slotted":
+            chip = "direct"
+        configs.append(
+            {
+                "dom": dom,
+                "chip": chip,
+                "effect": effect,
+                "pre": pre,
+                "pick": "Glass harp",
+                "loose": len(configs) % 2 == 1,
+            }
+        )
+    # Two sinks: another component whose label is drawn inside its own root, and a light field.
+    configs.append({"dom": "shadow", "chip": "direct", "effect": "none", "pre": False, "pick": "", "loose": False})
+    configs.append({"dom": "light", "chip": "direct", "effect": "none", "pre": False, "pick": "", "loose": False})
+    return configs
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_reports_a_tag_row_only_its_own_field_gained_and_never_as_a_commit() -> None:
+    configs = _cr_configs()
+    html = _CR_FIELDS_HTML.replace("__CONFIG__", json.dumps(configs))
+    wrong = []
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        select = _tool(tools, "select_combobox").handler
+        for i, cfg in enumerate(configs[:-2]):
+            before = await page.evaluate("(i) => window.__chips[i].slice()", i)
+            r = await select({"selector": f"#cr{i}", "value": cfg["pick"]})
+            after = await page.evaluate("(i) => window.__chips[i].slice()", i)
+            gained = cfg["pick"] in after and cfg["pick"] not in before
+            # Main's own verifier reads a light-DOM label slotted into a row outside a nested root as the commit.
+            mains = cfg["chip"] == "slotted" and cfg["dom"] != "nested"
+            right = (
+                (
+                    r.status == "ok" and "committed value" in r.content
+                    if mains
+                    else _reports_observed_row(r, cfg["pick"])
+                )
+                if gained
+                else r.error_class == "did_not_commit"
+            )
+            if not right:
+                wrong.append((i, cfg, before, after, r.status, r.error_class, r.content[:200]))
+    assert not wrong, wrong
+
+
+# Chips whose ownership the field cannot prove. A component beside the field draws the picked label as a removable chip
+# in its own root (a pill, a tag row, under a host aria-label): the field still picks, and the pill its own list gains
+# is the commit. A pill the field's own list already holds is left as is. A host carrying role=combobox with the real
+# input in its root is one field, so the pill beside it is still read. A label assigned to a slot the pill hides is not
+# drawn, so the pill reads as no chip. An owned pill commits only when it is new and carries the exact label. Two
+# light-DOM fields sharing a vocabulary behave as on main: each reads only its own pills.
+_UNPROVABLE_CHIPS_HTML = """<!doctype html><html><body style="font:14px sans-serif">
+<div id="cards"></div>
+<script>
+const css = 'display:inline-block;border:1px solid #888;padding:1px 6px;margin:2px';
+const pill = (v) => '<span class="chip" style="' + css + '">' + v + '<button type="button">x</button></span>';
+const OTHER = {
+  'pill-root': ['', pill('Glass harp')],
+  'option-root': ['', '<div role="option" style="' + css + '">Glass harp<button type="button">x</button></div>'],
+  'labelled-host': [' aria-label="Other instruments"', pill('Glass harp')],
+};
+const combo = (host, input, i, effect, own) => {
+  const close = () => {
+    const m = host.querySelector('[role=listbox]');
+    if (m) m.remove();
+    input.setAttribute('aria-expanded', 'false');
+  };
+  const open = () => {
+    close();
+    input.setAttribute('aria-expanded', 'true');
+    const m = document.createElement('div');
+    m.setAttribute('role', 'listbox');
+    m.style.cssText = 'border:1px solid #888;width:300px;background:#fff';
+    for (const v of ['Copper bell', 'Glass harp', 'Reed pipe'].filter((x) => x.toLowerCase().includes(input.value.toLowerCase()))) {
+      const o = document.createElement('div');
+      o.setAttribute('role', 'option');
+      o.textContent = v;
+      o.addEventListener('mousedown', (e) => e.preventDefault());
+      const added = effect === 'hidden-slot' ? v : pill(effect === 'substring' ? v + ' case' : v);
+      const lands = effect !== 'noop' && effect !== 'pre-noop';
+      o.addEventListener('click', () => { if (lands) own.insertAdjacentHTML('beforeend', added); close(); input.value = ''; });
+      m.appendChild(o);
+    }
+    input.after(m);
+  };
+  if (effect !== 'pre-noop') input.setAttribute('aria-expanded', 'false');
+  input.addEventListener('click', open);
+  input.addEventListener('input', open);
+};
+const EFFECTS = ['pill-root', 'option-root', 'labelled-host', 'noop', 'held', 'host-combobox', 'hidden-slot', 'substring',
+  'pre-noop'];
+EFFECTS.forEach((effect, i) => {
+  const card = document.createElement('div');
+  card.style.margin = '8px 0';
+  document.getElementById('cards').appendChild(card);
+  let own = document.createElement('div');
+  let input;
+  if (effect === 'hidden-slot') {
+    own = document.createElement('x-tagged');
+    card.appendChild(own);
+    const root = own.attachShadow({mode: 'open'});
+    root.innerHTML = '<input id="f' + i + '" role="combobox" aria-autocomplete="list" aria-label="Instruments ' + i
+      + '" style="width:300px"><span class="chip" style="' + css + '"><slot style="display:none"></slot>'
+      + '<button type="button">x</button></span>';
+    input = root.querySelector('input');
+    combo(root, input, i, effect, own);
+  } else if (effect === 'host-combobox') {
+    const host = document.createElement('x-combo');
+    host.setAttribute('role', 'combobox');
+    host.setAttribute('aria-haspopup', 'listbox');
+    host.style.display = 'block';
+    card.appendChild(host);
+    const root = host.attachShadow({mode: 'open'});
+    root.innerHTML = '<input id="f' + i + '" aria-label="Instruments ' + i + '" style="width:300px">';
+    input = root.querySelector('input');
+    combo(root, input, i, effect, own);
+  } else {
+    card.insertAdjacentHTML('beforeend', '<label for="f' + i + '">Instruments ' + i + '</label> '
+      + '<input id="f' + i + '" role="combobox" aria-autocomplete="list" style="width:300px">');
+    input = card.querySelector('input');
+    combo(card, input, i, effect, own);
+  }
+  if (effect !== 'hidden-slot') card.appendChild(own);
+  if (effect === 'held' || effect === 'pre-noop') own.innerHTML = pill('Glass harp');
+  const [attr, body] = OTHER[effect === 'noop' ? 'pill-root' : effect] || [];
+  if (body) {
+    const other = document.createElement('x-other');
+    if (attr) other.setAttribute('aria-label', 'Other instruments');
+    card.appendChild(other);
+    other.attachShadow({mode: 'open'}).innerHTML = body;
+  }
+});
+// Two light fields in one card share a vocabulary, the first already holding the label.
+const pair = document.createElement('div');
+document.getElementById('cards').appendChild(pair);
+[0, 1].forEach((k) => {
+  const id = 'f' + (EFFECTS.length + k);
+  const w = document.createElement('div');
+  pair.appendChild(w);
+  w.insertAdjacentHTML('beforeend', '<label for="' + id + '">Instruments ' + id + '</label> <input id="' + id
+    + '" role="combobox" aria-autocomplete="list" style="width:300px">');
+  const own = document.createElement('div');
+  own.className = 'own';
+  w.appendChild(own);
+  if (k === 0) own.innerHTML = pill('Glass harp');
+  combo(w, w.querySelector('input'), 0, 'pair', own);
+});
+window.pairPills = (id) => Array.from(document.getElementById(id).parentNode.querySelectorAll('.own > .chip'))
+  .map((c) => c.firstChild.nodeValue);
+window.ownPills = (i) => Array.from(document.querySelectorAll('#cards > div')[i].querySelectorAll(':scope > div > .chip'))
+  .map((c) => c.firstChild.nodeValue);
+</script></body></html>"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_picks_past_a_chip_it_cannot_prove_is_the_fields_own() -> None:
+    async with _content_page(_UNPROVABLE_CHIPS_HTML) as page:
+        select = _tool(build_browser_tools(_fixed_page_provider(page)), "select_combobox").handler
+        results = [await select({"selector": f"#f{i}", "value": "Glass harp"}) for i in range(11)]
+        pills = [await page.evaluate("(i) => window.ownPills(i)", i) for i in range(9)]
+        pair = [await page.evaluate("(id) => window.pairPills(id)", f"f{i}") for i in (9, 10)]
+        hidden_slot_chips = await page.evaluate(_OWN_CHIPS_JS, {"sel": "#f6"})
+    for i in (0, 1, 2, 5):
+        assert results[i].status == "ok" and "committed value" in results[i].content, (i, results[i].content)
+        assert pills[i] == ["Glass harp"], (i, pills[i])
+    assert results[3].error_class == "did_not_commit" and pills[3] == [], results[3].content
+    assert results[4].status == "ok" and "already selected" in results[4].content and pills[4] == ["Glass harp"]
+    assert hidden_slot_chips == []
+    assert results[7].error_class == "did_not_commit" and pills[7] == ["Glass harp case"], results[7].content
+    assert results[8].error_class == "did_not_commit" and pills[8] == ["Glass harp"], results[8].content
+    assert results[9].status == "ok" and "already selected" in results[9].content and pair[0] == ["Glass harp"]
+    assert results[10].status == "ok" and "committed value" in results[10].content and pair[1] == ["Glass harp"]
 
 
 # A menu row that holds its own list: the list's rows declare no role, so each belongs to the inner list, not to the
