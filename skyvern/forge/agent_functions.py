@@ -2185,6 +2185,10 @@ class AgentFunction:
     def note_browser_relaunch(self, browser_state: BrowserState | None, reason: str) -> None:
         """The next browser creation in this task replaces an earlier one of the same run. OSS no-op."""
 
+    def note_working_page_ready(self, browser_context: BrowserContext, page: Page) -> None:
+        """The state's working page is in place: its other pages are closed and any first navigation has run.
+        An override may only schedule work, never wait on it. OSS no-op."""
+
     def on_browser_run_released(self, browser_context: BrowserContext | BrowserArtifacts | None) -> None:
         """A run released a browser that no other run shares. OSS no-op."""
 
