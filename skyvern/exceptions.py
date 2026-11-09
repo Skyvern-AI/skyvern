@@ -8,6 +8,7 @@ from importlib.util import find_spec
 from typing import TYPE_CHECKING, Literal, NoReturn
 
 from skyvern.schemas.browser_session_timeouts import MAX_EXTENDED_TIMEOUT
+from skyvern.utils.strings import is_uuid
 
 if TYPE_CHECKING:
     from skyvern.errors.errors import UserDefinedError
@@ -810,11 +811,16 @@ def sanitize_credential_for_error(credential_id: object) -> str:
 
 class InvalidCredentialId(SkyvernHTTPException):
     def __init__(self, credential_id: str) -> None:
-        super().__init__(
+        message = (
             f"Invalid credential ID: {sanitize_credential_for_error(credential_id)}."
-            " Failed to resolve to a valid credential.",
-            status_code=HTTPStatus.BAD_REQUEST,
+            " Failed to resolve to a valid credential."
         )
+        if isinstance(credential_id, str) and is_uuid(credential_id):
+            message += (
+                " Credential IDs start with cred_. For a Bitwarden item ID, use a bitwarden_login_credential"
+                " parameter's bitwarden_item_id field."
+            )
+        super().__init__(message, status_code=HTTPStatus.BAD_REQUEST)
 
 
 class SequentialCredentialLimitExceeded(SkyvernHTTPException):
