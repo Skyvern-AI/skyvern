@@ -52,7 +52,7 @@ function TagChip({
     <span
       className={cn(
         badgeVariants({ variant: "secondary" }),
-        "max-w-full gap-1 font-normal",
+        "min-w-0 max-w-full gap-1 font-normal",
         className,
       )}
     >

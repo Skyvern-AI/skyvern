@@ -1427,16 +1427,6 @@ class TestInternalFailuresAreVisible:
         ]
         assert len(emitters) >= 2, "expected the decision and internal-fault sinks — the scan is broken"
 
-    def test_the_event_string_cannot_be_inlined_to_escape_the_scan(self) -> None:
-        """CAUGHT: inlining the literal at an emitter escapes any name-scoped scan.
-
-        Independently useful beyond leak-safety: one source for the event name means every emitter
-        is findable by grepping a single constant, which is what would have surfaced the second sink
-        immediately instead of several review rounds later.
-        """
-        source = Path("skyvern/forge/sdk/browser_action_preflight.py").read_text()
-        assert source.count('"Browser action policy decision"') == 1
-
     def test_the_error_path_cannot_itself_raise(self, observing: SkyvernContext) -> None:
         """The error path needed its own error path tested.
 

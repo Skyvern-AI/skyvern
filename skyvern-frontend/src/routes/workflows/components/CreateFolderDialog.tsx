@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -22,15 +22,20 @@ function CreateFolderDialog({ open, onOpenChange }: CreateFolderDialogProps) {
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const createFolderMutation = useCreateFolderMutation();
+  const submitting = useRef(false);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!title.trim()) return;
-
-    await createFolderMutation.mutateAsync({
-      title: title.trim(),
-      description: description.trim() || null,
-    });
+    if (!title.trim() || submitting.current) return;
+    submitting.current = true;
+    try {
+      await createFolderMutation.mutateAsync({
+        title: title.trim(),
+        description: description.trim() || null,
+      });
+    } finally {
+      submitting.current = false;
+    }
 
     setTitle("");
     setDescription("");

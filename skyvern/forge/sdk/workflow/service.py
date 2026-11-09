@@ -13,7 +13,7 @@ import time
 import unicodedata
 import uuid
 from collections import Counter, deque
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Iterable, Mapping, Sequence
 from contextlib import ExitStack, asynccontextmanager, nullcontext, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -43,7 +43,6 @@ from opentelemetry import trace as otel_trace
 
 import skyvern
 from skyvern import analytics
-from skyvern.client.types.output_parameter import OutputParameter as BlockOutputParameter
 from skyvern.config import settings
 from skyvern.constants import (
     DEFAULT_WORKFLOW_TITLES,
@@ -110,7 +109,12 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import is_temp_working_dir, resolve_run_download_id
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.artifact.storage.base import _file_infos_from_download_artifacts, artifact_filename_from_uri
-from skyvern.forge.sdk.artifact.storage.unique_pdfs import ResponseComparison, unique_pdf_file_infos
+from skyvern.forge.sdk.artifact.storage.unique_pdfs import (
+    ResponseComparison,
+    response_deadline,
+    unique_pdf_file_infos,
+    verified_pdf_digests,
+)
 from skyvern.forge.sdk.browser_action_policy import BrowserActionPolicy
 from skyvern.forge.sdk.cache import extraction_cache
 from skyvern.forge.sdk.cache.factory import CacheFactory
@@ -1157,6 +1161,110 @@ def _is_download_registration(value: dict[str, Any]) -> bool:
         and all(isinstance(aid, str) for aid in artifact_ids)
         and isinstance(value["downloaded_files"], list)
     )
+
+
+async def _as_outputs_copies(
+    files: list[FileInfo],
+    canonical: Sequence[FileInfo],
+    organization_id: str | None,
+    run_ids: Collection[str | None],
+    comparison: ResponseComparison | None,
+) -> list[FileInfo]:
+    """``files`` with each copy shown as the copy the run's Outputs keep for its content, once proven byte-equal."""
+    choices = {(fi.checksum, fi.file_size): fi for fi in canonical if fi.checksum and fi.file_size is not None}
+    swaps = [
+        (index, choice)
+        for index, fi in enumerate(files)
+        if fi.checksum
+        and fi.file_size is not None
+        and (choice := choices.get((fi.checksum, fi.file_size))) is not None
+        and choice.artifact_id != fi.artifact_id
+    ]
+    if not swaps or organization_id is None:
+        return files
+    pairs = [copy for index, choice in swaps for copy in (files[index], choice)]
+    digests = await verified_pdf_digests(pairs, organization_id, run_ids, comparison or ResponseComparison())
+    shown = list(files)
+    for n, (index, choice) in enumerate(swaps):
+        if digests[2 * n] is not None and digests[2 * n] == digests[2 * n + 1]:
+            shown[index] = choice
+    # An unregistered copy has no id, so its URL names it: distinct unregistered contents never merge.
+    unique: dict[tuple[bool, str], FileInfo] = {}
+    for fi in shown:
+        unique.setdefault((True, fi.artifact_id) if fi.artifact_id else (False, fi.url), fi)
+    return list(unique.values())
+
+
+def _mergeable_download_list(output: dict[str, Any]) -> bool:
+    """Whether ``output`` itself holds a complete automatic download list with content to match against Outputs."""
+    ids, entries = output.get("downloaded_file_artifact_ids"), output.get("downloaded_files")
+    urls = output.get("downloaded_file_urls")
+    automatic = "task_screenshot_artifact_ids" in output or "workflow_screenshot_artifact_ids" in output
+    if not (automatic or _is_download_registration(output)):
+        return False
+    if not (isinstance(ids, list) and isinstance(entries, list) and isinstance(urls, list)):
+        return False
+    if (
+        not all(isinstance(aid, str) for aid in ids)
+        or len(set(ids)) != len(ids)
+        or not len(ids) == len(entries) == len(urls)
+    ):
+        return False
+    # Entries that do not line up with their ids and URLs, such as a capped list's markers, are never rearranged.
+    if not all(
+        isinstance(entry, dict) and entry.get("artifact_id") == aid and isinstance(url, str) and entry.get("url") == url
+        for aid, entry, url in zip(ids, entries, urls)
+    ):
+        return False
+    # A member holding a nested value (a cap marker) or mistyped content metadata keeps its group as stored.
+    for entry in entries:
+        checksum, size = entry.get("checksum"), entry.get("file_size")
+        if (
+            any(isinstance(value, (dict, list)) for value in entry.values())
+            or not (checksum is None or isinstance(checksum, str))
+            or not (size is None or (type(size) is int and size >= 0))
+        ):
+            return False
+    return any(entry.get("checksum") and entry.get("file_size") for entry in entries)
+
+
+class TimelineDownloads:
+    """One timeline response's download listing state, shared by every run the response assembles."""
+
+    def __init__(self) -> None:
+        self.comparison: ResponseComparison | None = None
+        # A run mapped to None failed its read, which is not the same as recording no attempts.
+        self.attempts: dict[str, Sequence[Any] | None] = {}
+        self.attempt_downloads: dict[tuple[str, str, int], frozenset[str] | None] = {}
+        # What the run's Outputs list for each logical run and attempt; None records a failed selection.
+        self.outputs: dict[tuple[str, int], list[FileInfo] | None] = {}
+        # Each run's DOWNLOAD rows, read once per response; None records a failed read.
+        self.download_rows: dict[str, list[Artifact] | None] = {}
+
+    async def competes(
+        self, workflow_run_id: str, organization_id: str, ids: list[str], claims: list[Any]
+    ) -> bool | None:
+        """Whether any of ``ids`` shares its content with another of the run's downloads, from rows alone; None if unknown."""
+        if workflow_run_id not in self.download_rows:
+            try:
+                self.download_rows[workflow_run_id] = await app.DATABASE.artifacts.list_artifacts_for_run_by_type(
+                    run_id=workflow_run_id, organization_id=organization_id, artifact_type=ArtifactType.DOWNLOAD
+                )
+            except Exception:
+                self.download_rows[workflow_run_id] = None
+        rows = self.download_rows[workflow_run_id]
+        if rows is None or not set(ids) <= {row.artifact_id for row in rows}:
+            return None
+        shared = Counter((row.checksum, row.file_size) for row in rows)
+        return any(shared[claim] > 1 for claim in claims)
+
+    async def read_attempts(self, workflow_run_id: str) -> Sequence[Any]:
+        """The run's attempt rows, read once per response; a read that failed before is retried and may raise."""
+        rows = self.attempts.get(workflow_run_id)
+        if rows is None:
+            rows = await app.DATABASE.workflow_run_attempts.get_attempts(workflow_run_id)
+            self.attempts[workflow_run_id] = rows
+        return rows
 
 
 def _as_utc(dt: datetime) -> datetime:
@@ -3021,6 +3129,7 @@ class WorkflowService:
         historical_artifacts: list[Artifact] | None = None,
         current_attempt_artifacts: list[Artifact] | None = None,
         comparison: ResponseComparison | None = None,
+        canonical: Sequence[FileInfo] = (),
     ) -> Any:
         """Two-pass batch URL refresh: scan artifact IDs (sync), fetch all in 2 parallel DB calls, substitute in-place."""
         if not organization_id:
@@ -3095,6 +3204,7 @@ class WorkflowService:
             comparison=comparison,
             unresolved=unresolved,
             download_run_id=download_run_id,
+            canonical=canonical,
         )
 
     async def _substitute_artifact_urls(
@@ -3111,6 +3221,7 @@ class WorkflowService:
         comparison: ResponseComparison | None = None,
         unresolved: frozenset[str] = frozenset(),
         download_run_id: str | None = None,
+        canonical: Sequence[FileInfo] = (),
     ) -> Any:
         """Substitute artifact IDs with pre-built URLs and FileInfos (no DB in the common path).
 
@@ -3146,9 +3257,15 @@ class WorkflowService:
                         [download_run_id or workflow_run_id],
                         comparison,
                     )
-                    if len(unique) < len(refreshed) or not unresolved.isdisjoint(value["downloaded_file_artifact_ids"]):
+                    unique = await _as_outputs_copies(
+                        unique, canonical, organization_id, [download_run_id or workflow_run_id], comparison
+                    )
+                    shown_ids = [fi.artifact_id for fi in unique]
+                    if shown_ids != [fi.artifact_id for fi in refreshed] or not unresolved.isdisjoint(
+                        value["downloaded_file_artifact_ids"]
+                    ):
                         # This is the response copy; the stored output keeps every id, so a later read re-decides.
-                        value["downloaded_file_artifact_ids"] = [fi.artifact_id for fi in unique]
+                        value["downloaded_file_artifact_ids"] = [fi.artifact_id for fi in unique if fi.artifact_id]
                     if unique or download_scope_active:
                         value["downloaded_files"] = [fi.model_dump(mode="json") for fi in unique]
                         value["downloaded_file_urls"] = [fi.url for fi in unique]
@@ -3209,7 +3326,7 @@ class WorkflowService:
             else:
                 if _is_download_registration(value):
                     await self._select_registered_downloads(
-                        value, fileinfo_map, download_run_id or workflow_run_id, organization_id, comparison
+                        value, fileinfo_map, download_run_id or workflow_run_id, organization_id, comparison, canonical
                     )
                 for k, v in value.items():
                     # Only containers can hold artifact IDs; awaiting a coroutine per scalar leaf blocks the event
@@ -3230,6 +3347,7 @@ class WorkflowService:
                         comparison=comparison,
                         unresolved=unresolved,
                         download_run_id=download_run_id,
+                        canonical=canonical,
                     )
         elif isinstance(value, list):
             for i, item in enumerate(value):
@@ -3249,6 +3367,7 @@ class WorkflowService:
                     comparison=comparison,
                     unresolved=unresolved,
                     download_run_id=download_run_id,
+                    canonical=canonical,
                 )
         return value
 
@@ -3259,6 +3378,7 @@ class WorkflowService:
         download_run_id: str,
         organization_id: str | None,
         comparison: ResponseComparison | None,
+        canonical: Sequence[FileInfo] = (),
     ) -> None:
         """List each PDF content once in a host download registration whose every id is a download row of this run."""
         artifact_ids = value["downloaded_file_artifact_ids"]
@@ -3271,11 +3391,248 @@ class WorkflowService:
             [download_run_id],
             comparison,
         )
-        if len(unique) < len(registered):
+        unique = await _as_outputs_copies(unique, canonical, organization_id, [download_run_id], comparison)
+        if [fi.artifact_id for fi in unique] != artifact_ids or canonical:
             # This is the response copy; the stored output keeps every id, so a later read re-decides.
-            value["downloaded_file_artifact_ids"] = [fi.artifact_id for fi in unique]
+            value["downloaded_file_artifact_ids"] = [fi.artifact_id for fi in unique if fi.artifact_id]
             value["downloaded_files"] = [fi.model_dump(mode="json") for fi in unique]
             value["downloaded_file_urls"] = [fi.url for fi in unique]
+
+    async def _project_block_downloads(
+        self, block: WorkflowRunBlock, organization_id: str, downloads: TimelineDownloads
+    ) -> WorkflowRunBlock:
+        """``block`` showing, for each of its own automatic downloads, the copy the run's Outputs show for it."""
+        output = block.output
+        # A block that started another run can embed that run's payload, which its own row cannot attribute.
+        if block.block_workflow_run_id or not isinstance(output, dict) or not _mergeable_download_list(output):
+            return block
+        ids: list[str] = output["downloaded_file_artifact_ids"]
+        entries: list[dict[str, Any]] = output["downloaded_files"]
+        urls: list[str] = output["downloaded_file_urls"]
+        comparison = downloads.comparison = downloads.comparison or ResponseComparison()
+        # Every lookup, listing and read below shares the response's one absolute budget; none starts after it.
+        if asyncio.get_running_loop().time() >= comparison.deadline:
+            return block
+        declared = response_deadline.set(comparison.deadline)
+        try:
+            async with asyncio.timeout_at(comparison.deadline):
+                chosen = await self._outputs_choices(block, organization_id, downloads, ids, entries)
+        except TimeoutError:
+            LOG.warning(
+                "Stopped matching a timeline block's downloads to Outputs at the response deadline; listing every copy",
+                workflow_run_block_id=block.workflow_run_block_id,
+            )
+            return block
+        finally:
+            response_deadline.reset(declared)
+        if chosen is None:
+            return block
+        shown_ids: list[str] = []
+        shown_files: list[dict[str, Any]] = []
+        shown_urls: list[str] = []
+        for aid, entry, url, choice in zip(ids, entries, urls, chosen):
+            if choice is not None:
+                aid, entry, url = cast(str, choice.artifact_id), choice.model_dump(mode="json"), choice.url
+            if aid not in shown_ids:
+                shown_ids.append(aid)
+                shown_files.append(copy.deepcopy(entry))
+                shown_urls.append(url)
+        if (shown_ids, shown_files, shown_urls) == (ids, entries, urls):
+            return block
+        projected = {**output, "downloaded_file_artifact_ids": shown_ids, "downloaded_files": shown_files}
+        projected["downloaded_file_urls"] = shown_urls
+        # The count mirrors the stored list; a count that does not match it is left alone rather than inferred.
+        count = len(shown_ids) if block.downloaded_file_count == len(ids) else block.downloaded_file_count
+        return block.model_copy(update={"output": projected, "downloaded_file_count": count})
+
+    async def _outputs_choices(
+        self,
+        block: WorkflowRunBlock,
+        organization_id: str,
+        downloads: TimelineDownloads,
+        ids: list[str],
+        entries: list[dict[str, Any]],
+    ) -> list[FileInfo | None] | None:
+        """Per entry, the Outputs copy proven to hold its content (None keeps it), or None unless all are the block's."""
+        claims = [(entry.get("checksum"), entry.get("file_size")) for entry in entries]
+        download_run_id = await self._owned_download_key(block, organization_id, downloads, ids, claims)
+        # With no other copy of its content under its download key (or no answer), the block's own entry stands.
+        if download_run_id is None or not await downloads.competes(download_run_id, organization_id, ids, claims):
+            return None
+        try:
+            files = [FileInfo.model_validate(entry) for entry in entries]
+        except ValueError:
+            return None
+        outputs = await self._outputs_downloads(
+            block.workflow_run_id, block.attempt_number or 1, organization_id, downloads
+        )
+        if not outputs or downloads.comparison is None:
+            return None
+        chosen: list[FileInfo | None] = []
+        for file_info in files:
+            same = [
+                c
+                for c in outputs
+                if c.artifact_id and (c.checksum, c.file_size) == (file_info.checksum, file_info.file_size)
+            ]
+            choice = next((c for c in same if c.artifact_id == file_info.artifact_id), None)
+            for candidate in [] if choice is not None else same:
+                # The Outputs copy must itself be proven this block's run, attempt and storage key before it stands in.
+                owned_key = await self._owned_download_key(
+                    block,
+                    organization_id,
+                    downloads,
+                    [cast(str, candidate.artifact_id)],
+                    [(candidate.checksum, candidate.file_size)],
+                )
+                if owned_key != download_run_id:
+                    continue
+                digests = await verified_pdf_digests(
+                    [file_info, candidate], organization_id, [download_run_id], downloads.comparison
+                )
+                if digests[0] is not None and digests[0] == digests[1]:
+                    choice = candidate
+                    break
+            chosen.append(choice)
+        return chosen
+
+    async def _owned_download_key(
+        self,
+        block: WorkflowRunBlock,
+        organization_id: str,
+        downloads: TimelineDownloads,
+        ids: list[str],
+        claims: list[tuple[Any, Any]],
+    ) -> str | None:
+        """The one download key under which every id is proven a DOWNLOAD of the block's own run and attempt."""
+        comparison = downloads.comparison = downloads.comparison or ResponseComparison()
+        if missing := [aid for aid in ids if aid not in comparison.rows and aid not in comparison.looked_up]:
+            comparison.looked_up.update(missing)
+            try:
+                found = await app.DATABASE.artifacts.get_artifacts_by_ids(missing, organization_id)
+            except Exception:
+                LOG.warning(
+                    "Could not read a timeline block's download rows; listing every copy",
+                    workflow_run_block_id=block.workflow_run_block_id,
+                    exc_info=True,
+                )
+                return None
+            comparison.remember_rows(found, organization_id)
+        download_run_ids: set[str | None] = set()
+        for aid, claim in zip(ids, claims):
+            row = comparison.rows.get(aid)
+            # Each row must be a download of this block's run that still describes the content the block recorded.
+            if (
+                row is None
+                or row.artifact_type != ArtifactType.DOWNLOAD
+                or (row.workflow_run_id or row.run_id) != block.workflow_run_id
+                or (row.checksum, row.file_size) != claim
+            ):
+                return None
+            download_run_ids.add(row.run_id)
+        download_run_id = download_run_ids.pop() if len(download_run_ids) == 1 else None
+        if download_run_id is None or not await self._attempt_owns_downloads(
+            block.workflow_run_id, download_run_id, block.attempt_number or 1, organization_id, downloads, ids
+        ):
+            return None
+        return download_run_id
+
+    async def _outputs_downloads(
+        self, workflow_run_id: str, attempt_number: int, organization_id: str, downloads: TimelineDownloads
+    ) -> list[FileInfo] | None:
+        """The downloads the run's Outputs list for ``attempt_number``, selected as its status response selects them."""
+        key = (workflow_run_id, attempt_number)
+        if key not in downloads.outputs:
+            try:
+                workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
+                    workflow_run_id, organization_id=organization_id
+                )
+                listed: list[FileInfo] | None = None
+                if workflow_run is not None:
+                    task_v2 = await app.DATABASE.observer.get_task_v2_by_workflow_run_id(
+                        workflow_run_id=workflow_run_id, organization_id=organization_id
+                    )
+                    attempt_rows = downloads.attempts.get(workflow_run_id) or []
+                    historical_artifacts = None
+                    if any(row.attempt_number > attempt_number for row in attempt_rows):
+                        historical_artifacts = await app.DATABASE.workflow_runs.get_artifacts_for_attempt(
+                            workflow_run_id,
+                            organization_id,
+                            attempt_number,
+                            self._attempt_started_at(attempt_rows, attempt_number),
+                            self._successor_attempt_boundary(attempt_rows, attempt_number),
+                        )
+                    listed, _ = await self._fetch_downloaded_files(
+                        workflow_run,
+                        task_v2,
+                        attempt_rows=attempt_rows,
+                        attempt_number=attempt_number,
+                        historical_artifacts=historical_artifacts,
+                        comparison=downloads.comparison,
+                    )
+                downloads.outputs[key] = listed or []
+            except Exception:
+                LOG.warning(
+                    "Could not select a run's Outputs downloads for its timeline; listing every copy",
+                    workflow_run_id=workflow_run_id,
+                    exc_info=True,
+                )
+                downloads.outputs[key] = None
+        return downloads.outputs[key]
+
+    async def _attempt_owns_downloads(
+        self,
+        workflow_run_id: str,
+        download_run_id: str,
+        attempt_number: int,
+        organization_id: str,
+        downloads: TimelineDownloads,
+        artifact_ids: list[str],
+    ) -> bool:
+        """Whether every id is proven a download of the run's ``attempt_number``."""
+        if workflow_run_id not in downloads.attempts:
+            try:
+                await downloads.read_attempts(workflow_run_id)
+            except Exception:
+                LOG.warning(
+                    "Could not read a run's attempts for its timeline downloads; listing every copy",
+                    workflow_run_id=workflow_run_id,
+                    exc_info=True,
+                )
+                downloads.attempts[workflow_run_id] = None
+        attempt_rows = downloads.attempts[workflow_run_id]
+        if not attempt_rows:
+            # Without attempt rows only the legacy first attempt is known; a numbered retry stays unproven.
+            return attempt_rows is not None and attempt_number == 1
+        started_at = self._attempt_started_at(attempt_rows, attempt_number)
+        if started_at is None:
+            return False
+        key = (workflow_run_id, download_run_id, attempt_number)
+        if key not in downloads.attempt_downloads:
+            try:
+                # The live download listing also admits rows merely touched since the attempt started; removing a
+                # copy needs the attempt stamp or a creation inside the attempt's window.
+                artifacts = await app.DATABASE.workflow_runs.get_artifacts_for_attempt(
+                    workflow_run_id,
+                    organization_id,
+                    attempt_number,
+                    started_at,
+                    self._successor_attempt_boundary(attempt_rows, attempt_number),
+                    **({"artifact_run_id": download_run_id} if download_run_id != workflow_run_id else {}),
+                )
+                downloads.attempt_downloads[key] = frozenset(
+                    artifact.artifact_id for artifact in artifacts if artifact.artifact_type == ArtifactType.DOWNLOAD
+                )
+            except Exception:
+                LOG.warning(
+                    "Could not scope a run's timeline downloads to its attempt; listing every copy",
+                    workflow_run_id=workflow_run_id,
+                    attempt_number=attempt_number,
+                    exc_info=True,
+                )
+                downloads.attempt_downloads[key] = None
+        owned = downloads.attempt_downloads[key]
+        return owned is not None and owned.issuperset(artifact_ids)
 
     async def _validate_credential_ids(
         self,
@@ -12346,7 +12703,7 @@ class WorkflowService:
         if not workflow:
             raise WorkflowNotFound(workflow_permanent_id=workflow_permanent_id, version=version)
 
-        labels_to_outputs: dict[str, BlockOutputParameter] = {}
+        labels_to_outputs: dict[str, dict[str, Any]] = {}
         masked_counts: dict[str, int] = {}
 
         for block in workflow.workflow_definition.blocks:
@@ -12384,13 +12741,13 @@ class WorkflowService:
                 continue
 
             block_output_parameter["created_at"] = output_parameter.created_at
-            labels_to_outputs[label] = block_output_parameter  # type: ignore[assignment]
+            labels_to_outputs[label] = block_output_parameter
 
         for run_id, count in masked_counts.items():
             LOG.info(
                 "Parent workflow outputs masked", organization_id=organization_id, workflow_run_id=run_id, count=count
             )
-        return labels_to_outputs  # type: ignore[return-value]
+        return labels_to_outputs
 
     async def get_workflows_by_permanent_ids(
         self,
@@ -16562,6 +16919,7 @@ class WorkflowService:
                     attempt_rows=attempt_rows,
                     attempt_number=current_attempt,
                     comparison=comparison,
+                    canonical=downloaded_files or (),
                 )
             # The refresh expands artifact IDs into presigned URLs and FileInfo objects —
             # ~25x on an ID-dense value — so a value that fit before it can exceed the cap
@@ -19076,16 +19434,21 @@ class WorkflowService:
         workflow_run_id: str,
         organization_id: str | None = None,
         cap_output_values: bool = False,
+        downloads: TimelineDownloads | None = None,
     ) -> list[WorkflowRunTimeline]:
         """
         build the tree structure of the workflow run timeline
         """
-        workflow_run_blocks = await app.DATABASE.observer.get_workflow_run_blocks(
-            workflow_run_id=workflow_run_id,
-            organization_id=organization_id,
-            prefer_capped=cap_output_values,
-            with_tool_calls=True,
-        )
+        # Response copies: hydration, download listing and caps below never write to the rows that were read.
+        workflow_run_blocks = [
+            block.model_copy(update={"actions": list(block.actions)})
+            for block in await app.DATABASE.observer.get_workflow_run_blocks(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                prefer_capped=cap_output_values,
+                with_tool_calls=True,
+            )
+        ]
         access = BrowserSessionArtifactAccess(True)
         child_access = BrowserSessionArtifactAccess(True)
         if organization_id and workflow_run_blocks:
@@ -19131,6 +19494,22 @@ class WorkflowService:
                 workflow_run_id=workflow_run_id,
                 count=len(workflow_run_blocks),
             )
+
+        if organization_id and access.allowed and child_access.allowed:
+            downloads = downloads or TimelineDownloads()
+            for timeline in block_map.values():
+                if timeline.block is None:
+                    continue
+                output = timeline.block.output
+                if cap_output_values and isinstance(output, dict) and "downloaded_file_artifact_ids" in output:
+                    # A row without a capped copy reads back raw, so bound it before its download list is inspected.
+                    timeline.block.output = truncate_oversized_response_value(
+                        output,
+                        workflow_run_id=workflow_run_id,
+                        workflow_run_block_id=timeline.block.workflow_run_block_id,
+                        field="output",
+                    )
+                timeline.block = await self._project_block_downloads(timeline.block, organization_id, downloads)
 
         if cap_output_values:
             for timeline in block_map.values():

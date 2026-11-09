@@ -37,6 +37,7 @@ import {
   runWithConcurrency,
 } from "@/util/runWithConcurrency";
 import { bulkResultToast } from "@/util/bulkResultToast";
+import { getUniqueSlugForFolder } from "@/util/folderSlug";
 import {
   BookmarkFilledIcon,
   ChevronDownIcon,
@@ -112,46 +113,8 @@ import { useParameterExpansion } from "./hooks/useParameterExpansion";
 import { Folder } from "./types/folderTypes";
 import { defaultWorkflowRequest } from "./defaultWorkflowRequest";
 
-// Utility function to create URL-safe folder slugs from folder names
-function slugifyFolderName(name: string): string {
-  return name
-    .toLowerCase()
-    .trim()
-    .replace(/[^\w\s-]/g, "") // Remove special characters except spaces and hyphens
-    .replace(/\s+/g, "-") // Replace spaces with hyphens
-    .replace(/-+/g, "-") // Replace multiple hyphens with single hyphen
-    .replace(/^-|-$/g, ""); // Remove leading/trailing hyphens
-}
-
 const FOLDERS_PAGE_SIZE = 10;
 
-// Generate a unique slug for a folder, appending a number suffix only if there's a collision
-function getUniqueSlugForFolder(folder: Folder, allFolders: Folder[]): string {
-  const baseSlug = slugifyFolderName(folder.title);
-
-  // Find all folders that would have the same base slug
-  const foldersWithSameSlug = allFolders.filter(
-    (f) => slugifyFolderName(f.title) === baseSlug,
-  );
-
-  // If no collision, return the base slug
-  if (foldersWithSameSlug.length <= 1) {
-    return baseSlug;
-  }
-
-  // Sort by created_at to ensure consistent numbering
-  const sortedFolders = [...foldersWithSameSlug].sort(
-    (a, b) =>
-      new Date(a.created_at).getTime() - new Date(b.created_at).getTime(),
-  );
-
-  const index = sortedFolders.findIndex(
-    (f) => f.folder_id === folder.folder_id,
-  );
-
-  // First folder (oldest) gets the base slug, others get numbered suffixes
-  return index === 0 ? baseSlug : `${baseSlug}-${index + 1}`;
-}
 function WorkflowsFlat() {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
@@ -697,7 +660,13 @@ function WorkflowsFlat() {
             )}
           </div>
 
-          {recentFolders.length > 0 ? (
+          {isFoldersLoading ? (
+            <div className="grid grid-cols-5 gap-4">
+              {Array.from({ length: 5 }).map((_, i) => (
+                <Skeleton key={i} className="h-24 rounded-lg" />
+              ))}
+            </div>
+          ) : recentFolders.length > 0 ? (
             <div className="grid grid-cols-5 gap-4">
               {recentFolders.map((folder) => (
                 <FolderCard
@@ -754,8 +723,8 @@ function WorkflowsFlat() {
             </Button>
           )}
         </header>
-        <div className="flex justify-between">
-          <div className="flex items-center gap-3">
+        <div className="flex flex-wrap justify-between gap-y-2">
+          <div className="flex flex-wrap items-center gap-3">
             <TableSearchInput
               value={search}
               onChange={(value) => {
@@ -776,7 +745,7 @@ function WorkflowsFlat() {
               />
             ) : null}
           </div>
-          <div className="flex items-center gap-4">
+          <div className="flex flex-wrap items-center gap-4">
             <Link
               to="/discover"
               className="text-sm text-muted-foreground hover:text-foreground"
@@ -823,7 +792,7 @@ function WorkflowsFlat() {
           </div>
         </div>
         <div className="overflow-hidden rounded-lg border border-border">
-          <Table className="table-fixed [&_td:last-child]:pr-6 [&_th:last-child]:pr-6">
+          <Table className="min-w-[960px] table-fixed [&_td:last-child]:pr-6 [&_th:last-child]:pr-6">
             <TableHeader>
               <TableRow className="group/header">
                 {showCheckbox && (
@@ -1263,8 +1232,8 @@ function WorkflowsFlat() {
               )}
             </TableBody>
           </Table>
-          <div className="relative px-3 py-3">
-            <div className="absolute left-3 top-1/2 flex -translate-y-1/2 items-center gap-2 text-sm">
+          <div className="relative flex flex-col items-center gap-2 px-3 py-3 sm:block">
+            <div className="flex items-center gap-2 text-sm sm:absolute sm:left-3 sm:top-1/2 sm:-translate-y-1/2">
               <span className="text-muted-foreground">Items per page</span>
               <Select
                 value={String(itemsPerPage)}

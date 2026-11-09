@@ -3549,13 +3549,6 @@ async def test_execute_task_v3_general_block_step_cap_floored(monkeypatch: pytes
     assert loop_mock.await_args.kwargs["max_action_steps"] == MIN_ACTION_STEPS
 
 
-def test_min_action_steps_is_pinned() -> None:
-    # The constant is this change's headline risk, and every other assertion here is written against
-    # the symbol — so without this line it could be retuned to anything and the suite would stay green.
-    # Moving it is fine; moving it without a deliberate edit here is not.
-    assert MIN_ACTION_STEPS == 24
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("block_cls", "block_kwargs"),

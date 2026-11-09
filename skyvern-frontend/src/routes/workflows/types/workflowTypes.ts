@@ -505,6 +505,7 @@ export type SendEmailBlock = WorkflowBlockBase & {
   credential_id?: string | null;
   cc?: Array<string>;
   bcc?: Array<string>;
+  reply_to_message_id?: string | null;
 };
 
 export type FileURLParserBlock = WorkflowBlockBase & {
@@ -760,6 +761,7 @@ export type EmailInboxBlock = WorkflowBlockBase & {
   max_results: number;
   include_body: boolean;
   download_attachments: boolean;
+  message_id?: string | null;
   parameters: Array<WorkflowParameter>;
 };
 

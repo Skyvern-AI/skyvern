@@ -2553,8 +2553,13 @@ class ForgeAgent:
                     will_rename=local_basename != desired_name,
                 )
                 recorded_path = os.path.join(workflow_download_directory, local_file_name)
+                unnamed_path = recorded_path
                 if local_basename != desired_name:
                     recorded_path = rename_file(recorded_path, desired_name)
+                # rename_file returns the old path when it fails, so only a rename that took effect records a receipt.
+                download_run_id = resolve_run_download_id(context, fallback_run_id=task.workflow_run_id)
+                if context is not None and download_run_id and recorded_path != unnamed_path:
+                    await context.record_configured_download(recorded_path, download_run_id)
                 if recorded_into is not None:
                     recorded_into.append(recorded_path)
                 continue

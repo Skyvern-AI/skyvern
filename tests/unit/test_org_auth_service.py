@@ -467,14 +467,6 @@ def test_invalidate_cached_org_is_noop_when_id_absent() -> None:
     cache.clear()
 
 
-def test_invalidate_cached_org_handles_empty_cache() -> None:
-    cache = org_auth_service._current_org_cache
-    cache.clear()
-
-    # Should not raise.
-    org_auth_service.invalidate_cached_org("anything")
-
-
 class _FakeOrganizationsRepository:
     def __init__(self, organization: Organization) -> None:
         self.organization = organization

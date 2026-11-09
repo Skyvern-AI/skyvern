@@ -14,11 +14,13 @@ export function parseServerStamp(stamp: string): number {
   return Date.parse(/(Z|[+-]\d{2}:?\d{2})$/.test(stamp) ? stamp : `${stamp}Z`);
 }
 
+// Stopwatch style: "2:05", and "1:02:05" once it passes an hour.
 export function formatElapsedSeconds(ms: number): string {
   const seconds = Math.max(0, Math.round(ms / 1000));
-  const m = Math.floor(seconds / 60);
-  const s = seconds % 60;
-  return `${m}:${s.toString().padStart(2, "0")}`;
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const ss = (seconds % 60).toString().padStart(2, "0");
+  return h > 0 ? `${h}:${m.toString().padStart(2, "0")}:${ss}` : `${m}:${ss}`;
 }
 
 const clampToZero = (n: number) => Math.max(n, 0);

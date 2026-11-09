@@ -3009,8 +3009,12 @@ async def download(
                         desired_name_fp=diagnostic_fingerprint(desired_name),
                         will_rename=local_basename != desired_name,
                     )
+                    unnamed_path = file_path
                     if local_basename != desired_name:
                         file_path = rename_file(file_path, desired_name)
+                    # rename_file returns the old path when it fails, so only a rename that took effect records a receipt.
+                    if file_path != unnamed_path:
+                        await context.record_configured_download(str(file_path), download_run_id)
                     newly_downloaded_files.append(file_path)
 
             # Upload downloaded files from local filesystem to remote storage

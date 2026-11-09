@@ -29,6 +29,7 @@ export type SendEmailNodeData = NodeBaseData & {
   credentialId: string;
   cc: string;
   bcc: string;
+  replyToMessageId: string;
 };
 
 export type SendEmailNode = Node<SendEmailNodeData, "sendEmail">;
@@ -51,6 +52,7 @@ export const sendEmailNodeDefaultData: SendEmailNodeData = {
   credentialId: "",
   cc: "",
   bcc: "",
+  replyToMessageId: "",
   continueOnFailure: false,
   model: null,
 } as const;

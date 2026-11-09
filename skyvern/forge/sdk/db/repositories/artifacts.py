@@ -4,7 +4,7 @@ import datetime
 from typing import TYPE_CHECKING, Any, Callable
 
 import structlog
-from sqlalchemy import and_, delete, false, func, or_, select, update
+from sqlalchemy import and_, case, delete, false, func, or_, select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.sql.elements import ColumnElement
 
@@ -144,6 +144,7 @@ class ArtifactsRepository(BaseRepository):
         checksum: str | None = None,
         file_size: int | None = None,
         browser_session_id: str | None = None,
+        configured_name_sha256: str | None = None,
     ) -> Artifact:
         async with self.Session() as session:
             new_artifact = ArtifactModel(
@@ -162,6 +163,7 @@ class ArtifactsRepository(BaseRepository):
                 checksum=checksum,
                 file_size=file_size,
                 browser_session_id=browser_session_id,
+                configured_name_sha256=configured_name_sha256,
             )
             session.add(new_artifact)
             # The flush fills every column default, so the row needs no re-read; convert it before commit expires it.
@@ -177,9 +179,16 @@ class ArtifactsRepository(BaseRepository):
         organization_id: str,
         checksum: str | None,
         file_size: int | None,
+        configured_name_sha256: str | None = None,
     ) -> None:
         # file_size is written unconditionally: a None (size unreadable) is more honest than a
         # fresh checksum paired with the previous content's length.
+        granted = configured_name_sha256 if checksum is not None and configured_name_sha256 == checksum else None
+        # New content drops the old configured-name stamp in the same write, so returning to old bytes cannot revive it.
+        stamp = case(
+            (ArtifactModel.checksum == checksum, func.coalesce(granted, ArtifactModel.configured_name_sha256)),
+            else_=granted,
+        )
         async with self.Session() as session:
             await session.execute(
                 update(ArtifactModel)
@@ -188,7 +197,26 @@ class ArtifactsRepository(BaseRepository):
                     ArtifactModel.organization_id == organization_id,
                     ArtifactModel.artifact_type == ArtifactType.DOWNLOAD,
                 )
-                .values(checksum=checksum, file_size=file_size, modified_at=naive_utc_now())
+                .values(
+                    checksum=checksum, file_size=file_size, configured_name_sha256=stamp, modified_at=naive_utc_now()
+                )
+            )
+            await session.commit()
+
+    @db_operation("promote_configured_name")
+    async def promote_configured_name(
+        self, artifact_id: str, organization_id: str, configured_name_sha256: str
+    ) -> None:
+        async with self.Session() as session:
+            await session.execute(
+                update(ArtifactModel)
+                .where(
+                    ArtifactModel.artifact_id == artifact_id,
+                    ArtifactModel.organization_id == organization_id,
+                    ArtifactModel.artifact_type == ArtifactType.DOWNLOAD,
+                    ArtifactModel.checksum == configured_name_sha256,
+                )
+                .values(configured_name_sha256=configured_name_sha256)
             )
             await session.commit()
 
@@ -200,7 +228,13 @@ class ArtifactsRepository(BaseRepository):
         uri: str,
         file_size: int | None = None,
     ) -> Artifact | None:
-        update_values: dict[str, Any] = {"uri": uri}
+        # A stamp vouches for the object it was earned at; a moved object starts unproven.
+        update_values: dict[str, Any] = {
+            "uri": uri,
+            "configured_name_sha256": case(
+                (ArtifactModel.uri == uri, ArtifactModel.configured_name_sha256), else_=None
+            ),
+        }
         if file_size is not None:
             update_values["file_size"] = file_size
 
@@ -560,7 +594,8 @@ class ArtifactsRepository(BaseRepository):
 
         Unlike :meth:`get_artifacts_for_run` this does not consult a ``RunReader`` —
         it filters directly on the partial index ``ix_artifacts_run_id_partial`` and
-        returns the rows ordered by creation time.
+        returns the rows ordered by creation time; the artifact id only breaks ties, so
+        every read enumerates equal timestamps the same way.
         """
         async with self.Session() as session:
             artifacts = (
@@ -569,7 +604,7 @@ class ArtifactsRepository(BaseRepository):
                     .filter(ArtifactModel.run_id == run_id)
                     .filter(ArtifactModel.artifact_type == artifact_type)
                     .filter(ArtifactModel.organization_id == organization_id)
-                    .order_by(ArtifactModel.created_at)
+                    .order_by(ArtifactModel.created_at, ArtifactModel.artifact_id)
                 )
             ).all()
             return [convert_to_artifact(a, self.debug_enabled) for a in artifacts]

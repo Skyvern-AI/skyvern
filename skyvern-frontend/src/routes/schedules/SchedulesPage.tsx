@@ -338,8 +338,8 @@ function SchedulesPage() {
       </div>
 
       {/* Search + Filters + Create */}
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-3">
+      <div className="flex flex-wrap items-center justify-between gap-y-2">
+        <div className="flex flex-wrap items-center gap-3">
           <TableSearchInput
             value={search}
             onChange={setSearch}
@@ -400,7 +400,7 @@ function SchedulesPage() {
       {/* Table */}
       <div className="space-y-4">
         <div className="overflow-hidden rounded-lg border border-border">
-          <Table className="table-fixed">
+          <Table className="min-w-[960px] table-fixed">
             <TableHeader>
               <TableRow className="group/header">
                 {showCheckbox && (
