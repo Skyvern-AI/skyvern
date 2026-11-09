@@ -225,7 +225,7 @@ def _make_chat_request(
 
 
 @pytest.mark.asyncio
-async def test_demonstration_requires_shared_cache_for_record_control_and_done(
+async def test_multi_process_server_without_shared_cache_refuses_record_control_and_done(
     monkeypatch: pytest.MonkeyPatch,
     api_key_request: MagicMock,
     organization: SimpleNamespace,
@@ -233,6 +233,7 @@ async def test_demonstration_requires_shared_cache_for_record_control_and_done(
     cache = _FakeCache()
     cache.is_shared = False
     monkeypatch.setattr(app, "CACHE", cache)
+    monkeypatch.setenv("WEB_CONCURRENCY", "4")
 
     calls = (
         workflow_copilot_demonstration_record(
@@ -259,7 +260,7 @@ async def test_demonstration_requires_shared_cache_for_record_control_and_done(
     for call in calls:
         with pytest.raises(HTTPException) as exc_info:
             await call
-        assert exc_info.value.status_code == 403
+        assert exc_info.value.status_code == 501
 
 
 @pytest.mark.asyncio
