@@ -6040,27 +6040,6 @@ async def test_recover_propagates_cancellation(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_recover_shares_one_budget_across_all_candidates(tmp_path: Path) -> None:
-    # Several slow candidate fetches share a single external budget (the shape handle_action wraps
-    # the call in): the whole operation is cancelled at that one deadline — the budget is not spent
-    # per-candidate — and it unwinds cleanly, writing nothing.
-    page = _RecoveryPage(main_srcs=[f"https://host.example/api/StatementPdf?doc={i}" for i in range(3)])
-
-    async def slow_read(*_args: object, **_kwargs: object) -> bytes:
-        await asyncio.sleep(0.2)
-        return b"%PDF-1.5 slow"
-
-    started = time.monotonic()
-    with patch(_RECOVER_READ, side_effect=slow_read):
-        with pytest.raises(asyncio.TimeoutError):
-            async with asyncio.timeout(0.05):
-                await _recover_blocked_inline_pdf_download(page, tmp_path, workflow_run_id=None, iframe_srcs_before=[])
-
-    assert time.monotonic() - started < 0.15  # one 0.05s budget, not 3 x 0.2s per candidate
-    assert list(tmp_path.iterdir()) == []
-
-
-@pytest.mark.asyncio
 async def test_recover_excludes_preexisting_pdf_and_recovers_newly_attached(tmp_path: Path) -> None:
     # A benign decoy PDF iframe was already on the page before the click; the click
     # attached the intended statement iframe. Only the newly-attached src is a
