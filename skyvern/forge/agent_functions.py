@@ -2188,6 +2188,12 @@ class AgentFunction:
     def on_browser_run_released(self, browser_context: BrowserContext | BrowserArtifacts | None) -> None:
         """A run released a browser that no other run shares. OSS no-op."""
 
+    def on_browser_context_retired(self, browser_context: BrowserContext) -> None:
+        """A replacement took over from this context, which no run uses again; it may never emit close. OSS no-op."""
+
+    def on_browser_context_abandoned(self, browser_context: BrowserContext) -> None:
+        """Creation failed after this context was created, so no run ever acquired it. OSS no-op."""
+
     async def on_run_har_captured(
         self,
         browser_state: BrowserState,
