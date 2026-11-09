@@ -43,7 +43,6 @@ from opentelemetry import trace as otel_trace
 
 import skyvern
 from skyvern import analytics
-from skyvern.client.types.output_parameter import OutputParameter as BlockOutputParameter
 from skyvern.config import settings
 from skyvern.constants import (
     DEFAULT_WORKFLOW_TITLES,
@@ -12704,7 +12703,7 @@ class WorkflowService:
         if not workflow:
             raise WorkflowNotFound(workflow_permanent_id=workflow_permanent_id, version=version)
 
-        labels_to_outputs: dict[str, BlockOutputParameter] = {}
+        labels_to_outputs: dict[str, dict[str, Any]] = {}
         masked_counts: dict[str, int] = {}
 
         for block in workflow.workflow_definition.blocks:
@@ -12742,13 +12741,13 @@ class WorkflowService:
                 continue
 
             block_output_parameter["created_at"] = output_parameter.created_at
-            labels_to_outputs[label] = block_output_parameter  # type: ignore[assignment]
+            labels_to_outputs[label] = block_output_parameter
 
         for run_id, count in masked_counts.items():
             LOG.info(
                 "Parent workflow outputs masked", organization_id=organization_id, workflow_run_id=run_id, count=count
             )
-        return labels_to_outputs  # type: ignore[return-value]
+        return labels_to_outputs
 
     async def get_workflows_by_permanent_ids(
         self,
