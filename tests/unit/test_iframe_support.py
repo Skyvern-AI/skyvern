@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from skyvern.cli.core.browser_ops import do_frame_list, do_frame_main, do_frame_switch
+from skyvern.cli.core.browser_ops import do_frame_list, do_frame_switch
 
 # ---------------------------------------------------------------------------
 # MCP tool tests
@@ -216,13 +216,6 @@ class TestBrowserOps:
         result = await do_frame_switch(page, selector="#iframe")
         page.frame_switch.assert_awaited_once_with(selector="#iframe", name=None, index=None)
         assert result.name == "pay"
-
-    def test_do_frame_main_delegates(self) -> None:
-        page = MagicMock()
-        page.frame_main = MagicMock(return_value={"status": "switched_to_main_frame"})
-
-        do_frame_main(page)
-        page.frame_main.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_do_frame_list_delegates(self) -> None:

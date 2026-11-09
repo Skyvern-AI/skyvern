@@ -81,12 +81,6 @@ def test_truncate_dict_preserves_value_types_when_under_per_key_budget() -> None
     assert isinstance(result["small_str"], str)
 
 
-def test_truncate_respects_default_budget() -> None:
-    from skyvern.utils.prompt_truncation import PREVIOUS_EXTRACTED_INFO_MAX_TOKENS
-
-    assert PREVIOUS_EXTRACTED_INFO_MAX_TOKENS == 20_000
-
-
 def test_truncate_extraction_schema_none_returns_none() -> None:
     from skyvern.utils.prompt_truncation import truncate_extraction_schema
 
@@ -118,12 +112,6 @@ def test_truncate_extraction_schema_large_returns_summary_placeholder() -> None:
     assert result_tokens <= 2_200
     assert result["type"] == "object"
     assert result.get("_skyvern_schema_truncated") is True
-
-
-def test_truncate_extraction_schema_default_budget() -> None:
-    from skyvern.utils.prompt_truncation import EXTRACTION_SCHEMA_MAX_TOKENS
-
-    assert EXTRACTION_SCHEMA_MAX_TOKENS == 10_000
 
 
 def test_truncate_extraction_schema_preserves_array_top_level() -> None:

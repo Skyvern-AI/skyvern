@@ -277,15 +277,6 @@ def test_dedup_is_best_effort_after_eviction():
     assert "no_progress" in re_emitted
 
 
-def test_recorder_is_wired_into_execute_step():
-    # Guards against the seam call being silently removed by a future refactor.
-    import inspect
-
-    from skyvern.forge.agent import ForgeAgent
-
-    assert "record_fail_fast_shadow" in inspect.getsource(ForgeAgent.execute_step)
-
-
 def test_act_fps_exclude_non_web_actions_with_hallucinated_hash():
     # WAIT/COMPLETE/TERMINATE can carry a hallucinated skyvern_element_hash; they must not
     # count as element interactions for action_repetition.

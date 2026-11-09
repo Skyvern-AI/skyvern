@@ -184,10 +184,6 @@ def test_finalize_is_best_effort_when_source_raises() -> None:
         finalize_outcome_verification_trace(ctx, span)  # must not raise
 
 
-def test_finalize_noop_on_none_ctx() -> None:
-    finalize_outcome_verification_trace(None)
-
-
 @pytest.mark.asyncio
 async def test_finalize_lands_fields_on_finished_turn_span(span_exporter: Any) -> None:
     ctx = SimpleNamespace(

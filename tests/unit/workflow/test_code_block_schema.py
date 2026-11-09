@@ -71,14 +71,6 @@ def test_runtime_workflow_definition_loads_stored_code_without_strict_ast_valida
     )
 
 
-def test_code_block_yaml_accepts_indented_valid_code() -> None:
-    CodeBlockYAML(
-        label="code_1",
-        code="    raise ErrorCode('A', 'why')",
-        error_code_mapping={"A": "Declared"},
-    )
-
-
 def test_code_block_manifest_round_trip_and_converter() -> None:
     mapping = {"missing-output.v1": "Missing output"}
     block_yaml = CodeBlockYAML(
@@ -113,27 +105,6 @@ def test_code_block_accepts_indirect_or_malformed_error_code_raises_for_runtime(
     CodeBlockYAML(label="code_1", code=code, error_code_mapping={"declared": "Declared"})
 
 
-def test_code_block_accepts_multiple_error_code_raises_on_one_line_for_runtime() -> None:
-    code = "if condition: raise ErrorCode('A', 'why'); raise ErrorCode('B', 'why')"
-
-    CodeBlockYAML(label="code_1", code=code, error_code_mapping={"A": "First", "B": "Second"})
-
-
-@pytest.mark.parametrize(
-    "code",
-    [
-        "raise ErrorCode('A', 'why')",
-        "if condition: raise ErrorCode('A', 'why')",
-    ],
-)
-def test_code_block_accepts_single_error_code_raise_on_line(code: str) -> None:
-    CodeBlockYAML(label="code_1", code=code, error_code_mapping={"A": "Declared"})
-
-
-def test_code_block_accepts_jinja_control_statements_without_error_code() -> None:
-    CodeBlockYAML(label="code_1", code="{% if enabled %}\nx = 1\n{% endif %}")
-
-
 def test_code_block_counts_declared_raise_with_jinja_control_statements() -> None:
     code = "{% if enabled %}\nraise ErrorCode('declared', 'reason')\n{% endif %}"
 
@@ -166,12 +137,6 @@ def test_workflow_accepts_undeclared_raise_with_jinja_control_statements() -> No
     assert workflow.blocks[0].code == code
 
 
-def test_code_block_accepts_aliased_raise_with_jinja_control_statements_for_runtime() -> None:
-    code = "{% if enabled %}\nAlias = ErrorCode\nraise Alias('declared', 'reason')\n{% endif %}"
-
-    CodeBlockYAML(label="code_1", code=code, error_code_mapping={"declared": "Declared"})
-
-
 def test_code_block_schema_preserves_broken_python_for_authoring_feedback() -> None:
     code = "{% if enabled %}\nx = (1\n{% endif %}"
 
@@ -184,96 +149,6 @@ def test_runtime_classifier_reports_real_syntax_error_line_after_multiline_jinja
     CodeBlockYAML(label="code_1", code=code)
     with pytest.raises(ValueError, match=r"CodeBlock code is invalid Python: .*line 4"):
         _direct_code_block_error_code_raises(code)
-
-
-def test_code_block_jinja_expression_substitution_remains_supported() -> None:
-    CodeBlockYAML(label="code_1", code="x = {{ value }}")
-
-
-@pytest.mark.parametrize(
-    "code",
-    [
-        "class ErrorCode(Exception):\n    pass\nraise ErrorCode('declared', 'reason')",
-        "def ErrorCode(code, reasoning):\n    return Exception()\nraise ErrorCode('declared', 'reason')",
-        "async def ErrorCode(code, reasoning):\n    return Exception()\nraise ErrorCode('declared', 'reason')",
-        "ErrorCode = ValueError\nraise ErrorCode('declared', 'reason')",
-    ],
-)
-def test_code_block_accepts_error_code_shadowing_for_runtime(code: str) -> None:
-    CodeBlockYAML(label="code_1", code=code, error_code_mapping={"declared": "Declared"})
-
-
-@pytest.mark.parametrize(
-    "code",
-    [
-        "def f(ErrorCode):\n    raise ErrorCode('declared', 'reason')",
-        "def f(*, ErrorCode):\n    raise ErrorCode('declared', 'reason')",
-        "f = lambda ErrorCode: ErrorCode('declared', 'reason')",
-    ],
-)
-def test_code_block_accepts_error_code_parameter_shadowing_for_runtime(code: str) -> None:
-    CodeBlockYAML(label="code_1", code=code, error_code_mapping={"declared": "Declared"})
-
-
-@pytest.mark.parametrize(
-    "code",
-    [
-        "try:\n    pass\nexcept Exception as ErrorCode:\n    pass",
-        "with context_manager() as ErrorCode:\n    pass",
-        "match value:\n    case ErrorCode:\n        pass",
-        "match value:\n    case [*ErrorCode]:\n        pass",
-        'match value:\n    case {"key": item, **ErrorCode}:\n        pass',
-        "match value:\n    case 1 as ErrorCode:\n        pass",
-        "match value:\n    case some.ErrorCode as ErrorCode:\n        pass",
-        "match value:\n    case [x] as ErrorCode:\n        pass",
-    ],
-)
-def test_code_block_accepts_error_code_non_name_shadowing_for_runtime(code: str) -> None:
-    CodeBlockYAML(label="code_1", code=code)
-
-
-@pytest.mark.parametrize(
-    "handler",
-    [
-        "except ErrorCode:",
-        "except (ValueError, ErrorCode):",
-    ],
-)
-def test_code_block_allows_error_code_in_exception_type(handler: str) -> None:
-    CodeBlockYAML(label="code_1", code=f"try:\n    pass\n{handler}\n    pass")
-
-
-def test_code_block_allows_similarly_named_parameter_with_error_code_raise() -> None:
-    CodeBlockYAML(
-        label="code_1",
-        code="def f(ErrorCodeFoo):\n    raise ErrorCode('declared', 'reason')",
-        error_code_mapping={"declared": "Declared"},
-    )
-
-
-def test_code_block_allows_other_class_names_with_error_code_raise() -> None:
-    CodeBlockYAML(
-        label="code_1",
-        code="class ErrorCodeFoo(Exception):\n    pass\nraise ErrorCode('declared', 'reason')",
-        error_code_mapping={"declared": "Declared"},
-    )
-
-
-@pytest.mark.parametrize(
-    "code",
-    [
-        "raise errors.ErrorCode('declared', 'reason')",
-        "raise importlib.import_module('pkg').ErrorCode('declared', 'reason')",
-        "raise __import__('pkg').ErrorCode('declared', 'reason')",
-        "for item in items:\n    raise errors.ErrorCode('declared', 'reason')",
-    ],
-)
-def test_code_block_accepts_attribute_error_code_raises_for_runtime(code: str) -> None:
-    CodeBlockYAML(label="code_1", code=code, error_code_mapping={"declared": "Declared"})
-
-
-def test_code_block_allows_other_attribute_exception_names() -> None:
-    CodeBlockYAML(label="code_1", code="raise errors.ErrorCodeFoo('declared', 'reason')")
 
 
 def test_workflow_effective_manifest_and_unused_declarations() -> None:

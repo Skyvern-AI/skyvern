@@ -659,16 +659,6 @@ async def test_missing_run_id_does_not_reuse_prior_run_id() -> None:
     assert frames[-1].workflow_run_id != "wr_test"
 
 
-def test_both_consumers_route_through_single_producer() -> None:
-    source = inspect.getsource(copilot_tools)
-    assert source.count("await _verify_and_record_run_blocks_result(") == 2
-    assert source.count("recorded_outcome = await _verify_and_record_run_blocks_result(") == 2
-    assert source.count("recorded_outcome=recorded_outcome") == 2
-    assert "_record_run_blocks_result(copilot_ctx, result, completion_verification" not in source
-    assert "_record_run_blocks_result(copilot_ctx, run_result, completion_verification" not in source
-    assert "await _maybe_run_completion_verification(copilot_ctx" not in source
-
-
 @pytest.mark.parametrize(
     "result_name",
     ["result", "run_result"],

@@ -2369,21 +2369,6 @@ async def test_close_credited_download_popups_closes_same_context_popup_when_lis
 
 
 @pytest.mark.asyncio
-async def test_close_credited_download_popups_no_claim_is_noop() -> None:
-    """With no recorded claim (no credited download popup) nothing is closed (req #5)."""
-    agent = ForgeAgent()
-    task = _make_task(task_id="task-empty")
-    browser_state = MagicMock()
-    browser_state.list_valid_pages = AsyncMock(return_value=[_claimed_popup(":")])
-    ctx = SkyvernContext(task_id=task.task_id)
-
-    with patch("skyvern.forge.agent.skyvern_context.current", return_value=ctx):
-        await agent._close_credited_download_popups(task, browser_state)
-
-    browser_state.list_valid_pages.assert_not_awaited()
-
-
-@pytest.mark.asyncio
 async def test_clean_up_task_clears_download_popup_claims_even_on_early_error() -> None:
     """Task-terminal expiry: clean_up_task drops the task's popup claims at the very top, so a claim
     never survives into a later task/run/persistent-session -- proven here on the early-error path

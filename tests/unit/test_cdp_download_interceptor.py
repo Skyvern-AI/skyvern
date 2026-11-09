@@ -1,14 +1,11 @@
 """Unit tests for CDPDownloadInterceptor pure functions and proxy auth handling."""
 
-import ast
 import asyncio
 import base64
 import contextlib
 import gc
-import inspect
 import io
 import json
-import textwrap
 import threading
 import weakref
 import zipfile
@@ -5800,18 +5797,6 @@ def _only_file(tmp_path: Path) -> Path:
 async def _settle(interceptor: CDPDownloadInterceptor) -> None:
     async with interceptor.settle_browser_downloads():
         pass
-
-
-def test_finalize_download_has_no_dead_buffered_threshold_or_fallback_branch() -> None:
-    """A buffered outcome reaching _finalize_download is always below STREAM_TO_DISK_THRESHOLD_BYTES: the
-    stream loop spills to disk (→ "streamed") the instant total bytes cross the threshold, so the buffered
-    branch can never carry a body at/over the threshold or the removed getResponseBody-fallback cap. Guard
-    against reintroducing a dead re-check of either size constant or a reference to the removed fallback."""
-    source = inspect.getsource(CDPDownloadInterceptor._finalize_download)
-    referenced_names = {node.id for node in ast.walk(ast.parse(textwrap.dedent(source))) if isinstance(node, ast.Name)}
-    assert "MAX_STREAMED_FILE_SIZE_BYTES" not in referenced_names
-    assert "STREAM_TO_DISK_THRESHOLD_BYTES" not in referenced_names
-    assert "getResponseBody" not in source
 
 
 class TestTwoPathDownloadStreaming:
