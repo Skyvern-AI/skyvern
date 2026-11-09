@@ -2458,6 +2458,7 @@ class WorkflowRunContext:
                 collection_id=collection_id,
                 item_id=item_id,
                 email=email,
+                include_passkeys=bool(item_id) and email is not None,
             )
 
         try:
@@ -2485,6 +2486,14 @@ class WorkflowRunContext:
                     organization.organization_id, vault_item_ids=vault_item_ids, unresolved_vault_item=not item_id
                 )
             if secret_credentials:
+                if isinstance(secret_credentials, BitwardenLoginSecret) and secret_credentials.passkeys and item_id:
+                    await app.AGENT_FUNCTION.register_bitwarden_passkeys(
+                        workflow_run_id=self.workflow_run_id,
+                        organization_id=organization.organization_id,
+                        source_id=item_id,
+                        vault_passkeys=secret_credentials.passkeys,
+                        login_sites=secret_credentials.login_sites,
+                    )
                 self._bitwarden_email = email
                 self._bitwarden_resolved_collection_id = collection_id
                 self.secrets[BitwardenConstants.BW_ORGANIZATION_ID] = organization.bw_organization_id

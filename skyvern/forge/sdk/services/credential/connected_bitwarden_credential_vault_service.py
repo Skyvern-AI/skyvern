@@ -92,8 +92,6 @@ class ConnectedBitwardenCredentialVaultService(CredentialVaultService):
             token.credential.master_password,
             organization.bw_organization_id,
             collection_ids,
-            # Only satisfies the pre-read check; the item's own collections are checked against the scope.
-            collection_id=collection_ids[0] if collection_ids else None,
             item_id=db_credential.item_id,
             max_retries=1,
             timeout=CONNECTED_BITWARDEN_TIMEOUT_SECONDS,

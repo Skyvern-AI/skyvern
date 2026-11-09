@@ -31,7 +31,12 @@ from skyvern.constants import ERROR_CODE_REASONING_MAX_LENGTH, MAX_PDF_OCR_PAGES
 from skyvern.forge.sdk.api.llm.custom_llm_registry import is_custom_llm_key
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.browser_profile_key import validate_browser_profile_key
-from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType, WorkflowParameterType
+from skyvern.forge.sdk.workflow.models.parameter import (
+    BITWARDEN_AWS_KEY_DEFAULTS,
+    OutputParameter,
+    ParameterType,
+    WorkflowParameterType,
+)
 from skyvern.forge.sdk.workflow.models.run_limits import (
     WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES,
     MaxScreenshotScrolls,
@@ -735,10 +740,11 @@ class BitwardenLoginCredentialParameterYAML(ParameterYAML):
     # to infer the type of the parameter_type attribute.
     parameter_type: Literal[ParameterType.BITWARDEN_LOGIN_CREDENTIAL] = ParameterType.BITWARDEN_LOGIN_CREDENTIAL  # type: ignore
 
-    # bitwarden cli required fields
-    bitwarden_client_id_aws_secret_key: str
-    bitwarden_client_secret_aws_secret_key: str
-    bitwarden_master_password_aws_secret_key: str
+    bitwarden_client_id_aws_secret_key: str = BITWARDEN_AWS_KEY_DEFAULTS["bitwarden_client_id_aws_secret_key"]
+    bitwarden_client_secret_aws_secret_key: str = BITWARDEN_AWS_KEY_DEFAULTS["bitwarden_client_secret_aws_secret_key"]
+    bitwarden_master_password_aws_secret_key: str = BITWARDEN_AWS_KEY_DEFAULTS[
+        "bitwarden_master_password_aws_secret_key"
+    ]
     # parameter key for the url to request the login credentials from bitwarden
     url_parameter_key: str | None = None
     # bitwarden collection id to filter the login credentials from,
@@ -765,10 +771,11 @@ class BitwardenSensitiveInformationParameterYAML(ParameterYAML):
     # to infer the type of the parameter_type attribute.
     parameter_type: Literal["bitwarden_sensitive_information"] = ParameterType.BITWARDEN_SENSITIVE_INFORMATION  # type: ignore
 
-    # bitwarden cli required fields
-    bitwarden_client_id_aws_secret_key: str
-    bitwarden_client_secret_aws_secret_key: str
-    bitwarden_master_password_aws_secret_key: str
+    bitwarden_client_id_aws_secret_key: str = BITWARDEN_AWS_KEY_DEFAULTS["bitwarden_client_id_aws_secret_key"]
+    bitwarden_client_secret_aws_secret_key: str = BITWARDEN_AWS_KEY_DEFAULTS["bitwarden_client_secret_aws_secret_key"]
+    bitwarden_master_password_aws_secret_key: str = BITWARDEN_AWS_KEY_DEFAULTS[
+        "bitwarden_master_password_aws_secret_key"
+    ]
     # bitwarden collection id to filter the Bitwarden Identity from
     bitwarden_collection_id: str
     # unique key to identify the Bitwarden Identity in the collection
@@ -784,10 +791,11 @@ class BitwardenCreditCardDataParameterYAML(ParameterYAML):
     # This pattern already works in block.py but since the ParameterType is not defined in this file, mypy is not able
     # to infer the type of the parameter_type attribute.
     parameter_type: Literal[ParameterType.BITWARDEN_CREDIT_CARD_DATA] = ParameterType.BITWARDEN_CREDIT_CARD_DATA  # type: ignore
-    # bitwarden cli required fields
-    bitwarden_client_id_aws_secret_key: str
-    bitwarden_client_secret_aws_secret_key: str
-    bitwarden_master_password_aws_secret_key: str
+    bitwarden_client_id_aws_secret_key: str = BITWARDEN_AWS_KEY_DEFAULTS["bitwarden_client_id_aws_secret_key"]
+    bitwarden_client_secret_aws_secret_key: str = BITWARDEN_AWS_KEY_DEFAULTS["bitwarden_client_secret_aws_secret_key"]
+    bitwarden_master_password_aws_secret_key: str = BITWARDEN_AWS_KEY_DEFAULTS[
+        "bitwarden_master_password_aws_secret_key"
+    ]
     # bitwarden ids for the credit card item
     bitwarden_collection_id: str
     bitwarden_item_id: str
