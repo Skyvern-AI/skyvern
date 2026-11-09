@@ -9146,3 +9146,14 @@ async def test_a_replay_in_flight_at_finish_is_settled_before_the_task_is_writte
     assert captured["task"].status == TaskStatus.completed
     assert [p.read_bytes() for p in tmp_path.iterdir()] == ([_REPLAYED_CSV] if selection else [])
     assert target.replay_candidates() == {}
+
+
+@pytest.mark.asyncio
+async def test_v3_internal_branch_extraction_may_complete_on_blank_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    block = _make_block(ExtractionBlock, data_extraction_goal="Evaluate the condition")
+    block._allow_blank_start = True
+    outcome = LoopOutcome(status="completed", reason="matched", billable_actions=[], extracted_output={"result": True})
+    _step, task, _loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch, outcome, task_block=block, page_url_after_loop="about:blank"
+    )
+    assert task.status == TaskStatus.completed
