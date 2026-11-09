@@ -1220,6 +1220,7 @@ function convertToNode(
           credentialId: block.credential_id ?? "",
           cc: (block.cc ?? []).join(", "),
           bcc: (block.bcc ?? []).join(", "),
+          replyToMessageId: block.reply_to_message_id ?? "",
         },
       };
     }
@@ -1526,6 +1527,7 @@ function convertToNode(
           maxResults: block.max_results ?? 25,
           includeBody: block.include_body ?? true,
           downloadAttachments: block.download_attachments ?? false,
+          messageId: block.message_id ?? "",
           parameterKeys: (block.parameters ?? []).map((p) => p.key),
         },
       };
@@ -3750,6 +3752,7 @@ function getWorkflowBlock(
           file_attachments: splitEmailList(node.data.fileAttachments).filter(
             (attachment) => attachment !== SKYVERN_DOWNLOAD_DIRECTORY,
           ),
+          reply_to_message_id: node.data.replyToMessageId || null,
         };
       }
       return {
@@ -4008,6 +4011,7 @@ function getWorkflowBlock(
         max_results: node.data.maxResults,
         include_body: node.data.includeBody,
         download_attachments: node.data.downloadAttachments,
+        message_id: node.data.messageId || null,
         parameter_keys: node.data.parameterKeys,
       };
     }
@@ -5235,6 +5239,7 @@ function convertBlocksToBlockYAML(
           prompt: block.prompt,
           data_schema: block.data_schema,
           max_turns: block.max_turns,
+          model: blockModelOverride(block.model),
           tools: block.tools ?? null,
           parameter_keys: (block.parameters ?? []).map((p) => p.key),
         };
@@ -5467,6 +5472,7 @@ function convertBlocksToBlockYAML(
                 credential_id: block.credential_id ?? null,
                 cc: block.cc ?? [],
                 bcc: block.bcc ?? [],
+                reply_to_message_id: block.reply_to_message_id ?? null,
               }
             : {}),
         };
@@ -5581,6 +5587,7 @@ function convertBlocksToBlockYAML(
           max_results: block.max_results,
           include_body: block.include_body,
           download_attachments: block.download_attachments,
+          message_id: block.message_id ?? null,
           parameter_keys: (block.parameters ?? []).map((p) => p.key),
         };
         return blockYaml;

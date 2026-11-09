@@ -4,6 +4,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from skyvern.forge.sdk.db.exceptions import CredentialSitesChangedError
 from skyvern.forge.sdk.db.models import Base, CredentialModel
 from skyvern.forge.sdk.db.repositories.credentials import CredentialRepository
 from skyvern.forge.sdk.schemas.credentials import CredentialType, CredentialVaultType
@@ -55,6 +56,64 @@ async def test_search_matches_an_exact_credential_id_within_the_org(repo_and_ses
     assert await found(ORG_B, portal) == []
     assert await found(ORG_A, "cred") == []
     assert await found(ORG_A, "portal") == [portal]
+
+
+@pytest.mark.asyncio
+async def test_a_site_edit_lands_only_on_the_saved_sites_it_was_made_from(repo_and_session) -> None:
+    repo, session_factory = repo_and_session
+    credential_id = await _add_credential(session_factory, ORG_A, "Portal login")
+    site_a = "https://portal.example.com/login"
+    await repo.update_credential(credential_id, ORG_A, tested_url=site_a)
+
+    added = await repo.update_credential(
+        credential_id, ORG_A, extra_site_urls=["https://example.org/login"], expected_site_urls=[site_a]
+    )
+    assert added.extra_site_urls == ["https://example.org/login"]
+
+    with pytest.raises(CredentialSitesChangedError):
+        await repo.update_credential(
+            credential_id, ORG_A, tested_url="https://example.net/", expected_site_urls=[site_a]
+        )
+    assert (await repo.get_credential(credential_id, ORG_A)).tested_url == site_a
+
+    moved = await repo.update_credential(
+        credential_id,
+        ORG_A,
+        tested_url="https://example.org/login",
+        extra_site_urls=[],
+        expected_site_urls=[site_a, "https://example.org/login"],
+    )
+    assert (moved.tested_url, moved.extra_site_urls) == ("https://example.org/login", [])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("writer", ["update_credential", "update_credential_vault_data"])
+async def test_a_new_tested_url_drops_the_extra_site_it_now_covers(repo_and_session, writer: str) -> None:
+    repo, session_factory = repo_and_session
+    credential_id = await _add_credential(session_factory, ORG_A, "Portal login")
+    await repo.update_credential(
+        credential_id,
+        ORG_A,
+        tested_url="https://portal.example.com/login",
+        extra_site_urls=["https://example.org/login", "https://example.net/login"],
+    )
+
+    if writer == "update_credential":
+        retested = await repo.update_credential(credential_id, ORG_A, tested_url="https://example.org/signin")
+    else:
+        retested = await repo.update_credential_vault_data(
+            credential_id,
+            ORG_A,
+            item_id="item",
+            name="Portal login",
+            credential_type=CredentialType.PASSWORD,
+            tested_url="https://example.org/signin",
+        )
+
+    assert (retested.tested_url, retested.extra_site_urls) == (
+        "https://example.org/signin",
+        ["https://example.net/login"],
+    )
 
 
 @pytest.mark.asyncio

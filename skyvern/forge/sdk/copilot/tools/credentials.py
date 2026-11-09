@@ -626,8 +626,7 @@ def _missing_credential_reference_tool_error(missing_credential_ids: list[str]) 
         f"The credential {id_word} {formatted_ids} {was_word} not found in this organization. "
         "Stop before creating, updating, or running the workflow. Call `request_credential` with the sign-in "
         "page URL so the user can add or pick one in chat, or, failing that, ask them to create it in the "
-        "Credentials UI and return with its ID, or explicitly choose an unvalidated draft workflow that will "
-        "not be run until credentials are available."
+        "Credentials UI and return with its ID."
     )
 
 
@@ -1133,8 +1132,7 @@ async def _credential_ids_validation_error(credential_ids: list[str], ctx: Agent
         )
         return (
             "Credential ID validation failed, so the workflow cannot be created, updated, or run safely. "
-            "Ask the user to provide/select a valid credential ID or explicitly choose an unvalidated draft "
-            "workflow that will not be run until credentials are available."
+            "Ask the user to provide/select a valid credential ID."
         )
 
     found_password_ids = {credential.credential_id for credential in existing_credentials}
@@ -1177,6 +1175,8 @@ def _serialize_credential(credential: Credential) -> dict[str, Any]:
         "credential_type": str(credential.credential_type),
         "tested_url": credential.tested_url,
     }
+    if credential.extra_site_urls:
+        entry["also_saved_for"] = list(credential.extra_site_urls)
     accessors = credential_code_accessors(credential.credential_type, credential.totp_type)
     if accessors:
         entry["code"] = {"workflow_parameter_type": "credential_id", "accessors": list(accessors)}

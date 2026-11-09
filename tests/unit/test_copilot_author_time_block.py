@@ -8,7 +8,6 @@ from __future__ import annotations
 import dataclasses
 import importlib.util
 import inspect
-import json
 import textwrap
 from types import SimpleNamespace
 
@@ -24,7 +23,6 @@ from skyvern.forge.sdk.copilot.author_time_block import (
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
-from skyvern.forge.sdk.copilot.output_policy import OutputPolicyReason, OutputPolicyVerdict
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.schema_incompatibility import (
     SCHEMA_INCOMPATIBILITY_REASON_CODE,
@@ -32,9 +30,7 @@ from skyvern.forge.sdk.copilot.schema_incompatibility import (
 )
 from skyvern.forge.sdk.copilot.tools import _update_workflow
 from skyvern.forge.sdk.copilot.tools import blockers as blockers_module
-from skyvern.forge.sdk.copilot.tools import guardrails as guardrails_module
 from skyvern.forge.sdk.copilot.tools import workflow_update as workflow_update_module
-from skyvern.forge.sdk.copilot.tools.guardrails import _workflow_yaml_output_policy_guardrail
 
 _BLOCKERS_SOURCE = inspect.getsource(blockers_module)
 _BLOCKER_SIGNAL_SOURCE = inspect.getsource(blocker_signal_module)
@@ -43,19 +39,6 @@ _BLOCKER_SIGNAL_SOURCE = inspect.getsource(blocker_signal_module)
 def _yaml(body: str) -> str:
     return textwrap.dedent(body).strip() + "\n"
 
-
-_SAFE_YAML = _yaml(
-    """
-    title: Registry lookup
-    workflow_definition:
-      blocks:
-      - block_type: code
-        label: search_registry
-        code: |
-          await page.goto("https://example.com/search")
-          await page.locator("#search").fill("widget")
-    """
-)
 
 _UNSAFE_CODE_YAML = _yaml(
     """
@@ -219,25 +202,6 @@ async def test_credential_reference_validation_still_blocks(monkeypatch: pytest.
     assert result["ok"] is False
     assert result["block_id"] == CREDENTIAL_SCOUT_BLOCK_ID
     assert ctx.has_staged_proposal is False
-
-
-def test_tool_input_guardrail_allows_a_non_credential_verdict(monkeypatch: pytest.MonkeyPatch) -> None:
-    tool_context = SimpleNamespace(
-        tool_name="update_workflow",
-        tool_call_id="call_1",
-        tool_arguments=json.dumps({"workflow_yaml": _SAFE_YAML}),
-        context=SimpleNamespace(request_policy=RequestPolicy()),
-    )
-    monkeypatch.setattr(
-        guardrails_module,
-        "evaluate_output_policy",
-        lambda **_k: OutputPolicyVerdict(reason_codes=[OutputPolicyReason.PERSISTENCE_STATE_MISMATCH]),
-    )
-
-    output = _workflow_yaml_output_policy_guardrail(SimpleNamespace(context=tool_context))  # type: ignore[arg-type]
-
-    assert output.output_info["allowed"] is True
-    assert "block_id" not in output.output_info
 
 
 @pytest.mark.asyncio

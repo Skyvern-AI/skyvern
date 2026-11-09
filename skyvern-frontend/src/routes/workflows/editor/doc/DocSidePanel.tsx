@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 import { Cross2Icon } from "@radix-ui/react-icons";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { BlockConfigForm } from "../panels/BlockConfigForm";
+import { WorkflowSettingsEditor } from "../nodes/StartNode/WorkflowSettingsEditor";
 import { isWorkflowBlockNode, type AppNode } from "../nodes";
 import { blockTypeFromNode } from "../nodes/blockTypeFromNode";
 import { WorkflowBlockIcon } from "../nodes/WorkflowBlockIcon";
@@ -14,6 +15,7 @@ export function DocSidePanel({
   onTabChange,
   selectedStep,
   editable,
+  settingsReadable,
   learn,
   onLearn,
   onClose,
@@ -22,6 +24,7 @@ export function DocSidePanel({
   onTabChange: (tab: string) => void;
   selectedStep?: AppNode;
   editable: boolean;
+  settingsReadable: boolean;
   learn: DocLearnContent;
   onLearn: (content: DocLearnContent) => void;
   onClose: () => void;
@@ -95,6 +98,10 @@ export function DocSidePanel({
           )}
           {selectedStepId && editable ? (
             <BlockConfigForm key={selectedStepId} blockId={selectedStepId} />
+          ) : selectedStepId &&
+            selectedStep?.type === "start" &&
+            settingsReadable ? (
+            <WorkflowSettingsEditor blockId={selectedStepId} locked />
           ) : (
             <p className="text-sm text-muted-foreground">
               {selectedStepId

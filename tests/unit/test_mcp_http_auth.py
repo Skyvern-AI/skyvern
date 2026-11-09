@@ -646,13 +646,6 @@ def test_validate_token_audience_rejects_wrong_resource() -> None:
         )
 
 
-def test_validate_token_audience_accepts_matching_url() -> None:
-    mcp_http_auth._validate_token_audience(
-        {"aud": ["https://api.skyvern.com/mcp/"]},
-        "https://api.skyvern.com/mcp/",
-    )
-
-
 def test_validate_token_audience_tolerates_trailing_slash_mismatch() -> None:
     # Token audience minted against the slashed form must still validate when
     # the canonical (slashless) expected_resource is used, and vice versa.

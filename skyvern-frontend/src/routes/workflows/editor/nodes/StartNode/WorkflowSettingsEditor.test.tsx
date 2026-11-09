@@ -166,9 +166,15 @@ vi.mock("@/components/ui/select", () => ({
 }));
 
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
+import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
 import { WorkflowSettingsEditor } from "./WorkflowSettingsEditor";
 
-function renderSettings(overrides: Partial<WorkflowStartNodeData> = {}) {
+const GROUP_IDS = ["model", "runs", "safety", "browser", "runwith", "webhook"];
+
+function renderSettings(
+  overrides: Partial<WorkflowStartNodeData> = {},
+  options: { open?: boolean } = {},
+) {
   nodeData = {
     ...startNodeData,
     ...overrides,
@@ -176,11 +182,24 @@ function renderSettings(overrides: Partial<WorkflowStartNodeData> = {}) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
-  return render(
+  const view = render(
     <QueryClientProvider client={client}>
       <WorkflowSettingsEditor blockId="start" />
     </QueryClientProvider>,
   );
+  if (options.open !== false) openAllGroups();
+  return view;
+}
+
+function openAllGroups() {
+  for (const id of GROUP_IDS) {
+    const trigger = screen
+      .getByTestId(`settings-group-${id}`)
+      .querySelector("button");
+    if (trigger?.getAttribute("aria-expanded") === "false") {
+      fireEvent.click(trigger);
+    }
+  }
 }
 
 beforeEach(() => {
@@ -262,9 +281,9 @@ describe("WorkflowSettingsEditor browser session reuse", () => {
     });
 
     const label = screen.getByText("Reuse browser session");
-    const toggle = label.parentElement?.parentElement?.querySelector(
-      'button[role="switch"]',
-    );
+    const toggle = label
+      .closest(".items-start")
+      ?.querySelector('button[role="switch"]');
     expect(toggle).not.toBeNull();
     fireEvent.click(toggle!);
 
@@ -281,9 +300,9 @@ describe("WorkflowSettingsEditor browser session reuse", () => {
     });
 
     const label = screen.getByText("Reuse browser session");
-    const toggle = label.parentElement?.parentElement?.querySelector(
-      'button[role="switch"]',
-    );
+    const toggle = label
+      .closest(".items-start")
+      ?.querySelector('button[role="switch"]');
     expect(toggle).not.toBeNull();
     fireEvent.click(toggle!);
 
@@ -467,4 +486,54 @@ test("changing a retry status preserves the custom error-code draft", () => {
   expect((screen.getByLabelText("Error codes") as HTMLInputElement).value).toBe(
     "E_DRAFT",
   );
+});
+
+describe("WorkflowSettingsEditor groups", () => {
+  test("six groups start folded and summarise defaults", () => {
+    renderSettings({ runWith: "code" }, { open: false });
+
+    const groups = GROUP_IDS.map((id) =>
+      screen.getByTestId(`settings-group-${id}`),
+    );
+    expect(
+      groups.map((g) =>
+        g.querySelector("button")?.getAttribute("aria-expanded"),
+      ),
+    ).toEqual(GROUP_IDS.map(() => "false"));
+    expect(screen.getByText("Code")).toBeDefined();
+    expect(screen.getByText("No webhook")).toBeDefined();
+  });
+
+  test("Run With = agent hides AI fallback and code key; code shows them", () => {
+    renderSettings({ runWith: "agent" });
+    expect(screen.queryByText("AI Fallback (cached scripts)")).toBeNull();
+    expect(screen.queryByText("Code Key (optional)")).toBeNull();
+    cleanup();
+    renderSettings({ runWith: "code" });
+    expect(screen.getByText("AI Fallback (cached scripts)")).toBeDefined();
+    expect(screen.getByText("Code Key (optional)")).toBeDefined();
+  });
+});
+
+describe("WorkflowSettingsEditor locked editor", () => {
+  afterEach(() => {
+    useWorkflowYamlEditorStore.setState({ commitInProgress: false });
+  });
+
+  test("group triggers still open while the controls inside are disabled", () => {
+    useWorkflowYamlEditorStore.setState({ commitInProgress: true });
+    renderSettings({}, { open: false });
+
+    const trigger = screen
+      .getByTestId("settings-group-webhook")
+      .querySelector("button") as HTMLButtonElement;
+    expect(trigger.disabled).toBe(false);
+    fireEvent.click(trigger);
+
+    expect(trigger.getAttribute("aria-expanded")).toBe("true");
+    const fieldset = screen
+      .getByTestId("settings-group-webhook")
+      .querySelector("fieldset") as HTMLFieldSetElement;
+    expect(fieldset.disabled).toBe(true);
+  });
 });

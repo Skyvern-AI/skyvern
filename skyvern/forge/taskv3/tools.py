@@ -127,6 +127,7 @@ from skyvern.forge.taskv3.loop import (
     record_type_caret_held,
     record_type_reach,
     set_driver_timeout_predicate,
+    telemetry_hash,
 )
 from skyvern.forge.taskv3.preflight import PREFLIGHT_TOOL_NAMES, preflight_tool_action
 from skyvern.forge.taskv3.run_arms import (
@@ -208,6 +209,9 @@ _OBSERVE_DESCRIPTION_BASE = (
     "ref names the element this reading described and keeps working while that element is on the page. "
     "If it becomes ambiguous or is gone, the tool errors "
     "instead of acting on something else — re-observe and use a ref from the new reading. "
+    "`near=[slot:text, ...]` is text the page projects into the control's component through the named slots, and "
+    "each slot name says what its text is (a label, hint, prefix, and so on). It is not a binding: decide from the "
+    "page and the goal. "
 )
 _OBSERVE_DESCRIPTION_FRAME_REACH = (
     "Elements inside the page's child frames are included in the same list and are acted on by ref "
@@ -456,6 +460,74 @@ def _is_host_anchored_selector(selector: str) -> bool:
     return bool(_TV3_ANCHORED_SELECTOR_RE.match(_TV3_QUOTED_VALUE_RE.sub('""', selector.strip())))
 
 
+_ANY_QUOTED_RE = re.compile(r"\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*'")
+_XPATH_TRAILING_POSITION_RE = re.compile(
+    r"^(?P<base>.*\S)\s*\[\s*(?:\d+|position\(\)\s*=\s*\d+|last\(\)(?:\s*-\s*\d+)?)\s*\]$", re.DOTALL
+)
+_CSS_TRAILING_POSITION_RE = re.compile(
+    r"^(?P<base>.*?)(?::(?:nth-child|nth-last-child|nth-of-type|nth-last-of-type)\([^()]*\)|:(?:first|last)-(?:child|of-type))$",
+    re.DOTALL,
+)
+# A position on these axes picks the NEAREST element to an anchor, not one of several lookalikes.
+_XPATH_NEAREST_AXIS_RE = re.compile(
+    r"\b(?:following|preceding|following-sibling|preceding-sibling|ancestor(?:-or-self)?)::"
+)
+_POSITIONAL_LISTING_CAP = 8
+_POSITIONAL_SELECTED_CAP = 3
+
+
+def _blank_quotes(text: str) -> str:
+    """`text` with every quoted string's contents masked, same length, so structure scans skip literal text."""
+    return _ANY_QUOTED_RE.sub(lambda m: m.group(0)[0] + "_" * (len(m.group(0)) - 2) + m.group(0)[-1], text)
+
+
+def _balanced(masked: str, *, commas: bool = True) -> bool:
+    depth = 0
+    for ch in masked:
+        depth += (ch in "([") - (ch in ")]")
+        if depth < 0 or (not commas and depth == 0 and ch == ","):
+            return False
+    return depth == 0
+
+
+def _unpositioned_selector(selector: str) -> str | None:
+    """The typed selector without its trailing positional pick, or None when it has none or cannot be read
+    (None means no note, so a form this does not parse fails open)."""
+    stripped = selector.strip()
+    if not stripped or _TV3_MARKER_ANYWHERE_RE.search(stripped) or ">>" in _blank_quotes(stripped):
+        return None
+    prefix, body = "", stripped
+    engine = re.match(r"^(xpath|css)=", stripped)
+    if engine:
+        prefix, body = engine.group(0), stripped[engine.end() :]
+    elif _ENGINE_SELECTOR_RE.match(stripped) and not stripped.startswith("//"):
+        return None
+    masked = _blank_quotes(body)
+    xpath = prefix == "xpath=" or (not prefix and body.startswith(("/", "(", "..")))
+    if xpath:
+        m = _XPATH_TRAILING_POSITION_RE.match(masked)
+        if m is None or _XPATH_NEAREST_AXIS_RE.search(masked):
+            return None
+        base, masked_base = body[: m.end("base")], m.group("base")
+        if masked_base.startswith("(") and masked_base.endswith(")") and _balanced(masked_base[1:-1]):
+            base, masked_base = base[1:-1].strip(), masked_base[1:-1].strip()
+        elif "|" in masked_base:
+            # `//a | //b[1]` positions only the last branch of the union.
+            return None
+    else:
+        m = _CSS_TRAILING_POSITION_RE.match(masked)
+        # `:nth-child(An+B of S)` counts only siblings matching S, so dropping it would list unrelated elements.
+        if m is None or re.search(r"\(.*\sof\s", masked[m.end("base") :]):
+            return None
+        base, masked_base = body[: m.end("base")], m.group("base")
+        if not masked_base.strip() or masked_base[-1:] in " \t\n>+~":
+            base, masked_base = base + "*", masked_base + "*"
+    # A CSS list (`a, b:first-child`) positions only its last member.
+    if not masked_base.strip() or not _balanced(masked_base, commas=xpath):
+        return None
+    return prefix + base
+
+
 # A plain bare `#<id>`: no combinator/pseudo/attribute part, and no char that would need escaping
 # inside `[id="<id>"]` (quotes, backslash, and whitespace are excluded, so the rewrite is always safe).
 _BARE_ID_SELECTOR_RE = re.compile(r"""^#([^\s#.>+~\[\]()=,:*|^$'"\\]+)$""")
@@ -517,6 +589,12 @@ _SELECTOR_GUARD_TOOL_NAMES = frozenset(
     }
 )
 
+# The acting tools whose OK result notes what a typed positional selector chose between. The layer, toggle and
+# address probes pass through the same wrapper under their own names and never carry it.
+_POSITIONAL_NOTE_TOOL_NAMES = frozenset(_SELECTOR_GUARD_TOOL_NAMES - {"get_html", "scroll", "wait"})
+# The whole note read is bounded, so a slow page costs the action at most this.
+_POSITIONAL_NOTE_TIMEOUT_SECONDS = 1.0
+
 # The tools whose driver timeout actually propagates to the guard AND whose action needs its target
 # rendered. Measured per ANCHOR SHAPE, not per tool -- one shape answering does not mean the tool
 # does. On a display:none template: select_option on a native <select> and a click on a native
@@ -532,6 +610,140 @@ _INERT_DIAGNOSIS_TOOL_NAMES = frozenset({"click", "hover", "type", "select_combo
 # Above this, a model-authored selector names a whole class of elements rather than one control the
 # page happens to duplicate, so `_rendered_target` stops paying a visibility round trip per match.
 _RENDERED_TARGET_MATCH_CAP = 12
+
+# One element's facts for a positional-selector note: tag, accessible name, current value or selection, and
+# whether it is one of `picks`. Returned uncut so Python masks hidden values before the display cut; a
+# password's or a one-time-code box's value is never read, as in observe and get_html.
+_POSITIONAL_ROW_JS = (
+    "(el, picks) => {"
+    + OTP_INPUT_PRIVACY_JS
+    + r"""
+  let cut = false;
+  const raw = (v) => {
+    const t = String(v == null ? '' : v).replace(/\s+/g, ' ').trim();
+    if (t.length > 2000) cut = true;
+    return t.slice(0, 2000);
+  };
+  const otp = isOtpInputValueSecret(el);
+  const attr = (name) => {
+    const v = otp ? otpSafeInputAttribute(el, name, el.getAttribute(name)) : el.getAttribute(name);
+    return v && String(v).trim() ? v : '';
+  };
+  const nameOf = () => {
+    if (attr('aria-label')) return attr('aria-label');
+    const by = el.getAttribute('aria-labelledby');
+    if (by && by.trim()) {
+      const root = el.getRootNode();
+      const t = by.split(/\s+/).map((id) => {
+        const n = root.getElementById ? root.getElementById(id) : null;
+        return n ? n.textContent : '';
+      }).join(' ');
+      if (t.trim()) return t;
+    }
+    const labels = el.labels ? Array.from(el.labels).map((l) => l.innerText || l.textContent || '').join(' ') : '';
+    if (labels.trim()) return labels;
+    for (const a of ['title', 'placeholder', 'name']) { if (attr(a)) return attr(a); }
+    return /^(select|input|textarea)$/.test(el.localName) ? '' : (el.innerText || el.textContent || '');
+  };
+  const tag = el.localName;
+  const type = String(el.type || '').toLowerCase();
+  let kind = '', value = [];
+  if (tag === 'select') { kind = 'selected'; value = Array.from(el.selectedOptions || []).map((o) => raw(o.text)); }
+  else if (tag === 'input' && (type === 'checkbox' || type === 'radio')) kind = el.checked ? 'checked' : 'unchecked';
+  else if (tag === 'input' && (type === 'password' || otp)) kind = el.value ? 'hidden' : 'empty';
+  else if (tag === 'input' || tag === 'textarea') { kind = el.value ? 'value' : 'empty'; value = el.value ? [raw(el.value)] : []; }
+  const name = raw(nameOf());
+  return { tag, name, kind, value, picked: (picks || []).includes(el), cut };
+}"""
+)
+
+
+async def _positional_note(
+    page: Any, selector: str, mask_refs: Callable[[str], str] = str, *, before: str = "before this action"
+) -> tuple[str, dict[str, int]] | None:
+    """What a typed positional selector chooses between, read BEFORE the action so the values are the ones
+    the pick was made over, with counts for the log. None (no note, the action unchanged) when the selector
+    carries no position this reads, when its unpositioned form names at most one element, or on any error."""
+    base = _unpositioned_selector(selector)
+    if base is None:
+        return None
+    handles: list[Any] = []
+
+    # Only count, nth, element_handles and evaluate: the calls both browser engines' locators have.
+    async def read() -> tuple[int, int, list[dict[str, Any]]] | None:
+        base_locator = page.locator(base)
+        matches = await base_locator.count()
+        if matches <= 1:
+            return None
+        pick_locator = page.locator(selector)
+        picks = await pick_locator.count()
+        if picks == 0:
+            return None
+        if picks <= _POSITIONAL_LISTING_CAP:
+            handles.extend(await pick_locator.element_handles())
+        rows = []
+        for index in range(min(matches, _POSITIONAL_LISTING_CAP)):
+            row = await base_locator.nth(index).evaluate(_POSITIONAL_ROW_JS, handles)
+            rows.append(row if isinstance(row, dict) else {})
+        return matches, picks, rows
+
+    try:
+        found = await asyncio.wait_for(read(), _POSITIONAL_NOTE_TIMEOUT_SECONDS)
+    except Exception as exc:
+        LOG.info(
+            "taskv3 positional selector note unavailable",
+            reason="timeout" if isinstance(exc, TimeoutError) else type(exc).__name__,
+            tool_call_seq=current_tool_call_seq(),
+        )
+        found = None
+    finally:
+        if handles:
+            # Bounded like the read: on a slow engine a dispose must not hold the action.
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(
+                    asyncio.gather(*(handle.dispose() for handle in handles), return_exceptions=True),
+                    _POSITIONAL_NOTE_TIMEOUT_SECONDS,
+                )
+    if found is None:
+        return None
+    matches, picks, rows = found
+
+    def shown(text: object, page_cut: bool) -> str:
+        # Stripped of zero-width and line-forging characters first (so a split secret still matches its mask), then
+        # masked, then cut, then quoted with escaping, so page text cannot close the quote and fake the pick marker.
+        # The split-tail trim only applies where the page script cut the text: elsewhere it eats real characters.
+        clean = mask_refs(_DOWNLOAD_NOTICE_SANITIZE_RE.sub("", str(text)))
+        masked = _model_text(_without_split_hidden_tail(clean) if page_cut else clean, _MENU_ROW_TEXT_MAX * 4)
+        return repr(masked if len(masked) <= 60 else masked[:60] + "…")
+
+    marked = picks <= _POSITIONAL_LISTING_CAP
+    head = "picks by position" if marked else f"picks {picks} elements"
+    lines = [f"note: {selector} {head}; read {before}, without the position {base} matches {matches} elements:"]
+    for index, row in enumerate(rows, start=1):
+        page_cut = row.get("cut") is True
+        facts = [f"{index}. {_digest_token(row.get('tag') or 'element', 40)}"]
+        if row.get("name"):
+            facts.append(shown(row["name"], page_cut))
+        kind = row.get("kind")
+        values = [v for v in row.get("value") or [] if isinstance(v, str)]
+        if kind == "selected":
+            listed = ", ".join(shown(v, page_cut) for v in values[:_POSITIONAL_SELECTED_CAP])
+            more = f" ({len(values) - _POSITIONAL_SELECTED_CAP} more)" if len(values) > _POSITIONAL_SELECTED_CAP else ""
+            facts.append(f"selected {listed}{more}" if values else "nothing selected")
+        elif kind == "value":
+            facts.append("value " + shown(values[0] if values else "", page_cut))
+        elif kind == "hidden":
+            facts.append("value (hidden)")
+        elif kind in ("checked", "unchecked", "empty"):
+            facts.append(str(kind))
+        if marked and row.get("picked") is True:
+            facts.append("<- this selector's pick")
+        lines.append(" ".join(facts))
+    if matches > len(rows):
+        lines.append(f"({matches - len(rows)} more)")
+    if marked and not any(row.get("picked") is True for row in rows):
+        lines.append("(the pick is not among the listed rows)")
+    return "\n".join(lines), {"matches": matches, "listed": len(rows), "picks": picks}
 
 
 def _inert_target_error(selector: str) -> ToolResult:
@@ -1498,7 +1710,8 @@ _MENU_ROW_ROLES_JS = (
 
 # Counts the VISIBLE menu-row descendants of a node, using the SAME row definition _FIND_MENU_JS
 # reports on (its MENU_ROW_ROLES plus native <button>/<a>), so the growth signal and the finder cannot
-# disagree about what a row is. Assumes an enclosing `vis(el)` helper. Shared by the two click probes.
+# disagree about what a row is. It also holds the pick's state read, which both click probes share. Assumes an
+# enclosing `vis(el)` helper.
 _VIS_ROWS_JS = (
     r"""
   const MENU_ROW_ROLES = """
@@ -1507,12 +1720,47 @@ _VIS_ROWS_JS = (
   const _visRows = (el) => {
     let n = 0;
     try {
-      for (const d of el.querySelectorAll('[role], button, a')) {
+      for (const d of flatQueryAll(el, '[role], button, a')) {
         const t = d.tagName;
         if ((MENU_ROW_ROLES.has(d.getAttribute('role')) || t === 'BUTTON' || t === 'A') && vis(d)) n++;
       }
     } catch (e) {}
     return n;
+  };
+  const state = (el) => {
+    // .checked is a DOM property, not an attribute: a native-checkbox multi-select commits by
+    // flipping only it, with no aria/class/text change, as a row whose inner checkbox carries aria-checked does.
+    // Same for inline-style-only toggles.
+    let kids = '';
+    try {
+      for (const i of flatQueryAll(el, 'input,[aria-checked]')) {
+        kids += (i.localName === 'input' ? i.checked : i.getAttribute('aria-checked') === 'true') ? '1' : '0';
+      }
+    } catch (e) {}
+    return [
+      el.getAttribute('aria-checked'), el.getAttribute('aria-selected'), el.getAttribute('aria-pressed'),
+      el.className, flatChildCount(el), (el.innerText || '').trim(), composedRowText(el),
+      el.getAttribute('style'), kids,
+    ].join('|');
+  };
+  // Fixed-arity on purpose: every component is one attribute of the row itself, so a row that
+  // restructures cannot change this string, and only being picked can.
+  const selState = (el) => {
+    return [
+      el.getAttribute('aria-checked'), el.getAttribute('aria-selected'), el.getAttribute('aria-pressed'),
+    ].join('|');
+  };
+  // A pick shows on the leaf clicked or on its declared row, so both are read.
+  const pickState = (pick) => {
+    const parts = pick.leaf && pick.leaf !== pick.row ? [pick.leaf, pick.row] : [pick.row];
+    const sum = (f) => parts.reduce((n, el) => n + f(el), 0);
+    return {
+      optState: parts.map(state).join('#'),
+      optSel: parts.map(selState).join('#'),
+      optKids: sum(flatChildCount),
+      optH: sum((el) => Math.round(el.getBoundingClientRect().height)),
+      optVis: sum(_visRows),
+    };
   };
 """
 )
@@ -2757,14 +3005,234 @@ _PIERCED_QUERY_JS = (
     }
     return acc;
   };
+  // The flat-tree walk reads the DOM through its prototypes: a <form> exposes its named inputs as properties, so an
+  // input named `matches` or `parentNode` shadows the method on the form (and `document.host` reads a form named
+  // `host`), and a walk over those reads cycles. A read that still fails reads as "no such node".
+  const _getterOf = (proto, name) => {
+    try { const d = Object.getOwnPropertyDescriptor(proto, name); return d ? d.get : null; } catch (e) { return null; }
+  };
+  const _typeOf = _getterOf(Node.prototype, 'nodeType');
+  const _parentOf = _getterOf(Node.prototype, 'parentNode');
+  const _hostOf = _getterOf(ShadowRoot.prototype, 'host');
+  const _elSlotOf = _getterOf(Element.prototype, 'assignedSlot');
+  const _textSlotOf = _getterOf(Text.prototype, 'assignedSlot');
+  const _elMatches = Element.prototype.matches;
   // The composed-tree step, and the only one any probe below takes: parentNode, or the host at a
   // shadow boundary (a ShadowRoot has no parentNode, and parentElement is null there). A walk that
   // stops at the boundary answers about the component's inside, which is not the page's structure.
-  const composedParent = (n) => (n && (n.parentNode || n.host)) || null;
+  const composedParent = (n) => {
+    try {
+      if (!n) return null;
+      return (_typeOf.call(n) === 11 ? _hostOf.call(n) : _parentOf.call(n)) || null;
+    } catch (e) { return null; }
+  };
   const composedParentElement = (n) => {
     let p = composedParent(n);
     while (p && p.nodeType !== 1) p = composedParent(p);
     return p;
+  };
+  // The flat-tree step: a slotted node is drawn inside its assigned slot, so a row a component projects its
+  // text into is an ancestor of that text only through the slot. An unslotted node takes the composed step.
+  const flatParentNode = (n) => {
+    try {
+      if (!n) return null;
+      const t = _typeOf.call(n);
+      const slotOf = t === 1 ? _elSlotOf : (t === 3 ? _textSlotOf : null);
+      const slot = slotOf ? slotOf.call(n) : null;
+      return slot || composedParent(n);
+    } catch (e) { return null; }
+  };
+  const flatMatches = (n, sel) => {
+    try { return _typeOf.call(n) === 1 && _elMatches.call(n, sel); } catch (e) { return false; }
+  };
+  // The nearest flat-tree ancestor-or-self matching `sel`; null once the walk meets one matching `stop` first.
+  const flatClosest = (el, sel, stop) => {
+    for (let n = el, hops = 0; n && hops < 256; hops++, n = flatParentNode(n)) {
+      if (flatMatches(n, sel)) return n;
+      if (stop && flatMatches(n, stop)) return null;
+    }
+    return null;
+  };
+  const flatContains = (a, b) => {
+    if (!a || !b) return false;
+    for (let n = b, hops = 0; n && hops < 256; hops++, n = flatParentNode(n)) if (n === a) return true;
+    return false;
+  };
+  const OPT_SEL = '[role="option"],[role="menuitemradio"],[role="menuitemcheckbox"],[role="treeitem"],[role="radio"]';
+  const LIST_SEL = '[role="listbox"],[role="menu"],[role="tree"],[role="grid"],[role="radiogroup"],datalist';
+  const DECLARED_ROW_SEL = OPT_SEL + ',[role="menuitem"]';
+  // querySelectorAll over the flat tree below `el`: what a slot inside it draws is part of it. A Set, because a
+  // slot's fallback content is both its child and, with nothing assigned, what it draws.
+  const _shadowOf = _getterOf(Element.prototype, 'shadowRoot');
+  const _openRootOf = (e) => {
+    try { const sr = _shadowOf.call(e); return sr && _typeOf.call(sr) === 11 ? sr : null; } catch (err) { return null; }
+  };
+  const flatQueryAll = (el, sel) => {
+    const out = new Set();
+    const walked = new Set();
+    const walk = (root, depth) => {
+      if (walked.has(root)) return;
+      walked.add(root);
+      for (const e of root.querySelectorAll(sel)) out.add(e);
+      if (depth >= 8) return;
+      const own = _typeOf.call(root) === 1 ? _openRootOf(root) : null;
+      if (own) walk(own, depth + 1);
+      for (const h of root.querySelectorAll('*')) {
+        const sr = _openRootOf(h);
+        if (sr) walk(sr, depth + 1);
+      }
+      for (const s of root.querySelectorAll('slot')) {
+        for (const a of s.assignedElements({ flatten: true })) {
+          if (flatMatches(a, sel)) out.add(a);
+          walk(a, depth + 1);
+        }
+      }
+    };
+    try { walk(el, 0); } catch (e) {}
+    return Array.from(out);
+  };
+  // A row's child count over the flat tree: a slot counts as what it draws.
+  const flatChildCount = (el) => {
+    let n = 0;
+    try {
+      for (const c of el.children) {
+        n += c.localName === 'slot' ? (c.assignedElements({ flatten: true }).length || c.children.length) : 1;
+      }
+    } catch (e) {}
+    return n;
+  };
+  // A leaf's declared row, within the leaf's own list: a component projects an option's text into a row in its own
+  // root, which the text reaches only through the slot.
+  const declaredRowOf = (el) => flatClosest(el, DECLARED_ROW_SEL, LIST_SEL);
+  // The text a row renders, read through the flat tree: innerText stops at a shadow host, so an option
+  // component that draws its label in its own root would read as ''. A row declared inside the row is its
+  // own row, so a category's text is its own label, not its children's. `forName` drops zero-width characters and
+  // reads a walk cut short by its budget or depth as no text; aria-hidden text is text (an icon's ligature).
+  const composedRowText = (top, forName = false) => {
+    let out = '';
+    let budget = 2000;
+    let cut = false;
+    const walk = (n, depth) => {
+      if (depth > 32) { cut = true; return; }
+      let kids = null;
+      if (String(n.localName || '') === 'slot') {
+        try { kids = n.assignedNodes({ flatten: true }); } catch (e) { kids = null; }
+      }
+      if (!kids || !kids.length) {
+        let sr = null;
+        try { sr = n.nodeType === 1 ? n.shadowRoot : null; } catch (e) { sr = null; }
+        kids = sr && sr.nodeType === 11 ? sr.childNodes : n.childNodes;
+      }
+      for (const c of kids) {
+        if (budget-- <= 0) { cut = true; return; }
+        if (c.nodeType === 3) {
+          const p = c.parentElement || (c.parentNode && c.parentNode.host) || null;
+          let shown = true;
+          try { shown = !p || getComputedStyle(p).visibility !== 'hidden'; } catch (e) { shown = true; }
+          if (shown) out += c.data;
+          continue;
+        }
+        if (c.nodeType !== 1) continue;
+        const name = String(c.localName || '');
+        if (name === 'script' || name === 'style' || name === 'template' || name === 'noscript') continue;
+        if (name === 'br') { out += ' '; continue; }
+        try {
+          if (c.matches(DECLARED_ROW_SEL)) continue;
+        } catch (e) { /* unmatchable: read it */ }
+        let display = '';
+        try { display = getComputedStyle(c).display; } catch (e) { display = ''; }
+        if (display === 'none') continue;
+        const block = display !== '' && display !== 'contents' && !/^inline/.test(display);
+        if (block) out += ' ';
+        walk(c, depth + 1);
+        if (block) out += ' ';
+      }
+    };
+    try { walk(top, 0); } catch (e) { cut = true; /* a partial read is still the row's text so far */ }
+    if (forName) return cut ? '' : out.replace(/[\u200b-\u200d\ufeff]/g, '').replace(/\s+/g, ' ').trim();
+    return out.replace(/\s+/g, ' ').trim();
+  };
+  const CONTROL_SEL = 'button,a[href],input,[role="button"],[role="checkbox"],[role="switch"],[role="radio"]';
+  const separateControl = (leaf, row) => {
+    const m = flatClosest(leaf, CONTROL_SEL);
+    if (!m || m === row) return false;
+    return flatContains(row, m);
+  };
+  // A row's label: the own leaf that is all the text the row renders, so a row whose text also sits in a link, a badge,
+  // a description or untagged text claims nothing. A leaf holding another own leaf with text is not that label.
+  const rowLabelOf = (row, leaves) => {
+    const whole = composedRowText(row, true);
+    if (!whole) return null;
+    const own = leaves.filter((l) => l === row || declaredRowOf(l) === row);
+    return own.find((l) => composedRowText(l, true) === whole
+      && !own.some((m) => m !== l && flatContains(l, m) && composedRowText(m, true))) || null;
+  };
+  const LANDING_OUTSIDE = { outside: true };
+  // The innermost leaf holding the target is the pick, unless the target is a control not holding the label (a star).
+  // A target in a declared row outside its leaves picks the row's label (for a parent row, the child under `landing`),
+  // which `landing` can only withhold; `held` is the pair read before the click, whose label the commit may rewrite.
+  const menuPickOf = (leaves, target, landing, held = null) => {
+    if (!target) return null;
+    let leaf = null;
+    for (const l of leaves) if (flatContains(l, target) && (!leaf || flatContains(leaf, l))) leaf = l;
+    if (leaf) {
+      const row = declaredRowOf(leaf) || leaf;
+      const own = leaves.filter((l) => l === row || declaredRowOf(l) === row);
+      const label = own.find((l) => {
+        const a = flatClosest(l, 'a[href]');
+        return a ? a !== row && flatContains(row, a) : false;
+      }) || own.find((l) => !separateControl(l, row)) || null;
+      const ctl = flatClosest(target, CONTROL_SEL);
+      if (label && ctl && ctl !== row && flatContains(row, ctl) && !flatMatches(ctl, 'a[href]') && !flatContains(ctl, label)) {
+        return null;
+      }
+      return { leaf, row, level: 'leaf' };
+    }
+    const top = declaredRowOf(target);
+    if (!top || landing === LANDING_OUTSIDE) return null;
+    if (landing) for (const l of leaves) if (flatContains(l, landing) && (!leaf || flatContains(leaf, l))) leaf = l;
+    const nested = (l) => { const r = declaredRowOf(l) || l; return r !== top && flatContains(top, r); };
+    let row = top;
+    if (leaf && nested(leaf)) row = declaredRowOf(leaf) || leaf;
+    else if (leaves.some(nested)) return null;
+    const label = held && held.row === row ? held.leaf : rowLabelOf(row, leaves);
+    if (!label) return null;
+    const ctl = landing ? flatClosest(landing, CONTROL_SEL) : null;
+    if (ctl && ctl !== row && flatContains(row, ctl) && !flatContains(ctl, label)) return null;
+    return { leaf: label, row, level: 'row' };
+  };
+  const _nameOf = _getterOf(Element.prototype, 'localName');
+  // The element a recorded click reached, or LANDING_OUTSIDE when it is outside `target` (an overlay, a frame).
+  const landingOf = (hit, target) => {
+    try {
+      if (!hit || /^(iframe|frame|object|embed)$/.test(String(_nameOf.call(hit)))) return LANDING_OUTSIDE;
+      return flatContains(target, hit) ? hit : LANDING_OUTSIDE;
+    } catch (e) { return LANDING_OUTSIDE; }
+  };
+  // The element at the centre of `target`, where the driver clicks only when the box is whole and in view. Null
+  // (unreadable) with no box, a box not wholly in the viewport or with several rects, or a hit outside the target.
+  const _efpDoc = Document.prototype.elementFromPoint;
+  const _efpRoot = ShadowRoot.prototype.elementFromPoint;
+  const _rectOf = Element.prototype.getBoundingClientRect;
+  const _rectsOf = Element.prototype.getClientRects;
+  const landingIn = (target) => {
+    try {
+      const r = _rectOf.call(target);
+      if (!(r.width > 0 && r.height > 0)) return null;
+      if (r.left < 0 || r.top < 0 || r.right > window.innerWidth || r.bottom > window.innerHeight) return null;
+      if (_rectsOf.call(target).length > 1) return null;
+      const x = r.left + r.width / 2;
+      const y = r.top + r.height / 2;
+      let hit = _efpDoc.call(document, x, y);
+      for (let hops = 0; hit && hops < 32; hops++) {
+        const root = _openRootOf(hit);
+        const inner = root ? _efpRoot.call(root, x, y) : null;
+        if (!inner || inner === hit) break;
+        hit = inner;
+      }
+      const at = landingOf(hit, target);
+      return at === LANDING_OUTSIDE ? null : at;
+    } catch (e) { return null; }
   };
   // The nearest ancestor matching `sel`, across shadow boundaries: closest() covers the whole chain
   // within one root, then the walk hops to that root's host and repeats. Bounded by shadow depth --
@@ -2900,10 +3368,7 @@ _PRESNAPSHOT_JS = (
 # closest declaring ANCESTOR, not the reduced leaf (`<a href><span>` reduces to the span).
 _ROW_SEMANTICS_JS = (
     r"""
-  const OPT_SEL = '[role="option"],[role="menuitemradio"],[role="menuitemcheckbox"],[role="treeitem"],[role="radio"]';
   const NAV_SEL = 'a[href],button,[role="button"],[role="link"],[role="menuitem"],[role="tab"]';
-  const LIST_SEL = '[role="listbox"],[role="menu"],[role="tree"],[role="grid"],[role="radiogroup"],datalist';
-  const DECLARED_ROW_SEL = OPT_SEL + ',[role="menuitem"]';
   // An empty-state row is a list's own "nothing matched" line, never an answer: one the widget disables, or one that
   // echoes the typed query back inside quotation marks ('No results for "x"'), which is how a list quotes the input.
   const EMPTY_QUOTES = '"\'\u201c\u201d\u2018\u2019\u00ab\u00bb\u201e';
@@ -2912,49 +3377,6 @@ _ROW_SEMANTICS_JS = (
     const t = (n.innerText || '').replace(/\s+/g, ' ').trim().toLowerCase();
     const at = typedNorm ? t.indexOf(typedNorm) : -1;
     return at > 0 && EMPTY_QUOTES.includes(t[at - 1]) && EMPTY_QUOTES.includes(t[at + typedNorm.length] || '');
-  };
-  // The text a row renders, read through the flat tree: innerText stops at a shadow host, so an option
-  // component that draws its label in its own root would read as ''. A row declared inside the row is its
-  // own row, so a category's text is its own label, not its children's.
-  const composedRowText = (top) => {
-    let out = '';
-    let budget = 2000;
-    const walk = (n, depth) => {
-      if (depth > 32) return;
-      let kids = null;
-      if (String(n.localName || '') === 'slot') {
-        try { kids = n.assignedNodes({ flatten: true }); } catch (e) { kids = null; }
-      }
-      if (!kids || !kids.length) {
-        let sr = null;
-        try { sr = n.nodeType === 1 ? n.shadowRoot : null; } catch (e) { sr = null; }
-        kids = sr && sr.nodeType === 11 ? sr.childNodes : n.childNodes;
-      }
-      for (const c of kids) {
-        if (budget-- <= 0) return;
-        if (c.nodeType === 3) {
-          const p = c.parentElement || (c.parentNode && c.parentNode.host) || null;
-          let shown = true;
-          try { shown = !p || getComputedStyle(p).visibility !== 'hidden'; } catch (e) { shown = true; }
-          if (shown) out += c.data;
-          continue;
-        }
-        if (c.nodeType !== 1) continue;
-        const name = String(c.localName || '');
-        if (name === 'script' || name === 'style' || name === 'template' || name === 'noscript') continue;
-        if (name === 'br') { out += ' '; continue; }
-        try { if (c.matches(DECLARED_ROW_SEL)) continue; } catch (e) { /* unmatchable: read it */ }
-        let display = '';
-        try { display = getComputedStyle(c).display; } catch (e) { display = ''; }
-        if (display === 'none') continue;
-        const block = display !== '' && display !== 'contents' && !/^inline/.test(display);
-        if (block) out += ' ';
-        walk(c, depth + 1);
-        if (block) out += ' ';
-      }
-    };
-    try { walk(top, 0); } catch (e) { /* a partial read is still the row's text so far */ }
-    return out.replace(/\s+/g, ' ').trim();
   };
   // An undeclared leaf's row box: its largest ancestor that holds no other of the list's `leaves`, so a label whose
   // identifier sits in a sibling element reads as one row. A leaf no other leaf bounds (a lone filtered row) climbs
@@ -3011,13 +3433,13 @@ _ROW_SEMANTICS_JS = (
   // this one value. A closed root reads as '', so the leaf's own text stands in for it.
   const rowIdentity = (el, box) => {
     let row = null;
-    try { row = composedClosest(el, DECLARED_ROW_SEL); } catch (e) { row = null; }
+    try { row = declaredRowOf(el); } catch (e) { row = null; }
     return composedRowText(row || box || el) || (el.innerText || '').replace(/\s+/g, ' ').trim();
   };
   // Composed, not closest(): an option component declares the row's role on its HOST, outside the
   // root the pointer leaf lives in, so a same-root lookup reads that row as a bare button.
   const isNavRow = (el) => {
-    try { return !composedClosest(el, OPT_SEL) && !!composedClosest(el, NAV_SEL); } catch (e) { return true; }
+    try { return !flatClosest(el, OPT_SEL) && !!composedClosest(el, NAV_SEL); } catch (e) { return true; }
   };
   // A screen-reader announcement renders inside a log, status or alert region, which is never a list; bare
   // aria-live is left alone because widgets also put it on their own list. Rows of a list nested inside the
@@ -3041,8 +3463,8 @@ _ROW_SEMANTICS_JS = (
     + r""";
   const declaresOption = (el) => {
     try {
-      return el.matches(DECLARED_ROW_SEL) || !!el.querySelector(DECLARED_ROW_SEL) || !!composedClosest(el, DECLARED_ROW_SEL)
-        || !!composedClosest(el, '[role="listbox"],[role="menu"]');
+      return flatClosest(el, DECLARED_ROW_SEL) !== null || !!el.querySelector(DECLARED_ROW_SEL)
+        || !!flatClosest(el, '[role="listbox"],[role="menu"]');
     } catch (e) { return false; }
   };
   const admitRow = (el, txt, o) => {
@@ -4928,11 +5350,18 @@ _MARKER_MATCH_COUNT_JS = (
     + r""";
   const matches = new Set();
   let unreadable = false;
+  // With `rendered`, only holders drawn on screen count: no box, visibility hidden, or opacity 0 up the chain is none.
+  const drawn = (e) => {
+    if (!arg.rendered) return true;
+    if (!e.getClientRects().length) return false;
+    if (typeof e.checkVisibility === 'function') return e.checkVisibility({ opacityProperty: true, visibilityProperty: true });
+    return getComputedStyle(e).visibility !== 'hidden';
+  };
   try {
     for (const root of _roots(document)) {
-      try { for (const e of root.querySelectorAll(arg.sel)) matches.add(e); } catch (e) { unreadable = true; }
+      try { for (const e of root.querySelectorAll(arg.sel)) if (drawn(e)) matches.add(e); } catch (e) { unreadable = true; }
     }
-    if (matches.size === 0 && arg.el && arg.el.isConnected) matches.add(arg.el);
+    if (matches.size === 0 && arg.el && arg.el.isConnected && drawn(arg.el)) matches.add(arg.el);
   } catch (e) { unreadable = true; }
   if (matches.size > 1) return matches.size;
   return unreadable ? 1 : matches.size;
@@ -5300,15 +5729,15 @@ _LABEL_TEXT_JS = (
   const renders = """
     + _RENDERS_JS
     + r""";
-  return (l) => {
+  return (l, anyTag) => {
   try {
     const CAP = typeof _RETAIN_WIDTH === 'number' ? _RETAIN_WIDTH : 2000;
-    const holdsSlot = (n) => { try { return !!n.querySelector('slot'); } catch (e) { return false; } };
+    const holdsSlot = (n) => { try { return n.localName === 'slot' || !!n.querySelector('slot'); } catch (e) { return false; } };
     const styleOf = (n) => { try { return getComputedStyle(n); } catch (e) { return null; } };
     let root = null;
     try { root = Node.prototype.getRootNode.call(l); } catch (e) { root = null; }
     const isLabel = String(l.localName || '') === 'label';
-    if (!isLabel || !root || root.nodeType !== 11 || !holdsSlot(l)) return (l.innerText || '').trim();
+    if ((!isLabel && !anyTag) || !root || root.nodeType !== 11 || !holdsSlot(l)) return (l.innerText || '').trim();
     // Opacity above the label composes down; below it every element is screened on the way.
     if (renders.transparent(l)) return '';
     let out = '';
@@ -8195,30 +8624,13 @@ _CLICK_PRECHECK_JS = (
     } catch (e) {}
     return true;
   };
-  const state = (el) => {
-    // .checked is a DOM property, not an attribute: a native-checkbox multi-select commits by
-    // flipping only it, with no aria/class/text change. Same for inline-style-only toggles.
-    let kids = '';
-    try { for (const i of el.querySelectorAll('input')) kids += i.checked ? '1' : '0'; } catch (e) {}
-    return [
-      el.getAttribute('aria-checked'), el.getAttribute('aria-selected'), el.getAttribute('aria-pressed'),
-      el.className, el.children.length, (el.innerText || '').trim(),
-      el.getAttribute('style'), kids,
-    ].join('|');
-  };
-  // Fixed-arity on purpose: every component is one attribute of the row itself, so a row that
-  // restructures cannot change this string, and only being picked can.
-  const selState = (el) => {
-    return [
-      el.getAttribute('aria-checked'), el.getAttribute('aria-selected'), el.getAttribute('aria-pressed'),
-    ].join('|');
-  };
   const openRows = [];
   for (const el of pQSA('[data-tv3-menu]')) if (vis(el)) openRows.push(el);
   let target = null;
   try { target = pQS(clicked) || (arg.el && arg.el.isConnected ? arg.el : null); } catch (e) { target = (arg.el && arg.el.isConnected ? arg.el : null); }
   let isOption = false;
   let containsMenu = false;
+  let rowClick = false;
   let optText = '';
   let optState = '';
   let optSel = '';
@@ -8228,27 +8640,59 @@ _CLICK_PRECHECK_JS = (
 """
     + _VIS_ROWS_JS
     + r"""
+  let optLevel = '';
+  let optUnsure = false;
+  // Reset by every precheck so a pair held for another click never matches, and kept for a settle re-read. The landing
+  // is the first trusted pointerdown's target (a menu hidden on mousedown sends the click to the root), else a click's.
+  window.__tv3_pick = null;
+  window.__tv3_down = null;
+  window.__tv3_land = null;
+  if (!window.__tv3_land_hook) {
+    window.__tv3_land_hook = 1;
+    const record = (key) => (event) => {
+      if (!event.isTrusted || window[key]) return;
+      try { window[key] = event.composedPath()[0] || null; } catch (e) { window[key] = null; }
+    };
+    window.addEventListener('pointerdown', record('__tv3_down'), true);
+    window.addEventListener('click', record('__tv3_land'), true);
+  }
   if (target && openRows.length) {
-    for (const el of openRows) {
-      // The target being the row or inside it is an option pick. The target merely CONTAINING rows
-      // (the card around the menu) is not — and since a center-point click on the card can land on
-      // an arbitrary row, that case is flagged so the handler makes no claims about it at all.
-      if (el === target || pContains(el, target)) {
-        isOption = true;
-        optText = (el.innerText || '').trim();
-        optState = state(el);
-        optSel = selState(el);
-        optKids = el.children.length;
-        optH = Math.round(el.getBoundingClientRect().height);
-        optVis = _visRows(el);
-        break;
-      }
-      if (pContains(target, el)) containsMenu = true;
+    // A pick reads its declared row, which a component may draw in its own root. The target merely CONTAINING rows
+    // (the card around the menu) is not a pick, and since a center-point click on the card can land on an arbitrary
+    // row, that case is flagged so the handler makes no claims about it at all.
+    const est = landingIn(target);
+    let pick = menuPickOf(openRows, target, est);
+    const text = !pick ? '' : pick.level === 'row' ? composedRowText(pick.leaf, true)
+      : (pick.leaf.innerText || '').replace(/\s+/g, ' ').trim() || composedRowText(pick.leaf);
+    if (pick && pick.level === 'row' && !text) pick = null;
+    // A leaf inside a link that is not all the row's text may be the only tag the note lists for the row.
+    const link = pick && pick.level === 'leaf' ? flatClosest(pick.leaf, 'a[href]') : null;
+    if (link && link !== pick.row && flatContains(pick.row, link)
+      && composedRowText(link, true) !== composedRowText(pick.row, true)) {
+      pick = null;
+      rowClick = true;
+    }
+    if (pick) {
+      isOption = true;
+      optLevel = pick.level;
+      optText = text;
+      ({ optState, optSel, optKids, optH, optVis } = pickState(pick));
+      optUnsure = pick.level === 'row' && !est;
+      window.__tv3_pick = {
+        sel: clicked, leaf: pick.leaf, row: pick.row, level: pick.level, target, leaves: openRows, est: !!est,
+      };
+    } else if (!rowClick && openRows.some((el) => flatContains(target, el) && (declaredRowOf(el) || el) !== target)) {
+      containsMenu = true;
+    } else if (openRows.some((el) => flatContains(target, el))) {
+      rowClick = true;
     }
   }
   preReset();
   pScopeEach((el, inShadow) => { if (vis(el)) preMark(el, inShadow); });
-  return { menuOpen: openRows.length > 0, isOption, containsMenu, optText, optState, optSel, optKids, optH, optVis };
+  return {
+    menuOpen: openRows.length > 0, isOption, containsMenu, rowClick, optLevel, optUnsure, optText, optState, optSel,
+    optKids, optH, optVis,
+  };
 }"""
 )
 
@@ -8307,7 +8751,7 @@ def _with_act_deadline(tool_name: str, handler: ToolHandler) -> ToolHandler:
     return wrapped
 
 
-# Planted on window before an option click; a navigation clears window, so its absence afterwards is
+# Planted on window before a click on an open menu; a navigation clears window, so its absence afterwards is
 # the page saying "different document" even when the post-click probe's own JS is what failed.
 _CLICK_DOC_PLANT_JS = "() => { window.__tv3_click_doc = 1; }"
 _CLICK_DOC_CHECK_JS = "() => window.__tv3_click_doc === 1"
@@ -8329,24 +8773,6 @@ _MENU_AFTER_JS = (
     } catch (e) {}
     return true;
   };
-  const state = (el) => {
-    // .checked is a DOM property, not an attribute: a native-checkbox multi-select commits by
-    // flipping only it, with no aria/class/text change. Same for inline-style-only toggles.
-    let kids = '';
-    try { for (const i of el.querySelectorAll('input')) kids += i.checked ? '1' : '0'; } catch (e) {}
-    return [
-      el.getAttribute('aria-checked'), el.getAttribute('aria-selected'), el.getAttribute('aria-pressed'),
-      el.className, el.children.length, (el.innerText || '').trim(),
-      el.getAttribute('style'), kids,
-    ].join('|');
-  };
-  // Fixed-arity on purpose: every component is one attribute of the row itself, so a row that
-  // restructures cannot change this string, and only being picked can.
-  const selState = (el) => {
-    return [
-      el.getAttribute('aria-checked'), el.getAttribute('aria-selected'), el.getAttribute('aria-pressed'),
-    ].join('|');
-  };
 """
     + _VIS_ROWS_JS
     + r"""
@@ -8360,19 +8786,27 @@ _MENU_AFTER_JS = (
   let optKids = -1;
   let optH = -1;
   let optVis = -1;
-  if (target) {
-    for (const el of rows) {
-      if (el === target || pContains(el, target)) {
-        optState = state(el);
-        optSel = selState(el);
-        optKids = el.children.length;
-        optH = Math.round(el.getBoundingClientRect().height);
-        optVis = _visRows(el);
-        break;
-      }
-    }
+  // Read the pair held before the click while both are drawn, since the click may move what lies under its point.
+  const held = window.__tv3_pick;
+  const pick = held && held.sel === clicked && held.leaf.isConnected && held.row.isConnected && vis(held.leaf)
+    && vis(held.row)
+    ? { leaf: held.leaf, row: held.row }
+    : menuPickOf(rows, target, LANDING_OUTSIDE);
+  if (pick) ({ optState, optSel, optKids, optH, optVis } = pickState(pick));
+  // With no recorded click, an unreadable estimate cannot confirm the name.
+  let withheld = false;
+  let estUnsure = false;
+  if (held && held.sel === clicked && held.level === 'row') {
+    const real = window.__tv3_down || window.__tv3_land;
+    const again = real ? menuPickOf(held.leaves, held.target, landingOf(real, held.target), held) : null;
+    withheld = real ? !again || again.leaf !== held.leaf : !held.est;
+    // Read after the hover, the label is re-derived without the held pair, so a control the hover put under the point
+    // or text it revealed in the row leaves a navigation unconfirmed.
+    const estNow = landingIn(held.target);
+    const now = estNow ? menuPickOf(held.leaves, held.target, estNow) : null;
+    estUnsure = !now || now.leaf !== held.leaf;
   }
-  return { stillOpen, optState, optSel, optKids, optH, optVis };
+  return { stillOpen, optState, optSel, optKids, optH, optVis, withheld, estUnsure };
 }"""
 )
 
@@ -8457,9 +8891,26 @@ _TAG_SUGG_SCROLLER_JS = (
 # _FIND_SUGGESTION_JS. Unlike the typeahead finder this only REPORTS (the model does the clicking), so
 # navigational rows are listed too. Tags rows data-tv3-menu="1..N" (top-to-bottom) — in-DOM tags that
 # stay valid until the menu re-renders, so the model can pick an option without a re-observe re-minting
-# ids (the staging trace's staleness trap). Existing tags are cleared only when a new menu is tagged.
+# ids (the staging trace's staleness trap). Every scan clears the existing tags before it looks.
 _FIND_MENU_JS = (
     r"""(arg) => {
+  // `keepOpenTags`: the scan follows a click inside a menu that stayed open (a pick that grew its row, a control
+  // beside a label). The finder clears every tag before it looks, so a scan that finds no new menu puts back the tags
+  // of the open menu's rows that are still rendered.
+  const kept = [];
+  const _keepRoots = """
+    + _SHADOW_ROOTS_JS
+    + r""";
+  if (arg && arg.keepOpenTags) {
+    for (const root of _keepRoots(document)) {
+      try {
+        for (const e of root.querySelectorAll('[data-tv3-menu],[data-tv3-menu-scroller]')) {
+          kept.push([e, e.getAttribute('data-tv3-menu'), e.getAttribute('data-tv3-menu-scroller')]);
+        }
+      } catch (e) {}
+    }
+  }
+  const found = ((arg) => {
   const clicked = arg.sel;"""
     + _PIERCED_QUERY_JS
     + _ROW_SEMANTICS_JS
@@ -8660,7 +9111,7 @@ _FIND_MENU_JS = (
         // Test the closest option-role ANCESTOR, not the reduced leaf: a role=option row with a styled
         // <span> child reduces to the span (null role), so a leaf-only check would wrongly reject it.
         // menuitem rows are enumerable here too: a menu in a dialog is still a menu.
-        if (!g.every((c) => composedClosest(c.el, OPT_SEL + ',[role="menuitem"]'))) continue;
+        if (!g.every((c) => declaredRowOf(c.el))) continue;
       }
     } catch (e) {}
     const pr = p.getBoundingClientRect();
@@ -8677,12 +9128,6 @@ _FIND_MENU_JS = (
   // The leaves of one declared row are one entry, shown with the row's text and pointing at the tag of its
   // link, else its first leaf that is not a separate control; a row that nests declared rows, existed before the click,
   // exceeds the row caps or holds only controls is not that unit.
-  const CONTROL_SEL = 'button,a[href],input,[role="button"],[role="checkbox"],[role="switch"],[role="radio"]';
-  const separateControl = (leaf, row) => {
-    const m = composedClosest(leaf, CONTROL_SEL);
-    if (!m || m === row) return false;
-    return pContains(row, m);
-  };
   // An undeclared leaf is a fragment when a visible text node outside every leaf sits directly in the leaf's
   // own wrapper below the container (a second line, a bare identifier beside a label), or when its row box
   // renders text the leaf does not (an identifier in a sibling element). A header in its own element does not
@@ -8690,7 +9135,7 @@ _FIND_MENU_JS = (
   const boxes = leafBoxes(best.g.map((c) => c.el));
   const bareTextBeside = (c) => {
     let declared = null;
-    try { declared = composedClosest(c.el, DECLARED_ROW_SEL); } catch (e) { declared = null; }
+    try { declared = declaredRowOf(c.el); } catch (e) { declared = null; }
     const box = boxes.get(c.el);
     if (!declared && box && box !== c.el && composedRowText(box) !== composedRowText(c.el)) return true;
     let a = composedParentElement(c.el);
@@ -8706,11 +9151,11 @@ _FIND_MENU_JS = (
   const byRow = new Map();
   const leavesIn = new Map();
   for (const c of best.g) {
-    const row = composedClosest(c.el, DECLARED_ROW_SEL);
+    const row = declaredRowOf(c.el);
     if (row) leavesIn.set(row, (leavesIn.get(row) || 0) + 1);
   }
   for (const c of best.g) {
-    const row = composedClosest(c.el, DECLARED_ROW_SEL);
+    const row = declaredRowOf(c.el);
     if (!row || row === c.el) {
       entries.push({ leaves: [c], reason: row ? null : (bareTextBeside(c) ? 'bare_text_beside' : null) });
       continue;
@@ -8740,8 +9185,8 @@ _FIND_MENU_JS = (
     // A link inside the row is the row's own action (clicking a badge beside it does nothing). A button is
     // not preferred: a row's button is as often a separate control (a favourite star) as its action.
     const link = e.leaves.find((c) => {
-      const a = composedClosest(c.el, 'a[href]');
-      return a ? a !== e.row && pContains(e.row, a) : false;
+      const a = flatClosest(c.el, 'a[href]');
+      return a ? a !== e.row && flatContains(e.row, a) : false;
     });
     const label = link || e.leaves.find((c) => !separateControl(c.el, e.row));
     if (label) { listed.push({ leaves: e.leaves, head: label, reason: null }); continue; }
@@ -8806,10 +9251,21 @@ _FIND_MENU_JS = (
   } catch (e) { declared = 0; }
   // `count` is the note's rows; `tagged` is the leaves the full-text read should find, row pieces included;
   // `rows` is the distinct rendered rows those leaves sit in, the unit aria-setsize counts.
-  const rendered = new Set(best.g.map((c) => composedClosest(c.el, DECLARED_ROW_SEL) || c.el)).size;
+  const rendered = new Set(best.g.map((c) => declaredRowOf(c.el) || c.el)).size;
   const out = { count, tagged: n, rows: rendered, options, scroller, whole: !withheld, withheld_reason: withheld ? withheld.reason : null };
   if (declared > count) out.declared = declared;
   return out;
+  })(arg);
+  if (!found || (!found.count && !found.withheld_reason)) {
+    for (const [e, tag, scroller] of kept) {
+      try {
+        if (!e.isConnected || !e.getClientRects().length || getComputedStyle(e).visibility === 'hidden') continue;
+        if (tag !== null) e.setAttribute('data-tv3-menu', tag);
+        if (scroller !== null) e.setAttribute('data-tv3-menu-scroller', scroller);
+      } catch (err) {}
+    }
+  }
+  return found;
 }"""
 )
 
@@ -8859,9 +9315,8 @@ _MENU_OPTION_TEXTS_JS = (
   const tagged = Array.from(pQSA('[data-tv3-' + attr + ']'));
   const boxes = leafBoxes(tagged);
   // aria-setsize counts rows, and a declared row can hold several tagged leaves: only its first leaf leads it.
-  const rowOf = (el) => { try { return composedClosest(el, DECLARED_ROW_SEL); } catch (e) { return null; } };
   const leadOf = new Map();
-  for (const el of tagged) { const r = rowOf(el); if (r && !leadOf.has(r)) leadOf.set(r, el); }
+  for (const el of tagged) { const r = declaredRowOf(el); if (r && !leadOf.has(r)) leadOf.set(r, el); }
   return tagged.map((el) => {
     // An option whose ancestor declares aria-setsize is a child that declares none, so read the
     // closest declaring ancestor or the incomplete-list guard is bypassed.
@@ -8958,9 +9413,9 @@ _MENU_OPTION_TEXTS_JS = (
       // aria-setsize="-1" declares the total unknown, so the rendered rows are never the whole list.
       setsize_unknown: setsize === -1,
       group: grp ? accessibleName(grp) || grp.id || 'group' : '',
-      lead: !rowOf(el) || leadOf.get(rowOf(el)) === el,
+      lead: !declaredRowOf(el) || leadOf.get(declaredRowOf(el)) === el,
       // The tag of the declared row's first leaf: leaves of one row are one option to the matcher.
-      unit: rowOf(el) ? num(leadOf.get(rowOf(el))) : null,
+      unit: declaredRowOf(el) ? num(leadOf.get(declaredRowOf(el))) : null,
       box: box,
       after: after,
       line: Number.isFinite(line) && line > 0 ? line : null,
@@ -9407,6 +9862,8 @@ OBSERVE_FIELD_DISPLAY_MAX = max(OBSERVE_DISPLAY_WIDTHS.values())
 # A clipped field carries its clip in-band between NULs until the line is final. repr escapes every
 # control character, so page bytes can never contain one, and a line's identity can drop the span.
 _OBSERVE_CLIP_SPAN_RE = re.compile("\x00([^\x00]*)\x00")
+# A slot name is printed bare inside near=[slot:text, ...], so only name characters survive.
+_NEAR_SLOT_STRIP_RE = re.compile(r"[^\w.-]")
 
 
 def _observe_quoted_field(masked: str, width: int, *, cut_before: bool) -> str:
@@ -9418,6 +9875,18 @@ def _observe_quoted_field(masked: str, width: int, *, cut_before: bool) -> str:
         return shown
     # A value the page script cut stays marked even when masking has shortened it to fit.
     return f"{shown}\x00{max(cut, 0)}{' or more' if cut_before else ''}\x00"
+
+
+def _near_suffix(near: object, field: Callable[[str, int], str]) -> str:
+    if not isinstance(near, list):
+        return ""
+    entries = [
+        f"{_NEAR_SLOT_STRIP_RE.sub('', _digest_token(n.get('slot') or '', 40)) or 'default'}:"
+        f"{field(str(n.get('text') or ''), OBSERVE_DISPLAY_WIDTHS['group'])}"
+        for n in near
+        if isinstance(n, dict) and n.get("text")
+    ]
+    return f" near=[{', '.join(entries)}]" if entries else ""
 
 
 def _observe_line_identity(line: str) -> str:
@@ -9628,6 +10097,91 @@ async (__tv3TextArgs) => {
       }
     } catch (e) { /* fail open: the record keeps today's shape */ }
     return '';
+  };
+  // The texts a control's own component chain projects before it, each with the slot that carries it: every slot with
+  // assigned content in the siblings before the control's subtree, up to the nearest stop and at most 4, read through
+  // the flat tree. A slot carries placement, not meaning, so these are printed as candidates with their slot names
+  // (near=), never as the group; like main's walk it stops at a drawn control, a grid cell, a choice's caption and
+  // visible text in the control's own root, and never leaves the outermost host.
+  const _rootOfNode = Node.prototype.getRootNode;
+  const _shadowHostOf = _getter(ShadowRoot.prototype, 'host');
+  const _childrenOf = _getter(Element.prototype, 'children');
+  const _rootChildrenOf = _getter(DocumentFragment.prototype, 'children');
+  const _rootQs = DocumentFragment.prototype.querySelector;
+  const _assignedNodesOf = HTMLSlotElement.prototype.assignedNodes;
+  const _assignedElementsOf = HTMLSlotElement.prototype.assignedElements;
+  const _inShadowRoot = (el) => {
+    try { return _nodeTypeOf.call(_rootOfNode.call(el)) === 11; } catch (e) { return false; }
+  };
+  // Whether n holds a control in the flat tree: a host's open root (its unassigned light children are not drawn),
+  // a slot's assigned elements (its fallback content only when nothing is assigned), else its children. Once per node.
+  const _holdsSeen = new Map();
+  const _holdsControl = (n, depth) => {
+    if (_holdsSeen.has(n)) return _holdsSeen.get(n);
+    // Past 24 levels a subtree counts as holding a control: the walk fails closed, binding nothing.
+    let held = depth > 24 || _matches.call(n, _CTRL_SEL);
+    if (!held) {
+      const sr = _openShadowOf(n);
+      const slotted = _localNameOf.call(n) === 'slot' && _assignedNodesOf.call(n, { flatten: true }).length > 0;
+      const kids = sr ? _rootChildrenOf.call(sr) : slotted ? _assignedElementsOf.call(n, { flatten: true }) : _childrenOf.call(n);
+      for (const c of kids) { if (_holdsControl(c, depth + 1)) { held = true; break; } }
+    }
+    _holdsSeen.set(n, held);
+    return held;
+  };
+  const _projectingSlots = (n) => {
+    const slots = _localNameOf.call(n) === 'slot' ? [n] : Array.from(_qsa.call(n, 'slot'));
+    // A real assignment only: flattened, an unassigned slot returns its own fallback content. A host's whitespace
+    // between tags and an empty element are assigned too, and project nothing.
+    return slots.filter((sl) => _assignedNodesOf.call(sl).some((a) => {
+      const kind = _nodeTypeOf.call(a);
+      return kind === 1 ? !_unseen(a) : kind === 3 && !!_normText(_contentOf.call(a));
+    }));
+  };
+  const _projectedLabel = (el) => {
+    // Nearest first while walking, so each sibling's entries go in front: the list ends in tree order.
+    const found = [];
+    try {
+      const ownRoot = _rootOfNode.call(el);
+      let node = el;
+      for (let depth = 0; depth < 6 && _inShadowRoot(node) && found.length < 4; depth++) {
+        if (_matches.call(node, _GRID_CELL_SEL) && _closest.call(node, '[role=grid],[role=treegrid]')) break;
+        let scanned = 0;
+        for (let s = _prevOf.call(node); s && scanned < 8; s = _prevOf.call(s), scanned++) {
+          const kind = _nodeTypeOf.call(s);
+          // Main's walk stops at its root's top level, so text there is nearer than any projected text.
+          if (kind === 3) {
+            if (_rootOfNode.call(s) === ownRoot && /\p{L}/u.test(_normText(_contentOf.call(s)))) return found;
+            continue;
+          }
+          if (kind !== 1) continue;
+          if (_holdsControl(s, 0)) return found;
+          if (_unseen(s)) continue;
+          const slots = _projectingSlots(s);
+          if (!slots.length) {
+            if (_rootOfNode.call(s) === ownRoot && /\p{L}/u.test(_visibleText(s, 0))) return found;
+            continue;
+          }
+          // Main's caption rule: text right after a checkbox or radio is that control's caption.
+          let before = _prevOf.call(s);
+          while (before && _nodeTypeOf.call(before) !== 1 && !_normText(_contentOf.call(before))) before = _prevOf.call(before);
+          if (before && _nodeTypeOf.call(before) === 1) {
+            const bsr = _openShadowOf(before);
+            if (_captionHost(before) || (bsr && _rootQs.call(bsr, _CHOICE_SEL))) return found;
+          }
+          // Each slot is read on its own, so a text and its slot name always agree; an icon reads empty and is skipped.
+          const own = [];
+          for (const sl of slots) {
+            const t = _normText(_labelText(sl, true));
+            if (t) own.push({ slot: (Element.prototype.getAttribute.call(sl, 'name') || '').slice(0, 40), text: t });
+          }
+          found.unshift(...own.slice(Math.max(0, own.length - (4 - found.length))));
+          if (found.length >= 4) return found;
+        }
+        node = _parentOf.call(node) || _shadowHostOf.call(_rootOfNode.call(node));
+      }
+    } catch (e) { /* fail open: what was read so far */ }
+    return found;
   };
   // Pressable buttons that set a form value -- a wrapper holding only pressable buttons and the checkbox, radio
   // or hidden input they write (a Yes/No pair) -- answer one question, the way a radio group does. Without that
@@ -11127,6 +11681,7 @@ async (__tv3TextArgs) => {
   let lastGroup = '';
   let lastGroupToggle = false;
   let groupTotal = 0;
+  let nearTotal = 0;
   let radioGroupsMissing = 0;
   const _a11yRemoved = """
     + _A11Y_REMOVED_JS
@@ -11494,6 +12049,17 @@ async (__tv3TextArgs) => {
         // question beside it. The repeat is not charged, as the budget bounds distinct question text.
         rec.group = gtFull;
       }
+      const near = takesValue && !isChoice && !ownGroup && _inShadowRoot(el) ? _projectedLabel(el) : [];
+      // A budget of its own, so near never withholds a group main's walk would print. No dedupe: two fields with the
+      // same label each carry it.
+      const shownNear = [];
+      for (const n of near) {
+        const text = n.text.slice(0, _RETAIN_WIDTH);
+        if (nearTotal + Math.min(text.length, 200) > _GROUP_TEXT_TOTAL_CAP) break;
+        nearTotal += Math.min(text.length, 200);
+        shownNear.push({ slot: n.slot, text });
+      }
+      if (shownNear.length) rec.near = shownNear;
       // Every member carries its group's number, so the digest can say once per group that no
       // question was found; checkboxes are left out, being mostly self-describing consents.
       if (el.type === 'radio' || role === 'radio') {
@@ -14006,6 +14572,8 @@ def build_browser_tools(
     # concern. Threading a realm through forty call sites is how a concern gets scattered into the
     # tools, and each site becomes a place to forget it.
     _acted_realm: list[Any] = []
+    # Salts the selector hash on the positional-note log line: joinable within this run, not enumerable across runs.
+    _telemetry_salt = secrets.token_hex(16)
     # The live element handle the ref or mark resolved to, for the same single call, so a click can fall back to it
     # when the driver's selector engine cannot see the marker the resolver just wrote.
     _acted_handle: list[Any] = []
@@ -14535,15 +15103,17 @@ def build_browser_tools(
         truncated = data.get("truncated") or 0
         if truncated:
             # A page of components can spend the whole budget before reaching its submit control, and
-            # a list that stops silently reads as the complete set of what the page offers. No remedy
-            # is suggested because none exists: the list comes from querySelectorAll, so it is
-            # viewport-independent and scrolling returns the identical list and the identical count.
+            # a list that stops silently reads as the complete set of what the page offers. Scrolling is
+            # not offered: the list comes from querySelectorAll, so it is viewport-independent and
+            # scrolling returns the identical list and the identical count. The unlisted elements are
+            # still in the markup and still take a typed selector, which is the route the note names.
             note = f"note: {truncated} more element(s) matched but exceeded the element budget and are not listed"
             in_components = data.get("truncatedInComponents") or 0
             if in_components:
                 # The budget is spent light-DOM-first so the page's own submit control survives a
                 # page of components — which means component internals are what it starves.
                 note += f", {in_components} of them inside components"
+            note += "; get_html shows them, and click, type and select_option take a selector"
             lines.append(note)
         pointer_capped = int(data.get("pointerCapped") or 0)
         pointer_truncated = int(data.get("pointerTruncated") or 0)
@@ -14565,6 +15135,7 @@ def build_browser_tools(
             )
 
         bodies: list[str] = []
+        near_suffixes: list[str] = []
 
         def _realm_of(idx: int) -> Any:
             return owners[idx] if idx < len(owners) else None
@@ -14668,6 +15239,8 @@ def build_browser_tools(
             elif e.get("group_missing") and missing_key not in missing_groups_shown:
                 missing_groups_shown.add(missing_key)
                 extra += f" group={_NO_QUESTION_MARKER}"
+            # Kept out of the body: a line's identity, its qualifiers and the duplicate count stay main's.
+            near_suffixes.append(_near_suffix(e.get("near"), _field))
             if e.get("a11yRemoved"):
                 # What the page declared, not a prediction: aria-hidden with a negative tabindex does
                 # not stop a click landing or a field filling (measured), and a control the page
@@ -14718,8 +15291,8 @@ def build_browser_tools(
             ).values()
             if n > 1
         )
-        for e, body in zip(elements, bodies):
-            lines.append(f"ref={e['ref']} {body}")
+        for e, body, near in zip(elements, bodies, near_suffixes, strict=True):
+            lines.append(f"ref={e['ref']} {body}{near}")
         icons_cut = int(data.get("iconsTruncated") or 0)
         if icons_cut:
             lines.append(
@@ -14756,6 +15329,7 @@ def build_browser_tools(
             "markers_minted": data.get("markersMinted") or 0,
             "markers_reused": data.get("markersReused") or 0,
             "group_texts_found": sum(1 for e in elements if e.get("group")),
+            "near_texts_found": sum(1 for e in elements if e.get("near")),
             "a11y_removed_listed": sum(1 for e in elements if e.get("a11yRemoved")),
             # Every line but pointer roots', as before those were listed; theirs ride pointer_* below. Icons count:
             # they are lines the model reads, and the gate holds this to the digest's own duplicates.
@@ -15527,7 +16101,9 @@ def build_browser_tools(
         offset = int(args.get("offset") or 0)
         fmt = str(args.get("format") or "html").strip().lower()
         if fmt == "text":
-            return await _rendered_text_result(page, selector, offset)
+            return await _noting_other_matches(
+                page, selector, offset, await _rendered_text_result(page, selector, offset)
+            )
         if fmt != "html":
             # Falling through to markup would hand back the whole-page dump the prompt forbids, on a
             # typo the model cannot see. The enum is advisory: the spec is not emitted strict.
@@ -15567,7 +16143,45 @@ def build_browser_tools(
             report["head_fragment_len"] = head
         if notice_at is not None:
             report["notice_at"] = notice_at
-        return ToolResult.ok(markup, data=report or None)
+        return await _noting_other_matches(page, selector, offset, ToolResult.ok(markup, data=report or None))
+
+    async def _noting_other_matches(page: Any, selector: str | None, offset: int, result: ToolResult) -> ToolResult:
+        # A scoped read answers with the first match only; a selector the agent took for unique reads as
+        # the whole answer unless the count is said. The head window carries it, ahead of the content.
+        if not selector or offset or result.status != "ok":
+            return result
+        # A positional selector gets the candidate listing here, read-only, so it can be read before any action.
+        listing = (
+            await _positional_note(page, selector, _mask_refs, before="now")
+            if _unpositioned_selector(selector)
+            else None
+        )
+        if listing is not None:
+            LOG.info(
+                "taskv3 positional selector note",
+                tool="get_html",
+                tool_call_seq=current_tool_call_seq(),
+                selector_hash=telemetry_hash(_telemetry_salt, selector),
+                **listing[1],
+            )
+            line = listing[0] + "\n"
+        else:
+            try:
+                matches = await page.locator(selector).count()
+            except Exception as exc:
+                LOG.info(
+                    "taskv3 get_html match count unavailable",
+                    reason=type(exc).__name__,
+                    tool_call_seq=current_tool_call_seq(),
+                )
+                return result
+            if matches <= 1:
+                return result
+            line = f"({matches} elements match {selector}; this is the first of them.)\n"
+        data = result.data
+        if data and data.get("notice_at") is not None:
+            data = {**data, "notice_at": data["notice_at"] + len(line)}
+        return dataclasses.replace(result, content=line + result.content, data=data)
 
     async def _unreachable_error(selector: str) -> ToolResult:
         # A native checkbox or <select> inside a hidden template is refused HERE, by a visibility
@@ -15994,9 +16608,10 @@ def build_browser_tools(
             error_class="ambiguous_selector",
         )
 
-    async def _marker_matches(page: Any, selector: str) -> int:
+    async def _marker_matches(page: Any, selector: str, *, rendered: bool = False) -> int:
         try:
-            return int(await page.evaluate(_MARKER_MATCH_COUNT_JS, await _probe_arg(page, selector)))
+            arg = {**await _probe_arg(page, selector), "rendered": rendered}
+            return int(await page.evaluate(_MARKER_MATCH_COUNT_JS, arg))
         except Exception:
             return 1
 
@@ -16087,9 +16702,9 @@ def build_browser_tools(
         menu_note_census.update(_menu_note_fields(found))
         return _menu_open_note(found, selector, clicked_row=clicked_row)
 
-    async def _click_menu_scan(page: Any, arg: dict[str, Any]) -> Any:
+    async def _click_menu_scan(page: Any, arg: dict[str, Any], *, keep_open_tags: bool = False) -> Any:
         # Every menu the click tool reports goes through here, so a withheld one never keeps guessable numbers.
-        return await page.evaluate(_FIND_MENU_JS, {**arg, "saltUnlisted": True})
+        return await page.evaluate(_FIND_MENU_JS, {**arg, "saltUnlisted": True, "keepOpenTags": keep_open_tags})
 
     async def _click_reaction(
         page: Any, selector: str, pre: dict[str, Any], url_before: str, *, doc_planted: bool
@@ -16101,6 +16716,72 @@ def build_browser_tools(
         def _selected(text: str) -> str:
             menu_pick[PICKED_OPTION_DATA_KEY] = text
             return f"Selected option {text!r}"
+
+        def _navigated_pick() -> str:
+            # A row click whose landing was never read cannot be confirmed once the page has gone.
+            if pre.get("optUnsure"):
+                return f"{_navigated_phrase().capitalize()}."
+            return f"{_selected(opt)} — {_navigated_phrase()}."
+
+        async def _same_document() -> bool | None:
+            # The page's own answer, or None when it cannot be asked.
+            if not doc_planted:
+                return None
+            try:
+                answer = await page.evaluate(_CLICK_DOC_CHECK_JS)
+            except Exception:
+                return None
+            return answer if isinstance(answer, bool) else None
+
+        async def _url_navigated() -> bool:
+            # A moved URL is a navigation unless the page says it is the same document --
+            # a menu that syncs its selection into the query string never left.
+            url_now = await _url(page)
+            return bool(url_before and url_now and url_now != url_before) and await _same_document() is not True
+
+        async def _cascade_child_note() -> str | None:
+            # The clicked row DETACHED: a cascading category replaces the whole list with its
+            # children, which reads as "the menu closed" off the row alone — a false verdict
+            # exactly when the model must keep drilling. New rows in a floating container are those
+            # children. A real commit that closed the menu pays one probe; the wait extends only
+            # while the widget shows a busy indicator for the children it is still fetching.
+            baseline = time.monotonic() + 0.8
+            deadline = time.monotonic() + 2.4
+            while True:
+                try:
+                    found = await _click_menu_scan(page, {"sel": selector, "el": None, "cascade": True})
+                except Exception:
+                    return None
+                if isinstance(found, dict) and found.get("count"):
+                    return _menu_note(found, selector, clicked_row=True)
+                now = time.monotonic()
+                if now < baseline:
+                    # Children scheduled on a timer may announce nothing (no busy row) for a beat:
+                    # a short unconditional settling window before the busy signal is required.
+                    await asyncio.sleep(0.25)
+                    continue
+                try:
+                    busy = bool(await page.evaluate(_MENU_BUSY_JS, await _probe_arg(page, selector)))
+                except Exception:
+                    busy = False
+                if not busy or now >= deadline:
+                    return None
+                await asyncio.sleep(0.3)
+
+        async def _unnamed_click_note(after_raw: Any, *, row_click: bool) -> tuple[str | None, str | None]:
+            still_open = isinstance(after_raw, dict) and bool(after_raw.get("stillOpen"))
+            found = await _click_menu_scan(page, await _probe_arg(page, selector), keep_open_tags=still_open)
+            if isinstance(found, dict) and found.get("count"):
+                return _menu_note(found, selector), None
+            if isinstance(after_raw, dict) and not still_open:
+                child = await _cascade_child_note() if row_click else None
+                if child:
+                    return child, None
+                return (
+                    "Note: this click CLOSED the open menu; the field's value in the next observe shows whether "
+                    'an option was chosen. While the menu is open, an option\'s [data-tv3-menu="N"] selector picks it.'
+                ), None
+            return None, None
 
         if pre.get("isOption"):
             # Commit evidence, any one suffices: navigation, the menu closing, the option's own state
@@ -16177,52 +16858,23 @@ def build_browser_tools(
                     "blindly and do not assume the selection committed; re-observe first."
                 )
 
-            async def _child_menu_note() -> str | None:
+            async def _child_menu_note(still_open: bool) -> str | None:
                 # A row that expands a sub-list mutates ITSELF, so the fingerprint cannot tell
                 # "committed" from "expanded" and the child rows can -- a cascading click that opened
                 # them committed nothing yet.
                 try:
-                    found = await _click_menu_scan(page, await _probe_arg(page, selector))
+                    found = await _click_menu_scan(page, await _probe_arg(page, selector), keep_open_tags=still_open)
                 except Exception:
                     return None
                 if isinstance(found, dict) and found.get("count"):
                     return _menu_note(found, selector, clicked_row=True)
                 return None
 
-            async def _cascade_child_note() -> str | None:
-                # The clicked row DETACHED: a cascading category replaces the whole list with its
-                # children, which reads as "the menu closed" off the row alone — a false verdict
-                # exactly when the model must keep drilling. New rows in a floating container are those
-                # children. A real commit that closed the menu pays one probe; the wait extends only
-                # while the widget shows a busy indicator for the children it is still fetching.
-                baseline = time.monotonic() + 0.8
-                deadline = time.monotonic() + 2.4
-                while True:
-                    try:
-                        found = await _click_menu_scan(page, {"sel": selector, "el": None, "cascade": True})
-                    except Exception:
-                        return None
-                    if isinstance(found, dict) and found.get("count"):
-                        return _menu_note(found, selector, clicked_row=True)
-                    now = time.monotonic()
-                    if now < baseline:
-                        # Children scheduled on a timer may announce nothing (no busy row) for a beat:
-                        # a short unconditional settling window before the busy signal is required.
-                        await asyncio.sleep(0.25)
-                        continue
-                    try:
-                        busy = bool(await page.evaluate(_MENU_BUSY_JS, await _probe_arg(page, selector)))
-                    except Exception:
-                        busy = False
-                    if not busy or now >= deadline:
-                        return None
-                    await asyncio.sleep(0.3)
-
             async def _state_change_note(opt_text: str, after: dict[str, Any]) -> str:
                 # A row that did not grow cannot have expanded into itself, so nothing competes with
                 # the commit reading and the probe is not worth its page walk -- which is the
                 # ordinary multi-select click.
-                child = await _child_menu_note() if _grew(after) else None
+                child = await _child_menu_note(bool(after.get("stillOpen"))) if _grew(after) else None
                 if not child:
                     return f"{_selected(opt_text)} — its state changed (the menu stayed open)."
                 # It grew AND opened child rows, so a selection attribute means it did both and
@@ -16233,24 +16885,13 @@ def build_browser_tools(
                     return f"{_selected(opt_text)} — its state changed.\n{child}"
                 return child
 
-            async def _same_document() -> bool | None:
-                # The page's own answer, or None when it cannot be asked.
-                if not doc_planted:
-                    return None
-                try:
-                    answer = await page.evaluate(_CLICK_DOC_CHECK_JS)
-                except Exception:
-                    return None
-                return answer if isinstance(answer, bool) else None
-
-            url_now = await _url(page)
-            if url_before and url_now and url_now != url_before and await _same_document() is not True:
-                # A moved URL is a navigation unless the page says it is the same document --
-                # a menu that syncs its selection into the query string never left.
-                return f"{_selected(opt)} — {_navigated_phrase()}.", None
+            if await _url_navigated():
+                return _navigated_pick(), None
             after, navigated = await _after_read()
             if after is None and navigated:
-                return f"{_selected(opt)} — {_navigated_phrase()}.", None
+                return _navigated_pick(), None
+            if after is not None and after.get("withheld"):
+                return await _unnamed_click_note(after, row_click=True)
             if after is not None and not after.get("stillOpen"):
                 child = await _cascade_child_note()
                 if child:
@@ -16259,11 +16900,15 @@ def build_browser_tools(
             if after is not None and _committed_state(after):
                 held, failure = await _state_holds(after.get("optState") or "")
                 if failure == "navigated":
-                    return f"{_selected(opt)} — {_navigated_phrase()}.", None
+                    return _navigated_pick(), None
                 if failure == "unreadable":
                     return _unverified("state-hold")
                 if held is not None:
                     return await _state_change_note(opt, held), None
+            if pre.get("optLevel") == "row":
+                # A row click is named by its label wherever it lands, unless withheld: only a closed menu or a changed
+                # row is reported, since a pick shown on a part the state does not read is not evidence that it failed.
+                return None, None
             # Menus routinely close through a fade or an async server ack; declaring "did not commit"
             # off the instantaneous read would turn those healthy commits into false errors. One
             # bounded settle, only on this would-be-error path.
@@ -16271,7 +16916,7 @@ def build_browser_tools(
             settled, navigated = await _after_read()
             if settled is None:
                 if navigated:
-                    return f"{_selected(opt)} — {_navigated_phrase()}.", None
+                    return _navigated_pick(), None
                 return _unverified("post-click" if after is None else "settle")
             if not settled.get("stillOpen"):
                 child = await _cascade_child_note()
@@ -16281,14 +16926,14 @@ def build_browser_tools(
             if _committed_state(settled):
                 held, failure = await _state_holds(settled.get("optState") or "")
                 if failure == "navigated":
-                    return f"{_selected(opt)} — {_navigated_phrase()}.", None
+                    return _navigated_pick(), None
                 if failure == "unreadable":
                     return _unverified("state-hold")
                 if held is not None:
                     return await _state_change_note(opt, held), None
             # No-commit evidence is already established: a crash of this last informational probe must
             # not fall through to the caller's fail-open bare ok (_child_menu_note swallows).
-            late_child = await _child_menu_note()
+            late_child = await _child_menu_note(bool(settled.get("stillOpen")))
             if late_child:
                 return late_child, None
             return None, (
@@ -16302,19 +16947,14 @@ def build_browser_tools(
                 # Clicked the card AROUND the menu: the center-point click may have landed on an
                 # arbitrary row, so any open/closed/selected claim could be false. Say nothing.
                 return None, None
+            if await _url_navigated():
+                # The menu read below would run on the page the click reached, where every menu reads as closed.
+                return f"{_navigated_phrase().capitalize()}.", None
             try:
                 after_raw = await page.evaluate(_MENU_AFTER_JS, await _probe_arg(page, selector))
             except Exception:
                 return None, None
-            found = await _click_menu_scan(page, await _probe_arg(page, selector))
-            if isinstance(found, dict) and found.get("count"):
-                return _menu_note(found, selector), None
-            if isinstance(after_raw, dict) and not after_raw.get("stillOpen"):
-                return (
-                    "Note: this click CLOSED the open menu — no option was selected. To select, click "
-                    'an option\'s [data-tv3-menu="N"] selector while the menu is open.'
-                ), None
-            return None, None
+            return await _unnamed_click_note(after_raw, row_click=bool(pre.get("rowClick")))
         found = await _click_menu_scan(page, await _probe_arg(page, selector))
         if isinstance(found, dict) and found.get("count"):
             return _menu_note(found, selector), None
@@ -16372,12 +17012,17 @@ def build_browser_tools(
             )
         if _TV3_MARKER_SELECTOR_RE.match(selector.strip()):
             matches = await _marker_matches(page, selector)
-            if matches == 0:
+            # A menu tag held only by rows its menu has since hidden (one that faded out after the click read it
+            # open) is as stale as one nothing holds.
+            numbered = bool(_NUMBERED_MENU_SELECTOR_RE.match(selector.strip()))
+            if matches == 0 or (numbered and await _marker_matches(page, selector, rendered=True) == 0):
                 # An absent marker cannot reappear without a re-observe, so Playwright's full 15s
                 # actionability wait is pure loss (4x in the specimen trace). Short attach grace
                 # tolerates a framework re-attaching the same node mid-render.
                 try:
-                    await page.wait_for_selector(selector, state="attached", timeout=1200)
+                    await page.wait_for_selector(selector, state="visible" if numbered else "attached", timeout=1200)
+                    if numbered and await _marker_matches(page, selector, rendered=True) == 0:
+                        raise LookupError(selector)
                 except Exception:
                     raise ToolRefusal(
                         f"{selector} no longer exists on the page — element markers vanish when the "
@@ -16414,6 +17059,8 @@ def build_browser_tools(
             try:
                 await input_dispatch.hover(page, selector, timeout=2000)
                 hovered = await page.evaluate(_MENU_AFTER_JS, await _probe_arg(page, selector))
+                if isinstance(hovered, dict) and hovered.get("estUnsure"):
+                    pre["optUnsure"] = True
                 if isinstance(hovered, dict) and hovered.get("optState"):
                     pre["optState"] = hovered["optState"]
                     # Every baseline the commit checks read, not some of them: whichever is left
@@ -16433,7 +17080,7 @@ def build_browser_tools(
         # the page having moved.
         page_url_before = await _url(_current_page())
         doc_planted = False
-        if pre is not None and pre.get("isOption"):
+        if pre is not None and (pre.get("isOption") or (pre.get("menuOpen") and not pre.get("containsMenu"))):
             try:
                 await page.evaluate(_CLICK_DOC_PLANT_JS)
                 doc_planted = True
@@ -16477,7 +17124,7 @@ def build_browser_tools(
             """Whether the driver would refuse this target as not enabled, right now.
 
             Asked of the driver rather than re-derived: its rule is wider than `:disabled` and the
-            remainder is version-dependent (see cloud_docs/task-v3/README.md).
+            remainder is version-dependent (see the Task V3 README).
             """
             if isinstance(reach_pre, dict) and reach_pre.get("exists") and reach_pre.get("disabled"):
                 return True
@@ -23643,8 +24290,24 @@ def build_browser_tools(
                     # guard below reports, so the handler's own time is never billed to resolution.
                     record()
                     try:
+                        # Inside the try: a deadline landing in this read must still clear the realm and page slots.
+                        note = None
+                        if tool_name in _POSITIONAL_NOTE_TOOL_NAMES:
+                            note = await _positional_note(realm, selector, _mask_refs)
                         result = await handler(args)
                         await _note_frame_work(tool_name, realm, args.get("selector"), result)
+                        if note is not None and result.status == "ok":
+                            LOG.info(
+                                "taskv3 positional selector note",
+                                tool=tool_name,
+                                tool_call_seq=current_tool_call_seq(),
+                                selector_hash=telemetry_hash(_telemetry_salt, selector),
+                                **note[1],
+                            )
+                            # After the action's own sentence: goal_check reads a click's landing URL from the head
+                            # of its result.
+                            content = f"{result.content}\n{note[0]}" if result.content else note[0]
+                            result = dataclasses.replace(result, content=content)
                         return result
                     finally:
                         _acted_realm.clear()

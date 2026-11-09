@@ -45,6 +45,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     admit_credential_for_live_page,
     admit_vault_login_for_live_page,
     resolve_credential_for_live_page,
+    still_on_admitted_site,
 )
 from skyvern.forge.sdk.copilot.runtime import AgentContext, browser_session_recovery
 from skyvern.forge.sdk.copilot.secret_scrub import (
@@ -71,6 +72,7 @@ from skyvern.forge.sdk.schemas.credentials import (
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatHistoryMessage, WorkflowCopilotChatSender
 from skyvern.forge.sdk.services.bitwarden import BitwardenLoginSecret
 from skyvern.forge.sdk.services.credential.credential_vault_service import VaultLogin, VaultLoginListing
+from skyvern.forge.sdk.workflow.models.credential_release import login_release_sites
 from skyvern.library.skyvern_browser_page import SkyvernBrowserPage
 from skyvern.webeye.browser_retirement import BrowserOperationRejected, BrowserRetirementReason
 from skyvern.webeye.browser_state import BrowserState
@@ -95,7 +97,9 @@ _FIXTURE_LOGIN_URL = "https://authenticationtest.com/simpleFormAuth/"
 def _resolved_credential(
     credential_id: str = "cred_123", tested_url: str | None = _FIXTURE_LOGIN_URL
 ) -> SimpleNamespace:
-    return SimpleNamespace(credential_id=credential_id, name="authtest simple", tested_url=tested_url)
+    return SimpleNamespace(
+        credential_id=credential_id, name="authtest simple", tested_url=tested_url, extra_site_urls=[]
+    )
 
 
 def _policy(**overrides: Any) -> RequestPolicy:
@@ -159,19 +163,19 @@ def _ctx(**overrides: Any) -> SimpleNamespace:
 
 class TestCredentialFillPolicyGate:
     def test_origin_comparison_uses_browser_origin_semantics(self) -> None:
-        assert credential_fill_module._still_on_admitted_site(
+        assert still_on_admitted_site(
             "https://example.com/account",
             "https://example.com:443/login",
         )
-        assert credential_fill_module._still_on_admitted_site(
+        assert still_on_admitted_site(
             "https://example.com/account",
             "example.com/login",
         )
-        assert not credential_fill_module._still_on_admitted_site(
+        assert not still_on_admitted_site(
             "http://example.com/account",
             "https://example.com/login",
         )
-        assert not credential_fill_module._still_on_admitted_site(
+        assert not still_on_admitted_site(
             "https://example.com:8443/account",
             "https://example.com/login",
         )
@@ -190,9 +194,9 @@ class TestCredentialFillPolicyGate:
         ctx = _ctx(request_policy=_policy(allow_run_blocks=False))
         assert tools_module._credential_fill_prerequisite_error(ctx, "cred_123") is None
 
-    def test_rejects_raw_secret_turn_at_credential_fill_boundary(self) -> None:
-        ctx = _ctx(request_policy=_policy(raw_secret_detected=True))
-        assert tools_module._credential_fill_prerequisite_error(ctx, "cred_123") is not None
+    def test_allows_a_redacted_secret_turn_at_credential_fill_boundary(self) -> None:
+        ctx = _ctx(request_policy=_policy(raw_secret_detected=True, raw_secret_handling="redacted_draft"))
+        assert tools_module._credential_fill_prerequisite_error(ctx, "cred_123") is None
 
     def test_rejects_credential_outside_resolved_set(self) -> None:
         ctx = _ctx()
@@ -1550,6 +1554,7 @@ def _org_credential(
         credential_id=credential_id,
         name=name,
         tested_url=tested_url,
+        extra_site_urls=[],
         credential_type=credential_type,
         totp_type=totp_type,
     )
@@ -1746,8 +1751,51 @@ class TestCredentialFillLivePageAdmission:
         assert ctx.blocker_signal is None
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("release_url", ["about:blank", "https://sso.authenticationtest.com/login"])
-    async def test_a_refusal_off_another_site_keeps_the_retry_hint_and_opens_no_recovery(
+    async def test_a_sign_in_that_moves_to_a_sibling_host_of_the_same_site_fills(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        page = _FakePage(url=_FIXTURE_LOGIN_URL, release_url="https://sso.authenticationtest.com/login")
+        _wire_impl(monkeypatch, page)
+        ctx = _ctx()
+
+        result = await tools_module.fill_credential_field(ctx, "#passwordInput", "cred_123", "password")
+
+        assert result["ok"] is True
+        assert page.fill_calls == [("#passwordInput", _FAKE_PASSWORD)]
+        assert ctx.credential_origin_recovery is None
+        assert ctx.blocker_signal is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("tested_url", "release_url", "fills"),
+        [
+            ("https://portal.example.net/login", "https://sso.authenticationtest.com/login", False),
+            ("https://portal.example.net/login", "https://portal.example.net/login", False),
+            (_FIXTURE_LOGIN_URL, "https://sso.authenticationtest.com/login", True),
+        ],
+        ids=["sibling-off-the-saved-site", "saved-site-off-the-admitted-page", "sibling-on-the-saved-site"],
+    )
+    async def test_a_live_page_admission_reaches_sibling_hosts_only_on_the_saved_site(
+        self, monkeypatch: pytest.MonkeyPatch, tested_url: str, release_url: str, fills: bool
+    ) -> None:
+        """The admitting page proves its origin only; the saved run releases on the login's saved site."""
+        page = _FakePage(url=_FIXTURE_LOGIN_URL, release_url=release_url)
+        _wire_impl(monkeypatch, page)
+        policy = RequestPolicy(
+            resolved_credentials=[_resolved_credential(tested_url=tested_url)],
+            live_page_admitted_urls={"cred_123": _FIXTURE_LOGIN_URL},
+        )
+        ctx = _ctx(request_policy=policy)
+
+        result = await tools_module.fill_credential_field(ctx, "#passwordInput", "cred_123", "password")
+
+        assert result["ok"] is fills
+        assert bool(page.fill_calls) is fills
+        assert (ctx.credential_origin_recovery is None) is fills
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("release_url", ["about:blank", ""])
+    async def test_a_field_whose_frame_has_no_origin_is_refused_without_a_retry_hint(
         self, monkeypatch: pytest.MonkeyPatch, release_url: str
     ) -> None:
         page = _FakePage(url=_FIXTURE_LOGIN_URL, release_url=release_url)
@@ -1756,9 +1804,67 @@ class TestCredentialFillLivePageAdmission:
 
         result = await tools_module.fill_credential_field(ctx, "#passwordInput", "cred_123", "password")
 
-        assert result == {"ok": False, "error": credential_fill_module._credential_fill_origin_mismatch_error()}
+        assert result["ok"] is False
+        assert result["status"] == "no_frame_origin"
+        assert "recovery" not in result
+        assert "again" not in result["error"].lower()
+        assert "re-inspect" not in result["error"].lower()
+        assert page.fill_calls == []
         assert ctx.credential_origin_recovery is None
         assert ctx.blocker_signal is None
+
+    @pytest.mark.asyncio
+    async def test_a_vault_item_scoped_to_one_host_refuses_its_sibling_host(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sibling = "https://sso.authenticationtest.com/login"
+        page = _FakePage(url=_FIXTURE_LOGIN_URL, release_url=sibling)
+        _wire_impl(monkeypatch, page)
+        sites = [LoginSite("https://authenticationtest.com", whole_site=False)]
+        ctx = _ctx(scoped_login_sites_by_credential_id={"cred_123": sites})
+
+        result = await tools_module.fill_credential_field(ctx, "#passwordInput", "cred_123", "password")
+
+        assert result == {
+            "ok": False,
+            "error": credential_fill_module._vault_login_off_site_error("cred_123", sibling, sites),
+        }
+        assert page.fill_calls == []
+        assert ctx.credential_origin_recovery is None
+
+    @pytest.mark.asyncio
+    async def test_a_vault_item_naming_the_whole_site_fills_its_sibling_host_without_a_tested_url(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        page = _FakePage(url=_FIXTURE_LOGIN_URL, release_url="https://sso.authenticationtest.com/login")
+        _wire_impl(monkeypatch, page)
+        policy = RequestPolicy(
+            resolved_credentials=[_resolved_credential(tested_url=None)],
+            live_page_admitted_urls={"cred_123": _FIXTURE_LOGIN_URL},
+        )
+        ctx = _ctx(
+            request_policy=policy,
+            scoped_login_sites_by_credential_id={
+                "cred_123": [LoginSite("https://authenticationtest.com", whole_site=True)]
+            },
+        )
+
+        result = await tools_module.fill_credential_field(ctx, "#passwordInput", "cred_123", "password")
+
+        assert result["ok"] is True
+        assert page.fill_calls == [("#passwordInput", _FAKE_PASSWORD)]
+
+    def test_a_vault_item_naming_two_sites_does_not_carry_a_grant_from_one_to_the_other(self) -> None:
+        grant = credential_fill_module._CredentialFillOriginGrant(
+            "https://www.a-site.com/login",
+            vault_sites=(
+                LoginSite("https://a-site.com", whole_site=True),
+                LoginSite("https://b-site.com", whole_site=True),
+            ),
+        )
+
+        assert credential_fill_module._within_grant("https://login.a-site.com/signin", grant)
+        assert not credential_fill_module._within_grant("https://login.b-site.com/signin", grant)
 
     @pytest.mark.asyncio
     async def test_resolved_credential_without_a_user_provided_site_fails_closed(
@@ -1788,7 +1894,9 @@ class TestCredentialFillLivePageAdmission:
     ) -> tuple[Any, str | None]:
         """Grant for a resolved credential carrying no saved login URL."""
         resolved: list[Any] = [_resolved_credential(tested_url=None)]
-        resolved.extend(SimpleNamespace(credential_id=extra, tested_url=None) for extra in also_resolved or [])
+        resolved.extend(
+            SimpleNamespace(credential_id=extra, tested_url=None, extra_site_urls=[]) for extra in also_resolved or []
+        )
         policy = RequestPolicy(resolved_credentials=resolved)
         policy.user_provided_site_urls = list(user_urls or [])
         if named:
@@ -1812,7 +1920,8 @@ class TestCredentialFillLivePageAdmission:
         )
 
         assert error is None
-        assert grant is not None and grant.whole_site
+        assert grant is not None
+        assert credential_fill_module._within_grant("https://sso.authenticationtest.com/login", grant)
 
     @pytest.mark.asyncio
     async def test_a_site_the_user_pasted_in_an_earlier_turn_still_releases(self) -> None:
@@ -1878,7 +1987,9 @@ class TestCredentialFillLivePageAdmission:
         )
 
         assert error is None
-        assert grant is not None and not grant.whole_site
+        assert grant is not None
+        assert credential_fill_module._within_grant("http://localhost:8901/analytics_console/other/", grant)
+        assert not credential_fill_module._within_grant("http://localhost:8900/analytics_console/pathfold/", grant)
 
     @pytest.mark.asyncio
     async def test_a_login_target_the_user_never_wrote_cannot_vouch(self) -> None:
@@ -2561,7 +2672,8 @@ class TestVaultNamedSiteGrant:
         grant, error = await self._grant(vault_uris=["https://example.com"], page_url=page_url)
 
         assert error is None
-        assert grant is not None and grant.whole_site is True
+        assert grant is not None
+        assert credential_fill_module._within_grant("https://other.example.com/login", grant)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -2607,12 +2719,13 @@ class TestVaultNamedSiteGrant:
 
         assert credential_fill_module._within_grant(page_url, grant) is reachable
 
-    def test_a_tested_credential_keeps_the_tighter_scope(self) -> None:
-        """Evidence naming one page grants one origin; only a site-level entry grants a site."""
-        page_grant = credential_fill_module._CredentialFillOriginGrant("https://eu.example.com/login")
+    def test_a_vault_item_scoped_to_one_host_keeps_the_tighter_scope(self) -> None:
+        grant = credential_fill_module._CredentialFillOriginGrant(
+            "https://eu.example.com/login", vault_sites=(LoginSite("https://eu.example.com", whole_site=False),)
+        )
 
-        assert not credential_fill_module._within_grant("https://other.example.com/login", page_grant)
-        assert credential_fill_module._within_grant("https://eu.example.com/step2", page_grant)
+        assert not credential_fill_module._within_grant("https://other.example.com/login", grant)
+        assert credential_fill_module._within_grant("https://eu.example.com/step2", grant)
 
 
 _REAL_RESOLVE_CREDENTIAL_FILL_VALUE = credential_fill_module._resolve_credential_fill_value
@@ -2786,8 +2899,13 @@ class TestVaultLoginImportOnFill:
         assert [credential.credential_id for credential in await org_vault.imported_rows()] == [row.credential_id]
 
     @pytest.mark.asyncio
-    async def test_a_named_1password_login_keeps_its_tested_origin_after_its_first_fill_imports_it(
-        self, monkeypatch: pytest.MonkeyPatch, org_vault: OrgVaultFake
+    @pytest.mark.parametrize(
+        "item_sites",
+        [None, [LoginSite(_VAULT_PAGE_URL, whole_site=False)]],
+        ids=["unscoped-item", "origin-only-item"],
+    )
+    async def test_a_named_1password_login_reaches_as_far_as_the_run_after_its_first_fill_imports_it(
+        self, monkeypatch: pytest.MonkeyPatch, org_vault: OrgVaultFake, item_sites: list[LoginSite] | None
     ) -> None:
         login = _vault_login("item_op", urls=(_VAULT_PAGE_URL,))
         item = CredentialItem(
@@ -2796,6 +2914,7 @@ class TestVaultLoginImportOnFill:
             credential_type=CredentialType.PASSWORD,
             credential=PasswordCredential(username="vault-user@example.com", password=ORG_VAULT_LOGIN_PASSWORD),
             login_uris=[_VAULT_PAGE_URL],
+            login_sites=item_sites,
         )
         monkeypatch.setitem(
             app.CREDENTIAL_VAULT_SERVICES,
@@ -2813,13 +2932,21 @@ class TestVaultLoginImportOnFill:
         self._wire(monkeypatch)
         first = await tools_module.fill_credential_field(ctx, "#usernameInput", ref, "username")
         [row] = await org_vault.imported_rows()
-        sibling_host = self._wire(monkeypatch, "https://app.portal.example.com/login")
-
+        sibling_url = "https://app.portal.example.com/login"
+        sibling_host = self._wire(monkeypatch, sibling_url)
         second = await tools_module.fill_credential_field(ctx, "#passwordInput", row.credential_id, "password")
+        other_site = self._wire(monkeypatch, "https://portal.example.net/login")
 
+        third = await tools_module.fill_credential_field(ctx, "#passwordInput", row.credential_id, "password")
+
+        release_sites = login_release_sites(row.tested_url, item_sites)
+        run_releases_on_sibling = release_sites is not None and any(site.admits(sibling_url) for site in release_sites)
         assert first["ok"] is True
-        assert second["ok"] is False
-        assert sibling_host.fill_calls == []
+        assert run_releases_on_sibling is (item_sites is None)
+        assert second["ok"] is run_releases_on_sibling
+        assert bool(sibling_host.fill_calls) is run_releases_on_sibling
+        assert third["ok"] is False
+        assert other_site.fill_calls == []
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("tested_url", [None, "https://app.portal.example.com/login"])

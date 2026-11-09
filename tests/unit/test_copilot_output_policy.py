@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import inspect
 import json
 import string
 from types import SimpleNamespace
@@ -10,9 +9,8 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
-from agents import GuardrailFunctionOutput, OutputGuardrail, ToolInputGuardrailData
+from agents import GuardrailFunctionOutput, OutputGuardrail
 from agents.run_context import RunContextWrapper
-from agents.tool_context import ToolContext
 
 from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot import output_policy as output_policy_module
@@ -28,12 +26,10 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     contains_internal_machinery_leak,
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
-from skyvern.forge.sdk.copilot.loop_detection import tool_step_identity
 from skyvern.forge.sdk.copilot.output_policy import (
     CopilotOutputKind,
     OutputPolicyReason,
     OutputPolicyVerdict,
-    demote_author_time_steer_reasons,
     derive_output_kind,
     evaluate_output_policy,
     hard_block_output_policy_verdict,
@@ -42,13 +38,8 @@ from skyvern.forge.sdk.copilot.output_policy import (
 )
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
 from skyvern.forge.sdk.copilot.review_gate import workflow_block_fingerprints
-from skyvern.forge.sdk.copilot.tools import (
-    _WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL,
-    NATIVE_TOOLS,
-)
 from skyvern.forge.sdk.copilot.tools.run_execution import _watchdog_error_message
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
-from skyvern.utils.yaml_loader import safe_load_no_dates
 
 # Assembled at runtime so the source never contains a token-shaped literal for secret scanners to flag.
 _FAKE_OPENAI_KEY = "sk-" + string.ascii_lowercase[:24]
@@ -66,7 +57,7 @@ _FAKE_JWT = ".".join(
 def _credential(
     credential_id: str = "cred_safe", tested_url: str | None = "https://login.example.test/login"
 ) -> SimpleNamespace:
-    return SimpleNamespace(credential_id=credential_id, name="Saved Login", tested_url=tested_url)
+    return SimpleNamespace(credential_id=credential_id, name="Saved Login", tested_url=tested_url, extra_site_urls=[])
 
 
 def _policy(**overrides: object) -> RequestPolicy:
@@ -206,52 +197,6 @@ def _code_artifact_metadata(label: str = "open_results") -> list[dict[str, objec
             "exploration_observations": [],
         }
     ]
-
-
-def _inline_conditional_workflow_yaml(*, url: str = "https://login.example.test/login") -> str:
-    return f"""
-workflow_definition:
-  parameters:
-    - parameter_type: workflow
-      workflow_parameter_type: credential_id
-      key: login_credentials
-      default_value: cred_safe
-  blocks:
-    - block_type: conditional
-      label: route_login
-      branch_conditions:
-        - is_default: true
-          blocks:
-            - block_type: login
-              label: login
-              url: {url}
-              parameter_keys:
-                - login_credentials
-"""
-
-
-def _nested_branch_workflow_yaml(*, url: str = "https://login.example.test/login") -> str:
-    return f"""
-workflow_definition:
-  parameters:
-    - parameter_type: workflow
-      workflow_parameter_type: credential_id
-      key: login_credentials
-      default_value: cred_safe
-  blocks:
-    - block_type: conditional
-      label: route_login
-      branch_conditions:
-        - is_default: true
-          branch_conditions:
-            - is_default: true
-              blocks:
-                - block_type: login
-                  label: nested_login
-                  url: {url}
-                  parameter_keys:
-                    - login_credentials
-"""
 
 
 def test_rejects_raw_secret_echo_in_user_response() -> None:
@@ -394,16 +339,6 @@ def test_rejects_raw_secret_in_the_reply() -> None:
 
     assert not verdict.allowed
     assert OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes
-
-
-def test_a_draft_carrying_the_same_value_is_not_a_disclosure_surface() -> None:
-    # Persistence scrubbing and credential rebinding own what reaches storage. Refusing the draft
-    # only refused the user their own workflow, and judged the YAML encoding rather than the value.
-    draft_yaml = _workflow_yaml(navigation_goal="Log in with password: hunter2.")
-
-    verdict = evaluate_output_policy(request_policy=_policy(), workflow_yaml=draft_yaml)
-
-    assert verdict.allowed
 
 
 class TestSanctionedSecretReferenceIdiom:
@@ -670,17 +605,6 @@ def test_rejects_raw_secret_in_a_reply_that_also_contains_a_jinja_placeholder() 
     assert OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes
 
 
-def test_allows_sensitive_jinja_placeholder_in_navigation_goal() -> None:
-    verdict = evaluate_output_policy(
-        request_policy=_policy(),
-        workflow_yaml=_workflow_yaml(
-            navigation_goal="Type {{ parameters.password }} into the password field.",
-        ),
-    )
-
-    assert verdict.allowed
-
-
 def test_generic_request_policy_clarification_does_not_adjudicate_reply() -> None:
     verdict = evaluate_output_policy(
         request_policy=_policy(user_response_policy="ask_clarification", allow_update_workflow=False),
@@ -771,191 +695,6 @@ def test_allows_backend_authored_request_policy_clarification() -> None:
 
     assert verdict.allowed
     assert verdict.output_kind == CopilotOutputKind.CLARIFICATION_REQUEST
-
-
-@pytest.mark.parametrize(
-    "url",
-    ["https://evil.example.test/login", "https://bücher.example/login", r"https://evil.example.test\login"],
-)
-def test_rejects_existing_workflow_credential_id_on_new_origin(url: str) -> None:
-    verdict = evaluate_output_policy(
-        request_policy=_policy(
-            resolved_credentials=[],
-            existing_workflow_credential_ids=["cred_safe"],
-            existing_workflow_credential_origins={"cred_safe": ["https://login.example.test"]},
-            credential_input_kind="none",
-        ),
-        workflow_yaml=_workflow_yaml(url=url),
-    )
-
-    assert not verdict.allowed
-    assert OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED in verdict.reason_codes
-
-
-def test_rejects_existing_workflow_credential_id_on_inline_conditional_branch_new_origin() -> None:
-    verdict = evaluate_output_policy(
-        request_policy=_policy(
-            resolved_credentials=[],
-            existing_workflow_credential_ids=["cred_safe"],
-            existing_workflow_credential_origins={"cred_safe": ["https://login.example.test"]},
-            credential_input_kind="none",
-        ),
-        workflow_yaml=_inline_conditional_workflow_yaml(url="https://evil.example.test/login"),
-    )
-
-    assert not verdict.allowed
-    assert OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED in verdict.reason_codes
-
-
-def test_rejects_existing_workflow_credential_id_on_nested_branch_new_origin() -> None:
-    verdict = evaluate_output_policy(
-        request_policy=_policy(
-            resolved_credentials=[],
-            existing_workflow_credential_ids=["cred_safe"],
-            existing_workflow_credential_origins={"cred_safe": ["https://login.example.test"]},
-            credential_input_kind="none",
-        ),
-        workflow_yaml=_nested_branch_workflow_yaml(url="https://evil.example.test/login"),
-    )
-
-    assert not verdict.allowed
-    assert OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED in verdict.reason_codes
-
-
-def test_rejects_existing_workflow_credential_id_without_prior_origin_scope() -> None:
-    # Existing workflow credentials with no tracked URL scope cannot safely
-    # authorize later edits that introduce a credentialed URL.
-    verdict = evaluate_output_policy(
-        request_policy=_policy(
-            resolved_credentials=[],
-            existing_workflow_credential_ids=["cred_safe"],
-            existing_workflow_credential_origins={},
-            credential_input_kind="none",
-        ),
-        workflow_yaml=_workflow_yaml(url="https://login.example.test/login"),
-    )
-
-    assert not verdict.allowed
-    assert OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED in verdict.reason_codes
-
-
-def test_existing_workflow_credential_with_known_prior_origin_ignores_current_resolution() -> None:
-    verdict = evaluate_output_policy(
-        request_policy=_policy(
-            resolved_credentials=[_credential(tested_url="https://login.example.test/signin")],
-            existing_workflow_credential_ids=["cred_safe"],
-            existing_workflow_credential_origins={"cred_safe": ["https://portal.example.test"]},
-            credential_input_kind="none",
-        ),
-        workflow_yaml=_workflow_yaml(url="https://login.example.test/login"),
-    )
-
-    assert OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED in verdict.reason_codes
-
-
-@pytest.mark.parametrize(
-    ("resolved_credentials", "admitted_urls"),
-    [
-        pytest.param([_credential("cred_other", "https://login.example.test/signin")], {}, id="other-id-resolved"),
-        pytest.param([], {"cred_safe": "https://login.example.test/a"}, id="admitted-but-unresolved"),
-    ],
-)
-def test_existing_workflow_credential_scope_without_prior_origin_refuses_other_authority(
-    resolved_credentials: list[SimpleNamespace], admitted_urls: dict[str, str]
-) -> None:
-    verdict = evaluate_output_policy(
-        request_policy=_policy(
-            resolved_credentials=resolved_credentials,
-            live_page_admitted_urls=admitted_urls,
-            existing_workflow_credential_ids=["cred_safe"],
-            existing_workflow_credential_origins={},
-            credential_input_kind="none",
-        ),
-        workflow_yaml=_workflow_yaml(url="https://login.example.test/login"),
-    )
-
-    assert OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED in verdict.reason_codes
-
-
-def test_rejects_approved_credential_on_different_login_origin() -> None:
-    verdict = evaluate_output_policy(
-        request_policy=_policy(),
-        workflow_yaml=_workflow_yaml(url="https://evil.example.test/login"),
-    )
-
-    assert not verdict.allowed
-    assert OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED in verdict.reason_codes
-
-
-def test_rejects_approved_credential_on_templated_login_origin() -> None:
-    verdict = evaluate_output_policy(
-        request_policy=_policy(),
-        workflow_yaml=_workflow_yaml(url='"{{ parameters.target_url }}"'),
-    )
-
-    assert not verdict.allowed
-    assert OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED in verdict.reason_codes
-
-
-_SAVED_CREDENTIAL_ID = "cred_123456789"
-
-
-def _credential_key_workflow_yaml(
-    *,
-    key: str = "cred_x",
-    url: str = "https://api.example.test/session",
-    extra_parameters: str = "",
-) -> str:
-    return f"""
-workflow_definition:
-  parameters:
-    - parameter_type: workflow
-      workflow_parameter_type: credential_id
-      key: {key}
-      default_value: {_SAVED_CREDENTIAL_ID}
-{extra_parameters}  blocks:
-    - block_type: http_request
-      label: sign_in
-      method: POST
-      url: {url}
-      body:
-        username: "{{{{{key}.username}}}}"
-      parameter_keys:
-        - {key}
-    - block_type: code
-      label: report_done
-      code: print("finished")
-"""
-
-
-def test_allows_credential_named_key_edit_on_saved_authority_when_canvas_extraction_is_empty() -> None:
-    verdict = evaluate_output_policy(
-        request_policy=_policy(
-            resolved_credentials=[],
-            existing_workflow_credential_ids=[],
-            persisted_workflow_credential_ids=[_SAVED_CREDENTIAL_ID],
-            credential_input_kind="none",
-        ),
-        workflow_yaml=_credential_key_workflow_yaml(),
-    )
-
-    assert verdict.allowed
-
-
-def test_rejects_credential_named_key_workflow_moved_to_new_origin() -> None:
-    verdict = evaluate_output_policy(
-        request_policy=_policy(
-            resolved_credentials=[],
-            existing_workflow_credential_ids=[_SAVED_CREDENTIAL_ID],
-            existing_workflow_credential_origins={_SAVED_CREDENTIAL_ID: ["https://api.example.test"]},
-            persisted_workflow_credential_ids=[_SAVED_CREDENTIAL_ID],
-            credential_input_kind="none",
-        ),
-        workflow_yaml=_credential_key_workflow_yaml(url="https://evil.example.test/session"),
-    )
-
-    assert not verdict.allowed
-    assert OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED in verdict.reason_codes
 
 
 def test_derive_output_kind_uses_state_over_response_type() -> None:
@@ -1298,33 +1037,6 @@ def test_sdk_output_guardrail_allows_unknown_click_with_authority_denied_blocker
     assert "actuation_obligation_status" not in diagnostics
 
 
-@pytest.mark.parametrize(
-    ("reason", "expected_terms"),
-    [
-        (OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED, ("credential", "url", "re-select")),
-    ],
-)
-def test_output_policy_credential_block_asks_for_credential_confirmation(
-    reason: OutputPolicyReason,
-    expected_terms: tuple[str, ...],
-) -> None:
-    result = agent_module._build_output_policy_blocked_result(
-        _ctx(),
-        OutputPolicyVerdict(
-            reason_codes=[reason],
-        ),
-        prior_global_llm_context="{}",
-        prior_workflow_yaml="title: Prior",
-    )
-
-    assert result.response_type == "ASK_QUESTION"
-    assert result.clear_proposed_workflow is False
-    response = result.user_response.lower()
-    for term in expected_terms:
-        assert term in response
-    assert "I could not safely return" not in result.user_response
-
-
 def test_output_policy_block_turn_outcome_persists_and_logs_every_reason(monkeypatch: pytest.MonkeyPatch) -> None:
     log = MagicMock()
     monkeypatch.setattr(agent_module, "LOG", log)
@@ -1364,6 +1076,7 @@ def test_turn_outcome_drops_unknown_historical_output_policy_reasons() -> None:
             "terminal_reason": "output_policy_block",
             "output_policy_reasons": [
                 "internal_tool_instruction_leak",
+                "credential_scope_broadened",
                 OutputPolicyReason.RAW_SECRET_LEAK.value,
             ],
         }
@@ -1457,7 +1170,6 @@ def test_sdk_output_guardrail_ignores_internal_context_credential_ids() -> None:
             credential_input_kind="credential_name",
             credential_refs=["azure_credentials"],
             allow_run_blocks=False,
-            allow_missing_credentials_in_draft=True,
         ),
     )
     ctx.last_workflow = object()
@@ -1488,207 +1200,6 @@ workflow_definition:
     assert verdict.allowed
     assert diagnostics["raw_would_have_failed"] is False
     assert diagnostics["contained_failure"] is False
-
-
-def test_sdk_output_guardrail_defers_raw_question_after_untested_draft() -> None:
-    ctx = _ctx(
-        request_policy=_policy(
-            testing_intent="skip_test",
-            credential_input_kind="credential_name",
-            credential_refs=["azure_credentials"],
-            allow_run_blocks=False,
-            allow_missing_credentials_in_draft=True,
-            resolved_credentials=[],
-        ),
-    )
-    ctx.allow_untested_workflow_draft = True
-    ctx.last_run_skipped_unbound_credentials = True
-    ctx.last_workflow = object()
-    ctx.last_update_block_count = 9
-    ctx.last_workflow_yaml = """
-workflow_definition:
-  parameters:
-    - parameter_type: workflow
-      workflow_parameter_type: credential_id
-      key: azure_credentials
-  blocks:
-    - block_type: login
-      label: login
-      url: https://example.com/login
-      parameter_keys:
-        - azure_credentials
-"""
-
-    verdict, response_type, diagnostics = agent_module._evaluate_copilot_final_output_policy(
-        ctx,
-        {
-            "type": "ASK_QUESTION",
-            "user_response": "I found cred_unrelated in an internal tool observation. Should I use it?",
-        },
-    )
-
-    assert response_type == "ASK_QUESTION"
-    assert verdict.allowed
-    assert diagnostics["raw_output_kind"] == "workflow_draft_proposal"
-    assert diagnostics["final_output_kind"] == "workflow_draft_proposal"
-
-
-def test_translation_surfaces_untested_draft_when_agent_asks_after_drafting() -> None:
-    ctx = _ctx(
-        request_policy=_policy(
-            testing_intent="skip_test",
-            credential_input_kind="credential_name",
-            credential_refs=["azure_credentials"],
-            allow_run_blocks=False,
-            allow_missing_credentials_in_draft=True,
-            resolved_credentials=[],
-        ),
-    )
-    ctx.allow_untested_workflow_draft = True
-    ctx.last_run_skipped_unbound_credentials = True
-    ctx.last_workflow = object()
-    ctx.last_update_block_count = 9
-    ctx.workflow_persisted = True
-    ctx.last_workflow_yaml = """
-workflow_definition:
-  parameters:
-    - parameter_type: workflow
-      workflow_parameter_type: credential_id
-      key: azure_credentials
-  blocks:
-    - block_type: login
-      label: login
-      url: https://example.com/login
-      parameter_keys:
-        - azure_credentials
-"""
-
-    result = asyncio.run(
-        agent_module._translate_to_agent_result(
-            _fake_run_result(
-                {
-                    "type": "ASK_QUESTION",
-                    "user_response": "I found cred_unrelated in an internal tool observation. Should I use it?",
-                    "global_llm_context": "{}",
-                }
-            ),
-            ctx,
-            "{}",
-            _chat_request(),
-            "org-1",
-        )
-    )
-
-    assert result.response_type == "REPLY"
-    assert result.updated_workflow is ctx.last_workflow
-    assert result.proposal_disposition == "review_untested"
-    assert result.clear_proposed_workflow is False
-    assert "without testing it" in result.user_response
-    assert "not been verified" in result.user_response
-    assert "cred_unrelated" not in result.user_response
-
-
-@pytest.mark.asyncio
-async def test_workflow_mutation_tools_have_sdk_input_guardrails_and_admit_raw_secret() -> None:
-    guarded_tools = {
-        tool.name: tool for tool in NATIVE_TOOLS if tool.name in {"update_workflow", "update_and_run_blocks"}
-    }
-    assert guarded_tools.keys() == {"update_workflow", "update_and_run_blocks"}
-    assert guarded_tools["update_workflow"].tool_input_guardrails == [_WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL]
-    assert guarded_tools["update_and_run_blocks"].tool_input_guardrails == [_WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL]
-
-    ctx = _ctx()
-    ctx.consecutive_tool_tracker = [tool_step_identity("update_workflow"), tool_step_identity("update_workflow")]
-    ctx.failed_tool_step_tracker = {"sentinel": 2}
-
-    raw_secret_yaml = """
-workflow_definition:
-  blocks:
-    - block_type: navigation
-      label: login
-      navigation_goal: Type password: hunter2 into the password field.
-"""
-    result = await _WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL.run(
-        ToolInputGuardrailData(
-            context=ToolContext(
-                context=ctx,
-                tool_name="update_and_run_blocks",
-                tool_call_id="call-1",
-                tool_arguments=json.dumps({"workflow_yaml": raw_secret_yaml}),
-            ),
-            agent=SimpleNamespace(),
-        )
-    )
-
-    # A raw credential on an authoring argument is admitted here — the log and persistence seams own it —
-    # so the turn survives and no failed-tool boundary is recorded.
-    assert result.behavior["type"] == "allow"
-    assert ctx.consecutive_tool_tracker == [
-        tool_step_identity("update_workflow"),
-        tool_step_identity("update_workflow"),
-    ]
-    assert ctx.failed_tool_step_tracker == {"sentinel": 2}
-
-
-@pytest.mark.asyncio
-async def test_sdk_input_guardrail_blocks_a_workflow_object_that_moves_a_credential_to_a_new_origin() -> None:
-    ctx = _ctx(
-        request_policy=_policy(
-            resolved_credentials=[],
-            existing_workflow_credential_ids=["cred_safe"],
-            existing_workflow_credential_origins={"cred_safe": ["https://login.example.test"]},
-            credential_input_kind="none",
-        )
-    )
-    arguments = json.dumps(
-        {
-            "workflow": safe_load_no_dates(_workflow_yaml(url="https://evil.example.test/login")),
-            "block_labels": ["login"],
-        }
-    )
-
-    result = await _WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL.run(
-        ToolInputGuardrailData(
-            context=ToolContext(
-                context=ctx, tool_name="update_and_run_blocks", tool_call_id="call-cred", tool_arguments=arguments
-            ),
-            agent=SimpleNamespace(),
-        )
-    )
-
-    assert result.behavior["type"] == "reject_content"
-    assert OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED.value in result.behavior["message"]
-
-
-@pytest.mark.asyncio
-async def test_allowed_sdk_input_guardrail_does_not_record_consecutive_boundary() -> None:
-    ctx = _ctx()
-    ctx.consecutive_tool_tracker = ["update_workflow", "update_workflow"]
-
-    result = await _WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL.run(
-        ToolInputGuardrailData(
-            context=ToolContext(
-                context=ctx,
-                tool_name="update_and_run_blocks",
-                tool_call_id="call-allow",
-                tool_arguments=json.dumps(
-                    {
-                        "workflow_yaml": """
-workflow_definition:
-  blocks:
-    - block_type: goto_url
-      label: open_example
-      url: https://example.com
-"""
-                    }
-                ),
-            ),
-            agent=SimpleNamespace(),
-        )
-    )
-
-    assert result.behavior["type"] == "allow"
-    assert ctx.consecutive_tool_tracker == ["update_workflow", "update_workflow"]
 
 
 def test_inline_replace_output_policy_turn_outcome_keeps_raw_reasons_before_processing(monkeypatch) -> None:
@@ -1890,24 +1401,6 @@ workflow_definition:
 """
 
 
-def _discovered(credential_id: str, tested_url: str | None) -> object:
-    return SimpleNamespace(credential_id=credential_id, name=credential_id, tested_url=tested_url)
-
-
-def test_rejects_discovered_credential_bound_to_new_origin() -> None:
-    verdict = evaluate_output_policy(
-        request_policy=_policy(
-            resolved_credentials=[],
-            discovered_credentials=[_discovered("cred_safe", "https://login.example.test/login")],
-            credential_input_kind="none",
-        ),
-        workflow_yaml=_workflow_yaml(url="https://evil.example.test/login"),
-    )
-
-    assert not verdict.allowed
-    assert OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED in verdict.reason_codes
-
-
 def _present_contract_confirmation_policy() -> RequestPolicy:
     return _policy(
         user_response_policy="proceed",
@@ -1963,7 +1456,6 @@ def test_build_exit_result_passes_genuine_predicate_as_workflow_attempted(monkey
 
     def _capture_kind(**kwargs: Any) -> None:
         captured["derive"] = kwargs["workflow_attempted"]
-        return None
 
     monkeypatch.setattr(agent_module, "derive_output_kind", _capture_kind)
     monkeypatch.setattr(agent_module, "evaluate_output_policy", _capture_eval)
@@ -1974,12 +1466,6 @@ def test_build_exit_result_passes_genuine_predicate_as_workflow_attempted(monkey
     assert captured["derive"] is True
     assert captured["evaluate"] is True
     assert captured["evaluate"] == ctx.has_genuine_workflow_attempt()
-
-
-def test_agent_no_longer_derives_workflow_attempted_from_two_marker_fields() -> None:
-    source = inspect.getsource(agent_module)
-    assert "last_update_block_count is not None or ctx.last_test_ok is not None" not in source
-    assert "workflow_attempted=bool(ctx.last_run_blocks_workflow_run_id)" not in source
 
 
 _AVOIDABLE_ASK = {
@@ -2112,15 +1598,8 @@ def test_output_schema_ask_with_secret_leak_keeps_only_the_safety_block() -> Non
     assert diagnostics.get("deferred_to_recycle", False) is False
 
 
-_AUTHOR_TIME_KEEP_HARD_REASONS = frozenset(
-    {
-        OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED,
-    }
-)
-
-# Reads as "does not refuse", not "reaches data['findings']". Only schema_incompatibility,
-# code_artifact_metadata_incomplete and synthesized_code_block_not_imposed populate that bucket;
-# demoted OutputPolicyReason members land in the guardrail's steered_reason_codes log line.
+# Reads as "does not refuse", not "reaches data['findings']": only schema_incompatibility,
+# code_artifact_metadata_incomplete and synthesized_code_block_not_imposed populate that bucket.
 _FINDING = "finding"
 
 # Enumerated by hand on purpose: deriving it from the enum would auto-classify a new refusal
@@ -2131,7 +1610,6 @@ _AUTHORING_SEAM_REFUSAL_SOURCES: dict[str, str] = {
     "banned_blocks": BANNED_BLOCKS_BLOCK_ID,
     "raw_secret_leak": _FINDING,
     "unapproved_credential_reference": CREDENTIAL_SCOUT_BLOCK_ID,
-    "credential_scope_broadened": CREDENTIAL_SCOUT_BLOCK_ID,
     "persistence_state_mismatch": _FINDING,
     "output_policy_context_missing": _FINDING,
 }
@@ -2154,78 +1632,6 @@ def test_only_a_hard_block_identity_can_refuse(source: str) -> None:
             AuthorTimeBlock(block_id=source, error="steer")
         return
     assert AuthorTimeBlock(block_id=disposition, error="refuse").block_id in AUTHOR_TIME_HARD_BLOCKS
-
-
-@pytest.mark.parametrize("reason", list(OutputPolicyReason))
-def test_tool_input_disposition_matches_classification_table(reason: OutputPolicyReason) -> None:
-    """Pins every reason code to its reviewed verdict in
-    cloud_docs/workflow-copilot/architecture/output-policy-disposition.md."""
-    verdict = OutputPolicyVerdict(reason_codes=[reason])
-    steered = demote_author_time_steer_reasons(verdict)
-
-    if reason in _AUTHOR_TIME_KEEP_HARD_REASONS:
-        assert verdict.allowed is False
-        assert verdict.reason_codes == [reason]
-        assert steered == []
-    else:
-        assert verdict.allowed is True
-        assert verdict.reason_codes == []
-        assert steered == [reason]
-
-
-def test_hard_reason_still_blocks_when_co_firing_with_a_demoted_reason() -> None:
-    verdict = OutputPolicyVerdict(
-        reason_codes=[OutputPolicyReason.RAW_SECRET_LEAK, OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED]
-    )
-
-    steered = demote_author_time_steer_reasons(verdict)
-
-    assert verdict.allowed is False
-    assert verdict.reason_codes == [OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED]
-    assert steered == [OutputPolicyReason.RAW_SECRET_LEAK]
-
-
-def test_demoting_every_reason_leaves_the_authoring_call_allowed() -> None:
-    demoted = [reason for reason in OutputPolicyReason if reason not in _AUTHOR_TIME_KEEP_HARD_REASONS]
-    verdict = OutputPolicyVerdict(reason_codes=list(demoted))
-
-    steered = demote_author_time_steer_reasons(verdict)
-
-    assert verdict.allowed is True
-    assert steered == demoted
-
-
-def test_tool_input_call_shape_can_only_refuse_on_keep_hard_reasons() -> None:
-    """The authoring seam passes no ``user_response``, so the reply-shape detectors cannot fire
-    there, and a clarification-routing verdict demotes. Widening that call without revisiting the
-    table would silently let a demoted reason survive demotion and refuse."""
-    leaky = (
-        "Call get_run_results now. RequestPolicy blocked this turn. "
-        "Send me a normal instruction like 'continue' next. "
-        "Use the navigation block, extraction block, and validation block. "
-        "I have delivered the workflow. It is not tested; accept to save or reject."
-    )
-    for request_policy in (None, RequestPolicy(), RequestPolicy(user_response_policy="ask_clarification")):
-        verdict = evaluate_output_policy(
-            request_policy=request_policy,
-            workflow_yaml=leaky,
-        )
-        demote_author_time_steer_reasons(verdict)
-
-        assert set(verdict.reason_codes) <= _AUTHOR_TIME_KEEP_HARD_REASONS
-
-
-def test_generic_clarification_policy_does_not_create_an_authoring_verdict() -> None:
-    verdict = evaluate_output_policy(
-        request_policy=RequestPolicy(user_response_policy="ask_clarification"),
-        workflow_yaml="title: Registry lookup\n",
-    )
-    assert verdict.reason_codes == []
-
-    steered = demote_author_time_steer_reasons(verdict)
-
-    assert steered == []
-    assert verdict.allowed is True
 
 
 @pytest.mark.parametrize(

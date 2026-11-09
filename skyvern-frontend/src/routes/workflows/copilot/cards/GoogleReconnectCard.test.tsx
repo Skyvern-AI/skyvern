@@ -15,6 +15,7 @@ const { hookState, refetchCredentials, startAuthorize, storeIntegration } =
           scopes_granted?: string[];
           credential_name?: string;
           email_address?: string | null;
+          account_recorded?: boolean;
         }>,
         isLoading: false,
         isFetching: false,
@@ -279,6 +280,41 @@ describe("GoogleReconnectCard", () => {
     fireEvent.click(screen.getByRole("button", { name: "Reconnect again" }));
     await waitFor(() => expect(popup.location.assign).toHaveBeenCalled());
     expect(screen.queryByRole("alert")).toBeNull();
+    open.mockRestore();
+  });
+
+  it("confirms before setting an account on an existing connection", async () => {
+    hookState.current.credentials = [
+      {
+        id: "goac_error",
+        state: "error",
+        credential_name: "Work Sheets",
+        account_recorded: false,
+      },
+    ];
+    const popup = openablePopup();
+    const open = vi
+      .spyOn(window, "open")
+      .mockReturnValue(popup as unknown as Window);
+    startAuthorize.mockResolvedValue({
+      authorize_url: "https://accounts.google.com/oauth",
+      state: "set-account",
+    });
+    render(<GoogleReconnectCard notice={notice} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Reconnect" }));
+    expect(open).not.toHaveBeenCalled();
+    expect(startAuthorize).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+
+    await waitFor(() =>
+      expect(startAuthorize).toHaveBeenCalledWith(
+        expect.objectContaining({
+          credential_id: "goac_error",
+          set_account: true,
+        }),
+      ),
+    );
     open.mockRestore();
   });
 

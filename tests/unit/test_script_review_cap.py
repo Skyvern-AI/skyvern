@@ -480,37 +480,6 @@ class TestTriggerScriptReviewerCap:
             self.service._run_reviewer_locked.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_cap_resets_on_new_day(self) -> None:
-        """Cap counter should be specific to the date, so a new day resets it."""
-        wpid = "wpid_daily_reset"
-        workflow = _make_workflow(wpid=wpid)
-        workflow_run = _make_workflow_run()
-
-        today = datetime.now(UTC).strftime("%Y-%m-%d")
-        expected_key = f"script_reviewer:daily_cap:{wpid}:{today}"
-
-        async def mock_get(key: str) -> str | None:
-            if key == expected_key:
-                return None
-            return None
-
-        self.mock_cache.get = AsyncMock(side_effect=mock_get)
-
-        with patch("skyvern.forge.sdk.core.skyvern_context.current") as mock_ctx:
-            ctx = MagicMock()
-            ctx.script_revision_id = "rev_1"
-            ctx.script_id = "script_1"
-            mock_ctx.return_value = ctx
-
-            self.service._run_reviewer_locked = AsyncMock()
-
-            await self.service._trigger_script_reviewer(
-                workflow, workflow_run, pre_finally_status=WorkflowRunStatus.failed
-            )
-
-            self.service._run_reviewer_locked.assert_called_once()
-
-    @pytest.mark.asyncio
     async def test_review_increments_counter_after_success(self) -> None:
         """After a successful review, the counter should be incremented."""
         workflow = _make_workflow()

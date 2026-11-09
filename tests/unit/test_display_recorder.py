@@ -192,11 +192,41 @@ def test_acquired_video_artifact_advertises_mp4_before_first_artifact_creation(
         dr._REGISTRY.pop((":99", "wr_ext"), None)
 
 
-def test_startup_ack_deadline_is_15_seconds() -> None:
-    # The bridge cold start (double interpreter start + ctypes/X handshake + FFmpeg Popen) can take several
-    # seconds on a loaded worker; the READY ACK deadline must be 15s so a healthy-but-slow start is not refused
-    # and needlessly downgraded to Playwright. Regression guard against reverting to the old shorter default.
-    assert dr.STARTUP_ACK_TIMEOUT == 15.0
+@pytest.mark.parametrize(
+    "pythonpath, expected",
+    [
+        (["/x/site-packages/opentelemetry/instrumentation/auto_instrumentation", "/app", ""], ["/app", ""]),
+        (["/x/site-packages/opentelemetry/instrumentation/auto_instrumentation"], None),
+        (["/app", "/opt/auto_instrumentation"], ["/app", "/opt/auto_instrumentation"]),
+    ],
+    ids=["otel_dir_dropped_others_kept", "only_otel_dir_unsets_var", "unrelated_auto_instrumentation_kept"],
+)
+def test_bridge_spawn_env_drops_otel_auto_instrumentation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, pythonpath: list[str], expected: list[str] | None
+) -> None:
+    # opentelemetry-instrument puts its sitecustomize dir on PYTHONPATH. Both interpreters the recorder starts (the
+    # trampoline and the exec'd bridge) would re-run auto-instrumentation, about a second each, if they inherited it.
+    if dr.fcntl is None:
+        pytest.skip("fcntl unavailable on this platform")
+    spawn_env: dict[str, str] = {}
+
+    async def _fake_exec(*_args: object, **kwargs: object) -> "_FakeProc":
+        spawn_env.update(kwargs["env"])  # type: ignore[arg-type]
+        return _FakeProc(exits_on="never")
+
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(pythonpath))
+    monkeypatch.setattr(dr.os, "open", lambda *a, **k: 7)
+    monkeypatch.setattr(dr.fcntl, "flock", lambda *a, **k: None)
+    monkeypatch.setattr(dr.asyncio, "create_subprocess_exec", _fake_exec)
+
+    try:
+        acq = asyncio.run(dr.acquire_display_recorder(":99", "wr_env", tmp_path))
+        assert acq.started is True
+        got = spawn_env.get("PYTHONPATH")
+        assert (got.split(os.pathsep) if got is not None else None) == expected
+        assert os.environ["PYTHONPATH"] == os.pathsep.join(pythonpath)
+    finally:
+        dr._REGISTRY.pop((":99", "wr_env"), None)
 
 
 def test_owner_id_is_deterministic_and_owner_exact() -> None:

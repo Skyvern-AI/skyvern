@@ -7,8 +7,16 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from skyvern.forge.sdk.db.base_alchemy_db import BaseAlchemyDB
 from skyvern.forge.sdk.db.models import MicrosoftOAuthCredentialModel
-from skyvern.forge.sdk.db.repositories.microsoft_oauth import STATE_ACTIVE, STATE_REVOKED, MicrosoftOAuthRepository
+from skyvern.forge.sdk.db.repositories.microsoft_oauth import (
+    STATE_ACTIVE,
+    STATE_REVOKED,
+    IncompatibleScopeProfileError,
+    MicrosoftOAuthRepository,
+    PowerBIReconnectAccessDenied,
+    ReconnectIdentityUnavailableError,
+)
 from skyvern.forge.sdk.encrypt.base import EncryptMethod
+from skyvern.forge.sdk.services.microsoft_oauth_service import POWERBI_DATASET_READ_SCOPES, is_powerbi_scope_profile
 from tests.unit.conftest import SqliteEngineFactory
 
 
@@ -21,6 +29,226 @@ async def engine(sqlite_engine_factory: SqliteEngineFactory) -> AsyncEngine:
 async def repo(engine: AsyncEngine) -> MicrosoftOAuthRepository:
     db = BaseAlchemyDB(engine)
     return MicrosoftOAuthRepository(db.Session, debug_enabled=False)
+
+
+async def _seed_active_connection(
+    repo: MicrosoftOAuthRepository,
+    credential_id: str,
+    *,
+    organization_id: str = "o_test",
+    scopes: list[str] | None = None,
+    scopes_granted: list[str] | None = None,
+    tenant_id: str | None = "tenant-1",
+    object_id: str | None = "object-1",
+    initiating_user_id: str | None = "user-1",
+) -> None:
+    scopes = scopes or ["Mail.Read", "User.Read", "offline_access", "openid", "profile"]
+    now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+    nonce = f"nonce-{credential_id}"
+    await repo.insert_pending_credential(
+        credential_id=credential_id,
+        organization_id=organization_id,
+        credential_name="Default",
+        scopes_requested=scopes,
+        consent_nonce=nonce,
+        consent_redirect_uri="https://app/callback",
+        consent_expires_at=now + datetime.timedelta(minutes=10),
+        consent_code_verifier=f"verifier-{credential_id}",
+    )
+    await repo.promote_pending_to_active(
+        organization_id=organization_id,
+        nonce=nonce,
+        encrypted_refresh_token=f"cipher-{credential_id}",
+        encrypted_method=EncryptMethod.AES,
+        scopes_granted=scopes_granted or scopes,
+        initiating_user_id=initiating_user_id,
+        tenant_id=tenant_id,
+        object_id=object_id,
+        now=now,
+    )
+
+
+@pytest.mark.asyncio
+async def test_reauthorization_promotes_existing_connection_in_place_and_replaces_nonce(
+    repo: MicrosoftOAuthRepository, engine: AsyncEngine
+) -> None:
+    await _seed_active_connection(repo, "msoac_reconnect")
+    now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+    common = {
+        "credential_id": "msoac_reconnect",
+        "organization_id": "o_test",
+        "consent_redirect_uri": "https://app/callback",
+        "consent_expires_at": now + datetime.timedelta(minutes=10),
+        "now": now,
+        "outlook_scopes": ["Mail.Read", "offline_access", "openid", "profile", "User.Read"],
+        "powerbi_scopes": [
+            "https://analysis.windows.net/powerbi/api/Dataset.Read.All",
+            "offline_access",
+            "openid",
+        ],
+        "requesting_user_id": "user-1",
+    }
+    first = await repo.begin_reauthorization(
+        consent_nonce="nonce-first",
+        consent_code_verifier="verifier-first",
+        **common,
+    )
+    second = await repo.begin_reauthorization(
+        consent_nonce="nonce-second",
+        consent_code_verifier="verifier-second",
+        **common,
+    )
+
+    assert first is not None and second is not None
+    assert (first.id, second.id, second.state) == ("msoac_reconnect", "msoac_reconnect", STATE_ACTIVE)
+    assert await repo.load_pending_by_nonce("o_test", "nonce-first") is None
+    context = await repo.load_pending_by_nonce("o_test", "nonce-second")
+    assert context is not None
+    assert (context.state, context.tenant_id, context.object_id) == (STATE_ACTIVE, "tenant-1", "object-1")
+    assert context.scopes_granted == ["Mail.Read", "User.Read", "offline_access", "openid", "profile"]
+    payload = await repo.load_active_ciphertext("o_test", "msoac_reconnect")
+    assert payload is not None
+    assert payload.encrypted_refresh_token == "cipher-msoac_reconnect"
+
+    promoted = await repo.promote_pending_to_active(
+        organization_id="o_test",
+        nonce="nonce-second",
+        encrypted_refresh_token="cipher-new",
+        encrypted_method=EncryptMethod.AES,
+        scopes_granted=["Mail.Read", "User.Read", "offline_access"],
+        initiating_user_id="user-2",
+        tenant_id="tenant-1",
+        object_id="object-1",
+        now=now,
+    )
+
+    assert (promoted.id, promoted.state) == ("msoac_reconnect", STATE_ACTIVE)
+    async with engine.connect() as conn:
+        initiator = await conn.scalar(
+            select(MicrosoftOAuthCredentialModel.initiating_user_id).where(
+                MicrosoftOAuthCredentialModel.id == "msoac_reconnect"
+            )
+        )
+    assert initiator == "user-1"
+    payload = await repo.load_active_ciphertext("o_test", "msoac_reconnect")
+    assert payload is not None
+    assert payload.encrypted_refresh_token == "cipher-new"
+
+
+@pytest.mark.asyncio
+async def test_powerbi_reauthorization_keeps_the_connection_readable_when_email_was_granted(
+    repo: MicrosoftOAuthRepository,
+) -> None:
+    powerbi_scopes = list(POWERBI_DATASET_READ_SCOPES)
+    await _seed_active_connection(
+        repo,
+        "msoac_powerbi_email",
+        scopes=powerbi_scopes,
+        scopes_granted=["Dataset.Read.All", "offline_access", "openid", "profile", "email"],
+        initiating_user_id="owner",
+    )
+    now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+
+    started = await repo.begin_reauthorization(
+        credential_id="msoac_powerbi_email",
+        organization_id="o_test",
+        consent_nonce="nonce-powerbi",
+        consent_redirect_uri="https://app/callback",
+        consent_expires_at=now + datetime.timedelta(minutes=10),
+        consent_code_verifier="verifier-powerbi",
+        now=now,
+        outlook_scopes=["Mail.Read"],
+        powerbi_scopes=powerbi_scopes,
+        requesting_user_id="owner",
+    )
+
+    assert started is not None
+    assert "email" not in started.scopes_requested
+    assert is_powerbi_scope_profile(started.scopes_requested, started.scopes_granted)
+
+
+@pytest.mark.asyncio
+async def test_reauthorization_rejects_incompatible_legacy_and_unowned_connections(
+    repo: MicrosoftOAuthRepository,
+    engine: AsyncEngine,
+) -> None:
+    await _seed_active_connection(repo, "msoac_outlook")
+    await _seed_active_connection(repo, "msoac_legacy", tenant_id=None, object_id=None)
+    powerbi_scopes = ["https://analysis.windows.net/powerbi/api/Dataset.Read.All", "offline_access", "openid"]
+    await _seed_active_connection(repo, "msoac_powerbi", scopes=powerbi_scopes, initiating_user_id="owner")
+    now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+    common = {
+        "organization_id": "o_test",
+        "consent_nonce": "nonce-new",
+        "consent_redirect_uri": "https://app/callback",
+        "consent_expires_at": now + datetime.timedelta(minutes=10),
+        "consent_code_verifier": "verifier-new",
+        "now": now,
+        "outlook_scopes": ["Mail.Read", "offline_access", "openid", "profile", "User.Read"],
+        "powerbi_scopes": powerbi_scopes,
+    }
+
+    with pytest.raises(IncompatibleScopeProfileError):
+        await repo.begin_reauthorization(
+            credential_id="msoac_outlook",
+            requested_scopes=powerbi_scopes,
+            requesting_user_id="user-1",
+            **common,
+        )
+    with pytest.raises(ReconnectIdentityUnavailableError):
+        await repo.begin_reauthorization(
+            credential_id="msoac_legacy",
+            requested_scopes=None,
+            requesting_user_id="user-1",
+            **common,
+        )
+    with pytest.raises(PowerBIReconnectAccessDenied):
+        await repo.begin_reauthorization(
+            credential_id="msoac_powerbi",
+            requested_scopes=None,
+            requesting_user_id="other-user",
+            **common,
+        )
+    await repo.mark_revoked_and_scrub(
+        organization_id="o_test",
+        credential_id="msoac_outlook",
+        now=now,
+    )
+    assert (
+        await repo.begin_reauthorization(
+            credential_id="msoac_outlook",
+            requested_scopes=None,
+            requesting_user_id="user-1",
+            **common,
+        )
+        is None
+    )
+    assert (
+        await repo.begin_reauthorization(
+            credential_id="msoac_powerbi",
+            organization_id="o_other",
+            requested_scopes=None,
+            requesting_user_id="owner",
+            **{key: value for key, value in common.items() if key != "organization_id"},
+        )
+        is None
+    )
+
+    async with engine.connect() as conn:
+        rows = (
+            await conn.execute(
+                select(
+                    MicrosoftOAuthCredentialModel.id,
+                    MicrosoftOAuthCredentialModel.consent_nonce,
+                    MicrosoftOAuthCredentialModel.encrypted_refresh_token,
+                ).where(MicrosoftOAuthCredentialModel.id.in_(["msoac_outlook", "msoac_legacy", "msoac_powerbi"]))
+            )
+        ).all()
+    assert {row.id: (row.consent_nonce, row.encrypted_refresh_token) for row in rows} == {
+        "msoac_outlook": (None, None),
+        "msoac_legacy": (None, "cipher-msoac_legacy"),
+        "msoac_powerbi": (None, "cipher-msoac_powerbi"),
+    }
 
 
 @pytest.mark.asyncio

@@ -30,6 +30,7 @@ const control = vi.hoisted(() => ({
 }));
 vi.mock("./useDocRun", () => ({
   useDocRun: () => ({
+    rowsLoaded: true,
     runId: null,
     blocksByLabel: control.blocksByLabel,
     live: false,

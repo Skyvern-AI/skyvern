@@ -58,7 +58,7 @@ from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_copilot import CopilotAttachedFile
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatMessage as WorkflowCopilotChatMessageSchema
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotMessageFeedback
-from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.schemas.workflow_runs import AgentStepToolCall, WorkflowRunBlock
 from skyvern.forge.sdk.schemas.workflow_schedules import WorkflowSchedule
 from skyvern.forge.sdk.workflow import response_value_caps
 from skyvern.forge.sdk.workflow.constants import OUTPUT_PARAMETER_MAX_VALUE_BYTES
@@ -722,6 +722,7 @@ def convert_to_artifact(artifact_model: ArtifactModel, debug_enabled: bool = Fal
         uri=artifact_model.uri,
         bundle_key=artifact_model.bundle_key,
         checksum=artifact_model.checksum,
+        configured_name_sha256=artifact_model.configured_name_sha256,
         file_size=artifact_model.file_size,
         task_id=artifact_model.task_id,
         step_id=artifact_model.step_id,
@@ -1055,6 +1056,27 @@ def downloaded_file_count_from_output(output: dict | list | str | None) -> int |
     return None
 
 
+def _agent_step_tool_calls(workflow_run_block_model: WorkflowRunBlockModel) -> list[AgentStepToolCall] | None:
+    state = inspect(workflow_run_block_model, raiseerr=False)
+    if state is not None and "tool_calls" in state.unloaded:
+        return None
+    stored = workflow_run_block_model.tool_calls
+    # The jsonb size guard stores a marker dict in place of an oversized list.
+    if not isinstance(stored, list):
+        return None
+    calls: list[AgentStepToolCall] = []
+    for entry in stored:
+        try:
+            calls.append(AgentStepToolCall.model_validate(entry))
+        except pydantic.ValidationError as e:
+            LOG.warning(
+                "Dropped an invalid agent step tool call",
+                workflow_run_block_id=workflow_run_block_model.workflow_run_block_id,
+                errors=[(error["loc"], error["type"]) for error in e.errors(include_url=False, include_input=False)],
+            )
+    return calls
+
+
 def convert_to_workflow_run_block(
     workflow_run_block_model: WorkflowRunBlockModel,
     task: Task | None = None,
@@ -1099,6 +1121,7 @@ def convert_to_workflow_run_block(
         if workflow_run_block_model.script_run
         else None,
         downloaded_file_count=workflow_run_block_model.downloaded_file_count,
+        tool_calls=_agent_step_tool_calls(workflow_run_block_model),
     )
     if task:
         if task.finished_at and task.started_at:

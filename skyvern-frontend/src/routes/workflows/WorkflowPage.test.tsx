@@ -18,15 +18,19 @@ import {
   useLocation,
 } from "react-router-dom";
 
+import { AxiosError, AxiosHeaders } from "axios";
+
 import { Status, type WorkflowRunApiResponse } from "@/api/types";
 import CloudContext from "@/store/CloudContext";
 import { PageSlotsProvider, type PageSlots } from "@/store/PageSlots";
 import { WorkflowPage } from "./WorkflowPage";
 
-const { mockFeatureFlagEnabled, mockWorkflowRunsQuery } = vi.hoisted(() => ({
-  mockFeatureFlagEnabled: vi.fn(),
-  mockWorkflowRunsQuery: vi.fn(),
-}));
+const { mockFeatureFlagEnabled, mockWorkflowRunsQuery, mockWorkflowQuery } =
+  vi.hoisted(() => ({
+    mockFeatureFlagEnabled: vi.fn(),
+    mockWorkflowRunsQuery: vi.fn(),
+    mockWorkflowQuery: vi.fn(),
+  }));
 
 vi.mock("posthog-js/react", () => ({
   useFeatureFlagEnabled: (flag: string) => mockFeatureFlagEnabled(flag),
@@ -101,13 +105,14 @@ vi.mock("./workflowRun/WorkflowReliabilityPanel", () => ({
 }));
 
 vi.mock("./hooks/useWorkflowQuery", () => ({
-  useWorkflowQuery: () => ({
-    data: {
-      title: "Test Workflow",
-      workflow_definition: { parameters: [] },
+  useWorkflowQuery: () =>
+    mockWorkflowQuery() ?? {
+      data: {
+        title: "Test Workflow",
+        workflow_definition: { parameters: [] },
+      },
+      isLoading: false,
     },
-    isLoading: false,
-  }),
 }));
 
 vi.mock("./hooks/useGlobalWorkflowsQuery", () => ({
@@ -177,6 +182,7 @@ vi.mock("@/store/onboarding/useOnboardingState", () => ({
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  mockWorkflowQuery.mockReset();
 });
 
 type RenderOptions = {
@@ -184,6 +190,9 @@ type RenderOptions = {
   pageSlots?: PageSlots;
   initialEntries?: Array<string>;
   workflowRuns?: Array<WorkflowRunApiResponse>;
+  // Returned to the unfiltered single-run lookup a 404ing agent makes.
+  latestRuns?: Array<WorkflowRunApiResponse>;
+  latestRunsError?: boolean;
 };
 
 function LocationProbe() {
@@ -196,12 +205,19 @@ function renderWorkflowPage({
   pageSlots = {},
   initialEntries = ["/workflows/wpid_abc123"],
   workflowRuns = [],
+  latestRuns = workflowRuns,
+  latestRunsError = false,
 }: RenderOptions = {}) {
   mockFeatureFlagEnabled.mockReturnValue(true);
-  mockWorkflowRunsQuery.mockReturnValue({
-    data: workflowRuns,
-    isLoading: false,
-  });
+  mockWorkflowRunsQuery.mockImplementation(
+    ({ pageSize }: { pageSize?: number }) =>
+      pageSize === 1 && latestRunsError
+        ? { data: undefined, isLoading: false, isError: true }
+        : {
+            data: pageSize === 1 ? latestRuns : workflowRuns,
+            isLoading: false,
+          },
+  );
 
   return render(
     <CloudContext.Provider value={isCloud}>
@@ -437,6 +453,68 @@ describe("Past Runs list state in the URL", () => {
     );
 
     expect(locationSearch(container)).not.toContain("status=");
+  });
+});
+
+describe("agent that 404s", () => {
+  // Soft-deleted agents 404 on GET /workflows/{id} but keep their run history.
+  function mockWorkflowNotFound() {
+    mockWorkflowQuery.mockReturnValue({
+      data: undefined,
+      isLoading: false,
+      isError: true,
+      error: new AxiosError("Not Found", "404", undefined, undefined, {
+        status: 404,
+        statusText: "Not Found",
+        data: {},
+        headers: {},
+        config: { headers: new AxiosHeaders() },
+      }),
+    });
+  }
+
+  it("keeps the deleted agent's history when the filtered list is empty", () => {
+    mockWorkflowNotFound();
+    renderWorkflowPage({
+      initialEntries: ["/workflows/wpid_abc123?period=7d&status=failed"],
+      workflowRuns: [],
+      latestRuns: [makeWorkflowRun({ workflow_title: "Old Agent" })],
+    });
+
+    expect(screen.getByText("Old Agent (deleted)")).toBeTruthy();
+    expect(screen.getByText("Past Runs")).toBeTruthy();
+    expect(screen.queryByText("Not Found")).toBeNull();
+    for (const name of ["Scripts", "Edit", "Run"]) {
+      expect(screen.queryByRole("link", { name })).toBeNull();
+    }
+  });
+
+  it("keeps the page when the latest-run lookup fails", () => {
+    mockWorkflowNotFound();
+    renderWorkflowPage({
+      workflowRuns: [
+        makeWorkflowRun({
+          workflow_run_id: "wr_kept",
+          workflow_title: "Old Agent",
+        }),
+      ],
+      latestRunsError: true,
+    });
+
+    expect(screen.getByText("wr_kept")).toBeTruthy();
+    expect(screen.getByText("Old Agent (deleted)")).toBeTruthy();
+    expect(screen.queryByText("Not Found")).toBeNull();
+  });
+
+  it("shows the 404 page when the agent has no runs", () => {
+    mockWorkflowNotFound();
+    // The cloud app always adds a default ?period= window.
+    renderWorkflowPage({
+      initialEntries: ["/workflows/wpid_abc123?period=365d&page=1"],
+    });
+
+    expect(screen.getByText("Not Found")).toBeTruthy();
+    expect(screen.queryByText("Past Runs")).toBeNull();
   });
 });
 

@@ -448,6 +448,8 @@ class ArtifactModel(Base):
     browser_session_id = Column(String, nullable=True)
     checksum = Column(String, nullable=True)
     file_size = Column(BigInteger, nullable=True)
+    # The checksum of the content a configured download name was given to; it vouches for no other content.
+    configured_name_sha256 = Column(String(64), nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,
@@ -1710,6 +1712,8 @@ class WorkflowRunBlockModel(Base):
     # Scalar mirror of output["downloaded_files"] length: the JSON output column is
     # not replicated downstream, so download success would not otherwise be queryable.
     downloaded_file_count = Column(Integer, nullable=True)
+    # A large display-only list, so block reads load it only when asked for.
+    tool_calls = deferred(Column(JSON, nullable=True))
     attempt_number = Column(Integer, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
@@ -2102,6 +2106,7 @@ class CredentialModel(Base):
     browser_profile_id = Column(String, nullable=True)
     auto_profile_disabled = Column(Boolean, nullable=True, default=False)
     tested_url = Column(String, nullable=True)
+    extra_site_urls = Column(JSON, nullable=True)
     user_context = Column(String(1000), nullable=True)
     save_browser_session_intent = Column(Boolean, nullable=True, default=False)
     pin_saved_session_ip = Column(Boolean, nullable=False, default=False, server_default=sqlalchemy.false())
@@ -2241,7 +2246,7 @@ class WorkflowScriptModel(Base):
     workflow_id = Column(String, nullable=True)
     workflow_run_id = Column(String, nullable=True)
     cache_key = Column(String, nullable=False)  # e.g. "test-{{ website_url }}-cache"
-    cache_key_value = Column(String, nullable=False)  # e.g. "test-greenhouse.io/job/1-cache"
+    cache_key_value = Column(String, nullable=False)  # e.g. "jobs.example.com/job/1-cache"
     status = Column(String, nullable=True, default="published")
 
     # Script pinning

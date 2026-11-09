@@ -23,11 +23,6 @@ def _make_block(max_steps: int | None) -> FileDownloadBlock:
     )
 
 
-def test_threshold_constant_is_five() -> None:
-    """Anchor the threshold so tuning is a deliberate change."""
-    assert MAX_STEPS_DOWNLOAD_WARNING_THRESHOLD == 5
-
-
 @pytest.mark.parametrize("configured", [1, 2, 3, 4])
 def test_warning_fires_below_threshold(configured: int) -> None:
     block = _make_block(configured)

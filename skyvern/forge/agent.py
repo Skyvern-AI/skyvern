@@ -1428,6 +1428,7 @@ def recovery_credential_release_guard(
                 tested_url=tested_url,
                 vault_sites=workflow_run_context.bitwarden_login_sites.get(key),
                 enforce_vault_sites=enforce_vault_sites,
+                extra_site_urls=workflow_run_context.credential_extra_site_urls.get(key, ()),
             )
             if isinstance(fields, dict)
             else []
@@ -2552,8 +2553,13 @@ class ForgeAgent:
                     will_rename=local_basename != desired_name,
                 )
                 recorded_path = os.path.join(workflow_download_directory, local_file_name)
+                unnamed_path = recorded_path
                 if local_basename != desired_name:
                     recorded_path = rename_file(recorded_path, desired_name)
+                # rename_file returns the old path when it fails, so only a rename that took effect records a receipt.
+                download_run_id = resolve_run_download_id(context, fallback_run_id=task.workflow_run_id)
+                if context is not None and download_run_id and recorded_path != unnamed_path:
+                    await context.record_configured_download(recorded_path, download_run_id)
                 if recorded_into is not None:
                     recorded_into.append(recorded_path)
                 continue
@@ -10321,8 +10327,8 @@ class ForgeAgent:
                                 for file in exc.skipped_files
                             )
                         # Reconcile session-scoped DOWNLOAD rows the watcher left unbound, so
-                        # GET /v1/runs/{id} surfaces them (see
-                        # cloud_docs/BROWSER_SESSION_DOWNLOAD_ARTIFACTS.md).
+                        # GET /v1/runs/{id} surfaces them (see the browser session download
+                        # artifacts doc).
                         browser_session_id = context.browser_session_id if context else None
                         if browser_session_id and task.organization_id and finalization_run_id:
                             try:

@@ -113,8 +113,6 @@ async def take_steer_input(ctx: object) -> list[dict[str, Any]]:
         copilot_ctx.handled_steer_ids.add(steer.steer_id)
         if copilot_ctx.request_policy is not None:
             copilot_ctx.request_policy.project_steer_message(steer)
-    if copilot_ctx.request_policy is not None and any(steer.raw_secret_detected for steer in steers):
-        copilot_ctx.allow_untested_workflow_draft = copilot_ctx.request_policy.raw_secret_redacted_draft
     LOG.info(
         "copilot_steer_delivered",
         turn_id=copilot_ctx.turn_id,

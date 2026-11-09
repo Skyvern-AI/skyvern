@@ -25,7 +25,6 @@ class ResponseKind(StrEnum):
 class OutputPolicyReason(StrEnum):
     RAW_SECRET_LEAK = "raw_secret_leak"
     UNAPPROVED_CREDENTIAL_REFERENCE = "unapproved_credential_reference"
-    CREDENTIAL_SCOPE_BROADENED = "credential_scope_broadened"
     PERSISTENCE_STATE_MISMATCH = "persistence_state_mismatch"
     OUTPUT_POLICY_CONTEXT_MISSING = "output_policy_context_missing"
 

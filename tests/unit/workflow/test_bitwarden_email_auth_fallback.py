@@ -22,6 +22,8 @@ async def test_org_email_bitwarden_auth_falls_back_to_global_credentials(
         credential=SimpleNamespace(
             email="test@example.com",
             master_password="org-master-password",
+            client_id=None,
+            client_secret=None,
         )
     )
 

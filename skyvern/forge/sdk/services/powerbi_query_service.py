@@ -208,8 +208,8 @@ def _parse_rows_payload(payload: object, max_rows: int) -> list[dict[str, Any]]:
             raise PowerBIQueryError("invalid_response")
 
     provider_row_limit = min(MAX_PROVIDER_ROWS, MAX_PROVIDER_VALUES // len(columns))
-    # Reaching either cap can hide a truncated result, so fail rather than return a subset.
-    if len(rows) >= min(max_rows, provider_row_limit):
+    # Reaching the provider cap can hide a truncated result.
+    if len(rows) > max_rows or len(rows) >= provider_row_limit:
         raise PowerBIQueryError("row_limit_exceeded")
 
     # Preserve provider labels verbatim; normalization could collapse distinct DAX aliases.
@@ -247,8 +247,8 @@ def parse_powerbi_hop_rows(body: bytes, max_rows: int) -> list[dict[str, Any]]:
             raise PowerBIQueryError("invalid_response")
         if any(not isinstance(value, (str, int, float, bool, type(None))) for value in row.values()):
             raise PowerBIQueryError("invalid_response")
-    row_limit = min(max_rows, MAX_PROVIDER_ROWS, MAX_PROVIDER_VALUES // len(columns))
-    if len(rows) >= row_limit:
+    provider_row_limit = min(MAX_PROVIDER_ROWS, MAX_PROVIDER_VALUES // len(columns))
+    if len(rows) > max_rows or len(rows) >= provider_row_limit:
         raise PowerBIQueryError("row_limit_exceeded")
     return rows
 

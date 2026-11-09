@@ -9,6 +9,7 @@ import { GoogleOAuthCredential } from "@/api/types";
 import { MessageIcon } from "@/components/icons/MessageIcon";
 import { GoogleOAuthClientConfigForm } from "@/components/GoogleOAuthClientConfigForm";
 import { Button } from "@/components/ui/button";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import {
   Card,
   CardContent,
@@ -79,6 +80,10 @@ const integrations = [
 function Integrations() {
   const [connectingId, setConnectingId] = useState<string | null>(null);
   const [reconnectingId, setReconnectingId] = useState<string | null>(null);
+  const [pendingSetAccount, setPendingSetAccount] = useState<{
+    credential: GoogleOAuthCredential;
+    capability?: GmailCapability;
+  } | null>(null);
   const [enabling, setEnabling] = useState<{
     credentialId: string;
     capability: GmailCapability;
@@ -129,13 +134,21 @@ function Integrations() {
   // Re-authenticate an existing connection in place. Passing credential_id keeps
   // the connection's identity so workflows referencing it keep working — the
   // backend re-requests the scopes originally granted to this credential.
-  const reconnect = async (credential: GoogleOAuthCredential) => {
+  const reconnect = async (
+    credential: GoogleOAuthCredential,
+    setAccount = false,
+  ) => {
+    if (!setAccount && credential.account_recorded === false) {
+      setPendingSetAccount({ credential });
+      return;
+    }
     setReconnectingId(credential.id);
     try {
       const response = await startAuthorize({
         redirect_uri: buildGoogleOAuthRedirectUri(),
         app_origin: getGoogleOAuthAppOrigin(),
         credential_id: credential.id,
+        ...(setAccount ? { set_account: true } : {}),
       });
       window.location.assign(response.authorize_url);
     } finally {
@@ -148,7 +161,12 @@ function Integrations() {
   const enableCapability = async (
     credential: GoogleOAuthCredential,
     capability: GmailCapability,
+    setAccount = false,
   ) => {
+    if (!setAccount && credential.account_recorded === false) {
+      setPendingSetAccount({ credential, capability });
+      return;
+    }
     setEnabling({ credentialId: credential.id, capability });
     try {
       const response = await startAuthorize({
@@ -156,6 +174,7 @@ function Integrations() {
         app_origin: getGoogleOAuthAppOrigin(),
         credential_id: credential.id,
         scope_profile: capability === "send" ? "gmail_send" : "gmail",
+        ...(setAccount ? { set_account: true } : {}),
       });
       storeGoogleOAuthIntegrationIdForState(response.state, "gmail");
       window.location.assign(response.authorize_url);
@@ -165,7 +184,7 @@ function Integrations() {
   };
 
   return (
-    <div className="mx-auto flex max-w-5xl flex-col gap-6 p-6">
+    <div className="flex flex-col gap-6">
       <Card>
         <CardHeader className="border-b-2">
           <CardTitle className="text-lg">Google Integrations</CardTitle>
@@ -420,6 +439,27 @@ function Integrations() {
           )}
         </CardContent>
       </Card>
+      <ConfirmDialog
+        open={pendingSetAccount !== null}
+        onOpenChange={(open) => {
+          if (!open) setPendingSetAccount(null);
+        }}
+        title="Set Google account?"
+        description="This connection has no recorded Google account. Sign in with the account it should use. Workflows using this connection will use that account."
+        reversible
+        confirmLabel="Continue"
+        confirmVariant="default"
+        onConfirm={() => {
+          const pending = pendingSetAccount;
+          if (!pending) return;
+          setPendingSetAccount(null);
+          if (pending.capability) {
+            void enableCapability(pending.credential, pending.capability, true);
+          } else {
+            void reconnect(pending.credential, true);
+          }
+        }}
+      />
     </div>
   );
 }

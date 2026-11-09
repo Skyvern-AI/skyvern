@@ -126,20 +126,22 @@ function formatExecutionTime(
   if (isNaN(start.getTime()) || isNaN(end.getTime())) {
     return null;
   }
-  const totalSeconds = Math.max(
-    0,
-    Math.round((end.getTime() - start.getTime()) / 1000),
-  );
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = totalSeconds % 60;
-  if (hours > 0) {
-    return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
+  return formatSeconds((end.getTime() - start.getTime()) / 1000);
+}
+
+// Keeps the two largest units, so a 26h span reads "1d 2h".
+function formatSeconds(seconds: number): string {
+  const sec = Math.max(0, Math.round(seconds));
+  if (sec < 60) {
+    return `${sec}s`;
   }
-  if (minutes > 0) {
-    return seconds > 0 ? `${minutes}m ${seconds}s` : `${minutes}m`;
+  if (sec < 3600) {
+    return `${Math.floor(sec / 60)}m ${sec % 60}s`;
   }
-  return `${seconds}s`;
+  if (sec < 86400) {
+    return `${Math.floor(sec / 3600)}h ${Math.floor((sec % 3600) / 60)}m`;
+  }
+  return `${Math.floor(sec / 86400)}d ${Math.floor((sec % 86400) / 3600)}h`;
 }
 
 function formatDurationSeconds(seconds: number | null | undefined): string {
@@ -147,12 +149,7 @@ function formatDurationSeconds(seconds: number | null | undefined): string {
     return "—";
   }
 
-  const total = Math.round(seconds);
-  if (total < 60) {
-    return `${total}s`;
-  }
-
-  return `${Math.floor(total / 60)}m ${total % 60}s`;
+  return formatSeconds(seconds);
 }
 
 export {
@@ -165,4 +162,5 @@ export {
   formatTimeRemaining,
   formatExecutionTime,
   formatDurationSeconds,
+  formatSeconds,
 };

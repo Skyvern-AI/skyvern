@@ -18,6 +18,7 @@ from skyvern.forge.log_redaction import redact_sensitive_fields
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler, handler_llm_key
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
+from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
 from skyvern.forge.sdk.copilot.ask_user import QuestionInteraction
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.context import ProposedCredential, StructuredContext
@@ -63,7 +64,7 @@ from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     workflow_credential_ids,
     workflow_credential_origins,
 )
-from skyvern.forge.sdk.credential_site_policy import same_release_scope
+from skyvern.forge.sdk.credential_site_policy import same_release_scope, same_site
 from skyvern.forge.sdk.schemas.credentials import Credential, TotpType
 from skyvern.forge.sdk.schemas.google_oauth import STATE_ACTIVE
 from skyvern.forge.sdk.schemas.workflow_copilot import (
@@ -75,6 +76,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
 )
 from skyvern.forge.sdk.services import google_oauth_service
 from skyvern.forge.sdk.services.credential.credential_vault_service import VaultLogin, VaultLoginListing
+from skyvern.forge.sdk.workflow.models.credential_release import saved_site_urls
 from skyvern.forge.sdk.workflow.models.parameter import ParameterType
 from skyvern.schemas.google_sheets import extract_spreadsheet_id
 from skyvern.utils.strings import escape_code_fences
@@ -133,7 +135,6 @@ ClarificationReason = Literal[
     "invalid_conditional_container",
     "missing_conditional_condition",
     "missing_target_context",
-    "workflow_credential_inputs_unbound",
     "login_credentials_unresolved",
     "safety_screen_unavailable",
 ]
@@ -598,18 +599,12 @@ _VALID_CLARIFICATION_REASONS: frozenset[ClarificationReason] = frozenset(get_arg
 _DETERMINISTIC_ONLY_CLARIFICATION_REASONS: frozenset[ClarificationReason] = frozenset(
     {"login_credentials_unresolved", "safety_screen_unavailable"}
 )
-# Concrete credential states for which the combined update-and-run tool persists
-# the draft but cannot start a browser run.
-CREDENTIAL_DEFERRED_DRAFT_REASONS: frozenset[ClarificationReason] = frozenset(
-    {"workflow_credential_inputs_unbound", "credential_name_unresolved"}
-)
 # Broader: any reason credential_prompt_reason() should surface an add-credential CTA for.
 CREDENTIAL_PROMPT_CLARIFICATION_REASONS: frozenset[ClarificationReason] = frozenset(
     {
         "raw_secret",
         "credential_name_unresolved",
         "credential_invention_requested",
-        "workflow_credential_inputs_unbound",
         "login_credentials_unresolved",
     }
 )
@@ -1043,11 +1038,6 @@ class RequestPolicy:
     requires_user_clarification: bool = False
     allow_update_workflow: bool = True
     allow_run_blocks: bool = True
-    allow_missing_credentials_in_draft: bool = False
-    # Narrower than the flag above: True only when a credential-specific path (an explicit
-    # code-block credential draft, or a redacted raw secret) set it, not the generic
-    # skip_test fallthrough that fires for any untested draft regardless of credentials.
-    credential_draft_deferred_explicitly: bool = False
     user_response_policy: str = "proceed"
     completion_contract: str | None = None
     completion_criteria: list[CompletionCriterion] = field(default_factory=list)
@@ -1173,6 +1163,23 @@ class RequestPolicy:
             if ref in urls:
                 urls[credential_id] = urls.pop(ref)
 
+    def refresh_credential(self, credential: Credential) -> None:
+        """Swap in a re-read row wherever this turn holds the credential, so its saved sites are current."""
+        for credentials in (self.resolved_credentials, self.auto_bound_credentials, self.discovered_credentials):
+            for index, held in enumerate(credentials):
+                if held.credential_id == credential.credential_id:
+                    credentials[index] = credential
+
+    def credential_saved_site_urls(self, credential_id: str) -> list[str]:
+        return next(
+            (
+                saved_site_urls(credential.tested_url, credential.extra_site_urls)
+                for credential in self.resolved_credentials
+                if credential.credential_id == credential_id
+            ),
+            [],
+        )
+
     def credential_intended_url(self, credential_id: str) -> str | None:
         admitted_url = self.live_page_admitted_urls.get(credential_id)
         if admitted_url:
@@ -1233,10 +1240,6 @@ class RequestPolicy:
         self.raw_secret_detected = True
         self.raw_secret_handling = "redacted_draft"
         self.raw_secret_safety_status = "detected"
-        self.testing_intent = "skip_test"
-        self.allow_run_blocks = False
-        self.allow_missing_credentials_in_draft = True
-        self.credential_draft_deferred_explicitly = True
 
     def graded_completion_criteria(self) -> list[CompletionCriterion]:
         return [criterion for criterion in self.completion_criteria if not criterion.method_mandated]
@@ -1249,8 +1252,6 @@ class RequestPolicy:
             "clarification_reason": self.clarification_reason,
             "allow_update_workflow": self.allow_update_workflow,
             "allow_run_blocks": self.allow_run_blocks,
-            "allow_missing_credentials_in_draft": self.allow_missing_credentials_in_draft,
-            "credential_draft_deferred_explicitly": self.credential_draft_deferred_explicitly,
             "resolved_credential_count": len(self.resolved_credentials),
             "run_approved_google_connection_count": len(self.run_approved_google_connection_ids),
             "has_completion_contract": bool(self.completion_contract),
@@ -1449,14 +1450,8 @@ def credential_binding(policy: RequestPolicy, credential_id: str) -> CredentialB
 
 
 def credential_prompt_reason(policy: RequestPolicy | None) -> str | None:
-    # The explicit-defer flag, not allow_missing_credentials_in_draft, because the latter
-    # also covers the generic skip_test fallthrough with no credential involvement.
-    if not isinstance(policy, RequestPolicy):
-        return None
-    if policy.clarification_reason in CREDENTIAL_PROMPT_CLARIFICATION_REASONS:
+    if isinstance(policy, RequestPolicy) and policy.clarification_reason in CREDENTIAL_PROMPT_CLARIFICATION_REASONS:
         return policy.clarification_reason
-    if policy.credential_draft_deferred_explicitly:
-        return "credential_deferred_draft"
     return None
 
 
@@ -4407,6 +4402,9 @@ def credential_candidate_label(credential: Credential) -> str:
     facts: list[str] = []
     if credential.tested_url:
         facts.append(f'tested_url: "{_account_state_atom(credential.tested_url)}"')
+    if credential.extra_site_urls:
+        extra = ", ".join(f'"{_account_state_atom(url)}"' for url in credential.extra_site_urls)
+        facts.append(f"also saved for: {extra}")
     if credential.totp_type != TotpType.NONE:
         facts.append(f"totp_type: {credential.totp_type}")
     if not facts:
@@ -4478,6 +4476,25 @@ def _project_user_provided_sites(
             seen_origins.add(parts[2])
             policy.user_provided_site_urls.append(cleaned)
             policy.user_site_url_sources[cleaned] = item.source
+
+
+def still_on_admitted_site(current_url: str | None, admitted_url: str) -> bool:
+    # Origin, not path: a sign-in walks several paths of one site, but the secret must not follow a redirect off it.
+    admitted_parts = _url_parts(admitted_url)
+    current_parts = _url_parts(current_url or "")
+    admitted_origin = canonicalize_origin(admitted_parts[2]) if admitted_parts else None
+    current_origin = canonicalize_origin(current_parts[2]) if current_parts else None
+    return bool(current_origin and admitted_origin and current_origin == admitted_origin)
+
+
+def user_provided_site_url_match(policy: RequestPolicy, page_url: str) -> tuple[str | None, bool]:
+    # Hosts outside the public suffix list (internal domains, localhost) fall back to an exact-origin match.
+    for url in policy.user_provided_site_urls:
+        if same_site(page_url, url):
+            return url, True
+        if still_on_admitted_site(page_url, url):
+            return url, False
+    return None, False
 
 
 def project_question_response_sites(policy: RequestPolicy, interaction: QuestionInteraction) -> None:
@@ -4639,7 +4656,7 @@ def live_page_credentials_admissible(policy: RequestPolicy) -> bool:
     Callers that must pay for evidence — a browser read, a credential load — check this first so a
     turn that could never admit does not buy the evidence to decide it.
     """
-    return not policy.raw_secret_detected and not policy.named_login_not_found
+    return not policy.named_login_not_found
 
 
 def _live_page_url_abstains(
@@ -5115,13 +5132,8 @@ async def _build_request_policy_bootstrap(
             exc_info=True,
         )
 
-    # The literal is already absent from server-owned provenance. RequestPolicy keeps
-    # the safety-approved redacted draft update-only and prevents a browser run.
-    if policy.raw_secret_detected:
+    if policy.raw_secret_detected and not policy.raw_secret_redacted_draft:
         policy.allow_run_blocks = False
-        redacted_draft_candidate = policy.raw_secret_redacted_draft
-        policy.allow_missing_credentials_in_draft = redacted_draft_candidate
-        policy.credential_draft_deferred_explicitly = redacted_draft_candidate
 
     trace_data = policy.to_trace_data()
     with copilot_span("request_policy", data=trace_data):
@@ -5175,8 +5187,8 @@ async def build_request_policy_trust_floor(
     safety = await screen_raw_secret_safety(user_message, handler, organization_id=organization_id)
     credential_ids = _credential_ids(user_message)
     raw_secret_present = safety.status == "detected"
-    # Only an unavailable screen withholds the turn. A screen that ran and cited redacts what it
-    # cited and continues update-only, so a detection never costs the user the rest of their turn.
+    # Only an unavailable screen withholds the turn. A screen that ran and cited redacts what it cited,
+    # and the turn otherwise runs as normal.
     safety_blocked = safety.status == "blocked"
     policy = RequestPolicy(
         authoring_intent="author_now",

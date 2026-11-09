@@ -17,14 +17,7 @@ import {
   BULK_CONCURRENCY_LIMIT,
   runWithConcurrency,
 } from "@/util/runWithConcurrency";
-import {
-  Pagination,
-  PaginationContent,
-  PaginationItem,
-  PaginationLink,
-  PaginationNext,
-  PaginationPrevious,
-} from "@/components/ui/pagination";
+import { SimplePagination } from "@/components/ui/pagination";
 import {
   Select,
   SelectContent,
@@ -43,7 +36,6 @@ import {
 } from "@/components/ui/table";
 import { useBrowserProfilesQuery } from "@/routes/workflows/hooks/useBrowserProfilesQuery";
 import { useBrowserProfileCreateStore } from "@/store/useBrowserProfileCreateStore";
-import { cn } from "@/util/utils";
 
 import { BrowserProfileItem } from "./BrowserProfileItem";
 
@@ -63,16 +55,6 @@ function BrowserProfilesList({ searchKey, managed }: Props = {}) {
     const params = new URLSearchParams(searchParams);
     Object.entries(patch).forEach(([k, v]) => params.set(k, v));
     setSearchParams(params, { replace: true });
-  }
-
-  function handlePreviousPage() {
-    if (page === 1) return;
-    setParamPatch({ page: String(page - 1) });
-  }
-
-  function handleNextPage() {
-    if (isNextDisabled) return;
-    setParamPatch({ page: String(page + 1) });
   }
 
   const {
@@ -248,7 +230,7 @@ function BrowserProfilesList({ searchKey, managed }: Props = {}) {
   return (
     <div className="space-y-4">
       <div className="overflow-hidden rounded-lg border border-border">
-        <Table className="w-full table-fixed">
+        <Table className="min-w-[960px] table-fixed">
           <TableHeader>
             <TableRow className="group/header">
               <SelectionHeaderCheckboxCell
@@ -304,8 +286,8 @@ function BrowserProfilesList({ searchKey, managed }: Props = {}) {
             ))}
           </TableBody>
         </Table>
-        <div className="relative px-3 py-3">
-          <div className="absolute left-3 top-1/2 flex -translate-y-1/2 items-center gap-2 text-sm">
+        <div className="relative flex flex-col items-center gap-2 px-3 py-3 sm:block">
+          <div className="flex items-center gap-2 text-sm sm:absolute sm:left-3 sm:top-1/2 sm:-translate-y-1/2">
             <span className="text-neutral-600 dark:text-slate-400">
               Items per page
             </span>
@@ -329,29 +311,14 @@ function BrowserProfilesList({ searchKey, managed }: Props = {}) {
               </SelectContent>
             </Select>
           </div>
-          <Pagination className="pt-0">
-            <PaginationContent>
-              <PaginationItem>
-                <PaginationPrevious
-                  className={cn({
-                    "cursor-not-allowed opacity-50": page === 1,
-                  })}
-                  onClick={handlePreviousPage}
-                />
-              </PaginationItem>
-              <PaginationItem>
-                <PaginationLink>{page}</PaginationLink>
-              </PaginationItem>
-              <PaginationItem>
-                <PaginationNext
-                  className={cn({
-                    "cursor-not-allowed opacity-50": isNextDisabled,
-                  })}
-                  onClick={handleNextPage}
-                />
-              </PaginationItem>
-            </PaginationContent>
-          </Pagination>
+          <SimplePagination
+            className="pt-0"
+            page={page}
+            hasNext={!isNextDisabled}
+            onPageChange={(nextPage) =>
+              setParamPatch({ page: String(nextPage) })
+            }
+          />
         </div>
       </div>
       {selectedProfiles.length > 0 && (

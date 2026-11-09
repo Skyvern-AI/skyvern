@@ -2,7 +2,6 @@ import { useQuery } from "@tanstack/react-query";
 import { useNodesData } from "@xyflow/react";
 
 import { getClient } from "@/api/AxiosClient";
-import { ReadableActionTypes } from "@/api/types";
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -20,6 +19,7 @@ import { workflowBlockTitle } from "../types";
 import {
   AGENT_STEP_MAX_TURNS_LIMIT,
   agentStepDefaultDataSchema,
+  agentStepToolTitles,
   type AgentStepNode,
   type AgentStepNodeData,
 } from "./types";
@@ -30,17 +30,10 @@ type AgentStepTool = {
   block_type: WorkflowBlockType | null;
 };
 
-const nonBlockToolTitles: Record<string, string> = {
-  page_goto: workflowBlockTitle.goto_url,
-  page_click: ReadableActionTypes.click,
-  page_fill: ReadableActionTypes.input_text,
-  page_extract: ReadableActionTypes.extract,
-};
-
 function agentStepToolTitle(tool: AgentStepTool): string {
   return (
     (tool.block_type && workflowBlockTitle[tool.block_type]) ||
-    nonBlockToolTitles[tool.name] ||
+    agentStepToolTitles[tool.name] ||
     tool.name
   );
 }

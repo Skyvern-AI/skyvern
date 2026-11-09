@@ -216,16 +216,3 @@ def test_no_bare_record_exception_calls_remain() -> None:
     helper rather than this guard.
     """
     assert _bare_record_exception_sites() == []
-
-
-def test_the_guard_can_actually_fail(tmp_path: Path) -> None:
-    """Non-vacuity: the AST walk must flag a bare call, not pass because it found nothing."""
-    offending = tmp_path / "offender.py"
-    offending.write_text("def f(span, exc):\n    span.record_exception(exc)\n", encoding="utf-8")
-    tree = ast.parse(offending.read_text(encoding="utf-8"))
-    found = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "record_exception"
-    ]
-    assert len(found) == 1

@@ -1412,6 +1412,7 @@ def test_password_response_exposes_seed_presence_without_secret() -> None:
         auto_profile_disabled=False,
         pin_saved_session_ip=False,
         tested_url=None,
+        extra_site_urls=[],
         user_context=None,
         save_browser_session_intent=False,
         run_sequentially=False,

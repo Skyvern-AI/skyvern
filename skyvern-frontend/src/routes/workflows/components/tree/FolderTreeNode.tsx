@@ -146,7 +146,7 @@ function FolderTreeNode({
                       type="button"
                       onClick={() => setIsEditDialogOpen(true)}
                       className="rounded p-1.5 text-muted-foreground transition-colors hover:bg-slate-500/20 hover:text-tertiary-foreground"
-                      aria-label="Edit folder"
+                      aria-label={`Edit folder ${folder.title}`}
                     >
                       <Pencil1Icon className="h-4 w-4" />
                     </button>

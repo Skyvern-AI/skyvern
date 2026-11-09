@@ -30,7 +30,8 @@ from agents.items import TResponseOutputItem
 from agents.models.interface import Model
 from agents.tool_context import ToolContext
 from litellm.types.utils import ModelResponse as LitellmResponse
-from pydantic import ValidationError
+from openai.types.responses import ResponseFunctionToolCall
+from pydantic import JsonValue, ValidationError
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -51,11 +52,19 @@ from skyvern.forge.sdk.experimentation.providers import NoOpExperimentationProvi
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
+from skyvern.forge.sdk.schemas.workflow_runs import AgentStepToolCall
+from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager, WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import InvalidWorkflowDefinition
 from skyvern.forge.sdk.workflow.models import agent_step_loop, agent_step_tools
 from skyvern.forge.sdk.workflow.models.agent_step_block import AgentStepBlock
-from skyvern.forge.sdk.workflow.models.block import ConditionalBlock, ExtractionBlock, HttpRequestBlock, TaskBlock
+from skyvern.forge.sdk.workflow.models.block import (
+    ConditionalBlock,
+    ExtractionBlock,
+    HttpRequestBlock,
+    LoginBlock,
+    TaskBlock,
+)
 from skyvern.forge.sdk.workflow.models.parameter import (
     PLATFORM_SMTP_AWS_KEYS,
     AWSSecretParameter,
@@ -63,6 +72,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameterType,
 )
 from skyvern.forge.sdk.workflow.workflow_definition_converter import block_yaml_to_block, convert_workflow_definition
+from skyvern.forge.taskv3.opaque_refs import mask_opaque_urls
 from skyvern.schemas.llm import LLMConfig
 from skyvern.schemas.workflows import (
     AgentStepBlockYAML,
@@ -77,6 +87,8 @@ from skyvern.schemas.workflows import (
     WorkflowDefinitionYAML,
 )
 from skyvern.services import script_service
+from skyvern.utils.secret_redaction import REDACTED_SECRET_PLACEHOLDER
+from skyvern.webeye.actions.actions import ActionStatus, UploadFileAction
 from tests.unit.conftest import make_block_output_parameter
 from tests.unit.copilot_test_helpers import scripted_call, scripted_text, tool_outputs_for
 from tests.unit.test_context_manager import _initialize_smtp_workflow, _make_workflow, _platform_email
@@ -250,6 +262,7 @@ async def _run_agent_block(
     tools: list[str] | None = sorted(agent_step_tools.tool_descriptions()),
     parameter_keys: list[str] | None = None,
     stored_tools: list[str] | None = None,
+    block_model: dict[str, str | dict[str, str]] | None = None,
     **block_fields: bool,
 ) -> tuple[BlockResult, _FlagProvider]:
     """With no model, the block resolves the variant's real model, which sends through litellm.acompletion."""
@@ -266,6 +279,7 @@ async def _run_agent_block(
             max_turns=max_turns,
             tools=tools,
             parameter_keys=parameter_keys,
+            model=block_model,
             **block_fields,
         ),
         {
@@ -460,6 +474,18 @@ def _credential_parameter() -> WorkflowParameter:
         key="login_credential",
         workflow_parameter_id="wp_credential",
         workflow_parameter_type=WorkflowParameterType.CREDENTIAL_ID,
+        workflow_id="w_1",
+        created_at=now,
+        modified_at=now,
+    )
+
+
+def _file_parameter(key: str) -> WorkflowParameter:
+    now = datetime.now(UTC)
+    return WorkflowParameter(
+        key=key,
+        workflow_parameter_id=f"wp_{key}",
+        workflow_parameter_type=WorkflowParameterType.FILE_URL,
         workflow_id="w_1",
         created_at=now,
         modified_at=now,
@@ -738,6 +764,59 @@ async def test_agent_block_runs_only_on_a_flag_variant_that_pins_model_and_effor
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("variant", "model_name", "expected_key", "reasons"),
+    [
+        (HAIKU_MEDIUM, None, HAIKU_MEDIUM, None),
+        (HAIKU_MEDIUM, "luna-medium", LUNA_MEDIUM, None),
+        (HAIKU_MEDIUM, "luna-unpinned", None, ("'luna-unpinned'", "'LUNA_UNPINNED'")),
+        (HAIKU_MEDIUM, "not-in-the-list", HAIKU_MEDIUM, None),
+        (HAIKU_MEDIUM, {"name": "luna-medium"}, HAIKU_MEDIUM, None),
+        (None, "luna-medium", None, ("AGENT_BLOCK_LLM_NAME",)),
+    ],
+)
+async def test_the_block_model_picks_a_pinned_key_only_after_the_flag_enables_the_block(
+    monkeypatch: pytest.MonkeyPatch,
+    database: AgentDB,
+    variant: str | None,
+    model_name: str | dict[str, str] | None,
+    expected_key: str | None,
+    reasons: tuple[str, ...] | None,
+) -> None:
+    monkeypatch.setitem(LLMConfigRegistry._configs, HAIKU_MEDIUM, _pinned("medium", HAIKU))
+    monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
+    monkeypatch.setitem(
+        LLMConfigRegistry._configs,
+        "LUNA_UNPINNED",
+        LLMConfig("openai/test", [], supports_vision=False, add_assistant_prefix=False, reasoning_effort="medium"),
+    )
+    mapping = {
+        "luna-medium": {"llm_key": LUNA_MEDIUM, "label": "Luna (medium)"},
+        "luna-unpinned": {"llm_key": "LUNA_UNPINNED", "label": "Luna"},
+    }
+    monkeypatch.setattr(
+        type(SettingsManager.get_settings()),
+        "get_model_name_to_llm_key",
+        lambda _self, organization_id=None: mapping,
+    )
+    model = _ScriptedModel([[scripted_call("finish", {"answer": "ok"}, call_id="c1")]])
+
+    result, _ = await _run_agent_block(
+        monkeypatch, variant, model, block_model=None if model_name is None else {"model_name": model_name}
+    )
+
+    (row,) = await database.observer.get_workflow_run_blocks(workflow_run_id=RUN, organization_id=ORG)
+    if expected_key:
+        assert row.status == "completed"
+        assert isinstance(result.output_parameter_value, dict)
+        assert result.output_parameter_value["model"]["llm_key"] == expected_key
+    else:
+        assert row.status == "failed"
+        assert reasons and all(reason in (row.failure_reason or "") for reason in reasons)
+        assert model.inputs == []
+
+
+@pytest.mark.asyncio
 async def test_the_agent_block_sends_its_pinned_effort_on_a_bare_gpt_5_name(monkeypatch: pytest.MonkeyPatch) -> None:
     sent = _litellm_replies(monkeypatch, {"message": {"role": "assistant", "content": "ok"}})
     monkeypatch.setitem(LLMConfigRegistry._configs, "GPT5_PINNED_TEST", _pinned("high", "gpt-5.4"))
@@ -799,16 +878,7 @@ async def test_browser_task_hands_over_only_this_runs_files_by_name(
 ) -> None:
     monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
     context = app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts[RUN]
-    now = datetime.now(UTC)
-    fax_file = WorkflowParameter(
-        key="fax_file",
-        workflow_parameter_id="wp_fax",
-        workflow_parameter_type=WorkflowParameterType.FILE_URL,
-        workflow_id="w_1",
-        created_at=now,
-        modified_at=now,
-    )
-    context.parameters |= {"fax_file": fax_file, "login_credential": _credential_parameter()}
+    context.parameters |= {"fax_file": _file_parameter("fax_file"), "login_credential": _credential_parameter()}
     # A value left by an earlier execution of this step, whose child labels repeat.
     context.values |= {"fax_file": "file_123", CHILD_OUTPUT: {"llm_response": "stale"}}
     declared = dict(context.parameters)
@@ -849,6 +919,167 @@ async def test_browser_task_hands_over_only_this_runs_files_by_name(
         assert str(allowed) in report["error"]
         assert handed_over == []
     assert context.parameters == declared
+
+
+FORM_URL = "https://example.com/upload"
+FAX_URL = "https://bucket.example.com/fax.pdf?X-Amz-Signature=" + "0123456789abcdef" * 4
+NOTES_URL = "https://example.com/notes.pdf"
+DECOY_URL = "https://example.com/resume.pdf?signature=" + "fedcba9876543210" * 4
+MALFORMED_URL = "http://agent:pw@[bad/receipt.pdf?X-Amz-Signature=" + "9f8e7d6c5b4a3210" * 4
+DOWNLOADED_URL = "https://bucket.example.com/statement.pdf?X-Amz-Signature=" + "a1b2c3d4e5f60789" * 4
+
+
+def _token(url: str) -> str:
+    return mask_opaque_urls({"url": url}).mask(url)
+
+
+@pytest.mark.asyncio
+async def test_a_nested_agent_result_gives_page_url_at_start_and_each_upload_attempt(
+    monkeypatch: pytest.MonkeyPatch, database: AgentDB
+) -> None:
+    monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
+    context = app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts[RUN]
+    context.parameters |= {"fax_file": _file_parameter("fax_file"), "notes_file": _file_parameter("notes_file")}
+    context.values |= {"fax_file": FAX_URL, "notes_file": NOTES_URL}
+    working_page = SimpleNamespace(url="about:blank")
+    # The fourth call's page read and upload read both fail.
+    browser_state = SimpleNamespace(
+        get_working_page=AsyncMock(side_effect=[working_page] * 3 + [RuntimeError("page closed")]),
+        take_fullpage_screenshot=AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(app.BROWSER_MANAGER, "get_for_workflow_run", lambda *_, **__: browser_state)
+    read_actions = database.tasks.get_task_actions_hydrated
+    action_reads = [read_actions] * 3 + [AsyncMock(side_effect=RuntimeError("database unavailable"))]
+    monkeypatch.setattr(
+        database.tasks, "get_task_actions_hydrated", lambda *args, **kwargs: action_reads.pop(0)(*args, **kwargs)
+    )
+    # Each child: the upload rows its nested agent records, its status, its output, and the page it leaves.
+    children = [
+        (
+            [(_token(FAX_URL), ActionStatus.completed), (NOTES_URL, ActionStatus.completed)],
+            BlockStatus.completed,
+            None,
+            "https://agent:pw@example.com/upload?session_id=sK8pL2nQ5vR9xT3mW6yZ1aBc#done",
+        ),
+        (
+            [
+                (_token(DECOY_URL), ActionStatus.completed),
+                (MALFORMED_URL, ActionStatus.failed),
+                ("https://example.com/other.pdf?token=abc123", ActionStatus.failed),
+            ],
+            BlockStatus.completed,
+            {"downloaded_file_urls": [DOWNLOADED_URL]},
+            MALFORMED_URL,
+        ),
+        ([(_token(DOWNLOADED_URL), ActionStatus.completed)], BlockStatus.timed_out, None, FORM_URL),
+        ([(_token(FAX_URL), ActionStatus.completed)], BlockStatus.completed, None, FORM_URL),
+    ]
+
+    async def nested_agent(
+        block: TaskBlock, workflow_run_id: str, workflow_run_block_id: str, **_: object
+    ) -> BlockResult:
+        rows, status, output, page_after = children.pop(0)
+        task = await database.tasks.create_task(
+            url=block.url or "",
+            title=None,
+            navigation_goal=None,
+            data_extraction_goal=None,
+            navigation_payload=None,
+            organization_id=ORG,
+            workflow_run_id=RUN,
+        )
+        await database.observer.update_workflow_run_block(
+            workflow_run_block_id=workflow_run_block_id, organization_id=ORG, task_id=task.task_id
+        )
+        step = await database.tasks.create_step(
+            task_id=task.task_id, order=0, retry_index=0, organization_id=ORG, status=StepStatus.running
+        )
+        for order, (file_url, row_status) in enumerate(rows):
+            await database.workflow_params.create_action(
+                UploadFileAction(
+                    element_id="file",
+                    file_url=file_url,
+                    status=row_status,
+                    organization_id=ORG,
+                    workflow_run_id=RUN,
+                    task_id=task.task_id,
+                    step_id=step.step_id,
+                    step_order=0,
+                    action_order=order,
+                )
+            )
+        if output is not None:
+            await block.record_output_parameter_value(context, RUN, output)
+        working_page.url = page_after
+        return BlockResult(
+            success=status == BlockStatus.completed,
+            output_parameter=block.output_parameter,
+            output_parameter_value=output,
+            status=status,
+            workflow_run_block_id=workflow_run_block_id,
+        )
+
+    monkeypatch.setattr(TaskBlock, "execute", nested_agent)
+    model = _ScriptedModel(
+        [
+            [
+                scripted_call(
+                    "browser_task", {**UPLOAD, "url": FORM_URL, "files": ["fax_file", "notes_file"]}, call_id="upload"
+                )
+            ],
+            [scripted_call("browser_task", {"url": FORM_URL, "navigation_goal": "Read the receipt"}, call_id="read")],
+            [
+                scripted_call(
+                    "browser_task", {"navigation_goal": "Upload it", "files": ["agent_task_2_output"]}, call_id="again"
+                )
+            ],
+            [scripted_call("browser_task", {**UPLOAD, "url": FORM_URL, "files": ["fax_file"]}, call_id="broken")],
+            VALID_FINISH,
+        ]
+    )
+
+    result, _ = await _run_agent_block(monkeypatch, LUNA_MEDIUM, model, tools=["browser_task"])
+
+    facts = [
+        {key: report[key] for key in ("page_url_at_start", "upload_attempts") if key in report}
+        for report in (
+            json.loads(tool_outputs_for(model.inputs[-1][1], call)[0]) for call in ("upload", "read", "again", "broken")
+        )
+    ]
+    assert facts == [
+        {
+            "page_url_at_start": "about:blank",
+            "upload_attempts": [
+                {"parameter": "fax_file", "status": "completed"},
+                {"parameter": "notes_file", "status": "completed"},
+            ],
+        },
+        {
+            "page_url_at_start": FORM_URL,
+            "upload_attempts": [
+                {"source": _token(DECOY_URL), "status": "completed"},
+                {"source": "unparseable url", "status": "failed"},
+                {"source": "https://example.com/other.pdf", "status": "failed"},
+            ],
+        },
+        {
+            "page_url_at_start": "unparseable url",
+            "upload_attempts": [{"parameter": "agent_task_2_output", "status": "completed"}],
+        },
+        {},
+    ]
+    assert children == []
+    assert result.status == BlockStatus.completed
+    assert isinstance(result.output_parameter_value, dict)
+    tool_calls = result.output_parameter_value["tool_calls"][:4]
+    assert [call["status"] for call in tool_calls] == ["completed", "completed", "timed_out", "completed"]
+    assert [{key: call[key] for key in facts[0] if key in call} for call in tool_calls] == facts
+    block_output = json.dumps(result.output_parameter_value)
+    assert not [
+        url
+        for url in (FAX_URL, DECOY_URL, DOWNLOADED_URL, "agent:pw", "9f8e7d6c5b4a3210", "sK8pL2nQ5vR9", "abc123")
+        if url in block_output
+    ]
 
 
 EMAIL = {"sender": "agent@example.com", "subject": "Report", "body": "Done."}
@@ -1582,29 +1813,41 @@ async def test_no_call_runs_after_a_valid_finish_in_the_same_response(
 
     result, _ = await _run_agent_block(monkeypatch, LUNA_MEDIUM, model)
 
-    rows = await database.observer.get_workflow_run_blocks(workflow_run_id=RUN, organization_id=ORG)
+    rows = await database.observer.get_workflow_run_blocks(
+        workflow_run_id=RUN, organization_id=ORG, with_tool_calls=True
+    )
     assert [row.block_type for row in rows] == [BlockType.AGENT_STEP]
     assert child_prompts == []
     assert result.status == BlockStatus.completed
     assert isinstance(result.output_parameter_value, dict)
     assert result.output_parameter_value["output"] == {"answer": "done"}
+    assert [call["tool"] for call in result.output_parameter_value["tool_calls"]] == ["finish"]
+    assert [(call.tool, call.status) for call in rows[0].tool_calls or []] == [
+        ("finish", "completed"),
+        ("run_block", "skipped"),
+        ("finish", "skipped"),
+    ]
 
 
-@pytest.mark.asyncio
-async def test_tool_calls_from_one_response_run_one_at_a_time_in_the_order_the_model_wrote_them(
-    database: AgentDB,
-) -> None:
-    state = agent_step_loop._RunState(
+def _bare_state(workflow_run_block_id: str = "wrb_agent") -> agent_step_loop._RunState:
+    return agent_step_loop._RunState(
         label="agent",
         workflow_id="w_1",
         workflow_run_id=RUN,
-        workflow_run_block_id="wrb_agent",
+        workflow_run_block_id=workflow_run_block_id,
         organization_id=ORG,
         browser_session_id=None,
         run_context=app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts[RUN],
         credential_keys=[],
         ignore_workflow_system_prompt=False,
     )
+
+
+@pytest.mark.asyncio
+async def test_tool_calls_from_one_response_run_one_at_a_time_in_the_order_the_model_wrote_them(
+    database: AgentDB,
+) -> None:
+    state = _bare_state()
     state.call_order = ["goto", "extract"]
     ran: list[str] = []
 
@@ -1626,3 +1869,353 @@ async def test_tool_calls_from_one_response_run_one_at_a_time_in_the_order_the_m
     assert await asyncio.gather(goto, extract) == ["goto", "extract"]
     assert ran == ["goto start", "goto end", "extract start", "extract end"]
     assert state.call_order == []
+
+
+@pytest.mark.asyncio
+async def test_arguments_too_deep_to_parse_are_still_skipped_after_finish(database: AgentDB) -> None:
+    state = _bare_state()
+    state.answer = {"answer": "done"}
+    invoke = AsyncMock()
+    nested = "[" * 100_000 + "]" * 100_000
+    context = ToolContext(None, tool_name="page_extract", tool_call_id="late", tool_arguments=nested)
+
+    await agent_step_loop._in_turn(state, invoke)(context, nested)
+    assert state.trail_writer is not None
+    await state.trail_writer
+
+    invoke.assert_not_awaited()
+    assert [(call.tool, call.status) for call in state.trail] == [("page_extract", "skipped")]
+    assert state.trail[0].arguments.startswith('"[[[')
+
+
+@pytest.mark.asyncio
+async def test_unparseable_arguments_are_redacted_before_they_are_encoded_for_the_trail(database: AgentDB) -> None:
+    state = _bare_state()
+    state.run_context.secrets["quoted_secret"] = 'pa"ss-1234567'
+    arguments = '{"text": "pa\\"ss-1234567'
+    context = ToolContext(None, tool_name="page_fill", tool_call_id="fill", tool_arguments=arguments)
+
+    await agent_step_loop._in_turn(state, AsyncMock(return_value="ok"))(context, arguments)
+    assert state.trail_writer is not None
+    await state.trail_writer
+
+    shown = json.loads(state.trail[0].arguments)
+    assert "ss-1234567" not in shown
+    assert REDACTED_SECRET_PLACEHOLDER in shown
+
+
+@pytest.mark.asyncio
+async def test_a_call_still_runs_when_its_trail_entry_cannot_be_built(database: AgentDB) -> None:
+    state = _bare_state()
+    invoke = AsyncMock(return_value="ran")
+    arguments = '{"block_type": "text_prompt"}'
+    context = ToolContext(None, tool_name="run_block", tool_call_id="run", tool_arguments=arguments)
+
+    def broken_describe(_: JsonValue) -> tuple[BlockType | None, JsonValue]:
+        raise TypeError("describe failed")
+
+    assert await agent_step_loop._in_turn(state, invoke, broken_describe)(context, arguments) == "ran"
+    invoke.assert_awaited_once_with(arguments)
+    assert [(call.tool, call.block_type, call.arguments) for call in state.trail] == [
+        ("run_block", None, json.dumps(arguments))
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("broken", ["finished_entry", "column_write"])
+async def test_a_recorded_call_returns_its_result_when_its_trail_entry_or_write_fails(
+    monkeypatch: pytest.MonkeyPatch, database: AgentDB, broken: str
+) -> None:
+    state = _bare_state()
+    status = "completed"
+    if broken == "finished_entry":
+        status = "not_a_block_status"
+    else:
+        monkeypatch.setattr(
+            database.observer, "update_workflow_run_block_tool_calls", AsyncMock(side_effect=RuntimeError("db down"))
+        )
+
+    async def invoke(arguments: str) -> str:
+        agent_step_loop._record_call(state, {"url": "https://example.com"}, tool="page_goto", status=status)
+        return "ran"
+
+    context = ToolContext(None, tool_name="page_goto", tool_call_id="goto", tool_arguments="{}")
+
+    assert await agent_step_loop._in_turn(state, invoke)(context, "{}") == "ran"
+    assert state.trail_writer is not None
+    await state.trail_writer
+    assert [call["tool"] for call in state.calls] == ["page_goto"]
+    assert [(call.index, call.tool, call.status) for call in state.trail] == [
+        (1, "page_goto", None if broken == "finished_entry" else "completed")
+    ]
+    assert agent_step_loop._child_label(state, BlockType.TEXT_PROMPT) == "agent_text_prompt_2"
+
+
+@pytest.mark.asyncio
+async def test_a_non_ascii_trail_is_cut_to_fit_the_column_as_it_is_stored(
+    monkeypatch: pytest.MonkeyPatch, database: AgentDB
+) -> None:
+    monkeypatch.setattr(agent_step_loop, "_MAX_TRAIL_BYTES", 2_000)
+    row = await database.observer.create_workflow_run_block(
+        workflow_run_id=RUN, organization_id=ORG, block_type=BlockType.AGENT_STEP, label="agent"
+    )
+    state = _bare_state(row.workflow_run_block_id)
+    text = "\u65e5\u672c" * 75
+    state.trail = [
+        AgentStepToolCall(
+            index=index, tool="page_type", status="completed", arguments=text, started_at=datetime.now(UTC)
+        )
+        for index in (1, 2, 3)
+    ]
+    state.pending_trail = state.trail
+
+    await agent_step_loop._write_trail(state)
+
+    async with database.Session() as session:
+        stored = await session.scalar(
+            select(WorkflowRunBlockModel.tool_calls).where(
+                WorkflowRunBlockModel.workflow_run_block_id == row.workflow_run_block_id
+            )
+        )
+    assert len(json.dumps(stored)) <= 2_000
+    assert [call["arguments"] for call in stored] == ["", "", text]
+
+
+def _record_tool_call_writes(
+    monkeypatch: pytest.MonkeyPatch, database: AgentDB, gate: asyncio.Event | None = None
+) -> list[list[dict[str, Any]]]:
+    written: list[list[dict[str, Any]]] = []
+    update = database.observer.update_workflow_run_block_tool_calls
+
+    async def recording_update(
+        workflow_run_block_id: str, organization_id: str | None, tool_calls: list[AgentStepToolCall]
+    ) -> None:
+        if gate is not None:
+            await gate.wait()
+        written.append([call.model_dump(mode="json", exclude_none=True) for call in tool_calls])
+        await update(workflow_run_block_id, organization_id, tool_calls)
+
+    monkeypatch.setattr(database.observer, "update_workflow_run_block_tool_calls", recording_update)
+    return written
+
+
+@pytest.mark.asyncio
+async def test_each_call_is_written_to_tool_calls_while_it_runs_and_after_it_finishes_in_run_order(
+    monkeypatch: pytest.MonkeyPatch, database: AgentDB, page: SimpleNamespace, billing_hook: AsyncMock
+) -> None:
+    monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
+    app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts[RUN].parameters["login_credential"] = _credential_parameter()
+    written = _record_tool_call_writes(monkeypatch, database)
+
+    async def sign_in(block: LoginBlock, workflow_run_id: str, workflow_run_block_id: str, **_: object) -> BlockResult:
+        return BlockResult(
+            success=True,
+            output_parameter=block.output_parameter,
+            output_parameter_value={"signed_in": True},
+            status=BlockStatus.completed,
+            workflow_run_block_id=workflow_run_block_id,
+        )
+
+    monkeypatch.setattr(LoginBlock, "execute", sign_in)
+    model = _ScriptedModel(
+        [
+            [ResponseFunctionToolCall(id="fc_bad", call_id="bad", name="login", arguments="{no", type="function_call")],
+            [scripted_call("login", {"credential": "login_credential", "url": "https://example.com/"}, "login")],
+            [scripted_call("run_block", {"block_type": "text_prompt", "arguments": {"prompt": f"Say {SECRET}"}}, "t")],
+            [scripted_call("run_block", {"block_type": "text_prompt", "arguments": {"bogus": 1}}, "unconverted")],
+            [
+                scripted_call("page_extract", {"prompt": "price"}, call_id="extract"),
+                scripted_call("read_run_data", {}, call_id="index"),
+            ],
+            [scripted_call("finish", {"answer": "42"}, call_id="finish")],
+        ]
+    )
+
+    with skyvern_context.scoped(SkyvernContext(workflow_run_id=RUN, organization_id=ORG)):
+        result, _ = await _run_agent_block(
+            monkeypatch,
+            LUNA_MEDIUM,
+            model,
+            tools=["login", "text_prompt", "page_extract"],
+            parameter_keys=["login_credential"],
+        )
+
+    assert result.status == BlockStatus.completed
+    rows = await database.observer.get_workflow_run_blocks(
+        workflow_run_id=RUN, organization_id=ORG, with_tool_calls=True
+    )
+    (agent_row,) = (row for row in rows if row.block_type == BlockType.AGENT_STEP)
+    children = {row.label: row.workflow_run_block_id for row in rows if row is not agent_row}
+    trail = agent_row.tool_calls
+    assert trail is not None
+    assert [(call.index, call.tool, call.status, call.label) for call in trail] == [
+        (1, "login", "invalid_arguments", None),
+        (2, "login", "completed", "agent_login_2"),
+        (3, "run_block", "completed", "agent_text_prompt_3"),
+        (4, "run_block", "invalid_arguments", "agent_text_prompt_4"),
+        (5, "page_extract", "completed", None),
+        (6, "read_run_data", "completed", None),
+        (7, "finish", "completed", None),
+    ]
+    labels = [call.label for call in trail if call.label]
+    assert len(labels) == len(set(labels))
+    assert [call.child_workflow_run_block_id for call in trail[:4]] == [
+        None,
+        children["agent_login_2"],
+        children["agent_text_prompt_3"],
+        None,
+    ]
+    login_block, prompt_block = (json.loads(call.block or "null") for call in trail[1:3])
+    assert (login_block["block_type"], login_block["parameter_keys"]) == ("login", ["login_credential"])
+    assert "credential" not in login_block
+    assert prompt_block["label"] == "agent_text_prompt_3"
+    assert [call.block for call in [trail[0], *trail[3:]]] == [None] * 5
+    assert all(call.finished_at is not None and call.started_at <= call.finished_at for call in trail)
+    assert SECRET not in json.dumps(written)
+
+    output = result.output_parameter_value
+    assert isinstance(output, dict)
+    assert [(call.tool, call.status, call.arguments) for call in trail[1:]] == [
+        (call["tool"], call["status"], call["arguments"]) for call in output["tool_calls"]
+    ]
+    assert not any(
+        {"index", "started_at", "finished_at", "block", "child_workflow_run_block_id"} & call.keys()
+        for call in output["tool_calls"]
+    )
+    assert _billed_decisions(billing_hook) == 5
+
+    assert [(call["index"], call["status"]) for call in written[0]] == [(1, "invalid_arguments")]
+    # The writer keeps only the newest pending snapshot, so which running snapshots land depends on scheduling.
+    assert all([call["index"] for call in snapshot] == list(range(1, len(snapshot) + 1)) for snapshot in written)
+    lengths = [len(snapshot) for snapshot in written]
+    assert lengths == sorted(lengths)
+    final = {call.index: call.label for call in trail}
+    for snapshot in written:
+        if snapshot and snapshot[-1]["status"] == "running":
+            assert snapshot[-1].get("label") == final[snapshot[-1]["index"]]
+    assert written[-1] == [call.model_dump(mode="json", exclude_none=True) for call in trail]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("compact", [False, True])
+async def test_tools_do_not_wait_for_tool_calls_writes_and_long_calls_are_cut_to_fit(
+    monkeypatch: pytest.MonkeyPatch, database: AgentDB, compact: bool
+) -> None:
+    monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
+    if compact:
+        monkeypatch.setattr(agent_step_loop, "_MAX_TRAIL_BYTES", 2_000)
+    gate = asyncio.Event()
+    written = _record_tool_call_writes(monkeypatch, database, gate)
+    prompt = "x" * 9_000
+
+    def finish_after_the_prompt_ran(model_input: list[Any]) -> list[TResponseOutputItem]:
+        assert json.loads(tool_outputs_for(model_input, "long")[0])["status"] == "completed"
+        assert written == []
+        gate.set()
+        return VALID_FINISH
+
+    model = _ScriptedModel(
+        [
+            [scripted_call("run_block", {"block_type": "text_prompt", "arguments": {"prompt": prompt}}, "long")],
+            [scripted_call("run_block", {"block_type": "text_prompt", "arguments": {"prompt": "Say hi"}}, "short")],
+            finish_after_the_prompt_ran,
+        ]
+    )
+
+    result, _ = await _run_agent_block(monkeypatch, LUNA_MEDIUM, model, tools=["text_prompt"])
+
+    assert result.status == BlockStatus.completed
+    rows = await database.observer.get_workflow_run_blocks(
+        workflow_run_id=RUN, organization_id=ORG, with_tool_calls=True
+    )
+    (agent_row,) = (row for row in rows if row.block_type == BlockType.AGENT_STEP)
+    assert agent_row.tool_calls is not None
+    assert written[-1] == [call.model_dump(mode="json", exclude_none=True) for call in agent_row.tool_calls]
+    assert all(call.status != "running" for call in agent_row.tool_calls)
+    first, newest = agent_row.tool_calls[:2]
+    assert (first.index, first.tool, first.label) == (1, "run_block", "agent_text_prompt_1")
+    assert json.loads(newest.block or "null")["label"] == "agent_text_prompt_2"
+    assert "Say hi" in newest.arguments
+    if compact:
+        assert (first.arguments, first.block) == ("", None)
+    else:
+        assert prompt in (first.block or "")
+        assert first.arguments.endswith("...[truncated]")
+        assert len(first.arguments) == agent_step_loop._MAX_TRAIL_ARGUMENT_CHARS + len("...[truncated]")
+    assert isinstance(result.output_parameter_value, dict)
+    assert prompt in result.output_parameter_value["tool_calls"][0]["arguments"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("column", "read_tools"),
+    [
+        ({"truncated": True, "reason": "exceeded_max_jsonb_value_size"}, None),
+        (
+            [
+                {"index": 1, "tool": "page_goto", "started_at": "2026-11-06T00:00:00Z", "arguments": "{}"},
+                {"index": "two", "tool": "page_click"},
+            ],
+            ["page_goto"],
+        ),
+    ],
+)
+async def test_a_tool_calls_column_reads_only_its_valid_calls(
+    database: AgentDB, column: JsonValue, read_tools: list[str] | None
+) -> None:
+    row = await database.observer.create_workflow_run_block(
+        workflow_run_id=RUN, organization_id=ORG, block_type=BlockType.AGENT_STEP, label="agent"
+    )
+    async with database.Session() as session:
+        await session.execute(
+            update(WorkflowRunBlockModel)
+            .where(WorkflowRunBlockModel.workflow_run_block_id == row.workflow_run_block_id)
+            .values(tool_calls=column)
+        )
+        await session.commit()
+
+    (stored,) = await database.observer.get_workflow_run_blocks(
+        workflow_run_id=RUN, organization_id=ORG, with_tool_calls=True
+    )
+    (unloaded,) = await database.observer.get_workflow_run_blocks(workflow_run_id=RUN, organization_id=ORG)
+
+    assert (None if stored.tool_calls is None else [call.tool for call in stored.tool_calls]) == read_tools
+    assert unloaded.tool_calls is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("cut_off", "status"), [("invalid_definition", "failed"), ("cancelled", "canceled")])
+async def test_a_call_cut_off_mid_run_keeps_its_entry_and_the_final_tool_calls_has_no_running_call(
+    monkeypatch: pytest.MonkeyPatch, database: AgentDB, billing_hook: AsyncMock, cut_off: str, status: str
+) -> None:
+    monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
+    block_task = asyncio.current_task()
+    assert block_task is not None
+
+    async def cut_off_read(state: agent_step_loop._RunState, name: str | None = None) -> object:
+        if cut_off == "invalid_definition":
+            raise InvalidWorkflowDefinition("bad definition")
+        block_task.cancel()
+        await asyncio.sleep(1)
+        return None
+
+    monkeypatch.setattr(agent_step_loop, "_read_run_data", cut_off_read)
+    model = _ScriptedModel([[scripted_call("read_run_data", {"name": "x"}, call_id="read")], VALID_FINISH])
+
+    if cut_off == "cancelled":
+        with pytest.raises(asyncio.CancelledError):
+            await _run_agent_block(monkeypatch, LUNA_MEDIUM, model)
+        block_task.uncancel()
+    else:
+        result, _ = await _run_agent_block(monkeypatch, LUNA_MEDIUM, model)
+        assert result.status == BlockStatus.failed
+
+    (agent_row,) = await database.observer.get_workflow_run_blocks(
+        workflow_run_id=RUN, organization_id=ORG, with_tool_calls=True
+    )
+    assert [(call.index, call.tool, call.status) for call in agent_row.tool_calls or []] == [
+        (1, "read_run_data", status)
+    ]
+    output = app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts[RUN].values["agent_output"]
+    assert output["tool_calls"] == []
+    assert _billed_decisions(billing_hook) == 0

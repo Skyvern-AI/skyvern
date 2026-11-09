@@ -17,6 +17,7 @@ from google.api_core.exceptions import GoogleAPICallError, RetryError
 
 from skyvern.exceptions import (
     BitwardenAccessDeniedError,
+    BitwardenVerificationRequiredError,
     CredentialItemNotFoundError,
     CredentialParameterNotFoundError,
     CredentialSourceNotConfiguredError,
@@ -55,6 +56,7 @@ _CUSTOMER_CONFIG_ERRORS: tuple[type[BaseException], ...] = (
     CredentialSourceNotConfiguredError,
     CustomCredentialConfigurationError,
     BitwardenAccessDeniedError,
+    BitwardenVerificationRequiredError,
     OnePasswordSessionExpiredError,
     RuntimeSequentialCredentialUnsupported,
     DisabledBlockExecutionError,

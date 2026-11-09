@@ -76,6 +76,16 @@ export function useDemonstrationRecorder({
   const demonstrationIdRef = useRef<string | null>(null);
   const phaseRef = useRef<DemonstrationPhase>("idle");
   const insertionRef = useRef<WorkflowCopilotDemonstrationInsertion>();
+  const [insertion, setInsertionState] = useState<
+    WorkflowCopilotDemonstrationInsertion | undefined
+  >();
+  const setInsertion = useCallback(
+    (next: WorkflowCopilotDemonstrationInsertion | undefined) => {
+      insertionRef.current = next;
+      setInsertionState(next);
+    },
+    [],
+  );
   const onDoneRef = useRef(onDone);
   onDoneRef.current = onDone;
   const onStartFailedRef = useRef(onStartFailed);
@@ -117,8 +127,8 @@ export function useDemonstrationRecorder({
     setLimitReached(false);
     setBrowserRestarted(false);
     updateBusy(false);
-    insertionRef.current = undefined;
-  }, [updateBusy, updateDemonstrationId, updatePhase]);
+    setInsertion(undefined);
+  }, [setInsertion, updateBusy, updateDemonstrationId, updatePhase]);
 
   const handleStreamFrame = useCallback(
     (frame: WorkflowCopilotDemonstrationUpdate): boolean => {
@@ -258,7 +268,7 @@ export function useDemonstrationRecorder({
 
   const start = useCallback(
     ({
-      insertion,
+      insertion: startInsertion,
     }: { insertion?: WorkflowCopilotDemonstrationInsertion } = {}) => {
       if (busyRef.current) return;
       actionsRef.current = [];
@@ -268,10 +278,10 @@ export function useDemonstrationRecorder({
       setCanFillCredentials(false);
       setHasSkippedSensitiveField(false);
       setLimitReached(false);
-      insertionRef.current = insertion;
+      setInsertion(startInsertion);
       void openStream();
     },
-    [openStream],
+    [openStream, setInsertion],
   );
 
   const resume = useCallback(
@@ -603,7 +613,7 @@ export function useDemonstrationRecorder({
         setActions(actionsRef.current);
         setCanFillCredentials(response.data.can_fill_credentials);
         setLimitReached(!response.data.can_resume);
-        insertionRef.current = response.data.insertion ?? undefined;
+        setInsertion(response.data.insertion ?? undefined);
         updatePhase("stopped");
       } catch (error) {
         if (isAxiosError(error) && error.response?.status === 403)
@@ -619,6 +629,7 @@ export function useDemonstrationRecorder({
     clear,
     credentialGetter,
     sendControl,
+    setInsertion,
     updateBusy,
     updateDemonstrationId,
     updatePhase,
@@ -644,6 +655,7 @@ export function useDemonstrationRecorder({
     hasSkippedSensitiveField,
     limitReached,
     browserRestarted,
+    insertion,
     unavailable,
     busy,
     start,

@@ -21,7 +21,7 @@ LEGACY_TOOL_MANIFEST_DIGESTS = {
     "skyvern_act": "407b30ac46dc9cbf83e1eca17c7eef3c19bf850ef8a87b76a3f089dce114d669",
     "skyvern_bitwarden_config_clear": "107c38d2c0da3a2f2fcc0b75935dcfe2b9d24ef1f7e369e22834ef23d6cd4ea3",
     "skyvern_bitwarden_config_get": "da79546595e7667c65a5e45b8625c8712026adb71b4d2dfc627621af1a2577c4",
-    "skyvern_bitwarden_config_set": "b454d21e59f7421d14983aa02b64e0fa897ee03af3888114df19ddd6a91bf2cc",
+    "skyvern_bitwarden_config_set": "a2060a44ff914b81cae13fa5e669be5b05f5b6c6e4b2b0bd6c29c156b936c6c3",
     "skyvern_bitwarden_items": "abf727ff755578e4dc4a475643ca1477a7c923c4009edca27b782afbfb63cd30",
     "skyvern_block_schema": "e7527dcb32d072814b3660ad5b1b837e957bd1605c872f8340cbc670fe59d2f5",
     "skyvern_block_validate": "ba988cb4d78e5f4c08e002f91b446dfbb2cdb4672a78060d15c76f91e7be3da1",

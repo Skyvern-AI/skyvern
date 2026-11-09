@@ -2151,3 +2151,165 @@ describe("CredentialCard missing-authenticator ask", () => {
     );
   });
 });
+
+describe("CredentialCard site question", () => {
+  const question = {
+    credential_id: "cred-hn",
+    name: "HN Login",
+    site: "https://b.example.com",
+    saved_sites: ["https://a.example.com"],
+    vault_sourced: true,
+  };
+
+  it("offers no Allow for a login whose sites come from a connected vault", () => {
+    const onSiteAnswer = vi.fn();
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame()}
+        mode="inline-pause"
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+        siteQuestion={question}
+        onSiteAnswer={onSiteAnswer}
+      />,
+    );
+
+    expect(
+      screen.getByText(/add b\.example\.com to it in that vault/),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /^Allow on / })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "No" }));
+    expect(onSiteAnswer).toHaveBeenCalledWith("no");
+  });
+
+  it("announces that the site is being saved while an answer is pending", () => {
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame()}
+        mode="inline-pause"
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+        siteQuestion={{ ...question, vault_sourced: false }}
+        siteAnswerPending
+        onSiteAnswer={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("status").textContent).toBe("Saving the site…");
+  });
+
+  it("asks with the server's sites only, keeping the scheme of a site that is not https", () => {
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame({
+          message: "Use this login, it is the right one.",
+        })}
+        mode="inline-pause"
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+        siteQuestion={{
+          ...question,
+          site: "http://b.example.com:8080",
+          vault_sourced: false,
+        }}
+        onSiteAnswer={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByText(
+        "'HN Login' is saved for a.example.com. Use it on http://b.example.com:8080?",
+      ),
+    ).toBeTruthy();
+    expect(
+      screen.getByText(
+        "Allowing lets Skyvern type this login's password on http://b.example.com:8080, in this chat and in every saved run that uses it.",
+      ),
+    ).toBeTruthy();
+    expect(
+      screen.getByText(
+        "http://b.example.com:8080 is not https, so the password would be sent without encryption.",
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText(/it is the right one/)).toBeNull();
+  });
+
+  it("says where the password goes without an encryption warning for an https site", () => {
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame()}
+        mode="inline-pause"
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+        siteQuestion={{ ...question, vault_sourced: false }}
+        onSiteAnswer={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByText(
+        "Allowing lets Skyvern type this login's password on b.example.com, in this chat and in every saved run that uses it.",
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText(/without encryption/)).toBeNull();
+  });
+
+  it("names every site an allowed login keeps working on", () => {
+    render(
+      <CredentialCard
+        frame={buildCredentialRequiredFrame()}
+        mode="inline-pause"
+        resolvedOutcome={{
+          outcome: "connected",
+          name: "HN Login",
+          siteAnswer: "add",
+          siteA: "https://a.example.com",
+          savedSites: ["https://a.example.com", "https://c.example.com"],
+          siteB: "https://b.example.com",
+        }}
+        onConnect={vi.fn()}
+        onSkip={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByText(
+        /works on a\.example\.com, c\.example\.com and b\.example\.com/,
+      ),
+    ).toBeTruthy();
+  });
+
+  it.each<[string, CredentialPauseHistorical, RegExp]>([
+    [
+      "a refused pick",
+      { outcome: "not_admitted", name: "HN Login" },
+      /'HN Login' not used here/,
+    ],
+    [
+      "a No answer",
+      {
+        outcome: "not_admitted",
+        siteAnswer: "no",
+        siteA: "https://a.example.com",
+        siteB: "https://b.example.com",
+      },
+      /Not used on b\.example\.com/,
+    ],
+  ])(
+    "renders %s as not used, never as a skipped sign-in",
+    (_, resolvedOutcome, text) => {
+      render(
+        <CredentialCard
+          frame={buildCredentialRequiredFrame()}
+          mode="inline-pause"
+          resolvedOutcome={resolvedOutcome}
+          onConnect={vi.fn()}
+          onSkip={vi.fn()}
+        />,
+      );
+
+      expect(screen.getByText(text)).toBeTruthy();
+      expect(screen.queryByText(/Sign-in skipped/)).toBeNull();
+    },
+  );
+});

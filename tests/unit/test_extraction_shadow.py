@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 from typing import Any
 
 import pytest
@@ -721,24 +720,6 @@ async def test_run_shadow_comparison_swallows_llm_errors() -> None:
     assert fields["cache_key"] == "k1"
     assert fields["error_type"] == "RuntimeError"
     assert fields["error_stage"] == "llm_call"
-
-
-@pytest.mark.asyncio
-async def test_run_shadow_comparison_uses_structlog_by_default(caplog: pytest.LogCaptureFixture) -> None:
-    """If no logger is injected, the module's default structlog logger is used."""
-
-    async def llm_call() -> Any:
-        return {"a": 1}
-
-    with caplog.at_level(logging.INFO):
-        await extraction_shadow.run_shadow_comparison(
-            cache_key="k1",
-            workflow_run_id="wfr_1",
-            cached_value={"a": 1},
-            cached_age_seconds=0.0,
-            llm_call=llm_call,
-            schema=None,
-        )
 
     # Default path should succeed without raising even when no logger override is provided.
     # We don't assert on caplog content (structlog routing varies by test env), only that

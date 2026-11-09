@@ -79,6 +79,23 @@ export type WorkflowRunBlock = {
   instructions?: string | null;
   positive_descriptor?: string | null;
   negative_descriptor?: string | null;
+
+  // agent step block: its calls in run order, the last one possibly still running
+  tool_calls?: Array<AgentStepToolCall> | null;
+};
+
+export type AgentStepToolCall = {
+  index: number;
+  tool: string;
+  status?: Status | "invalid_arguments" | null;
+  started_at: string;
+  finished_at?: string | null;
+  arguments: string;
+  block_type?: WorkflowBlockType | null;
+  label?: string | null;
+  // The child block's workflow YAML block, as JSON.
+  block?: string | null;
+  child_workflow_run_block_id?: string | null;
 };
 
 export function isWorkflowRunLoopContainerBlock(block: {

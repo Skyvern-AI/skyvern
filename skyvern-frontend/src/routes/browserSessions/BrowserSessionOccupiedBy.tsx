@@ -1,6 +1,6 @@
 import { Link } from "react-router-dom";
 
-import { CopyText } from "@/routes/workflows/editor/Workspace";
+import { CopyButton } from "@/components/CopyButton";
 
 function BrowserSessionOccupiedBy({ runnableId }: { runnableId: string }) {
   return (
@@ -12,7 +12,11 @@ function BrowserSessionOccupiedBy({ runnableId }: { runnableId: string }) {
       >
         {runnableId}
       </Link>
-      <CopyText className="opacity-75 hover:opacity-100" text={runnableId} />
+      <CopyButton
+        className="opacity-75 hover:opacity-100"
+        value={runnableId}
+        ariaLabel="Copy run ID"
+      />
     </div>
   );
 }

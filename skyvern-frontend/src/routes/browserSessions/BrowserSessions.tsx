@@ -24,14 +24,7 @@ import { HelpTooltip } from "@/components/HelpTooltip";
 import { Pill } from "@/components/StatusBadge";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import {
-  Pagination,
-  PaginationContent,
-  PaginationItem,
-  PaginationLink,
-  PaginationNext,
-  PaginationPrevious,
-} from "@/components/ui/pagination";
+import { SimplePagination } from "@/components/ui/pagination";
 import { ProxySelector } from "@/components/ProxySelector";
 import {
   Select,
@@ -56,7 +49,7 @@ import {
   type BrowserSessionExtension,
   type BrowserSessionType,
 } from "@/routes/workflows/types/browserSessionTypes";
-import { CopyText } from "@/routes/workflows/editor/Workspace";
+import { CopyButton } from "@/components/CopyButton";
 import { basicTimeFormat } from "@/util/timeFormat";
 import { cn, formatMs, toDate } from "@/util/utils";
 
@@ -125,16 +118,6 @@ function BrowserSessionsContent() {
     const params = new URLSearchParams(searchParams);
     Object.entries(patch).forEach(([k, v]) => params.set(k, v));
     setSearchParams(params, { replace: true });
-  }
-
-  function handlePreviousPage() {
-    if (page === 1) return;
-    setParamPatch({ page: String(page - 1) });
-  }
-
-  function handleNextPage() {
-    if (isNextDisabled) return;
-    setParamPatch({ page: String(page + 1) });
   }
 
   const createBrowserSessionMutation = useCreateBrowserSessionMutation();
@@ -214,12 +197,19 @@ function BrowserSessionsContent() {
           </div>
         </div>
         <div className="overflow-hidden rounded-lg border border-border">
-          <Table className="w-full table-fixed">
+          <Table className="min-w-[960px] table-fixed">
             <TableHeader>
               <TableRow>
-                <TableHead className="w-[20%] truncate">ID</TableHead>
+                <TableHead
+                  className={cn(
+                    "truncate",
+                    showCreator ? "w-[25%]" : "w-[31%]",
+                  )}
+                >
+                  ID
+                </TableHead>
                 <TableHead className="w-[8%] truncate">Open</TableHead>
-                <TableHead className="w-[12%]">
+                <TableHead className="w-[15%]">
                   <span className="inline-flex items-center gap-1.5">
                     Occupied
                     <HelpTooltip
@@ -232,11 +222,11 @@ function BrowserSessionsContent() {
                   <TableHead className="w-[14%] truncate">Created By</TableHead>
                 )}
                 <TableHead className="w-[12%] truncate">Started</TableHead>
-                <TableHead className="w-[10%] truncate">Timeout</TableHead>
+                <TableHead className="w-[12%] truncate">Timeout</TableHead>
                 <TableHead
                   className={cn(
                     "truncate",
-                    showCreator ? "w-[24%]" : "w-[38%]",
+                    showCreator ? "w-[14%]" : "w-[22%]",
                   )}
                 >
                   CDP Url
@@ -279,9 +269,10 @@ function BrowserSessionsContent() {
                           <div className="truncate text-muted-foreground">
                             {browserSession.browser_session_id}
                           </div>
-                          <CopyText
+                          <CopyButton
                             className="opacity-60 hover:opacity-100"
-                            text={browserSession.browser_session_id}
+                            value={browserSession.browser_session_id}
+                            ariaLabel="Copy session ID"
                           />
                         </div>
                       </TableCell>
@@ -317,9 +308,10 @@ function BrowserSessionsContent() {
                             {cdpUrl}
                           </div>
                           {cdpUrl !== "-" ? (
-                            <CopyText
+                            <CopyButton
                               className="opacity-75 hover:opacity-100"
-                              text={cdpUrl}
+                              value={cdpUrl}
+                              ariaLabel="Copy CDP URL"
                             />
                           ) : null}
                         </div>
@@ -330,8 +322,8 @@ function BrowserSessionsContent() {
               )}
             </TableBody>
           </Table>
-          <div className="relative px-3 py-3">
-            <div className="absolute left-3 top-1/2 flex -translate-y-1/2 items-center gap-2 text-sm">
+          <div className="relative flex flex-col items-center gap-2 px-3 py-3 sm:block">
+            <div className="flex items-center gap-2 text-sm sm:absolute sm:left-3 sm:top-1/2 sm:-translate-y-1/2">
               <span className="text-slate-400">Items per page</span>
               <Select
                 value={String(itemsPerPage)}
@@ -353,29 +345,14 @@ function BrowserSessionsContent() {
                 </SelectContent>
               </Select>
             </div>
-            <Pagination className="pt-0">
-              <PaginationContent>
-                <PaginationItem>
-                  <PaginationPrevious
-                    className={cn({
-                      "cursor-not-allowed opacity-50": page === 1,
-                    })}
-                    onClick={handlePreviousPage}
-                  />
-                </PaginationItem>
-                <PaginationItem>
-                  <PaginationLink>{page}</PaginationLink>
-                </PaginationItem>
-                <PaginationItem>
-                  <PaginationNext
-                    className={cn({
-                      "cursor-not-allowed opacity-50": isNextDisabled,
-                    })}
-                    onClick={handleNextPage}
-                  />
-                </PaginationItem>
-              </PaginationContent>
-            </Pagination>
+            <SimplePagination
+              className="pt-0"
+              page={page}
+              hasNext={!isNextDisabled}
+              onPageChange={(nextPage) =>
+                setParamPatch({ page: String(nextPage) })
+              }
+            />
           </div>
         </div>
       </div>

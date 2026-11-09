@@ -49,7 +49,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from skyvern.config import settings
 from skyvern.exceptions import (
+    BITWARDEN_VERIFICATION_REQUIRED_MESSAGE,
     BitwardenCredentialsRejectedError,
+    BitwardenUnlockError,
+    BitwardenVerificationRequiredError,
     BrowserProfileNotFound,
     CredentialSourceNotConfiguredError,
 )
@@ -64,8 +67,10 @@ from skyvern.forge import app
 from skyvern.forge.agent_functions import OnePasswordTelemetryErrorClass, record_request_audit_event
 from skyvern.forge.sdk.api.files import discard_temp_working_dir
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
+from skyvern.forge.sdk.credential_site_policy import LoginSite
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowBuildSource
+from skyvern.forge.sdk.db.exceptions import CredentialSitesChangedError
 from skyvern.forge.sdk.db.models import CredentialFolderModel
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.routes.code_samples import (
@@ -180,6 +185,7 @@ from skyvern.forge.sdk.services.onepassword_token_service import resolve_onepass
 from skyvern.forge.sdk.services.request_principal import RequestPrincipal, get_request_principal, synthetic_user_id
 from skyvern.forge.sdk.services.route_authorization import require_request_actions
 from skyvern.forge.sdk.workflow.browser_session_persistence import retrieve_persisted_workflow_browser_state_dir
+from skyvern.forge.sdk.workflow.models.credential_release import normalize_extra_site_urls
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRunStatus
 from skyvern.schemas.credential_folders import (
@@ -949,6 +955,16 @@ def _build_login_test_blocks(
     return blocks
 
 
+async def vault_login_sites(credential: Credential) -> list[LoginSite] | None:
+    """The sites a connected vault names for this login, or None when Skyvern holds them."""
+    service = app.CREDENTIAL_VAULT_SERVICES.get(credential.vault_type or CredentialVaultType.BITWARDEN)
+    if service is None:
+        return None
+    item = await service.get_credential_item(credential)
+    sites = item.named_login_sites()
+    return sites if sites or item.login_sites is not None else None
+
+
 @base_router.patch(
     "/credentials/{credential_id}",
     response_model=CredentialResponse,
@@ -1001,6 +1017,25 @@ async def rename_credential(
         update_kwargs["pin_saved_session_ip"] = data.pin_saved_session_ip
     if data.tested_url is not None:
         update_kwargs["tested_url"] = data.tested_url
+    if data.extra_site_urls:
+        try:
+            vault_sites = await vault_login_sites(credential)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail="Could not read this login's vault entry") from exc
+        if vault_sites is not None:
+            raise HTTPException(
+                status_code=422, detail="This login's sites come from its connected vault; add the site there"
+            )
+    if data.extra_site_urls is not None:
+        try:
+            update_kwargs["extra_site_urls"] = normalize_extra_site_urls(
+                data.tested_url or credential.tested_url, data.extra_site_urls
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+    sites_change = data.tested_url is not None or data.extra_site_urls is not None
+    if sites_change and data.expected_site_urls is not None:
+        update_kwargs["expected_site_urls"] = data.expected_site_urls
     if data.user_context is not None:
         update_kwargs["user_context"] = data.user_context
     if data.save_browser_session_intent is not None:
@@ -1033,11 +1068,16 @@ async def rename_credential(
             credential_id=credential_id,
         )
     async with write_guard:
-        updated = await _update_credential_or_profile_conflict(**update_kwargs)
+        try:
+            updated = await _update_credential_or_profile_conflict(**update_kwargs)
+        except CredentialSitesChangedError as exc:
+            raise HTTPException(
+                status_code=409, detail="This login's sites changed since it was opened. Reload it and try again."
+            ) from exc
     if not updated:
         raise HTTPException(status_code=500, detail="Failed to update credential")
 
-    changed_fields = tuple(sorted(update_kwargs.keys() - {"credential_id", "organization_id"}))
+    changed_fields = tuple(sorted(update_kwargs.keys() - {"credential_id", "organization_id", "expected_site_urls"}))
     if changed_fields:
         await record_request_audit_event(
             current_org.organization_id,
@@ -3651,8 +3691,8 @@ async def list_bitwarden_items(
 
     try:
         items = await BitwardenService.list_item_overviews(
-            client_id=None,
-            client_secret=None,
+            client_id=org_auth_token.credential.client_id,
+            client_secret=org_auth_token.credential.client_secret,
             master_password=org_auth_token.credential.master_password,
             bw_organization_id=current_org.bw_organization_id,
             bw_collection_ids=current_org.bw_collection_ids,
@@ -3666,7 +3706,12 @@ async def list_bitwarden_items(
             error=str(e),
             exc_info=True,
         )
-        if isinstance(e, BitwardenCredentialsRejectedError):
+        if isinstance(e, BitwardenVerificationRequiredError):
+            raise HTTPException(
+                status_code=400,
+                detail=BITWARDEN_VERIFICATION_REQUIRED_MESSAGE,
+            ) from e
+        if isinstance(e, (BitwardenCredentialsRejectedError, BitwardenUnlockError)):
             raise HTTPException(
                 status_code=400,
                 detail="Bitwarden rejected the credentials; check your Bitwarden credentials in Settings",
@@ -3842,7 +3887,7 @@ async def clear_org_auth_credential(
 
 
 def _to_safe_bitwarden_response(auth_token: BitwardenOrganizationAuthToken) -> BitwardenCredentialResponse:
-    """Strip master_password from the response for security."""
+    """Strip master_password and client_secret from the response for security."""
     safe_token = BitwardenOrganizationAuthTokenSafe(
         id=auth_token.id,
         organization_id=auth_token.organization_id,
@@ -3850,7 +3895,9 @@ def _to_safe_bitwarden_response(auth_token: BitwardenOrganizationAuthToken) -> B
         valid=auth_token.valid,
         created_at=auth_token.created_at,
         modified_at=auth_token.modified_at,
-        credential=BitwardenCredentialSafe(email=auth_token.credential.email),
+        credential=BitwardenCredentialSafe(
+            email=auth_token.credential.email, client_id=auth_token.credential.client_id
+        ),
     )
     return BitwardenCredentialResponse(token=safe_token)
 
@@ -3935,6 +3982,16 @@ async def update_bitwarden_credential(
     If a valid credential already exists, it will be invalidated before creating the new one.
     """
     try:
+        if bool(request.credential.client_id) != bool(request.credential.client_secret):
+            raise HTTPException(
+                status_code=422,
+                detail="Enter both the client ID and the client secret of your Bitwarden personal API key, or neither.",
+            )
+        if request.credential.client_id and not request.credential.client_id.startswith("user."):
+            raise HTTPException(
+                status_code=422,
+                detail="Use a Bitwarden personal API key. Its client ID starts with 'user.'.",
+            )
         # Atomically invalidate old + create new in a single transaction
         auth_token = await app.DATABASE.organizations.replace_org_auth_token(
             organization_id=current_org.organization_id,

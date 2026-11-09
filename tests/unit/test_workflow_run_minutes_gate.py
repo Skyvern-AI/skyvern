@@ -759,7 +759,7 @@ async def test_duration_log_reads_unknown_for_a_different_runs_context(
     # Null, not false: a code-mode run whose attribution was lost must not read as an agent-mode run.
     assert duration_logs[0]["would_be_code"] is None
     # And no route_reason, which is why the single-log arm read documented in
-    # cloud_docs/feature-flags/task-v3-billing-tier-rollout.md cannot see this population at all: a
+    # the Task V3 billing-tier rollout doc cannot see this population at all: a
     # route_reason filter drops these rows from both arms, so they have to be counted and
     # reattributed from the arm-resolution log rather than filtered away (SKY-16122).
     assert duration_logs[0]["route_reason"] is None

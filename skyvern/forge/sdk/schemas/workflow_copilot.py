@@ -593,6 +593,17 @@ class WorkflowCopilotCredentialDeletionRequest(BaseModel):
     credential_ids: list[str] = Field(min_length=1)
 
 
+CredentialSiteAnswer = Literal["add", "no"]
+
+
+class WorkflowCopilotCredentialSiteQuestion(BaseModel):
+    credential_id: str
+    name: str
+    site: str = Field(..., description="The origin this card signs in on")
+    saved_sites: list[str] = Field(..., description="Origins the login is saved for")
+    vault_sourced: bool = Field(..., description="The sites come from a connected vault, so only the vault can add one")
+
+
 class WorkflowCopilotCredentialResponseRequest(BaseModel):
     turn_id: str = Field(..., description="turn_id from the matching credential_required frame")
     workflow_copilot_chat_id: str = Field(..., description="chat ID from the matching credential_required frame")
@@ -605,6 +616,10 @@ class WorkflowCopilotCredentialResponseRequest(BaseModel):
         ),
     )
     credential_id: str | None = Field(None, description="Saved credential ID; required when action is 'connected'")
+    asks_site: bool = Field(False, description="Ask before connecting a login saved for another site than the card's")
+    site_answer: CredentialSiteAnswer | None = Field(
+        None, description="The answer to the site question this card asked about the same credential"
+    )
 
 
 class WorkflowCopilotDemonstrationControlRequest(BaseModel):
@@ -665,7 +680,22 @@ class WorkflowCopilotCredentialGenerateResult(BaseModel):
 
 
 class WorkflowCopilotCredentialResponseResult(BaseModel):
-    result: Literal["accepted", "signed_in", "no_sign_in_found", "save_failed"]
+    result: Literal[
+        "accepted",
+        "signed_in",
+        "no_sign_in_found",
+        "save_failed",
+        "site_question",
+        "site_changed_not_connected",
+        "site_change_unknown",
+    ] = Field(
+        ...,
+        description=(
+            "'site_question' asks the user first; 'site_changed_not_connected' saved the site after the pause "
+            "ended; 'site_change_unknown' could not confirm the save, and the paused turn reads the login back"
+        ),
+    )
+    site_question: WorkflowCopilotCredentialSiteQuestion | None = None
     expires_at: datetime | None = Field(None, description="The pause's new deadline after 'signing_in'")
     host: str | None = Field(None, description="The sign-in site the browser cookies were read for")
     browser_profile_id: str | None = Field(None, description="The profile saved from the user's sign-in")
@@ -1170,6 +1200,9 @@ class WorkflowCopilotCredentialRequiredUpdate(BaseModel):
     registration: WorkflowCopilotCredentialRegistration | None = Field(
         None, description="Account details a Generate and save answer would store; never a password"
     )
+    site_question: WorkflowCopilotCredentialSiteQuestion | None = Field(
+        None, description="The site question asked about a picked login, so a reloaded card asks it again"
+    )
     timestamp: datetime = Field(..., description="Server timestamp")
 
 
@@ -1191,6 +1224,10 @@ class WorkflowCopilotCredentialPauseResolvedUpdate(BaseModel):
         None, description="Display name of the connected credential, or of the profile saved from a sign-in"
     )
     browser_profile_id: str | None = Field(None, description="The profile saved from the user's own sign-in")
+    site_answer: CredentialSiteAnswer | None = Field(None, description="The user's answer to the site question")
+    site_a: str | None = Field(None, description="The origin the login was saved for before the answer")
+    saved_sites: list[str] | None = Field(None, description="Every origin the login was saved for before the answer")
+    site_b: str | None = Field(None, description="The origin the card signs in on")
     timestamp: datetime = Field(..., description="Server timestamp")
 
 

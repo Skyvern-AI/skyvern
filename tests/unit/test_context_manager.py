@@ -1417,6 +1417,7 @@ class TestBitwardenLoginScope:
             totp_identifier=None,
             run_sequentially=False,
             tested_url="https://other.example.com/login",
+            extra_site_urls=[],
         )
         item = CredentialItem(
             item_id=_VAULT_ITEM_ID,
@@ -1443,6 +1444,48 @@ class TestBitwardenLoginScope:
         assert armed.enforced
         assert armed.admits(allowed)
         assert not armed.admits(refused)
+
+    @pytest.mark.asyncio
+    async def test_a_login_saved_for_an_added_site_is_released_on_both_sites_and_nowhere_else(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        db_credential = SimpleNamespace(
+            credential_id="cred_1",
+            organization_id="org_test",
+            item_id="item_1",
+            vault_type=CredentialVaultType.AZURE_VAULT,
+            totp_identifier=None,
+            run_sequentially=False,
+            tested_url="https://portal.example.com/login",
+            extra_site_urls=["https://login.example.org/signin"],
+        )
+        item = CredentialItem(
+            item_id="item_1",
+            name="Portal",
+            credential_type=CredentialType.PASSWORD,
+            credential=PasswordCredential(username="user@example.com", password="synthetic-password"),
+        )
+        _install_credential_app(
+            monkeypatch,
+            db_credential=db_credential,
+            vault_service=SimpleNamespace(get_credential_item=AsyncMock(return_value=item)),
+        )
+        portal = _make_workflow_parameter("portal_login", workflow_parameter_type=WorkflowParameterType.CREDENTIAL_ID)
+
+        context = await _init_context(workflow_parameter_tuples=[(portal, _make_run_parameter(portal, "cred_1"))])
+        armed = CredentialReleaseGuard().arm_login(
+            ["synthetic-password"],
+            "portal_login",
+            tested_url=context.credential_tested_urls.get("portal_login"),
+            vault_sites=context.bitwarden_login_sites.get("portal_login"),
+            enforce_vault_sites=True,
+            extra_site_urls=context.credential_extra_site_urls.get("portal_login", ()),
+        )
+
+        assert all(entry.enforced for entry in armed)
+        assert any(entry.admits("https://www.example.com/account") for entry in armed)
+        assert any(entry.admits("https://app.example.org/home") for entry in armed)
+        assert not any(entry.admits("https://example.net/login") for entry in armed)
 
     @pytest.mark.asyncio
     async def test_a_login_read_that_lost_its_sites_is_recorded_as_having_none(
@@ -1592,6 +1635,7 @@ class TestRunCredentialFetchOutcome:
             totp_identifier=None,
             run_sequentially=False,
             tested_url=None,
+            extra_site_urls=[],
         )
         item = CredentialItem(
             item_id="item_1",
@@ -1638,6 +1682,7 @@ class TestRunCredentialFetchOutcome:
             totp_identifier=None,
             run_sequentially=False,
             tested_url=None,
+            extra_site_urls=[],
         )
         item = CredentialItem(
             item_id="item_1",

@@ -1285,6 +1285,15 @@ def _log_select_shadow_match(
         LOG.debug("select_shadow_match failed", exc_info=True)
 
 
+async def _record_configured_target(path: Path) -> None:
+    # Completion, not intent: only bytes Skyvern finished writing to a target it named count.
+    context = skyvern_context.current()
+    if context is not None and path.name in context.download_suffix_applied_files:
+        run_id = resolve_run_download_id(context, fallback_run_id=context.workflow_run_id)
+        if run_id is not None:
+            await context.record_configured_download(str(path), run_id)
+
+
 def _download_target_path(download_dir: Path, suggested_filename: str | None) -> Path:
     filename = Path(suggested_filename or "download").name
     stem, suffix = os.path.splitext(filename)
@@ -1561,6 +1570,7 @@ async def _save_adopted_session_download(
     # (matching _persist_captured_download's empty-file handling and the CDP interceptor).
     if download.url.startswith("blob:") and eager_blob_bytes:
         download_target.write_bytes(eager_blob_bytes)
+        await _record_configured_target(download_target)
         return download_target
     if download.url.startswith("blob:") and eager_blob_bytes == b"":
         LOG.warning(
@@ -1609,6 +1619,7 @@ async def _save_adopted_session_download(
                 )
             if recovered_bytes is not None:
                 download_target.write_bytes(recovered_bytes)
+                await _record_configured_target(download_target)
                 LOG.info(
                     "Recovered adopted-session statement from a live blob: PDF iframe",
                     download_dir=str(download_dir),
@@ -1625,6 +1636,7 @@ async def _save_adopted_session_download(
             )
             return None
         download_target.write_bytes(blob_bytes)
+        await _record_configured_target(download_target)
         return download_target
 
     try:
@@ -1644,6 +1656,7 @@ async def _save_adopted_session_download(
             )
             return None
         download_target.write_bytes(body)
+        await _record_configured_target(download_target)
         return download_target
     except (SkyvernHTTPException, HttpException) as exc:
         LOG.error(
@@ -2079,6 +2092,7 @@ async def _persist_captured_download(
                 return _CapturedDownloadPersistence(None, "path_unavailable")
             await download.save_as(target)
             if target.is_file() and target.stat().st_size:
+                await _record_configured_target(target)
                 return _CapturedDownloadPersistence(target, "saved")
             target.unlink(missing_ok=True)
             return _CapturedDownloadPersistence(None, "empty")
@@ -2401,6 +2415,7 @@ async def _recover_blocked_inline_pdf_download(
     try:
         download_dir.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
+        await _record_configured_target(target)
     except OSError:
         LOG.warning(
             "Failed to persist recovered blocked-iframe PDF",

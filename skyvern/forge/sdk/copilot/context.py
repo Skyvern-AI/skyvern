@@ -334,9 +334,9 @@ class TurnNarrativePayload(TypedDict):
     # {"outcome": "connected"|"skipped"|"timeout", "credentialId": ..., "anchorToolCallId": ...}, set
     # when a mid-build credential pause (credential_pause.py) resolved during this turn. The anchor is
     # the tool call whose row was newest when the card was raised.
-    credentialPause: NotRequired[dict[str, str]]
+    credentialPause: NotRequired[dict[str, str | list[str]]]
     # Every pick card's credentialPause, oldest first; set only when more than one card settled this turn.
-    credentialPauses: NotRequired[list[dict[str, str]]]
+    credentialPauses: NotRequired[list[dict[str, str | list[str]]]]
     # {"credentialId": ..., "name": ...}, set when a credential was bound this turn without an ask
     # (deterministic auto-bind); the FE renders it as a receipt with a Change affordance.
     credentialAutoBound: NotRequired[dict[str, str]]
@@ -375,6 +375,7 @@ if TYPE_CHECKING:
         RecordedBuildTestOutcome,
     )
     from skyvern.forge.sdk.copilot.completion_criteria_store import CompletionCriteriaTurnState
+    from skyvern.forge.sdk.copilot.credential_pause import SiteAnswer
     from skyvern.forge.sdk.copilot.diagnosis_repair_contract import DiagnosisRepairContract
     from skyvern.forge.sdk.copilot.interruption import StoppedTurnFacts
     from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
@@ -1327,7 +1328,6 @@ class CopilotContext(AgentContext):
     pre_run_gated_output_warning_fingerprint: tuple[tuple[str, str, bool, str], ...] = ()
     user_message: str = ""
     block_goal_main_goal: str = ""
-    allow_untested_workflow_draft: bool = False
     request_policy: RequestPolicy | None = None
     copilot_config: CopilotConfig | None = None
     block_authoring_policy: BlockAuthoringPolicy = BlockAuthoringPolicy.TASK_V3_PURE
@@ -1346,10 +1346,8 @@ class CopilotContext(AgentContext):
     latest_diagnosis_repair_contract: DiagnosisRepairContract | None = None
     blocked_reply_signatures: list[str] = field(default_factory=list)
 
-    # Mid-build credential pause (credential_pause.py). last_run_skipped_unbound_credentials
-    # is set by tools/__init__.py's update_and_run_blocks skip branch; client_supports_credential_pause
-    # is set from the chat request at construction; the rest are owned by maybe_credential_pause.
-    last_run_skipped_unbound_credentials: bool = False
+    # Mid-build credential pause (credential_pause.py). client_supports_credential_pause is set from the
+    # chat request at construction; the rest are owned by maybe_credential_pause.
     client_supports_credential_pause: bool = False
     client_supports_credential_pause_recovery: bool = False
     client_supports_credential_generation: bool = False
@@ -1365,7 +1363,8 @@ class CopilotContext(AgentContext):
     credential_generation_spent: bool = False
     credential_pause_connected_credential_id: str | None = None
     credential_pause_anchor_tool_call_id: str | None = None
-    credential_pause_receipts: list[dict[str, str]] = field(default_factory=list)
+    credential_pause_receipts: list[dict[str, str | list[str]]] = field(default_factory=list)
+    credential_pause_site_answer: SiteAnswer | None = None
     demonstration_requested: bool = False
     demonstration_ran: bool = False
     demonstration_id: str | None = None

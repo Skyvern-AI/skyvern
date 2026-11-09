@@ -1,0 +1,142 @@
+title: Find Latest Release and Check Project Maintenance Status
+description: Finds a software project's source repo and latest release; downloads the release if it is under six months old, otherwise outputs the README to check for deprecation/maintenance notices.
+workflow_definition:
+  version: 2
+  parameters:
+    - parameter_type: workflow
+      key: project_name
+      workflow_parameter_type: string
+      description: Name of the software project
+      default_value: ripgrep
+  blocks:
+    - block_type: agent_step
+      label: find_release
+      prompt: Find the official source repository for the software project named '{{ project_name }}'. Open the repository's releases page and identify its LATEST release (the newest published release, ignoring drafts; note if it is a pre-release). Report the repository URL, the latest release tag/name, the release date as an ISO date (YYYY-MM-DD), the URL of the release page, and the direct URLs of the release's downloadable assets (binaries/archives; include the source archive link if there are no assets). If the repository has no releases, set release_found to false and leave the release fields null. Today's date is {{ current_date }}.
+      parameter_keys:
+        - project_name
+      tools: [page_goto, page_extract, browser_task, finish]
+      max_turns: 25
+      data_schema:
+        type: object
+        properties:
+          repository_url:
+            type:
+              - string
+              - 'null'
+          release_found:
+            type: boolean
+          latest_release_name:
+            type:
+              - string
+              - 'null'
+          release_date:
+            type:
+              - string
+              - 'null'
+            description: ISO date YYYY-MM-DD
+          release_page_url:
+            type:
+              - string
+              - 'null'
+          asset_urls:
+            type: array
+            items:
+              type: string
+        required:
+          - repository_url
+          - release_found
+          - latest_release_name
+          - release_date
+          - release_page_url
+          - asset_urls
+    - block_type: code
+      label: check_recency
+      parameter_keys:
+        - find_release_output
+      code: |
+        data = find_release_output
+        if isinstance(data, dict) and 'output' in data and isinstance(data['output'], dict):
+            data = data['output']
+        if isinstance(data, str):
+            data = json.loads(data)
+        release_date = data.get('release_date') if isinstance(data, dict) else None
+        within = False
+        days = None
+        if release_date:
+            d = datetime.datetime.strptime(release_date[:10], '%Y-%m-%d').date()
+            days = (datetime.date.today() - d).days
+            within = days <= 183
+        result = {'within_six_months': within, 'days_since_release': days, 'release_date': release_date}
+        print(result)
+        return result
+    - block_type: conditional
+      label: release_recent
+      branch_conditions:
+        - criteria:
+            criteria_type: jinja2_template
+            expression: '{{ check_recency.within_six_months == true }}'
+          next_block_label: download_release
+          description: Latest release is within the last six months
+          is_default: false
+        - is_default: true
+          next_block_label: read_readme
+          description: Release is older than six months or none was found
+    - block_type: agent_step
+      label: download_release
+      prompt: 'Download the latest release of ''{{ project_name }}''. Release page: {{ find_release_output.output.release_page_url }}. Candidate asset URLs: {{ find_release_output.output.asset_urls }}. Download the main release artifact (prefer the primary source archive or the most general package; if there are platform-specific binaries, pick the Linux x86_64 build plus nothing else). Use download_to_s3 for direct URLs, or file_download if a page interaction is needed. Report which file was downloaded.'
+      parameter_keys:
+        - project_name
+        - find_release_output
+      tools:
+        - download_to_s3
+        - file_download
+        - page_goto
+        - finish
+      max_turns: 15
+      next_block_label: null
+      data_schema:
+        type: object
+        properties:
+          downloaded:
+            type: boolean
+          file_name:
+            type:
+              - string
+              - 'null'
+          file_url:
+            type:
+              - string
+              - 'null'
+        required:
+          - downloaded
+          - file_name
+          - file_url
+    - block_type: agent_step
+      label: read_readme
+      prompt: 'The latest release of ''{{ project_name }}'' is older than six months or does not exist (repository: {{ find_release_output.output.repository_url }}, last release date: {{ find_release_output.output.release_date }}). Open the repository''s README and output it. Determine whether the README (or any prominent banner in the repository) contains a deprecation, archived, unmaintained, or maintenance-mode notice, and quote that notice verbatim if present.'
+      parameter_keys:
+        - project_name
+        - find_release_output
+      tools: [page_goto, page_extract, browser_task, finish]
+      max_turns: 15
+      next_block_label: null
+      data_schema:
+        type: object
+        properties:
+          readme_text:
+            type:
+              - string
+              - 'null'
+            description: Full README text
+          has_deprecation_or_maintenance_notice:
+            type: boolean
+          notice_text:
+            type:
+              - string
+              - 'null'
+        required:
+          - readme_text
+          - has_deprecation_or_maintenance_notice
+          - notice_text
+  finally_block_label: null
+max_elapsed_time_minutes: null

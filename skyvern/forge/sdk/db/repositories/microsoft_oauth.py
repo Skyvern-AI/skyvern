@@ -28,7 +28,31 @@ def _is_powerbi_connection(scopes_requested: list[str] | None, scopes_granted: l
     return _has_scope(scopes_requested, "Dataset.Read.All") or _has_scope(scopes_granted, "Dataset.Read.All")
 
 
+def _can_manage_credential(
+    scopes_requested: list[str] | None,
+    scopes_granted: list[str] | None,
+    owner_user_id: str | None,
+    organization_id: str,
+    user_id: str | None,
+) -> bool:
+    return not _is_powerbi_connection(scopes_requested, scopes_granted) or (
+        user_id is not None and user_id != f"{organization_id}_user" and user_id == owner_user_id
+    )
+
+
 class InvalidConsentNonceError(ValueError):
+    pass
+
+
+class ReconnectIdentityUnavailableError(ValueError):
+    pass
+
+
+class IncompatibleScopeProfileError(ValueError):
+    pass
+
+
+class PowerBIReconnectAccessDenied(PermissionError):
     pass
 
 
@@ -37,8 +61,12 @@ class PendingConsentContext:
     credential_id: str
     consent_redirect_uri: str | None
     consent_code_verifier: str | None
+    state: str = STATE_PENDING_CONSENT
     consent_app_origin: str | None = None
     scopes_requested: list[str] | None = None
+    scopes_granted: list[str] | None = None
+    tenant_id: str | None = None
+    object_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -78,16 +106,6 @@ class ActiveCustodyConnection:
 
 
 class MicrosoftOAuthRepository(BaseRepository):
-    @db_operation("get_credential_state")
-    async def get_credential_state(self, organization_id: str, credential_id: str) -> str | None:
-        async with self.Session() as session:
-            return await session.scalar(
-                select(MicrosoftOAuthCredentialModel.state).where(
-                    MicrosoftOAuthCredentialModel.organization_id == organization_id,
-                    MicrosoftOAuthCredentialModel.id == credential_id,
-                )
-            )
-
     @db_operation("insert_pending_credential")
     async def insert_pending_credential(
         self,
@@ -134,12 +152,16 @@ class MicrosoftOAuthRepository(BaseRepository):
                 MicrosoftOAuthCredentialModel.id,
                 MicrosoftOAuthCredentialModel.consent_redirect_uri,
                 MicrosoftOAuthCredentialModel.consent_code_verifier,
+                MicrosoftOAuthCredentialModel.state,
                 MicrosoftOAuthCredentialModel.consent_app_origin,
                 MicrosoftOAuthCredentialModel.scopes_requested,
+                MicrosoftOAuthCredentialModel.scopes_granted,
+                MicrosoftOAuthCredentialModel.tenant_id,
+                MicrosoftOAuthCredentialModel.object_id,
             ).where(
                 MicrosoftOAuthCredentialModel.consent_nonce == nonce,
                 MicrosoftOAuthCredentialModel.organization_id == organization_id,
-                MicrosoftOAuthCredentialModel.state == STATE_PENDING_CONSENT,
+                MicrosoftOAuthCredentialModel.state.in_([STATE_PENDING_CONSENT, STATE_ACTIVE, STATE_ERROR]),
                 MicrosoftOAuthCredentialModel.consent_expires_at >= cutoff,
             )
             row = (await session.execute(stmt)).one_or_none()
@@ -149,9 +171,97 @@ class MicrosoftOAuthRepository(BaseRepository):
                 credential_id=row[0],
                 consent_redirect_uri=row[1],
                 consent_code_verifier=row[2],
-                consent_app_origin=row[3],
-                scopes_requested=list(row[4] or []),
+                state=row[3],
+                consent_app_origin=row[4],
+                scopes_requested=list(row[5] or []),
+                scopes_granted=list(row[6] or []),
+                tenant_id=row[7],
+                object_id=row[8],
             )
+
+    @db_operation(
+        "begin_reauthorization",
+        expected_errors=(
+            ReconnectIdentityUnavailableError,
+            IncompatibleScopeProfileError,
+            PowerBIReconnectAccessDenied,
+        ),
+    )
+    async def begin_reauthorization(
+        self,
+        credential_id: str,
+        organization_id: str,
+        consent_nonce: str,
+        consent_redirect_uri: str,
+        consent_expires_at: datetime.datetime,
+        consent_code_verifier: str,
+        now: datetime.datetime,
+        outlook_scopes: list[str],
+        powerbi_scopes: list[str],
+        requested_scopes: list[str] | None = None,
+        consent_app_origin: str | None = None,
+        requesting_user_id: str | None = None,
+    ) -> MicrosoftOAuthCredentialBase | None:
+        async with self.Session() as session:
+            row = (
+                await session.execute(
+                    select(MicrosoftOAuthCredentialModel)
+                    .where(
+                        MicrosoftOAuthCredentialModel.id == credential_id,
+                        MicrosoftOAuthCredentialModel.organization_id == organization_id,
+                        MicrosoftOAuthCredentialModel.state.in_([STATE_ACTIVE, STATE_ERROR]),
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            if not row.tenant_id or not row.object_id:
+                raise ReconnectIdentityUnavailableError(
+                    "This Microsoft connection has no recorded account identity. Create a new connection instead."
+                )
+
+            existing_is_powerbi = _is_powerbi_connection(row.scopes_requested, row.scopes_granted)
+            profile_scopes = requested_scopes or (powerbi_scopes if existing_is_powerbi else outlook_scopes)
+            requested_is_powerbi = _is_powerbi_connection(profile_scopes, [])
+            if requested_is_powerbi != existing_is_powerbi:
+                raise IncompatibleScopeProfileError(
+                    "Microsoft Graph and Power BI permissions require separate connections. Connect a separate account."
+                )
+            if not _can_manage_credential(
+                row.scopes_requested,
+                row.scopes_granted,
+                row.initiating_user_id,
+                organization_id,
+                requesting_user_id,
+            ):
+                raise PowerBIReconnectAccessDenied("Only the owner can reconnect this Power BI connection")
+
+            granted_scopes = list(row.scopes_granted or [])
+            if existing_is_powerbi:
+                # Credential reads reject a Power BI row whose requested scopes include anything outside the profile.
+                profile_by_name = {scope.rsplit("/", 1)[-1]: scope for scope in powerbi_scopes}
+                granted_scopes = [
+                    profile_by_name[scope.rsplit("/", 1)[-1]]
+                    for scope in granted_scopes
+                    if scope.rsplit("/", 1)[-1] in profile_by_name
+                ]
+            merged_by_name = {scope.rsplit("/", 1)[-1]: scope for scope in granted_scopes}
+            for scope in profile_scopes:
+                merged_by_name.setdefault(scope.rsplit("/", 1)[-1], scope)
+
+            # Like Google, an abandoned consent leaves this widened request; reads go by scopes_granted.
+            row.scopes_requested = list(merged_by_name.values())
+            row.consent_nonce = consent_nonce
+            row.consent_redirect_uri = consent_redirect_uri
+            row.consent_expires_at = consent_expires_at
+            row.consent_code_verifier = consent_code_verifier
+            row.consent_app_origin = consent_app_origin
+            row.modified_at = now
+            await session.flush()
+            result = MicrosoftOAuthCredentialBase.model_validate(row, from_attributes=True)
+            await session.commit()
+            return result
 
     @db_operation("promote_pending_to_active")
     async def promote_pending_to_active(
@@ -172,7 +282,7 @@ class MicrosoftOAuthRepository(BaseRepository):
                 .where(
                     MicrosoftOAuthCredentialModel.consent_nonce == nonce,
                     MicrosoftOAuthCredentialModel.organization_id == organization_id,
-                    MicrosoftOAuthCredentialModel.state == STATE_PENDING_CONSENT,
+                    MicrosoftOAuthCredentialModel.state.in_([STATE_PENDING_CONSENT, STATE_ACTIVE, STATE_ERROR]),
                     MicrosoftOAuthCredentialModel.consent_expires_at >= now,
                 )
                 .values(
@@ -182,7 +292,9 @@ class MicrosoftOAuthRepository(BaseRepository):
                     scopes_granted=scopes_granted,
                     tenant_id=tenant_id or MicrosoftOAuthCredentialModel.tenant_id,
                     object_id=object_id or MicrosoftOAuthCredentialModel.object_id,
-                    initiating_user_id=initiating_user_id or MicrosoftOAuthCredentialModel.initiating_user_id,
+                    initiating_user_id=func.coalesce(
+                        MicrosoftOAuthCredentialModel.initiating_user_id, initiating_user_id
+                    ),
                     connection_id=MicrosoftOAuthCredentialModel.id,
                     consent_nonce=None,
                     consent_redirect_uri=None,
@@ -205,9 +317,7 @@ class MicrosoftOAuthRepository(BaseRepository):
                 ).scalar_one_or_none()
                 if fallback is None:
                     raise InvalidConsentNonceError("Unknown OAuth consent nonce")
-                if fallback.state == STATE_ERROR:
-                    raise InvalidConsentNonceError("OAuth consent row is in error state")
-                if fallback.state != STATE_PENDING_CONSENT:
+                if fallback.state not in [STATE_PENDING_CONSENT, STATE_ACTIVE, STATE_ERROR]:
                     raise InvalidConsentNonceError("OAuth consent nonce already consumed")
                 raise InvalidConsentNonceError("OAuth consent nonce expired")
             result = MicrosoftOAuthCredentialBase.model_validate(promoted, from_attributes=True)
@@ -341,9 +451,7 @@ class MicrosoftOAuthRepository(BaseRepository):
             if values is None:
                 return False
             requested, granted, owner_user_id = values
-            return not _is_powerbi_connection(requested, granted) or (
-                user_id is not None and user_id != f"{organization_id}_user" and user_id == owner_user_id
-            )
+            return _can_manage_credential(requested, granted, owner_user_id, organization_id, user_id)
 
     @db_operation("load_active_custody_connection")
     async def load_active_custody_connection(

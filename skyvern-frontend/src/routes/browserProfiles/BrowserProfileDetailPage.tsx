@@ -12,7 +12,7 @@ import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
-import { CopyText } from "@/routes/workflows/editor/Workspace";
+import { CopyButton } from "@/components/CopyButton";
 import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 
 import { DeleteBrowserProfileButton } from "./DeleteBrowserProfileButton";
@@ -159,9 +159,10 @@ function BrowserProfileDetailPage() {
               </dt>
               <dd className="flex items-center font-mono text-sm">
                 <span className="break-all">{profile.browser_profile_id}</span>
-                <CopyText
+                <CopyButton
                   className="ml-1 opacity-75 hover:opacity-100"
-                  text={profile.browser_profile_id}
+                  value={profile.browser_profile_id}
+                  ariaLabel="Copy profile ID"
                 />
               </dd>
 
@@ -229,9 +230,10 @@ function BrowserProfileDetailPage() {
                             Consistent IP active: identity{" "}
                             {existingProxyIdentity}
                           </span>
-                          <CopyText
+                          <CopyButton
                             className="opacity-75 hover:opacity-100"
-                            text={profile.proxy_session_id}
+                            value={profile.proxy_session_id}
+                            ariaLabel="Copy proxy session ID"
                           />
                         </p>
                         <div className="flex flex-wrap items-center gap-2">

@@ -30,6 +30,15 @@ describe("a step's failure in plain words", () => {
     ).toBe("Could not find AAPL quote");
   });
 
+  test("a step run with no page to start on says so without internal names", () => {
+    const text = failureHeadlineInPlainWords(
+      "navigation block failed. failure reason: block 'go_to_url_2' has no starting URL set. The first browser block must have a URL to navigate to. Set a URL on the block, or reference a workflow parameter (e.g. '{{ starting_url }}').",
+      headline,
+    );
+    expect(text).toMatch(/needs a page to start on/);
+    expect(text).not.toMatch(/go_to_url_2|block|workflow parameter|\{\{/);
+  });
+
   test("other failures keep their own headline", () => {
     expect(failureHeadlineInPlainWords("Page timed out. More.", headline)).toBe(
       "Page timed out",

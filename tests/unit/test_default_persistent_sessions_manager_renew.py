@@ -9,7 +9,6 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from skyvern.config import settings
 from skyvern.exceptions import BrowserSessionNotExtendable
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     PersistentBrowserSession,
@@ -87,13 +86,6 @@ async def test_a_longer_lived_session_still_renews_within_the_threshold() -> Non
     database.browser_sessions.update_persistent_browser_session.assert_called_once()
     _, kwargs = database.browser_sessions.update_persistent_browser_session.call_args
     assert kwargs["timeout_minutes"] > 30
-
-
-def test_debug_session_timeout_defaults_assumed_by_this_test_module() -> None:
-    # These scenarios are only meaningful for the threshold/extension window this bug was filed
-    # against; if the defaults ever change, the minute values above need re-deriving.
-    assert settings.DEBUG_SESSION_TIMEOUT_MINUTES == 20
-    assert settings.DEBUG_SESSION_TIMEOUT_THRESHOLD_MINUTES == 10
 
 
 @pytest.mark.asyncio

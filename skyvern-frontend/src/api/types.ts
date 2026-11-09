@@ -429,6 +429,7 @@ export interface GoogleOAuthCredential {
   valid?: boolean | null;
   // Decided by the server: active, send permission granted, and a verified account identity on record.
   gmail_send_ready?: boolean;
+  account_recorded?: boolean;
   created_at: string;
   modified_at: string;
 }
@@ -478,6 +479,7 @@ export interface CreateGoogleOAuthAuthorizeRequest {
   // Existing credential to re-authenticate in place, preserving its id so
   // workflows referencing it keep working without edits.
   credential_id?: string;
+  set_account?: boolean;
 }
 
 export interface GoogleOAuthAuthorizeResponse {
@@ -655,10 +657,13 @@ export interface DisablePhoneNumberRequest {
 export interface BitwardenCredential {
   email: string;
   master_password: string;
+  client_id?: string;
+  client_secret?: string;
 }
 
 export interface BitwardenCredentialSafe {
   email: string;
+  client_id?: string | null;
 }
 
 export interface BitwardenOrganizationAuthToken {
@@ -1242,6 +1247,7 @@ export type CredentialApiResponse = {
     | "bitwarden"
     | "azure_vault"
     | "gcp"
+    | "aws_secrets_manager"
     | "custom"
     | "onepassword"
     | "bitwarden_connected"
@@ -1253,6 +1259,8 @@ export type CredentialApiResponse = {
   auto_profile_disabled?: boolean | null;
   pin_saved_session_ip?: boolean | null;
   tested_url?: string | null;
+  // More sites this login signs in on, each covering its whole site.
+  extra_site_urls?: string[] | null;
   user_context?: string | null;
   save_browser_session_intent?: boolean | null;
   run_sequentially?: boolean | null;

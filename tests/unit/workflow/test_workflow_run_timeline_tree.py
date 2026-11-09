@@ -343,7 +343,7 @@ async def test_flatten_nested_task_v2_keeps_both_replaced_blocks(monkeypatch: py
     )
     runs = {"wr_outer_child": [inner], "wr_inner_child": [leaf]}
 
-    async def flatten_run(organization_id: str, workflow_run_id: str, cap_output_values: bool) -> list:
+    async def flatten_run(organization_id: str, workflow_run_id: str, cap_output_values: bool, downloads: Any) -> list:
         return [
             row
             for item in runs[workflow_run_id]

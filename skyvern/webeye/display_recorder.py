@@ -78,6 +78,22 @@ _PDEATHSIG_TRAMPOLINE = (
     "os.execvp(sys.argv[2],sys.argv[2:])\n"
 )
 
+_OTEL_AUTO_INSTRUMENTATION_DIR = ("opentelemetry", "instrumentation", "auto_instrumentation")
+
+
+def _bridge_env() -> dict[str, str]:
+    # opentelemetry-instrument puts its sitecustomize dir on PYTHONPATH, and every interpreter that inherits it re-runs
+    # auto-instrumentation (~1 s). The recorder starts two (trampoline, then bridge), neither of which needs OTel.
+    env = dict(os.environ)
+    pythonpath = env.get("PYTHONPATH")
+    if pythonpath:
+        kept = [p for p in pythonpath.split(os.pathsep) if Path(p).parts[-3:] != _OTEL_AUTO_INSTRUMENTATION_DIR]
+        if kept:
+            env["PYTHONPATH"] = os.pathsep.join(kept)
+        else:
+            del env["PYTHONPATH"]
+    return env
+
 
 @dataclass(frozen=True)
 class RecordingProfile:
@@ -648,6 +664,7 @@ async def acquire_display_recorder(
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
+            env=_bridge_env(),
             # Own process group so a force-kill reaps the bridge AND its ffmpeg child together (no orphan);
             # PDEATHSIG still binds the bridge to worker death independently of the group.
             start_new_session=(os.name == "posix"),

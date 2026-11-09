@@ -9,7 +9,7 @@ fallback) without writing a new adapter.
 Invariant documented in ``architecture.md``: raw ``litellm.acompletion`` is
 banned — every v3 LLM call must preserve BOTH telemetry parity AND
 router-level fallback parity (Gemini 3 Flash → GPT-5-mini via
-``cloud/llm/router.py``).
+the cloud LLM router).
 """
 
 from __future__ import annotations

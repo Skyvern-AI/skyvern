@@ -80,7 +80,6 @@ async def test_anchored_repair_restores_only_legacy_editor_engine_default(
     prior = _definition(engine)
     update = AsyncMock(return_value={"ok": False, "error": "stop after the persistence handoff"})
     monkeypatch.setattr(tools, "_authority_tool_error", lambda *_args: None)
-    monkeypatch.setattr(tools, "_update_and_run_requires_skipped_run", lambda *_args: False)
     monkeypatch.setattr(tools, "_get_prior_workflow_definition", AsyncMock(return_value=prior))
     monkeypatch.setattr(tools, "_update_workflow", update)
     monkeypatch.setattr(tools, "_record_workflow_update_result", lambda *_args: None)

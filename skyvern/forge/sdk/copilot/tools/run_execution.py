@@ -4046,6 +4046,19 @@ def _test_start_unavailable_result(ctx: CopilotContext) -> dict[str, Any]:
     }
 
 
+_UNCONFIRMED_LOGIN_REASON = "The test needs a saved login you haven't confirmed in this chat yet."
+
+
+def _refused_before_dispatch(ctx: CopilotContext, error: str, *, user_reason: str | None = None) -> dict[str, Any]:
+    # The reply guards and the diagnosis read the latest attempt's facts; only the run outcome is withheld.
+    # `error` is written for the model, so a refusal that has a user-facing sentence gives the reply that instead.
+    result: dict[str, Any] = {"ok": False, "error": error, "data": {"run_dispatched": False}}
+    _record_run_blocks_result(ctx, result, record_outcome=False)
+    if user_reason:
+        ctx.last_test_failure_reason = user_reason
+    return result
+
+
 async def _canonical_workflow_unavailable_refusal(ctx: CopilotContext) -> dict[str, Any] | None:
     if not ctx.workflow_copilot_chat_id:
         return None
@@ -4464,7 +4477,7 @@ async def _run_blocks_with_minted_browser_claim(
 
     block_labels = params["block_labels"]
     if not block_labels:
-        return {"ok": False, "error": "block_labels must not be empty"}
+        return _refused_before_dispatch(ctx, "block_labels must not be empty")
 
     labels_to_execute = list(labels_to_execute) if labels_to_execute else list(block_labels)
     block_outputs_to_seed = copy.deepcopy(block_outputs_to_seed or {})
@@ -4490,7 +4503,7 @@ async def _run_blocks_with_minted_browser_claim(
 
     snapshot = execution_snapshot or await _select_execution_snapshot(ctx, block_labels)
     if snapshot is None:
-        return {"ok": False, "error": f"Workflow not found: {ctx.workflow_permanent_id}"}
+        return _refused_before_dispatch(ctx, f"Workflow not found: {ctx.workflow_permanent_id}")
     workflow = snapshot.workflow
     execution = _RunExecution(
         snapshot=snapshot,
@@ -4525,7 +4538,7 @@ async def _run_blocks_with_minted_browser_claim(
             proposal_owner_turn_id=execution.proposal_owner_turn_id,
             proposal_revision=execution.proposal_revision,
         )
-        return {"ok": False, "error": COPILOT_PROPOSAL_SETTINGS_CHANGED_ERROR}
+        return _refused_before_dispatch(ctx, COPILOT_PROPOSAL_SETTINGS_CHANGED_ERROR)
 
     if explicit_blank and snapshot.provenance == "canonical" and execution.source_is_current(ctx):
         # Existing verification consumers need the same source this full test selected.
@@ -4535,7 +4548,7 @@ async def _run_blocks_with_minted_browser_claim(
 
     for label in block_labels:
         if not workflow.get_output_parameter(label):
-            return {"ok": False, "error": f"Block label not found in saved workflow: {label!r}"}
+            return _refused_before_dispatch(ctx, f"Block label not found in saved workflow: {label!r}")
 
     # Resolved once: the origin-input check must compare exactly what gets dispatched.
     origin_checked_resolution: tuple[dict[str, Any], list[str], list[str], list[CopilotTestInput]] | None = None
@@ -4682,7 +4695,7 @@ async def _run_blocks_with_minted_browser_claim(
         )
         tool_error = stash_blocker_signal(ctx, google_approval_blocker)
         stash_turn_halt_from_blocker_signal(ctx, google_approval_blocker, source="run_execution")
-        return {"ok": False, "error": tool_error}
+        return _refused_before_dispatch(ctx, tool_error, user_reason=google_approval_blocker.user_facing_reason)
     _retire_stale_google_connection_denial(
         ctx,
         workflow_definition=workflow.workflow_definition,
@@ -4694,14 +4707,14 @@ async def _run_blocks_with_minted_browser_claim(
         additional_approved_ids=dispatch_scoped_sheet_ids,
     )
     if credential_approval_error is not None:
-        return {"ok": False, "error": credential_approval_error}
+        return _refused_before_dispatch(ctx, credential_approval_error, user_reason=_UNCONFIRMED_LOGIN_REASON)
 
     credential_error = await _credential_ids_validation_error(credential_ids, ctx)
     if credential_error is not None:
-        return {"ok": False, "error": credential_error}
+        return _refused_before_dispatch(ctx, credential_error)
     placement_error = await run_input_vault_placement_error(workflow.workflow_definition, params.get("parameters"), ctx)
     if placement_error is not None:
-        return {"ok": False, "error": placement_error}
+        return _refused_before_dispatch(ctx, placement_error)
 
     from skyvern.forge.sdk.schemas.organizations import Organization
     from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody
@@ -4709,7 +4722,7 @@ async def _run_blocks_with_minted_browser_claim(
 
     org = await app.DATABASE.organizations.get_organization(organization_id=ctx.organization_id)
     if not org:
-        return {"ok": False, "error": "Organization not found"}
+        return _refused_before_dispatch(ctx, "Organization not found")
 
     organization = Organization.model_validate(org)
     # Retain the per-org rollout, but never use its negative decision as permission to execute
@@ -4860,7 +4873,7 @@ async def _run_blocks_with_minted_browser_claim(
                 return _saved_profile_start_failure("saved_profile_unresolved", requested_block_labels=block_labels)
             seed_approval_error = _credential_run_approval_error(seed_owner_ids, ctx.request_policy)
             if seed_approval_error is not None:
-                return {"ok": False, "error": seed_approval_error}
+                return _refused_before_dispatch(ctx, seed_approval_error, user_reason=_UNCONFIRMED_LOGIN_REASON)
         if preview is not None and preview[1] == BrowserSeedSource.picked:
             # A draft can name any profile in the org; only the saved workflow's pick at turn start, or the
             # profile the user's own sign-in saved on this turn's card, is settled.
@@ -7156,6 +7169,7 @@ def _record_run_blocks_result(
     result: dict[str, Any],
     completion_verification: CompletionVerificationResult | None = None,
     connect_failure_reason: str | None = None,
+    record_outcome: bool = True,
 ) -> RecordedRunOutcome | None:
     """Record the run result on ctx without letting a second judge rewrite it."""
     _record_executed_block_labels(copilot_ctx, result)
@@ -7429,6 +7443,8 @@ def _record_run_blocks_result(
         copilot_ctx, copilot_ctx.last_test_failure_reason, result
     )
     _update_verification_evidence_from_run_result(copilot_ctx, result)
+    if not record_outcome:
+        return None
     displayed_failure_reason = copilot_ctx.last_test_failure_reason or str(result.get("error") or "The run failed.")
     recorded_outcome = RecordedRunOutcome(
         verdict="not_demonstrated",

@@ -26,7 +26,7 @@ import {
 } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
-import { AxiosError } from "axios";
+import { AxiosError, AxiosHeaders } from "axios";
 import { parse, stringify } from "yaml";
 
 import {
@@ -523,6 +523,15 @@ beforeEach(() => {
   });
 });
 
+function openSettingsGroup(id: string) {
+  const trigger = screen
+    .getByTestId(`settings-group-${id}`)
+    .querySelector("button") as HTMLButtonElement;
+  if (trigger.getAttribute("aria-expanded") === "false") {
+    fireEvent.click(trigger);
+  }
+}
+
 describe("WorkflowEditor deleted-agent run fallback", () => {
   test("renders the studio run view from the run snapshot when the workflow query 404s", () => {
     workflowQueryMock.mockReturnValue({
@@ -572,6 +581,25 @@ describe("WorkflowEditor deleted-agent run fallback", () => {
 
     expect(screen.queryByTestId("run-view-body")).toBeNull();
     expect(screen.queryByText(/Agent deleted on/)).toBeNull();
+  });
+
+  test("shows the 404 page when the workflow query 404s and no run can stand in", () => {
+    workflowQueryMock.mockReturnValue({
+      data: undefined,
+      isLoading: false,
+      isError: true,
+      error: new AxiosError("Not Found", "404", undefined, undefined, {
+        status: 404,
+        statusText: "Not Found",
+        data: {},
+        headers: {},
+        config: { headers: new AxiosHeaders() },
+      }),
+    });
+
+    renderStudioAt("/agents/wpid_missing/studio");
+
+    expect(screen.getByText("Not Found")).toBeTruthy();
   });
 
   test("a healthy workflow keeps the full studio (no deleted degradation)", () => {
@@ -1825,6 +1853,7 @@ describe("save failures stop navigation and block runs", () => {
     workflowQueryMock.mockReturnValue({ data: workflow, isLoading: false });
     const view = renderSettingsWorkspace(workflow);
     try {
+      openSettingsGroup("webhook");
       const webhook = screen.getByPlaceholderText(
         "https://",
       ) as HTMLInputElement;
@@ -4747,6 +4776,7 @@ describe("A49 metadata authorship through editor actions", () => {
             canvas.current!.nodes.find((node) => node.type === "start")!.id,
           ),
       );
+      openSettingsGroup("model");
       const selector = screen
         .getAllByRole("combobox")
         .find((element) => element.textContent?.includes("Proposal model"))!;
