@@ -9264,7 +9264,8 @@
                 "type": "null"
               }
             ],
-            "title": "Max Steps Per Run"
+            "title": "Max Steps Per Run",
+            "description": "Action-step budget for one run, not an exact stop. On the skyvern-3.0 (Task V3) engine, except on action and validation blocks, the effective budget is never below 24: a positive value under 24 runs as 24, and a run still making progress can be granted steps past the budget."
           },
           "parameter_keys": {
             "anyOf": [
@@ -15717,7 +15718,8 @@
                 "type": "null"
               }
             ],
-            "title": "Max Steps Per Run"
+            "title": "Max Steps Per Run",
+            "description": "Action-step budget for one run, not an exact stop. On the skyvern-3.0 (Task V3) engine, except on action and validation blocks, the effective budget is never below 24: a positive value under 24 runs as 24, and a run still making progress can be granted steps past the budget."
           },
           "parameter_keys": {
             "anyOf": [
@@ -16708,7 +16710,8 @@
                 "type": "null"
               }
             ],
-            "title": "Max Steps Per Run"
+            "title": "Max Steps Per Run",
+            "description": "Action-step budget for one run, not an exact stop. On the skyvern-3.0 (Task V3) engine, except on action and validation blocks, the effective budget is never below 24: a positive value under 24 runs as 24, and a run still making progress can be granted steps past the budget."
           },
           "parameter_keys": {
             "anyOf": [
@@ -20870,7 +20873,8 @@
                 "type": "null"
               }
             ],
-            "title": "Max Steps Per Run"
+            "title": "Max Steps Per Run",
+            "description": "Action-step budget for one run, not an exact stop. On the skyvern-3.0 (Task V3) engine, except on action and validation blocks, the effective budget is never below 24: a positive value under 24 runs as 24, and a run still making progress can be granted steps past the budget."
           },
           "parameter_keys": {
             "anyOf": [
@@ -21689,7 +21693,8 @@
                 "type": "null"
               }
             ],
-            "title": "Max Steps Per Run"
+            "title": "Max Steps Per Run",
+            "description": "Action-step budget for one run, not an exact stop. On the skyvern-3.0 (Task V3) engine, except on action and validation blocks, the effective budget is never below 24: a positive value under 24 runs as 24, and a run still making progress can be granted steps past the budget."
           },
           "parameter_keys": {
             "anyOf": [
@@ -26552,7 +26557,8 @@
                 "type": "null"
               }
             ],
-            "title": "Max Steps Per Run"
+            "title": "Max Steps Per Run",
+            "description": "Action-step budget for one run, not an exact stop. On the skyvern-3.0 (Task V3) engine, except on action and validation blocks, the effective budget is never below 24: a positive value under 24 runs as 24, and a run still making progress can be granted steps past the budget."
           },
           "parameter_keys": {
             "anyOf": [
@@ -30122,7 +30128,8 @@
                 "type": "null"
               }
             ],
-            "title": "Max Steps Per Run"
+            "title": "Max Steps Per Run",
+            "description": "Action-step budget for one run, not an exact stop. On the skyvern-3.0 (Task V3) engine, except on action and validation blocks, the effective budget is never below 24: a positive value under 24 runs as 24, and a run still making progress can be granted steps past the budget."
           },
           "parameter_keys": {
             "anyOf": [
