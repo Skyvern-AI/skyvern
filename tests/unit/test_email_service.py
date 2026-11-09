@@ -1709,3 +1709,24 @@ async def test_outlook_list_folder_messages_keeps_message_when_attachment_fetch_
         )
     assert messages[0].attachment_list_error is None
     assert requested[0].attachment_list_error == "ServiceUnavailable"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["rateLimitExceeded", "userRateLimitExceeded"])
+async def test_gmail_get_json_retries_403_rate_limits(monkeypatch: pytest.MonkeyPatch, reason: str) -> None:
+    calls = 0
+
+    async def fake_sleep(_seconds: float) -> None:
+        pass
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(403, json={"error": {"errors": [{"reason": reason}]}})
+
+    monkeypatch.setattr(gmail_client, "asyncio", ScopedAsyncio(sleep=fake_sleep))
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(email.GmailAPIError) as exc_info:
+            await gmail_client.get_json(client, "https://gmail.example/messages", access_token="AT")
+    assert calls == 3
+    assert exc_info.value.code == reason

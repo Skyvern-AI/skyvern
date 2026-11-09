@@ -2182,3 +2182,101 @@ def test_gmail_send_yaml_keeps_a_blank_draft_and_rejects_the_other_transports_fi
         SendEmailBlockYAML(label="send_email", recipients=["to@example.com"], subject="s", body="b")
     with pytest.raises(ValidationError, match="cannot be combined with the gmail transport"):
         _send_email_block_yaml(transport="gmail", custom_smtp_host="smtp.example.com")
+
+
+@pytest.mark.asyncio
+async def test_gmail_reply_in_thread(gmail_env: GmailEnv, monkeypatch: pytest.MonkeyPatch) -> None:
+    await gmail_env.set_connection(
+        scopes_granted=[google_oauth_service.GOOGLE_GMAIL_SEND_SCOPE, google_oauth_service.GOOGLE_GMAIL_READONLY_SCOPE]
+    )
+    fetch = AsyncMock(
+        return_value={
+            "threadId": "thread-1",
+            "payload": {
+                "headers": [
+                    {"name": "Message-ID", "value": "<original@example.com>"},
+                    {"name": "References", "value": "<earlier@example.com>"},
+                    {"name": "Subject", "value": "Re: Original"},
+                    {"name": "Reply-To", "value": "reply@example.com"},
+                ]
+            },
+        }
+    )
+    monkeypatch.setattr(block_module, "get_json", fetch)
+    result = await _run_gmail(_gmail_block(reply_to_message_id="message/1", recipients=[]))
+    assert result.status == BlockStatus.completed
+    assert fetch.await_args.args[1].endswith("/messages/message%2F1")
+    (request,) = gmail_env.requests
+    assert request.url.params["uploadType"] == "multipart"
+    assert b'"threadId": "thread-1"' in request.content
+    assert b"In-Reply-To: <original@example.com>" in request.content
+    assert b"References: <earlier@example.com> <original@example.com>" in request.content
+    assert b"To: reply@example.com" in request.content
+    assert b"Subject: Re: Original" in request.content
+
+
+@pytest.mark.asyncio
+async def test_gmail_reply_requires_read_permission(gmail_env: GmailEnv) -> None:
+    result = await _run_gmail(_gmail_block(reply_to_message_id="message-1"))
+    assert result.status == BlockStatus.failed
+    assert "Reconnect" in result.failure_reason
+    assert not gmail_env.requests
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "code", "expected"),
+    [
+        (401, None, "reconnect"),
+        (403, "reconnect_required", "reconnect"),
+        (429, None, "rate_limited"),
+        (403, "rateLimitExceeded", "rate_limited"),
+        (403, "userRateLimitExceeded", "rate_limited"),
+        (503, "upstream_unavailable", "internal_error"),
+    ],
+)
+async def test_gmail_reply_fetch_failure(
+    gmail_env: GmailEnv, monkeypatch: pytest.MonkeyPatch, status: int, code: str | None, expected: str
+) -> None:
+    await gmail_env.set_connection(
+        scopes_granted=[google_oauth_service.GOOGLE_GMAIL_SEND_SCOPE, google_oauth_service.GOOGLE_GMAIL_READONLY_SCOPE]
+    )
+    monkeypatch.setattr(
+        block_module,
+        "get_json",
+        AsyncMock(side_effect=block_module.GmailAPIError(status=status, code=code, message="private")),
+    )
+    result = await _run_gmail(_gmail_block(reply_to_message_id="message-1"))
+    assert result.status == BlockStatus.failed
+    assert result.output_parameter_value["error_code"] == expected
+    assert "private" not in result.failure_reason
+    assert not gmail_env.requests
+
+
+@pytest.mark.asyncio
+async def test_gmail_reply_to_sent_message_uses_original_recipients(
+    gmail_env: GmailEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await gmail_env.set_connection(
+        scopes_granted=[google_oauth_service.GOOGLE_GMAIL_SEND_SCOPE, google_oauth_service.GOOGLE_GMAIL_READONLY_SCOPE]
+    )
+    monkeypatch.setattr(
+        block_module,
+        "get_json",
+        AsyncMock(
+            return_value={
+                "threadId": "thread-1",
+                "payload": {
+                    "headers": [
+                        {"name": "Message-ID", "value": "<original@example.com>"},
+                        {"name": "From", "value": GMAIL_SENDER.upper()},
+                        {"name": "To", "value": "recipient@example.com"},
+                        {"name": "Subject", "value": "Original"},
+                    ]
+                },
+            }
+        ),
+    )
+    result = await _run_gmail(_gmail_block(reply_to_message_id="sent-1", recipients=[]))
+    assert result.status == BlockStatus.completed
+    assert b"To: recipient@example.com" in gmail_env.requests[0].content

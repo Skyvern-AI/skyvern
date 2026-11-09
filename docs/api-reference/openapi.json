@@ -14752,6 +14752,17 @@
             ],
             "title": "Credential Id"
           },
+          "message_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Message Id"
+          },
           "folder": {
             "anyOf": [
               {
@@ -14981,6 +14992,17 @@
             ],
             "title": "Credential Id",
             "x-skyvern-connected-account": true
+          },
+          "message_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Message Id"
           },
           "folder": {
             "anyOf": [
@@ -24702,6 +24724,17 @@
             ],
             "title": "Credential Id"
           },
+          "reply_to_message_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reply To Message Id"
+          },
           "cc": {
             "items": {
               "type": "string"
@@ -24938,6 +24971,18 @@
             "title": "Credential Id",
             "description": "ID of a connected Google account that has send permission. Used only with transport 'gmail'.",
             "x-skyvern-connected-account": true
+          },
+          "reply_to_message_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reply To Message Id",
+            "description": "Gmail message ID to reply to in its original thread; requires send and read permissions."
           },
           "cc": {
             "items": {

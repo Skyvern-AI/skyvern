@@ -707,6 +707,7 @@ def block_yaml_to_block(
             credential_id=block_yaml.credential_id,
             cc=block_yaml.cc,
             bcc=block_yaml.bcc,
+            reply_to_message_id=block_yaml.reply_to_message_id,
         )
     elif block_yaml.block_type == BlockType.FILE_URL_PARSER:
         return FileParserBlock(
@@ -1058,6 +1059,7 @@ def block_yaml_to_block(
             credential_source=block_yaml.credential_source,
             connection_id=block_yaml.connection_id,
             credential_id=block_yaml.credential_id,
+            message_id=block_yaml.message_id,
             folder=block_yaml.folder,
             prompt=block_yaml.prompt,
             sender=block_yaml.sender,

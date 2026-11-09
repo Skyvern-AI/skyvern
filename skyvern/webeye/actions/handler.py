@@ -3923,6 +3923,11 @@ async def _fill_secret_with_readback(
                 raise
             readback_expected = canonical
             date_recovered = True
+        # The sequential transport emits the keyboard events a JS-gated form tracks edits with; an atomic fill
+        # emits none, so without this the login form keeps its submit disabled over a correctly filled field.
+        # A deferred-editing field is excluded: `blur` ends its editing session, which it drives itself.
+        if not deferred_editing:
+            await skyvern_element.commit_input_value()
 
     if _secret_input_cannot_round_trip(readback_expected, maxlength=maxlength):
         LOG.info(
@@ -3981,6 +3986,7 @@ async def _fill_secret_with_readback(
     await skyvern_element.input_clear()
     if date_recovered:
         await skyvern_element.input_fill(text=readback_expected)
+        await skyvern_element.commit_input_value()
     else:
         await skyvern_element.input_sequentially(text=text)
     actual_value, navigated = await _read_back()

@@ -10,6 +10,7 @@ import structlog
 
 GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1"
 _RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
+GMAIL_RATE_LIMIT_REASONS = {"rateLimitExceeded", "userRateLimitExceeded"}
 _MAX_ATTEMPTS = 3
 _MAX_BACKOFF_SECONDS = 5.0
 LOG = structlog.get_logger()
@@ -42,6 +43,18 @@ def _compute_backoff(attempt: int, retry_after: str | None) -> float:
     return min(0.5 * (3 ** (attempt - 1)), _MAX_BACKOFF_SECONDS)
 
 
+def _error_reason(response: httpx.Response) -> str | None:
+    try:
+        error = response.json().get("error")
+        details = error.get("errors") if isinstance(error, dict) else None
+        reason = (
+            details[0].get("reason") if isinstance(details, list) and details and isinstance(details[0], dict) else None
+        )
+        return reason if isinstance(reason, str) else None
+    except (ValueError, AttributeError):
+        return None
+
+
 async def get_json(
     client: httpx.AsyncClient,
     url: str,
@@ -66,7 +79,10 @@ async def get_json(
                 ) from exc
             await asyncio.sleep(_compute_backoff(attempt, None))
             continue
-        if response.is_success or response.status_code not in _RETRYABLE_STATUSES or attempt == _MAX_ATTEMPTS:
+        retryable = response.status_code in _RETRYABLE_STATUSES or (
+            response.status_code == 403 and _error_reason(response) in GMAIL_RATE_LIMIT_REASONS
+        )
+        if response.is_success or not retryable or attempt == _MAX_ATTEMPTS:
             break
         await asyncio.sleep(_compute_backoff(attempt, response.headers.get("Retry-After")))
 
