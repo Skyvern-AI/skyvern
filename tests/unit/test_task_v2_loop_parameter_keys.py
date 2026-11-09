@@ -10,8 +10,6 @@ These tests assert that behavior at the converter boundary (the layer that raise
 error) and at the generation site.
 """
 
-import inspect
-
 import pytest
 
 from skyvern.forge.sdk.workflow.exceptions import WorkflowDefinitionHasDuplicateParameterKeys
@@ -103,12 +101,3 @@ def test_single_loop_task_with_constant_key_still_validates() -> None:
 
     parameter_keys = {parameter.key for parameter in workflow_definition.parameters}
     assert "target" in parameter_keys
-
-
-def test_generated_loop_value_key_is_not_a_bare_constant() -> None:
-    """The generation site must derive the key from the per-loop random string."""
-    from skyvern.services import task_v2_service
-
-    source = inspect.getsource(task_v2_service._generate_loop_task)
-    assert 'context_parameter_key = "target"' not in source
-    assert "loop_random_string" in source

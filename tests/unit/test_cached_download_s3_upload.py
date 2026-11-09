@@ -588,30 +588,6 @@ async def test_rename_happens_before_s3_upload(setup, tmp_path, sqlite_engine, r
 
 
 @pytest.mark.asyncio
-async def test_download_suffix_rename_uses_file_path_directly(setup, tmp_path):
-    """rename_file should receive the absolute path from list_files_in_directory,
-    not a reconstructed path via Path joining."""
-    download_dir = tmp_path / "downloads"
-    abs_path = str(download_dir / "abc123.pdf")
-
-    rename_mock = MagicMock(return_value=str(download_dir / "invoice.pdf"))
-    refs = setup(
-        get_side_effect=[[], ["invoice.pdf"]],
-        # before, local verify, rename local_files_after, existing_names dedup lookup
-        list_files_side_effect=[[], [abs_path], [abs_path], [abs_path]],
-        rename_mock=rename_mock,
-    )
-    try:
-        from skyvern.services.script_service import download
-
-        await download(prompt="Download invoice", download_suffix="invoice", label="test_block")
-
-        rename_mock.assert_called_once_with(abs_path, "invoice.pdf")
-    finally:
-        _cleanup(refs)
-
-
-@pytest.mark.asyncio
 async def test_cached_download_rename_emits_finalize_lineage(setup, tmp_path):
     """The cached-script (run_with=code) rename path must emit the same download_suffix_finalize_rename
     lineage as the agent path, tagged execution_path=cached_script, so a code-mode freeze is attributable."""

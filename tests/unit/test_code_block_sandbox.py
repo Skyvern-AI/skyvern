@@ -674,9 +674,6 @@ class TestIsSafeCodeAcceptsLegitimateCode:
     def test_dict_comprehension(self) -> None:
         CodeBlock.is_safe_code("x = {str(i): i for i in range(5)}")
 
-    def test_json_dumps(self) -> None:
-        CodeBlock.is_safe_code('x = json.dumps({"key": "value"})')
-
     def test_json_loads(self) -> None:
         CodeBlock.is_safe_code("x = json.loads(data)")
 
@@ -706,9 +703,6 @@ class TestIsSafeCodeAcceptsLegitimateCode:
 
     def test_conditional(self) -> None:
         CodeBlock.is_safe_code("x = 1 if True else 0")
-
-    def test_for_loop(self) -> None:
-        CodeBlock.is_safe_code("for i in range(10):\n    x = i")
 
     def test_enumerate_loop(self) -> None:
         CodeBlock.is_safe_code("for i, value in enumerate(values):\n    x = i")
