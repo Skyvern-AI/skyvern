@@ -298,7 +298,12 @@ class CopilotTriggerSummary:
 
 
 TriggerMappingReasonCode = Literal[
-    "mapping_path_missing", "invalid_mapping", "invalid_parameters", "owner_lookup_failed", "owner_not_authorized"
+    "mapping_path_missing",
+    "invalid_mapping",
+    "invalid_parameters",
+    "owner_lookup_failed",
+    "owner_not_authorized",
+    "email_not_mapped",
 ]
 
 

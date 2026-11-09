@@ -2230,6 +2230,7 @@ _TRIGGER_MAPPING_REASON_LABELS: dict[TriggerMappingReasonCode, str] = {
     "mapping_path_missing": "A mapped path isn't in the body",
     "invalid_mapping": "Mapping is invalid",
     "invalid_parameters": "Inputs failed validation",
+    "email_not_mapped": "The whole email is not mapped to the email input",
     "owner_lookup_failed": "Couldn't look up your role; try again",
     "owner_not_authorized": "Trigger owner cannot access a required credential",
 }
