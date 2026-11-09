@@ -450,6 +450,7 @@ from skyvern.webeye.navigation import (
 )
 from skyvern.webeye.playwright_input import playwright_input_defaults_for_page
 from skyvern.webeye.real_browser_state import RealBrowserState, is_external_browser_state
+from skyvern.webeye.scraper.scraper import page_is_dead_blank
 from skyvern.webeye.utils.captcha_solver import (
     MAX_IMAGE_CAPTCHA_READS,
     ChallengeStatus,
@@ -2657,6 +2658,7 @@ class BaseTaskBlock(Block):
     # synthetic block follows the run's arm. Private so an internal experiment toggle stays out of
     # the published block schemas and out of stored workflow definitions.
     _exclude_from_engine_ab: bool = PrivateAttr(default=False)
+    _allow_blank_start: bool = PrivateAttr(default=False)
 
     def resolve_engine(self, workflow_run_id: str | None) -> RunEngine:
         """The engine this block dispatches to, after the per-run A/B.
@@ -3192,7 +3194,11 @@ class BaseTaskBlock(Block):
                     raise e
 
                 # Validate starter URL before downstream scraping on a blank page
-                if not (self.url and self.url.strip()) and working_page.url in ("about:blank", "", ":"):
+                if (
+                    not self._allow_blank_start
+                    and not (self.url and self.url.strip())
+                    and working_page.url in ("about:blank", "", ":")
+                ):
                     missing_url_exc = MissingStarterUrl(block_label=self.label)
                     LOG.warning(
                         "First browser block has no starter URL",
@@ -3273,6 +3279,9 @@ class BaseTaskBlock(Block):
                             organization_id=workflow_run.organization_id,
                         )
                         raise e
+
+            if self._allow_blank_start:
+                self._allow_blank_start = page_is_dead_blank(working_page)
 
             try:
                 current_context = skyvern_context.ensure_context()
@@ -20174,6 +20183,7 @@ async def _evaluate_prompt_branch_conditions_batch(
         # Unlike the loop-value synthetic, this block is NOT excluded from the engine A/B:
         # eligibility vets prompt-branch conditionals (v3_ab_ineligibility_reason), so the run's
         # resolved arm covers branch evaluation too.
+        extraction_block._allow_blank_start = True
         extraction_block.mark_data_extraction_goal_prerendered()
         extraction_block.mark_internal_evaluation()
 

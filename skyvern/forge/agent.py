@@ -463,7 +463,9 @@ def _get_browser_state_for_cleanup(task: Task) -> BrowserState | None:
     return browser_state
 
 
-async def resolve_inherited_workflow_task_page(browser_state: BrowserState, workflow_run_id: str) -> Page:
+async def resolve_inherited_workflow_task_page(
+    browser_state: BrowserState, workflow_run_id: str, support_empty_page: bool = False
+) -> Page:
     working_page = await browser_state.get_working_page()
     if not working_page:
         LOG.error(
@@ -476,7 +478,7 @@ async def resolve_inherited_workflow_task_page(browser_state: BrowserState, work
             detected_at=datetime.now(UTC),
         )
 
-    if working_page.url not in BLANK_WORKFLOW_TASK_URLS:
+    if working_page.url not in BLANK_WORKFLOW_TASK_URLS or (support_empty_page and working_page.url == "about:blank"):
         return working_page
 
     if working_page.url not in RECOVERABLE_BLANK_WORKFLOW_TASK_URLS:
@@ -2839,6 +2841,7 @@ class ForgeAgent:
                 working_page = await resolve_inherited_workflow_task_page(
                     browser_state=browser_state,
                     workflow_run_id=workflow_run.workflow_run_id,
+                    support_empty_page=task_block._allow_blank_start,
                 )
                 task_url = working_page.url
             else:
@@ -4385,7 +4388,11 @@ class ForgeAgent:
             # A page-bound goal cannot have been met on a tab with no document, and reporting it
             # completed pins the failure on the next block instead (SKY-16924). A download already
             # delivered the goal, and the tab it opens is routinely left blank.
-            elif not page_free_validation and not download_finalized:
+            elif (
+                not page_free_validation
+                and not download_finalized
+                and not (task_block and task_block._allow_blank_start)
+            ):
                 blank_page = None
                 try:
                     first_sample = gate_page
@@ -6182,6 +6189,7 @@ class ForgeAgent:
                         step,
                         browser_state,
                         engine,
+                        support_empty_page=bool(task_block and task_block._allow_blank_start),
                     )
                 except ScrapingFailedBlankPage:
                     # The working page is a dead blank after the scrape ladder. If a survivor exists,
@@ -8454,6 +8462,7 @@ class ForgeAgent:
         scrape_type: ScrapeType,
         engine: RunEngine,
         navigation_deadline: float | None = None,
+        support_empty_page: bool = False,
     ) -> ScrapedPage:
         if scrape_type == ScrapeType.NORMAL:
             pass
@@ -8479,7 +8488,7 @@ class ForgeAgent:
             max_screenshot_number = 1
             scroll = False
 
-        return await browser_state.scrape_website(
+        scraped_page = await browser_state.scrape_website(
             url=task.url,
             cleanup_element_tree=app.AGENT_FUNCTION.cleanup_element_tree_factory(
                 task=task,
@@ -8493,8 +8502,11 @@ class ForgeAgent:
             # Only this agent-step scrape opts into transient-UI scroll suppression (SKY-12735);
             # verification / extraction / error-detection scrapes keep legacy scrolling.
             allow_transient_ui_suppression=True,
+            support_empty_page=support_empty_page,
             navigation_deadline=navigation_deadline,
         )
+        scraped_page._support_empty_page = support_empty_page
+        return scraped_page
 
     async def _observe_claimed_download_within_grace(
         self,
@@ -8772,6 +8784,7 @@ class ForgeAgent:
         engine: RunEngine,
         *,
         persist_artifacts: bool = True,
+        support_empty_page: bool = False,
     ) -> StepPromptResult:
         _scrape_span = otel_trace.get_current_span()
         _scrape_span.set_attribute("engine", str(engine))
@@ -8883,6 +8896,7 @@ class ForgeAgent:
                         scrape_type=scrape_type,
                         engine=engine,
                         navigation_deadline=navigation_deadline,
+                        support_empty_page=support_empty_page,
                     )
                     break
                 except (FailedToTakeScreenshot, ScrapingFailed, FailedToReloadPage) as e:

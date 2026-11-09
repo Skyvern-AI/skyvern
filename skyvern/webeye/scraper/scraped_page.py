@@ -244,6 +244,7 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
     _browser_state: "BrowserState" = PrivateAttr()
     _clean_up_func: CleanupElementTreeFunc = PrivateAttr()
     _scrape_exclude: ScrapeExcludeFunc | None = PrivateAttr(default=None)
+    _support_empty_page: bool = PrivateAttr(default=False)
     _document_loader_id: str | None = PrivateAttr(default=None)
     _origin: "_ScrapeOrigin | None" = PrivateAttr(default=None)
 
@@ -575,6 +576,7 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
             scrape_exclude=self._scrape_exclude,
             draw_boxes=draw_boxes,
             scroll=scroll,
+            support_empty_page=self._support_empty_page,
         )
         self.elements = refreshed_page.elements
         self.id_to_css_dict = refreshed_page.id_to_css_dict
