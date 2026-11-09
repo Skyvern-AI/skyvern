@@ -179,7 +179,9 @@ MIN_DEADLINE_REMAINING_SECONDS = 1.0
 SCREENSHOT_SENTINEL = "[copilot:screenshot] "
 PAIRED_OBSERVATION_MARKER = "[copilot:paired-observation] "
 NUDGE_SENTINEL = "[copilot:nudge] "
+ATTACHED_IMAGE_SENTINEL = "[copilot:attached-image] "
 SCREENSHOT_PLACEHOLDER = SCREENSHOT_SENTINEL + "[prior screenshot removed to save context]"
+IMAGE_REMOVED_PLACEHOLDER = "[image removed from this request]"
 FINAL_REPLY_OBSERVATION = (
     NUDGE_SENTINEL + "Your last response was empty. Call `reply` now with your final response for this turn; "
     "any other tool call will not run."
@@ -651,9 +653,19 @@ def _is_nudge_message(item: Any) -> bool:
     return isinstance(content, str) and content.startswith(NUDGE_SENTINEL)
 
 
+def is_attached_image_message(item: Any) -> bool:
+    if _item_field(item, "role") != "user":
+        return False
+    content = _item_field(item, "content")
+    return isinstance(content, list) and any(
+        isinstance(text := _item_field(block, "text"), str) and text.startswith(ATTACHED_IMAGE_SENTINEL)
+        for block in content
+    )
+
+
 def is_synthetic_user_message(item: Any) -> bool:
-    """Return True if item is a screenshot or enforcement nudge, not a real user turn."""
-    return is_screenshot_message(item) or _is_nudge_message(item)
+    """Return True if item is a screenshot, attached-image message or enforcement nudge, not a real user turn."""
+    return is_screenshot_message(item) or is_attached_image_message(item) or _is_nudge_message(item)
 
 
 _PACKET_FAILURE_SCALARS = ("block_label", "block_status", "reason", "failing_line")
@@ -1310,16 +1322,10 @@ _NUDGE_TYPE_BY_KEY: dict[str, str] = {
 
 
 def _strip_input_images(current_input: str | list) -> tuple[str | list, bool]:
-    """Replace ``input_image`` parts in *current_input* with a text placeholder.
-
-    Used on context-overflow retry to ensure a freshly injected screenshot
-    payload doesn't re-trigger the same failure. Returns ``(pruned, stripped)``
-    where ``stripped`` is True iff at least one image was removed — the caller
-    uses that to warn the agent not to reason about the page from memory.
-    """
+    """Replace ``input_image`` parts with placeholders; ``stripped`` is True only when a page screenshot was removed."""
     if not isinstance(current_input, list):
         return current_input, False
-    stripped_any = False
+    screenshot_stripped = False
     result: list[Any] = []
     for item in current_input:
         if not isinstance(item, dict):
@@ -1329,15 +1335,18 @@ def _strip_input_images(current_input: str | list) -> tuple[str | list, bool]:
         if not isinstance(content, list):
             result.append(item)
             continue
+        # Only a page screenshot may carry the sentinel; on an attached image it would claim live-page provenance.
+        screenshot = is_screenshot_message(item)
+        placeholder = SCREENSHOT_PLACEHOLDER if screenshot else IMAGE_REMOVED_PLACEHOLDER
         new_content: list[Any] = []
         for part in content:
             if isinstance(part, dict) and part.get("type") == "input_image":
-                new_content.append({"type": "input_text", "text": SCREENSHOT_PLACEHOLDER})
-                stripped_any = True
+                new_content.append({"type": "input_text", "text": placeholder})
+                screenshot_stripped = screenshot_stripped or screenshot
             else:
                 new_content.append(part)
         result.append({**item, "content": new_content})
-    return result, stripped_any
+    return result, screenshot_stripped
 
 
 async def _recover_from_context_overflow(session: Any, current_input: str | list) -> tuple[str | list, bool]:
