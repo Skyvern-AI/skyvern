@@ -1,3 +1,4 @@
+import json
 from collections.abc import Callable
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -247,8 +248,34 @@ async def test_create_artifact_redacts_har_structured_fields_with_empty_secret_s
     assert b"Bearer token" not in artifact_redaction_setup.stored[0][1]
 
 
+def _har_with_sensitive_fields() -> bytes:
+    har = {
+        "log": {
+            "entries": [
+                {
+                    "request": {
+                        "headers": [{"name": "Cookie", "value": "sid=sess-abc"}],
+                        "cookies": [{"name": "sid", "value": "sess-abc"}],
+                        "postData": {
+                            "mimeType": "application/x-www-form-urlencoded",
+                            "params": [
+                                {"name": "username", "value": "agent.demo"},
+                                {"name": "password", "value": "hunter2-plain"},
+                            ],
+                        },
+                    },
+                    "response": {
+                        "headers": [{"name": "Set-Cookie", "value": "sid=sess-abc; Path=/"}],
+                    },
+                }
+            ]
+        }
+    }
+    return json.dumps(har).encode()
+
+
 @pytest.mark.asyncio
-async def test_create_artifact_leaves_har_unchanged_when_workflow_opted_out(
+async def test_create_artifact_redacts_har_name_based_fields_when_workflow_opted_out_with_no_secrets(
     artifact_redaction_setup: _FakeStorage,
     monkeypatch: pytest.MonkeyPatch,
     workflow_context_manager_factory: Callable[..., WorkflowContextManager],
@@ -256,13 +283,122 @@ async def test_create_artifact_leaves_har_unchanged_when_workflow_opted_out(
     monkeypatch.setattr(
         artifact_manager_module.app,
         "WORKFLOW_CONTEXT_MANAGER",
-        workflow_context_manager_factory(workflow_run_id="wr_redact", mask_secrets=False),
+        workflow_context_manager_factory(workflow_run_id="wr_redact", mask_secrets=False, secrets={}),
     )
     manager = ArtifactManager()
     step = create_fake_step(TEST_STEP_ID)
-    har_data = b'{"log":{"entries":[{"request":{"headers":[{"name":"Authorization","value":"Bearer token"}]}}]}}'
+    har_data = _har_with_sensitive_fields()
+
+    await manager.create_artifact(step=step, artifact_type=ArtifactType.HAR, data=har_data)
+    await manager.wait_for_upload_aiotasks([step.task_id])
+
+    stored = artifact_redaction_setup.stored[0][1]
+    assert b"sess-abc" not in stored
+    assert b"hunter2-plain" not in stored
+    assert REDACTED_SECRET_PLACEHOLDER.encode() in stored
+
+
+@pytest.mark.asyncio
+async def test_create_artifact_redacts_har_for_bare_task_with_no_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = _FakeStorage()
+    monkeypatch.setattr(artifact_manager_module.settings, "ENABLE_SECRET_ARTIFACT_REDACTION", True)
+    monkeypatch.setattr(artifact_manager_module.app, "STORAGE", storage)
+    monkeypatch.setattr(
+        artifact_manager_module.app,
+        "DATABASE",
+        SimpleNamespace(artifacts=_FakeArtifactDatabase()),
+    )
+    monkeypatch.setattr(artifact_manager_module.app, "WORKFLOW_CONTEXT_MANAGER", WorkflowContextManager())
+    skyvern_context.reset()
+    skyvern_context.set(SkyvernContext(organization_id=TEST_ORGANIZATION_ID, workflow_run_id=None))
+
+    manager = ArtifactManager()
+    step = create_fake_step(TEST_STEP_ID)
+    har_data = _har_with_sensitive_fields()
+
+    # Note: this bare-task path had no opt-out to begin with, so it passed before the fix too.
+    # Kept here as a regression test alongside the opted-out-workflow case above.
+    try:
+        await manager.create_artifact(step=step, artifact_type=ArtifactType.HAR, data=har_data)
+        await manager.wait_for_upload_aiotasks([step.task_id])
+    finally:
+        skyvern_context.reset()
+
+    stored = storage.stored[0][1]
+    assert b"sess-abc" not in stored
+    assert b"hunter2-plain" not in stored
+    assert REDACTED_SECRET_PLACEHOLDER.encode() in stored
+
+
+@pytest.mark.asyncio
+async def test_create_artifact_leaves_har_unchanged_when_global_switch_disabled(
+    artifact_redaction_setup: _FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+    workflow_context_manager_factory: Callable[..., WorkflowContextManager],
+) -> None:
+    monkeypatch.setattr(artifact_manager_module.settings, "ENABLE_SECRET_ARTIFACT_REDACTION", False)
+    monkeypatch.setattr(
+        artifact_manager_module.app,
+        "WORKFLOW_CONTEXT_MANAGER",
+        workflow_context_manager_factory(workflow_run_id="wr_redact", mask_secrets=False, secrets={}),
+    )
+    manager = ArtifactManager()
+    step = create_fake_step(TEST_STEP_ID)
+    har_data = _har_with_sensitive_fields()
 
     await manager.create_artifact(step=step, artifact_type=ArtifactType.HAR, data=har_data)
     await manager.wait_for_upload_aiotasks([step.task_id])
 
     assert artifact_redaction_setup.stored[0][1] == har_data
+
+
+@pytest.mark.asyncio
+async def test_create_artifact_leaves_har_unchanged_when_no_sensitive_fields_present(
+    artifact_redaction_setup: _FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+    workflow_context_manager_factory: Callable[..., WorkflowContextManager],
+) -> None:
+    monkeypatch.setattr(
+        artifact_manager_module.app,
+        "WORKFLOW_CONTEXT_MANAGER",
+        workflow_context_manager_factory(workflow_run_id="wr_redact", mask_secrets=False, secrets={}),
+    )
+    manager = ArtifactManager()
+    step = create_fake_step(TEST_STEP_ID)
+    har_data = b'{"log":{"entries":[{"request":{"headers":[{"name":"Accept","value":"text/html"}]}}]}}'
+
+    await manager.create_artifact(step=step, artifact_type=ArtifactType.HAR, data=har_data)
+    await manager.wait_for_upload_aiotasks([step.task_id])
+
+    assert artifact_redaction_setup.stored[0][1] == har_data
+
+
+@pytest.mark.asyncio
+async def test_create_artifact_redacts_har_names_but_keeps_configured_secret_when_workflow_opted_out(
+    artifact_redaction_setup: _FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+    workflow_context_manager_factory: Callable[..., WorkflowContextManager],
+) -> None:
+    # Per-run opt-out disables value-based redaction only; name-based HAR fields still redact.
+    monkeypatch.setattr(
+        artifact_manager_module.app,
+        "WORKFLOW_CONTEXT_MANAGER",
+        workflow_context_manager_factory(
+            workflow_run_id="wr_redact", mask_secrets=False, secrets={"password": "secret-value"}
+        ),
+    )
+    manager = ArtifactManager()
+    step = create_fake_step(TEST_STEP_ID)
+    har_data = (
+        b'{"log":{"entries":[{"request":{"headers":[{"name":"Authorization","value":"Bearer token"}]},'
+        b'"response":{"content":{"text":"secret-value"}}}]}}'
+    )
+
+    await manager.create_artifact(step=step, artifact_type=ArtifactType.HAR, data=har_data)
+    await manager.wait_for_upload_aiotasks([step.task_id])
+
+    stored = artifact_redaction_setup.stored[0][1]
+    assert b"Bearer token" not in stored
+    assert b"secret-value" in stored
