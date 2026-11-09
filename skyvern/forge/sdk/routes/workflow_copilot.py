@@ -5058,7 +5058,7 @@ async def _demonstration_cache() -> BaseCache:
         # 501, not 403: the server's setup refuses this, not the caller's credentials.
         raise HTTPException(
             status_code=status.HTTP_501_NOT_IMPLEMENTED,
-            detail="Demonstrations need this server to run as one process, or a shared Redis cache",
+            detail="Run this server as one process to record demonstrations",
         )
     return cache
 
