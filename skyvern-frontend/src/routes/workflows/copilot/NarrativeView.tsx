@@ -20,6 +20,7 @@ import {
   ReaderIcon,
   StopIcon,
 } from "@radix-ui/react-icons";
+import { formatElapsedSeconds } from "@/util/utils";
 import {
   REVEAL_MS_PER_CHAR,
   buildRevealOffsets,
@@ -271,10 +272,7 @@ function paletteFor(blockType: string): BlockPalette {
 function liveElapsed(startedAt: string | null): string | null {
   const ms = parseUtcIsoMs(startedAt);
   if (ms === null) return null;
-  const secs = Math.max(0, Math.round((Date.now() - ms) / 1000));
-  const m = Math.floor(secs / 60);
-  const s = secs % 60;
-  return `${m}:${s.toString().padStart(2, "0")}`;
+  return formatElapsedSeconds(Date.now() - ms);
 }
 
 function Spinner({ small = false }: { small?: boolean }) {
@@ -1252,8 +1250,7 @@ function testCardStatus(
 function formatActionDuration(ms: number | null): string | null {
   if (ms === null) return null;
   if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
-  const secs = Math.round(ms / 1000);
-  return `${Math.floor(secs / 60)}:${(secs % 60).toString().padStart(2, "0")}`;
+  return formatElapsedSeconds(ms);
 }
 
 // A failure's first line reads under its row in full; the rest of the recorded

@@ -6,8 +6,10 @@ import {
   basicTimeFormat,
   formatDurationSeconds,
   formatExecutionTime,
+  formatSeconds,
   normalizeUtcTimestamp,
 } from "./timeFormat";
+import { formatElapsedSeconds } from "./utils";
 
 describe("normalizeUtcTimestamp", () => {
   test("appends Z to timezone-less timestamps", () => {
@@ -82,26 +84,6 @@ describe("formatExecutionTime", () => {
     expect(formatExecutionTime(base, finishedAt)).toBe("2m 45s");
   });
 
-  test("returns minutes only when seconds is zero", () => {
-    const finishedAt = "2026-01-01T00:02:00.000Z";
-    expect(formatExecutionTime(base, finishedAt)).toBe("2m");
-  });
-
-  test("returns hours and minutes for multi-hour duration", () => {
-    const finishedAt = "2026-01-01T01:05:30.000Z";
-    expect(formatExecutionTime(base, finishedAt)).toBe("1h 5m");
-  });
-
-  test("returns hours only when minutes is zero", () => {
-    const finishedAt = "2026-01-01T02:00:00.000Z";
-    expect(formatExecutionTime(base, finishedAt)).toBe("2h");
-  });
-
-  test("drops seconds for hour-plus durations when minutes are zero", () => {
-    const finishedAt = "2026-01-01T01:00:30.000Z";
-    expect(formatExecutionTime(base, finishedAt)).toBe("1h");
-  });
-
   test("normalizes UTC timestamps without Z suffix", () => {
     const createdWithoutZ = "2026-01-01T00:00:00.000000";
     const finishedWithoutZ = "2026-01-01T00:02:45.000000";
@@ -113,6 +95,33 @@ describe("formatExecutionTime", () => {
   test("clamps negative duration to 0s when finishedAt is before createdAt", () => {
     const finishedAt = "2025-12-31T23:59:59.000Z";
     expect(formatExecutionTime(base, finishedAt)).toBe("0s");
+  });
+});
+
+describe("formatSeconds", () => {
+  test.each([
+    [0, "0s"],
+    [45.4, "45s"],
+    [59.6, "1m 0s"],
+    [165, "2m 45s"],
+    [3600, "1h 0m"],
+    [3930, "1h 5m"],
+    [26 * 3600, "1d 2h"],
+    [40 * 86400 + 3 * 3600 + 59, "40d 3h"],
+    [-5, "0s"],
+  ])("%s -> %s", (seconds, expected) => {
+    expect(formatSeconds(seconds)).toBe(expected);
+  });
+});
+
+describe("formatElapsedSeconds", () => {
+  test.each([
+    [5_000, "0:05"],
+    [125_000, "2:05"],
+    [3_725_000, "1:02:05"],
+    [26 * 3_600_000, "26:00:00"],
+  ])("%s ms -> %s", (ms, expected) => {
+    expect(formatElapsedSeconds(ms)).toBe(expected);
   });
 });
 
