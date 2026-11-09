@@ -10490,15 +10490,18 @@
           },
           "bitwarden_client_id_aws_secret_key": {
             "type": "string",
-            "title": "Bitwarden Client Id Aws Secret Key"
+            "title": "Bitwarden Client Id Aws Secret Key",
+            "default": "SKYVERN_BITWARDEN_CLIENT_ID"
           },
           "bitwarden_client_secret_aws_secret_key": {
             "type": "string",
-            "title": "Bitwarden Client Secret Aws Secret Key"
+            "title": "Bitwarden Client Secret Aws Secret Key",
+            "default": "SKYVERN_BITWARDEN_CLIENT_SECRET"
           },
           "bitwarden_master_password_aws_secret_key": {
             "type": "string",
-            "title": "Bitwarden Master Password Aws Secret Key"
+            "title": "Bitwarden Master Password Aws Secret Key",
+            "default": "SKYVERN_BITWARDEN_MASTER_PASSWORD"
           },
           "bitwarden_collection_id": {
             "type": "string",
@@ -10512,9 +10515,6 @@
         "type": "object",
         "required": [
           "key",
-          "bitwarden_client_id_aws_secret_key",
-          "bitwarden_client_secret_aws_secret_key",
-          "bitwarden_master_password_aws_secret_key",
           "bitwarden_collection_id",
           "bitwarden_item_id"
         ],
@@ -10668,15 +10668,18 @@
           },
           "bitwarden_client_id_aws_secret_key": {
             "type": "string",
-            "title": "Bitwarden Client Id Aws Secret Key"
+            "title": "Bitwarden Client Id Aws Secret Key",
+            "default": "SKYVERN_BITWARDEN_CLIENT_ID"
           },
           "bitwarden_client_secret_aws_secret_key": {
             "type": "string",
-            "title": "Bitwarden Client Secret Aws Secret Key"
+            "title": "Bitwarden Client Secret Aws Secret Key",
+            "default": "SKYVERN_BITWARDEN_CLIENT_SECRET"
           },
           "bitwarden_master_password_aws_secret_key": {
             "type": "string",
-            "title": "Bitwarden Master Password Aws Secret Key"
+            "title": "Bitwarden Master Password Aws Secret Key",
+            "default": "SKYVERN_BITWARDEN_MASTER_PASSWORD"
           },
           "url_parameter_key": {
             "anyOf": [
@@ -10725,10 +10728,7 @@
         },
         "type": "object",
         "required": [
-          "key",
-          "bitwarden_client_id_aws_secret_key",
-          "bitwarden_client_secret_aws_secret_key",
-          "bitwarden_master_password_aws_secret_key"
+          "key"
         ],
         "title": "BitwardenLoginCredentialParameterYAML"
       },
@@ -10854,15 +10854,18 @@
           },
           "bitwarden_client_id_aws_secret_key": {
             "type": "string",
-            "title": "Bitwarden Client Id Aws Secret Key"
+            "title": "Bitwarden Client Id Aws Secret Key",
+            "default": "SKYVERN_BITWARDEN_CLIENT_ID"
           },
           "bitwarden_client_secret_aws_secret_key": {
             "type": "string",
-            "title": "Bitwarden Client Secret Aws Secret Key"
+            "title": "Bitwarden Client Secret Aws Secret Key",
+            "default": "SKYVERN_BITWARDEN_CLIENT_SECRET"
           },
           "bitwarden_master_password_aws_secret_key": {
             "type": "string",
-            "title": "Bitwarden Master Password Aws Secret Key"
+            "title": "Bitwarden Master Password Aws Secret Key",
+            "default": "SKYVERN_BITWARDEN_MASTER_PASSWORD"
           },
           "bitwarden_collection_id": {
             "type": "string",
@@ -10883,9 +10886,6 @@
         "type": "object",
         "required": [
           "key",
-          "bitwarden_client_id_aws_secret_key",
-          "bitwarden_client_secret_aws_secret_key",
-          "bitwarden_master_password_aws_secret_key",
           "bitwarden_collection_id",
           "bitwarden_identity_key",
           "bitwarden_identity_fields"
