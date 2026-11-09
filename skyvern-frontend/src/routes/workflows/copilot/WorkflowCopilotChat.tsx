@@ -10765,7 +10765,7 @@ export function WorkflowCopilotChat({
   const recordTaskUnavailableReason =
     authoringUnavailableReason ??
     (demonstrationUnavailable
-      ? "This server can't record demonstrations. Run it as one process, or add a shared Redis cache."
+      ? "Run this server as one process to record demonstrations."
       : "Demonstrate task is available when the browser is ready");
   const startRecordTask = () => {
     if (refuseMutationDuringYamlCommit()) return;
