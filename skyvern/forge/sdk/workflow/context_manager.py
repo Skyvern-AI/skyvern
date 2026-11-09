@@ -361,13 +361,21 @@ def _diff_spans(rendered: str, alternate: str, window: int) -> tuple[tuple[int, 
     )
 
 
-def _swap_secret(value: Any, secret: str, canary: str) -> Any:
+def _swap_secret(value: Any, secret: str, canary: str, ancestors: frozenset[int] = frozenset()) -> Any:
     if isinstance(value, str):
         return value.replace(secret, canary)
-    if isinstance(value, Mapping):
-        return {_swap_secret(key, secret, canary): _swap_secret(item, secret, canary) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_swap_secret(item, secret, canary) for item in value]
+    if isinstance(value, (Mapping, list, tuple)):
+        if id(value) in ancestors:
+            # Raise instead of recursing to the interpreter's limit, where any finalizer a garbage collection runs
+            # overflows too. The caller fails closed on this error.
+            raise ValueError("Template data contains a reference cycle")
+        ancestors = ancestors | {id(value)}
+        if isinstance(value, Mapping):
+            return {
+                _swap_secret(key, secret, canary, ancestors): _swap_secret(item, secret, canary, ancestors)
+                for key, item in value.items()
+            }
+        return [_swap_secret(item, secret, canary, ancestors) for item in value]
     if isinstance(value, (int, float)) and not isinstance(value, bool) and str(value) == secret:
         return canary
     return value
