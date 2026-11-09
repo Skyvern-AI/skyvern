@@ -209,9 +209,10 @@ _OBSERVE_DESCRIPTION_BASE = (
     "ref names the element this reading described and keeps working while that element is on the page. "
     "If it becomes ambiguous or is gone, the tool errors "
     "instead of acting on something else — re-observe and use a ref from the new reading. "
-    "`near=[slot:text, ...]` is text the page projects into the control's component through the named slots, and "
-    "each slot name says what its text is (a label, hint, prefix, and so on). It is not a binding: decide from the "
-    "page and the goal. "
+    "`near=[slot:text, ...]` is text the page projects into the control's component through the named slots. A slot "
+    "name is the component author's own label for its text (a label, hint, prefix, and so on) and may say nothing. "
+    "An `(own text)` entry is text drawn in the component's own root beside the control, not projected through a "
+    "slot. It is not a binding: decide from the page and the goal. "
 )
 _OBSERVE_DESCRIPTION_FRAME_REACH = (
     "Elements inside the page's child frames are included in the same list and are acted on by ref "
@@ -9864,6 +9865,7 @@ OBSERVE_FIELD_DISPLAY_MAX = max(OBSERVE_DISPLAY_WIDTHS.values())
 _OBSERVE_CLIP_SPAN_RE = re.compile("\x00([^\x00]*)\x00")
 # A slot name is printed bare inside near=[slot:text, ...], so only name characters survive.
 _NEAR_SLOT_STRIP_RE = re.compile(r"[^\w.-]")
+_NEAR_OWN_TEXT = "(own text)"
 
 
 def _observe_quoted_field(masked: str, width: int, *, cut_before: bool) -> str:
@@ -9877,12 +9879,18 @@ def _observe_quoted_field(masked: str, width: int, *, cut_before: bool) -> str:
     return f"{shown}\x00{max(cut, 0)}{' or more' if cut_before else ''}\x00"
 
 
+def _near_name(n: dict[str, Any]) -> str:
+    # The own-text marker comes from the page script's flag, so a slot the page names "(own text)" is stripped as usual.
+    if n.get("own") is True:
+        return _NEAR_OWN_TEXT
+    return _NEAR_SLOT_STRIP_RE.sub("", _digest_token(n.get("slot") or "", 40)) or "default"
+
+
 def _near_suffix(near: object, field: Callable[[str, int], str]) -> str:
     if not isinstance(near, list):
         return ""
     entries = [
-        f"{_NEAR_SLOT_STRIP_RE.sub('', _digest_token(n.get('slot') or '', 40)) or 'default'}:"
-        f"{field(str(n.get('text') or ''), OBSERVE_DISPLAY_WIDTHS['group'])}"
+        f"{_near_name(n)}:{field(str(n.get('text') or ''), OBSERVE_DISPLAY_WIDTHS['group'])}"
         for n in near
         if isinstance(n, dict) and n.get("text")
     ]
@@ -10101,8 +10109,8 @@ async (__tv3TextArgs) => {
   // The texts a control's own component chain projects before it, each with the slot that carries it: every slot with
   // assigned content in the siblings before the control's subtree, up to the nearest stop and at most 4, read through
   // the flat tree. A slot carries placement, not meaning, so these are printed as candidates with their slot names
-  // (near=), never as the group; like main's walk it stops at a drawn control, a grid cell, a choice's caption and
-  // visible text in the control's own root, and never leaves the outermost host.
+  // (near=), never as the group, beside the text drawn in the control's own root; like main's walk it stops at a drawn
+  // control, a grid cell and a choice's caption, and never leaves the outermost host.
   const _rootOfNode = Node.prototype.getRootNode;
   const _shadowHostOf = _getter(ShadowRoot.prototype, 'host');
   const _childrenOf = _getter(Element.prototype, 'children');
@@ -10115,11 +10123,13 @@ async (__tv3TextArgs) => {
   };
   // Whether n holds a control in the flat tree: a host's open root (its unassigned light children are not drawn),
   // a slot's assigned elements (its fallback content only when nothing is assigned), else its children. Once per node.
+  // Drawn widgets main's walks, sharing _CTRL_SEL, do not stop at; one that is not drawn is no stop.
+  const _NEAR_STOP_SEL = '[role=slider],[role=textbox],[role=searchbox],iframe';
   const _holdsSeen = new Map();
   const _holdsControl = (n, depth) => {
     if (_holdsSeen.has(n)) return _holdsSeen.get(n);
     // Past 24 levels a subtree counts as holding a control: the walk fails closed, binding nothing.
-    let held = depth > 24 || _matches.call(n, _CTRL_SEL);
+    let held = depth > 24 || _matches.call(n, _CTRL_SEL) || (_matches.call(n, _NEAR_STOP_SEL) && !_unseen(n));
     if (!held) {
       const sr = _openShadowOf(n);
       const slotted = _localNameOf.call(n) === 'slot' && _assignedNodesOf.call(n, { flatten: true }).length > 0;
@@ -10129,18 +10139,51 @@ async (__tv3TextArgs) => {
     _holdsSeen.set(n, held);
     return held;
   };
+  // A real assignment only: flattened, an unassigned slot returns its own fallback content. A host's whitespace
+  // between tags and an empty element are assigned too, and project nothing; a forwarded slot projects what it is
+  // assigned itself, and only while it is drawn.
+  const _assigns = (sl) => _assignedNodesOf.call(sl).some((a) => {
+    const kind = _nodeTypeOf.call(a);
+    if (kind === 3) return !!_normText(_contentOf.call(a));
+    return kind === 1 && !_unseen(a) && (_localNameOf.call(a) !== 'slot' || _assigns(a));
+  });
   const _projectingSlots = (n) => {
     const slots = _localNameOf.call(n) === 'slot' ? [n] : Array.from(_qsa.call(n, 'slot'));
-    // A real assignment only: flattened, an unassigned slot returns its own fallback content. A host's whitespace
-    // between tags and an empty element are assigned too, and project nothing.
-    return slots.filter((sl) => _assignedNodesOf.call(sl).some((a) => {
-      const kind = _nodeTypeOf.call(a);
-      return kind === 1 ? !_unseen(a) : kind === 3 && !!_normText(_contentOf.call(a));
-    }));
+    return slots.filter(_assigns);
+  };
+  // Main's _captionHost read through an open root: a root holding a choice is a caption host when it and the text
+  // slotted into its host read under two characters.
+  const _rootCaptionHost = (sr) => {
+    if (!_rootQs.call(sr, _CHOICE_SEL)) return false;
+    let out = '';
+    for (let c = _firstChildOf.call(sr); c; c = _nextOf.call(c)) {
+      const kind = _nodeTypeOf.call(c);
+      if (kind === 3) out += ' ' + _contentOf.call(c);
+      else if (kind === 1 && !_unseen(c)) out += ' ' + _labelText(c, true);
+    }
+    return _normText(out).length < 2;
+  };
+  // The text a sibling draws itself, all slots left out with `skipSlots`; the sibling itself was screened by the walk.
+  const _ownDrawnText = (n, depth, skipSlots) => {
+    if (depth > 4 || (depth > 0 && _unseen(n))) return '';
+    // A slot draws its default text only while nothing, not even whitespace, is assigned to it.
+    if (_localNameOf.call(n) === 'slot' && (skipSlots || _assignedNodesOf.call(n).length)) return '';
+    let out = '';
+    for (let c = _firstChildOf.call(n); c; c = _nextOf.call(c)) {
+      const kind = _nodeTypeOf.call(c);
+      if (kind === 3) out += ' ' + _contentOf.call(c);
+      else if (kind === 1) out += ' ' + _ownDrawnText(c, depth + 1, skipSlots);
+    }
+    return out;
   };
   const _projectedLabel = (el) => {
-    // Nearest first while walking, so each sibling's entries go in front: the list ends in tree order.
+    // Nearest first while walking, so each sibling's entries go in front: the list ends in tree order. A sibling's own
+    // text goes before its slot entries.
     const found = [];
+    const add = (entries, ownText) => {
+      const all = ownText ? [{ slot: '(own text)', own: true, text: ownText }, ...entries] : entries;
+      found.unshift(...all.slice(Math.max(0, all.length - (4 - found.length))));
+    };
     try {
       const ownRoot = _rootOfNode.call(el);
       let node = el;
@@ -10149,9 +10192,11 @@ async (__tv3TextArgs) => {
         let scanned = 0;
         for (let s = _prevOf.call(node); s && scanned < 8; s = _prevOf.call(s), scanned++) {
           const kind = _nodeTypeOf.call(s);
-          // Main's walk stops at its root's top level, so text there is nearer than any projected text.
+          const inOwnRoot = _rootOfNode.call(s) === ownRoot;
+          // Text drawn in the control's own root is a candidate of its own, never a stop: the model judges it.
           if (kind === 3) {
-            if (_rootOfNode.call(s) === ownRoot && /\p{L}/u.test(_normText(_contentOf.call(s)))) return found;
+            if (inOwnRoot) add([], _normText(_contentOf.call(s)));
+            if (found.length >= 4) return found;
             continue;
           }
           if (kind !== 1) continue;
@@ -10159,7 +10204,8 @@ async (__tv3TextArgs) => {
           if (_unseen(s)) continue;
           const slots = _projectingSlots(s);
           if (!slots.length) {
-            if (_rootOfNode.call(s) === ownRoot && /\p{L}/u.test(_visibleText(s, 0))) return found;
+            if (inOwnRoot) add([], _normText(_ownDrawnText(s, 0, false)));
+            if (found.length >= 4) return found;
             continue;
           }
           // Main's caption rule: text right after a checkbox or radio is that control's caption.
@@ -10167,7 +10213,7 @@ async (__tv3TextArgs) => {
           while (before && _nodeTypeOf.call(before) !== 1 && !_normText(_contentOf.call(before))) before = _prevOf.call(before);
           if (before && _nodeTypeOf.call(before) === 1) {
             const bsr = _openShadowOf(before);
-            if (_captionHost(before) || (bsr && _rootQs.call(bsr, _CHOICE_SEL))) return found;
+            if (_captionHost(before) || (bsr && _rootCaptionHost(bsr))) return found;
           }
           // Each slot is read on its own, so a text and its slot name always agree; an icon reads empty and is skipped.
           const own = [];
@@ -10175,7 +10221,9 @@ async (__tv3TextArgs) => {
             const t = _normText(_labelText(sl, true));
             if (t) own.push({ slot: (Element.prototype.getAttribute.call(sl, 'name') || '').slice(0, 40), text: t });
           }
-          found.unshift(...own.slice(Math.max(0, own.length - (4 - found.length))));
+          // A projecting sibling's own text is what it draws outside its slots.
+          const ownText = inOwnRoot ? _normText(_ownDrawnText(s, 0, true)) : '';
+          add(own, ownText);
           if (found.length >= 4) return found;
         }
         node = _parentOf.call(node) || _shadowHostOf.call(_rootOfNode.call(node));
@@ -12057,7 +12105,7 @@ async (__tv3TextArgs) => {
         const text = n.text.slice(0, _RETAIN_WIDTH);
         if (nearTotal + Math.min(text.length, 200) > _GROUP_TEXT_TOTAL_CAP) break;
         nearTotal += Math.min(text.length, 200);
-        shownNear.push({ slot: n.slot, text });
+        shownNear.push(n.own ? { slot: n.slot, own: true, text } : { slot: n.slot, text });
       }
       if (shownNear.length) rec.near = shownNear;
       // Every member carries its group's number, so the digest can say once per group that no
@@ -15287,7 +15335,9 @@ def build_browser_tools(
         still_identical = sum(
             n
             for n in Counter(
-                _observe_line_identity(b) for e, b in zip(elements, bodies) if not e.get("pointerRoot")
+                _observe_line_identity(b + near)
+                for e, b, near in zip(elements, bodies, near_suffixes, strict=True)
+                if not e.get("pointerRoot")
             ).values()
             if n > 1
         )
