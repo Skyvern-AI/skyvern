@@ -1017,12 +1017,12 @@ describe("WorkflowCopilotChat demonstration", () => {
       path === "/workflow/copilot/demonstration/active"
         ? Promise.reject(
             new AxiosError(
-              "forbidden",
-              "ERR_BAD_REQUEST",
+              "not implemented",
+              "ERR_BAD_RESPONSE",
               undefined,
               undefined,
               {
-                status: 403,
+                status: 501,
               } as AxiosResponse,
             ),
           )
