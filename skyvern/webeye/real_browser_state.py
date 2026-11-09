@@ -1940,6 +1940,8 @@ class RealBrowserState(BrowserState):
                 fresh_pw.stop(), BROWSER_CLOSE_TIMEOUT, "new Playwright driver shutdown after failed reconnect"
             )
             raise
+        if stale_context is not None and stale_context is not self.browser_context:
+            app.AGENT_FUNCTION.on_browser_context_retired(stale_context)
 
         def observe_stale_loss() -> None:
             stale_transport_error = driver_transport_error_future(stale_pw)
