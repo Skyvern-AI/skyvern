@@ -870,7 +870,8 @@ class RealBrowserState(BrowserState):
             skyvern_context.record_browser_success()
             LOG.info("browser context is created")
 
-        if await self.get_working_page() is None:
+        working_page = await self.get_working_page()
+        if working_page is None:
             page: Page | None = None
             use_existing_page = False
             # Some remote browser sessions bind their capture/streaming to the
@@ -901,15 +902,33 @@ class RealBrowserState(BrowserState):
                     before_navigation(self)
                 try:
                     await self.navigate_to_url(page=page, url=url)
+                except Exception:
+                    # A failed first navigation still leaves the working page; a cancellation starts nothing new.
+                    self._note_working_page_ready(page)
+                    raise
+                else:
+                    self._note_working_page_ready(page)
                 finally:
                     # Arm ONLY around the optional initial navigate: a successful first navigation records the
                     # target page; a permanent navigation failure still records the current diagnostic/error
                     # page; the original navigation exception propagates unchanged (arm never masks it).
                     self._arm_display_recorder()
                 return
+            working_page = page
 
         # No initial navigation ran (page already existed, or no/same URL): arm now that a working page exists.
+        self._note_working_page_ready(working_page)
         self._arm_display_recorder()
+
+    def _note_working_page_ready(self, page: Page) -> None:
+        # The hook only schedules; it can neither delay nor fail the run, nor mask a navigation error.
+        browser_context = self.browser_context
+        if browser_context is None:
+            return
+        try:
+            app.AGENT_FUNCTION.note_working_page_ready(browser_context, page)
+        except Exception:
+            LOG.warning("Failed to report the working page ready", exc_info=True)
 
     def begin_navigation(self) -> None:
         browser_context = getattr(self, "_browser_context", None)
