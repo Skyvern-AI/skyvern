@@ -68,6 +68,10 @@ class PersistentSessionsManager(Protocol):
         """Return the authoritative budget for a browser session to become ready."""
         ...
 
+    async def wait_for_browser_launch(self, session_id: str, organization_id: str) -> bool:
+        """Wait out the browser startup this manager owns; True when a fresh lookup may now find the browser."""
+        ...
+
     def can_probe_registered_browser_state(self) -> bool: ...
 
     def launches_browser_on_create(self) -> bool:

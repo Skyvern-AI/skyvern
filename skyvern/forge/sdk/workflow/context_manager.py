@@ -614,6 +614,7 @@ class WorkflowRunContext:
         parent_workflow_run_id: str | None = None,
         requested_by: str | None = None,
         powerbi_hop_tokens: Mapping[str, str] | None = None,
+        powerbi_hop_refusals: Mapping[str, str] | None = None,
     ) -> Self:
         denied_parameters = [
             parameter
@@ -652,6 +653,7 @@ class WorkflowRunContext:
             parent_workflow_run_id=parent_workflow_run_id,
             requested_by=requested_by,
             powerbi_hop_tokens=powerbi_hop_tokens,
+            powerbi_hop_refusals=powerbi_hop_refusals,
         )
 
         if context := skyvern_context.current():
@@ -761,6 +763,7 @@ class WorkflowRunContext:
         parent_workflow_run_id: str | None = None,
         requested_by: str | None = None,
         powerbi_hop_tokens: Mapping[str, str] | None = None,
+        powerbi_hop_refusals: Mapping[str, str] | None = None,
     ) -> None:
         self.workflow_title = workflow_title
         self.workflow_id = workflow_id
@@ -769,6 +772,7 @@ class WorkflowRunContext:
         self.parent_workflow_run_id = parent_workflow_run_id
         self.requested_by = requested_by
         self._powerbi_hop_tokens = dict(powerbi_hop_tokens or {})
+        self._powerbi_hop_refusals = dict(powerbi_hop_refusals or {})
         self.attempt_number = attempt_number
         self.workflow = workflow
         self.mask_secrets: bool = mask_secrets
@@ -1034,6 +1038,11 @@ class WorkflowRunContext:
 
     def get_gmail_hop_token(self, block_label: str) -> str | None:
         return self.get_powerbi_hop_token(block_label)
+
+    def get_powerbi_hop_refusal(self, block_label: str) -> str | None:
+        """Return why the run was issued no capability for this block; the block owns the known reason codes."""
+        refusal = self._powerbi_hop_refusals.get(block_label)
+        return refusal if isinstance(refusal, str) else None
 
     def get_value(self, key: str) -> Any:
         """
@@ -3199,20 +3208,30 @@ class WorkflowContextManager:
         requested_by: str | None = None,
     ) -> WorkflowRunContext:
         powerbi_hop_tokens: Mapping[str, str] = {}
+        powerbi_hop_refusals: Mapping[str, str] = {}
         if workflow is not None:
             from skyvern.forge.sdk.workflow.models.block import get_all_blocks
 
-            powerbi_block_labels = [
+            all_blocks = get_all_blocks(workflow.workflow_definition.blocks)
+            powerbi_query_labels = [block.label for block in all_blocks if block.block_type == BlockType.POWERBI_QUERY]
+            powerbi_block_labels = powerbi_query_labels + [
                 block.label
-                for block in get_all_blocks(workflow.workflow_definition.blocks)
-                if block.block_type == BlockType.POWERBI_QUERY
-                or (block.block_type == BlockType.EMAIL_INBOX and block.credential_source == "nango")
+                for block in all_blocks
+                if block.block_type == BlockType.EMAIL_INBOX and block.credential_source == "nango"
             ]
             if powerbi_block_labels:
                 powerbi_hop_tokens = await app.AGENT_FUNCTION.get_powerbi_query_hop_tokens(
                     organization_id=organization.organization_id,
                     workflow_run_id=workflow_run_id,
                     block_labels=powerbi_block_labels,
+                )
+            # Only a block with no capability needs a reason, so a run that got one pays nothing for this.
+            refused_labels = [label for label in powerbi_query_labels if label not in powerbi_hop_tokens]
+            if refused_labels:
+                powerbi_hop_refusals = await app.AGENT_FUNCTION.get_powerbi_query_hop_refusals(
+                    organization_id=organization.organization_id,
+                    workflow_run_id=workflow_run_id,
+                    block_labels=refused_labels,
                 )
         workflow_run_context = await WorkflowRunContext.init(
             self.aws_client,
@@ -3233,6 +3252,7 @@ class WorkflowContextManager:
             parent_workflow_run_id=parent_workflow_run_id,
             requested_by=requested_by,
             powerbi_hop_tokens=powerbi_hop_tokens,
+            powerbi_hop_refusals=powerbi_hop_refusals,
         )
         self.workflow_run_contexts[workflow_run_id] = workflow_run_context
         return workflow_run_context

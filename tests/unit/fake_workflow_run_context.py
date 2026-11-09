@@ -42,10 +42,14 @@ class FakeWorkflowRunContext:
         self.succeeded_code_block_labels: set[str] = set()
         self.parameters: dict[str, Any] = {}
         self._powerbi_hop_tokens: dict[str, str] = {}
+        self._powerbi_hop_refusals: dict[str, str] = {}
         self.workflow = None
 
     def get_powerbi_hop_token(self, block_label: str) -> str | None:
         return self._powerbi_hop_tokens.get(block_label)
+
+    def get_powerbi_hop_refusal(self, block_label: str) -> str | None:
+        return self._powerbi_hop_refusals.get(block_label)
 
     def get_block_metadata(self, label: str | None) -> dict[str, Any]:
         if not label:

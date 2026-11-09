@@ -9,11 +9,13 @@ from typing import Any, ClassVar, Literal
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from fastapi import UploadFile
+from fastapi import HTTPException, UploadFile
 
 from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge import app
 from skyvern.forge.sdk.cache.base import NoopLock
+from skyvern.forge.sdk.cache.local import LocalCache
+from skyvern.forge.sdk.cache.process_local import ProcessLocalCache
 from skyvern.forge.sdk.copilot import demonstration_recorder as recorder_module
 from skyvern.forge.sdk.copilot import demonstration_replay as replay_module
 from skyvern.forge.sdk.copilot import runtime as copilot_runtime
@@ -50,6 +52,7 @@ from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType, Cr
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotDemonstrationControlRequest
 from skyvern.services import uploaded_file_service
 from tests.unit.copilot_test_helpers import make_copilot_ctx, stamping_browser_manager, stop_activity_renewer
+from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
 class _SharedCache:
@@ -1154,6 +1157,7 @@ async def test_demonstration_upload_passes_a_restricted_type_through_to_the_reco
         )
     )
     cache.store[demonstration_controls_key("org-1", "demo-1")] = "[]"
+    monkeypatch.setattr(app, "CACHE", cache)
     monkeypatch.setattr(
         copilot_routes,
         "app",
@@ -1775,6 +1779,9 @@ async def test_recorder_teardown_ends_renewal_for_a_browser_minted_into_its_cont
         renewable_at_mint.append(browser_manager._renewable_session_ids())
 
     monkeypatch.setattr(recorder_module, "resolve_persistent_browser_state", _mint_then_lose_browser)
+    monkeypatch.setattr(
+        app, "PERSISTENT_SESSIONS_MANAGER", SimpleNamespace(wait_for_browser_launch=AsyncMock(return_value=False))
+    )
 
     try:
         await recorder.run()
@@ -2537,3 +2544,108 @@ async def test_sensitive_select_is_reported_and_replays_as_a_withheld_selection(
         ("select_option", {"selector": "#plan", "value": "<value not recorded>"})
     ]
     assert ctx.demonstration_items == ["Select a sensitive option"]
+
+
+@pytest.mark.asyncio
+async def test_single_process_server_without_shared_cache_records_and_keeps_a_full_recording(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(app, "CACHE", LocalCache())
+    monkeypatch.setattr(recorder_module, "_PROCESS_DEMONSTRATION_CACHE", ProcessLocalCache(maxsize=25_000))
+    monkeypatch.delenv("WEB_CONCURRENCY", raising=False)
+    cache = await copilot_routes._demonstration_cache()
+    claim = await claim_demonstration_recording(
+        cache,
+        organization_id="org-1",
+        workflow_permanent_id="wfp-1",
+        browser_session_id="pbs-1",
+        demonstration_id=None,
+    )
+    recorder = DemonstrationRecorder(
+        cache=cache,
+        organization_id="org-1",
+        workflow_permanent_id="wfp-1",
+        browser_session_id="pbs-1",
+        claim=claim,
+        stream=_Stream(),
+    )
+    max_events = recorder_module.DEMONSTRATION_MAX_EVENTS
+    for seq in range(max_events):
+        await recorder._append_event({"kind": "click", "selector": f"#a{seq}", "label": f"Click {seq}"})
+
+    labels = await demonstration_action_labels(cache, "org-1", claim.demonstration_id, max_events)
+    assert len(labels) == max_events
+
+    await cache.set("short-lived", "x", ex=timedelta(milliseconds=50))
+    await asyncio.sleep(0.1)
+    assert await cache.get("short-lived") is None
+
+    monkeypatch.setenv("WEB_CONCURRENCY", "2")
+    with pytest.raises(HTTPException) as refused:
+        await copilot_routes.workflow_copilot_demonstration_active(
+            workflow_permanent_id="wfp-1",
+            browser_session_id="pbs-1",
+            organization=SimpleNamespace(organization_id="org-1"),  # type: ignore[arg-type]
+        )
+    assert refused.value.status_code == 501
+
+
+@pytest.mark.asyncio
+async def test_recorder_waits_for_the_managers_launch_instead_of_stopping_as_browser_gone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache = _SharedCache()
+    cache.store[demonstration_record_key("org-1", "demo-1")] = encode_demonstration_record(
+        DemonstrationRecord(
+            workflow_permanent_id="wfp-1",
+            browser_session_id="pbs-1",
+            status="recording",
+            event_count=0,
+            owner="owner-1",
+            owner_seen_at=datetime.now(UTC),
+            final_url=None,
+            recording_started_at=datetime.now(UTC),
+        )
+    )
+    cache.store[demonstration_controls_key("org-1", "demo-1")] = "[]"
+    page = SimpleNamespace(url="https://example.test/start", is_closed=lambda: False)
+    click = TapEvent(page, "tap-1", "main", True, "", {"kind": "click", "ts": 1, "url": page.url, "selector": "#go"})
+    _FakeTap.events = [click]
+    _FakeTap.flush_events = []
+    monkeypatch.setattr(recorder_module, "PageTap", _FakeTap)
+    browser_state = SimpleNamespace(
+        browser_context=SimpleNamespace(pages=[page]), get_working_page=AsyncMock(return_value=page)
+    )
+    monkeypatch.setattr(
+        recorder_module, "resolve_persistent_browser_state", AsyncMock(side_effect=[None, browser_state])
+    )
+    launched = asyncio.Event()
+
+    async def slow_launch(_session_id: str, _organization_id: str) -> bool:
+        await launched.wait()
+        return True
+
+    # The fake manager offers no startup timeout, so the recorder cannot time the launch on its own.
+    monkeypatch.setattr(app, "PERSISTENT_SESSIONS_MANAGER", SimpleNamespace(wait_for_browser_launch=slow_launch))
+    asyncio.get_running_loop().call_later(0.05, launched.set)
+    real_sleep = asyncio.sleep
+
+    async def yield_only(_seconds: float) -> None:
+        await real_sleep(0)
+
+    monkeypatch.setattr(recorder_module, "asyncio", ScopedAsyncio(sleep=yield_only))
+    stream = _Stream()
+    stream.is_disconnected = AsyncMock(side_effect=[False, False, True])  # type: ignore[method-assign]
+    recorder = DemonstrationRecorder(
+        cache=cache,  # type: ignore[arg-type]
+        organization_id="org-1",
+        workflow_permanent_id="wfp-1",
+        browser_session_id="pbs-1",
+        claim=DemonstrationClaim("demo-1", "owner-1", False, 0),
+        stream=stream,
+    )
+
+    await recorder.run()
+
+    record = await load_demonstration_record(cache, "org-1", "demo-1")  # type: ignore[arg-type]
+    assert record is not None and record.event_count == 1 and record.stop_reason == "disconnected"
