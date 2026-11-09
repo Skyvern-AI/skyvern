@@ -2625,6 +2625,7 @@ OBSERVE_SUMMARY_FIELDS = frozenset(
         "markers_minted",
         "markers_reused",
         "group_texts_found",
+        "near_texts_found",
         "a11y_removed_listed",
         "duplicate_digest_lines",
         "frames_same_origin",

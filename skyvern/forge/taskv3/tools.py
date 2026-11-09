@@ -209,6 +209,9 @@ _OBSERVE_DESCRIPTION_BASE = (
     "ref names the element this reading described and keeps working while that element is on the page. "
     "If it becomes ambiguous or is gone, the tool errors "
     "instead of acting on something else — re-observe and use a ref from the new reading. "
+    "`near=[slot:text, ...]` is text the page projects into the control's component through the named slots, and "
+    "each slot name says what its text is (a label, hint, prefix, and so on). It is not a binding: decide from the "
+    "page and the goal. "
 )
 _OBSERVE_DESCRIPTION_FRAME_REACH = (
     "Elements inside the page's child frames are included in the same list and are acted on by ref "
@@ -5726,15 +5729,15 @@ _LABEL_TEXT_JS = (
   const renders = """
     + _RENDERS_JS
     + r""";
-  return (l) => {
+  return (l, anyTag) => {
   try {
     const CAP = typeof _RETAIN_WIDTH === 'number' ? _RETAIN_WIDTH : 2000;
-    const holdsSlot = (n) => { try { return !!n.querySelector('slot'); } catch (e) { return false; } };
+    const holdsSlot = (n) => { try { return n.localName === 'slot' || !!n.querySelector('slot'); } catch (e) { return false; } };
     const styleOf = (n) => { try { return getComputedStyle(n); } catch (e) { return null; } };
     let root = null;
     try { root = Node.prototype.getRootNode.call(l); } catch (e) { root = null; }
     const isLabel = String(l.localName || '') === 'label';
-    if (!isLabel || !root || root.nodeType !== 11 || !holdsSlot(l)) return (l.innerText || '').trim();
+    if ((!isLabel && !anyTag) || !root || root.nodeType !== 11 || !holdsSlot(l)) return (l.innerText || '').trim();
     // Opacity above the label composes down; below it every element is screened on the way.
     if (renders.transparent(l)) return '';
     let out = '';
@@ -9859,6 +9862,8 @@ OBSERVE_FIELD_DISPLAY_MAX = max(OBSERVE_DISPLAY_WIDTHS.values())
 # A clipped field carries its clip in-band between NULs until the line is final. repr escapes every
 # control character, so page bytes can never contain one, and a line's identity can drop the span.
 _OBSERVE_CLIP_SPAN_RE = re.compile("\x00([^\x00]*)\x00")
+# A slot name is printed bare inside near=[slot:text, ...], so only name characters survive.
+_NEAR_SLOT_STRIP_RE = re.compile(r"[^\w.-]")
 
 
 def _observe_quoted_field(masked: str, width: int, *, cut_before: bool) -> str:
@@ -9870,6 +9875,18 @@ def _observe_quoted_field(masked: str, width: int, *, cut_before: bool) -> str:
         return shown
     # A value the page script cut stays marked even when masking has shortened it to fit.
     return f"{shown}\x00{max(cut, 0)}{' or more' if cut_before else ''}\x00"
+
+
+def _near_suffix(near: object, field: Callable[[str, int], str]) -> str:
+    if not isinstance(near, list):
+        return ""
+    entries = [
+        f"{_NEAR_SLOT_STRIP_RE.sub('', _digest_token(n.get('slot') or '', 40)) or 'default'}:"
+        f"{field(str(n.get('text') or ''), OBSERVE_DISPLAY_WIDTHS['group'])}"
+        for n in near
+        if isinstance(n, dict) and n.get("text")
+    ]
+    return f" near=[{', '.join(entries)}]" if entries else ""
 
 
 def _observe_line_identity(line: str) -> str:
@@ -10080,6 +10097,91 @@ async (__tv3TextArgs) => {
       }
     } catch (e) { /* fail open: the record keeps today's shape */ }
     return '';
+  };
+  // The texts a control's own component chain projects before it, each with the slot that carries it: every slot with
+  // assigned content in the siblings before the control's subtree, up to the nearest stop and at most 4, read through
+  // the flat tree. A slot carries placement, not meaning, so these are printed as candidates with their slot names
+  // (near=), never as the group; like main's walk it stops at a drawn control, a grid cell, a choice's caption and
+  // visible text in the control's own root, and never leaves the outermost host.
+  const _rootOfNode = Node.prototype.getRootNode;
+  const _shadowHostOf = _getter(ShadowRoot.prototype, 'host');
+  const _childrenOf = _getter(Element.prototype, 'children');
+  const _rootChildrenOf = _getter(DocumentFragment.prototype, 'children');
+  const _rootQs = DocumentFragment.prototype.querySelector;
+  const _assignedNodesOf = HTMLSlotElement.prototype.assignedNodes;
+  const _assignedElementsOf = HTMLSlotElement.prototype.assignedElements;
+  const _inShadowRoot = (el) => {
+    try { return _nodeTypeOf.call(_rootOfNode.call(el)) === 11; } catch (e) { return false; }
+  };
+  // Whether n holds a control in the flat tree: a host's open root (its unassigned light children are not drawn),
+  // a slot's assigned elements (its fallback content only when nothing is assigned), else its children. Once per node.
+  const _holdsSeen = new Map();
+  const _holdsControl = (n, depth) => {
+    if (_holdsSeen.has(n)) return _holdsSeen.get(n);
+    // Past 24 levels a subtree counts as holding a control: the walk fails closed, binding nothing.
+    let held = depth > 24 || _matches.call(n, _CTRL_SEL);
+    if (!held) {
+      const sr = _openShadowOf(n);
+      const slotted = _localNameOf.call(n) === 'slot' && _assignedNodesOf.call(n, { flatten: true }).length > 0;
+      const kids = sr ? _rootChildrenOf.call(sr) : slotted ? _assignedElementsOf.call(n, { flatten: true }) : _childrenOf.call(n);
+      for (const c of kids) { if (_holdsControl(c, depth + 1)) { held = true; break; } }
+    }
+    _holdsSeen.set(n, held);
+    return held;
+  };
+  const _projectingSlots = (n) => {
+    const slots = _localNameOf.call(n) === 'slot' ? [n] : Array.from(_qsa.call(n, 'slot'));
+    // A real assignment only: flattened, an unassigned slot returns its own fallback content. A host's whitespace
+    // between tags and an empty element are assigned too, and project nothing.
+    return slots.filter((sl) => _assignedNodesOf.call(sl).some((a) => {
+      const kind = _nodeTypeOf.call(a);
+      return kind === 1 ? !_unseen(a) : kind === 3 && !!_normText(_contentOf.call(a));
+    }));
+  };
+  const _projectedLabel = (el) => {
+    // Nearest first while walking, so each sibling's entries go in front: the list ends in tree order.
+    const found = [];
+    try {
+      const ownRoot = _rootOfNode.call(el);
+      let node = el;
+      for (let depth = 0; depth < 6 && _inShadowRoot(node) && found.length < 4; depth++) {
+        if (_matches.call(node, _GRID_CELL_SEL) && _closest.call(node, '[role=grid],[role=treegrid]')) break;
+        let scanned = 0;
+        for (let s = _prevOf.call(node); s && scanned < 8; s = _prevOf.call(s), scanned++) {
+          const kind = _nodeTypeOf.call(s);
+          // Main's walk stops at its root's top level, so text there is nearer than any projected text.
+          if (kind === 3) {
+            if (_rootOfNode.call(s) === ownRoot && /\p{L}/u.test(_normText(_contentOf.call(s)))) return found;
+            continue;
+          }
+          if (kind !== 1) continue;
+          if (_holdsControl(s, 0)) return found;
+          if (_unseen(s)) continue;
+          const slots = _projectingSlots(s);
+          if (!slots.length) {
+            if (_rootOfNode.call(s) === ownRoot && /\p{L}/u.test(_visibleText(s, 0))) return found;
+            continue;
+          }
+          // Main's caption rule: text right after a checkbox or radio is that control's caption.
+          let before = _prevOf.call(s);
+          while (before && _nodeTypeOf.call(before) !== 1 && !_normText(_contentOf.call(before))) before = _prevOf.call(before);
+          if (before && _nodeTypeOf.call(before) === 1) {
+            const bsr = _openShadowOf(before);
+            if (_captionHost(before) || (bsr && _rootQs.call(bsr, _CHOICE_SEL))) return found;
+          }
+          // Each slot is read on its own, so a text and its slot name always agree; an icon reads empty and is skipped.
+          const own = [];
+          for (const sl of slots) {
+            const t = _normText(_labelText(sl, true));
+            if (t) own.push({ slot: (Element.prototype.getAttribute.call(sl, 'name') || '').slice(0, 40), text: t });
+          }
+          found.unshift(...own.slice(Math.max(0, own.length - (4 - found.length))));
+          if (found.length >= 4) return found;
+        }
+        node = _parentOf.call(node) || _shadowHostOf.call(_rootOfNode.call(node));
+      }
+    } catch (e) { /* fail open: what was read so far */ }
+    return found;
   };
   // Pressable buttons that set a form value -- a wrapper holding only pressable buttons and the checkbox, radio
   // or hidden input they write (a Yes/No pair) -- answer one question, the way a radio group does. Without that
@@ -11579,6 +11681,7 @@ async (__tv3TextArgs) => {
   let lastGroup = '';
   let lastGroupToggle = false;
   let groupTotal = 0;
+  let nearTotal = 0;
   let radioGroupsMissing = 0;
   const _a11yRemoved = """
     + _A11Y_REMOVED_JS
@@ -11946,6 +12049,17 @@ async (__tv3TextArgs) => {
         // question beside it. The repeat is not charged, as the budget bounds distinct question text.
         rec.group = gtFull;
       }
+      const near = takesValue && !isChoice && !ownGroup && _inShadowRoot(el) ? _projectedLabel(el) : [];
+      // A budget of its own, so near never withholds a group main's walk would print. No dedupe: two fields with the
+      // same label each carry it.
+      const shownNear = [];
+      for (const n of near) {
+        const text = n.text.slice(0, _RETAIN_WIDTH);
+        if (nearTotal + Math.min(text.length, 200) > _GROUP_TEXT_TOTAL_CAP) break;
+        nearTotal += Math.min(text.length, 200);
+        shownNear.push({ slot: n.slot, text });
+      }
+      if (shownNear.length) rec.near = shownNear;
       // Every member carries its group's number, so the digest can say once per group that no
       // question was found; checkboxes are left out, being mostly self-describing consents.
       if (el.type === 'radio' || role === 'radio') {
@@ -15021,6 +15135,7 @@ def build_browser_tools(
             )
 
         bodies: list[str] = []
+        near_suffixes: list[str] = []
 
         def _realm_of(idx: int) -> Any:
             return owners[idx] if idx < len(owners) else None
@@ -15124,6 +15239,8 @@ def build_browser_tools(
             elif e.get("group_missing") and missing_key not in missing_groups_shown:
                 missing_groups_shown.add(missing_key)
                 extra += f" group={_NO_QUESTION_MARKER}"
+            # Kept out of the body: a line's identity, its qualifiers and the duplicate count stay main's.
+            near_suffixes.append(_near_suffix(e.get("near"), _field))
             if e.get("a11yRemoved"):
                 # What the page declared, not a prediction: aria-hidden with a negative tabindex does
                 # not stop a click landing or a field filling (measured), and a control the page
@@ -15174,8 +15291,8 @@ def build_browser_tools(
             ).values()
             if n > 1
         )
-        for e, body in zip(elements, bodies):
-            lines.append(f"ref={e['ref']} {body}")
+        for e, body, near in zip(elements, bodies, near_suffixes, strict=True):
+            lines.append(f"ref={e['ref']} {body}{near}")
         icons_cut = int(data.get("iconsTruncated") or 0)
         if icons_cut:
             lines.append(
@@ -15212,6 +15329,7 @@ def build_browser_tools(
             "markers_minted": data.get("markersMinted") or 0,
             "markers_reused": data.get("markersReused") or 0,
             "group_texts_found": sum(1 for e in elements if e.get("group")),
+            "near_texts_found": sum(1 for e in elements if e.get("near")),
             "a11y_removed_listed": sum(1 for e in elements if e.get("a11yRemoved")),
             # Every line but pointer roots', as before those were listed; theirs ride pointer_* below. Icons count:
             # they are lines the model reads, and the gate holds this to the digest's own duplicates.
