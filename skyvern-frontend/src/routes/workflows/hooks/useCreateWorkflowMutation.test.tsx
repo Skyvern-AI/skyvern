@@ -99,6 +99,31 @@ describe("useCreateWorkflowMutation", () => {
     );
   });
 
+  it("drops a second mutate while the first create is in flight", async () => {
+    mockPost.mockResolvedValue({
+      data: {
+        workflow_permanent_id: "wpid_x",
+        workflow_definition: { blocks: [] },
+      },
+    });
+    const { result } = renderHook(() => useCreateWorkflowMutation(), {
+      wrapper,
+    });
+
+    act(() => {
+      result.current.mutate({ title: "New Agent" } as never);
+      result.current.mutate({ title: "New Agent" } as never);
+    });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(mockPost).toHaveBeenCalledTimes(1);
+
+    act(() => {
+      result.current.mutate({ title: "New Agent" } as never);
+    });
+    await waitFor(() => expect(mockPost).toHaveBeenCalledTimes(2));
+  });
+
   it("emits onboarding flow_completed when the creation came from the onboarding template path", async () => {
     mockPost.mockResolvedValue({
       data: {

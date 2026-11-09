@@ -68,7 +68,7 @@ function TagChipList({
   return (
     <div
       className={cn(
-        "flex items-center gap-1",
+        "flex min-w-0 max-w-full items-center gap-1",
         compact ? "flex-nowrap" : "flex-wrap",
         className,
       )}

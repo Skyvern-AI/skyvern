@@ -379,8 +379,8 @@ function WorkflowPage() {
           </div>
         ) : (
           <>
-            <div className="flex items-center justify-between gap-4">
-              <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center justify-between gap-4 gap-y-2">
+              <div className="flex flex-wrap items-center gap-2">
                 <TableSearchInput
                   value={search}
                   onChange={(value) => {
@@ -409,7 +409,7 @@ function WorkflowPage() {
                   />
                 ) : null}
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 {WorkflowRunsFilterControls ? (
                   <WorkflowRunsFilterControls />
                 ) : null}
@@ -429,7 +429,7 @@ function WorkflowPage() {
               </div>
             </div>
             <div className="overflow-hidden rounded-lg border border-border">
-              <Table>
+              <Table className="min-w-[960px]">
                 <TableHeader>
                   <TableRow className="group/header">
                     {showCheckbox && (
@@ -666,8 +666,8 @@ function WorkflowPage() {
                 workflowPermanentId={workflowPermanentId}
                 workflowRunId={openRunParams}
               />
-              <div className="relative px-3 py-3">
-                <div className="absolute left-3 top-1/2 flex -translate-y-1/2 items-center gap-2 text-sm">
+              <div className="relative flex flex-col items-center gap-2 px-3 py-3 sm:block">
+                <div className="flex items-center gap-2 text-sm sm:absolute sm:left-3 sm:top-1/2 sm:-translate-y-1/2">
                   <span className="text-muted-foreground">Items per page</span>
                   <Select
                     value={String(pageSize)}
