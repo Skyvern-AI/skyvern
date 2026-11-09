@@ -151,8 +151,7 @@ def collect_google_connection_notices(
 
 
 def _holds_other_profile_grant(credential: GoogleOAuthCredentialBase, scope_profile: GoogleSetupScopeProfile) -> bool:
-    """Reauthorizing a row replaces its granted scopes with this profile's, keeping only Gmail send, so any other
-    profile scope it holds would be revoked."""
+    """Return whether a row already holds a grant from a different Google setup profile."""
     kept = {*GOOGLE_OAUTH_SCOPE_PROFILES[scope_profile], *GOOGLE_GMAIL_SEND_SCOPES}
     return any(
         scope in credential.scopes_granted
@@ -188,7 +187,7 @@ def google_setup_notice(
     connection_id: str | None,
     visible_credentials: list[GoogleOAuthCredentialBase],
 ) -> GoogleConnectionNotice:
-    """Reconnect only a row that was asked for this profile, since reauthorizing a row replaces its scopes."""
+    """Reconnect a row associated with this profile, or offer an unbound connection choice."""
     scope = GOOGLE_SETUP_PROFILE_DATA_SCOPES[scope_profile]
     ready = google_setup_ready_connections(scope_profile, visible_credentials)
     target = next((credential for credential in visible_credentials if credential.id == connection_id), None)

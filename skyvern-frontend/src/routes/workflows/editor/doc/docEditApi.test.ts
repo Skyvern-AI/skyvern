@@ -2,7 +2,11 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import * as toastModule from "@/components/ui/use-toast";
 
 import { isWorkflowBlockNode, type AppNode } from "../nodes";
-import { createNode, getElements } from "../workflowEditorUtils";
+import {
+  createNode,
+  getElements,
+  getWorkflowBlocks,
+} from "../workflowEditorUtils";
 import { createDocEditApi, docDestinations, TOP_SCOPE } from "./docEditApi";
 import { docStepChoices } from "./docStepChoices";
 import type { DocGraph } from "./docGraphEdits";
@@ -11,6 +15,8 @@ import { useLocateBlockStore } from "../runValidation/useLocateBlockStore";
 import { block, code, conditional, forLoop, settings } from "./docTestBlocks";
 import { docStepProblems } from "./docProblems";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
+import { useDocUnfinishedStore } from "./docUnfinished";
+import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -156,7 +162,7 @@ describe("doc edit api", () => {
 
   test("deleting the finally step clears the finally label, so the save is not refused", () => {
     const graph = getElements(
-      [code("first", null), code("cleanup", null)],
+      [code("first", "second"), code("second", null), code("cleanup", null)],
       settings("cleanup"),
       true,
     ) as DocGraph;
@@ -182,7 +188,13 @@ describe("doc edit api", () => {
       inputKeys: [],
       credentialKeys: new Set(),
     });
-    api.remove(cleanup.id);
+    const idOf = (label: string) =>
+      graph.nodes.find((n) => isWorkflowBlockNode(n) && n.data.label === label)!
+        .id;
+    // Focus after deleting the finally step goes to the step above it, not to the first step.
+    expect(api.neighbourOf(cleanup.id)).toBe(idOf("second"));
+    expect(api.neighbourOf(idOf("first"))).toBe(idOf("second"));
+    expect(api.remove(cleanup.id)).toBe(true);
     const start = (applied as DocGraph | null)?.nodes.find(
       (n: AppNode) => n.type === "start" && !n.parentId,
     );
@@ -342,6 +354,254 @@ describe("building from scratch in the doc", () => {
       loopVariableReference: "{{ list_output }}",
     });
     expect(docStepProblems(latest().nodes).has(loop.id)).toBe(false);
+  });
+
+  const extractionHint =
+    "Pick the list inside extraction_1_output, for example extraction_1_output.extracted_information.<field>, with <field> listed in extraction_1's data schema. Use extraction_1_output.extracted_information only if that data schema is an array.";
+  const loopAfter = (source: ReturnType<typeof block>, extra = {}) =>
+    getElements(
+      [
+        source,
+        forLoop("books", null, [code("inner", null)], {
+          loop_over: null,
+          ...extra,
+        }),
+      ],
+      settings(),
+      true,
+    ) as DocGraph;
+  const loopProblems = (graph: DocGraph) =>
+    docStepProblems(graph.nodes).get(byLabel(graph, "books").id);
+  const extraction = (dataSchema: unknown = null) =>
+    block("extraction", "extraction_1", "books", {
+      data_extraction_goal: "List the titles",
+      data_schema: dataSchema,
+    });
+
+  test.each([
+    ["{{ extraction_1_output }}", null, true],
+    ["{{extraction_1_output}}", null, true],
+    ["extraction_1_output", null, true],
+    ["{{ extraction_1 }}", null, true],
+    ["extraction_1", null, true],
+    ["{{ extraction_1_output.extracted_information.titles }}", null, false],
+    ["{{ extraction_1_output | map(attribute='x') }}", null, false],
+    ["{{ book_list }}", null, false],
+    ["{{ extraction_1_output }}", { type: "array" }, true],
+  ])(
+    "a loop over %s (data schema %j) is flagged only when it goes through a whole result record",
+    (reference, dataSchema, flagged) => {
+      const problems = loopProblems(
+        loopAfter(extraction(dataSchema), {
+          loop_variable_reference: reference,
+        }),
+      );
+      if (flagged) expect(problems).toEqual([extractionHint]);
+      else expect(problems).toBeUndefined();
+    },
+  );
+
+  const recordHint = (path: string) =>
+    path === "extracted_information.<field>"
+      ? "Pick the list inside task_1_output, for example task_1_output.extracted_information.<field>, with <field> listed in task_1's data schema. Use task_1_output.extracted_information only if that data schema is an array."
+      : `Pick the list inside task_1_output, for example task_1_output.${path}.`;
+
+  test.each([
+    ["task", {}, "extracted_information.<field>"],
+    ["navigation", {}, "extracted_information.<field>"],
+    ["http_request", {}, "body"],
+    ["google_sheets_read", {}, "rows"],
+    ["google_sheets_read", { has_header_row: false }, "values"],
+    ["email_inbox", {}, "emails"],
+    ["web_search", {}, "results"],
+    ["code", { code: "", parameters: [] }, null],
+    ["code", { code: "items = [1, 2]\nreturn items", parameters: [] }, null],
+    ["file_url_parser", {}, null],
+    ["text_prompt", {}, null],
+    ["for_loop", { loop_over: { key: "items" }, loop_blocks: [] }, null],
+  ])(
+    "a loop over a whole %s result (%j) is flagged only for a step whose output is always a record",
+    (blockType, extra, path) => {
+      const problems = loopProblems(
+        loopAfter(block(blockType, "task_1", "books", extra), {
+          loop_variable_reference: "{{ task_1_output }}",
+        }),
+      );
+      if (path) expect(problems).toEqual([recordHint(path)]);
+      else expect(problems).toBeUndefined();
+    },
+  );
+
+  test("a label that itself ends in _output resolves as the label as written", () => {
+    const graph = getElements(
+      [
+        block("extraction", "titles", "titles_output", {
+          data_extraction_goal: "List the titles",
+        }),
+        block("extraction", "titles_output", "books", {
+          data_extraction_goal: "List the titles",
+        }),
+        forLoop("books", null, [code("inner", null)], {
+          loop_over: null,
+          loop_variable_reference: "titles_output",
+        }),
+      ],
+      settings(),
+      true,
+    ) as DocGraph;
+    expect(loopProblems(graph)).toEqual([
+      "Pick the list inside titles_output_output, for example titles_output_output.extracted_information.<field>, with <field> listed in titles_output's data schema. Use titles_output_output.extracted_information only if that data schema is an array.",
+    ]);
+  });
+
+  const titlesSchema = {
+    type: "object",
+    properties: {
+      titles: { type: "array", items: { type: "string" } },
+      total: { type: "integer" },
+    },
+  };
+  const loopListItems = (graph: DocGraph) => {
+    const { api } = editing(graph);
+    return api
+      .references(byLabel(graph, "books").id, false)
+      .flatMap((group) => group.items);
+  };
+  const savedLoop = (graph: DocGraph) =>
+    getWorkflowBlocks(graph.nodes, graph.edges).find(
+      (b) => b.label === "books",
+    );
+
+  test("@ on a loop's list offers an earlier extraction's array field by its plain name, and picking it saves the hand-typed path", () => {
+    const graph = loopAfter(extraction(titlesSchema), {
+      loop_variable_reference: null,
+    });
+    const offered = loopListItems(graph).find(
+      (item) => item.label === "titles",
+    );
+    expect(offered).toBeDefined();
+    expect(loopListItems(graph).map((item) => item.label)).not.toContain(
+      "total",
+    );
+
+    // The menu inserts `{{ key }}` at the caret, as for any reference.
+    const picked = editing(graph);
+    const loopId = byLabel(graph, "books").id;
+    picked.api.setText(loopId, "description", `{{ ${offered!.key} }}`);
+    const typed = editing(graph);
+    typed.api.setText(
+      loopId,
+      "description",
+      "{{ extraction_1_output.extracted_information.titles }}",
+    );
+    expect(savedLoop(picked.latest())).toEqual(savedLoop(typed.latest()));
+    expect(savedLoop(picked.latest())).toMatchObject({
+      loop_variable_reference:
+        "{{ extraction_1_output.extracted_information.titles }}",
+    });
+    expect(loopProblems(picked.latest())).toBeUndefined();
+  });
+
+  test("an extraction without an array field offers no list, and its bare result still holds Run", () => {
+    const graph = loopAfter(
+      extraction({
+        type: "object",
+        properties: { total: { type: "integer" } },
+      }),
+      { loop_variable_reference: "{{ extraction_1_output }}" },
+    );
+    expect(loopListItems(graph).map((item) => item.key)).toEqual([
+      "extraction_1_output",
+    ]);
+    expect(loopProblems(graph)).toEqual([extractionHint]);
+  });
+
+  test("a Unicode list field is offered and saves its dotted path; a name with a space or a dash is not", () => {
+    const graph = loopAfter(
+      extraction({
+        type: "object",
+        properties: {
+          éléments: { type: "array" },
+          "two words": { type: "array" },
+          "with-dash": { type: "array" },
+        },
+      }),
+      { loop_variable_reference: null },
+    );
+    expect(
+      loopListItems(graph)
+        .map((item) => item.label)
+        .filter(Boolean),
+    ).toEqual(["éléments"]);
+    const offered = loopListItems(graph).find(
+      (item) => item.label === "éléments",
+    );
+    const { api, latest } = editing(graph);
+    api.setText(
+      byLabel(graph, "books").id,
+      "description",
+      `{{ ${offered!.key} }}`,
+    );
+    expect(savedLoop(latest())).toMatchObject({
+      loop_variable_reference:
+        "{{ extraction_1_output.extracted_information.éléments }}",
+    });
+    expect(loopProblems(latest())).toBeUndefined();
+  });
+
+  test("a list field named like a dict method or a keyword is not offered and holds Run when typed, and a note on the loop gets no list", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        items: { type: "array" },
+        keys: { type: "array" },
+        class: { type: "array" },
+        titles: { type: "array" },
+      },
+    };
+    const graph = loopAfter(extraction(schema), {
+      loop_variable_reference: null,
+    });
+    expect(loopListItems(graph)).toEqual([
+      {
+        key: "extraction_1_output",
+        hint: "Whole result, not a list",
+      },
+      {
+        key: "extraction_1_output.extracted_information.titles",
+        label: "titles",
+        hint: "List in extraction_1_output",
+      },
+    ]);
+    const loopId = byLabel(graph, "books").id;
+    expect(editing(graph).api.references(loopId, true)).toEqual([]);
+
+    const typed = (field: string) =>
+      loopProblems(
+        loopAfter(extraction(schema), {
+          loop_variable_reference: `{{ extraction_1_output.extracted_information.${field} }}`,
+        }),
+      );
+    expect(typed("items")).toEqual([
+      `Rename the list field "items" in the earlier step's data schema. A loop can't go through a field with that name.`,
+    ]);
+    expect(typed("titles")).toBeUndefined();
+  });
+
+  test("a while loop or a loop read only from its loop value is not flagged", () => {
+    const graph = loopAfter(extraction(), {
+      loop_variable_reference: "{{ extraction_1_output }}",
+    });
+    Object.assign(byLabel(graph, "books").data, { loopKind: "while" });
+    expect(loopProblems(graph)).toBeUndefined();
+    expect(
+      loopProblems(
+        loopAfter(extraction(), {
+          loop_over: { key: "extraction_1_output" },
+          loop_variable_reference: "",
+        }),
+      ),
+    ).toBeUndefined();
   });
 
   test("a Go to URL's line is its address; a note naming a site never sets it", () => {
@@ -559,6 +819,112 @@ describe("building from scratch in the doc", () => {
     );
   });
 
+  test("a step made by Enter stays quiet until the person leaves it", () => {
+    useDocUnfinishedStore.getState().clear();
+    const graph = getElements(
+      [code("only", null, { prompt: "Open the page" })],
+      settings(),
+      true,
+    ) as DocGraph;
+    const only = byLabel(graph, "only");
+    const { api } = editingAdding(graph);
+    const added = api.splitStep({ scope: TOP_SCOPE, index: 0 }, only.id, {
+      key: "prompt",
+      before: "Open the page",
+      after: "",
+    });
+    expect(useDocUnfinishedStore.getState().ids.has(added!)).toBe(true);
+    useDocUnfinishedStore.getState().clear();
+  });
+
+  test("/ on an empty step replaces it in one add, with the neighbours joined around the new step", () => {
+    const graph = getElements(
+      [
+        code("before", "empty_one", { prompt: "Open the page" }),
+        block("goto_url", "empty_one", "after", { url: "" }),
+        code("after", null),
+      ],
+      settings(),
+      true,
+    ) as DocGraph;
+    const addStep = vi.fn(() => "new_loop");
+    const api = createDocEditApi({
+      ...graph,
+      edits: { apply: vi.fn(), update: () => {}, addStep, duplicate: () => {} },
+      finallyId: null,
+      workflowId: "wpid_test",
+      selectBranch: () => {},
+      selectedBranch: () => undefined,
+      inputKeys: [],
+      credentialKeys: new Set(),
+    });
+    const empty = byLabel(graph, "empty_one");
+
+    expect(api.isEmptyStep(empty.id)).toBe(true);
+    expect(api.replaceStep(empty.id, "loop")).toBe("new_loop");
+
+    expect(addStep).toHaveBeenCalledWith(
+      expect.objectContaining({
+        nodeType: "loop",
+        replacing: empty.id,
+        previous: byLabel(graph, "before").id,
+        next: byLabel(graph, "after").id,
+      }),
+    );
+  });
+
+  test("an empty step whose output feeds a context input is not replaced", () => {
+    const graph = getElements(
+      [block("goto_url", "empty_one", null, { url: "" })],
+      settings(),
+      true,
+    ) as DocGraph;
+    const empty = byLabel(graph, "empty_one");
+    useWorkflowParametersStore.setState({
+      parameters: [
+        {
+          key: "from_step",
+          parameterType: "context",
+          sourceParameterKey: "empty_one_output",
+        },
+      ] as never,
+    });
+    const { api } = editing(graph);
+    expect(api.isEmptyStep(empty.id)).toBe(false);
+    useWorkflowParametersStore.setState({ parameters: [] });
+  });
+
+  test("turning an untouched step into another type renames it and its output for the new type", () => {
+    const graph = getElements(
+      [block("goto_url", "go_to_url_2", null, { url: "" })],
+      settings(),
+      true,
+    ) as DocGraph;
+    const step = byLabel(graph, "go_to_url_2");
+    const { api, latest } = editing(graph);
+    api.turnInto(step.id, "extraction");
+    const turned = latest().nodes.find((n) => n.id === step.id)!;
+    expect(turned.type).toBe("extraction");
+    expect(turned.data.label).toBe("extraction_1");
+  });
+
+  test("turning a step that something refers to keeps its name", () => {
+    const graph = getElements(
+      [
+        block("goto_url", "go_to_url_2", "after", { url: "" }),
+        code("after", null, { code: "{{ go_to_url_2_output }}" }),
+      ],
+      settings(),
+      true,
+    ) as DocGraph;
+    const step = byLabel(graph, "go_to_url_2");
+    const { api, latest } = editing(graph);
+    api.turnInto(step.id, "extraction");
+    expect(latest().nodes.find((n) => n.id === step.id)!.data.label).toBe(
+      "go_to_url_2",
+    );
+  });
+
   test("a note under an empty loop stays put when the picked step has no instruction field", () => {
     const graph = getElements(
       [forLoop("books", null, [])],
@@ -609,5 +975,82 @@ describe("building from scratch in the doc", () => {
     expect(
       (byLabel(latest(), "after").data as Record<string, unknown>).notes,
     ).toBe(big);
+  });
+  test("a recording takes the place of an empty step instead of landing after it", () => {
+    const graph = getElements(
+      [
+        block("goto_url", "go_to_url_1", "go_to_url_2", {
+          url: "https://a.test",
+        }),
+        block("goto_url", "go_to_url_2", "extract", { url: "" }),
+        code("extract", null, { description: "keep me" }),
+      ],
+      settings(),
+      true,
+    ) as DocGraph;
+    let applied = graph;
+    const api = createDocEditApi({
+      ...graph,
+      edits: {
+        apply: (next) => {
+          applied = next;
+        },
+        update: () => {},
+        addStep: () => null,
+        duplicate: () => {},
+      },
+      finallyId: null,
+      workflowId: "wpid_test",
+      selectBranch: () => {},
+      selectedBranch: () => undefined,
+      inputKeys: [],
+      credentialKeys: new Set(),
+    });
+    const blank = graph.nodes.find((n) => n.data.label === "go_to_url_2")!;
+    const place = { scope: TOP_SCOPE, index: 1 };
+
+    expect(api.canReplaceBlankStep(blank.id)).toBe(true);
+    expect(api.demonstrationInsertion({ ...place, index: 2 })).toEqual({
+      after_label: "go_to_url_2",
+      before_label: "extract",
+    });
+    expect(api.demonstrationInsertion(place, blank.id)).toEqual({
+      after_label: "go_to_url_1",
+      before_label: "extract",
+    });
+    const written = graph.nodes.find((n) => n.data.label === "extract")!;
+    expect(api.canReplaceBlankStep(written.id)).toBe(false);
+    expect(api.removeBlankStep(blank.id)).toBe(true);
+    expect(applied.nodes.some((n) => n.data.label === "go_to_url_2")).toBe(
+      false,
+    );
+  });
+  test("an empty step another step reads the output of is not replaced", () => {
+    const graph = getElements(
+      [
+        block("goto_url", "go_to_url_1", "extract", { url: "" }),
+        code("extract", null, { code: "{{ go_to_url_1_output }}" }),
+      ],
+      settings(),
+      true,
+    ) as DocGraph;
+    const api = createDocEditApi({
+      ...graph,
+      edits: {
+        apply: () => {},
+        update: () => {},
+        addStep: () => null,
+        duplicate: () => {},
+      },
+      finallyId: null,
+      workflowId: "wpid_test",
+      selectBranch: () => {},
+      selectedBranch: () => undefined,
+      inputKeys: [],
+      credentialKeys: new Set(),
+    });
+    const blank = graph.nodes.find((n) => n.data.label === "go_to_url_1")!;
+
+    expect(api.canReplaceBlankStep(blank.id)).toBe(false);
   });
 });

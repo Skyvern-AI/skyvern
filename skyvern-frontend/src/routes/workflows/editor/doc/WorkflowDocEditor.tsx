@@ -1,5 +1,6 @@
 import { graphNoteReadings } from "./noteSequences";
 import { useSearchParams } from "react-router-dom";
+import type { WorkflowCopilotDemonstrationInsertion } from "../../copilot/workflowCopilotTypes";
 import {
   type HTMLAttributes,
   type Ref,
@@ -32,6 +33,8 @@ import {
   WorkflowParameterValueType,
 } from "../../types/workflowTypes";
 import { isWorkflowBlockNode, type AppNode } from "../nodes";
+import { useBrowserTypeOptionsQuery } from "@/routes/workflows/utils";
+import { changedSettingCount } from "../nodes/StartNode/agentSettingsSummary";
 import { useLocateBlockStore } from "../runValidation/useLocateBlockStore";
 import { isEditableTarget } from "../editableTarget";
 import {
@@ -51,7 +54,7 @@ import {
   saveDocInput,
 } from "./docInputs";
 import { DocInputEditor } from "./DocInputEditor";
-import { takeReferenceLine } from "./docKeys";
+import { armNextCaretOffset, takeReferenceLine, useDocTouch } from "./docKeys";
 import type { ParametersState } from "../types";
 import { toast, useToast } from "@/components/ui/use-toast";
 import {
@@ -60,11 +63,14 @@ import {
 } from "./WorkflowDocActionsContext";
 import { docBranchSelection } from "./docBranchSelection";
 import { useDocRun } from "./useDocRun";
+import { docRunFor } from "./useDocRunFor";
 import { useDocRunStore, type DocRunInput } from "./docRunStore";
 import { DocLiveIndicator } from "./DocLiveIndicator";
 import { DocOutline } from "./DocOutline";
 import { DocStepSearch } from "./DocStepSearch";
+import { DocAnnouncer } from "./DocAnnouncer";
 import { DocAddStep, DocScope, type DocNoteProblem } from "./DocScope";
+import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
 import { DocSidePanel } from "./DocSidePanel";
 import { DocText } from "./DocText";
 import { DocEditBar } from "./DocEditing";
@@ -80,12 +86,7 @@ import { countReferences, findOutputUsers } from "./docGraphEdits";
 import { docStepTitle } from "./docStepRegistry";
 import { docStepProblems } from "./docProblems";
 import { stepsLeftBy, useDocUnfinishedStore } from "./docUnfinished";
-import {
-  DocGettingStarted,
-  DocKeyHints,
-  DocStarterNote,
-  DocTip,
-} from "./DocStarter";
+import { DocGettingStarted, DocStarterNote, DocTip } from "./DocStarter";
 import { docTipIndex, type DocStarterProgress } from "./docStarterTips";
 import { useRunValidationStore } from "../runValidation/useRunValidationStore";
 import {
@@ -186,6 +187,8 @@ const InputChip = forwardRef<
   );
 });
 
+const REPLACE_WAIT_MS = 120_000;
+
 export function WorkflowDocEditor({
   nodes: liveNodes,
   edges: liveEdges,
@@ -211,11 +214,15 @@ export function WorkflowDocEditor({
   const nodes = proposal?.nodes ?? liveNodes;
   const edges = proposal?.edges ?? liveEdges;
   const docRun = useDocRun();
-  const { blocksByLabel } = docRun;
   const [searchParams] = useSearchParams();
   // A full run from the Doc holds the doc still (no adding or inserting); a one-step run doesn't.
   const fullRunGoing = docRun.live && docRun.owned && !searchParams.has("bl");
-  const editable = !scopeReadOnly && !locked && !proposal && !fullRunGoing;
+  // A demonstration anchors its insertion by step labels, so the Doc holds still while one runs.
+  const demonstrating = useRecordingLauncherStore(
+    (s) => s.demonstration !== null,
+  );
+  const editable =
+    !scopeReadOnly && !locked && !proposal && !fullRunGoing && !demonstrating;
   const showingProposal = proposal !== null;
   const setDocMounted = useWorkflowPresentationStore((s) => s.setDocMounted);
   useEffect(() => {
@@ -260,6 +267,7 @@ export function WorkflowDocEditor({
     () => new Set(),
   );
   const [searchOpen, setSearchOpen] = useState(false);
+  const touch = useDocTouch();
   const locateRequest = useLocateBlockStore((s) => s.request);
   const clearLocate = useLocateBlockStore((s) => s.clearLocate);
   const [wide, setWide] = useState(false);
@@ -285,11 +293,14 @@ export function WorkflowDocEditor({
       const line = takeReferenceLine();
       const active = document.activeElement;
       if (!line || (active && active !== document.body)) return;
-      Array.from(
+      const target = Array.from(
         rootRef.current?.querySelectorAll<HTMLElement>("[data-doc-line]") ?? [],
-      )
-        .filter((el) => el.getAttribute("aria-label") === line.label)
-        [line.index]?.focus();
+      ).filter((el) => el.getAttribute("aria-label") === line.label)[
+        line.index
+      ];
+      if (!target) return;
+      armNextCaretOffset(line.offset);
+      target.focus();
     });
     return () => cancelAnimationFrame(frame);
   }, [editingInput]);
@@ -311,6 +322,13 @@ export function WorkflowDocEditor({
   const [validationProblems, setValidationProblems] = useState<
     WorkflowValidationProblem[]
   >([]);
+  const { data: browserTypeOptions } = useBrowserTypeOptionsQuery();
+  const changedSettingsCount = useMemo(() => {
+    const start = nodes.find((n) => n.type === "start" && !n.parentId);
+    return start?.type === "start" && start.data.withWorkflowSettings
+      ? changedSettingCount(start.data, { browserTypeOptions })
+      : 0;
+  }, [nodes, browserTypeOptions]);
   // The settings store is filled by the canvas Start node only once it renders.
   const finallyBlockLabel = useMemo(() => {
     const start = nodes.find((n) => n.type === "start" && !n.parentId);
@@ -385,7 +403,7 @@ export function WorkflowDocEditor({
               node.data.label,
               branches[item.nodeId],
               byId,
-              blocksByLabel,
+              docRunFor(docRun, node.data.label).blocksByLabel,
             ).selected.branchId,
           );
         item.branches.forEach((branch) => visit(branch.children));
@@ -393,9 +411,57 @@ export function WorkflowDocEditor({
     };
     visit(tree.items);
     return selected;
-  }, [tree, byId, blocksByLabel, branches]);
+  }, [tree, byId, docRun, branches]);
   const selectBranch = (conditionalId: string, branchId: string) =>
     setBranches((current) => ({ ...current, [conditionalId]: branchId }));
+  const startDemonstration = useRecordingLauncherStore(
+    (s) => s.startDemonstration,
+  );
+  // An empty step a recording is meant to replace goes only once the recording is open, so a refused or failed start leaves it.
+  const replaceOnRecording = useRef<{
+    id: string;
+    insertion: WorkflowCopilotDemonstrationInsertion;
+    failures: number;
+    timer: ReturnType<typeof setTimeout>;
+  } | null>(null);
+  const latestEdit = useRef<{
+    removeBlankStep: (id: string) => boolean;
+  } | null>(null);
+  useEffect(
+    () =>
+      useRecordingLauncherStore.subscribe((state) => {
+        const pending = replaceOnRecording.current;
+        if (!pending) return;
+        if (state.demonstrationStartFailures !== pending.failures) {
+          clearTimeout(pending.timer);
+          replaceOnRecording.current = null;
+          return;
+        }
+        const status = state.demonstration;
+        if (!status) return;
+        if (status.phase === "stopped") {
+          clearTimeout(pending.timer);
+          replaceOnRecording.current = null;
+        } else if (
+          status.phase === "recording" &&
+          status.insertion?.after_label === pending.insertion.after_label &&
+          status.insertion?.before_label === pending.insertion.before_label
+        ) {
+          clearTimeout(pending.timer);
+          replaceOnRecording.current = null;
+          latestEdit.current?.removeBlankStep(pending.id);
+        }
+      }),
+    [],
+  );
+  useEffect(
+    () => () => {
+      const waiting = replaceOnRecording.current;
+      if (waiting) clearTimeout(waiting.timer);
+      replaceOnRecording.current = null;
+    },
+    [],
+  );
   const openStepSettings = (id: string) => {
     panelOpener.current = document.activeElement as HTMLElement;
     panelStepId.current = id;
@@ -423,13 +489,13 @@ export function WorkflowDocEditor({
     insertStep: (place: DocPlace, nodeType: NodeType) => {
       const added = baseEdit.insertStep(place, nodeType);
       if (added) {
-        useDocUnfinishedStore.getState().add(added);
         // A login has nothing to run without its credential, so its settings open on it.
         if (nodeType === "login") openStepSettings(added);
       }
       return added;
     },
   };
+  latestEdit.current = edit;
   // References to step outputs that no step saves any more, for the inline "missing" pills.
   const missingOutputs = useMemo(() => {
     const labels = new Set(
@@ -839,8 +905,9 @@ export function WorkflowDocEditor({
         (p as { dataType?: string }).dataType ===
           WorkflowParameterValueType.CredentialId
       ) {
+        // The server runs without a credential an input names but no step uses.
+        if (!used.has(p.key)) return [];
         const required = !p.credentialId;
-        if (!used.has(p.key) && !required) return [];
         return [
           {
             key: p.key,
@@ -1017,6 +1084,7 @@ export function WorkflowDocEditor({
       value={{
         editable,
         runControlsVisible: !scopeReadOnly && !proposal && !fullRunGoing,
+        runGoing: docRun.live && docRun.owned,
         openSettings: openStepSettings,
         openVisual: () =>
           useWorkflowPresentationStore.getState().setPresentation("visual"),
@@ -1042,6 +1110,31 @@ export function WorkflowDocEditor({
         edit,
         destinations: () =>
           docDestinations(tree.items, byId, (node) => docStepTitle(node)),
+        demonstrateAt: (place, replacing) => {
+          const insertion = startDemonstration
+            ? (edit?.demonstrationInsertion(place, replacing) ?? null)
+            : null;
+          return insertion && startDemonstration
+            ? () => {
+                // The wait ends when the recording opens or the start is refused or fails; the timer is only a safety net.
+                const waiting = replaceOnRecording.current;
+                if (waiting) clearTimeout(waiting.timer);
+                replaceOnRecording.current = replacing
+                  ? {
+                      id: replacing,
+                      insertion,
+                      failures:
+                        useRecordingLauncherStore.getState()
+                          .demonstrationStartFailures,
+                      timer: setTimeout(() => {
+                        replaceOnRecording.current = null;
+                      }, REPLACE_WAIT_MS),
+                    }
+                  : null;
+                startDemonstration({ insertion, keepEditor: true });
+              }
+            : null;
+        },
         outputUsers: (id) =>
           findOutputUsers(nodes, id).map((node) => ({
             id: node.id,
@@ -1131,14 +1224,15 @@ export function WorkflowDocEditor({
         <div ref={scrollRef} className="min-w-0 flex-1 overflow-y-auto">
           <div
             className={cn(
-              "relative mx-auto w-full max-w-[820px] px-8 pb-40 pt-7 sm:pt-11",
-              wide && "sm:px-10",
+              // From sm up, the left margin holds each step's grip beside a loop's arrow.
+              "relative mx-auto w-full max-w-[820px] pb-40 pl-8 pr-8 pt-7 sm:pl-16 sm:pt-11",
+              wide && "sm:pr-10",
             )}
           >
             <div
               className={cn(
-                "sm:absolute sm:inset-x-0 sm:top-2 sm:px-8",
-                wide && "sm:px-10",
+                "sm:absolute sm:inset-x-0 sm:top-2 sm:pl-16 sm:pr-8",
+                wide && "sm:pr-10",
               )}
             >
               <DocEditBar
@@ -1289,6 +1383,9 @@ export function WorkflowDocEditor({
                 >
                   <GearIcon className="size-[13px]" />
                   Agent settings
+                  {changedSettingsCount > 0
+                    ? ` · ${changedSettingsCount} changed`
+                    : ""}
                 </button>
               )}
               {inputs.length === 0 && !edit && (
@@ -1318,8 +1415,13 @@ export function WorkflowDocEditor({
                 onClick={() => setSearchOpen(true)}
                 className="rounded-md px-2 py-[3px] outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
               >
-                Search{" "}
-                <kbd className="text-[11px] text-muted-foreground">⌘K</kbd>
+                Search
+                {!touch && (
+                  <>
+                    {" "}
+                    <kbd className="text-[11px] text-muted-foreground">⌘K</kbd>
+                  </>
+                )}
               </button>
               {containerIds.length >= 2 && (
                 <>
@@ -1395,6 +1497,7 @@ export function WorkflowDocEditor({
                 noteProblems={noteProblems}
               />
               <DocUnanchoredRemovals />
+              <DocAnnouncer />
               {edit && (
                 <div className="mt-3">
                   <DocAddStep
@@ -1404,7 +1507,6 @@ export function WorkflowDocEditor({
                     }}
                     label="Add step"
                   />
-                  <DocKeyHints />
                   {showTip && (
                     <DocTip
                       progress={starterProgress}
@@ -1443,6 +1545,7 @@ export function WorkflowDocEditor({
             onTabChange={setPanelTab}
             selectedStep={selectedStepId ? byId.get(selectedStepId) : undefined}
             editable={editable}
+            settingsReadable={!proposal}
             learn={learn}
             onLearn={setLearn}
             onClose={closePanel}

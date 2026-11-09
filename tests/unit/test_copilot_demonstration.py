@@ -320,7 +320,7 @@ async def test_replay_contract_never_touches_a_browser_and_consumes_once(monkeyp
             owner_seen_at=None,
             final_url="https://example.test/done",
             stop_reason="disconnected",
-            insertion={"after_label": "Saved step", "before_label": None},
+            insertion={"after_label": "Saved step", "before_label": None, "replace_label": "Fill form"},
         )
     )
     for seq, event in enumerate(events, 1):
@@ -410,6 +410,7 @@ async def test_replay_contract_never_touches_a_browser_and_consumes_once(monkeyp
     assert "swordfish" not in json.dumps(ctx.demonstration_items)
     assert any("#unlabelled" in label for label in ctx.demonstration_items)
     assert "Saved step" in serialized
+    assert "Fill form" in serialized
     assert "Ignored request step" not in serialized
     record = decode_demonstration_record(cache.store[demonstration_record_key("org-1", "demo-1")])
     assert record is not None and record.status == "consumed"
@@ -1294,7 +1295,7 @@ async def test_notes_merge_until_an_action_and_replay_as_the_users_screened_word
     assert "start on https://shop.example.test/home" in policy.canonical_user_message
     assert "swordfish" not in policy.canonical_user_message
     assert any("shop.example.test" in url for url in policy.user_provided_site_urls)
-    assert policy.raw_secret_redacted_draft and ctx.allow_untested_workflow_draft
+    assert policy.raw_secret_redacted_draft and policy.allow_run_blocks and policy.testing_intent != "skip_test"
     navigate_index = next(i for i, item in enumerate(history) if "example.test/next" in json.dumps(item))
     first_index = next(
         i for i, item in enumerate(history) if item.get("content") == "start on https://shop.example.test/home"
@@ -1846,7 +1847,7 @@ async def test_credential_fill_control_never_persists_secret(
     )
     page = SimpleNamespace(url="https://example.test/login")
 
-    async def fill(ctx: Any, selector: str, credential_id: str, field: str) -> dict[str, Any]:
+    async def fill(ctx: Any, selector: str, credential_id: str, field: str, frame: Any = None) -> dict[str, Any]:
         policy = ctx.request_policy
         assert policy.credential_ask_login_page_urls == ["https://example.test/login"]
         assert credential in policy.resolved_credentials
@@ -1916,6 +1917,58 @@ async def test_credential_fill_control_never_persists_secret(
 
 
 @pytest.mark.asyncio
+async def test_credential_fill_control_fills_a_field_inside_an_iframe_in_that_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache = _SharedCache()
+    cache.store[demonstration_record_key("org-1", "demo-iframe")] = encode_demonstration_record(
+        DemonstrationRecord("wfp-1", "pbs-1", "recording", 0, "owner-1", datetime.now(UTC), None)
+    )
+    credential = _credential()
+    monkeypatch.setattr(
+        app,
+        "DATABASE",
+        SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=AsyncMock(return_value=[credential]))),
+    )
+    filled_in: list[Any] = []
+
+    async def fill(ctx: Any, selector: str, credential_id: str, field: str, frame: Any = None) -> dict[str, Any]:
+        filled_in.append(frame)
+        return {"ok": True}
+
+    monkeypatch.setattr(recorder_module, "fill_credential_field", fill)
+    recorder = DemonstrationRecorder(
+        cache=cache,  # type: ignore[arg-type]
+        organization_id="org-1",
+        workflow_permanent_id="wfp-1",
+        browser_session_id="pbs-1",
+        claim=DemonstrationClaim("demo-iframe", "owner-1", False, 0),
+        stream=_Stream(),
+    )
+    page = SimpleNamespace(url="https://example.test/login")
+    recorder.tap = SimpleNamespace(frame_path=AsyncMock(return_value=[{"owner_selector": "#login-frame"}]))  # type: ignore[assignment]
+    selector = "#password-input #input"
+    await recorder._record_tap_event(
+        TapEvent(
+            page=page,
+            session_key="tap-1",
+            frame_id="child",
+            is_main_frame=False,
+            frame_name="",
+            payload={"kind": "secret_focus", "selector": selector, "field": "password", "url": page.url},
+        )
+    )
+
+    await recorder._fill_credential(
+        {"credential_id": credential.credential_id, "selector": selector, "field": "password"}
+    )
+
+    assert filled_in == [{"owner_selector": "#login-frame"}]
+    stored = json.loads(cache.store[demonstration_event_key("org-1", "demo-iframe", 1)])
+    assert stored["frame"]["path"] == [{"owner_selector": "#login-frame"}]
+
+
+@pytest.mark.asyncio
 async def test_credential_fill_control_refuses_a_credential_bound_to_another_origin(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1930,7 +1983,7 @@ async def test_credential_fill_control_refuses_a_credential_bound_to_another_ori
         SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=AsyncMock(return_value=[credential]))),
     )
 
-    async def fill(ctx: Any, selector: str, credential_id: str, field: str) -> dict[str, Any]:
+    async def fill(ctx: Any, selector: str, credential_id: str, field: str, frame: Any = None) -> dict[str, Any]:
         assert ctx.request_policy.live_page_admitted_urls[credential_id] == credential.tested_url
         return {"ok": False, "error": "origin mismatch"}
 
@@ -2114,18 +2167,21 @@ async def test_recorder_persists_each_capture_gap_kind() -> None:
             "child",
             {"kind": "drag", "ts": 4, "selector": "#card", "target_selector": "#done"},
         ),
+        TapEvent(page, "tap", "main", True, "", {"kind": "click_navigation_unconfirmed", "ts": 5, "url": page.url}),
     ]
 
     for event in events:
         await recorder._record_tap_event(event)
 
-    stored = [json.loads(cache.store[demonstration_event_key("org-1", "demo-1", seq)]) for seq in range(1, 5)]
+    stored = [json.loads(cache.store[demonstration_event_key("org-1", "demo-1", seq)]) for seq in range(1, 6)]
     assert [event["reason"] for event in stored] == [
         "nested_frame",
         "frame_navigation",
         "unsupported_event:unsupported_input",
         "freeform_drag",
+        "click_navigation_unconfirmed",
     ]
+    assert stored[-1]["label"] == "Click not recorded"
 
 
 @pytest.mark.asyncio

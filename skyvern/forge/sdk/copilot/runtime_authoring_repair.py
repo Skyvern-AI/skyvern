@@ -731,7 +731,7 @@ def run_id_from_result_data(data: dict[str, Any]) -> str | None:
 def _error_text_requires_stop(copilot_ctx: Any, data: dict[str, Any], result: dict[str, Any] | None = None) -> bool:
     if getattr(copilot_ctx, "last_test_non_retriable_nav_error", None):
         return True
-    text_values = [data.get("failure_reason"), data.get("skip_reason")]
+    text_values = [data.get("failure_reason")]
     if result is not None:
         text_values.append(result.get("error"))
     # A failure in Skyvern's own egress is not a defect in the block, so authoring repair must not
@@ -749,22 +749,16 @@ def _error_text_requires_stop(copilot_ctx: Any, data: dict[str, Any], result: di
 
 
 def _error_text_requires_ask(data: dict[str, Any], result: dict[str, Any] | None = None) -> bool:
-    text_values = [data.get("failure_reason"), data.get("skip_reason"), data.get("failure_type")]
+    text_values = [data.get("failure_reason"), data.get("failure_type")]
     if result is not None:
         text_values.append(result.get("error"))
     text = " ".join(str(value).lower() for value in text_values if value)
-    return (
-        "workflow_credential_inputs_unbound" in text
-        or "credential inputs unbound" in text
-        or "required credentials are not configured" in text
-        or "missing_credential_or_init" in text
-    )
+    return "credential inputs unbound" in text or "missing_credential_or_init" in text
 
 
 def _pending_state_has_stop_or_ask_precedence(copilot_ctx: Any, pending: CodeAuthoringRepairContext) -> bool:
     data = {
         "failure_reason": pending.runtime_failure_reason,
-        "skip_reason": pending.runtime_failure_reason,
         "failure_type": pending.runtime_failure_class,
     }
     return _error_text_requires_stop(copilot_ctx, data) or _error_text_requires_ask(data)
@@ -774,8 +768,6 @@ def _result_has_terminal_or_ask_precedence(copilot_ctx: Any, data: dict[str, Any
     if _error_text_requires_stop(copilot_ctx, data, result):
         return True
     if _error_text_requires_ask(data, result):
-        return True
-    if data.get("skip_reason") == "workflow_credential_inputs_unbound":
         return True
     if data.get("failure_type") == "missing_credential_or_init":
         return True

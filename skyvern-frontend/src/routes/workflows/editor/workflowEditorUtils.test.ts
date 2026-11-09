@@ -193,6 +193,61 @@ describe("send email attachments", () => {
   });
 });
 
+test("Gmail message ids survive load, save and export", () => {
+  const stored = [
+    {
+      block_type: "send_email",
+      label: "reply",
+      transport: "gmail",
+      credential_id: "cred_1",
+      sender: "",
+      recipients: [],
+      subject: "Re: invoice",
+      body: "Thanks",
+      file_attachments: [],
+      reply_to_message_id: "{{ message_id }}",
+      continue_on_failure: false,
+      next_loop_on_failure: false,
+      model: null,
+    },
+    {
+      block_type: "email_inbox",
+      label: "read",
+      email_client: "gmail",
+      credential_id: "cred_1",
+      folder: "INBOX",
+      prompt: "",
+      sender: null,
+      subject: null,
+      newer_than_days: null,
+      max_results: 25,
+      include_body: true,
+      download_attachments: false,
+      message_id: "{{ message_id }}",
+      parameters: [],
+      continue_on_failure: false,
+      next_loop_on_failure: false,
+      model: null,
+    },
+  ] as unknown as Array<WorkflowBlock>;
+  const { nodes, edges } = getElements(stored, SETTINGS, true);
+  const source = {
+    title: "Source",
+    description: null,
+    is_saved_task: false,
+    status: null,
+    run_with: "agent",
+    workflow_definition: { parameters: [], blocks: stored },
+  } as unknown as WorkflowApiResponse;
+  const expected = [
+    { reply_to_message_id: "{{ message_id }}" },
+    { message_id: "{{ message_id }}" },
+  ];
+
+  expect(getWorkflowBlocks(nodes, edges)).toMatchObject(expected);
+  expect(convert(source).workflow_definition.blocks).toMatchObject(expected);
+});
+
 describe("withGoalUndoRecordsFrom", () => {
   const edited = {
     ...codeBlock(true),

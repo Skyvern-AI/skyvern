@@ -878,6 +878,11 @@ class Settings(BaseSettings):
     GCP_CREDENTIAL_VAULT_PROJECT_ID: str | None = None  # project hosting the Secret Manager secrets
     GCP_CREDENTIAL_VAULT_PREFIX: str = "skyvern-cred-"  # secret-id prefix; must be unique per deployment
 
+    # AWS Secrets Manager credential vault settings
+    AWS_CREDENTIAL_VAULT_REGION: str | None = None  # region holding the secrets; setting it enables the vault
+    AWS_CREDENTIAL_VAULT_PREFIX: str = "skyvern-credentials/"  # secret-name prefix; must be unique per deployment
+    AWS_CREDENTIAL_VAULT_KMS_KEY_ID: str | None = None  # KMS key for new secrets; unset uses aws/secretsmanager
+
     # Azure Setting
     AZURE_TENANT_ID: str | None = None
     AZURE_CLIENT_ID: str | None = None
@@ -1358,6 +1363,14 @@ class Settings(BaseSettings):
                 else "ANTHROPIC_CLAUDE5.5_OPUS"
             ),
             "label": "Anthropic Claude Opus 5.5",
+        }
+        mapping["claude-haiku-5-5"] = {
+            "llm_key": (
+                "BEDROCK_ANTHROPIC_CLAUDE5_5_HAIKU_INFERENCE_PROFILE"
+                if self.ENABLE_BEDROCK_ANTHROPIC
+                else "ANTHROPIC_CLAUDE5_5_HAIKU"
+            ),
+            "label": "Anthropic Claude Haiku 5.5",
         }
 
         try:

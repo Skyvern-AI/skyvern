@@ -1047,6 +1047,10 @@ class BrowserContextFactory:
             # still mapped; a close cancel is latched so the recorder still releases and cancellation wins after.
             close_cancelled = False
             if browser_context is not None:
+                try:
+                    app.AGENT_FUNCTION.on_browser_context_abandoned(browser_context)
+                except Exception as exc:
+                    LOG.warning("Failed to report an abandoned browser context", error_type=type(exc).__name__)
                 # FIXME: sometimes it can't close the browser context?
                 LOG.error("unexpected error happens after created browser context, going to close the context")
                 try:

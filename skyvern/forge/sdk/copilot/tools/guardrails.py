@@ -1,31 +1,12 @@
 from __future__ import annotations
 
-import hashlib
-import json
 from typing import Any
 
 import structlog
-from agents import ToolGuardrailFunctionOutput, ToolInputGuardrail, ToolInputGuardrailData
 
-from skyvern.forge.sdk.copilot.ask_user import ACCOUNT_GROUP_SUBMIT_TOOL_NAME
-from skyvern.forge.sdk.copilot.author_time_block import CREDENTIAL_SCOUT_BLOCK_ID, AuthorTimeBlock
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
-from skyvern.forge.sdk.copilot.build_test_outcome import (
-    record_build_test_outcome,
-    recorded_outcome_from_author_time_reject,
-)
-from skyvern.forge.sdk.copilot.output_policy import (
-    OutputPolicyVerdict,
-    demote_author_time_steer_reasons,
-    evaluate_output_policy,
-    format_output_policy_tool_error,
-    output_policy_verdict_to_trace_data,
-)
-from skyvern.forge.sdk.copilot.request_policy import CREDENTIAL_DEFERRED_DRAFT_REASONS, RequestPolicy
-from skyvern.forge.sdk.copilot.runtime import RAW_SECRET_BROWSER_ERROR, AgentContext, raw_secret_browser_denied
-from skyvern.forge.sdk.copilot.tools.locator_inspection import TOOL_NAME as LOCATOR_INSPECTION_TOOL_NAME
+from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
-from skyvern.forge.sdk.copilot.workflow_yaml import tool_call_submitted_yaml
 from skyvern.forge.sdk.workflow.models.parameter import (
     OutputParameter,
     WorkflowParameter,
@@ -36,109 +17,6 @@ from skyvern.forge.sdk.workflow.models.workflow import Workflow
 from ._shared import _emit_tool_blocker_signal
 
 LOG = structlog.get_logger()
-
-
-def _guardrail_tool_arguments(tool_context: Any) -> tuple[dict[str, Any], Any]:
-    raw_arguments = getattr(tool_context, "tool_arguments", "")
-    try:
-        # Agents SDK guardrails may hand us either raw JSON or an already parsed mapping.
-        parsed_arguments = json.loads(raw_arguments) if isinstance(raw_arguments, str) else raw_arguments
-    except json.JSONDecodeError:
-        parsed_arguments = {}
-    return parsed_arguments if isinstance(parsed_arguments, dict) else {}, raw_arguments
-
-
-def _workflow_yaml_output_policy_guardrail(data: ToolInputGuardrailData) -> ToolGuardrailFunctionOutput:
-    tool_context = data.context
-    tool_arguments, raw_arguments = _guardrail_tool_arguments(tool_context)
-    if not raw_arguments:
-        LOG.warning(
-            "workflow YAML output policy guardrail received no tool arguments",
-            tool_name=getattr(tool_context, "tool_name", None),
-            tool_call_id=getattr(tool_context, "tool_call_id", None),
-        )
-    effective_yaml = tool_call_submitted_yaml(tool_arguments)
-
-    verdict = evaluate_output_policy(
-        request_policy=getattr(getattr(tool_context, "context", None), "request_policy", None),
-        workflow_yaml=effective_yaml,
-    )
-    steered_reasons = demote_author_time_steer_reasons(verdict)
-    trace_data = output_policy_verdict_to_trace_data(
-        verdict,
-        surface="tool_input",
-        tool_name=getattr(tool_context, "tool_name", None),
-    )
-    if steered_reasons:
-        trace_data = {**trace_data, "steered_reason_codes": [reason.value for reason in steered_reasons]}
-    if verdict.allowed:
-        LOG.info("copilot output policy tool guardrail verdict", **trace_data)
-        return ToolGuardrailFunctionOutput.allow(output_info=trace_data)
-    LOG.info("copilot output policy tool guardrail verdict", **trace_data)
-    block = AuthorTimeBlock(block_id=CREDENTIAL_SCOUT_BLOCK_ID, error=format_output_policy_tool_error(verdict))
-    trace_data = {**trace_data, "block_id": block.block_id}
-    tool_name = getattr(tool_context, "tool_name", None)
-    if isinstance(tool_name, str) and tool_name:
-        _record_output_policy_guardrail_outcome(
-            getattr(tool_context, "context", None), tool_name, effective_yaml, verdict
-        )
-    return _guardrail_block(tool_context, tool_arguments, block, trace_data)
-
-
-def _guardrail_block(
-    tool_context: Any,
-    tool_arguments: dict[str, Any],
-    block: AuthorTimeBlock,
-    trace_data: dict[str, Any],
-) -> ToolGuardrailFunctionOutput:
-    """The tool-input half of the author-time decision point: only an ``AuthorTimeBlock``
-    turns a guardrail verdict into a rejection the model cannot author past."""
-    return ToolGuardrailFunctionOutput.reject_content(block.error, output_info=trace_data)
-
-
-def _record_output_policy_guardrail_outcome(
-    ctx: object, tool_name: str, workflow_yaml: str | None, verdict: OutputPolicyVerdict
-) -> None:
-    if not isinstance(ctx, AgentContext):
-        return
-    reason_code_set = frozenset(reason.value for reason in verdict.reason_codes)
-    structural_payload = {
-        "surface": "output_policy_tool_input",
-        "tool": tool_name,
-        "reason_codes": sorted(reason_code_set),
-        "workflow_yaml_hash": hashlib.sha256((workflow_yaml or "").encode("utf-8")).hexdigest(),
-    }
-    record_build_test_outcome(
-        ctx,
-        recorded_outcome_from_author_time_reject(
-            reason_code="output_policy_reject",
-            attempted_tool=tool_name,
-            structural_payload=structural_payload,
-        ),
-    )
-
-
-_WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL = ToolInputGuardrail(
-    guardrail_function=_workflow_yaml_output_policy_guardrail,
-    name="workflow_yaml_output_policy_guardrail",
-)
-
-
-def _credential_deferred_draft_requires_skipped_run(ctx: AgentContext) -> bool:
-    policy = getattr(ctx, "request_policy", None)
-    if not isinstance(policy, RequestPolicy):
-        return False
-    if policy.raw_secret_redacted_draft:
-        return True
-    return policy.allow_missing_credentials_in_draft and (
-        policy.clarification_reason in CREDENTIAL_DEFERRED_DRAFT_REASONS
-    )
-
-
-def _update_and_run_requires_skipped_run(ctx: AgentContext, tool_name: str) -> bool:
-    return tool_name in {"update_and_run_blocks", "edit_block_and_run"} and (
-        _credential_deferred_draft_requires_skipped_run(ctx)
-    )
 
 
 def _authority_tool_error(
@@ -158,35 +36,6 @@ def _authority_tool_error(
                 ),
                 user_facing_reason="The code block AI fallback cannot use this tool.",
                 recovery_hint="stop",
-                renders_final_reply=False,
-            ),
-        )
-    if tool_name in {
-        "run_blocks_and_collect_debug",
-        "edit_block_and_run",
-        "discover_workflow_entrypoint",
-        "search_web",
-        "run_browser_code",
-        "solve_page_challenge",
-        "start_fresh_browser",
-        "upload_attached_file",
-        "inspect_page_for_composition",
-        LOCATOR_INSPECTION_TOOL_NAME,
-        ACCOUNT_GROUP_SUBMIT_TOOL_NAME,
-    } and raw_secret_browser_denied(ctx):
-        return _emit_tool_blocker_signal(
-            ctx,
-            CopilotToolBlockerSignal(
-                blocker_kind="tool_error",
-                blocked_tool=tool_name,
-                classifier_mode="raw_secret_safety",
-                internal_reason_code="raw_secret_browser_action_blocked",
-                agent_steering_text=RAW_SECRET_BROWSER_ERROR,
-                user_facing_reason=(
-                    "I saved only a redacted draft and did not use the browser because the request contained a "
-                    "value that may be a secret."
-                ),
-                recovery_hint="retry_with_different_tool",
                 renders_final_reply=False,
             ),
         )

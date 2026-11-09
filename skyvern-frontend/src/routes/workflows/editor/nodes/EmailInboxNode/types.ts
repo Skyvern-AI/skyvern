@@ -17,6 +17,7 @@ export type EmailInboxNodeData = NodeBaseData & {
   maxResults: number;
   includeBody: boolean;
   downloadAttachments: boolean;
+  messageId: string;
   parameterKeys: Array<string>;
 };
 
@@ -40,6 +41,7 @@ export const emailInboxNodeDefaultData: EmailInboxNodeData = {
   maxResults: 25,
   includeBody: true,
   downloadAttachments: false,
+  messageId: "",
   parameterKeys: [],
 };
 

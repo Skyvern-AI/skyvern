@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from skyvern.forge.sdk.copilot.agent import (
-    _UNEXPECTED_ERROR_REPLY_UNVALIDATED,
     _build_cancel_exit_result,
     _build_max_turns_exit_result,
     _build_timeout_exit_result,
@@ -34,7 +33,3 @@ def test_cancel_exit_writes_no_copy_of_its_own() -> None:
     assert result.user_response == ""
     assert result.turn_outcome is not None
     assert result.turn_outcome.terminal_reason == "cancel"
-
-
-def test_unexpected_error_draft_copy_remains_available() -> None:
-    assert "unexpected issue" in _UNEXPECTED_ERROR_REPLY_UNVALIDATED

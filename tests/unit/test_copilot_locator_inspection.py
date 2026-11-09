@@ -1049,6 +1049,8 @@ async def test_prior_run_result_uses_its_exact_failed_row_and_workflow_for_typed
         created_at=datetime(2026, 4, 21, 12, 0),
         trigger_type=None,
         workflow_definition_sha256=None,
+        credits_used=0,
+        cached_credits_used=0,
     )
     now = datetime.now(UTC)
     block = WorkflowRunBlock(

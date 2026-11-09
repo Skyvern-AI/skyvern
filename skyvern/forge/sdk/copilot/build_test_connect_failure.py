@@ -19,6 +19,7 @@ BuildTestConnectFailureState = Literal[
 _SAVED_PROFILE_STATES = ("saved_profile_unresolved", "saved_profile_not_applied", "unsaved_browser_profile_pick")
 
 SUPERSEDED_BY_NEWER_TEST_REASON = "Stopped because a newer test in this chat took over the browser."
+BROWSER_TOOLS_UNAVAILABLE_ERROR = "Browser tools are unavailable on this turn."
 
 
 class BuildTestConnectFailure(BaseModel):
@@ -77,6 +78,8 @@ class BuildTestConnectFailure(BaseModel):
 def build_test_connect_failure_sentence(failure: BuildTestConnectFailure) -> str:
     """A run id means the session was lost after the run started, so the operator must not be
     pointed at provisioning."""
+    if failure.diagnostic == BROWSER_TOOLS_UNAVAILABLE_ERROR:
+        return failure.diagnostic
     if failure.state == "billing_credit_admission_refusal":
         return (
             "Build test did not start because credits are exhausted. "
@@ -111,5 +114,21 @@ def build_test_connect_failure_sentence(failure: BuildTestConnectFailure) -> str
             "retry in a fresh session, or wait for the running test to finish."
         )
     if failure.workflow_run_id:
-        return f"Build-test browser session was unavailable before any block ran: {failure.state}."
-    return f"Build-test browser acquisition stopped: {failure.state}."
+        return (
+            "The test run started, but its browser was lost before any block ran, so nothing was tested. "
+            "Trying again in a fresh browser may work."
+        )
+    if failure.state == "provisioning_unavailable":
+        return (
+            "Build test did not start: no test browser was ready in time. This was a problem on Skyvern's side, "
+            "not with the workflow or the account's credits. No run started. Trying again may work."
+        )
+    if failure.state == "cdp_connect_failed":
+        return (
+            "Build test did not start: Skyvern could not connect to the test browser. This was a problem on "
+            "Skyvern's side, not with the workflow or the account's credits. No run started. Trying again may work."
+        )
+    return (
+        "Build test did not start: the test browser had already closed. No run started. "
+        "Trying again in a fresh browser may work."
+    )

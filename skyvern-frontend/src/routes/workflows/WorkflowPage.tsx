@@ -14,14 +14,7 @@ import { WorkflowRunAttemptChip } from "@/components/WorkflowRunAttemptChip";
 import { CredentialFallbackRetryBadge } from "@/components/CredentialFallbackRetryBadge";
 import { StatusFilterDropdown } from "@/components/StatusFilterDropdown";
 import { Button } from "@/components/ui/button";
-import {
-  Pagination,
-  PaginationContent,
-  PaginationItem,
-  PaginationLink,
-  PaginationNext,
-  PaginationPrevious,
-} from "@/components/ui/pagination";
+import { SimplePagination } from "@/components/ui/pagination";
 import {
   Select,
   SelectContent,
@@ -30,6 +23,8 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Status404 } from "@/components/Status404";
+import { isAxiosError } from "axios";
 import {
   Table,
   TableBody,
@@ -155,6 +150,28 @@ function WorkflowPage() {
   const { tags: urlTags, hold: holdForTaggingFlag } =
     useUrlTagFilter(tagsParam);
 
+  const {
+    data: workflow,
+    isLoading: workflowIsLoading,
+    isError: workflowIsError,
+    error: workflowError,
+  } = useWorkflowQuery({
+    workflowPermanentId,
+  });
+  // useWorkflowQuery stays disabled (never loading, never errored) when this one fails.
+  const { isError: globalWorkflowsIsError } = useGlobalWorkflowsQuery();
+  // A soft-deleted agent also 404s, but its run history is still listed, so
+  // only an agent without any runs (ignoring filters) gets the 404 page.
+  const workflowNotFound =
+    isAxiosError(workflowError) && workflowError.response?.status === 404;
+  const { data: latestRuns, isLoading: latestRunsIsLoading } =
+    useWorkflowRunsQuery({
+      workflowPermanentId,
+      page: 1,
+      pageSize: 1,
+      enabled: workflowNotFound,
+    });
+
   const { data: workflowRuns, isLoading: isRunsQueryLoading } =
     useWorkflowRunsQuery({
       workflowPermanentId,
@@ -177,16 +194,6 @@ function WorkflowPage() {
       setSearchParams(params, { replace: true });
     }
   }, [workflowRuns, isLoading, page, searchParams, setSearchParams]);
-
-  const {
-    data: workflow,
-    isLoading: workflowIsLoading,
-    isError: workflowIsError,
-  } = useWorkflowQuery({
-    workflowPermanentId,
-  });
-  // useWorkflowQuery stays disabled (never loading, never errored) when this one fails.
-  const { isError: globalWorkflowsIsError } = useGlobalWorkflowsQuery();
 
   const { data: workflowTagsMap = {} } = useWorkflowTagsBatchQuery(
     workflowPermanentId ? [workflowPermanentId] : [],
@@ -264,6 +271,16 @@ function WorkflowPage() {
     return null; // this should never happen
   }
 
+  // Only a lookup that succeeded with zero runs proves the agent is gone.
+  if (workflowNotFound && latestRuns?.length === 0) {
+    return <Status404 />;
+  }
+  if (workflowNotFound && latestRunsIsLoading) {
+    return null;
+  }
+  const deletedWorkflowTitle = (latestRuns ?? workflowRuns)?.[0]
+    ?.workflow_title;
+
   const analyticsWorkflow =
     workflow?.workflow_permanent_id === workflowPermanentId
       ? workflow
@@ -285,7 +302,12 @@ function WorkflowPage() {
                 </>
               ) : (
                 <>
-                  <h1 className="text-lg font-semibold">{workflow?.title}</h1>
+                  <h1 className="text-lg font-semibold">
+                    {workflowNotFound
+                      ? deletedWorkflowTitle &&
+                        `${deletedWorkflowTitle} (deleted)`
+                      : workflow?.title}
+                  </h1>
                   <h2 className="text-sm text-muted-foreground">
                     {workflowPermanentId}
                   </h2>
@@ -319,27 +341,31 @@ function WorkflowPage() {
                 </Link>
               </Button>
             ) : null}
-            <Button asChild variant="secondary">
-              <Link to={`/agents/${workflowPermanentId}/scripts`}>
-                <CodeIcon className="mr-2 size-4" />
-                Scripts
-              </Link>
-            </Button>
-            <Button asChild variant="secondary">
-              <Link
-                to={workflowEditorPath(workflowPermanentId, studioEnabled)}
-                data-testid="workflow-open-editor-link"
-              >
-                <Pencil2Icon className="mr-2 size-4" />
-                Edit
-              </Link>
-            </Button>
-            <Button asChild>
-              <Link to={`/agents/${workflowPermanentId}/run`}>
-                <PlayIcon className="mr-2 size-4" />
-                Run
-              </Link>
-            </Button>
+            {workflowNotFound ? null : (
+              <>
+                <Button asChild variant="secondary">
+                  <Link to={`/agents/${workflowPermanentId}/scripts`}>
+                    <CodeIcon className="mr-2 size-4" />
+                    Scripts
+                  </Link>
+                </Button>
+                <Button asChild variant="secondary">
+                  <Link
+                    to={workflowEditorPath(workflowPermanentId, studioEnabled)}
+                    data-testid="workflow-open-editor-link"
+                  >
+                    <Pencil2Icon className="mr-2 size-4" />
+                    Edit
+                  </Link>
+                </Button>
+                <Button asChild>
+                  <Link to={`/agents/${workflowPermanentId}/run`}>
+                    <PlayIcon className="mr-2 size-4" />
+                    Run
+                  </Link>
+                </Button>
+              </>
+            )}
           </div>
         </div>
         {WorkflowAnalyticsPanel ? (
@@ -386,8 +412,8 @@ function WorkflowPage() {
           </div>
         ) : (
           <>
-            <div className="flex items-center justify-between gap-4">
-              <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center justify-between gap-4 gap-y-2">
+              <div className="flex flex-wrap items-center gap-2">
                 <TableSearchInput
                   value={search}
                   onChange={(value) => {
@@ -416,7 +442,7 @@ function WorkflowPage() {
                   />
                 ) : null}
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 {WorkflowRunsFilterControls ? (
                   <WorkflowRunsFilterControls />
                 ) : null}
@@ -436,7 +462,7 @@ function WorkflowPage() {
               </div>
             </div>
             <div className="overflow-hidden rounded-lg border border-border">
-              <Table>
+              <Table className="min-w-[960px]">
                 <TableHeader>
                   <TableRow className="group/header">
                     {showCheckbox && (
@@ -673,8 +699,8 @@ function WorkflowPage() {
                 workflowPermanentId={workflowPermanentId}
                 workflowRunId={openRunParams}
               />
-              <div className="relative px-3 py-3">
-                <div className="absolute left-3 top-1/2 flex -translate-y-1/2 items-center gap-2 text-sm">
+              <div className="relative flex flex-col items-center gap-2 px-3 py-3 sm:block">
+                <div className="flex items-center gap-2 text-sm sm:absolute sm:left-3 sm:top-1/2 sm:-translate-y-1/2">
                   <span className="text-muted-foreground">Items per page</span>
                   <Select
                     value={String(pageSize)}
@@ -697,43 +723,16 @@ function WorkflowPage() {
                     </SelectContent>
                   </Select>
                 </div>
-                <Pagination className="pt-0">
-                  <PaginationContent>
-                    <PaginationItem>
-                      <PaginationPrevious
-                        className={cn({ "cursor-not-allowed": page === 1 })}
-                        onClick={() => {
-                          if (page === 1) {
-                            return;
-                          }
-                          const params = new URLSearchParams(searchParams);
-                          params.set("page", String(Math.max(1, page - 1)));
-                          setSearchParams(params, { replace: true });
-                        }}
-                      />
-                    </PaginationItem>
-                    <PaginationItem>
-                      <PaginationLink>{page}</PaginationLink>
-                    </PaginationItem>
-                    <PaginationItem>
-                      <PaginationNext
-                        className={cn({
-                          "cursor-not-allowed":
-                            workflowRuns !== undefined &&
-                            workflowRuns.length < pageSize,
-                        })}
-                        onClick={() => {
-                          if (workflowRuns && workflowRuns.length < pageSize) {
-                            return;
-                          }
-                          const params = new URLSearchParams(searchParams);
-                          params.set("page", String(page + 1));
-                          setSearchParams(params, { replace: true });
-                        }}
-                      />
-                    </PaginationItem>
-                  </PaginationContent>
-                </Pagination>
+                <SimplePagination
+                  className="pt-0"
+                  page={page}
+                  hasNext={!workflowRuns || workflowRuns.length >= pageSize}
+                  onPageChange={(nextPage) => {
+                    const params = new URLSearchParams(searchParams);
+                    params.set("page", String(nextPage));
+                    setSearchParams(params, { replace: true });
+                  }}
+                />
               </div>
             </div>
           </>

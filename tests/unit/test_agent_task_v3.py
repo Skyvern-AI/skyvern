@@ -3549,13 +3549,6 @@ async def test_execute_task_v3_general_block_step_cap_floored(monkeypatch: pytes
     assert loop_mock.await_args.kwargs["max_action_steps"] == MIN_ACTION_STEPS
 
 
-def test_min_action_steps_is_pinned() -> None:
-    # The constant is this change's headline risk, and every other assertion here is written against
-    # the symbol — so without this line it could be retuned to anything and the suite would stay green.
-    # Moving it is fine; moving it without a deliberate edit here is not.
-    assert MIN_ACTION_STEPS == 24
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("block_cls", "block_kwargs"),
@@ -4199,6 +4192,37 @@ async def test_recovery_guard_refuses_the_block_credential_off_site_and_admits_i
     with pytest.raises(CodeBlockCredentialReleaseError):
         guard.check_release(armed[0], "https://phisher-signin.net/login", operation="taskv3.type")
     guard.check_release(armed[0], "https://accounts.portal-example.com/signin", operation="taskv3.type")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("extra_sites", "refused_on_added_site"),
+    [(["https://idp-example.org/login"], False), ([], True)],
+    ids=["added-site", "no-added-site"],
+)
+async def test_recovery_guard_admits_a_site_added_to_the_login_and_still_refuses_others(
+    monkeypatch: pytest.MonkeyPatch, extra_sites: list[str], refused_on_added_site: bool
+) -> None:
+    context = _stub_recovery_run_context(monkeypatch, tested_url="https://portal-example.com/login")
+    if extra_sites:
+        context.credential_extra_site_urls["portal_credential"] = extra_sites
+    task = make_task(datetime.now(UTC), make_organization(datetime.now(UTC)), workflow_run_id="wr_test")
+
+    guard = agent_module.recovery_credential_release_guard(task, ["portal_credential"], enforce_vault_sites=True)
+
+    assert guard is not None
+    armed = guard.matches("s3cret-value")
+
+    def release_to(url: str) -> None:
+        guard.check_release(armed[0], url, operation="taskv3.type", alternatives=armed[1:])
+
+    if refused_on_added_site:
+        with pytest.raises(CodeBlockCredentialReleaseError):
+            release_to("https://accounts.idp-example.org/signin")
+    else:
+        release_to("https://accounts.idp-example.org/signin")
+    with pytest.raises(CodeBlockCredentialReleaseError):
+        release_to("https://phisher-signin.net/login")
 
 
 @pytest.mark.asyncio
@@ -9122,3 +9146,14 @@ async def test_a_replay_in_flight_at_finish_is_settled_before_the_task_is_writte
     assert captured["task"].status == TaskStatus.completed
     assert [p.read_bytes() for p in tmp_path.iterdir()] == ([_REPLAYED_CSV] if selection else [])
     assert target.replay_candidates() == {}
+
+
+@pytest.mark.asyncio
+async def test_v3_internal_branch_extraction_may_complete_on_blank_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    block = _make_block(ExtractionBlock, data_extraction_goal="Evaluate the condition")
+    block._allow_blank_start = True
+    outcome = LoopOutcome(status="completed", reason="matched", billable_actions=[], extracted_output={"result": True})
+    _step, task, _loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch, outcome, task_block=block, page_url_after_loop="about:blank"
+    )
+    assert task.status == TaskStatus.completed

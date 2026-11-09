@@ -24,6 +24,7 @@ async def test_register_credential_parameter_uses_db_totp_identifier(monkeypatch
         totp_identifier="user@example.com",
         run_sequentially=False,
         tested_url="https://login.example.com/account",
+        extra_site_urls=[],
     )
 
     class FakeCredential:
@@ -103,6 +104,7 @@ async def _register_with_credential(
         totp_identifier=None,
         run_sequentially=False,
         tested_url=None,
+        extra_site_urls=[],
     )
 
     class FakeCredentialItem:

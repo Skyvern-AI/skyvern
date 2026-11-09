@@ -26,6 +26,12 @@ import {
 } from "@/store/WorkflowYamlEditorStore";
 import { ArtifactDownloadLink } from "@/components/ArtifactDownloadLink";
 import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { StartFromCards } from "@/components/StartFromCards";
 import { useWorkflowDocEditorFlag } from "@/hooks/useWorkflowDocEditorFlag";
 import {
@@ -38,7 +44,11 @@ import {
   useCallback,
   memo,
 } from "react";
-import type { AxiosInstance, AxiosRequestConfig } from "axios";
+import {
+  isAxiosError,
+  type AxiosInstance,
+  type AxiosRequestConfig,
+} from "axios";
 import { getClient, deleteUploadedFileOnPageExit } from "@/api/AxiosClient";
 import { queryClient } from "@/api/QueryClient";
 import {
@@ -70,7 +80,11 @@ import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { useManualSignInStore } from "@/store/useManualSignInStore";
-import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
+import {
+  noteDemonstrationStartFailed,
+  useRecordingLauncherStore,
+  type StartDemonstrationOptions,
+} from "@/store/useRecordingLauncherStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 import {
   type CopilotAttention,
@@ -128,7 +142,8 @@ import {
   WorkflowCopilotCredentialGenerateResult,
   WorkflowCopilotCredentialResponseResult,
   WorkflowCopilotCredentialPauseResolvedUpdate,
-  WorkflowCopilotDemonstrationInsertion,
+  CredentialSiteAnswer,
+  CredentialSiteQuestion,
   WorkflowCopilotTitleUpdate,
   WorkflowCopilotChatSender,
   WorkflowCopilotChatRequest,
@@ -228,6 +243,7 @@ import {
   getReviewGateVerdict,
 } from "./cards/ReviewGateCard";
 import { TURN_ROW_INSET } from "./cards/cardLayout";
+import { CardFooter, CardHeader, CopilotCard } from "./cards/cardChrome";
 import { type AttentionTrayPresentation } from "./cards/AttentionTray";
 import { TestRunOutputCard } from "./cards/TestRunOutputCard";
 import { GoogleReconnectCard } from "./cards/GoogleReconnectCard";
@@ -1070,20 +1086,28 @@ function autoBoundReceiptFor(
   return credentialCardFrameFor(turn) ? null : turn.credentialAutoBound;
 }
 
-// The persisted credentialPause carries no name, so a tab that received the live
-// credential_pause_resolved frame names the receipt from it.
 function historicalCredentialOutcome(
   pause: TurnNarrativeState["credentialPause"],
   pauseCardResolutions: Record<string, CredentialPauseHistorical>,
 ): CredentialPauseHistorical | undefined {
   if (!pause || pause.outcome === "declined") return undefined;
   const credentialId = pause.credentialId ?? undefined;
-  const name = credentialId
-    ? Object.values(pauseCardResolutions).find(
-        (resolution) => resolution.credentialId === credentialId,
-      )?.name
-    : undefined;
-  return { outcome: pause.outcome, credentialId, name };
+  const name =
+    pause.name ??
+    (credentialId
+      ? Object.values(pauseCardResolutions).find(
+          (resolution) => resolution.credentialId === credentialId,
+        )?.name
+      : undefined);
+  return {
+    outcome: pause.outcome,
+    credentialId,
+    name,
+    siteAnswer: pause.siteAnswer,
+    siteA: pause.siteA,
+    siteB: pause.siteB,
+    savedSites: pause.savedSites,
+  };
 }
 
 type CredentialResolution = CredentialPauseHistorical & {
@@ -1527,48 +1551,50 @@ const constrainPosition = (
   };
 };
 
-function DemonstrateTaskButton({
-  label = "Demonstrate task",
+function DemonstrationOfferCard({
   disabled,
   disabledReason,
-  onClick,
+  onStart,
 }: {
-  label?: string;
   disabled: boolean;
   disabledReason: string;
-  onClick: () => void;
+  onStart: () => void;
 }) {
   return (
-    <TooltipProvider>
-      <ControlTooltip
-        content={
-          disabled
-            ? disabledReason
-            : "Skyvern records your clicks, typing, and navigation, then turns them into workflow steps"
+    <CopilotCard>
+      <CardHeader
+        icon={
+          <span
+            aria-hidden="true"
+            className="h-2.5 w-2.5 rounded-full bg-red-500"
+          />
         }
-        blocked={disabled}
-        side="top"
-        wrapperClassName="min-w-0 w-full"
-      >
-        <button
-          type="button"
-          aria-label={label}
-          className="flex w-full min-w-0 items-center gap-3 rounded-lg border border-border bg-slate-elevation3 p-3 text-left transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50"
-          disabled={disabled}
-          onClick={onClick}
-        >
-          <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-border bg-slate-elevation2">
-            <span className="h-2.5 w-2.5 rounded-full bg-red-500" />
-          </span>
-          <span className="min-w-0">
-            <span className="block font-medium text-foreground">{label}</span>
-            <span className="mt-0.5 block text-xs leading-snug text-muted-foreground">
-              Show Copilot how in the browser
-            </span>
-          </span>
-        </button>
-      </ControlTooltip>
-    </TooltipProvider>
+        wrapTitle
+        title="Show Copilot how in the browser"
+      />
+      <CardFooter className="flex items-center">
+        <TooltipProvider>
+          <ControlTooltip
+            content={
+              disabled
+                ? disabledReason
+                : "Skyvern records your clicks, typing, and navigation, then turns them into workflow steps"
+            }
+            blocked={disabled}
+            side="top"
+          >
+            <Button
+              type="button"
+              size="sm"
+              disabled={disabled}
+              onClick={onStart}
+            >
+              Start demonstration
+            </Button>
+          </ControlTooltip>
+        </TooltipProvider>
+      </CardFooter>
+    </CopilotCard>
   );
 }
 
@@ -1901,6 +1927,14 @@ export function WorkflowCopilotChat({
   // Live pause answers keyed by resume_token: one turn can raise a pick card and then an update card.
   const [pauseCardResolutions, setPauseCardResolutions] = useState<
     Record<string, CredentialResolution>
+  >({});
+  // Per resume token: the site question a pick raised, and whether its answer is still being saved.
+  const [siteQuestions, setSiteQuestions] = useState<
+    Record<string, { question: CredentialSiteQuestion; pending: boolean }>
+  >({});
+  // Per resume token: the user set aside the question the card opened with, to pick another login.
+  const [dismissedFrameQuestions, setDismissedFrameQuestions] = useState<
+    Record<string, true>
   >({});
   // Per resume token: a Done in flight, the site a Done found no sign-in for, or a Done that failed to save.
   const [manualSignIns, setManualSignIns] = useState<
@@ -2755,6 +2789,8 @@ export function WorkflowCopilotChat({
       action: "connected" | "skip" | "signing_in" | "signed_in" | "generate",
       credentialId?: string,
       name?: string,
+      siteAnswer?: CredentialSiteAnswer,
+      question?: CredentialSiteQuestion,
     ): Promise<WorkflowCopilotCredentialResponseResult | undefined> => {
       if (credentialResponseInFlight.current) return;
       if (
@@ -2795,6 +2831,12 @@ export function WorkflowCopilotChat({
           // Any answer, even an unconfirmed one, can mean a new saved login the picker should list.
           setCredentialsReloadKey((key) => key + 1);
         } else {
+          if (siteAnswer && question) {
+            setSiteQuestions((prev) => ({
+              ...prev,
+              [frame.resume_token]: { question, pending: true },
+            }));
+          }
           const response =
             await client.post<WorkflowCopilotCredentialResponseResult>(
               "/workflow/copilot/credential-response",
@@ -2803,6 +2845,8 @@ export function WorkflowCopilotChat({
                 action,
                 credential_id:
                   action === "connected" ? credentialId : undefined,
+                ...(action === "connected" ? { asks_site: true } : {}),
+                ...(siteAnswer ? { site_answer: siteAnswer } : {}),
               },
             );
           // A backend that predates sign-in answers 204 with no body.
@@ -2849,17 +2893,46 @@ export function WorkflowCopilotChat({
         ) {
           return result;
         }
+        const askedSite = result.site_question;
+        if (result.result === "site_question" && askedSite) {
+          setSiteQuestions((prev) => ({
+            ...prev,
+            [frame.resume_token]: { question: askedSite, pending: false },
+          }));
+          return result;
+        }
+        // The paused turn reads the login back and its credential_pause_resolved frame settles the card.
+        if (result.result === "site_change_unknown") return result;
+        const siteFacts =
+          siteAnswer && question
+            ? {
+                siteAnswer,
+                siteA: question.saved_sites[0],
+                savedSites: question.saved_sites,
+                siteB: question.site,
+                name: question.name,
+              }
+            : {};
         const resolution: CredentialResolution = generated
           ? {
               outcome: "connected",
               credentialId: generated.credential_id ?? undefined,
               name: generated.name ?? undefined,
             }
-          : action === "connected"
-            ? { outcome: "connected", credentialId, name }
-            : action === "signed_in"
-              ? { outcome: "signed_in" }
-              : { outcome: "skipped" };
+          : result.result === "site_changed_not_connected"
+            ? {
+                outcome: "timeout",
+                credentialId,
+                ...siteFacts,
+                siteSavedNotConnected: true,
+              }
+            : action === "connected" && siteAnswer === "no"
+              ? { outcome: "not_admitted", credentialId, ...siteFacts }
+              : action === "connected"
+                ? { outcome: "connected", credentialId, name, ...siteFacts }
+                : action === "signed_in"
+                  ? { outcome: "signed_in" }
+                  : { outcome: "skipped" };
         // The waiter's credential_pause_resolved frame can land first and carries the admitted verdict.
         setPauseCardResolutions((prev) =>
           prev[frame.resume_token]
@@ -2894,6 +2967,52 @@ export function WorkflowCopilotChat({
         if (action === "generate") {
           void refreshRegistrationCard(frame);
           return;
+        }
+        if (siteAnswer) {
+          // A 409 or 422 saved nothing and reopened the card, so the question is asked again on the next pick.
+          const status = isAxiosError(error)
+            ? error.response?.status
+            : undefined;
+          const conflict = status === 409 || status === 422;
+          setSiteQuestions((prev) => {
+            const next = { ...prev };
+            if (conflict) {
+              delete next[frame.resume_token];
+            } else if (next[frame.resume_token]) {
+              next[frame.resume_token] = {
+                ...next[frame.resume_token]!,
+                pending: false,
+              };
+            }
+            return next;
+          });
+          if (conflict) {
+            setDismissedFrameQuestions((prev) => ({
+              ...prev,
+              [frame.resume_token]: true,
+            }));
+          }
+          if (status === 422) {
+            const detail = isAxiosError(error)
+              ? error.response?.data?.detail
+              : undefined;
+            toast({
+              title: "Couldn't save this site on the login",
+              description:
+                typeof detail === "string" ? detail : "Pick another login.",
+              variant: "destructive",
+            });
+            return;
+          }
+          if (conflict) {
+            toast({
+              title: "This login changed",
+              description:
+                "Its sites changed since the card asked. Pick it again.",
+              variant: "destructive",
+            });
+            return;
+          }
         }
         toast({
           title: "Couldn't send your credential response",
@@ -6798,6 +6917,7 @@ export function WorkflowCopilotChat({
       return sent;
     },
     onStartFailed: () => {
+      noteDemonstrationStartFailed();
       const messageId = demonstrationMessageIdRef.current;
       demonstrationMessageIdRef.current = null;
       setMessages((prev) => prev.filter((message) => message.id !== messageId));
@@ -7315,15 +7435,28 @@ export function WorkflowCopilotChat({
         demonstrationRecorder.phase === "recording"
           ? navigateDemonstration
           : null,
+      demonstration:
+        demonstrationRecorder.phase === "idle"
+          ? null
+          : {
+              phase: demonstrationRecorder.phase,
+              actionCount: demonstrationRecorder.actionCount,
+              interrupted: demonstrationRecorder.browserRestarted,
+              insertion: demonstrationRecorder.insertion ?? null,
+            },
     });
     return () =>
       useRecordingLauncherStore.setState({
         demonstrationBrowserSessionId: null,
         demonstrationRecordingBrowserSessionId: null,
         navigateDemonstration: null,
+        demonstration: null,
       });
   }, [
     demonstrationRecorder.phase,
+    demonstrationRecorder.actionCount,
+    demonstrationRecorder.browserRestarted,
+    demonstrationRecorder.insertion,
     isDemonstrating,
     liveBrowserSessionId,
     navigateDemonstration,
@@ -8963,9 +9096,21 @@ export function WorkflowCopilotChat({
                   outcome: pause.outcome,
                   credentialId: pause.credentialId ?? undefined,
                   name: payload.name ?? undefined,
+                  ...(payload.site_answer
+                    ? {
+                        siteAnswer: payload.site_answer,
+                        siteA: payload.site_a ?? undefined,
+                        savedSites: payload.saved_sites ?? undefined,
+                        siteB: payload.site_b ?? undefined,
+                      }
+                    : {}),
                 };
                 setPauseCardResolutions((prev) =>
-                  withCappedResolution(prev, payload.resume_token, resolution),
+                  withCappedResolution(prev, payload.resume_token, {
+                    ...prev[payload.resume_token],
+                    ...resolution,
+                    name: resolution.name ?? prev[payload.resume_token]?.name,
+                  }),
                 );
                 return false;
               }
@@ -9298,16 +9443,16 @@ export function WorkflowCopilotChat({
   const panesRef = useRef({ openPane, setOpenPanes, resolveLivePanes });
   panesRef.current = { openPane, setOpenPanes, resolveLivePanes };
   const handleStartDemonstration = useCallback(
-    ({
-      insertion,
-    }: { insertion?: WorkflowCopilotDemonstrationInsertion } = {}) => {
+    ({ insertion, keepEditor = false }: StartDemonstrationOptions = {}) => {
       if (!liveBrowserSessionId) return;
       if (historyLoadedForRef.current !== workflowPermanentId) {
         toast({ title: "Wait for Copilot to finish loading" });
+        noteDemonstrationStartFailed();
         return;
       }
       if (hasPendingQuestion) {
         toast({ title: "Answer Copilot's question first" });
+        noteDemonstrationStartFailed();
         return;
       }
       if (
@@ -9317,6 +9462,7 @@ export function WorkflowCopilotChat({
         isDemonstrating
       ) {
         toast({ title: "Wait for Copilot to finish" });
+        noteDemonstrationStartFailed();
         return;
       }
       void stopSpeech();
@@ -9325,11 +9471,12 @@ export function WorkflowCopilotChat({
       // steps aside for the browser and returns when the recording ends.
       // Copilot holds Done and Discard, so it opens too.
       const panes = panesRef.current;
-      panes.openPane("browser");
+      // showPane keeps one pending request, so the Browser opens last to be the one a folded Doc layout expands.
       if (!panes.resolveLivePanes().includes("copilot"))
         panes.openPane("copilot");
+      panes.openPane("browser");
       const live = panes.resolveLivePanes();
-      if (live.includes("editor")) {
+      if (live.includes("editor") && !keepEditor) {
         editorHiddenForDemonstrationRef.current = true;
         panes.setOpenPanes(live.filter((id) => id !== "editor"));
       }
@@ -9985,7 +10132,11 @@ export function WorkflowCopilotChat({
   ) => (
     <CredentialCard
       key={frame.resume_token}
-      frame={liveFrameToCardFrame(frame)}
+      frame={liveFrameToCardFrame(
+        dismissedFrameQuestions[frame.resume_token]
+          ? { ...frame, site_question: null }
+          : frame,
+      )}
       mode="inline-pause"
       reloadKey={credentialsReloadKey}
       resolvedOutcome={pauseCardResolutions[frame.resume_token]}
@@ -10006,6 +10157,35 @@ export function WorkflowCopilotChat({
       }
       onSkip={() => void respondToCredentialPause(frame, "skip")}
       onGenerate={() => void respondToCredentialPause(frame, "generate")}
+      siteQuestion={siteQuestions[frame.resume_token]?.question}
+      siteAnswerPending={Boolean(siteQuestions[frame.resume_token]?.pending)}
+      onSiteAnswer={(answer) => {
+        const question =
+          siteQuestions[frame.resume_token]?.question ??
+          (dismissedFrameQuestions[frame.resume_token]
+            ? null
+            : frame.site_question);
+        if (!question) return;
+        void respondToCredentialPause(
+          frame,
+          "connected",
+          question.credential_id,
+          question.name,
+          answer,
+          question,
+        );
+      }}
+      onDismissSiteQuestion={() => {
+        setSiteQuestions((prev) => {
+          const next = { ...prev };
+          delete next[frame.resume_token];
+          return next;
+        });
+        setDismissedFrameQuestions((prev) => ({
+          ...prev,
+          [frame.resume_token]: true,
+        }));
+      }}
       signIn={
         frame.sign_in_browser_session_id &&
         frame.sign_in_browser_session_id === liveBrowserSessionId
@@ -10589,6 +10769,15 @@ export function WorkflowCopilotChat({
     if (refuseMutationDuringYamlCommit()) return;
     onRecordTask?.();
   };
+  const composerDemonstrateDisabledReason = recordTaskDisabled
+    ? recordTaskUnavailableReason
+    : isDemonstrating
+      ? "A demonstration is already open"
+      : hasPendingQuestion
+        ? "Answer Copilot's question first"
+        : isLoading
+          ? "Wait for Copilot to finish"
+          : null;
   const content = (
     <div
       className={
@@ -11053,26 +11242,23 @@ export function WorkflowCopilotChat({
                         ),
                       )}
                       {message.narrative.demonstrationOffer ? (
-                        <div className="max-w-sm">
-                          <DemonstrateTaskButton
-                            label="Start demonstration"
-                            disabled={
-                              !isLastMessage ||
-                              isLoading ||
-                              hasPendingQuestion ||
-                              isDemonstrating ||
-                              recordTaskDisabled
-                            }
-                            disabledReason={
-                              recordTaskDisabled
-                                ? recordTaskUnavailableReason
-                                : !isLastMessage
-                                  ? "Only the latest message can start a demonstration"
-                                  : "Demonstrate task is unavailable right now"
-                            }
-                            onClick={startRecordTask}
-                          />
-                        </div>
+                        <DemonstrationOfferCard
+                          disabled={
+                            !isLastMessage ||
+                            isLoading ||
+                            hasPendingQuestion ||
+                            isDemonstrating ||
+                            recordTaskDisabled
+                          }
+                          disabledReason={
+                            recordTaskDisabled
+                              ? recordTaskUnavailableReason
+                              : !isLastMessage
+                                ? "Only the latest message can start a demonstration"
+                                : "Demonstrate task is unavailable right now"
+                          }
+                          onStart={startRecordTask}
+                        />
                       ) : null}
                       {showReviewGate ? (
                         <div className="space-y-2">
@@ -11948,16 +12134,59 @@ export function WorkflowCopilotChat({
             />
             {/* As tall as one textarea line box, so the controls center on the last line as the textarea grows. */}
             <div className="flex h-10 shrink-0 items-center gap-1.5">
-              <button
-                type="button"
-                onClick={() => attachmentInputRef.current?.click()}
-                disabled={attachDisabledReason !== null}
-                title={attachDisabledReason ?? "Attach a file"}
-                aria-label="Attach a file"
-                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-muted-foreground transition hover:bg-accent hover:text-accent-foreground disabled:opacity-50"
-              >
-                <PlusIcon className="h-4 w-4" />
-              </button>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <button
+                    type="button"
+                    disabled={
+                      attachDisabledReason !== null &&
+                      composerDemonstrateDisabledReason !== null
+                    }
+                    title={
+                      attachDisabledReason !== null &&
+                      composerDemonstrateDisabledReason !== null
+                        ? attachDisabledReason
+                        : "Attach a file or demonstrate"
+                    }
+                    aria-label="Attach a file or demonstrate"
+                    className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-muted-foreground transition hover:bg-accent hover:text-accent-foreground disabled:opacity-50"
+                  >
+                    <PlusIcon className="h-4 w-4" />
+                  </button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent side="top" align="start" className="w-64">
+                  <DropdownMenuItem
+                    disabled={attachDisabledReason !== null}
+                    onSelect={() => attachmentInputRef.current?.click()}
+                    className="items-start gap-2 p-2"
+                  >
+                    <FileIcon className="mt-0.5 h-4 w-4 shrink-0" />
+                    <span className="min-w-0">
+                      <span className="block">Attach a file</span>
+                      <span className="block text-xs text-muted-foreground">
+                        {attachDisabledReason ??
+                          "A document, spreadsheet, or SOP for Copilot"}
+                      </span>
+                    </span>
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    disabled={composerDemonstrateDisabledReason !== null}
+                    onSelect={startRecordTask}
+                    className="items-start gap-2 p-2"
+                  >
+                    <span className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center">
+                      <span className="h-2.5 w-2.5 rounded-full bg-red-500" />
+                    </span>
+                    <span className="min-w-0">
+                      <span className="block">Demonstrate task</span>
+                      <span className="block text-xs text-muted-foreground">
+                        {composerDemonstrateDisabledReason ??
+                          "Show Copilot how in the browser"}
+                      </span>
+                    </span>
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
               <SpeechInputButton
                 isSupported={isSpeechSupported}
                 isListening={isSpeechListening}

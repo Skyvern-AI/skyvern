@@ -131,7 +131,7 @@ async def test_authenticated_question_url_reaches_the_real_card_and_rebuilds_fro
             card = ctx.stream.send.await_args_list[0].args[0]
             assert card.type is WorkflowCopilotStreamMessageType.CREDENTIAL_REQUIRED
             assert card.login_page_urls == (["https://portal.example.com"] if raw_secret else [_LOGIN_URL])
-            assert ctx.request_policy.allow_run_blocks is not raw_secret
+            assert ctx.request_policy.allow_run_blocks is True
         finally:
             if not waiting.done():
                 waiting.cancel()
@@ -290,10 +290,8 @@ def test_question_response_with_detected_raw_secret_grants_no_url_authority() ->
     assert policy.user_site_url_sources == {}
     assert policy.raw_secret_detected is True
     assert policy.raw_secret_safety_status == "detected"
-    assert policy.testing_intent == "skip_test"
-    assert policy.allow_run_blocks is False
-    assert policy.allow_missing_credentials_in_draft is True
-    assert policy.credential_draft_deferred_explicitly is True
+    assert policy.testing_intent != "skip_test"
+    assert policy.allow_run_blocks is True
 
 
 @pytest.mark.asyncio
@@ -302,7 +300,7 @@ async def test_question_source_reaches_fill_boundary_without_weakening_origin_gu
 ) -> None:
     source = QuestionResponseSiteURLSource(interaction_id="interaction-1")
     policy = RequestPolicy(
-        resolved_credentials=[SimpleNamespace(credential_id="cred_1", tested_url=None)],
+        resolved_credentials=[SimpleNamespace(credential_id="cred_1", tested_url=None, extra_site_urls=[])],
         current_turn_named_credential_ids={"cred_1"},
         user_provided_site_urls=[_LOGIN_URL],
         user_site_url_sources={_LOGIN_URL: source},

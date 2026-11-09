@@ -20,6 +20,7 @@ import {
   ReaderIcon,
   StopIcon,
 } from "@radix-ui/react-icons";
+import { formatElapsedSeconds } from "@/util/utils";
 import {
   REVEAL_MS_PER_CHAR,
   buildRevealOffsets,
@@ -55,6 +56,7 @@ import {
   SkippedPrefixBlock,
 } from "./workflowCopilotTypes";
 import { useWorkflowRunByIdQuery } from "../hooks/useWorkflowRunQuery";
+import { runIsLogicallyFinal } from "../workflowRun/runRetryState";
 import { RunFieldValue } from "../studio/runview/RunFieldValue";
 import { WorkflowParameterValueType } from "../types/workflowTypes";
 import {
@@ -270,10 +272,7 @@ function paletteFor(blockType: string): BlockPalette {
 function liveElapsed(startedAt: string | null): string | null {
   const ms = parseUtcIsoMs(startedAt);
   if (ms === null) return null;
-  const secs = Math.max(0, Math.round((Date.now() - ms) / 1000));
-  const m = Math.floor(secs / 60);
-  const s = secs % 60;
-  return `${m}:${s.toString().padStart(2, "0")}`;
+  return formatElapsedSeconds(Date.now() - ms);
 }
 
 function Spinner({ small = false }: { small?: boolean }) {
@@ -1251,8 +1250,7 @@ function testCardStatus(
 function formatActionDuration(ms: number | null): string | null {
   if (ms === null) return null;
   if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
-  const secs = Math.round(ms / 1000);
-  return `${Math.floor(secs / 60)}:${(secs % 60).toString().padStart(2, "0")}`;
+  return formatElapsedSeconds(ms);
 }
 
 // A failure's first line reads under its row in full; the rest of the recorded
@@ -1792,28 +1790,72 @@ function TestInputValues({
   );
 }
 
+function TestRunCost({
+  workflowRunId,
+  turnEnded,
+  listClass,
+}: {
+  workflowRunId: string;
+  turnEnded: boolean;
+  listClass?: string;
+}) {
+  const { data: run } = useWorkflowRunByIdQuery(workflowRunId, turnEnded);
+  if (!turnEnded || !run || !runIsLogicallyFinal(run)) return null;
+  const cost = (
+    <span
+      data-test-run-cost
+      className={`whitespace-nowrap py-px text-[12px] leading-[1.5] ${STEP_TEXT}`}
+      title="Credits consumed by this run (live + cached)"
+    >
+      <span className="tabular-nums">
+        {(
+          (run.credits_used ?? 0) + (run.cached_credits_used ?? 0)
+        ).toLocaleString()}
+      </span>{" "}
+      credits
+    </span>
+  );
+  return listClass ? (
+    <ul className={listClass}>
+      <li>{cost}</li>
+    </ul>
+  ) : (
+    cost
+  );
+}
+
 function TestInputsDisclosure({
   entry,
+  turnEnded,
   className,
 }: {
   entry: ActivityEntry;
+  turnEnded: boolean;
   className?: string;
 }) {
   const [open, setOpen] = useState(false);
-  const inputs = entry.testInputs;
-  if (!entry.workflowRunId || !inputs?.length) return null;
+  const inputs = entry.testInputs ?? [];
+  if (!entry.workflowRunId) return null;
   return (
     <div data-test-inputs className={className}>
-      <button
-        type="button"
-        aria-expanded={open}
-        className={`flex items-center gap-1.5 py-px text-left text-[12px] leading-[1.5] ${STEP_TEXT} hover:text-foreground`}
-        onClick={() => setOpen(!open)}
-      >
-        <Chevron open={open} />
-        {`Test inputs (${inputs.length})`}
-      </button>
-      {open ? (
+      <div className="flex flex-wrap items-center gap-x-3">
+        {inputs.length ? (
+          <button
+            type="button"
+            aria-expanded={open}
+            className={`flex items-center gap-1.5 py-px text-left text-[12px] leading-[1.5] ${STEP_TEXT} hover:text-foreground`}
+            onClick={() => setOpen(!open)}
+          >
+            <Chevron open={open} />
+            {`Test inputs (${inputs.length})`}
+          </button>
+        ) : null}
+        <TestRunCost
+          workflowRunId={entry.workflowRunId}
+          turnEnded={turnEnded}
+        />
+      </div>
+      {open && inputs.length ? (
         <TestInputValues workflowRunId={entry.workflowRunId} inputs={inputs} />
       ) : null}
     </div>
@@ -1926,7 +1968,11 @@ function FCallItem({
       ) : null}
       {evidence}
       {open && detail !== null ? <FDetailBox>{detail}</FDetailBox> : null}
-      <TestInputsDisclosure entry={entry} className="ml-[18px]" />
+      <TestInputsDisclosure
+        entry={entry}
+        turnEnded={turnEnded}
+        className="ml-[18px]"
+      />
     </li>
   );
 }
@@ -2287,8 +2333,20 @@ function FActivityLogRow({
       } else if (entry.testInputs?.length) {
         items.push(
           <li key={`inputs-${toolCallIdOf(entry) ?? entry.id}`}>
-            <TestInputsDisclosure entry={entry} />
+            <TestInputsDisclosure entry={entry} turnEnded={turnEnded} />
           </li>,
+        );
+      } else if (entry.workflowRunId) {
+        // Its own list: an item pushed into the shared one would leave an empty
+        // bordered list above the cards until the run is final.
+        flushItems();
+        segments.push(
+          <TestRunCost
+            key={`cost-${toolCallIdOf(entry) ?? entry.id}`}
+            workflowRunId={entry.workflowRunId}
+            turnEnded={turnEnded}
+            listClass={listClass}
+          />,
         );
       }
       flushItems();

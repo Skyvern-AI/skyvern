@@ -1322,11 +1322,17 @@ class SendEmailBlockYAML(BlockYAML):
         description="ID of a connected Google account that has send permission. Used only with transport 'gmail'.",
         json_schema_extra={"x-skyvern-connected-account": True},
     )
+    reply_to_message_id: str | None = Field(
+        default=None,
+        description="Gmail message ID to reply to in its original thread; requires send and read permissions.",
+    )
     cc: list[str] = Field(default_factory=list, description="Cc recipients. Only with transport 'gmail'.")
     bcc: list[str] = Field(default_factory=list, description="Bcc recipients. Only with transport 'gmail'.")
 
     @model_validator(mode="after")
     def _validate_transport_fields(self) -> "SendEmailBlockYAML":
+        if self.reply_to_message_id is not None and self.transport != EmailTransport.GMAIL:
+            raise ValueError("reply_to_message_id is only supported with the gmail transport")
         if self.transport == EmailTransport.GMAIL:
             custom_smtp_text = (self.custom_smtp_host, self.custom_smtp_username, self.custom_smtp_password)
             if self.custom_smtp_port is not None or any(value and value.strip() for value in custom_smtp_text):
@@ -1829,6 +1835,7 @@ class EmailInboxBlockYAML(BlockYAML):
     credential_source: Literal["native", "nango"] = "native"
     connection_id: str | None = Field(default=None, json_schema_extra={"x-skyvern-connected-account": True})
     credential_id: str | None = Field(default=None, json_schema_extra={"x-skyvern-connected-account": True})
+    message_id: str | None = None
     folder: str | None = None
     prompt: str | None = None
     sender: str | None = None

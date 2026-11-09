@@ -641,6 +641,10 @@ class AzureStorage(BaseStorage, StreamingArtifactStorage):
             # already in the uploads bucket is what outgrows SAVE_DOWNLOADED_FILES_TIMEOUT.
             if already_saved.get(uri) == checksum:
                 unchanged_file_count += 1
+                if run_id is not None:
+                    await app.ARTIFACT_MANAGER.record_unchanged_download(
+                        organization_id=organization_id, run_id=run_id, uri=uri, checksum=checksum, source_path=fpath
+                    )
                 continue
             file_size = _safe_get_file_size(fpath)
             # Azure Blob metadata values must be ASCII; preserve the full
@@ -683,6 +687,7 @@ class AzureStorage(BaseStorage, StreamingArtifactStorage):
                         workflow_run_id=retry_workflow_run_id if retry_attempt else None,
                         checksum=checksum,
                         file_size=file_size,
+                        source_path=fpath,
                     )
                 except Exception:
                     LOG.warning(

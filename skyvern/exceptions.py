@@ -1248,6 +1248,20 @@ class BitwardenCredentialsRejectedError(BitwardenLoginError):
     pass
 
 
+BITWARDEN_VERIFICATION_REQUIRED_MESSAGE = (
+    "Bitwarden asked for a verification code (a new-device check or two-step login), "
+    "and Skyvern cannot enter codes. Add your Bitwarden personal API key in Skyvern's Bitwarden settings."
+)
+
+
+class BitwardenVerificationRequiredError(BitwardenLoginError):
+    def __init__(
+        self,
+        message: str = BITWARDEN_VERIFICATION_REQUIRED_MESSAGE,
+    ) -> None:
+        super().__init__(message)
+
+
 class BitwardenUnlockError(BitwardenBaseError):
     def __init__(self, message: str) -> None:
         super().__init__(f"Error unlocking Bitwarden: {message}")

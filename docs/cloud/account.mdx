@@ -38,7 +38,7 @@ Everything in Skyvern (agents, runs, credentials, API keys, credits) belongs to 
 
 ## API keys
 
-Your API key authenticates every API, SDK, CLI and MCP request for your organization. Only an Admin can open this page; a Member who follows a link to it sees **Organization admin access is required**.
+Your API key authenticates every API, SDK, CLI and MCP request for your organization. Every Admin and Member can open this page, unless your organization enables [role-based access control](#roles) and withholds `api_key.list` from their role.
 
 <Steps>
   <Step title="Open API keys">
@@ -140,21 +140,17 @@ Each person in an organization is an **Admin** or a **Member**, set on [Members]
 
 | Role | What it can do |
 |---|---|
-| **Admin** | Everything in the organization, including the admin-only actions below. |
-| **Member** | All day-to-day work: build, run and edit agents, manage credentials, and view runs and results. The app hides **Billing** and **API keys** from Members; opening either page shows **Organization admin access is required**. |
+| **Admin** | Everything in the organization, and the only role that can manage member roles and turn role-based access control on. |
+| **Member** | Build, run and edit agents, manage credentials, view runs and results, and reach Billing and API keys, subject to the limits below. |
 
-By default, these actions are refused for Members with `403`:
+**Role-based access control is opt-in.** Until an Admin turns it on, a Member can access most organization actions. Managing member roles and SFTP and Concord fax adapter configuration remain Admin-only either way, including configuration reads and writes. A Member can't grant themselves more access or switch role-based access control on.
 
-| Action | Who can do it |
-|---|---|
-| Create, change, enable, disable, replay or delete [event triggers](/developers/event-triggers), and rotate their signing secrets | An Admin signed in to the app |
-| Create, list, revoke or reissue additional organization API keys | An Admin signed in to the app |
-| Change or remove the organization's 1Password connection | An Admin, or a request with the organization API key |
-| Export the organization's [audit log](#audit-log) | An Admin, or a request with the organization API key |
+Once an Admin enables it, each person's role decides what they can do and requests outside their role are refused with `403`. That covers event triggers, additional organization API keys, the 1Password connection, the [audit log](#audit-log) export and the rest of the organization's actions.
 
-An API key can't manage API keys, event triggers or member roles, so a leaked key can't create a replacement for itself.
+These limits also apply whether or not you enable role-based access control:
 
-Members who open the Azure Key Vault or Custom Credential Service connection see its secret masked.
+- An API key can't manage API keys, event triggers or member roles, so a leaked key can't create a replacement for itself.
+- A browser session alone can't perform admin-only actions; those need a signed-in session.
 
 <Warning>
 Every Admin and Member can get the organization API key: an Admin from **Settings → API keys**, a Member by signing in to the CLI. The key can do everything an Admin can except manage API keys, event triggers and member roles. Treat every Admin and Member as able to use the API with full access, and use separate organizations where people must be kept apart.
@@ -260,7 +256,7 @@ Questions about a migration: [support@skyvern.com](mailto:support@skyvern.com).
 
 ## Billing and credits
 
-Open **Settings → Billing**. On the Trial and Hobby plans, the **Upgrade plan** link at the bottom of the sidebar opens the same page; on other plans it reads **Plan & usage**. Billing is Admin-only: a Member sees neither the **Billing** page in Settings nor that sidebar link.
+Open **Settings → Billing**. On the Trial and Hobby plans, the **Upgrade plan** link at the bottom of the sidebar opens the same page; on other plans it reads **Plan & usage**. Every Admin and Member can reach Billing, unless your organization enables [role-based access control](#roles) and withholds the billing actions from their role.
 
 <img src="/images/cloud/settings-billing-overview.png" alt="Billing page with a current Free plan card, Hobby, Pro, and Enterprise plan cards, and a Credit Usage meter showing 3,948 of 5,000 one-time credits used" />
 
@@ -321,8 +317,6 @@ Go to **Settings → Members** to invite teammates by email and manage their rol
 
 Pick a role when you invite someone, and change it later from the member list: **Admin** or **Member**. [Roles](#roles) explains what each one can do.
 
-**Your role in this organization** at the top of the page shows the role Skyvern recognizes for your session. It reads **Role information unavailable** when no role comes back.
-
 <img src="/images/cloud/cloud-settings-members.png" alt="Settings, Members page showing No organization yet and the Create organization button" />
 
 If you signed up without an organization, Members shows **No organization yet**. Click **Create organization**, then invite people.
@@ -349,7 +343,7 @@ Vault connections (1Password, Bitwarden, Azure Key Vault, Custom Credential Serv
 
 ## Audit log
 
-Go to **Settings → Audit log**. By default, only Admins can open it; Members don't see it. Access requires `audit.export`, so another role with that grant can also use it when your organization enforces custom role grants.
+Go to **Settings → Audit log**. Every Admin and Member can open it. Once your organization enables [role-based access control](#roles), access requires the `audit.export` grant, so only roles that hold it can open the page or export.
 
 - **Changes** lists organization configuration and membership activity, including who acted, the action, the resource and the time.
 - **Runs** lists top-level workflow runs, including when they were created, who started them and their trigger.
@@ -364,7 +358,7 @@ Click **Export CSV** to download the filtered tab. Downloads stop at 25,000 rows
 
 ### Export with the API
 
-Use an Admin session, a role granted `audit.export`, or your organization API key:
+Use a signed-in session, a role granted `audit.export`, or your organization API key:
 
 - `GET /v1/audit-events/export` exports changes.
 - `GET /v1/audit-events/runs/export` exports runs.

@@ -48,7 +48,7 @@ function DeleteFolderButton({ folderId, folderTitle }: Props) {
                 setIsDialogOpen(true);
               }}
               className="rounded p-1.5 text-red-700 transition-colors hover:bg-red-500/20 hover:text-red-700 dark:text-red-400 dark:hover:text-red-300"
-              aria-label="Delete folder"
+              aria-label={`Delete folder ${folderTitle}`}
             >
               <GarbageIcon className="h-4 w-4" />
             </button>

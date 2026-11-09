@@ -207,12 +207,12 @@ function CreateOrgScheduleDialog({ open, onOpenChange }: Readonly<Props>) {
                   placeholder="Search agents..."
                 />
                 {workflowPickerOpen && (
-                  <div className="max-h-40 overflow-y-auto rounded-md border border-slate-700 bg-slate-elevation3">
+                  <div className="max-h-40 overflow-y-auto rounded-md border border-border bg-slate-elevation3">
                     {workflows.map((wf) => (
                       <button
                         key={wf.workflow_permanent_id}
                         type="button"
-                        className="w-full px-3 py-2 text-left text-sm hover:bg-slate-700"
+                        className="w-full px-3 py-2 text-left text-sm hover:bg-slate-elevation5 dark:hover:bg-slate-700"
                         onClick={() => {
                           setSelectedWorkflow(wf);
                           setWorkflowSearch("");

@@ -1,5 +1,4 @@
 import asyncio
-import inspect
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, Mock
@@ -331,15 +330,6 @@ async def test_normal_collapse_gate_does_not_seed_custom_assignment(monkeypatch:
     gate = await handler._resolve_collapse_gate(task, CUSTOM_FLAG, "custom-select")
     assert gate == handler._CollapseGateResult(family_enabled=True, assigned=True, gate_error=False)
     assert len(_umbrella_calls(provider)) == 1
-
-
-def test_consult_assignment_false_is_keyword_only_and_normal_only() -> None:
-    parameter = inspect.signature(handler._resolve_collapse_gate).parameters["consult_assignment"]
-    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
-    assert parameter.default is True
-
-    assert inspect.getsource(handler).count("consult_assignment=False") == 1
-    assert "consult_assignment=False" in inspect.getsource(handler._is_collapse_select_fanout_enabled)
 
 
 @pytest.mark.asyncio

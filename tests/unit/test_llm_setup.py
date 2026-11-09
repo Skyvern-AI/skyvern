@@ -15,21 +15,23 @@ from skyvern.cli import llm_setup
     [
         (None, None, None),
         ("", None, None),
-        ("GEMINI_2.5_FLASH", None, None),
+        ("ALTERNATE_MODEL", None, None),
         ("CUSTOM_SAFETY_MODEL", None, None),
-        ("GEMINI_2.5_FLASH", "GEMINI_3.1_PRO", None),
-        (None, "GEMINI_2.5_FLASH", None),
+        ("ALTERNATE_MODEL", "PRIMARY_MODEL", None),
+        (None, "ALTERNATE_MODEL", None),
         (None, None, "CUSTOM_RUNTIME_MODEL"),
         ("CUSTOM_FILE_MODEL", None, "CUSTOM_RUNTIME_MODEL"),
         ("CUSTOM_FILE_MODEL", None, ""),
     ],
 )
-def test_setup_explicitly_configures_copilot_safety_model(
+@pytest.mark.parametrize("use_default_env_path", [False, True])
+def test_configure_copilot_safety_model_preserves_or_updates_selection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     existing_model: str | None,
     selected_model: str | None,
     runtime_model: str | None,
+    use_default_env_path: bool,
 ) -> None:
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("WORKFLOW_COPILOT_LITE_LLM_KEY", raising=False)
@@ -40,31 +42,59 @@ def test_setup_explicitly_configures_copilot_safety_model(
         env_path.parent.mkdir()
         env_path.write_text(f"WORKFLOW_COPILOT_LITE_LLM_KEY='{existing_model}'\n")
 
-    confirmations = iter([False, False, False, False, True, False])
-    monkeypatch.setattr(llm_setup.Confirm, "ask", lambda *_args, **_kwargs: next(confirmations))
-    monkeypatch.setattr(llm_setup, "ask_secret", lambda *_args, **_kwargs: "test-gemini-key")
-    monkeypatch.setattr(llm_setup, "capture_setup_event", MagicMock())
+    monkeypatch.setattr(llm_setup, "resolve_backend_env_path", lambda **_kwargs: env_path)
     monkeypatch.setattr(llm_setup, "console", MagicMock())
     prompts: list[dict[str, object]] = []
 
+    def ask_model(_prompt: str, *, choices: list[str], default: str) -> str:
+        prompts.append({"choices": choices, "default": default})
+        return selected_model or default
+
+    monkeypatch.setattr(llm_setup.Prompt, "ask", ask_model)
+    with patch.dict(os.environ):
+        llm_setup._configure_copilot_safety_model(
+            ["PRIMARY_MODEL", "ALTERNATE_MODEL"],
+            "PRIMARY_MODEL",
+            env_path=None if use_default_env_path else str(env_path),
+        )
+
+    expected_default = existing_model or runtime_model or "PRIMARY_MODEL"
+    values = dotenv_values(env_path)
+    assert values["WORKFLOW_COPILOT_LITE_LLM_KEY"] == (selected_model or expected_default)
+    assert len(prompts) == 1
+    assert prompts[0]["default"] == expected_default
+    assert expected_default in prompts[0]["choices"]
+    assert not (tmp_path / ".env").exists()
+
+
+def test_setup_configures_safety_model(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("WORKFLOW_COPILOT_LITE_LLM_KEY", raising=False)
+    env_path = tmp_path / "config" / "backend.env"
+    monkeypatch.setattr(llm_setup.Confirm, "ask", lambda prompt, **_kwargs: "Gemini" in prompt)
+    monkeypatch.setattr(llm_setup, "ask_secret", lambda *_args, **_kwargs: "test-gemini-key")
+    monkeypatch.setattr(llm_setup, "capture_setup_event", MagicMock())
+    monkeypatch.setattr(llm_setup, "console", MagicMock())
+    safety_prompts: list[dict[str, object]] = []
+
     def ask_model(prompt: str, *, choices: list[str], default: str) -> str:
         if "Copilot safety" in prompt:
-            prompts.append({"choices": choices, "default": default})
-            return selected_model or default
+            safety_prompts.append({"choices": choices, "default": default})
+            return default
         return "1"
 
     monkeypatch.setattr(llm_setup.Prompt, "ask", ask_model)
     with patch.dict(os.environ):
         llm_setup.setup_llm_providers(env_path=env_path)
 
-    expected_default = existing_model or runtime_model or "GEMINI_3.1_PRO"
     values = dotenv_values(env_path)
-    assert values["LLM_KEY"] == "GEMINI_3.1_PRO"
-    assert values["WORKFLOW_COPILOT_LITE_LLM_KEY"] == (selected_model or expected_default)
+    assert values["ENABLE_GEMINI"] == "true"
     assert values["GEMINI_API_KEY"] == "test-gemini-key"
-    assert len(prompts) == 1
-    assert prompts[0]["default"] == expected_default
-    assert expected_default in prompts[0]["choices"]
+    assert values["LLM_KEY"]
+    assert values["WORKFLOW_COPILOT_LITE_LLM_KEY"] == values["LLM_KEY"]
+    assert len(safety_prompts) == 1
+    assert safety_prompts[0]["default"] == values["LLM_KEY"]
+    assert values["LLM_KEY"] in safety_prompts[0]["choices"]
     assert not (tmp_path / ".env").exists()
 
 

@@ -12,7 +12,12 @@ import pytest
 from fastapi import FastAPI
 from fastapi.routing import APIRoute
 
-from skyvern.forge.api_app import custom_openapi, register_agent_route_aliases
+from skyvern.forge.api_app import (
+    _schema_refs,
+    custom_openapi,
+    register_agent_route_aliases,
+    strip_internal_schema_properties,
+)
 from skyvern.forge.sdk.routes.routers import base_router
 from tests.unit.shared_route_app import shared_route_app
 
@@ -87,3 +92,29 @@ def test_block_note_fields_stay_out_of_the_public_schema() -> None:
     for name in ("TaskBlockYAML", "TaskBlock", "ForLoopBlockYAML"):
         assert name in schemas
         assert {"notes", "trailing_notes", "description"}.isdisjoint(schemas[name]["properties"]), name
+
+
+def test_internal_components_are_dropped_without_dangling_refs() -> None:
+    ref = "#/components/schemas/{}".format
+    synthetic = {
+        "paths": {"/v1/x": {"get": {"responses": {"200": {"schema": {"$ref": ref("Public")}}}}}},
+        "components": {
+            "schemas": {
+                "Public": {"properties": {"calls": {"x-internal": True, "items": {"$ref": ref("Internal")}}}},
+                "Internal": {"x-internal": True, "properties": {"entry": {"$ref": ref("OnlyInternal")}}},
+                "OnlyInternal": {"properties": {}},
+                "Unreferenced": {"properties": {}},
+            }
+        },
+    }
+    strip_internal_schema_properties(synthetic)
+    assert set(synthetic["components"]["schemas"]) == {"Public", "Unreferenced"}
+
+    importlib.import_module("skyvern.forge.sdk.routes.agent_protocol")
+    fastapi_app = FastAPI()
+    fastapi_app.include_router(base_router, prefix="/v1")
+    openapi = custom_openapi(fastapi_app)
+    schemas = openapi["components"]["schemas"]
+    assert "AgentStepToolCall" not in schemas
+    dangling = {name for name in _schema_refs(openapi) if name not in schemas}
+    assert dangling == set()

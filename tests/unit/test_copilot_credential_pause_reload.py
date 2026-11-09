@@ -233,7 +233,7 @@ def _sign_in_card_context(ctx, *, recovery: bool):
     ctx.credential_recovery_armed = False
     ctx.credential_recovery_token_digest = pauses.credential_recovery_token_digest("a" * 64) if recovery else None
     ctx.copilot_config = CopilotConfig(credential_pause_enabled=True, credential_pause_timeout_seconds=5)
-    ctx.request_policy = RequestPolicy(credential_draft_deferred_explicitly=True)
+    ctx.request_policy = RequestPolicy()
     _ground_user_provided_sites(ctx.request_policy, "https://portal.example.com/login", [])
     ctx.stream = _make_stream()
     emitted = asyncio.Event()
@@ -306,6 +306,7 @@ async def test_signing_in_survives_a_reload_and_done_resumes_the_same_call_with_
                 "expires_at": None,
                 "host": "portal.example.com",
                 "browser_profile_id": None,
+                "site_question": None,
             }
             failed = await client.post("/credential-response", json={**body, "action": "signed_in"})
             assert failed.json()["result"] == "save_failed"
@@ -331,7 +332,6 @@ async def test_signing_in_survives_a_reload_and_done_resumes_the_same_call_with_
     assert ctx.credential_pause_outcome == "signed_in"
     assert ctx.request_policy.credential_pause_signed_in_profile_id == "bp_signed_in"
     assert ctx.request_policy.credential_pause_signed_in_site == "portal.example.com"
-    assert ctx.request_policy.credential_draft_deferred_explicitly is False
     assert ctx.request_policy.resolved_credentials == []
     assert any(entry["event"] == "copilot_credential_pause_signed_in" for entry in logs)
 

@@ -1788,18 +1788,6 @@ def test_google_drive_maps_insufficient_scope_to_reconnect() -> None:
     assert exc_info.value.code == "reconnect_required"
 
 
-def test_sheets_api_runtime_defaults_match_previous_hardcoded_values() -> None:
-    """Google API timeout/retry settings default to known values so unset envs
-    produce no behavior change for upgrading deployments."""
-    from skyvern.config import Settings
-
-    fresh = Settings()
-    assert fresh.GOOGLE_SHEETS_API_TIMEOUT_SECONDS == 30.0
-    assert fresh.GOOGLE_SHEETS_API_MAX_RETRIES == 3
-    assert fresh.GOOGLE_DRIVE_API_TIMEOUT_SECONDS == 30.0
-    assert fresh.GOOGLE_DRIVE_API_MAX_RETRIES == 3
-
-
 @pytest.mark.asyncio
 async def test_resolve_client_config_prefers_org_token(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
@@ -4619,12 +4607,6 @@ class _ConsentRepoDouble:
             consent_app_origin=row.get("consent_app_origin"),
             client_id=row.get("client_id"),
         )
-
-    async def get_credential_state(self, organization_id: str, credential_id: str) -> str | None:
-        for row in self.rows.values():
-            if row["organization_id"] == organization_id and row["credential_id"] == credential_id:
-                return google_oauth_service.STATE_PENDING_CONSENT
-        return None
 
     async def promote_pending_to_active(
         self,

@@ -19,8 +19,6 @@ from skyvern.exceptions import (
     SequentialCredentialLimitExceeded,
     SkyvernHTTPException,
 )
-from skyvern.forge.sdk.copilot.output_policy import OutputPolicyReason, evaluate_output_policy
-from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.db.agent_db import AgentDB, _build_engine
 from skyvern.forge.sdk.db.models import (
     CredentialModel,
@@ -624,36 +622,6 @@ async def test_workflow_save_validation_dedupes_credential_ids_preserving_order(
     mock_get_credentials.assert_awaited_once_with(["cred_a", "cred_b", "cred_c"], organization_id="org_test")
 
 
-def test_output_policy_origin_broadening_checks_non_first_rotating_credential() -> None:
-    workflow_yaml = """
-title: Login
-workflow_definition:
-  parameters:
-    - parameter_type: credential
-      key: login_cred
-      credential_id: cred_first
-      credential_ids:
-        - cred_first
-        - cred_second
-  blocks:
-    - block_type: login
-      label: Login
-      url: https://portal.example.com/login
-      parameter_keys:
-        - login_cred
-"""
-    request_policy = RequestPolicy(
-        resolved_credentials=[
-            SimpleNamespace(credential_id="cred_first", tested_url="https://portal.example.com/login"),
-            SimpleNamespace(credential_id="cred_second", tested_url="https://other.example.com/login"),
-        ]
-    )
-
-    verdict = evaluate_output_policy(request_policy=request_policy, workflow_yaml=workflow_yaml)
-
-    assert OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED in verdict.reason_codes
-
-
 def test_yaml_to_credential_parameter_round_trip_preserves_rotation_fields() -> None:
     yaml_definition = WorkflowDefinitionYAML(
         parameters=[
@@ -1047,6 +1015,7 @@ async def test_runtime_credential_registration_proceeds_when_lane_is_safe(
         credential_id="cred_runtime",
         run_sequentially=run_sequentially,
         tested_url=None,
+        extra_site_urls=[],
         vault_type=None,
         totp_identifier=None,
     )

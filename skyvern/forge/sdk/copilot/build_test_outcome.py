@@ -75,7 +75,6 @@ BuildTestOutcomeReasonCode = Literal[
     "missing_structural_evidence",
     "unchanged_after_recorded_outcome",
     "metadata_reject",
-    "output_policy_reject",
     "scout_act_observe_hollow_after_interaction",
     "required_input_unbound",
     "definition_contract_unsatisfied",
@@ -251,6 +250,7 @@ class BuildTestPacketRun(BaseModel):
     execution_source: dict[str, Any] | None = None
     browser_start: dict[str, Any] | None = None
     loop_inputs: LoopInputs | LoopInputsUnavailable | None = None
+    credits_used: int | None = None
 
 
 class BuildTestPacketPageState(BaseModel):

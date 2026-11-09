@@ -2230,6 +2230,7 @@ _TRIGGER_MAPPING_REASON_LABELS: dict[TriggerMappingReasonCode, str] = {
     "mapping_path_missing": "A mapped path isn't in the body",
     "invalid_mapping": "Mapping is invalid",
     "invalid_parameters": "Inputs failed validation",
+    "email_not_mapped": "The whole email is not mapped to the email input",
     "owner_lookup_failed": "Couldn't look up your role; try again",
     "owner_not_authorized": "Trigger owner cannot access a required credential",
 }
@@ -2257,12 +2258,9 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
 
     if tool_name == "update_workflow":
         return f"{_workflow_write_phrase(data)} ({data.get('block_count', '?')} blocks)"
-    if tool_name == "update_and_run_blocks" or (tool_name == "edit_block_and_run" and data.get("skipped_run")):
+    if tool_name == "update_and_run_blocks":
         if not isinstance(raw_data, dict):
             return "OK"
-        if data.get("skipped_run"):
-            return f"{_workflow_write_phrase(data)} ({data.get('block_count', '?')} blocks); browser run skipped"
-        # Non-skip result is run-blocks-shaped (overall_status, no block_count).
         ran = "Staged a workflow draft and ran it" if data.get("persistence") else "Updated the workflow and ran it"
         status = data.get("overall_status") or data.get("status")
         if status:

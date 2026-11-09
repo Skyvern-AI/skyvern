@@ -97,6 +97,9 @@ class _FakeAgentFunction:
     def on_origin_scoped_headers_route_installed(self, browser_context: Any, target_origin: Any) -> None:
         self.header_route_origins.append(target_origin)
 
+    def on_browser_context_abandoned(self, browser_context: Any) -> None:
+        return None
+
 
 async def _factory_context(
     monkeypatch: pytest.MonkeyPatch,

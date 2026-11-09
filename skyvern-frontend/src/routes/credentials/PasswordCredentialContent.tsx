@@ -755,8 +755,8 @@ function PasswordCredentialContent({
 
   return (
     <div className="space-y-5">
-      <div className="flex items-center gap-12">
-        <div className="w-40 shrink-0">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-12">
+        <div className="shrink-0 sm:w-40">
           <Label>Name</Label>
         </div>
         <div className="relative w-full">
@@ -783,8 +783,8 @@ function PasswordCredentialContent({
       {onUrlChange !== undefined && (
         <>
           <Separator />
-          <div className="flex items-center gap-12">
-            <div className="w-40 shrink-0">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-12">
+            <div className="shrink-0 sm:w-40">
               <Label>
                 Login Page URL
                 {urlRequired && <span className="text-destructive"> *</span>}
@@ -801,8 +801,8 @@ function PasswordCredentialContent({
       )}
       {afterUrl}
       <Separator />
-      <div className="flex items-center gap-12">
-        <div className="w-40 shrink-0">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-12">
+        <div className="shrink-0 sm:w-40">
           <Label>Username or Email</Label>
         </div>
         <div className="relative w-full">
@@ -825,8 +825,8 @@ function PasswordCredentialContent({
           )}
         </div>
       </div>
-      <div className="flex items-center gap-12">
-        <div className="w-40 shrink-0">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-12">
+        <div className="shrink-0 sm:w-40">
           <Label>Password</Label>
         </div>
         {valuesReadOnly ? (
@@ -1019,8 +1019,8 @@ function PasswordCredentialContent({
                 <>
                   {authenticatorPrecedenceNotice}
                   <div className="space-y-2">
-                    <div className="flex items-center gap-12">
-                      <div className="w-40 shrink-0">
+                    <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-12">
+                      <div className="shrink-0 sm:w-40">
                         <Label>{totpIdentifierLabel}</Label>
                       </div>
                       <div className="w-full">
@@ -1159,8 +1159,8 @@ function PasswordCredentialContent({
               {totpMethod === "authenticator" && (
                 <div className="space-y-4">
                   {authenticatorTypeSelector}
-                  <div className="flex items-center gap-12">
-                    <div className="w-40 shrink-0">
+                  <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-12">
+                    <div className="shrink-0 sm:w-40">
                       <Label className="whitespace-nowrap">
                         Authenticator Key
                         <span className="text-destructive"> *</span>

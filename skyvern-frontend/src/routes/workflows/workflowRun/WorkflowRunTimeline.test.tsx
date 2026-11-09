@@ -6,6 +6,7 @@ import {
   fireEvent,
   render,
   screen,
+  waitFor,
   within,
 } from "@testing-library/react";
 import {
@@ -23,6 +24,16 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 
 import { Status } from "@/api/types";
+import { EXTERNAL_BROWSER_DIAGNOSTIC } from "@/routes/streaming/StreamDiagnostics";
+import {
+  FakeStreamSocket,
+  SCREENCAST_PATH,
+  closeVncAndServeFrame,
+  expectForcedCdpFrame,
+  expectUnforcedInputSocket,
+  socketsAt,
+  stubAnimationFrame,
+} from "@/testUtils/fakeStreamSocket";
 import type {
   WorkflowRunBlock,
   WorkflowRunTimelineBlockItem as TimelineBlockItem,
@@ -42,6 +53,8 @@ const mocks = vi.hoisted(() => ({
   timeline: undefined as unknown,
   statusUnavailable: false,
   timelineQuery: vi.fn(),
+  streamTransport: "cdp" as string | undefined,
+  isExternal: false,
 }));
 
 vi.mock("../hooks/useWorkflowRunQuery", () => ({
@@ -62,8 +75,25 @@ vi.mock("../hooks/useWorkflowRunTimelineQuery", () => ({
   },
 }));
 vi.mock("@/hooks/useRuntimeConfig", () => ({
-  useStreamTransport: () => ({ streamTransport: "cdp" }),
+  useStreamTransport: () => ({
+    streamTransport: mocks.streamTransport,
+    isExternal: mocks.isExternal,
+  }),
 }));
+vi.mock("@/components/BrowserStream", () => ({
+  BrowserStream: ({ onClose }: { onClose: () => void }) => (
+    <button type="button" data-testid="vnc-stream" onClick={onClose} />
+  ),
+}));
+vi.mock("@/util/env", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/util/env")>()),
+  newWssBaseUrl: "ws://127.0.0.1:8000/api/v1",
+  getWebSocketProtocols: async () => ["skyvern.v1", "apikey.test"],
+}));
+vi.mock("@/hooks/useCredentialGetter", () => {
+  const credentialGetter = async () => null;
+  return { useCredentialGetter: () => credentialGetter };
+});
 vi.mock("./RunHealChip", () => ({ RunHealChip: () => null }));
 vi.mock("./RunReliabilityUplink", () => ({ RunReliabilityUplink: () => null }));
 vi.mock("./WorkflowRunBlockScreenshot", () => ({
@@ -209,6 +239,8 @@ afterEach(() => {
   mocks.timeline = undefined;
   mocks.statusUnavailable = false;
   mocks.timelineQuery.mockClear();
+  mocks.streamTransport = "cdp";
+  mocks.isExternal = false;
 });
 
 describe("WorkflowRunTimeline", () => {
@@ -997,4 +1029,80 @@ it.each([
   expect(
     screen.getByRole("button", { name: /Attempt 2.*failed/ }),
   ).toBeTruthy();
+});
+
+describe("WorkflowRunOverview CDP fallback after a VNC close", () => {
+  const SESSION = "pbs_overview";
+  let client: QueryClient;
+
+  function renderOverview(status: Status = Status.Running) {
+    mocks.workflowRun = {
+      workflow_run_id: "wr_1",
+      status,
+      browser_session_id: SESSION,
+      workflow: {
+        workflow_definition: { blocks: [], finally_block_label: null },
+      },
+    };
+    mocks.timeline = [];
+    return render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={["/"]}>
+          <WorkflowRunOverview />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+  }
+
+  beforeEach(() => {
+    client = new QueryClient();
+    mocks.streamTransport = "vnc";
+    stubAnimationFrame();
+    vi.stubGlobal("WebSocket", FakeStreamSocket);
+  });
+
+  afterEach(() => {
+    cleanup();
+    client.clear();
+    FakeStreamSocket.instances.length = 0;
+    vi.unstubAllGlobals();
+    vi.stubGlobal("ResizeObserver", MockResizeObserver);
+  });
+
+  it("renders a frame from a force_cdp screencast instead of the 4001 panel", async () => {
+    renderOverview();
+    expect(socketsAt(SCREENCAST_PATH)).toHaveLength(0);
+    const socket = await closeVncAndServeFrame("frame-1");
+    await expectForcedCdpFrame(socket, SESSION, "frame-1");
+  });
+
+  it("keeps the paused run's input socket on its own unforced path", async () => {
+    renderOverview(Status.Paused);
+    const socket = await closeVncAndServeFrame("frame-2");
+    await expectForcedCdpFrame(socket, SESSION, "frame-2");
+    expectUnforcedInputSocket(SESSION);
+  });
+
+  it("opens the screencast without force_cdp on the cdp transport", async () => {
+    mocks.streamTransport = "cdp";
+    renderOverview();
+    expect(screen.queryByTestId("vnc-stream")).toBeNull();
+    await waitFor(() => expect(socketsAt(SCREENCAST_PATH)).toHaveLength(1));
+    expect(new URL(socketsAt(SCREENCAST_PATH)[0]!.url).search).toBe("");
+  });
+
+  it("opens no socket for an external browser", async () => {
+    mocks.isExternal = true;
+    renderOverview();
+    await act(async () => {});
+    expect(FakeStreamSocket.instances).toHaveLength(0);
+    expect(screen.getByText(EXTERNAL_BROWSER_DIAGNOSTIC.title)).toBeTruthy();
+  });
+
+  it("stays on VNC with no screencast socket until VNC closes", async () => {
+    renderOverview();
+    await act(async () => {});
+    expect(screen.getByTestId("vnc-stream")).toBeTruthy();
+    expect(socketsAt(SCREENCAST_PATH)).toHaveLength(0);
+  });
 });

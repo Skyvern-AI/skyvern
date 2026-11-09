@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -9,6 +10,7 @@ import {
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { useContext } from "react";
 
+import { toast } from "@/components/ui/use-toast";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { AxiosError } from "axios";
 
@@ -20,15 +22,18 @@ import {
 } from "@/store/WorkflowYamlEditorStore";
 import { useWorkflowSnapshotStore } from "@/store/WorkflowSnapshotStore";
 
-import { DocEditBar, DocStepPicker } from "./DocEditing";
+import { DocEditableLine, DocEditBar, DocStepPicker } from "./DocEditing";
+import { useDocSaveFailureStore } from "./docSaveState";
 import { caretOnEdge } from "./docCaret";
 import { DocStepHeader } from "./DocStep";
 import { WorkflowDocActionsContext } from "./WorkflowDocActionsContext";
 import { createDocEditApi, TOP_SCOPE } from "./docEditApi";
+import { clearDocAnnouncement, docAnnouncement } from "./docAnnounce";
 import type { DocGraph } from "./docGraphEdits";
 import { getElements } from "../workflowEditorUtils";
 import { isWorkflowBlockNode } from "../nodes";
-import { block, settings } from "./docTestBlocks";
+import { block, code, forLoop, settings } from "./docTestBlocks";
+import { docStepProblems } from "./docProblems";
 
 const save = vi.hoisted(() => vi.fn(async () => undefined));
 const catalogState = vi.hoisted(() => ({
@@ -36,9 +41,14 @@ const catalogState = vi.hoisted(() => ({
     | Array<{ id: string; status: "live" | "comingSoon" }>
     | undefined,
 }));
+vi.mock("@/components/ui/use-toast", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/components/ui/use-toast")>()),
+  toast: vi.fn(),
+}));
 vi.mock("../hooks/useSaveWorkflow", () => ({ useSaveWorkflow: () => save }));
 vi.mock("./useDocRun", () => ({
   useDocRun: () => ({
+    rowsLoaded: true,
     runId: undefined,
     run: undefined,
     blocksByLabel: new Map(),
@@ -60,6 +70,8 @@ afterEach(() => {
   useWorkflowHistoryAccessStore.getState().reset();
   useWorkflowSnapshotStore.getState().clearSnapshot();
   useWorkflowHasChangesStore.setState({ hasChanges: false });
+  useWorkflowYamlEditorStore.setState({ editorOwner: null, pendingSaves: {} });
+  useDocSaveFailureStore.setState({ failures: {} });
 });
 
 describe("Doc edit bar row", () => {
@@ -110,6 +122,9 @@ describe("Doc Save", () => {
   });
 
   test("a failed save says why, keeps the edit and offers Try again", async () => {
+    useWorkflowYamlEditorStore.setState({
+      editorOwner: { workflowPermanentId: "wpid_1", active: true },
+    });
     useWorkflowHasChangesStore.setState({ hasChanges: true });
     save.mockRejectedValueOnce(new AxiosError("Network Error", "ERR_NETWORK"));
     render(<DocEditBar />);
@@ -146,13 +161,59 @@ describe("Doc Save", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
-    await screen.findByText(/Couldn't save/);
-    const pendingSaves = useWorkflowYamlEditorStore.getState().pendingSaves;
-    expect(pendingSaves.wpid_a).toBeUndefined();
-    expect(pendingSaves.wpid_b?.persisting).toBe(true);
+    await waitFor(() =>
+      expect(
+        useWorkflowYamlEditorStore.getState().pendingSaves.wpid_a,
+      ).toBeUndefined(),
+    );
+    expect(
+      useWorkflowYamlEditorStore.getState().pendingSaves.wpid_b?.persisting,
+    ).toBe(true);
+    // The reason belongs to the workflow that failed, not to the one now open.
+    expect(useDocSaveFailureStore.getState().failures).toEqual({
+      wpid_a: "can't reach the server",
+    });
+    expect(screen.queryByText(/Couldn't save/)).toBe(null);
+  });
+
+  test("a failure recorded for another workflow does not show on this bar", () => {
     useWorkflowYamlEditorStore.setState({
-      editorOwner: null,
-      pendingSaves: {},
+      editorOwner: { workflowPermanentId: "wpid_b", active: true },
+    });
+    useDocSaveFailureStore.setState({
+      failures: { wpid_a: "can't reach the server" },
+    });
+    useWorkflowHasChangesStore.setState({ hasChanges: true });
+    render(<DocEditBar />);
+
+    expect(screen.queryByText(/Couldn't save/)).toBe(null);
+    expect(screen.getByRole("button", { name: "Save" })).toBeTruthy();
+  });
+
+  test("the bar drops only its own workflow's failure when the Doc unmounts or has no unsaved changes", () => {
+    useWorkflowYamlEditorStore.setState({
+      editorOwner: { workflowPermanentId: "wpid_1", active: true },
+    });
+    const failures = {
+      wpid_1: "can't reach the server",
+      wpid_2: "the server had a problem",
+    };
+    useDocSaveFailureStore.setState({ failures });
+    useWorkflowHasChangesStore.setState({ hasChanges: true });
+    const { unmount } = render(<DocEditBar />);
+    expect(
+      screen.getByText(/Couldn't save: can't reach the server/),
+    ).toBeTruthy();
+    unmount();
+    expect(useDocSaveFailureStore.getState().failures).toEqual({
+      wpid_2: "the server had a problem",
+    });
+
+    useDocSaveFailureStore.setState({ failures });
+    render(<DocEditBar />);
+    act(() => useWorkflowHasChangesStore.getState().setHasChanges(false));
+    expect(useDocSaveFailureStore.getState().failures).toEqual({
+      wpid_2: "the server had a problem",
     });
   });
 
@@ -245,6 +306,101 @@ describe("Add a step search", () => {
     );
     expect(tag.getAttribute("aria-expanded")).toBe("false");
     expect(screen.queryByPlaceholderText("Turn into…")).toBeNull();
+    expect(docAnnouncement()).toBe("Turned into Wait");
+  });
+
+  describe("grip menu announcements", () => {
+    function setup() {
+      clearDocAnnouncement();
+      const graph = getElements(
+        [
+          block("text_prompt", "first", null, { prompt: "A", parameters: [] }),
+          block("text_prompt", "second", null, { prompt: "B", parameters: [] }),
+        ],
+        settings(),
+        true,
+      ) as DocGraph;
+      const node = graph.nodes.filter(isWorkflowBlockNode)[1]!;
+      const edit = createDocEditApi({
+        ...graph,
+        edits: {
+          apply: () => {},
+          update: () => {},
+          addStep: () => null,
+          duplicate: () => {},
+        },
+        finallyId: null,
+        workflowId: "wpid_test",
+        selectBranch: () => {},
+        selectedBranch: () => undefined,
+        inputKeys: [],
+        credentialKeys: new Set(),
+      });
+      function Header() {
+        const actions = useContext(WorkflowDocActionsContext);
+        return (
+          <WorkflowDocActionsContext.Provider
+            value={{
+              ...actions,
+              editable: true,
+              edit,
+              outputUsers: () => [],
+              destinations: () => [
+                {
+                  label: "Top of the doc",
+                  scope: TOP_SCOPE,
+                  index: 0,
+                  insideOf: null,
+                },
+              ],
+            }}
+          >
+            <DocStepHeader
+              node={node}
+              editable
+              showRunControl={false}
+              place={{ scope: TOP_SCOPE, index: 1, count: 2, isFinally: false }}
+            />
+          </WorkflowDocActionsContext.Provider>
+        );
+      }
+      render(<Header />);
+      fireEvent.click(
+        screen.getByRole("button", { name: /step second, actions/ }),
+      );
+    }
+
+    test("Move up says so", async () => {
+      setup();
+      fireEvent.click(screen.getByRole("menuitem", { name: "Move up" }));
+      expect(docAnnouncement()).toBe("Moved up");
+    });
+
+    test("Move to… names the place", async () => {
+      setup();
+      fireEvent.click(screen.getByRole("menuitem", { name: "Move to…" }));
+      fireEvent.click(await screen.findByText("Top of the doc"));
+      await waitFor(() =>
+        expect(docAnnouncement()).toBe("Moved to Top of the doc"),
+      );
+    });
+
+    test("Duplicate and Delete name the step", async () => {
+      setup();
+      fireEvent.click(screen.getByRole("menuitem", { name: "Duplicate" }));
+      await waitFor(() => expect(docAnnouncement()).toBe("Duplicated second"));
+      fireEvent.click(
+        screen.getByRole("button", { name: /step second, actions/ }),
+      );
+      fireEvent.click(screen.getByRole("menuitem", { name: "Delete" }));
+      // Delete keeps its toast, which announces itself; the announcer stays silent so it is not read twice.
+      await waitFor(() =>
+        expect(toast).toHaveBeenCalledWith(
+          expect.objectContaining({ title: "Deleted second" }),
+        ),
+      );
+      expect(docAnnouncement()).not.toMatch(/Deleted/);
+    });
   });
 
   test("Power BI is offered only when the served catalog marks it live", () => {
@@ -258,14 +414,107 @@ describe("Add a step search", () => {
     expect(screen.getByRole("option", { name: /Power BI Query/ })).toBeTruthy();
   });
 
-  test("an exact step name comes first, above steps that only mention it", () => {
-    render(<DocStepPicker onPick={() => {}} />);
-    fireEvent.change(screen.getByPlaceholderText("Add a step…"), {
-      target: { value: "Wait" },
-    });
+  test.each([false, true])(
+    "an exact step name comes first, above steps that only mention it (Demonstrate offered: %s)",
+    (withDemonstrate) => {
+      render(
+        <DocStepPicker
+          onPick={() => {}}
+          onDemonstrate={withDemonstrate ? () => {} : undefined}
+        />,
+      );
+      fireEvent.change(screen.getByPlaceholderText("Add a step…"), {
+        target: { value: "Wait" },
+      });
+      const options = screen.getAllByRole("option");
+      expect(options[0]!.textContent).toMatch(/^Wait/);
+      expect(options[0]!.getAttribute("aria-selected")).toBe("true");
+    },
+  );
+
+  function enterPick(query: string, withDemonstrate: boolean) {
+    let picked = "nothing";
+    render(
+      <DocStepPicker
+        onPick={(type) => {
+          picked = type;
+        }}
+        onDemonstrate={
+          withDemonstrate
+            ? () => {
+                picked = "demonstrate";
+              }
+            : undefined
+        }
+      />,
+    );
+    const input = screen.getByPlaceholderText("Add a step…");
+    fireEvent.change(input, { target: { value: query } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    cleanup();
+    return picked;
+  }
+
+  test.each([
+    "co",
+    "te",
+    "task",
+    "ac",
+    "em",
+    "re",
+    "wait",
+    "if",
+    "for",
+    "email",
+    "browser",
+    "loop",
+    "text",
+  ])(
+    "Enter after %j picks the same step whether Demonstrate is offered or not",
+    (query) => {
+      const without = enterPick(query, false);
+      expect(without).not.toBe("nothing");
+      expect(enterPick(query, true)).toBe(without);
+    },
+  );
+
+  test.each(["co", "re"])(
+    "a %j query leaves Demonstrate task out of the list",
+    (query) => {
+      render(<DocStepPicker onPick={() => {}} onDemonstrate={() => {}} />);
+      fireEvent.change(screen.getByPlaceholderText("Add a step…"), {
+        target: { value: query },
+      });
+      expect(
+        screen.queryByRole("option", { name: /Demonstrate task/ }),
+      ).toBeNull();
+    },
+  );
+
+  test("Demonstrate task is the first item while nothing is typed", () => {
+    render(<DocStepPicker onPick={() => {}} onDemonstrate={() => {}} />);
     const options = screen.getAllByRole("option");
-    expect(options[0]!.textContent).toMatch(/^Wait/);
+    expect(options[0]!.textContent).toMatch(/^Demonstrate task/);
     expect(options[0]!.getAttribute("aria-selected")).toBe("true");
+  });
+
+  test.each(["demonstrate", "demo"])(
+    "Enter after %j starts a demonstration",
+    (query) => {
+      expect(enterPick(query, true)).toBe("demonstrate");
+    },
+  );
+
+  test("a query that matches a step and Demonstrate lists Demonstrate after the step", () => {
+    render(<DocStepPicker onPick={() => {}} onDemonstrate={() => {}} />);
+    fireEvent.change(screen.getByPlaceholderText("Add a step…"), {
+      target: { value: "task" },
+    });
+    const names = screen.getAllByRole("option").map((o) => o.textContent);
+    const demonstrate = names.findIndex((n) =>
+      n?.startsWith("Demonstrate task"),
+    );
+    expect(demonstrate).toBeGreaterThan(0);
   });
 
   test("the words the Doc shows put Conditional and Loop first, even when another group mentions them", () => {
@@ -311,5 +560,114 @@ describe("caretOnEdge", () => {
       [proto.getClientRects, proto.getBoundingClientRect] = saved;
       el.remove();
     }
+  });
+});
+
+describe("@ in a loop's list", () => {
+  beforeEach(() => {
+    globalThis.ResizeObserver ??= class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    } as unknown as typeof ResizeObserver;
+    Element.prototype.scrollIntoView ??= () => {};
+  });
+  afterEach(() => {
+    Reflect.deleteProperty(document, "execCommand");
+  });
+
+  test("Enter on the array field fills the slot with its list, not a new input, and the loop can run", () => {
+    let current = getElements(
+      [
+        block("extraction", "extraction_1", "books", {
+          data_extraction_goal: "List the titles",
+          data_schema: {
+            type: "object",
+            properties: { titles: { type: "array" } },
+          },
+        }),
+        forLoop("books", null, [code("inner", null)], {
+          loop_over: null,
+          loop_variable_reference: null,
+        }),
+      ],
+      settings(),
+      true,
+    ) as DocGraph;
+    const edit = createDocEditApi({
+      ...current,
+      edits: {
+        apply: (next) => {
+          current = next;
+        },
+        update: (change) => {
+          current = { ...current, nodes: change(current.nodes) };
+        },
+        addStep: () => null,
+        duplicate: () => {},
+      },
+      finallyId: null,
+      workflowId: "wpid_test",
+      selectBranch: () => {},
+      selectedBranch: () => undefined,
+      inputKeys: [],
+      credentialKeys: new Set(),
+    });
+    const loopId = current.nodes.find((n) => n.type === "loop")!.id;
+    const created: string[] = [];
+    function Line() {
+      const actions = useContext(WorkflowDocActionsContext);
+      return (
+        <WorkflowDocActionsContext.Provider
+          value={{
+            ...actions,
+            createInput: (key) => {
+              created.push(key);
+              return true;
+            },
+          }}
+        >
+          <DocEditableLine
+            value=""
+            editable
+            autoFocus
+            label="books description"
+            references={() => edit.references(loopId, false)}
+            onChange={(v) => edit.setText(loopId, "description", v)}
+          />
+        </WorkflowDocActionsContext.Provider>
+      );
+    }
+    render(<Line />);
+    const line = screen.getByRole("textbox", { name: "books description" });
+    // jsdom has neither execCommand nor innerText: type the text the way the browser would.
+    Object.assign(document, {
+      execCommand: (_command: string, _ui: boolean, text: string) => {
+        Object.defineProperty(line, "innerText", {
+          value: text,
+          configurable: true,
+        });
+        fireEvent.input(line);
+        return true;
+      },
+    });
+    fireEvent.keyDown(line, { key: "@" });
+    expect(
+      screen.getByRole("option", {
+        name: "titlesList in extraction_1_output",
+      }),
+    ).toBeTruthy();
+    const search = screen.getByPlaceholderText("Insert a reference…");
+    fireEvent.change(search, { target: { value: "titles" } });
+    fireEvent.keyDown(search, { key: "Enter" });
+
+    expect(screen.queryByRole("option")).toBeNull();
+    expect(created).toEqual([]);
+    const loop = current.nodes.find((n) => n.id === loopId)!;
+    expect(loop.data).toMatchObject({
+      loopVariableReference:
+        "{{ extraction_1_output.extracted_information.titles }}",
+    });
+    expect(docStepProblems(current.nodes).has(loopId)).toBe(false);
   });
 });

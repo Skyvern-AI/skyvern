@@ -357,6 +357,7 @@ export type AgentStepBlockYAML = BlockYAMLBase & {
   prompt: string;
   data_schema: Record<string, unknown> | string | null;
   max_turns: number;
+  model?: WorkflowModel | null;
   tools?: Array<string> | null;
   parameter_keys?: Array<string> | null;
 };
@@ -481,6 +482,7 @@ export type SendEmailBlockYAML = BlockYAMLBase & {
   credential_id?: string | null;
   cc?: Array<string>;
   bcc?: Array<string>;
+  reply_to_message_id?: string | null;
 };
 
 export type FileUrlParserBlockYAML = BlockYAMLBase & {
@@ -600,6 +602,7 @@ export type EmailInboxBlockYAML = BlockYAMLBase & {
   max_results: number;
   include_body: boolean;
   download_attachments: boolean;
+  message_id?: string | null;
   parameter_keys?: Array<string> | null;
 };
 

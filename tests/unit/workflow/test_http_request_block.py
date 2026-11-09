@@ -46,6 +46,7 @@ def _make_context(
     context.browser_session_id = None
     context.mask_secrets = False
     context.credential_tested_urls = {}
+    context.credential_extra_site_urls = {}
     context.bitwarden_login_sites = {}
     return context
 
@@ -1100,6 +1101,37 @@ class TestHttpRequestBlockCredentialSiteConfinement:
 
         assert result.success is True
         assert sent["data"] == {"password": "hunter2-secret"}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("extra_sites", "url", "sent_expected"),
+        [
+            (["https://idp.example.org/login"], "https://auth.example.org/token", True),
+            (["https://idp.example.org/login"], "https://collector.example.net/ingest", False),
+            ([], "https://auth.example.org/token", False),
+        ],
+        ids=["added-site", "other-site", "no-added-site"],
+    )
+    async def test_execute_sends_a_credential_to_a_site_added_to_its_login_and_no_other(
+        self, monkeypatch: pytest.MonkeyPatch, extra_sites: list[str], url: str, sent_expected: bool
+    ) -> None:
+        context = _context_with_credential("https://login.example.com/login")
+        context.credential_extra_site_urls = {"login_credentials": extra_sites} if extra_sites else {}
+        block = _http_block(url=url, body={"password": "{{ login_credentials.password }}"})
+        sent: dict[str, object] = {}
+
+        async def fake_aiohttp_request(**kwargs: object) -> tuple[int, dict[str, str], dict[str, object]]:
+            sent.update(kwargs)
+            return 200, {"Content-Type": "application/json"}, {"ok": True}
+
+        monkeypatch.setattr(HttpRequestBlock, "get_workflow_run_context", lambda _self, _workflow_run_id: context)
+        monkeypatch.setattr(block_module, "aiohttp_request", fake_aiohttp_request)
+        monkeypatch.setattr(block_module.app, "DATABASE", AsyncMock())
+
+        result = await block.execute(workflow_run_id="wr-1", workflow_run_block_id="wrb-1")
+
+        assert result.success is sent_expected
+        assert bool(sent) is sent_expected
 
     @pytest.mark.asyncio
     async def test_execute_allows_a_request_carrying_no_credential(self, monkeypatch: pytest.MonkeyPatch) -> None:

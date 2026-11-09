@@ -104,6 +104,7 @@ function RunLiveStreamTransport({
         showControlButtons={interactive}
         onUrlChange={onUrlChange}
         onStreamStateChange={onStreamStateChange}
+        forceCdp={vncFailed}
         centered
       />
     );

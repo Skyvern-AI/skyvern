@@ -41,6 +41,7 @@ from skyvern.forge.sdk.copilot.agent_context import (
     SdkActionWorkflowRunCacheKey,
 )
 from skyvern.forge.sdk.copilot.build_test_connect_failure import (
+    BROWSER_TOOLS_UNAVAILABLE_ERROR,
     SUPERSEDED_BY_NEWER_TEST_REASON,
     BuildTestConnectFailure,
     build_test_connect_failure_sentence,
@@ -381,17 +382,6 @@ def effective_browser_session_id(ctx: AgentContext) -> str | None:
     ``ctx.browser_session_id`` describes the chat's page while the call acts on another.
     """
     return _CALL_BROWSER_SESSION_ID.get() or ctx.browser_session_id
-
-
-BROWSER_TOOLS_UNAVAILABLE_ERROR = "Browser tools are unavailable on this turn."
-RAW_SECRET_BROWSER_ERROR = (
-    "This turn withheld a value that may be a secret. Do not use the browser; persist only the redacted draft and call "
-    "`request_credential` with the user's sign-in URL so they can connect a saved credential before testing."
-)
-
-
-def raw_secret_browser_denied(ctx: AgentContext) -> bool:
-    return ctx.request_policy is not None and ctx.request_policy.raw_secret_detected
 
 
 def browser_session_lock(ctx: AgentContext, *, session_id: str | None = None) -> asyncio.Lock:
@@ -1223,12 +1213,6 @@ def _browser_session_denial(ctx: AgentContext) -> BuildTestConnectFailure | None
             browser_session_id=ctx.browser_session_id,
             diagnostic=BROWSER_TOOLS_UNAVAILABLE_ERROR,
         )
-    if raw_secret_browser_denied(ctx):
-        return BuildTestConnectFailure(
-            state="provisioning_unavailable",
-            browser_session_id=ctx.browser_session_id,
-            diagnostic=RAW_SECRET_BROWSER_ERROR,
-        )
     return None
 
 
@@ -1282,7 +1266,7 @@ async def acquire_fresh_exit_browser_session(
 
 
 def browser_session_acquisition_failure_sentence(failure: BuildTestConnectFailure) -> str:
-    if failure.diagnostic in (BROWSER_TOOLS_UNAVAILABLE_ERROR, RAW_SECRET_BROWSER_ERROR):
+    if failure.diagnostic == BROWSER_TOOLS_UNAVAILABLE_ERROR:
         return failure.diagnostic
     if failure.state == "billing_credit_admission_refusal":
         return "Browser session did not start because credits are exhausted. Upgrade your plan in Billing."

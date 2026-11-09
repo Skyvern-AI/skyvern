@@ -2,14 +2,7 @@ import { getClient } from "@/api/AxiosClient";
 import { Status, TaskApiResponse } from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
 import { StatusFilterDropdown } from "@/components/StatusFilterDropdown";
-import {
-  Pagination,
-  PaginationContent,
-  PaginationItem,
-  PaginationLink,
-  PaginationNext,
-  PaginationPrevious,
-} from "@/components/ui/pagination";
+import { SimplePagination } from "@/components/ui/pagination";
 import {
   Table,
   TableBody,
@@ -24,7 +17,6 @@ import { TagChipList } from "@/routes/workflows/components/tagging/TagChipList";
 import { useTagKeysQuery } from "@/routes/workflows/hooks/useTagKeysQuery";
 import { useTagValuesQuery } from "@/routes/workflows/hooks/useTagValuesQuery";
 import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
-import { cn } from "@/util/utils";
 import { useQuery } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
@@ -36,6 +28,8 @@ import { downloadBlob } from "@/util/downloadBlob";
 import { useRunTagsBatchQuery } from "../hooks/useRunTagsBatchQuery";
 
 const EMPTY_LABEL_SUGGESTIONS: Array<string> = [];
+
+const PAGE_SIZE = 10;
 
 function TaskHistory() {
   const credentialGetter = useCredentialGetter();
@@ -57,6 +51,7 @@ function TaskHistory() {
 
       const params = new URLSearchParams();
       params.append("page", String(page));
+      params.append("page_size", String(PAGE_SIZE));
       statusFilters.forEach((status) => {
         params.append("task_status", status);
       });
@@ -139,9 +134,9 @@ function TaskHistory() {
 
   return (
     <div className="space-y-4">
-      <header className="flex items-center justify-between">
+      <header className="flex flex-wrap items-center justify-between gap-y-2">
         <h1 className="text-2xl">Task Runs</h1>
-        <div className="flex gap-2">
+        <div className="flex flex-wrap gap-2">
           <StatusFilterDropdown
             values={statusFilters}
             onChange={(values) => {
@@ -238,35 +233,16 @@ function TaskHistory() {
             )}
           </TableBody>
         </Table>
-        <Pagination className="pt-2">
-          <PaginationContent>
-            <PaginationItem>
-              <PaginationPrevious
-                className={cn({ "cursor-not-allowed": page === 1 })}
-                onClick={() => {
-                  if (page === 1) {
-                    return;
-                  }
-                  const params = new URLSearchParams();
-                  params.set("page", String(Math.max(1, page - 1)));
-                  setSearchParams(params, { replace: true });
-                }}
-              />
-            </PaginationItem>
-            <PaginationItem>
-              <PaginationLink>{page}</PaginationLink>
-            </PaginationItem>
-            <PaginationItem>
-              <PaginationNext
-                onClick={() => {
-                  const params = new URLSearchParams();
-                  params.set("page", String(page + 1));
-                  setSearchParams(params, { replace: true });
-                }}
-              />
-            </PaginationItem>
-          </PaginationContent>
-        </Pagination>
+        <SimplePagination
+          className="pt-2"
+          page={page}
+          hasNext={(tasks?.length ?? 0) >= PAGE_SIZE}
+          onPageChange={(nextPage) => {
+            const params = new URLSearchParams();
+            params.set("page", String(nextPage));
+            setSearchParams(params, { replace: true });
+          }}
+        />
       </div>
     </div>
   );

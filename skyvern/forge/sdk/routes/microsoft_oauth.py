@@ -136,8 +136,18 @@ async def microsoft_oauth_authorize(
             credential_name=request.credential_name,
             scope_profile=request.scope_profile,
             app_origin=request.app_origin,
+            credential_id=request.credential_id,
             initiator_id=current_user_id,
         )
+    except microsoft_oauth_service.CredentialNotReauthorizableError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (
+        microsoft_oauth_service.ReconnectIdentityUnavailableError,
+        microsoft_oauth_service.IncompatibleScopeProfileError,
+    ) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except microsoft_oauth_service.PowerBIReconnectAccessDenied as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     except InvalidAppOriginError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except microsoft_oauth_service.UnsupportedScopeProfileError as exc:
@@ -195,7 +205,12 @@ async def microsoft_oauth_callback(
         LOG.exception("Microsoft OAuth client credentials not configured")
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except microsoft_oauth_service.MicrosoftOAuthError as exc:
-        LOG.warning("Microsoft OAuth exchange failed", error=str(exc))
+        LOG.warning(
+            "Microsoft OAuth exchange failed",
+            error_type=type(exc).__name__,
+            status_code=exc.status_code,
+            error_code=exc.error_code,
+        )
         raise HTTPException(
             status_code=400,
             detail="Microsoft authorization failed. Please reconnect the Microsoft account.",
@@ -214,6 +229,31 @@ async def microsoft_oauth_callback(
             detail="No refresh token received. Ensure offline_access is included in the OAuth flow.",
         )
     scopes_granted = _require_scopes_from_token(token_data)
+    tenant_id, object_id = microsoft_oauth_service.identity_from_id_token(token_data.get("id_token"))
+    is_reconnect = context.state in {
+        microsoft_oauth_service.STATE_ACTIVE,
+        microsoft_oauth_service.STATE_ERROR,
+    }
+    if is_reconnect:
+        if not (tenant_id and object_id) or (tenant_id, object_id) != (context.tenant_id, context.object_id):
+            raise HTTPException(
+                status_code=409,
+                detail="Reconnect with the same Microsoft account. The previous connection is unchanged.",
+            )
+        openid_scopes = {"openid", "profile", "email", "offline_access"}
+        required_scopes = [
+            scope for scope in context.scopes_granted or [] if scope.rsplit("/", 1)[-1] not in openid_scopes
+        ]
+        required_scopes.append(
+            microsoft_oauth_service.POWERBI_DATASET_READ_SCOPE
+            if scope_profile == microsoft_oauth_service.MICROSOFT_OAUTH_SCOPE_PROFILE_POWERBI_DATASET_READ
+            else "Mail.Read"
+        )
+        if not microsoft_oauth_service.has_required_scopes(scopes_granted, required_scopes):
+            raise HTTPException(
+                status_code=409,
+                detail="Grant every required Microsoft permission and try again. The previous connection is unchanged.",
+            )
     if scope_profile == microsoft_oauth_service.MICROSOFT_OAUTH_SCOPE_PROFILE_POWERBI_DATASET_READ:
         if not microsoft_oauth_service.is_powerbi_scope_profile(context.scopes_requested, scopes_granted):
             raise HTTPException(
@@ -227,21 +267,7 @@ async def microsoft_oauth_callback(
             detail="Microsoft did not grant Mail.Read. Please re-connect and accept all requested permissions.",
         )
 
-    prior_state = None
-    prior_state_known = False
-    try:
-        prior_state = await app.DATABASE.microsoft_oauth.get_credential_state(
-            current_org.organization_id, context.credential_id
-        )
-        prior_state_known = True
-    except Exception:
-        LOG.warning(
-            "Failed to read Microsoft OAuth credential state before promotion",
-            organization_id=current_org.organization_id,
-            credential_id=context.credential_id,
-            exc_info=True,
-        )
-    tenant_id, object_id = microsoft_oauth_service.identity_from_id_token(token_data.get("id_token"))
+    prior_state = context.state
     try:
         credential = await microsoft_oauth_service.promote_pending_credential(
             organization_id=current_org.organization_id,
@@ -257,7 +283,7 @@ async def microsoft_oauth_callback(
     except microsoft_oauth_service.EncryptionNotConfiguredError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
-    if not prior_state_known or prior_state in {
+    if prior_state in {
         microsoft_oauth_service.STATE_ACTIVE,
         microsoft_oauth_service.STATE_ERROR,
     }:
@@ -275,29 +301,22 @@ async def microsoft_oauth_callback(
             credential.id,
         )
 
-    if not prior_state_known:
+    try:
+        await app.AGENT_FUNCTION.on_integration_connected(
+            organization_id=current_org.organization_id,
+            provider="microsoft",
+            credential_id=credential.id,
+            is_reconnect=is_reconnect,
+            actor_user_id=current_user_id,
+            connected_at=credential.modified_at,
+        )
+    except Exception:
         LOG.warning(
-            "Skipping Microsoft integration lifecycle analytics because prior credential state is unknown",
+            "Microsoft integration lifecycle analytics hook failed",
             organization_id=current_org.organization_id,
             credential_id=credential.id,
+            exc_info=True,
         )
-    else:
-        try:
-            await app.AGENT_FUNCTION.on_integration_connected(
-                organization_id=current_org.organization_id,
-                provider="microsoft",
-                credential_id=credential.id,
-                is_reconnect=prior_state in {microsoft_oauth_service.STATE_ACTIVE, microsoft_oauth_service.STATE_ERROR},
-                actor_user_id=current_user_id,
-                connected_at=credential.modified_at,
-            )
-        except Exception:
-            LOG.warning(
-                "Microsoft integration lifecycle analytics hook failed",
-                organization_id=current_org.organization_id,
-                credential_id=credential.id,
-                exc_info=True,
-            )
 
     email_address = None
     should_resolve_email = True

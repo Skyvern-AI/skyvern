@@ -13515,6 +13515,14 @@
             "title": "Tested Url",
             "description": "Login page URL used during the credential test"
           },
+          "extra_site_urls": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Extra Site Urls",
+            "description": "More sites this login may sign in on, each covering its whole site"
+          },
           "user_context": {
             "anyOf": [
               {
@@ -13630,6 +13638,7 @@
           "bitwarden",
           "azure_vault",
           "gcp",
+          "aws_secrets_manager",
           "custom",
           "onepassword",
           "bitwarden_connected"
@@ -14743,6 +14752,17 @@
             ],
             "title": "Credential Id"
           },
+          "message_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Message Id"
+          },
           "folder": {
             "anyOf": [
               {
@@ -14972,6 +14992,17 @@
             ],
             "title": "Credential Id",
             "x-skyvern-connected-account": true
+          },
+          "message_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Message Id"
           },
           "folder": {
             "anyOf": [
@@ -24693,6 +24724,17 @@
             ],
             "title": "Credential Id"
           },
+          "reply_to_message_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reply To Message Id"
+          },
           "cc": {
             "items": {
               "type": "string"
@@ -24929,6 +24971,18 @@
             "title": "Credential Id",
             "description": "ID of a connected Google account that has send permission. Used only with transport 'gmail'.",
             "x-skyvern-connected-account": true
+          },
+          "reply_to_message_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reply To Message Id",
+            "description": "Gmail message ID to reply to in its original thread; requires send and read permissions."
           },
           "cc": {
             "items": {

@@ -54,6 +54,7 @@ vi.mock("./useDocRun", () => {
   const blocksByLabel = new Map();
   return {
     useDocRun: () => ({
+      rowsLoaded: true,
       runId: null,
       blocksByLabel,
       live: false,

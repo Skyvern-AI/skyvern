@@ -1,14 +1,13 @@
 """URL matching and dispatch order for network routing.
 
-Two production security guards depend on the exact semantics here -- `codeblock/egress_policy.py` and
-`cloud/webeye/copilot_candidate_network.py` -- and both fail *open* if the details are wrong, without
-raising anything. So the details are pinned rather than described:
+Two production security guards in Skyvern Cloud depend on the exact semantics here, and both fail *open* if the
+details are wrong, without raising anything. So the details are pinned rather than described:
 
 - Playwright's glob is not Chrome's. `*` does not cross `/`, `**` does, and `?` is a literal, not a
   wildcard. Matching happens in Python for that reason; Chrome's own matcher cannot express it.
 - Handlers dispatch last-registered-first, and a handler that calls `fallback()` hands down to the
-  next one. `cloud/agent_functions.py` registers the candidate guard last specifically so it runs
-  first, and the whole passthrough mechanism in `egress_policy.py` exists because `continue_()`
+  next one. The cloud agent functions register the candidate guard last specifically so it runs
+  first, and the whole passthrough mechanism in the egress policy exists because `continue_()`
   short-circuits the chain while `fallback()` does not.
 """
 
@@ -46,7 +45,7 @@ def test_playwright_glob_semantics(pattern: str, url: str, expected: bool) -> No
 
 
 def test_a_callable_pattern_is_asked_about_the_url() -> None:
-    """`cloud/webeye/favicon_blocker.py` passes a predicate precisely to avoid regex-on-full-URL."""
+    """A caller can pass a predicate precisely to avoid regex-on-full-URL."""
     assert url_matches(lambda url: url.endswith("favicon.ico"), "https://h.invalid/favicon.ico") is True
     assert url_matches(lambda url: url.endswith("favicon.ico"), "https://h.invalid/index.html") is False
 
@@ -57,7 +56,7 @@ def test_a_regex_pattern_is_searched_not_fullmatched() -> None:
 
 
 def test_handlers_run_last_registered_first() -> None:
-    """LIFO. cloud/agent_functions.py relies on it to keep the candidate guard ahead of the blocker."""
+    """LIFO. The cloud agent functions rely on it to keep the candidate guard ahead of the blocker."""
     table = RouteTable()
     order: list[str] = []
 

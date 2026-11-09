@@ -283,8 +283,8 @@ def _jinja_domain_filter(url: str) -> str:
     """Extract the domain (netloc) from a URL for use as a cache key grouping.
 
     Examples:
-        "https://jobs.lever.co/textnow/abc" → "jobs.lever.co"
-        "https://boards.greenhouse.io/robinhood/jobs/123" → "boards.greenhouse.io"
+        "https://jobs.example.com/acme/abc" → "jobs.example.com"
+        "https://boards.example.org/acme/jobs/123" → "boards.example.org"
     """
     try:
         return urllib.parse.urlparse(str(url)).netloc or str(url)

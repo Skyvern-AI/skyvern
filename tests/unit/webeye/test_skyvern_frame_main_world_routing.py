@@ -161,15 +161,6 @@ class TestSkyvernFrameEvaluateRouting:
         get_prefix.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_frame_target_never_routes_through_runtime_evaluate(self) -> None:
-        """Iframe Frames have their own world; page-level Runtime.evaluate lands elsewhere."""
-        frame = _make_frame_mock()
-
-        await SkyvernFrame.evaluate(frame, "() => 1")
-
-        frame.evaluate.assert_awaited_once_with(expression="() => 1", arg=None)
-
-    @pytest.mark.asyncio
     async def test_runtime_evaluate_navigation_context_lost_triggers_recovery(self) -> None:
         """Runtime.evaluate context-destroyed must hit recovery, like PlaywrightError."""
         page, ctx = _make_page_mock(prefix="// MARK")

@@ -87,6 +87,35 @@ def update_or_add_env_var(
     os.environ[key] = value
 
 
+def _configure_copilot_safety_model(
+    model_options: list[str],
+    chosen_model: str,
+    *,
+    env_path: Path | str | None = None,
+) -> None:
+    """Prompt for an explicit safety model while preserving an existing selection."""
+    console.print("\n[bold blue]--- Workflow Copilot Safety Model ---[/bold blue]")
+    console.print(
+        "Copilot requires an explicitly configured model to screen messages for secrets. "
+        "You can select the same model as your main model."
+    )
+    if env_path is None:
+        backend_env_path = resolve_backend_env_path(for_write=True)
+    else:
+        backend_env_path = Path(env_path).expanduser()
+    safety_model_default = (
+        dotenv_values(backend_env_path).get("WORKFLOW_COPILOT_LITE_LLM_KEY")
+        or os.environ.get("WORKFLOW_COPILOT_LITE_LLM_KEY")
+        or chosen_model
+    )
+    safety_model = Prompt.ask(
+        "Choose a Copilot safety model by model key",
+        choices=list(dict.fromkeys([*model_options, safety_model_default])),
+        default=safety_model_default,
+    )
+    update_or_add_env_var("WORKFLOW_COPILOT_LITE_LLM_KEY", safety_model, env_path=backend_env_path)
+
+
 def setup_llm_providers(env_path: Path | str | None = None) -> None:
     """Configure Large Language Model (LLM) Providers."""
 
@@ -261,26 +290,7 @@ def setup_llm_providers(env_path: Path | str | None = None) -> None:
         chosen_model = model_options[int(chosen_model_idx) - 1]
         console.print(f"🎉 [bold green]Chosen LLM Model: {chosen_model}[/bold green]")
         set_env_var("LLM_KEY", chosen_model)
-        console.print("\n[bold blue]--- Workflow Copilot Safety Model ---[/bold blue]")
-        console.print(
-            "Copilot requires an explicitly configured model to screen messages for secrets. "
-            "You can select the same model as your main model."
-        )
-        if env_path is None:
-            backend_env_path = resolve_backend_env_path(for_write=True)
-        else:
-            backend_env_path = Path(env_path).expanduser()
-        safety_model_default = (
-            dotenv_values(backend_env_path).get("WORKFLOW_COPILOT_LITE_LLM_KEY")
-            or os.environ.get("WORKFLOW_COPILOT_LITE_LLM_KEY")
-            or chosen_model
-        )
-        safety_model = Prompt.ask(
-            "Choose a Copilot safety model by model key",
-            choices=list(dict.fromkeys([*model_options, safety_model_default])),
-            default=safety_model_default,
-        )
-        set_env_var("WORKFLOW_COPILOT_LITE_LLM_KEY", safety_model)
+        _configure_copilot_safety_model(model_options, chosen_model, env_path=env_path)
         capture_setup_event(
             "llm-complete",
             success=True,

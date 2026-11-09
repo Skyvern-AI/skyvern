@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import inspect
 import json
 import textwrap
 import time
@@ -4078,11 +4077,6 @@ def _goto_only_result() -> dict:
             ],
         },
     }
-
-
-def test_interactive_run_execution_has_no_completion_verifier() -> None:
-    source = inspect.getsource(run_execution_module)
-    assert "_maybe_run_completion_verification" not in source
 
 
 @pytest.mark.asyncio

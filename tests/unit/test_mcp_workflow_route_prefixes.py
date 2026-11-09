@@ -10,7 +10,7 @@ If you're adding a new MCP workflow raw helper and this test fails, either
 (a) your new helper uses the wrong prefix for its responsibility, or
 (b) this test needs a new assertion entry for the new helper.
 
-See ``cloud_docs/fern-sdk/README.md`` for the rationale behind the split.
+The Skyvern Cloud Fern SDK runbook gives the rationale behind the split.
 """
 
 from __future__ import annotations
@@ -175,5 +175,5 @@ def test_no_hardcoded_workflow_routes_outside_constants() -> None:
         "Hardcoded workflow route literal(s) detected in _workflow_http.py:\n"
         + "\n".join(f"  {o}" for o in offenders)
         + "\n\nUse PUBLIC_WORKFLOW_ROUTE or INTERNAL_WORKFLOW_ROUTE constants instead. "
-        "See cloud_docs/fern-sdk/README.md."
+        "See the Skyvern Cloud Fern SDK runbook."
     )

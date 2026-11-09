@@ -412,7 +412,6 @@ def _ctx() -> MagicMock:
     ctx.workflow_id = "w_test"
     ctx.workflow_permanent_id = "wpid_test"
     ctx.organization_id = "o_test"
-    ctx.allow_untested_workflow_draft = False
     ctx.request_policy = RequestPolicy(allow_update_workflow=True, allow_run_blocks=True)
     ctx.code_artifact_metadata = {}
     ctx.code_authoring_guardrail_reject_count = 0
@@ -558,6 +557,7 @@ class _ListedCredential:
         self.credential_id = credential_id
         self.name = name
         self.tested_url = tested_url
+        self.extra_site_urls: list[str] = []
         self.credential_type = "password"
         self.username = None
         self.totp_type = None
@@ -683,9 +683,8 @@ def test_a_new_bitwarden_credit_card_binding_is_refused_but_one_the_workflow_had
 
 
 @pytest.mark.asyncio
-async def test_update_workflow_refuses_a_new_bitwarden_parameter_even_when_an_untested_draft_is_allowed() -> None:
+async def test_update_workflow_refuses_a_new_bitwarden_parameter() -> None:
     ctx = _ctx_with_policy()
-    ctx.allow_untested_workflow_draft = True
 
     result = await _update_workflow({"workflow_yaml": _LITERAL_BINDING}, ctx)
 

@@ -203,8 +203,8 @@ class OnePasswordCredentialVaultService(CredentialVaultService):
                         item_id=item.id,
                         title=item.title,
                         urls=websites,
-                        # An imported 1Password login fills only at its tested URL's origin, so it is not
-                        # placed anywhere wider before it is imported.
+                        # Before import, a 1Password login is admitted only at its tested URL's origin.
+                        # After import, its fill reaches the tested URL's release scope.
                         sites=(LoginSite(tested_url, whole_site=False),) if tested_url else (),
                         tested_url=tested_url,
                     )

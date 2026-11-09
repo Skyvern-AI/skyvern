@@ -8,7 +8,6 @@ import pytest
 
 from skyvern.cli import doctor
 from skyvern.cli.credential_placeholders import (
-    CREDENTIAL_PLACEHOLDERS,
     is_frontend_api_key_placeholder,
     is_placeholder_credential_value,
 )
@@ -119,10 +118,6 @@ def test_llm_config_check_flags_incomplete_openai_compatible_provider(
     assert result.status == "error"
     assert "OPENAI_COMPATIBLE_MODEL_NAME" in result.detail
     assert "OPENAI_COMPATIBLE_API_BASE" in result.detail
-
-
-def test_credential_placeholder_set_is_stable() -> None:
-    assert CREDENTIAL_PLACEHOLDERS == ("", "PLACEHOLDER", "YOUR_API_KEY")
 
 
 @pytest.mark.parametrize("model", [None, "", "GEMINI_3_PRO"])

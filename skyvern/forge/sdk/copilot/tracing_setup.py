@@ -1,7 +1,7 @@
 """Tracing helpers for the workflow copilot OpenAI Agents SDK integration.
 
-Tracing is dev-only and opt-in. See ``cloud_docs/local-dev/copilot-tracing.md``
-for how to enable it without adding logfire to the project lockfile.
+Tracing is dev-only and opt-in. The copilot tracing dev guide says how to enable it
+without adding logfire to the project lockfile.
 """
 
 from __future__ import annotations

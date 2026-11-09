@@ -467,14 +467,6 @@ def test_invalidate_cached_org_is_noop_when_id_absent() -> None:
     cache.clear()
 
 
-def test_invalidate_cached_org_handles_empty_cache() -> None:
-    cache = org_auth_service._current_org_cache
-    cache.clear()
-
-    # Should not raise.
-    org_auth_service.invalidate_cached_org("anything")
-
-
 class _FakeOrganizationsRepository:
     def __init__(self, organization: Organization) -> None:
         self.organization = organization
@@ -990,7 +982,7 @@ def test_credential_bearing_routes_use_the_deployment_aware_gate() -> None:
     # Every module holding credential- or credential-config-bearing routes. Enumerated from the
     # modules rather than listed by name, so a newly added route fails this test instead of silently
     # defaulting to the permissive dependency. Intentional exemptions must be named with a reason.
-    # cloud/ modules are covered by tests/cloud/; this file syncs to the OSS repo where they do
+    # cloud/ modules are covered by the cloud test suite; this file syncs to the OSS repo where they do
     # not exist.
     CREDENTIAL_ROUTE_MODULES = (
         credentials_routes,

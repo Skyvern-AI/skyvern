@@ -34,6 +34,7 @@ from skyvern.forge.sdk.copilot.agent import (
 )
 from skyvern.forge.sdk.copilot.agent_context import RegisteredArtifactEntry, RegisteredArtifactEvidence
 from skyvern.forge.sdk.copilot.build_test_connect_failure import (
+    BROWSER_TOOLS_UNAVAILABLE_ERROR,
     BuildTestConnectFailureState,
     build_test_connect_failure_sentence,
 )
@@ -595,7 +596,7 @@ def test_connect_failure_projects_through_recorded_outcome_and_packet() -> None:
     )
     result = {
         "ok": False,
-        "error": "Build-test browser acquisition stopped: cdp_connect_failed.",
+        "error": build_test_connect_failure_sentence(failure),
         "data": {
             "workflow_run_id": "wr_1",
             "overall_status": "setup_failed",
@@ -615,6 +616,76 @@ def test_connect_failure_projects_through_recorded_outcome_and_packet() -> None:
     assert packet.failure is not None
     assert packet.failure.connect_failure == failure
     assert packet.canonical_workflow_yaml == "title: preserved draft"
+
+
+_BROWSER_LOST_AFTER_RUN_START = (
+    "The test run started, but its browser was lost before any block ran, so nothing was tested. "
+    "Trying again in a fresh browser may work."
+)
+
+
+@pytest.mark.parametrize(
+    ("state", "workflow_run_id", "sentence"),
+    [
+        (
+            "provisioning_unavailable",
+            None,
+            "Build test did not start: no test browser was ready in time. This was a problem on Skyvern's side, "
+            "not with the workflow or the account's credits. No run started. Trying again may work.",
+        ),
+        (
+            "cdp_connect_failed",
+            None,
+            "Build test did not start: Skyvern could not connect to the test browser. This was a problem on "
+            "Skyvern's side, not with the workflow or the account's credits. No run started. Trying again may work.",
+        ),
+        (
+            "already_closed",
+            None,
+            "Build test did not start: the test browser had already closed. No run started. "
+            "Trying again in a fresh browser may work.",
+        ),
+        ("provisioning_unavailable", "wr_1", _BROWSER_LOST_AFTER_RUN_START),
+        ("cdp_connect_failed", "wr_1", _BROWSER_LOST_AFTER_RUN_START),
+        ("already_closed", "wr_1", _BROWSER_LOST_AFTER_RUN_START),
+    ],
+)
+def test_a_browser_start_failure_reads_as_a_plain_sentence_and_keeps_its_typed_state(
+    state: BuildTestConnectFailureState, workflow_run_id: str | None, sentence: str
+) -> None:
+    failure = BuildTestConnectFailure(state=state, workflow_run_id=workflow_run_id)
+
+    result = runtime._build_test_connect_failure_result(failure)
+
+    assert build_test_connect_failure_sentence(failure) == sentence
+    assert state not in sentence
+    assert result["error"] == sentence
+    assert result["data"]["build_test_connect_failure"]["state"] == state
+
+
+def test_a_denied_browser_keeps_its_denial_instead_of_a_retry_invitation() -> None:
+    failure = BuildTestConnectFailure(state="provisioning_unavailable", diagnostic=BROWSER_TOOLS_UNAVAILABLE_ERROR)
+
+    assert build_test_connect_failure_sentence(failure) == BROWSER_TOOLS_UNAVAILABLE_ERROR
+
+
+@pytest.mark.asyncio
+async def test_a_finished_run_hands_its_recorded_live_and_cached_credits_to_the_packet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_get_run_results_harness(
+        monkeypatch,
+        run_status="completed",
+        blocks=[run_result_block_row("open_site", "completed", "https://fixture.test/")],
+        run_credits=(40, 15),
+    )
+
+    hydrated = await run_execution_module.hydrate_prior_run_packet(
+        make_copilot_ctx(workflow_permanent_id="wpid-1"), workflow_run_id="wr-1"
+    )
+
+    assert hydrated is not None
+    assert hydrated["run"]["credits_used"] == 55
 
 
 def test_billing_credit_refusal_schema_requires_no_retry_or_new_identity() -> None:
@@ -855,7 +926,10 @@ def test_a_post_run_connect_failure_keeps_the_block_failures_diagnostic_evidence
             reason_code="unrecoverable_tool_error",
             workflow_run_id="wr_1",
             structural_failure_identity="build_test_connect:cdp_connect_failed",
-            observed_evidence_summary="Build-test browser acquisition stopped: cdp_connect_failed.",
+            observed_evidence_summary=(
+                "Build test did not start: Skyvern could not connect to the test browser. This was a problem on "
+                "Skyvern's side, not with the workflow or the account's credits. No run started. Trying again may work."
+            ),
             connect_failure=BuildTestConnectFailure(
                 state="cdp_connect_failed",
                 browser_session_id="pbs_stale",
@@ -902,7 +976,10 @@ def test_a_block_that_died_on_a_plain_exception_is_preserved_like_a_browser_fail
             verdict="not_authoritative",
             reason_code="unrecoverable_tool_error",
             workflow_run_id="wr_1",
-            observed_evidence_summary="Build-test browser acquisition stopped: cdp_connect_failed.",
+            observed_evidence_summary=(
+                "Build test did not start: Skyvern could not connect to the test browser. This was a problem on "
+                "Skyvern's side, not with the workflow or the account's credits. No run started. Trying again may work."
+            ),
             connect_failure=BuildTestConnectFailure(
                 state="cdp_connect_failed",
                 browser_session_id="pbs_stale",
@@ -2136,40 +2213,6 @@ def test_metadata_reject_key_uses_typed_fields_not_wording() -> None:
     assert changed_missing_field.structural_key != first.structural_key
 
 
-def test_output_policy_reject_key_uses_stable_trace_payload() -> None:
-    payload = {
-        "surface": "tool_body",
-        "tool_name": "update_workflow",
-        "allowed": False,
-        "output_kind": "workflow_update_proposal",
-        "reason_codes": ["raw_secret_leak"],
-    }
-    first = recorded_outcome_from_author_time_reject(
-        reason_code="output_policy_reject",
-        structural_payload=payload,
-        observed_evidence_summary="Output policy blocked this Copilot output before persistence.",
-    )
-    same_structure = recorded_outcome_from_author_time_reject(
-        reason_code="output_policy_reject",
-        structural_payload=dict(payload),
-        observed_evidence_summary="Different wording for the same output-policy reject.",
-    )
-    changed_reason = recorded_outcome_from_author_time_reject(
-        reason_code="output_policy_reject",
-        structural_payload={**payload, "reason_codes": ["unapproved_credential_reference"]},
-    )
-    changed_surface = recorded_outcome_from_author_time_reject(
-        reason_code="output_policy_reject",
-        structural_payload={**payload, "surface": "final_response"},
-    )
-
-    assert first.reason_code == "output_policy_reject"
-    assert first.is_authoritative is True
-    assert first.structural_key == same_structure.structural_key
-    assert changed_reason.structural_key != first.structural_key
-    assert changed_surface.structural_key != first.structural_key
-
-
 def test_runtime_block_failure_outcome_includes_bounded_page_state_and_run_id() -> None:
     result = {
         "ok": False,
@@ -2249,6 +2292,8 @@ async def test_failed_run_complete_fact_packet_reaches_ordinary_repair_input(
         created_at=datetime(2026, 4, 21, 12, 0),
         trigger_type=None,
         workflow_definition_sha256=None,
+        credits_used=0,
+        cached_credits_used=0,
     )
     block = SimpleNamespace(
         workflow_run_block_id="wrb_failed_complete_packet",
@@ -4667,7 +4712,6 @@ workflow_definition:
         )
         return copilot_ctx.latest_recorded_build_test_outcome
 
-    monkeypatch.setattr(tools_module, "_update_and_run_requires_skipped_run", lambda *args: False)
     monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
     monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
     monkeypatch.setattr(tools_module, "_frontier_runtime_page_url", AsyncMock(return_value=None))
@@ -6041,7 +6085,9 @@ async def test_candidate_run_bind_after_a_rejected_restore_dispatches_only_the_s
         assert forge_app.WORKFLOW_SERVICE.execute_workflow.call_count == 0
     elif case == "other_settings":
         second = await _run_extract_heading(ctx)
-        assert [first, second] == [{"ok": False, "error": COPILOT_PROPOSAL_SETTINGS_CHANGED_ERROR}] * 2
+        assert [first, second] == [
+            {"ok": False, "error": COPILOT_PROPOSAL_SETTINGS_CHANGED_ERROR, "data": {"run_dispatched": False}}
+        ] * 2
         workflow_service_module.prepare_workflow.assert_not_awaited()
         assert ctx.private_workflow_settings == settings_before
         assert (ctx.proposal_owner_turn_id, ctx.proposal_revision, ctx.staged_workflow) == ("turn-one", 1, None)
@@ -6083,7 +6129,7 @@ async def test_candidate_run_bind_and_publish_stay_refused_while_an_accept_claim
     with capture_logs() as logs:
         runs = [json.loads(await tools_module.run_blocks_tool.on_invoke_tool(tool_context, arguments))]
         runs.append(await _run_extract_heading(ctx))
-        edits = [await _update_workflow({"workflow_yaml": edit}, ctx, allow_missing_credentials=True) for _ in "ab"]
+        edits = [await _update_workflow({"workflow_yaml": edit}, ctx) for _ in "ab"]
 
     assert [(result["ok"], result["conflict_reason"], result["adoption"]) for result in runs + edits] == [
         (False, "being_accepted", "claimed")
@@ -6176,7 +6222,7 @@ async def test_stale_proposal_token_conflict_recovers_so_the_next_call_succeeds(
     async def test_or_edit() -> dict[str, Any]:
         if path == "test":
             return await _run_extract_heading(ctx)
-        return await _update_workflow({"workflow_yaml": edit}, ctx, allow_missing_credentials=True)
+        return await _update_workflow({"workflow_yaml": edit}, ctx)
 
     with capture_logs() as logs:
         first = await test_or_edit()
@@ -6247,7 +6293,7 @@ async def test_stale_proposal_token_adoption_refuses_a_call_written_before_it(
         if kind == "test":
             return _run_extract_heading(ctx)
         params = {"workflow_yaml": edit, "code_artifact_metadata": metadata}
-        return _update_workflow(params, ctx, allow_missing_credentials=True)
+        return _update_workflow(params, ctx)
 
     if overlap:
         results = await asyncio.gather(call(first_call), call(second_call, stale_metadata))
@@ -6285,7 +6331,7 @@ async def test_stale_proposal_token_adoption_keeps_the_saved_completion_contract
         "      - id: report\n        kind: generated_file\n        min_count: 1\n",
     )
     if dropped_by == "earlier_edit":
-        dropped = await _update_workflow({"workflow_yaml": contract_dropping_edit}, ctx, allow_missing_credentials=True)
+        dropped = await _update_workflow({"workflow_yaml": contract_dropping_edit}, ctx)
         assert dropped["ok"] is True and ctx.clear_persisted_completion_contract is True
         await _publish_from_another_turn(chat_id)
         adopting = await _run_extract_heading(ctx)
@@ -6306,22 +6352,20 @@ async def test_stale_proposal_token_adoption_keeps_the_saved_completion_contract
 
         async def sibling_edit() -> dict[str, Any]:
             try:
-                return await _update_workflow(
-                    {"workflow_yaml": HANDBACK_WORKFLOW_YAML}, ctx, allow_missing_credentials=True
-                )
+                return await _update_workflow({"workflow_yaml": HANDBACK_WORKFLOW_YAML}, ctx)
             finally:
                 sibling_adopted.set()
 
         adopting, in_flight = await asyncio.gather(
             sibling_edit(),
-            _update_workflow({"workflow_yaml": contract_dropping_edit}, ctx, allow_missing_credentials=True),
+            _update_workflow({"workflow_yaml": contract_dropping_edit}, ctx),
         )
         assert (in_flight["ok"], in_flight["adoption"]) == (False, "adopted")
     assert (adopting["ok"], adopting["adoption"]) == (False, "adopted")
 
     await _next_model_response(ctx)
     edit = HANDBACK_WORKFLOW_YAML.replace("Extract the page heading.", "Extract the page title.")
-    assert (await _update_workflow({"workflow_yaml": edit}, ctx, allow_missing_credentials=True))["ok"] is True
+    assert (await _update_workflow({"workflow_yaml": edit}, ctx))["ok"] is True
 
     assert (ctx.has_staged_proposal, ctx.clear_persisted_completion_contract) == (True, False)
 
@@ -7897,7 +7941,7 @@ def _install_rescued_run(
 
     code_row = run_result_block_row("collect_metrics", "completed", task_id="tsk_code")
     code_row.block_type = BlockType.CODE
-    recovery_row = run_result_block_row("Self-heal recovery", "completed", task_id="tsk_fallback")
+    recovery_row = run_result_block_row("Fallback to AI", "completed", task_id="tsk_fallback")
     recovery_row.parent_workflow_run_block_id = code_row.workflow_run_block_id
     fired = any(episode.status != HealStatus.skipped for episode in heal_episodes)
     ctx = install_get_run_results_harness(
@@ -7942,11 +7986,11 @@ async def test_a_rescued_block_reads_as_an_ai_fallback_rescue_in_run_results_and
         "failing_line": 5,
         "failure_text": _CODE_ERROR,
     }
-    assert rows["Self-heal recovery"]["parent_block_label"] == "collect_metrics"
+    assert rows["Fallback to AI"]["parent_block_label"] == "collect_metrics"
     assert "ai_fallback" not in rows["write_sheet"]
     compacted = {row["label"]: row for row in json.loads(_summarize_tool_output(json.dumps(page)))["blocks"]}
     assert compacted["collect_metrics"]["ai_fallback"] == {"status": "fired_completed", "failure_text": _CODE_ERROR}
-    assert compacted["Self-heal recovery"]["parent_block_label"] == "collect_metrics"
+    assert compacted["Fallback to AI"]["parent_block_label"] == "collect_metrics"
 
 
 @pytest.mark.asyncio

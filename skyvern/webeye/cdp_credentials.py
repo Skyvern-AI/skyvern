@@ -1,15 +1,15 @@
 """Where a credential can hide inside a CDP or live-view address.
 
 The owning definition of a grammar two components must agree on: the router's ``_parse_request``
-(cloud/cdp_proxy/adapters/websocket_server.py) pulls a client's credential *out* of an incoming
+(in the cloud CDP proxy's websocket server) pulls a client's credential *out* of an incoming
 address, and ``redact_cdp_url`` (skyvern/webeye/cdp_connection.py) masks every position that
 parser would read. A position one accepts and the other misses writes a live session token to
 the logs.
 
 The proxy adapter cannot import this module — `.importlinter`'s proxy-runner-isolation contract
 forbids that package from importing `skyvern` at all, and `skyvern` may not import `cloud` — so
-it restates the two tuples locally. That copy is not maintained by hand: the contract tests in
-tests/cloud/cdp_proxy/test_websocket_server.py pin it equal to this one *and* assert the
+it restates the two tuples locally. That copy is not maintained by hand: the cloud contract tests
+for the proxy's websocket server pin it equal to this one *and* assert the
 behavior end to end, so a change here that is not mirrored there fails CI rather than quietly
 unmasking a token.
 """

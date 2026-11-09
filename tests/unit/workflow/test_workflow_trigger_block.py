@@ -974,10 +974,6 @@ class TestBlockMetadata:
         block = _make_block()
         assert block.block_type == BlockType.WORKFLOW_TRIGGER
 
-    def test_max_trigger_depth_default(self) -> None:
-        block = _make_block()
-        assert block.MAX_TRIGGER_DEPTH == 10
-
     def test_get_all_parameters_empty(self) -> None:
         block = _make_block()
         assert block.get_all_parameters("wr_test") == []

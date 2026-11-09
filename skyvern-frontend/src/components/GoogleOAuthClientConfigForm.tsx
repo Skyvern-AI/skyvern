@@ -170,7 +170,7 @@ export function GoogleOAuthClientConfigForm({ onSuccess }: Props = {}) {
           </a>
         </div>
         {!encryptionEnabled && (
-          <div className="rounded-md border border-yellow-300 bg-yellow-50 px-3 py-2 text-sm text-yellow-900">
+          <div className="rounded-md border border-yellow-300 bg-yellow-50 px-3 py-2 text-sm text-yellow-900 dark:border-yellow-600/40 dark:bg-yellow-900/20 dark:text-yellow-200">
             Enable AES encryption before saving or connecting Google accounts.
           </div>
         )}

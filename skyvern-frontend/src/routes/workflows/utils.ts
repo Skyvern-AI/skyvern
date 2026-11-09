@@ -308,36 +308,6 @@ export const getInitialValues = (
   );
 };
 
-export interface Duration {
-  hour: number;
-  minute: number;
-  second: number;
-}
-
-export const toDuration = (seconds: number): Duration => {
-  let minutes = Math.floor(seconds / 60);
-  let hours = Math.floor(minutes / 60);
-  seconds = seconds % 60;
-  minutes = minutes % 60;
-  hours = hours % 24;
-
-  return {
-    hour: Math.floor(hours),
-    minute: Math.floor(minutes),
-    second: Math.floor(seconds),
-  };
-};
-
-export const formatDuration = (duration: Duration): string => {
-  if (duration.hour) {
-    return `${duration.hour}h ${duration.minute}m ${duration.second}s`;
-  } else if (duration.minute) {
-    return `${duration.minute}m ${duration.second}s`;
-  } else {
-    return `${duration.second}s`;
-  }
-};
-
 export const getOrderedBlockLabels = (workflow?: WorkflowApiResponse) => {
   if (!workflow) {
     return [];

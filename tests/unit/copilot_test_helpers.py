@@ -11,8 +11,8 @@ from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from itertools import count
 from types import SimpleNamespace
-from typing import Any, Protocol, TypeVar
-from unittest.mock import AsyncMock, MagicMock
+from typing import Any, Literal, Protocol, TypeVar
+from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import urlparse
 
 import pytest
@@ -40,16 +40,19 @@ from skyvern.forge.sdk.copilot import runtime as copilot_runtime
 from skyvern.forge.sdk.copilot.active_run_session import ActiveRunSessionAssociation
 from skyvern.forge.sdk.copilot.agent import _run_agent_loop_with_surface, run_copilot_agent
 from skyvern.forge.sdk.copilot.agent_context import OriginRunRedactionRegistry
+from skyvern.forge.sdk.copilot.ask_user import QuestionInteraction, QuestionResponse
 from skyvern.forge.sdk.copilot.browser_ablation import CopilotEvalMode
 from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.context import AgentResult, CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
+    DiagnosisFailureType,
     DiagnosisInput,
     DiagnosisRepairContract,
     DiagnosisResult,
     RepairDecision,
     RepairNextAction,
+    RepairRootCauseIdentity,
     VerificationResult,
 )
 from skyvern.forge.sdk.copilot.enforcement import (
@@ -67,7 +70,7 @@ from skyvern.forge.sdk.copilot.repair_origin_run import (
     RepairOriginBinding,
     SelectedOutputSource,
 )
-from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion
+from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
 from skyvern.forge.sdk.copilot.review_gate import build_review_projection, workflow_block_fingerprints
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.screenshot_utils import (
@@ -76,13 +79,16 @@ from skyvern.forge.sdk.copilot.screenshot_utils import (
     ScreenshotProvenance,
     resize_screenshot_b64,
 )
+from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER
 from skyvern.forge.sdk.copilot.session_factory import (
     copilot_call_model_input_filter,
     copilot_session_input_callback,
 )
+from skyvern.forge.sdk.copilot.tools import credentials as credentials_module
 from skyvern.forge.sdk.copilot.tools import reply_ends_turn, reply_tool
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
+from skyvern.forge.sdk.copilot.tools.credentials import _resolve_exact_credential
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml as process_workflow_yaml
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -92,6 +98,7 @@ from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType, Cr
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.forge.sdk.schemas.workflow_copilot import (
+    CopilotSteerMessage,
     WorkflowCopilotChatMessage,
     WorkflowCopilotChatRequest,
     WorkflowCopilotChatSender,
@@ -288,6 +295,8 @@ def harness_run(
     workflow_permanent_id: str = "wpid-1",
     organization_id: str = "org-1",
     workflow_definition_sha256: str | None = None,
+    credits_used: int = 0,
+    cached_credits_used: int = 0,
 ) -> SimpleNamespace:
     """Naive-UTC created_at, as the database returns it."""
     return SimpleNamespace(
@@ -302,6 +311,8 @@ def harness_run(
         failure_reason=None,
         browser_session_id="pbs-1",
         workflow_definition_sha256=workflow_definition_sha256,
+        credits_used=credits_used,
+        cached_credits_used=cached_credits_used,
     )
 
 
@@ -320,11 +331,18 @@ def install_get_run_results_harness(
     carried_run_id: str | None = None,
     heal_episodes: list[HealEpisode] | None = None,
     run_definition_sha256: str | None = None,
+    run_credits: tuple[int, int] = (0, 0),
 ) -> SimpleNamespace:
     """Stub the collaborators ``_get_run_results`` reaches and return the ctx to call it with; the run pool is
     ``wr-1`` plus ``other_runs``, and run lookup and history listing honor their arguments."""
     pool = [
-        harness_run("wr-1", status=run_status, workflow_definition_sha256=run_definition_sha256),
+        harness_run(
+            "wr-1",
+            status=run_status,
+            workflow_definition_sha256=run_definition_sha256,
+            credits_used=run_credits[0],
+            cached_credits_used=run_credits[1],
+        ),
         *(other_runs or []),
     ]
     workflow = SimpleNamespace(
@@ -1371,6 +1389,18 @@ def make_verified_goal_contract(
     )
 
 
+def make_missing_credential_ask_contract() -> DiagnosisRepairContract:
+    return DiagnosisRepairContract(
+        diagnosis_input=DiagnosisInput(source_tool="update_and_run_blocks"),
+        diagnosis_result=DiagnosisResult(
+            suspected_failure_type=DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT,
+            root_cause_identity=RepairRootCauseIdentity(failure_categories=("CREDENTIAL_ERROR",)),
+        ),
+        repair_decision=RepairDecision(next_action=RepairNextAction.ASK),
+        verification_result=VerificationResult(),
+    )
+
+
 def make_completion_criterion(
     cid: str,
     outcome: str,
@@ -1493,6 +1523,13 @@ def captured_frame_entry(width: int = 1920, height: int = 947) -> ScreenshotEntr
             viewport_css_px=(width, height),
         ),
     )
+
+
+def image_parts(item: Any) -> list[Any]:
+    content = item.get("content") if isinstance(item, dict) else None
+    if not isinstance(content, list):
+        return []
+    return [part for part in content if part.get("type") == "input_image"]
 
 
 def sent_image_px(message: Any) -> list[tuple[int, int]]:
@@ -2036,3 +2073,37 @@ def receipt_coverage_after(
     projection = build_review_projection(RECEIPT_WORKFLOW_YAML, RECEIPT_WORKFLOW_YAML, seed)
     assert projection is not None
     return {block["label"]: block["coverage"] for block in projection["blocks"]}
+
+
+async def resolve_exact_credential_data(
+    reference: str, policy: RequestPolicy, inventory: list[Credential]
+) -> dict[str, Any]:
+    ctx = SimpleNamespace(organization_id="o_test_org", request_policy=policy)
+    with patch.object(credentials_module, "load_credentials", AsyncMock(return_value=inventory)):
+        result = await _resolve_exact_credential(reference, ctx)
+    return result["data"]
+
+
+def redact_mid_turn(policy: RequestPolicy, source: Literal["question_answer", "steer"]) -> None:
+    now = datetime.now(UTC)
+    if source == "question_answer":
+        policy.project_question_response_sites(
+            QuestionInteraction(
+                interaction_id="q_1",
+                turn_id="turn-1",
+                tool_call_id="call_1",
+                parts=[],
+                status="resolved",
+                response=QuestionResponse(text=REDACTED_SECRET_PLACEHOLDER, raw_secret_detected=True),
+            )
+        )
+    else:
+        policy.project_steer_message(
+            CopilotSteerMessage(
+                steer_id="steer_1",
+                text=REDACTED_SECRET_PLACEHOLDER,
+                raw_secret_detected=True,
+                created_at=now,
+                delivered_at=now,
+            )
+        )

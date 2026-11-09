@@ -24,6 +24,7 @@ import {
   useManualSignInControl,
 } from "@/store/useManualSignInStore";
 import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
+import { copyText } from "@/util/copyText";
 import { wssBaseUrl, newWssBaseUrl } from "@/util/env";
 import { installNoVncGestureCrashGuard } from "@/util/novncGestureCrashGuard";
 import { cn } from "@/util/utils";
@@ -38,6 +39,8 @@ import type {
 } from "@/routes/streaming/streamState";
 import {
   VNC_SUPER_L_KEYSYM,
+  decodeVncClipboardText,
+  handleVncClipboardCopyShortcut,
   handleVncClipboardPasteShortcut,
   pasteTextIntoVnc,
   type HeldMetaSides,
@@ -54,7 +57,10 @@ import {
   TakeControlButton,
 } from "@/routes/streaming/StreamControlBar";
 import { useRecordingMessageChannel } from "@/routes/streaming/useRecordingMessageChannel";
-import { useWebSocketParams } from "@/routes/streaming/webSocketParams";
+import {
+  generateClientId,
+  useWebSocketParams,
+} from "@/routes/streaming/webSocketParams";
 
 import "./browser-stream.css";
 
@@ -83,6 +89,30 @@ type BrowserSessionLiveness = Pick<
   BrowserSession,
   "browser_address" | "started_at" | "completed_at"
 >;
+
+// x11vnc polls CLIPBOARD only about every 1.8 s and also sends the X PRIMARY
+// selection, which a plain mouse selection sets: only the first update this soon
+// after the user's own copy counts as that copy, and a selection made in the window still can.
+const VNC_COPY_WINDOW_MS = 3000;
+
+function copyRemoteClipboardText(text: string, rfb: RFB) {
+  void copyText(text).then((copied) => {
+    // copyText's fallback focuses a hidden textarea; give keystrokes back to the page.
+    rfb.focus({ preventScroll: true });
+    toast(
+      copied
+        ? {
+            title: "Copied to Clipboard",
+            description: "The text has been copied to your clipboard.",
+          }
+        : {
+            variant: "destructive",
+            title: "Failed to write to Clipboard",
+            description: "The text could not be copied to your clipboard.",
+          },
+    );
+  });
+}
 
 function getBrowserSessionState(browserSession: BrowserSessionLiveness | null) {
   const hasBrowserSession = Boolean(
@@ -257,6 +287,11 @@ function BrowserStream({
     right: false,
   });
   const leftCmdSentAsSuperRef = useRef(false);
+  const lastRemoteClipboardRef = useRef("");
+  const copyEventDeadlineRef = useRef(0);
+  const copyFallbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
   const observerRef = useRef<MutationObserver | null>(null);
   const vncReconnectAttemptsRef = useRef(0);
   const vncReconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
@@ -272,7 +307,8 @@ function BrowserStream({
   const settingsStore = useSettingsStore();
   const credentialGetter = useCredentialGetter();
   const logging = useLogging();
-  const getWebSocketParams = useWebSocketParams();
+  const [clientId] = useState(generateClientId);
+  const getWebSocketParams = useWebSocketParams(clientId);
   const isBrowserSessionAvailable =
     entity !== "browserSession" || hasBrowserSession;
   const isBrowserSessionBackendReady =
@@ -324,6 +360,7 @@ function BrowserStream({
         ? `${wssBaseUrl}/stream/messages/workflow_run/${runId}`
         : undefined;
   const { isMessageConnected, sendCommand } = useRecordingMessageChannel({
+    clientId,
     browserSessionId: runId,
     enabled:
       showStream &&
@@ -601,6 +638,32 @@ function BrowserStream({
           vncReconnectAttemptsRef.current = 0;
         });
 
+        // The remote clipboard also changes on the agent's copies; only copies
+        // made while the user holds control reach their clipboard, and an agent
+        // copy is never replayed by the repeat-copy fallback.
+        rfb.addEventListener("clipboard", (e: RfbEvent) => {
+          const text = decodeVncClipboardText(e.detail.text ?? "");
+          if (!text) {
+            return;
+          }
+          if (!userCanSendVncInputRef.current) {
+            lastRemoteClipboardRef.current = "";
+            copyEventDeadlineRef.current = 0;
+            return;
+          }
+          // Not a copy; a pending repeat-copy fallback stays armed.
+          if (performance.now() > copyEventDeadlineRef.current) {
+            return;
+          }
+          copyEventDeadlineRef.current = 0;
+          if (copyFallbackTimerRef.current) {
+            clearTimeout(copyFallbackTimerRef.current);
+            copyFallbackTimerRef.current = null;
+          }
+          lastRemoteClipboardRef.current = text;
+          copyRemoteClipboardText(text, rfb);
+        });
+
         rfb.addEventListener("disconnect", (e: RfbEvent) => {
           if (cancelled || didDisconnect) return;
           didDisconnect = true;
@@ -793,6 +856,8 @@ function BrowserStream({
         return;
       }
       await pasteTextIntoVnc(rfb, text);
+      // A paste sets the remote clipboard without the VNC server echoing it back.
+      lastRemoteClipboardRef.current = text;
       if (rfbRef.current !== rfb) {
         return;
       }
@@ -855,10 +920,49 @@ function BrowserStream({
         return;
       }
 
+      if (
+        (event.ctrlKey || event.metaKey) &&
+        !event.altKey &&
+        event.key.toLowerCase() === "c"
+      ) {
+        // The VNC server only sends the remote clipboard when it changes, so
+        // copying the same text twice brings nothing back: rewrite the last one.
+        // A copy with nothing selected also rewrites it.
+        copyEventDeadlineRef.current = performance.now() + VNC_COPY_WINDOW_MS;
+        if (copyFallbackTimerRef.current) {
+          clearTimeout(copyFallbackTimerRef.current);
+        }
+        copyFallbackTimerRef.current = setTimeout(() => {
+          copyFallbackTimerRef.current = null;
+          copyEventDeadlineRef.current = 0;
+          const rfb = rfbRef.current;
+          if (
+            rfb &&
+            userCanSendVncInputRef.current &&
+            lastRemoteClipboardRef.current
+          ) {
+            copyRemoteClipboardText(lastRemoteClipboardRef.current, rfb);
+          }
+        }, VNC_COPY_WINDOW_MS);
+      }
+
+      if (
+        handleVncClipboardCopyShortcut(
+          event,
+          rfbRef.current,
+          () => heldMetaSidesRef.current,
+        )
+      ) {
+        return;
+      }
+
       void handleVncClipboardPasteShortcut(event, rfbRef.current, {
         getHeldMetaSides: () => heldMetaSidesRef.current,
         onPasteError: toastClipboardReadFailed,
-        onPasted: showPasted,
+        onPasted: (text) => {
+          lastRemoteClipboardRef.current = text;
+          showPasted(text);
+        },
         onEmptyClipboard: toastNothingToPaste,
       });
     };
@@ -905,6 +1009,11 @@ function BrowserStream({
     window.addEventListener("keyup", handleKeyUp, true);
     window.addEventListener("blur", handleBlur);
     return () => {
+      if (copyFallbackTimerRef.current) {
+        clearTimeout(copyFallbackTimerRef.current);
+        copyFallbackTimerRef.current = null;
+      }
+      copyEventDeadlineRef.current = 0;
       canvasContainer.removeEventListener("keydown", handleKeyDown, true);
       canvasContainer.removeEventListener("paste", handlePaste);
       window.removeEventListener("keyup", handleKeyUp, true);

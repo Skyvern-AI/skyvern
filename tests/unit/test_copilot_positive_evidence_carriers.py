@@ -1528,6 +1528,8 @@ async def test_origin_registry_recovers_when_a_later_terminal_read_finds_the_han
         created_at=datetime(2026, 4, 21, 12, 0),
         trigger_type=None,
         workflow_definition_sha256=None,
+        credits_used=0,
+        cached_credits_used=0,
     )
     workflow = SimpleNamespace(
         workflow_id="wf_origin",

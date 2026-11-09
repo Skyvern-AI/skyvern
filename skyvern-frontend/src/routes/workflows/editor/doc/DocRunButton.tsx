@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { DOC_RUN_AGENT_EVENT } from "./docKeys";
+import { DOC_RUN_AGENT_EVENT, docShortcut } from "./docKeys";
+import { DocKeyLabel } from "./DocKeyLabel";
 import { PlayIcon, ReloadIcon, StopIcon } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useLocation, useNavigate } from "react-router-dom";
@@ -38,14 +39,16 @@ import type {
 } from "../../types/workflowTypes";
 import { claimRunCompletionNotice } from "../../workflowRun/runCompletionNotices";
 import { liveSearch } from "../../studio/liveSearch";
+import { searchWithRunReference } from "../../studio/panes";
 import { searchWithoutRun } from "../../studio/runSwitchNavigation";
 import { ControlTooltip } from "../../studio/ControlTooltip";
 import { useStudioPanes } from "../../studio/useStudioPanes";
 import { getRunBlockingTooltipText } from "../runValidation/runBlockingCopy";
 import { useRunValidationStore } from "../runValidation/useRunValidationStore";
 import { useStudioRunId } from "../../studio/useStudioRunId";
-import { docRunEndMessage, docRunRowsSettled } from "./docRunState";
+import { docRunEndMessage } from "./docRunState";
 import { useDocRunStore, type DocRunInput } from "./docRunStore";
+import { saveAndReport } from "./docSaveState";
 import { docLatestRunKey, useDocRun } from "./useDocRun";
 
 class DocSaveFailedError extends Error {}
@@ -178,6 +181,8 @@ export function DocRunButton() {
     live,
     owned,
     blockRun,
+    rowsSettled,
+    previous,
   } = useDocRun();
   const inputs = useDocRunStore((s) => s.inputs);
   const blockingBlocks = useRunValidationStore((s) => s.blockingBlocks);
@@ -203,11 +208,18 @@ export function DocRunButton() {
     mutationFn: async (data: Record<string, unknown>) => {
       // Never run an older saved version than the doc on screen.
       if (useWorkflowHasChangesStore.getState().hasChanges) {
-        try {
-          await saveWorkflow.mutateAsync(undefined);
-        } catch {
-          throw new DocSaveFailedError();
-        }
+        // A refusal is not stored: the save's own toast already says it.
+        const outcome = await saveAndReport(
+          () => saveWorkflow.mutateAsync(undefined),
+          { recordRefusals: false },
+        );
+        // An unanswered save has no toast of its own, and the edit bar's reason can be scrolled out of view.
+        if (outcome === "released")
+          toast({
+            variant: "destructive",
+            title: "Couldn't save: can't reach the server",
+          });
+        if (outcome !== "saved") throw new DocSaveFailedError();
         if (useWorkflowHasChangesStore.getState().hasChanges)
           throw new Error("Save the agent before running");
       }
@@ -244,13 +256,21 @@ export function DocRunButton() {
         ]);
       }
       // The run lives in the Doc's remembered run, not ?wr=: a ?wr= URL reloads into the run view.
-      // A run already in the URL would outrank the new one, so drop it.
-      if (urlRunId) stayInDoc(searchWithoutRun(liveSearch(location.search)));
+      // A run already in the URL would outrank the new one, so drop it. An open Run pane refills an
+      // empty ?wr= with its cached latest run (still the older one), so there name the new run instead.
+      if (urlRunId) {
+        const search = searchWithoutRun(liveSearch(location.search));
+        stayInDoc(
+          resolveLivePanes().includes("overview")
+            ? searchWithRunReference(search, newRunId)
+            : search,
+        );
+      }
     },
     onError: (
       error: Error & { response?: { data?: { detail?: unknown } } },
     ) => {
-      // A failed save already showed its own reason.
+      // A failed save already told the person.
       if (error instanceof DocSaveFailedError) return;
       const detail = error.response?.data?.detail;
       toast({
@@ -319,7 +339,7 @@ export function DocRunButton() {
     };
     // A canceled run's rows can stay "running"; its ending needs no rows to name. Otherwise wait
     // for the rows (they re-run this effect when they land), with a bounded fallback.
-    if (run.status === Status.Canceled || docRunRowsSettled(blocksByLabel)) {
+    if (run.status === Status.Canceled || rowsSettled) {
       announce();
       return;
     }
@@ -334,6 +354,7 @@ export function DocRunButton() {
     urlRunId,
     blocksByLabel,
     loopsByLabel,
+    rowsSettled,
   ]);
 
   const openPopover = () => {
@@ -424,9 +445,12 @@ export function DocRunButton() {
       </Button>
     );
 
+  const hasResults =
+    Boolean(runId) &&
+    (blocksByLabel.size > 0 || (previous?.blocksByLabel.size ?? 0) > 0);
   return (
     <div className="flex items-center gap-2">
-      {runId && blocksByLabel.size > 0 && (
+      {hasResults && (
         <Button
           variant="outline"
           className="h-8 px-3 text-xs"
@@ -438,7 +462,11 @@ export function DocRunButton() {
       <Popover open={open} onOpenChange={setOpen}>
         <ControlTooltip
           content={
-            runBlocked ? getRunBlockingTooltipText(blockingBlocks) : "Run"
+            runBlocked ? (
+              getRunBlockingTooltipText(blockingBlocks)
+            ) : (
+              <DocKeyLabel label="Run" keys="Enter" shift />
+            )
           }
           blocked={runBlocked}
         >
@@ -447,6 +475,7 @@ export function DocRunButton() {
               className="h-8 border border-transparent px-3"
               aria-haspopup="dialog"
               aria-expanded={open}
+              aria-keyshortcuts={docShortcut("Enter", true).aria}
               disabled={start.isPending || runBlocked}
               onClick={() => (open ? setOpen(false) : openPopover())}
             >

@@ -1,6 +1,6 @@
 """Tests for the browser-session download artifact pipeline.
 
-See ``cloud_docs/BROWSER_SESSION_DOWNLOAD_ARTIFACTS.md`` for the design.
+The design is in the Skyvern Cloud docs on browser-session download artifacts.
 The unit-level tests below cover:
 
 - ``ArtifactManager.create_browser_session_download_artifact`` — DB-only
@@ -615,7 +615,7 @@ async def test_delete_browser_session_file_swallows_db_failure_and_still_deletes
     storage.async_client.delete_file.assert_awaited_once()
 
 
-# Watcher-level tests for browser_controller live under tests/cloud/ — the
+# Watcher-level tests for browser_controller live in the cloud test suite — the
 # browser_controller module imports cloud-only dependencies (redis client) and
 # can't load in the OSS-synced unit suite.
 
