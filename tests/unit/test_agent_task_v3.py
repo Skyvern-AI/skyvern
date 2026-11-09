@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import itertools
 import json
+import re
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
@@ -115,7 +116,7 @@ from skyvern.forge.taskv3.tools import NO_ONE_TIME_CODE_SOURCE, PageProvider, _r
 from skyvern.schemas.llm import LLMConfig
 from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.steps import StepToolCall
-from skyvern.schemas.workflows import BlockType
+from skyvern.schemas.workflows import MAX_STEPS_PER_RUN_DESCRIPTION, BlockType
 from skyvern.utils.secret_redaction import REDACTED_SECRET_PLACEHOLDER
 from skyvern.webeye.actions.actions import (
     ActionStatus,
@@ -911,6 +912,10 @@ async def test_execute_task_v3_floors_low_explicit_step_cap(monkeypatch: pytest.
         monkeypatch, outcome, max_steps_per_run=7, data_extraction_goal=None, extracted_information_schema=None
     )
     assert loop_mock.await_args.kwargs["max_action_steps"] == MIN_ACTION_STEPS
+
+
+def test_max_steps_per_run_description_states_the_current_floor() -> None:
+    assert set(re.findall(r"\b(\d{2,})\b", MAX_STEPS_PER_RUN_DESCRIPTION)) == {str(MIN_ACTION_STEPS)}
 
 
 @pytest.mark.asyncio
