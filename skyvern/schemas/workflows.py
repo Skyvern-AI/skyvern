@@ -105,6 +105,12 @@ ENGINE_PINNED_DESCRIPTION = (
     "Set to true only when skyvern-1.0 was explicitly chosen for this block; leave it unset otherwise."
 )
 
+MAX_STEPS_PER_RUN_DESCRIPTION = (
+    "Action-step budget for one run, not an exact stop. On the skyvern-3.0 (Task V3) engine, except on action and "
+    "validation blocks, the effective budget is never below 24: a positive value under 24 runs as 24, and a run "
+    "still making progress can be granted steps past the budget."
+)
+
 FORCE_OCR_DESCRIPTION = (
     "PDF only: ignore the PDF's embedded text layer and read the pages with vision OCR instead. "
     "Use it when a PDF's text layer is unreadable in a way Skyvern does not detect on its own. "
@@ -925,7 +931,7 @@ class TaskBlockYAML(BlockYAML):
     data_schema: dict[str, Any] | list | str | None = None
     error_code_mapping: dict[str, str] | None = None
     max_retries: int = 0
-    max_steps_per_run: int | None = None
+    max_steps_per_run: int | None = Field(default=None, description=MAX_STEPS_PER_RUN_DESCRIPTION)
     parameter_keys: list[str] | None = None
     complete_on_download: bool = False
     download_suffix: str | None = (
@@ -1369,7 +1375,7 @@ class ValidationBlockYAML(BlockYAML):
     complete_criterion: str | None = None
     terminate_criterion: str | None = None
     error_code_mapping: dict[str, str] | None = None
-    max_steps_per_run: int | None = None
+    max_steps_per_run: int | None = Field(default=None, description=MAX_STEPS_PER_RUN_DESCRIPTION)
     parameter_keys: list[str] | None = None
     disable_cache: bool = False
     without_page_information: bool = False
@@ -1387,7 +1393,7 @@ class ActionBlockYAML(BlockYAML):
     ai_fallback: AIFallbackMode = AIFallbackMode.FALLBACK
     error_code_mapping: dict[str, str] | None = None
     max_retries: int = 0
-    max_steps_per_run: int | None = None
+    max_steps_per_run: int | None = Field(default=None, description=MAX_STEPS_PER_RUN_DESCRIPTION)
     parameter_keys: list[str] | None = None
     complete_on_download: bool = False
     download_suffix: str | None = (
@@ -1408,7 +1414,7 @@ class NavigationBlockYAML(BlockYAML):
     engine_pinned: bool = Field(default=False, description=ENGINE_PINNED_DESCRIPTION)
     error_code_mapping: dict[str, str] | None = None
     max_retries: int = 0
-    max_steps_per_run: int | None = None
+    max_steps_per_run: int | None = Field(default=None, description=MAX_STEPS_PER_RUN_DESCRIPTION)
     parameter_keys: list[str] | None = None
     complete_on_download: bool = False
     download_suffix: str | None = (
@@ -1434,7 +1440,7 @@ class ExtractionBlockYAML(BlockYAML):
     engine_pinned: bool = Field(default=False, description=ENGINE_PINNED_DESCRIPTION)
     data_schema: dict[str, Any] | list | str | None = None
     max_retries: int = 0
-    max_steps_per_run: int | None = None
+    max_steps_per_run: int | None = Field(default=None, description=MAX_STEPS_PER_RUN_DESCRIPTION)
     parameter_keys: list[str] | None = None
     disable_cache: bool = False
 
@@ -1456,7 +1462,7 @@ class LoginBlockYAML(BlockYAML):
     navigation_goal: str | None = None
     error_code_mapping: dict[str, str] | None = None
     max_retries: int = 0
-    max_steps_per_run: int | None = None
+    max_steps_per_run: int | None = Field(default=None, description=MAX_STEPS_PER_RUN_DESCRIPTION)
     parameter_keys: list[str] | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
@@ -1632,7 +1638,7 @@ class FileDownloadBlockYAML(BlockYAML):
     engine_pinned: bool = Field(default=False, description=ENGINE_PINNED_DESCRIPTION)
     error_code_mapping: dict[str, str] | None = None
     max_retries: int = 0
-    max_steps_per_run: int | None = None
+    max_steps_per_run: int | None = Field(default=None, description=MAX_STEPS_PER_RUN_DESCRIPTION)
     parameter_keys: list[str] | None = None
     download_suffix: str | None = (
         None  # DEPRECATED: This field now sets the complete filename instead of appending to a random name
