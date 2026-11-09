@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import os
 import time
@@ -21,6 +22,7 @@ from skyvern.forge.sdk.api.files import check_downloading_files_and_wait_for_dow
 from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at
 from skyvern.forge.sdk.artifact.storage.local import managed_file_uri
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.models.block import FileDownloadBlock
@@ -35,7 +37,7 @@ from skyvern.webeye.actions.responses import ActionSuccess
 from skyvern.webeye.cdp_download_interceptor import ORIGINAL_FILENAME_MARKER, CDPDownloadInterceptor
 from tests.unit._fingerprint_expectations import expected_fingerprint
 from tests.unit.conftest import settle_or_fail
-from tests.unit.helpers import ParkedOperation, start_pooled_operation, stop_pooled_operations
+from tests.unit.helpers import ParkedOperation, register_download, start_pooled_operation, stop_pooled_operations
 
 
 @pytest.fixture(autouse=True)
@@ -1824,8 +1826,9 @@ async def test_native_probe_error_still_reaps_the_file_wait(tmp_path) -> None:
     assert residual.exists()
 
 
+@pytest.mark.parametrize("suffix", [None, "statement"])
 @pytest.mark.asyncio
-async def test_finalize_skips_session_copy_whose_bytes_already_in_run_dir(tmp_path) -> None:
+async def test_finalize_skips_session_copy_whose_bytes_already_in_run_dir(tmp_path, sqlite_engine, suffix) -> None:
     # A persistent-session blob: download lands in BOTH the session downloads dir and the run dir
     # (the eager blob carve-out). Finalization must not materialize a second physical copy of
     # identical bytes, or FileUploadBlock uploads the same statement twice and the customer's
@@ -1842,10 +1845,11 @@ async def test_finalize_skips_session_copy_whose_bytes_already_in_run_dir(tmp_pa
     session_uri = "s3://bucket/browser_sessions/pbs-1/downloads/Statement.pdf"
     aws_client = MagicMock()
     aws_client.download_file = AsyncMock(return_value=statement_bytes)
+    context = SkyvernContext(organization_id="org-1", run_id="wr-dedupe") if suffix else None
 
     with (
         patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value=download_dir),
-        patch("skyvern.forge.agent.skyvern_context.current", return_value=None),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=context),
         patch("skyvern.forge.agent.get_aws_client", return_value=aws_client),
         patch("skyvern.forge.agent.app") as mock_app,
     ):
@@ -1853,14 +1857,20 @@ async def test_finalize_skips_session_copy_whose_bytes_already_in_run_dir(tmp_pa
         await agent._finalize_downloaded_files_for_task(
             task,
             organization_id=task.organization_id,
-            download_suffix=None,
+            download_suffix=suffix,
             list_files_before=[],
             randomize_if_missing=False,
         )
 
     remaining = sorted(p.name for p in download_dir.iterdir())
-    assert remaining == ["run-copy.pdf"], f"session copy should be deduped by content, got {remaining}"
-    assert (download_dir / "run-copy.pdf").read_bytes() == statement_bytes
+    kept = f"{suffix}.pdf" if suffix else "run-copy.pdf"
+    assert remaining == [kept], f"session copy should be deduped by content, got {remaining}"
+    assert (download_dir / kept).read_bytes() == statement_bytes
+    aws_client.download_file.assert_awaited_once_with(session_uri, log_exception=False)
+    if context:
+        database = AgentDB(str(sqlite_engine.url), db_engine=sqlite_engine)
+        registered = await register_download(database, download_dir / kept, context)
+        assert registered.configured_name_sha256 == hashlib.sha256(statement_bytes).hexdigest()
 
 
 @pytest.mark.asyncio

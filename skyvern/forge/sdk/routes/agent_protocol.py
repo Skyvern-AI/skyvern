@@ -203,6 +203,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
 from skyvern.forge.sdk.workflow.retry_policy import is_retry_pending
 from skyvern.forge.sdk.workflow.secret_encryption import mask_workflow_for_api
 from skyvern.forge.sdk.workflow.service import (
+    TimelineDownloads,
     cap_action_payloads,
     capped_task_v1_response,
     capped_task_v2,
@@ -7407,6 +7408,7 @@ async def _flatten_workflow_run_timeline_recursive(
     timeline: WorkflowRunTimeline,
     organization_id: str,
     cap_output_values: bool = False,
+    downloads: TimelineDownloads | None = None,
 ) -> list[WorkflowRunTimeline]:
     """
     Recursively flatten a timeline item and its children, handling TaskV2 blocks.
@@ -7424,6 +7426,7 @@ async def _flatten_workflow_run_timeline_recursive(
                 organization_id=organization_id,
                 workflow_run_id=timeline.block.block_workflow_run_id,
                 cap_output_values=cap_output_values,
+                downloads=downloads,
             )
 
             def inherit_attempt(item: WorkflowRunTimeline) -> WorkflowRunTimeline:
@@ -7462,6 +7465,7 @@ async def _flatten_workflow_run_timeline_recursive(
                     timeline=child,
                     organization_id=organization_id,
                     cap_output_values=cap_output_values,
+                    downloads=downloads,
                 )
                 new_children.extend(child_results)
 
@@ -7485,10 +7489,13 @@ async def _flatten_workflow_run_timeline(
     workflow_run_id: str,
     cap_output_values: bool = False,
     task_v2: TaskV2 | None = None,
+    downloads: TimelineDownloads | None = None,
 ) -> list[WorkflowRunTimeline]:
     """
     Get the timeline workflow runs including the nested workflow runs in a flattened list
     """
+    # Every nested run of one response shares one download comparison budget and one attempt read per run.
+    downloads = downloads or TimelineDownloads()
 
     # None means not looked up yet, not that the run has no task v2.
     task_v2_obj = task_v2 or await app.DATABASE.observer.get_task_v2_by_workflow_run_id(
@@ -7500,6 +7507,7 @@ async def _flatten_workflow_run_timeline(
         workflow_run_id=workflow_run_id,
         organization_id=organization_id,
         cap_output_values=cap_output_values,
+        downloads=downloads,
     )
 
     # Recursively flatten the timeline, handling TaskV2 blocks at any nesting level
@@ -7512,6 +7520,7 @@ async def _flatten_workflow_run_timeline(
             timeline=timeline,
             organization_id=organization_id,
             cap_output_values=cap_output_values,
+            downloads=downloads,
         )
         final_workflow_run_block_timeline.extend(flattened)
 
@@ -7527,7 +7536,7 @@ async def _flatten_workflow_run_timeline(
             cap_output_values=cap_output_values,
             workflow_run_id=workflow_run_id,
         )
-        attempt_rows = await app.DATABASE.workflow_run_attempts.get_attempts(workflow_run_id)
+        attempt_rows = await downloads.read_attempts(workflow_run_id)
         block_attempts: dict[str, int] = {}
 
         def collect_block_attempts(items: list[WorkflowRunTimeline]) -> None:

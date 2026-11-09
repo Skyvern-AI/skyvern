@@ -913,6 +913,7 @@ async def test_a_two_document_promise_counts_each_pdf_content_once(
                     organization_id=organization_id,
                     run_id="wr_1",
                     created_at=_T0 + timedelta(minutes=int(artifact_id[-1])),
+                    configured_name_sha256=None,
                 )
                 for artifact_id in ids
             ]
