@@ -1075,6 +1075,12 @@ class AgentFunction:
     ) -> dict[str, str]:
         return {}
 
+    async def get_powerbi_query_hop_refusals(
+        self, *, organization_id: str, workflow_run_id: str, block_labels: list[str]
+    ) -> dict[str, str]:
+        """Per-block ``PowerBIHopRefusal`` values recorded when a run was issued no capability."""
+        return {}
+
     async def ensure_email_forwarding_available(
         self, organization_id: str | None = None, *, fresh: bool = True
     ) -> bool:

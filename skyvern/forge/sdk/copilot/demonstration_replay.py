@@ -24,6 +24,7 @@ from skyvern.forge.sdk.copilot.demonstration_recorder import (
     DemonstrationRecord,
     DemonstrationRejection,
     decode_demonstration_record,
+    demonstration_cache,
     demonstration_event_key,
     demonstration_lock_key,
     demonstration_record_key,
@@ -59,9 +60,9 @@ _TYPED_VALUE_SCREEN_CONCURRENCY = 4
 
 
 async def replay_demonstration(ctx: CopilotContext, mcp_server: SkyvernOverlayMCPServer) -> list[dict[str, Any]]:
-    cache = app.CACHE
+    cache = demonstration_cache()
     demonstration_id = ctx.demonstration_id
-    if cache is None or not cache.is_shared or not demonstration_id:
+    if cache is None or not demonstration_id:
         return []
     record = await _claim_replay(cache, ctx, demonstration_id)
     replay_token = record.replay_token
