@@ -123,6 +123,7 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.db.models import FolderModel
     from skyvern.forge.sdk.integrations.catalog import AccountsById, IntegrationEntry
     from skyvern.forge.sdk.schemas.totp_codes import OTPType
+    from skyvern.forge.sdk.schemas.workflow_copilot import CopilotTurnControl
     from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
     from skyvern.forge.sdk.workflow.code_block_authorized_files import (
         AuthorizedFileMaterialization,
@@ -2196,6 +2197,16 @@ class AgentFunction:
     ) -> str | None:
         """The key Copilot's tools send to the API on behalf of the chat user; raises HTTPException to refuse."""
         return request_key
+
+    async def copilot_turn_control_allowed(
+        self,
+        principal: RequestPrincipal | None,
+        organization_id: str,
+        starter_user_id: str | None,
+        control: CopilotTurnControl,
+    ) -> bool:
+        """Whether the caller may steer, answer or cancel a running Copilot turn."""
+        return True
 
     async def browser_context_route_handlers_allowed(self, **_: Any) -> bool:
         return True

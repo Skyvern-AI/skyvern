@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Collection, Mapping
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
@@ -1346,15 +1346,18 @@ class WorkflowParametersRepository(BaseRepository):
 
     @db_operation("refresh_copilot_question_client")
     async def refresh_copilot_question_client(
-        self, organization_id: str, chat_id: str
+        self, organization_id: str, chat_id: str, seen_turn_ids: Collection[str] | None = None
     ) -> dict[str, CopilotPendingTurn]:
+        """Expire absent-client questions on every turn; mark the client seen only on `seen_turn_ids` (None: all)."""
         async with self.Session() as session:
             chat = await self._locked_question_chat(session, organization_id, chat_id)
             now = datetime.now(timezone.utc)
             entries = {key: CopilotPendingTurn.model_validate(raw) for key, raw in (chat.pending_turns or {}).items()}
             for entry in entries.values():
                 expired = self._expire_absent_question_client(entry, now)
-                pending = any(item.status == "pending" for item in entry.question_interactions)
+                pending = any(item.status == "pending" for item in entry.question_interactions) and (
+                    seen_turn_ids is None or entry.turn_id in seen_turn_ids
+                )
                 if pending:
                     entry.question_client_seen_at = now
                 if expired or pending:
