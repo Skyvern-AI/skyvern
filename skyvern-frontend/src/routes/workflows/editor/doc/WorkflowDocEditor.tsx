@@ -92,6 +92,7 @@ import { docStepTitle } from "./docStepRegistry";
 import { docProblemEntries, docStepProblems } from "./docProblems";
 import { customSettingsShortText } from "./docSettingsChips";
 import { DocProblemsList } from "./DocProblemsList";
+import { docPromptUrlOffer } from "./docPromptUrl";
 import { stepsLeftBy, useDocUnfinishedStore } from "./docUnfinished";
 import { DocGettingStarted, DocStarterNote, DocTip } from "./DocStarter";
 import { docTipIndex, type DocStarterProgress } from "./docStarterTips";
@@ -1026,6 +1027,7 @@ export function WorkflowDocEditor({
         goTo,
         selectedBranch: (conditionalId) => branchSelections.get(conditionalId),
         previousNoteReader,
+        promptUrlOffer: (node) => docPromptUrlOffer({ nodes, edges }, node),
         selectBranch,
         loopOpen: (loopId) => !closedLoops.has(loopId),
         toggleLoop: (loopId) =>

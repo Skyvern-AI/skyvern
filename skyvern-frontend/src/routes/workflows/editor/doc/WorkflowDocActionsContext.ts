@@ -1,4 +1,6 @@
+import type { AppNode } from "../nodes";
 import type { DocScopeRef } from "./docGraphEdits";
+import type { DocPromptUrlOffer } from "./docPromptUrl";
 import { createContext } from "react";
 import type { DocEditApi, DocDestination, DocPlace } from "./docEditApi";
 
@@ -21,6 +23,8 @@ export const WorkflowDocActionsContext = createContext<{
   selectedBranch: (conditionalId: string) => string | undefined;
   // The step that also reads this step's above note at run time: the one before it in its run sequence.
   previousNoteReader: (nodeId: string) => string | undefined;
+  // The URL in the step's prompt, offered for its empty URL field.
+  promptUrlOffer: (node: AppNode) => DocPromptUrlOffer | null;
   selectBranch: (conditionalId: string, branchId: string) => void;
   loopOpen: (loopId: string) => boolean;
   toggleLoop: (loopId: string) => void;
@@ -54,6 +58,7 @@ export const WorkflowDocActionsContext = createContext<{
   goTo: () => {},
   selectedBranch: () => undefined,
   previousNoteReader: () => undefined,
+  promptUrlOffer: () => null,
   selectBranch: () => {},
   loopOpen: () => true,
   toggleLoop: () => {},

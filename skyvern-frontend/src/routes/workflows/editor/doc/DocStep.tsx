@@ -62,6 +62,7 @@ import {
   getDocMainPlaceholder,
   getDocMissingSettings,
   loopLineLeadsIn,
+  getDocFilledProseFields,
   getDocProseFields,
   getDocSettingSummary,
   getDocStepSummary,
@@ -82,6 +83,7 @@ import {
   DocStepPicker,
 } from "./DocEditing";
 import { useDocStepPending } from "./DocProposalView";
+import { DocOneActionHint } from "./DocOneActionHint";
 import {
   docShortcut,
   takeCaretAtStart,
@@ -709,11 +711,7 @@ export function DocStepBody({
     typeof data[key] === "string" ? (data[key] as string) : "";
   // A field emptied while it is being edited stays on screen until the line is left.
   const [kept, setKept] = useState<string[]>([]);
-  const prose = fields.flatMap((f) =>
-    stringOf(f.key).trim() || kept.includes(f.key)
-      ? [{ ...f, value: stringOf(f.key) }]
-      : [],
-  );
+  const prose = getDocFilledProseFields(node, kept);
   const description = stringOf("description").trim()
     ? stringOf("description")
     : null;
@@ -746,6 +744,16 @@ export function DocStepBody({
   const emptyText = getDocMainPlaceholder(node, editable);
   const forEachLoop = node.type === "loop" && data.loopKind !== "while";
   const mainKey = isProse ? fields[0]!.key : "description";
+  // Hidden while the main line is being typed in, so a half-typed URL ("https://exa") is not offered. Focus is kept per
+  // rendering of the line, because React fires no blur when the focused line unmounts; a run or a demonstration that
+  // takes editing away clears it, so the same rendering coming back is not read as still focused.
+  const lineMode = `${editable}-${isProse}`;
+  const [focusedMode, setFocusedMode] = useState<string | null>(null);
+  if (!editable && focusedMode !== null) setFocusedMode(null);
+  const urlOffer =
+    editable && actions.edit && focusedMode !== lineMode
+      ? actions.promptUrlOffer(node)
+      : null;
   const line = (
     key: string,
     value: string,
@@ -797,7 +805,11 @@ export function DocStepBody({
   );
   return (
     <>
-      <div className="min-h-[1.55em] text-base font-normal leading-[1.55]">
+      <div
+        className="min-h-[1.55em] text-base font-normal leading-[1.55]"
+        onFocus={() => setFocusedMode(lineMode)}
+        onBlur={() => setFocusedMode(null)}
+      >
         {isProse ? (
           main ? (
             line(main.key, main.value, emptyText, "")
@@ -912,6 +924,7 @@ export function DocStepBody({
               : (description ?? getDocStepSummary(node))
         }
       />
+      {editableProp && <DocOneActionHint node={node} urlOffer={urlOffer} />}
     </>
   );
 }
