@@ -11,13 +11,24 @@ import {
   type ReactNode,
 } from "react";
 import { cn } from "@/util/utils";
-import { LockClosedIcon, PlusIcon } from "@radix-ui/react-icons";
+import {
+  ExclamationTriangleIcon,
+  LockClosedIcon,
+  PlusIcon,
+} from "@radix-ui/react-icons";
 import { isWorkflowBlockNode, type AppNode } from "../nodes";
 import { workflowBlockTitle } from "../nodes/types";
-import { countDocSteps, type DocItem, type DocNoteItem } from "./buildDocTree";
+import { loopSchemaStepId } from "./docProblems";
+import {
+  countDocSteps,
+  isNumberedItem,
+  type DocItem,
+  type DocNoteItem,
+} from "./buildDocTree";
 import { WorkflowDocActionsContext } from "./WorkflowDocActionsContext";
 import {
   docBlockType,
+  docStepCaption,
   getDocMissingSettings,
   getDocProseFields,
 } from "./docStepRegistry";
@@ -172,13 +183,23 @@ function previousReason(items: DocItem[], index: number) {
 function DocStepProblem({
   nodeId,
   problems,
+  byId,
+  editable,
 }: {
   nodeId: string;
   problems: ReadonlyMap<string, DocNoteProblem>;
+  byId: Map<string, AppNode>;
+  editable: boolean;
 }) {
+  const actions = useContext(WorkflowDocActionsContext);
   const problem = problems.get(`${nodeId}:step`);
   // What the step still needs before it can run, found as the draft is typed.
   const fix = problems.get(`${nodeId}:fix`);
+  const node = byId.get(nodeId);
+  const schemaStep =
+    fix && node && editable && actions.edit
+      ? byId.get(loopSchemaStepId(node, [...byId.values()]) ?? "")
+      : undefined;
   return (
     <>
       {fix && (
@@ -186,12 +207,25 @@ function DocStepProblem({
           {fix.message.split("\n").map((message) => (
             <li
               key={message}
-              className="text-[13px] leading-[1.55] text-muted-foreground [overflow-wrap:anywhere]"
+              className="flex gap-1.5 text-[13px] leading-[1.55] text-amber-700 [overflow-wrap:anywhere] dark:text-amber-300"
             >
-              {message}
+              <ExclamationTriangleIcon
+                aria-hidden
+                className="mt-[3px] size-3.5 shrink-0"
+              />
+              <span className="min-w-0">{message}</span>
             </li>
           ))}
         </ul>
+      )}
+      {schemaStep && (
+        <button
+          type="button"
+          onClick={() => actions.openSettings(schemaStep.id)}
+          className="mt-1 rounded-md border border-border px-2 py-0.5 text-[12.5px] text-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          {`Open ${docStepCaption(schemaStep) ?? schemaStep.data.label}'s Data Schema`}
+        </button>
       )}
       {problem && (
         <p
@@ -210,6 +244,7 @@ function DocNode({
   byId,
   readOnly,
   place,
+  number,
   onEnter,
   noteProblems,
 }: {
@@ -217,6 +252,7 @@ function DocNode({
   byId: Map<string, AppNode>;
   readOnly: boolean;
   place?: DocStepPlace;
+  number: string;
   onEnter?: (split: LineSplit | null, key?: string) => void;
   noteProblems: ReadonlyMap<string, DocNoteProblem>;
 }) {
@@ -248,13 +284,16 @@ function DocNode({
           editable={editable}
           showRunControl={showRunControl}
           place={place}
+          number={number}
           onEnter={onEnter}
-          renderChildren={(children, scope, branchId) => (
+          renderChildren={(children, scope, branchId, numberStart) => (
             <>
               <DocScope
                 items={children}
                 byId={byId}
                 scope={scope}
+                numberPrefix={`${number}.`}
+                numberStart={numberStart}
                 readOnly={readOnly || Boolean(item.readOnlyReason)}
                 emptyText={scope ? "No steps in this branch yet" : undefined}
                 noteProblems={noteProblems}
@@ -263,7 +302,12 @@ function DocNode({
             </>
           )}
         />
-        <DocStepProblem nodeId={item.nodeId} problems={noteProblems} />
+        <DocStepProblem
+          nodeId={item.nodeId}
+          problems={noteProblems}
+          byId={byId}
+          editable={editable}
+        />
       </>
     );
   const inside = item.kind === "loop" ? countDocSteps(item.children) : 0;
@@ -275,6 +319,7 @@ function DocNode({
           editable={editable}
           showRunControl={showRunControl}
           place={place}
+          number={number}
           disclosure={
             item.kind === "loop"
               ? { open, onToggle: () => actions.toggleLoop(item.nodeId) }
@@ -342,6 +387,8 @@ function DocNode({
             <DocStepBody
               node={node}
               editable={editable && Boolean(actions.edit)}
+              hasFix={noteProblems.has(`${node.id}:fix`)}
+              renamable={editable && Boolean(place)}
               onEnter={onEnter}
               onMove={
                 place && actions.edit && !place.isFinally
@@ -400,7 +447,12 @@ function DocNode({
             />
           </div>
         </DocInsertPopover>
-        <DocStepProblem nodeId={item.nodeId} problems={noteProblems} />
+        <DocStepProblem
+          nodeId={item.nodeId}
+          problems={noteProblems}
+          byId={byId}
+          editable={editable}
+        />
         {editable && <DocOneActionHint node={node} />}
         <DocStepResult label={node.data.label} />
       </div>
@@ -410,6 +462,7 @@ function DocNode({
             items={item.children}
             byId={byId}
             scope={{ parentId: item.nodeId, conditionalBranchId: null }}
+            numberPrefix={`${number}.`}
             readOnly={readOnly || Boolean(item.readOnlyReason)}
             emptyText="No steps in this loop yet"
             noteProblems={noteProblems}
@@ -800,6 +853,8 @@ export function DocScope({
   scope,
   emptyText,
   noteProblems = new Map(),
+  numberPrefix = "",
+  numberStart = 1,
 }: {
   items: DocItem[];
   byId: Map<string, AppNode>;
@@ -808,11 +863,15 @@ export function DocScope({
   scope?: DocScopeRef;
   emptyText?: string;
   noteProblems?: ReadonlyMap<string, DocNoteProblem>;
+  // The parent step's number and a dot inside a loop or branch: "3." numbers its steps 3.1, 3.2.
+  numberPrefix?: string;
+  // The first step's number after the prefix; a branch continues the count of the branches before it.
+  numberStart?: number;
 }) {
   const actions = useContext(WorkflowDocActionsContext);
-  const steps = items.filter(
-    (i): i is Exclude<PlacedItem, { kind: "unplaced" }> =>
-      i.kind !== "note" && i.kind !== "unplaced",
+  const steps = items.filter(isNumberedItem);
+  const stepNumbers = new Map(
+    steps.map((s, i) => [s.nodeId, `${numberPrefix}${i + numberStart}`]),
   );
   // Steps shared by several branches sit in this list but belong to the branches.
   const structural =
@@ -1142,8 +1201,16 @@ export function DocScope({
                 <DocProposalStepMark key={id} node={node}>
                   <div data-doc-node-id={id}>
                     <DocStepHeader node={node} editable={false} />
-                    <DocStepBody node={node} />
-                    <DocStepProblem nodeId={id} problems={noteProblems} />
+                    <DocStepBody
+                      node={node}
+                      hasFix={noteProblems.has(`${id}:fix`)}
+                    />
+                    <DocStepProblem
+                      nodeId={id}
+                      problems={noteProblems}
+                      byId={byId}
+                      editable={false}
+                    />
                     <DocStepResult label={node.data.label} />
                     {node.type === "loop" && (
                       <DocProposalLoopRemovals loopLabel={node.data.label} />
@@ -1186,6 +1253,7 @@ export function DocScope({
               byId={byId}
               readOnly={readOnly}
               place={placeOf(item.nodeId)}
+              number={stepNumbers.get(item.nodeId)!}
               onEnter={
                 editable
                   ? (split, key) => enterAfter(item.nodeId, split, key)

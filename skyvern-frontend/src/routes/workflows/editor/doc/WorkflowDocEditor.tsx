@@ -54,7 +54,13 @@ import {
   saveDocInput,
 } from "./docInputs";
 import { DocInputEditor } from "./DocInputEditor";
-import { armNextCaretOffset, takeReferenceLine, useDocTouch } from "./docKeys";
+import {
+  armNextCaretOffset,
+  DOC_SHOW_PROBLEMS_EVENT,
+  docStepLine,
+  takeReferenceLine,
+  useDocTouch,
+} from "./docKeys";
 import type { ParametersState } from "../types";
 import { toast, useToast } from "@/components/ui/use-toast";
 import {
@@ -65,7 +71,6 @@ import { docBranchSelection } from "./docBranchSelection";
 import { useDocRun } from "./useDocRun";
 import { docRunFor } from "./useDocRunFor";
 import { useDocRunStore, type DocRunInput } from "./docRunStore";
-import { DocLiveIndicator } from "./DocLiveIndicator";
 import { DocOutline } from "./DocOutline";
 import { DocStepSearch } from "./DocStepSearch";
 import { DocAnnouncer } from "./DocAnnouncer";
@@ -82,9 +87,11 @@ import {
   type DocPlace,
   type NodeType,
 } from "./docEditApi";
-import { countReferences, findOutputUsers } from "./docGraphEdits";
+import { countReferences, findOutputUsers, textValues } from "./docGraphEdits";
 import { docStepTitle } from "./docStepRegistry";
-import { docStepProblems } from "./docProblems";
+import { docProblemEntries, docStepProblems } from "./docProblems";
+import { customSettingsShortText } from "./docSettingsChips";
+import { DocProblemsList } from "./DocProblemsList";
 import { stepsLeftBy, useDocUnfinishedStore } from "./docUnfinished";
 import { DocGettingStarted, DocStarterNote, DocTip } from "./DocStarter";
 import { docTipIndex, type DocStarterProgress } from "./docStarterTips";
@@ -152,14 +159,6 @@ const OUTLINE_MIN_WIDTH = 640;
 
 const REFERENCE = /\{\{\s*([A-Za-z_][A-Za-z0-9_]*)_output\b/g;
 const PLAIN_OUTPUT = /^\s*([A-Za-z_][A-Za-z0-9_]*_output)(?![A-Za-z0-9_])/;
-
-function textValues(value: unknown, out: string[] = []): string[] {
-  if (typeof value === "string") out.push(value);
-  else if (Array.isArray(value)) value.forEach((v) => textValues(v, out));
-  else if (value && typeof value === "object")
-    Object.values(value).forEach((v) => textValues(v, out));
-  return out;
-}
 
 type WorkflowValidationProblem = {
   block_label: string | null;
@@ -278,8 +277,7 @@ export function WorkflowDocEditor({
   const [pendingNote, setPendingNote] = useState<DocPendingNote | null>(null);
   const [dragId, setDragId] = useState<string | null>(null);
   const [editingInput, setEditingInput] = useState<{
-    key: string | null;
-    type: "workflow" | "context";
+    key: string;
     isNew?: boolean;
   } | null>(null);
   // Closing the input editor that "@ > Create input" opened puts the caret back in the line the "@" came from.
@@ -547,10 +545,6 @@ export function WorkflowDocEditor({
       ),
     [nodes, unfinishedIds],
   );
-  const fixCount = [...stepFixes.values()].reduce(
-    (count, messages) => count + messages.length,
-    0,
-  );
   const shownProblems = useMemo(
     () =>
       validationProblems.filter(
@@ -559,12 +553,17 @@ export function WorkflowDocEditor({
       ),
     [validationProblems, unfinishedLabels],
   );
-  const problems = shownProblems.length + fixCount;
-  // A check that couldn't reach the server says so, but doesn't hold the run. The problems it left
-  // from an earlier check describe an older draft, so they stay on screen but no longer block it.
-  const checkFailed = validationProblems.some(
-    (problem) => problem.code === "validation_failed",
+  const problemEntries = useMemo(
+    () =>
+      docProblemEntries({
+        nodes,
+        items: tree.items,
+        fixes: stepFixes,
+        problems: shownProblems,
+      }),
+    [nodes, tree, stepFixes, shownProblems],
   );
+  const problems = problemEntries.length;
   const workflowProblems = useMemo(
     () => validationProblems.filter((problem) => !problem.block_label),
     [validationProblems],
@@ -607,21 +606,11 @@ export function WorkflowDocEditor({
   }, [nodes, shownProblems, stepFixes]);
 
   // Step warnings sit in the same map but are not notes and do not need fixing.
+  // Counts notes, not problems: one credential named in two notes is one problem and two notes to fix.
   const noteProblemCount = [...noteProblems.keys()].filter(
     (key) => !key.endsWith(":step") && !key.endsWith(":fix"),
   ).length;
-  // A credential named in a note is only a save warning, but the run would read it, so it holds Run like a step problem.
-  const runProblems =
-    fixCount +
-    (checkFailed ? 0 : noteProblemCount) +
-    (checkFailed
-      ? 0
-      : shownProblems.filter(
-          (problem) =>
-            problem.code !== "validation_failed" &&
-            problem.severity !== "warning" &&
-            problem.code !== "credential_in_note",
-        ).length);
+  const runProblems = problemEntries.filter((entry) => entry.blocking).length;
   useEffect(() => {
     useRunValidationStore.getState().setDocProblemCount(runProblems);
   }, [runProblems]);
@@ -660,40 +649,6 @@ export function WorkflowDocEditor({
       store().clear();
     };
   }, []);
-  const firstProblemId = useMemo(() => {
-    const ids = new Set(
-      [...noteProblems.keys()]
-        .filter((key) => key.endsWith(":step") || key.endsWith(":fix"))
-        .map((key) => key.slice(0, key.lastIndexOf(":"))),
-    );
-    const visit = (items: DocItem[]): string | null => {
-      for (const item of items) {
-        if (item.kind === "note") {
-          if (noteProblems.has(`${item.ownerNodeId}:${item.placement}`))
-            return item.ownerNodeId;
-          continue;
-        }
-        if (item.kind === "unplaced") {
-          const hit = item.nodeIds.find((id) => ids.has(id));
-          if (hit) return hit;
-          continue;
-        }
-        if (ids.has(item.nodeId)) return item.nodeId;
-        const inner =
-          item.kind === "loop"
-            ? visit(item.children)
-            : item.kind === "conditional"
-              ? item.branches.reduce<string | null>(
-                  (found, branch) => found ?? visit(branch.children),
-                  null,
-                )
-              : null;
-        if (inner) return inner;
-      }
-      return null;
-    };
-    return visit(tree.items);
-  }, [noteProblems, tree]);
   const starter = useDocStarter(
     workflowId ?? null,
     Boolean(edit) && stepCount === 0 && !description?.trim(),
@@ -818,15 +773,7 @@ export function WorkflowDocEditor({
 
   const closePanel = () => {
     setPanelOpen(false);
-    // The step's line was replaced when it lost focus, so look it up again.
-    const stepLine =
-      panelStepId.current && rootRef.current
-        ? Array.from(
-            rootRef.current.querySelectorAll<HTMLElement>("[data-doc-node-id]"),
-          )
-            .find((el) => el.dataset.docNodeId === panelStepId.current)
-            ?.querySelector<HTMLElement>("[data-doc-line]")
-        : null;
+    const stepLine = docStepLine(rootRef.current, panelStepId.current);
     panelStepId.current = null;
     (panelOpener.current?.isConnected
       ? panelOpener.current
@@ -879,16 +826,13 @@ export function WorkflowDocEditor({
   // The run-blocking panel's Locate lands here while the canvas is covered.
   const goToRef = useRef(goTo);
   goToRef.current = goTo;
-  const firstProblemIdRef = useRef(firstProblemId);
-  firstProblemIdRef.current = firstProblemId;
+  // A refused Run opens the problems list without jumping: a jump could scroll the list's button out of view.
   useEffect(() => {
-    const show = () => {
-      if (firstProblemIdRef.current) goToRef.current(firstProblemIdRef.current);
-    };
-    useRunValidationStore.getState().setDocShowFirstProblem(show);
+    const show = () => window.dispatchEvent(new Event(DOC_SHOW_PROBLEMS_EVENT));
+    useRunValidationStore.getState().setDocShowProblems(show);
     return () => {
-      if (useRunValidationStore.getState().docShowFirstProblem === show)
-        useRunValidationStore.getState().setDocShowFirstProblem(null);
+      if (useRunValidationStore.getState().docShowProblems === show)
+        useRunValidationStore.getState().setDocShowProblems(null);
     };
   }, []);
   const runInputs = useMemo<DocRunInput[]>(() => {
@@ -983,11 +927,7 @@ export function WorkflowDocEditor({
       return next;
     });
   const changesBeforeNewInput = useRef(false);
-  const addInput = (type: "workflow" | "context") => {
-    if (type === "context") {
-      setEditingInput({ key: null, type });
-      return;
-    }
+  const addInput = () => {
     changesBeforeNewInput.current =
       useWorkflowHasChangesStore.getState().hasChanges;
     const key = newDocInputKey(liveParameters, liveNodes);
@@ -1005,12 +945,9 @@ export function WorkflowDocEditor({
       null,
     );
     forgetRemovedInput(key);
-    setEditingInput({ key, type, isNew: true });
+    setEditingInput({ key, isNew: true });
   };
-  const saveInput = (
-    oldKey: string | null,
-    parameter: ParametersState[number],
-  ) => {
+  const saveInput = (oldKey: string, parameter: ParametersState[number]) => {
     const nameProblem = docInputNameProblem(
       parameter.key,
       oldKey,
@@ -1028,9 +965,7 @@ export function WorkflowDocEditor({
       return;
     }
     const rewritten =
-      oldKey === parameter.key || oldKey === null
-        ? 0
-        : countReferences(liveNodes, oldKey);
+      oldKey === parameter.key ? 0 : countReferences(liveNodes, oldKey);
     const result = saveDocInput(liveParameters, oldKey, parameter);
     applyInputs(result.parameters, result.nodes);
     forgetRemovedInput(parameter.key);
@@ -1045,7 +980,7 @@ export function WorkflowDocEditor({
   const closeInputEditor = () => {
     const editing = editingInput;
     setEditingInput(null);
-    if (!editing?.isNew || editing.key === null) return;
+    if (!editing?.isNew) return;
     const parameter = liveParameters.find((p) => p.key === editing.key);
     const untouched =
       parameter?.parameterType === "workflow" &&
@@ -1162,7 +1097,7 @@ export function WorkflowDocEditor({
                 useWorkflowHasChangesStore.getState().hasChanges;
               applyInputs([...liveParameters, parsed.parameter], null);
               forgetRemovedInput(key);
-              setEditingInput({ key, type: "workflow", isNew: true });
+              setEditingInput({ key, isNew: true });
               return true;
             }
           : null,
@@ -1264,23 +1199,18 @@ export function WorkflowDocEditor({
                       proposal
                         ? undefined
                         : inDoc
-                          ? () =>
-                              setEditingInput({
-                                key: input.key,
-                                type:
-                                  parameter.parameterType === "context"
-                                    ? "context"
-                                    : "workflow",
-                              })
+                          ? () => setEditingInput({ key: input.key })
                           : openInputs
                     }
-                    aria-label={`Input ${input.key}${input.missing ? ", needed to run" : ""}${input.unused ? ", not used yet" : ""}`}
+                    aria-label={`Input ${input.key}${input.missing ? ", needed to run" : ""}${parameter?.parameterType === "context" ? `, uses data from ${parameter.sourceParameterKey}` : ""}${input.unused ? ", not used yet" : ""}`}
                     title={
                       input.missing
                         ? "Needed to run"
-                        : input.unused
-                          ? "Not used by any step"
-                          : undefined
+                        : parameter?.parameterType === "context"
+                          ? `Uses data from ${parameter.sourceParameterKey}${input.unused ? "; not used by any step" : ""}`
+                          : input.unused
+                            ? "Not used by any step"
+                            : undefined
                     }
                     className={cn(
                       "inline-flex max-w-full items-center gap-[5px] whitespace-nowrap rounded-md border border-border bg-background py-0.5 pl-[7px] pr-[9px] text-[13px] outline-none focus-visible:ring-2 focus-visible:ring-ring",
@@ -1327,42 +1257,13 @@ export function WorkflowDocEditor({
                 );
               })}
               {edit && (
-                <DocInputEditor
-                  open={
-                    editingInput?.key === null &&
-                    editingInput.type === "workflow"
-                  }
-                  type={WorkflowEditorParameterTypes.Workflow}
-                  onSave={(value) => saveInput(null, value)}
-                  onClose={() => setEditingInput(null)}
+                <button
+                  type="button"
+                  onClick={addInput}
+                  className="inline-flex items-center whitespace-nowrap rounded-md border border-dashed border-border bg-background py-0.5 pl-[7px] pr-[9px] text-[13px] text-muted-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
                 >
-                  <button
-                    type="button"
-                    onClick={() => addInput("workflow")}
-                    className="inline-flex items-center whitespace-nowrap rounded-md border border-dashed border-border bg-background py-0.5 pl-[7px] pr-[9px] text-[13px] text-muted-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
-                  >
-                    + Input
-                  </button>
-                </DocInputEditor>
-              )}
-              {edit && (
-                <DocInputEditor
-                  open={
-                    editingInput?.key === null &&
-                    editingInput.type === "context"
-                  }
-                  type={WorkflowEditorParameterTypes.Context}
-                  onSave={(value) => saveInput(null, value)}
-                  onClose={() => setEditingInput(null)}
-                >
-                  <button
-                    type="button"
-                    onClick={() => addInput("context")}
-                    className="inline-flex items-center whitespace-nowrap rounded-md border border-dashed border-border bg-background py-0.5 pl-[7px] pr-[9px] text-[13px] text-muted-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
-                  >
-                    + Context input
-                  </button>
-                </DocInputEditor>
+                  + Input
+                </button>
               )}
               {startId && !proposal && (
                 <button
@@ -1384,7 +1285,7 @@ export function WorkflowDocEditor({
                   <GearIcon className="size-[13px]" />
                   Agent settings
                   {changedSettingsCount > 0
-                    ? ` · ${changedSettingsCount} changed`
+                    ? ` · ${customSettingsShortText(changedSettingsCount)}`
                     : ""}
                 </button>
               )}
@@ -1399,17 +1300,12 @@ export function WorkflowDocEditor({
                 {stepCount} step{stepCount === 1 ? "" : "s"}
               </span>
               {problems > 0 && (
-                <button
-                  type="button"
-                  data-doc-problems
-                  disabled={!firstProblemId}
-                  onClick={() => firstProblemId && goTo(firstProblemId)}
-                  className="rounded-md border border-border px-2 py-[2px] text-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-default"
-                >
-                  {problems} problem{problems === 1 ? "" : "s"}
-                </button>
+                <DocProblemsList
+                  entries={problemEntries}
+                  byId={byId}
+                  goTo={goTo}
+                />
               )}
-              <DocLiveIndicator />
               <button
                 type="button"
                 onClick={() => setSearchOpen(true)}

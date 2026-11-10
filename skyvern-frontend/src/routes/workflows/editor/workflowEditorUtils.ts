@@ -1218,6 +1218,8 @@ function convertToNode(
           customSmtpPassword: block.custom_smtp_password ?? null,
           transport: block.transport ?? "smtp",
           credentialId: block.credential_id ?? "",
+          credentialSource: block.credential_source ?? "native",
+          connectionId: block.connection_id ?? "",
           cc: (block.cc ?? []).join(", "),
           bcc: (block.bcc ?? []).join(", "),
           replyToMessageId: block.reply_to_message_id ?? "",
@@ -3742,6 +3744,12 @@ function getWorkflowBlock(
           block_type: "send_email",
           transport: "gmail",
           credential_id: node.data.credentialId || null,
+          ...(node.data.credentialSource === "nango"
+            ? {
+                credential_source: "nango",
+                connection_id: node.data.connectionId || null,
+              }
+            : {}),
           sender: "",
           recipients: splitEmailList(node.data.recipients),
           cc: splitEmailList(node.data.cc),
@@ -5470,6 +5478,12 @@ function convertBlocksToBlockYAML(
             ? {
                 transport: block.transport,
                 credential_id: block.credential_id ?? null,
+                ...(block.credential_source === "nango"
+                  ? {
+                      credential_source: block.credential_source,
+                      connection_id: block.connection_id ?? null,
+                    }
+                  : {}),
                 cc: block.cc ?? [],
                 bcc: block.bcc ?? [],
                 reply_to_message_id: block.reply_to_message_id ?? null,

@@ -46,6 +46,12 @@ class _FakeContextForTest:
     def build_workflow_run_summary(self) -> str:
         return ""
 
+    def get_gmail_hop_token(self, label: str) -> str | None:
+        return None
+
+    def get_gmail_hop_refusal(self, label: str) -> str | None:
+        return None
+
 
 def _make_output_parameter(label: str = "read_email") -> OutputParameter:
     return OutputParameter(

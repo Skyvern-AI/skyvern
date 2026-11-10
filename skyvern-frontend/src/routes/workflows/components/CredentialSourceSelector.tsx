@@ -3,7 +3,10 @@ import {
   type BrokerCredentialSelectorProps,
 } from "@/store/PageSlots";
 import { GoogleOAuthCredentialSelector } from "./GoogleOAuthCredentialSelector";
-import { GOOGLE_GMAIL_REQUIRED_SCOPES } from "@/util/googleScopes";
+import {
+  GOOGLE_GMAIL_REQUIRED_SCOPES,
+  GOOGLE_GMAIL_SEND_REQUIRED_SCOPES,
+} from "@/util/googleScopes";
 
 export function CredentialSourceSelector(props: BrokerCredentialSelectorProps) {
   const { brokerCredentialSelector: BrokerSelector } = usePageSlots();
@@ -20,7 +23,12 @@ export function CredentialSourceSelector(props: BrokerCredentialSelectorProps) {
           nodeId={props.nodeId}
           value={props.credentialSource === "native" ? props.credentialId : ""}
           onChange={(id) => props.onChange("native", id)}
-          requiredScopes={GOOGLE_GMAIL_REQUIRED_SCOPES}
+          requiredScopes={
+            props.purpose === "send" || props.purpose === "reply"
+              ? GOOGLE_GMAIL_SEND_REQUIRED_SCOPES
+              : GOOGLE_GMAIL_REQUIRED_SCOPES
+          }
+          gmailSendOnly={props.purpose === "send" || props.purpose === "reply"}
           disabled={props.disabled}
           ariaLabel="Gmail account"
           showEmail

@@ -705,6 +705,8 @@ def block_yaml_to_block(
             file_attachments=block_yaml.file_attachments or [],
             transport=block_yaml.transport,
             credential_id=block_yaml.credential_id,
+            credential_source=block_yaml.credential_source,
+            connection_id=block_yaml.connection_id,
             cc=block_yaml.cc,
             bcc=block_yaml.bcc,
             reply_to_message_id=block_yaml.reply_to_message_id,
