@@ -43,8 +43,9 @@ from skyvern.config import settings
 from skyvern.core.script_generations.generate_script import _build_file_url_parser_statement
 from skyvern.exceptions import PDFParsingError
 from skyvern.forge import app
+from skyvern.forge.failure_classifier import classify_from_failure_reason
 from skyvern.forge.forge_app_initializer import start_forge_app
-from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMResponseFormat
+from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMResponseFormat, LLMProviderErrorRetryableTask
 from skyvern.forge.sdk.utils.capped_subprocess import MEMORY_CAP_ENFORCED, CappedSubprocessError
 from skyvern.forge.sdk.utils.capped_subprocess_child import MIN_MEMORY_BUDGET_BYTES
 from skyvern.forge.sdk.utils.pdf_parser import (
@@ -932,19 +933,77 @@ class TestOcrPdfPages:
         assert "text for good-1" in result and "text for good-3" in result
         assert "--- Page 2 ---" not in result
 
-    async def test_all_pages_failed_raises(self) -> None:
-        """A total OCR outage (every page errors) propagates instead of returning empty text."""
+    async def test_all_pages_failed_raises_without_the_provider_text(self) -> None:
+        """A total OCR outage fails the pass instead of returning empty text, and names only the error type."""
         block = _make_file_parser_block("https://example.com/scan.pdf", FileType.PDF)
 
         async def fake_handler(**kwargs: Any) -> dict[str, str]:
-            raise RuntimeError("vision model outage")
+            raise ValueError("vision model outage quoting the page")
 
         with pytest.MonkeyPatch.context() as mp:
             handler = AsyncMock(side_effect=fake_handler)
             self._patch_handler(mp, handler)
 
-            with pytest.raises(RuntimeError, match="vision model outage"):
+            with pytest.raises(RuntimeError, match=r"any of the PDF's 3 pages \(ValueError\)") as raised:
                 await block._ocr_pdf_pages([b"p1", b"p2", b"p3"])
+
+        assert "quoting the page" not in str(raised.value)
+        assert raised.value.__cause__ is None and raised.value.__suppress_context__
+
+    @pytest.mark.parametrize("failed_page", [None, b"p2"], ids=["all_cancelled", "cancelled_and_failed"])
+    async def test_a_cancelled_page_in_a_total_outage_propagates_cancellation(self, failed_page: bytes | None) -> None:
+        """A cancelled pass must stay a cancellation so the block is not recorded as failed."""
+        block = _make_file_parser_block("https://example.com/scan.pdf", FileType.PDF)
+
+        async def fake_handler(**kwargs: Any) -> dict[str, str]:
+            (image,) = kwargs["screenshots"]
+            if image == failed_page:
+                raise RuntimeError("vision model outage")
+            raise asyncio.CancelledError()
+
+        with pytest.MonkeyPatch.context() as mp:
+            handler = AsyncMock(side_effect=fake_handler)
+            self._patch_handler(mp, handler)
+
+            with pytest.raises(asyncio.CancelledError):
+                await block._ocr_pdf_pages([b"p1", b"p2"])
+
+    @pytest.mark.parametrize("outage", ["rate_limited", "failed_validation"])
+    async def test_a_total_outage_reason_classifies_as_the_provider_text_did(self, outage: str) -> None:
+        """Failure attribution reads the reason text, so dropping the provider's words must not change its category."""
+        block = _make_file_parser_block("https://example.com/scan.pdf", FileType.PDF)
+        provider_text = "Rate limit reached for the request quoting the page"
+
+        class RateLimitError(Exception):
+            pass
+
+        cause = RateLimitError(provider_text)
+        provider_error = LLMProviderErrorRetryableTask("synthetic-llm", cause=cause)
+
+        async def fake_handler(**kwargs: Any) -> Any:
+            if outage == "failed_validation":
+                return {"extracted_text": None}
+            raise provider_error from cause
+
+        with pytest.MonkeyPatch.context() as mp:
+            handler = AsyncMock(side_effect=fake_handler)
+            self._patch_handler(mp, handler)
+            with pytest.raises(RuntimeError) as raised:
+                await block._ocr_pdf_pages([b"p1", b"p2"])
+
+        if outage == "rate_limited":
+            previous_reason = str(provider_error)
+            expected_category: str | None = "LLM_ERROR"
+        else:
+            previous_reason = "OCR response must include extracted_text as a string; got null."
+            expected_category = None
+        reason = str(raised.value)
+        assert "quoting the page" not in reason
+        categories = classify_from_failure_reason(reason)
+        assert categories == classify_from_failure_reason(previous_reason)
+        assert (categories[0]["category"] if categories else None) == expected_category
+        if outage == "failed_validation":
+            assert previous_reason in reason
 
     @pytest.mark.parametrize(
         ("call_timeout", "pass_timeout", "expected_reason"),
