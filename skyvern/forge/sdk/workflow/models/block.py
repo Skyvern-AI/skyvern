@@ -14425,8 +14425,8 @@ class SendEmailBlock(Block):
             ):
                 raise _GmailSendRefused(
                     GmailSendErrorCode.CONFIGURATION,
-                    "This Gmail account can send only in runs a person starts. Scheduled, event, API-key and child "
-                    "workflow runs are not supported; use a natively connected Google account for those. "
+                    "This Gmail account can send only in runs a person starts. Scheduled, webhook, event, API-key "
+                    "and child workflow runs are not supported; use a natively connected Google account for those. "
                     "Nothing was sent.",
                 )
             raise _GmailSendRefused(GmailSendErrorCode.CONFIGURATION)
