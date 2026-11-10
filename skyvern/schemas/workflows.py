@@ -31,7 +31,12 @@ from skyvern.constants import ERROR_CODE_REASONING_MAX_LENGTH, MAX_PDF_OCR_PAGES
 from skyvern.forge.sdk.api.llm.custom_llm_registry import is_custom_llm_key
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.browser_profile_key import validate_browser_profile_key
-from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType, WorkflowParameterType
+from skyvern.forge.sdk.workflow.models.parameter import (
+    BITWARDEN_AWS_KEY_DEFAULTS,
+    OutputParameter,
+    ParameterType,
+    WorkflowParameterType,
+)
 from skyvern.forge.sdk.workflow.models.run_limits import (
     WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES,
     MaxScreenshotScrolls,
@@ -103,6 +108,12 @@ def _get_text_prompt_model_name_by_llm_key() -> dict[str, str]:
 
 ENGINE_PINNED_DESCRIPTION = (
     "Set to true only when skyvern-1.0 was explicitly chosen for this block; leave it unset otherwise."
+)
+
+MAX_STEPS_PER_RUN_DESCRIPTION = (
+    "Action-step budget for one run, not an exact stop. On the skyvern-3.0 (Task V3) engine, except on action and "
+    "validation blocks, the effective budget is never below 24: a positive value under 24 runs as 24, and a run "
+    "still making progress can be granted steps past the budget."
 )
 
 FORCE_OCR_DESCRIPTION = (
@@ -729,10 +740,11 @@ class BitwardenLoginCredentialParameterYAML(ParameterYAML):
     # to infer the type of the parameter_type attribute.
     parameter_type: Literal[ParameterType.BITWARDEN_LOGIN_CREDENTIAL] = ParameterType.BITWARDEN_LOGIN_CREDENTIAL  # type: ignore
 
-    # bitwarden cli required fields
-    bitwarden_client_id_aws_secret_key: str
-    bitwarden_client_secret_aws_secret_key: str
-    bitwarden_master_password_aws_secret_key: str
+    bitwarden_client_id_aws_secret_key: str = BITWARDEN_AWS_KEY_DEFAULTS["bitwarden_client_id_aws_secret_key"]
+    bitwarden_client_secret_aws_secret_key: str = BITWARDEN_AWS_KEY_DEFAULTS["bitwarden_client_secret_aws_secret_key"]
+    bitwarden_master_password_aws_secret_key: str = BITWARDEN_AWS_KEY_DEFAULTS[
+        "bitwarden_master_password_aws_secret_key"
+    ]
     # parameter key for the url to request the login credentials from bitwarden
     url_parameter_key: str | None = None
     # bitwarden collection id to filter the login credentials from,
@@ -759,10 +771,11 @@ class BitwardenSensitiveInformationParameterYAML(ParameterYAML):
     # to infer the type of the parameter_type attribute.
     parameter_type: Literal["bitwarden_sensitive_information"] = ParameterType.BITWARDEN_SENSITIVE_INFORMATION  # type: ignore
 
-    # bitwarden cli required fields
-    bitwarden_client_id_aws_secret_key: str
-    bitwarden_client_secret_aws_secret_key: str
-    bitwarden_master_password_aws_secret_key: str
+    bitwarden_client_id_aws_secret_key: str = BITWARDEN_AWS_KEY_DEFAULTS["bitwarden_client_id_aws_secret_key"]
+    bitwarden_client_secret_aws_secret_key: str = BITWARDEN_AWS_KEY_DEFAULTS["bitwarden_client_secret_aws_secret_key"]
+    bitwarden_master_password_aws_secret_key: str = BITWARDEN_AWS_KEY_DEFAULTS[
+        "bitwarden_master_password_aws_secret_key"
+    ]
     # bitwarden collection id to filter the Bitwarden Identity from
     bitwarden_collection_id: str
     # unique key to identify the Bitwarden Identity in the collection
@@ -778,10 +791,11 @@ class BitwardenCreditCardDataParameterYAML(ParameterYAML):
     # This pattern already works in block.py but since the ParameterType is not defined in this file, mypy is not able
     # to infer the type of the parameter_type attribute.
     parameter_type: Literal[ParameterType.BITWARDEN_CREDIT_CARD_DATA] = ParameterType.BITWARDEN_CREDIT_CARD_DATA  # type: ignore
-    # bitwarden cli required fields
-    bitwarden_client_id_aws_secret_key: str
-    bitwarden_client_secret_aws_secret_key: str
-    bitwarden_master_password_aws_secret_key: str
+    bitwarden_client_id_aws_secret_key: str = BITWARDEN_AWS_KEY_DEFAULTS["bitwarden_client_id_aws_secret_key"]
+    bitwarden_client_secret_aws_secret_key: str = BITWARDEN_AWS_KEY_DEFAULTS["bitwarden_client_secret_aws_secret_key"]
+    bitwarden_master_password_aws_secret_key: str = BITWARDEN_AWS_KEY_DEFAULTS[
+        "bitwarden_master_password_aws_secret_key"
+    ]
     # bitwarden ids for the credit card item
     bitwarden_collection_id: str
     bitwarden_item_id: str
@@ -925,7 +939,7 @@ class TaskBlockYAML(BlockYAML):
     data_schema: dict[str, Any] | list | str | None = None
     error_code_mapping: dict[str, str] | None = None
     max_retries: int = 0
-    max_steps_per_run: int | None = None
+    max_steps_per_run: int | None = Field(default=None, description=MAX_STEPS_PER_RUN_DESCRIPTION)
     parameter_keys: list[str] | None = None
     complete_on_download: bool = False
     download_suffix: str | None = (
@@ -1322,11 +1336,17 @@ class SendEmailBlockYAML(BlockYAML):
         description="ID of a connected Google account that has send permission. Used only with transport 'gmail'.",
         json_schema_extra={"x-skyvern-connected-account": True},
     )
+    reply_to_message_id: str | None = Field(
+        default=None,
+        description="Gmail message ID to reply to in its original thread; requires send and read permissions.",
+    )
     cc: list[str] = Field(default_factory=list, description="Cc recipients. Only with transport 'gmail'.")
     bcc: list[str] = Field(default_factory=list, description="Bcc recipients. Only with transport 'gmail'.")
 
     @model_validator(mode="after")
     def _validate_transport_fields(self) -> "SendEmailBlockYAML":
+        if self.reply_to_message_id is not None and self.transport != EmailTransport.GMAIL:
+            raise ValueError("reply_to_message_id is only supported with the gmail transport")
         if self.transport == EmailTransport.GMAIL:
             custom_smtp_text = (self.custom_smtp_host, self.custom_smtp_username, self.custom_smtp_password)
             if self.custom_smtp_port is not None or any(value and value.strip() for value in custom_smtp_text):
@@ -1363,7 +1383,7 @@ class ValidationBlockYAML(BlockYAML):
     complete_criterion: str | None = None
     terminate_criterion: str | None = None
     error_code_mapping: dict[str, str] | None = None
-    max_steps_per_run: int | None = None
+    max_steps_per_run: int | None = Field(default=None, description=MAX_STEPS_PER_RUN_DESCRIPTION)
     parameter_keys: list[str] | None = None
     disable_cache: bool = False
     without_page_information: bool = False
@@ -1381,7 +1401,7 @@ class ActionBlockYAML(BlockYAML):
     ai_fallback: AIFallbackMode = AIFallbackMode.FALLBACK
     error_code_mapping: dict[str, str] | None = None
     max_retries: int = 0
-    max_steps_per_run: int | None = None
+    max_steps_per_run: int | None = Field(default=None, description=MAX_STEPS_PER_RUN_DESCRIPTION)
     parameter_keys: list[str] | None = None
     complete_on_download: bool = False
     download_suffix: str | None = (
@@ -1402,7 +1422,7 @@ class NavigationBlockYAML(BlockYAML):
     engine_pinned: bool = Field(default=False, description=ENGINE_PINNED_DESCRIPTION)
     error_code_mapping: dict[str, str] | None = None
     max_retries: int = 0
-    max_steps_per_run: int | None = None
+    max_steps_per_run: int | None = Field(default=None, description=MAX_STEPS_PER_RUN_DESCRIPTION)
     parameter_keys: list[str] | None = None
     complete_on_download: bool = False
     download_suffix: str | None = (
@@ -1428,7 +1448,7 @@ class ExtractionBlockYAML(BlockYAML):
     engine_pinned: bool = Field(default=False, description=ENGINE_PINNED_DESCRIPTION)
     data_schema: dict[str, Any] | list | str | None = None
     max_retries: int = 0
-    max_steps_per_run: int | None = None
+    max_steps_per_run: int | None = Field(default=None, description=MAX_STEPS_PER_RUN_DESCRIPTION)
     parameter_keys: list[str] | None = None
     disable_cache: bool = False
 
@@ -1450,7 +1470,7 @@ class LoginBlockYAML(BlockYAML):
     navigation_goal: str | None = None
     error_code_mapping: dict[str, str] | None = None
     max_retries: int = 0
-    max_steps_per_run: int | None = None
+    max_steps_per_run: int | None = Field(default=None, description=MAX_STEPS_PER_RUN_DESCRIPTION)
     parameter_keys: list[str] | None = None
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
@@ -1626,7 +1646,7 @@ class FileDownloadBlockYAML(BlockYAML):
     engine_pinned: bool = Field(default=False, description=ENGINE_PINNED_DESCRIPTION)
     error_code_mapping: dict[str, str] | None = None
     max_retries: int = 0
-    max_steps_per_run: int | None = None
+    max_steps_per_run: int | None = Field(default=None, description=MAX_STEPS_PER_RUN_DESCRIPTION)
     parameter_keys: list[str] | None = None
     download_suffix: str | None = (
         None  # DEPRECATED: This field now sets the complete filename instead of appending to a random name
@@ -1829,6 +1849,7 @@ class EmailInboxBlockYAML(BlockYAML):
     credential_source: Literal["native", "nango"] = "native"
     connection_id: str | None = Field(default=None, json_schema_extra={"x-skyvern-connected-account": True})
     credential_id: str | None = Field(default=None, json_schema_extra={"x-skyvern-connected-account": True})
+    message_id: str | None = None
     folder: str | None = None
     prompt: str | None = None
     sender: str | None = None

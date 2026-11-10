@@ -144,6 +144,7 @@ def _make_secret_element(readbacks: list[str | None]) -> MagicMock:
     element.input_sequentially = AsyncMock()
     element.input_clear = AsyncMock()
     element.input_fill = AsyncMock()
+    element.commit_input_value = AsyncMock()
     element.refresh_locator_if_stale = AsyncMock()
     return element
 
@@ -201,6 +202,33 @@ async def test_fill_secret_first_write_is_atomic_fill() -> None:
     element.input_fill.assert_awaited_once_with(text=SECRET)
     element.input_sequentially.assert_not_awaited()
     element.input_clear.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_atomic_fill_commits_the_value_to_a_js_gated_form() -> None:
+    # SKY-20195: an atomic fill emits only `input`. A login form that tracks edits on `change`/`blur` kept its
+    # own state empty, so the field held the credential while the submit stayed disabled and the click failed.
+    # The read-back cannot catch this -- it reads the element's .value, which matches.
+    element = _make_secret_element([SECRET])
+    manager = MagicMock()
+    manager.attach_mock(element.input_fill, "fill")
+    manager.attach_mock(element.commit_input_value, "commit")
+
+    result = await _fill(element)
+
+    assert result is None
+    assert [call[0] for call in manager.mock_calls] == ["fill", "commit"]
+
+
+@pytest.mark.asyncio
+async def test_sequential_write_does_not_need_the_commit_events() -> None:
+    # The sequential transport types with real keyboard events, which a JS-gated form already tracks.
+    element = _make_secret_element([SECRET])
+
+    result = await _fill(element, sequential_first=True)
+
+    assert result is None
+    element.commit_input_value.assert_not_awaited()
 
 
 @pytest.mark.asyncio

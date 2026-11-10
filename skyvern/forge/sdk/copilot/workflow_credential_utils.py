@@ -8,7 +8,7 @@ from urllib.parse import urlparse
 
 from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
 from skyvern.forge.sdk.copilot.workflow_block_traversal import workflow_block_locations
-from skyvern.forge.sdk.workflow.models.parameter import ParameterType
+from skyvern.forge.sdk.workflow.models.parameter import BITWARDEN_AWS_KEY_DEFAULTS, ParameterType
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
 URL_CANDIDATE_RE = re.compile(r"\b(?:https?://[^\s)>,]+|www\.[^\s)>,]+)", re.IGNORECASE)
@@ -57,7 +57,10 @@ def bitwarden_secret_bindings(workflow_yaml: str) -> set[str]:
         json.dumps(
             {
                 "parameter_type": parameter_type,
-                **{name: parameter.get(name) for name in _BITWARDEN_SECRET_BINDING_FIELDS},
+                **{
+                    name: parameter.get(name, BITWARDEN_AWS_KEY_DEFAULTS.get(name))
+                    for name in _BITWARDEN_SECRET_BINDING_FIELDS
+                },
             },
             sort_keys=True,
         )

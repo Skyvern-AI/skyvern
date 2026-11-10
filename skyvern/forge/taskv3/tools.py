@@ -209,9 +209,10 @@ _OBSERVE_DESCRIPTION_BASE = (
     "ref names the element this reading described and keeps working while that element is on the page. "
     "If it becomes ambiguous or is gone, the tool errors "
     "instead of acting on something else — re-observe and use a ref from the new reading. "
-    "`near=[slot:text, ...]` is text the page projects into the control's component through the named slots, and "
-    "each slot name says what its text is (a label, hint, prefix, and so on). It is not a binding: decide from the "
-    "page and the goal. "
+    "`near=[slot:text, ...]` is text the page projects into the control's component through the named slots. A slot "
+    "name is the component author's own label for its text (a label, hint, prefix, and so on) and may say nothing. "
+    "An `(own text)` entry is text drawn in the component's own root beside the control, not projected through a "
+    "slot. It is not a binding: decide from the page and the goal. "
 )
 _OBSERVE_DESCRIPTION_FRAME_REACH = (
     "Elements inside the page's child frames are included in the same list and are acted on by ref "
@@ -908,6 +909,9 @@ class _TypeaheadPick(NamedTuple):
     # The field's own committed surface when a short-form render (e.g. a dial code) matched more than
     # one row visible at the click — set only when that ambiguity is why nothing was reported committed.
     shared_surface: str | None = None
+    # A removable row with the picked label that the field's container gained while the field's value did not
+    # change, and whose ownership the field cannot prove: shown to the model, never a commit.
+    observed_row: dict[str, str] | None = None
     # The call's final result when pressing Enter to search settled it before any row was picked.
     verdict: ToolResult | None = None
     # How the picked row names the value, and why no row was picked.
@@ -4691,7 +4695,10 @@ _OWN_FIELD_SCOPES_FN_JS = r"""
   const FIELD_SEL = 'input:not([type=hidden]),textarea,select,[role="combobox"],[aria-haspopup="listbox"],[aria-haspopup="menu"],button[aria-expanded]';
   const fieldCount = (root) => {
     let n = 0;
-    for (const f of root.querySelectorAll(FIELD_SEL)) {
+    for (const f of flatQueryAll(root, FIELD_SEL)) {
+      // A host and the control inside its own root are one field.
+      const h = f.getRootNode().host;
+      if (h && h !== root && pContains(root, h) && h.matches(FIELD_SEL)) continue;
       const fr = f.getBoundingClientRect();
       if (fr.width > 0 && fr.height > 0 && ++n >= 2) break;
     }
@@ -4742,11 +4749,16 @@ _FIELD_OWN_STATE_FN_JS = r"""
     return fieldOwnPopup(el, true) !== null;
   };
   const offered = (n) => { try { return composedClosest(n, OFFER_SEL) !== null; } catch (e) { return true; } };
+  // A slot has no box of its own, so only its own display and visibility say whether it draws what is assigned to it.
+  const drawn = (n) => {
+    if (n.localName !== 'slot') return visible(n);
+    try { const cs = getComputedStyle(n); return cs.visibility !== 'hidden' && cs.display !== 'none'; } catch (e) { return true; }
+  };
   const textRuns = (root, el) => {
     const runs = [];
     const walk = (n, depth) => {
       if (depth > 6) return;
-      for (const c of n.childNodes) {
+      for (const c of (n.localName === 'slot' ? n.assignedNodes({ flatten: true }) : n.childNodes)) {
         if (runs.length > 8) return;
         if (c.nodeType === 3) {
           const t = ownNrm(c.nodeValue);
@@ -4756,7 +4768,8 @@ _FIELD_OWN_STATE_FN_JS = r"""
         if (c.nodeType !== 1 || c === el) continue;
         let skip = true;
         try {
-          skip = c.matches('input,select,textarea,button,[role="button"],script,style,svg') || c.matches(OFFER_SEL) || !visible(c);
+          skip = c.matches('input,select,textarea,button,[role="button"],script,style,svg') || c.matches(OFFER_SEL)
+            || !drawn(c);
         } catch (e) { skip = true; }
         if (!skip) walk(c, depth + 1);
       }
@@ -4788,18 +4801,30 @@ _FIELD_OWN_STATE_FN_JS = r"""
   // The chip's branch under the scope it shares with the field holds no caption of its own: a sibling
   // group's chips sit under that group's caption ("Countries lived in"), which a field-less group cannot
   // otherwise be told apart by.
+  // A component may draw its tags as options, each nesting its own remove control; an offered row nests no control.
+  const nestsControl = (c) => flatQueryAll(c, 'button,[role="button"]').length > 0;
+  const tagRow = (c) => c.matches('[role="option"]') && nestsControl(c);
+  // The caption walk reads the flat tree: a host draws its root with the slots filled, so a caption slotted into a
+  // component below the scope counts, and a label slotted into a tag row does not (the row is skipped whole).
+  const flatKids = (n) => {
+    if (n.localName === 'slot') {
+      const a = n.assignedNodes({ flatten: true });
+      return a.length ? a : Array.from(n.childNodes);
+    }
+    return n.shadowRoot ? Array.from(n.shadowRoot.childNodes) : Array.from(n.childNodes);
+  };
   const captionFree = (scope, c) => {
     let branch = c;
     while (branch && scopeUp(branch) !== scope) branch = scopeUp(branch);
-    if (!branch || branch.nodeType !== 1 || branch === c) return true;
+    if (!branch || branch === c) return true;
     const runs = [];
     const walk = (n, depth) => {
       if (depth > 6 || runs.length) return;
-      for (const k of n.childNodes) {
+      for (const k of flatKids(n)) {
         if (k.nodeType === 3) { if (ownNrm(k.nodeValue)) { runs.push(k); return; } continue; }
         if (k.nodeType !== 1) continue;
         let skip = true;
-        try { skip = k.matches(CHIP_SEL) || k.matches('script,style,svg') || !visible(k); } catch (e) { skip = true; }
+        try { skip = k.matches(CHIP_SEL) || tagRow(k) || k.matches('script,style,svg') || !drawn(k); } catch (e) { skip = true; }
         if (!skip) walk(k, depth + 1);
       }
     };
@@ -4843,24 +4868,49 @@ _FIELD_OWN_STATE_FN_JS = r"""
     walk(scope, 0);
     return !text;
   };
-  // `strict` (the pre-act no-op) keeps only chips whose ownership is provable.
-  const ownChipLabels = (el, strict) => {
+  // A tag row is a chip while it sits in the field's own container outside the live list and the field's declared list.
+  const tagOption = (el, c) => tagRow(c) && !c.closest(OFFER_TAGS) && !declaredTargets(el).some((t) => pContains(t, c));
+  // A chip in a root the field is not inside belongs to another component as far as the page shows.
+  const inFieldRoots = (el, c) => {
+    for (let r = el.getRootNode(); r; r = r.host ? r.host.getRootNode() : null) if (r === c.getRootNode()) return true;
+    return false;
+  };
+  // The scopes are read over the flat tree. A chip is the field's own only when it is not a tag row (a list of recent
+  // picks draws the same shape), sits in one of the field's roots, and with `strict` (the pre-act no-op) passes
+  // chipProvablyOwned; the rest are rows the field's container shows, never a commit.
+  const chipReads = (el, strict) => {
     const found = [];
+    // A chip refused for its caption in a nearer scope stays refused where that caption is out of reach.
+    const captioned = new Set();
     for (const scope of ownFieldScopes(el)) {
-      for (const c of scope.querySelectorAll(CHIP_SEL)) {
-        if (found.some((f) => f.node === c) || excludedFor(el, c) || offered(c) || !visible(c)) continue;
-        if (c.matches('[aria-selected],[aria-pressed],[aria-checked],[aria-expanded],[type="submit" i]')) continue;
+      for (const c of flatQueryAll(scope, CHIP_SEL + ',[role="option"]')) {
+        if (found.some((f) => f.node === c) || captioned.has(c) || !visible(c)) continue;
+        if (!tagOption(el, c) && (excludedFor(el, c) || offered(c)
+          || c.matches('[aria-selected],[aria-pressed],[aria-checked],[aria-expanded],[type="submit" i]'))) continue;
         const runs = textRuns(c, el);
         if (!runs.length) continue;
         const aria = ownNrm(c.getAttribute('aria-label'));
         let removable = runs.slice(1).some((t) => REMOVAL_RE.test(t)) || (!!aria && aria !== runs[0] && REMOVAL_RE.test(aria));
-        try { removable = removable || c.querySelector('button,[role="button"]') !== null; } catch (e) { /* keep */ }
-        if (!removable || !captionFree(scope, c) || (strict && !chipProvablyOwned(el, c))) continue;
-        found.push({ node: c, label: runs.filter((t) => !REMOVAL_RE.test(t)).join(' ') });
+        try { removable = removable || nestsControl(c); } catch (e) { /* keep */ }
+        if (!removable) continue;
+        if (!captionFree(scope, c)) { captioned.add(c); continue; }
+        const owned = !tagRow(c) && inFieldRoots(el, c) && (!strict || chipProvablyOwned(el, c));
+        found.push({ node: c, label: runs.filter((t) => !REMOVAL_RE.test(t)).join(' '), owned });
       }
     }
-    return found.filter((f) => !found.some((o) => o !== f && f.node.contains(o.node))).map((f) => f.label);
+    return found.filter((f) => !found.some((o) => o !== f && f.node.contains(o.node)));
   };
+  const ownChipLabels = (el, strict) => chipReads(el, strict).filter((f) => f.owned).map((f) => f.label);
+  const observedRows = (el, want) => chipReads(el, false).filter((f) => !f.owned && f.label === want).map((f) => {
+    const list = composedClosest(f.node.parentNode || f.node, '[role="listbox"],[role="list"],ul,ol');
+    const host = (list || f.node).getRootNode().host;
+    return {
+      text: f.label,
+      role: f.node.getAttribute('role') || f.node.localName,
+      list: list ? ownNrm(list.getAttribute('aria-label')) : '',
+      host: host ? host.localName : '',
+    };
+  });
   const anchorHolds = (el, want, anyState) => {
     if (['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName) || el.isContentEditable) return false;
     if (!anyState && ownPopupOpen(el)) return false;
@@ -4926,7 +4976,8 @@ _SEMANTIC_COMMIT_STATE_JS = (
   }
   if (arg.baseline === true) {
     if (!el || !want) return null;
-    return fieldOwnSources(el, want, true);
+    // 'row': an exact-label row the field cannot prove its own was already there, so a later one is not new.
+    return fieldOwnSources(el, want, true).concat(observedRows(el, want).length ? ['row'] : []);
   }
   if (!el || !want) return { committed: false };
   if (el.tagName === 'SELECT') return { committed: false };
@@ -4968,6 +5019,7 @@ _OWN_CHIPS_JS = (
   if (!el) return null;
   // A popup the field declares is its list, whatever its role; while it is on screen no chip counts as held.
   if (arg.strict === true && declaredTargets(el).some((t) => !pContains(t, el) && visible(t))) return null;
+  if (typeof arg.observe === 'string') return observedRows(el, ownNrm(arg.observe));
   return ownChipLabels(el, arg.strict === true);
 }"""
 )
@@ -9864,6 +9916,7 @@ OBSERVE_FIELD_DISPLAY_MAX = max(OBSERVE_DISPLAY_WIDTHS.values())
 _OBSERVE_CLIP_SPAN_RE = re.compile("\x00([^\x00]*)\x00")
 # A slot name is printed bare inside near=[slot:text, ...], so only name characters survive.
 _NEAR_SLOT_STRIP_RE = re.compile(r"[^\w.-]")
+_NEAR_OWN_TEXT = "(own text)"
 
 
 def _observe_quoted_field(masked: str, width: int, *, cut_before: bool) -> str:
@@ -9877,12 +9930,18 @@ def _observe_quoted_field(masked: str, width: int, *, cut_before: bool) -> str:
     return f"{shown}\x00{max(cut, 0)}{' or more' if cut_before else ''}\x00"
 
 
+def _near_name(n: dict[str, Any]) -> str:
+    # The own-text marker comes from the page script's flag, so a slot the page names "(own text)" is stripped as usual.
+    if n.get("own") is True:
+        return _NEAR_OWN_TEXT
+    return _NEAR_SLOT_STRIP_RE.sub("", _digest_token(n.get("slot") or "", 40)) or "default"
+
+
 def _near_suffix(near: object, field: Callable[[str, int], str]) -> str:
     if not isinstance(near, list):
         return ""
     entries = [
-        f"{_NEAR_SLOT_STRIP_RE.sub('', _digest_token(n.get('slot') or '', 40)) or 'default'}:"
-        f"{field(str(n.get('text') or ''), OBSERVE_DISPLAY_WIDTHS['group'])}"
+        f"{_near_name(n)}:{field(str(n.get('text') or ''), OBSERVE_DISPLAY_WIDTHS['group'])}"
         for n in near
         if isinstance(n, dict) and n.get("text")
     ]
@@ -10101,8 +10160,8 @@ async (__tv3TextArgs) => {
   // The texts a control's own component chain projects before it, each with the slot that carries it: every slot with
   // assigned content in the siblings before the control's subtree, up to the nearest stop and at most 4, read through
   // the flat tree. A slot carries placement, not meaning, so these are printed as candidates with their slot names
-  // (near=), never as the group; like main's walk it stops at a drawn control, a grid cell, a choice's caption and
-  // visible text in the control's own root, and never leaves the outermost host.
+  // (near=), never as the group, beside the text drawn in the control's own root; like main's walk it stops at a drawn
+  // control, a grid cell and a choice's caption, and never leaves the outermost host.
   const _rootOfNode = Node.prototype.getRootNode;
   const _shadowHostOf = _getter(ShadowRoot.prototype, 'host');
   const _childrenOf = _getter(Element.prototype, 'children');
@@ -10115,11 +10174,13 @@ async (__tv3TextArgs) => {
   };
   // Whether n holds a control in the flat tree: a host's open root (its unassigned light children are not drawn),
   // a slot's assigned elements (its fallback content only when nothing is assigned), else its children. Once per node.
+  // Drawn widgets main's walks, sharing _CTRL_SEL, do not stop at; one that is not drawn is no stop.
+  const _NEAR_STOP_SEL = '[role=slider],[role=textbox],[role=searchbox],iframe';
   const _holdsSeen = new Map();
   const _holdsControl = (n, depth) => {
     if (_holdsSeen.has(n)) return _holdsSeen.get(n);
     // Past 24 levels a subtree counts as holding a control: the walk fails closed, binding nothing.
-    let held = depth > 24 || _matches.call(n, _CTRL_SEL);
+    let held = depth > 24 || _matches.call(n, _CTRL_SEL) || (_matches.call(n, _NEAR_STOP_SEL) && !_unseen(n));
     if (!held) {
       const sr = _openShadowOf(n);
       const slotted = _localNameOf.call(n) === 'slot' && _assignedNodesOf.call(n, { flatten: true }).length > 0;
@@ -10129,18 +10190,51 @@ async (__tv3TextArgs) => {
     _holdsSeen.set(n, held);
     return held;
   };
+  // A real assignment only: flattened, an unassigned slot returns its own fallback content. A host's whitespace
+  // between tags and an empty element are assigned too, and project nothing; a forwarded slot projects what it is
+  // assigned itself, and only while it is drawn.
+  const _assigns = (sl) => _assignedNodesOf.call(sl).some((a) => {
+    const kind = _nodeTypeOf.call(a);
+    if (kind === 3) return !!_normText(_contentOf.call(a));
+    return kind === 1 && !_unseen(a) && (_localNameOf.call(a) !== 'slot' || _assigns(a));
+  });
   const _projectingSlots = (n) => {
     const slots = _localNameOf.call(n) === 'slot' ? [n] : Array.from(_qsa.call(n, 'slot'));
-    // A real assignment only: flattened, an unassigned slot returns its own fallback content. A host's whitespace
-    // between tags and an empty element are assigned too, and project nothing.
-    return slots.filter((sl) => _assignedNodesOf.call(sl).some((a) => {
-      const kind = _nodeTypeOf.call(a);
-      return kind === 1 ? !_unseen(a) : kind === 3 && !!_normText(_contentOf.call(a));
-    }));
+    return slots.filter(_assigns);
+  };
+  // Main's _captionHost read through an open root: a root holding a choice is a caption host when it and the text
+  // slotted into its host read under two characters.
+  const _rootCaptionHost = (sr) => {
+    if (!_rootQs.call(sr, _CHOICE_SEL)) return false;
+    let out = '';
+    for (let c = _firstChildOf.call(sr); c; c = _nextOf.call(c)) {
+      const kind = _nodeTypeOf.call(c);
+      if (kind === 3) out += ' ' + _contentOf.call(c);
+      else if (kind === 1 && !_unseen(c)) out += ' ' + _labelText(c, true);
+    }
+    return _normText(out).length < 2;
+  };
+  // The text a sibling draws itself, all slots left out with `skipSlots`; the sibling itself was screened by the walk.
+  const _ownDrawnText = (n, depth, skipSlots) => {
+    if (depth > 4 || (depth > 0 && _unseen(n))) return '';
+    // A slot draws its default text only while nothing, not even whitespace, is assigned to it.
+    if (_localNameOf.call(n) === 'slot' && (skipSlots || _assignedNodesOf.call(n).length)) return '';
+    let out = '';
+    for (let c = _firstChildOf.call(n); c; c = _nextOf.call(c)) {
+      const kind = _nodeTypeOf.call(c);
+      if (kind === 3) out += ' ' + _contentOf.call(c);
+      else if (kind === 1) out += ' ' + _ownDrawnText(c, depth + 1, skipSlots);
+    }
+    return out;
   };
   const _projectedLabel = (el) => {
-    // Nearest first while walking, so each sibling's entries go in front: the list ends in tree order.
+    // Nearest first while walking, so each sibling's entries go in front: the list ends in tree order. A sibling's own
+    // text goes before its slot entries.
     const found = [];
+    const add = (entries, ownText) => {
+      const all = ownText ? [{ slot: '(own text)', own: true, text: ownText }, ...entries] : entries;
+      found.unshift(...all.slice(Math.max(0, all.length - (4 - found.length))));
+    };
     try {
       const ownRoot = _rootOfNode.call(el);
       let node = el;
@@ -10149,9 +10243,11 @@ async (__tv3TextArgs) => {
         let scanned = 0;
         for (let s = _prevOf.call(node); s && scanned < 8; s = _prevOf.call(s), scanned++) {
           const kind = _nodeTypeOf.call(s);
-          // Main's walk stops at its root's top level, so text there is nearer than any projected text.
+          const inOwnRoot = _rootOfNode.call(s) === ownRoot;
+          // Text drawn in the control's own root is a candidate of its own, never a stop: the model judges it.
           if (kind === 3) {
-            if (_rootOfNode.call(s) === ownRoot && /\p{L}/u.test(_normText(_contentOf.call(s)))) return found;
+            if (inOwnRoot) add([], _normText(_contentOf.call(s)));
+            if (found.length >= 4) return found;
             continue;
           }
           if (kind !== 1) continue;
@@ -10159,7 +10255,8 @@ async (__tv3TextArgs) => {
           if (_unseen(s)) continue;
           const slots = _projectingSlots(s);
           if (!slots.length) {
-            if (_rootOfNode.call(s) === ownRoot && /\p{L}/u.test(_visibleText(s, 0))) return found;
+            if (inOwnRoot) add([], _normText(_ownDrawnText(s, 0, false)));
+            if (found.length >= 4) return found;
             continue;
           }
           // Main's caption rule: text right after a checkbox or radio is that control's caption.
@@ -10167,7 +10264,7 @@ async (__tv3TextArgs) => {
           while (before && _nodeTypeOf.call(before) !== 1 && !_normText(_contentOf.call(before))) before = _prevOf.call(before);
           if (before && _nodeTypeOf.call(before) === 1) {
             const bsr = _openShadowOf(before);
-            if (_captionHost(before) || (bsr && _rootQs.call(bsr, _CHOICE_SEL))) return found;
+            if (_captionHost(before) || (bsr && _rootCaptionHost(bsr))) return found;
           }
           // Each slot is read on its own, so a text and its slot name always agree; an icon reads empty and is skipped.
           const own = [];
@@ -10175,7 +10272,9 @@ async (__tv3TextArgs) => {
             const t = _normText(_labelText(sl, true));
             if (t) own.push({ slot: (Element.prototype.getAttribute.call(sl, 'name') || '').slice(0, 40), text: t });
           }
-          found.unshift(...own.slice(Math.max(0, own.length - (4 - found.length))));
+          // A projecting sibling's own text is what it draws outside its slots.
+          const ownText = inOwnRoot ? _normText(_ownDrawnText(s, 0, true)) : '';
+          add(own, ownText);
           if (found.length >= 4) return found;
         }
         node = _parentOf.call(node) || _shadowHostOf.call(_rootOfNode.call(node));
@@ -12057,7 +12156,7 @@ async (__tv3TextArgs) => {
         const text = n.text.slice(0, _RETAIN_WIDTH);
         if (nearTotal + Math.min(text.length, 200) > _GROUP_TEXT_TOTAL_CAP) break;
         nearTotal += Math.min(text.length, 200);
-        shownNear.push({ slot: n.slot, text });
+        shownNear.push(n.own ? { slot: n.slot, own: true, text } : { slot: n.slot, text });
       }
       if (shownNear.length) rec.near = shownNear;
       // Every member carries its group's number, so the digest can say once per group that no
@@ -13470,23 +13569,38 @@ def _readiness_note(reached: str | None, waited_seconds: float) -> str:
     )
 
 
-# A probe that reads the DOM from the page's own JS realm can be answered by the page: prototype
-# methods and instance properties are both replaceable there, so a forged label earns a forced click
-# through a real cover. These probes run in a per-page isolated world instead, a realm the page has
-# no handle on, rebuilt whenever the document it was created against is gone.
-_ISOLATED_WORLDS: weakref.WeakKeyDictionary[Any, dict[str, Any]] = weakref.WeakKeyDictionary()
-# One CDP session per PAGE, shared by every realm probed on it. Keyed per realm instead, a run that
-# probes many child frames -- an SPA or an ad-heavy page that churns iframes -- opens a session per
-# frame and never detaches any: the frame goes away, its worlds entry is collected, and the session is
-# left orphaned but still attached. A page is long-lived and bounded; the set of frames on it is not.
-_PAGE_CDP_SESSIONS: weakref.WeakKeyDictionary[Any, Any] = weakref.WeakKeyDictionary()
+# Kept on the page, so the collector frees it with the page. A CDP session and a child frame both reach
+# their page, so a module-level weak-key map holding either never clears and pins every finished run.
+@dataclasses.dataclass
+class _PageState:
+    # A probe that reads the DOM from the page's own JS realm can be answered by the page: prototype
+    # methods and instance properties are both replaceable there, so a forged label earns a forced click
+    # through a real cover. These probes run in a per-page isolated world instead, a realm the page has
+    # no handle on, rebuilt whenever the document it was created against is gone.
+    worlds: weakref.WeakKeyDictionary[Any, dict[str, Any]] = dataclasses.field(
+        default_factory=weakref.WeakKeyDictionary
+    )
+    # One CDP session per PAGE, shared by every realm probed on it. Keyed per realm instead, a run that
+    # probes many child frames -- an SPA or an ad-heavy page that churns iframes -- opens a session per
+    # frame and never detaches any: the frame goes away, its worlds entry is collected, and the session is
+    # left orphaned but still attached.
+    cdp_session: Any = None
+    frame_work: dict[str, Any] = dataclasses.field(
+        default_factory=lambda: {"filled": {}, "submitted": {}, "documents": {}}
+    )
+
+
+def _page_state(page: Any) -> _PageState:
+    state: _PageState = vars(page).setdefault("_skyvern_taskv3_state", _PageState())
+    return state
 
 
 async def _page_cdp_session(page: Any) -> Any:
-    session = _PAGE_CDP_SESSIONS.get(page)
+    state = _page_state(page)
+    session = state.cdp_session
     if session is None:
         session = await page.context.new_cdp_session(page)
-        _PAGE_CDP_SESSIONS[page] = session
+        state.cdp_session = session
     return session
 
 
@@ -13569,12 +13683,13 @@ async def _realm_frame_record(target: Any, session: Any) -> dict[str, Any] | Non
 
 
 async def _isolated_world(page: Any, *, fresh: bool = False) -> tuple[Any, int] | None:
-    state = _ISOLATED_WORLDS.get(page)
+    page_state = _page_state(_realm_page(page))
+    state = page_state.worlds.get(page)
     if state is None:
         # The miss is cached too: a page with no CDP session (a non-Chromium engine) would otherwise
         # pay a failed handshake on every probe for the rest of the run.
         state = {"session": None, "context_id": None}
-        _ISOLATED_WORLDS[page] = state
+        page_state.worlds[page] = state
         try:
             # Always the PAGE's session, never the realm's. `new_cdp_session` accepts a Frame per its
             # signature, but it RAISES for a frame that shares its parent's renderer -- "this frame does
@@ -13620,10 +13735,10 @@ async def _isolated_world(page: Any, *, fresh: bool = False) -> tuple[Any, int] 
             # page while the worlds are keyed per realm, so evicting only the observing realm left every
             # sibling frame holding a detached session and a context id that looks usable -- and their
             # next probe answered from the realm the page can patch, permanently.
-            for realm, other in list(_ISOLATED_WORLDS.items()):
+            for realm, other in list(page_state.worlds.items()):
                 if other.get("session") is dead:
-                    _ISOLATED_WORLDS.pop(realm, None)
-            _PAGE_CDP_SESSIONS.pop(_realm_page(page), None)
+                    page_state.worlds.pop(realm, None)
+            page_state.cdp_session = None
             raise
     return state["session"], int(state["context_id"])
 
@@ -13817,18 +13932,11 @@ def _frame_depth(frame: Any, main_frame: Any) -> int:
 # at the action removes the walk entirely -- and it is more accurate as well as bounded, because the
 # guards care about the model's own unsubmitted work rather than about every field on every document.
 #
-# Page-keyed and weak, like _ISOLATED_WORLDS: a closure writes it and module-level `pending_marker`
+# Held on the page, like the isolated worlds: a closure writes it and module-level `pending_marker`
 # reads it. Entries are per realm, and a realm whose document identity has changed has had its work
 # discarded WITH that document, so its entries are dropped on read rather than trusted.
-_FRAME_WORK: weakref.WeakKeyDictionary[Any, dict[str, Any]] = weakref.WeakKeyDictionary()
-
-
 def _frame_work(page: Any) -> dict[str, Any]:
-    state = _FRAME_WORK.get(page)
-    if state is None:
-        state = {"filled": {}, "submitted": {}, "documents": {}}
-        _FRAME_WORK[page] = state
-    return state
+    return _page_state(page).frame_work
 
 
 async def _record_frame_work(page: Any, realm: Any, selector: str, kind: str, document_id: str) -> None:
@@ -13867,10 +13975,7 @@ def _recorded_work_frames(page: Any) -> list[Any]:
     the sample it leaves behind is STABLE, which reads as settled. Bounded by the actions the model took
     rather than by the page's frame count, which is why this is a ledger read and not another walk.
     """
-    state = _FRAME_WORK.get(page)
-    if state is None:
-        return []
-    return list(state["documents"])
+    return list(_frame_work(page)["documents"])
 
 
 def _safe_url(target: Any) -> str:
@@ -15287,7 +15392,9 @@ def build_browser_tools(
         still_identical = sum(
             n
             for n in Counter(
-                _observe_line_identity(b) for e, b in zip(elements, bodies) if not e.get("pointerRoot")
+                _observe_line_identity(b + near)
+                for e, b, near in zip(elements, bodies, near_suffixes, strict=True)
+                if not e.get("pointerRoot")
             ).values()
             if n > 1
         )
@@ -18040,6 +18147,17 @@ def build_browser_tools(
             return None
         return [str(c) for c in chips if isinstance(c, str)] if isinstance(chips, list) else None
 
+    async def _observed_row(page: Any, selector: str, label: str, pre_held: list[str] | None) -> dict[str, str] | None:
+        if pre_held is None or "row" in pre_held:
+            return None
+        try:
+            rows = await page.evaluate(_OWN_CHIPS_JS, {**(await _probe_arg(page, selector)), "observe": label})
+        except Exception:
+            return None
+        if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
+            return None
+        return {k: str(rows[0].get(k) or "") for k in ("text", "role", "list", "host")}
+
     async def _holds_own_chips(page: Any, selector: str) -> bool:
         return bool(await _own_chip_labels(page, selector))
 
@@ -18617,6 +18735,7 @@ def build_browser_tools(
                 committed, readable = post_own, True
             elif short_verdict is CommitStatus.UNVERIFIED:
                 shared_surface = post_own
+        observed_row = None if committed or shared_surface else await _observed_row(page, selector, best_txt, pre_held)
         return _TypeaheadPick(
             committed or None,
             best_txt,
@@ -18626,6 +18745,7 @@ def build_browser_tools(
             declared=declared_rows,
             pre_surface_hit=pre_surface_hit,
             shared_surface=shared_surface,
+            observed_row=observed_row,
             tier=choice.tier if isinstance(choice, Pick) else None,
         )
 
@@ -21417,6 +21537,8 @@ def build_browser_tools(
                     pick.tier,
                     _model_text(text, 60),
                 )
+            if not pick.committed and pick.observed_row:
+                return _observed_row_result(f"typed into {selector} and picked {suggestion!r}", pick.observed_row)
             if not pick.committed and pick.shared_surface:
                 # The widget renders only a short form of the label ("+1"), and either another row visible
                 # at the click showed it too or the field was unreadable before the click.
@@ -22489,6 +22611,8 @@ def build_browser_tools(
                 tier,
                 _model_text(value, 60),
             )
+        if not committed and (row := await _observed_row(page, selector, matched, pre_held)):
+            return _observed_row_result(f"selected {matched!r} for {selector}", row)
         if verdict is CommitStatus.UNVERIFIED and matches != 1:
             return unconfirmed_ok(
                 f"selected {matched!r} for {selector}, but it re-resolved to {matches} elements so the "
@@ -22506,6 +22630,18 @@ def build_browser_tools(
             )
         return ToolResult.error(
             f"clicked {matched!r} but {selector} did not commit a value", error_class="did_not_commit"
+        )
+
+    def _observed_row_result(did: str, row: dict[str, str]) -> ToolResult:
+        where = f"the list {row['list']!r}" if row["list"] else "the field's container"
+        if row["host"]:
+            where += f" inside <{row['host']}>"
+        text = _model_text(row["text"], 60)
+        return unconfirmed_ok(
+            f"{did}; the field's value did not change, and a removable {row['role']} row {text!r} appeared in "
+            f"{where}. The tool cannot tell whether that row is this field's selected tag or a row of another list "
+            f"(recent picks, another field), so the pick is NOT confirmed. Compare the row with the field and the "
+            f"goal before acting: picking {text!r} again may remove it."
         )
 
     def _already_held_result(selector: str, value: str) -> ToolResult:
@@ -22590,6 +22726,7 @@ def build_browser_tools(
             declared: bool,
             surface_vouched_pre_click: bool = False,
             shared_surface: str | None = None,
+            observed_row: dict[str, str] | None = None,
             clicked: bool,
             tier: Tier | None = None,
         ) -> ToolResult:
@@ -22610,6 +22747,8 @@ def build_browser_tools(
                     if closed is not None:
                         return closed
                 return ToolResult.ok(f"selected {opt_txt!r} for {selector} (committed value: {committed!r})")
+            if not committed and observed_row:
+                return _observed_row_result(f"selected suggestion {opt_txt!r} for {selector}", observed_row)
             if not committed and shared_surface:
                 # The widget renders only a short form of the label ("+1"), and either another row visible
                 # at the click showed it too or the field was unreadable before the click.
@@ -22653,6 +22792,7 @@ def build_browser_tools(
                     declared=live_pick.declared,
                     surface_vouched_pre_click=live_pick.pre_surface_hit,
                     shared_surface=live_pick.shared_surface,
+                    observed_row=live_pick.observed_row,
                     clicked=True,
                     tier=live_pick.tier,
                 )
@@ -22726,6 +22866,7 @@ def build_browser_tools(
                         declared=rung_pick.declared,
                         surface_vouched_pre_click=rung_pick.pre_surface_hit,
                         shared_surface=rung_pick.shared_surface,
+                        observed_row=rung_pick.observed_row,
                         clicked=rung_pick.clicked,
                         tier=rung_pick.tier,
                     )
@@ -22987,6 +23128,7 @@ def build_browser_tools(
                     declared=pick.declared,
                     surface_vouched_pre_click=pick.pre_surface_hit,
                     shared_surface=pick.shared_surface,
+                    observed_row=pick.observed_row,
                     clicked=pick.clicked,
                     tier=pick.tier,
                 ),

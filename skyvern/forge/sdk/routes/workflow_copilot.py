@@ -92,6 +92,7 @@ from skyvern.forge.sdk.copilot.demonstration_recorder import (
     append_demonstration_control,
     claim_demonstration_recording,
     demonstration_action_labels,
+    demonstration_cache,
     demonstration_file_ids,
     demonstration_limit_reached,
     demonstration_owner_is_live,
@@ -3814,16 +3815,11 @@ async def workflow_copilot_chat_post(
     )
     eval_cost_enabled = _copilot_eval_cost_enabled(organization.organization_id)
     eval_entrypoint_url = _validated_eval_entrypoint_url(request, chat_request, organization)
-    if app.CACHE is None or not app.CACHE.is_shared:
-        # Demonstrations live in the shared cache, so Copilot must not offer one this backend cannot start.
+    if demonstration_cache() is None:
+        # Copilot must not offer a demonstration this backend cannot start.
         chat_request.supports_demonstration_offer = False
     if chat_request.product_action == "demonstrate":
-        cache = app.CACHE
-        if cache is None or not cache.is_shared:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Copilot demonstration requires a shared cache",
-            )
+        cache = await _demonstration_cache()
         if not chat_request.demonstration_id:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -5057,11 +5053,12 @@ async def _change_credential_site(
 
 
 async def _demonstration_cache() -> BaseCache:
-    cache = app.CACHE
-    if cache is None or not cache.is_shared:
+    cache = demonstration_cache()
+    if cache is None:
+        # 501, not 403: the server's setup refuses this, not the caller's credentials.
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Copilot demonstration requires a shared cache",
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail="Run this server as one process to record demonstrations",
         )
     return cache
 

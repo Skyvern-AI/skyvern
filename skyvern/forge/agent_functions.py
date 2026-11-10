@@ -51,6 +51,7 @@ from skyvern.forge.sdk.copilot.config import (
     authoring_capability_for_request,
 )
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.credential_site_policy import LoginSite
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.experimentation.billing_tier import BillingTier
 from skyvern.forge.sdk.models import Step, StepStatus
@@ -63,6 +64,7 @@ from skyvern.forge.sdk.schemas.credentials import (
     NonEmptyCreditCardCredential,
     NonEmptyPasswordCredential,
     SecretCredential,
+    VaultPasskey,
 )
 from skyvern.forge.sdk.schemas.feedback import AgentFeedback, FeedbackEvent
 from skyvern.forge.sdk.schemas.files import FileInfo
@@ -1073,6 +1075,12 @@ class AgentFunction:
     async def get_powerbi_query_hop_tokens(
         self, *, organization_id: str, workflow_run_id: str, block_labels: list[str]
     ) -> dict[str, str]:
+        return {}
+
+    async def get_powerbi_query_hop_refusals(
+        self, *, organization_id: str, workflow_run_id: str, block_labels: list[str]
+    ) -> dict[str, str]:
+        """Per-block ``PowerBIHopRefusal`` values recorded when a run was issued no capability."""
         return {}
 
     async def ensure_email_forwarding_available(
@@ -2357,6 +2365,17 @@ class AgentFunction:
         vault_type: CredentialVaultType,
     ) -> bool:
         return False
+
+    async def register_bitwarden_passkeys(
+        self,
+        *,
+        workflow_run_id: str,
+        organization_id: str,
+        source_id: str,
+        vault_passkeys: list[VaultPasskey],
+        login_sites: list[LoginSite] | None,
+    ) -> None:
+        return None
 
     async def process_registered_credential_item(
         self,

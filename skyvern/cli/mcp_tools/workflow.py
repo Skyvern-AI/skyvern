@@ -1319,6 +1319,15 @@ async def _inject_workflow_update_parameters(
     modified = _auto_wire_code_block_parameter_keys(raw, protected_keys, existing_labels) or converted
 
     if protected_keys:
+        existing_by_key = {param["key"]: _strip_runtime_fields(param) for param in existing_params}
+        for param in update_params:
+            if isinstance(param, dict) and param.get("key") in protected_keys:
+                existing_param = existing_by_key[param["key"]]
+                if any(existing_param.get(name) != value for name, value in _strip_runtime_fields(param).items()):
+                    warnings.append(
+                        f"Parameter '{param['key']}': the update kept the existing credential. "
+                        "Create a new workflow or use the web app to change it."
+                    )
         # Remove any protected params the caller may have included (may have stale data)
         update_params = [p for p in update_params if not (isinstance(p, dict) and p.get("key") in protected_keys)]
         # Inject all protected params from the existing workflow, stripping runtime-only

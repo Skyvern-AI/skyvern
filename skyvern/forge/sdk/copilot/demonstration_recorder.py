@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import functools
 import json
 import mimetypes
+import os
 import secrets
 import time
 from collections.abc import Awaitable, Coroutine
@@ -23,6 +25,7 @@ from skyvern.config import settings
 from skyvern.exceptions import BlockedHost, SkyvernHTTPException
 from skyvern.forge import app
 from skyvern.forge.sdk.cache.base import BaseCache
+from skyvern.forge.sdk.cache.process_local import ProcessLocalCache
 from skyvern.forge.sdk.copilot.agent_context import ScoutedInteraction
 from skyvern.forge.sdk.copilot.config import ALL_BLOCK_FAMILIES, AuthoringCapability
 from skyvern.forge.sdk.copilot.context import CopilotContext
@@ -70,6 +73,32 @@ DEMONSTRATION_OWNER_REFRESH_SECONDS = 5
 DEMONSTRATION_OWNER_LIVE_SECONDS = 20
 DEMONSTRATION_MAX_SECONDS = 30 * 60
 DEMONSTRATION_REPLAY_LEASE = timedelta(minutes=5)
+# Each action is its own item, so this holds about 25 full recordings at once.
+_PROCESS_DEMONSTRATION_CACHE = ProcessLocalCache(maxsize=25 * DEMONSTRATION_MAX_EVENTS)
+
+
+def demonstration_cache() -> BaseCache | None:
+    """Where demonstrations live: the shared cache, or this process when it is the server's only one."""
+    if app.CACHE is not None and app.CACHE.is_shared:
+        return app.CACHE
+    # uvicorn reads the same variable for its worker count.
+    try:
+        workers = int(os.environ.get("WEB_CONCURRENCY") or 1)
+    except ValueError:
+        LOG.warning("Copilot demonstrations refused: WEB_CONCURRENCY is not a number")
+        return None
+    if workers > 1:
+        return None
+    _log_process_demonstration_cache()
+    return _PROCESS_DEMONSTRATION_CACHE
+
+
+@functools.cache
+def _log_process_demonstration_cache() -> None:
+    LOG.warning(
+        "Copilot demonstrations use this process's memory; set WEB_CONCURRENCY if the server runs several processes"
+    )
+
 
 _DESCRIBE_FILE_INPUT = (
     "function() { const tap = globalThis.__skyvernDemoTap; "
@@ -650,6 +679,11 @@ class DemonstrationRecorder:
                 session_id=self.browser_session_id,
                 organization_id=self.organization_id,
             )
+            if browser_state is None and await self._wait_for_browser_launch():
+                browser_state = await resolve_persistent_browser_state(
+                    session_id=self.browser_session_id,
+                    organization_id=self.organization_id,
+                )
             if browser_state is None or browser_state.browser_context is None:
                 return
             record_attached_browser_driver(self.recording_ctx, self.browser_session_id, browser_state)
@@ -724,6 +758,21 @@ class DemonstrationRecorder:
             # A credential fill can mint a browser into this context, and no turn finally ends its renewal.
             end_minted_browser_renewals(self.recording_ctx)
             await finish_shielded(self._stop(reason))
+
+    async def _wait_for_browser_launch(self) -> bool:
+        # The manager owns the startup bound (ADR-0032), so a browser it is still launching is not gone.
+        launch = asyncio.ensure_future(
+            app.PERSISTENT_SESSIONS_MANAGER.wait_for_browser_launch(self.browser_session_id, self.organization_id)
+        )
+        try:
+            while not launch.done():
+                if await self.stream.is_disconnected():
+                    return False
+                await self._refresh_owner()
+                await asyncio.wait({launch}, timeout=DEMONSTRATION_OWNER_REFRESH_SECONDS)
+            return await launch
+        finally:
+            launch.cancel()
 
     async def _append_event(self, event: dict[str, Any], *, reserve: int = 0) -> int | None:
         record_key = demonstration_record_key(self.organization_id, self.demonstration_id)

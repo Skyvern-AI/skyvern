@@ -1656,6 +1656,7 @@ class _AuthTransport:
 
 def _signing_client(monkeypatch: pytest.MonkeyPatch, transport: _AuthTransport) -> real_gcp.RealAsyncGcsStorageClient:
     """The real client, warm, signing as a Workload Identity service account over ``transport`` only."""
+    monkeypatch.setenv("DISABLE_GCS_PYTHON_CLIENT_OTEL_BUCKET_METADATA", "true")
     monkeypatch.setattr(real_gcp, "GoogleAuthRequest", transport.built_by("real_gcp"))
     monkeypatch.setattr(google_auth_requests, "Request", transport.built_by("library"))
     monkeypatch.setattr(settings, "GCS_SIGNER_SA_EMAIL", _SIGNER)
@@ -1708,8 +1709,12 @@ def _cold_client(
 
     Discovery, refresh and universe lookups reach ``transport``. Storage's data requests run the real AuthorizedSession
     logic down to the HTTP adapter, which records them on the same timeline instead of sending them."""
+    monkeypatch.setenv("DISABLE_GCS_PYTHON_CLIENT_OTEL_BUCKET_METADATA", "true")
     monkeypatch.setattr(real_gcp, "GoogleAuthRequest", transport.built_by("real_gcp"))
     monkeypatch.setattr(google_auth_requests, "Request", transport.built_by("library"))
+    # A bucket-named call otherwise queues the SDK's bucket-metadata lookup on a thread that outlives the test and
+    # reaches the real Storage endpoint from whichever test runs next.
+    monkeypatch.setenv("DISABLE_GCS_PYTHON_CLIENT_OTEL_BUCKET_METADATA", "true")
     statuses = list(data_statuses or [])
 
     def send(adapter: Any, request: Any, *_: Any, timeout: Any = None, **__: Any) -> requests.Response:

@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import dataclasses
 import decimal
+import gc
 import html
 import html as html_lib
 import inspect
@@ -21,6 +22,7 @@ import random
 import re
 import time
 import unicodedata
+import weakref
 from collections import Counter
 from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime
@@ -92,6 +94,7 @@ from skyvern.forge.taskv3.tools import (
     _MENU_OPTION_TEXTS_JS,
     _NO_QUESTION_MARKER,
     _OPAQUE_ID_RUN_RE,
+    _OWN_CHIPS_JS,
     _PIERCED_QUERY_JS,
     _SEMANTIC_COMMIT_STATE_JS,
     _TYPE_TARGET_PROBE_JS,
@@ -49185,7 +49188,7 @@ async def test_a_dropdown_inside_a_component_is_listed_with_its_own_question() -
 
 # Generated component chains: each root may hold a projecting slot, a decoration, plain text, a choice, a grid or a
 # sibling holding a control. The oracle is the structure: the question as near=[q:...] when a slot projects it
-# before the field with no stop between, else no near, and never a group.
+# before the field with no stop between, else no near, and never a group; own-root text is compared apart.
 def _near_of(e: dict[str, Any]) -> tuple[tuple[str, str], ...] | None:
     near = e.get("near")
     return tuple((n["slot"], n["text"]) for n in near) if near else None
@@ -49205,7 +49208,6 @@ _PL_DECOS = (
     '<pl-c t="pl-deco"></pl-c>',
     "<div><span>Static intro text</span><slot></slot></div>",
 )
-_PL_TEXT_DECOS = ("<span>Plain text beside the field</span>", "<div><span>Static intro text</span><slot></slot></div>")
 _PL_STOPS = ('<button type="button">Help</button>', '<pl-c t="pl-btn"></pl-c>')
 _PL_SCRIPT = """<template id="pl-btn"><button type="button">Help</button></template>
 <template id="pl-deco"><span style="display:inline-block;width:16px;height:16px"></span></template>
@@ -49269,9 +49271,6 @@ def _pl_page(seed: int) -> tuple[str, dict[str, tuple[tuple[str, str], ...] | No
             if rng.random() < 0.6:
                 deco = rng.choice(_PL_DECOS)
                 before.append(deco)
-                # Visible text at the top level of the control's own root ends the walk before an outer level.
-                if lv == depth and level < depth and deco in _PL_TEXT_DECOS:
-                    bound = False
             stop = rng.random() < 0.15
             if lv == level and place in ("before", "wrapped"):
                 slot = (
@@ -49309,7 +49308,6 @@ def _pl_page(seed: int) -> tuple[str, dict[str, tuple[tuple[str, str], ...] | No
                 affix = True
             if lv == depth and rng.random() < 0.1:
                 before.append("<span>Note near the field</span>")
-                bound = False
             tid = f"pl{seed}t{ci}l{lv}"
             templates.append(f'<template id="{tid}">{"".join(before)}{body}{after}</template>')
             inner_light = (light if lv == level else "") + (own_light if lv == depth else "")
@@ -49341,7 +49339,9 @@ async def test_observe_group_text_reads_only_the_label_a_component_chain_project
             for e in data["elements"]:
                 found = re.findall(r"\bpl\d+x\d+\b", json.dumps({k: e.get(k) for k in ("selector", "name", "id")}))
                 if found and e.get("tag") == "input":
-                    got[found[0]] = (e.get("group"), _near_of(e))
+                    # Own-root text is a candidate of its own, pinned by the exact and light-twin tests.
+                    slots = tuple(n for n in _near_of(e) or () if n[0] != "(own text)")
+                    got[found[0]] = (e.get("group"), slots or None)
             for name, entries in expected.items():
                 want = (None, entries)
                 if got.get(name, "<unlisted>") != want:
@@ -49349,8 +49349,8 @@ async def test_observe_group_text_reads_only_the_label_a_component_chain_project
     assert not wrong, wrong
 
 
-# Main's stops hold in the projected walk too: a choice's caption, a grid cell's neighbour, text at the top level of
-# the control's own root (main's walk never scans it), and a slot that receives only whitespace or an empty element.
+# Main's stops hold in the projected walk too: a choice's caption, a grid cell's neighbour, and a slot that receives
+# only whitespace or an empty element.
 @_skip_no_browser
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -49387,23 +49387,10 @@ async def test_observe_group_text_reads_only_the_label_a_component_chain_project
         ),
         (
             {
-                "a": '<div><slot name="title"></slot></div><p>What is your phone number?</p><div><input name="pin"></div>'
-            },
-            '<pl-c t="a"><span slot="title">Contact details</span></pl-c>',
-        ),
-        (
-            {
                 "in": '<input name="pin">',
                 "a": '<div><p>Please answer every question below.</p><slot></slot></div><pl-c t="in"></pl-c>',
             },
             '<pl-c t="a">\n</pl-c>',
-        ),
-        (
-            {
-                "a": '<div><slot name="q"></slot></div><div><p>All prices include tax.</p><slot name="x"></slot></div>'
-                '<input name="pin">'
-            },
-            '<pl-c t="a"><span slot="q">Contact details</span><span slot="x"></span></pl-c>',
         ),
     ],
     ids=[
@@ -49411,9 +49398,7 @@ async def test_observe_group_text_reads_only_the_label_a_component_chain_project
         "choice_component_caption",
         "grid_cell",
         "grid_cell_component",
-        "own_root_top_level_text",
         "whitespace_default_slot",
-        "empty_element_slotted",
     ],
 )
 async def test_observe_group_text_projected_label_keeps_mains_stops(templates: dict[str, str], page: str) -> None:
@@ -49423,6 +49408,298 @@ async def test_observe_group_text_projected_label_keeps_mains_stops(templates: d
             (e.get("group"), e.get("near")) for e in (await _observe_data(p))["elements"] if '"pin"' in json.dumps(e)
         ]
     assert reads == [(None, None)], reads
+
+
+# A forwarded slot projects only what its own slot is assigned, never its fallback, and only while it is drawn itself.
+# The inner root's own question is a candidate beside it, and the walk goes on to the outer title.
+_M_TITLE_QUESTION = (("title", "Contact details"), ("(own text)", "What is your phone number?"))
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("forwarded", "light", "printed"),
+    [
+        ('<slot name="hint" slot="hint"></slot>', "", _M_TITLE_QUESTION),
+        ('<slot name="hint" slot="hint">Ten digits</slot>', "", _M_TITLE_QUESTION),
+        ("", "", _M_TITLE_QUESTION),
+        (
+            '<slot name="hint" slot="hint"></slot>',
+            '<span slot="hint">Ten digits</span>',
+            (*_M_TITLE_QUESTION, ("hint", "Ten digits")),
+        ),
+        (
+            '<slot name="hint" slot="hint" style="display:block;opacity:0"></slot>',
+            '<span slot="hint">Ten digits</span>',
+            _M_TITLE_QUESTION,
+        ),
+        (
+            '<slot name="hint" slot="hint" aria-hidden="true"></slot>',
+            '<span slot="hint">Ten digits</span>',
+            _M_TITLE_QUESTION,
+        ),
+    ],
+    ids=["empty", "fallback_only", "not_forwarded", "assigned", "transparent", "aria_hidden"],
+)
+async def test_observe_near_counts_a_forwarded_slot_by_its_own_assignment(
+    forwarded: str, light: str, printed: tuple[tuple[str, str], ...] | None
+) -> None:
+    templates = {
+        "in": '<div><p>What is your phone number?</p><slot name="hint"></slot></div><input name="pin">',
+        "a": f'<h3><slot name="title"></slot></h3><pl-c t="in">{forwarded}</pl-c>',
+    }
+    tpl = "".join(f'<template id="{k}">{v}</template>' for k, v in templates.items())
+    page = f'<pl-c t="a"><span slot="title">Contact details</span>{light}</pl-c>'
+    async with _content_page(f"<!doctype html><html><body>{page}{tpl}{_PL_SCRIPT}</body></html>") as p:
+        reads = [
+            (e.get("group"), _near_of(e)) for e in (await _observe_data(p))["elements"] if '"pin"' in json.dumps(e)
+        ]
+    assert reads == [(None, printed)], reads
+
+
+# A drawn slider, textbox, searchbox or iframe ends the projected walk; one that is not drawn does not.
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stop", "printed"),
+    [
+        ('<div role="slider" tabindex="0" aria-valuenow="5" style="width:80px;height:10px"></div>', None),
+        ('<div role="textbox" tabindex="0" style="width:80px;height:10px"></div>', None),
+        ('<div role="searchbox" tabindex="0" style="width:80px;height:10px"></div>', None),
+        ('<iframe style="width:80px;height:20px"></iframe>', None),
+        ('<iframe style="display:none"></iframe>', (("q", "Volume"),)),
+        ('<div role="textbox" tabindex="0" style="display:none"></div>', (("q", "Volume"),)),
+    ],
+    ids=["slider", "textbox", "searchbox", "iframe", "hidden_iframe", "hidden_textbox"],
+)
+async def test_observe_near_stops_at_a_drawn_widget_main_does_not_list_as_a_control(
+    stop: str, printed: tuple[tuple[str, str], ...] | None
+) -> None:
+    tpl = f'<template id="a"><div><slot name="q"></slot></div>{stop}<input name="pin"></template>'
+    page = '<pl-c t="a"><span slot="q">Volume</span></pl-c>'
+    async with _content_page(f"<!doctype html><html><body>{page}{tpl}{_PL_SCRIPT}</body></html>") as p:
+        reads = [
+            (e.get("group"), _near_of(e)) for e in (await _observe_data(p))["elements"] if '"pin"' in json.dumps(e)
+        ]
+    assert reads == [(None, printed)], reads
+
+
+# A component holding options before the slotted label is their caption host only when its root reads under two
+# characters through the flat tree: its text, bare or in an element, and what it draws through its slots, forwarded or
+# not. Light text it never draws is no caption.
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("q_root", "q_light", "outer_light", "printed"),
+    [
+        ('<span>*</span><input type="radio" name="e">', "", "", None),
+        ('<span>OK</span><input type="radio" name="e">', "", "", (("label", "If yes, which car?"),)),
+        ('OK<input type="radio" name="e">', "", "", (("label", "If yes, which car?"),)),
+        ('<label><input type="radio" name="e"><slot></slot></label>', "Yes", "", (("label", "If yes, which car?"),)),
+        ('<label><input type="radio" name="e"><slot></slot></label>', "", "", None),
+        (
+            '<label><input type="radio" name="e"><slot></slot></label>',
+            '<slot name="cap"></slot>',
+            '<span slot="cap">Yes</span>',
+            (("label", "If yes, which car?"),),
+        ),
+        ('<label><input type="radio" name="e"></label>', "Hidden words nobody sees", "", None),
+        ('<style>:host{display:inline-block}</style><label><input type="radio" name="e"></label>', "", "", None),
+        ('<label><input type="radio" name="e"></label><style>:host{display:inline-block}</style>', "", "", None),
+        (
+            '<script type="text/x-config">var caption = 1;</script><label><input type="radio" name="e"></label>',
+            "",
+            "",
+            None,
+        ),
+        ('<template><p>Unused row</p></template><label><input type="radio" name="e"></label>', "", "", None),
+    ],
+    ids=[
+        "one_character",
+        "two_characters",
+        "bare_text",
+        "slotted_caption",
+        "nothing",
+        "caption_forwarded_through_an_outer_slot",
+        "undrawn_host_text",
+        "style_before_the_radio",
+        "style_after_the_radio",
+        "script_beside_the_radio",
+        "template_beside_the_radio",
+    ],
+)
+async def test_observe_near_reads_a_choice_component_as_a_caption_host_by_its_text(
+    q_root: str, q_light: str, outer_light: str, printed: tuple[tuple[str, str], ...] | None
+) -> None:
+    templates = {
+        "q": q_root,
+        "a": f'<pl-c t="q" style="display:inline-block">{q_light}</pl-c><slot name="label"></slot><input name="pin">',
+    }
+    tpl = "".join(f'<template id="{k}">{v}</template>' for k, v in templates.items())
+    page = f'<pl-c t="a"><span slot="label">If yes, which car?</span>{outer_light}</pl-c>'
+    async with _content_page(f"<!doctype html><html><body>{page}{tpl}{_PL_SCRIPT}</body></html>") as p:
+        reads = [
+            (e.get("group"), _near_of(e)) for e in (await _observe_data(p))["elements"] if '"pin"' in json.dumps(e)
+        ]
+    assert reads == [(None, printed)], reads
+
+
+# Text drawn in the control's own root prints as `(own text)` and never ends the walk: a paragraph between the slotted
+# title and the field, a wrapper's text beside an empty slotted element, and an unassigned slot's default text.
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("root", "light", "printed"),
+    [
+        (
+            '<div><slot name="title"></slot></div><p>What is your phone number?</p><div><input name="pin"></div>',
+            '<span slot="title">Contact details</span>',
+            (("title", "Contact details"), ("(own text)", "What is your phone number?")),
+        ),
+        (
+            '<div><slot name="q"></slot></div><div><p>All prices include tax.</p><slot name="x"></slot></div>'
+            '<input name="pin">',
+            '<span slot="q">Contact details</span><span slot="x"></span>',
+            (("q", "Contact details"), ("(own text)", "All prices include tax.")),
+        ),
+        (
+            '<div><slot name="q">Default helper text</slot></div><div><input type="text" name="pin"></div>',
+            "",
+            (("(own text)", "Default helper text"),),
+        ),
+    ],
+    ids=["paragraph_before_the_field", "wrapper_beside_an_empty_slotted_element", "unassigned_slot_default_text"],
+)
+async def test_observe_near_prints_own_root_text_as_a_candidate(
+    root: str, light: str, printed: tuple[tuple[str, str], ...]
+) -> None:
+    tpl = f'<template id="a">{root}</template>'
+    async with _content_page(
+        f'<!doctype html><html><body><pl-c t="a">{light}</pl-c>{tpl}{_PL_SCRIPT}</body></html>'
+    ) as p:
+        reads = [
+            (e.get("group"), _near_of(e)) for e in (await _observe_data(p))["elements"] if '"pin"' in json.dumps(e)
+        ]
+    assert reads == [(None, printed)], reads
+
+
+# A slot with anything assigned, whitespace included, draws that and never its default text, so it carries no own text.
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("root", "light", "printed"),
+    [
+        (
+            '<slot name="label"></slot><slot name="help">Optional</slot><input name="pin">',
+            '<span slot="label">Which car?</span><span slot="help">Your main car</span>',
+            (("label", "Which car?"), ("help", "Your main car")),
+        ),
+        (
+            '<slot name="label"></slot><slot>Optional</slot><input name="pin">',
+            '\n<span slot="label">Which car?</span>\n',
+            (("label", "Which car?"),),
+        ),
+    ],
+    ids=["assigned_text", "assigned_whitespace"],
+)
+async def test_observe_near_reads_no_own_text_from_an_assigned_slot_sibling(
+    root: str, light: str, printed: tuple[tuple[str, str], ...]
+) -> None:
+    tpl = f'<template id="a">{root}</template>'
+    page = f'<pl-c t="a">{light}</pl-c>'
+    async with _content_page(f"<!doctype html><html><body>{page}{tpl}{_PL_SCRIPT}</body></html>") as p:
+        reads = [
+            (e.get("group"), _near_of(e)) for e in (await _observe_data(p))["elements"] if '"pin"' in json.dumps(e)
+        ]
+    assert reads == [(None, printed)], reads
+
+
+# Generated pages, each a component and its light twin: the same texts before the field, slotted into the component or
+# drawn in its root, and written out in the twin. Every word main prints as the twin's group= is among the near texts.
+def _twin_pages(seeds: range) -> tuple[str, list[int]]:
+    defs, hosts, twins = [], [], []
+    for seed in seeds:
+        rng = random.Random(seed)
+        root, light, twin = [], [], []
+        for k in range(rng.randint(1, 3)):
+            text = f"Question {seed} part {k}"
+            kind = rng.choice(("slot", "own", "both", "bare"))
+            if kind == "slot":
+                root.append(f'<div><slot name="s{k}"></slot></div>')
+                light.append(f'<span slot="s{k}">{text}</span>')
+                twin.append(f"<div><span>{text}</span></div>")
+            elif kind == "own":
+                root.append(f"<div>{text}</div>")
+                twin.append(f"<div>{text}</div>")
+            elif kind == "both":
+                root.append(f'<div><span>{text} own</span><slot name="s{k}"></slot></div>')
+                light.append(f'<span slot="s{k}">{text} slotted</span>')
+                twin.append(f"<div><span>{text} own</span> <span>{text} slotted</span></div>")
+            else:
+                root.append(text)
+                twin.append(text)
+        root_html = json.dumps("".join(root) + f'<input type="text" name="c{seed}">')
+        defs.append(
+            f"customElements.define('x-t{seed}', class extends HTMLElement {{ connectedCallback() {{"
+            f" this.attachShadow({{mode: 'open'}}).innerHTML = {root_html}; }} }});"
+        )
+        hosts.append(f"<x-t{seed}>{''.join(light)}</x-t{seed}>")
+        twins.append(f"<form>{''.join(twin)}<input type='text' name='t{seed}'></form>")
+    html = f"<!doctype html><html><body>{''.join(twins)}{''.join(hosts)}<script>{''.join(defs)}</script></body></html>"
+    return html, list(seeds)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_near_carries_every_word_of_the_light_twins_group() -> None:
+    html, seeds = _twin_pages(range(40))
+    async with _content_page(html) as page:
+        elements = (await _observe_data(page))["elements"]
+    by_name = {}
+    for e in elements:
+        found = re.findall(r"\b[ct]\d+\b", json.dumps({k: e.get(k) for k in ("selector", "name")}))
+        if found:
+            by_name[found[0]] = e
+    wrong = []
+    for seed in seeds:
+        twin, comp = by_name.get(f"t{seed}"), by_name.get(f"c{seed}")
+        words = set(" ".join(text for _, text in _near_of(comp) or ()).split()) if comp else set()
+        group = (twin or {}).get("group") or ""
+        if not group or comp is None or comp.get("group") or not set(group.split()) <= words:
+            wrong.append((seed, group, _near_of(comp) if comp else "<unlisted>"))
+    assert not wrong, wrong
+
+
+# near is computed only for a field main's walk leaves without a group: a one-word root text keeps it alone.
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_near_is_not_read_beside_mains_group() -> None:
+    templates = {"a": '<div><span>Required field</span><div><slot name="q"></slot></div><input name="pin"></div>'}
+    tpl = "".join(f'<template id="{k}">{v}</template>' for k, v in templates.items())
+    page = '<pl-c t="a"><span slot="q">Which city do you live in?</span></pl-c>'
+    async with _content_page(f"<!doctype html><html><body>{page}{tpl}{_PL_SCRIPT}</body></html>") as p:
+        reads = [
+            (e.get("group"), e.get("near")) for e in (await _observe_data(p))["elements"] if '"pin"' in json.dumps(e)
+        ]
+    assert reads == [("Required field", None)], reads
+
+
+# Lines that read the same until near= tells them apart are not counted as reading the same; the duplicate telemetry
+# keeps counting the lines main prints.
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_same_line_note_counts_near() -> None:
+    hosts = '<x-c><span slot="label">Home phone</span></x-c><x-c><span slot="label">Work phone</span></x-c>'
+    script = (
+        "<script>customElements.define('x-c', class extends HTMLElement { connectedCallback() {"
+        " this.attachShadow({mode: 'open'}).innerHTML = '<div><slot name=\"label\"></slot></div><input>'; } });</script>"
+    )
+    async with _content_page(f"<!doctype html><html><body>{hosts}{script}</body></html>") as page:
+        result = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+    lines = [line for line in result.content.splitlines() if line.startswith("ref=")]
+    assert [line.rsplit(" near=", 1)[1] for line in lines] == ["[label:'Home phone']", "[label:'Work phone']"], lines
+    assert "read the same as another line" not in result.content, result.content
+    assert result.data is not None and result.data["summary"]["duplicate_digest_lines"] == 2, result.data
 
 
 # Plain text in an outer root is never read and does not end the walk: the slotted text before it is still printed.
@@ -49553,12 +49830,37 @@ async def test_observe_near_leaves_the_qualifiers_of_twin_fields_as_on_main(
             '<div><slot name="label"></slot></div><div><div><input type="text" name="pin"></div></div>',
             '<span slot="label">Expected salary</span>',
         ),
+        (
+            "<fieldset><p>Do you drive?</p><label><input type='radio' name='d'>Yes</label>"
+            "<label><input type='radio' name='d'>No</label></fieldset><span>If yes, which car?</span>"
+            "<input type='text' name='pin'>",
+            '<x-q></x-q><slot name="label"></slot><input type="text" name="pin">',
+            '<span slot="label">If yes, which car?</span>',
+        ),
+        (
+            "<label><input type='radio' name='r'>Yes</label><span>If yes, which car?</span>"
+            "<input type='text' name='pin'>",
+            '<x-r>Yes</x-r><slot name="label"></slot><input type="text" name="pin">',
+            '<span slot="label">If yes, which car?</span>',
+        ),
     ],
-    ids=["text_before", "label_element", "label_and_helper", "two_levels_up"],
+    ids=[
+        "text_before",
+        "label_element",
+        "label_and_helper",
+        "two_levels_up",
+        "after_a_question_with_options",
+        "after_a_radio_with_a_slotted_caption",
+    ],
 )
 async def test_observe_near_reads_what_main_reads_for_the_light_twin(light_twin: str, root: str, slotted: str) -> None:
     script = (
-        "<script>customElements.define('x-c', class extends HTMLElement { connectedCallback() {"
+        "<script>customElements.define('x-q', class extends HTMLElement { connectedCallback() {"
+        ' this.attachShadow({mode: \'open\'}).innerHTML = \'<p>Do you drive?</p><label><input type="radio" name="e">'
+        'Yes</label><label><input type="radio" name="e">No</label>\'; } });'
+        "customElements.define('x-r', class extends HTMLElement { connectedCallback() {"
+        " this.attachShadow({mode: 'open'}).innerHTML = '<label><input type=\"radio\" name=\"f\"><slot></slot></label>'; } });"
+        "customElements.define('x-c', class extends HTMLElement { connectedCallback() {"
         f" this.attachShadow({{mode: 'open'}}).innerHTML = {json.dumps(root)}; }} }});</script>"
     )
     page_html = f"<!doctype html><html><body><form>{light_twin}</form><x-c>{slotted}</x-c>{script}</body></html>"
@@ -49568,7 +49870,7 @@ async def test_observe_near_reads_what_main_reads_for_the_light_twin(light_twin:
     assert " ".join(text for _, text in _near_of(pins[1]) or ()) == pins[0]["group"], pins
 
 
-# Lit renders `${label}<input>`: bare text at the top level of the control's own root ends the walk like an element.
+# Lit renders `${label}<input>`: bare text at the top level of the control's own root is an own-text candidate.
 # A checkbox and a radio in a root take no near (their question is the group's), and the climb reads the control and
 # its first 5 ancestors only.
 @_skip_no_browser
@@ -49576,7 +49878,10 @@ async def test_observe_near_reads_what_main_reads_for_the_light_twin(light_twin:
 @pytest.mark.parametrize(
     ("root", "printed"),
     [
-        ('<div><slot name="label"></slot></div>What is your phone number?<input type="text" name="pin">', None),
+        (
+            '<div><slot name="label"></slot></div>What is your phone number?<input type="text" name="pin">',
+            (("label", "Contact details"), ("(own text)", "What is your phone number?")),
+        ),
         ('<div><slot name="label"></slot></div><input type="checkbox" name="pin">', None),
         ('<div><slot name="label"></slot></div><input type="radio" name="pin">', None),
         (
@@ -49584,8 +49889,24 @@ async def test_observe_near_reads_what_main_reads_for_the_light_twin(light_twin:
             (("label", "Contact details"),),
         ),
         ('<div><slot name="label"></slot></div>' + "<div>" * 6 + '<input type="text" name="pin">' + "</div>" * 6, None),
+        (
+            '<div><slot name="label"></slot></div>' + "<div>" * 25 + "</div>" * 25 + '<input type="text" name="pin">',
+            (("label", "Contact details"),),
+        ),
+        (
+            '<div><slot name="label"></slot></div>' + "<div>" * 26 + "</div>" * 26 + '<input type="text" name="pin">',
+            None,
+        ),
     ],
-    ids=["bare_text_node", "checkbox", "radio", "five_ancestors_up", "six_ancestors_up"],
+    ids=[
+        "bare_text_node",
+        "checkbox",
+        "radio",
+        "five_ancestors_up",
+        "six_ancestors_up",
+        "sibling_25_levels_deep",
+        "sibling_past_the_24_level_cap",
+    ],
 )
 async def test_observe_near_edges(root: str, printed: tuple[tuple[str, str], ...] | None) -> None:
     script = (
@@ -49649,13 +49970,11 @@ async def test_observe_near_prints_a_repeated_label_on_every_field() -> None:
             ),
             "Which city do you live in?",
         ),
-        ("", '<div><slot name="q">Default helper text</slot></div><div><input type="text" name="pin"></div>', None),
     ],
     ids=[
         "slotted_listbox_before",
         "slotted_listbox_beside_a_label",
         "unslotted_button_in_a_decoration",
-        "fallback_label_text_only",
     ],
 )
 async def test_observe_group_text_projected_label_stops_only_at_a_drawn_control(
@@ -49694,7 +50013,7 @@ async def test_observe_group_text_projected_label_stops_only_at_a_drawn_control(
         (
             '<span slot="q">Which city do you live in?</span>',
             '<div><slot name="q"></slot><span>(required)</span></div><div><input type="text" name="pin"></div>',
-            "near=[q:'Which city do you live in?']",
+            "near=[(own text):'(required)', q:'Which city do you live in?']",
         ),
         (
             '<svg slot="icon" width="16" height="16"><rect width="16" height="16"></rect></svg>'
@@ -49737,11 +50056,17 @@ async def test_observe_group_text_projected_label_stops_only_at_a_drawn_control(
             '<div><slot></slot></div><div><input type="text" name="pin"></div>',
             "near=[default:'Which city do you live in?']",
         ),
+        (
+            '<span slot="vol">Volume</span><span slot="name">Display name</span>',
+            '<slot name="vol"></slot><div role="slider" tabindex="0" aria-valuenow="5" style="width:80px;height:10px"></div><slot name="name"></slot>'
+            '<input type="text" name="pin">',
+            "near=[name:'Display name']",
+        ),
     ],
     ids=[
         "affix_with_letters",
         "helper_slot_before_the_input",
-        "wrapper_static_text_unread",
+        "wrapper_static_text_as_own_text",
         "icon_slot_before_the_label",
         "label_and_helper_in_one_wrapper",
         "label_and_usd_prefix",
@@ -49750,6 +50075,7 @@ async def test_observe_group_text_projected_label_stops_only_at_a_drawn_control(
         "hostile_slot_name",
         "five_slots_keep_the_nearest_four",
         "default_slot",
+        "slider_between_two_slots",
     ],
 )
 async def test_observe_near_prints_the_projected_text_with_its_slot_name(light: str, root: str, printed: str) -> None:
@@ -49843,11 +50169,11 @@ async def test_a_slotted_option_menu_is_listed_whole_and_its_selecting_click_is_
 
 
 # select_combobox commits both variants. The single-choice read-back sees the value in the input; the multiple-choice
-# chip sits in a tag list inside the field's own shadow tree, and the read-back reports no commit while it is there.
-# That half is a known residual, pinned as today's output; invert it when the chip read-back closes.
+# pick shows as a tag row (an option nesting its remove button) in a tag list inside the field's own shadow tree. That
+# shape is also how a list of recent picks can look, so the tool reports the row it saw without calling it a commit.
 @_skip_no_browser
 @pytest.mark.asyncio
-async def test_select_combobox_commits_shadow_form_dropdowns_and_misreads_the_multiple_choice_chip() -> None:
+async def test_select_combobox_commits_shadow_form_dropdowns_and_reports_the_multiple_choice_tag_row() -> None:
     async with _content_page(_SHADOW_SCREENING_FORM_HTML) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         orbit, instruments, _ = await _shadow_form_combobox_refs(tools)
@@ -49857,7 +50183,370 @@ async def test_select_combobox_commits_shadow_form_dropdowns_and_misreads_the_mu
 
         multiple = await _tool(tools, "select_combobox").handler({"selector": instruments, "value": "Glass harp"})
         assert await _shadow_form_committed(page, "tools") == ["Glass harp"]
-        assert multiple.status == "error" and multiple.error_class == "did_not_commit", multiple.content
+        assert _reports_observed_row(multiple, "Glass harp"), multiple.content
+
+
+def _reports_observed_row(r: ToolResult, label: str) -> bool:
+    return (
+        r.status == "ok"
+        and r.ok_class == "unverified"
+        and f"'{label.lower()}'" in r.content.lower()
+        and "cannot tell" in r.content
+    )
+
+
+# A field's picks shown as tag rows, generated over where the field and its tag list live (light DOM, one shadow root,
+# nested roots), how a row carries its text (direct or slotted, beside a remove button) and what the pick did. A
+# page-level tag list, a captioned list of recent picks (plain, or a component with a slotted caption) and two other
+# fields hold every label too. A tag row is never a commit: the one this field's own list gained with the pick is
+# reported as an observed row, and a row that was already there, another field's row, another label and a pick that did
+# nothing leave the pick refused.
+_CR_FIELDS_HTML = """<!doctype html><html><body style="font:14px sans-serif">
+<div role="listbox" aria-label="Saved tags" id="saved"></div>
+<form id="crf"></form>
+<script>
+const CR = __CONFIG__;
+const VALUES = ['Copper bell', 'Glass harp', 'Glass harp case', 'Reed pipe'];
+window.__chips = {};
+const chipNode = (label, kind, loose) => {
+  const shown = loose ? '  ' + label.toUpperCase().replace(/ /g, '   ') + ' ' : label;
+  const css = 'display:inline-block;border:1px solid #888;padding:1px 6px;margin:2px';
+  if (kind === 'slotted') {
+    const host = document.createElement('cr-chip');
+    host.textContent = shown;
+    host.attachShadow({mode: 'open'}).innerHTML = '<div role="option" aria-selected="false" style="' + css
+      + '"><slot></slot><button type="button">x</button></div>';
+    return host;
+  }
+  const d = document.createElement('div');
+  d.setAttribute('role', 'option');
+  d.setAttribute('aria-selected', 'false');
+  d.style.cssText = css;
+  d.appendChild(document.createTextNode(shown));
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.textContent = kind === 'remove' ? 'Remove' : '\\u2715';
+  d.appendChild(b);
+  return d;
+};
+const fields = [];
+const paint = (f) => {
+  f.tags.textContent = '';
+  for (const v of f.chips) f.tags.appendChild(chipNode(v, f.cfg.chip, f.cfg.loose));
+  window.__chips[f.i] = f.chips.slice();
+};
+const shadowHost = (tag, parent) => {
+  const h = document.createElement(tag);
+  h.style.display = 'block';
+  parent.appendChild(h);
+  return h.attachShadow({mode: 'open'});
+};
+CR.forEach((cfg, i) => {
+  const card = document.createElement('div');
+  card.style.margin = '8px 0';
+  document.getElementById('crf').appendChild(card);
+  const root = cfg.dom === 'light' ? card : shadowHost('cr-wrap', card);
+  const cap = document.createElement('div');
+  cap.textContent = 'Instruments ' + i;
+  root.appendChild(cap);
+  const inputRoot = cfg.dom === 'nested' ? shadowHost('cr-in', root) : root;
+  const wrap = document.createElement('div');
+  inputRoot.appendChild(wrap);
+  const input = document.createElement('input');
+  input.id = 'cr' + i;
+  input.type = 'text';
+  input.style.width = '300px';
+  input.setAttribute('role', 'combobox');
+  input.setAttribute('aria-label', 'Instruments ' + i);
+  input.setAttribute('aria-autocomplete', 'list');
+  input.setAttribute('aria-expanded', 'false');
+  input.setAttribute('aria-controls', 'crm' + i);
+  wrap.appendChild(input);
+  const tagsRoot = cfg.dom === 'nested' ? shadowHost('cr-tags', root) : root;
+  const tags = document.createElement('div');
+  tags.setAttribute('role', 'listbox');
+  tags.setAttribute('aria-label', 'Selected values');
+  tagsRoot.appendChild(tags);
+  // A captioned list of recent picks beside the field's own tags is not its selection.
+  const recents = document.createElement('div');
+  recents.setAttribute('role', 'listbox');
+  const recentsBox = document.createElement('div');
+  recentsBox.textContent = 'Recently used:';
+  recentsBox.appendChild(recents);
+  root.appendChild(recentsBox);
+  // The same list as a component of its own: its caption is slotted text, its list in its root.
+  const recentsHost = document.createElement('cr-recents');
+  recentsHost.innerHTML = '<span>Recently used:</span>';
+  const recentsRoot = recentsHost.attachShadow({mode: 'open'});
+  recentsRoot.innerHTML = '<div><slot></slot><div role="listbox"></div></div>';
+  if (cfg.effect === 'recents-component-wrapped') {
+    const w = document.createElement('div');
+    w.appendChild(recentsHost);
+    root.appendChild(w);
+  } else root.appendChild(recentsHost);
+  // Another field beside this one in its card, a component named by its aria-label alone: no caption to see.
+  let sibTags = null;
+  if (cfg.effect === 'other-unlabelled-component') {
+    const sib = shadowHost('cr-sib', card);
+    const sibInput = document.createElement('input');
+    sibInput.setAttribute('aria-label', 'Other instrument ' + i);
+    sibInput.style.width = '200px';
+    sib.appendChild(sibInput);
+    sibTags = document.createElement('div');
+    sibTags.setAttribute('role', 'listbox');
+    sib.appendChild(sibTags);
+  }
+  const f = {i, cfg, tags, chips: cfg.pre ? [cfg.pick] : []};
+  fields.push(f);
+  paint(f);
+  const close = () => {
+    const m = inputRoot.querySelector('#crm' + i);
+    if (m) m.remove();
+    input.setAttribute('aria-expanded', 'false');
+  };
+  const add = (g, v) => { if (!g.chips.includes(v)) { g.chips.push(v); paint(g); } };
+  const pick = (v) => {
+    const sink = fields[fields.length - 1];
+    const otherComponent = fields[fields.length - 2];
+    if (cfg.effect === 'add') add(f, v);
+    else if (cfg.effect === 'toggle') { f.chips = f.chips.includes(v) ? f.chips.filter((x) => x !== v) : f.chips.concat([v]); paint(f); }
+    else if (cfg.effect === 'other-field') add(sink, v);
+    else if (cfg.effect === 'other-component') add(otherComponent, v);
+    else if (cfg.effect === 'other-unlabelled-component') sibTags.appendChild(chipNode(v, cfg.chip, cfg.loose));
+    else if (cfg.effect === 'recents') recents.appendChild(chipNode(v, cfg.chip, cfg.loose));
+    else if (cfg.effect.startsWith('recents-component')) {
+      recentsRoot.querySelector('[role=listbox]').appendChild(chipNode(v, cfg.chip, cfg.loose));
+    }
+    else if (cfg.effect === 'other-label') add(f, v + ' case');
+    close();
+    input.value = '';
+  };
+  const open = () => {
+    close();
+    const m = document.createElement('div');
+    m.id = 'crm' + i;
+    m.setAttribute('role', 'listbox');
+    m.style.cssText = 'border:1px solid #888;width:300px;background:#fff';
+    const typed = input.value.toLowerCase();
+    for (const v of VALUES.filter((x) => x.toLowerCase().includes(typed))) {
+      const o = document.createElement('div');
+      o.setAttribute('role', 'option');
+      o.textContent = v;
+      o.style.cssText = 'padding:4px;cursor:pointer';
+      o.addEventListener('mousedown', (e) => e.preventDefault());
+      o.addEventListener('click', () => pick(v));
+      m.appendChild(o);
+    }
+    wrap.after(m);
+    input.setAttribute('aria-expanded', 'true');
+  };
+  input.addEventListener('click', open);
+  input.addEventListener('input', open);
+  input.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); });
+});
+for (const v of VALUES) document.getElementById('saved').appendChild(chipNode(v, 'direct', false));
+</script></body></html>"""
+
+# effect: what the pick does to the chips; pre: the picked label is a chip of this field before the pick.
+_CR_OUTCOMES = (
+    ("add", False),
+    ("none", False),
+    ("other-field", False),
+    ("other-label", False),
+    ("other-component", False),
+    ("other-unlabelled-component", False),
+    ("recents", False),
+    ("recents-component", False),
+    ("recents-component-wrapped", False),
+    ("toggle", True),
+    ("none", True),
+)
+
+
+def _cr_configs() -> list[dict[str, Any]]:
+    # Every outcome once, the place and the row shape rotating, and the gaining pick in all nine of them.
+    shapes = list(itertools.product(("light", "shadow", "nested"), ("direct", "remove", "slotted")))
+    picks = [(shapes[k % 9], outcome) for k, outcome in enumerate(_CR_OUTCOMES)]
+    picks += [(shape, ("add", False)) for shape in shapes if shape != shapes[0]]
+    configs: list[dict[str, Any]] = []
+    for (dom, chip), (effect, pre) in picks:
+        # Main reads a slotted chip in a captioned recents list as a commit too; that limit predates the chip read.
+        if effect == "recents" and chip == "slotted":
+            chip = "direct"
+        configs.append(
+            {
+                "dom": dom,
+                "chip": chip,
+                "effect": effect,
+                "pre": pre,
+                "pick": "Glass harp",
+                "loose": len(configs) % 2 == 1,
+            }
+        )
+    # Two sinks: another component whose label is drawn inside its own root, and a light field.
+    configs.append({"dom": "shadow", "chip": "direct", "effect": "none", "pre": False, "pick": "", "loose": False})
+    configs.append({"dom": "light", "chip": "direct", "effect": "none", "pre": False, "pick": "", "loose": False})
+    return configs
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_reports_a_tag_row_only_its_own_field_gained_and_never_as_a_commit() -> None:
+    configs = _cr_configs()
+    html = _CR_FIELDS_HTML.replace("__CONFIG__", json.dumps(configs))
+    wrong = []
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        select = _tool(tools, "select_combobox").handler
+        for i, cfg in enumerate(configs[:-2]):
+            before = await page.evaluate("(i) => window.__chips[i].slice()", i)
+            r = await select({"selector": f"#cr{i}", "value": cfg["pick"]})
+            after = await page.evaluate("(i) => window.__chips[i].slice()", i)
+            gained = cfg["pick"] in after and cfg["pick"] not in before
+            # Main's own verifier reads a light-DOM label slotted into a row outside a nested root as the commit.
+            mains = cfg["chip"] == "slotted" and cfg["dom"] != "nested"
+            right = (
+                (
+                    r.status == "ok" and "committed value" in r.content
+                    if mains
+                    else _reports_observed_row(r, cfg["pick"])
+                )
+                if gained
+                else r.error_class == "did_not_commit"
+            )
+            if not right:
+                wrong.append((i, cfg, before, after, r.status, r.error_class, r.content[:200]))
+    assert not wrong, wrong
+
+
+# Chips whose ownership the field cannot prove. A component beside the field draws the picked label as a removable chip
+# in its own root (a pill, a tag row, under a host aria-label): the field still picks, and the pill its own list gains
+# is the commit. A pill the field's own list already holds is left as is. A host carrying role=combobox with the real
+# input in its root is one field, so the pill beside it is still read. A label assigned to a slot the pill hides is not
+# drawn, so the pill reads as no chip. An owned pill commits only when it is new and carries the exact label. Two
+# light-DOM fields sharing a vocabulary behave as on main: each reads only its own pills.
+_UNPROVABLE_CHIPS_HTML = """<!doctype html><html><body style="font:14px sans-serif">
+<div id="cards"></div>
+<script>
+const css = 'display:inline-block;border:1px solid #888;padding:1px 6px;margin:2px';
+const pill = (v) => '<span class="chip" style="' + css + '">' + v + '<button type="button">x</button></span>';
+const OTHER = {
+  'pill-root': ['', pill('Glass harp')],
+  'option-root': ['', '<div role="option" style="' + css + '">Glass harp<button type="button">x</button></div>'],
+  'labelled-host': [' aria-label="Other instruments"', pill('Glass harp')],
+};
+const combo = (host, input, i, effect, own) => {
+  const close = () => {
+    const m = host.querySelector('[role=listbox]');
+    if (m) m.remove();
+    input.setAttribute('aria-expanded', 'false');
+  };
+  const open = () => {
+    close();
+    input.setAttribute('aria-expanded', 'true');
+    const m = document.createElement('div');
+    m.setAttribute('role', 'listbox');
+    m.style.cssText = 'border:1px solid #888;width:300px;background:#fff';
+    for (const v of ['Copper bell', 'Glass harp', 'Reed pipe'].filter((x) => x.toLowerCase().includes(input.value.toLowerCase()))) {
+      const o = document.createElement('div');
+      o.setAttribute('role', 'option');
+      o.textContent = v;
+      o.addEventListener('mousedown', (e) => e.preventDefault());
+      const added = effect === 'hidden-slot' ? v : pill(effect === 'substring' ? v + ' case' : v);
+      const lands = effect !== 'noop' && effect !== 'pre-noop';
+      o.addEventListener('click', () => { if (lands) own.insertAdjacentHTML('beforeend', added); close(); input.value = ''; });
+      m.appendChild(o);
+    }
+    input.after(m);
+  };
+  if (effect !== 'pre-noop') input.setAttribute('aria-expanded', 'false');
+  input.addEventListener('click', open);
+  input.addEventListener('input', open);
+};
+const EFFECTS = ['pill-root', 'option-root', 'labelled-host', 'noop', 'held', 'host-combobox', 'hidden-slot', 'substring',
+  'pre-noop'];
+EFFECTS.forEach((effect, i) => {
+  const card = document.createElement('div');
+  card.style.margin = '8px 0';
+  document.getElementById('cards').appendChild(card);
+  let own = document.createElement('div');
+  let input;
+  if (effect === 'hidden-slot') {
+    own = document.createElement('x-tagged');
+    card.appendChild(own);
+    const root = own.attachShadow({mode: 'open'});
+    root.innerHTML = '<input id="f' + i + '" role="combobox" aria-autocomplete="list" aria-label="Instruments ' + i
+      + '" style="width:300px"><span class="chip" style="' + css + '"><slot style="display:none"></slot>'
+      + '<button type="button">x</button></span>';
+    input = root.querySelector('input');
+    combo(root, input, i, effect, own);
+  } else if (effect === 'host-combobox') {
+    const host = document.createElement('x-combo');
+    host.setAttribute('role', 'combobox');
+    host.setAttribute('aria-haspopup', 'listbox');
+    host.style.display = 'block';
+    card.appendChild(host);
+    const root = host.attachShadow({mode: 'open'});
+    root.innerHTML = '<input id="f' + i + '" aria-label="Instruments ' + i + '" style="width:300px">';
+    input = root.querySelector('input');
+    combo(root, input, i, effect, own);
+  } else {
+    card.insertAdjacentHTML('beforeend', '<label for="f' + i + '">Instruments ' + i + '</label> '
+      + '<input id="f' + i + '" role="combobox" aria-autocomplete="list" style="width:300px">');
+    input = card.querySelector('input');
+    combo(card, input, i, effect, own);
+  }
+  if (effect !== 'hidden-slot') card.appendChild(own);
+  if (effect === 'held' || effect === 'pre-noop') own.innerHTML = pill('Glass harp');
+  const [attr, body] = OTHER[effect === 'noop' ? 'pill-root' : effect] || [];
+  if (body) {
+    const other = document.createElement('x-other');
+    if (attr) other.setAttribute('aria-label', 'Other instruments');
+    card.appendChild(other);
+    other.attachShadow({mode: 'open'}).innerHTML = body;
+  }
+});
+// Two light fields in one card share a vocabulary, the first already holding the label.
+const pair = document.createElement('div');
+document.getElementById('cards').appendChild(pair);
+[0, 1].forEach((k) => {
+  const id = 'f' + (EFFECTS.length + k);
+  const w = document.createElement('div');
+  pair.appendChild(w);
+  w.insertAdjacentHTML('beforeend', '<label for="' + id + '">Instruments ' + id + '</label> <input id="' + id
+    + '" role="combobox" aria-autocomplete="list" style="width:300px">');
+  const own = document.createElement('div');
+  own.className = 'own';
+  w.appendChild(own);
+  if (k === 0) own.innerHTML = pill('Glass harp');
+  combo(w, w.querySelector('input'), 0, 'pair', own);
+});
+window.pairPills = (id) => Array.from(document.getElementById(id).parentNode.querySelectorAll('.own > .chip'))
+  .map((c) => c.firstChild.nodeValue);
+window.ownPills = (i) => Array.from(document.querySelectorAll('#cards > div')[i].querySelectorAll(':scope > div > .chip'))
+  .map((c) => c.firstChild.nodeValue);
+</script></body></html>"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_picks_past_a_chip_it_cannot_prove_is_the_fields_own() -> None:
+    async with _content_page(_UNPROVABLE_CHIPS_HTML) as page:
+        select = _tool(build_browser_tools(_fixed_page_provider(page)), "select_combobox").handler
+        results = [await select({"selector": f"#f{i}", "value": "Glass harp"}) for i in range(11)]
+        pills = [await page.evaluate("(i) => window.ownPills(i)", i) for i in range(9)]
+        pair = [await page.evaluate("(id) => window.pairPills(id)", f"f{i}") for i in (9, 10)]
+        hidden_slot_chips = await page.evaluate(_OWN_CHIPS_JS, {"sel": "#f6"})
+    for i in (0, 1, 2, 5):
+        assert results[i].status == "ok" and "committed value" in results[i].content, (i, results[i].content)
+        assert pills[i] == ["Glass harp"], (i, pills[i])
+    assert results[3].error_class == "did_not_commit" and pills[3] == [], results[3].content
+    assert results[4].status == "ok" and "already selected" in results[4].content and pills[4] == ["Glass harp"]
+    assert hidden_slot_chips == []
+    assert results[7].error_class == "did_not_commit" and pills[7] == ["Glass harp case"], results[7].content
+    assert results[8].error_class == "did_not_commit" and pills[8] == ["Glass harp"], results[8].content
+    assert results[9].status == "ok" and "already selected" in results[9].content and pair[0] == ["Glass harp"]
+    assert results[10].status == "ok" and "committed value" in results[10].content and pair[1] == ["Glass harp"]
 
 
 # A menu row that holds its own list: the list's rows declare no role, so each belongs to the inner list, not to the
@@ -51769,3 +52458,40 @@ customElements.define('colour-pick', class extends HTMLElement {
         await page.evaluate(_FIND_MENU_JS, {"sel": "h2", "el": None, "keepOpenTags": False})
         cleared = await page.evaluate(count_tags)
     assert (kept, cleared) == (3, 0)
+
+
+@pytest.mark.asyncio
+async def test_a_page_is_freed_after_a_cdp_probe_and_recorded_frame_work() -> None:
+    # A real CDP session reaches its page through the driver connection, modelled here by a direct reference.
+    class Session:
+        def __init__(self, page: Any) -> None:
+            self.page = page
+
+        async def send(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+            if method == "Page.getFrameTree":
+                return {"frameTree": {"frame": {"id": "main", "url": "https://main.test/"}}}
+            if method == "Page.createIsolatedWorld":
+                return {"executionContextId": 1}
+            return {"result": {"value": 1}}
+
+    class Context:
+        async def new_cdp_session(self, page: Any) -> Session:
+            return Session(page)
+
+    class Page:
+        context = Context()
+
+    class Frame:
+        def __init__(self, page: Page) -> None:
+            self.page = page
+
+    page = Page()
+    frame = Frame(page)
+    assert await taskv3_tools._evaluate_isolated(page, "(arg) => 1", "#t") == 1
+    await taskv3_tools._record_frame_work(page, frame, "#t", "filled", "document-1")
+
+    released = weakref.ref(page)
+    del page, frame
+    gc.collect()
+
+    assert released() is None

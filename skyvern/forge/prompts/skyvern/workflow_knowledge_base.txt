@@ -128,7 +128,7 @@ title: str                                     # Required: The title of the bloc
 navigation_goal: <action_description>          # Required: What actions to perform
 error_code_mapping: {}                         # Optional: Map errors to custom codes
 max_retries: 0                                 # Optional: Number of retry attempts
-max_steps_per_run: null                        # Optional: Limit steps per execution
+max_steps_per_run: null                        # Optional
 parameter_keys: []                             # Optional: Parameters used in this block
 complete_on_download: false                    # Optional: Complete when file downloads
 download_suffix: null                          # Optional: Downloaded file name
@@ -435,7 +435,7 @@ title: str                      # Required: The title of the block
 navigation_goal: null           # Optional: Additional navigation after login
 error_code_mapping: {}          # Optional: Custom error codes
 max_retries: 0                  # Optional: Retry attempts
-max_steps_per_run: null         # Optional: Step limit
+max_steps_per_run: null         # Optional
 parameter_keys: []              # Required: Should include credential parameters
 totp_identifier: <email_addr>   # Optional: Email or phone for inbox-integration OTP (no saved credential required)
 totp_verification_url: <url>    # Optional: URL where the TOTP code must be entered
@@ -533,7 +533,7 @@ data_extraction_goal: <what_to_extract>  # Required: Description of data to extr
 data_schema: <json_schema>               # Optional: Structure of extracted data
 url: <page_url>                          # Optional: URL to navigate to first
 max_retries: 0                           # Optional: Retry attempts
-max_steps_per_run: null                  # Optional: Step limit
+max_steps_per_run: null                  # Optional
 parameter_keys: []                       # Optional: Parameters used
 disable_cache: false                     # Optional: Disable cache
 Use Cases:
@@ -590,7 +590,7 @@ url: <starting_url>                            # Optional: URL to navigate to fi
 title: str                                     # Optional: Title for the block
 error_code_mapping: {}                         # Optional: Map errors to custom codes
 max_retries: 0                                 # Optional: Number of retry attempts
-max_steps_per_run: null                        # Optional: Limit steps per execution
+max_steps_per_run: null                        # Optional
 parameter_keys: []                             # Optional: Parameters used in this block
 download_suffix: null                          # Optional: Full filename for the download
 totp_verification_url: null                    # Optional: TOTP verification URL
@@ -1123,7 +1123,6 @@ blocks:
 
 * Performance:
    - Use disable_cache: true for dynamic content
-   - Set max_steps_per_run to prevent infinite loops
    - Use navigation blocks for actions and extraction blocks for data extraction
 
 * Security:

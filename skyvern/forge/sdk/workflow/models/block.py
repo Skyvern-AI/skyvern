@@ -37,6 +37,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time
 from email.message import EmailMessage
 from email.policy import SMTP as SMTP_EMAIL_POLICY
+from email.utils import getaddresses
 from enum import StrEnum
 from functools import partial
 from pathlib import Path, PurePosixPath
@@ -67,6 +68,7 @@ import aiofiles
 import aiohttp
 import docx
 import filetype
+import httpx
 import pandas as pd
 import structlog
 from charset_normalizer import from_bytes
@@ -394,6 +396,7 @@ from skyvern.schemas.workflows import (
 )
 from skyvern.services import otp_email, otp_service, planner_levers
 from skyvern.services.email.gmail import GMAIL_MAX_MESSAGE_BYTES, GmailSendResult, send_raw_message
+from skyvern.services.email.gmail_client import GMAIL_API_BASE, GMAIL_RATE_LIMIT_REASONS, GmailAPIError, get_json
 from skyvern.services.error_detection_service import detect_user_defined_errors_for_task
 from skyvern.utils.contained_effects import contained_effect
 from skyvern.utils.parquet_export import ParquetExportError, export_parquet_records
@@ -450,6 +453,7 @@ from skyvern.webeye.navigation import (
 )
 from skyvern.webeye.playwright_input import playwright_input_defaults_for_page
 from skyvern.webeye.real_browser_state import RealBrowserState, is_external_browser_state
+from skyvern.webeye.scraper.scraper import page_is_dead_blank
 from skyvern.webeye.utils.captcha_solver import (
     MAX_IMAGE_CAPTCHA_READS,
     ChallengeStatus,
@@ -2657,6 +2661,7 @@ class BaseTaskBlock(Block):
     # synthetic block follows the run's arm. Private so an internal experiment toggle stays out of
     # the published block schemas and out of stored workflow definitions.
     _exclude_from_engine_ab: bool = PrivateAttr(default=False)
+    _allow_blank_start: bool = PrivateAttr(default=False)
 
     def resolve_engine(self, workflow_run_id: str | None) -> RunEngine:
         """The engine this block dispatches to, after the per-run A/B.
@@ -3192,7 +3197,11 @@ class BaseTaskBlock(Block):
                     raise e
 
                 # Validate starter URL before downstream scraping on a blank page
-                if not (self.url and self.url.strip()) and working_page.url in ("about:blank", "", ":"):
+                if (
+                    not self._allow_blank_start
+                    and not (self.url and self.url.strip())
+                    and working_page.url in ("about:blank", "", ":")
+                ):
                     missing_url_exc = MissingStarterUrl(block_label=self.label)
                     LOG.warning(
                         "First browser block has no starter URL",
@@ -3273,6 +3282,9 @@ class BaseTaskBlock(Block):
                             organization_id=workflow_run.organization_id,
                         )
                         raise e
+
+            if self._allow_blank_start:
+                self._allow_blank_start = page_is_dead_blank(working_page)
 
             try:
                 current_context = skyvern_context.ensure_context()
@@ -13845,8 +13857,15 @@ def _build_gmail_message_bytes(
     body: str,
     body_format: EmailBodyFormat,
     attachment_paths: list[str],
+    in_reply_to: str | None = None,
+    references: str | None = None,
 ) -> bytes:
     msg = EmailMessage()
+    msg["X-Skyvern-Automation"] = "send-email-block"
+    if in_reply_to:
+        msg["In-Reply-To"] = in_reply_to
+    if references:
+        msg["References"] = references
     msg["From"] = from_address
     for header, addresses in (("To", to), ("Cc", cc), ("Bcc", bcc)):
         if addresses:
@@ -13903,6 +13922,7 @@ class SendEmailBlock(Block):
     # credential_id; sender and the smtp_* settings are not used.
     transport: EmailTransport | None = None
     credential_id: str | None = None
+    reply_to_message_id: str | None = None
     cc: list[str] = []
     bcc: list[str] = []
 
@@ -13915,6 +13935,7 @@ class SendEmailBlock(Block):
             "custom_smtp_username",
             "file_attachments",
             "recipients",
+            "reply_to_message_id",
             "sender",
             "subject",
         }
@@ -13955,7 +13976,12 @@ class SendEmailBlock(Block):
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
         if self.transport != EmailTransport.GMAIL:
             self.sender = self.render_templatable_field("sender", self.sender, workflow_run_context)
-        self.subject = self.render_templatable_field("subject", self.subject, workflow_run_context)
+        if self.reply_to_message_id:
+            self.reply_to_message_id = self.render_templatable_field(
+                "reply_to_message_id", self.reply_to_message_id, workflow_run_context
+            ).strip()
+        if not self.reply_to_message_id:
+            self.subject = self.render_templatable_field("subject", self.subject, workflow_run_context)
         self.body = self.render_templatable_field("body", self.body, workflow_run_context)
 
         # Format recipients
@@ -14157,6 +14183,7 @@ class SendEmailBlock(Block):
         organization_id: str | None = None,
     ) -> EmailMessage:
         msg = EmailMessage()
+        msg["X-Skyvern-Automation"] = "send-email-block"
         # Flattened after Jinja rendering: a substituted value carrying a newline would otherwise
         # be rejected by the email header policy and fail the send.
         msg["Subject"] = self.subject.strip().replace("\n", "").replace("\r", "")
@@ -14332,6 +14359,77 @@ class SendEmailBlock(Block):
         to = self._resolve_recipient_entries(self.recipients, workflow_run_context)
         cc = self._resolve_recipient_entries(self.cc, workflow_run_context)
         bcc = self._resolve_recipient_entries(self.bcc, workflow_run_context)
+        thread_id = None
+        in_reply_to = None
+        references = None
+        reply_authorization = None
+        if self.reply_to_message_id:
+            row = await app.DATABASE.google_oauth.get_credential(organization_id, credential_id)
+            if row is None:
+                raise _GmailSendRefused(GmailSendErrorCode.CONFIGURATION)
+            if google_oauth_service.GOOGLE_GMAIL_READONLY_SCOPE not in (row.scopes_granted or []):
+                raise _GmailSendRefused(
+                    GmailSendErrorCode.RECONNECT,
+                    "Reconnect the Gmail account to grant read permission before replying.",
+                )
+            reply_authorization = await google_oauth_service.resolve_gmail_send_authorization(
+                organization_id, credential_id
+            )
+            if (
+                reply_authorization.status != google_oauth_service.GmailSendAuthorizationStatus.READY
+                or not reply_authorization.access_token
+            ):
+                raise _GmailSendRefused(
+                    _GMAIL_AUTHORIZATION_ERROR_CODES.get(reply_authorization.status, GmailSendErrorCode.INTERNAL_ERROR)
+                )
+            try:
+                async with httpx.AsyncClient() as client:
+                    original = await get_json(
+                        client,
+                        f"{GMAIL_API_BASE}/users/me/messages/{quote(self.reply_to_message_id, safe='')}",
+                        access_token=reply_authorization.access_token,
+                        params={
+                            "format": "metadata",
+                            "metadataHeaders": ["Message-ID", "References", "Subject", "Reply-To", "From", "To"],
+                        },
+                    )
+            except GmailAPIError as exc:
+                if exc.status == 401 or exc.code == "reconnect_required":
+                    raise _GmailSendRefused(GmailSendErrorCode.RECONNECT) from None
+                if exc.status == 429 or (exc.status == 403 and exc.code in GMAIL_RATE_LIMIT_REASONS):
+                    raise _GmailSendRefused(GmailSendErrorCode.RATE_LIMITED) from None
+                if exc.status >= 500:
+                    raise _GmailSendRefused(
+                        GmailSendErrorCode.INTERNAL_ERROR,
+                        "Gmail could not read the original message. Nothing was sent; try again later.",
+                    ) from None
+                raise _GmailSendRefused(GmailSendErrorCode.PROVIDER_REJECTED) from None
+            payload = original.get("payload") or {}
+            headers = {
+                h["name"].lower(): re.sub(r"\r?\n[ \t]+", " ", h["value"])
+                .replace("\x00", "")
+                .encode("utf-8", "replace")
+                .decode("utf-8")
+                for h in payload.get("headers", [])
+                if isinstance(h, dict) and isinstance(h.get("name"), str) and isinstance(h.get("value"), str)
+            }
+            in_reply_to = headers.get("message-id", "").strip()
+            thread_id = original.get("threadId")
+            if not in_reply_to or not isinstance(thread_id, str) or not thread_id:
+                raise _GmailSendRefused(GmailSendErrorCode.INVALID_HEADER)
+            references = " ".join(filter(None, [headers.get("references", "").strip(), in_reply_to]))
+            self.subject = "Re: " + re.sub(r"^(?:re:\s*)+", "", headers.get("subject", "").strip(), flags=re.IGNORECASE)
+            if not to:
+                original_senders = getaddresses([headers.get("from", "")])
+                sent_by_account = any(
+                    address.casefold() == (reply_authorization.from_address or "").casefold()
+                    for _, address in original_senders
+                    if address
+                )
+                recipient_header = (
+                    headers.get("to", "") if sent_by_account else headers.get("reply-to") or headers.get("from", "")
+                )
+                to = [address for _, address in getaddresses([recipient_header]) if address]
         if not (to or cc or bcc):
             raise _GmailSendRefused(GmailSendErrorCode.NO_RECIPIENTS)
         try:
@@ -14352,7 +14450,9 @@ class SendEmailBlock(Block):
                 workflow_run_context, workflow_run_id, organization_id, staging_dir
             )
 
-            authorization = await google_oauth_service.resolve_gmail_send_authorization(organization_id, credential_id)
+            authorization = reply_authorization or await google_oauth_service.resolve_gmail_send_authorization(
+                organization_id, credential_id
+            )
             if (
                 authorization.status != google_oauth_service.GmailSendAuthorizationStatus.READY
                 or not authorization.access_token
@@ -14376,6 +14476,8 @@ class SendEmailBlock(Block):
                     body=body,
                     body_format=self.body_format,
                     attachment_paths=attachment_paths,
+                    in_reply_to=in_reply_to,
+                    references=references,
                 )
             except ValueError:
                 raise _GmailSendRefused(GmailSendErrorCode.INVALID_HEADER) from None
@@ -14412,7 +14514,11 @@ class SendEmailBlock(Block):
 
         # From here the claim row is the record: a cancellation or crash leaves it unresolved, which reads as unknown.
         try:
-            result = await send_raw_message(authorization.access_token, mime_bytes)
+            result = (
+                await send_raw_message(authorization.access_token, mime_bytes, thread_id=thread_id)
+                if thread_id
+                else await send_raw_message(authorization.access_token, mime_bytes)
+            )
         except Exception:
             result = GmailSendResult(GmailSendOutcome.UNKNOWN, error_code=GmailSendErrorCode.OUTCOME_UNKNOWN)
         try:
@@ -20174,6 +20280,7 @@ async def _evaluate_prompt_branch_conditions_batch(
         # Unlike the loop-value synthetic, this block is NOT excluded from the engine A/B:
         # eligibility vets prompt-branch conditionals (v3_ab_ineligibility_reason), so the run's
         # resolved arm covers branch evaluation too.
+        extraction_block._allow_blank_start = True
         extraction_block.mark_data_extraction_goal_prerendered()
         extraction_block.mark_internal_evaluation()
 

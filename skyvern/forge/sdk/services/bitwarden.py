@@ -1395,7 +1395,7 @@ class BitwardenService:
         """
         fail_reasons: list[str] = []
         last_error: Exception | None = None
-        if not bw_organization_id and bw_collection_ids and collection_id not in bw_collection_ids:
+        if not item_id and not bw_organization_id and bw_collection_ids and collection_id not in bw_collection_ids:
             raise BitwardenAccessDeniedError()
 
         if item_id and not is_uuid(item_id):

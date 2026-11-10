@@ -69,7 +69,7 @@ export function useDemonstrationRecorder({
     useState(false);
   const [limitReached, setLimitReached] = useState(false);
   const [browserRestarted, setBrowserRestarted] = useState(false);
-  // The backend refuses demonstrations with 403 when its cache is not shared (no Redis).
+  // The backend refuses demonstrations with 501 when it runs several processes without a shared cache.
   const [unavailable, setUnavailable] = useState(false);
   const busyRef = useRef(false);
   const streamControllerRef = useRef<AbortController | null>(null);
@@ -616,7 +616,7 @@ export function useDemonstrationRecorder({
         setInsertion(response.data.insertion ?? undefined);
         updatePhase("stopped");
       } catch (error) {
-        if (isAxiosError(error) && error.response?.status === 403)
+        if (isAxiosError(error) && error.response?.status === 501)
           setUnavailable(true);
       }
     })();
