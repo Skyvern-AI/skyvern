@@ -563,7 +563,10 @@ async def _resolve_copilot_request_config(
 
 
 async def _resolve_copilot_api_key(request: Request, organization_id: str) -> str | None:
-    return request.headers.get("x-api-key") or await app.AGENT_FUNCTION.resolve_org_api_key(organization_id)
+    request_key = request.headers.get("x-api-key") or await app.AGENT_FUNCTION.resolve_org_api_key(organization_id)
+    return await app.AGENT_FUNCTION.resolve_copilot_loopback_api_key(
+        get_request_principal(), organization_id, request_key
+    )
 
 
 def _with_current_copilot_code_mode_metadata(
