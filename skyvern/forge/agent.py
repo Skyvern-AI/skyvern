@@ -757,7 +757,8 @@ _PAGE_FINGERPRINT_PROBE_JS = (
     "| data-tv3=\"t\\d+(?:-\\d+)?\"/gi, '');"
     # Each sample scores every element's own text, capped at 2: +1 when rewritten, -1 when unchanged, 0 when it grew.
     # From 2 until back at 0 it is a ticker, and the settle check (maskTicks) ignores a ticker's change only to a
-    # text whose digit-masked shape it has shown before: a countdown, a clock or a carousel, never a new word.
+    # text whose digit-masked shape it has shown before (a countdown, a clock or a carousel, never a new word),
+    # decided whole on the sample where the text changed, so a still page hashes the same on every sample.
     " let seen = window.__tv3_settle_text;"
     " if (!(seen instanceof WeakMap)) seen = window.__tv3_settle_text = new WeakMap();"
     " const own = (n) => { let t = ''; for (const c of n.childNodes) if (c.nodeType === 3) t += c.nodeValue; return t; };"
@@ -765,9 +766,12 @@ _PAGE_FINGERPRINT_PROBE_JS = (
     " const all = root.querySelectorAll('*'); elems += all.length;"
     " for (const el of [root, ...all]) { const t = own(el); const r = seen.get(el); if (!r && !t.trim()) continue;"
     " const shape = t.replace(/[0-9]+/g, '#');"
+    " let moved = false;"
     " if (!r) seen.set(el, { t: t, n: 0, s: new Set([shape]) }); else if (r.t === t) r.n = Math.max(0, r.n - 1);"
-    " else { r.n = t.length > r.t.length && t.startsWith(r.t.slice(0, -3)) ? 0 : Math.min(2, r.n + 1); r.t = t; }"
-    " if (r) r.k = r.n >= 2 || (!!r.k && r.n > 0); if (!(r && r.k && r.s.has(shape))) text = mix('|' + t, text);"
+    " else { r.n = t.length > r.t.length && t.startsWith(r.t.slice(0, -3)) ? 0 : Math.min(2, r.n + 1); r.t = t;"
+    " moved = true; }"
+    " if (r) { r.k = r.n >= 2 || (!!r.k && r.n > 0); if (moved) r.m = r.k && r.s.has(shape); }"
+    " if (!(r && r.m)) text = mix('|' + t, text);"
     " if (r && r.s.size < 16) r.s.add(shape); }"
     " h = mix(maskTicks ? ('>' + html + '<').replace(/>[^<]*</g, '><') + ':' + text : html, h);"
     " for (const el of root.querySelectorAll('input, textarea, select'))"
