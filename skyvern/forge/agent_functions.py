@@ -1155,6 +1155,10 @@ class AgentFunction:
     ) -> bool:
         return True
 
+    async def role_allows(self, principal: RequestPrincipal | None, action: str) -> bool:
+        """Whether an enforced role grant allows ``action``; deployments without roles allow everything."""
+        return True
+
     async def can_access_sessionless_artifacts(
         self,
         principal: RequestPrincipal | None,

@@ -6,6 +6,7 @@ import random
 import re
 import time
 from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from enum import Enum
@@ -91,7 +92,9 @@ from skyvern.forge.sdk.db.repositories.tags import (
     TagValueRenameResult,
 )
 from skyvern.forge.sdk.db.repositories.workflow_runs import (
+    RUN_INPUT_SEARCH_ACCESS,
     RUNS_LIST_STATEMENT_TIMEOUT_SECONDS,
+    RunInputSearchAccess,
     is_indexed_runs_list_search_key,
 )
 from skyvern.forge.sdk.db.repositories.workflows import WorkflowCreationLockTimeout, WorkflowFolderChangedError
@@ -5207,9 +5210,10 @@ async def get_runs(
     if page > 10:
         return []
 
-    runs = await app.DATABASE.workflow_runs.get_all_runs(
-        current_org.organization_id, page=page, page_size=page_size, status=status, search_key=search_key
-    )
+    async with _run_input_search_scope(search_key):
+        runs = await app.DATABASE.workflow_runs.get_all_runs(
+            current_org.organization_id, page=page, page_size=page_size, status=status, search_key=search_key
+        )
     await app.WORKFLOW_SERVICE._attach_latest_attempt_views([run for run in runs if isinstance(run, WorkflowRun)])
     workflow_runs = iter(
         await _redact_workflow_run_list(
@@ -5451,17 +5455,18 @@ async def get_runs_v2(
     run_tags = await _parse_and_gate_tag_filter_terms(tags, current_org)
 
     try:
-        rows = await app.DATABASE.workflow_runs.get_all_runs_v2(
-            current_org.organization_id,
-            page=page,
-            page_size=page_size,
-            status=[s.value for s in status] if status else None,
-            search_key=search_key,
-            run_type=[r.value for r in run_type] if run_type else None,
-            workflow_permanent_ids=workflow_permanent_id,
-            run_tags=run_tags or None,
-            failure_category=failure_category,
-        )
+        async with _run_input_search_scope(search_key):
+            rows = await app.DATABASE.workflow_runs.get_all_runs_v2(
+                current_org.organization_id,
+                page=page,
+                page_size=page_size,
+                status=[s.value for s in status] if status else None,
+                search_key=search_key,
+                run_type=[r.value for r in run_type] if run_type else None,
+                workflow_permanent_ids=workflow_permanent_id,
+                run_tags=run_tags or None,
+                failure_category=failure_category,
+            )
     except SQLAlchemyError as exc:
         if not is_statement_timeout(exc) or not search_key:
             raise
@@ -5950,16 +5955,17 @@ async def get_workflow_runs(
             _ORG_RUNS_SEARCH_DEFAULT_WINDOW
         )
     try:
-        workflow_runs = await app.WORKFLOW_SERVICE.get_workflow_runs(
-            organization_id=current_org.organization_id,
-            page=page,
-            page_size=page_size,
-            status=status,
-            search_key=search_key,
-            error_code=error_code,
-            created_at_start=effective_created_at_start,
-            created_at_end=created_at_end,
-        )
+        async with _run_input_search_scope(search_key):
+            workflow_runs = await app.WORKFLOW_SERVICE.get_workflow_runs(
+                organization_id=current_org.organization_id,
+                page=page,
+                page_size=page_size,
+                status=status,
+                search_key=search_key,
+                error_code=error_code,
+                created_at_start=effective_created_at_start,
+                created_at_end=created_at_end,
+            )
         workflow_runs = await _redact_workflow_run_list(workflow_runs, current_org.organization_id)
         await _redact_browser_session_addresses(workflow_runs, current_org.organization_id)
         return workflow_runs
@@ -6007,6 +6013,23 @@ _PUBLIC_WORKFLOW_RUNS_BY_ID_DESCRIPTION = (
 )
 
 
+@asynccontextmanager
+async def _run_input_search_scope(search_key: str | None) -> AsyncIterator[None]:
+    if not search_key:
+        yield
+        return
+    principal = get_request_principal()
+    access = RunInputSearchAccess(
+        run_inputs=await app.AGENT_FUNCTION.role_allows(principal, "workflow_run.read"),
+        agent_definition=await app.AGENT_FUNCTION.role_allows(principal, "workflow.read"),
+    )
+    token = RUN_INPUT_SEARCH_ACCESS.set(access)
+    try:
+        yield
+    finally:
+        RUN_INPUT_SEARCH_ACCESS.reset(token)
+
+
 async def _get_workflow_runs_by_id(
     *,
     workflow_id: str,
@@ -6034,19 +6057,20 @@ async def _get_workflow_runs_by_id(
         )
 
     try:
-        workflow_runs = await app.WORKFLOW_SERVICE.get_workflow_runs_for_workflow_permanent_id(
-            workflow_permanent_id=workflow_id,
-            organization_id=organization_id,
-            page=page,
-            page_size=page_size,
-            status=status,
-            search_key=search_key,
-            error_code=error_code,
-            exclude_child_runs=exclude_child_runs,
-            created_at_start=created_at_start,
-            created_at_end=created_at_end,
-            run_tags=run_tags,
-        )
+        async with _run_input_search_scope(search_key):
+            workflow_runs = await app.WORKFLOW_SERVICE.get_workflow_runs_for_workflow_permanent_id(
+                workflow_permanent_id=workflow_id,
+                organization_id=organization_id,
+                page=page,
+                page_size=page_size,
+                status=status,
+                search_key=search_key,
+                error_code=error_code,
+                exclude_child_runs=exclude_child_runs,
+                created_at_start=created_at_start,
+                created_at_end=created_at_end,
+                run_tags=run_tags,
+            )
         workflow_runs = await _redact_workflow_run_list(workflow_runs, organization_id)
         await _redact_browser_session_addresses(workflow_runs, organization_id)
         return workflow_runs
@@ -6321,6 +6345,9 @@ async def get_workflow_and_run_from_workflow_run_id(
     x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> WorkflowRunWithWorkflowResponse:
     analytics.capture("skyvern-oss-agent-workflow-run-get")
+    # The route needs run read access; the agent definition it also returns needs agent read access.
+    if not await app.AGENT_FUNCTION.role_allows(get_request_principal(), "workflow.read"):
+        raise HTTPException(status_code=http_status.HTTP_403_FORBIDDEN, detail="Your role can't read this agent.")
     with browser_session_artifact_read(get_request_principal()):
         response = await run_service.coalesce_in_flight(
             _build_workflow_and_run_from_workflow_run_id,

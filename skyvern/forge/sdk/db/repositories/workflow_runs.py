@@ -4,6 +4,7 @@ import json
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Sequence
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple
@@ -153,6 +154,19 @@ RUNS_LIST_STATEMENT_TIMEOUT_SECONDS = 30
 # A budget this far gone cannot answer anything; spend it provoking the cancellation that ends the
 # request rather than adding a branch that reports the same condition a second way.
 _RUNS_LIST_EXHAUSTED_BUDGET_SECONDS = 0.25
+
+
+@dataclass(frozen=True)
+class RunInputSearchAccess:
+    run_inputs: bool = False
+    agent_definition: bool = False
+
+
+# A search over run inputs lets a caller rebuild what it matches a few characters at a time, so each arm is off unless
+# the list route grants it: parameter values and extra headers need run read, parameter names need agent read.
+RUN_INPUT_SEARCH_ACCESS: ContextVar[RunInputSearchAccess] = ContextVar(
+    "run_input_search_access", default=RunInputSearchAccess()
+)
 
 
 def _runs_list_search_id_prefix(search_key: str) -> str | None:
@@ -3274,7 +3288,11 @@ class WorkflowRunsRepository(BaseRepository):
             extra_http_headers_col.isnot(None),
             func.cast(extra_http_headers_col, Text()).icontains(search_key, autoescape=True),
         )
-        return [param_key_desc_exists, param_value_exists, extra_headers_match]
+        access = RUN_INPUT_SEARCH_ACCESS.get()
+        return [
+            *([param_key_desc_exists] if access.agent_definition else []),
+            *([param_value_exists, extra_headers_match] if access.run_inputs else []),
+        ]
 
     def _run_identifier_search_clauses(
         self,
