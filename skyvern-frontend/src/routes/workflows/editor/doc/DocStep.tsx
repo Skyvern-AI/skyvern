@@ -951,7 +951,11 @@ function schemaFieldNames(raw: unknown): string[] {
   } catch {
     return [];
   }
-  const properties = (schema as { properties?: unknown } | null)?.properties;
+  const shape = schema as {
+    properties?: unknown;
+    items?: { properties?: unknown };
+  } | null;
+  const properties = shape?.properties ?? shape?.items?.properties;
   return properties && typeof properties === "object"
     ? Object.keys(properties)
     : [];

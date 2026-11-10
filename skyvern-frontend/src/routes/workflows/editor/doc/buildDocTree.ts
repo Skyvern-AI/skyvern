@@ -26,7 +26,10 @@ export type DocBranch = {
   condition: string;
   check: "ai" | "exact" | null;
   children: DocItem[];
+  // Every step the branch holds, nested and unplaced ones included.
   stepCount: number;
+  // The branch's own numbered steps, which offset the numbers of the branches after it.
+  numberedCount: number;
   jumpTo?: string;
 };
 type DocPlacement = {
@@ -365,7 +368,8 @@ export function buildDocTree(
           "",
         check: branchCheck(definition),
         children,
-        stepCount: children.filter(isNumberedItem).length,
+        stepCount: countDocSteps(children),
+        numberedCount: children.filter(isNumberedItem).length,
         ...(firstShared !== -1 && { jumpTo: chain[firstShared] }),
       };
     });
@@ -378,6 +382,7 @@ export function buildDocTree(
         check: null,
         children: [],
         stepCount: 0,
+        numberedCount: 0,
       });
     const tailItems = placeSequence(rejoin?.tail ?? [], null, {
       reason: conditionalReason,

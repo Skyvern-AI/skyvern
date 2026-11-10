@@ -54,7 +54,13 @@ import {
   saveDocInput,
 } from "./docInputs";
 import { DocInputEditor } from "./DocInputEditor";
-import { armNextCaretOffset, takeReferenceLine, useDocTouch } from "./docKeys";
+import {
+  armNextCaretOffset,
+  DOC_SHOW_PROBLEMS_EVENT,
+  docStepLine,
+  takeReferenceLine,
+  useDocTouch,
+} from "./docKeys";
 import type { ParametersState } from "../types";
 import { toast, useToast } from "@/components/ui/use-toast";
 import {
@@ -83,8 +89,9 @@ import {
 } from "./docEditApi";
 import { countReferences, findOutputUsers, textValues } from "./docGraphEdits";
 import { docStepTitle } from "./docStepRegistry";
-import { docStepProblems } from "./docProblems";
+import { docProblemEntries, docStepProblems } from "./docProblems";
 import { customSettingsShortText } from "./docSettingsChips";
+import { DocProblemsList } from "./DocProblemsList";
 import { stepsLeftBy, useDocUnfinishedStore } from "./docUnfinished";
 import { DocGettingStarted, DocStarterNote, DocTip } from "./DocStarter";
 import { docTipIndex, type DocStarterProgress } from "./docStarterTips";
@@ -538,10 +545,6 @@ export function WorkflowDocEditor({
       ),
     [nodes, unfinishedIds],
   );
-  const fixCount = [...stepFixes.values()].reduce(
-    (count, messages) => count + messages.length,
-    0,
-  );
   const shownProblems = useMemo(
     () =>
       validationProblems.filter(
@@ -550,12 +553,17 @@ export function WorkflowDocEditor({
       ),
     [validationProblems, unfinishedLabels],
   );
-  const problems = shownProblems.length + fixCount;
-  // A check that couldn't reach the server says so, but doesn't hold the run. The problems it left
-  // from an earlier check describe an older draft, so they stay on screen but no longer block it.
-  const checkFailed = validationProblems.some(
-    (problem) => problem.code === "validation_failed",
+  const problemEntries = useMemo(
+    () =>
+      docProblemEntries({
+        nodes,
+        items: tree.items,
+        fixes: stepFixes,
+        problems: shownProblems,
+      }),
+    [nodes, tree, stepFixes, shownProblems],
   );
+  const problems = problemEntries.length;
   const workflowProblems = useMemo(
     () => validationProblems.filter((problem) => !problem.block_label),
     [validationProblems],
@@ -598,21 +606,11 @@ export function WorkflowDocEditor({
   }, [nodes, shownProblems, stepFixes]);
 
   // Step warnings sit in the same map but are not notes and do not need fixing.
+  // Counts notes, not problems: one credential named in two notes is one problem and two notes to fix.
   const noteProblemCount = [...noteProblems.keys()].filter(
     (key) => !key.endsWith(":step") && !key.endsWith(":fix"),
   ).length;
-  // A credential named in a note is only a save warning, but the run would read it, so it holds Run like a step problem.
-  const runProblems =
-    fixCount +
-    (checkFailed ? 0 : noteProblemCount) +
-    (checkFailed
-      ? 0
-      : shownProblems.filter(
-          (problem) =>
-            problem.code !== "validation_failed" &&
-            problem.severity !== "warning" &&
-            problem.code !== "credential_in_note",
-        ).length);
+  const runProblems = problemEntries.filter((entry) => entry.blocking).length;
   useEffect(() => {
     useRunValidationStore.getState().setDocProblemCount(runProblems);
   }, [runProblems]);
@@ -651,40 +649,6 @@ export function WorkflowDocEditor({
       store().clear();
     };
   }, []);
-  const firstProblemId = useMemo(() => {
-    const ids = new Set(
-      [...noteProblems.keys()]
-        .filter((key) => key.endsWith(":step") || key.endsWith(":fix"))
-        .map((key) => key.slice(0, key.lastIndexOf(":"))),
-    );
-    const visit = (items: DocItem[]): string | null => {
-      for (const item of items) {
-        if (item.kind === "note") {
-          if (noteProblems.has(`${item.ownerNodeId}:${item.placement}`))
-            return item.ownerNodeId;
-          continue;
-        }
-        if (item.kind === "unplaced") {
-          const hit = item.nodeIds.find((id) => ids.has(id));
-          if (hit) return hit;
-          continue;
-        }
-        if (ids.has(item.nodeId)) return item.nodeId;
-        const inner =
-          item.kind === "loop"
-            ? visit(item.children)
-            : item.kind === "conditional"
-              ? item.branches.reduce<string | null>(
-                  (found, branch) => found ?? visit(branch.children),
-                  null,
-                )
-              : null;
-        if (inner) return inner;
-      }
-      return null;
-    };
-    return visit(tree.items);
-  }, [noteProblems, tree]);
   const starter = useDocStarter(
     workflowId ?? null,
     Boolean(edit) && stepCount === 0 && !description?.trim(),
@@ -809,15 +773,7 @@ export function WorkflowDocEditor({
 
   const closePanel = () => {
     setPanelOpen(false);
-    // The step's line was replaced when it lost focus, so look it up again.
-    const stepLine =
-      panelStepId.current && rootRef.current
-        ? Array.from(
-            rootRef.current.querySelectorAll<HTMLElement>("[data-doc-node-id]"),
-          )
-            .find((el) => el.dataset.docNodeId === panelStepId.current)
-            ?.querySelector<HTMLElement>("[data-doc-line]")
-        : null;
+    const stepLine = docStepLine(rootRef.current, panelStepId.current);
     panelStepId.current = null;
     (panelOpener.current?.isConnected
       ? panelOpener.current
@@ -870,16 +826,13 @@ export function WorkflowDocEditor({
   // The run-blocking panel's Locate lands here while the canvas is covered.
   const goToRef = useRef(goTo);
   goToRef.current = goTo;
-  const firstProblemIdRef = useRef(firstProblemId);
-  firstProblemIdRef.current = firstProblemId;
+  // A refused Run opens the problems list without jumping: a jump could scroll the list's button out of view.
   useEffect(() => {
-    const show = () => {
-      if (firstProblemIdRef.current) goToRef.current(firstProblemIdRef.current);
-    };
-    useRunValidationStore.getState().setDocShowFirstProblem(show);
+    const show = () => window.dispatchEvent(new Event(DOC_SHOW_PROBLEMS_EVENT));
+    useRunValidationStore.getState().setDocShowProblems(show);
     return () => {
-      if (useRunValidationStore.getState().docShowFirstProblem === show)
-        useRunValidationStore.getState().setDocShowFirstProblem(null);
+      if (useRunValidationStore.getState().docShowProblems === show)
+        useRunValidationStore.getState().setDocShowProblems(null);
     };
   }, []);
   const runInputs = useMemo<DocRunInput[]>(() => {
@@ -1347,15 +1300,11 @@ export function WorkflowDocEditor({
                 {stepCount} step{stepCount === 1 ? "" : "s"}
               </span>
               {problems > 0 && (
-                <button
-                  type="button"
-                  data-doc-problems
-                  disabled={!firstProblemId}
-                  onClick={() => firstProblemId && goTo(firstProblemId)}
-                  className="rounded-md border border-border px-2 py-[2px] text-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-default"
-                >
-                  {problems} problem{problems === 1 ? "" : "s"}
-                </button>
+                <DocProblemsList
+                  entries={problemEntries}
+                  byId={byId}
+                  goTo={goTo}
+                />
               )}
               <button
                 type="button"

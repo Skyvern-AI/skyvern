@@ -13,7 +13,7 @@ import type { DocGraph } from "./docGraphEdits";
 import { buildDocTree } from "./buildDocTree";
 import { useLocateBlockStore } from "../runValidation/useLocateBlockStore";
 import { block, code, conditional, forLoop, settings } from "./docTestBlocks";
-import { docStepProblems } from "./docProblems";
+import { docStepProblems, loopSchemaStepId } from "./docProblems";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { useDocUnfinishedStore } from "./docUnfinished";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
@@ -356,8 +356,8 @@ describe("building from scratch in the doc", () => {
     expect(docStepProblems(latest().nodes).has(loop.id)).toBe(false);
   });
 
-  const extractionHint =
-    "Pick the list inside extraction_1_output, for example extraction_1_output.extracted_information.<field>, with <field> listed in extraction_1's data schema. Use extraction_1_output.extracted_information only if that data schema is an array.";
+  const noSchemaList =
+    "extraction_1 has no top-level list in its Data Schema, so the loop has nothing to go through. Add a list field at the top level of its Data Schema, then pick it here with @.";
   const loopAfter = (source: ReturnType<typeof block>, extra = {}) =>
     getElements(
       [
@@ -387,7 +387,6 @@ describe("building from scratch in the doc", () => {
     ["{{ extraction_1_output.extracted_information.titles }}", null, false],
     ["{{ extraction_1_output | map(attribute='x') }}", null, false],
     ["{{ book_list }}", null, false],
-    ["{{ extraction_1_output }}", { type: "array" }, true],
   ])(
     "a loop over %s (data schema %j) is flagged only when it goes through a whole result record",
     (reference, dataSchema, flagged) => {
@@ -396,15 +395,88 @@ describe("building from scratch in the doc", () => {
           loop_variable_reference: reference,
         }),
       );
-      if (flagged) expect(problems).toEqual([extractionHint]);
+      if (flagged) expect(problems).toEqual([noSchemaList]);
       else expect(problems).toBeUndefined();
     },
   );
 
-  const recordHint = (path: string) =>
-    path === "extracted_information.<field>"
-      ? "Pick the list inside task_1_output, for example task_1_output.extracted_information.<field>, with <field> listed in task_1's data schema. Use task_1_output.extracted_information only if that data schema is an array."
-      : `Pick the list inside task_1_output, for example task_1_output.${path}.`;
+  test("a loop over an extraction's whole result says what to pick, by what its Data Schema holds", () => {
+    const resultsSchema = {
+      type: "object",
+      properties: { results: { type: "array" } },
+    };
+    const over = (
+      dataSchema: unknown,
+      reference = "{{ extraction_1_output }}",
+    ) =>
+      loopAfter(extraction(dataSchema), { loop_variable_reference: reference });
+    const noSchema = over(null);
+    expect(loopProblems(noSchema)).toEqual([noSchemaList]);
+    expect(loopSchemaStepId(byLabel(noSchema, "books"), noSchema.nodes)).toBe(
+      byLabel(noSchema, "extraction_1").id,
+    );
+    const withList = over(resultsSchema);
+    expect(loopProblems(withList)).toEqual([
+      "extraction_1_output is the whole result of extraction_1, not a list. Pick one of its list fields with @.",
+    ]);
+    expect(loopSchemaStepId(byLabel(withList, "books"), withList.nodes)).toBe(
+      null,
+    );
+    expect(loopProblems(over({ type: "array" }))).toEqual([
+      "extraction_1_output is the whole result of extraction_1, not a list. Its Data Schema is a list, so use extraction_1_output.extracted_information.",
+    ]);
+    // The backend reads a nullable array schema as an array.
+    expect(
+      loopProblems(
+        over({ type: ["array", "null"], items: { type: "object" } }),
+      ),
+    ).toEqual([
+      "extraction_1_output is the whole result of extraction_1, not a list. Its Data Schema is a list, so use extraction_1_output.extracted_information.",
+    ]);
+    // A union takes its first non-null type, as the backend does: this one is an object.
+    expect(
+      loopProblems(
+        over({ ...resultsSchema, type: ["object", "array", "null"] }),
+      ),
+    ).toEqual([
+      "extraction_1_output is the whole result of extraction_1, not a list. Pick one of its list fields with @.",
+    ]);
+    const nested = over({
+      type: "object",
+      properties: {
+        page: { type: "object", properties: { books: { type: "array" } } },
+      },
+    });
+    // A list one level down is not offered by @, so the message says top-level.
+    expect(loopProblems(nested)).toEqual([noSchemaList]);
+    expect(
+      loopProblems(
+        over({ type: "object", properties: { items: { type: "array" } } }),
+      ),
+    ).toEqual([
+      `Rename the list field "items" in the earlier step's data schema. A loop can't go through a field with that name.`,
+    ]);
+    expect(loopProblems(over("{ not json"))).toEqual([
+      "extraction_1_output is the whole result of extraction_1, not a list. Pick one of its list fields with @.",
+    ]);
+    expect(
+      loopProblems(
+        over(
+          resultsSchema,
+          "{{ extraction_1_output.extracted_information.results }}",
+        ),
+      ),
+    ).toBeUndefined();
+  });
+
+  const recordHint = (blockType: string, path: string) =>
+    blockType === "task"
+      ? /^.+ has no top-level list in its Data Schema, so the loop has nothing to go through\./
+      : blockType === "navigation"
+        ? /^task_1_output is the whole result of .+, not a list, and this step's result usually holds no list\. Pick a list from an earlier extraction with @\.$/
+        : new RegExp(
+            `^task_1_output is the whole result of .+, not a list\\. Pick the list inside it, for example task_1_output\\.${path}\\.$`,
+          );
 
   test.each([
     ["task", {}, "extracted_information.<field>"],
@@ -427,7 +499,10 @@ describe("building from scratch in the doc", () => {
           loop_variable_reference: "{{ task_1_output }}",
         }),
       );
-      if (path) expect(problems).toEqual([recordHint(path)]);
+      if (path)
+        expect(problems).toEqual([
+          expect.stringMatching(recordHint(blockType, path)),
+        ]);
       else expect(problems).toBeUndefined();
     },
   );
@@ -450,7 +525,7 @@ describe("building from scratch in the doc", () => {
       true,
     ) as DocGraph;
     expect(loopProblems(graph)).toEqual([
-      "Pick the list inside titles_output_output, for example titles_output_output.extracted_information.<field>, with <field> listed in titles_output's data schema. Use titles_output_output.extracted_information only if that data schema is an array.",
+      "Titles output has no top-level list in its Data Schema, so the loop has nothing to go through. Add a list field at the top level of its Data Schema, then pick it here with @.",
     ]);
   });
 
@@ -513,7 +588,9 @@ describe("building from scratch in the doc", () => {
     expect(loopListItems(graph).map((item) => item.key)).toEqual([
       "extraction_1_output",
     ]);
-    expect(loopProblems(graph)).toEqual([extractionHint]);
+    expect(loopProblems(graph)).toEqual([
+      "extraction_1 has no top-level list in its Data Schema, so the loop has nothing to go through. Add a list field at the top level of its Data Schema, then pick it here with @.",
+    ]);
   });
 
   test("a Unicode list field is offered and saves its dotted path; a name with a space or a dash is not", () => {

@@ -18,6 +18,7 @@ import {
 } from "@radix-ui/react-icons";
 import { isWorkflowBlockNode, type AppNode } from "../nodes";
 import { workflowBlockTitle } from "../nodes/types";
+import { loopSchemaStepId } from "./docProblems";
 import {
   countDocSteps,
   isNumberedItem,
@@ -27,6 +28,7 @@ import {
 import { WorkflowDocActionsContext } from "./WorkflowDocActionsContext";
 import {
   docBlockType,
+  docStepCaption,
   getDocMissingSettings,
   getDocProseFields,
 } from "./docStepRegistry";
@@ -181,13 +183,23 @@ function previousReason(items: DocItem[], index: number) {
 function DocStepProblem({
   nodeId,
   problems,
+  byId,
+  editable,
 }: {
   nodeId: string;
   problems: ReadonlyMap<string, DocNoteProblem>;
+  byId: Map<string, AppNode>;
+  editable: boolean;
 }) {
+  const actions = useContext(WorkflowDocActionsContext);
   const problem = problems.get(`${nodeId}:step`);
   // What the step still needs before it can run, found as the draft is typed.
   const fix = problems.get(`${nodeId}:fix`);
+  const node = byId.get(nodeId);
+  const schemaStep =
+    fix && node && editable && actions.edit
+      ? byId.get(loopSchemaStepId(node, [...byId.values()]) ?? "")
+      : undefined;
   return (
     <>
       {fix && (
@@ -205,6 +217,15 @@ function DocStepProblem({
             </li>
           ))}
         </ul>
+      )}
+      {schemaStep && (
+        <button
+          type="button"
+          onClick={() => actions.openSettings(schemaStep.id)}
+          className="mt-1 rounded-md border border-border px-2 py-0.5 text-[12.5px] text-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          {`Open ${docStepCaption(schemaStep) ?? schemaStep.data.label}'s Data Schema`}
+        </button>
       )}
       {problem && (
         <p
@@ -281,7 +302,12 @@ function DocNode({
             </>
           )}
         />
-        <DocStepProblem nodeId={item.nodeId} problems={noteProblems} />
+        <DocStepProblem
+          nodeId={item.nodeId}
+          problems={noteProblems}
+          byId={byId}
+          editable={editable}
+        />
       </>
     );
   const inside = item.kind === "loop" ? countDocSteps(item.children) : 0;
@@ -421,7 +447,12 @@ function DocNode({
             />
           </div>
         </DocInsertPopover>
-        <DocStepProblem nodeId={item.nodeId} problems={noteProblems} />
+        <DocStepProblem
+          nodeId={item.nodeId}
+          problems={noteProblems}
+          byId={byId}
+          editable={editable}
+        />
         {editable && <DocOneActionHint node={node} />}
         <DocStepResult label={node.data.label} />
       </div>
@@ -1174,7 +1205,12 @@ export function DocScope({
                       node={node}
                       hasFix={noteProblems.has(`${id}:fix`)}
                     />
-                    <DocStepProblem nodeId={id} problems={noteProblems} />
+                    <DocStepProblem
+                      nodeId={id}
+                      problems={noteProblems}
+                      byId={byId}
+                      editable={false}
+                    />
                     <DocStepResult label={node.data.label} />
                     {node.type === "loop" && (
                       <DocProposalLoopRemovals loopLabel={node.data.label} />
