@@ -1598,7 +1598,7 @@ class AgentFunction:
     def get_cloud_integration_entries(self) -> list[IntegrationEntry]:
         return []
 
-    async def get_cloud_integration_accounts(self, organization_id: str) -> AccountsById:
+    async def get_cloud_integration_accounts(self, organization_id: str, user_id: str | None = None) -> AccountsById:
         return {}
 
     def onepassword_instance_default_policy_mode(self) -> str:

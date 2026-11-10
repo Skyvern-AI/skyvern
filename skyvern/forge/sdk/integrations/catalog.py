@@ -435,11 +435,12 @@ async def read_account_source(organization_id: str, entry_ids: frozenset[str], s
 
 
 def with_accounts(
-    entry: IntegrationEntry, accounts: list[IntegrationAccount] | AccountsUnavailable | None
+    entry: IntegrationEntry, accounts: list[IntegrationAccount] | None, unavailable: AccountsUnavailable | None
 ) -> IntegrationEntry:
-    if isinstance(accounts, str):
-        return entry.model_copy(update={"accounts": None, "accounts_unavailable": accounts})
-    return entry.model_copy(update={"accounts": accounts, "accounts_unavailable": None})
+    # One source being off must not hide the accounts another source found for the same entry.
+    if accounts is not None and unavailable == "not_enabled":
+        unavailable = None
+    return entry.model_copy(update={"accounts": accounts, "accounts_unavailable": unavailable})
 
 
 def integration_entries(
@@ -528,10 +529,15 @@ async def integrations_for_org(organization_id: str, user_id: str | None = None)
     reads = await asyncio.gather(
         *(read_account_source(organization_id, entry_ids, source) for entry_ids, source in _ACCOUNT_SOURCES),
         microsoft_reader,
-        app.AGENT_FUNCTION.get_cloud_integration_accounts(organization_id),
+        app.AGENT_FUNCTION.get_cloud_integration_accounts(organization_id, user_id),
     )
-    accounts: AccountsById = {}
+    accounts: dict[str, list[IntegrationAccount]] = {}
+    unavailable: dict[str, AccountsUnavailable] = {}
     for found in reads:
-        accounts.update(found)
+        for entry_id, value in found.items():
+            if isinstance(value, list):
+                accounts.setdefault(entry_id, []).extend(value)
+            elif unavailable.get(entry_id) != "read_failed":
+                unavailable[entry_id] = value
     entries = await integration_entries_for_org(organization_id)
-    return [with_accounts(entry, accounts.get(entry.id)) for entry in entries]
+    return [with_accounts(entry, accounts.get(entry.id), unavailable.get(entry.id)) for entry in entries]
