@@ -216,7 +216,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
-from skyvern.forge.sdk.credential_site_policy import LoginSite, describe_release_scope, origin_of
+from skyvern.forge.sdk.credential_site_policy import LoginSite, describe_release_scope
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.enums import TaskType, WorkflowRunTriggerType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
@@ -344,7 +344,9 @@ from skyvern.forge.sdk.workflow.models.code_block_recording import CodeBlockActi
 from skyvern.forge.sdk.workflow.models.credential_release import (
     CodeBlockCredentialReleaseError,
     CredentialReleaseGuard,
+    describe_refused_target,
     login_release_sites,
+    redact_secrets,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
@@ -18695,20 +18697,24 @@ class HttpRequestBlock(Block):
         off_site_release = self._off_site_credential_release()
         if off_site_release is not None:
             parameter_key, sites, destination = off_site_release
+            # The rendered destination can carry any of the run's secrets in its host.
+            secret_labels = [
+                (value, "[redacted]") for value in workflow_run_context.secrets.values() if isinstance(value, str)
+            ]
+            # Never fall back to the stored URL itself: it can carry basic-auth credentials or a token.
+            site_scopes = {describe_release_scope(site.url, whole_site=site.whole_site) for site in sites}
             allowed_scope = (
-                ", ".join(
-                    sorted({describe_release_scope(site.url, whole_site=site.whole_site) or site.url for site in sites})
-                )
+                redact_secrets(", ".join(sorted(scope for scope in site_scopes if scope)), secret_labels)
                 or "no website a scope can be read from"
             )
-            actual_scope = describe_release_scope(destination) or "a destination whose site could not be identified"
-            actual_origin = origin_of(destination)
+            actual_scope, actual_host = describe_refused_target(destination, secret_labels)
+            actual_scope = actual_scope or "a destination whose site could not be identified"
             LOG.warning(
                 "http_request_credential_release_refused",
                 parameter_key=parameter_key,
                 allowed_scope=allowed_scope,
                 actual_scope=actual_scope,
-                actual_host=actual_origin.host if actual_origin is not None else None,
+                actual_host=actual_host,
                 workflow_run_id=workflow_run_id,
                 block_label=self.label,
             )
