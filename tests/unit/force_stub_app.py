@@ -163,6 +163,7 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.AGENT_FUNCTION.resolve_copilot_loopback_api_key = (
         base_agent_function.resolve_copilot_loopback_api_key
     )
+    fake_app_module.AGENT_FUNCTION.copilot_turn_control_allowed = base_agent_function.copilot_turn_control_allowed
     fake_app_module.AGENT_FUNCTION.resolve_api_key_profile = AsyncMock(
         return_value=APIKeyAuthProfile("full_org", None, True)
     )
