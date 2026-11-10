@@ -618,7 +618,7 @@ async def _copilot_control_allowed(
         )
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Copilot could not check who started this turn. Retry shortly.",
+            detail="Copilot could not check whether you can do this. Retry shortly.",
             headers={"Retry-After": "2"},
         ) from None
 
@@ -626,8 +626,9 @@ async def _copilot_control_allowed(
 async def _require_copilot_turn_control(
     organization_id: str, turn: CopilotPendingTurn | None, control: CopilotTurnControl
 ) -> None:
-    # Steer, answer and credential-deletion reject an unmatched id downstream (409 or 404). Cancel accepts it: the
-    # token is the proof, and an unmatched one only sets the stop flag for that token.
+    # Steer and credential-deletion reject an unmatched id downstream (409 or 404); so does an answer, unless the stored
+    # question is already resolved, which returns that record (200) and writes nothing. Cancel accepts it, because the
+    # token is the proof and an unmatched one only sets that token's stop flag.
     if turn is None:
         return
     if not await _copilot_control_allowed(organization_id, turn.starter_user_id, control):
@@ -643,7 +644,7 @@ async def _copilot_turns_without_control(
     organization_id: str, chat: WorkflowCopilotChat | None, control: CopilotTurnControl
 ) -> set[str]:
     """Turn ids on which the caller may not use `control`, so chat-history hides that control's fields."""
-    # Fails closed (hide) on purpose, unlike _copilot_turn_control_allowed's 503: a poll must not fail on a lookup.
+    # Fails closed (hide) on purpose, unlike _copilot_control_allowed's 503: a poll must not fail on a lookup.
     hidden: set[str] = set()
     allowed_by_starter: dict[str | None, bool] = {}
     for turn in chat.pending_turns.values() if chat else []:
