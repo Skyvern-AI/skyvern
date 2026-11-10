@@ -30690,6 +30690,14 @@ _TICK = "t.textContent = String(Number(t.textContent) - 1)"
             ],
             False,
         ),
+        # A still page hashes the same however long it holds, even as a ticker's score decays between the two samples.
+        ("<p>Session expires in <span id=t>3600</span> s</p>", [_TICK, _TICK, _TICK, "", ""], True),
+        # A ticker that moves to a shape it has not shown keeps that sample's unmasked decision while the page holds.
+        (
+            "<p>Session expires in <span id=t>3600</span> s</p>",
+            [_TICK, _TICK, _TICK, "t.textContent = 'Saved'", ""],
+            True,
+        ),
         # A tracked ticker cleared to empty inside the pair still blocks.
         ("<p>Session expires in <span id=t>3600</span> s</p>", [_TICK, _TICK, _TICK, "t.textContent = ''"], False),
         # Two rewrites make a ticker, not one: a value that changed before both samples of the pair still blocks.
