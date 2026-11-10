@@ -68,16 +68,21 @@ export function DocRunLine({
     : (STATUS_WORDS[run.status] ?? run.status);
   const status = [statusWord, step ?? now].filter(Boolean).join(" · ");
   const ranVersion = run.workflow.version;
-  const { currentVersion } = docRun;
-  const version =
-    currentVersion === undefined
+  const { currentVersion, proposalPending } = docRun;
+  // A Copilot test run executes a draft version no one can open: it is soft-deleted after the
+  // run ends (best effort, often after the last poll). A pending proposal keeps its number.
+  const testRun =
+    Boolean(run.workflow.deleted_at) ||
+    (Boolean(run.copilot_session_id) && !proposalPending);
+  const version = testRun
+    ? "a test run"
+    : currentVersion === undefined
       ? null
       : ranVersion === currentVersion
         ? "this version"
         : `${ranVersion < currentVersion ? "an earlier" : "a newer"} version, v${ranVersion}`;
-  const rest = [age && (ended ? age : `started ${age}`), version].filter(
-    Boolean,
-  );
+  const liveAge = run.started_at ? `started ${age}` : `queued ${age}`;
+  const rest = [age && (ended ? age : liveAge), version].filter(Boolean);
   return (
     <div
       className="mb-3 flex flex-wrap items-center gap-x-2 gap-y-1 text-[13px] text-muted-foreground"
