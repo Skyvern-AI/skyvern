@@ -1,6 +1,8 @@
 import {
+  Fragment,
   useContext,
   useEffect,
+  useId,
   useRef,
   useState,
   type KeyboardEvent,
@@ -8,11 +10,17 @@ import {
 } from "react";
 import { useDocUnfinishedStore } from "./docUnfinished";
 import { stripJinjaReferences } from "./docTextUtils";
+import {
+  codeBlockUses,
+  SKIP_KEYS_FOR_JINJA_CHECK,
+  transformStringFieldsInObject,
+} from "../jinjaReferences";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { goalChangeIsPending } from "../workflowEditorUtils";
 import type { CodeBlockNodeData } from "../nodes/CodeBlockNode/types";
 import {
   CheckIcon,
+  ChevronDownIcon,
   ChevronRightIcon,
   ClockIcon,
   Cross2Icon,
@@ -25,6 +33,7 @@ import {
   DropdownMenuItem,
   DropdownMenuPortal,
   DropdownMenuSeparator,
+  DropdownMenuShortcut,
   DropdownMenuSub,
   DropdownMenuSubContent,
   DropdownMenuSubTrigger,
@@ -37,9 +46,15 @@ import { WorkflowBlockIcon } from "../nodes/WorkflowBlockIcon";
 import { announceDoc, announceMoved, announceTurnedInto } from "./docAnnounce";
 import { workflowBlockTitle } from "../nodes/types";
 import { WorkflowDocActionsContext } from "./WorkflowDocActionsContext";
-import { customSettingsText, getDocSettingsChips } from "./docSettingsChips";
+import {
+  customSettingsText,
+  getDocSettingsChips,
+  getDocSettingsRows,
+  type DocSettingRow,
+} from "./docSettingsChips";
 import {
   docBlockType,
+  docStepCaption,
   docTagClasses,
   docTagColor,
   getDocKeyFields,
@@ -57,7 +72,7 @@ import { DocRunStepButton } from "./DocRunStepButton";
 import { useBlockPlayRegistry } from "@/store/BlockPlayRegistryStore";
 import { docTagState, type DocTagState } from "./docRunState";
 import { useDocRunFor } from "./useDocRunFor";
-import { DocText } from "./DocText";
+import { DocText, docReferencePill } from "./DocText";
 import type { DocPlace } from "./docEditApi";
 import {
   DocDeleteConfirm,
@@ -286,8 +301,14 @@ function DocStepMenu({
               </DropdownMenuPortal>
             </DropdownMenuSub>
           )}
-          <DropdownMenuItem onSelect={() => actions.openSettings(node.id)}>
+          <DropdownMenuItem
+            onSelect={() => actions.openSettings(node.id)}
+            aria-keyshortcuts={docShortcut(".").aria}
+          >
             Settings
+            <DropdownMenuShortcut>
+              {docShortcut(".").label}
+            </DropdownMenuShortcut>
           </DropdownMenuItem>
           {!place.isFinally && (
             <DropdownMenuItem
@@ -543,17 +564,41 @@ export function DocStepControls({
   node,
   editable,
   showRunControl,
+  settings = true,
 }: {
   node: WorkflowBlockNode;
   editable: boolean;
   showRunControl: boolean;
+  // A step's settings open from its "Step options" instead.
+  settings?: boolean;
 }) {
   return (
     <span className="inline-flex items-center gap-0.5">
       {showRunControl && <DocRunStepButton node={node} disabled={!editable} />}
-      <DocSettingsButton node={node} editable={editable} />
+      {settings && <DocSettingsButton node={node} editable={editable} />}
     </span>
   );
+}
+
+/** A step's place in its list, "2" or "3.1". */
+export function DocStepNumber({ number }: { number?: string }) {
+  return number ? (
+    <span
+      data-testid="doc-step-number"
+      className="text-[12.5px] tabular-nums text-muted-foreground"
+    >
+      {number}
+    </span>
+  ) : null;
+}
+
+export function DocStepCaption({ node }: { node: WorkflowBlockNode }) {
+  const caption = docStepCaption(node);
+  return caption ? (
+    <span className="min-w-0 truncate text-[13px] font-medium text-foreground">
+      {caption}
+    </span>
+  ) : null;
 }
 
 export function DocStepHeader({
@@ -563,6 +608,7 @@ export function DocStepHeader({
   extra,
   disclosure,
   place,
+  number,
 }: {
   node: WorkflowBlockNode;
   editable: boolean;
@@ -570,6 +616,7 @@ export function DocStepHeader({
   extra?: ReactNode;
   disclosure?: { open: boolean; onToggle: () => void };
   place?: DocStepPlace;
+  number?: string;
 }) {
   return (
     <div className="relative flex min-h-[26px] flex-wrap items-center gap-2">
@@ -595,31 +642,19 @@ export function DocStepHeader({
           />
         </button>
       )}
+      <DocStepNumber number={number} />
       <DocTag
         node={node}
         place={editable ? place : undefined}
         besideChevron={Boolean(disclosure)}
       />
+      <DocStepCaption node={node} />
       {extra}
-      {docStepProducesData(node) && (
-        <span className="flex min-w-0 items-baseline gap-1 text-[12.5px] text-muted-foreground">
-          saves{" "}
-          {editable && place ? (
-            <DocOutputName id={node.id} label={node.data.label} />
-          ) : (
-            <span
-              title={`${node.data.label}_output`}
-              className="inline-block min-w-0 max-w-full rounded bg-muted px-[5px] align-baseline font-medium leading-[1.25] [overflow-wrap:anywhere]"
-            >
-              {node.data.label}_output
-            </span>
-          )}
-        </span>
-      )}
       <DocStepControls
         node={node}
         editable={editable}
         showRunControl={showRunControl}
+        settings={false}
       />
     </div>
   );
@@ -635,11 +670,14 @@ export function DocStepBody({
   onMove,
   onRunStep,
   hasFix = false,
+  renamable = false,
 }: {
   node: WorkflowBlockNode;
   editable?: boolean;
   // The step's problem line (what it still needs before it can run) is on screen under it.
   hasFix?: boolean;
+  // Whether the output name can be renamed here.
+  renamable?: boolean;
   // Enter; `key` is the field the caret was in, and the split is null outside the step's main text.
   onEnter?: (split: LineSplit | null, key: string) => void;
   onSlash?: PickerOpener;
@@ -759,7 +797,7 @@ export function DocStepBody({
   );
   return (
     <>
-      <div className="min-h-[1.55em] text-base font-medium leading-[1.55]">
+      <div className="min-h-[1.55em] text-base font-normal leading-[1.55]">
         {isProse ? (
           main ? (
             line(main.key, main.value, emptyText, "")
@@ -862,6 +900,235 @@ export function DocStepBody({
           ))}
         </div>
       )}
+      <DocStepSummary
+        node={node}
+        editable={editableProp}
+        renamable={renamable}
+        mainLine={
+          isProse
+            ? (main?.value ?? "")
+            : forEachLoop
+              ? (description ?? loopList(data))
+              : (description ?? getDocStepSummary(node))
+        }
+      />
     </>
+  );
+}
+
+// The Doc does not show a Code step's Python, so its reads are not listed.
+const CODE_SKIP_KEYS = new Set([...SKIP_KEYS_FOR_JINJA_CHECK, "code", "steps"]);
+
+// The inputs and results the step reads (declared keys, then `{{ }}` reads) that its main line does not show.
+function stepReferences(node: WorkflowBlockNode, mainLine: string): string[] {
+  const shown = new Set(codeBlockUses([], mainLine));
+  const texts: string[] = [];
+  transformStringFieldsInObject(
+    node.data,
+    (text) => {
+      texts.push(text);
+      return text;
+    },
+    node.type === "codeBlock" ? CODE_SKIP_KEYS : SKIP_KEYS_FOR_JINJA_CHECK,
+  );
+  const declared = (node.data as Record<string, unknown>).parameterKeys;
+  return [
+    ...new Set([
+      ...(Array.isArray(declared) ? (declared as string[]) : []),
+      ...texts.flatMap((text) => codeBlockUses([], text)),
+    ]),
+  ].filter((ref) => !shown.has(ref));
+}
+
+// Text Prompt, Web Search and the file and PDF parsers keep their output schema in jsonSchema.
+const outputFieldNames = (data: Record<string, unknown>) =>
+  schemaFieldNames(data.dataSchema ?? data.jsonSchema);
+
+function schemaFieldNames(raw: unknown): string[] {
+  let schema: unknown;
+  try {
+    schema = typeof raw === "string" ? JSON.parse(raw) : raw;
+  } catch {
+    return [];
+  }
+  const properties = (schema as { properties?: unknown } | null)?.properties;
+  return properties && typeof properties === "object"
+    ? Object.keys(properties)
+    : [];
+}
+
+const MAX_SHOWN_REFERENCES = 4;
+
+/** One muted line: what the step uses and saves, its custom settings, and its options. */
+function DocStepSummary({
+  node,
+  editable,
+  renamable,
+  mainLine,
+}: {
+  node: WorkflowBlockNode;
+  editable: boolean;
+  renamable: boolean;
+  mainLine: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const panelId = useId();
+  const refs = stepReferences(node, mainLine);
+  const saves = docStepProducesData(node);
+  const custom = getDocSettingsChips(node);
+  const options = editable ? stepOptionRows(node) : [];
+  if (!refs.length && !saves && !custom.length && !options.length) return null;
+  return (
+    <>
+      <div className="mt-1 flex flex-wrap items-baseline gap-x-2 gap-y-1 text-[12.5px] text-muted-foreground">
+        {refs.length > 0 && (
+          <span className="flex min-w-0 flex-wrap items-baseline gap-1">
+            Uses
+            {refs.slice(0, MAX_SHOWN_REFERENCES).map((ref) => (
+              <span key={ref} className={docReferencePill}>
+                {ref}
+              </span>
+            ))}
+            {refs.length > MAX_SHOWN_REFERENCES && (
+              <span>+{refs.length - MAX_SHOWN_REFERENCES}</span>
+            )}
+          </span>
+        )}
+        {saves && (
+          <span className="flex min-w-0 items-baseline gap-1">
+            Saves
+            {renamable ? (
+              <DocOutputName id={node.id} label={node.data.label} />
+            ) : (
+              <span
+                title={`${node.data.label}_output`}
+                className="inline-block min-w-0 max-w-full rounded bg-muted px-[5px] align-baseline font-medium leading-[1.25] [overflow-wrap:anywhere]"
+              >
+                {node.data.label}_output
+              </span>
+            )}
+          </span>
+        )}
+        {custom.map((chip) => (
+          <span
+            key={chip.key}
+            className="rounded-md border border-border px-1.5 leading-[1.5]"
+          >
+            {chip.label}
+          </span>
+        ))}
+        {options.length > 0 && (
+          <DocKeyTooltip
+            content={
+              custom.length ? customSettingsText(custom.length) : "Settings"
+            }
+          >
+            <button
+              type="button"
+              aria-label={`Step options for ${docStepCaption(node) ?? node.data.label}`}
+              aria-expanded={open}
+              aria-controls={panelId}
+              onClick={() => setOpen(!open)}
+              className="inline-flex items-center gap-0.5 rounded px-1 text-[12.5px] text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              Step options
+              <ChevronDownIcon
+                aria-hidden
+                className={cn(
+                  "size-3 transition-transform",
+                  open && "rotate-180",
+                )}
+              />
+            </button>
+          </DocKeyTooltip>
+        )}
+      </div>
+      {options.length > 0 && open && (
+        <DocStepOptions
+          id={panelId}
+          node={node}
+          rows={options}
+          onClose={() => setOpen(false)}
+        />
+      )}
+    </>
+  );
+}
+
+function stepOptionRows(node: WorkflowBlockNode): DocSettingRow[] {
+  const data = node.data as Record<string, unknown>;
+  const url = typeof data.url === "string" ? data.url.trim() : "";
+  const fields = outputFieldNames(data);
+  return [
+    ...getDocSettingsRows(node).map((row) => ({
+      ...row,
+      value:
+        row.custom || row.value === "Default"
+          ? row.value
+          : `${row.value} (default)`,
+    })),
+    ...("url" in data && getDocProseFields(node)[0]?.key !== "url"
+      ? [{ key: "url", label: "URL", value: url || "Not set", custom: !!url }]
+      : []),
+    ...(fields.length
+      ? [
+          {
+            key: "dataSchema",
+            label: "Output fields",
+            value: fields.join(", "),
+            custom: true,
+          },
+        ]
+      : []),
+  ];
+}
+
+function DocStepOptions({
+  id,
+  node,
+  rows,
+  onClose,
+}: {
+  id: string;
+  node: WorkflowBlockNode;
+  rows: DocSettingRow[];
+  onClose: () => void;
+}) {
+  const actions = useContext(WorkflowDocActionsContext);
+  return (
+    <div
+      id={id}
+      className="mt-1 rounded-md border border-border px-3 py-2 text-[13px]"
+    >
+      <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-0.5">
+        {rows.map((row) => (
+          <Fragment key={row.key}>
+            <dt className="text-muted-foreground">{row.label}</dt>
+            <dd
+              className={cn(
+                "min-w-0 [overflow-wrap:anywhere]",
+                !row.custom && "text-muted-foreground",
+              )}
+            >
+              {row.key === "url" && row.custom ? (
+                <DocText value={row.value} />
+              ) : (
+                row.value
+              )}
+            </dd>
+          </Fragment>
+        ))}
+      </dl>
+      <button
+        type="button"
+        onClick={() => {
+          onClose();
+          actions.openSettings(node.id);
+        }}
+        className="mt-1.5 rounded text-[12.5px] text-muted-foreground underline underline-offset-4 outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        Edit in side panel
+      </button>
+    </div>
   );
 }

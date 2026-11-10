@@ -45,6 +45,15 @@ export type DocItem =
       ));
 export type DocTree = { items: DocItem[] };
 
+export type DocNumberedItem = Exclude<
+  DocItem,
+  DocNoteItem | { kind: "unplaced" }
+>;
+
+// Notes and steps the Doc cannot place take no step number.
+export const isNumberedItem = (item: DocItem): item is DocNumberedItem =>
+  item.kind !== "note" && item.kind !== "unplaced";
+
 const isBlock = (node: Node) =>
   node.type !== "start" && node.type !== "nodeAdder";
 const UNPLACED =
@@ -356,7 +365,7 @@ export function buildDocTree(
           "",
         check: branchCheck(definition),
         children,
-        stepCount: countDocSteps(children),
+        stepCount: children.filter(isNumberedItem).length,
         ...(firstShared !== -1 && { jumpTo: chain[firstShared] }),
       };
     });

@@ -5,7 +5,10 @@ import {
   type WorkflowBlockType,
 } from "../../types/workflowTypes";
 import { blockTypeFromNode } from "../nodes/blockTypeFromNode";
+import { workflowBlockTitle } from "../nodes/types";
+import { humanizeBlockLabel } from "../../copilot/blockLabel";
 import { stripJinjaReferences } from "./docTextUtils";
+import { nodeLibraryItems } from "../panels/nodeLibraryItems";
 
 export type DocTagColor = "blue" | "green" | "purple" | "orange" | "brown";
 
@@ -412,6 +415,49 @@ export function docStepTitle(node: Node): string {
       ? String(node.data.label)
       : getDocStepSummary(node));
   return clip(title);
+}
+
+/** A step type's name from the full library, so a type the picker hides today (Agent, Power BI) still has its title. */
+export const nodeLibraryTitle = (type: string) =>
+  nodeLibraryItems.find((item) => item.nodeType === type)?.title ?? type;
+
+/** The name stem for a step type: "Go to URL Block" gives go_to_url. */
+export function labelStem(title: string): string {
+  return (
+    title
+      .replace(/ Block$/, "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "_")
+      .replace(/^_+|_+$/g, "")
+      .replace(/^(?=\d)/, "step_") || "step"
+  );
+}
+
+/** The step's label in words, or null for a default name (block_3, extraction_1) that says no more than its type. */
+export function docStepCaption(node: Node): string | null {
+  const label = typeof node.data.label === "string" ? node.data.label : "";
+  const blockType = docBlockType(node);
+  const stems = [
+    "block",
+    labelStem(nodeLibraryTitle(node.type ?? "")),
+    ...(blockType ? [labelStem(workflowBlockTitle[blockType])] : []),
+  ];
+  const unversioned = label.replace(/_v\d+$/, "");
+  const generic = stems.some(
+    (stem) =>
+      unversioned.startsWith(stem) &&
+      /^(_\d+)?$/.test(unversioned.slice(stem.length)),
+  );
+  if (!label.trim() || generic) return null;
+  // Sentence case reads as a title; a word with capitals after its first letter (PDF) keeps them.
+  return humanizeBlockLabel(label)
+    .split(" ")
+    .map((word, i) =>
+      i > 0 && word.slice(1) === word.slice(1).toLowerCase()
+        ? word.toLowerCase()
+        : word,
+    )
+    .join(" ");
 }
 
 function clip(title: string): string {

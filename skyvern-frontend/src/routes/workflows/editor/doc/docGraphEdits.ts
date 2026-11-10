@@ -34,7 +34,11 @@ import {
 import { extractSpreadsheetIdFromUrl } from "@/util/googleSheetsUrl";
 import type { CodeBlockNodeData } from "../nodes/CodeBlockNode/types";
 import { recordListFields, stepResultIsRecord } from "./docProblems";
-import { docMainIsSetting, getDocProseFields } from "./docStepRegistry";
+import {
+  docMainIsSetting,
+  getDocProseFields,
+  labelStem,
+} from "./docStepRegistry";
 
 export type DocScopeRef = SortableBlockScopeDescriptor;
 export type DocGraph = { nodes: AppNode[]; edges: Edge[] };
@@ -473,7 +477,7 @@ export function insertionPoint(
 
 const outputKey = (label: string) => `${label}_output`;
 
-function textValues(value: unknown, out: string[] = []): string[] {
+export function textValues(value: unknown, out: string[] = []): string[] {
   if (typeof value === "string") out.push(value);
   else if (Array.isArray(value)) value.forEach((v) => textValues(v, out));
   else if (value && typeof value === "object")
@@ -584,18 +588,6 @@ export function checkLabel(
   if (outputCollision)
     return `The step output "${outputCollision}" conflicts with an existing workflow parameter.`;
   return null;
-}
-
-/** The name stem for a step type: "Go to URL Block" gives go_to_url. */
-export function labelStem(title: string): string {
-  return (
-    title
-      .replace(/ Block$/, "")
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "_")
-      .replace(/^_+|_+$/g, "")
-      .replace(/^(?=\d)/, "step_") || "step"
-  );
 }
 
 /** A free name read from the step type: "Go to URL Block" gives go_to_url_1. */

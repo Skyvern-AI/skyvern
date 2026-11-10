@@ -81,7 +81,7 @@ import {
   type DocPlace,
   type NodeType,
 } from "./docEditApi";
-import { countReferences, findOutputUsers } from "./docGraphEdits";
+import { countReferences, findOutputUsers, textValues } from "./docGraphEdits";
 import { docStepTitle } from "./docStepRegistry";
 import { docStepProblems } from "./docProblems";
 import { customSettingsShortText } from "./docSettingsChips";
@@ -152,14 +152,6 @@ const OUTLINE_MIN_WIDTH = 640;
 
 const REFERENCE = /\{\{\s*([A-Za-z_][A-Za-z0-9_]*)_output\b/g;
 const PLAIN_OUTPUT = /^\s*([A-Za-z_][A-Za-z0-9_]*_output)(?![A-Za-z0-9_])/;
-
-function textValues(value: unknown, out: string[] = []): string[] {
-  if (typeof value === "string") out.push(value);
-  else if (Array.isArray(value)) value.forEach((v) => textValues(v, out));
-  else if (value && typeof value === "object")
-    Object.values(value).forEach((v) => textValues(v, out));
-  return out;
-}
 
 type WorkflowValidationProblem = {
   block_label: string | null;

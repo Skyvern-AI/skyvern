@@ -9,6 +9,7 @@ import { WorkflowBlockIcon } from "../nodes/WorkflowBlockIcon";
 import { workflowBlockTitle } from "../nodes/types";
 import type { WorkflowBlockType } from "../../types/workflowTypes";
 import { docLearnContent, type DocLearnContent } from "./docLearnContent";
+import { docStepCaption, docStepTitle } from "./docStepRegistry";
 
 export function DocSidePanel({
   tab,
@@ -67,31 +68,33 @@ export function DocSidePanel({
         </TabsList>
         <TabsContent value="settings">
           {selectedStep && (
-            <div
-              className="mb-4 flex min-w-0 items-center gap-2 text-sm"
-              aria-label="Selected step"
-            >
-              {blockType && (
-                <WorkflowBlockIcon
-                  workflowBlockType={blockType}
-                  className="size-4 shrink-0"
-                />
-              )}
-              {selectedStep.type === "start" ? (
-                <span className="shrink-0">Agent settings</span>
-              ) : (
-                <>
-                  <span className="shrink-0">
-                    {blockType
+            <div className="mb-4 min-w-0 text-sm" aria-label="Selected step">
+              <div className="flex min-w-0 items-center gap-2">
+                {blockType && (
+                  <WorkflowBlockIcon
+                    workflowBlockType={blockType}
+                    className="size-4 shrink-0"
+                  />
+                )}
+                <span className="shrink-0">
+                  {selectedStep.type === "start"
+                    ? "Agent settings"
+                    : blockType
                       ? workflowBlockTitle[blockType]
                       : selectedStep.type}
-                  </span>
-                  <span
-                    className="min-w-0 truncate font-mono text-xs text-muted-foreground"
+                </span>
+              </div>
+              {selectedStep.type !== "start" && (
+                <>
+                  <p className="mt-1 truncate text-sm font-medium">
+                    {docStepCaption(selectedStep) ?? docStepTitle(selectedStep)}
+                  </p>
+                  <p
+                    className="truncate font-mono text-xs text-muted-foreground"
                     title={selectedStep.data.label}
                   >
                     {selectedStep.data.label}
-                  </span>
+                  </p>
                 </>
               )}
             </div>
