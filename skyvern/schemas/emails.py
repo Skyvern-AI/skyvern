@@ -51,6 +51,8 @@ class EmailAttachment(BaseModel):
     is_inline: bool = Field(default=False, exclude=True)
     # Gmail stores small attachment bytes in body.data instead of issuing an attachmentId.
     embedded_data: str | None = Field(default=None, exclude=True, repr=False)
+    # Opaque proof, issued with the listing, that a connected-account download targets a listed attachment.
+    download_grant: str | None = Field(default=None, exclude=True, repr=False)
 
     @field_validator("name")
     @classmethod

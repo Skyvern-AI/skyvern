@@ -42,6 +42,7 @@ _SENSITIVE_ENDPOINTS = {
     "POST /api/v1/internal/powerbi/query",
     "POST /api/v1/internal/gmail/inbox",
     "POST /api/v1/internal/gmail/send",
+    "POST /api/v1/internal/gmail/attachment",
     # Agent reports can contain credentials before route redaction.
     "POST /v1/agent_feedback",
     "GET /api/v1/users/me/onboarding",
@@ -96,6 +97,8 @@ _STREAMING_REQUEST_ENDPOINT_PATTERNS = (
     # The internal Gmail send hop carries a whole encoded message; its route reads the body with its own bound.
     re.compile(r"^POST /api/v1/internal/gmail/send$"),
 )
+# Binary bodies streamed on purpose; buffering them for the log would hold a whole file in memory.
+_STREAMING_RESPONSE_ENDPOINTS = frozenset({"POST /api/v1/internal/gmail/attachment"})
 _MAX_BODY_LENGTH = 1000
 _READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 # 404/405 are dominated by internet scanners and MCP clients probing GET for an SSE stream;
@@ -508,7 +511,10 @@ async def log_raw_request_middleware(request: Request, call_next: Callable[[Requ
 
     response = await call_next(request)
     resp_content_type = response.headers.get("content-type", "")
-    is_streaming_response = any(content_type in resp_content_type for content_type in _STREAMING_CONTENT_TYPES)
+    is_streaming_response = (
+        any(content_type in resp_content_type for content_type in _STREAMING_CONTENT_TYPES)
+        or f"{http_method} {url_path.rstrip('/')}" in _STREAMING_RESPONSE_ENDPOINTS
+    )
 
     # Skip successful reads before buffering the response body; 4xx/5xx and
     # mutating paths keep logging, and sensitive endpoints always keep

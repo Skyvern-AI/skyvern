@@ -114,7 +114,7 @@ class EmailInboxBlock(Block):
         self,
         messages: list[email.EmailMessage],
         *,
-        access_token: str,
+        access_token: str | None,
         organization_id: str,
         workflow_run_context: WorkflowRunContext,
         workflow_run_id: str,
@@ -175,15 +175,21 @@ class EmailInboxBlock(Block):
                             attachment_output["download_error"] = "run_size_limit"
                             continue
 
+                    # None means the bytes are streamed from a connected account straight into the file below.
+                    content: bytes | None = None
                     try:
                         if attachment.embedded_data is not None:
                             content = email.gmail.decode_attachment_data(
                                 attachment.embedded_data, max_size_bytes=file_limit
                             )
+                        elif self.credential_source == "nango":
+                            if not attachment.download_grant:
+                                attachment_output["download_error"] = "missing_attachment_id"
+                                continue
                         else:
                             content = await email.download_attachment(
                                 email_client=self.email_client,
-                                access_token=access_token,
+                                access_token=access_token or "",
                                 message_id=message.id,
                                 attachment_id=attachment.attachment_id or "",
                                 max_size_bytes=file_limit,
@@ -202,12 +208,13 @@ class EmailInboxBlock(Block):
                         )
                         continue
 
-                    if len(content) > file_limit:
+                    if content is not None and len(content) > file_limit:
                         attachment_output["download_error"] = "file_size_limit"
                         continue
-                    if run_size + len(content) > run_limit:
+                    if content is not None and run_size + len(content) > run_limit:
                         attachment_output["download_error"] = "run_size_limit"
                         continue
+                    max_bytes = min(file_limit, run_limit - run_size)
 
                     # Split before sanitizing: its 200-character cap would otherwise cut off a long name's extension.
                     raw_stem, raw_extension = os.path.splitext(attachment.name)
@@ -231,13 +238,41 @@ class EmailInboxBlock(Block):
                         try:
                             with path.open("xb") as file:
                                 file_created = True
-                                file.write(content)
+                                if content is None:
+                                    written = await app.AGENT_FUNCTION.download_gmail_attachment_for_run(
+                                        organization_id=organization_id,
+                                        workflow_run_id=workflow_run_id,
+                                        workflow_run_block_id=workflow_run_block_id,
+                                        connection_id=self.connection_id or "",
+                                        hop_token=workflow_run_context.get_gmail_hop_token(self.label),
+                                        message_id=message.id,
+                                        attachment_id=attachment.attachment_id or "",
+                                        download_grant=attachment.download_grant or "",
+                                        max_bytes=max_bytes,
+                                        destination=file,
+                                    )
+                                    # A stream cut short can still end cleanly; the listed size catches it.
+                                    if attachment.size is not None and written != attachment.size:
+                                        raise email.GmailAPIError(
+                                            status=502, code="download_failed", message="Incomplete attachment"
+                                        )
+                                else:
+                                    file.write(content)
+                                    written = len(content)
                             saved_path = path
                             break
                         except FileExistsError:
                             suffix += 1
-                        except OSError:
-                            attachment_output["download_error"] = "save_failed"
+                        except (OSError, email.GmailAPIError) as exc:
+                            if not isinstance(exc, email.GmailAPIError):
+                                attachment_output["download_error"] = "save_failed"
+                            elif exc.code == "file_size_limit":
+                                # ponytail: the stream stops at the tighter bound, so name the limit that set it.
+                                attachment_output["download_error"] = (
+                                    "file_size_limit" if max_bytes == file_limit else "run_size_limit"
+                                )
+                            else:
+                                attachment_output["download_error"] = "download_failed"
                             if file_created:
                                 try:
                                     path.unlink()
@@ -248,11 +283,29 @@ class EmailInboxBlock(Block):
                                         "Failed to remove incomplete email attachment download",
                                         workflow_run_block_id=workflow_run_block_id,
                                     )
+                            if isinstance(exc, email.GmailAPIError) and exc.code == "reconnect_required":
+                                raise email.GmailAPIError(
+                                    status=exc.status,
+                                    code=exc.code,
+                                    message="Reconnect the Gmail account to download attachments",
+                                ) from exc
                             break
+                        except BaseException:
+                            # A cancelled run must not leave a partial file under a final name: run cleanup
+                            # would persist it as a complete download.
+                            if file_created:
+                                try:
+                                    path.unlink(missing_ok=True)
+                                except OSError:
+                                    LOG.warning(
+                                        "Failed to remove incomplete email attachment download",
+                                        workflow_run_block_id=workflow_run_block_id,
+                                    )
+                            raise
                     if saved_path is None:
                         continue
                     file_count += 1
-                    run_size += len(content)
+                    run_size += written
                     saved_names.add(saved_path.name)
                     attachment_output["file_name"] = saved_path.name
                     attachment_output["file_path"] = str(saved_path)
@@ -333,7 +386,6 @@ class EmailInboxBlock(Block):
             if self.credential_source == "nango":
                 if (
                     self.email_client != "gmail"
-                    or self.download_attachments
                     or not self.connection_id
                     or any(marker in self.connection_id for marker in ("{{", "{%", "{#"))
                 ):
@@ -362,6 +414,7 @@ class EmailInboxBlock(Block):
                     newer_than_days=max(1, self.newer_than_days) if self.newer_than_days is not None else None,
                     max_results=max(1, min(self.max_results, 100)),
                     include_body=self.include_body,
+                    include_attachments=self.download_attachments,
                 )
                 try:
                     candidates = [email.EmailMessage.model_validate(item) for item in data]
@@ -436,6 +489,17 @@ class EmailInboxBlock(Block):
                 organization_id=organization_id,
             )
 
+        # A connected-account message too large to read in full is left out, but named in the output so the skip
+        # is visible; the id stays out of logs.
+        candidate_count = len(candidates)
+        skipped = [c for c in candidates if c.attachment_list_error == "message_too_large"]
+        if skipped:
+            LOG.warning(
+                "Skipped Gmail messages over the connected-account read limit",
+                workflow_run_block_id=workflow_run_block_id,
+                skipped_count=len(skipped),
+            )
+            candidates = [c for c in candidates if c.attachment_list_error != "message_too_large"]
         criteria = self.prompt.strip() if self.prompt else ""
         matched = (
             await self._match_emails(candidates, criteria=criteria, organization_id=effective_org_id)
@@ -445,7 +509,7 @@ class EmailInboxBlock(Block):
         emails = [message.model_dump(mode="json") for message in matched]
         downloaded_files: list[FileInfo] = []
         if self.download_attachments:
-            assert access_token is not None
+            assert access_token is not None or self.credential_source == "nango"
             try:
                 emails, downloaded_files = await self._download_matched_attachments(
                     matched,
@@ -476,10 +540,12 @@ class EmailInboxBlock(Block):
         output_data: dict[str, Any] = {
             "email_client": self.email_client,
             "folder": folder_used,
-            "candidate_count": len(candidates),
+            "candidate_count": candidate_count,
             "matched_count": len(matched),
             "emails": emails,
         }
+        if skipped:
+            output_data["skipped_messages"] = [{"id": c.id, "reason": "message_too_large"} for c in skipped]
         if self.download_attachments:
             output_data["downloaded_files"] = [file.model_dump() for file in downloaded_files]
             output_data["downloaded_file_urls"] = [file.url for file in downloaded_files]

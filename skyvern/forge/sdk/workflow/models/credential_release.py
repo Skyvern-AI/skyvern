@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from os import PathLike, fspath
@@ -169,6 +170,39 @@ def login_release_sites(
     return sites or None
 
 
+def redact_secrets(text: str | None, labels: Iterable[tuple[str, str]]) -> str | None:
+    """``text`` with each (secret, label) secret replaced by its label in one pass, longest first and ignoring case,
+    since a refused URL's host is lowercased. No length floor: over-redacting a short secret only garbles refusal
+    text, while a floor would let a short secret such as a PIN through."""
+    if text is None:
+        return None
+    by_secret: dict[str, str] = {}
+    for secret, label in labels:
+        if secret:
+            by_secret.setdefault(secret.casefold(), label)
+    if not by_secret:
+        return text
+    pattern = re.compile("|".join(re.escape(secret) for secret in sorted(by_secret, key=len, reverse=True)), re.I)
+    return pattern.sub(lambda match: by_secret.get(match.group(0).casefold(), "[redacted]"), text)
+
+
+def describe_refused_target(url: str | None, labels: Iterable[tuple[str, str]]) -> tuple[str | None, str | None]:
+    """(site, host) of a refused target with its secrets redacted. Redacted before parsing too, since reducing a URL
+    to its site cuts a secret holding `.` or `/` into fragments the full-secret match no longer finds."""
+    labels = [(secret, label) for secret, label in labels if secret]
+    # Hostname-safe stand-ins keep the redacted URL parseable; the real labels go in after parsing.
+    tokens = [(secret, f"redacted{index}x") for index, (secret, _) in enumerate(labels)]
+    restore = [(token, label) for (_, token), (_, label) in zip(tokens, labels, strict=True)]
+    redacted_url = redact_secrets(url, tokens)
+    origin = origin_of(redacted_url)
+    scope = describe_release_scope(redacted_url)
+    host = origin.host if origin is not None else None
+    return (
+        redact_secrets(redact_secrets(scope, restore), labels),
+        redact_secrets(redact_secrets(host, restore), labels),
+    )
+
+
 class CodeBlockCredentialReleaseError(Exception):
     # Duck-typed marker consumed by the secure runner's transport map (same convention as
     # RecordingLocator._skyvern_brokerable_handle): a refusal must cross the protocol as a
@@ -334,14 +368,20 @@ class CredentialReleaseGuard:
             self._log_would_refuse(deciding[0], target_url)
         return None
 
+    def _labels(self) -> list[tuple[str, str]]:
+        return [(entry.secret_value, entry.parameter_key) for entry in self._armed]
+
+    def _redact(self, text: str | None) -> str | None:
+        return redact_secrets(text, self._labels())
+
     def _log_would_refuse(self, entry: ArmedSecret, target_url: str | None) -> None:
-        actual_origin = origin_of(target_url)
+        actual_scope, actual_host = describe_refused_target(target_url, self._labels())
         LOG.info(
             "codeblock_credential_release_would_refuse",
             parameter_key=entry.parameter_key,
-            allowed_scope=entry.allowed_scope,
-            actual_scope=describe_release_scope(target_url),
-            actual_host=actual_origin.host if actual_origin is not None else None,
+            allowed_scope=self._redact(entry.allowed_scope),
+            actual_scope=actual_scope,
+            actual_host=actual_host,
             workflow_run_id=self._workflow_run_id,
             block_label=self._block_label,
         )
@@ -360,16 +400,16 @@ class CredentialReleaseGuard:
         entry = refused
         # Never fall back to the stored URL itself: it can carry basic-auth credentials or a
         # token in its query, and this string reaches both the logs and the run record.
-        allowed_scope = entry.allowed_scope or "no website Skyvern can check"
-        actual_scope = describe_release_scope(target_url) or "a page whose site could not be identified"
-        actual_origin = origin_of(target_url)
+        allowed_scope = self._redact(entry.allowed_scope) or "no website Skyvern can check"
+        actual_scope, actual_host = describe_refused_target(target_url, self._labels())
+        actual_scope = actual_scope or "a page whose site could not be identified"
         LOG.warning(
             "codeblock_credential_release_refused",
             parameter_key=entry.parameter_key,
             allowed_scope=allowed_scope,
             actual_scope=actual_scope,
             # The host is the actionable fact for a repair; the message stays at site granularity.
-            actual_host=actual_origin.host if actual_origin is not None else None,
+            actual_host=actual_host,
             operation=operation,
             workflow_run_id=self._workflow_run_id,
             block_label=self._block_label,

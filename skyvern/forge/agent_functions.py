@@ -10,7 +10,7 @@ from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, AbstractContextManager, asynccontextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Callable, Literal, TypedDict
+from typing import TYPE_CHECKING, Any, BinaryIO, Callable, Literal, TypedDict
 
 import httpx
 import structlog
@@ -96,6 +96,7 @@ from skyvern.schemas.emails import GmailSendErrorCode, GmailSendOutcome
 from skyvern.schemas.run_enums import RunEngine, RunType
 from skyvern.schemas.workflows import BlockResult, CodeBlockFailureKind, FileStorageType, FileUploadDestination
 from skyvern.services.email.gmail import GmailSendResult
+from skyvern.services.email.gmail_client import GmailAPIError
 from skyvern.services.otp_email import EmailOTPSearchError, EmailOTPVerificationContext, build_email_otp_sources
 from skyvern.services.webhook_delivery import WebhookDeliveryAttempts, bound_webhook_request
 from skyvern.services.workflow_run_group_service import schedule_advance_after_terminal
@@ -1060,9 +1061,25 @@ class AgentFunction:
         newer_than_days: int | None,
         max_results: int,
         include_body: bool,
+        include_attachments: bool = False,
     ) -> list[dict[str, object]]:
-        from skyvern.services.email import GmailAPIError
+        raise GmailAPIError(status=404, code="integration_unavailable", message="Gmail integration unavailable")
 
+    async def download_gmail_attachment_for_run(
+        self,
+        *,
+        organization_id: str,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        connection_id: str,
+        hop_token: str | None,
+        message_id: str,
+        attachment_id: str,
+        download_grant: str,
+        max_bytes: int,
+        destination: BinaryIO,
+    ) -> int:
+        """Stream one attachment of a connected account into destination and return the bytes written."""
         raise GmailAPIError(status=404, code="integration_unavailable", message="Gmail integration unavailable")
 
     async def send_gmail_for_run(
