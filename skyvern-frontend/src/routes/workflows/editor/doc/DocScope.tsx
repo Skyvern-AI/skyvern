@@ -285,14 +285,12 @@ function DocNode({
           place={place}
           number={number}
           onEnter={onEnter}
-          renderChildren={(children, scope, branchId, numberStart) => (
+          renderChildren={(children, scope, branchId) => (
             <>
               <DocScope
                 items={children}
                 byId={byId}
                 scope={scope}
-                numberPrefix={`${number}.`}
-                numberStart={numberStart}
                 readOnly={readOnly || Boolean(item.readOnlyReason)}
                 emptyText={scope ? "No steps in this branch yet" : undefined}
                 noteProblems={noteProblems}
@@ -460,7 +458,6 @@ function DocNode({
             items={item.children}
             byId={byId}
             scope={{ parentId: item.nodeId, conditionalBranchId: null }}
-            numberPrefix={`${number}.`}
             readOnly={readOnly || Boolean(item.readOnlyReason)}
             emptyText="No steps in this loop yet"
             noteProblems={noteProblems}
@@ -851,8 +848,6 @@ export function DocScope({
   scope,
   emptyText,
   noteProblems = new Map(),
-  numberPrefix = "",
-  numberStart = 1,
 }: {
   items: DocItem[];
   byId: Map<string, AppNode>;
@@ -861,16 +856,9 @@ export function DocScope({
   scope?: DocScopeRef;
   emptyText?: string;
   noteProblems?: ReadonlyMap<string, DocNoteProblem>;
-  // The parent step's number and a dot inside a loop or branch: "3." numbers its steps 3.1, 3.2.
-  numberPrefix?: string;
-  // The first step's number after the prefix; a branch continues the count of the branches before it.
-  numberStart?: number;
 }) {
   const actions = useContext(WorkflowDocActionsContext);
   const steps = items.filter(isNumberedItem);
-  const stepNumbers = new Map(
-    steps.map((s, i) => [s.nodeId, `${numberPrefix}${i + numberStart}`]),
-  );
   // Steps shared by several branches sit in this list but belong to the branches.
   const structural =
     Boolean(actions.edit && scope) &&
@@ -1251,7 +1239,8 @@ export function DocScope({
               byId={byId}
               readOnly={readOnly}
               place={placeOf(item.nodeId)}
-              number={stepNumbers.get(item.nodeId)!}
+              // A numbering mismatch leaves the step unnumbered rather than breaking the render.
+              number={actions.stepNumbers.get(item.nodeId) ?? ""}
               onEnter={
                 editable
                   ? (split, key) => enterAfter(item.nodeId, split, key)

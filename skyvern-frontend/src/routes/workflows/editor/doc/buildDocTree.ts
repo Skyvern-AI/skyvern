@@ -76,6 +76,30 @@ function branchCheck(branch: BranchCondition): DocBranch["check"] {
     : "ai";
 }
 
+/** Each placed step's number: "3.1" inside step 3, a conditional's branches counted in tab order. */
+export function docStepNumbers(
+  items: DocItem[],
+  prefix = "",
+  start = 1,
+  into = new Map<string, string>(),
+): Map<string, string> {
+  items.filter(isNumberedItem).forEach((item, i) => {
+    const number = `${prefix}${i + start}`;
+    into.set(item.nodeId, number);
+    if (item.kind === "loop")
+      docStepNumbers(item.children, `${number}.`, 1, into);
+    if (item.kind === "conditional")
+      [
+        ...item.branches.filter((b) => b.kind !== "otherwise"),
+        ...item.branches.filter((b) => b.kind === "otherwise"),
+      ].reduce((next, branch) => {
+        docStepNumbers(branch.children, `${number}.`, next, into);
+        return next + branch.numberedCount;
+      }, 1);
+  });
+  return into;
+}
+
 export function countDocSteps(items: DocItem[]): number {
   return items.reduce((count, item) => {
     if (item.kind === "note") return count;

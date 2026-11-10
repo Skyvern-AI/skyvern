@@ -25,6 +25,8 @@ export const WorkflowDocActionsContext = createContext<{
   previousNoteReader: (nodeId: string) => string | undefined;
   // The URL in the step's prompt, offered for its empty URL field.
   promptUrlOffer: (node: AppNode) => DocPromptUrlOffer | null;
+  // Each placed step's number, from docStepNumbers over the whole tree.
+  stepNumbers: ReadonlyMap<string, string>;
   selectBranch: (conditionalId: string, branchId: string) => void;
   loopOpen: (loopId: string) => boolean;
   toggleLoop: (loopId: string) => void;
@@ -59,6 +61,7 @@ export const WorkflowDocActionsContext = createContext<{
   selectedBranch: () => undefined,
   previousNoteReader: () => undefined,
   promptUrlOffer: () => null,
+  stepNumbers: new Map(),
   selectBranch: () => {},
   loopOpen: () => true,
   toggleLoop: () => {},

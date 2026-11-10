@@ -152,6 +152,28 @@ describe("WorkflowDocEditor navigation", () => {
     vi.unstubAllGlobals();
   });
 
+  test("a run line above the steps says which run the results come from, and shows only with a run", () => {
+    renderDoc();
+    expect(screen.queryByTestId("doc-run-line")).toBeNull();
+    cleanup();
+    docRun.current = {
+      runId: "wr_1",
+      run: {
+        status: Status.Failed,
+        created_at: new Date().toISOString(),
+        workflow: { version: 2 },
+      },
+      currentVersion: 3,
+      earlierVersion: true,
+      blocksByLabel: new Map(),
+      live: false,
+    };
+    renderDoc();
+    expect(screen.getByTestId("doc-run-line").textContent).toContain(
+      "Run wr_1 · Failed · just now · an earlier version, v2",
+    );
+  });
+
   describe("keyboard-first editing", () => {
     const editsWithAdd = (): DocGraphEdits => ({
       apply: vi.fn(),

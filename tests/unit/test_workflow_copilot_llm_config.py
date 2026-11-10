@@ -473,7 +473,7 @@ async def _answer_followup(
     screen: Callable[..., Awaitable[_RawSecretSafetyScreen]],
     monkeypatch: pytest.MonkeyPatch,
 ) -> Response:
-    chat = SimpleNamespace(workflow_copilot_chat_id="chat_eval", workflow_permanent_id="wpid_eval")
+    chat = SimpleNamespace(workflow_copilot_chat_id="chat_eval", workflow_permanent_id="wpid_eval", pending_turns={})
     params = SimpleNamespace(
         get_workflow_copilot_chat_by_id=AsyncMock(return_value=chat),
         resolve_copilot_question=AsyncMock(
