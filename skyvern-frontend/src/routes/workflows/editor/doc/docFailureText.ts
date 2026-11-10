@@ -18,8 +18,8 @@ export function plainFailureText(raw: string): string {
 
 // The server's MissingStarterUrl text, which names the step's internal label and template syntax.
 const NO_START_PAGE = /has no starting URL set/i;
-export const NO_START_PAGE_TEXT =
-  "This step needs a page to start on. Run from the Go to URL step, or run the whole agent.";
+export const NO_START_PAGE_REASON = "This step needs a page to start on.";
+export const NO_START_PAGE_TEXT = `${NO_START_PAGE_REASON} Run from the Go to URL step, or run the whole agent.`;
 
 export function failureHeadlineInPlainWords(
   raw: string,

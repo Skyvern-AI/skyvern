@@ -57,7 +57,6 @@ import {
   type LineSplit,
   type PickerOpener,
 } from "./docKeys";
-import { DocOneActionHint } from "./DocOneActionHint";
 import {
   announceAdded,
   announceMoved,
@@ -453,7 +452,6 @@ function DocNode({
           byId={byId}
           editable={editable}
         />
-        {editable && <DocOneActionHint node={node} />}
         <DocStepResult label={node.data.label} />
       </div>
       {item.kind === "loop" && open && (
