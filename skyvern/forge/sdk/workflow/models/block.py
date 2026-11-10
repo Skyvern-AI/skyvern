@@ -107,7 +107,11 @@ from skyvern.constants import (
     MAX_PDF_OCR_PAGES,
     MAX_UPLOAD_FILE_COUNT,
     NAVIGATION_MAX_RETRY_TIME,
+    PDF_OCR_FALLBACK_RENDER_RESOLUTION,
+    PDF_OCR_MAX_PAGE_IMAGE_BYTES,
+    PDF_OCR_MAX_PAGE_IMAGE_EDGE_PX,
     PDF_OCR_PAGE_CONCURRENCY,
+    PDF_OCR_RENDER_RESOLUTION,
     PDF_OCR_TOTAL_TIMEOUT_SECONDS,
     PROXY_TRANSPORT_NAV_ERRORS,
     SAVE_DOWNLOADED_FILES_TIMEOUT,
@@ -214,7 +218,7 @@ from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.credential_site_policy import LoginSite, describe_release_scope, origin_of
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
-from skyvern.forge.sdk.db.enums import TaskType
+from skyvern.forge.sdk.db.enums import TaskType, WorkflowRunTriggerType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.id import generate_action_id, generate_workflow_run_id
 from skyvern.forge.sdk.db.repositories.google_oauth import DISPATCH_ACCEPTED, DISPATCH_FAILED, GmailSendDispatch
@@ -242,6 +246,7 @@ from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants, generate_totp_code
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import traced
+from skyvern.forge.sdk.utils.capped_subprocess import CappedSubprocessError
 from skyvern.forge.sdk.utils.pdf_parser import (
     PdfExtractStats,
     extract_pdf_file,
@@ -369,7 +374,13 @@ from skyvern.forge.taskv3.handoff_redaction import pin_caller_authored_block_url
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.browser_session_kind import BrowserSessionKind
 from skyvern.schemas.browser_settings import requested_timezone_id
-from skyvern.schemas.emails import EmailBodyFormat, EmailTransport, GmailSendErrorCode, GmailSendOutcome
+from skyvern.schemas.emails import (
+    EmailBodyFormat,
+    EmailTransport,
+    GmailHopRefusal,
+    GmailSendErrorCode,
+    GmailSendOutcome,
+)
 from skyvern.schemas.runs import RunEngine, read_browser_type
 from skyvern.schemas.self_heal import HealClassification, HealSkipReason, HealStatus, OutputObligation
 from skyvern.schemas.workflows import (
@@ -13771,6 +13782,26 @@ GMAIL_SEND_FAILURE_MESSAGES: dict[GmailSendErrorCode, str] = {
     GmailSendErrorCode.INTERNAL_ERROR: "The email could not be prepared. Nothing was sent.",
 }
 
+# The only triggers a person starts directly; a connected account's capability is never prepared for the rest.
+_PERSON_TRIGGER_TYPES = frozenset(
+    {None, WorkflowRunTriggerType.manual, WorkflowRunTriggerType.mcp, WorkflowRunTriggerType.api}
+)
+
+
+async def _is_unattended_run(workflow_run_id: str, organization_id: str) -> bool:
+    """Whether the run is a child or was triggered without a person; an unreadable run reads as neither."""
+    try:
+        run = await app.DATABASE.workflow_runs.get_workflow_run(workflow_run_id, organization_id=organization_id)
+    except Exception:  # noqa: BLE001 - only the wording of a refusal depends on this.
+        return False
+    return run is not None and (run.parent_workflow_run_id is not None or run.trigger_type not in _PERSON_TRIGGER_TYPES)
+
+
+_CONNECTED_ACCOUNT_RECONNECT_MESSAGE = (
+    "The selected Gmail account must be reconnected on the Integrations page and then selected again in this block "
+    "before it can send email. Nothing was sent."
+)
+
 _GMAIL_AUTHORIZATION_ERROR_CODES: dict[google_oauth_service.GmailSendAuthorizationStatus, GmailSendErrorCode] = {
     google_oauth_service.GmailSendAuthorizationStatus.CONFIGURATION: GmailSendErrorCode.CONFIGURATION,
     google_oauth_service.GmailSendAuthorizationStatus.MISSING_SCOPE: GmailSendErrorCode.MISSING_SCOPE,
@@ -13849,7 +13880,7 @@ def _add_file_attachment(msg: EmailMessage, path: str) -> None:
 
 def _build_gmail_message_bytes(
     *,
-    from_address: str,
+    from_address: str | None,
     to: list[str],
     cc: list[str],
     bcc: list[str],
@@ -13866,7 +13897,8 @@ def _build_gmail_message_bytes(
         msg["In-Reply-To"] = in_reply_to
     if references:
         msg["References"] = references
-    msg["From"] = from_address
+    if from_address is not None:
+        msg["From"] = from_address
     for header, addresses in (("To", to), ("Cc", cc), ("Bcc", bcc)):
         if addresses:
             msg[header] = ", ".join(addresses)
@@ -13922,6 +13954,9 @@ class SendEmailBlock(Block):
     # credential_id; sender and the smtp_* settings are not used.
     transport: EmailTransport | None = None
     credential_id: str | None = None
+    # With nango, the message is sent from the connected account named by connection_id instead of credential_id.
+    credential_source: Literal["native", "nango"] = "native"
+    connection_id: str | None = None
     reply_to_message_id: str | None = None
     cc: list[str] = []
     bcc: list[str] = []
@@ -14353,8 +14388,31 @@ class SendEmailBlock(Block):
         except Exception as exc:
             raise _gmail_template_refusal(exc, self.secret_redactor(workflow_run_context)) from None
 
-        credential_id = (self.credential_id or "").strip()
-        if not credential_id:
+        is_connected_account = self.credential_source == "nango"
+        credential_id = ((self.connection_id if is_connected_account else self.credential_id) or "").strip()
+        if not credential_id or (
+            is_connected_account
+            and (len(credential_id) > 64 or any(marker in credential_id for marker in ("{{", "{%", "{#")))
+        ):
+            raise _GmailSendRefused(GmailSendErrorCode.CONFIGURATION)
+        if is_connected_account and self.reply_to_message_id:
+            raise _GmailSendRefused(
+                GmailSendErrorCode.CONFIGURATION,
+                "Replying to a message needs a Google account connected on the Integrations page. Nothing was sent.",
+            )
+        if is_connected_account and not workflow_run_context.get_gmail_hop_token(self.label):
+            refusal = workflow_run_context.get_gmail_hop_refusal(self.label)
+            if refusal == GmailHopRefusal.reconnect:
+                raise _GmailSendRefused(GmailSendErrorCode.RECONNECT, _CONNECTED_ACCOUNT_RECONNECT_MESSAGE)
+            if refusal == GmailHopRefusal.run_not_supported or (
+                refusal is None and await _is_unattended_run(workflow_run_id, organization_id)
+            ):
+                raise _GmailSendRefused(
+                    GmailSendErrorCode.CONFIGURATION,
+                    "This Gmail account can send only in runs a person starts. Scheduled, event, API-key and child "
+                    "workflow runs are not supported; use a natively connected Google account for those. "
+                    "Nothing was sent.",
+                )
             raise _GmailSendRefused(GmailSendErrorCode.CONFIGURATION)
         to = self._resolve_recipient_entries(self.recipients, workflow_run_context)
         cc = self._resolve_recipient_entries(self.cc, workflow_run_context)
@@ -14450,17 +14508,20 @@ class SendEmailBlock(Block):
                 workflow_run_context, workflow_run_id, organization_id, staging_dir
             )
 
-            authorization = reply_authorization or await google_oauth_service.resolve_gmail_send_authorization(
-                organization_id, credential_id
-            )
-            if (
-                authorization.status != google_oauth_service.GmailSendAuthorizationStatus.READY
-                or not authorization.access_token
-                or not authorization.from_address
-            ):
-                raise _GmailSendRefused(
-                    _GMAIL_AUTHORIZATION_ERROR_CODES.get(authorization.status, GmailSendErrorCode.INTERNAL_ERROR)
+            # A connected account is authorized server-side, which also sets From to its verified address.
+            authorization = None
+            if not is_connected_account:
+                authorization = reply_authorization or await google_oauth_service.resolve_gmail_send_authorization(
+                    organization_id, credential_id
                 )
+                if (
+                    authorization.status != google_oauth_service.GmailSendAuthorizationStatus.READY
+                    or not authorization.access_token
+                    or not authorization.from_address
+                ):
+                    raise _GmailSendRefused(
+                        _GMAIL_AUTHORIZATION_ERROR_CODES.get(authorization.status, GmailSendErrorCode.INTERNAL_ERROR)
+                    )
 
             body = self.body
             if body and workflow_run_context.has_parameter(body) and workflow_run_context.has_value(body):
@@ -14468,7 +14529,7 @@ class SendEmailBlock(Block):
             try:
                 mime_bytes = await asyncio.to_thread(
                     _build_gmail_message_bytes,
-                    from_address=authorization.from_address,
+                    from_address=authorization.from_address if authorization else None,
                     to=to,
                     cc=cc,
                     bcc=bcc,
@@ -14514,11 +14575,19 @@ class SendEmailBlock(Block):
 
         # From here the claim row is the record: a cancellation or crash leaves it unresolved, which reads as unknown.
         try:
-            result = (
-                await send_raw_message(authorization.access_token, mime_bytes, thread_id=thread_id)
-                if thread_id
-                else await send_raw_message(authorization.access_token, mime_bytes)
-            )
+            if authorization is None:
+                result = await app.AGENT_FUNCTION.send_gmail_for_run(
+                    organization_id=organization_id,
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    connection_id=credential_id,
+                    hop_token=workflow_run_context.get_gmail_hop_token(self.label),
+                    mime_bytes=mime_bytes,
+                )
+            elif thread_id:
+                result = await send_raw_message(authorization.access_token or "", mime_bytes, thread_id=thread_id)
+            else:
+                result = await send_raw_message(authorization.access_token or "", mime_bytes)
         except Exception:
             result = GmailSendResult(GmailSendOutcome.UNKNOWN, error_code=GmailSendErrorCode.OUTCOME_UNKNOWN)
         try:
@@ -14573,6 +14642,9 @@ class SendEmailBlock(Block):
             result = GmailSendResult(GmailSendOutcome.FAILED, error_code=GmailSendErrorCode.INTERNAL_ERROR)
 
         accepted = result.outcome == GmailSendOutcome.ACCEPTED
+        # Reconnecting a connected account creates a new connection, so the block has to be pointed at it again.
+        if result.error_code == GmailSendErrorCode.RECONNECT and self.credential_source == "nango":
+            refusal_reason = refusal_reason or _CONNECTED_ACCOUNT_RECONNECT_MESSAGE
         LOG.info(
             "SendEmailBlock Gmail send finished",
             workflow_run_id=workflow_run_id,
@@ -14719,6 +14791,7 @@ async def _run_blocking_parse_step(
     func: Callable[..., _ParseStepResult],
     *args: Any,
     executor: Executor | None = None,
+    step_timeout_seconds: float | None = None,
     **kwargs: Any,
 ) -> _ParseStepResult:
     """Run a blocking file-parse step in a worker thread under a wall-clock ceiling.
@@ -14733,17 +14806,25 @@ async def _run_blocking_parse_step(
         if executor is None
         else asyncio.get_running_loop().run_in_executor(executor, partial(copy_context().run, func, *args, **kwargs))
     )
+    if step_timeout_seconds is None:
+        step_timeout_seconds = FILE_PARSE_STEP_TIMEOUT_SECONDS
     try:
         # With an executor, time spent queued behind its busy workers counts against the ceiling too.
-        return await asyncio.wait_for(work, timeout=FILE_PARSE_STEP_TIMEOUT_SECONDS)
+        return await asyncio.wait_for(work, timeout=step_timeout_seconds)
     except asyncio.TimeoutError:
         LOG.warning(
             "File parse step exceeded its time budget",
             step=step,
             file_url=file_url,
-            timeout_seconds=FILE_PARSE_STEP_TIMEOUT_SECONDS,
+            timeout_seconds=step_timeout_seconds,
         )
-        raise FileParseTimeout(file_url=file_url, step=step, timeout_seconds=FILE_PARSE_STEP_TIMEOUT_SECONDS)
+        raise FileParseTimeout(file_url=file_url, step=step, timeout_seconds=step_timeout_seconds)
+
+
+def _page_image_over_ocr_caps(png: bytes) -> bool:
+    # A PNG's IHDR chunk holds the width and height at bytes 16 to 24.
+    width, height = int.from_bytes(png[16:20], "big"), int.from_bytes(png[20:24], "big")
+    return len(png) > PDF_OCR_MAX_PAGE_IMAGE_BYTES or max(width, height) > PDF_OCR_MAX_PAGE_IMAGE_EDGE_PX
 
 
 PDF_EMPTY_TEXT_LAYER_REASON = "PDF text extraction returned empty content"
@@ -15311,14 +15392,7 @@ class FileParserBlock(Block):
             ocr_reason=ocr_reason,
         )
         try:
-            page_images = await _run_blocking_parse_step(
-                "PDF page rendering",
-                self.file_url,
-                render_pdf_pages_as_images,
-                file_path,
-                file_identifier=self.file_url,
-                max_pages=MAX_PDF_OCR_PAGES,
-            )
+            page_images = await self._render_pdf_pages_for_ocr(file_path)
             if not page_images:
                 return extracted_text
             return await self._ocr_pdf_pages(
@@ -15332,6 +15406,57 @@ class FileParserBlock(Block):
                 file_url=self.file_url,
             )
             raise
+
+    async def _render_pdf_pages_for_ocr(self, file_path: str) -> list[bytes]:
+        # Both resolutions share one step budget, so a slow failed first render cannot double the step's time.
+        started_at = monotonic()
+        has_fallback = PDF_OCR_FALLBACK_RENDER_RESOLUTION < PDF_OCR_RENDER_RESOLUTION
+        try:
+            page_images = await self._render_pdf_pages(
+                file_path, PDF_OCR_RENDER_RESOLUTION, FILE_PARSE_STEP_TIMEOUT_SECONDS
+            )
+        except CappedSubprocessError as exc:
+            # A timeout has used the step's budget and no_headroom reserves the same memory at any resolution; the
+            # other failures (page images over the result cap, PageImagesTooLarge as kind error, out of memory) are
+            # what the lower resolution avoids.
+            remaining_seconds = FILE_PARSE_STEP_TIMEOUT_SECONDS - (monotonic() - started_at)
+            if not has_fallback or exc.kind in ("timeout", "no_headroom") or remaining_seconds <= 0:
+                raise
+            failure_kind: str = exc.kind
+        else:
+            # The provider refuses a page image over its byte or pixel limit and the page is then skipped, so one such
+            # page sends the whole document to the lower resolution. A fallback still over a cap is used as it is.
+            if not has_fallback or not any(_page_image_over_ocr_caps(image) for image in page_images):
+                return page_images
+            remaining_seconds = FILE_PARSE_STEP_TIMEOUT_SECONDS - (monotonic() - started_at)
+            if remaining_seconds <= 0:
+                return page_images
+            # These images are discarded either way; held during the second render, they would shrink its child's
+            # memory headroom by their size.
+            del page_images
+            failure_kind = "page_image_over_cap"
+        LOG.warning(
+            "PDF pages could not be rendered for OCR at the higher resolution, rendering them at the lower one",
+            file_url=_log_safe_url(self.file_url),
+            failure_kind=failure_kind,
+            resolution=PDF_OCR_RENDER_RESOLUTION,
+            fallback_resolution=PDF_OCR_FALLBACK_RENDER_RESOLUTION,
+            remaining_seconds=round(remaining_seconds, 1),
+        )
+        return await self._render_pdf_pages(file_path, PDF_OCR_FALLBACK_RENDER_RESOLUTION, remaining_seconds)
+
+    async def _render_pdf_pages(self, file_path: str, resolution: int, budget_seconds: float) -> list[bytes]:
+        return await _run_blocking_parse_step(
+            "PDF page rendering",
+            self.file_url,
+            render_pdf_pages_as_images,
+            file_path,
+            step_timeout_seconds=budget_seconds,
+            file_identifier=self.file_url,
+            max_pages=MAX_PDF_OCR_PAGES,
+            resolution=resolution,
+            timeout_seconds=budget_seconds,
+        )
 
     async def _resolve_file_parser_handler(
         self, prompt_type: str, distinct_id: str | None, organization_id: str | None

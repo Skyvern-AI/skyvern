@@ -503,6 +503,8 @@ export type SendEmailBlock = WorkflowBlockBase & {
   file_attachments: Array<string>;
   transport?: EmailTransport | null;
   credential_id?: string | null;
+  credential_source?: "native" | "nango";
+  connection_id?: string | null;
   cc?: Array<string>;
   bcc?: Array<string>;
   reply_to_message_id?: string | null;

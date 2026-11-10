@@ -23,6 +23,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     sanitize_filename,
 )
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE
+from skyvern.schemas.emails import GmailHopRefusal
 from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType
 from skyvern.services import email
 from skyvern.services.email.gmail import _message_from_gmail
@@ -340,6 +341,15 @@ class EmailInboxBlock(Block):
                         status=404, code="integration_unavailable", message="Gmail integration unavailable"
                     )
                 assert folder_used is not None
+                if (
+                    not workflow_run_context.get_gmail_hop_token(self.label)
+                    and workflow_run_context.get_gmail_hop_refusal(self.label) == GmailHopRefusal.reconnect
+                ):
+                    raise email.GmailAPIError(
+                        status=403,
+                        code="reconnect_required",
+                        message="reconnect it on the Integrations page, then select it again in this block",
+                    )
                 data = await app.AGENT_FUNCTION.execute_gmail_inbox_for_run(
                     organization_id=effective_org_id,
                     workflow_run_id=workflow_run_id,

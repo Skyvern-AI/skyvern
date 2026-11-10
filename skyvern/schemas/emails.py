@@ -13,6 +13,14 @@ class EmailTransport(StrEnum):
     GMAIL = "gmail"
 
 
+class GmailHopRefusal(StrEnum):
+    """Why a run got no capability for a connected Gmail account, recorded per block when the run is prepared."""
+
+    reconnect = "reconnect"
+    run_not_supported = "run_not_supported"
+    account_unavailable = "account_unavailable"
+
+
 class GmailSendOutcome(StrEnum):
     ACCEPTED = "accepted"
     FAILED = "failed"

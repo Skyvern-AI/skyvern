@@ -92,8 +92,10 @@ from skyvern.forge.sdk.services.request_principal import (
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, BlockTypeVar, CodeFailure
 from skyvern.forge.sdk.workflow.retry_policy import WORKFLOW_WEBHOOK_HTTP_TIMEOUT_SECONDS
+from skyvern.schemas.emails import GmailSendErrorCode, GmailSendOutcome
 from skyvern.schemas.run_enums import RunEngine, RunType
 from skyvern.schemas.workflows import BlockResult, CodeBlockFailureKind, FileStorageType, FileUploadDestination
+from skyvern.services.email.gmail import GmailSendResult
 from skyvern.services.otp_email import EmailOTPSearchError, EmailOTPVerificationContext, build_email_otp_sources
 from skyvern.services.webhook_delivery import WebhookDeliveryAttempts, bound_webhook_request
 from skyvern.services.workflow_run_group_service import schedule_advance_after_terminal
@@ -1061,6 +1063,19 @@ class AgentFunction:
         from skyvern.services.email import GmailAPIError
 
         raise GmailAPIError(status=404, code="integration_unavailable", message="Gmail integration unavailable")
+
+    async def send_gmail_for_run(
+        self,
+        *,
+        organization_id: str,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        connection_id: str,
+        hop_token: str | None,
+        mime_bytes: bytes,
+    ) -> GmailSendResult:
+        """Send one message from a connected account; mime_bytes carries no From header."""
+        return GmailSendResult(GmailSendOutcome.FAILED, error_code=GmailSendErrorCode.CONFIGURATION)
 
     async def nango_powerbi_catalog_available(self, organization_id: str) -> bool:
         return False

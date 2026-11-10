@@ -1,5 +1,6 @@
 import { isLoginBlockMissingCredentials } from "../../runValidation";
 import { isWorkflowBlockNode, type AppNode } from "../nodes";
+import { loopHasNoList } from "./docStepRegistry";
 
 const text = (value: unknown) =>
   typeof value === "string" ? value.trim() : "";
@@ -109,13 +110,10 @@ export function docStepProblems(nodes: AppNode[]): Map<string, string[]> {
     if (!isWorkflowBlockNode(node)) continue;
     const data = node.data as Record<string, unknown>;
     const found: string[] = [];
-    if (
-      node.type === "loop" &&
-      data.loopKind !== "while" &&
-      !text(data.loopVariableReference) &&
-      !text(data.loopValue)
-    )
-      found.push("Pick the list to go through with @");
+    if (node.type === "loop" && loopHasNoList(data))
+      found.push(
+        "This loop has no list to go through. Type @ on its line and pick a list.",
+      );
     const wholeRecord =
       node.type === "loop" && data.loopKind !== "while"
         ? wholeRecordLoopSource(text(data.loopVariableReference), nodes)

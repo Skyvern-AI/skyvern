@@ -47,7 +47,6 @@ import { WorkflowDocEditor } from "./WorkflowDocEditor";
 
 // The run widgets need studio run contexts; this file tests the proposal, so they are stubbed.
 vi.mock("./DocStepResult", () => ({ DocStepResult: () => null }));
-vi.mock("./DocLiveIndicator", () => ({ DocLiveIndicator: () => null }));
 vi.mock("./DocRunStepButton", () => ({ DocRunStepButton: () => null }));
 
 vi.mock("./useDocRun", () => {
@@ -565,6 +564,39 @@ describe("Copilot proposal in the Doc view", () => {
     expect(removed?.closest("[data-doc-node-id]")?.textContent).toContain(
       "No steps in this loop yet",
     );
+  });
+
+  test("a proposed loop with no list keeps its For each item summary, as a proposal shows no problems", async () => {
+    const loop = (description: string | null) =>
+      ({
+        label: "each_item",
+        block_type: "for_loop",
+        loop_variable_reference: "{{ }}",
+        description,
+        loop_blocks: [task("only", null)],
+        next_block_label: null,
+      }) as unknown as WorkflowBlock;
+    const baselineBlocks = [loop(null)];
+    useCopilotProposalStore.getState().setProposal({
+      proposed: workflow([loop("For each of the search results")]),
+      baseline: workflow(baselineBlocks),
+      review: {
+        ...review,
+        blocks: [
+          { label: "each_item", blockType: "for_loop", change: "changed" },
+        ],
+      },
+      actionable: true,
+      acceptable: true,
+      decide: vi.fn(async () => true),
+    });
+    const live = getElements(baselineBlocks, settings, true);
+    await renderInStudio(
+      <WorkflowDocEditor nodes={live.nodes} edges={live.edges} />,
+    );
+
+    expect(screen.getByText("For each item")).toBeTruthy();
+    expect(document.querySelector("[data-doc-step-fix]")).toBeNull();
   });
 
   test("does not validate live save data against a pending proposal", async () => {

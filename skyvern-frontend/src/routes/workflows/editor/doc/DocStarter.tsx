@@ -6,7 +6,7 @@ import { TIPS, docTipIndex, type DocStarterProgress } from "./docStarterTips";
 import { docStarterDone } from "./useDocStarter";
 
 export const DOC_SAMPLE_NOTE =
-  "One thing per line. Lines without a tag, like this one, are notes the agent reads while it runs.";
+  "Type / to add a step. Plain text, like this line, is a note the agent reads while it runs.";
 
 /** Shown in place of the first line while a doc has no steps; it isn't saved. */
 export function DocStarterNote() {

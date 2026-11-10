@@ -147,14 +147,18 @@ const proseFields: Record<string, DocProseField[]> = {
   fileDownload: [field("navigationGoal", "Download goal")],
 };
 
-// The source is loopVariableReference when set (it wins at run time), else loopValue; a new loop uses the first.
-export function loopSourceKey(
-  node: Node,
+// As at run time, any nonempty loopVariableReference wins over loopValue, even one naming no list (`{{ }}`); a new loop uses it too.
+function loopSourceField(
+  data: Record<string, unknown>,
 ): "loopVariableReference" | "loopValue" {
-  return !text(node, "loopVariableReference") && text(node, "loopValue")
+  return !data.loopVariableReference &&
+    typeof data.loopValue === "string" &&
+    data.loopValue.trim()
     ? "loopValue"
     : "loopVariableReference";
 }
+
+export const loopSourceKey = (node: Node) => loopSourceField(node.data);
 
 export function getDocProseFields(node: Node): DocProseField[] {
   // "Complete if" isn't saved for 2.0 navigation, so it isn't shown there.
@@ -201,23 +205,22 @@ export function docStepIsNoteOnly(node: Node): boolean {
   );
 }
 
-/** What an empty main line shows: the step's own summary when its field is a setting or short prompt. */
-export function getDocMainPlaceholder(node: Node): string {
-  const type = node.type ?? "";
-  const isPrompt = [
-    "task",
-    "taskv2",
-    "navigation",
-    "action",
-    "extraction",
-    "login",
-    "validation",
-    "human_interaction",
-    "textPrompt",
-    "agentStep",
-    "fileDownload",
-  ].includes(type);
-  return isPrompt ? "No instructions yet" : getDocStepSummary(node);
+const NO_INSTRUCTIONS = "No instructions yet";
+const REFERENCE_HINT = "Type @ to use an input or an earlier step's result.";
+const editingHints: Record<string, string> = {
+  validation: `Write what must be true for this check to pass. ${REFERENCE_HINT}`,
+  human_interaction: `Write what the approver should look at before deciding. ${REFERENCE_HINT}`,
+};
+
+/** What an empty main line shows: the step's own summary when it has one, else an editing hint while editing. */
+export function getDocMainPlaceholder(node: Node, editable: boolean): string {
+  return (
+    fixedStepSummary(node) ??
+    (editable
+      ? (editingHints[node.type ?? ""] ??
+        `Write what the agent should do. ${REFERENCE_HINT}`)
+      : NO_INSTRUCTIONS)
+  );
 }
 
 // Settings a step cannot run without; Doc shows each as a chip while it is empty.
@@ -254,7 +257,22 @@ function settingIsSet(node: Node, key: string): boolean {
 const text = (node: Node, key: string) =>
   typeof node.data[key] === "string" ? (node.data[key] as string).trim() : "";
 
+// The list a for-each loop goes through, or "" when its source names none.
+export function loopList(data: Record<string, unknown>): string {
+  const source = data[loopSourceField(data)];
+  const list = typeof source === "string" ? source.trim() : "";
+  return stripJinjaReferences(list).trim() ? list : "";
+}
+
+export const loopHasNoList = (data: Record<string, unknown>) =>
+  data.loopKind !== "while" && loopList(data) === "";
+
 export function getDocStepSummary(node: Node): string {
+  return fixedStepSummary(node) ?? NO_INSTRUCTIONS;
+}
+
+// Null for a step driven by its prompt, which has no summary of its own.
+function fixedStepSummary(node: Node): string | null {
   switch (node.type) {
     case "url":
       return text(node, "url") ? `Go to ${text(node, "url")}` : "Go to a URL";
@@ -296,6 +314,8 @@ export function getDocStepSummary(node: Node): string {
       return text(node, "query")
         ? `Search the web for ${text(node, "query")}`
         : "Search the web";
+    case "powerBIQuery":
+      return "Run a Power BI query";
     case "emailInbox":
       return text(node, "prompt") || "Find an email";
     case "terminate":
@@ -307,11 +327,11 @@ export function getDocStepSummary(node: Node): string {
     case "loop":
       return node.data.loopKind === "while"
         ? `Repeat while ${text(node, "whileConditionExpression") || "a condition holds"}`
-        : text(node, "loopVariableReference") || text(node, "loopValue")
-          ? `For each of ${text(node, "loopVariableReference") || text(node, "loopValue")}`
+        : loopList(node.data)
+          ? `For each of ${loopList(node.data)}`
           : "For each item";
     default:
-      return "No instructions yet";
+      return null;
   }
 }
 

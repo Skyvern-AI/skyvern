@@ -24729,6 +24729,26 @@
             ],
             "title": "Credential Id"
           },
+          "credential_source": {
+            "type": "string",
+            "enum": [
+              "native",
+              "nango"
+            ],
+            "title": "Credential Source",
+            "default": "native"
+          },
+          "connection_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connection Id"
+          },
           "reply_to_message_id": {
             "anyOf": [
               {
@@ -24975,6 +24995,28 @@
             ],
             "title": "Credential Id",
             "description": "ID of a connected Google account that has send permission. Used only with transport 'gmail'.",
+            "x-skyvern-connected-account": true
+          },
+          "credential_source": {
+            "type": "string",
+            "enum": [
+              "native",
+              "nango"
+            ],
+            "title": "Credential Source",
+            "description": "'nango' sends from the connected account named by connection_id instead of credential_id.",
+            "default": "native"
+          },
+          "connection_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connection Id",
             "x-skyvern-connected-account": true
           },
           "reply_to_message_id": {

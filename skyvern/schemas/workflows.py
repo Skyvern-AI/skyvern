@@ -1336,6 +1336,11 @@ class SendEmailBlockYAML(BlockYAML):
         description="ID of a connected Google account that has send permission. Used only with transport 'gmail'.",
         json_schema_extra={"x-skyvern-connected-account": True},
     )
+    credential_source: Literal["native", "nango"] = Field(
+        default="native",
+        description="'nango' sends from the connected account named by connection_id instead of credential_id.",
+    )
+    connection_id: str | None = Field(default=None, json_schema_extra={"x-skyvern-connected-account": True})
     reply_to_message_id: str | None = Field(
         default=None,
         description="Gmail message ID to reply to in its original thread; requires send and read permissions.",
@@ -1347,6 +1352,10 @@ class SendEmailBlockYAML(BlockYAML):
     def _validate_transport_fields(self) -> "SendEmailBlockYAML":
         if self.reply_to_message_id is not None and self.transport != EmailTransport.GMAIL:
             raise ValueError("reply_to_message_id is only supported with the gmail transport")
+        if self.credential_source == "nango" and self.transport != EmailTransport.GMAIL:
+            raise ValueError("credential_source 'nango' is only supported with the gmail transport")
+        if self.credential_source == "nango" and self.reply_to_message_id is not None:
+            raise ValueError("reply_to_message_id is not supported with credential_source 'nango'")
         if self.transport == EmailTransport.GMAIL:
             custom_smtp_text = (self.custom_smtp_host, self.custom_smtp_username, self.custom_smtp_password)
             if self.custom_smtp_port is not None or any(value and value.strip() for value in custom_smtp_text):
