@@ -43,15 +43,21 @@ from skyvern.forge.sdk.db.models import (
     TaskRunModel,
     TaskV2Model,
     WorkflowModel,
+    WorkflowParameterModel,
     WorkflowRunAttemptModel,
     WorkflowRunBlockModel,
     WorkflowRunCredentialSelectionModel,
     WorkflowRunModel,
+    WorkflowRunParameterModel,
 )
 from skyvern.forge.sdk.db.repositories import workflow_run_attempts as attempts_repository_module
 from skyvern.forge.sdk.db.repositories import workflow_runs as workflow_runs_repository
 from skyvern.forge.sdk.db.repositories.workflow_run_attempts import TerminalSideEffectCheckpoint
-from skyvern.forge.sdk.db.repositories.workflow_runs import WorkflowRunsRepository
+from skyvern.forge.sdk.db.repositories.workflow_runs import (
+    RUN_INPUT_SEARCH_ACCESS,
+    RunInputSearchAccess,
+    WorkflowRunsRepository,
+)
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow import service as workflow_service_module
@@ -2244,7 +2250,11 @@ async def test_get_all_runs_v2_search_key_matches_parameter_inputs() -> None:
 
     repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session), debug_enabled=False)
 
-    await repo.get_all_runs_v2(organization_id="o_test", search_key="Paris")
+    token = RUN_INPUT_SEARCH_ACCESS.set(RunInputSearchAccess(run_inputs=True, agent_definition=True))
+    try:
+        await repo.get_all_runs_v2(organization_id="o_test", search_key="Paris")
+    finally:
+        RUN_INPUT_SEARCH_ACCESS.reset(token)
 
     primary_where = _where_clause_sql(captured_queries[0])
     # Parameter EXISTS subqueries correlate on the run_id of the primary task_runs row.
@@ -2457,6 +2467,64 @@ async def test_get_workflow_runs_for_workflow_permanent_id_search_key_matches_ru
             search_key=search_key,
         )
         assert {run.workflow_run_id for run in runs} == {expected_run_id}, search_key
+
+
+@pytest.mark.asyncio
+async def test_run_input_search_arms_match_only_what_the_list_route_grants(sqlite_db: AgentDB) -> None:
+    run = _workflow_run_model(workflow_run_id="wr_inputs", queued_at=datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc))
+    run.extra_http_headers = {"X-Api-Token": "hdr-value-981"}
+    async with sqlite_db.Session() as session:
+        session.add(OrganizationModel(organization_id="org_test", organization_name="Test Organization"))
+        await session.flush()
+        session.add(
+            WorkflowModel(
+                workflow_id="wf_test",
+                workflow_permanent_id="wpid_test",
+                title="inputs",
+                workflow_definition={},
+                version=1,
+            )
+        )
+        session.add(
+            WorkflowParameterModel(
+                workflow_parameter_id="wp_member",
+                workflow_parameter_type="string",
+                key="member_number",
+                workflow_id="wf_test",
+            )
+        )
+        session.add(run)
+        await session.flush()
+        session.add(
+            WorkflowRunParameterModel(workflow_run_id="wr_inputs", workflow_parameter_id="wp_member", value="pv-4417")
+        )
+        await session.commit()
+
+    async def matches(search_key: str) -> tuple[set[str], set[str]]:
+        per_agent = await sqlite_db.workflow_runs.get_workflow_runs_for_workflow_permanent_id(
+            workflow_permanent_id="wpid_test", organization_id="org_test", search_key=search_key
+        )
+        org_wide = await sqlite_db.workflow_runs.get_all_runs(organization_id="org_test", search_key=search_key)
+        return {r.workflow_run_id for r in per_agent}, {r.workflow_run_id for r in org_wide}
+
+    async def matches_with(access: RunInputSearchAccess, search_key: str) -> tuple[set[str], set[str]]:
+        token = RUN_INPUT_SEARCH_ACCESS.set(access)
+        try:
+            return await matches(search_key)
+        finally:
+            RUN_INPUT_SEARCH_ACCESS.reset(token)
+
+    found = ({"wr_inputs"}, {"wr_inputs"})
+    # Without a grant from a list route, no input arm matches.
+    for search_key in ("pv-44", "hdr-value", "member_num"):
+        assert await matches(search_key) == (set(), set()), search_key
+    inputs_only = RunInputSearchAccess(run_inputs=True)
+    definition_only = RunInputSearchAccess(agent_definition=True)
+    assert await matches_with(inputs_only, "pv-44") == found
+    assert await matches_with(inputs_only, "hdr-value") == found
+    assert await matches_with(inputs_only, "member_num") == (set(), set())
+    assert await matches_with(definition_only, "member_num") == found
+    assert await matches_with(definition_only, "pv-44") == (set(), set())
 
 
 @pytest.mark.asyncio
