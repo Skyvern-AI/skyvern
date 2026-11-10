@@ -1044,6 +1044,9 @@ class WorkflowRunContext:
         refusal = self._powerbi_hop_refusals.get(block_label)
         return refusal if isinstance(refusal, str) else None
 
+    def get_gmail_hop_refusal(self, block_label: str) -> str | None:
+        return self.get_powerbi_hop_refusal(block_label)
+
     def get_value(self, key: str) -> Any:
         """
         Get the value of a parameter. If the parameter is an AWS secret, the value will be the random secret id, not
@@ -3226,7 +3229,8 @@ class WorkflowContextManager:
             powerbi_block_labels = powerbi_query_labels + [
                 block.label
                 for block in all_blocks
-                if block.block_type == BlockType.EMAIL_INBOX and block.credential_source == "nango"
+                if block.block_type in (BlockType.EMAIL_INBOX, BlockType.SEND_EMAIL)
+                and block.credential_source == "nango"
             ]
             if powerbi_block_labels:
                 powerbi_hop_tokens = await app.AGENT_FUNCTION.get_powerbi_query_hop_tokens(
@@ -3235,7 +3239,7 @@ class WorkflowContextManager:
                     block_labels=powerbi_block_labels,
                 )
             # Only a block with no capability needs a reason, so a run that got one pays nothing for this.
-            refused_labels = [label for label in powerbi_query_labels if label not in powerbi_hop_tokens]
+            refused_labels = [label for label in powerbi_block_labels if label not in powerbi_hop_tokens]
             if refused_labels:
                 powerbi_hop_refusals = await app.AGENT_FUNCTION.get_powerbi_query_hop_refusals(
                     organization_id=organization.organization_id,
