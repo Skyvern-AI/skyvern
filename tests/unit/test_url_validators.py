@@ -107,6 +107,9 @@ def test_public_run_callback_error_names_field_without_value(field_name: str, mo
         ("HTTPS://Hooks.Example/sms%2Fpath#fragment", "HTTPS://Hooks.Example/sms%2Fpath#fragment"),
         ("https://hooks.example/sms#fragment?not-a-query", "https://hooks.example/sms#fragment?not-a-query"),
         ("", ""),
+        ("https://bucket.example/docs/report?X-Amz-Signature=deadbeef", "https://bucket.example/docs/report"),
+        ("not-a-url", "not-a-url"),
+        ("http://[::1/p?q=1", "<redacted>"),
     ],
 )
 def test_redact_url_query(url: str, expected: str) -> None:
