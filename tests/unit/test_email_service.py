@@ -819,6 +819,33 @@ async def test_outlook_otp_search_returns_strong_then_hidden_fallback(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("identifier", "expected_message_ids"),
+    [("user+tag@example.com", ["confirmation"]), ("user@example.com", [])],
+)
+async def test_outlook_otp_search_accepts_confirmation_mail_only_for_plus_addresses(
+    monkeypatch: pytest.MonkeyPatch,
+    identifier: str,
+    expected_message_ids: list[str],
+) -> None:
+    message = _outlook_otp_message(
+        "confirmation",
+        recipient=identifier,
+        subject="Confirm your signup",
+        body="Thanks for joining. Use the link below to finish.",
+    )
+    _patch_outlook_otp_graph(monkeypatch, [message])
+
+    candidates = await email.outlook.search_recent_otp_messages(
+        access_token="AT",
+        totp_identifier=identifier,
+        created_after=datetime(2026, 7, 30, 12, 0, tzinfo=timezone.utc),
+    )
+
+    assert [candidate.message_id for candidate in candidates] == expected_message_ids
+
+
+@pytest.mark.asyncio
 async def test_outlook_otp_search_distinguishes_empty_body_from_missing_hydration_body(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
