@@ -402,6 +402,28 @@ describe("DocStepResult", () => {
     expect(screen.getByText("3 more rows")).toBeTruthy();
   });
 
+  it("links a file URL in a result table by its file name and previews an object cell by its keys", () => {
+    const url = "https://example.com/uploads/2026/passport.jpg";
+    renderResult(
+      block({
+        output: {
+          extracted_information: [
+            {
+              photo: url,
+              order: { customer_ref: "c1", amount: 3, currency: "USD" },
+            },
+          ],
+        },
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /show result of/i }));
+    const link = screen.getByRole("link", { name: "passport.jpg" });
+    expect(link.getAttribute("href")).toBe(url);
+    expect(link.getAttribute("target")).toBe("_blank");
+    expect(link.getAttribute("title")).toBe(url);
+    expect(screen.getByText("{customer_ref, amount, +1}")).toBeTruthy();
+  });
+
   it("gives a step with nothing to show no chevron and says it returned nothing", () => {
     renderResult(
       block({ block_type: "code", label: "run_code", output: null }),

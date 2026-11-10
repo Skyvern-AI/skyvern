@@ -49,7 +49,7 @@ import {
 } from "./buildDocTree";
 import { docLearnContent, type DocLearnContent } from "./docLearnContent";
 import { docStarterDone, useDocStarter } from "./useDocStarter";
-import { getDocInputChips } from "./docInputChips";
+import { getDocInputChips, NOT_USED_TITLE } from "./docInputChips";
 import {
   docInputNameProblem,
   isDocEditableInput,
@@ -1212,7 +1212,7 @@ export function WorkflowDocEditor({
                         : parameter?.parameterType === "context"
                           ? `Uses data from ${parameter.sourceParameterKey}${input.unused ? "; not used by any step" : ""}`
                           : input.unused
-                            ? "Not used by any step"
+                            ? NOT_USED_TITLE
                             : undefined
                     }
                     className={cn(
@@ -1226,8 +1226,9 @@ export function WorkflowDocEditor({
                     <span className="truncate">{input.key}</span>
                     {(input.missing || input.value) && (
                       <em
+                        title={input.missing ? undefined : input.valueTitle}
                         className={cn(
-                          "max-w-[160px] truncate not-italic text-muted-foreground",
+                          "max-w-[240px] truncate not-italic text-muted-foreground",
                           input.missing && "text-[#B45B0A] dark:text-[#E79A55]",
                         )}
                       >
