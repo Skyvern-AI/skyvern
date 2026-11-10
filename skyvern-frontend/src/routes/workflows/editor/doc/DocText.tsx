@@ -3,6 +3,9 @@ import { cn } from "@/util/utils";
 import { splitJinjaReferences } from "./docTextUtils";
 import { WorkflowDocActionsContext } from "./WorkflowDocActionsContext";
 
+export const docReferencePill =
+  "inline-block max-w-full rounded bg-muted px-[5px] align-baseline font-[520] leading-[1.25] text-foreground [overflow-wrap:anywhere]";
+
 /** Plain text with each {{ reference }} shown as a grey pill. */
 export function DocText({
   value,
@@ -29,7 +32,7 @@ export function DocText({
                 : `{{ ${part.ref} }}`
             }
             className={cn(
-              "inline-block max-w-full rounded bg-muted px-[5px] align-baseline font-[520] leading-[1.25] text-foreground [overflow-wrap:anywhere]",
+              docReferencePill,
               missingReference(part.ref) &&
                 "bg-destructive/10 text-destructive",
             )}

@@ -59,6 +59,8 @@ vi.mock("../workflowYamlDocument", async (importOriginal) => ({
 // The run widgets need studio run contexts; this file tests navigation, so they are stubbed.
 vi.mock("./DocStepResult", () => ({ DocStepResult: () => null }));
 vi.mock("./DocRunStepButton", () => ({ DocRunStepButton: () => null }));
+// The settings form is mocked because these tests check the side panel's header only.
+vi.mock("../panels/BlockConfigForm", () => ({ BlockConfigForm: () => null }));
 
 const output = (label: string) => ({
   parameter_type: "output",
@@ -1050,6 +1052,212 @@ describe("WorkflowDocEditor navigation", () => {
     expect(toggle.getAttribute("aria-expanded")).toBe("true");
     expect(useLocateBlockStore.getState().request).toBeNull();
   });
+
+  test("steps are numbered in their list, a loop's steps under the loop's number, and a named step shows its name in words", () => {
+    const nodes = renderDoc([
+      block("extraction", "extraction_1", "find_prices", {
+        data_extraction_goal: "Read the page",
+      }),
+      block("extraction", "find_prices", "each_row", {
+        data_extraction_goal: "Get the prices",
+      }),
+      loop,
+    ]);
+    const step = (label: string) =>
+      within(
+        document.querySelector<HTMLElement>(
+          `[data-doc-node-id="${nodes.find((n) => n.data.label === label)!.id}"]`,
+        )!,
+      );
+    expect(step("extraction_1").getByText("1")).toBeTruthy();
+    expect(step("find_prices").getByText("2")).toBeTruthy();
+    expect(step("each_row").getByText("3")).toBeTruthy();
+    expect(step("inner_step").getByText("3.1")).toBeTruthy();
+    expect(step("find_prices").getByText("Find prices")).toBeTruthy();
+    expect(step("extraction_1").queryByText("Extraction 1")).toBeNull();
+    // A for-each loop's unused while condition is not listed as something it uses.
+    expect(step("each_row").queryByText("true")).toBeNull();
+  });
+
+  test("a conditional's branches continue one count, so no two branches share a step number, and the selected condition shows once", () => {
+    const nodes = renderDoc([
+      conditional("route", "after", [
+        { id: "yes", next: "first_if", when: "Check the condition" },
+        { id: "no", next: "only_else" },
+      ]),
+      code("first_if", "second_if"),
+      code("second_if", "after"),
+      code("only_else", "after"),
+      code("after", null),
+    ]);
+    const number = (label: string) =>
+      document.querySelector(
+        `[data-doc-node-id="${nodes.find((n) => n.data.label === label)!.id}"] [data-testid="doc-step-number"]`,
+      )?.textContent;
+    expect(number("first_if")).toBe("1.1");
+    expect(number("second_if")).toBe("1.2");
+    expect(number("after")).toBe("2");
+    // The full condition is on the Condition line; the selected tab names only its kind.
+    expect(screen.getAllByText(/^Check the condition$/)).toHaveLength(1);
+    fireEvent.click(screen.getByRole("tab", { name: /Otherwise/ }));
+    expect(number("only_else")).toBe("1.3");
+  });
+
+  test("Step options names its step, lists the step's settings in place, and Edit in side panel opens the side panel", () => {
+    renderDoc(
+      [
+        block("extraction", "find_prices", null, {
+          data_extraction_goal: "Get the prices",
+          max_retries: 3,
+          max_steps_per_run: 12,
+        }),
+      ],
+      { apply: vi.fn(), update: vi.fn(), addStep: vi.fn(), duplicate: vi.fn() },
+    );
+    expect(screen.getByText("Max retries: 3")).toBeTruthy();
+    const toggle = screen.getByRole("button", {
+      name: "Step options for Find prices",
+    });
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    const options = within(
+      document.getElementById(toggle.getAttribute("aria-controls")!)!,
+    );
+    expect(options.getByText("Max steps").nextElementSibling?.textContent).toBe(
+      "12",
+    );
+    // The extraction form has no max retries control, so the box leaves it out.
+    expect(options.queryByText("Max retries")).toBeNull();
+    expect(
+      options.getByText("Continue on failure").nextElementSibling?.textContent,
+    ).toBe("Off (default)");
+
+    fireEvent.click(
+      options.getByRole("button", { name: "Edit in side panel" }),
+    );
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    const selected = within(screen.getByLabelText("Selected step"));
+    expect(selected.getByText("Find prices")).toBeTruthy();
+    expect(selected.getByText("find_prices")).toBeTruthy();
+  });
+
+  test("a step whose form edits none of the listed settings has no Step options", () => {
+    const nodes = renderDoc(
+      [
+        block("wait", "pause", "open_site", { wait_sec: 5 }),
+        block("goto_url", "open_site", "save_page", {
+          url: "https://example.com",
+        }),
+        block("print_page", "save_page", "query_sales", {}),
+        block("powerbi_query", "query_sales", "stop_here", {
+          query: "EVALUATE Sales",
+        }),
+        block("terminate", "stop_here", null, { reason: "Done" }),
+      ],
+      { apply: vi.fn(), update: vi.fn(), addStep: vi.fn(), duplicate: vi.fn() },
+    );
+    expect(nodes.filter(isWorkflowBlockNode).map((n) => n.type)).toEqual([
+      "wait",
+      "url",
+      "printPage",
+      "powerBIQuery",
+      "terminate",
+    ]);
+    expect(
+      screen.queryAllByRole("button", { name: /^Step options for/ }),
+    ).toEqual([]);
+    expect(screen.queryByText(/Continue on failure|Model:/)).toBeNull();
+  });
+
+  test("Uses lists a step's declared inputs and its {{ }} reads, matching the input chips, and never a Code step's Python", () => {
+    useWorkflowParametersStore.setState({
+      parameters: [
+        {
+          key: "site_login",
+          parameterType: "credential",
+          dataType: WorkflowParameterValueType.CredentialId,
+          credentialId: "cred_1",
+          description: null,
+        },
+        {
+          key: "account_id",
+          parameterType: "workflow",
+          dataType: WorkflowParameterValueType.String,
+          description: null,
+          defaultValue: "a1",
+        },
+        {
+          key: "unused_input",
+          parameterType: "workflow",
+          dataType: WorkflowParameterValueType.String,
+          description: null,
+          defaultValue: "x",
+        },
+      ] as never,
+    });
+    const nodes = renderDoc(
+      [
+        block("login", "sign_in", "count_rows", {
+          url: "https://example.com/login",
+          navigation_goal: "Sign in",
+          complete_criterion: "The account {{ account_id }} page shows",
+          parameters: [{ key: "site_login" }],
+        }),
+        block("code", "count_rows", null, {
+          parameters: [],
+          code: 'result = f"{{\\"count\\": {len(rows)}}}"',
+        }),
+      ],
+      { apply: vi.fn(), update: vi.fn(), addStep: vi.fn(), duplicate: vi.fn() },
+    );
+    const step = (label: string) =>
+      within(
+        document.querySelector<HTMLElement>(
+          `[data-doc-node-id="${nodes.find((n) => n.data.label === label)!.id}"]`,
+        )!,
+      );
+    const uses = step("sign_in").getByText("Uses");
+    expect(
+      Array.from(uses.querySelectorAll("span"), (pill) => pill.textContent),
+    ).toEqual(["site_login", "account_id"]);
+    expect(step("count_rows").queryByText("Uses")).toBeNull();
+    const chip = (key: string) =>
+      screen.getByRole("button", { name: new RegExp(`^Input ${key}`) });
+    expect(chip("site_login").getAttribute("aria-label")).not.toMatch(
+      /not used/,
+    );
+    expect(chip("account_id").getAttribute("aria-label")).not.toMatch(
+      /not used/,
+    );
+    expect(chip("unused_input").getAttribute("aria-label")).toMatch(/not used/);
+  });
+
+  test("Step options lists the output fields of a step that keeps its schema in jsonSchema", () => {
+    renderDoc(
+      [
+        block("text_prompt", "summarize_page", null, {
+          prompt: "Summarize the page",
+          json_schema: {
+            type: "object",
+            properties: {
+              title: { type: "string" },
+              price: { type: "number" },
+            },
+          },
+        }),
+      ],
+      { apply: vi.fn(), update: vi.fn(), addStep: vi.fn(), duplicate: vi.fn() },
+    );
+    const toggle = screen.getByRole("button", { name: /^Step options for/ });
+    fireEvent.click(toggle);
+    const options = within(
+      document.getElementById(toggle.getAttribute("aria-controls")!)!,
+    );
+    expect(
+      options.getByText("Output fields").nextElementSibling?.textContent,
+    ).toBe("title, price");
+  });
 });
 
 test("a step that reads an output only some branches produce shows the warning under it", async () => {
@@ -1670,8 +1878,8 @@ describe("Demonstrate task in the step menu", () => {
 
     const line = screen.getByText(/^Demonstrating · 2 actions$/);
     expect(line.textContent).toBe("Demonstrating · 2 actions");
-    const first = screen.getByText(/first_step|first step/i);
-    const second = screen.getByText(/second_step|second step/i);
+    const first = screen.getByText("First step");
+    const second = screen.getByText("Second step");
     expect(
       first.compareDocumentPosition(line) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();

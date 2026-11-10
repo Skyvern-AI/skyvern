@@ -21,7 +21,13 @@ import type { DocBranch, DocItem } from "./buildDocTree";
 import { WorkflowDocActionsContext } from "./WorkflowDocActionsContext";
 import { docStepTitle } from "./docStepRegistry";
 import { DocStepResult } from "./DocStepResult";
-import { DocStepControls, DocTag, type DocStepPlace } from "./DocStep";
+import {
+  DocStepCaption,
+  DocStepControls,
+  DocStepNumber,
+  DocTag,
+  type DocStepPlace,
+} from "./DocStep";
 import { runStepByKey, type LineSplit } from "./docKeys";
 import type { DocScopeRef } from "./docGraphEdits";
 import { DocText } from "./DocText";
@@ -92,7 +98,9 @@ function BranchTab({
       <span className="shrink-0 font-semibold text-[#8456A8] dark:text-[#B793DA]">
         {kindLabel[branch.kind]}
       </span>
+      {/* The selected branch's condition is in full on its Condition line, so its tab names only the kind. */}
       {branch.kind !== "otherwise" &&
+        !selected &&
         (label ? (
           <span className="min-w-0 truncate">{label}</span>
         ) : (
@@ -102,7 +110,7 @@ function BranchTab({
         ))}
       {branch.stepCount > 0 && (
         <span className="text-[11px] text-muted-foreground">
-          {branch.stepCount}
+          · {branch.stepCount} step{branch.stepCount === 1 ? "" : "s"}
         </span>
       )}
       {ran && (
@@ -153,6 +161,7 @@ export function DocConditional({
   editable,
   showRunControl = editable,
   place,
+  number,
   onEnter,
   renderChildren,
 }: {
@@ -162,12 +171,14 @@ export function DocConditional({
   editable: boolean;
   showRunControl?: boolean;
   place?: DocStepPlace;
+  number?: string;
   // Enter on the If line starts the line after the conditional.
   onEnter?: (split: LineSplit | null, key?: string) => void;
   renderChildren: (
     children: DocItem[],
     scope?: DocScopeRef,
     branchId?: string,
+    numberStart?: number,
   ) => ReactNode;
 }) {
   const actions = useContext(WorkflowDocActionsContext);
@@ -205,6 +216,10 @@ export function DocConditional({
     actions.selectBranch(node.id, branch.branchId);
   };
   const empty = selected.children.length === 0 && !selected.jumpTo;
+  const tabOrder = [...conditions, ...(otherwise ? [otherwise] : [])];
+  const numberStart = tabOrder
+    .slice(0, tabOrder.indexOf(selected))
+    .reduce((n, branch) => n + branch.stepCount, 1);
   const [confirmingRemove, setConfirmingRemove] = useState(false);
   const conditionIndex = conditions.indexOf(selected);
   const canMoveEarlier = conditionIndex > 0;
@@ -230,7 +245,9 @@ export function DocConditional({
     <div className="rounded py-[3px]">
       {/* The hover group is the header only: the steps inside a branch show their own controls. */}
       <div className="group/line relative flex min-h-[26px] flex-wrap items-center gap-2">
+        <DocStepNumber number={number} />
         <DocTag node={node} place={editable ? place : undefined} />
+        <DocStepCaption node={node} />
         <button
           type="button"
           aria-label={`${open ? "Collapse" : "Expand"} ${docStepTitle(node)}`}
@@ -245,8 +262,9 @@ export function DocConditional({
           )}
         </button>
         <span className="text-[12.5px] text-muted-foreground">
-          {conditions.length} condition{conditions.length === 1 ? "" : "s"} +
-          Otherwise · checked left to right
+          {conditions.length === 1
+            ? "If the condition holds, its steps run; otherwise the fallback branch runs"
+            : "Runs the first branch whose condition matches, checked left to right"}
         </span>
         <DocStepControls
           node={node}
@@ -266,7 +284,7 @@ export function DocConditional({
           />
           {typeof node.data.description === "string" &&
             node.data.description.trim() && (
-              <p className="mb-1.5 text-base font-medium leading-[1.55]">
+              <p className="mb-1.5 text-base font-normal leading-[1.55]">
                 <DocText value={node.data.description} />
               </p>
             )}
@@ -396,14 +414,14 @@ export function DocConditional({
             )}
           </div>
           <div role="tabpanel" data-doc-branch-id={selected.branchId}>
-            <p className="text-base font-medium leading-[1.55]">
+            <p className="flex gap-1.5 text-[13.5px] leading-[1.55] text-muted-foreground">
               {selected.kind === "otherwise" ? (
-                "Otherwise"
+                "Runs when no condition before it matches."
               ) : (
                 <>
-                  {kindLabel[selected.kind]}{" "}
+                  <span className="shrink-0">Condition</span>
                   {conditionEditable && branchEdits ? (
-                    <span className="inline-block min-w-[12ch] align-baseline">
+                    <span className="min-w-[12ch] flex-1 text-base text-foreground">
                       <DocEditableLine
                         key={selected.branchId}
                         value={selected.condition}
@@ -431,7 +449,10 @@ export function DocConditional({
                       />
                     </span>
                   ) : selected.condition ? (
-                    <DocText value={selected.condition} />
+                    <DocText
+                      value={selected.condition}
+                      className="text-base text-foreground"
+                    />
                   ) : (
                     <span className="font-normal italic text-[#B45B0A] dark:text-[#E79A55]">
                       no condition
@@ -441,9 +462,7 @@ export function DocConditional({
               )}
             </p>
             <div className="my-0.5 flex items-center gap-[5px] text-xs leading-[1.55] text-muted-foreground">
-              {selected.kind === "otherwise" ? (
-                "Runs when no condition before it matches."
-              ) : selected.check === "exact" ? (
+              {selected.check === "exact" ? (
                 <>
                   <CodeIcon className="size-[11px]" />
                   Exact check, no AI
@@ -478,6 +497,7 @@ export function DocConditional({
                       conditionalBranchId: selected.branchId,
                     },
                 selected.branchId,
+                numberStart,
               )}
               {selected.jumpTo && (
                 <DocJump
