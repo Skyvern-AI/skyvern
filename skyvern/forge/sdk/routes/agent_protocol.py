@@ -32,7 +32,7 @@ from fastapi import (
 from fastapi import status as http_status
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from opentelemetry import trace
-from pydantic import TypeAdapter, ValidationError
+from pydantic import BaseModel, TypeAdapter, ValidationError
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from starlette.types import Receive, Scope, Send
 
@@ -5180,6 +5180,83 @@ async def _redact_workflow_run_list(runs: list[WorkflowRun], organization_id: st
         return await redact_workflow_run_artifact_rows(runs, organization_id)
 
 
+# What a caller without run read access sees in a run list: status and metadata. Any other field, including one added
+# later, is reset to its default, so run inputs, settings and failure text stay with run readers.
+WORKFLOW_RUN_LIST_METADATA_FIELDS = frozenset(
+    {
+        "workflow_run_id",
+        "workflow_id",
+        "workflow_permanent_id",
+        "organization_id",
+        "workflow_title",
+        "browser_session_id",
+        "browser_profile_id",
+        "browser_sink_profile_id",
+        "debug_session_id",
+        "status",
+        "attempt",
+        "retry_pending",
+        "next_attempt_at",
+        "attempts",
+        "retried_from_workflow_run_id",
+        "fallback_attempt",
+        "parent_workflow_run_id",
+        "run_with",
+        "script_run",
+        "job_id",
+        "depends_on_workflow_run_id",
+        "trigger_type",
+        "workflow_schedule_id",
+        "copilot_session_id",
+        "created_by",
+        "credits_used",
+        "cached_credits_used",
+        "queued_at",
+        "started_at",
+        "finished_at",
+        "created_at",
+        "modified_at",
+    }
+)
+WORKFLOW_RUN_ATTEMPT_LIST_METADATA_FIELDS = frozenset(
+    {
+        "attempt_number",
+        "status",
+        "error_codes",
+        "started_at",
+        "finished_at",
+        "retry_decision",
+        "next_attempt_at",
+        "webhook_sent_at",
+    }
+)
+
+
+def _reset_fields_outside(model: BaseModel, kept: frozenset[str]) -> dict[str, Any]:
+    return {
+        name: field.get_default(call_default_factory=True)
+        for name, field in type(model).model_fields.items()
+        if name not in kept
+    }
+
+
+async def _project_run_list_for_role(runs: list[WorkflowRun]) -> list[WorkflowRun]:
+    if await app.AGENT_FUNCTION.role_allows(get_request_principal(), "workflow_run.read"):
+        return runs
+    return [
+        run.model_copy(
+            update={
+                **_reset_fields_outside(run, WORKFLOW_RUN_LIST_METADATA_FIELDS),
+                "attempts": [
+                    attempt.model_copy(update=_reset_fields_outside(attempt, WORKFLOW_RUN_ATTEMPT_LIST_METADATA_FIELDS))
+                    for attempt in run.attempts
+                ],
+            }
+        )
+        for run in runs
+    ]
+
+
 @legacy_base_router.get(
     "/runs",
     tags=["agent"],
@@ -5968,7 +6045,7 @@ async def get_workflow_runs(
             )
         workflow_runs = await _redact_workflow_run_list(workflow_runs, current_org.organization_id)
         await _redact_browser_session_addresses(workflow_runs, current_org.organization_id)
-        return workflow_runs
+        return await _project_run_list_for_role(workflow_runs)
     except RunsListSearchCanceled as exc:
         LOG.warning(
             "runs_list_statement_timeout",
@@ -6073,7 +6150,7 @@ async def _get_workflow_runs_by_id(
             )
         workflow_runs = await _redact_workflow_run_list(workflow_runs, organization_id)
         await _redact_browser_session_addresses(workflow_runs, organization_id)
-        return workflow_runs
+        return await _project_run_list_for_role(workflow_runs)
     except RunsListSearchCanceled as exc:
         # Only the search statement raises this, so a cancellation in the attempt lookup that
         # follows it stays a server error instead of being reported as a slow search.

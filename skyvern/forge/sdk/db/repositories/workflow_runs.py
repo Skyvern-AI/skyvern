@@ -163,7 +163,8 @@ class RunInputSearchAccess:
 
 
 # A search over run inputs lets a caller rebuild what it matches a few characters at a time, so each arm is off unless
-# the list route grants it: parameter values and extra headers need run read, parameter names need agent read.
+# the list route grants it: parameter values, headers, webhook URL and credential picks need run read; parameter names
+# and the agent's credential binding need agent read.
 RUN_INPUT_SEARCH_ACCESS: ContextVar[RunInputSearchAccess] = ContextVar(
     "run_input_search_access", default=RunInputSearchAccess()
 )
@@ -3308,9 +3309,10 @@ class WorkflowRunsRepository(BaseRepository):
         credential can also reach a run as a plain input value, so these arms stay ORed with the input
         search instead of replacing it the way ``_indexed_identifier_run_ids`` does.
         """
-        clauses: list[ColumnElement[bool]] = [
-            WorkflowRunModel.webhook_callback_url.icontains(search_key, autoescape=True)
-        ]
+        access = RUN_INPUT_SEARCH_ACCESS.get()
+        clauses: list[ColumnElement[bool]] = (
+            [WorkflowRunModel.webhook_callback_url.icontains(search_key, autoescape=True)] if access.run_inputs else []
+        )
         if _runs_list_search_id_prefix(search_key) == CREDENTIAL_PREFIX:
             selection_run_id = WorkflowRunCredentialSelectionModel.workflow_run_id
             # Retries retain prior picks as <run_id>:attempt:<n>; include those picks in the run's history.
@@ -3354,11 +3356,14 @@ class WorkflowRunsRepository(BaseRepository):
                 )
                 .where(~overriding_selection)
             )
-            clauses += [
-                WorkflowRunModel.sequential_credential_id == search_key,
-                workflow_run_id_col.in_(selected_runs),
-                and_(WorkflowRunModel.workflow_id.in_(bound_workflows), bound_when_created),
-            ]
+            # The run's own credential picks are run settings; the definition's binding is agent content.
+            if access.run_inputs:
+                clauses += [
+                    WorkflowRunModel.sequential_credential_id == search_key,
+                    workflow_run_id_col.in_(selected_runs),
+                ]
+            if access.agent_definition:
+                clauses.append(and_(WorkflowRunModel.workflow_id.in_(bound_workflows), bound_when_created))
         return clauses
 
     @staticmethod
