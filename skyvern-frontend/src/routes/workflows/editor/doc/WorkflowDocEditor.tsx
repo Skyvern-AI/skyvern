@@ -65,7 +65,6 @@ import { docBranchSelection } from "./docBranchSelection";
 import { useDocRun } from "./useDocRun";
 import { docRunFor } from "./useDocRunFor";
 import { useDocRunStore, type DocRunInput } from "./docRunStore";
-import { DocLiveIndicator } from "./DocLiveIndicator";
 import { DocOutline } from "./DocOutline";
 import { DocStepSearch } from "./DocStepSearch";
 import { DocAnnouncer } from "./DocAnnouncer";
@@ -85,6 +84,7 @@ import {
 import { countReferences, findOutputUsers } from "./docGraphEdits";
 import { docStepTitle } from "./docStepRegistry";
 import { docStepProblems } from "./docProblems";
+import { customSettingsShortText } from "./docSettingsChips";
 import { stepsLeftBy, useDocUnfinishedStore } from "./docUnfinished";
 import { DocGettingStarted, DocStarterNote, DocTip } from "./DocStarter";
 import { docTipIndex, type DocStarterProgress } from "./docStarterTips";
@@ -278,8 +278,7 @@ export function WorkflowDocEditor({
   const [pendingNote, setPendingNote] = useState<DocPendingNote | null>(null);
   const [dragId, setDragId] = useState<string | null>(null);
   const [editingInput, setEditingInput] = useState<{
-    key: string | null;
-    type: "workflow" | "context";
+    key: string;
     isNew?: boolean;
   } | null>(null);
   // Closing the input editor that "@ > Create input" opened puts the caret back in the line the "@" came from.
@@ -983,11 +982,7 @@ export function WorkflowDocEditor({
       return next;
     });
   const changesBeforeNewInput = useRef(false);
-  const addInput = (type: "workflow" | "context") => {
-    if (type === "context") {
-      setEditingInput({ key: null, type });
-      return;
-    }
+  const addInput = () => {
     changesBeforeNewInput.current =
       useWorkflowHasChangesStore.getState().hasChanges;
     const key = newDocInputKey(liveParameters, liveNodes);
@@ -1005,12 +1000,9 @@ export function WorkflowDocEditor({
       null,
     );
     forgetRemovedInput(key);
-    setEditingInput({ key, type, isNew: true });
+    setEditingInput({ key, isNew: true });
   };
-  const saveInput = (
-    oldKey: string | null,
-    parameter: ParametersState[number],
-  ) => {
+  const saveInput = (oldKey: string, parameter: ParametersState[number]) => {
     const nameProblem = docInputNameProblem(
       parameter.key,
       oldKey,
@@ -1028,9 +1020,7 @@ export function WorkflowDocEditor({
       return;
     }
     const rewritten =
-      oldKey === parameter.key || oldKey === null
-        ? 0
-        : countReferences(liveNodes, oldKey);
+      oldKey === parameter.key ? 0 : countReferences(liveNodes, oldKey);
     const result = saveDocInput(liveParameters, oldKey, parameter);
     applyInputs(result.parameters, result.nodes);
     forgetRemovedInput(parameter.key);
@@ -1045,7 +1035,7 @@ export function WorkflowDocEditor({
   const closeInputEditor = () => {
     const editing = editingInput;
     setEditingInput(null);
-    if (!editing?.isNew || editing.key === null) return;
+    if (!editing?.isNew) return;
     const parameter = liveParameters.find((p) => p.key === editing.key);
     const untouched =
       parameter?.parameterType === "workflow" &&
@@ -1162,7 +1152,7 @@ export function WorkflowDocEditor({
                 useWorkflowHasChangesStore.getState().hasChanges;
               applyInputs([...liveParameters, parsed.parameter], null);
               forgetRemovedInput(key);
-              setEditingInput({ key, type: "workflow", isNew: true });
+              setEditingInput({ key, isNew: true });
               return true;
             }
           : null,
@@ -1264,23 +1254,18 @@ export function WorkflowDocEditor({
                       proposal
                         ? undefined
                         : inDoc
-                          ? () =>
-                              setEditingInput({
-                                key: input.key,
-                                type:
-                                  parameter.parameterType === "context"
-                                    ? "context"
-                                    : "workflow",
-                              })
+                          ? () => setEditingInput({ key: input.key })
                           : openInputs
                     }
-                    aria-label={`Input ${input.key}${input.missing ? ", needed to run" : ""}${input.unused ? ", not used yet" : ""}`}
+                    aria-label={`Input ${input.key}${input.missing ? ", needed to run" : ""}${parameter?.parameterType === "context" ? `, uses data from ${parameter.sourceParameterKey}` : ""}${input.unused ? ", not used yet" : ""}`}
                     title={
                       input.missing
                         ? "Needed to run"
-                        : input.unused
-                          ? "Not used by any step"
-                          : undefined
+                        : parameter?.parameterType === "context"
+                          ? `Uses data from ${parameter.sourceParameterKey}${input.unused ? "; not used by any step" : ""}`
+                          : input.unused
+                            ? "Not used by any step"
+                            : undefined
                     }
                     className={cn(
                       "inline-flex max-w-full items-center gap-[5px] whitespace-nowrap rounded-md border border-border bg-background py-0.5 pl-[7px] pr-[9px] text-[13px] outline-none focus-visible:ring-2 focus-visible:ring-ring",
@@ -1327,42 +1312,13 @@ export function WorkflowDocEditor({
                 );
               })}
               {edit && (
-                <DocInputEditor
-                  open={
-                    editingInput?.key === null &&
-                    editingInput.type === "workflow"
-                  }
-                  type={WorkflowEditorParameterTypes.Workflow}
-                  onSave={(value) => saveInput(null, value)}
-                  onClose={() => setEditingInput(null)}
+                <button
+                  type="button"
+                  onClick={addInput}
+                  className="inline-flex items-center whitespace-nowrap rounded-md border border-dashed border-border bg-background py-0.5 pl-[7px] pr-[9px] text-[13px] text-muted-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
                 >
-                  <button
-                    type="button"
-                    onClick={() => addInput("workflow")}
-                    className="inline-flex items-center whitespace-nowrap rounded-md border border-dashed border-border bg-background py-0.5 pl-[7px] pr-[9px] text-[13px] text-muted-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
-                  >
-                    + Input
-                  </button>
-                </DocInputEditor>
-              )}
-              {edit && (
-                <DocInputEditor
-                  open={
-                    editingInput?.key === null &&
-                    editingInput.type === "context"
-                  }
-                  type={WorkflowEditorParameterTypes.Context}
-                  onSave={(value) => saveInput(null, value)}
-                  onClose={() => setEditingInput(null)}
-                >
-                  <button
-                    type="button"
-                    onClick={() => addInput("context")}
-                    className="inline-flex items-center whitespace-nowrap rounded-md border border-dashed border-border bg-background py-0.5 pl-[7px] pr-[9px] text-[13px] text-muted-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
-                  >
-                    + Context input
-                  </button>
-                </DocInputEditor>
+                  + Input
+                </button>
               )}
               {startId && !proposal && (
                 <button
@@ -1384,7 +1340,7 @@ export function WorkflowDocEditor({
                   <GearIcon className="size-[13px]" />
                   Agent settings
                   {changedSettingsCount > 0
-                    ? ` · ${changedSettingsCount} changed`
+                    ? ` · ${customSettingsShortText(changedSettingsCount)}`
                     : ""}
                 </button>
               )}
@@ -1409,7 +1365,6 @@ export function WorkflowDocEditor({
                   {problems} problem{problems === 1 ? "" : "s"}
                 </button>
               )}
-              <DocLiveIndicator />
               <button
                 type="button"
                 onClick={() => setSearchOpen(true)}

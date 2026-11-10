@@ -37,7 +37,7 @@ import { WorkflowBlockIcon } from "../nodes/WorkflowBlockIcon";
 import { announceDoc, announceMoved, announceTurnedInto } from "./docAnnounce";
 import { workflowBlockTitle } from "../nodes/types";
 import { WorkflowDocActionsContext } from "./WorkflowDocActionsContext";
-import { getDocSettingsChips } from "./docSettingsChips";
+import { customSettingsText, getDocSettingsChips } from "./docSettingsChips";
 import {
   docBlockType,
   docTagClasses,
@@ -50,6 +50,8 @@ import {
   getDocProseFields,
   getDocSettingSummary,
   getDocStepSummary,
+  loopHasNoList,
+  loopList,
 } from "./docStepRegistry";
 import { DocRunStepButton } from "./DocRunStepButton";
 import { useBlockPlayRegistry } from "@/store/BlockPlayRegistryStore";
@@ -511,11 +513,7 @@ export function DocSettingsButton({
       content={
         <>
           <DocKeyLabel
-            label={
-              changed
-                ? `${changed} setting${changed > 1 ? "s" : ""} changed`
-                : "Settings"
-            }
+            label={changed ? customSettingsText(changed) : "Settings"}
             keys="."
           />
         </>
@@ -523,7 +521,7 @@ export function DocSettingsButton({
     >
       <button
         type="button"
-        aria-label={`Settings for ${node.data.label}${changed ? `, ${changed} changed` : ""}`}
+        aria-label={`Settings for ${node.data.label}${changed ? `, ${customSettingsText(changed)}` : ""}`}
         aria-keyshortcuts={docShortcut(".").aria}
         onClick={() => actions.openSettings(node.id)}
         className={cn(
@@ -636,9 +634,12 @@ export function DocStepBody({
   onBackspaceAtStart,
   onMove,
   onRunStep,
+  hasFix = false,
 }: {
   node: WorkflowBlockNode;
   editable?: boolean;
+  // The step's problem line (what it still needs before it can run) is on screen under it.
+  hasFix?: boolean;
   // Enter; `key` is the field the caret was in, and the split is null outside the step's main text.
   onEnter?: (split: LineSplit | null, key: string) => void;
   onSlash?: PickerOpener;
@@ -691,19 +692,20 @@ export function DocStepBody({
   const missing = unfinished ? [] : getDocMissingSettings(node);
   // A description sits under a prompt-driven step's text; on other steps it is the main line, with the setting it would hide underneath.
   // A loop's line that already names its list says what "For each of …" would, so the summary is left out.
-  const loopSource = stripJinjaReferences(
-    stringOf("loopVariableReference") || stringOf("loopValue"),
-  );
+  const loopSource = stripJinjaReferences(loopList(data));
   const lineNamesLoopSource =
     node.type === "loop" &&
     loopSource !== "" &&
     stripJinjaReferences(description ?? "").includes(loopSource);
+  // Under a description, a for-each loop with no list would only add "For each item"; where its problem line shows, that says what is missing.
+  const summaryYieldsToProblem =
+    hasFix && node.type === "loop" && loopHasNoList(data);
   const settingSummary =
-    !isProse && description && !lineNamesLoopSource
+    !isProse && description && !lineNamesLoopSource && !summaryYieldsToProblem
       ? getDocSettingSummary(node)
       : null;
   const focus = actions.focusId === node.id;
-  const emptyText = getDocMainPlaceholder(node);
+  const emptyText = getDocMainPlaceholder(node, editable);
   const forEachLoop = node.type === "loop" && data.loopKind !== "while";
   const mainKey = isProse ? fields[0]!.key : "description";
   const line = (
@@ -776,18 +778,11 @@ export function DocStepBody({
                 line(
                   "description",
                   description ?? "",
-                  stringOf("loopVariableReference") ||
-                    stringOf("loopValue") ||
-                    "@ pick a list",
+                  loopList(data) || "@ pick a list",
                   "",
                 )
               ) : (
-                <DocText
-                  value={
-                    description ??
-                    (stringOf("loopVariableReference") || stringOf("loopValue"))
-                  }
-                />
+                <DocText value={description ?? loopList(data)} />
               )}
             </span>
           </div>

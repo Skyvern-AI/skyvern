@@ -38,7 +38,6 @@ vi.mock("./useDocRun", () => ({
   }),
 }));
 vi.mock("./DocStepResult", () => ({ DocStepResult: () => null }));
-vi.mock("./DocLiveIndicator", () => ({ DocLiveIndicator: () => null }));
 vi.mock("../nodes/components/NodeHeader", () => ({
   NodeHeader: ({ nodeId }: { nodeId: string }) => {
     const [pending, setPending] = useState(false);

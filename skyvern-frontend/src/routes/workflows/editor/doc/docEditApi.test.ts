@@ -345,7 +345,7 @@ describe("building from scratch in the doc", () => {
     ) as DocGraph;
     const loop = byLabel(graph, "books");
     expect(docStepProblems(graph.nodes).get(loop.id)).toEqual([
-      "Pick the list to go through with @",
+      "This loop has no list to go through. Type @ on its line and pick a list.",
     ]);
     const { api, latest } = editing(graph);
     api.setText(loop.id, "description", "For each book in {{ list_output }}");

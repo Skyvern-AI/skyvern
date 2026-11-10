@@ -58,7 +58,6 @@ vi.mock("../workflowYamlDocument", async (importOriginal) => ({
 
 // The run widgets need studio run contexts; this file tests navigation, so they are stubbed.
 vi.mock("./DocStepResult", () => ({ DocStepResult: () => null }));
-vi.mock("./DocLiveIndicator", () => ({ DocLiveIndicator: () => null }));
 vi.mock("./DocRunStepButton", () => ({ DocRunStepButton: () => null }));
 
 const output = (label: string) => ({
@@ -653,6 +652,34 @@ describe("WorkflowDocEditor navigation", () => {
     },
   );
 
+  test.each([
+    ["navigation", { navigation_goal: "" }, /agent should do\. Type @/],
+    ["validation", { complete_criterion: "" }, /check to pass\. Type @/],
+    [
+      "human_interaction",
+      { instructions: "", recipients: [] },
+      /before deciding\. Type @/,
+    ],
+  ])(
+    "an empty %s step shows its editing hint while editable and No instructions yet when read-only",
+    (blockType, extra, hint) => {
+      const step = () => [block(blockType, "the_step", null, extra)];
+      renderDoc(step(), {
+        apply: vi.fn(),
+        update: vi.fn(),
+        addStep: vi.fn(),
+        duplicate: vi.fn(),
+      });
+      expect(screen.getByText(hint)).toBeTruthy();
+      cleanup();
+      renderDoc(step());
+      expect(screen.queryByText(hint)).toBeNull();
+      expect(screen.getAllByText("No instructions yet").length).toBeGreaterThan(
+        0,
+      );
+    },
+  );
+
   test("a read-only doc reserves no empty row above Inputs", () => {
     renderDoc([block("goto_url", "open_site", null, { url: "x" })]);
     expect(document.querySelector('[aria-hidden="true"].h-\\[28px\\]')).toBe(
@@ -1131,6 +1158,52 @@ describe("a step that was just added", () => {
     expect(screen.queryByText(/need.* fixing/)).toBeNull();
   });
 
+  test.each([
+    ["no list", null, true],
+    ["an empty reference", "{{ }}", true],
+    ["a blank reference", "{{   }}", true],
+    ["an earlier step's output list", "{{ search_output.results }}", false],
+    ["a parameter list", "{{ topics }}", false],
+    ["a literal list", '["a", "b"]', false],
+  ])(
+    "a loop line with %s shows the missing-list problem in place of its summary only when it names no list",
+    (_, list, noList) => {
+      renderDoc([
+        forLoop("each_result", null, [code("open_result", null)], {
+          loop_over: null,
+          loop_variable_reference: list,
+          description: "For each of the search results",
+        }),
+      ]);
+      expect(screen.getByText("For each of the search results")).toBeTruthy();
+      expect(screen.queryByText("For each item")).toBeNull();
+      const fix =
+        document.querySelector("[data-doc-step-fix]")?.textContent ?? "";
+      expect(fix.includes("no list to go through")).toBe(noList);
+    },
+  );
+
+  test.each([
+    ["{{ }}", "a stale list behind it", { key: "stale_topics" }],
+    ["{{ }}", "nothing behind it", null],
+    ["  ", "a stale list behind it", { key: "stale_topics" }],
+  ])(
+    "a loop whose reference is %j with %s has no list and holds Run",
+    (reference, _, loopOver) => {
+      renderDoc([
+        forLoop("each_result", null, [code("open_result", null)], {
+          loop_over: loopOver,
+          loop_variable_reference: reference,
+        }),
+      ]);
+      expect(document.querySelector("[data-doc-step-fix]")).toBeTruthy();
+      expect(useRunValidationStore.getState().docProblemCount).toBeGreaterThan(
+        0,
+      );
+      expect(screen.queryByText(/stale_topics/)).toBeNull();
+    },
+  );
+
   test("a new Go to URL step shows no URL-required chip until the user leaves it", () => {
     const nodes = renderDoc([
       block("goto_url", "open_site", null, { url: "" }),
@@ -1402,19 +1475,26 @@ describe("Doc inputs", () => {
     expect(prompt().parameterKeys).toEqual(["search"]);
     expect(loopSource()).toBe("search");
 
-    fireEvent.click(screen.getByRole("button", { name: "+ Context input" }));
-    expect(screen.getByText("Add Context Input")).toBeTruthy();
-    fireEvent.change(
-      within(screen.getByRole("dialog")).getAllByRole("textbox")[0]!,
-      { target: { value: "derived" } },
-    );
-    fireEvent.click(within(screen.getByRole("dialog")).getByRole("combobox"));
-    fireEvent.click(screen.getByRole("option", { name: "search" }));
-    fireEvent.click(inPopover("Save"));
-    expect(keys()).toEqual(["search", "topic", "derived"]);
-    expect(screen.getByRole("button", { name: /^Input derived/ })).toBeTruthy();
-
+    // The Doc no longer offers a context input; one saved earlier still shows, opens and blocks deleting its source.
+    expect(screen.queryByRole("button", { name: /context input/i })).toBeNull();
+    useWorkflowParametersStore.setState({
+      parameters: [
+        ...useWorkflowParametersStore.getState().parameters,
+        {
+          key: "derived",
+          parameterType: "context",
+          sourceParameterKey: "search",
+          description: null,
+        },
+      ],
+    });
     rendered.rerender(view());
+    const derived = screen.getByRole("button", { name: /^Input derived/ });
+    expect(derived.getAttribute("title")).toMatch(/^Uses data from search/);
+    fireEvent.click(derived);
+    expect(screen.getByText("Edit Context Input")).toBeTruthy();
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+
     fireEvent.click(screen.getByRole("button", { name: /^Input search/ }));
     fireEvent.click(inPopover("Delete input"));
     expect(keys()).toEqual(["search", "topic", "derived"]);

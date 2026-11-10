@@ -11,7 +11,11 @@ import {
   type ReactNode,
 } from "react";
 import { cn } from "@/util/utils";
-import { LockClosedIcon, PlusIcon } from "@radix-ui/react-icons";
+import {
+  ExclamationTriangleIcon,
+  LockClosedIcon,
+  PlusIcon,
+} from "@radix-ui/react-icons";
 import { isWorkflowBlockNode, type AppNode } from "../nodes";
 import { workflowBlockTitle } from "../nodes/types";
 import { countDocSteps, type DocItem, type DocNoteItem } from "./buildDocTree";
@@ -186,9 +190,13 @@ function DocStepProblem({
           {fix.message.split("\n").map((message) => (
             <li
               key={message}
-              className="text-[13px] leading-[1.55] text-muted-foreground [overflow-wrap:anywhere]"
+              className="flex gap-1.5 text-[13px] leading-[1.55] text-amber-700 [overflow-wrap:anywhere] dark:text-amber-300"
             >
-              {message}
+              <ExclamationTriangleIcon
+                aria-hidden
+                className="mt-[3px] size-3.5 shrink-0"
+              />
+              <span className="min-w-0">{message}</span>
             </li>
           ))}
         </ul>
@@ -342,6 +350,7 @@ function DocNode({
             <DocStepBody
               node={node}
               editable={editable && Boolean(actions.edit)}
+              hasFix={noteProblems.has(`${node.id}:fix`)}
               onEnter={onEnter}
               onMove={
                 place && actions.edit && !place.isFinally
@@ -1142,7 +1151,10 @@ export function DocScope({
                 <DocProposalStepMark key={id} node={node}>
                   <div data-doc-node-id={id}>
                     <DocStepHeader node={node} editable={false} />
-                    <DocStepBody node={node} />
+                    <DocStepBody
+                      node={node}
+                      hasFix={noteProblems.has(`${id}:fix`)}
+                    />
                     <DocStepProblem nodeId={id} problems={noteProblems} />
                     <DocStepResult label={node.data.label} />
                     {node.type === "loop" && (

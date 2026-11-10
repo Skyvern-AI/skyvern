@@ -91,6 +91,11 @@ const chipFields = {
   completeOnDownload: "Complete on download",
 };
 
+export const customSettingsText = (count: number) =>
+  `${count} custom setting${count === 1 ? "" : "s"}`;
+
+export const customSettingsShortText = (count: number) => `${count} custom`;
+
 export function getDocSettingsChips(
   node: Node,
 ): { key: string; label: string }[] {
