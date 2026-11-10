@@ -1,3 +1,4 @@
+import keyword
 import os
 import random
 import re
@@ -66,6 +67,12 @@ def sanitize_identifier(value: str, default: str = "identifier") -> str:
 
     if not sanitized:
         sanitized = default
+
+    # `class`, `for`, `None`, ... pass the character rules above unchanged but are not
+    # usable as variable names, so a label/key called "class" would produce
+    # `{{ class }}` in a prompt and `class = ...` in a generated script.
+    if keyword.iskeyword(sanitized):
+        sanitized = f"{sanitized}_"
 
     return sanitized
 
