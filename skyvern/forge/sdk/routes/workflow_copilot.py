@@ -625,7 +625,8 @@ async def _copilot_turn_control_allowed(
 async def _require_copilot_turn_control(
     organization_id: str, turn: CopilotPendingTurn | None, control: CopilotTurnControl
 ) -> None:
-    # An unmatched token is rejected downstream (not-found or turn-ended); the token itself is the proof.
+    # Steer, answer and credential-deletion reject an unmatched id downstream (409 or 404). Cancel accepts it: the
+    # token is the proof, and an unmatched one only sets the stop flag for that token.
     if turn is None:
         return
     if not await _copilot_turn_control_allowed(organization_id, turn, control):

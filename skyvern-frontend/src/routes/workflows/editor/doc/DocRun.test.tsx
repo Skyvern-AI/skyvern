@@ -1298,6 +1298,54 @@ describe("DocRunLine", () => {
     expect(shown?.textContent).not.toContain("Failed");
   });
 
+  it.each([
+    [Status.Queued, null, "Queued · queued 12 min ago"],
+    [Status.Created, null, "Queued · queued 12 min ago"],
+    [Status.Running, ago(5), "Running · started 5 min ago"],
+  ])(
+    "says started only once a %s run has started",
+    (status, startedAt, text) => {
+      const shown = line(
+        { live: true, owned: true },
+        { status, started_at: startedAt, created_at: ago(12) },
+      );
+      expect(shown?.textContent).toContain(`${text} · this version`);
+    },
+  );
+
+  it.each([
+    [
+      "a soft-deleted version",
+      { deleted_at: "2026-11-10T11:00:00Z" },
+      {},
+      {},
+      "a test run",
+    ],
+    [
+      "a Copilot run whose draft is not deleted yet",
+      { deleted_at: null },
+      { copilot_session_id: "wcc_1" },
+      {},
+      "a test run",
+    ],
+    [
+      "a Copilot run whose proposal is pending",
+      { deleted_at: null },
+      { copilot_session_id: "wcc_1" },
+      { proposalPending: true },
+      "a newer version, v7",
+    ],
+    ["a plain run", { deleted_at: null }, {}, {}, "a newer version, v7"],
+  ])("names the version of %s", (_, workflow, run, overrides, words) => {
+    const shown = line(overrides, {
+      status: Status.Completed,
+      workflow: { version: 7, ...workflow },
+      finished_at: ago(2),
+      ...run,
+    });
+    expect(shown?.textContent).toContain(`Completed · 2 min ago · ${words}`);
+  });
+
   it("says a one-step run is a step run and names its step", () => {
     const shown = line(
       { blockRun: true, blockRunTarget: "open_site" },
