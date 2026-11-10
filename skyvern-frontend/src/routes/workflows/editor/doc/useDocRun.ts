@@ -274,6 +274,7 @@ export function useDocRun(): DocRunLayer & {
   sharedRunId: string | null;
   blockRunTarget: string | null;
   currentDefinition: unknown;
+  currentVersion: number | undefined;
   previous: DocRunLayer | null;
 } {
   const urlRunId = useStudioRunId();
@@ -403,6 +404,7 @@ export function useDocRun(): DocRunLayer & {
     [run],
   );
   const currentDefinition = current?.workflow_definition;
+  const currentVersion = current?.version;
   // One object per change, so a memo keyed on the whole run does not recompute on every render.
   return useMemo(
     () => ({
@@ -425,6 +427,7 @@ export function useDocRun(): DocRunLayer & {
       blockRun,
       blockRunTarget,
       currentDefinition,
+      currentVersion,
       previous,
     }),
     [
@@ -441,6 +444,7 @@ export function useDocRun(): DocRunLayer & {
       blockRun,
       blockRunTarget,
       currentDefinition,
+      currentVersion,
       previous,
     ],
   );

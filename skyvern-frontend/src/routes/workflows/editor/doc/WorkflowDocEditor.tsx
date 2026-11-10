@@ -41,7 +41,12 @@ import {
   useWorkflowScopeId,
   useWorkflowScopeReadOnly,
 } from "../WorkflowScopeContext";
-import { buildDocTree, countDocSteps, type DocItem } from "./buildDocTree";
+import {
+  buildDocTree,
+  countDocSteps,
+  docStepNumbers,
+  type DocItem,
+} from "./buildDocTree";
 import { docLearnContent, type DocLearnContent } from "./docLearnContent";
 import { docStarterDone, useDocStarter } from "./useDocStarter";
 import { getDocInputChips } from "./docInputChips";
@@ -72,6 +77,7 @@ import { useDocRun } from "./useDocRun";
 import { docRunFor } from "./useDocRunFor";
 import { useDocRunStore, type DocRunInput } from "./docRunStore";
 import { DocOutline } from "./DocOutline";
+import { DocRunLine } from "./DocRunLine";
 import { DocStepSearch } from "./DocStepSearch";
 import { DocAnnouncer } from "./DocAnnouncer";
 import { DocAddStep, DocScope, type DocNoteProblem } from "./DocScope";
@@ -339,6 +345,7 @@ export function WorkflowDocEditor({
     () => buildDocTree(nodes, edges, finallyBlockLabel),
     [nodes, edges, finallyBlockLabel],
   );
+  const stepNumbers = useMemo(() => docStepNumbers(tree.items), [tree.items]);
   const previousNoteReader = useMemo(() => {
     const { previousByLabel } = graphNoteReadings(
       nodes,
@@ -1028,6 +1035,7 @@ export function WorkflowDocEditor({
         selectedBranch: (conditionalId) => branchSelections.get(conditionalId),
         previousNoteReader,
         promptUrlOffer: (node) => docPromptUrlOffer({ nodes, edges }, node),
+        stepNumbers,
         selectBranch,
         loopOpen: (loopId) => !closedLoops.has(loopId),
         toggleLoop: (loopId) =>
@@ -1177,14 +1185,7 @@ export function WorkflowDocEditor({
                 proposalPending={Boolean(proposal)}
               />
             </div>
-            {docRun.earlierVersion && docRun.runId && (
-              <div
-                className="mb-3 text-[13px] text-muted-foreground"
-                data-testid="doc-earlier-version-note"
-              >
-                Results from the last run (an earlier version)
-              </div>
-            )}
+            <DocRunLine docRun={docRun} numbers={stepNumbers} byId={byId} />
             <div className="mb-[26px] flex flex-wrap items-center gap-1.5 border-b border-border pb-[18px]">
               <span className="mr-1 text-[12.5px] text-[hsl(0_0%_60%)] dark:text-[hsl(215_14%_52%)]">
                 Inputs
