@@ -605,15 +605,52 @@ def _chain_start_label(blocks: list[BlockYAML], label_to_block: dict[str, BlockY
     return blocks[0].label
 
 
-def _repair_next_block_label_chain(blocks: list[BlockYAML], *, list_ordered: bool = False) -> None:
-    """Stitch blocks into one acyclic chain in place, recursing into loops; branch targets keep their places.
-    A list_ordered (version 1) top level runs in list order and may not route, so only its loop bodies are stitched."""
+def _drop_unknown_next_block_labels(blocks: list[BlockYAML]) -> list[tuple[BlockYAML, int | None, str]]:
+    labels = {block.label for block in blocks}
+    dropped: list[tuple[BlockYAML, int | None, str]] = []
+    for block in blocks:
+        if block.next_block_label is not None and block.next_block_label not in labels:
+            dropped.append((block, None, block.next_block_label))
+            block.next_block_label = None
+        if isinstance(block, ConditionalBlockYAML):
+            for index, branch in enumerate(block.branch_conditions):
+                if branch.next_block_label is not None and branch.next_block_label not in labels:
+                    dropped.append((block, index, branch.next_block_label))
+                    branch.next_block_label = None
+    for block, branch_index, target in dropped:
+        LOG.warning(
+            "Copilot dropped link to unknown block", block=block.label, target=target, branch_index=branch_index
+        )
+    return dropped
+
+
+def _repair_next_block_label_chain(blocks: list[BlockYAML], *, list_ordered: bool = False) -> list[dict[str, Any]]:
+    """Null links to labels missing from the same list, then stitch blocks into one acyclic chain in place, recursing
+    into loops; branch targets keep their places. A list_ordered (version 1) top level runs in list order and may not
+    route, so only its loop bodies are stitched. Returns each dropped link with the label it points to now."""
+    dropped = _drop_unknown_next_block_labels(blocks)
+    dropped_in_loops = _stitch_next_block_label_chain(blocks, list_ordered=list_ordered)
+    links: list[dict[str, Any]] = []
+    for block, index, target in dropped:
+        if index is None:
+            now = block.next_block_label
+        else:
+            assert isinstance(block, ConditionalBlockYAML)
+            # The engine graph draws a conditional's edges only from its branches, so a None branch can leave its merge
+            # block unreachable. Copied after stitching so the branch gets the conditional's final, cycle-free next block.
+            now = block.branch_conditions[index].next_block_label = block.next_block_label
+        links.append({"block": block.label, "branch_index": index, "target": target, "now": now})
+    return links + dropped_in_loops
+
+
+def _stitch_next_block_label_chain(blocks: list[BlockYAML], *, list_ordered: bool) -> list[dict[str, Any]]:
+    dropped_in_loops: list[dict[str, Any]] = []
     for block in blocks:
         if isinstance(block, (ForLoopBlockYAML, WhileLoopBlockYAML)) and block.loop_blocks:
-            _repair_next_block_label_chain(block.loop_blocks)
+            dropped_in_loops += _repair_next_block_label_chain(block.loop_blocks)
 
     if list_ordered or len(blocks) <= 1:
-        return
+        return dropped_in_loops
 
     # Warn on duplicate labels — the dict comprehension silently keeps the last
     # occurrence, so earlier blocks with the same label become invisible.
@@ -658,9 +695,16 @@ def _repair_next_block_label_chain(blocks: list[BlockYAML], *, list_ordered: boo
 
         if terminal_label and ordered_orphan_labels:
             label_to_block[terminal_label].next_block_label = ordered_orphan_labels[0]
+    return dropped_in_loops
 
 
 def _normalize_copilot_yaml(workflow_yaml: str) -> WorkflowCreateYAMLRequest:
+    return _normalize_copilot_yaml_with_dropped_links(workflow_yaml)[0]
+
+
+def _normalize_copilot_yaml_with_dropped_links(
+    workflow_yaml: str,
+) -> tuple[WorkflowCreateYAMLRequest, list[dict[str, Any]]]:
     parsed_yaml = safe_load_no_dates(workflow_yaml)
 
     # Fixing trivial common LLM mistakes; non-dict YAML falls through to model_validate.
@@ -687,9 +731,11 @@ def _normalize_copilot_yaml(workflow_yaml: str) -> WorkflowCreateYAMLRequest:
         p for p in workflow_yaml_request.workflow_definition.parameters if p.parameter_type != ParameterType.OUTPUT
     ]
 
-    _repair_next_block_label_chain(workflow_yaml_request.workflow_definition.blocks, list_ordered=list_ordered)
+    dropped_links = _repair_next_block_label_chain(
+        workflow_yaml_request.workflow_definition.blocks, list_ordered=list_ordered
+    )
 
-    return workflow_yaml_request
+    return workflow_yaml_request, dropped_links
 
 
 def _yaml_bool_setting(workflow_yaml: str | None, setting_name: str) -> bool | None:

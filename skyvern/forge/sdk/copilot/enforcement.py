@@ -986,6 +986,9 @@ def _summarize_tool_output(output: str) -> str:
         block_type_changes = data.get("block_type_changes")
         if isinstance(block_type_changes, dict) and block_type_changes:
             synopsis["block_type_changes"] = block_type_changes
+        dropped_next_block_links = data.get("dropped_next_block_links")
+        if isinstance(dropped_next_block_links, list) and dropped_next_block_links:
+            synopsis["dropped_next_block_links"] = dropped_next_block_links
 
         # Preserve failure_categories — tools._record_run_blocks_result injects
         # these specifically for downstream reasoning about why a test failed.
