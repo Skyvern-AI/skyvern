@@ -6,7 +6,9 @@ export type DocValuePreview = { text: string; title?: string; href?: string };
 // A URL with a {{ }} template in it is not a real address yet, so it stays text.
 const WEB_URL = /^https?:\/\/[^\s{}]+$/i;
 // Any other scheme (s3:// from an upload, gs://, ...) is named but never linked.
-const STORAGE_URI = /^([a-z][a-z0-9+.-]*):\/\/([^\s/{}]+)((?:\/[^\s{}]*)?)$/i;
+// An upload keeps its file name unescaped in the last segment only, so only that segment may hold spaces.
+const STORAGE_URI =
+  /^([a-z][a-z0-9+.-]*):\/\/([^\s/{}]+)((?:\/[^\s/{}]*)*(?:\/[^/{}\r\n]*)?)$/i;
 const MAX_TITLE = 2000;
 
 function webUrl(value: unknown): URL | null {
@@ -33,9 +35,11 @@ function pathSegments(path: string): string[] {
 function storagePreview(text: string): DocValuePreview | null {
   const [, scheme = "", host = "", path = ""] = text.match(STORAGE_URI) ?? [];
   if (!scheme || /^https?$/i.test(scheme)) return null;
+  const name = pathSegments(path).pop();
+  if (name !== undefined && !name.trim()) return null;
   return {
-    text: pathSegments(path).pop() ?? `${scheme}://${host}`,
-    title: text,
+    text: name ?? `${scheme}://${host}`,
+    title: cappedTitle(text),
   };
 }
 
@@ -82,7 +86,9 @@ export function docInputValuePreview(value: unknown): DocValuePreview | null {
   if (storage) return storage;
   const json = parsedJson(text);
   if (json) return jsonPreview(json);
-  return { text: text.replace(/^https?:\/\//, "") };
+  const shown = text.replace(/^https?:\/\//, "");
+  // The chip cuts by width, not by characters, so every value keeps the whole of it on hover.
+  return { text: shown, title: cappedTitle(text) };
 }
 
 function cellUrlText(url: URL, text: string): string {

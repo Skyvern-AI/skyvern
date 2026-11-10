@@ -5,6 +5,8 @@ const LONG = "https://example.com/a/very/long/path/to/some/page?query=1";
 const ORDER = { customer_ref: "c1", amount: 3, currency: "USD", note: "" };
 const UPLOAD =
   "s3://uploads-bucket/production/o_1/2026-11-10/passport%20scan.pdf";
+const SPACED = "s3://bkt/prod/o_1/2026-11-10/fid_My Passport.jpg";
+const FREE_TEXT = ["ftp://host/a and/or b, please check", "s3://b/dir/ "];
 const ARTIFACT =
   "https://api.example.com/v1/artifacts/a_1/content?expiry=1&artifact_name=invoice.pdf&signature=x";
 
@@ -49,6 +51,40 @@ describe("docInputValuePreview", () => {
     });
     expect(docInputValuePreview("")).toBeNull();
   });
+
+  test("names an uploaded file whose name has a space, but not a host with one", () => {
+    expect(docInputValuePreview(SPACED)).toEqual({
+      text: "fid_My Passport.jpg",
+      title: SPACED,
+    });
+    expect(docInputValuePreview("s3://my bucket/a.jpg")).toEqual({
+      text: "s3://my bucket/a.jpg",
+      title: "s3://my bucket/a.jpg",
+    });
+  });
+
+  test.each([
+    "accounts.payable@northwind-traders.com",
+    "hello world",
+    "https://example.com/{{ order_id }}",
+    ...FREE_TEXT,
+  ])(
+    "the chip cuts by width, so %s keeps the whole value as its title",
+    (value) => {
+      expect(docInputValuePreview(value)?.title).toBe(value);
+    },
+  );
+
+  test("text after a scheme reads as the whole value; a long storage URI gets a capped title", () => {
+    for (const value of FREE_TEXT) {
+      expect(docInputValuePreview(value)?.text).toBe(value);
+    }
+    const long = `s3://bkt/${"d/".repeat(1500)}scan.pdf`;
+    const title = docInputValuePreview(long)?.title;
+    expect(docInputValuePreview(long)?.text).toBe("scan.pdf");
+    expect(title).toHaveLength(2001);
+    expect(title?.endsWith("…")).toBe(true);
+  });
 });
 
 describe("docCellPreview", () => {
@@ -86,7 +122,13 @@ describe("docCellPreview", () => {
       { text: "invoice.pdf", href: ARTIFACT },
     ],
     ["an uploaded file", UPLOAD, { text: "passport scan.pdf" }],
+    ["an uploaded file with a space", SPACED, { text: "fid_My Passport.jpg" }],
     ["plain text", "hello world", { text: "hello world" }],
+    ...FREE_TEXT.map((value): [string, string, { text: string }] => [
+      `free text ${value}`,
+      value,
+      { text: value },
+    ]),
     [
       "a URL with a template",
       "https://example.com/{{ id }}",
