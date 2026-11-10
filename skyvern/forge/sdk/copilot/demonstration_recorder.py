@@ -9,7 +9,7 @@ import mimetypes
 import os
 import secrets
 import time
-from collections.abc import Awaitable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
@@ -136,6 +136,8 @@ class DemonstrationRecord:
     replay_token: str | None = None
     recording_started_at: datetime | None = None
     value_chars: int = 0
+    # The person who started the demonstration; None for an organization key or a record from before this was kept.
+    human_user_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -200,6 +202,7 @@ def encode_demonstration_record(record: DemonstrationRecord) -> str:
             "replay_token": record.replay_token,
             "recording_started_at": record.recording_started_at.isoformat() if record.recording_started_at else None,
             "value_chars": record.value_chars,
+            "human_user_id": record.human_user_id,
         },
         separators=(",", ":"),
     )
@@ -256,6 +259,7 @@ def decode_demonstration_record(raw: Any) -> DemonstrationRecord | None:
         replay_started_at=replay_started_at,
         replay_token=data.get("replay_token") if isinstance(data.get("replay_token"), str) else None,
         recording_started_at=_decode_timestamp(data.get("recording_started_at")),
+        human_user_id=data.get("human_user_id") if isinstance(data.get("human_user_id"), str) else None,
     )
 
 
@@ -351,6 +355,8 @@ async def claim_demonstration_recording(
     browser_session_id: str,
     demonstration_id: str | None,
     insertion: dict[str, str | None] | None = None,
+    human_user_id: str | None = None,
+    authorize_replace: Callable[[DemonstrationRecord], Awaitable[None]] | None = None,
 ) -> DemonstrationClaim:
     browser_key = demonstration_browser_key(organization_id, browser_session_id)
     replaced: tuple[str, int] | None = None
@@ -420,6 +426,9 @@ async def claim_demonstration_recording(
                         HTTPStatus.CONFLICT, "Another demonstration is recording on this browser"
                     )
                 if indexed is not None and indexed.status in {"recording", "stopping", "stopped"}:
+                    # Checked here, under both locks, so the record checked is the one cancelled, whatever its workflow.
+                    if authorize_replace is not None:
+                        await authorize_replace(indexed)
                     indexed.status = "cancelled"
                     indexed.owner = None
                     indexed.owner_seen_at = None
@@ -442,6 +451,7 @@ async def claim_demonstration_recording(
             final_url=None,
             insertion=insertion,
             recording_started_at=datetime.now(UTC),
+            human_user_id=human_user_id,
         )
         await cache.set(demonstration_controls_key(organization_id, demonstration_id), "[]", ex=DEMONSTRATION_TTL)
         await cache.set(
