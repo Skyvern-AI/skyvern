@@ -28,6 +28,7 @@ import { useHeroScreenshot } from "../../studio/runview/useHeroScreenshot";
 import { useBlockScreenshot } from "../../workflowRun/useBlockScreenshot";
 import type { WorkflowRunBlock } from "../../types/workflowRunTypes";
 import { useBlockRunTarget } from "../hooks/useBlockRunTarget";
+import { docCellPreview } from "./docValuePreview";
 import { useDocRunFor } from "./useDocRunFor";
 import {
   docFailureDetail,
@@ -182,11 +183,21 @@ function resultText(
   }
 }
 
-const cellText = (value: unknown): string => {
-  if (value === null || value === undefined || value === "") return "–";
-  if (typeof value === "object") return JSON.stringify(value);
-  return String(value);
-};
+function CellValue({ value }: { value: unknown }) {
+  const { text, title, href } = docCellPreview(value);
+  if (!href) return <span title={title}>{text}</span>;
+  return (
+    <a
+      href={href}
+      target="_blank"
+      rel="noopener noreferrer"
+      title={title}
+      className="underline decoration-muted-foreground underline-offset-2 hover:decoration-foreground"
+    >
+      {text}
+    </a>
+  );
+}
 
 const CELL = "px-2.5 py-1 align-top [overflow-wrap:anywhere]";
 
@@ -232,7 +243,7 @@ function ProducedValues({ produced }: { produced: DocProduced }) {
                           "whitespace-nowrap text-right tabular-nums",
                       )}
                     >
-                      {cellText(row[column])}
+                      <CellValue value={row[column]} />
                     </td>
                   ))}
                 </tr>
@@ -270,7 +281,7 @@ function ProducedValues({ produced }: { produced: DocProduced }) {
                       "whitespace-nowrap text-right tabular-nums",
                   )}
                 >
-                  {cellText(value)}
+                  <CellValue value={value} />
                 </td>
               </tr>
             ))}

@@ -178,7 +178,6 @@ export function DocConditional({
     children: DocItem[],
     scope?: DocScopeRef,
     branchId?: string,
-    numberStart?: number,
   ) => ReactNode;
 }) {
   const actions = useContext(WorkflowDocActionsContext);
@@ -216,10 +215,6 @@ export function DocConditional({
     actions.selectBranch(node.id, branch.branchId);
   };
   const empty = selected.children.length === 0 && !selected.jumpTo;
-  const tabOrder = [...conditions, ...(otherwise ? [otherwise] : [])];
-  const numberStart = tabOrder
-    .slice(0, tabOrder.indexOf(selected))
-    .reduce((n, branch) => n + branch.numberedCount, 1);
   const [confirmingRemove, setConfirmingRemove] = useState(false);
   const conditionIndex = conditions.indexOf(selected);
   const canMoveEarlier = conditionIndex > 0;
@@ -497,7 +492,6 @@ export function DocConditional({
                       conditionalBranchId: selected.branchId,
                     },
                 selected.branchId,
-                numberStart,
               )}
               {selected.jumpTo && (
                 <DocJump

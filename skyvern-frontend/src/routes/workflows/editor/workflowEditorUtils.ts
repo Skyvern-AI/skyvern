@@ -4793,7 +4793,8 @@ function leavesBrowserState(node: AppNode, nodes: Array<AppNode>): boolean {
     case "navigation":
       return node.data.engine !== RunEngine.SkyvernV2;
     case "loop":
-      // A container itself navigates nothing; its children do.
+      // A container itself navigates nothing; its children do. A loop that runs zero times opens nothing
+      // either; counting it anyway is a deliberate approximation that can only hide this warning.
       return nodes.some(
         (child) =>
           child.parentId === node.id && leavesBrowserState(child, nodes),
@@ -4830,15 +4831,8 @@ function isFirstBrowserTaskBlock(
   });
 }
 
-// A run starts on about:blank, so the backend fails a first page-opening block that has no
-// URL (MissingStarterUrl).
-function isMissingRequiredStartUrl(
-  nodes: Array<AppNode>,
-  edges: Array<Edge>,
-  id: string,
-): boolean {
-  const node = nodes.find((node) => node.id === id);
-  if (!node) return false;
+// A page-opening block with an empty URL field starts on whatever page the run has open.
+function opensPageWithoutUrl(node: AppNode, nodes: Array<AppNode>): boolean {
   switch (node.type) {
     case "task":
     case "navigation":
@@ -4847,14 +4841,25 @@ function isMissingRequiredStartUrl(
     case "login":
     case "url":
     case "fileDownload":
-      return (
-        node.data.url.trim() === "" &&
-        leavesBrowserState(node, nodes) &&
-        isFirstBrowserTaskBlock(nodes, edges, id)
-      );
+      return node.data.url.trim() === "" && leavesBrowserState(node, nodes);
     default:
       return false;
   }
+}
+
+// A run starts on about:blank, so the backend fails a first page-opening block that has no
+// URL (MissingStarterUrl).
+function isMissingRequiredStartUrl(
+  nodes: Array<AppNode>,
+  edges: Array<Edge>,
+  id: string,
+): boolean {
+  const node = nodes.find((node) => node.id === id);
+  return (
+    node !== undefined &&
+    opensPageWithoutUrl(node, nodes) &&
+    isFirstBrowserTaskBlock(nodes, edges, id)
+  );
 }
 
 function convertParametersToParameterYAML(
@@ -6409,6 +6414,7 @@ export {
   getAvailableOutputParameterKeys,
   isFirstBrowserTaskBlock,
   isMissingRequiredStartUrl,
+  opensPageWithoutUrl,
   urlMayBeGoogleDrive,
   getBlockNameOfOutputParameterKey,
   getDefaultValueForParameterType,

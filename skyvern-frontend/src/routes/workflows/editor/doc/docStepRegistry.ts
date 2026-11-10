@@ -179,6 +179,18 @@ export function getDocProseFields(node: Node): DocProseField[] {
   return proseFields[node.type ?? ""] ?? [];
 }
 
+/** The prose fields with text, in order; the first is the line the Doc shows as the step's prompt. */
+export function getDocFilledProseFields(
+  node: Node,
+  keep: readonly string[] = [],
+): (DocProseField & { value: string })[] {
+  return getDocProseFields(node).flatMap((f) => {
+    const value =
+      typeof node.data[f.key] === "string" ? (node.data[f.key] as string) : "";
+    return value.trim() || keep.includes(f.key) ? [{ ...f, value }] : [];
+  });
+}
+
 // Steps whose main line is a setting (a URL, a file), not an instruction; their title stays the summary.
 const SETTING_MAIN = new Set([
   "url",

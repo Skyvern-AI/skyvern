@@ -1163,7 +1163,9 @@ async def test_demonstration_upload_passes_a_restricted_type_through_to_the_reco
         "app",
         SimpleNamespace(
             CACHE=cache,
-            AGENT_FUNCTION=SimpleNamespace(enforce_folder_access=AsyncMock()),
+            AGENT_FUNCTION=SimpleNamespace(
+                enforce_folder_access=AsyncMock(), copilot_turn_control_allowed=AsyncMock(return_value=True)
+            ),
             SETTINGS_MANAGER=SimpleNamespace(MAX_UPLOAD_FILE_SIZE=1024 * 1024),
         ),
     )

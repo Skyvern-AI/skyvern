@@ -51,7 +51,7 @@ export function DocSidePanel({
     <aside
       ref={panelRef}
       aria-label="Document panel"
-      className="absolute inset-0 z-20 overflow-y-auto bg-slate-elevation1 sm:relative sm:inset-auto sm:w-96 sm:max-w-[45%] sm:shrink-0 sm:border-l sm:border-border"
+      className="absolute inset-0 z-20 overflow-y-auto bg-slate-elevation1 sm:relative sm:inset-auto sm:w-[22rem] sm:max-w-[36%] sm:shrink-0 sm:border-l sm:border-border"
     >
       <button
         type="button"

@@ -152,6 +152,28 @@ describe("WorkflowDocEditor navigation", () => {
     vi.unstubAllGlobals();
   });
 
+  test("a run line above the steps says which run the results come from, and shows only with a run", () => {
+    renderDoc();
+    expect(screen.queryByTestId("doc-run-line")).toBeNull();
+    cleanup();
+    docRun.current = {
+      runId: "wr_1",
+      run: {
+        status: Status.Failed,
+        created_at: new Date().toISOString(),
+        workflow: { version: 2 },
+      },
+      currentVersion: 3,
+      earlierVersion: true,
+      blocksByLabel: new Map(),
+      live: false,
+    };
+    renderDoc();
+    expect(screen.getByTestId("doc-run-line").textContent).toContain(
+      "Run wr_1 · Failed · just now · an earlier version, v2",
+    );
+  });
+
   describe("keyboard-first editing", () => {
     const editsWithAdd = (): DocGraphEdits => ({
       apply: vi.fn(),
@@ -700,6 +722,132 @@ describe("WorkflowDocEditor navigation", () => {
   test("a Go to URL step with no URL shows a required chip", () => {
     renderDoc([block("goto_url", "open_site", null, { url: "" })]);
     expect(document.querySelector('[data-doc-missing="URL"]')).toBeTruthy();
+  });
+
+  test("a step offers its prompt's URL for its empty URL field after Step options, with the reason, and not while typing or read-only", () => {
+    const task = block("task", "search_step", "next_step", {
+      url: "",
+      navigation_goal: "Go to https://example.com/page and search for shoes",
+    });
+    const next = block("task", "next_step", null, {
+      url: "",
+      navigation_goal: "Then open https://example.com/other",
+    });
+    const edits: DocGraphEdits = {
+      apply: vi.fn(),
+      update: vi.fn(),
+      addStep: vi.fn(),
+      duplicate: vi.fn(),
+    };
+    const nodes = renderDoc([task, next], edits);
+    const offer = () =>
+      screen.queryByRole("button", {
+        name: "Use https://example.com/page as the URL",
+      });
+    expect(
+      screen.getByText("This step needs a page to start on."),
+    ).toBeTruthy();
+    expect(
+      screen.getByText(
+        "Without a URL, this step starts on the previous step's page.",
+      ),
+    ).toBeTruthy();
+
+    const mainLine = screen.getByRole("textbox", {
+      name: "search_step navigationGoal",
+    });
+    fireEvent.focus(mainLine);
+    expect(offer()).toBe(null);
+    fireEvent.blur(
+      screen.getByRole("textbox", { name: "search_step navigationGoal" }),
+    );
+
+    // Forward Tab follows the DOM: the prompt, then Step options, then the offer.
+    const tabbable = [
+      ...document.querySelectorAll<HTMLElement>('[role="textbox"], button'),
+    ];
+    const at = (el: HTMLElement) => tabbable.indexOf(el);
+    const prompt = screen.getByRole("textbox", {
+      name: "search_step navigationGoal",
+    });
+    const options = screen.getByRole("button", {
+      name: /^Step options for .*search/i,
+    });
+    expect(at(prompt)).toBeLessThan(at(options));
+    expect(at(options)).toBeLessThan(at(offer()!));
+    expect(
+      tabbable
+        .slice(at(options) + 1, at(offer()!))
+        .some((el) => el.getAttribute("role") === "textbox"),
+    ).toBe(false);
+
+    fireEvent.click(offer()!);
+    const updater = vi.mocked(edits.update).mock.calls[0]![0];
+    const data = updater(nodes).find(isWorkflowBlockNode)!.data as Record<
+      string,
+      unknown
+    >;
+    expect(data.url).toBe("https://example.com/page");
+    expect(data.navigationGoal).toBe(
+      "Go to https://example.com/page and search for shoes",
+    );
+    expect(docAnnouncement()).toBe("URL set to https://example.com/page");
+    expect(document.activeElement?.getAttribute("aria-label")).toBe(
+      "search_step navigationGoal",
+    );
+
+    // Dismissing an offer puts focus back on its step's prompt line.
+    const nextOffer = document.querySelector<HTMLElement>(
+      '[data-doc-suggestion="url"]',
+    )!;
+    fireEvent.click(within(nextOffer).getByRole("button", { name: "Dismiss" }));
+    expect(nextOffer.isConnected).toBe(false);
+    expect(document.activeElement?.getAttribute("aria-label")).toBe(
+      "next_step navigationGoal",
+    );
+
+    cleanup();
+    renderDoc([task, next]);
+    expect(offer()).toBe(null);
+  });
+
+  test("a step's URL offer comes back after a demonstration takes editing away while its prompt is focused and focus moves on", () => {
+    renderDoc(
+      [
+        block("task", "focus_step", null, {
+          url: "",
+          navigation_goal: "Go to https://example.com/focus and search",
+        }),
+      ],
+      { apply: vi.fn(), update: vi.fn(), addStep: vi.fn(), duplicate: vi.fn() },
+    );
+    const offer = () =>
+      screen.queryByRole("button", {
+        name: "Use https://example.com/focus as the URL",
+      });
+    fireEvent.focus(
+      screen.getByRole("textbox", { name: "focus_step navigationGoal" }),
+    );
+    expect(offer()).toBe(null);
+    act(() =>
+      useRecordingLauncherStore.setState({
+        demonstration: {
+          phase: "recording",
+          actionCount: 0,
+          interrupted: false,
+          insertion: null,
+        },
+      }),
+    );
+    // Focus moves on during the demonstration (to the control that started it), so the line does not take it back.
+    const elsewhere = document.body.appendChild(
+      document.createElement("button"),
+    );
+    act(() => elsewhere.focus());
+    act(() => useRecordingLauncherStore.setState({ demonstration: null }));
+    expect(document.activeElement).toBe(elsewhere);
+    expect(offer()).not.toBe(null);
+    elsewhere.remove();
   });
 
   test("Locate on a step inside a collapsed loop reopens the loop and consumes the request", () => {

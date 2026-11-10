@@ -41,10 +41,15 @@ import {
   useWorkflowScopeId,
   useWorkflowScopeReadOnly,
 } from "../WorkflowScopeContext";
-import { buildDocTree, countDocSteps, type DocItem } from "./buildDocTree";
+import {
+  buildDocTree,
+  countDocSteps,
+  docStepNumbers,
+  type DocItem,
+} from "./buildDocTree";
 import { docLearnContent, type DocLearnContent } from "./docLearnContent";
 import { docStarterDone, useDocStarter } from "./useDocStarter";
-import { getDocInputChips } from "./docInputChips";
+import { getDocInputChips, NOT_USED_TITLE } from "./docInputChips";
 import {
   docInputNameProblem,
   isDocEditableInput,
@@ -72,6 +77,7 @@ import { useDocRun } from "./useDocRun";
 import { docRunFor } from "./useDocRunFor";
 import { useDocRunStore, type DocRunInput } from "./docRunStore";
 import { DocOutline } from "./DocOutline";
+import { DocRunLine } from "./DocRunLine";
 import { DocStepSearch } from "./DocStepSearch";
 import { DocAnnouncer } from "./DocAnnouncer";
 import { DocAddStep, DocScope, type DocNoteProblem } from "./DocScope";
@@ -92,6 +98,7 @@ import { docStepTitle } from "./docStepRegistry";
 import { docProblemEntries, docStepProblems } from "./docProblems";
 import { customSettingsShortText } from "./docSettingsChips";
 import { DocProblemsList } from "./DocProblemsList";
+import { docPromptUrlOffer } from "./docPromptUrl";
 import { stepsLeftBy, useDocUnfinishedStore } from "./docUnfinished";
 import { DocGettingStarted, DocStarterNote, DocTip } from "./DocStarter";
 import { docTipIndex, type DocStarterProgress } from "./docStarterTips";
@@ -338,6 +345,7 @@ export function WorkflowDocEditor({
     () => buildDocTree(nodes, edges, finallyBlockLabel),
     [nodes, edges, finallyBlockLabel],
   );
+  const stepNumbers = useMemo(() => docStepNumbers(tree.items), [tree.items]);
   const previousNoteReader = useMemo(() => {
     const { previousByLabel } = graphNoteReadings(
       nodes,
@@ -1026,6 +1034,8 @@ export function WorkflowDocEditor({
         goTo,
         selectedBranch: (conditionalId) => branchSelections.get(conditionalId),
         previousNoteReader,
+        promptUrlOffer: (node) => docPromptUrlOffer({ nodes, edges }, node),
+        stepNumbers,
         selectBranch,
         loopOpen: (loopId) => !closedLoops.has(loopId),
         toggleLoop: (loopId) =>
@@ -1175,14 +1185,7 @@ export function WorkflowDocEditor({
                 proposalPending={Boolean(proposal)}
               />
             </div>
-            {docRun.earlierVersion && docRun.runId && (
-              <div
-                className="mb-3 text-[13px] text-muted-foreground"
-                data-testid="doc-earlier-version-note"
-              >
-                Results from the last run (an earlier version)
-              </div>
-            )}
+            <DocRunLine docRun={docRun} numbers={stepNumbers} byId={byId} />
             <div className="mb-[26px] flex flex-wrap items-center gap-1.5 border-b border-border pb-[18px]">
               <span className="mr-1 text-[12.5px] text-[hsl(0_0%_60%)] dark:text-[hsl(215_14%_52%)]">
                 Inputs
@@ -1209,7 +1212,7 @@ export function WorkflowDocEditor({
                         : parameter?.parameterType === "context"
                           ? `Uses data from ${parameter.sourceParameterKey}${input.unused ? "; not used by any step" : ""}`
                           : input.unused
-                            ? "Not used by any step"
+                            ? NOT_USED_TITLE
                             : undefined
                     }
                     className={cn(
@@ -1223,8 +1226,9 @@ export function WorkflowDocEditor({
                     <span className="truncate">{input.key}</span>
                     {(input.missing || input.value) && (
                       <em
+                        title={input.missing ? undefined : input.valueTitle}
                         className={cn(
-                          "max-w-[160px] truncate not-italic text-muted-foreground",
+                          "max-w-[240px] truncate not-italic text-muted-foreground",
                           input.missing && "text-[#B45B0A] dark:text-[#E79A55]",
                         )}
                       >
