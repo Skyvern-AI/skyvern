@@ -5180,8 +5180,8 @@ async def _redact_workflow_run_list(runs: list[WorkflowRun], organization_id: st
         return await redact_workflow_run_artifact_rows(runs, organization_id)
 
 
-# What a caller without run read access sees in a run list: status and metadata. Any other field, including one added
-# later, is reset to its default, so run inputs, settings and failure text stay with run readers.
+# What a caller without run read access sees in a list of WorkflowRun rows: status and metadata. Any other field,
+# including one added later, is reset to its default, so run inputs, settings and failure text stay with run readers.
 WORKFLOW_RUN_LIST_METADATA_FIELDS = frozenset(
     {
         "workflow_run_id",

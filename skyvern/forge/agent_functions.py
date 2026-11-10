@@ -2191,6 +2191,12 @@ class AgentFunction:
         """Return an org-scoped API key; returns None in the base implementation."""
         return None
 
+    async def resolve_copilot_loopback_api_key(
+        self, principal: RequestPrincipal | None, organization_id: str, request_key: str | None
+    ) -> str | None:
+        """The key Copilot's tools send to the API on behalf of the chat user; raises HTTPException to refuse."""
+        return request_key
+
     async def browser_context_route_handlers_allowed(self, **_: Any) -> bool:
         return True
 
