@@ -86,6 +86,7 @@ from skyvern.forge.sdk.copilot.credential_pause import (
 )
 from skyvern.forge.sdk.copilot.credential_resolution import load_credentials, loggable_origin
 from skyvern.forge.sdk.copilot.demonstration_recorder import (
+    DemonstrationRecord,
     DemonstrationRecorder,
     DemonstrationRejection,
     active_demonstration,
@@ -604,12 +605,12 @@ COPILOT_SUPERSEDE_REFUSED = (
 )
 
 
-async def _copilot_turn_control_allowed(
-    organization_id: str, turn: CopilotPendingTurn, control: CopilotTurnControl
+async def _copilot_control_allowed(
+    organization_id: str, starter_user_id: str | None, control: CopilotTurnControl
 ) -> bool:
     try:
         return await app.AGENT_FUNCTION.copilot_turn_control_allowed(
-            get_request_principal(), organization_id, turn.starter_user_id, control
+            get_request_principal(), organization_id, starter_user_id, control
         )
     except Exception:
         LOG.warning(
@@ -629,7 +630,7 @@ async def _require_copilot_turn_control(
     # token is the proof, and an unmatched one only sets the stop flag for that token.
     if turn is None:
         return
-    if not await _copilot_turn_control_allowed(organization_id, turn, control):
+    if not await _copilot_control_allowed(organization_id, turn.starter_user_id, control):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only the person who started this Copilot turn, or an Admin, can stop it."
@@ -658,6 +659,21 @@ async def _copilot_turns_without_control(
         if not allowed_by_starter[turn.starter_user_id]:
             hidden.add(turn.turn_id)
     return hidden
+
+
+async def _require_demonstration_control(
+    organization_id: str, demonstration: DemonstrationRecord | None, control: CopilotTurnControl
+) -> None:
+    # A demonstration drives its starter's browser session, so it follows the same rule as a running turn.
+    if demonstration is None:
+        return
+    if not await _copilot_control_allowed(organization_id, demonstration.human_user_id, control):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the person who started this demonstration, or an Admin, can stop it."
+            if control == "cancel"
+            else "Only the person who started this demonstration can use it.",
+        )
 
 
 async def _cancel_already_requested(cache: BaseCache | None, organization_id: str, cancel_token: str) -> bool:
@@ -693,7 +709,7 @@ async def _turns_a_new_turn_supersedes(
 async def _require_control_of_superseded_turns(organization_id: str, turns: list[CopilotPendingTurn]) -> None:
     # Starting a turn stops these, so the caller needs the right to stop each one.
     for turn in turns:
-        if not await _copilot_turn_control_allowed(organization_id, turn, "cancel"):
+        if not await _copilot_control_allowed(organization_id, turn.starter_user_id, "cancel"):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=COPILOT_SUPERSEDE_REFUSED)
 
 
@@ -3949,6 +3965,7 @@ async def workflow_copilot_chat_post(
             )
         except DemonstrationRejection as rejection:
             raise HTTPException(status_code=rejection.status_code, detail=rejection.detail) from rejection
+        await _require_demonstration_control(organization.organization_id, demonstration, "steer")
         # A reloaded card no longer holds the files it attached; the recorded upload events still do.
         demonstrated_file_ids = await demonstration_file_ids(
             cache, organization.organization_id, chat_request.demonstration_id, demonstration.event_count
@@ -5235,6 +5252,17 @@ async def workflow_copilot_demonstration_record(
     )
     if browser_session is None or workflow is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown workflow or browser session")
+    if record_request.demonstration_id is not None:
+        await _require_demonstration_control(
+            organization.organization_id,
+            await load_demonstration_record(cache, organization.organization_id, record_request.demonstration_id),
+            "steer",
+        )
+
+    async def authorize_replace(replaced: DemonstrationRecord) -> None:
+        # A new recording cancels the browser's current demonstration, so it needs the right to stop that one.
+        await _require_demonstration_control(organization.organization_id, replaced, "cancel")
+
     try:
         claim = await claim_demonstration_recording(
             cache,
@@ -5243,6 +5271,8 @@ async def workflow_copilot_demonstration_record(
             browser_session_id=record_request.browser_session_id,
             demonstration_id=record_request.demonstration_id,
             insertion=record_request.insertion.model_dump() if record_request.insertion is not None else None,
+            human_user_id=human_user_id(get_request_principal(), organization.organization_id),
+            authorize_replace=authorize_replace,
         )
     except DemonstrationRejection as rejection:
         raise HTTPException(status_code=rejection.status_code, detail=rejection.detail) from rejection
@@ -5301,6 +5331,11 @@ async def workflow_copilot_demonstration_control(
             "workflow_copilot.manage",
             {"workflow_permanent_id": demonstration.workflow_permanent_id},
         )
+    await _require_demonstration_control(
+        organization.organization_id,
+        demonstration,
+        "cancel" if control_request.action in {"stop", "cancel"} else "steer",
+    )
     try:
         seq = await append_demonstration_control(
             cache,
@@ -5343,6 +5378,7 @@ async def workflow_copilot_demonstration_upload(
         "workflow_copilot.manage",
         {"workflow_permanent_id": demonstration.workflow_permanent_id},
     )
+    await _require_demonstration_control(organization.organization_id, demonstration, "steer")
     if demonstration.status != "recording":
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Demonstration is not recording")
     attached_file_ids = await demonstration_file_ids(
@@ -5396,6 +5432,10 @@ async def workflow_copilot_demonstration_active(
     if active is None:
         return None
     demonstration_id, record = active
+    # The id is the handle /control stop and cancel take, so a caller who may stop the demonstration receives it;
+    # the controls they may not use still answer 403.
+    if not await _copilot_control_allowed(organization.organization_id, record.human_user_id, "cancel"):
+        return None
     copilot_config = await app.AGENT_FUNCTION.get_copilot_config_for_request(
         organization.organization_id,
         code_block_mode=None,
