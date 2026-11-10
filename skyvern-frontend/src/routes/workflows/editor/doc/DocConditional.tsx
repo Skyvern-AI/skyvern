@@ -219,7 +219,7 @@ export function DocConditional({
   const tabOrder = [...conditions, ...(otherwise ? [otherwise] : [])];
   const numberStart = tabOrder
     .slice(0, tabOrder.indexOf(selected))
-    .reduce((n, branch) => n + branch.stepCount, 1);
+    .reduce((n, branch) => n + branch.numberedCount, 1);
   const [confirmingRemove, setConfirmingRemove] = useState(false);
   const conditionIndex = conditions.indexOf(selected);
   const canMoveEarlier = conditionIndex > 0;

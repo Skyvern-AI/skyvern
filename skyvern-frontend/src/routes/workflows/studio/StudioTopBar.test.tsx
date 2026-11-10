@@ -1056,16 +1056,16 @@ describe("RunStopButton while the Doc lists problems", () => {
   afterEach(() => {
     useRunValidationStore.setState({
       docProblemCount: 0,
-      docShowFirstProblem: null,
+      docShowProblems: null,
     });
   });
 
   test("Run stays enabled; a click says what to fix, jumps to it and starts nothing", () => {
     workflowRunQueryMock.mockReturnValue({ data: undefined });
-    const showFirstProblem = vi.fn();
+    const showProblems = vi.fn();
     useRunValidationStore.setState({
       docProblemCount: 2,
-      docShowFirstProblem: showFirstProblem,
+      docShowProblems: showProblems,
     });
     renderAt("/workflows/wpid_1/studio");
 
@@ -1073,7 +1073,7 @@ describe("RunStopButton while the Doc lists problems", () => {
     expect(runButton.hasAttribute("disabled")).toBe(false);
     fireEvent.click(runButton);
 
-    expect(showFirstProblem).toHaveBeenCalledTimes(1);
+    expect(showProblems).toHaveBeenCalledTimes(1);
     expect(screen.queryByTestId("location")).toBeNull();
   });
 });

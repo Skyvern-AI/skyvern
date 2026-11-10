@@ -52,6 +52,7 @@ import { DocEditBar } from "./DocEditing";
 import { DocRunButton } from "./DocRunButton";
 import { useDocRunStore } from "./docRunStore";
 import { useDocSaveFailureStore } from "./docSaveState";
+import { useRunValidationStore } from "../runValidation/useRunValidationStore";
 
 const block = {
   label: "open_site",
@@ -238,6 +239,41 @@ describe("DocRunButton pre-save", () => {
     const dialog = await screen.findByRole("dialog", { name: "Run with" });
     fireEvent.submit(dialog.querySelector("form")!);
   }
+
+  it("a Run refused for problems opens the Doc's problems list and does not open Run with", () => {
+    const showProblems = vi.fn();
+    useRunValidationStore.setState({
+      docProblemCount: 2,
+      docShowProblems: showProblems,
+    });
+    try {
+      render(
+        <QueryClientProvider client={new QueryClient()}>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/workflows/wpid_1/studio"]}>
+              <Routes>
+                <Route
+                  path="/workflows/:workflowPermanentId/studio"
+                  element={<DocRunButton />}
+                />
+              </Routes>
+            </MemoryRouter>
+          </TooltipProvider>
+        </QueryClientProvider>,
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Run" }));
+      expect(toastSpy).toHaveBeenCalledWith({
+        title: "Fix 2 problems before running",
+      });
+      expect(showProblems).toHaveBeenCalled();
+      expect(screen.queryByRole("dialog", { name: "Run with" })).toBeNull();
+    } finally {
+      useRunValidationStore.setState({
+        docProblemCount: 0,
+        docShowProblems: null,
+      });
+    }
+  });
 
   it("a Run whose save gets no answer leaves the Doc editable, says why, and does not start", async () => {
     useWorkflowYamlEditorStore.setState({

@@ -270,6 +270,24 @@ describe("buildDocTree", () => {
     expect(placedLabels(tree.items, labelOf)).toHaveLength(3);
   });
 
+  test("a branch counts every step inside it but numbers only its own steps", () => {
+    const blocks = [
+      conditional("check", "after", [
+        { id: "yes", next: "each", when: "found" },
+        { id: "else", next: null },
+      ]),
+      forLoop("each", "after", [
+        code("a", "b"),
+        code("b", "c"),
+        code("c", null),
+      ]),
+      code("after", null),
+    ];
+    const { tree } = expectNothingMissing(blocks);
+    const { branches } = tree.items[0] as { branches: DocBranch[] };
+    expect(branches[0]).toMatchObject({ stepCount: 4, numberedCount: 1 });
+  });
+
   test("branches that rejoin end in a Jump and the shared step shows once after the conditional", () => {
     const blocks = [
       code("start", "decide"),
