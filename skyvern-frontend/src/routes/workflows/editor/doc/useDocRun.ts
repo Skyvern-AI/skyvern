@@ -275,7 +275,6 @@ export function useDocRun(): DocRunLayer & {
   blockRunTarget: string | null;
   currentDefinition: unknown;
   currentVersion: number | undefined;
-  proposalPending: boolean;
   previous: DocRunLayer | null;
 } {
   const urlRunId = useStudioRunId();
@@ -429,7 +428,6 @@ export function useDocRun(): DocRunLayer & {
       blockRunTarget,
       currentDefinition,
       currentVersion,
-      proposalPending,
       previous,
     }),
     [
@@ -447,7 +445,6 @@ export function useDocRun(): DocRunLayer & {
       blockRunTarget,
       currentDefinition,
       currentVersion,
-      proposalPending,
       previous,
     ],
   );
