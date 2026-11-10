@@ -74,7 +74,7 @@ export function docPromptUrlOffer(
   };
 }
 
-const MAX_SHOWN = 40;
+export const MAX_SHOWN = 40;
 
 // The scheme and host are always shown in full, so a long subdomain cannot hide the real host.
 export function docShortUrl(url: string): string {

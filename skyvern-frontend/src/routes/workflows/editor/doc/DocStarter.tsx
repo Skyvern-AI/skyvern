@@ -67,7 +67,7 @@ export function DocGettingStarted({
   compact = false,
   clearOfPanel = false,
 }: {
-  // The side panel takes up to 24rem or 45% of the pane on its right; stay left of it.
+  // The side panel takes up to 22rem or 36% of the pane on its right; stay left of it.
   clearOfPanel?: boolean;
   // A narrow pane shows a small pill that opens the card, so it never covers the step being edited.
   compact?: boolean;
@@ -98,7 +98,7 @@ export function DocGettingStarted({
   const done = items.filter(([d]) => d).length;
   const position = cn(
     "absolute bottom-4 z-40",
-    clearOfPanel ? "right-[calc(min(24rem,45%)+1.25rem)]" : "right-5",
+    clearOfPanel ? "right-[calc(min(22rem,36%)+1.25rem)]" : "right-5",
   );
   if (asPill) {
     return (
