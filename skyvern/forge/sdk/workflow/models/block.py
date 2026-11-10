@@ -11771,6 +11771,22 @@ def _log_safe_url(value: str | None) -> str | None:
     return urlunsplit((split.scheme, split.netloc, split.path, "", ""))
 
 
+class _OcrPageValidationError(ValueError):
+    """An OCR answer that failed validation; its message is written by this module and quotes no page text."""
+
+
+def _content_free_ocr_error(error: BaseException) -> str:
+    if isinstance(error, _OcrPageValidationError):
+        return str(error)
+    description = type(error).__name__
+    if error.__cause__ is not None:
+        cause_name = type(error.__cause__).__name__
+        description += f" caused by {cause_name}"
+        if "RateLimit" in cause_name:
+            description += ", an LLM rate limit"
+    return description
+
+
 def _llm_response_format_failure_reason(error: Exception) -> str:
     return f"LLM response could not be parsed or coerced into the required JSON shape ({type(error).__name__})."
 
@@ -14815,10 +14831,12 @@ async def _run_blocking_parse_step(
         LOG.warning(
             "File parse step exceeded its time budget",
             step=step,
-            file_url=file_url,
+            file_url=_log_safe_url(file_url),
             timeout_seconds=step_timeout_seconds,
         )
-        raise FileParseTimeout(file_url=file_url, step=step, timeout_seconds=step_timeout_seconds)
+        raise FileParseTimeout(
+            file_url=_log_safe_url(file_url) or file_url, step=step, timeout_seconds=step_timeout_seconds
+        )
 
 
 def _page_image_over_ocr_caps(png: bytes) -> bool:
@@ -15388,7 +15406,7 @@ class FileParserBlock(Block):
         # or two.
         LOG.info(
             "Falling back to vision LLM OCR for the PDF text layer",
-            file_url=self.file_url,
+            file_url=_log_safe_url(self.file_url),
             ocr_reason=ocr_reason,
         )
         try:
@@ -15403,7 +15421,7 @@ class FileParserBlock(Block):
         except Exception:
             LOG.exception(
                 "Failed to extract text from PDF via vision LLM fallback",
-                file_url=self.file_url,
+                file_url=_log_safe_url(self.file_url),
             )
             raise
 
@@ -15521,14 +15539,14 @@ class FileParserBlock(Block):
                         will_retry = attempt + 1 < self.ocr_validation_max_attempts
                         LOG.warning(
                             "FileParserBlock PDF OCR LLM response failed response-format validation",
-                            file_url=self.file_url,
+                            file_url=_log_safe_url(self.file_url),
                             attempt=attempt + 1,
                             max_attempts=self.ocr_validation_max_attempts,
                             will_retry=will_retry,
                             error_type=type(e).__name__,
                         )
                         if not will_retry:
-                            raise ValueError(failure_reason) from e
+                            raise _OcrPageValidationError(failure_reason) from e
                         prompt_for_attempt = self._build_ocr_validation_retry_prompt(llm_prompt, failure_reason)
                         continue
 
@@ -15539,14 +15557,14 @@ class FileParserBlock(Block):
                     will_retry = attempt + 1 < self.ocr_validation_max_attempts
                     LOG.warning(
                         "FileParserBlock PDF OCR LLM response failed schema validation",
-                        file_url=self.file_url,
+                        file_url=_log_safe_url(self.file_url),
                         attempt=attempt + 1,
                         max_attempts=self.ocr_validation_max_attempts,
                         will_retry=will_retry,
                         failure_reason=ocr_failure_reason,
                     )
                     if not will_retry:
-                        raise ValueError(ocr_failure_reason)
+                        raise _OcrPageValidationError(ocr_failure_reason)
                     prompt_for_attempt = self._build_ocr_validation_retry_prompt(llm_prompt, ocr_failure_reason)
                 raise RuntimeError("OCR retry loop exhausted without returning or raising.")
 
@@ -15579,7 +15597,16 @@ class FileParserBlock(Block):
         # prior single-call path, which propagated OCR errors. Partial failures are skipped below.
         errors = [r for r in page_results if isinstance(r, BaseException)]
         if errors and len(errors) == len(page_results):
-            raise errors[0]
+            # Cancellation and other control-flow exceptions must propagate as they are, not as a failed block.
+            control_flow = [e for e in errors if not isinstance(e, Exception)]
+            if control_flow:
+                raise control_flow[0]
+            # The provider's error text can quote the page and would reach the failure log and traceback. The
+            # failure classifier reads this reason, so a rate limit is named in words it matches.
+            raise RuntimeError(
+                f"The model could not transcribe any of the PDF's {len(page_results)} pages "
+                f"({_content_free_ocr_error(errors[0])})."
+            ) from None
 
         page_chunks: list[str] = []
         current_tokens = 0
@@ -15587,9 +15614,10 @@ class FileParserBlock(Block):
             if isinstance(result, BaseException):
                 LOG.warning(
                     "Failed to OCR a PDF page via vision LLM, skipping it",
-                    file_url=self.file_url,
+                    file_url=_log_safe_url(self.file_url),
                     page_number=page_number,
-                    error=str(result),
+                    # The provider's error text can quote the page, so only its type is logged.
+                    error_type=type(result).__name__,
                 )
                 continue
             page_text = result.strip()
