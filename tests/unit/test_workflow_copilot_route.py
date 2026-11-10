@@ -10321,3 +10321,16 @@ async def test_convert_route_stitches_only_a_version_2_top_level(version_line: s
 
     blocks = response.workflow_definition["blocks"]
     assert [block["next_block_label"] for block in blocks] == [first_next, None]
+
+
+@pytest.mark.asyncio
+async def test_copilot_loopback_key_is_the_request_key_unless_the_hook_replaces_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(workflow_copilot_route, "get_request_principal", lambda: None)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "resolve_org_api_key", AsyncMock(return_value="org-key"))
+    with_key = SimpleNamespace(headers={"x-api-key": "ui-key"})
+    without_key = SimpleNamespace(headers={})
+
+    assert await workflow_copilot_route._resolve_copilot_api_key(with_key, "o_1") == "ui-key"  # type: ignore[arg-type]
+    assert await workflow_copilot_route._resolve_copilot_api_key(without_key, "o_1") == "org-key"  # type: ignore[arg-type]
