@@ -770,8 +770,8 @@ async def test_a_307_redirect_keeps_the_navigation_pending_until_the_final_respo
     page, browser_state = await _browser_state(context, base)
     navigation = _navigation(browser_state, page)
 
-    await _navigate(page, f"{base}/moved")
-    await _until(lambda: site.count("GET", "/slow") == 1)
+    async with page.expect_request(f"{base}/slow"):
+        await _navigate(page, f"{base}/moved")
     assert navigation.is_pending, "a redirect hop must keep the navigation pending"
 
     await navigation.wait(time.monotonic() + 10)
@@ -832,13 +832,16 @@ async def test_iframe_navigations_are_ignored_and_downloads_and_empty_responses_
     page, browser_state = await _browser_state(context, base)
     navigation = _navigation(browser_state, page)
 
-    await page.goto(f"{base}/iframe-loading", wait_until="commit")
-    await _until(lambda: site.count("GET", "/hang") == 1)
+    async with page.expect_request(f"{base}/hang"):
+        await page.goto(f"{base}/iframe-loading", wait_until="commit")
     assert not navigation.is_pending, "a pending iframe navigation is not the page's navigation"
 
     for path in ("/file", "/empty"):
         await page.goto(f"{base}/start")
-        await _navigate(page, f"{base}{path}")
+        # The script returns before the browser reports its navigation; waiting before then passes vacuously and lets
+        # the late navigation abort the next goto.
+        async with page.expect_request(f"{base}{path}"):
+            await _navigate(page, f"{base}{path}")
         await navigation.wait(time.monotonic() + 5)
         assert _settled(navigation), path
 
