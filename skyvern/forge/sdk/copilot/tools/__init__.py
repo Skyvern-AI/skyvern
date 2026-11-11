@@ -27,6 +27,7 @@ from skyvern.forge.sdk.copilot.ask_user import (
     ACCOUNT_GROUP_STATUS_TOOL_NAME,
     ACCOUNT_GROUP_SUBMIT_TOOL_NAME,
     CREDENTIAL_DELETE_TOOL_NAME,
+    SINGLE_RUN_TOOL_NAME,
     AskUserArguments,
     QuestionInput,
 )
@@ -90,6 +91,9 @@ from skyvern.forge.sdk.copilot.screenshot_utils import (
 )
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.tools.account_groups import (
+    SINGLE_RUN_TOOL_DESCRIPTION,
+)
+from skyvern.forge.sdk.copilot.tools.account_groups import (
     SUBMIT_TOOL_DESCRIPTION as ACCOUNT_GROUP_SUBMIT_TOOL_DESCRIPTION,
 )
 from skyvern.forge.sdk.copilot.tools.account_groups import (
@@ -97,6 +101,8 @@ from skyvern.forge.sdk.copilot.tools.account_groups import (
     account_group_submit_enabled,
     cancel_account_group,
     run_for_accounts,
+    run_saved_workflow,
+    single_run_submit_enabled,
 )
 from skyvern.forge.sdk.copilot.tools.credential_deletion import (
     DELETE_TOOL_DESCRIPTION as CREDENTIAL_DELETE_TOOL_DESCRIPTION,
@@ -1202,6 +1208,24 @@ async def run_workflow_for_accounts_tool(
     return result.model_dump_json(exclude_none=True, exclude={"repeated_after_prior_effect": {"__all__": {"identity"}}})
 
 
+@function_tool(
+    failure_error_function=copilot_tool_failure,
+    name_override=SINGLE_RUN_TOOL_NAME,
+    description_override=SINGLE_RUN_TOOL_DESCRIPTION,
+    strict_mode=False,
+)
+async def run_saved_workflow_tool(
+    ctx: ToolContext[CopilotContext], action_summary: str, inputs: dict[str, JsonValue] | None = None
+) -> str:
+    authority_error = _authority_tool_error(ctx.context, SINGLE_RUN_TOOL_NAME)
+    if authority_error is not None:
+        return json.dumps({"ok": False, "dispatched": False, "error": authority_error})
+    result = await run_saved_workflow(
+        ctx.context, tool_call_id=ctx.tool_call_id, inputs=inputs or {}, action_summary=action_summary
+    )
+    return result.model_dump_json()
+
+
 @function_tool(failure_error_function=copilot_tool_failure, name_override=ACCOUNT_GROUP_STATUS_TOOL_NAME)
 async def get_account_group_status_tool(ctx: ToolContext[CopilotContext], workflow_run_group_id: str) -> str:
     """Read each account's run id, status and outcome for a group started by run_workflow_for_accounts.
@@ -1584,12 +1608,12 @@ its size, a preview and child_count, and its iterations are readable as their ow
 If workflow_run_id is omitted, fetches the run this chat carries: its last
 successful test run, else the last run it tested or was opened about. When
 it carries none, fetches the most recently created finished run
-({join_phrases([status.value for status in _FINAL_RUN_STATUSES], "or")}) not started by a
-Copilot chat. selected_by says which of these happened ("carried_from_chat",
+({join_phrases([status.value for status in _FINAL_RUN_STATUSES], "or")}) that is not a
+Copilot test run. selected_by says which of these happened ("carried_from_chat",
 "latest_for_workflow", or "explicit" when workflow_run_id was passed), and
 created_at and trigger_type describe the returned run.
 newer_finished_runs lists finished runs of this workflow created after the
-returned run, excluding runs started by any Copilot chat, newest first; it
+returned run, excluding Copilot test runs, newest first; it
 holds at most {_NEWER_FINISHED_RUNS_LIMIT}, so more may exist. When that lookup fails the result has
 newer_finished_runs_unavailable instead, so a missing list is not "none".
 execution_source with source_kind run_version describes the saved version the run executed, which may
@@ -2465,6 +2489,7 @@ NATIVE_TOOLS = [
     read_attached_pdf_tool,
     read_chat_history_tool,
     run_workflow_for_accounts_tool,
+    run_saved_workflow_tool,
     get_account_group_status_tool,
     cancel_account_group_tool,
     delete_saved_credentials_tool,
@@ -2487,6 +2512,7 @@ BROWSER_BOUND_TOOL_NAMES = BLOCK_RUNNING_TOOLS | frozenset(
         SESSION_EXTENSION_TOOL_NAME,
         UPLOAD_TOOL_NAME,
         ACCOUNT_GROUP_SUBMIT_TOOL_NAME,
+        SINGLE_RUN_TOOL_NAME,
     }
 )
 
@@ -2498,6 +2524,7 @@ _PAGE_STATE_TOOL_NAMES = (
     - {
         SESSION_EXTENSION_TOOL_NAME,
         ACCOUNT_GROUP_SUBMIT_TOOL_NAME,
+        SINGLE_RUN_TOOL_NAME,
     }
 )
 
@@ -2628,6 +2655,7 @@ def copilot_native_tools(
     authoring_capability: AuthoringCapability | BlockAuthoringPolicy | str | None = None,
     run_tools_available: bool,
     supports_account_group_card: bool = False,
+    supports_single_run_card: bool = False,
     supports_credential_delete_card: bool = False,
     supports_google_setup_card: bool = False,
     supports_demonstration_offer: bool = False,
@@ -2645,6 +2673,7 @@ def copilot_native_tools(
             or (tool.name == GOOGLE_SETUP_TOOL_NAME and not supports_google_setup_card)
             or (tool.name == DEMONSTRATION_OFFER_TOOL_NAME and not supports_demonstration_offer)
             or (tool.name == ACCOUNT_GROUP_SUBMIT_TOOL_NAME and not account_group_submit_enabled())
+            or (tool.name == SINGLE_RUN_TOOL_NAME and not (supports_single_run_card and single_run_submit_enabled()))
             or (
                 tool.name == CREDENTIAL_DELETE_TOOL_NAME
                 and not (supports_credential_delete_card and credential_delete_enabled())

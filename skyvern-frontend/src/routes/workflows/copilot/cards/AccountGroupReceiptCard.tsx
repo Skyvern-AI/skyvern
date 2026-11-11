@@ -10,6 +10,8 @@ import type {
   AccountGroupReview,
   QuestionInteraction,
 } from "../workflowCopilotTypes";
+import { useWorkflowRunByIdQuery } from "../../hooks/useWorkflowRunQuery";
+import { runIsLogicallyFinal } from "../../workflowRun/runRetryState";
 import { AttentionMarker } from "./AttentionTray";
 import { TONE_CLASSES, type Tone } from "./receiptTone";
 
@@ -133,6 +135,7 @@ export function AccountGroupReceiptCard({
     review.rows.map((row) => [row.credential_id, row.label]),
   );
   const decision = review.decision;
+  const singleRun = Boolean(review.single_run);
 
   if (interaction.status === "pending") {
     return (
@@ -144,7 +147,11 @@ export function AccountGroupReceiptCard({
               className="size-3.5 shrink-0"
             />
           }
-          title={`Copilot asked you to review ${plural(review.rows.length, "account")}`}
+          title={
+            singleRun
+              ? "Copilot asked you to review a run"
+              : `Copilot asked you to review ${plural(review.rows.length, "account")}`
+          }
         />
       </div>
     );
@@ -163,14 +170,47 @@ export function AccountGroupReceiptCard({
           tone={interrupted ? "error" : "neutral"}
           title={
             interaction.status === "resolved"
-              ? "You declined the account review. Nothing ran."
-              : "The account review ended. Nothing ran."
+              ? `You declined the ${singleRun ? "run" : "account"} review. Nothing ran.`
+              : `The ${singleRun ? "run" : "account"} review ended. Nothing ran.`
           }
         />
         {interrupted ? (
           <p className="pl-4 text-muted-foreground">
             Send a new message to continue.
           </p>
+        ) : null}
+      </div>
+    );
+  }
+  if (singleRun) {
+    return (
+      <div
+        data-interaction-id={interaction.interaction_id}
+        className={cn(
+          "flex flex-col gap-1.5 rounded-lg border px-3 py-[11px] text-xs",
+          TONE_CLASSES.answered.card,
+        )}
+      >
+        <Heading tone="answered" title="You approved one run" />
+        {review.workflow_run_id ? (
+          <a
+            className="break-words pl-4 underline-offset-2 hover:underline"
+            href={`/runs/${review.workflow_run_id}`}
+            target="_blank"
+            rel="noreferrer"
+          >
+            {review.workflow_title}
+            <span className="sr-only"> (opens in new tab)</span>
+          </a>
+        ) : turnLive ? (
+          <p className="pl-4 text-muted-foreground">Starting the run…</p>
+        ) : (
+          <p className="pl-4 text-muted-foreground">
+            No run is linked to this approval.
+          </p>
+        )}
+        {review.workflow_run_id ? (
+          <SingleRunStatus workflowRunId={review.workflow_run_id} />
         ) : null}
       </div>
     );
@@ -242,6 +282,23 @@ export function AccountGroupReceiptCard({
         </p>
       )}
     </div>
+  );
+}
+
+function SingleRunStatus({ workflowRunId }: { workflowRunId: string }) {
+  const { data: run } = useWorkflowRunByIdQuery(workflowRunId, true);
+  return (
+    <>
+      {run ? (
+        <p className="pl-4 text-muted-foreground">Status: {run.status}</p>
+      ) : null}
+      {run && runIsLogicallyFinal(run) ? null : (
+        <p className="pl-4 text-muted-foreground">
+          The chat's Stop button does not stop this run. To stop it, cancel it
+          from its run page.
+        </p>
+      )}
+    </>
   );
 }
 

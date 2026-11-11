@@ -2501,6 +2501,24 @@ class WorkflowRunsRepository(BaseRepository):
             ordered = sorted(candidates.values(), key=lambda r: (r.queued_at, r.workflow_run_id))
             return [convert_to_workflow_run(candidate) for candidate in ordered]
 
+    @db_operation("get_unfinished_run_id_on_version")
+    async def get_unfinished_run_id_on_version(
+        self, organization_id: str, workflow_permanent_id: str, workflow_id: str
+    ) -> str | None:
+        async with self.Session() as session:
+            return await session.scalar(
+                select(WorkflowRunModel.workflow_run_id)
+                .where(WorkflowRunModel.organization_id == organization_id)
+                .where(WorkflowRunModel.workflow_permanent_id == workflow_permanent_id)
+                .where(WorkflowRunModel.workflow_id == workflow_id)
+                # The worker reads the version row at start and again for each retry attempt; a paused run resumes from
+                # memory, and a run waiting out a retry delay keeps the final status its retry rule matched until its
+                # next attempt queues, so it is not held. A subset of ix_workflow_runs_nonterminal_status's predicate,
+                # so that partial index applies.
+                .where(WorkflowRunModel.status.in_(["created", "queued", "running"]))
+                .limit(1)
+            )
+
     @db_operation("get_last_queued_workflow_run")
     async def get_last_queued_workflow_run(
         self,

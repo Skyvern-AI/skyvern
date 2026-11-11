@@ -10959,6 +10959,17 @@
         ],
         "title": "Body_upload_file_v1_upload_file_post"
       },
+      "BotProtection": {
+        "type": "string",
+        "enum": [
+          "recaptcha",
+          "hcaptcha",
+          "cloudflare",
+          "akamai"
+        ],
+        "title": "BotProtection",
+        "description": "A service a site uses to tell people from automated browsers, such as a captcha."
+      },
       "BranchCondition": {
         "properties": {
           "id": {
@@ -12914,6 +12925,17 @@
             "title": "Needs Live View",
             "description": "Whether a person will watch this session's browser live. Defaults to false, which suits unattended automation; the Skyvern app sets it because a session opened in the UI is watched. It requests a capability, not a particular browser, and cannot be used to select where the session runs.",
             "default": false
+          },
+          "bot_protection": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BotProtection"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The bot protection the target site uses, such as a captcha, when known. Together with url, it can determine where the session runs."
           }
         },
         "type": "object",

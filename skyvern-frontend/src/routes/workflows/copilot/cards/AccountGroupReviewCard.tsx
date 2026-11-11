@@ -24,16 +24,7 @@ function inputText(value: unknown): string {
   return typeof value === "string" ? value : JSON.stringify(value);
 }
 
-export function AccountGroupReviewCard({
-  review,
-  disabled,
-  lockReason,
-  collapsed,
-  onCollapsedChange,
-  onApprove,
-  onDecline,
-  upNext,
-}: {
+type ReviewCardProps = {
   review: AccountGroupReview;
   disabled: boolean;
   lockReason: string | null;
@@ -42,7 +33,154 @@ export function AccountGroupReviewCard({
   onApprove: (credentialIds: string[]) => void;
   onDecline: () => void;
   upNext?: string | null;
+};
+
+export function AccountGroupReviewCard(props: ReviewCardProps) {
+  return props.review.single_run ? (
+    <SingleRunReviewCard {...props} />
+  ) : (
+    <GroupReviewCard {...props} />
+  );
+}
+
+function ReviewActions({
+  disabled,
+  lockReason,
+  approveDisabled,
+  approveLabel,
+  onApprove,
+  onDecline,
+}: {
+  disabled: boolean;
+  lockReason: string | null;
+  approveDisabled: boolean;
+  approveLabel: string;
+  onApprove: () => void;
+  onDecline: () => void;
 }) {
+  return (
+    <div
+      className="flex shrink-0 flex-wrap items-center gap-2 border-t border-border px-3 py-1.5"
+      title={lockReason ?? undefined}
+    >
+      <Button
+        size="sm"
+        className="h-7"
+        disabled={disabled || approveDisabled}
+        onClick={onApprove}
+      >
+        {approveLabel}
+      </Button>
+      <Button
+        size="sm"
+        variant="ghost"
+        className="h-7"
+        disabled={disabled}
+        onClick={onDecline}
+      >
+        Decline
+      </Button>
+      {lockReason ? (
+        <span className="min-w-0 truncate text-[11px] text-muted-foreground">
+          {lockReason}
+        </span>
+      ) : null}
+    </div>
+  );
+}
+
+function InputList({ inputs }: { inputs: Record<string, unknown> }) {
+  const entries = Object.entries(inputs);
+  return entries.length > 0 ? (
+    <dl className="grid grid-cols-[auto,1fr] gap-x-2 gap-y-0.5">
+      {entries.map(([key, value]) => (
+        <div key={key} className="contents">
+          <dt className="text-muted-foreground">{key}</dt>
+          <dd className="break-words">{inputText(value)}</dd>
+        </div>
+      ))}
+    </dl>
+  ) : null;
+}
+
+function SingleRunReviewCard({
+  review,
+  disabled,
+  lockReason,
+  collapsed,
+  onCollapsedChange,
+  onApprove,
+  onDecline,
+  upNext,
+}: ReviewCardProps) {
+  const titleId = useId();
+  return (
+    <AttentionTray
+      aria-label="Run review"
+      aria-describedby={titleId}
+      title="Review the run before it starts"
+      titleId={titleId}
+      wrapTitle
+      collapsedTitle="Copilot is waiting on your review of a run"
+      collapsed={collapsed}
+      onCollapsedChange={onCollapsedChange}
+      minimizeLabel="Minimize run review"
+      upNext={upNext}
+    >
+      <div className="flex min-h-0 flex-col gap-2 overflow-y-auto px-3 pb-2.5 pt-1 text-xs">
+        <p className="whitespace-pre-wrap break-words text-[13.5px] font-medium leading-relaxed">
+          {review.action_summary}
+        </p>
+        <p className="text-muted-foreground">
+          {review.workflow_title} · version {review.version} · one real run of
+          the saved workflow. It keeps running after Copilot replies.
+        </p>
+        <InputList inputs={review.common_inputs} />
+        {review.rows.length > 0 ? (
+          <div className="flex flex-col gap-1">
+            <p className="text-muted-foreground">Signs in with</p>
+            <dl className="grid grid-cols-[auto,1fr] gap-x-2 gap-y-0.5">
+              {review.rows.map((row) => (
+                <div
+                  key={row.parameter_key ?? row.credential_id}
+                  className="contents"
+                >
+                  <dt className="text-muted-foreground">
+                    {row.parameter_key ?? "credential"}
+                  </dt>
+                  <dd className="break-words">{row.label}</dd>
+                </div>
+              ))}
+            </dl>
+          </div>
+        ) : null}
+        <p className="text-muted-foreground">
+          This runs the saved workflow the same way pressing Run does, with the
+          logins it&apos;s set up to use.
+        </p>
+      </div>
+      <ReviewActions
+        disabled={disabled}
+        lockReason={lockReason}
+        approveDisabled={false}
+        approveLabel="Run once"
+        onApprove={() => onApprove(review.rows.map((row) => row.credential_id))}
+        onDecline={onDecline}
+      />
+    </AttentionTray>
+  );
+}
+
+function GroupReviewCard({
+  review,
+  disabled,
+  lockReason,
+  collapsed,
+  onCollapsedChange,
+  onApprove,
+  onDecline,
+  upNext,
+}: ReviewCardProps) {
   const titleId = useId();
   const [checked, setChecked] = useState(
     () =>
@@ -61,7 +199,6 @@ export function AccountGroupReviewCard({
   const approved = review.rows
     .map((row) => row.credential_id)
     .filter((credentialId) => checked.has(credentialId));
-  const inputs = Object.entries(review.common_inputs);
 
   return (
     <AttentionTray
@@ -97,16 +234,7 @@ export function AccountGroupReviewCard({
             selected account.
           </p>
         )}
-        {inputs.length > 0 ? (
-          <dl className="grid grid-cols-[auto,1fr] gap-x-2 gap-y-0.5">
-            {inputs.map(([key, value]) => (
-              <div key={key} className="contents">
-                <dt className="text-muted-foreground">{key}</dt>
-                <dd className="break-words">{inputText(value)}</dd>
-              </div>
-            ))}
-          </dl>
-        ) : null}
+        <InputList inputs={review.common_inputs} />
         <ul className="flex flex-col gap-1">
           {review.rows.map((row) => {
             const warning = row.prior_outcome
@@ -141,33 +269,14 @@ export function AccountGroupReviewCard({
           })}
         </ul>
       </div>
-      <div
-        className="flex shrink-0 flex-wrap items-center gap-2 border-t border-border px-3 py-1.5"
-        title={lockReason ?? undefined}
-      >
-        <Button
-          size="sm"
-          className="h-7"
-          disabled={disabled || approved.length === 0}
-          onClick={() => onApprove(approved)}
-        >
-          Approve {plural(approved.length, "run")}
-        </Button>
-        <Button
-          size="sm"
-          variant="ghost"
-          className="h-7"
-          disabled={disabled}
-          onClick={onDecline}
-        >
-          Decline
-        </Button>
-        {lockReason ? (
-          <span className="min-w-0 truncate text-[11px] text-muted-foreground">
-            {lockReason}
-          </span>
-        ) : null}
-      </div>
+      <ReviewActions
+        disabled={disabled}
+        lockReason={lockReason}
+        approveDisabled={approved.length === 0}
+        approveLabel={`Approve ${plural(approved.length, "run")}`}
+        onApprove={() => onApprove(approved)}
+        onDecline={onDecline}
+      />
     </AttentionTray>
   );
 }

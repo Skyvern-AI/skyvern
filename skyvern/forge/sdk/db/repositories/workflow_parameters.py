@@ -1476,6 +1476,56 @@ class WorkflowParametersRepository(BaseRepository):
             self._store_question_turn(chat, entry)
             await session.commit()
 
+    @db_operation("record_copilot_single_run")
+    async def record_copilot_single_run(
+        self, organization_id: str, chat_id: str, interaction_id: str, workflow_run_id: str
+    ) -> None:
+        async with self.Session() as session:
+            chat = await self._locked_question_chat(session, organization_id, chat_id)
+            entry, item = self._question_in_pending(chat, interaction_id)
+            if item.account_group_review is None or not item.account_group_review.single_run:
+                raise ValueError("This question has no single-run review")
+            item.account_group_review.workflow_run_id = workflow_run_id
+            self._store_question_turn(chat, entry)
+            await session.commit()
+
+    @db_operation("unlink_copilot_single_run")
+    async def unlink_copilot_single_run(
+        self, organization_id: str, chat_id: str, interaction_id: str, workflow_run_id: str
+    ) -> None:
+        async with self.Session() as session:
+            chat = await self._locked_question_chat(session, organization_id, chat_id)
+            try:
+                entry, item = self._question_in_pending(chat, interaction_id)
+            except NotFoundError:
+                # The turn ended after the link was written, and turn end copied the link into the saved history.
+                saved = await session.scalars(
+                    select(WorkflowCopilotChatMessageModel.narrative_payload)
+                    .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
+                    .where(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id == chat_id)
+                    .where(WorkflowCopilotChatMessageModel.narrative_payload.is_not(None))
+                )
+                linked = [
+                    QuestionInteraction.model_validate(raw)
+                    for payload in saved
+                    for raw in (payload or {}).get("questionInteractions", [])
+                    if raw.get("interaction_id") == interaction_id
+                    and (raw.get("account_group_review") or {}).get("workflow_run_id") == workflow_run_id
+                ]
+                for item in linked:
+                    if item.account_group_review is not None:
+                        item.account_group_review.workflow_run_id = None
+                if linked:
+                    await self._patch_narrative_questions(session, organization_id, chat_id, linked)
+                    await session.commit()
+                return
+            review = item.account_group_review
+            if review is None or review.workflow_run_id != workflow_run_id:
+                return
+            review.workflow_run_id = None
+            self._store_question_turn(chat, entry)
+            await session.commit()
+
     @db_operation("claim_copilot_credential_deletion")
     async def claim_copilot_credential_deletion(
         self,
@@ -1885,11 +1935,13 @@ class WorkflowParametersRepository(BaseRepository):
                     **terminal.turn_outcome,
                     "request_browser_allocations": entry.request_browser_allocations.model_dump(mode="json"),
                 }
-            # The turn's row was written from an earlier read, so a deletion claimed then may have resolved since.
+            # The turn's row was written from an earlier read, so a deletion claimed then may have resolved since, and
+            # a single run may have been linked or unlinked since.
             claimed = [
                 item
                 for item in entry.question_interactions
-                if item.credential_delete_review is not None and item.credential_delete_review.claimed_at is not None
+                if (item.credential_delete_review is not None and item.credential_delete_review.claimed_at is not None)
+                or (item.account_group_review is not None and item.account_group_review.single_run)
             ]
             if claimed:
                 await self._patch_narrative_questions(session, organization_id, workflow_copilot_chat_id, claimed)
