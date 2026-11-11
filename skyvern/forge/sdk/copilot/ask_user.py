@@ -88,6 +88,7 @@ class QuestionAnswer(BaseModel):
 ACCOUNT_GROUP_SUBMIT_TOOL_NAME = "run_workflow_for_accounts"
 ACCOUNT_GROUP_STATUS_TOOL_NAME = "get_account_group_status"
 ACCOUNT_GROUP_CANCEL_TOOL_NAME = "cancel_account_group"
+SINGLE_RUN_TOOL_NAME = "run_saved_workflow"
 
 REPEAT_RISK_OUTCOMES = (
     WorkflowRunGroupItemOutcome.completed,
@@ -111,6 +112,7 @@ class AccountGroupRow(BaseModel):
     prior_outcome: WorkflowRunGroupItemOutcome | None = None
     last_group_id: str | None = None
     preselected: bool = True
+    parameter_key: str | None = Field(default=None, exclude_if=lambda key: key is None)
 
 
 class AccountGroupReview(BaseModel):
@@ -123,6 +125,9 @@ class AccountGroupReview(BaseModel):
     credential_parameter_key: str
     action_summary: str
     common_inputs: dict[str, JsonValue] = Field(default_factory=dict)
+    single_run: bool = Field(default=False, exclude_if=lambda single_run: not single_run)
+    credential_inputs: dict[str, str] = Field(default_factory=dict, exclude_if=lambda inputs: not inputs)
+    workflow_run_id: str | None = Field(default=None, exclude_if=lambda run_id: run_id is None)
     clean_group_run_id: str | None = None
     credential_parameter_used_by: list[str] = Field(default_factory=list)
     rows: list[AccountGroupRow]
@@ -258,6 +263,19 @@ class QuestionInteraction(BaseModel):
     def tool_result(self) -> dict[str, Any]:
         if self.status != "resolved" or self.response is None:
             raise ValueError("Question has no accepted response")
+        if self.account_group_review is not None and self.account_group_review.single_run:
+            decision = self.account_group_decision
+            approved = decision is not None and decision.approved
+            run_id = self.account_group_review.workflow_run_id
+            return {
+                "ok": True,
+                "interaction_id": self.interaction_id,
+                "tool_call_id": self.tool_call_id,
+                "approved": approved,
+                # The link is written before the run is created, so a linked run may not exist.
+                "dispatched": None if run_id is not None else False,
+                "workflow_run_id": run_id,
+            }
         if self.account_group_review is not None:
             decision = self.account_group_decision
             approved_ids = decision.credential_ids if decision is not None and decision.approved else []
@@ -409,6 +427,10 @@ def _validate_account_group_decision(
     if not decision.approved:
         if decision.credential_ids:
             raise ValueError("A declined review approves no accounts")
+        return
+    if review.single_run:
+        if sorted(decision.credential_ids) != sorted(row.credential_id for row in review.rows):
+            raise ValueError("A single run is approved with exactly the accounts it showed")
         return
     if not decision.credential_ids:
         raise ValueError("Approve at least one account")

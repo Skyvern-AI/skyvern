@@ -129,7 +129,7 @@ from skyvern.forge.sdk.copilot.request_policy import raw_secret_safety_log_field
 from skyvern.forge.sdk.copilot.review_gate import parse_execution_receipts, serialize_execution_receipts
 from skyvern.forge.sdk.copilot.runtime import close_browser_session_quietly
 from skyvern.forge.sdk.copilot.steer import STEER_DOORBELL_TTL, copilot_steer_key
-from skyvern.forge.sdk.copilot.tools.account_groups import recover_account_group_links
+from skyvern.forge.sdk.copilot.tools.account_groups import recover_account_group_links, single_run_submit_enabled
 from skyvern.forge.sdk.copilot.tools.credential_deletion import (
     credential_delete_enabled,
     enforce_credential_delete_access,
@@ -301,6 +301,14 @@ ALLOWED_WORKFLOW_COPILOT_AUDIO_CONTENT_TYPES = {
 LOG = structlog.get_logger()
 _T = TypeVar("_T")
 
+_AUTO_ACCEPT_DEFERRED_FOR_UNFINISHED_RUN = (
+    "I did not apply this change automatically because run {workflow_run_id} of the saved version has not finished "
+    "yet. Accept the change when you are ready; it is saved as a new version and that run is not affected."
+)
+_AUTO_ACCEPT_DEFERRED_FOR_UNCHECKED_RUNS = (
+    "I did not apply this change automatically because I could not check whether a run of the saved version is "
+    "still waiting to start. Accept the change when you are ready; it is saved as a new version."
+)
 _AUTO_ACCEPT_DEFERRED_FOR_RUN_GROUP = (
     "I did not apply this change automatically because a group of account runs is still running the saved "
     "version. Accept the change when you are ready; it is saved as a new version and the running group is "
@@ -2048,7 +2056,28 @@ async def _finalise_normal_turn(
 
     applied_workflow = agent_result.updated_workflow
     staged_commit_landed = False
-    if _should_commit_staged_workflow(chat.auto_accept, agent_result):
+    should_commit = _should_commit_staged_workflow(chat.auto_accept, agent_result)
+    holding_run_id = (
+        await _run_holding_version(organization_id, chat.workflow_permanent_id, chat_request.workflow_id)
+        if should_commit and single_run_submit_enabled()
+        else None
+    )
+    if holding_run_id is not None:
+        LOG.info(
+            "copilot auto-accept deferred while a run of the saved version is unfinished",
+            auto_accept_deferred_reason="workflow_run_unfinished",
+            holding_workflow_run_id=holding_run_id,
+        )
+        otel_trace.get_current_span().set_attribute("copilot.auto_accept_deferred_reason", "workflow_run_unfinished")
+        agent_result.proposal_disposition = "review_tested"
+        deferred = (
+            _AUTO_ACCEPT_DEFERRED_FOR_UNFINISHED_RUN.format(workflow_run_id=holding_run_id)
+            if holding_run_id
+            else _AUTO_ACCEPT_DEFERRED_FOR_UNCHECKED_RUNS
+        )
+        agent_result.user_response = f"{user_response}\n\n{deferred}"
+        user_response = agent_result.user_response
+    elif should_commit:
         try:
             applied_workflow = await _commit_staged_workflow(
                 organization_id=organization_id,
@@ -2242,6 +2271,18 @@ async def _resolve_proposal_for_accept(
         yaml_request = WorkflowCreateYAMLRequest.model_validate(resolved)
 
     return yaml_request
+
+
+async def _run_holding_version(organization_id: str, workflow_permanent_id: str, workflow_id: str) -> str | None:
+    """An unfinished run reads its version row when its worker starts, so an in-place save would change what it runs.
+    A failed lookup returns "" and holds the version, so the change waits for a manual Accept instead of failing."""
+    try:
+        return await app.DATABASE.workflow_runs.get_unfinished_run_id_on_version(
+            organization_id, workflow_permanent_id, workflow_id
+        )
+    except Exception:
+        LOG.warning("Could not check for unfinished runs before auto-accept", exc_info=True)
+        return ""
 
 
 async def _commit_staged_workflow(
