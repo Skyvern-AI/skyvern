@@ -444,11 +444,15 @@ def with_accounts(
 
 
 def integration_entries(
-    email_forwarding_available: bool = True, powerbi_available: bool = False, gmail_available: bool = False
+    email_forwarding_available: bool = True,
+    powerbi_available: bool = False,
+    gmail_available: bool = False,
+    hidden_ids: frozenset[str] = frozenset(),
 ) -> list[IntegrationEntry]:
     entries = [*SKYVERN_INTEGRATIONS, *app.AGENT_FUNCTION.get_cloud_integration_entries()]
     if not email_forwarding_available:
-        entries = [entry for entry in entries if entry.id != "email_forwarding"]
+        hidden_ids = hidden_ids | {"email_forwarding"}
+    entries = [entry for entry in entries if entry.id not in hidden_ids]
     if gmail_available:
         entries = [
             entry.model_copy(update={"additional_credential_backends": ["nango"]})
@@ -512,6 +516,7 @@ async def integration_entries_for_org(organization_id: str) -> list[IntegrationE
         email_forwarding_available=email_forwarding_available,
         powerbi_available=powerbi_available,
         gmail_available=gmail_available,
+        hidden_ids=await app.AGENT_FUNCTION.hidden_integration_ids(organization_id),
     )
 
 
