@@ -520,11 +520,14 @@ def gpt56_litellm_models() -> Iterator[None]:
 # DDL, and each test still gets its own isolated database.
 
 
+_REGISTERED_ENCRYPTION_SECRET_KEY = "registered-encryption-test-key"
+
+
 @pytest.fixture
 def registered_encryption() -> Iterator[None]:
-    """The real AES-CBC and AES-GCM encryptors, registered as a deployment with ENABLE_ENCRYPTION would."""
+    """The real AES-GCM encryptor and legacy AES-CBC reader, registered as a deployment with ENABLE_ENCRYPTION would."""
     with patch.dict(encryptor._methods, clear=True):
-        register_aes_encryptor(secret_key="registered-encryption-test-key")
+        register_aes_encryptor(secret_key=_REGISTERED_ENCRYPTION_SECRET_KEY)
         yield
 
 
