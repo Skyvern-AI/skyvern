@@ -36,7 +36,11 @@ import {
 import { isWorkflowBlockNode } from "../nodes";
 import { getElements } from "../workflowEditorUtils";
 import { useLocateBlockStore } from "../runValidation/useLocateBlockStore";
-import { DOC_SHOW_PROBLEMS_EVENT } from "./docKeys";
+import {
+  DOC_SHOW_PROBLEMS_EVENT,
+  type DocShowProblemsDetail,
+  captureReturnPoint,
+} from "./docKeys";
 import { docDetailsText } from "./docDetailsText";
 import { useDocRunCheckStore } from "./docRunCheckStore";
 import { WorkflowScopeContext } from "../WorkflowScopeContext";
@@ -2158,20 +2162,28 @@ describe("a step that was just added", () => {
   test("Fix problems from Run's question opens the list, and Escape returns focus to the line Run was pressed from", async () => {
     const nodes = renderDoc(
       [
-        block("goto_url", "open_site", "write_it", { url: "" }),
-        block("text_prompt", "write_it", null, { prompt: "Do the next thing" }),
+        block("goto_url", "open_site", "find_it", { url: "" }),
+        block("navigation", "find_it", null, {
+          navigation_goal: "Find the price",
+          complete_criterion: "The price is shown",
+        }),
       ],
       { apply: vi.fn(), update: vi.fn(), addStep: vi.fn(), duplicate: vi.fn() },
     );
-    const site = nodes.find((node) => node.data.label === "write_it")!;
-    act(() => screen.getByRole("textbox", { name: "write_it prompt" }).focus());
-    const typing = document.activeElement as HTMLElement;
-    // The Run question had focus when its Fix problems was pressed.
+    const step = nodes.find((node) => node.data.label === "find_it")!;
+    const second = "find_it completeCriterion";
+    fireEvent.click(
+      screen.getByRole("button", { name: "Details for Find it" }),
+    );
+    act(() => screen.getByRole("textbox", { name: second }).focus());
+    const point = captureReturnPoint(document.activeElement);
+    expect(point).toMatchObject({ stepId: step.id, lineLabel: second });
+    // The Run question had focus when its Fix problems was pressed; the line's edit span is gone by then.
     act(() => (document.activeElement as HTMLElement).blur());
     act(() => {
       window.dispatchEvent(
-        new CustomEvent(DOC_SHOW_PROBLEMS_EVENT, {
-          detail: { returnFocus: typing, returnStepId: site.id },
+        new CustomEvent<DocShowProblemsDetail>(DOC_SHOW_PROBLEMS_EVENT, {
+          detail: { returnPoint: point },
         }),
       );
     });
@@ -2181,9 +2193,7 @@ describe("a step that was just added", () => {
     });
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
     await waitFor(() =>
-      expect(document.activeElement?.closest("[data-doc-node-id]")).toBe(
-        document.querySelector(`[data-doc-node-id="${site.id}"]`),
-      ),
+      expect(document.activeElement?.getAttribute("aria-label")).toBe(second),
     );
   });
 

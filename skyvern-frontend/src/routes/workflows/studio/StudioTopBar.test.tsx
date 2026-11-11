@@ -17,6 +17,7 @@ import {
   beforeEach,
   describe,
   expect,
+  onTestFinished,
   test,
   vi,
 } from "vitest";
@@ -1163,12 +1164,131 @@ describe("RunStopButton with critical Doc problems", () => {
 
       fireEvent.click(run);
       fireEvent.click(screen.getByRole("button", { name: "Fix problems" }));
-      expect((shown.mock.calls[0]![0] as CustomEvent).detail.returnFocus).toBe(
-        run,
-      );
+      expect(
+        (shown.mock.calls[0]![0] as CustomEvent).detail.returnPoint.element,
+      ).toBe(run);
     } finally {
       window.removeEventListener(DOC_SHOW_PROBLEMS_EVENT, shown);
     }
+  });
+
+  const docLine = (label: string) => {
+    const el = document.createElement("div");
+    el.setAttribute("data-doc-line", "");
+    el.setAttribute("role", "textbox");
+    el.setAttribute("aria-label", label);
+    el.tabIndex = 0;
+    return el;
+  };
+  // Run pressed from the line at `pressedAt` (inside step n1 unless `topLevel`); the Doc remounts it as
+  // `remountedLabel` while the question is open.
+  const askFromLine = ({
+    labels,
+    pressedAt,
+    topLevel = false,
+  }: {
+    labels: string[];
+    pressedAt: number;
+    topLevel?: boolean;
+  }) => {
+    renderAt("/workflows/wpid_1/studio");
+    const step = document.createElement("div");
+    if (!topLevel) step.setAttribute("data-doc-node-id", "n1");
+    const lines = labels.map(docLine);
+    step.append(...lines);
+    document.body.append(step);
+    onTestFinished(() => step.remove());
+    act(() => lines[pressedAt]!.focus());
+    act(() => {
+      window.dispatchEvent(new Event(DOC_RUN_AGENT_EVENT));
+    });
+    expect(screen.queryByText("Run with 1 problem?")).not.toBeNull();
+    return lines;
+  };
+  const remountAndEscape = (line: HTMLElement, remountedLabel: string) => {
+    const remounted = docLine(remountedLabel);
+    line.replaceWith(remounted);
+    fireEvent.keyDown(document.activeElement ?? document.body, {
+      key: "Escape",
+    });
+    return remounted;
+  };
+
+  test("Escape returns focus to the remounted line Run was pressed from, not the step's first line", async () => {
+    const lines = askFromLine({
+      labels: ["navigation navigationGoal", "navigation url"],
+      pressedAt: 1,
+    });
+    const remounted = remountAndEscape(lines[1]!, "navigation url");
+    await waitFor(() => expect(document.activeElement).toBe(remounted));
+  });
+
+  test("Escape returns to the second of two Notes in a loop when it remounts, not the first", async () => {
+    const lines = askFromLine({ labels: ["Note", "Note"], pressedAt: 1 });
+    const remounted = remountAndEscape(lines[1]!, "Note");
+    await waitFor(() => expect(document.activeElement).toBe(remounted));
+    expect(document.activeElement).not.toBe(lines[0]);
+  });
+
+  test("Escape falls back to the step's first line when the line Run was pressed from is gone", async () => {
+    const lines = askFromLine({
+      labels: ["navigation navigationGoal", "navigation url"],
+      pressedAt: 1,
+    });
+    remountAndEscape(lines[1]!, "navigation title");
+    await waitFor(() => expect(document.activeElement).toBe(lines[0]));
+  });
+
+  test("Escape from a top-level Note that remounted lands on Run, not on the page", async () => {
+    const lines = askFromLine({
+      labels: ["Note"],
+      pressedAt: 0,
+      topLevel: true,
+    });
+    remountAndEscape(lines[0]!, "Note");
+    const run = screen.getByRole("button", { name: /Run/ });
+    await waitFor(() => expect(document.activeElement).toBe(run));
+  });
+
+  test("Fix problems hands the list the pressed line's step, label and index", () => {
+    const shown = vi.fn();
+    window.addEventListener(DOC_SHOW_PROBLEMS_EVENT, shown);
+    onTestFinished(() =>
+      window.removeEventListener(DOC_SHOW_PROBLEMS_EVENT, shown),
+    );
+    const lines = askFromLine({ labels: ["Note", "Note"], pressedAt: 1 });
+    fireEvent.click(screen.getByRole("button", { name: "Fix problems" }));
+    expect((shown.mock.calls[0]![0] as CustomEvent).detail.returnPoint).toEqual(
+      { element: lines[1], stepId: "n1", lineLabel: "Note", lineIndex: 1 },
+    );
+  });
+
+  test("asked from the 'Start a full run?' question, Escape returns focus to Run", async () => {
+    mockRun(Status.Running);
+    renderAt("/workflows/wpid_1/studio?wr=wr_1&bl=Block%201");
+    const run = screen.getByRole("button", { name: /Run/ });
+    fireEvent.click(run);
+    const start = screen.getByRole("button", { name: "Start full run" });
+    act(() => start.focus());
+    fireEvent.click(start);
+    expect(screen.queryByText("Run with 1 problem?")).not.toBeNull();
+    fireEvent.keyDown(document.activeElement ?? document.body, {
+      key: "Escape",
+    });
+    await waitFor(() => expect(document.activeElement).toBe(run));
+
+    // Fix problems hands the Doc's list the same place to return to, not the closed question's button.
+    const shown = vi.fn();
+    window.addEventListener(DOC_SHOW_PROBLEMS_EVENT, shown);
+    onTestFinished(() =>
+      window.removeEventListener(DOC_SHOW_PROBLEMS_EVENT, shown),
+    );
+    fireEvent.click(run);
+    fireEvent.click(screen.getByRole("button", { name: "Start full run" }));
+    fireEvent.click(screen.getByRole("button", { name: "Fix problems" }));
+    expect(
+      (shown.mock.calls[0]![0] as CustomEvent).detail.returnPoint.element,
+    ).toBe(run);
   });
 
   test("the question shows the problems at the click, even if the check changes while it is open", () => {

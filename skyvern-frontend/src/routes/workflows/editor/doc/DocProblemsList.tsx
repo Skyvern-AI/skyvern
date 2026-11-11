@@ -9,8 +9,10 @@ import { type AppNode } from "../nodes";
 import { docProblemsTitle, type DocProblemEntry } from "./docProblems";
 import {
   DOC_SHOW_PROBLEMS_EVENT,
+  type DocReturnPoint,
   type DocShowProblemsDetail,
-  docStepLine,
+  captureReturnPoint,
+  resolveReturnPoint,
 } from "./docKeys";
 import { docProblemStep } from "./docProblemStep";
 import { type DocGoToDetails } from "./WorkflowDocActionsContext";
@@ -26,8 +28,7 @@ export function DocProblemsList({
 }) {
   const [open, setOpen] = useState(false);
   const jumped = useRef(false);
-  const returnFocus = useRef<HTMLElement | null>(null);
-  const returnStepId = useRef<string | null>(null);
+  const returnPoint = useRef<DocReturnPoint | null>(null);
   const trigger = useRef<HTMLButtonElement>(null);
   const titleId = useId();
   useEffect(() => {
@@ -40,13 +41,9 @@ export function DocProblemsList({
       frame = requestAnimationFrame(() => {
         // Run can ask while the Doc is scrolled down; the popover is anchored to this button.
         trigger.current?.scrollIntoView?.({ block: "nearest" });
-        const active = detail ? detail.returnFocus : document.activeElement;
-        returnFocus.current = active instanceof HTMLElement ? active : null;
-        returnStepId.current = detail
-          ? detail.returnStepId
-          : (active
-              ?.closest<HTMLElement>("[data-doc-node-id]")
-              ?.getAttribute("data-doc-node-id") ?? null);
+        returnPoint.current = detail
+          ? detail.returnPoint
+          : captureReturnPoint(document.activeElement);
         setOpen(true);
       });
     };
@@ -66,8 +63,7 @@ export function DocProblemsList({
           data-doc-problems
           onClick={() => {
             // Closing from the button leaves focus on it.
-            returnFocus.current = null;
-            returnStepId.current = null;
+            returnPoint.current = null;
           }}
           className="rounded-md border border-border px-2 py-[2px] text-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
         >
@@ -80,23 +76,20 @@ export function DocProblemsList({
         aria-labelledby={titleId}
         className="max-h-[min(420px,var(--radix-popover-content-available-height))] w-[min(380px,calc(100vw-32px))] overflow-y-auto p-2"
         onInteractOutside={() => {
-          returnFocus.current = null;
-          returnStepId.current = null;
+          returnPoint.current = null;
         }}
         onCloseAutoFocus={(event) => {
           // Escape returns to where focus was when Run was pressed; an entry's jump keeps the step's focus.
           // A line being typed in blurs when the list takes focus and its edit span is replaced.
-          if (jumped.current || returnFocus.current) event.preventDefault();
-          if (!jumped.current && returnFocus.current) {
-            const target = returnFocus.current.isConnected
-              ? returnFocus.current
-              : (docStepLine(document, returnStepId.current) ??
-                trigger.current);
+          if (jumped.current || returnPoint.current) event.preventDefault();
+          if (!jumped.current && returnPoint.current) {
+            const target =
+              resolveReturnPoint(document, returnPoint.current) ??
+              trigger.current;
             target?.focus({ preventScroll: true });
           }
           jumped.current = false;
-          returnFocus.current = null;
-          returnStepId.current = null;
+          returnPoint.current = null;
         }}
       >
         <p id={titleId} className="px-2 pb-1 pt-0.5 text-[13px] font-medium">

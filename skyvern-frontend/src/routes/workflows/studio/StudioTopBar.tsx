@@ -9,7 +9,14 @@ import {
   runIsCancellable,
   runIsLogicallyFinal,
 } from "@/routes/workflows/workflowRun/runRetryState";
-import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type ReactNode,
+  type RefObject,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { AxiosError } from "axios";
 import {
   CalendarIcon,
@@ -88,7 +95,10 @@ import { useStudioWorkflowDeletedAt } from "./StudioShellContext";
 import {
   DOC_RUN_AGENT_EVENT,
   DOC_SHOW_PROBLEMS_EVENT,
+  type DocReturnPoint,
   type DocShowProblemsDetail,
+  captureReturnPoint,
+  resolveReturnPoint,
 } from "../editor/doc/docKeys";
 import {
   type DocRunCheckProblem,
@@ -530,22 +540,21 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
   const docCritical = useDocRunCheckStore((s) => s.critical);
   const critical = docOnScreen && editorOpen ? docCritical : NO_DOC_PROBLEMS;
   // What was true at the click: a check landing while the dialog is open does not change it.
-  const [problemsAsked, setProblemsAsked] = useState<{
-    problems: DocRunCheckProblem[];
-    returnFocus: HTMLElement | null;
-    returnStepId: string | null;
-  } | null>(null);
+  const [problemsAsked, setProblemsAsked] = useState<DocProblemsAsked | null>(
+    null,
+  );
+  const runButton = useRef<HTMLButtonElement>(null);
   const requestFullRun = () => {
     if (critical.length > 0) {
       const active = document.activeElement;
-      const returnFocus = active instanceof HTMLElement ? active : null;
+      // Asked from the "Start a full run?" question, which closes as this one opens: focus goes back to Run.
       setProblemsAsked({
         problems: critical,
-        returnFocus,
-        returnStepId:
-          returnFocus
-            ?.closest<HTMLElement>("[data-doc-node-id]")
-            ?.getAttribute("data-doc-node-id") ?? null,
+        returnPoint: captureReturnPoint(
+          active instanceof HTMLElement && !active.closest('[role="dialog"]')
+            ? active
+            : runButton.current,
+        ),
       });
       return;
     }
@@ -576,6 +585,7 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
   const problemsDialog = (
     <DocProblemsRunDialog
       asked={problemsAsked}
+      runButton={runButton}
       onClose={() => setProblemsAsked(null)}
       onRunAnyway={startFullRun}
     />
@@ -636,6 +646,7 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
           <ControlTooltip content={runBlockedReason} blocked={runBlocked}>
             <DialogTrigger asChild>
               <Button
+                ref={runButton}
                 size="default"
                 className="h-8 border border-transparent px-3 disabled:pointer-events-none"
                 disabled={runBlocked}
@@ -684,6 +695,7 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
         blocked={runBlocked}
       >
         <Button
+          ref={runButton}
           size="default"
           className="h-8 border border-transparent px-3 disabled:pointer-events-none"
           disabled={runBlocked}
@@ -698,16 +710,19 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
   );
 }
 
+type DocProblemsAsked = {
+  problems: DocRunCheckProblem[];
+  returnPoint: DocReturnPoint | null;
+};
+
 function DocProblemsRunDialog({
   asked,
+  runButton,
   onClose,
   onRunAnyway,
 }: {
-  asked: {
-    problems: DocRunCheckProblem[];
-    returnFocus: HTMLElement | null;
-    returnStepId: string | null;
-  } | null;
+  asked: DocProblemsAsked | null;
+  runButton: RefObject<HTMLButtonElement | null>;
   onClose: () => void;
   onRunAnyway: () => void;
 }) {
@@ -728,9 +743,13 @@ function DocProblemsRunDialog({
     >
       <DialogContent
         onCloseAutoFocus={(event) => {
-          const target = last.current?.returnFocus;
+          // The Doc can remount the line Run was pressed from while the question is open; Run takes over when
+          // nothing in the Doc does (a top-level note), or the Run button that asked is gone.
+          const target =
+            resolveReturnPoint(document, last.current?.returnPoint ?? null) ??
+            runButton.current;
           if (handedOff.current) event.preventDefault();
-          else if (target?.isConnected) {
+          else if (target) {
             event.preventDefault();
             target.focus({ preventScroll: true });
           }
@@ -773,10 +792,7 @@ function DocProblemsRunDialog({
                   new CustomEvent<DocShowProblemsDetail>(
                     DOC_SHOW_PROBLEMS_EVENT,
                     {
-                      detail: {
-                        returnFocus: asked?.returnFocus ?? null,
-                        returnStepId: asked?.returnStepId ?? null,
-                      },
+                      detail: { returnPoint: asked?.returnPoint ?? null },
                     },
                   ),
                 );
