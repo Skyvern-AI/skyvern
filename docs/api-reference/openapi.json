@@ -26953,7 +26953,7 @@
               }
             ],
             "title": "Max Steps",
-            "description": "\nMaximum number of steps the task can take. Task will fail if it exceeds this number. Cautions: you are charged per step so please set this number to a reasonable value. Contact sales@skyvern.com for custom pricing.\n",
+            "description": "\nMaximum number of steps the task can take. Task will fail if it exceeds this number. Cautions: a run that takes more steps can cost more, so please set this number to a reasonable value. Contact sales@skyvern.com for custom pricing.\n",
             "examples": [
               10,
               25
@@ -27294,7 +27294,7 @@
               }
             ],
             "title": "Max Steps",
-            "description": "\nMaximum number of steps the task can take. Task will fail if it exceeds this number. Cautions: you are charged per step so please set this number to a reasonable value. Contact sales@skyvern.com for custom pricing.\n",
+            "description": "\nMaximum number of steps the task can take. Task will fail if it exceeds this number. Cautions: a run that takes more steps can cost more, so please set this number to a reasonable value. Contact sales@skyvern.com for custom pricing.\n",
             "examples": [
               10,
               25
