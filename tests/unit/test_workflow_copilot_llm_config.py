@@ -3,8 +3,10 @@
 Optional settings give operators independent control over the main Copilot lane,
 agent-specific lane, and fast-consumer lane:
 ``WORKFLOW_COPILOT_LLM_KEY``, ``WORKFLOW_COPILOT_AGENT_LLM_KEY``, and
-``WORKFLOW_COPILOT_FAST_LLM_KEY``. ``WORKFLOW_COPILOT_LITE_LLM_KEY`` is the
-dedicated raw-secret safety lane and never falls back to the acting model.
+``WORKFLOW_COPILOT_FAST_LLM_KEY``. ``WORKFLOW_COPILOT_LITE_LLM_KEY`` selects the
+dedicated raw-secret safety model; the resolver itself never falls back to the
+acting model; when the key is empty, open-source startup supplies the base
+Copilot handler.
 These tests cover the public contract: defaults, fallback chains, and
 PostHog → env-specific → default resolution order.
 """
