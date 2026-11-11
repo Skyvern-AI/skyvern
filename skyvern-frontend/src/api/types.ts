@@ -990,6 +990,8 @@ export type WorkflowRunApiResponse = {
   workflow_run_id: string;
   workflow_title: string | null;
   retried_from_workflow_run_id?: string | null;
+  // Set when the run was started from the editor's per-block Run.
+  debug_session_id?: string | null;
 } & Pick<
   WorkflowRunRetryFields,
   "attempt" | "retry_pending" | "next_attempt_at"

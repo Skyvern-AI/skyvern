@@ -5,11 +5,14 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 import { cn } from "@/util/utils";
-import { isWorkflowBlockNode, type AppNode } from "../nodes";
-import { workflowBlockTitle } from "../nodes/types";
+import { type AppNode } from "../nodes";
 import { docProblemsTitle, type DocProblemEntry } from "./docProblems";
-import { DOC_SHOW_PROBLEMS_EVENT, docStepLine } from "./docKeys";
-import { docBlockType, docStepCaption, docStepTitle } from "./docStepRegistry";
+import {
+  DOC_SHOW_PROBLEMS_EVENT,
+  type DocShowProblemsDetail,
+  docStepLine,
+} from "./docKeys";
+import { docProblemStep } from "./docProblemStep";
 
 export function DocProblemsList({
   entries,
@@ -28,17 +31,21 @@ export function DocProblemsList({
   const titleId = useId();
   useEffect(() => {
     let frame = 0;
-    const show = () => {
+    const show = (event: Event) => {
+      // Where focus was when Run was pressed; the Run dialog has it by now.
+      const detail = (event as CustomEvent<DocShowProblemsDetail | undefined>)
+        .detail;
       cancelAnimationFrame(frame);
       frame = requestAnimationFrame(() => {
-        // A refused Run can come while the Doc is scrolled down; the popover is anchored to this button.
+        // Run can ask while the Doc is scrolled down; the popover is anchored to this button.
         trigger.current?.scrollIntoView?.({ block: "nearest" });
-        const active = document.activeElement;
+        const active = detail ? detail.returnFocus : document.activeElement;
         returnFocus.current = active instanceof HTMLElement ? active : null;
-        returnStepId.current =
-          active
-            ?.closest<HTMLElement>("[data-doc-node-id]")
-            ?.getAttribute("data-doc-node-id") ?? null;
+        returnStepId.current = detail
+          ? detail.returnStepId
+          : (active
+              ?.closest<HTMLElement>("[data-doc-node-id]")
+              ?.getAttribute("data-doc-node-id") ?? null);
         setOpen(true);
       });
     };
@@ -76,7 +83,7 @@ export function DocProblemsList({
           returnStepId.current = null;
         }}
         onCloseAutoFocus={(event) => {
-          // Escape returns to where focus was when a refused Run opened the list; an entry's jump keeps the step's focus.
+          // Escape returns to where focus was when Run was pressed; an entry's jump keeps the step's focus.
           // A line being typed in blurs when the list takes focus and its edit span is replaced.
           if (jumped.current || returnFocus.current) event.preventDefault();
           if (!jumped.current && returnFocus.current) {
@@ -97,15 +104,14 @@ export function DocProblemsList({
         <ul data-doc-problem-list className="flex flex-col">
           {entries.map((entry) => {
             const node = entry.nodeId ? byId.get(entry.nodeId) : undefined;
-            const blockType =
-              node && isWorkflowBlockNode(node) ? docBlockType(node) : null;
+            const step = node ? docProblemStep(node) : null;
             const body = (
               <>
-                {node && (
+                {step && (
                   <span className="block text-[12.5px] text-muted-foreground">
-                    {blockType ? `${workflowBlockTitle[blockType]} · ` : ""}
+                    {step.type ? `${step.type} · ` : ""}
                     <span className="font-medium text-foreground">
-                      {docStepCaption(node) ?? docStepTitle(node)}
+                      {step.name}
                     </span>
                   </span>
                 )}

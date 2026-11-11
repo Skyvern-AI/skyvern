@@ -46,17 +46,8 @@ vi.mock("@/components/ui/use-toast", async (importOriginal) => ({
   toast: vi.fn(),
 }));
 vi.mock("../hooks/useSaveWorkflow", () => ({ useSaveWorkflow: () => save }));
-vi.mock("./useDocRun", () => ({
-  useDocRun: () => ({
-    rowsLoaded: true,
-    runId: undefined,
-    run: undefined,
-    blocksByLabel: new Map(),
-    loopsByLabel: new Map(),
-    live: false,
-    blockRun: false,
-    unknownLabels: new Set(),
-  }),
+vi.mock("./useDocLatestRunCompleted", () => ({
+  useDocLatestRunCompleted: () => false,
 }));
 vi.mock("@/hooks/useIntegrationCatalogQuery", () => ({
   useIntegrationCatalogQuery: () => ({ data: catalogState.data }),

@@ -2,10 +2,15 @@ import { useSyncExternalStore } from "react";
 import { useBlockPlayRegistry } from "@/store/BlockPlayRegistryStore";
 import { isMacPlatform } from "@/util/platform";
 
-/** Fired by the run-agent shortcut; the top-bar Run button opens its "Run with" box (or runs, if it is open). */
+/** Fired by the run-agent shortcut; the top-bar Run button handles it as a click. */
 export const DOC_RUN_AGENT_EVENT = "skyvern:doc-run-agent";
-/** Fired when Run is refused for problems; the Doc opens its problems list. */
+/** Fired by "Fix problems" in the Run confirmation; the Doc opens its problems list. */
 export const DOC_SHOW_PROBLEMS_EVENT = "skyvern:doc-show-problems";
+/** Where focus goes back to when the problems list closes: where it was when Run was pressed. */
+export type DocShowProblemsDetail = {
+  returnFocus: HTMLElement | null;
+  returnStepId: string | null;
+};
 
 // A line's edit span is replaced when it loses focus, so a saved element can be gone: look the step's line up again.
 export function docStepLine(

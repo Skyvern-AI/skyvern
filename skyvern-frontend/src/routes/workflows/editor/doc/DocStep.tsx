@@ -19,13 +19,9 @@ import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { goalChangeIsPending } from "../workflowEditorUtils";
 import type { CodeBlockNodeData } from "../nodes/CodeBlockNode/types";
 import {
-  CheckIcon,
   ChevronDownIcon,
   ChevronRightIcon,
-  ClockIcon,
-  Cross2Icon,
   GearIcon,
-  ReloadIcon,
 } from "@radix-ui/react-icons";
 import {
   DropdownMenu,
@@ -71,9 +67,6 @@ import {
 } from "./docStepRegistry";
 import { DocRunStepButton } from "./DocRunStepButton";
 import { useBlockPlayRegistry } from "@/store/BlockPlayRegistryStore";
-import { docTagState, type DocTagState } from "./docRunState";
-import { useDocRunFor } from "./useDocRunFor";
-import { docStepActions, type DocStepAction } from "./docStepActions";
 import { DocText, docReferencePill } from "./DocText";
 import type { DocPlace } from "./docEditApi";
 import {
@@ -95,72 +88,27 @@ import {
 /** Where a step sits, for the moves its tag menu offers. Absent when the step's place can't be edited. */
 export type DocStepPlace = DocPlace & { count: number; isFinally: boolean };
 
-const tagStateClasses: Partial<Record<DocTagState, string>> = {
-  succeeded:
-    "bg-[#EAF3EC] text-[#3F7A57] dark:bg-[rgba(108,191,140,.14)] dark:text-[#6CBF8C]",
-  failed:
-    "bg-[#FBEAE8] text-[#C0392B] dark:bg-[rgba(240,138,126,.15)] dark:text-[#F08A7E]",
-  waiting:
-    "bg-[#FBEEE2] text-[#B45B0A] dark:bg-[rgba(231,154,85,.15)] dark:text-[#E79A55]",
-  // The dark block-type colours would outrank plain utilities, so dark restates the grey.
-  notReached:
-    "bg-muted text-muted-foreground dark:bg-[rgba(255,255,255,.04)] dark:text-muted-foreground",
-};
-
-const tagStateNames: Record<DocTagState, string> = {
-  running: "running",
-  succeeded: "done",
-  failed: "failed",
-  waiting: "waiting for you",
-  notReached: "not reached",
-};
-
 const tagClass = (
   blockType: ReturnType<typeof docBlockType>,
   pending = false,
-  state: DocTagState | null = null,
 ) =>
   cn(
     "inline-flex h-[21px] shrink-0 items-center gap-1 whitespace-nowrap rounded px-[6px] text-[12.5px] font-semibold leading-none",
     docTagClasses[docTagColor(blockType)],
     pending &&
       "border border-dashed border-current bg-transparent px-[5px] opacity-80 dark:bg-transparent",
-    state && tagStateClasses[state],
   );
-
-/** The step's state in the Doc's run, for its tag. */
-function useDocTagState(label: string): DocTagState | null {
-  const {
-    runId,
-    blocksByLabel,
-    live,
-    blockRun,
-    unknownLabels,
-    ranLabels,
-    rowsLoaded,
-  } = useDocRunFor(label);
-  const block = blocksByLabel.get(label);
-  if (unknownLabels.has(label) || !rowsLoaded) return null;
-  if (blockRun && !block) return null;
-  if (!block && ranLabels && !ranLabels.has(label)) return null;
-  return docTagState(block, live, Boolean(runId));
-}
 
 function DocTagIcon({
   blockType,
-  state,
 }: {
   blockType: ReturnType<typeof docBlockType>;
-  state: DocTagState | null;
 }) {
-  const icon = "size-3 shrink-0";
-  if (state === "running")
-    return <ReloadIcon aria-hidden className={cn(icon, "animate-spin")} />;
-  if (state === "succeeded") return <CheckIcon aria-hidden className={icon} />;
-  if (state === "failed") return <Cross2Icon aria-hidden className={icon} />;
-  if (state === "waiting") return <ClockIcon aria-hidden className={icon} />;
   return blockType ? (
-    <WorkflowBlockIcon workflowBlockType={blockType} className={icon} />
+    <WorkflowBlockIcon
+      workflowBlockType={blockType}
+      className="size-3 shrink-0"
+    />
   ) : null;
 }
 
@@ -205,10 +153,9 @@ function DocStepMenu({
   const [confirming, setConfirming] = useState(false);
   const blockType = docBlockType(node);
   const pending = useDocStepPending(node);
-  const state = useDocTagState(node.data.label);
   const playing = useBlockPlayRegistry((s) => s.handles[node.id]?.playing);
   // A step that is running can't be moved, changed into another type or deleted.
-  const running = state === "running" || Boolean(playing);
+  const running = Boolean(playing);
   // The grip unmounts while the step runs; its menu must not come back on its own afterwards.
   useEffect(() => {
     if (running) setMenuAt((open) => (open === "grip" ? null : open));
@@ -467,15 +414,13 @@ function DocStepMenu({
             onKeyDown={openOnArrow("tag")}
             title="Click for actions"
             aria-label={`${blockType ? workflowBlockTitle[blockType] : node.type} step ${node.data.label}, actions`}
-            data-doc-tag-state={state}
             className={cn(
-              tagClass(blockType, pending, state),
+              tagClass(blockType, pending),
               "outline-none hover:brightness-95 focus-visible:ring-2 focus-visible:ring-ring",
             )}
           >
-            <DocTagIcon blockType={blockType} state={state} />
+            <DocTagIcon blockType={blockType} />
             {blockType ? workflowBlockTitle[blockType] : node.type}
-            {state && <span className="sr-only">, {tagStateNames[state]}</span>}
           </button>
           {menu("tag")}
         </span>
@@ -504,19 +449,14 @@ export function DocTag({
   const actions = useContext(WorkflowDocActionsContext);
   const blockType = docBlockType(node);
   const pending = useDocStepPending(node);
-  const state = useDocTagState(node.data.label);
   if (actions.edit && place)
     return (
       <DocStepMenu node={node} place={place} besideChevron={besideChevron} />
     );
   return (
-    <span
-      className={tagClass(blockType, pending, state)}
-      data-doc-tag-state={state}
-    >
-      <DocTagIcon blockType={blockType} state={state} />
+    <span className={tagClass(blockType, pending)}>
+      <DocTagIcon blockType={blockType} />
       {blockType ? workflowBlockTitle[blockType] : node.type}
-      {state && <span className="sr-only">, {tagStateNames[state]}</span>}
     </span>
   );
 }
@@ -915,7 +855,6 @@ export function DocStepBody({
       )}
       <DocStepSummary
         node={node}
-        editable={editableProp}
         renamable={renamable}
         mainLine={
           isProse
@@ -980,12 +919,10 @@ const MAX_SHOWN_REFERENCES = 4;
 /** One muted line: what the step uses and saves, its custom settings, and its options. */
 function DocStepSummary({
   node,
-  editable,
   renamable,
   mainLine,
 }: {
   node: WorkflowBlockNode;
-  editable: boolean;
   renamable: boolean;
   mainLine: string;
 }) {
@@ -994,7 +931,7 @@ function DocStepSummary({
   const refs = stepReferences(node, mainLine);
   const saves = docStepProducesData(node);
   const custom = getDocSettingsChips(node);
-  const options = editable ? stepOptionRows(node) : [];
+  const options = stepOptionRows(node);
   return (
     <>
       <div className="mt-1 flex flex-wrap items-baseline gap-x-2 gap-y-1 text-[12.5px] text-muted-foreground">
@@ -1036,11 +973,7 @@ function DocStepSummary({
         ))}
         <DocKeyTooltip
           content={
-            custom.length
-              ? customSettingsText(custom.length)
-              : editable
-                ? "Actions and settings"
-                : "Actions"
+            custom.length ? customSettingsText(custom.length) : "Settings"
           }
         >
           <button
@@ -1102,93 +1035,6 @@ function stepOptionRows(node: WorkflowBlockNode): DocSettingRow[] {
   ];
 }
 
-type DocStepRun =
-  | { state: "none" | "edited" | "notReached" | "notYet" }
-  | {
-      state: "ran";
-      shown: DocStepAction[];
-      more: number;
-      runCount: number;
-    };
-
-/** The actions this block took in the run its result line reads (a looped block's latest run). */
-function useDocStepRun(label: string): DocStepRun {
-  const {
-    runId,
-    blocksByLabel,
-    runsByLabel,
-    unknownLabels,
-    rowsLoaded,
-    live,
-    blockRun,
-  } = useDocRunFor(label);
-  if (!runId || !rowsLoaded) return { state: "none" };
-  if (unknownLabels.has(label)) return { state: "edited" };
-  const block = blocksByLabel.get(label);
-  // As on the result line: a one-step run says nothing about a step it has no row for.
-  if (blockRun && !block) return { state: "none" };
-  return block
-    ? {
-        state: "ran",
-        ...docStepActions(block.actions),
-        runCount: runsByLabel?.get(label)?.count ?? 1,
-      }
-    : { state: live ? "notYet" : "notReached" };
-}
-
-const RUN_NOTE: Record<Exclude<DocStepRun["state"], "ran">, string> = {
-  none: "No run yet. After a run, the actions it took show here.",
-  edited: "Edited since the last run. Run again to see its actions.",
-  notReached: "The last run did not reach this.",
-  notYet: "The run has not reached this yet.",
-};
-
-function DocStepRunActions({ label }: { label: string }) {
-  const run = useDocStepRun(label);
-  if (run.state !== "ran")
-    return <p className="text-muted-foreground">{RUN_NOTE[run.state]}</p>;
-  const many = run.runCount > 1;
-  if (!run.shown.length)
-    return (
-      <p className="text-muted-foreground">
-        {many
-          ? `The last of ${run.runCount} runs took no page actions here.`
-          : "The last run took no page actions here."}
-      </p>
-    );
-  const { more } = run;
-  return (
-    <>
-      <p className="text-[12px] text-muted-foreground">
-        {many
-          ? `Actions in the last of ${run.runCount} runs`
-          : "Actions in the last run"}
-      </p>
-      <ol className="mt-0.5 list-decimal space-y-0.5 pl-5">
-        {run.shown.map((action) => (
-          // The title carries text the clamp hides; 2000 characters keeps a huge reasoning out of the tooltip.
-          <li key={action.key} title={action.text?.slice(0, 2000)}>
-            <span className="line-clamp-2 [overflow-wrap:anywhere]">
-              <span className="font-medium">{action.type}</span>
-              {action.text && (
-                <span className="text-muted-foreground"> {action.text}</span>
-              )}
-            </span>
-            {action.failed && (
-              <span className="text-destructive"> (failed)</span>
-            )}
-          </li>
-        ))}
-      </ol>
-      {more > 0 && (
-        <p className="text-muted-foreground">
-          +{more} more in the run&rsquo;s timeline
-        </p>
-      )}
-    </>
-  );
-}
-
 function DocStepDetails({
   id,
   node,
@@ -1206,9 +1052,8 @@ function DocStepDetails({
       id={id}
       className="mt-1 rounded-md border border-border px-3 py-2 text-[13px]"
     >
-      <DocStepRunActions label={node.data.label} />
       {rows.length > 0 && (
-        <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-4 gap-y-0.5 border-t border-border pt-2">
+        <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-0.5">
           {rows.map((row) => (
             <Fragment key={row.key}>
               <dt className="text-muted-foreground">{row.label}</dt>

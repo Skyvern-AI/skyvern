@@ -577,7 +577,7 @@ describe("building from scratch in the doc", () => {
     expect(loopProblems(picked.latest())).toBeUndefined();
   });
 
-  test("an extraction without an array field offers no list, and its bare result still holds Run", () => {
+  test("an extraction without an array field offers no list, and its bare result still asks before Run", () => {
     const graph = loopAfter(
       extraction({
         type: "object",
@@ -626,7 +626,7 @@ describe("building from scratch in the doc", () => {
     expect(loopProblems(latest())).toBeUndefined();
   });
 
-  test("a list field named like a dict method or a keyword is not offered and holds Run when typed, and a note on the loop gets no list", () => {
+  test("a list field named like a dict method or a keyword is not offered and asks before Run when typed, and a note on the loop gets no list", () => {
     const schema = {
       type: "object",
       properties: {

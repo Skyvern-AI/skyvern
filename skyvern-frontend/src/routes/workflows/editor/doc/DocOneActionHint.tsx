@@ -3,10 +3,11 @@ import { useContext, useId, useState } from "react";
 import { Button } from "@/components/ui/button";
 import type { AppNode } from "../nodes";
 import { announceDoc } from "./docAnnounce";
-import { NO_START_PAGE_REASON } from "./docFailureText";
 import { docOneActionStepWantsTask } from "./docOneAction";
 import { docShortUrl, type DocPromptUrlOffer } from "./docPromptUrl";
 import { WorkflowDocActionsContext } from "./WorkflowDocActionsContext";
+
+const NO_START_PAGE_REASON = "This step needs a page to start on.";
 
 // Dismissals outlive the component: switching an If branch unmounts its steps' hints.
 const dismissed = new Set<string>();
