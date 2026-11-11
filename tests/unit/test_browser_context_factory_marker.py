@@ -16,6 +16,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import structlog
 from playwright.async_api import BrowserContext, Locator, Page
 
 from skyvern.config import settings
@@ -104,6 +105,9 @@ async def test_ordinary_local_creator_leaves_marker_false(monkeypatch: pytest.Mo
         async def should_apply_banked_cookies(self, organization_id: str | None) -> bool:
             return False
 
+        def on_browser_context_abandoned(self, browser_context: Any) -> None:
+            return None
+
     class _FakeApp:
         AGENT_FUNCTION = _FakeAgentFunction()
 
@@ -131,6 +135,9 @@ def _factory_harness(monkeypatch: pytest.MonkeyPatch) -> None:
 
         async def should_apply_banked_cookies(self, organization_id: str | None) -> bool:
             return False
+
+        def on_browser_context_abandoned(self, browser_context: Any) -> None:
+            return None
 
     class _FakeApp:
         AGENT_FUNCTION = _FakeAgentFunction()
@@ -440,16 +447,26 @@ async def test_headful_creator_releases_recorder_when_launch_is_cancelled(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("abandon_hook_raises", [False, True], ids=["hook_ok", "hook_raises"])
 @pytest.mark.parametrize(
-    "release_cancels, expected_exc",
+    "release_cancels, post_return_error, expected_exc",
     [
-        (False, Exception),  # ordinary post-return error -> close before release, cleanup runs, error wraps
-        (True, asyncio.CancelledError),  # a release cancel: cleanup_func STILL runs once, then cancellation wins
+        # ordinary post-return error -> close before release, cleanup runs, error wraps
+        (False, RuntimeError("post-return-boom"), Exception),
+        # a release cancel: cleanup_func STILL runs once, then cancellation wins
+        (True, RuntimeError("post-return-boom"), asyncio.CancelledError),
+        # the post-return work itself is cancelled: the same cleanup order, then the cancellation propagates
+        (False, asyncio.CancelledError(), asyncio.CancelledError),
     ],
-    ids=["ordinary_error", "release_cancel_runs_cleanup"],
+    ids=["ordinary_error", "release_cancel_runs_cleanup", "post_return_cancel"],
 )
 async def test_factory_closes_context_before_releasing_recorder_on_post_return_failure(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Any, release_cancels: bool, expected_exc: type[BaseException]
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+    release_cancels: bool,
+    post_return_error: BaseException,
+    expected_exc: type[BaseException],
+    abandon_hook_raises: bool,
 ) -> None:
     # A post-return setup failure must unmap the tenant's window (context.close) BEFORE the display fence is
     # released (freeing the fence while mapped lets a later different-owner acquire capture it), and cleanup_func
@@ -494,13 +511,25 @@ async def test_factory_closes_context_before_releasing_recorder_on_post_return_f
     monkeypatch.setattr(factory_module, "release_display_recorder", _release)
 
     def _boom(*_a: Any, **_k: Any) -> None:
-        raise RuntimeError("post-return-boom")
+        raise post_return_error
 
     monkeypatch.setattr(factory_module, "register_playwright_input_context", _boom)
 
+    def _raising_hook(_context: Any) -> None:
+        raise RuntimeError("hook-secret-text")
+
+    if abandon_hook_raises:
+        # A failing abandonment report never skips the cleanup or replaces the original failure.
+        monkeypatch.setattr(factory_module.app.AGENT_FUNCTION, "on_browser_context_abandoned", _raising_hook)
+
     try:
-        with pytest.raises(expected_exc):
+        with structlog.testing.capture_logs() as logs, pytest.raises(expected_exc):
             await BrowserContextFactory.create_browser_context(playwright=object())
+        reports = [entry for entry in logs if entry["event"] == "Failed to report an abandoned browser context"]
+        assert [(entry.get("error_type"), "exc_info" in entry) for entry in reports] == (
+            [("RuntimeError", False)] if abandon_hook_raises else []
+        )
+        assert all("hook-secret-text" not in repr(entry) for entry in logs)
         assert order == ["close", "release", "cleanup"]  # unmap -> fence release -> cleanup_func, in that order
         cleanup.assert_awaited_once()  # cleanup_func runs exactly once even when the release cancels
         assert (":99", "wr_t1") not in dr._REGISTRY and rec.is_stopped  # released + deregistered

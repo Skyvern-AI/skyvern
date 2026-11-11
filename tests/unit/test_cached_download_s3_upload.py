@@ -11,6 +11,7 @@ Validates that the cached download flow:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 from datetime import UTC, datetime
 from pathlib import Path
@@ -21,8 +22,11 @@ import pytest
 from structlog.testing import capture_logs
 
 from skyvern.forge.sdk.api import files as files_module
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.services import script_service
 from tests.unit._fingerprint_expectations import expected_fingerprint
+from tests.unit.helpers import register_download
 
 MODULE = "skyvern.services.script_service"
 
@@ -64,6 +68,7 @@ def mock_context():
     ctx.run_id = ctx.workflow_run_id
     ctx.prompt = None
     ctx.download_suffix_applied_files = {}
+    ctx.record_configured_download = AsyncMock()
     return ctx
 
 
@@ -81,6 +86,7 @@ def setup(mock_context, tmp_path):
         save_side_effect=None,
         list_files_side_effect=None,
         rename_mock=None,
+        context=None,
     ):
         storage = _make_storage(get_side_effect)
         if save_side_effect is not None:
@@ -111,7 +117,7 @@ def setup(mock_context, tmp_path):
                     extra_template_data["original_filename"] if extra_template_data else "{{ original_filename }}",
                 ),
             ),
-            patch(f"{MODULE}.skyvern_context.ensure_context", return_value=mock_context),
+            patch(f"{MODULE}.skyvern_context.ensure_context", return_value=context or mock_context),
             patch(f"{MODULE}._prepare_cached_block_inputs", new_callable=AsyncMock),
             patch(f"{MODULE}._run_cached_function", new=run_cached_mock),
             patch(f"{MODULE}._update_workflow_block", update_block_mock),
@@ -135,7 +141,7 @@ def setup(mock_context, tmp_path):
             "update_block": update_block_mock,
             "rename": rename,
             "run_cached": run_cached_mock,
-            "context": mock_context,
+            "context": context or mock_context,
             "wait_downloads": wait_downloads_mock,
             "get_download_dir": get_download_dir_mock,
         }
@@ -533,8 +539,9 @@ async def test_cached_missing_destination_halts_without_fallback(setup, tmp_path
         _cleanup(refs)
 
 
+@pytest.mark.parametrize("renamed", [True, False], ids=["rename_took_effect", "rename_failed"])
 @pytest.mark.asyncio
-async def test_rename_happens_before_s3_upload(setup, tmp_path):
+async def test_rename_happens_before_s3_upload(setup, tmp_path, sqlite_engine, renamed):
     """download_suffix rename must happen BEFORE save_downloaded_files.
 
     This ensures remote storage receives the correctly-named file and subsequent
@@ -542,21 +549,27 @@ async def test_rename_happens_before_s3_upload(setup, tmp_path):
     """
     download_dir = tmp_path / "downloads"
     call_order: list[str] = []
+    context = SkyvernContext(organization_id="o_test_org", run_id="wr_test_run", workflow_run_id="wr_test_run")
+    database = AgentDB(str(sqlite_engine.url), db_engine=sqlite_engine)
+    registered = []
 
-    rename_mock = MagicMock(side_effect=lambda path, name: call_order.append("rename"))
+    def rename(path, name):
+        call_order.append("rename")
+        # A failed rename_file hands back the path it was given.
+        return files_module.rename_file(path, name) if renamed else path
 
     async def track_save(**kwargs):
         call_order.append("save")
-
-    fake_file = str(download_dir / "uuid-random.pdf")
+        registered.extend([await register_download(database, path, context) for path in download_dir.iterdir()])
 
     refs = setup(
         get_side_effect=[[], ["invoice.pdf"]],
         save_side_effect=track_save,
-        # before, local verify, rename local_files_after, existing_names dedup lookup
-        list_files_side_effect=[[], [fake_file], [fake_file], [fake_file]],
-        rename_mock=rename_mock,
+        list_files_side_effect=files_module.list_files_in_directory,
+        rename_mock=rename,
+        context=context,
     )
+    refs["run_cached"].side_effect = lambda *_: (download_dir / "uuid-random.pdf").write_bytes(b"%PDF-1.4 invoice")
     try:
         from skyvern.services.script_service import download
 
@@ -565,30 +578,13 @@ async def test_rename_happens_before_s3_upload(setup, tmp_path):
         assert call_order == ["rename", "save"], f"Expected rename before save, got: {call_order}"
     finally:
         _cleanup(refs)
-
-
-@pytest.mark.asyncio
-async def test_download_suffix_rename_uses_file_path_directly(setup, tmp_path):
-    """rename_file should receive the absolute path from list_files_in_directory,
-    not a reconstructed path via Path joining."""
-    download_dir = tmp_path / "downloads"
-    abs_path = str(download_dir / "abc123.pdf")
-
-    rename_mock = MagicMock(return_value=str(download_dir / "invoice.pdf"))
-    refs = setup(
-        get_side_effect=[[], ["invoice.pdf"]],
-        # before, local verify, rename local_files_after, existing_names dedup lookup
-        list_files_side_effect=[[], [abs_path], [abs_path], [abs_path]],
-        rename_mock=rename_mock,
-    )
-    try:
-        from skyvern.services.script_service import download
-
-        await download(prompt="Download invoice", download_suffix="invoice", label="test_block")
-
-        rename_mock.assert_called_once_with(abs_path, "invoice.pdf")
-    finally:
-        _cleanup(refs)
+    kept = download_dir / ("invoice.pdf" if renamed else "uuid-random.pdf")
+    digest = hashlib.sha256(kept.read_bytes()).hexdigest()
+    receipts = {path: (org, run, sha) for path, (org, run, _, sha) in context.configured_downloads.items()}
+    assert receipts == ({os.path.realpath(kept): ("o_test_org", "wr_test_run", digest)} if renamed else {})
+    assert [(Path(row.uri).name, row.configured_name_sha256) for row in registered] == [
+        (kept.name, digest if renamed else None)
+    ]
 
 
 @pytest.mark.asyncio

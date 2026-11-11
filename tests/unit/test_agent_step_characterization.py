@@ -12,14 +12,15 @@ import pytest
 
 from skyvern.exceptions import FailedToReloadPage, NoTOTPVerificationCodeFound, ScrapingFailedBlankPage
 from skyvern.forge import app
-from skyvern.forge.agent import ForgeAgent, StepPromptResult
+from skyvern.forge.agent import ForgeAgent, ScrapeType, StepPromptResult
 from skyvern.forge.sdk.api.llm.exceptions import LLMResponseMissingActionsError
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task
-from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, FileDownloadBlock
+from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, ExtractionBlock, FileDownloadBlock
+from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
@@ -33,7 +34,9 @@ from skyvern.webeye.actions.actions import (
 )
 from skyvern.webeye.actions.models import DetailedAgentStepOutput
 from skyvern.webeye.actions.responses import ActionFailure, ActionResult, ActionSuccess
+from skyvern.webeye.scraper import scraper
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
+from tests.unit._task_block_fakes import output_parameter
 from tests.unit.helpers import make_browser_state, make_organization, make_step, make_task
 from tests.unit.scoped_asyncio import ScopedAsyncio
 
@@ -658,3 +661,55 @@ async def test_get_failure_reason_for_task_falls_back_when_no_terminate_action_f
     reason = await ForgeAgent().get_failure_reason_for_task(task)
 
     assert reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("allow_blank", [False, True])
+async def test_internal_extraction_blank_page_reaches_real_scrape_check(
+    monkeypatch: pytest.MonkeyPatch, allow_blank: bool
+) -> None:
+    rig = make_agent_step_rig(monkeypatch)
+    monkeypatch.setattr(object.__getattribute__(app, "_inst"), "scrape_exclude", None, raising=False)
+    block = ExtractionBlock(label="branch", data_extraction_goal="condition", output_parameter=output_parameter())
+    block._allow_blank_start = allow_blank
+    page = MagicMock(url="about:blank")
+    page.main_frame.child_frames = []
+    frame = MagicMock()
+    monkeypatch.setattr(scraper.SkyvernFrame, "create_instance", AsyncMock(return_value=frame))
+    monkeypatch.setattr(scraper, "_wait_for_scrape_ready", AsyncMock())
+
+    async def scrape_website(**kwargs: Any) -> ScrapedPage:
+        await scraper._prepare_scrape_frame(rig.browser_state, page, None, kwargs["support_empty_page"])
+        return rig.scraped_page
+
+    rig.browser_state.scrape_website = AsyncMock(side_effect=scrape_website)
+    result = rig.agent.build_and_record_step_prompt.return_value
+
+    async def build_prompt(task: Any, step: Any, browser_state: Any, engine: Any, **kwargs: Any) -> Any:
+        await rig.agent._scrape_with_type(task, step, browser_state, ScrapeType.NORMAL, engine, **kwargs)
+        return result
+
+    rig.agent.build_and_record_step_prompt = AsyncMock(side_effect=build_prompt)
+    if allow_blank:
+        step, _ = await rig.run(block)
+        assert step.status == StepStatus.completed
+    else:
+        with pytest.raises(ScrapingFailedBlankPage):
+            await rig.run(block)
+    assert rig.browser_state.scrape_website.await_args.kwargs["support_empty_page"] is allow_blank
+
+
+@pytest.mark.asyncio
+async def test_step_prompt_passes_blank_page_opt_in_to_scraper(monkeypatch: pytest.MonkeyPatch) -> None:
+    rig = make_agent_step_rig(monkeypatch)
+    monkeypatch.setattr("skyvern.forge.agent.resolve_transient_ui_capture_arm", AsyncMock())
+    rig.agent._scrape_with_type = AsyncMock(side_effect=RuntimeError("scrape reached"))
+    skyvern_context.set(rig.context)
+    try:
+        with pytest.raises(RuntimeError, match="scrape reached"):
+            await ForgeAgent.build_and_record_step_prompt(
+                rig.agent, rig.task, rig.step, rig.browser_state, RunEngine.skyvern_v1, support_empty_page=True
+            )
+    finally:
+        skyvern_context.reset()
+    assert rig.agent._scrape_with_type.await_args.kwargs["support_empty_page"] is True

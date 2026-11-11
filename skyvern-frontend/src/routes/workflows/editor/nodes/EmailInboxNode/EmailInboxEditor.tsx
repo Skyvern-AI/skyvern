@@ -209,8 +209,7 @@ function EmailInboxEditorBody({
           <p className="text-xs text-muted-foreground">
             This Gmail account requires an eligible human-initiated root run.
             Scheduled, event, and child runs are unsupported. Folder, sender,
-            and subject must be literal; attachment downloads are unsupported.
-            Reads return at most 100 messages.
+            and subject must be literal. Reads return at most 100 messages.
           </p>
         ) : null}
       </div>
@@ -360,7 +359,6 @@ function EmailInboxEditorBody({
                 <Switch
                   aria-label="Download Attachments"
                   checked={data.downloadAttachments}
-                  disabled={isNango && !data.downloadAttachments}
                   onCheckedChange={(checked) =>
                     update({ downloadAttachments: checked })
                   }

@@ -363,14 +363,14 @@ export function DocRunButton() {
       toast({ title: "Add a step first: type / on a line." });
       return;
     }
-    // Same as the shared Run: while the Doc lists problems, a click explains and jumps to the first.
-    const { docProblemCount, docShowFirstProblem } =
+    // Same as the shared Run: while the Doc lists problems, a click explains and opens the list.
+    const { docProblemCount, docShowProblems } =
       useRunValidationStore.getState();
     if (docProblemCount > 0) {
       toast({
         title: `Fix ${docProblemCount} problem${docProblemCount === 1 ? "" : "s"} before running`,
       });
-      docShowFirstProblem?.();
+      docShowProblems?.();
       return;
     }
     setValues((current) =>

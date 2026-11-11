@@ -10,7 +10,15 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  onTestFinished,
+  test,
+  vi,
+} from "vitest";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ReactFlowProvider } from "@xyflow/react";
@@ -58,8 +66,9 @@ vi.mock("../workflowYamlDocument", async (importOriginal) => ({
 
 // The run widgets need studio run contexts; this file tests navigation, so they are stubbed.
 vi.mock("./DocStepResult", () => ({ DocStepResult: () => null }));
-vi.mock("./DocLiveIndicator", () => ({ DocLiveIndicator: () => null }));
 vi.mock("./DocRunStepButton", () => ({ DocRunStepButton: () => null }));
+// The settings form is mocked because these tests check the side panel's header only.
+vi.mock("../panels/BlockConfigForm", () => ({ BlockConfigForm: () => null }));
 
 const output = (label: string) => ({
   parameter_type: "output",
@@ -141,6 +150,28 @@ describe("WorkflowDocEditor navigation", () => {
     cleanup();
     useLocateBlockStore.getState().clearLocate();
     vi.unstubAllGlobals();
+  });
+
+  test("a run line above the steps says which run the results come from, and shows only with a run", () => {
+    renderDoc();
+    expect(screen.queryByTestId("doc-run-line")).toBeNull();
+    cleanup();
+    docRun.current = {
+      runId: "wr_1",
+      run: {
+        status: Status.Failed,
+        created_at: new Date().toISOString(),
+        workflow: { version: 2 },
+      },
+      currentVersion: 3,
+      earlierVersion: true,
+      blocksByLabel: new Map(),
+      live: false,
+    };
+    renderDoc();
+    expect(screen.getByTestId("doc-run-line").textContent).toContain(
+      "Run wr_1 · Failed · just now · an earlier version, v2",
+    );
   });
 
   describe("keyboard-first editing", () => {
@@ -653,6 +684,34 @@ describe("WorkflowDocEditor navigation", () => {
     },
   );
 
+  test.each([
+    ["navigation", { navigation_goal: "" }, /agent should do\. Type @/],
+    ["validation", { complete_criterion: "" }, /check to pass\. Type @/],
+    [
+      "human_interaction",
+      { instructions: "", recipients: [] },
+      /before deciding\. Type @/,
+    ],
+  ])(
+    "an empty %s step shows its editing hint while editable and No instructions yet when read-only",
+    (blockType, extra, hint) => {
+      const step = () => [block(blockType, "the_step", null, extra)];
+      renderDoc(step(), {
+        apply: vi.fn(),
+        update: vi.fn(),
+        addStep: vi.fn(),
+        duplicate: vi.fn(),
+      });
+      expect(screen.getByText(hint)).toBeTruthy();
+      cleanup();
+      renderDoc(step());
+      expect(screen.queryByText(hint)).toBeNull();
+      expect(screen.getAllByText("No instructions yet").length).toBeGreaterThan(
+        0,
+      );
+    },
+  );
+
   test("a read-only doc reserves no empty row above Inputs", () => {
     renderDoc([block("goto_url", "open_site", null, { url: "x" })]);
     expect(document.querySelector('[aria-hidden="true"].h-\\[28px\\]')).toBe(
@@ -663,6 +722,132 @@ describe("WorkflowDocEditor navigation", () => {
   test("a Go to URL step with no URL shows a required chip", () => {
     renderDoc([block("goto_url", "open_site", null, { url: "" })]);
     expect(document.querySelector('[data-doc-missing="URL"]')).toBeTruthy();
+  });
+
+  test("a step offers its prompt's URL for its empty URL field after Details, with the reason, and not while typing or read-only", () => {
+    const task = block("task", "search_step", "next_step", {
+      url: "",
+      navigation_goal: "Go to https://example.com/page and search for shoes",
+    });
+    const next = block("task", "next_step", null, {
+      url: "",
+      navigation_goal: "Then open https://example.com/other",
+    });
+    const edits: DocGraphEdits = {
+      apply: vi.fn(),
+      update: vi.fn(),
+      addStep: vi.fn(),
+      duplicate: vi.fn(),
+    };
+    const nodes = renderDoc([task, next], edits);
+    const offer = () =>
+      screen.queryByRole("button", {
+        name: "Use https://example.com/page as the URL",
+      });
+    expect(
+      screen.getByText("This step needs a page to start on."),
+    ).toBeTruthy();
+    expect(
+      screen.getByText(
+        "Without a URL, this step starts on the previous step's page.",
+      ),
+    ).toBeTruthy();
+
+    const mainLine = screen.getByRole("textbox", {
+      name: "search_step navigationGoal",
+    });
+    fireEvent.focus(mainLine);
+    expect(offer()).toBe(null);
+    fireEvent.blur(
+      screen.getByRole("textbox", { name: "search_step navigationGoal" }),
+    );
+
+    // Forward Tab follows the DOM: the prompt, then Details, then the offer.
+    const tabbable = [
+      ...document.querySelectorAll<HTMLElement>('[role="textbox"], button'),
+    ];
+    const at = (el: HTMLElement) => tabbable.indexOf(el);
+    const prompt = screen.getByRole("textbox", {
+      name: "search_step navigationGoal",
+    });
+    const options = screen.getByRole("button", {
+      name: /^Details for .*search/i,
+    });
+    expect(at(prompt)).toBeLessThan(at(options));
+    expect(at(options)).toBeLessThan(at(offer()!));
+    expect(
+      tabbable
+        .slice(at(options) + 1, at(offer()!))
+        .some((el) => el.getAttribute("role") === "textbox"),
+    ).toBe(false);
+
+    fireEvent.click(offer()!);
+    const updater = vi.mocked(edits.update).mock.calls[0]![0];
+    const data = updater(nodes).find(isWorkflowBlockNode)!.data as Record<
+      string,
+      unknown
+    >;
+    expect(data.url).toBe("https://example.com/page");
+    expect(data.navigationGoal).toBe(
+      "Go to https://example.com/page and search for shoes",
+    );
+    expect(docAnnouncement()).toBe("URL set to https://example.com/page");
+    expect(document.activeElement?.getAttribute("aria-label")).toBe(
+      "search_step navigationGoal",
+    );
+
+    // Dismissing an offer puts focus back on its step's prompt line.
+    const nextOffer = document.querySelector<HTMLElement>(
+      '[data-doc-suggestion="url"]',
+    )!;
+    fireEvent.click(within(nextOffer).getByRole("button", { name: "Dismiss" }));
+    expect(nextOffer.isConnected).toBe(false);
+    expect(document.activeElement?.getAttribute("aria-label")).toBe(
+      "next_step navigationGoal",
+    );
+
+    cleanup();
+    renderDoc([task, next]);
+    expect(offer()).toBe(null);
+  });
+
+  test("a step's URL offer comes back after a demonstration takes editing away while its prompt is focused and focus moves on", () => {
+    renderDoc(
+      [
+        block("task", "focus_step", null, {
+          url: "",
+          navigation_goal: "Go to https://example.com/focus and search",
+        }),
+      ],
+      { apply: vi.fn(), update: vi.fn(), addStep: vi.fn(), duplicate: vi.fn() },
+    );
+    const offer = () =>
+      screen.queryByRole("button", {
+        name: "Use https://example.com/focus as the URL",
+      });
+    fireEvent.focus(
+      screen.getByRole("textbox", { name: "focus_step navigationGoal" }),
+    );
+    expect(offer()).toBe(null);
+    act(() =>
+      useRecordingLauncherStore.setState({
+        demonstration: {
+          phase: "recording",
+          actionCount: 0,
+          interrupted: false,
+          insertion: null,
+        },
+      }),
+    );
+    // Focus moves on during the demonstration (to the control that started it), so the line does not take it back.
+    const elsewhere = document.body.appendChild(
+      document.createElement("button"),
+    );
+    act(() => elsewhere.focus());
+    act(() => useRecordingLauncherStore.setState({ demonstration: null }));
+    expect(document.activeElement).toBe(elsewhere);
+    expect(offer()).not.toBe(null);
+    elsewhere.remove();
   });
 
   test("Locate on a step inside a collapsed loop reopens the loop and consumes the request", () => {
@@ -765,7 +950,7 @@ describe("WorkflowDocEditor navigation", () => {
     ).toBeNull();
   });
 
-  test("counts server validation problems in the edit bar", async () => {
+  test("counts server validation problems in the edit bar the same way Run counts them", async () => {
     vi.useFakeTimers();
     const post = vi.fn().mockResolvedValue({
       data: {
@@ -773,12 +958,25 @@ describe("WorkflowDocEditor navigation", () => {
           {
             code: "unknown_reference",
             block_label: "inner_step",
+            field: "prompt",
+            message: "Unknown reference: missing_value.",
+          },
+          {
+            code: "unknown_reference",
+            block_label: "inner_step",
+            field: "url",
             message: "Unknown reference: missing_value.",
           },
           {
             code: "schema_error",
             block_label: "inner_step",
             message: "This block has an invalid setting.",
+          },
+          {
+            code: "unknown_loop_source",
+            block_label: "inner_step",
+            severity: "warning",
+            message: "The loop source isn't a known input.",
           },
         ],
       },
@@ -795,7 +993,9 @@ describe("WorkflowDocEditor navigation", () => {
         await vi.advanceTimersByTimeAsync(1000);
       });
 
-      expect(screen.getByText("2 problems")).toBeTruthy();
+      // The same reference in two fields is one problem; the warning is listed but does not hold Run.
+      expect(screen.getByText("2 problems, 1 warning")).toBeTruthy();
+      expect(useRunValidationStore.getState().docProblemCount).toBe(2);
       expect(
         screen.getByText(/This block has an invalid setting\./),
       ).toBeTruthy();
@@ -819,6 +1019,13 @@ describe("WorkflowDocEditor navigation", () => {
             field: "notes",
             message: "Notes can't use a credential input.",
           },
+          {
+            code: "credential_in_note",
+            severity: "warning",
+            block_label: "inner_step",
+            field: "trailing_notes",
+            message: "Notes can't use a credential input.",
+          },
         ],
       },
     });
@@ -832,6 +1039,8 @@ describe("WorkflowDocEditor navigation", () => {
       await act(async () => {
         await vi.advanceTimersByTimeAsync(1000);
       });
+      // Named in the note above and the trailing note: one entry, and Run counts that one.
+      expect(screen.getByText("1 problem")).toBeTruthy();
       expect(useRunValidationStore.getState().docProblemCount).toBe(1);
     } finally {
       useWorkflowHasChangesStore.setState({ getSaveData });
@@ -885,7 +1094,7 @@ describe("WorkflowDocEditor navigation", () => {
       expect(screen.getByRole("alert").textContent).toContain(
         "Couldn't check this workflow: Workflow validation drafts must be at most 100000 bytes.",
       );
-      expect(screen.getByText("2 problems")).toBeTruthy();
+      expect(screen.getByText("2 warnings")).toBeTruthy();
       // The earlier check's warning describes an older draft, so it no longer holds the run.
       expect(useRunValidationStore.getState().docProblemCount).toBe(0);
     } finally {
@@ -959,7 +1168,7 @@ describe("WorkflowDocEditor navigation", () => {
       await act(async () => {
         await vi.advanceTimersByTimeAsync(1000);
       });
-      expect(screen.getByText("1 problem")).toBeTruthy();
+      expect(screen.getByText("1 warning")).toBeTruthy();
       expect(useRunValidationStore.getState().docProblemCount).toBe(0);
     } finally {
       useWorkflowHasChangesStore.setState({ getSaveData });
@@ -1022,6 +1231,428 @@ describe("WorkflowDocEditor navigation", () => {
     ).not.toBeNull();
     expect(toggle.getAttribute("aria-expanded")).toBe("true");
     expect(useLocateBlockStore.getState().request).toBeNull();
+  });
+
+  test("steps are numbered in their list, a loop's steps under the loop's number, and a named step shows its name in words", () => {
+    const nodes = renderDoc([
+      block("extraction", "extraction_1", "find_prices", {
+        data_extraction_goal: "Read the page",
+      }),
+      block("extraction", "find_prices", "each_row", {
+        data_extraction_goal: "Get the prices",
+      }),
+      loop,
+    ]);
+    const step = (label: string) =>
+      within(
+        document.querySelector<HTMLElement>(
+          `[data-doc-node-id="${nodes.find((n) => n.data.label === label)!.id}"]`,
+        )!,
+      );
+    expect(step("extraction_1").getByText("1")).toBeTruthy();
+    expect(step("find_prices").getByText("2")).toBeTruthy();
+    expect(step("each_row").getByText("3")).toBeTruthy();
+    expect(step("inner_step").getByText("3.1")).toBeTruthy();
+    expect(step("find_prices").getByText("Find prices")).toBeTruthy();
+    expect(step("extraction_1").queryByText("Extraction 1")).toBeNull();
+    // A for-each loop's unused while condition is not listed as something it uses.
+    expect(step("each_row").queryByText("true")).toBeNull();
+  });
+
+  test("a conditional's branches continue one count, so no two branches share a step number, and the selected condition shows once", () => {
+    const nodes = renderDoc([
+      conditional("route", "after", [
+        { id: "yes", next: "first_if", when: "Check the condition" },
+        { id: "no", next: "only_else" },
+      ]),
+      code("first_if", "second_if"),
+      code("second_if", "after"),
+      code("only_else", "after"),
+      code("after", null),
+    ]);
+    const number = (label: string) =>
+      document.querySelector(
+        `[data-doc-node-id="${nodes.find((n) => n.data.label === label)!.id}"] [data-testid="doc-step-number"]`,
+      )?.textContent;
+    expect(number("first_if")).toBe("1.1");
+    expect(number("second_if")).toBe("1.2");
+    expect(number("after")).toBe("2");
+    // The full condition is on the Condition line; the selected tab names only its kind.
+    expect(screen.getAllByText(/^Check the condition$/)).toHaveLength(1);
+    fireEvent.click(screen.getByRole("tab", { name: /Otherwise/ }));
+    expect(number("only_else")).toBe("1.3");
+  });
+
+  test("Details names its step, numbers the actions of the last run, lists the step's settings, and its last item opens the side panel", () => {
+    docRun.current = {
+      runId: "wr_1",
+      live: false,
+      blocksByLabel: new Map([
+        [
+          "find_prices",
+          {
+            status: Status.Completed,
+            // Newest first, as the run timeline sends them.
+            actions: [
+              {
+                action_id: "a2",
+                action_type: "extract",
+                status: Status.Failed,
+                intention: "Read every price",
+              },
+              {
+                action_id: "a1",
+                action_type: "click",
+                status: Status.Completed,
+                reasoning: "Open the price list",
+              },
+            ],
+          },
+        ],
+      ]),
+    };
+    renderDoc(
+      [
+        block("extraction", "find_prices", null, {
+          data_extraction_goal: "Get the prices",
+          max_retries: 3,
+          max_steps_per_run: 12,
+        }),
+      ],
+      { apply: vi.fn(), update: vi.fn(), addStep: vi.fn(), duplicate: vi.fn() },
+    );
+    expect(screen.getByText("Max retries: 3")).toBeTruthy();
+    const toggle = screen.getByRole("button", {
+      name: "Details for Find prices",
+    });
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    const options = within(
+      document.getElementById(toggle.getAttribute("aria-controls")!)!,
+    );
+    expect(
+      options.getAllByRole("listitem").map((item) => item.textContent),
+    ).toEqual([
+      "Click Open the price list",
+      "Extract Data Read every price (failed)",
+    ]);
+    expect(options.getByText("Actions in the last run")).toBeTruthy();
+    expect(options.getByText("Max steps").nextElementSibling?.textContent).toBe(
+      "12",
+    );
+    // The extraction form has no max retries control, so the box leaves it out.
+    expect(options.queryByText("Max retries")).toBeNull();
+    expect(
+      options.getByText("Continue on failure").nextElementSibling?.textContent,
+    ).toBe("Off (default)");
+
+    fireEvent.click(
+      options.getByRole("button", { name: "More details in the side panel" }),
+    );
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    const selected = within(screen.getByLabelText("Selected step"));
+    expect(selected.getByText("Find prices")).toBeTruthy();
+    expect(selected.getByText("find_prices")).toBeTruthy();
+  });
+
+  test("Details of a step that ran several times in a loop says it shows the last of those runs", () => {
+    docRun.current = {
+      runId: "wr_1",
+      live: false,
+      blocksByLabel: new Map([
+        [
+          "find_prices",
+          {
+            status: Status.Completed,
+            actions: [
+              {
+                action_id: "a1",
+                action_type: "click",
+                status: Status.Completed,
+              },
+            ],
+          },
+        ],
+      ]),
+      runsByLabel: new Map([
+        ["find_prices", { count: 3, failed: 0, canceled: 0, withOutput: 0 }],
+      ]),
+    };
+    renderDoc([block("extraction", "find_prices", null, {})]);
+    fireEvent.click(
+      screen.getByRole("button", { name: "Details for Find prices" }),
+    );
+    expect(screen.getByText("Actions in the last of 3 runs")).toBeTruthy();
+  });
+
+  test("Details of a step outside a one-step run reads as no run, not as not reached", () => {
+    docRun.current = {
+      runId: "wr_step",
+      live: false,
+      blockRun: true,
+      blockRunTarget: "open_page",
+      blocksByLabel: new Map([
+        ["open_page", { status: Status.Completed, actions: [] }],
+      ]),
+    };
+    renderDoc([
+      block("navigation", "open_page", "find_prices", {}),
+      block("extraction", "find_prices", null, {}),
+    ]);
+    fireEvent.click(
+      screen.getByRole("button", { name: "Details for Find prices" }),
+    );
+    expect(
+      screen.getByText(
+        "No run yet. After a run, the actions it took show here.",
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText("The last run did not reach this.")).toBeNull();
+  });
+
+  test("Details keeps the failed mark of a long action outside the two-line clamp", () => {
+    docRun.current = {
+      runId: "wr_1",
+      live: false,
+      blocksByLabel: new Map([
+        [
+          "find_prices",
+          {
+            status: Status.Failed,
+            actions: [
+              {
+                action_id: "a1",
+                action_type: "extract",
+                status: Status.Failed,
+                intention: "Read every price on the page ".repeat(20),
+              },
+            ],
+          },
+        ],
+      ]),
+    };
+    renderDoc([block("extraction", "find_prices", null, {})]);
+    fireEvent.click(
+      screen.getByRole("button", { name: "Details for Find prices" }),
+    );
+    const item = screen.getByRole("listitem");
+    const clamped = item.querySelector(".line-clamp-2");
+    expect(clamped?.textContent).toContain("Read every price");
+    expect(clamped?.textContent).not.toContain("(failed)");
+    expect(item.textContent?.endsWith(" (failed)")).toBe(true);
+  });
+
+  test("the side panel closes with its Close button and with Escape, and Details reopens it", () => {
+    renderDoc(
+      [
+        block("extraction", "find_prices", null, {
+          data_extraction_goal: "Get the prices",
+        }),
+      ],
+      { apply: vi.fn(), update: vi.fn(), addStep: vi.fn(), duplicate: vi.fn() },
+    );
+    const toggle = screen.getByRole("button", {
+      name: "Details for Find prices",
+    });
+    const openPanel = () => {
+      fireEvent.click(toggle);
+      fireEvent.click(
+        screen.getByRole("button", { name: "More details in the side panel" }),
+      );
+      expect(
+        screen.getByRole("complementary", { name: "Document panel" }),
+      ).toBeTruthy();
+    };
+    openPanel();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Close document panel" }),
+    );
+    expect(
+      screen.queryByRole("complementary", { name: "Document panel" }),
+    ).toBeNull();
+    openPanel();
+    fireEvent.keyDown(
+      screen.getByRole("button", { name: "Close document panel" }),
+      { key: "Escape" },
+    );
+    expect(
+      screen.queryByRole("complementary", { name: "Document panel" }),
+    ).toBeNull();
+  });
+
+  test("every step has Details: without a run it says so, and a form with none of the listed settings lists none", () => {
+    const nodes = renderDoc(
+      [
+        block("wait", "pause", "open_site", { wait_sec: 5 }),
+        block("goto_url", "open_site", "save_page", {
+          url: "https://example.com",
+        }),
+        block("print_page", "save_page", "query_sales", {}),
+        block("powerbi_query", "query_sales", "stop_here", {
+          query: "EVALUATE Sales",
+        }),
+        block("terminate", "stop_here", null, { reason: "Done" }),
+      ],
+      { apply: vi.fn(), update: vi.fn(), addStep: vi.fn(), duplicate: vi.fn() },
+    );
+    expect(nodes.filter(isWorkflowBlockNode).map((n) => n.type)).toEqual([
+      "wait",
+      "url",
+      "printPage",
+      "powerBIQuery",
+      "terminate",
+    ]);
+    const details = screen.getAllByRole("button", { name: /^Details for/ });
+    expect(details).toHaveLength(5);
+    fireEvent.click(details[0]!);
+    const box = within(
+      document.getElementById(details[0]!.getAttribute("aria-controls")!)!,
+    );
+    expect(
+      box.getByText("No run yet. After a run, the actions it took show here."),
+    ).toBeTruthy();
+    expect(box.queryByRole("term")).toBeNull();
+    expect(screen.queryByText(/Continue on failure|Model:/)).toBeNull();
+
+    // Read-only Details is intended: it still lists the run's actions, without the settings.
+    cleanup();
+    docRun.current = {
+      runId: "wr_1",
+      live: false,
+      blocksByLabel: new Map([
+        [
+          "find_prices",
+          {
+            status: Status.Completed,
+            actions: [
+              {
+                action_id: "a1",
+                action_type: "click",
+                status: Status.Completed,
+              },
+            ],
+          },
+        ],
+      ]),
+    };
+    renderDoc([
+      block("extraction", "find_prices", null, { max_steps_per_run: 12 }),
+    ]);
+    const readOnly = screen.getByRole("button", {
+      name: "Details for Find prices",
+    });
+    fireEvent.click(readOnly);
+    const readOnlyBox = within(
+      document.getElementById(readOnly.getAttribute("aria-controls")!)!,
+    );
+    expect(readOnlyBox.getAllByRole("listitem")).toHaveLength(1);
+    expect(readOnlyBox.queryByRole("term")).toBeNull();
+  });
+
+  test("Uses lists a step's declared inputs and its {{ }} reads, matching the input chips, and never a Code step's Python", () => {
+    useWorkflowParametersStore.setState({
+      parameters: [
+        {
+          key: "site_login",
+          parameterType: "credential",
+          dataType: WorkflowParameterValueType.CredentialId,
+          credentialId: "cred_1",
+          description: null,
+        },
+        {
+          key: "account_id",
+          parameterType: "workflow",
+          dataType: WorkflowParameterValueType.String,
+          description: null,
+          defaultValue: "a1",
+        },
+        {
+          key: "unused_input",
+          parameterType: "workflow",
+          dataType: WorkflowParameterValueType.String,
+          description: null,
+          defaultValue: "x",
+        },
+      ] as never,
+    });
+    const nodes = renderDoc(
+      [
+        block("login", "sign_in", "count_rows", {
+          url: "https://example.com/login",
+          navigation_goal: "Sign in",
+          complete_criterion: "The account {{ account_id }} page shows",
+          parameters: [{ key: "site_login" }],
+        }),
+        block("code", "count_rows", null, {
+          parameters: [],
+          code: 'result = f"{{\\"count\\": {len(rows)}}}"',
+        }),
+      ],
+      { apply: vi.fn(), update: vi.fn(), addStep: vi.fn(), duplicate: vi.fn() },
+    );
+    const step = (label: string) =>
+      within(
+        document.querySelector<HTMLElement>(
+          `[data-doc-node-id="${nodes.find((n) => n.data.label === label)!.id}"]`,
+        )!,
+      );
+    const uses = step("sign_in").getByText("Uses");
+    expect(
+      Array.from(uses.querySelectorAll("span"), (pill) => pill.textContent),
+    ).toEqual(["site_login", "account_id"]);
+    expect(step("count_rows").queryByText("Uses")).toBeNull();
+    const chip = (key: string) =>
+      screen.getByRole("button", { name: new RegExp(`^Input ${key}`) });
+    expect(chip("site_login").getAttribute("aria-label")).not.toMatch(
+      /not used/,
+    );
+    expect(chip("account_id").getAttribute("aria-label")).not.toMatch(
+      /not used/,
+    );
+    expect(chip("unused_input").getAttribute("aria-label")).toMatch(/not used/);
+  });
+
+  test("Details lists the output fields of a jsonSchema step and of an extraction that returns a list of rows", () => {
+    renderDoc(
+      [
+        block("text_prompt", "summarize_page", "list_orders", {
+          prompt: "Summarize the page",
+          json_schema: {
+            type: "object",
+            properties: {
+              title: { type: "string" },
+              price: { type: "number" },
+            },
+          },
+        }),
+        block("extraction", "list_orders", null, {
+          data_extraction_goal: "Get every order",
+          data_schema: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                order_id: { type: "string" },
+                total: { type: "number" },
+              },
+            },
+          },
+        }),
+      ],
+      { apply: vi.fn(), update: vi.fn(), addStep: vi.fn(), duplicate: vi.fn() },
+    );
+    const fields = (title: string) => {
+      const toggle = screen.getByRole("button", {
+        name: `Details for ${title}`,
+      });
+      fireEvent.click(toggle);
+      return within(
+        document.getElementById(toggle.getAttribute("aria-controls")!)!,
+      ).getByText("Output fields").nextElementSibling?.textContent;
+    };
+    expect(fields("Summarize page")).toBe("title, price");
+    expect(fields("List orders")).toBe("order_id, total");
   });
 });
 
@@ -1123,13 +1754,61 @@ describe("a step that was just added", () => {
     fireEvent.pointerDown(document.body);
 
     expect(
-      screen.getAllByText("Choose a saved credential in this step's settings"),
+      screen.getAllByText(
+        "This step has no saved credential. Open Details, then More details in the side panel to choose one.",
+      ),
     ).toHaveLength(1);
     expect(document.querySelector("[data-doc-problems]")?.textContent).toBe(
       "1 problem",
     );
     expect(screen.queryByText(/need.* fixing/)).toBeNull();
   });
+
+  test.each([
+    ["no list", null, true],
+    ["an empty reference", "{{ }}", true],
+    ["a blank reference", "{{   }}", true],
+    ["an earlier step's output list", "{{ search_output.results }}", false],
+    ["a parameter list", "{{ topics }}", false],
+    ["a literal list", '["a", "b"]', false],
+  ])(
+    "a loop line with %s shows the missing-list problem in place of its summary only when it names no list",
+    (_, list, noList) => {
+      renderDoc([
+        forLoop("each_result", null, [code("open_result", null)], {
+          loop_over: null,
+          loop_variable_reference: list,
+          description: "For each of the search results",
+        }),
+      ]);
+      expect(screen.getByText("For each of the search results")).toBeTruthy();
+      expect(screen.queryByText("For each item")).toBeNull();
+      const fix =
+        document.querySelector("[data-doc-step-fix]")?.textContent ?? "";
+      expect(fix.includes("the loop needs the list itself")).toBe(noList);
+    },
+  );
+
+  test.each([
+    ["{{ }}", "a stale list behind it", { key: "stale_topics" }],
+    ["{{ }}", "nothing behind it", null],
+    ["  ", "a stale list behind it", { key: "stale_topics" }],
+  ])(
+    "a loop whose reference is %j with %s has no list and holds Run",
+    (reference, _, loopOver) => {
+      renderDoc([
+        forLoop("each_result", null, [code("open_result", null)], {
+          loop_over: loopOver,
+          loop_variable_reference: reference,
+        }),
+      ]);
+      expect(document.querySelector("[data-doc-step-fix]")).toBeTruthy();
+      expect(useRunValidationStore.getState().docProblemCount).toBeGreaterThan(
+        0,
+      );
+      expect(screen.queryByText(/stale_topics/)).toBeNull();
+    },
+  );
 
   test("a new Go to URL step shows no URL-required chip until the user leaves it", () => {
     const nodes = renderDoc([
@@ -1156,15 +1835,128 @@ describe("a step that was just added", () => {
         loop_variable_reference: reference,
       }),
     ];
-    renderDoc(steps("{{ extraction_1_output }}"));
+    renderDoc(steps("{{ extraction_1_output }}"), {
+      apply: vi.fn(),
+      update: vi.fn(),
+      addStep: vi.fn(() => "new_step"),
+      duplicate: vi.fn(),
+    });
     expect(
-      screen.getByText(/^Pick the list inside extraction_1_output/),
+      screen.getByText(
+        /^extraction_1 has no top-level list in its Data Schema/,
+      ),
     ).toBeTruthy();
     expect(useRunValidationStore.getState().docProblemCount).toBe(1);
+    fireEvent.click(
+      screen.getByRole("button", { name: "Open extraction_1's Data Schema" }),
+    );
+    expect(
+      within(screen.getByLabelText("Selected step")).getByText("extraction_1"),
+    ).toBeTruthy();
     cleanup();
     renderDoc(steps("{{ extraction_1_output.extracted_information.titles }}"));
-    expect(screen.queryByText(/Pick the list/)).toBeNull();
+    expect(
+      screen.queryByText(/has no top-level list in its Data Schema/),
+    ).toBeNull();
     expect(useRunValidationStore.getState().docProblemCount).toBe(0);
+  });
+
+  test("the problems button lists every problem it counts, jumps to the step of the one picked, and a refused Run opens it in view", async () => {
+    // jsdom has no scrollIntoView, so vi.spyOn has nothing to wrap; the original is put back after the test.
+    const original = Element.prototype.scrollIntoView;
+    const scroll = vi.fn();
+    Element.prototype.scrollIntoView = scroll;
+    onTestFinished(() => {
+      Element.prototype.scrollIntoView = original;
+    });
+    const nodes = renderDoc([
+      block("login", "sign_in", "each_result", { url: "" }),
+      forLoop(
+        "each_result",
+        "open_site",
+        [block("navigation", "open_result", null)],
+        {
+          loop_over: null,
+          loop_variable_reference: null,
+        },
+      ),
+      block("goto_url", "open_site", null, { url: "" }),
+    ]);
+    const trigger = document.querySelector<HTMLElement>("[data-doc-problems]")!;
+    expect(trigger.textContent).toBe("3 problems");
+    expect(trigger.getAttribute("aria-expanded")).toBe("false");
+    fireEvent.click(trigger);
+    const list = await screen.findByRole("dialog", { name: "3 problems" });
+    const entries = within(list).getAllByRole("button");
+    expect(entries).toHaveLength(3);
+    expect(entries.map((entry) => entry.textContent)).toEqual([
+      expect.stringMatching(/Login.*no saved credential/),
+      expect.stringMatching(/Loop.*no list to go through/),
+      expect.stringMatching(/Go to URL.*no URL/),
+    ]);
+    fireEvent.click(entries[2]!);
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    const site = nodes.find((node) => node.data.label === "open_site")!;
+    await waitFor(() =>
+      expect(scroll.mock.contexts[0]).toBe(
+        document.querySelector(`[data-doc-node-id="${site.id}"]`),
+      ),
+    );
+
+    // A refused Run, from the Doc or the top bar, calls the callback the Doc registers.
+    // It brings the list's button into view instead of jumping, so the list is never anchored off screen.
+    scroll.mockClear();
+    act(() => {
+      useRunValidationStore.getState().docShowProblems?.();
+    });
+    expect(
+      await screen.findByRole("dialog", { name: "3 problems" }),
+    ).toBeTruthy();
+    expect(scroll.mock.contexts).toEqual([trigger]);
+    fireEvent.keyDown(document.activeElement ?? document.body, {
+      key: "Escape",
+    });
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await waitFor(() =>
+      expect(
+        document.activeElement
+          ?.closest("[data-doc-node-id]")
+          ?.getAttribute("data-doc-node-id"),
+      ).toBe(site.id),
+    );
+  });
+
+  test("Escape on a list a refused Run opened while typing returns focus to the line, not the page", async () => {
+    const nodes = renderDoc(
+      [
+        block("goto_url", "open_site", "write_it", { url: "" }),
+        block("text_prompt", "write_it", null, { prompt: "Do the next thing" }),
+      ],
+      { apply: vi.fn(), update: vi.fn(), addStep: vi.fn(), duplicate: vi.fn() },
+    );
+    const site = nodes.find((node) => node.data.label === "write_it")!;
+    const step = document.querySelector<HTMLElement>(
+      `[data-doc-node-id="${site.id}"]`,
+    )!;
+    act(() => screen.getByRole("textbox", { name: "write_it prompt" }).focus());
+    const typing = document.activeElement as HTMLElement;
+    expect(typing.closest("[data-doc-node-id]")).toBe(step);
+    expect(typing.getAttribute("contenteditable")).toBe("plaintext-only");
+
+    act(() => {
+      useRunValidationStore.getState().docShowProblems?.();
+    });
+    await screen.findByRole("dialog", { name: "1 problem" });
+    await waitFor(() => expect(typing.isConnected).toBe(false));
+    fireEvent.keyDown(document.activeElement ?? document.body, {
+      key: "Escape",
+    });
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await waitFor(() =>
+      expect(document.activeElement?.closest("[data-doc-node-id]")).toBe(
+        document.querySelector(`[data-doc-node-id="${site.id}"]`),
+      ),
+    );
   });
 
   test("a freshly added loop over a picked whole result holds Run once the user leaves it", () => {
@@ -1180,13 +1972,17 @@ describe("a step that was just added", () => {
     ]);
     const loop = nodes.find((n) => n.type === "loop")!;
     act(() => useDocUnfinishedStore.getState().add(loop.id));
-    expect(screen.queryByText(/^Pick the list inside/)).toBeNull();
+    expect(
+      screen.queryByText(/has no top-level list in its Data Schema/),
+    ).toBeNull();
     expect(useRunValidationStore.getState().docProblemCount).toBe(0);
 
     fireEvent.pointerDown(document.body);
 
     expect(
-      screen.getByText(/^Pick the list inside extraction_1_output/),
+      screen.getByText(
+        /^extraction_1 has no top-level list in its Data Schema/,
+      ),
     ).toBeTruthy();
     expect(useRunValidationStore.getState().docProblemCount).toBe(1);
   });
@@ -1402,19 +2198,26 @@ describe("Doc inputs", () => {
     expect(prompt().parameterKeys).toEqual(["search"]);
     expect(loopSource()).toBe("search");
 
-    fireEvent.click(screen.getByRole("button", { name: "+ Context input" }));
-    expect(screen.getByText("Add Context Input")).toBeTruthy();
-    fireEvent.change(
-      within(screen.getByRole("dialog")).getAllByRole("textbox")[0]!,
-      { target: { value: "derived" } },
-    );
-    fireEvent.click(within(screen.getByRole("dialog")).getByRole("combobox"));
-    fireEvent.click(screen.getByRole("option", { name: "search" }));
-    fireEvent.click(inPopover("Save"));
-    expect(keys()).toEqual(["search", "topic", "derived"]);
-    expect(screen.getByRole("button", { name: /^Input derived/ })).toBeTruthy();
-
+    // The Doc no longer offers a context input; one saved earlier still shows, opens and blocks deleting its source.
+    expect(screen.queryByRole("button", { name: /context input/i })).toBeNull();
+    useWorkflowParametersStore.setState({
+      parameters: [
+        ...useWorkflowParametersStore.getState().parameters,
+        {
+          key: "derived",
+          parameterType: "context",
+          sourceParameterKey: "search",
+          description: null,
+        },
+      ],
+    });
     rendered.rerender(view());
+    const derived = screen.getByRole("button", { name: /^Input derived/ });
+    expect(derived.getAttribute("title")).toMatch(/^Uses data from search/);
+    fireEvent.click(derived);
+    expect(screen.getByText("Edit Context Input")).toBeTruthy();
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+
     fireEvent.click(screen.getByRole("button", { name: /^Input search/ }));
     fireEvent.click(inPopover("Delete input"));
     expect(keys()).toEqual(["search", "topic", "derived"]);
@@ -1590,8 +2393,8 @@ describe("Demonstrate task in the step menu", () => {
 
     const line = screen.getByText(/^Demonstrating · 2 actions$/);
     expect(line.textContent).toBe("Demonstrating · 2 actions");
-    const first = screen.getByText(/first_step|first step/i);
-    const second = screen.getByText(/second_step|second step/i);
+    const first = screen.getByText("First step");
+    const second = screen.getByText("Second step");
     expect(
       first.compareDocumentPosition(line) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();

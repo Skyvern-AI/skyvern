@@ -154,7 +154,7 @@ Use a session when you need a browser right now. Use a profile when you want to 
 
     If you pin a session id in a recurring job, treat all three codes as terminal for that session id: create a new session or omit `browser_session_id`, rather than retrying the same id on the next tick.
 
-    **Extend a running session.** Each call adds minutes, up to 6 hours in total since the session started. Read the new `timeout` from the response; a retried call adds again. The call returns `409` if the session has ended, has under two minutes left, or is already at 6 hours. The TypeScript SDK has no `extendBrowserSession` method yet; call the REST endpoint.
+    **Extend a running session.** Each call adds minutes, up to 6 hours in total since the session started. Read the new `timeout` from the response; a retried call adds again. The call returns `409` if the session has ended, has under two minutes left, or is already at 6 hours.
 
     <CodeGroup>
     ```python Python
@@ -162,6 +162,12 @@ Use a session when you need a browser right now. Use a profile when you want to 
         browser_session_id="pbs_123",
         additional_minutes=60,
     )
+    ```
+
+    ```typescript TypeScript
+    const session = await client.extendBrowserSession("pbs_123", {
+      additional_minutes: 60,
+    });
     ```
 
     ```bash cURL
@@ -287,7 +293,7 @@ A profile is a snapshot of a browser's state. Start a session or a run from it a
     ```
     </CodeGroup>
 
-    `POST /v1/run/tasks` accepts `browser_profile_id` too, but only with `engine=skyvern_v2` (other engines return a 400 error), and the SDK `run_task` / `runTask` helpers don't expose it yet; call the REST endpoint. A session started from a profile saves its state back to that profile when it closes, so the profile stays fresh.
+    `POST /v1/run/tasks` accepts `browser_profile_id` too, but only with `"engine": "skyvern-2.0"` (other engines return a 400 error), and the SDK `run_task` / `runTask` helpers don't expose it yet; call the REST endpoint. A session started from a profile saves its state back to that profile when it closes, so the profile stays fresh.
 
     Manage profiles with `list_browser_profiles`, `get_browser_profile`, `update_browser_profile` and `delete_browser_profile`.
 

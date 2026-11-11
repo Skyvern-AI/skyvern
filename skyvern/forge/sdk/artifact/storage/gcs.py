@@ -4,7 +4,7 @@ import shutil
 import uuid
 from collections.abc import AsyncIterator, Awaitable
 from datetime import datetime, timezone
-from typing import BinaryIO, TypeVar
+from typing import Any, BinaryIO, TypeVar
 
 import structlog
 
@@ -44,7 +44,7 @@ from skyvern.forge.sdk.artifact.storage.run_recording_clips import (
     RUN_RECORDING_PATH_SEGMENT,
     sync_run_recording_clips,
 )
-from skyvern.forge.sdk.artifact.storage.unique_pdfs import settle
+from skyvern.forge.sdk.artifact.storage.unique_pdfs import response_deadline, settle
 from skyvern.forge.sdk.artifact.utils import replace_file_extension
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
@@ -65,9 +65,9 @@ def _safe_get_file_size(path: str) -> int | None:
         return None
 
 
-async def _get_object_info_safe(storage: "GcsStorage", uri: str) -> dict | None:
+async def _get_object_info_safe(storage: "GcsStorage", uri: str, **within: Any) -> dict | None:
     try:
-        return await storage.async_client.get_object_info(uri)
+        return await storage.async_client.get_object_info(uri, **within)
     except Exception:
         LOG.warning("Object info retrieval failed", uri=uri, exc_info=True)
         return None
@@ -675,6 +675,10 @@ class GcsStorage(BaseStorage, StreamingArtifactStorage):
             # already in the uploads bucket is what outgrows SAVE_DOWNLOADED_FILES_TIMEOUT.
             if already_saved.get(uri) == checksum:
                 unchanged_file_count += 1
+                if run_id is not None:
+                    await app.ARTIFACT_MANAGER.record_unchanged_download(
+                        organization_id=organization_id, run_id=run_id, uri=uri, checksum=checksum, source_path=fpath
+                    )
                 continue
             file_size = _safe_get_file_size(fpath)
             # GCS custom metadata values must be ASCII (sent as HTTP headers);
@@ -716,6 +720,7 @@ class GcsStorage(BaseStorage, StreamingArtifactStorage):
                         workflow_run_id=retry_workflow_run_id if retry_attempt else None,
                         checksum=checksum,
                         file_size=file_size,
+                        source_path=fpath,
                     )
                 except Exception:
                     LOG.warning(
@@ -789,7 +794,10 @@ class GcsStorage(BaseStorage, StreamingArtifactStorage):
             )
         artifacts_by_uri = {artifact.uri: artifact for artifact in download_artifacts or []}
         uri = f"gs://{settings.GCS_BUCKET_UPLOADS}/{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/{run_id}"
-        object_keys = await self.async_client.list_files(uri=uri)
+        # Only a timeline response declares a deadline; every other listing keeps the client's own request options.
+        deadline = response_deadline.get()
+        within: dict[str, Any] = {} if deadline is None else {"deadline": deadline}
+        object_keys = await self.async_client.list_files(uri=uri, **within)
         if len(object_keys) == 0:
             return []
 
@@ -802,7 +810,7 @@ class GcsStorage(BaseStorage, StreamingArtifactStorage):
             metadata = {}
             content_length: int | None = None
             blob_modified_at = None
-            object_info = await _get_object_info_safe(self, object_uri)
+            object_info = await _get_object_info_safe(self, object_uri, **within)
             if object_info:
                 metadata = object_info.get("Metadata", {})
                 content_length = object_info.get("ContentLength")
@@ -812,7 +820,9 @@ class GcsStorage(BaseStorage, StreamingArtifactStorage):
             display_name = metadata.get("original_filename", filename) if metadata else filename
             artifact = artifacts_by_uri.get(object_uri)
 
-            signed_urls = await self.async_client.create_signed_urls([object_uri], attachment_filenames=[display_name])
+            signed_urls = await self.async_client.create_signed_urls(
+                [object_uri], attachment_filenames=[display_name], **within
+            )
             if not signed_urls:
                 continue
 

@@ -1231,7 +1231,7 @@ async def delete_saved_credentials_tool(ctx: ToolContext[CopilotContext], creden
 
 
 # This description is measured, not prose: a storage-fidelity sentence in it took authoring from 15/20 to 3/20.
-# Re-measure with the arms in cloud_docs/workflow-copilot/architecture/offline-replay.md before editing.
+# Re-measure with the arms of the copilot offline-replay harness before editing.
 @function_tool(failure_error_function=copilot_tool_failure, name_override="set_work_plan")
 async def set_work_plan_tool(ctx: ToolContext[CopilotContext], items: list[str]) -> str:
     """Replace your own work plan for this chat with `items`, in the order you mean to do them.

@@ -1,6 +1,8 @@
 import {
+  Fragment,
   useContext,
   useEffect,
+  useId,
   useRef,
   useState,
   type KeyboardEvent,
@@ -8,11 +10,17 @@ import {
 } from "react";
 import { useDocUnfinishedStore } from "./docUnfinished";
 import { stripJinjaReferences } from "./docTextUtils";
+import {
+  codeBlockUses,
+  SKIP_KEYS_FOR_JINJA_CHECK,
+  transformStringFieldsInObject,
+} from "../jinjaReferences";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { goalChangeIsPending } from "../workflowEditorUtils";
 import type { CodeBlockNodeData } from "../nodes/CodeBlockNode/types";
 import {
   CheckIcon,
+  ChevronDownIcon,
   ChevronRightIcon,
   ClockIcon,
   Cross2Icon,
@@ -25,6 +33,7 @@ import {
   DropdownMenuItem,
   DropdownMenuPortal,
   DropdownMenuSeparator,
+  DropdownMenuShortcut,
   DropdownMenuSub,
   DropdownMenuSubContent,
   DropdownMenuSubTrigger,
@@ -37,9 +46,15 @@ import { WorkflowBlockIcon } from "../nodes/WorkflowBlockIcon";
 import { announceDoc, announceMoved, announceTurnedInto } from "./docAnnounce";
 import { workflowBlockTitle } from "../nodes/types";
 import { WorkflowDocActionsContext } from "./WorkflowDocActionsContext";
-import { getDocSettingsChips } from "./docSettingsChips";
+import {
+  customSettingsText,
+  getDocSettingsChips,
+  getDocSettingsRows,
+  type DocSettingRow,
+} from "./docSettingsChips";
 import {
   docBlockType,
+  docStepCaption,
   docTagClasses,
   docTagColor,
   getDocKeyFields,
@@ -47,15 +62,19 @@ import {
   getDocMainPlaceholder,
   getDocMissingSettings,
   loopLineLeadsIn,
+  getDocFilledProseFields,
   getDocProseFields,
   getDocSettingSummary,
   getDocStepSummary,
+  loopHasNoList,
+  loopList,
 } from "./docStepRegistry";
 import { DocRunStepButton } from "./DocRunStepButton";
 import { useBlockPlayRegistry } from "@/store/BlockPlayRegistryStore";
 import { docTagState, type DocTagState } from "./docRunState";
 import { useDocRunFor } from "./useDocRunFor";
-import { DocText } from "./DocText";
+import { docStepActions, type DocStepAction } from "./docStepActions";
+import { DocText, docReferencePill } from "./DocText";
 import type { DocPlace } from "./docEditApi";
 import {
   DocDeleteConfirm,
@@ -65,6 +84,7 @@ import {
   DocStepPicker,
 } from "./DocEditing";
 import { useDocStepPending } from "./DocProposalView";
+import { DocOneActionHint } from "./DocOneActionHint";
 import {
   docShortcut,
   takeCaretAtStart,
@@ -284,8 +304,14 @@ function DocStepMenu({
               </DropdownMenuPortal>
             </DropdownMenuSub>
           )}
-          <DropdownMenuItem onSelect={() => actions.openSettings(node.id)}>
+          <DropdownMenuItem
+            onSelect={() => actions.openSettings(node.id)}
+            aria-keyshortcuts={docShortcut(".").aria}
+          >
             Settings
+            <DropdownMenuShortcut>
+              {docShortcut(".").label}
+            </DropdownMenuShortcut>
           </DropdownMenuItem>
           {!place.isFinally && (
             <DropdownMenuItem
@@ -511,11 +537,7 @@ export function DocSettingsButton({
       content={
         <>
           <DocKeyLabel
-            label={
-              changed
-                ? `${changed} setting${changed > 1 ? "s" : ""} changed`
-                : "Settings"
-            }
+            label={changed ? customSettingsText(changed) : "Settings"}
             keys="."
           />
         </>
@@ -523,7 +545,7 @@ export function DocSettingsButton({
     >
       <button
         type="button"
-        aria-label={`Settings for ${node.data.label}${changed ? `, ${changed} changed` : ""}`}
+        aria-label={`Settings for ${node.data.label}${changed ? `, ${customSettingsText(changed)}` : ""}`}
         aria-keyshortcuts={docShortcut(".").aria}
         onClick={() => actions.openSettings(node.id)}
         className={cn(
@@ -545,17 +567,41 @@ export function DocStepControls({
   node,
   editable,
   showRunControl,
+  settings = true,
 }: {
   node: WorkflowBlockNode;
   editable: boolean;
   showRunControl: boolean;
+  // A step's settings open from its "Details" instead.
+  settings?: boolean;
 }) {
   return (
     <span className="inline-flex items-center gap-0.5">
       {showRunControl && <DocRunStepButton node={node} disabled={!editable} />}
-      <DocSettingsButton node={node} editable={editable} />
+      {settings && <DocSettingsButton node={node} editable={editable} />}
     </span>
   );
+}
+
+/** A step's place in its list, "2" or "3.1". */
+export function DocStepNumber({ number }: { number?: string }) {
+  return number ? (
+    <span
+      data-testid="doc-step-number"
+      className="text-[12.5px] tabular-nums text-muted-foreground"
+    >
+      {number}
+    </span>
+  ) : null;
+}
+
+export function DocStepCaption({ node }: { node: WorkflowBlockNode }) {
+  const caption = docStepCaption(node);
+  return caption ? (
+    <span className="min-w-0 truncate text-[13px] font-medium text-foreground">
+      {caption}
+    </span>
+  ) : null;
 }
 
 export function DocStepHeader({
@@ -565,6 +611,7 @@ export function DocStepHeader({
   extra,
   disclosure,
   place,
+  number,
 }: {
   node: WorkflowBlockNode;
   editable: boolean;
@@ -572,6 +619,7 @@ export function DocStepHeader({
   extra?: ReactNode;
   disclosure?: { open: boolean; onToggle: () => void };
   place?: DocStepPlace;
+  number?: string;
 }) {
   return (
     <div className="relative flex min-h-[26px] flex-wrap items-center gap-2">
@@ -597,31 +645,19 @@ export function DocStepHeader({
           />
         </button>
       )}
+      <DocStepNumber number={number} />
       <DocTag
         node={node}
         place={editable ? place : undefined}
         besideChevron={Boolean(disclosure)}
       />
+      <DocStepCaption node={node} />
       {extra}
-      {docStepProducesData(node) && (
-        <span className="flex min-w-0 items-baseline gap-1 text-[12.5px] text-muted-foreground">
-          saves{" "}
-          {editable && place ? (
-            <DocOutputName id={node.id} label={node.data.label} />
-          ) : (
-            <span
-              title={`${node.data.label}_output`}
-              className="inline-block min-w-0 max-w-full rounded bg-muted px-[5px] align-baseline font-medium leading-[1.25] [overflow-wrap:anywhere]"
-            >
-              {node.data.label}_output
-            </span>
-          )}
-        </span>
-      )}
       <DocStepControls
         node={node}
         editable={editable}
         showRunControl={showRunControl}
+        settings={false}
       />
     </div>
   );
@@ -636,9 +672,15 @@ export function DocStepBody({
   onBackspaceAtStart,
   onMove,
   onRunStep,
+  hasFix = false,
+  renamable = false,
 }: {
   node: WorkflowBlockNode;
   editable?: boolean;
+  // The step's problem line (what it still needs before it can run) is on screen under it.
+  hasFix?: boolean;
+  // Whether the output name can be renamed here.
+  renamable?: boolean;
   // Enter; `key` is the field the caret was in, and the split is null outside the step's main text.
   onEnter?: (split: LineSplit | null, key: string) => void;
   onSlash?: PickerOpener;
@@ -670,11 +712,7 @@ export function DocStepBody({
     typeof data[key] === "string" ? (data[key] as string) : "";
   // A field emptied while it is being edited stays on screen until the line is left.
   const [kept, setKept] = useState<string[]>([]);
-  const prose = fields.flatMap((f) =>
-    stringOf(f.key).trim() || kept.includes(f.key)
-      ? [{ ...f, value: stringOf(f.key) }]
-      : [],
-  );
+  const prose = getDocFilledProseFields(node, kept);
   const description = stringOf("description").trim()
     ? stringOf("description")
     : null;
@@ -691,21 +729,32 @@ export function DocStepBody({
   const missing = unfinished ? [] : getDocMissingSettings(node);
   // A description sits under a prompt-driven step's text; on other steps it is the main line, with the setting it would hide underneath.
   // A loop's line that already names its list says what "For each of …" would, so the summary is left out.
-  const loopSource = stripJinjaReferences(
-    stringOf("loopVariableReference") || stringOf("loopValue"),
-  );
+  const loopSource = stripJinjaReferences(loopList(data));
   const lineNamesLoopSource =
     node.type === "loop" &&
     loopSource !== "" &&
     stripJinjaReferences(description ?? "").includes(loopSource);
+  // Under a description, a for-each loop with no list would only add "For each item"; where its problem line shows, that says what is missing.
+  const summaryYieldsToProblem =
+    hasFix && node.type === "loop" && loopHasNoList(data);
   const settingSummary =
-    !isProse && description && !lineNamesLoopSource
+    !isProse && description && !lineNamesLoopSource && !summaryYieldsToProblem
       ? getDocSettingSummary(node)
       : null;
   const focus = actions.focusId === node.id;
-  const emptyText = getDocMainPlaceholder(node);
+  const emptyText = getDocMainPlaceholder(node, editable);
   const forEachLoop = node.type === "loop" && data.loopKind !== "while";
   const mainKey = isProse ? fields[0]!.key : "description";
+  // Hidden while the main line is being typed in, so a half-typed URL ("https://exa") is not offered. Focus is kept per
+  // rendering of the line, because React fires no blur when the focused line unmounts; a run or a demonstration that
+  // takes editing away clears it, so the same rendering coming back is not read as still focused.
+  const lineMode = `${editable}-${isProse}`;
+  const [focusedMode, setFocusedMode] = useState<string | null>(null);
+  if (!editable && focusedMode !== null) setFocusedMode(null);
+  const urlOffer =
+    editable && actions.edit && focusedMode !== lineMode
+      ? actions.promptUrlOffer(node)
+      : null;
   const line = (
     key: string,
     value: string,
@@ -757,7 +806,11 @@ export function DocStepBody({
   );
   return (
     <>
-      <div className="min-h-[1.55em] text-base font-medium leading-[1.55]">
+      <div
+        className="min-h-[1.55em] text-base font-normal leading-[1.55]"
+        onFocus={() => setFocusedMode(lineMode)}
+        onBlur={() => setFocusedMode(null)}
+      >
         {isProse ? (
           main ? (
             line(main.key, main.value, emptyText, "")
@@ -776,18 +829,11 @@ export function DocStepBody({
                 line(
                   "description",
                   description ?? "",
-                  stringOf("loopVariableReference") ||
-                    stringOf("loopValue") ||
-                    "@ pick a list",
+                  loopList(data) || "@ pick a list",
                   "",
                 )
               ) : (
-                <DocText
-                  value={
-                    description ??
-                    (stringOf("loopVariableReference") || stringOf("loopValue"))
-                  }
-                />
+                <DocText value={description ?? loopList(data)} />
               )}
             </span>
           </div>
@@ -867,6 +913,331 @@ export function DocStepBody({
           ))}
         </div>
       )}
+      <DocStepSummary
+        node={node}
+        editable={editableProp}
+        renamable={renamable}
+        mainLine={
+          isProse
+            ? (main?.value ?? "")
+            : forEachLoop
+              ? (description ?? loopList(data))
+              : (description ?? getDocStepSummary(node))
+        }
+      />
+      {editableProp && <DocOneActionHint node={node} urlOffer={urlOffer} />}
     </>
+  );
+}
+
+// The Doc does not show a Code step's Python, so its reads are not listed.
+const CODE_SKIP_KEYS = new Set([...SKIP_KEYS_FOR_JINJA_CHECK, "code", "steps"]);
+
+// The inputs and results the step reads (declared keys, then `{{ }}` reads) that its main line does not show.
+function stepReferences(node: WorkflowBlockNode, mainLine: string): string[] {
+  const shown = new Set(codeBlockUses([], mainLine));
+  const texts: string[] = [];
+  transformStringFieldsInObject(
+    node.data,
+    (text) => {
+      texts.push(text);
+      return text;
+    },
+    node.type === "codeBlock" ? CODE_SKIP_KEYS : SKIP_KEYS_FOR_JINJA_CHECK,
+  );
+  const declared = (node.data as Record<string, unknown>).parameterKeys;
+  return [
+    ...new Set([
+      ...(Array.isArray(declared) ? (declared as string[]) : []),
+      ...texts.flatMap((text) => codeBlockUses([], text)),
+    ]),
+  ].filter((ref) => !shown.has(ref));
+}
+
+// Text Prompt, Web Search and the file and PDF parsers keep their output schema in jsonSchema.
+const outputFieldNames = (data: Record<string, unknown>) =>
+  schemaFieldNames(data.dataSchema ?? data.jsonSchema);
+
+function schemaFieldNames(raw: unknown): string[] {
+  let schema: unknown;
+  try {
+    schema = typeof raw === "string" ? JSON.parse(raw) : raw;
+  } catch {
+    return [];
+  }
+  const shape = schema as {
+    properties?: unknown;
+    items?: { properties?: unknown };
+  } | null;
+  const properties = shape?.properties ?? shape?.items?.properties;
+  return properties && typeof properties === "object"
+    ? Object.keys(properties)
+    : [];
+}
+
+const MAX_SHOWN_REFERENCES = 4;
+
+/** One muted line: what the step uses and saves, its custom settings, and its options. */
+function DocStepSummary({
+  node,
+  editable,
+  renamable,
+  mainLine,
+}: {
+  node: WorkflowBlockNode;
+  editable: boolean;
+  renamable: boolean;
+  mainLine: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const panelId = useId();
+  const refs = stepReferences(node, mainLine);
+  const saves = docStepProducesData(node);
+  const custom = getDocSettingsChips(node);
+  const options = editable ? stepOptionRows(node) : [];
+  return (
+    <>
+      <div className="mt-1 flex flex-wrap items-baseline gap-x-2 gap-y-1 text-[12.5px] text-muted-foreground">
+        {refs.length > 0 && (
+          <span className="flex min-w-0 flex-wrap items-baseline gap-1">
+            Uses
+            {refs.slice(0, MAX_SHOWN_REFERENCES).map((ref) => (
+              <span key={ref} className={docReferencePill}>
+                {ref}
+              </span>
+            ))}
+            {refs.length > MAX_SHOWN_REFERENCES && (
+              <span>+{refs.length - MAX_SHOWN_REFERENCES}</span>
+            )}
+          </span>
+        )}
+        {saves && (
+          <span className="flex min-w-0 items-baseline gap-1">
+            Saves
+            {renamable ? (
+              <DocOutputName id={node.id} label={node.data.label} />
+            ) : (
+              <span
+                title={`${node.data.label}_output`}
+                className="inline-block min-w-0 max-w-full rounded bg-muted px-[5px] align-baseline font-medium leading-[1.25] [overflow-wrap:anywhere]"
+              >
+                {node.data.label}_output
+              </span>
+            )}
+          </span>
+        )}
+        {custom.map((chip) => (
+          <span
+            key={chip.key}
+            className="rounded-md border border-border px-1.5 leading-[1.5]"
+          >
+            {chip.label}
+          </span>
+        ))}
+        <DocKeyTooltip
+          content={
+            custom.length
+              ? customSettingsText(custom.length)
+              : editable
+                ? "Actions and settings"
+                : "Actions"
+          }
+        >
+          <button
+            type="button"
+            aria-label={`Details for ${docStepCaption(node) ?? node.data.label}`}
+            aria-expanded={open}
+            aria-controls={panelId}
+            onClick={() => setOpen(!open)}
+            className="inline-flex items-center gap-0.5 rounded px-1 text-[12.5px] text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            Details
+            <ChevronDownIcon
+              aria-hidden
+              className={cn(
+                "size-3 transition-transform",
+                open && "rotate-180",
+              )}
+            />
+          </button>
+        </DocKeyTooltip>
+      </div>
+      {open && (
+        <DocStepDetails
+          id={panelId}
+          node={node}
+          rows={options}
+          onClose={() => setOpen(false)}
+        />
+      )}
+    </>
+  );
+}
+
+function stepOptionRows(node: WorkflowBlockNode): DocSettingRow[] {
+  const data = node.data as Record<string, unknown>;
+  const url = typeof data.url === "string" ? data.url.trim() : "";
+  const fields = outputFieldNames(data);
+  return [
+    ...getDocSettingsRows(node).map((row) => ({
+      ...row,
+      value:
+        row.custom || row.value === "Default"
+          ? row.value
+          : `${row.value} (default)`,
+    })),
+    ...("url" in data && getDocProseFields(node)[0]?.key !== "url"
+      ? [{ key: "url", label: "URL", value: url || "Not set", custom: !!url }]
+      : []),
+    ...(fields.length
+      ? [
+          {
+            key: "dataSchema",
+            label: "Output fields",
+            value: fields.join(", "),
+            custom: true,
+          },
+        ]
+      : []),
+  ];
+}
+
+type DocStepRun =
+  | { state: "none" | "edited" | "notReached" | "notYet" }
+  | {
+      state: "ran";
+      shown: DocStepAction[];
+      more: number;
+      runCount: number;
+    };
+
+/** The actions this block took in the run its result line reads (a looped block's latest run). */
+function useDocStepRun(label: string): DocStepRun {
+  const {
+    runId,
+    blocksByLabel,
+    runsByLabel,
+    unknownLabels,
+    rowsLoaded,
+    live,
+    blockRun,
+  } = useDocRunFor(label);
+  if (!runId || !rowsLoaded) return { state: "none" };
+  if (unknownLabels.has(label)) return { state: "edited" };
+  const block = blocksByLabel.get(label);
+  // As on the result line: a one-step run says nothing about a step it has no row for.
+  if (blockRun && !block) return { state: "none" };
+  return block
+    ? {
+        state: "ran",
+        ...docStepActions(block.actions),
+        runCount: runsByLabel?.get(label)?.count ?? 1,
+      }
+    : { state: live ? "notYet" : "notReached" };
+}
+
+const RUN_NOTE: Record<Exclude<DocStepRun["state"], "ran">, string> = {
+  none: "No run yet. After a run, the actions it took show here.",
+  edited: "Edited since the last run. Run again to see its actions.",
+  notReached: "The last run did not reach this.",
+  notYet: "The run has not reached this yet.",
+};
+
+function DocStepRunActions({ label }: { label: string }) {
+  const run = useDocStepRun(label);
+  if (run.state !== "ran")
+    return <p className="text-muted-foreground">{RUN_NOTE[run.state]}</p>;
+  const many = run.runCount > 1;
+  if (!run.shown.length)
+    return (
+      <p className="text-muted-foreground">
+        {many
+          ? `The last of ${run.runCount} runs took no page actions here.`
+          : "The last run took no page actions here."}
+      </p>
+    );
+  const { more } = run;
+  return (
+    <>
+      <p className="text-[12px] text-muted-foreground">
+        {many
+          ? `Actions in the last of ${run.runCount} runs`
+          : "Actions in the last run"}
+      </p>
+      <ol className="mt-0.5 list-decimal space-y-0.5 pl-5">
+        {run.shown.map((action) => (
+          // The title carries text the clamp hides; 2000 characters keeps a huge reasoning out of the tooltip.
+          <li key={action.key} title={action.text?.slice(0, 2000)}>
+            <span className="line-clamp-2 [overflow-wrap:anywhere]">
+              <span className="font-medium">{action.type}</span>
+              {action.text && (
+                <span className="text-muted-foreground"> {action.text}</span>
+              )}
+            </span>
+            {action.failed && (
+              <span className="text-destructive"> (failed)</span>
+            )}
+          </li>
+        ))}
+      </ol>
+      {more > 0 && (
+        <p className="text-muted-foreground">
+          +{more} more in the run&rsquo;s timeline
+        </p>
+      )}
+    </>
+  );
+}
+
+function DocStepDetails({
+  id,
+  node,
+  rows,
+  onClose,
+}: {
+  id: string;
+  node: WorkflowBlockNode;
+  rows: DocSettingRow[];
+  onClose: () => void;
+}) {
+  const actions = useContext(WorkflowDocActionsContext);
+  return (
+    <div
+      id={id}
+      className="mt-1 rounded-md border border-border px-3 py-2 text-[13px]"
+    >
+      <DocStepRunActions label={node.data.label} />
+      {rows.length > 0 && (
+        <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-4 gap-y-0.5 border-t border-border pt-2">
+          {rows.map((row) => (
+            <Fragment key={row.key}>
+              <dt className="text-muted-foreground">{row.label}</dt>
+              <dd
+                className={cn(
+                  "min-w-0 [overflow-wrap:anywhere]",
+                  !row.custom && "text-muted-foreground",
+                )}
+              >
+                {row.key === "url" && row.custom ? (
+                  <DocText value={row.value} />
+                ) : (
+                  row.value
+                )}
+              </dd>
+            </Fragment>
+          ))}
+        </dl>
+      )}
+      <button
+        type="button"
+        onClick={() => {
+          onClose();
+          actions.openSettings(node.id);
+        }}
+        className="mt-1.5 rounded text-[12.5px] text-muted-foreground underline underline-offset-4 outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        More details in the side panel
+      </button>
+    </div>
   );
 }

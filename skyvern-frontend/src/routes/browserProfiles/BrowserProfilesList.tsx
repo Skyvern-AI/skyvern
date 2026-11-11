@@ -230,7 +230,7 @@ function BrowserProfilesList({ searchKey, managed }: Props = {}) {
   return (
     <div className="space-y-4">
       <div className="overflow-hidden rounded-lg border border-border">
-        <Table className="w-full table-fixed">
+        <Table className="min-w-[960px] table-fixed">
           <TableHeader>
             <TableRow className="group/header">
               <SelectionHeaderCheckboxCell
@@ -286,8 +286,8 @@ function BrowserProfilesList({ searchKey, managed }: Props = {}) {
             ))}
           </TableBody>
         </Table>
-        <div className="relative px-3 py-3">
-          <div className="absolute left-3 top-1/2 flex -translate-y-1/2 items-center gap-2 text-sm">
+        <div className="relative flex flex-col items-center gap-2 px-3 py-3 sm:block">
+          <div className="flex items-center gap-2 text-sm sm:absolute sm:left-3 sm:top-1/2 sm:-translate-y-1/2">
             <span className="text-neutral-600 dark:text-slate-400">
               Items per page
             </span>

@@ -15,7 +15,7 @@ import {
 import { Collapsible, CollapsibleContent } from "@/components/ui/collapsible";
 import { InlineMarkdown } from "@/components/AgentMarkdown";
 import { statusIsFinalized } from "@/routes/tasks/types";
-import { formatDuration, toDuration } from "@/routes/workflows/utils";
+import { formatSeconds } from "@/util/timeFormat";
 import { getWebSearchResultSummary } from "./blockResult";
 import { StatusDot } from "./StatusDot";
 import { cn } from "@/util/utils";
@@ -171,7 +171,7 @@ function getRecordedActionMeta(action: ActionsApiResponse): {
 function formatActionDurationMs(durationMs: number): string {
   const seconds = durationMs / 1000;
   if (seconds >= 60) {
-    return formatDuration(toDuration(seconds));
+    return formatSeconds(seconds);
   }
   return `${seconds.toFixed(1).replace(/\.0$/, "")}s`;
 }
@@ -1153,7 +1153,7 @@ function WorkflowRunTimelineBlockItem({
   const isFinallyBlock = finallyBlockLabel && block.label === finallyBlockLabel;
   const isRunning = block.status === Status.Running && !workflowRunIsFinalized;
   const duration =
-    block.duration !== null ? formatDuration(toDuration(block.duration)) : null;
+    block.duration !== null ? formatSeconds(block.duration) : null;
   const blockTypeTitle = workflowBlockTitle[block.block_type];
   const blockIndex = blockOrder?.get(block.workflow_run_block_id);
   const actions = block.actions ?? [];

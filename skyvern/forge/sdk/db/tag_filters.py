@@ -71,7 +71,7 @@ def workflow_tag_wpid_subqueries(
     Shared by the analytics summary filter and the workflows-list filter: exact ``(key, value)``
     (OR within a key), group-only ``(key, None)``, and label-only ``(None, value)``, AND-ed across
     distinct terms. Shape semantics are exercised in ``tests/unit/test_workflows_list_tag_filter.py``
-    and ``tests/cloud/test_analytics_workflow_tag_filter.py``."""
+    and in the cloud analytics tag-filter tests."""
     return _tag_event_entity_subqueries(
         event_model=WorkflowTagEventModel,
         entity_column=WorkflowTagEventModel.workflow_permanent_id,

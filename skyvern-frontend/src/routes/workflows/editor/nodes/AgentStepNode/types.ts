@@ -42,6 +42,7 @@ export const agentStepNodeDefaultData: AgentStepNodeData = {
   maxTurns: 25,
   tools: [
     "browser_task",
+    "code",
     "download_to_s3",
     "file_download",
     "page_click",

@@ -187,6 +187,8 @@ class CopilotPendingTurn(BaseModel):
     question_heartbeat_at: datetime | None = None
     question_client_seen_at: datetime | None = None
     cancel_token: str | None = None
+    # The person who started the turn; None for a turn started by an organization API key or before this was recorded.
+    starter_user_id: str | None = None
     request_browser_allocations: CopilotRequestBrowserAllocations | None = None
     # Build-test runs this turn ended so it could take the chat's browser. Copilot owns this list;
     # the run row's failure_reason carries the same fact but a later finalizer can overwrite it.
@@ -195,6 +197,9 @@ class CopilotPendingTurn(BaseModel):
     # Each draft frame overwrites this, never appends, so an entry holds at most one workflow.
     latest_draft: ClientVisibleProposedWorkflow | None = None
     latest_draft_at: datetime | None = None
+
+
+CopilotTurnControl = Literal["steer", "answer", "cancel"]
 
 
 class CopilotInFlightTurn(BaseModel):

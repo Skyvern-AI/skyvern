@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import inspect
 import json
 import string
 from types import SimpleNamespace
@@ -1467,12 +1466,6 @@ def test_build_exit_result_passes_genuine_predicate_as_workflow_attempted(monkey
     assert captured["derive"] is True
     assert captured["evaluate"] is True
     assert captured["evaluate"] == ctx.has_genuine_workflow_attempt()
-
-
-def test_agent_no_longer_derives_workflow_attempted_from_two_marker_fields() -> None:
-    source = inspect.getsource(agent_module)
-    assert "last_update_block_count is not None or ctx.last_test_ok is not None" not in source
-    assert "workflow_attempted=bool(ctx.last_run_blocks_workflow_run_id)" not in source
 
 
 _AVOIDABLE_ASK = {

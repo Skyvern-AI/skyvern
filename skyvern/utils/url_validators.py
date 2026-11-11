@@ -55,7 +55,10 @@ def strip_query_params(url: str) -> str:
 
 def redact_url_query(url: str) -> str:
     """Remove the query string while preserving the other URL components."""
-    parsed = urlsplit(url)
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return "<redacted>"
     if not parsed.query:
         return url
     return urlunsplit(parsed._replace(query=""))

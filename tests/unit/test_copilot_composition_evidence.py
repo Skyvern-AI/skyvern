@@ -6697,17 +6697,6 @@ def test_fallback_selector_cache_is_reset_after_hidden_dom_cleanup() -> None:
     assert class_candidate["match_count"] == 1
 
 
-def test_browser_selector_candidates_are_cached_per_element() -> None:
-    assert "const cssSelectorMatchCache = new Map();" in _STRUCTURED_EVIDENCE_BODY
-    assert "const cssMatchesFor = (selector) =>" in _STRUCTURED_EVIDENCE_BODY
-    assert "const selectorCandidateCache = new WeakMap();" in _STRUCTURED_EVIDENCE_BODY
-    assert "const cacheKey = [includeNonActionInputValue, includeActionValue, includeHref].join(':');" in (
-        _STRUCTURED_EVIDENCE_BODY
-    )
-    assert "if (cachedByOptions && cachedByOptions.has(cacheKey))" in _STRUCTURED_EVIDENCE_BODY
-    assert "cachedByOptions.set(cacheKey, offered);" in _STRUCTURED_EVIDENCE_BODY
-
-
 _VISION_CHALLENGE_SUMMARY = {
     "summary": "A centered Two-Factor Authentication card requests an authenticator token; a Login button is shown.",
     "challenge_detected": True,

@@ -46,6 +46,12 @@ class _FakeContextForTest:
     def build_workflow_run_summary(self) -> str:
         return ""
 
+    def get_gmail_hop_token(self, label: str) -> str | None:
+        return None
+
+    def get_gmail_hop_refusal(self, label: str) -> str | None:
+        return None
+
 
 def _make_output_parameter(label: str = "read_email") -> OutputParameter:
     return OutputParameter(
@@ -656,3 +662,45 @@ async def test_attachment_reconnect_required_fails_block_without_provider_messag
         "code": "reconnect_required",
         "error": "Reconnect the Gmail account to download attachments",
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("include_body", "download_attachments", "format"),
+    [(True, False, "full"), (False, True, "full"), (False, False, "metadata")],
+)
+async def test_fetch_gmail_by_message_id(
+    monkeypatch: pytest.MonkeyPatch, include_body: bool, download_attachments: bool, format: str
+) -> None:
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION, "get_google_workspace_credentials", AsyncMock(return_value=SimpleNamespace(token="AT"))
+    )
+    get_message = AsyncMock(return_value={"id": "msg_1", "threadId": "thread_1", "payload": {}})
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.email_inbox_block.get_json", get_message)
+    list_messages = AsyncMock()
+    monkeypatch.setattr(email, "list_folder_messages", list_messages)
+
+    result = await _execute_block_for_test(
+        _make_block(message_id="msg/1", include_body=include_body, download_attachments=download_attachments)
+    )
+
+    assert result.success is True
+    assert result.output_parameter_value["folder"] is None
+    assert [item["id"] for item in result.output_parameter_value["emails"]] == ["msg_1"]
+    assert get_message.await_args.args[1].endswith("/messages/msg%2F1")
+    assert get_message.await_args.kwargs["params"] == {"format": format}
+    list_messages.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("overrides", [{"email_client": "outlook"}, {"credential_source": "nango"}])
+async def test_fetch_by_id_rejects_unsupported_connections(overrides: dict[str, str]) -> None:
+    result = await _execute_block_for_test(_make_block(message_id="msg_1", **overrides))
+    assert result.success is False
+    assert result.failure_reason == "Fetching by message ID requires a native Gmail connection"
+
+
+def test_fetch_id_yaml_conversion() -> None:
+    yaml = EmailInboxBlockYAML(label="read_email", email_client="gmail", message_id="{{ message_id }}")
+    block = block_yaml_to_block(yaml, {"read_email_output": _make_output_parameter()})
+    assert block.message_id == "{{ message_id }}"

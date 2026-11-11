@@ -146,17 +146,15 @@ export function parseDocInputForm(
   };
 }
 
-/** Adds the input, or replaces `oldKey`; a rename rewrites the steps' references to it. */
+/** Replaces the input `oldKey`; a rename rewrites the steps' references to it. */
 export function saveDocInput(
   parameters: ParametersState,
-  oldKey: string | null,
+  oldKey: string,
   parameter: ParametersState[number],
 ): {
   parameters: ParametersState;
   nodes: (<T extends Node>(nodes: T[]) => T[]) | null;
 } {
-  if (oldKey === null)
-    return { parameters: [...parameters, parameter], nodes: null };
   return {
     parameters: replaceParameter(parameters, oldKey, parameter).map((entry) =>
       entry.parameterType === "context" && entry.sourceParameterKey === oldKey

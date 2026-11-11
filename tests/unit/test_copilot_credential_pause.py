@@ -1657,7 +1657,7 @@ def test_a_card_connected_credential_keeps_its_durable_cross_turn_approval(login
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("previous_origin", [None, "", "https://old.example.com/login"])
+@pytest.mark.parametrize("previous_origin", [None, "", "https://old.example.net/login"])
 @pytest.mark.parametrize(
     "login_url",
     [
@@ -1690,8 +1690,9 @@ async def test_card_selection_keeps_its_origin_on_the_next_turn(
     assert error is None
     assert grant is not None
     assert tools_module.credential_fill._within_grant("https://portal.example.com/password", grant)
-    assert not tools_module.credential_fill._within_grant("https://elsewhere.example.com/login", grant)
-    assert not tools_module.credential_fill._within_grant("https://old.example.com/login", grant)
+    assert not tools_module.credential_fill._within_grant("https://sso.example.com/login", grant)
+    assert not tools_module.credential_fill._within_grant("https://elsewhere.example.net/login", grant)
+    assert not tools_module.credential_fill._within_grant("https://old.example.net/login", grant)
 
 
 @pytest.mark.asyncio
@@ -3874,7 +3875,8 @@ async def test_registration_card_generates_one_credential_and_resumes_with_only_
     grant, error = await tools_module.credential_fill._credential_fill_origin_grant(ctx, "cred_new")
     assert error is None and grant is not None
     assert tools_module.credential_fill._within_grant("https://portal.example.com/signup", grant)
-    assert not tools_module.credential_fill._within_grant("https://elsewhere.example.com/signup", grant)
+    assert not tools_module.credential_fill._within_grant("https://sso.example.com/signup", grant)
+    assert not tools_module.credential_fill._within_grant("https://elsewhere.example.net/signup", grant)
     assert vault.stored == 1
     await asyncio.sleep(0)
     assert vault.hooks_run == ["cred_new"]

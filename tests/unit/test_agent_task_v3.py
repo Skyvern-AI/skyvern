@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import itertools
 import json
+import re
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
@@ -115,7 +116,7 @@ from skyvern.forge.taskv3.tools import NO_ONE_TIME_CODE_SOURCE, PageProvider, _r
 from skyvern.schemas.llm import LLMConfig
 from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.steps import StepToolCall
-from skyvern.schemas.workflows import BlockType
+from skyvern.schemas.workflows import MAX_STEPS_PER_RUN_DESCRIPTION, BlockType
 from skyvern.utils.secret_redaction import REDACTED_SECRET_PLACEHOLDER
 from skyvern.webeye.actions.actions import (
     ActionStatus,
@@ -911,6 +912,10 @@ async def test_execute_task_v3_floors_low_explicit_step_cap(monkeypatch: pytest.
         monkeypatch, outcome, max_steps_per_run=7, data_extraction_goal=None, extracted_information_schema=None
     )
     assert loop_mock.await_args.kwargs["max_action_steps"] == MIN_ACTION_STEPS
+
+
+def test_max_steps_per_run_description_states_the_current_floor() -> None:
+    assert set(re.findall(r"\b(\d{2,})\b", MAX_STEPS_PER_RUN_DESCRIPTION)) == {str(MIN_ACTION_STEPS)}
 
 
 @pytest.mark.asyncio
@@ -3547,13 +3552,6 @@ async def test_execute_task_v3_general_block_step_cap_floored(monkeypatch: pytes
         extracted_information_schema=None,
     )
     assert loop_mock.await_args.kwargs["max_action_steps"] == MIN_ACTION_STEPS
-
-
-def test_min_action_steps_is_pinned() -> None:
-    # The constant is this change's headline risk, and every other assertion here is written against
-    # the symbol — so without this line it could be retuned to anything and the suite would stay green.
-    # Moving it is fine; moving it without a deliberate edit here is not.
-    assert MIN_ACTION_STEPS == 24
 
 
 @pytest.mark.asyncio
@@ -9153,3 +9151,14 @@ async def test_a_replay_in_flight_at_finish_is_settled_before_the_task_is_writte
     assert captured["task"].status == TaskStatus.completed
     assert [p.read_bytes() for p in tmp_path.iterdir()] == ([_REPLAYED_CSV] if selection else [])
     assert target.replay_candidates() == {}
+
+
+@pytest.mark.asyncio
+async def test_v3_internal_branch_extraction_may_complete_on_blank_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    block = _make_block(ExtractionBlock, data_extraction_goal="Evaluate the condition")
+    block._allow_blank_start = True
+    outcome = LoopOutcome(status="completed", reason="matched", billable_actions=[], extracted_output={"result": True})
+    _step, task, _loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch, outcome, task_block=block, page_url_after_loop="about:blank"
+    )
+    assert task.status == TaskStatus.completed

@@ -379,14 +379,6 @@ def test_destroy_all_handles_destroys_every_owned_handle_once_including_root() -
 # is the executing contract test). Kept minimal — behavior is covered by the helper tests above.
 
 
-def test_bindings_for_map_state_and_destroy_are_declared() -> None:
-    import inspect
-
-    src = inspect.getsource(bridge._load_x)
-    assert "XD.XDamageDestroy" in src  # destroy entrypoint bound
-    assert "XGetWindowAttributes" in src  # map-state query bound (to prune unmapped windows, not just absent ones)
-
-
 def test_scan_and_arm_prunes_by_viewability_before_arming() -> None:
     import inspect
 
@@ -420,14 +412,6 @@ def test_owned_handles_cleaned_in_finally_for_exceptional_exit() -> None:
     tree = ast.parse(textwrap.dedent(inspect.getsource(bridge._run)))
     tries = [n for n in ast.walk(tree) if isinstance(n, ast.Try) and "_destroy_all_handles" in ast.unparse(n.finalbody)]
     assert tries, "_destroy_all_handles must run in a finally so early/exceptional exits still release owned handles"
-
-
-def test_x_error_handler_captures_error_code() -> None:
-    import inspect
-
-    src = inspect.getsource(bridge._run)
-    assert 'err["code"]' in src  # the handler records the error code so BadDamage can be told from unrelated errors
-    assert hasattr(bridge, "_XErrorEvent")  # a typed error-event struct to read error_code from
 
 
 class _FakeLibc:

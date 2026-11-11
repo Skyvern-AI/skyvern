@@ -1,5 +1,8 @@
+import asyncio
+import hashlib
 import os
 import shutil
+import threading
 from datetime import UTC, datetime
 from pathlib import Path, PurePath
 from typing import BinaryIO
@@ -29,6 +32,7 @@ from skyvern.forge.sdk.artifact.storage.base import (
     is_file_from_retry_attempt,
     resolve_download_attempt_fail_open,
 )
+from skyvern.forge.sdk.artifact.storage.unique_pdfs import settle
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.files import FileInfo
@@ -87,6 +91,14 @@ def managed_file_uri(path: PurePath) -> str:
     URI's last segment, which download_file uses as the temporary file's name.
     """
     return "file://" + quote(path.as_posix())
+
+
+def _sha256_unless_stopped(path: str, stop: threading.Event) -> str | None:
+    digest = hashlib.sha256()
+    with open(path, "rb") as file:
+        while not stop.is_set() and (chunk := file.read(1024 * 1024)):
+            digest.update(chunk)
+    return None if stop.is_set() else digest.hexdigest()
 
 
 class LocalStorage(BaseStorage):
@@ -455,6 +467,13 @@ class LocalStorage(BaseStorage):
             try:
                 checksum = calculate_sha256_for_file(str(source))
                 if saved.get(uri) == checksum and target.is_file():
+                    await app.ARTIFACT_MANAGER.record_unchanged_download(
+                        organization_id=organization_id,
+                        run_id=run_id,
+                        uri=uri,
+                        checksum=checksum,
+                        source_path=str(source),
+                    )
                     continue
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, target)
@@ -466,6 +485,7 @@ class LocalStorage(BaseStorage):
                     filename=filename,
                     checksum=checksum,
                     file_size=target.stat().st_size,
+                    source_path=str(source),
                 )
             except Exception:
                 LOG.warning("Failed to preserve local download", filename=filename, run_id=run_id, exc_info=True)
@@ -624,12 +644,21 @@ class LocalStorage(BaseStorage):
             for artifact in snapshots.values()
         ]
         files_and_folders = os.listdir(download_dir)
+        stop = threading.Event()
         for file_or_folder in files_and_folders:
             if file_or_folder.endswith(BROWSER_DOWNLOADING_SUFFIX):
                 continue
             path = os.path.join(download_dir, file_or_folder)
             if os.path.isfile(path):
-                checksum = calculate_sha256_for_file(path)
+                # Hashing reads the whole file off the event loop; a cancelled listing stops it at the next chunk and
+                # waits for it, so no read outlives the response.
+                worker = asyncio.ensure_future(asyncio.to_thread(_sha256_unless_stopped, path, stop))
+                try:
+                    checksum = await asyncio.shield(worker)
+                except BaseException:
+                    stop.set()
+                    await settle(worker)
+                    raise
                 if (file_or_folder, checksum) in snapshot_contents:
                     continue
                 uri = f"file://{path}"

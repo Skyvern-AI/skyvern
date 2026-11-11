@@ -1591,7 +1591,9 @@ class TestS3SaveDownloadedFiles:
             s3_module,
             "app",
             SimpleNamespace(
-                ARTIFACT_MANAGER=SimpleNamespace(create_download_artifact=_create_row),
+                ARTIFACT_MANAGER=SimpleNamespace(
+                    create_download_artifact=_create_row, record_unchanged_download=AsyncMock()
+                ),
                 WORKFLOW_CONTEXT_MANAGER=WorkflowContextManager(),
                 DATABASE=SimpleNamespace(
                     artifacts=SimpleNamespace(list_artifacts_for_run_by_type=_list_rows),
@@ -1686,7 +1688,9 @@ class TestS3SaveDownloadedFiles:
             s3_module,
             "app",
             fake_app := SimpleNamespace(
-                ARTIFACT_MANAGER=SimpleNamespace(create_download_artifact=AsyncMock(side_effect=_save_row)),
+                ARTIFACT_MANAGER=SimpleNamespace(
+                    create_download_artifact=AsyncMock(side_effect=_save_row), record_unchanged_download=AsyncMock()
+                ),
                 WORKFLOW_CONTEXT_MANAGER=WorkflowContextManager(),
                 DATABASE=SimpleNamespace(
                     artifacts=SimpleNamespace(list_artifacts_for_run_by_type=_list_rows),

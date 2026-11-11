@@ -89,7 +89,7 @@ def target_label_hides_a_secret(raw: Any, secret_values: Collection[str]) -> boo
 # matcher above has nothing to compare against. It is an ALLOWLIST: a name is used only if it
 # positively reads like a UI label, and anything unusual falls to the role floor by default, so a new
 # credential shape needs no new rule. Strictness is cheap here, since the fallback is "Clicked a button".
-# The model cannot do this (cloud_docs/task-v3/CHARTER.md, "Is the harness doing the model's job?"): the
+# The model cannot do this (the Task V3 charter, "Is the harness doing the model's job?"): the
 # label must be produced with no LLM call, and the check decides what may be persisted, not what the page
 # means for the next action.
 TARGET_LABEL_MAX_CHARS = 40

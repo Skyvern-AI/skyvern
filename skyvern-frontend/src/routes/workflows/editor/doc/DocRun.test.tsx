@@ -7,14 +7,16 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ArtifactType, Status } from "@/api/types";
 import { useBlockPlayRegistry } from "@/store/BlockPlayRegistryStore";
 import type { WorkflowRunBlock } from "../../types/workflowRunTypes";
-import type { WorkflowBlockNode } from "../nodes";
+import type { AppNode, WorkflowBlockNode } from "../nodes";
 import { getDocStepSummary } from "./docStepRegistry";
 import { DocConditional } from "./DocConditional";
 import { WorkflowDocActionsContext } from "./WorkflowDocActionsContext";
-import type { DocItem } from "./buildDocTree";
+import { docStepNumbers, type DocItem } from "./buildDocTree";
 import { DocRunStepButton } from "./DocRunStepButton";
 import { DocStepResult } from "./DocStepResult";
 import { DocScope } from "./DocScope";
+import { DocRunLine } from "./DocRunLine";
+import type { useDocRun } from "./useDocRun";
 
 const docRun = vi.hoisted(() => ({ current: {} as Record<string, unknown> }));
 vi.mock("./useDocRun", () => ({
@@ -398,6 +400,28 @@ describe("DocStepResult", () => {
     fireEvent.click(screen.getByRole("button", { name: /show result of/i }));
     expect(screen.getAllByRole("row")).toHaveLength(1 + 5 + 1);
     expect(screen.getByText("3 more rows")).toBeTruthy();
+  });
+
+  it("links a file URL in a result table by its file name and previews an object cell by its keys", () => {
+    const url = "https://example.com/uploads/2026/passport.jpg";
+    renderResult(
+      block({
+        output: {
+          extracted_information: [
+            {
+              photo: url,
+              order: { customer_ref: "c1", amount: 3, currency: "USD" },
+            },
+          ],
+        },
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /show result of/i }));
+    const link = screen.getByRole("link", { name: "passport.jpg" });
+    expect(link.getAttribute("href")).toBe(url);
+    expect(link.getAttribute("target")).toBe("_blank");
+    expect(link.getAttribute("title")).toBe(url);
+    expect(screen.getByText("{customer_ref, amount, +1}")).toBeTruthy();
   });
 
   it("gives a step with nothing to show no chevron and says it returned nothing", () => {
@@ -1174,4 +1198,203 @@ it("shows the run result of an executed step in a read-only region", () => {
     </QueryClientProvider>,
   );
   expect(screen.getByText("Found 3 items · 9s")).toBeTruthy();
+});
+
+describe("DocRunLine", () => {
+  const loopNode = {
+    id: "n2",
+    type: "loop",
+    data: { label: "each_invoice" },
+  } as unknown as WorkflowBlockNode;
+  const items = [
+    { kind: "step", nodeId: "n0" },
+    { kind: "loop", nodeId: "n2", children: [{ kind: "step", nodeId: "n1" }] },
+  ] as DocItem[];
+  const byId = new Map<string, unknown>([
+    ["n0", { ...stepNode, id: "n0", data: { label: "open_site" } }],
+    ["n1", stepNode],
+    ["n2", loopNode],
+  ]) as Map<string, AppNode>;
+  const ago = (minutes: number) =>
+    new Date(Date.now() - minutes * 60_000).toISOString();
+  const line = (
+    overrides: Record<string, unknown>,
+    run: Record<string, unknown>,
+  ) => {
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter>
+          <DocRunLine
+            docRun={
+              {
+                runId: "wr_389105791398582218",
+                blocksByLabel: new Map(),
+                earlierVersion: false,
+                currentVersion: 6,
+                live: false,
+                blockRun: false,
+                blockRunTarget: null,
+                sharedRunId: null,
+                previous: null,
+                run: { workflow: { version: 6 }, created_at: ago(0), ...run },
+                ...overrides,
+              } as unknown as ReturnType<typeof useDocRun>
+            }
+            numbers={docStepNumbers(items)}
+            byId={byId}
+          />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    return screen.queryByTestId("doc-run-line");
+  };
+
+  it("names a finished run by its version number, counting its age from the end", () => {
+    // Steps unchanged since v5 (earlierVersion false); a settings-only save made v6.
+    const shown = line(
+      {},
+      {
+        status: Status.Completed,
+        workflow: { version: 5 },
+        started_at: ago(48),
+        finished_at: ago(1),
+      },
+    );
+    expect(shown?.textContent).toContain(
+      "Run wr_…582218 · Completed · 1 min ago · an earlier version, v5",
+    );
+    const open = screen.getByRole("link", {
+      name: "Open run wr_389105791398582218",
+    });
+    expect(open.getAttribute("href")).toBe("/runs/wr_389105791398582218");
+  });
+
+  it("says this version when the run's version is the current one", () => {
+    const shown = line(
+      { earlierVersion: true },
+      { status: Status.Completed, finished_at: ago(3) },
+    );
+    expect(shown?.textContent).toContain(
+      "Completed · 3 min ago · this version",
+    );
+  });
+
+  it("names the step a live run is on, by its Doc number, and when it started", () => {
+    const shown = line(
+      {
+        live: true,
+        owned: true,
+        blocksByLabel: new Map([
+          [
+            "each_invoice",
+            block({
+              label: "each_invoice",
+              status: Status.Running,
+              created_at: "2026-11-09T10:00:00Z",
+            }),
+          ],
+          [
+            "get_invoices",
+            block({
+              status: Status.Running,
+              created_at: "2026-11-09T10:00:05Z",
+            }),
+          ],
+        ]),
+      },
+      { status: Status.Running, started_at: ago(47) },
+    );
+    expect(shown?.textContent).toContain(
+      "Running · step 2.1 Get invoices · started 47 min ago · this version",
+    );
+  });
+
+  it("says a run waiting for its automatic retry is pending, not failed", () => {
+    const shown = line(
+      { live: true, owned: true },
+      { status: Status.Failed, retry_pending: true, started_at: ago(3) },
+    );
+    expect(shown?.textContent).toContain(
+      "Retry pending · started 3 min ago · this version",
+    );
+    expect(shown?.textContent).not.toContain("Failed");
+  });
+
+  it.each([
+    [Status.Queued, null, "Queued · queued 12 min ago"],
+    [Status.Created, null, "Queued · queued 12 min ago"],
+    [Status.Running, ago(5), "Running · started 5 min ago"],
+  ])(
+    "says started only once a %s run has started",
+    (status, startedAt, text) => {
+      const shown = line(
+        { live: true, owned: true },
+        { status, started_at: startedAt, created_at: ago(12) },
+      );
+      expect(shown?.textContent).toContain(`${text} · this version`);
+    },
+  );
+
+  it("ages a re-queued retry from when it was queued again, not from when the run was created", () => {
+    const shown = line(
+      { live: true, owned: true },
+      {
+        status: Status.Queued,
+        started_at: null,
+        created_at: ago(47),
+        queued_at: ago(1),
+      },
+    );
+    expect(shown?.textContent).toContain(
+      "Queued · queued 1 min ago · this version",
+    );
+  });
+
+  it.each([
+    [
+      "a soft-deleted version",
+      { deleted_at: "2026-11-10T11:00:00Z" },
+      {},
+      {},
+      "a test run",
+    ],
+    [
+      "a Copilot run whose draft is not deleted yet",
+      { deleted_at: null },
+      { copilot_session_id: "wcc_1" },
+      {},
+      "a test run",
+    ],
+
+    [
+      "a Copilot run whose proposal is pending",
+      { deleted_at: null },
+      { copilot_session_id: "wcc_1" },
+      { proposalPending: true },
+      "a test run",
+    ],
+    ["a plain run", { deleted_at: null }, {}, {}, "a newer version, v7"],
+  ])("names the version of %s", (_, workflow, run, overrides, words) => {
+    const shown = line(overrides, {
+      status: Status.Completed,
+      workflow: { version: 7, ...workflow },
+      finished_at: ago(2),
+      ...run,
+    });
+    expect(shown?.textContent).toContain(`Completed · 2 min ago · ${words}`);
+  });
+
+  it("says a one-step run is a step run and names its step", () => {
+    const shown = line(
+      { blockRun: true, blockRunTarget: "open_site" },
+      { status: Status.Failed },
+    );
+    expect(shown?.textContent).toContain(
+      "Step run wr_…582218 · Failed · step 1 Open site · just now",
+    );
+  });
+
+  it("draws nothing without a run", () => {
+    expect(line({ runId: undefined, run: undefined }, {})).toBeNull();
+  });
 });

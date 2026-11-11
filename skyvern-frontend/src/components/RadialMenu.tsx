@@ -233,17 +233,17 @@ export function RadialMenu({
             >
               <button
                 disabled={!isEnabled}
-                className="flex items-center justify-center rounded-full bg-white shadow-lg hover:bg-gray-50 disabled:cursor-not-allowed"
+                className="flex items-center justify-center rounded-full border border-border bg-popover text-popover-foreground hover:bg-accent disabled:cursor-not-allowed"
                 style={{
                   width: btnSize,
                   height: btnSize,
                 }}
               >
-                <div className="text-gray-700">{item.icon}</div>
+                <div>{item.icon}</div>
               </button>
               {item.text && (
                 <span
-                  className="whitespace-nowrap rounded bg-white px-2 py-1 text-xs text-gray-700 shadow-md"
+                  className="whitespace-nowrap rounded border border-border bg-popover px-2 py-1 text-xs text-popover-foreground"
                   style={{
                     opacity: isEnabled ? 1 : 0.5,
                     cursor: isEnabled ? "pointer" : "not-allowed",
@@ -287,7 +287,7 @@ export function RadialMenu({
                 close();
               }}
               disabled={!isEnabled}
-              className="absolute left-1/2 top-1/2 z-30 flex items-center justify-center rounded-full bg-white shadow-lg transition-all duration-300 ease-out hover:bg-gray-50 disabled:cursor-not-allowed"
+              className="absolute left-1/2 top-1/2 z-30 flex items-center justify-center rounded-full border border-border bg-popover text-popover-foreground transition-all duration-300 ease-out hover:bg-accent disabled:cursor-not-allowed"
               style={{
                 width: btnSize,
                 height: btnSize,
@@ -299,7 +299,7 @@ export function RadialMenu({
                 transitionDelay: isOpen ? `${index * 50}ms` : "0ms",
               }}
             >
-              <div className="text-gray-700">{item.icon}</div>
+              <div>{item.icon}</div>
             </button>
             {item.text && (
               <div
@@ -308,7 +308,7 @@ export function RadialMenu({
                   item.onClick();
                   close();
                 }}
-                className="absolute left-1/2 top-1/2 z-30 cursor-pointer whitespace-nowrap rounded bg-white px-2 py-1 text-xs text-gray-700 shadow-md transition-all duration-300 ease-out"
+                className="absolute left-1/2 top-1/2 z-30 cursor-pointer whitespace-nowrap rounded border border-border bg-popover px-2 py-1 text-xs text-popover-foreground transition-all duration-300 ease-out"
                 style={{
                   transform: isOpen
                     ? rotateText

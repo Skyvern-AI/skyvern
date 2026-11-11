@@ -5,7 +5,7 @@ import json
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -22,10 +22,12 @@ from agents import (
     RunErrorHandlerResult,
     RunHooks,
     Runner,
+    ToolErrorFormatterArgs,
     ToolsToFinalOutputResult,
     TResponseInputItem,
     Usage,
 )
+from agents._tool_identity import build_function_tool_lookup_map, get_function_tool_lookup_key_for_call
 from agents.models.interface import Model
 from agents.tool_context import ToolContext
 from openai.types.responses import ResponseFunctionToolCall, ResponseOutputMessage, ResponseOutputRefusal
@@ -139,7 +141,7 @@ class _RunState:
     page: ScriptSkyvernPage | None = None
     task: Task | None = None
     step: Step | None = None
-    # The tool_calls column holds every call, including ones no tool recorded in calls, so only calls feeds billing.
+    # The tool_calls column holds every call a tool ran, even ones not recorded in calls, so only calls feeds billing.
     # One background task writes the newest snapshot, so a tool never waits on that write.
     trail: list[AgentStepToolCall] = field(default_factory=list)
     running: AgentStepToolCall | None = None
@@ -313,7 +315,14 @@ class _LoopHooks(RunHooks[Any]):
     async def on_llm_end(self, context: RunContextWrapper[Any], agent: Agent[Any], response: ModelResponse) -> None:
         self.usage.add(response.usage)
         await self._store(ArtifactType.LLM_RESPONSE, {"output": response.output, "usage": response.usage})
-        self.state.call_order = [item.call_id for item in response.output if isinstance(item, ResponseFunctionToolCall)]
+        # A call the SDK cannot resolve to a tool never runs, so in the queue it would hold every call after it.
+        # The SDK's own lookup key decides that, so a namespaced call is unresolved even when its bare name is offered.
+        offered = build_function_tool_lookup_map([tool for tool in agent.tools if isinstance(tool, FunctionTool)])
+        self.state.call_order = [
+            item.call_id
+            for item in response.output
+            if isinstance(item, ResponseFunctionToolCall) and get_function_tool_lookup_key_for_call(item) in offered
+        ]
         refusals = [
             part.refusal
             for item in response.output
@@ -757,8 +766,12 @@ def _offers(state: _RunState, name: str) -> bool:
     return name in ALWAYS_OFFERED_TOOLS or name in (state.tools or ())
 
 
+def _run_block_types(state: _RunState) -> list[str]:
+    return [name for name in RUN_BLOCK_TYPES if _offers(state, name)]
+
+
 def _tools(state: _RunState) -> list[FunctionTool]:
-    block_types = [name for name in RUN_BLOCK_TYPES if _offers(state, name)]
+    block_types = _run_block_types(state)
     return [
         *(
             _dedicated_tool(block_type, tool, state)
@@ -772,6 +785,29 @@ def _tools(state: _RunState) -> list[FunctionTool]:
             if _offers(state, name)
         ),
     ]
+
+
+def _tool_not_found_formatter(
+    state: _RunState, block_types: list[str], names: list[str]
+) -> Callable[[ToolErrorFormatterArgs[Any]], str | None]:
+    def format_error(args: ToolErrorFormatterArgs[Any]) -> str | None:
+        if args.kind != "tool_not_found":
+            return None
+        LOG.warning(
+            "Agent step model called a tool it was not given",
+            label=state.label,
+            tool_name=args.tool_name,
+            workflow_run_id=state.workflow_run_id,
+            workflow_run_block_id=state.workflow_run_block_id,
+        )
+        if args.tool_name in block_types:
+            return (
+                f'{args.tool_name} is a block type; call run_block with block_type="{args.tool_name}" '
+                "and its arguments."
+            )
+        return f"There is no tool named {args.tool_name}. The tools are {names}."
+
+    return format_error
 
 
 async def _run_child_block(
@@ -985,6 +1021,12 @@ async def run_agent_step(
     effort = LLMConfigRegistry.get_config(llm_key).reasoning_effort
     model, run_config = resolve_agent_model(llm_key)
     finish = _finish_tool(block.data_schema, state)
+    tools = [*_tools(state), finish]
+    run_config = replace(
+        run_config,
+        tool_not_found_behavior="return_error_to_model",
+        tool_error_formatter=_tool_not_found_formatter(state, _run_block_types(state), [tool.name for tool in tools]),
+    )
     agent = Agent(
         name=block.label,
         # LiteLLM's chat-to-Responses bridge drops the served service tier, which leaves GPT calls unpriced;
@@ -996,7 +1038,7 @@ async def run_agent_step(
             + (f"\n\n{block.workflow_system_prompt}" if block.workflow_system_prompt else ""),
             cache_namespace=workflow_run_block_id,
         ),
-        tools=[*_tools(state), finish],
+        tools=tools,
         model=model,
         # Without reasoning set, the SDK drops Claude's thinking blocks from later turns and Anthropic rejects them.
         # model_construct because Claude keys can pin "max", which openai's Reasoning type does not list.

@@ -86,6 +86,13 @@ PLATFORM_SMTP_AWS_KEYS = {
 }
 
 
+BITWARDEN_AWS_KEY_DEFAULTS = {
+    "bitwarden_client_id_aws_secret_key": "SKYVERN_BITWARDEN_CLIENT_ID",
+    "bitwarden_client_secret_aws_secret_key": "SKYVERN_BITWARDEN_CLIENT_SECRET",
+    "bitwarden_master_password_aws_secret_key": "SKYVERN_BITWARDEN_MASTER_PASSWORD",
+}
+
+
 class AWSSecretParameter(Parameter):
     parameter_type: Literal[ParameterType.AWS_SECRET] = ParameterType.AWS_SECRET
 

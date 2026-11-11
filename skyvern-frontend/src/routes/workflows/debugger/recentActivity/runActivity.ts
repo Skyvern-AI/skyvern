@@ -1,5 +1,5 @@
 import { formatMs, toDate } from "@/util/utils";
-import { formatDuration, toDuration } from "@/routes/workflows/utils";
+import { formatSeconds } from "@/util/timeFormat";
 
 import { workflowBlockTitle } from "../../editor/nodes/types";
 import type {
@@ -55,7 +55,7 @@ export function getRunDurationLabel(
   if (!begin || !end) return null;
   const seconds = Math.round((end.getTime() - begin.getTime()) / 1000);
   if (seconds < 0) return null;
-  return formatDuration(toDuration(seconds));
+  return formatSeconds(seconds);
 }
 
 export function getRunAgoLabel(

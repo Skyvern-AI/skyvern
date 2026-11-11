@@ -7,6 +7,7 @@ import { getElements, getWorkflowBlocks } from "../workflowEditorUtils";
 import {
   buildDocTree,
   countDocSteps,
+  docStepNumbers,
   getDocNotesByNodeId,
   type DocBranch,
   type DocItem,
@@ -270,6 +271,24 @@ describe("buildDocTree", () => {
     expect(placedLabels(tree.items, labelOf)).toHaveLength(3);
   });
 
+  test("a branch counts every step inside it but numbers only its own steps", () => {
+    const blocks = [
+      conditional("check", "after", [
+        { id: "yes", next: "each", when: "found" },
+        { id: "else", next: null },
+      ]),
+      forLoop("each", "after", [
+        code("a", "b"),
+        code("b", "c"),
+        code("c", null),
+      ]),
+      code("after", null),
+    ];
+    const { tree } = expectNothingMissing(blocks);
+    const { branches } = tree.items[0] as { branches: DocBranch[] };
+    expect(branches[0]).toMatchObject({ stepCount: 4, numberedCount: 1 });
+  });
+
   test("branches that rejoin end in a Jump and the shared step shows once after the conditional", () => {
     const blocks = [
       code("start", "decide"),
@@ -471,5 +490,60 @@ describe("doc fields round-trip through the editor graph", () => {
       },
       { label: "nulls" },
     ]);
+  });
+});
+
+test("docStepNumbers counts an Otherwise last and continues the count across branches and into loops", () => {
+  const branch = (
+    branchId: string,
+    kind: DocBranch["kind"],
+    children: DocItem[],
+  ): DocBranch => ({
+    branchId,
+    kind,
+    synthetic: false,
+    condition: "",
+    check: null,
+    children,
+    stepCount: children.length,
+    numberedCount: children.filter((c) => c.kind !== "note").length,
+  });
+  const items: DocItem[] = [
+    { kind: "step", nodeId: "a" },
+    { kind: "note", ownerNodeId: "a", placement: "trailing", text: "n" },
+    {
+      kind: "conditional",
+      nodeId: "c",
+      branches: [
+        branch("b0", "otherwise", [{ kind: "step", nodeId: "o1" }]),
+        branch("b1", "if", [
+          { kind: "step", nodeId: "i1" },
+          {
+            kind: "loop",
+            nodeId: "l",
+            children: [
+              {
+                kind: "loop",
+                nodeId: "l2",
+                children: [{ kind: "step", nodeId: "x" }],
+              },
+            ],
+          },
+        ]),
+        branch("b2", "elseIf", [{ kind: "step", nodeId: "e1" }]),
+      ],
+    },
+    { kind: "step", nodeId: "z" },
+  ];
+  expect(Object.fromEntries(docStepNumbers(items))).toEqual({
+    a: "1",
+    c: "2",
+    i1: "2.1",
+    l: "2.2",
+    l2: "2.2.1",
+    x: "2.2.1.1",
+    e1: "2.3",
+    o1: "2.4",
+    z: "3",
   });
 });

@@ -13,8 +13,9 @@ import stat
 import threading
 from collections import Counter
 from collections.abc import Callable, Collection, Sequence
+from contextvars import ContextVar
 from pathlib import Path
-from typing import TypeVar
+from typing import Any, TypeVar
 
 import structlog
 
@@ -24,6 +25,7 @@ from skyvern.forge import app
 from skyvern.forge.sdk.api.files import download_dir_path_for_run, parse_uri_to_path
 from skyvern.forge.sdk.artifact.models import Artifact
 from skyvern.forge.sdk.artifact.storage.base import StreamingArtifactStorage
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.schemas.files import FileInfo
 
 LOG = structlog.get_logger()
@@ -34,6 +36,8 @@ _CHUNK_BYTES = 1024 * 1024
 # A PDF ends with an %%EOF marker after its trailer, so a cut-off copy lacks it. This is a completion hint used only to
 # decide which equal copies may be merged; it does not parse or validate the document.
 _PDF_EOF_SEARCH_BYTES = 1024
+# The loop time a timeline response matching downloads to Outputs must end by; storage work it reaches may honour it.
+response_deadline: ContextVar[float | None] = ContextVar("response_deadline", default=None)
 
 
 class _PdfDigest:
@@ -164,7 +168,7 @@ async def _streamed_pdf_digest(storage: StreamingArtifactStorage, artifact: Arti
     return digest.hexdigest() if digest.size == size else None
 
 
-def _first_of_each(items: Sequence[_T], digests: Sequence[str | None], order: Sequence[float]) -> list[_T]:
+def _first_of_each(items: Sequence[_T], digests: Sequence[str | None], order: Sequence[Any]) -> list[_T]:
     """Keep items in place, dropping any whose digest an earlier one (by ``order``, then position) already holds."""
     owners: dict[str, int] = {}
     for index in sorted(range(len(items)), key=lambda i: (order[i], i)):
@@ -193,7 +197,20 @@ def unique_pdf_paths(paths: list[str], stop: threading.Event | None = None) -> l
     ]
     if stop is not None and stop.is_set():
         return paths
-    return _first_of_each(paths, [r[0] if r else None for r in read], [r[1] if r else math.inf for r in read])
+    # A file this run gave a configured name to, still holding those bytes, outranks its twins; then a .pdf name wins,
+    # as it does when the registered rows are compared, then the earliest write.
+    context = skyvern_context.current()
+    run_id = (context.run_id or context.workflow_run_id) if context else None
+    order: list[tuple[bool, bool, float]] = []
+    for path, r in zip(paths, read):
+        named = (
+            context is not None
+            and context.organization_id is not None
+            and r is not None
+            and context.configured_download_digest(path, context.organization_id, run_id) == r[0]
+        )
+        order.append((not named, not path.lower().endswith(".pdf"), r[1] if r else math.inf))
+    return _first_of_each(paths, [r[0] if r else None for r in read], order)
 
 
 async def run_stoppable_comparison(work: Callable[[threading.Event], _T]) -> _T:
@@ -257,7 +274,7 @@ async def _verified(
     run_ids: frozenset[str],
     comparison: ResponseComparison,
     unbound_ids: Collection[str],
-) -> tuple[list[str | None], list[float]]:
+) -> tuple[list[str | None], list[tuple[bool, bool, float, str]]]:
     claims: list[tuple[str, int] | None] = [
         (checksum, size)
         if (checksum := file_info.checksum)
@@ -270,7 +287,7 @@ async def _verified(
     shared = Counter(claim for claim in claims if claim is not None)
     candidates = [(index, claim[1]) for index, claim in enumerate(claims) if claim is not None and shared[claim] > 1]
     digests: list[str | None] = [None] * len(files)
-    order = [math.inf] * len(files)
+    order = [(True, True, math.inf, "")] * len(files)
     if not candidates:
         return digests, order
     if missing := [
@@ -291,8 +308,38 @@ async def _verified(
     for index, _ in owned:
         result = comparison.verdicts[keys[index]]
         if result is not None and result[0] == files[index].checksum:
-            digests[index], order[index] = result
+            digests[index] = result[0]
+            order[index] = _rank(files[index], comparison.rows.get(files[index].artifact_id or ""), result[1])
     return digests, order
+
+
+def _rank(file_info: FileInfo, row: Artifact | None, stored_at: float) -> tuple[bool, bool, float, str]:
+    """Copies a configured name was given to first, then ``.pdf`` names, then the earliest stored, then the lowest id.
+
+    The configured-name stamp counts only for the very bytes it was earned on."""
+    configured = (
+        row is not None
+        and row.configured_name_sha256 is not None
+        and row.configured_name_sha256 == row.checksum == file_info.checksum
+    )
+    pdf_name = (file_info.filename or "").lower().endswith(".pdf")
+    return (not configured, not pdf_name, stored_at, file_info.artifact_id or "")
+
+
+async def verified_pdf_digests(
+    files: list[FileInfo], organization_id: str, run_ids: Collection[str | None], comparison: ResponseComparison
+) -> list[str | None]:
+    """The verified content digest of each of ``files``, None where unproven, within the response's deadline."""
+    scoped_runs = frozenset(run_id for run_id in run_ids if run_id)
+    if not scoped_runs:
+        return [None] * len(files)
+    try:
+        async with asyncio.timeout_at(comparison.deadline):
+            digests, _ = await _verified(files, organization_id, scoped_runs, comparison, ())
+    except Exception:
+        LOG.warning("Could not verify download contents; keeping the stored entries", exc_info=True)
+        return [None] * len(files)
+    return digests
 
 
 async def unique_pdf_file_infos(

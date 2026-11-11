@@ -144,6 +144,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowYAMLConversionRequest,
     copilot_proposal_metadata,
 )
+from skyvern.forge.sdk.services.request_principal import AuthKind, RequestPrincipal
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
 from skyvern.schemas.workflows import WorkflowCreateYAMLRequest
@@ -225,7 +226,7 @@ def _make_chat_request(
 
 
 @pytest.mark.asyncio
-async def test_demonstration_requires_shared_cache_for_record_control_and_done(
+async def test_multi_process_server_without_shared_cache_refuses_record_control_and_done(
     monkeypatch: pytest.MonkeyPatch,
     api_key_request: MagicMock,
     organization: SimpleNamespace,
@@ -233,6 +234,7 @@ async def test_demonstration_requires_shared_cache_for_record_control_and_done(
     cache = _FakeCache()
     cache.is_shared = False
     monkeypatch.setattr(app, "CACHE", cache)
+    monkeypatch.setenv("WEB_CONCURRENCY", "4")
 
     calls = (
         workflow_copilot_demonstration_record(
@@ -259,7 +261,7 @@ async def test_demonstration_requires_shared_cache_for_record_control_and_done(
     for call in calls:
         with pytest.raises(HTTPException) as exc_info:
             await call
-        assert exc_info.value.status_code == 403
+        assert exc_info.value.status_code == 501
 
 
 @pytest.mark.asyncio
@@ -10320,3 +10322,59 @@ async def test_convert_route_stitches_only_a_version_2_top_level(version_line: s
 
     blocks = response.workflow_definition["blocks"]
     assert [block["next_block_label"] for block in blocks] == [first_next, None]
+
+
+@pytest.mark.asyncio
+async def test_copilot_loopback_key_is_the_request_key_unless_the_hook_replaces_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(workflow_copilot_route, "get_request_principal", lambda: None)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "resolve_org_api_key", AsyncMock(return_value="org-key"))
+    with_key = SimpleNamespace(headers={"x-api-key": "ui-key"})
+    without_key = SimpleNamespace(headers={})
+
+    assert await workflow_copilot_route._resolve_copilot_api_key(with_key, "o_1") == "ui-key"  # type: ignore[arg-type]
+    assert await workflow_copilot_route._resolve_copilot_api_key(without_key, "o_1") == "org-key"  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("auth_kind", "recorded"),
+    [
+        (AuthKind.ui_session_and_bearer, "user_starter"),
+        (AuthKind.member_api_key, "user_starter"),
+        (AuthKind.api_key_and_bearer, None),
+        (AuthKind.scoped_api_key, None),
+    ],
+)
+async def test_a_copilot_turn_records_the_person_who_started_it(
+    monkeypatch: pytest.MonkeyPatch,
+    api_key_request: MagicMock,
+    copilot_stream: MagicMock,
+    organization: SimpleNamespace,
+    auth_kind: AuthKind,
+    recorded: str | None,
+) -> None:
+    captured = install_fake_create(monkeypatch)
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(
+        workflow_id="wf-canonical", title="Original", description="Original description", workflow_definition=None
+    )
+    result = AgentResult(user_response="done", updated_workflow=None, global_llm_context=None)
+    setup_new_copilot_mocks(monkeypatch, chat, original_workflow, result)
+    monkeypatch.setattr(workflow_copilot_route, "run_copilot_agent", AsyncMock(return_value=result))
+    # An organization key sent with a bearer acts for the organization, so it records no person.
+    starter = RequestPrincipal("org-1", auth_kind, "user_starter", "org:member")
+    monkeypatch.setattr(workflow_copilot_route, "get_request_principal", lambda: starter)
+
+    await workflow_copilot_chat_post(api_key_request, _make_chat_request(), organization)
+    await captured["handler"](copilot_stream)
+
+    pending_turn = app.DATABASE.workflow_params.start_copilot_turn.await_args.kwargs["pending_turn"]
+    assert pending_turn.starter_user_id == recorded

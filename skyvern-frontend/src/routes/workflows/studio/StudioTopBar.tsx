@@ -455,7 +455,7 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
   const hasNoBlocks = useWorkflowHasChangesStore(
     (s) => s.editorHasBlocks === false,
   );
-  // While the Doc lists problems Run stays normal: a click explains and jumps to the first one.
+  // While the Doc lists problems Run stays normal: a click explains and opens the list.
   const docHasProblems = docProblemCount > 0;
   const runBlocked = hasNoBlocks || (hasBlockingBlocks && !docHasProblems);
   const runBlockedReason = hasBlockingBlocks
@@ -469,7 +469,7 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
     toast({
       title: `Fix ${docProblemCount} problem${docProblemCount === 1 ? "" : "s"} before running`,
     });
-    useRunValidationStore.getState().docShowFirstProblem?.();
+    useRunValidationStore.getState().docShowProblems?.();
     return true;
   };
   const rerunEligible = Boolean(

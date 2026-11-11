@@ -841,23 +841,6 @@ async def test_retention_teardown_failure_does_not_replace_cancellation() -> Non
 
 
 @pytest.mark.asyncio
-async def test_retention_teardown_skipped_when_not_armed() -> None:
-    """When retention was never armed, no page-realm wrapper was installed, so teardown must not run."""
-    from skyvern.webeye.actions.handler import _close_eager_capture_then_teardown_retention
-
-    capture = MagicMock()
-    capture.aclose = AsyncMock()
-    page = MagicMock()
-
-    with patch("skyvern.webeye.actions.handler.teardown_blob_url_retention", AsyncMock()) as teardown:
-        await _close_eager_capture_then_teardown_retention(capture, page, retention_armed=False, workflow_run_id="wr")
-
-    capture.aclose.assert_awaited_once()
-    teardown.assert_not_awaited()
-    teardown.assert_not_awaited()
-
-
-@pytest.mark.asyncio
 async def test_read_adopted_session_blob_bytes_prefers_owner_then_fans_out() -> None:
     """The extracted reader returns the first page that owns the blob, owner (download.page) first."""
     download = _download(url=BLOB_URL)

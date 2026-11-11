@@ -34,6 +34,7 @@ from openai.types.responses import ResponseFunctionToolCall
 from pydantic import JsonValue, ValidationError
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
+from structlog.testing import capture_logs
 
 from skyvern.core.script_generations import real_skyvern_page_ai
 from skyvern.core.script_generations.real_skyvern_page_ai import _render_template_with_label
@@ -60,6 +61,7 @@ from skyvern.forge.sdk.workflow.models import agent_step_loop, agent_step_tools
 from skyvern.forge.sdk.workflow.models.agent_step_block import AgentStepBlock
 from skyvern.forge.sdk.workflow.models.block import (
     ConditionalBlock,
+    DownloadToS3Block,
     ExtractionBlock,
     HttpRequestBlock,
     LoginBlock,
@@ -585,6 +587,58 @@ async def test_a_run_block_call_for_an_unlisted_block_type_runs_no_child(
     assert [row.block_type for row in rows] == [BlockType.AGENT_STEP]
     assert child_prompts == []
     assert "['http_request']" in tool_outputs_for(model.inputs[1][1], "t")[0]
+
+
+@pytest.mark.asyncio
+async def test_a_call_to_an_unoffered_tool_name_returns_the_right_call_and_the_step_continues(
+    monkeypatch: pytest.MonkeyPatch, database: AgentDB, tmp_path: Path
+) -> None:
+    monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
+    downloaded = tmp_path / "report.pdf"
+    downloaded.write_bytes(b"%PDF")
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.workflow.models.block.resolve_local_or_download_file",
+        AsyncMock(return_value=str(downloaded)),
+    )
+    monkeypatch.setattr(DownloadToS3Block, "_upload_file_to_s3", AsyncMock())
+    url = "https://example.com/report.pdf"
+    model = _ScriptedModel(
+        [
+            [
+                scripted_call("run_block", {}, call_id="n").model_copy(update={"namespace": "other"}),
+                scripted_call("download_to_s3", {"url": url}, call_id="u"),
+                scripted_call("run_block", {"block_type": "download_to_s3", "arguments": {"url": url}}, call_id="r"),
+            ],
+            [scripted_call("open_file", {}, call_id="o")],
+            VALID_FINISH,
+        ]
+    )
+
+    with capture_logs() as logs:
+        async with asyncio.timeout(10):
+            result, _ = await _run_agent_block(monkeypatch, LUNA_MEDIUM, model)
+
+    assert (result.status, result.failure_reason) == (BlockStatus.completed, None)
+    assert isinstance(result.output_parameter_value, dict)
+    assert result.output_parameter_value["stop_reason"] == "completed"
+    (hint,) = tool_outputs_for(model.inputs[1][1], "u")
+    assert "run_block" in hint and 'block_type="download_to_s3"' in hint
+    (unknown,) = tool_outputs_for(model.inputs[2][1], "o")
+    assert all(repr(name) in unknown for name in ALL_TOOLS)
+    rows = await database.observer.get_workflow_run_blocks(workflow_run_id=RUN, organization_id=ORG)
+    (agent_row,) = (row for row in rows if row.block_type == BlockType.AGENT_STEP)
+    children = [row for row in rows if row.parent_workflow_run_block_id == agent_row.workflow_run_block_id]
+    assert [(row.block_type, row.status) for row in children] == [(BlockType.DOWNLOAD_TO_S3, "completed")]
+    assert all(names == ALL_TOOLS for names in model.tool_names)
+    assert [
+        (log["label"], log["tool_name"], log["workflow_run_id"], log["workflow_run_block_id"])
+        for log in logs
+        if log["event"] == "Agent step model called a tool it was not given"
+    ] == [
+        ("agent", "other.run_block", RUN, agent_row.workflow_run_block_id),
+        ("agent", "download_to_s3", RUN, agent_row.workflow_run_block_id),
+        ("agent", "open_file", RUN, agent_row.workflow_run_block_id),
+    ]
 
 
 @pytest.mark.parametrize("name", ["run_block", "update_workflow", "create_schedule", "not_a_tool"])

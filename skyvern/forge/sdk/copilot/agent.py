@@ -329,9 +329,11 @@ from skyvern.forge.sdk.copilot.video_attachment import (
     VideoAttachmentEvidence,
     build_video_attachment_message,
     create_video_evidence_artifacts,
+    is_image_attachment,
     is_video_attachment,
     load_video_attachment_evidence,
     screen_video_frames_for_copilot,
+    screened_image_attachment_message,
 )
 from skyvern.forge.sdk.copilot.work_plan import hydrate_work_plan, work_plan_prompt
 from skyvern.forge.sdk.copilot.workflow_yaml import (
@@ -5794,6 +5796,21 @@ async def _run_copilot_turn_impl(
             )
         video_attachment_message = build_video_attachment_message(video_evidence)
 
+    # A demonstration turn attaches the recording's uploads for the workflow to replay, not images to read.
+    turn_attachment_ids = set() if chat_request.product_action == "demonstrate" else set(chat_request.attached_file_ids)
+    image_files = [
+        attached_file
+        for attached_file in attached_files
+        if attached_file.file_id in turn_attachment_ids and is_image_attachment(attached_file.filename)
+    ]
+    image_attachment_message = (
+        await screened_image_attachment_message(
+            image_files, handler=raw_secret_safety_handler, organization_id=organization_id
+        )
+        if image_files and ctx.supports_vision
+        else None
+    )
+
     full_alias_map = alias_map = get_skyvern_mcp_alias_map()
     full_overlays = overlays = _build_skyvern_mcp_overlays(
         copilot_config.authoring_capability, notes_visible=copilot_sees_notes(ctx)
@@ -5929,10 +5946,12 @@ async def _run_copilot_turn_impl(
         scope_check=copilot_config.scope_check,
     )
     initial_input: str | list[dict[str, Any]] = user_message
-    if video_attachment_message is not None or direct_test_handoff is not None:
+    if video_attachment_message is not None or image_attachment_message is not None or direct_test_handoff is not None:
         initial_input = [{"role": "user", "content": user_message}]
         if video_attachment_message is not None:
             initial_input.append(video_attachment_message)
+        if image_attachment_message is not None:
+            initial_input.append(image_attachment_message)
         if direct_test_handoff is not None:
             initial_input.extend(direct_test_handoff)
 

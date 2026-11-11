@@ -30,7 +30,13 @@ type BrokerCredentialSelectorBase = Readonly<{
 export type BrokerCredentialSelectorProps = BrokerCredentialSelectorBase &
   (
     | Readonly<{ provider: "powerbi" }>
-    | Readonly<{ provider: "gmail"; nodeId: string; credentialId: string }>
+    | Readonly<{
+        provider: "gmail";
+        nodeId: string;
+        credentialId: string;
+        // send filters the native accounts to those that can send; reply also omits connected accounts.
+        purpose?: "read" | "send" | "reply";
+      }>
   );
 
 export type PermissionCapability = Readonly<{

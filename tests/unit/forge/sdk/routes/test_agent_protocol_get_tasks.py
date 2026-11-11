@@ -125,6 +125,7 @@ async def test_workflow_run_listing_respects_connect_authorization(
         SimpleNamespace(
             browser_session_ids_authorized_for_connect=authorization,
             should_check_browser_session_artifacts=AsyncMock(return_value=False),
+            role_allows=AsyncMock(return_value=True),
         ),
     )
     monkeypatch.setattr(agent_protocol.analytics, "capture", lambda *args, **kwargs: None)

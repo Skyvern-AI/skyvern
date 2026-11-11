@@ -112,6 +112,7 @@ from skyvern.forge.sdk.copilot.tools.mcp_hooks import (
     get_skyvern_mcp_alias_map,
 )
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
+from skyvern.forge.sdk.services.request_principal import AuthKind, RequestPrincipal
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.webeye.browser_state import PageCrashRecord
 from skyvern.webeye.persistent_sessions_manager import (
@@ -3261,6 +3262,9 @@ def _schedule_server(
     )
     database.workflow_params.get_workflow_copilot_chat_by_id = AsyncMock(return_value=None)
     monkeypatch.setattr(mcp_hooks.app, "DATABASE", database)
+    # Schedule writes deny a chat with no bound requester.
+    requester = RequestPrincipal(organization_id=ctx.organization_id, auth_kind=AuthKind.api_key)
+    monkeypatch.setattr(mcp_hooks, "get_request_principal", lambda: requester)
     server = _make_server(ctx, payload, SchemaOverlay(), alias_map=get_skyvern_mcp_alias_map())
     server._overlays = _build_skyvern_mcp_overlays()
     return server
