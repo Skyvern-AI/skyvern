@@ -389,6 +389,7 @@ async def create_browser_session(
             created_by=user_id if user_id is not None else API_BROWSER_SESSION_CREATED_BY,
             session_kind=BrowserSessionKind.api,
             browser_settings=browser_session_request.browser_settings,
+            bot_protection=browser_session_request.bot_protection,
         )
     response = await BrowserSessionResponse.from_browser_session(browser_session)
     response.warning = timeout_warning

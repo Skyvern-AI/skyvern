@@ -772,8 +772,14 @@ def _format_chat_history(chat_history: list[WorkflowCopilotChatHistoryMessage]) 
                     if interaction.status == "resolved"
                     else {"interaction_id": interaction.interaction_id, "status": interaction.status}
                 )
-                review_kind = "run" if interaction.account_group_review is not None else "cancel"
-                lines.append(f"account group {review_kind} review: {json.dumps(summary)}")
+                review = interaction.account_group_review
+                review_kind = "run" if review is not None else "cancel"
+                review_name = (
+                    "saved workflow single run review"
+                    if review is not None and review.single_run
+                    else f"account group {review_kind} review"
+                )
+                lines.append(f"{review_name}: {json.dumps(summary)}")
             elif interaction.credential_delete_review is not None:
                 summary = (
                     interaction.tool_result()
@@ -5827,6 +5833,7 @@ async def _run_copilot_turn_impl(
         native_tools=copilot_native_tools(
             supports_question_tool=chat_request.supports_question_tool,
             supports_account_group_card=chat_request.supports_account_group_card,
+            supports_single_run_card=chat_request.supports_single_run_card,
             supports_google_setup_card=chat_request.supports_google_setup_card,
             supports_demonstration_offer=chat_request.supports_demonstration_offer,
             supports_credential_delete_card=chat_request.supports_credential_delete_card,

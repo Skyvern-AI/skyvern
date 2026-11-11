@@ -16,6 +16,7 @@ from skyvern.forge.sdk.copilot.ask_user import (
     ACCOUNT_GROUP_STATUS_TOOL_NAME,
     ACCOUNT_GROUP_SUBMIT_TOOL_NAME,
     CREDENTIAL_DELETE_TOOL_NAME,
+    SINGLE_RUN_TOOL_NAME,
 )
 from skyvern.forge.sdk.copilot.code_write_diff import CodeWriteDiff
 from skyvern.forge.sdk.copilot.context import (
@@ -112,6 +113,7 @@ _TOOL_ACTIVITY_DISPLAY_LABELS = {
     "request_credential": "Requesting a credential",
     "ask_user": "Asking you",
     ACCOUNT_GROUP_SUBMIT_TOOL_NAME: "Reviewing the accounts with you",
+    SINGLE_RUN_TOOL_NAME: "Reviewing the run with you",
     ACCOUNT_GROUP_STATUS_TOOL_NAME: "Checking the account runs",
     ACCOUNT_GROUP_CANCEL_TOOL_NAME: "Reviewing a cancel with you",
     CREDENTIAL_DELETE_TOOL_NAME: "Reviewing a credential deletion with you",
