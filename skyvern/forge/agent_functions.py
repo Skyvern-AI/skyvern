@@ -1098,6 +1098,10 @@ class AgentFunction:
     async def nango_powerbi_catalog_available(self, organization_id: str) -> bool:
         return False
 
+    async def hidden_integration_ids(self, organization_id: str) -> frozenset[str]:
+        """Catalog entries this organization must not see at all, not even as coming soon."""
+        return frozenset()
+
     async def powerbi_plan_allows(self, organization_id: str) -> bool | None:
         """None when the plan could not be read."""
         return True
