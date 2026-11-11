@@ -62,6 +62,36 @@ describe("account group review", () => {
     expect(onApprove).toHaveBeenCalledWith(["cred_c"]);
   });
 
+  it("approves a single run with exactly the accounts it shows, with nothing to uncheck", () => {
+    const onApprove = vi.fn();
+    render(
+      <AccountGroupReviewCard
+        review={{
+          ...review,
+          credential_parameter_key: "",
+          single_run: true,
+          rows: [
+            { ...review.rows[2]!, parameter_key: "login" },
+            { ...review.rows[1]!, parameter_key: "portal" },
+          ],
+        }}
+        disabled={false}
+        lockReason={null}
+        collapsed={false}
+        onCollapsedChange={() => {}}
+        onApprove={onApprove}
+        onDecline={() => {}}
+      />,
+    );
+    expect(screen.getByText("login").nextSibling?.textContent).toBe("Ops");
+    expect(screen.getByText("portal").nextSibling?.textContent).toBe("Payroll");
+    expect(screen.queryByRole("checkbox")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Run once" }));
+
+    expect(onApprove).toHaveBeenCalledWith(["cred_c", "cred_b"]);
+  });
+
   it("lists the runs a cancel would stop and answers stop or keep", () => {
     const onDecide = vi.fn();
     render(

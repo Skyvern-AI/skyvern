@@ -4,6 +4,7 @@ from typing import Any
 from pydantic import BaseModel, Field, field_validator
 
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import Extensions, PersistentBrowserType
+from skyvern.schemas.bot_protection import BotProtection
 from skyvern.schemas.browser_session_timeouts import DEFAULT_TIMEOUT, MAX_EXTENDED_TIMEOUT, MAX_TIMEOUT, MIN_TIMEOUT
 from skyvern.schemas.browser_settings import BrowserSettings, require_known_timezone
 from skyvern.schemas.docs.doc_strings import PROXY_LOCATION_DOC_STRING
@@ -101,6 +102,12 @@ class CreateBrowserSessionRequest(BaseModel):
         description="Whether a person will watch this session's browser live. Defaults to false, which suits "
         "unattended automation; the Skyvern app sets it because a session opened in the UI is watched. It requests "
         "a capability, not a particular browser, and cannot be used to select where the session runs.",
+    )
+
+    bot_protection: BotProtection | None = Field(
+        default=None,
+        description="The bot protection the target site uses, such as a captcha, when known. Together with url, "
+        "it can determine where the session runs.",
     )
 
 

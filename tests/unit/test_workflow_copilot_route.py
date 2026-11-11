@@ -876,11 +876,13 @@ async def test_finalise_normal_turn_applies_a_verified_proposal_with_auto_accept
         (WorkflowPinnedByRunGroup("wf-canonical"), "_AUTO_ACCEPT_DEFERRED_FOR_RUN_GROUP"),
         # A folder check refuses before any write, so the draft must stay reviewable rather than fail the turn.
         (HTTPException(status_code=403, detail="folder"), "_AUTO_ACCEPT_DEFERRED_FOR_FOLDER_ACCESS"),
+        # An unfinished run reads the version row when its worker starts, so nothing may write it in place.
+        (None, "_AUTO_ACCEPT_DEFERRED_FOR_UNFINISHED_RUN"),
     ],
 )
 @pytest.mark.asyncio
 async def test_auto_accept_refused_before_any_write_leaves_the_draft_pending(
-    monkeypatch: pytest.MonkeyPatch, refusal: Exception, reason: str
+    monkeypatch: pytest.MonkeyPatch, refusal: Exception | None, reason: str
 ) -> None:
     chat = SimpleNamespace(
         organization_id="org-1",
@@ -903,27 +905,35 @@ async def test_auto_accept_refused_before_any_write_leaves_the_draft_pending(
         has_staged_proposal=True,
     )
     restore, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
-    monkeypatch.setattr(
-        workflow_copilot_route,
-        "_commit_staged_workflow",
-        AsyncMock(side_effect=refusal),
-    )
+    commit = AsyncMock(side_effect=refusal)
+    monkeypatch.setattr(workflow_copilot_route, "_commit_staged_workflow", commit)
+    holding_run = AsyncMock(return_value="wr_queued" if refusal is None else None)
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "get_unfinished_run_id_on_version", holding_run)
     stream = MagicMock(send=AsyncMock(return_value=True))
+    chat_request = _make_chat_request()
 
     await workflow_copilot_route._finalise_normal_turn(
         stream=stream,
         chat=chat,
         organization_id="org-1",
         original_workflow=original_workflow,
-        chat_request=_make_chat_request(),
+        chat_request=chat_request,
         agent_result=agent_result,
     )
 
     response_frame = stream.send.await_args.args[0]
     assert response_frame.workflow_applied is False
     assert response_frame.proposal_disposition == "review_tested"
-    assert getattr(workflow_copilot_route, reason) in response_frame.message
+    expected = getattr(workflow_copilot_route, reason)
+    if refusal is None:
+        expected = expected.format(workflow_run_id="wr_queued")
+    assert expected in response_frame.message
     restore.assert_not_awaited()
+    assert commit.await_count == (0 if refusal is None else 1)
+    # The hold must ask about the version row this turn would overwrite.
+    holding_run.assert_awaited_once_with("org-1", "wpid-1", chat_request.workflow_id)
+    if commit.await_args is not None:
+        assert commit.await_args.kwargs["workflow_id"] == chat_request.workflow_id
     publication = workflow_params.publish_workflow_copilot_candidate.await_args
     assert publication is not None
     assert publication.kwargs["proposal"] is not None
@@ -9604,6 +9614,7 @@ async def test_a_staged_commit_that_landed_before_the_write_failed_is_not_denied
     _restore, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
     commit = AsyncMock()
     monkeypatch.setattr(workflow_copilot_route, "_commit_staged_workflow", commit)
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "get_unfinished_run_id_on_version", AsyncMock(return_value=None))
     reads = 0
 
     async def history(workflow_copilot_chat_id: str) -> list[Any]:
