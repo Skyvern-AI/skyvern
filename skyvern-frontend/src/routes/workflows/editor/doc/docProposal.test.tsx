@@ -825,6 +825,16 @@ describe("Copilot proposal in the Doc view", () => {
       true,
     ],
     ["with nothing beyond its goal, leaves Details closed", {}, false],
+    [
+      "as an Action at its defaults (No, 0), leaves Details closed",
+      { block_type: "action" },
+      false,
+    ],
+    [
+      "as an Action that continues on failure, opens Details",
+      { block_type: "action", continue_on_failure: true },
+      true,
+    ],
   ])("a step the proposal adds %s", async (_case, extra, open) => {
     const before = [task("open_page", null)];
     useCopilotProposalStore.getState().setProposal({

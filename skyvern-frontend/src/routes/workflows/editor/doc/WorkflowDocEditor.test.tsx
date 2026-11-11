@@ -24,10 +24,12 @@ import { ReactFlowProvider } from "@xyflow/react";
 import { MemoryRouter } from "react-router-dom";
 
 import { ProxyLocation } from "@/api/types";
+import { useCopilotProposalStore } from "@/store/CopilotProposalStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 
 import {
   WorkflowParameterValueType,
+  type WorkflowApiResponse,
   type WorkflowBlock,
   type WorkflowSettings,
 } from "../../types/workflowTypes";
@@ -37,6 +39,9 @@ import { useLocateBlockStore } from "../runValidation/useLocateBlockStore";
 import { DOC_SHOW_PROBLEMS_EVENT } from "./docKeys";
 import { docDetailsText } from "./docDetailsText";
 import { useDocRunCheckStore } from "./docRunCheckStore";
+import { WorkflowScopeContext } from "../WorkflowScopeContext";
+import { StudioShellContext } from "../../studio/StudioShellContext";
+import { DOC_COPILOT_NUDGE } from "./DocStarter";
 import { WorkflowDocEditor } from "./WorkflowDocEditor";
 import { useDocUnfinishedStore } from "./docUnfinished";
 import { splitAtCaret } from "./docCaret";
@@ -65,6 +70,15 @@ vi.mock("../workflowYamlDocument", async (importOriginal) => ({
 vi.mock("./DocRunStepButton", () => ({ DocRunStepButton: () => null }));
 // The settings form is mocked because these tests check the side panel's header only.
 vi.mock("../panels/BlockConfigForm", () => ({ BlockConfigForm: () => null }));
+const openPane = vi.hoisted(() => vi.fn());
+vi.mock("../../studio/useStudioPanes", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("../../studio/useStudioPanes")>();
+  return {
+    ...actual,
+    useStudioPanes: () => ({ ...actual.useStudioPanes(), openPane }),
+  };
+});
 
 const output = (label: string) => ({
   parameter_type: "output",
@@ -99,6 +113,7 @@ function renderDoc(
   blocks: WorkflowBlock[] = [loop],
   edits?: DocGraphEdits,
   url = "/",
+  workflowId: string | null = null,
 ) {
   const { nodes, edges } = getElements(
     blocks,
@@ -112,7 +127,11 @@ function renderDoc(
     <QueryClientProvider client={new QueryClient()}>
       <MemoryRouter initialEntries={[url]}>
         <ReactFlowProvider>
-          <WorkflowDocEditor nodes={nodes} edges={edges} edits={edits} />
+          <WorkflowScopeContext.Provider
+            value={{ workflowId, readOnly: false }}
+          >
+            <WorkflowDocEditor nodes={nodes} edges={edges} edits={edits} />
+          </WorkflowScopeContext.Provider>
         </ReactFlowProvider>
       </MemoryRouter>
     </QueryClientProvider>,
@@ -183,6 +202,183 @@ describe("WorkflowDocEditor navigation", () => {
     cleanup();
     useLocateBlockStore.getState().clearLocate();
     vi.unstubAllGlobals();
+  });
+
+  describe("the Copilot suggestion", () => {
+    const edits = {
+      apply: vi.fn(),
+      update: vi.fn(),
+      addStep: vi.fn(),
+      duplicate: vi.fn(),
+    };
+    const nudge = () => document.querySelector("[data-doc-copilot-nudge]");
+    const checklist = () =>
+      screen.queryByRole("region", { name: "Getting started" }) ??
+      screen.queryByLabelText(/^Getting started/);
+    // The suggestion is shown once per browser; each case starts from a browser that has not seen it.
+    beforeEach(() => {
+      localStorage.removeItem("skyvern.doc.gettingStarted");
+      openPane.mockClear();
+    });
+    afterEach(() => {
+      localStorage.removeItem("skyvern.doc.gettingStarted");
+      useCopilotProposalStore.getState().setProposal(null);
+    });
+
+    test("a fresh empty Doc suggests Copilot alone; Dismiss hides it for good and the getting-started aids come back", () => {
+      renderDoc([], edits, "/", "wpid_1");
+      // One onboarding aid at a time: no tip and no checklist beside the suggestion.
+      const tipOrChecklist = () =>
+        document.querySelector('[role="note"]:not([data-doc-copilot-nudge])') ??
+        checklist();
+      expect(nudge()).not.toBeNull();
+      expect(tipOrChecklist()).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+      expect(nudge()).toBeNull();
+      expect(tipOrChecklist()).not.toBeNull();
+      cleanup();
+      renderDoc([], edits, "/", "wpid_1");
+      expect(nudge()).toBeNull();
+    });
+
+    test("Try Copilot opens the Copilot pane and the suggestion does not come back", () => {
+      renderDoc([], edits);
+      fireEvent.click(screen.getByRole("button", { name: "Try Copilot" }));
+      expect(openPane).toHaveBeenCalledWith("copilot");
+      expect(nudge()).toBeNull();
+      cleanup();
+      renderDoc([], edits);
+      expect(nudge()).toBeNull();
+    });
+
+    test("writing in the blank step answers the suggestion: clearing the text again does not bring it back", () => {
+      const client = new QueryClient();
+      const view = (prompt: string) => {
+        const { nodes, edges } = getElements(
+          [block("text_prompt", "write_it", null, { prompt })],
+          settings(),
+          true,
+        );
+        return (
+          <QueryClientProvider client={client}>
+            <MemoryRouter>
+              <ReactFlowProvider>
+                <WorkflowDocEditor nodes={nodes} edges={edges} edits={edits} />
+              </ReactFlowProvider>
+            </MemoryRouter>
+          </QueryClientProvider>
+        );
+      };
+      const rendered = render(view(""));
+      expect(nudge()).not.toBeNull();
+      rendered.rerender(view("S"));
+      expect(nudge()).toBeNull();
+      rendered.rerender(view(""));
+      expect(nudge()).toBeNull();
+    });
+
+    test("asking Copilot while the suggestion shows answers it: it stays answered after the proposal clears", () => {
+      renderDoc([], edits, "/", "wpid_1");
+      expect(nudge()).not.toBeNull();
+      const proposed = {
+        workflow_id: "w_1",
+        workflow_permanent_id: "wpid_1",
+        title: "Synthetic",
+        description: null,
+        workflow_definition: {
+          version: 2,
+          blocks: [block("text_prompt", "write_it", null, { prompt: "Hi" })],
+          parameters: [],
+        },
+      } as unknown as WorkflowApiResponse;
+      act(() =>
+        useCopilotProposalStore.getState().setProposal({
+          proposed,
+          baseline: {
+            ...proposed,
+            workflow_definition: { version: 2, blocks: [], parameters: [] },
+          },
+          review: null,
+          actionable: true,
+          acceptable: true,
+          decide: async () => true,
+        }),
+      );
+      expect(nudge()).toBeNull();
+      act(() => useCopilotProposalStore.getState().setProposal(null));
+      expect(nudge()).toBeNull();
+      cleanup();
+      renderDoc([], edits, "/", "wpid_1");
+      expect(nudge()).toBeNull();
+    });
+
+    test.each([
+      ["closed, folded, or open but not on screen", false, true],
+      ["on screen beside the Doc", true, false],
+    ])(
+      "with Copilot %s, the suggestion offers Try Copilot only when Copilot is not on screen",
+      (_state, onScreen, offersTry) => {
+        render(
+          <QueryClientProvider client={new QueryClient()}>
+            <MemoryRouter>
+              <ReactFlowProvider>
+                <StudioShellContext.Provider
+                  value={{
+                    copilotPortalEl: null,
+                    panelPortalEl: null,
+                    setEditorStreamSlot: () => {},
+                    setBrowserStreamSlot: () => {},
+                    setRunStreamSlot: () => {},
+                    isPaneOnScreen: (id) => onScreen && id === "copilot",
+                  }}
+                >
+                  <WorkflowDocEditor nodes={[]} edges={[]} edits={edits} />
+                </StudioShellContext.Provider>
+              </ReactFlowProvider>
+            </MemoryRouter>
+          </QueryClientProvider>,
+        );
+        expect(nudge()?.textContent).toContain(
+          offersTry ? DOC_COPILOT_NUDGE.text : DOC_COPILOT_NUDGE.textBeside,
+        );
+        expect(
+          screen.queryByRole("button", { name: "Try Copilot" }) !== null,
+        ).toBe(offersTry);
+      },
+    );
+
+    test("one step with blank text suggests it; a step with text or a step with no text to write does not", () => {
+      renderDoc(
+        [block("text_prompt", "write_it", null, { prompt: "" })],
+        edits,
+      );
+      expect(nudge()).not.toBeNull();
+      cleanup();
+      renderDoc(
+        [
+          block("text_prompt", "write_it", null, {
+            prompt: "Summarize the page",
+          }),
+        ],
+        edits,
+      );
+      expect(nudge()).toBeNull();
+      cleanup();
+      renderDoc([block("wait", "pause", null, { wait_sec: 5 })], edits);
+      expect(nudge()).toBeNull();
+      cleanup();
+      // A URL is a setting beyond text: the step is configured, not blank.
+      renderDoc(
+        [
+          block("navigation", "open_page", null, {
+            navigation_goal: "",
+            url: "https://example.com",
+          }),
+        ],
+        edits,
+      );
+      expect(nudge()).toBeNull();
+    });
   });
 
   describe("keyboard-first editing", () => {

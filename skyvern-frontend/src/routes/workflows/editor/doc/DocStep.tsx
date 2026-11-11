@@ -3,6 +3,7 @@ import {
   useContext,
   useEffect,
   useId,
+  useMemo,
   useRef,
   useState,
   type KeyboardEvent,
@@ -45,6 +46,7 @@ import { WorkflowDocActionsContext } from "./WorkflowDocActionsContext";
 import {
   customSettingsText,
   docCustomSettings,
+  docKeySettings,
   docStepShowsKey,
   type DocSettingRow,
   yamlKey,
@@ -55,7 +57,6 @@ import {
   docStepCaption,
   docTagClasses,
   docTagColor,
-  getDocKeyFields,
   docStepProducesData,
   getDocMainPlaceholder,
   getDocMissingSettings,
@@ -670,7 +671,10 @@ export function DocStepBody({
           ...prose.filter((f) => f.key !== fields[0]!.key),
         ]
       : prose;
-  const keyFields = getDocKeyFields(node);
+  const keyFields = useMemo(
+    () => docKeySettings(node, actions.loginCredentialKeys),
+    [node, actions.loginCredentialKeys],
+  );
   const unfinished = useDocUnfinishedStore((state) => state.ids.has(node.id));
   const missing = unfinished ? [] : getDocMissingSettings(node);
   // A description sits under a prompt-driven step's text; on other steps it is the main line, with the setting it would hide underneath.
@@ -793,7 +797,12 @@ export function DocStepBody({
           {keyFields.map((f) => (
             <Fragment key={f.key}>
               <dt className="text-muted-foreground">{f.label}</dt>
-              <dd className="min-w-0 [overflow-wrap:anywhere]">
+              <dd
+                className={cn(
+                  "min-w-0 [overflow-wrap:anywhere]",
+                  f.unset && "text-muted-foreground",
+                )}
+              >
                 <DocText value={f.value} />
               </dd>
             </Fragment>
@@ -897,7 +906,7 @@ export function DocStepBody({
         hasDetailsLines={
           (!restInView && rest.length > 0) ||
           descriptionInDetails ||
-          keyFields.length > 0
+          keyFields.some((f) => f.changed)
         }
         editable={editableProp}
         renamable={renamable}

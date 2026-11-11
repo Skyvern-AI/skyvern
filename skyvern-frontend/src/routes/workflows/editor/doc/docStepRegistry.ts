@@ -371,36 +371,6 @@ export function getDocSettingSummary(node: Node): string | null {
     : null;
 }
 
-export type DocKeyField = { key: string; label: string; value: string };
-
-const keyFields: Record<string, Array<[string, string]>> = {
-  http_request: [["method", "Method"]],
-  sendEmail: [
-    ["recipients", "Recipients"],
-    ["subject", "Subject"],
-  ],
-  fileParser: [["fileType", "Type"]],
-  workflowTrigger: [["workflowTitle", "Agent"]],
-  googleSheetsRead: [["range", "Range"]],
-  googleSheetsWrite: [["range", "Range"]],
-};
-
-/** Every key field of the type, filled or not. */
-export const docKeyFieldKeys = (type: string) =>
-  (keyFields[type] ?? []).map(([key]) => key);
-
-export function getDocKeyFields(node: Node): DocKeyField[] {
-  return (keyFields[node.type ?? ""] ?? []).flatMap(([key, label]) => {
-    const value = node.data[key];
-    const shown = Array.isArray(value)
-      ? value.filter((v) => typeof v === "string" && v).join(", ")
-      : typeof value === "string" || typeof value === "number"
-        ? String(value).trim()
-        : "";
-    return shown ? [{ key, label, value: shown }] : [];
-  });
-}
-
 /** One line naming a step, for the outline and Jump buttons. */
 export function docStepTitle(node: Node): string {
   if (node.type === "conditional") {

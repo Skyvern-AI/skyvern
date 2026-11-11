@@ -87,20 +87,36 @@ import {
   type DocPlace,
   type NodeType,
 } from "./docEditApi";
-import { countReferences, findOutputUsers, textValues } from "./docGraphEdits";
-import { docStepTitle } from "./docStepRegistry";
+import {
+  countReferences,
+  findOutputUsers,
+  isBlankStep,
+  textValues,
+} from "./docGraphEdits";
+import { docStepTitle, getDocProseFields } from "./docStepRegistry";
 import {
   docProblemEntries,
   docStepFixes,
   type DocStepFix,
 } from "./docProblems";
-import { customSettingsShortText } from "./docSettingsChips";
+import {
+  customSettingsShortText,
+  docLoginCredentialKeys,
+} from "./docSettingsChips";
 import { DocProblemsList } from "./DocProblemsList";
 import { docProblemStep } from "./docProblemStep";
 import { publishDocCriticalProblems } from "./docRunCheckStore";
 import { docPromptUrlOffer } from "./docPromptUrl";
 import { stepsLeftBy, useDocUnfinishedStore } from "./docUnfinished";
-import { DocGettingStarted, DocStarterNote, DocTip } from "./DocStarter";
+import {
+  DOC_COPILOT_NUDGE,
+  DocCopilotNudge,
+  DocGettingStarted,
+  DocStarterNote,
+  DocTip,
+} from "./DocStarter";
+import { useStudioPanes } from "../../studio/useStudioPanes";
+import { useStudioShellContext } from "../../studio/StudioShellContext";
 import { docTipIndex, type DocStarterProgress } from "./docStarterTips";
 import { useDocLatestRunCompleted } from "./useDocLatestRunCompleted";
 import {
@@ -385,6 +401,10 @@ export function WorkflowDocEditor({
           )
           .map((p) => p.key),
       ),
+    [parameters],
+  );
+  const loginCredentialKeys = useMemo(
+    () => docLoginCredentialKeys(parameters),
     [parameters],
   );
   const stepCount = countDocSteps(tree.items);
@@ -689,9 +709,40 @@ export function WorkflowDocEditor({
     problems,
     ran: latestRunCompleted,
   };
-  // One onboarding aid at a time: the checklist waits while a tip is showing.
+  const { openPane } = useStudioPanes();
+  const { isPaneOnScreen } = useStudioShellContext();
+  const copilotBeside = isPaneOnScreen?.("copilot") === true;
+  // Building from nothing is Copilot's job: an empty Doc, or one step whose text is still blank, suggests it once per browser.
+  const nearlyEmpty =
+    stepCount <= 1 &&
+    !description?.trim() &&
+    nodes
+      .filter(isWorkflowBlockNode)
+      // A step with no text to write (a wait, a loop) is already configured, not blank.
+      .every((node) => isBlankStep(node) && getDocProseFields(node).length > 0);
+  const copilotNudge =
+    Boolean(edit) &&
+    !proposal &&
+    nearlyEmpty &&
+    !starter.seenTips.includes(DOC_COPILOT_NUDGE.tip);
+  // Writing in the Doc or asking Copilot while it shows answers the suggestion, so it does not come back.
+  const nudgeShown = useRef(false);
+  const editing = Boolean(edit);
+  const { seeTip } = starter;
+  useEffect(() => {
+    if (
+      nudgeShown.current &&
+      !copilotNudge &&
+      (proposal !== null || (editing && !nearlyEmpty))
+    )
+      seeTip(DOC_COPILOT_NUDGE.tip);
+    nudgeShown.current = copilotNudge;
+  }, [copilotNudge, nearlyEmpty, proposal, editing, seeTip]);
+  // One onboarding aid at a time: the tip and the checklist wait while the Copilot suggestion or a tip shows.
   const showTip =
-    starter.active && docTipIndex(starterProgress, starter.seenTips) >= 0;
+    starter.active &&
+    !copilotNudge &&
+    docTipIndex(starterProgress, starter.seenTips) >= 0;
   const reached = docStarterDone(starterProgress);
   const { markDone } = starter;
   useEffect(() => {
@@ -973,6 +1024,7 @@ export function WorkflowDocEditor({
       value={{
         editable,
         runControlsVisible: !scopeReadOnly && !proposal,
+        loginCredentialKeys,
         openSettings: openStepSettings,
         openVisual: () =>
           useWorkflowPresentationStore.getState().setPresentation("visual"),
@@ -1332,6 +1384,19 @@ export function WorkflowDocEditor({
               </p>
             )}
             {proposal && <DocProposalCard proposal={proposal} goTo={goTo} />}
+            {copilotNudge && (
+              <DocCopilotNudge
+                onTry={
+                  copilotBeside
+                    ? null
+                    : () => {
+                        starter.seeTip(DOC_COPILOT_NUDGE.tip);
+                        openPane("copilot");
+                      }
+                }
+                onDismiss={() => starter.seeTip(DOC_COPILOT_NUDGE.tip)}
+              />
+            )}
             {edit && stepCount === 0 && !description?.trim() && (
               <DocStarterNote />
             )}
@@ -1365,16 +1430,20 @@ export function WorkflowDocEditor({
             </DocProposalProvider>
           </div>
         </div>
-        {edit && starter.active && !showTip && !(panelOpen && !wide) && (
-          <DocGettingStarted
-            progress={starterProgress}
-            kept={starter.done}
-            onHide={starter.hide}
-            folded={toastShowing}
-            compact={!wide}
-            clearOfPanel={panelOpen}
-          />
-        )}
+        {edit &&
+          starter.active &&
+          !showTip &&
+          !copilotNudge &&
+          !(panelOpen && !wide) && (
+            <DocGettingStarted
+              progress={starterProgress}
+              kept={starter.done}
+              onHide={starter.hide}
+              folded={toastShowing}
+              compact={!wide}
+              clearOfPanel={panelOpen}
+            />
+          )}
         {wide && !panelOpen && (
           <DocOutline items={tree.items} byId={byId} scrollRef={scrollRef} />
         )}

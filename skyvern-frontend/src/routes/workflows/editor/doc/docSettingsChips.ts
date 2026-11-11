@@ -1,4 +1,9 @@
-import type { WorkflowBlock } from "../../types/workflowTypes";
+import type { Node } from "@xyflow/react";
+import {
+  WorkflowParameterValueType,
+  type WorkflowBlock,
+  type WorkflowBlockType,
+} from "../../types/workflowTypes";
 import { diffBlockFields } from "../../util/compareBlocks";
 import {
   isWorkflowBlockNode,
@@ -6,14 +11,18 @@ import {
   type WorkflowBlockNode,
 } from "../nodes";
 import { RunEngine } from "@/api/types";
+import {
+  parameterIsAzureVaultCredential,
+  parameterIsBitwardenCredential,
+  parameterIsOnePasswordCredential,
+  parameterIsSkyvernCredential,
+  type ParametersState,
+} from "../types";
 import { humanizeKey, reviewFieldValue } from "../panels/workflowReviewDiff";
 import { createNode, getWorkflowBlocks } from "../workflowEditorUtils";
 import { docDetailsText } from "./docDetailsText";
-import {
-  getDocFilledProseFields,
-  getDocKeyFields,
-  getDocProseFields,
-} from "./docStepRegistry";
+import { DOC_FIELD_MAP } from "./docFieldMap";
+import { getDocFilledProseFields, getDocProseFields } from "./docStepRegistry";
 import { taskv2NodeDefaultData } from "../nodes/Taskv2Node/types";
 
 // createNode makes a navigation step for taskv2, which left the add menu, but saved task_v2 blocks still load as taskv2.
@@ -30,7 +39,15 @@ export const customSettingsText = (count: number) =>
 
 export const customSettingsShortText = (count: number) => `${count} custom`;
 
-export type DocSettingRow = { key: string; label: string; value: string };
+export type DocSettingRow = {
+  key: string;
+  label: string;
+  value: string;
+  // A key setting with no value, shown as its empty text.
+  unset?: boolean;
+  // A key setting whose saved value differs from a new step's.
+  changed?: boolean;
+};
 
 // Saved keys a step shows outside Details (its title, list, branches, wait, notes) or that only the editor writes.
 export const DOC_SHOWN_ON_STEP: ReadonlySet<string> = new Set([
@@ -149,6 +166,133 @@ function withoutShownCondition(block: Record<string, unknown>) {
   return { ...block, condition: rest };
 }
 
+// Keyed like the custom-settings cache, so a step is serialized once per edit for both lists.
+const savedBlocks = new WeakMap<object, Record<string, unknown> | null>();
+
+// The step as it saves; null where the editor cannot serialize it.
+function savedBlock(node: WorkflowBlockNode): Record<string, unknown> | null {
+  if (!savedBlocks.has(node.data)) {
+    let saved: Record<string, unknown> | null = null;
+    try {
+      const [block] = getWorkflowBlocks([{ ...node, parentId: undefined }], []);
+      saved = (block as Record<string, unknown>) ?? null;
+    } catch (error) {
+      if (import.meta.env.DEV && !warned) {
+        warned = true;
+        console.warn("Doc: a step could not be serialized for Details", error);
+      }
+    }
+    savedBlocks.set(node.data, saved);
+  }
+  return savedBlocks.get(node.data) ?? null;
+}
+
+const proseKeys = (node: Node) =>
+  new Set(getDocProseFields(node).map((f) => yamlKey(f.key)));
+
+// By the saved type: a navigation on the 2.0 engine saves as task_v2, which has its own fields.
+const typeSpecs = (saved: Record<string, unknown>) =>
+  DOC_FIELD_MAP[saved.block_type as WorkflowBlockType] ?? [];
+
+const shortValue = (value: string) =>
+  value.length > MAX_VALUE ? `${value.slice(0, MAX_VALUE - 1)}…` : value;
+
+/** The parameters a login can use as its credential, by the Login panel's own credential rules. */
+export function docLoginCredentialKeys(
+  parameters: ParametersState,
+): ReadonlySet<string> {
+  return new Set(
+    parameters.flatMap((p) => {
+      if (p.parameterType === "workflow")
+        return p.dataType === WorkflowParameterValueType.CredentialId
+          ? [p.key]
+          : [];
+      if (p.parameterType !== "credential" && p.parameterType !== "onepassword")
+        return [];
+      return parameterIsSkyvernCredential(p) ||
+        parameterIsBitwardenCredential(p) ||
+        parameterIsOnePasswordCredential(p) ||
+        parameterIsAzureVaultCredential(p)
+        ? [p.key]
+        : [];
+    }),
+  );
+}
+
+/** The step type's key settings with their values, except a field the step shows as one of its lines. */
+export function docKeySettings(
+  node: AppNode,
+  loginCredentialKeys: ReadonlySet<string>,
+): DocSettingRow[] {
+  if (!isWorkflowBlockNode(node)) return [];
+  const saved = savedBlock(node);
+  if (!saved) return [];
+  const lines = proseKeys(node);
+  const changedKeys = changedFromNewStep(node, saved);
+  return typeSpecs(saved).flatMap((spec) => {
+    if (spec.hiddenWhen?.(saved)) return [];
+    if (spec.keys.every((key) => lines.has(key))) return [];
+    // The Login panel reads only the first entry as the credential and keeps later ones as inputs; a first entry that
+    // is not a credential (a dangling reference, a plain input) is left out, since the Doc cannot tell what it is.
+    const values = spec.keys.map((key) => {
+      const raw = saved[key];
+      return spec.credentialsOnly && Array.isArray(raw)
+        ? { raw, kept: raw.slice(0, 1) }
+        : { raw, kept: raw };
+    });
+    if (
+      spec.credentialsOnly &&
+      values.some(
+        ({ kept }) =>
+          Array.isArray(kept) &&
+          kept.some((k) => !loginCredentialKeys.has(String(k))),
+      )
+    )
+      return [];
+    const shownByEditor = spec.editorValue?.(
+      node.data as Record<string, unknown>,
+    );
+    const value =
+      (typeof shownByEditor === "string" && shownByEditor.trim()
+        ? shownByEditor
+        : null) ??
+      values
+        .map(({ kept }, i) => reviewFieldValue(spec.keys[i]!, kept))
+        // A value that formats to blank text, such as a list of empty recipients, reads as unset.
+        .find((v) => v !== null && v.trim() !== "") ??
+      null;
+    return [
+      {
+        key: spec.keys[0]!,
+        label: spec.label,
+        value: value === null ? spec.empty : shortValue(value),
+        unset: value === null,
+        changed:
+          value !== null &&
+          (changedKeys?.some((key) => spec.keys.includes(key)) ?? true),
+      },
+    ];
+  });
+}
+
+// The saved keys that differ from a new step of the same type; null when the new step cannot be serialized.
+function changedFromNewStep(
+  node: WorkflowBlockNode,
+  saved: Record<string, unknown>,
+): string[] | null {
+  let base: Record<string, unknown> | null;
+  try {
+    base = baselineBlock(node);
+  } catch {
+    return null;
+  }
+  if (!base) return null;
+  return diffBlockFields(
+    withoutShownCondition(base) as WorkflowBlock,
+    withoutShownCondition(saved) as WorkflowBlock,
+  ).map(({ key }) => key);
+}
+
 /** Every saved setting of the step that differs from a new step of its saved type, named as the review card names it; null when the step cannot be saved as it stands. */
 export function docCustomSettings(node: AppNode): DocSettingRow[] | null {
   if (!isWorkflowBlockNode(node)) return [];
@@ -162,10 +306,9 @@ export function docCustomSettings(node: AppNode): DocSettingRow[] | null {
 function computeCustomSettings(
   node: WorkflowBlockNode,
 ): DocSettingRow[] | null {
-  let block: unknown;
+  const block = savedBlock(node);
   let base: Record<string, unknown> | null;
   try {
-    [block] = getWorkflowBlocks([{ ...node, parentId: undefined }], []);
     base = baselineBlock(node);
   } catch (error) {
     if (import.meta.env.DEV && !warned) {
@@ -177,14 +320,13 @@ function computeCustomSettings(
   if (!block || !base) return null;
   const shown = new Set([
     ...SHOWN_ELSEWHERE,
-    ...[...getDocProseFields(node), ...getDocKeyFields(node)].map((f) =>
-      yamlKey(f.key),
-    ),
+    ...proseKeys(node),
+    // A key a hiddenWhen rule leaves out has no row, so a non-default value of it shows here.
+    ...typeSpecs(block)
+      .filter((spec) => !spec.hiddenWhen?.(block))
+      .flatMap((spec) => spec.keys),
   ]);
-  // The Agent row names a trigger's target by its title; a loaded or proposed trigger starts without one.
-  if (node.type === "workflowTrigger" && node.data.workflowTitle.trim())
-    shown.add("workflow_permanent_id");
-  const saved = block as Record<string, unknown>;
+  const saved = block;
   const defaultData = newStepData(node);
   const branches = Object.entries(serializedTypeFields(node)).flatMap(
     ([field, value]) =>
@@ -204,8 +346,6 @@ function computeCustomSettings(
     if (shown.has(key)) return [];
     // A setting the user cleared still differs from its default.
     const value = reviewFieldValue(key, after) ?? docDetailsText.notSet;
-    const short =
-      value.length > MAX_VALUE ? `${value.slice(0, MAX_VALUE - 1)}…` : value;
-    return [{ key, label: humanizeKey(key), value: short }];
+    return [{ key, label: humanizeKey(key), value: shortValue(value) }];
   });
 }
