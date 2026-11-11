@@ -1051,7 +1051,8 @@ class Settings(BaseSettings):
     """Accept new serial workflow run groups. Turning it off stops submission only; reads, cancels and
     dispatch of already-submitted groups continue."""
     COPILOT_ACCOUNT_GROUP_SUBMIT_ENABLED: bool = True
-    """Offer Copilot's run_workflow_for_accounts tool. Turning it off keeps group status, cancel and receipts."""
+    """Offer Copilot's run_workflow_for_accounts and run_saved_workflow tools. Turning it off keeps status, cancel
+    and receipts."""
     COPILOT_CREDENTIAL_DELETE_ENABLED: bool = True
     """Offer Copilot's delete_saved_credentials card. Turning it off hides the tool and refuses confirmations."""
 
