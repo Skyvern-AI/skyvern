@@ -19,6 +19,8 @@ export type DocGoToDetails = "open" | "proposal";
 export const WorkflowDocActionsContext = createContext<{
   editable: boolean;
   runControlsVisible: boolean;
+  // Parameters a login can use as its credential, so it names its credential and not every input it reads.
+  loginCredentialKeys: ReadonlySet<string>;
   openSettings: (id: string) => void;
   openVisual: () => void;
   goTo: (id: string, details?: DocGoToDetails) => void;
@@ -59,6 +61,7 @@ export const WorkflowDocActionsContext = createContext<{
 }>({
   editable: false,
   runControlsVisible: false,
+  loginCredentialKeys: new Set(),
   openSettings: () => {},
   openVisual: () => {},
   goTo: () => {},

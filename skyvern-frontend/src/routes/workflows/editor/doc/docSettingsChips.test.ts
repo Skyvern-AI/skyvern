@@ -2,15 +2,67 @@ import { describe, expect, test } from "vitest";
 
 import type { AppNode, WorkflowBlockNode } from "../nodes";
 import { agentStepNodeDefaultData } from "../nodes/AgentStepNode/types";
+import { codeBlockNodeDefaultData } from "../nodes/CodeBlockNode/types";
 import { emailInboxNodeDefaultData } from "../nodes/EmailInboxNode/types";
 import { extractionNodeDefaultData } from "../nodes/ExtractionNode/types";
+import { fileDownloadNodeDefaultData } from "../nodes/FileDownloadNode/types";
+import { loginNodeDefaultData } from "../nodes/LoginNode/types";
 import { loopNodeDefaultData } from "../nodes/LoopNode/types";
 import { navigationNodeDefaultData } from "../nodes/NavigationNode/types";
 import { powerBIQueryNodeDefaultData } from "../nodes/PowerBIQueryNode/types";
-import { docCustomSettings, yamlKey } from "./docSettingsChips";
-import { docKeyFieldKeys, getDocProseFields } from "./docStepRegistry";
-import { createNode } from "../workflowEditorUtils";
+import { sendEmailNodeDefaultData } from "../nodes/SendEmailNode/types";
+import { createNode, getWorkflowBlocks } from "../workflowEditorUtils";
 import { taskv2NodeDefaultData } from "../nodes/Taskv2Node/types";
+import { workflowTriggerNodeDefaultData } from "../nodes/WorkflowTriggerNode/types";
+import { httpRequestNodeDefaultData } from "../nodes/HttpRequestNode/types";
+import { urlNodeDefaultData } from "../nodes/URLNode/types";
+import { getDocProseFields } from "./docStepRegistry";
+import { DOC_FIELD_MAP } from "./docFieldMap";
+import {
+  docCustomSettings,
+  docKeySettings,
+  docLoginCredentialKeys,
+  yamlKey,
+} from "./docSettingsChips";
+import type { ParametersState } from "../types";
+
+// Typed as a record so a new block type fails tsc here until it is listed.
+const BLOCK_TYPES: Record<WorkflowBlockNode["type"], true> = {
+  task: true,
+  taskv2: true,
+  navigation: true,
+  action: true,
+  extraction: true,
+  login: true,
+  validation: true,
+  human_interaction: true,
+  wait: true,
+  terminate: true,
+  loop: true,
+  conditional: true,
+  codeBlock: true,
+  textPrompt: true,
+  sendEmail: true,
+  emailInbox: true,
+  fileDownload: true,
+  fileUpload: true,
+  download: true,
+  upload: true,
+  fileParser: true,
+  pdfParser: true,
+  pdfFill: true,
+  splitPdf: true,
+  dataExport: true,
+  url: true,
+  web_search: true,
+  http_request: true,
+  printPage: true,
+  workflowTrigger: true,
+  googleSheetsRead: true,
+  googleSheetsWrite: true,
+  agentStep: true,
+  powerBIQuery: true,
+};
 
 describe("docCustomSettings", () => {
   const extraction = (data: Record<string, unknown>) =>
@@ -26,7 +78,7 @@ describe("docCustomSettings", () => {
       },
     }) as AppNode;
 
-  test("lists every saved setting that differs from a new step of the type, and nothing at its default", () => {
+  test("lists every saved setting that differs from a new step of the type, except its key settings, and nothing at its default", () => {
     expect(
       docCustomSettings(
         extraction({
@@ -40,8 +92,6 @@ describe("docCustomSettings", () => {
     ).toEqual([
       ["continue_on_failure", "Continue on failure", "Yes"],
       ["model", "Model", "model-x"],
-      ["max_steps_per_run", "Max steps", "12"],
-      ["engine", "Engine", "skyvern-2.0"],
     ]);
   });
 
@@ -138,44 +188,6 @@ describe("docCustomSettings", () => {
       keys(loop({ whileConditionDescription: "Until the last page" })),
     ).toEqual(["condition"]);
   });
-
-  // Typed as a record so a new block type fails tsc here until it is listed.
-  const BLOCK_TYPES: Record<WorkflowBlockNode["type"], true> = {
-    task: true,
-    taskv2: true,
-    navigation: true,
-    action: true,
-    extraction: true,
-    login: true,
-    validation: true,
-    human_interaction: true,
-    wait: true,
-    terminate: true,
-    loop: true,
-    conditional: true,
-    codeBlock: true,
-    textPrompt: true,
-    sendEmail: true,
-    emailInbox: true,
-    fileDownload: true,
-    fileUpload: true,
-    download: true,
-    upload: true,
-    fileParser: true,
-    pdfParser: true,
-    pdfFill: true,
-    splitPdf: true,
-    dataExport: true,
-    url: true,
-    web_search: true,
-    http_request: true,
-    printPage: true,
-    workflowTrigger: true,
-    googleSheetsRead: true,
-    googleSheetsWrite: true,
-    agentStep: true,
-    powerBIQuery: true,
-  };
   const newStep = (
     type: WorkflowBlockNode["type"],
     data: Record<string, unknown> = {},
@@ -261,11 +273,9 @@ describe("docCustomSettings", () => {
     },
   );
 
-  test("a trigger without a title lists its target, since the Agent row cannot name it", () => {
+  test("a trigger's target is never a custom setting: its Agent row names it", () => {
     const target = { workflowPermanentId: "wpid_target" };
-    expect(keys(newStep("workflowTrigger", target))).toEqual([
-      "workflow_permanent_id",
-    ]);
+    expect(keys(newStep("workflowTrigger", target))).toEqual([]);
     expect(
       keys(
         newStep("workflowTrigger", { ...target, workflowTitle: "Pay bills" }),
@@ -274,34 +284,330 @@ describe("docCustomSettings", () => {
   });
 
   test("no field the Doc shows in its own place is also listed under Custom settings", () => {
+    const camel = (key: string) =>
+      key.replace(/_([a-z0-9])/g, (_, c: string) => c.toUpperCase());
+    const set = (value: unknown) =>
+      Array.isArray(value)
+        ? ["someone@example.com"]
+        : typeof value === "number"
+          ? 7
+          : typeof value === "boolean"
+            ? !value
+            : "{{ set_value }}";
     for (const type of Object.keys(
       BLOCK_TYPES,
     ) as WorkflowBlockNode["type"][]) {
       const base = newStep(type);
-      const shownKeys = [
+      const data = base.data as Record<string, unknown>;
+      const [saved] = getWorkflowBlocks([base], []) as unknown as Record<
+        string,
+        unknown
+      >[];
+      const specKeys = (
+        DOC_FIELD_MAP[saved!.block_type as keyof typeof DOC_FIELD_MAP] ?? []
+      ).flatMap((spec) => spec.keys);
+      const dataKeys = [
         ...getDocProseFields(base).map((f) => f.key),
-        ...docKeyFieldKeys(type),
+        ...specKeys.map(camel).filter((key) => key in data),
         "notes",
         "trailingNotes",
         "description",
         ...(type === "workflowTrigger" ? ["workflowPermanentId"] : []),
       ];
-      const set = (value: unknown) =>
-        Array.isArray(value)
-          ? ["someone@example.com"]
-          : typeof value === "number"
-            ? 7
-            : "{{ set_value }}";
-      const data = base.data as Record<string, unknown>;
       const filled = newStep(
         type,
-        Object.fromEntries(shownKeys.map((key) => [key, set(data[key])])),
+        Object.fromEntries(dataKeys.map((key) => [key, set(data[key])])),
       );
-      const listed = keys(filled) ?? [];
+      const shown = new Set([...dataKeys.map(yamlKey), ...specKeys]);
       expect([
         type,
-        listed.filter((key) => shownKeys.map(yamlKey).includes(key)),
+        (keys(filled) ?? []).filter((key) => shown.has(key)),
       ]).toEqual([type, []]);
     }
+  });
+});
+
+describe("docKeySettings", () => {
+  const node = (type: string, data: Record<string, unknown>) =>
+    ({
+      id: "n",
+      position: { x: 0, y: 0 },
+      type,
+      data: { ...data, label: "step_one" },
+    }) as AppNode;
+  const rows = (n: AppNode) =>
+    docKeySettings(n, new Set(["site_login"])).map((row) => [
+      row.label,
+      row.value,
+    ]);
+
+  test("a login shows its credential and 2FA first, with the empty text for a field that has no value", () => {
+    expect(
+      rows(
+        node("login", {
+          ...loginNodeDefaultData,
+          // Only the first entry is the credential slot; later entries are inputs the login reads.
+          parameterKeys: ["site_login", "username"],
+          totpIdentifier: "codes@example.com",
+          url: "https://example.com/login",
+        }),
+      ),
+    ).toEqual([
+      ["Credential", "site_login"],
+      ["2FA", "codes@example.com"],
+      ["Error codes", "Not set"],
+      ["URL", "https://example.com/login"],
+    ]);
+    // The selected credential can carry the 2FA identifier at run time, so an empty field is not "Off".
+    expect(rows(node("login", loginNodeDefaultData))[1]).toEqual([
+      "2FA",
+      "Not set",
+    ]);
+  });
+
+  test("a row the saved block does not use is left out: Sender on Gmail, Download timeout on an SFTP download", () => {
+    const labels = (transport: string) =>
+      rows(node("sendEmail", { ...sendEmailNodeDefaultData, transport })).map(
+        ([label]) => label,
+      );
+    expect(labels("gmail")).not.toContain("Sender");
+    expect(labels("smtp")).toContain("Sender");
+    const download = (data: Record<string, unknown>) =>
+      rows(
+        node("fileDownload", { ...fileDownloadNodeDefaultData, ...data }),
+      ).map(([label]) => label);
+    expect(
+      download({ downloadTarget: "sftp", sftpSourcePath: "/in/report.pdf" }),
+    ).not.toContain("Download timeout");
+    expect(download({})).toContain("Download timeout");
+  });
+
+  test("a key a hiddenWhen rule leaves out shows under Custom settings when it differs from a new step's", () => {
+    const customKeys = (n: AppNode) =>
+      docCustomSettings(n)?.map((row) => row.key);
+    for (const method of ["GET", "HEAD", "DELETE"]) {
+      const request = node("http_request", {
+        ...httpRequestNodeDefaultData,
+        method,
+        body: '{"id": 1}',
+      });
+      expect(rows(request).map(([label]) => label)).not.toContain("Body");
+      expect(customKeys(request)).toContain("body");
+    }
+    const sftp = node("fileDownload", {
+      ...fileDownloadNodeDefaultData,
+      downloadTarget: "sftp",
+      sftpSourcePath: "/in/report.pdf",
+      downloadTimeout: 90,
+    });
+    expect(rows(sftp).map(([label]) => label)).not.toContain(
+      "Download timeout",
+    );
+    expect(customKeys(sftp)).toContain("download_timeout");
+  });
+
+  test("a value that formats to blank text reads as unset: no SMTP recipients, a blank subject", () => {
+    const email = docKeySettings(
+      node("sendEmail", {
+        ...sendEmailNodeDefaultData,
+        transport: "smtp",
+        recipients: "",
+        subject: "   ",
+      }),
+      new Set(),
+    );
+    expect(email.find((row) => row.key === "recipients")).toMatchObject({
+      value: "Not set",
+      unset: true,
+      changed: false,
+    });
+    expect(email.find((row) => row.key === "subject")).toMatchObject({
+      value: "Not set",
+      unset: true,
+    });
+  });
+
+  test("an HTTP request shows its Body only for a method that sends one", () => {
+    const labels = (method: string) =>
+      rows(
+        node("http_request", {
+          ...httpRequestNodeDefaultData,
+          method,
+          body: "{}",
+        }),
+      ).map(([label]) => label);
+    expect(labels("GET")).not.toContain("Body");
+    expect(labels("POST")).toContain("Body");
+  });
+
+  test("an HTTP request shows its Method; a Go to URL step has no key settings", () => {
+    expect(
+      rows(
+        node("http_request", { ...httpRequestNodeDefaultData, method: "POST" }),
+      ).find(([label]) => label === "Method"),
+    ).toEqual(["Method", "POST"]);
+    expect(
+      rows(node("url", { ...urlNodeDefaultData, url: "https://example.com" })),
+    ).toEqual([]);
+  });
+
+  test("a trigger's Agent row shows its title, or its target when the title is not known", () => {
+    const trigger = (workflowTitle: string) =>
+      rows(
+        node("workflowTrigger", {
+          ...workflowTriggerNodeDefaultData,
+          workflowPermanentId: "wpid_target",
+          workflowTitle,
+        }),
+      );
+    expect(trigger("Pay bills")).toEqual([["Agent", "Pay bills"]]);
+    expect(trigger("")).toEqual([["Agent", "wpid_target"]]);
+  });
+
+  test("a login names only its credential parameter, by the Login panel's credential rules", () => {
+    const parameters = [
+      {
+        key: "site_login",
+        parameterType: "credential",
+        credentialId: "cred_1",
+      },
+      {
+        key: "account",
+        parameterType: "context",
+        sourceParameterKey: "site_login",
+      },
+    ] as unknown as ParametersState;
+    const credential = (keys: string[]) =>
+      docKeySettings(
+        node("login", { ...loginNodeDefaultData, parameterKeys: keys }),
+        docLoginCredentialKeys(parameters),
+      ).find((row) => row.label === "Credential")?.value;
+    expect(credential(["site_login", "account"])).toBe("site_login");
+    expect(credential(["account"])).toBeUndefined();
+    expect(credential([])).toBe("Not set");
+  });
+
+  test("a login's Credential row reads only the first entry, as the Login panel does", () => {
+    const credential = (keys: string[]) =>
+      docKeySettings(
+        node("login", { ...loginNodeDefaultData, parameterKeys: keys }),
+        new Set(["site_login", "backup_login"]),
+      ).find((row) => row.label === "Credential")?.value;
+    expect(credential(["site_login", "backup_login"])).toBe("site_login");
+    expect(credential(["username", "site_login"])).toBeUndefined();
+  });
+
+  test("a set value that reads as zero or No is shown as set, not as the empty text", () => {
+    const extraction = docKeySettings(
+      node("extraction", { ...extractionNodeDefaultData, maxRetries: 0 }),
+      new Set(),
+    ).find((row) => row.label === "Max retries");
+    expect([extraction?.value, extraction?.unset]).toEqual(["0", false]);
+    const code = docKeySettings(
+      node("codeBlock", {
+        ...codeBlockNodeDefaultData,
+        continueOnFailure: false,
+      }),
+      new Set(),
+    ).find((row) => row.label === "Continue on failure");
+    expect([code?.value, code?.unset]).toEqual(["No", false]);
+  });
+
+  test("a login whose inputs include no credential input shows no Credential row, since the Doc cannot tell which is its credential", () => {
+    expect(
+      rows(
+        node("login", { ...loginNodeDefaultData, parameterKeys: ["username"] }),
+      ).map(([label]) => label),
+    ).toEqual(["2FA", "Error codes", "URL"]);
+  });
+
+  test("a navigation on the 2.0 engine saves as task_v2 and shows no Navigation key settings", () => {
+    expect(
+      rows(
+        node("navigation", {
+          ...navigationNodeDefaultData,
+          engine: "skyvern-2.0",
+          prompt: "Open the page",
+        }),
+      ),
+    ).toEqual([]);
+  });
+
+  test("a file download leads with its file name; a navigation lists its URL", () => {
+    expect(
+      rows(
+        node("fileDownload", {
+          ...fileDownloadNodeDefaultData,
+          downloadSuffix: "invoice.pdf",
+        }),
+      )[0],
+    ).toEqual(["File name", "invoice.pdf"]);
+    expect(
+      rows(node("navigation", navigationNodeDefaultData)).map(([l]) => l),
+    ).toEqual(["Engine", "Max steps", "Error codes", "URL"]);
+  });
+});
+
+describe("DOC_FIELD_MAP", () => {
+  test("lists only fields the editor saves for that block type", () => {
+    const savedKeys = new Map<string, Set<string>>();
+    // A field shown as one of the step's lines never renders as a key setting.
+    const lineKeys = new Map<string, Set<string>>();
+    for (const type of Object.keys(BLOCK_TYPES))
+      // The variants that save as another block type or branch, and one with the fields saved only when set.
+      for (const variant of [
+        {},
+        { loopKind: "while" },
+        { engine: "skyvern-2.0" },
+        { maxRetries: 1 },
+        { transport: "gmail" },
+        { downloadTarget: "sftp" },
+        { downloadTarget: "s3" },
+      ]) {
+        const data =
+          type === "taskv2"
+            ? taskv2NodeDefaultData
+            : createNode({ id: "n" }, type as WorkflowBlockNode["type"], "")
+                .data;
+        const [block] = getWorkflowBlocks(
+          [
+            {
+              id: "n",
+              position: { x: 0, y: 0 },
+              type,
+              data: { ...data, ...variant, label: "b" },
+            } as AppNode,
+          ],
+          [],
+        ) as unknown as Record<string, unknown>[];
+        const keys = savedKeys.get(String(block!.block_type)) ?? new Set();
+        Object.keys(block!).forEach((key) => keys.add(key));
+        savedKeys.set(String(block!.block_type), keys);
+        const lines = lineKeys.get(String(block!.block_type)) ?? new Set();
+        getDocProseFields({
+          id: "n",
+          position: { x: 0, y: 0 },
+          type,
+          data: { ...data, ...variant },
+        } as AppNode).forEach((f) => lines.add(yamlKey(f.key)));
+        lineKeys.set(String(block!.block_type), lines);
+      }
+    const unsaved = Object.entries(DOC_FIELD_MAP).flatMap(([type, specs]) =>
+      specs!.flatMap((spec) =>
+        spec.keys
+          .filter((key) => !savedKeys.get(type)?.has(key))
+          .map((key) => `${type}.${key}`),
+      ),
+    );
+    expect(unsaved).toEqual([]);
+    const shownAsLines = Object.entries(DOC_FIELD_MAP).flatMap(
+      ([type, specs]) =>
+        specs!.flatMap((spec) =>
+          spec.keys
+            .filter((key) => lineKeys.get(type)?.has(key))
+            .map((key) => `${type}.${key}`),
+        ),
+    );
+    expect(shownAsLines).toEqual([]);
   });
 });

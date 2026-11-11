@@ -15,6 +15,7 @@ from fastapi import HTTPException
 from skyvern.forge.sdk.db.repositories.microsoft_oauth import ActiveCredentialCiphertext, PendingConsentContext
 from skyvern.forge.sdk.encrypt import Encryptor
 from skyvern.forge.sdk.encrypt.aes import AES
+from skyvern.forge.sdk.encrypt.aes_gcm import AESGCMEncryptor
 from skyvern.forge.sdk.routes import microsoft_oauth as microsoft_oauth_routes
 from skyvern.forge.sdk.schemas.microsoft_oauth import (
     CreateMicrosoftOAuthAuthorizeRequest,
@@ -22,6 +23,9 @@ from skyvern.forge.sdk.schemas.microsoft_oauth import (
     MicrosoftOAuthCredentialBase,
 )
 from skyvern.forge.sdk.services import microsoft_oauth_service
+
+# "rt-legacy" as the retired CBC writer stored it under legacy-test-key / legacy-salt / legacy-iv.
+LEGACY_CBC_REFRESH_TOKEN = "vAV6Q7iRBxtfQM2THvF6pQ=="
 
 
 def _install_microsoft_transport(
@@ -997,9 +1001,12 @@ async def test_rotated_token_survives_backfill_reencrypting_the_row_mid_refresh(
     monkeypatch.setattr(microsoft_oauth_service.settings, "ENABLE_ENCRYPTION", True, raising=False)
     monkeypatch.setattr(microsoft_oauth_service.settings, "ENCRYPTOR_AES_SECRET_KEY", "gcm-test-key", raising=False)
     monkeypatch.setattr(microsoft_oauth_service.settings, "ENCRYPTOR_AES_SALT", "gcm-test-salt", raising=False)
-    encrypt_method = microsoft_oauth_service.EncryptMethod
+    deployment_encryptor = Encryptor()
+    deployment_encryptor.add_encrypt_method(AES(secret_key="legacy-test-key", salt="legacy-salt", iv="legacy-iv"))
+    deployment_encryptor.add_encrypt_method(AESGCMEncryptor(secret_key="legacy-test-key", salt="legacy-salt"))
+    monkeypatch.setattr(microsoft_oauth_service, "encryptor", deployment_encryptor)
     row = {
-        "ciphertext": await microsoft_oauth_service.encryptor.encrypt("rt-legacy", encrypt_method.AES),
+        "ciphertext": LEGACY_CBC_REFRESH_TOKEN,
         "method": "aes",
     }
 
@@ -1017,7 +1024,7 @@ async def test_rotated_token_survives_backfill_reencrypting_the_row_mid_refresh(
     async def refresh_access_token(*_: Any, **__: Any) -> dict[str, str]:
         # The GCM backfill rewrites the row after the refresh read it but before the refresh writes.
         row.update(
-            ciphertext=await microsoft_oauth_service.encryptor.encrypt("rt-legacy", encrypt_method.AES_GCM),
+            ciphertext=await deployment_encryptor.encrypt("rt-legacy", microsoft_oauth_service.EncryptMethod.AES_GCM),
             method="aes_gcm",
         )
         return {"access_token": "at-fresh", "refresh_token": "rt-rotated"}
@@ -1053,7 +1060,7 @@ async def test_legacy_cbc_credential_refreshes_and_is_rewritten_as_gcm(
     legacy_aes = AES(secret_key="legacy-test-key", salt="legacy-salt", iv="legacy-iv")
     legacy_encryptor = Encryptor()
     legacy_encryptor.add_encrypt_method(legacy_aes)
-    ciphertext = await legacy_encryptor.encrypt("rt-legacy", microsoft_oauth_service.EncryptMethod.AES)
+    ciphertext = LEGACY_CBC_REFRESH_TOKEN
     update_active_refresh_token = AsyncMock()
     repository = SimpleNamespace(
         load_active_ciphertext=AsyncMock(
@@ -1154,7 +1161,7 @@ async def test_legacy_cbc_credential_remains_readable_without_refresh(monkeypatc
     legacy_aes = AES(secret_key="legacy-test-key", salt="legacy-salt", iv="legacy-iv")
     legacy_encryptor = Encryptor()
     legacy_encryptor.add_encrypt_method(legacy_aes)
-    ciphertext = await legacy_encryptor.encrypt("rt-legacy", microsoft_oauth_service.EncryptMethod.AES)
+    ciphertext = LEGACY_CBC_REFRESH_TOKEN
     repository = SimpleNamespace(
         load_active_ciphertext=AsyncMock(
             return_value=ActiveCredentialCiphertext(
@@ -1179,7 +1186,7 @@ async def test_refresh_fails_closed_without_gcm_key_and_leaves_legacy_row_untouc
     legacy_aes = AES(secret_key="legacy-test-key", salt="legacy-salt", iv="legacy-iv")
     legacy_encryptor = Encryptor()
     legacy_encryptor.add_encrypt_method(legacy_aes)
-    old_ciphertext = await legacy_encryptor.encrypt("rt-legacy", microsoft_oauth_service.EncryptMethod.AES)
+    old_ciphertext = LEGACY_CBC_REFRESH_TOKEN
     update_active_refresh_token = AsyncMock()
     repository = SimpleNamespace(
         load_active_ciphertext=AsyncMock(

@@ -1,4 +1,4 @@
-"""Registers the AES-CBC and AES-GCM encrypt methods from deployment settings.
+"""Registers the AES-GCM encrypt method and the decrypt-only legacy AES-CBC reader from deployment settings.
 
 Shared by the open-source forge app and the cloud bootstrap so both apply the same
 fail-closed rules to the configured key material.
@@ -41,13 +41,13 @@ def create_aes_encryptor(
     iv: str | None = None,
     fallback_decrypt_keys: Iterable[tuple[str | None, str | None]] | None = None,
 ) -> AES:
-    """Create AES from deployment settings, deriving unset salt/IV from ``secret_key``.
+    """Create the legacy AES-CBC reader from deployment settings, deriving unset salt/IV from ``secret_key``.
 
-    Passing ``salt``/``iv`` through to ``AES`` unset would silently select the public
-    ``default_salt``/``default_iv`` in ``aes.py``, so derive deployment-private values
-    from the operator's secret instead. A placeholder or empty secret key has no such
-    fallback and fails closed: encrypting under a public default is worse than
-    ENABLE_ENCRYPTION=false because operators believe the data is protected.
+    Rows a deployment wrote while salt/IV were unset used the derived values, and rows
+    older than the derivation used the public defaults in ``aes.py``, so both stay in the
+    decrypt candidate set. A placeholder or empty secret key fails closed, as it does for
+    the GCM writer: encrypting under a public default is worse than ENABLE_ENCRYPTION=false
+    because operators believe the data is protected.
     """
     _require_real_secret_key(secret_key)
     fallback_parameters = list(fallback_decrypt_keys or ())

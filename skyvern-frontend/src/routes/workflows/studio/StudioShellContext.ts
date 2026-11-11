@@ -25,6 +25,8 @@ type StudioShellContextValue = {
   showPane?: (id: StudioPaneId) => void;
   // Whether an open pane is folded into a strip to make room for the Doc.
   isPaneFolded?: (id: StudioPaneId) => boolean;
+  // Whether a pane is on screen now: open, not folded, not hidden at phone width or behind an expanded pane.
+  isPaneOnScreen?: (id: StudioPaneId) => boolean;
 };
 
 export const StudioShellContext = createContext<StudioShellContextValue>({

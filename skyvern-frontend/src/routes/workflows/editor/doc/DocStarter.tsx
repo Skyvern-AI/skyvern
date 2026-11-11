@@ -20,6 +20,51 @@ export function DocStarterNote() {
   );
 }
 
+export const DOC_COPILOT_NUDGE = {
+  tip: "copilot",
+  text: "Starting a new agent? Copilot can build it from a description of the task. The Doc is best for reading and fixing an agent.",
+  // Copilot is already on screen beside the Doc, so the note points at it instead of offering to open it.
+  textBeside:
+    "Starting a new agent? Copilot, next to this page, can build it from a description of the task. The Doc is best for reading and fixing an agent.",
+  action: "Try Copilot",
+  dismiss: "Dismiss",
+} as const;
+
+/** A suggestion to build with Copilot, for a Doc that is empty or nearly so; the Doc stays usable around it. */
+export function DocCopilotNudge({
+  onTry,
+  onDismiss,
+}: {
+  // Null while Copilot is already on screen.
+  onTry: (() => void) | null;
+  onDismiss: () => void;
+}) {
+  return (
+    <div
+      role="note"
+      data-doc-copilot-nudge
+      className="mb-3 flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-md border border-border px-3 py-2 text-[13.5px] leading-[1.45]"
+    >
+      <span className="min-w-0 flex-1">
+        {onTry ? DOC_COPILOT_NUDGE.text : DOC_COPILOT_NUDGE.textBeside}
+      </span>
+      {onTry && (
+        <Button size="sm" variant="outline" className="h-7" onClick={onTry}>
+          {DOC_COPILOT_NUDGE.action}
+        </Button>
+      )}
+      <button
+        type="button"
+        aria-label={DOC_COPILOT_NUDGE.dismiss}
+        onClick={onDismiss}
+        className="rounded p-0.5 text-muted-foreground outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        <Cross2Icon aria-hidden className="size-3.5" />
+      </button>
+    </div>
+  );
+}
+
 export function DocTip({
   progress,
   seen,

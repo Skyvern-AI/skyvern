@@ -1017,6 +1017,7 @@ async def test_update_active_refresh_token_uses_token_identity_guard_across_rena
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("registered_encryption")
 @pytest.mark.parametrize(
     ("rewritten_refresh_token", "rotation_persisted"),
     [
@@ -1028,7 +1029,6 @@ async def test_refresh_rotation_survives_reencryption_between_read_and_write(
     repo: GoogleOAuthRepository,
     engine: AsyncEngine,
     monkeypatch: pytest.MonkeyPatch,
-    registered_encryption: None,
     rewritten_refresh_token: str,
     rotation_persisted: bool,
 ) -> None:
@@ -1040,7 +1040,8 @@ async def test_refresh_rotation_survives_reencryption_between_read_and_write(
                 organization_id="o_test",
                 credential_name="Default",
                 state=STATE_ACTIVE,
-                encrypted_refresh_token=await encryptor.encrypt("rt-original", EncryptMethod.AES),
+                # "rt-original" as the retired CBC writer stored it for the registered_encryption deployment.
+                encrypted_refresh_token="yS/54s7S50IRsXn0xjoW2g==",
                 encrypted_method=EncryptMethod.AES.value,
                 created_at=credential_version,
                 modified_at=credential_version,
