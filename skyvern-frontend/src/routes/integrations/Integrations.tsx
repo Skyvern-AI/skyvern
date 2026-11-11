@@ -184,7 +184,7 @@ function Integrations() {
   };
 
   return (
-    <div className="mx-auto flex max-w-5xl flex-col gap-6 p-6">
+    <div className="flex flex-col gap-6">
       <Card>
         <CardHeader className="border-b-2">
           <CardTitle className="text-lg">Google Integrations</CardTitle>

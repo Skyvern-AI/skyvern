@@ -2558,6 +2558,19 @@ def test_unreadable_allowed_url_is_not_echoed_into_the_refusal() -> None:
     assert "tok3n" not in str(exc_info.value)
 
 
+@pytest.mark.parametrize("secret", ["Hunter2Pass", "Hunter2.Pass"], ids=["mixed_case", "dotted"])
+def test_a_secret_in_the_refused_host_is_redacted_whatever_its_case_or_dots(secret: str) -> None:
+    guard = CredentialReleaseGuard(workflow_run_id="wr_x", block_label="b")
+    guard.arm(secret, "https://one.example.com/login", "login_credentials")
+    entry = guard.match(secret)
+    assert entry is not None
+    with capture_logs() as logs, pytest.raises(CodeBlockCredentialReleaseError) as exc_info:
+        guard.check_release(entry, f"https://{secret}.com/x", operation="taskv3.navigate")
+    recorded = [str(exc_info.value).lower(), repr(logs).lower()]
+    fragments = ("hunter2", "pass.com")
+    assert not [text for text in recorded if any(fragment in text for fragment in fragments)]
+
+
 @pytest.mark.asyncio
 async def test_credential_release_refusal_reaches_the_run_record(monkeypatch: pytest.MonkeyPatch) -> None:
     """The refusal names both sites, and that text is the observation the next authoring iteration

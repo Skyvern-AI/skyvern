@@ -3,6 +3,7 @@
 // component without re-evaluating reducer state, and so the reducer can be
 // exercised under vitest without a JSX runtime.
 
+import { formatElapsedSeconds } from "@/util/utils";
 import { buildRevealOffsets } from "./actionReveal";
 import {
   type ActivityBucket,
@@ -2395,10 +2396,7 @@ export function formatElapsed(
   const startMs = parseUtcIsoMs(startedAt);
   const endMs = parseUtcIsoMs(endedAt);
   if (startMs === null || endMs === null) return null;
-  const seconds = Math.max(0, Math.round((endMs - startMs) / 1000));
-  const m = Math.floor(seconds / 60);
-  const s = seconds % 60;
-  return `${m}:${s.toString().padStart(2, "0")}`;
+  return formatElapsedSeconds(endMs - startMs);
 }
 
 export function latestBlocksByLabel(blocks: BlockState[]): BlockState[] {

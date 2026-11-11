@@ -8,6 +8,7 @@ token truncation, and error handling for DOCX files.
 from __future__ import annotations
 
 import asyncio
+import gc
 import gzip
 import json
 import os
@@ -15,11 +16,13 @@ import re
 import struct
 import tempfile
 import time
+import weakref
 import zipfile
 import zlib
 from collections.abc import Awaitable, Iterator
 from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
+from io import BytesIO
 from pathlib import Path
 from typing import Any, get_args
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -29,6 +32,7 @@ import libcst as cst
 import pandas as pd
 import pytest
 import structlog
+from PIL import Image, ImageDraw
 from pypdf import PdfReader, apply_configuration
 from pypdf.errors import LimitReachedError, PdfReadError
 
@@ -39,8 +43,9 @@ from skyvern.config import settings
 from skyvern.core.script_generations.generate_script import _build_file_url_parser_statement
 from skyvern.exceptions import PDFParsingError
 from skyvern.forge import app
+from skyvern.forge.failure_classifier import classify_from_failure_reason
 from skyvern.forge.forge_app_initializer import start_forge_app
-from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMResponseFormat
+from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMResponseFormat, LLMProviderErrorRetryableTask
 from skyvern.forge.sdk.utils.capped_subprocess import MEMORY_CAP_ENFORCED, CappedSubprocessError
 from skyvern.forge.sdk.utils.capped_subprocess_child import MIN_MEMORY_BUDGET_BYTES
 from skyvern.forge.sdk.utils.pdf_parser import (
@@ -928,19 +933,77 @@ class TestOcrPdfPages:
         assert "text for good-1" in result and "text for good-3" in result
         assert "--- Page 2 ---" not in result
 
-    async def test_all_pages_failed_raises(self) -> None:
-        """A total OCR outage (every page errors) propagates instead of returning empty text."""
+    async def test_all_pages_failed_raises_without_the_provider_text(self) -> None:
+        """A total OCR outage fails the pass instead of returning empty text, and names only the error type."""
         block = _make_file_parser_block("https://example.com/scan.pdf", FileType.PDF)
 
         async def fake_handler(**kwargs: Any) -> dict[str, str]:
-            raise RuntimeError("vision model outage")
+            raise ValueError("vision model outage quoting the page")
 
         with pytest.MonkeyPatch.context() as mp:
             handler = AsyncMock(side_effect=fake_handler)
             self._patch_handler(mp, handler)
 
-            with pytest.raises(RuntimeError, match="vision model outage"):
+            with pytest.raises(RuntimeError, match=r"any of the PDF's 3 pages \(ValueError\)") as raised:
                 await block._ocr_pdf_pages([b"p1", b"p2", b"p3"])
+
+        assert "quoting the page" not in str(raised.value)
+        assert raised.value.__cause__ is None and raised.value.__suppress_context__
+
+    @pytest.mark.parametrize("failed_page", [None, b"p2"], ids=["all_cancelled", "cancelled_and_failed"])
+    async def test_a_cancelled_page_in_a_total_outage_propagates_cancellation(self, failed_page: bytes | None) -> None:
+        """A cancelled pass must stay a cancellation so the block is not recorded as failed."""
+        block = _make_file_parser_block("https://example.com/scan.pdf", FileType.PDF)
+
+        async def fake_handler(**kwargs: Any) -> dict[str, str]:
+            (image,) = kwargs["screenshots"]
+            if image == failed_page:
+                raise RuntimeError("vision model outage")
+            raise asyncio.CancelledError()
+
+        with pytest.MonkeyPatch.context() as mp:
+            handler = AsyncMock(side_effect=fake_handler)
+            self._patch_handler(mp, handler)
+
+            with pytest.raises(asyncio.CancelledError):
+                await block._ocr_pdf_pages([b"p1", b"p2"])
+
+    @pytest.mark.parametrize("outage", ["rate_limited", "failed_validation"])
+    async def test_a_total_outage_reason_classifies_as_the_provider_text_did(self, outage: str) -> None:
+        """Failure attribution reads the reason text, so dropping the provider's words must not change its category."""
+        block = _make_file_parser_block("https://example.com/scan.pdf", FileType.PDF)
+        provider_text = "Rate limit reached for the request quoting the page"
+
+        class RateLimitError(Exception):
+            pass
+
+        cause = RateLimitError(provider_text)
+        provider_error = LLMProviderErrorRetryableTask("synthetic-llm", cause=cause)
+
+        async def fake_handler(**kwargs: Any) -> Any:
+            if outage == "failed_validation":
+                return {"extracted_text": None}
+            raise provider_error from cause
+
+        with pytest.MonkeyPatch.context() as mp:
+            handler = AsyncMock(side_effect=fake_handler)
+            self._patch_handler(mp, handler)
+            with pytest.raises(RuntimeError) as raised:
+                await block._ocr_pdf_pages([b"p1", b"p2"])
+
+        if outage == "rate_limited":
+            previous_reason = str(provider_error)
+            expected_category: str | None = "LLM_ERROR"
+        else:
+            previous_reason = "OCR response must include extracted_text as a string; got null."
+            expected_category = None
+        reason = str(raised.value)
+        assert "quoting the page" not in reason
+        categories = classify_from_failure_reason(reason)
+        assert categories == classify_from_failure_reason(previous_reason)
+        assert (categories[0]["category"] if categories else None) == expected_category
+        if outage == "failed_validation":
+            assert previous_reason in reason
 
     @pytest.mark.parametrize(
         ("call_timeout", "pass_timeout", "expected_reason"),
@@ -3517,3 +3580,194 @@ class TestFileParserBlock:
         assert result[2]["Region"] == "nan"
         assert result[2]["Sales"] == 3000.0
         assert result[2]["Timestamp"] == "2018-01-03T00:00:00"
+
+
+@pytest.mark.asyncio
+class TestScannedPdfOcrResolution:
+    @staticmethod
+    def _scanned_letter_page() -> Image.Image:
+        # A US-letter page with no text layer: a 200 dpi bitmap of typed lines, under the page image caps at 300 dpi.
+        page = Image.new("L", (1700, 2200), 255)
+        draw = ImageDraw.Draw(page)
+        for y in range(100, 2100, 40):
+            draw.text((100, y), "SYNTHETIC FAX LINE 0123456789 " * 3, fill=0)
+        return page
+
+    @classmethod
+    def _scanned_letter_pdf(cls, path: Path) -> Path:
+        cls._scanned_letter_page().save(path, format="PDF", resolution=200.0)
+        return path
+
+    @staticmethod
+    async def _ocr_image_widths(pdf_path: Path) -> list[int]:
+        block = _make_file_parser_block("https://example.com/fax.pdf", FileType.PDF)
+        handler = AsyncMock(return_value={"extracted_text": "Patient: SYNTHETIC"})
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                "skyvern.forge.sdk.workflow.models.block.LLMAPIHandlerFactory.get_override_llm_api_handler",
+                lambda *a, **kw: handler,
+            )
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt", MagicMock(return_value="p"))
+            text = await block._parse_pdf_file(str(pdf_path))
+        assert "SYNTHETIC" in text
+        return [Image.open(BytesIO(call.kwargs["screenshots"][0])).width for call in handler.await_args_list]
+
+    async def test_scanned_pages_reach_ocr_at_300_dpi(self, tmp_path: Path) -> None:
+        widths = await self._ocr_image_widths(self._scanned_letter_pdf(tmp_path / "fax.pdf"))
+        assert widths == [2550]
+
+    async def test_a_page_over_the_image_byte_cap_sends_the_document_to_150_dpi(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pdf_path = self._scanned_letter_pdf(tmp_path / "fax.pdf")
+        low, high = (len(render_pdf_pages_as_images(str(pdf_path), resolution=dpi)[0]) for dpi in (150, 300))
+        monkeypatch.setattr(block_module, "PDF_OCR_MAX_PAGE_IMAGE_BYTES", (low + high) // 2)
+
+        assert await self._ocr_image_widths(pdf_path) == [1275]
+
+    async def test_an_a0_page_too_large_for_the_render_child_is_read_at_150_dpi(self, tmp_path: Path) -> None:
+        # 331 x 468 px at 10 dpi is an A0 page (33.1 x 46.8 in): 9,930 x 14,040 px at 300 dpi, 4,965 x 7,020 at 150.
+        pdf_path = tmp_path / "a0.pdf"
+        Image.new("L", (331, 468), 255).save(pdf_path, format="PDF", resolution=10.0)
+
+        assert await self._ocr_image_widths(pdf_path) == [4965]
+
+    async def test_a_page_over_the_image_pixel_cap_sends_the_document_to_150_dpi(self, tmp_path: Path) -> None:
+        # A 10 x 27 in page renders to about 3,000 x 8,100 px at 300 dpi, over the 7,900 px edge cap but small in bytes.
+        pdf_path = tmp_path / "tall.pdf"
+        Image.new("L", (100, 270), 255).save(pdf_path, format="PDF", resolution=10.0)
+
+        assert await self._ocr_image_widths(pdf_path) == [1500]
+
+    async def test_a_second_page_alone_over_the_byte_cap_sends_the_document_to_150_dpi(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        scanned = self._scanned_letter_pdf(tmp_path / "scanned.pdf")
+        blank = Image.new("L", (1700, 2200), 255)
+        pdf_path = tmp_path / "fax.pdf"
+        blank.save(pdf_path, format="PDF", resolution=200.0, save_all=True, append_images=[self._scanned_letter_page()])
+        low, high = (len(render_pdf_pages_as_images(str(scanned), resolution=dpi)[0]) for dpi in (150, 300))
+        blank_high = len(render_pdf_pages_as_images(str(pdf_path), resolution=300)[0])
+        assert blank_high < low
+        monkeypatch.setattr(block_module, "PDF_OCR_MAX_PAGE_IMAGE_BYTES", (low + high) // 2)
+
+        assert await self._ocr_image_widths(pdf_path) == [1275, 1275]
+
+    async def test_the_higher_resolution_images_are_released_before_the_fallback_render(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class _PageImages(list):
+            pass
+
+        wide = BytesIO()
+        Image.new("L", (8000, 1), 255).save(wide, format="PNG")
+        first_render: list[weakref.ref[_PageImages]] = []
+        released_before_fallback: list[bool] = []
+
+        async def render(_self: FileParserBlock, _file_path: str, resolution: int, _budget: float) -> list[bytes]:
+            if resolution == 300:
+                images = _PageImages([wide.getvalue()])
+                first_render.append(weakref.ref(images))
+                return images
+            gc.collect()
+            released_before_fallback.append(first_render[0]() is None)
+            return []
+
+        monkeypatch.setattr(FileParserBlock, "_render_pdf_pages", render)
+        block = _make_file_parser_block("https://example.com/fax.pdf", FileType.PDF)
+
+        assert await block._render_pdf_pages_for_ocr(str(tmp_path / "fax.pdf")) == []
+        assert released_before_fallback == [True]
+
+    async def test_the_fallback_render_child_and_its_wait_get_only_what_the_first_render_left(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        clock = [1000.0]
+        child_timeouts: list[float] = []
+        step_timeouts: list[float | None] = []
+
+        def capped_child(*_args: Any, timeout_seconds: float, **_kwargs: Any) -> tuple[list[bytes], int]:
+            child_timeouts.append(timeout_seconds)
+            if len(child_timeouts) == 1:
+                clock[0] += 200.0
+                raise CappedSubprocessError("page images over the result limit", kind="result_too_large")
+            return [], 0
+
+        run_blocking_parse_step = block_module._run_blocking_parse_step
+
+        async def recording_step(*args: Any, step_timeout_seconds: float | None = None, **kwargs: Any) -> Any:
+            step_timeouts.append(step_timeout_seconds)
+            return await run_blocking_parse_step(*args, step_timeout_seconds=step_timeout_seconds, **kwargs)
+
+        monkeypatch.setattr(block_module, "monotonic", lambda: clock[0])
+        monkeypatch.setattr(pdf_parser_module, "run_in_capped_subprocess", capped_child)
+        monkeypatch.setattr(block_module, "_run_blocking_parse_step", recording_step)
+        block = _make_file_parser_block("https://example.com/fax.pdf", FileType.PDF)
+
+        assert await block._render_pdf_pages_for_ocr(str(tmp_path / "fax.pdf")) == []
+        assert step_timeouts == [300.0, 100.0]
+        assert child_timeouts == [pytest.approx(300.0, abs=5), pytest.approx(100.0, abs=5)]
+
+    async def test_pages_too_large_at_300_dpi_are_read_at_150(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pdf_path = self._scanned_letter_pdf(tmp_path / "fax.pdf")
+        low, high = (len(render_pdf_pages_as_images(str(pdf_path), resolution=dpi)[0]) for dpi in (150, 300))
+        monkeypatch.setattr(settings, "PDFPLUMBER_MAX_RESULT_BYTES", (low + high) // 2)
+
+        assert await self._ocr_image_widths(pdf_path) == [1275]
+
+    @pytest.mark.parametrize("over_cap_page", [False, True], ids=["child_failure", "page_over_image_cap"])
+    @pytest.mark.parametrize(("first_attempt_seconds", "fallback_budgets"), [(200.0, [100.0]), (300.0, [])])
+    async def test_the_lower_resolution_retry_gets_only_what_the_first_render_left(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        first_attempt_seconds: float,
+        fallback_budgets: list[float],
+        over_cap_page: bool,
+    ) -> None:
+        clock = [1000.0]
+        budgets: list[tuple[int, float]] = []
+        wide = BytesIO()
+        Image.new("L", (8000, 1), 255).save(wide, format="PNG")
+
+        def slow_then_too_large(*_args: Any, resolution: int, timeout_seconds: float, **_kwargs: Any) -> list[bytes]:
+            budgets.append((resolution, timeout_seconds))
+            if resolution == 300:
+                clock[0] += first_attempt_seconds
+                if over_cap_page:
+                    return [wide.getvalue()]
+                raise CappedSubprocessError("page images over the result limit", kind="result_too_large")
+            return []
+
+        monkeypatch.setattr(block_module, "monotonic", lambda: clock[0])
+        monkeypatch.setattr(block_module, "render_pdf_pages_as_images", slow_then_too_large)
+        block = _make_file_parser_block("https://example.com/fax.pdf", FileType.PDF)
+
+        if fallback_budgets:
+            assert await block._render_pdf_pages_for_ocr(str(tmp_path / "fax.pdf")) == []
+        elif over_cap_page:
+            # With no time left for a second render, the 300 dpi images are used as they are.
+            assert await block._render_pdf_pages_for_ocr(str(tmp_path / "fax.pdf")) == [wide.getvalue()]
+        else:
+            with pytest.raises(CappedSubprocessError):
+                await block._render_pdf_pages_for_ocr(str(tmp_path / "fax.pdf"))
+        assert budgets == [(300, 300.0)] + [(150, budget) for budget in fallback_budgets]
+
+    async def test_a_render_already_at_the_fallback_resolution_is_not_retried(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        resolutions: list[int] = []
+
+        def too_large(*_args: Any, resolution: int, **_kwargs: Any) -> list[bytes]:
+            resolutions.append(resolution)
+            raise CappedSubprocessError("page images over the result limit", kind="result_too_large")
+
+        monkeypatch.setattr(block_module, "PDF_OCR_RENDER_RESOLUTION", 150)
+        monkeypatch.setattr(block_module, "render_pdf_pages_as_images", too_large)
+        block = _make_file_parser_block("https://example.com/fax.pdf", FileType.PDF)
+
+        with pytest.raises(CappedSubprocessError):
+            await block._render_pdf_pages_for_ocr(str(tmp_path / "fax.pdf"))
+        assert resolutions == [150]

@@ -1,5 +1,5 @@
 import { Status } from "@/api/types";
-import { formatDuration, toDuration } from "@/routes/workflows/utils";
+import { formatSeconds } from "@/util/timeFormat";
 import {
   getBlockOutputDisplayValue,
   gmailSendOutcomeSummary,
@@ -89,6 +89,6 @@ export function blockDownloadedFileCount(block: WorkflowRunBlock): number {
 
 export function formatBlockDuration(block: WorkflowRunBlock): string | null {
   return block.duration !== null && block.duration !== undefined
-    ? formatDuration(toDuration(block.duration))
+    ? formatSeconds(block.duration)
     : null;
 }

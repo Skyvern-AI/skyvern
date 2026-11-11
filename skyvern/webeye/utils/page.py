@@ -3,13 +3,17 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import contextvars
 import dataclasses
+import functools
 import gc
 import json
 import re
 import time
 import urllib.parse
+import weakref
 from collections.abc import Awaitable, Callable
+from concurrent.futures import ThreadPoolExecutor
 from enum import StrEnum
 from html import escape
 from html.parser import HTMLParser
@@ -1727,7 +1731,9 @@ def _collect_after_stitch() -> None:
     gc.collect()
 
 
-def _stitch_screenshots_to_png(screenshots: list[bytes], positions: list[int]) -> bytes:
+def _stitch_screenshots_to_png(
+    screenshots: list[bytes], positions: list[int], collect_due: list[bool] | None = None
+) -> bytes:
     images: list[Image.Image] = []
     merged_img: Image.Image | None = None
     buffer: BytesIO | None = None
@@ -1746,6 +1752,85 @@ def _stitch_screenshots_to_png(screenshots: list[bytes], positions: list[int]) -
     finally:
         _close_screenshot_stitch_resources(images, merged_img, buffer)
         if len(images) > 1:
+            if collect_due is None:
+                _collect_after_stitch()
+            else:
+                collect_due.append(True)
+
+
+# One decoded stitch at a time per event loop, as when the stitch ran on the loop itself. Values are weak so a
+# finished loop is not kept alive by its bound lock; every holder and waiter keeps its own strong reference.
+_stitch_admission_locks: weakref.WeakValueDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
+
+
+# One process-owned worker runs every offloaded stitch, so the large decode/merge/encode allocations are not spread
+# across the shared default pool's threads; retained RSS grew as more pool threads did stitching. Each loop's
+# admission still allows at most one submitted stitch from that loop.
+_STITCH_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="screenshot-stitch")
+
+
+def _stitch_admission() -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    lock = _stitch_admission_locks.get(loop)
+    if lock is None:
+        lock = asyncio.Lock()
+        _stitch_admission_locks[loop] = lock
+    return lock
+
+
+class _DeferredCancellation:
+    """Cancellation absorbed while a submitted stitch finishes, re-delivered with the same count afterwards."""
+
+    def __init__(self, task: asyncio.Task[Any]) -> None:
+        self._task = task
+        self._absorbed = 0
+        self._undelivered = 0
+
+    def absorb(self) -> None:
+        self._task.uncancel()
+        self._absorbed += 1
+
+    def redeliver_soon(self) -> None:
+        # Queued rather than immediate, so it lands at the next suspension like a cancel requested while the loop
+        # was blocked; an immediate cancel would be claimed by the scroll restore's own timeout.
+        loop = asyncio.get_running_loop()
+        for _ in range(self._absorbed):
+            self._undelivered += 1
+            loop.call_soon(self._deliver)
+        self._absorbed = 0
+
+    def _deliver(self) -> None:
+        self._undelivered -= 1
+        self._task.cancel()
+
+    async def deliver_before_exit(self) -> None:
+        # The restore and fallback can finish without suspending, which would let the call return past a cancel.
+        if self._undelivered:
+            await asyncio.sleep(0)
+
+
+async def _stitch_screenshots_off_loop(
+    screenshots: list[bytes], positions: list[int], deferred: _DeferredCancellation
+) -> bytes:
+    """Caller holds the stitch admission. The submitted job cannot be interrupted, so cancellation waits for it."""
+    collect_due: list[bool] = []
+    job = asyncio.get_running_loop().run_in_executor(
+        _STITCH_EXECUTOR,
+        functools.partial(
+            contextvars.copy_context().run, _stitch_screenshots_to_png, screenshots, positions, collect_due
+        ),
+    )
+    try:
+        while not job.done():
+            try:
+                await asyncio.wait((job,))
+            except asyncio.CancelledError:
+                deferred.absorb()
+        return job.result()
+    finally:
+        if collect_due:
             _collect_after_stitch()
 
 
@@ -2753,7 +2838,9 @@ class SkyvernFrame:
                         elapsed_ms=(_monotonic() - started) * 1000,
                     )
             if partial_frames and isinstance(exc, TimeoutError):
-                partial = _stitch_partial_frames(partial_frames)
+                admission = _stitch_admission()
+                async with admission:
+                    partial = _stitch_partial_frames(partial_frames)
                 if partial is not None:
                     return partial
             raise
@@ -2799,6 +2886,8 @@ class SkyvernFrame:
         skyvern_frame: SkyvernFrame | None = None
         x: int | None = None
         y: int | None = None
+        deferred: _DeferredCancellation | None = None
+        disarmed = False
         capture_timeout = asyncio.timeout_at(deadline)
         try:
             async with capture_timeout:
@@ -2813,10 +2902,22 @@ class SkyvernFrame:
                         partial_frames=partial_frames,
                         capture=capture,
                     )
-                    img_data = _stitch_screenshots_to_png(screenshots, positions)
-                    if file_path is not None:
-                        with open(file_path, "wb") as f:
-                            f.write(img_data)
+                    # A returned capture's stitch is never cut short by this deadline; a failed one falls back under it.
+                    if not capture_timeout.expired():
+                        capture_timeout.reschedule(None)
+                        disarmed = True
+                    admission = _stitch_admission()
+                    async with admission:
+                        task = asyncio.current_task()
+                        assert task is not None
+                        deferred = _DeferredCancellation(task)
+                        try:
+                            img_data = await _stitch_screenshots_off_loop(screenshots, positions, deferred)
+                            if file_path is not None:
+                                with open(file_path, "wb") as f:
+                                    f.write(img_data)
+                        finally:
+                            deferred.redeliver_soon()
 
                     end_time = time.time()
                     LOG.debug(
@@ -2831,6 +2932,8 @@ class SkyvernFrame:
                     y = None
                     raise
                 except Exception:
+                    if disarmed:
+                        capture_timeout.reschedule(deadline)
                     LOG.warning(
                         "Failed to take full page screenshot, fallback to use playwright full page screenshot",
                         exc_info=True,
@@ -2851,15 +2954,19 @@ class SkyvernFrame:
                 partial_frames.clear()
             raise
         finally:
-            if skyvern_frame is not None and x is not None and y is not None:
-                # Courtesy restore of the pre-screenshot scroll position, kept outside the deadline block so a
-                # hung page here cannot discard captured bytes, but given only what remains of the same budget.
-                remaining = max(0.0, deadline - loop.time())
-                with contextlib.suppress(TimeoutError):
-                    async with asyncio.timeout(
-                        min(remaining, SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS / 1000)
-                    ):
-                        await skyvern_frame.safe_scroll_to_x_y(x, y)
+            try:
+                if skyvern_frame is not None and x is not None and y is not None:
+                    # Courtesy restore of the pre-screenshot scroll position, kept outside the deadline block so a
+                    # hung page here cannot discard captured bytes, but given only what remains of the same budget.
+                    remaining = max(0.0, deadline - loop.time())
+                    with contextlib.suppress(TimeoutError):
+                        async with asyncio.timeout(
+                            min(remaining, SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS / 1000)
+                        ):
+                            await skyvern_frame.safe_scroll_to_x_y(x, y)
+            finally:
+                if deferred is not None:
+                    await deferred.deliver_before_exit()
 
     @staticmethod
     @traced(name="skyvern.browser.split_screenshots")

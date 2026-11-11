@@ -67,7 +67,7 @@ from skyvern.forge.sdk.core.http_request_authorization import (
 )
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext, current, ensure_context
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput, get_tzinfo_from_proxy
-from skyvern.utils.url_validators import redacted_url_origin, signed_url_ttl_remaining_seconds
+from skyvern.utils.url_validators import redact_url_query, redacted_url_origin, signed_url_ttl_remaining_seconds
 from skyvern.webeye.attach_only import forbid
 from skyvern.webeye.attach_only import is_enforcing as attach_only_enforcing
 from skyvern.webeye.browser_acquisition_sample import (
@@ -439,14 +439,6 @@ def _completed_file_suffix(name: str) -> str:
     return "" if suffix == BROWSER_DOWNLOADING_SUFFIX else suffix
 
 
-def _redact_url_query(url: str) -> str:
-    # Download URLs are often S3 presigned, carrying an X-Amz signature in the query — drop it before logging.
-    try:
-        return urlparse(url)._replace(query="").geturl()
-    except Exception:
-        return "<redacted>"
-
-
 def set_download_file_listener(
     browser_context: BrowserContext,
     download_timeout: float | None = None,
@@ -512,7 +504,7 @@ def set_download_file_listener(
                 workflow_run_id=workflow_run_id,
                 task_id=task_id,
                 suggested_filename_fp=diagnostic_fingerprint(download.suggested_filename),
-                url=_redact_url_query(download.url),
+                url=redact_url_query(download.url),
             )
             suffix = _completed_file_suffix(download.suggested_filename)
             if suffix:
@@ -580,7 +572,7 @@ def set_download_file_listener(
                     workflow_run_id=workflow_run_id,
                     task_id=task_id,
                     failure=failure,
-                    url=_redact_url_query(download.url),
+                    url=redact_url_query(download.url),
                     seconds_since_download_event=time.monotonic() - download_started_at,
                     url_origin=redacted_url_origin(download.url),
                     signed_url_ttl_remaining_s=signed_url_ttl_remaining_seconds(download.url, datetime.now(UTC)),
@@ -1047,6 +1039,10 @@ class BrowserContextFactory:
             # still mapped; a close cancel is latched so the recorder still releases and cancellation wins after.
             close_cancelled = False
             if browser_context is not None:
+                try:
+                    app.AGENT_FUNCTION.on_browser_context_abandoned(browser_context)
+                except Exception as exc:
+                    LOG.warning("Failed to report an abandoned browser context", error_type=type(exc).__name__)
                 # FIXME: sometimes it can't close the browser context?
                 LOG.error("unexpected error happens after created browser context, going to close the context")
                 try:

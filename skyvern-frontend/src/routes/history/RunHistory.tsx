@@ -465,7 +465,7 @@ function RunHistory() {
             className="max-w-0 truncate"
             title={run.title ?? undefined}
           >
-            <div className="flex min-w-0 items-center gap-2">
+            <div className="flex min-w-0 flex-col gap-1">
               <div className="min-w-0 truncate">{titleContent}</div>
               {taggingEnabled && runTags && runTags.length > 0 ? (
                 <TagChipList
@@ -475,7 +475,6 @@ function RunHistory() {
                   maxVisible={2}
                   hideSystemTags
                   compact
-                  className="shrink-0"
                 />
               ) : null}
             </div>
@@ -632,8 +631,8 @@ function RunHistory() {
         </div>
       ) : (
         <>
-          <div className="flex items-center justify-between gap-4">
-            <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center justify-between gap-4 gap-y-2">
+            <div className="flex flex-wrap items-center gap-2">
               <TableSearchInput
                 value={search}
                 onChange={(value) => {
@@ -657,7 +656,7 @@ function RunHistory() {
                 />
               ) : null}
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               <AgentFilterDropdown
                 values={agentFilters}
                 onChange={(filters) => {
@@ -701,7 +700,7 @@ function RunHistory() {
             </div>
           </div>
           <div className="overflow-hidden rounded-lg border border-border">
-            <Table className="sm:table-fixed">
+            <Table className="min-w-[960px] table-fixed">
               <TableHeader>
                 <TableRow className="group/header">
                   {showCheckbox && (
@@ -745,8 +744,8 @@ function RunHistory() {
                 onClearSelection={clearSelection}
               />
             ) : null}
-            <div className="relative px-3 py-3">
-              <div className="absolute left-3 top-1/2 flex -translate-y-1/2 items-center gap-2 text-sm">
+            <div className="relative flex flex-col items-center gap-2 px-3 py-3 sm:block">
+              <div className="flex items-center gap-2 text-sm sm:absolute sm:left-3 sm:top-1/2 sm:-translate-y-1/2">
                 <span className="text-neutral-600 dark:text-slate-400">
                   Items per page
                 </span>

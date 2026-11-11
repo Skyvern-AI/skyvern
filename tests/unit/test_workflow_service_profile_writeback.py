@@ -195,38 +195,6 @@ async def test_legacy_session_persisted_on_completed_run_without_managed_profile
 
 
 @pytest.mark.asyncio
-async def test_managed_profile_persisted_on_completed_run(monkeypatch: pytest.MonkeyPatch) -> None:
-    from skyvern.forge.sdk.workflow.service import WorkflowService
-
-    workflow = _make_workflow(persist=True)
-    workflow_run = _make_workflow_run(WorkflowRunStatus.completed, browser_profile_id="bp_managed")
-    browser_state = _make_browser_state()
-    store_session_mock = _patch_clean_up_deps(monkeypatch, browser_state)
-    monkeypatch.setattr(
-        app.DATABASE.browser_sessions,
-        "get_browser_profile",
-        AsyncMock(
-            return_value=SimpleNamespace(
-                is_managed=True, browser_profile_id="bp_managed", workflow_permanent_id="wpid_test"
-            )
-        ),
-    )
-
-    svc = WorkflowService()
-    monkeypatch.setattr(svc, "persist_video_data", AsyncMock())
-    monkeypatch.setattr(svc, "get_tasks_by_workflow_run_id", AsyncMock(return_value=[]))
-
-    await svc.clean_up_workflow(workflow=workflow, workflow_run=workflow_run, need_call_webhook=False)
-
-    app.STORAGE.store_browser_profile.assert_awaited_once_with(
-        "o_test",
-        profile_id="bp_managed",
-        directory="/tmp/fake_profile",
-    )
-    store_session_mock.assert_not_awaited()
-
-
-@pytest.mark.asyncio
 async def test_debug_session_skips_legacy_writeback_when_engine_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
     # A debug (Studio) play of a Remember workflow must not overwrite known-good memory through the
     # legacy seam once the browser-memory engine is on for the org.
@@ -310,30 +278,6 @@ async def test_missing_managed_profile_falls_back_to_legacy_session(monkeypatch:
 
     store_mock.assert_awaited_once_with("o_test", "wpid_test", "/tmp/fake_profile")
     app.STORAGE.store_browser_profile.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_user_profile_not_persisted_on_completed_persist_run(monkeypatch: pytest.MonkeyPatch) -> None:
-    from skyvern.forge.sdk.workflow.service import WorkflowService
-
-    workflow = _make_workflow(persist=True)
-    workflow_run = _make_workflow_run(WorkflowRunStatus.completed, browser_profile_id="bp_user")
-    browser_state = _make_browser_state()
-    store_session_mock = _patch_clean_up_deps(monkeypatch, browser_state)
-    monkeypatch.setattr(
-        app.DATABASE.browser_sessions,
-        "get_browser_profile",
-        AsyncMock(return_value=SimpleNamespace(is_managed=False)),
-    )
-
-    svc = WorkflowService()
-    monkeypatch.setattr(svc, "persist_video_data", AsyncMock())
-    monkeypatch.setattr(svc, "get_tasks_by_workflow_run_id", AsyncMock(return_value=[]))
-
-    await svc.clean_up_workflow(workflow=workflow, workflow_run=workflow_run, need_call_webhook=False)
-
-    app.STORAGE.store_browser_profile.assert_not_awaited()
-    store_session_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio

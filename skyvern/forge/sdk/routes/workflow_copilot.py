@@ -86,12 +86,14 @@ from skyvern.forge.sdk.copilot.credential_pause import (
 )
 from skyvern.forge.sdk.copilot.credential_resolution import load_credentials, loggable_origin
 from skyvern.forge.sdk.copilot.demonstration_recorder import (
+    DemonstrationRecord,
     DemonstrationRecorder,
     DemonstrationRejection,
     active_demonstration,
     append_demonstration_control,
     claim_demonstration_recording,
     demonstration_action_labels,
+    demonstration_cache,
     demonstration_file_ids,
     demonstration_limit_reached,
     demonstration_owner_is_live,
@@ -204,6 +206,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     CopilotProposalMetadata,
     CopilotProposalRunFacts,
     CopilotSteerMessage,
+    CopilotTurnControl,
     CopilotVideoEvidenceArtifact,
     WorkflowCopilotApplyProposedWorkflowRequest,
     WorkflowCopilotAudioUploadResponse,
@@ -249,7 +252,7 @@ from skyvern.forge.sdk.services.credential.credential_creation_service import (
     store_new_credential,
 )
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
-from skyvern.forge.sdk.services.request_principal import enforce_principal_role, get_request_principal
+from skyvern.forge.sdk.services.request_principal import enforce_principal_role, get_request_principal, human_user_id
 from skyvern.forge.sdk.services.route_authorization import require_request_actions
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException, WorkflowVersionConflict
 from skyvern.forge.sdk.workflow.models.credential_release import normalize_extra_site_urls
@@ -562,7 +565,10 @@ async def _resolve_copilot_request_config(
 
 
 async def _resolve_copilot_api_key(request: Request, organization_id: str) -> str | None:
-    return request.headers.get("x-api-key") or await app.AGENT_FUNCTION.resolve_org_api_key(organization_id)
+    request_key = request.headers.get("x-api-key") or await app.AGENT_FUNCTION.resolve_org_api_key(organization_id)
+    return await app.AGENT_FUNCTION.resolve_copilot_loopback_api_key(
+        get_request_principal(), organization_id, request_key
+    )
 
 
 def _with_current_copilot_code_mode_metadata(
@@ -592,6 +598,135 @@ COPILOT_CANCEL_POLL_SECONDS = 1.5
 
 def _copilot_cancel_key(organization_id: str, cancel_token: str) -> str:
     return f"copilot_cancel:{organization_id}:{cancel_token}"
+
+
+COPILOT_SUPERSEDE_REFUSED = (
+    "Another member's Copilot turn is still running in this chat. Wait for it to finish, or ask an Admin to stop it."
+)
+
+
+async def _copilot_control_allowed(
+    organization_id: str, starter_user_id: str | None, control: CopilotTurnControl
+) -> bool:
+    try:
+        return await app.AGENT_FUNCTION.copilot_turn_control_allowed(
+            get_request_principal(), organization_id, starter_user_id, control
+        )
+    except Exception:
+        LOG.warning(
+            "Copilot turn control check failed", organization_id=organization_id, control=control, exc_info=True
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Copilot could not check whether you can do this. Retry shortly.",
+            headers={"Retry-After": "2"},
+        ) from None
+
+
+async def _require_copilot_turn_control(
+    organization_id: str, turn: CopilotPendingTurn | None, control: CopilotTurnControl
+) -> None:
+    # Steer and credential-deletion reject an unmatched id downstream (409 or 404); so does an answer, unless the stored
+    # question is already resolved, which returns that record (200) and writes nothing. Cancel accepts it, because the
+    # token is the proof and an unmatched one only sets that token's stop flag.
+    if turn is None:
+        return
+    if not await _copilot_control_allowed(organization_id, turn.starter_user_id, control):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the person who started this Copilot turn, or an Admin, can stop it."
+            if control == "cancel"
+            else "Only the person who started this Copilot turn can respond to it.",
+        )
+
+
+async def _copilot_turns_without_control(
+    organization_id: str, chat: WorkflowCopilotChat | None, control: CopilotTurnControl
+) -> set[str]:
+    """Turn ids on which the caller may not use `control`, so chat-history hides that control's fields."""
+    # Fails closed (hide) on purpose, unlike _copilot_control_allowed's 503: a poll must not fail on a lookup.
+    hidden: set[str] = set()
+    allowed_by_starter: dict[str | None, bool] = {}
+    for turn in chat.pending_turns.values() if chat else []:
+        if turn.starter_user_id not in allowed_by_starter:
+            try:
+                allowed = await app.AGENT_FUNCTION.copilot_turn_control_allowed(
+                    get_request_principal(), organization_id, turn.starter_user_id, control
+                )
+            except Exception:
+                LOG.warning("Copilot turn control check failed", organization_id=organization_id, exc_info=True)
+                allowed = False
+            allowed_by_starter[turn.starter_user_id] = allowed
+        if not allowed_by_starter[turn.starter_user_id]:
+            hidden.add(turn.turn_id)
+    return hidden
+
+
+async def _require_demonstration_control(
+    organization_id: str, demonstration: DemonstrationRecord | None, control: CopilotTurnControl
+) -> None:
+    # A demonstration drives its starter's browser session, so it follows the same rule as a running turn.
+    if demonstration is None:
+        return
+    if not await _copilot_control_allowed(organization_id, demonstration.human_user_id, control):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the person who started this demonstration, or an Admin, can stop it."
+            if control == "cancel"
+            else "Only the person who started this demonstration can use it.",
+        )
+
+
+async def _cancel_already_requested(cache: BaseCache | None, organization_id: str, cancel_token: str) -> bool:
+    if cache is None:
+        return False
+    try:
+        return bool(await cache.get(_copilot_cancel_key(organization_id, cancel_token)))
+    except Exception:
+        LOG.debug("Copilot cancel flag read failed; treating the turn as live", exc_info=True)
+        return False
+
+
+async def _turns_a_new_turn_supersedes(
+    cache: BaseCache | None,
+    organization_id: str,
+    chat: WorkflowCopilotChat,
+    turn_id: str,
+    own_cancel_token: str | None,
+) -> list[CopilotPendingTurn]:
+    # A turn already told to stop is skipped: its entry can outlive a dead task until reconcile claims it,
+    # and an Admin Stop has to unblock the chat before then.
+    return [
+        entry
+        for entry in chat.pending_turns.values()
+        if entry.turn_id != turn_id
+        and entry.cancel_token
+        and entry.cancel_token != own_cancel_token
+        and entry.recovering_at is None
+        and not await _cancel_already_requested(cache, organization_id, entry.cancel_token)
+    ]
+
+
+async def _require_control_of_superseded_turns(organization_id: str, turns: list[CopilotPendingTurn]) -> None:
+    # Starting a turn stops these, so the caller needs the right to stop each one.
+    for turn in turns:
+        if not await _copilot_control_allowed(organization_id, turn.starter_user_id, "cancel"):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=COPILOT_SUPERSEDE_REFUSED)
+
+
+def _pending_turn_with_cancel_token(chat: WorkflowCopilotChat, cancel_token: str) -> CopilotPendingTurn | None:
+    return next((turn for turn in chat.pending_turns.values() if turn.cancel_token == cancel_token), None)
+
+
+def _pending_turn_with_question(chat: WorkflowCopilotChat, interaction_id: str) -> CopilotPendingTurn | None:
+    return next(
+        (
+            turn
+            for turn in chat.pending_turns.values()
+            if any(item.interaction_id == interaction_id for item in turn.question_interactions)
+        ),
+        None,
+    )
 
 
 def _copilot_idempotency_digest(
@@ -659,17 +794,12 @@ async def _stop_older_live_turns(
     organization_id: str,
     chat: WorkflowCopilotChat,
     turn_id: str,
-    own_cancel_token: str | None,
+    superseded_turns: list[CopilotPendingTurn],
 ) -> None:
     # ponytail: the markers come from the chat load, so a turn saved after this request loaded the chat is not seen.
     # Returning the other markers from start_copilot_turn's locked read would close that window.
-    for entry in chat.pending_turns.values():
-        if (
-            entry.turn_id == turn_id
-            or not entry.cancel_token
-            or entry.cancel_token == own_cancel_token
-            or entry.recovering_at is not None
-        ):
+    for entry in superseded_turns:
+        if not entry.cancel_token:
             continue
         key = _copilot_cancel_key(organization_id, entry.cancel_token)
         with contained_effect("copilot older-turn stop", workflow_copilot_chat_id=chat.workflow_copilot_chat_id):
@@ -2808,6 +2938,10 @@ async def _new_copilot_chat_post(
             )
             proposed_workflow_at_turn_start = chat.proposed_workflow
             chat_request.workflow_copilot_chat_id = chat.workflow_copilot_chat_id
+            superseded_turns = await _turns_a_new_turn_supersedes(
+                getattr(app, "CACHE", None), organization.organization_id, chat, turn_id, chat_request.cancel_token
+            )
+            await _require_control_of_superseded_turns(organization.organization_id, superseded_turns)
             # Before any await that could raise into the recovery writer: that writer opens the row
             # with the product sender, so the caller's prose must already be gone.
             await _apply_diagnose_run_action(
@@ -2977,6 +3111,7 @@ async def _new_copilot_chat_post(
                         turn_id=turn_id,
                         started_at=datetime.now(UTC),
                         cancel_token=chat_request.cancel_token,
+                        starter_user_id=human_user_id(get_request_principal(), organization.organization_id),
                         request_browser_allocations=CopilotRequestBrowserAllocations(
                             organization_id=organization.organization_id,
                             workflow_permanent_id=chat.workflow_permanent_id,
@@ -3038,9 +3173,7 @@ async def _new_copilot_chat_post(
             # request while starting the turn.
             cache = getattr(app, "CACHE", None)
             if cache is not None:
-                await _stop_older_live_turns(
-                    cache, organization.organization_id, chat, turn_id, chat_request.cancel_token
-                )
+                await _stop_older_live_turns(cache, organization.organization_id, chat, turn_id, superseded_turns)
             if chat_request.cancel_token and cache is not None:
                 handler_task = asyncio.current_task()
                 if handler_task is not None:
@@ -3814,16 +3947,11 @@ async def workflow_copilot_chat_post(
     )
     eval_cost_enabled = _copilot_eval_cost_enabled(organization.organization_id)
     eval_entrypoint_url = _validated_eval_entrypoint_url(request, chat_request, organization)
-    if app.CACHE is None or not app.CACHE.is_shared:
-        # Demonstrations live in the shared cache, so Copilot must not offer one this backend cannot start.
+    if demonstration_cache() is None:
+        # Copilot must not offer a demonstration this backend cannot start.
         chat_request.supports_demonstration_offer = False
     if chat_request.product_action == "demonstrate":
-        cache = app.CACHE
-        if cache is None or not cache.is_shared:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Copilot demonstration requires a shared cache",
-            )
+        cache = await _demonstration_cache()
         if not chat_request.demonstration_id:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -3838,6 +3966,7 @@ async def workflow_copilot_chat_post(
             )
         except DemonstrationRejection as rejection:
             raise HTTPException(status_code=rejection.status_code, detail=rejection.detail) from rejection
+        await _require_demonstration_control(organization.organization_id, demonstration, "steer")
         # A reloaded card no longer holds the files it attached; the recorded upload events still do.
         demonstrated_file_ids = await demonstration_file_ids(
             cache, organization.organization_id, chat_request.demonstration_id, demonstration.event_count
@@ -4190,12 +4319,19 @@ async def workflow_copilot_chat_history(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="workflow_permanent_id or workflow_copilot_chat_id is required",
         )
+    # Only the caller's answerable questions count as seen by a client. The refresh can return turns committed after
+    # this read, so the response's redaction is recomputed from the refreshed turns below.
+    turns_not_seen = await _copilot_turns_without_control(organization.organization_id, chat, "answer")
     if chat:
         if any(
             item.status == "pending" for entry in chat.pending_turns.values() for item in entry.question_interactions
         ):
             chat.pending_turns = await app.DATABASE.workflow_params.refresh_copilot_question_client(
-                organization.organization_id, chat.workflow_copilot_chat_id
+                organization.organization_id,
+                chat.workflow_copilot_chat_id,
+                seen_turn_ids={
+                    entry.turn_id for entry in chat.pending_turns.values() if entry.turn_id not in turns_not_seen
+                },
             )
         await _reconcile_interrupted_copilot_turns(chat, organization.organization_id)
         chat_messages = await app.DATABASE.workflow_params.get_workflow_copilot_chat_messages(
@@ -4345,6 +4481,8 @@ async def workflow_copilot_chat_history(
         key=lambda entry: _as_utc(entry.started_at),
         default=None,
     )
+    turns_without_answer = await _copilot_turns_without_control(organization.organization_id, chat, "answer")
+    turns_without_cancel = await _copilot_turns_without_control(organization.organization_id, chat, "cancel")
     return WorkflowCopilotChatHistoryResponse(
         pending_credential_requests=pending_credentials,
         workflow_copilot_chat_id=chat.workflow_copilot_chat_id if chat else None,
@@ -4353,19 +4491,24 @@ async def workflow_copilot_chat_history(
         in_flight_turn=(
             CopilotInFlightTurn(
                 turn_id=live_entry.turn_id,
-                cancel_token=live_entry.cancel_token,
+                cancel_token=live_entry.cancel_token if live_entry.turn_id not in turns_without_cancel else None,
                 latest_draft=live_entry.latest_draft,
                 latest_draft_at=live_entry.latest_draft_at,
             )
             if live_entry is not None
             else None
         ),
-        question_interactions=question_interactions,
+        question_interactions=[
+            item
+            for item in question_interactions
+            if not (item.status == "pending" and item.turn_id in turns_without_answer)
+        ],
         pending_question_cancel_token=next(
             (
                 entry.cancel_token
                 for entry in (chat.pending_turns.values() if chat else [])
-                if any(item.interaction_id in pending_ids for item in entry.question_interactions)
+                if entry.turn_id not in turns_without_cancel
+                and any(item.interaction_id in pending_ids for item in entry.question_interactions)
             ),
             None,
         ),
@@ -4392,6 +4535,9 @@ async def workflow_copilot_question_response(
     )
     if chat is None:
         raise HTTPException(status_code=404, detail="Unknown Copilot chat")
+    await _require_copilot_turn_control(
+        organization.organization_id, _pending_turn_with_question(chat, question_response.interaction_id), "answer"
+    )
     eval_llm_overrides = admit_eval_llm_overrides(
         request.headers.get(EVAL_LLM_OVERRIDES_HEADER), organization.organization_id
     )
@@ -4565,6 +4711,13 @@ async def workflow_copilot_credential_deletion(
         "workflow_copilot.update",
         {"workflow_copilot_chat_id": deletion_request.workflow_copilot_chat_id},
     )
+    chat = await app.DATABASE.workflow_params.get_workflow_copilot_chat_by_id(
+        organization_id, deletion_request.workflow_copilot_chat_id
+    )
+    if chat is not None:
+        await _require_copilot_turn_control(
+            organization_id, _pending_turn_with_question(chat, deletion_request.interaction_id), "answer"
+        )
     try:
         claimed = await app.DATABASE.workflow_params.claim_copilot_credential_deletion(
             organization_id,
@@ -4604,6 +4757,9 @@ async def workflow_copilot_steer(
     )
     if chat is None:
         raise HTTPException(status_code=404, detail="Unknown Copilot chat")
+    await _require_copilot_turn_control(
+        organization.organization_id, _pending_turn_with_cancel_token(chat, steer_request.cancel_token), "steer"
+    )
     eval_llm_overrides = admit_eval_llm_overrides(
         request.headers.get(EVAL_LLM_OVERRIDES_HEADER), organization.organization_id
     )
@@ -4726,6 +4882,14 @@ async def workflow_copilot_cancel(
     """
     cancelled_questions = False
     if cancel_request.workflow_copilot_chat_id:
+        chat = await app.DATABASE.workflow_params.get_workflow_copilot_chat_by_id(
+            organization.organization_id, cancel_request.workflow_copilot_chat_id
+        )
+        if chat is None:
+            raise HTTPException(status_code=404, detail="Unknown Copilot chat")
+        await _require_copilot_turn_control(
+            organization.organization_id, _pending_turn_with_cancel_token(chat, cancel_request.cancel_token), "cancel"
+        )
         try:
             cancelled_questions = await app.DATABASE.workflow_params.cancel_copilot_questions(
                 organization.organization_id, cancel_request.workflow_copilot_chat_id, cancel_request.cancel_token
@@ -5057,11 +5221,12 @@ async def _change_credential_site(
 
 
 async def _demonstration_cache() -> BaseCache:
-    cache = app.CACHE
-    if cache is None or not cache.is_shared:
+    cache = demonstration_cache()
+    if cache is None:
+        # 501, not 403: the server's setup refuses this, not the caller's credentials.
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Copilot demonstration requires a shared cache",
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail="Run this server as one process to record demonstrations",
         )
     return cache
 
@@ -5088,6 +5253,17 @@ async def workflow_copilot_demonstration_record(
     )
     if browser_session is None or workflow is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown workflow or browser session")
+    if record_request.demonstration_id is not None:
+        await _require_demonstration_control(
+            organization.organization_id,
+            await load_demonstration_record(cache, organization.organization_id, record_request.demonstration_id),
+            "steer",
+        )
+
+    async def authorize_replace(replaced: DemonstrationRecord) -> None:
+        # A new recording cancels the browser's current demonstration, so it needs the right to stop that one.
+        await _require_demonstration_control(organization.organization_id, replaced, "cancel")
+
     try:
         claim = await claim_demonstration_recording(
             cache,
@@ -5096,6 +5272,8 @@ async def workflow_copilot_demonstration_record(
             browser_session_id=record_request.browser_session_id,
             demonstration_id=record_request.demonstration_id,
             insertion=record_request.insertion.model_dump() if record_request.insertion is not None else None,
+            human_user_id=human_user_id(get_request_principal(), organization.organization_id),
+            authorize_replace=authorize_replace,
         )
     except DemonstrationRejection as rejection:
         raise HTTPException(status_code=rejection.status_code, detail=rejection.detail) from rejection
@@ -5154,6 +5332,11 @@ async def workflow_copilot_demonstration_control(
             "workflow_copilot.manage",
             {"workflow_permanent_id": demonstration.workflow_permanent_id},
         )
+    await _require_demonstration_control(
+        organization.organization_id,
+        demonstration,
+        "cancel" if control_request.action in {"stop", "cancel"} else "steer",
+    )
     try:
         seq = await append_demonstration_control(
             cache,
@@ -5196,6 +5379,7 @@ async def workflow_copilot_demonstration_upload(
         "workflow_copilot.manage",
         {"workflow_permanent_id": demonstration.workflow_permanent_id},
     )
+    await _require_demonstration_control(organization.organization_id, demonstration, "steer")
     if demonstration.status != "recording":
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Demonstration is not recording")
     attached_file_ids = await demonstration_file_ids(
@@ -5249,6 +5433,10 @@ async def workflow_copilot_demonstration_active(
     if active is None:
         return None
     demonstration_id, record = active
+    # The id is the handle /control stop and cancel take, so a caller who may stop the demonstration receives it;
+    # the controls they may not use still answer 403.
+    if not await _copilot_control_allowed(organization.organization_id, record.human_user_id, "cancel"):
+        return None
     copilot_config = await app.AGENT_FUNCTION.get_copilot_config_for_request(
         organization.organization_id,
         code_block_mode=None,

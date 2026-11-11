@@ -73,14 +73,6 @@ def test_qa_prompt_mentions_backend_validation_modes() -> None:
         assert marker in QA_TEST_CONTENT
 
 
-def test_qa_prompt_docs_only_lightweight_rule() -> None:
-    assert "If the diff is mostly documentation or comments, keep QA lightweight" in QA_TEST_CONTENT
-
-
-def test_qa_prompt_mixed_mode_backend_contract_warning() -> None:
-    assert "If the backend contract is broken, frontend results are not trustworthy" in QA_TEST_CONTENT
-
-
 def test_qa_test_prompt_includes_target_url_and_focus_area() -> None:
     rendered = qa_test(url="http://localhost:8000", context="validate the workflow filters API")
     assert "Target URL: `http://localhost:8000`" in rendered

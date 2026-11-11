@@ -448,6 +448,8 @@ class ArtifactModel(Base):
     browser_session_id = Column(String, nullable=True)
     checksum = Column(String, nullable=True)
     file_size = Column(BigInteger, nullable=True)
+    # The checksum of the content a configured download name was given to; it vouches for no other content.
+    configured_name_sha256 = Column(String(64), nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,

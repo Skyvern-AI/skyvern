@@ -3,8 +3,13 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from pydantic import SecretStr
+from structlog.testing import capture_logs
 
 from skyvern.exceptions import BitwardenListItemsError
+from skyvern.forge.sdk.credential_site_policy import LoginSite
+from skyvern.forge.sdk.schemas.credentials import VaultPasskey
+from skyvern.forge.sdk.services.bitwarden import BitwardenLoginSecret
 from skyvern.forge.sdk.workflow import context_manager as cm
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.parameter import (
@@ -68,6 +73,7 @@ async def test_org_email_bitwarden_auth_falls_back_to_global_credentials(
         max_retries: int = 2,
         timeout: int = 60,
         email: str | None = None,
+        include_passkeys: bool = False,
     ) -> dict[str, str]:
         calls.append(
             {
@@ -188,6 +194,7 @@ async def test_bitwarden_login_error_includes_resolved_collection_and_item_ids(
         max_retries: int = 2,
         timeout: int = 60,
         email: str | None = None,
+        include_passkeys: bool = False,
     ) -> dict[str, str]:
         assert collection_id == "resolved-collection-id"
         assert item_id == "resolved-item-id"
@@ -433,3 +440,123 @@ async def test_bitwarden_credit_card_resolves_collection_and_item_parameters(
     assert "{{ item_param }}" not in message
     assert "global-client-secret" not in message
     assert "global-master-password" not in message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("by_item_id,fallback", [(True, False), (False, False), (True, True)])
+async def test_direct_bitwarden_passkeys_require_own_account_and_item_id(
+    monkeypatch: pytest.MonkeyPatch, by_item_id: bool, fallback: bool
+) -> None:
+    item_id = "12345678-1234-4234-8234-123456789abc"
+    sites = [LoginSite(url="https://example.com/login", whole_site=False)]
+    passkey = VaultPasskey(
+        rp_id="example.com",
+        credential_id="cGFzc2tleS1pZA",
+        private_key=SecretStr("private-key-test-material"),
+        user_handle=None,
+        counter=0,
+        discoverable=True,
+    )
+    register = AsyncMock()
+    monkeypatch.setattr(
+        cm,
+        "app",
+        SimpleNamespace(
+            DATABASE=SimpleNamespace(
+                organizations=SimpleNamespace(
+                    get_valid_org_auth_token=AsyncMock(
+                        return_value=SimpleNamespace(
+                            credential=SimpleNamespace(
+                                email="test@example.com",
+                                master_password="own-password",
+                                client_id=None,
+                                client_secret=None,
+                            )
+                        )
+                    )
+                )
+            ),
+            AGENT_FUNCTION=SimpleNamespace(
+                enforce_workflow_context_credential_use=AsyncMock(),
+                enforce_platform_bitwarden_item_ownership=AsyncMock(return_value=False),
+                register_bitwarden_passkeys=register,
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        cm,
+        "settings",
+        SimpleNamespace(
+            BITWARDEN_CLIENT_ID="shared-client-id",
+            BITWARDEN_CLIENT_SECRET="shared-client-secret",
+            BITWARDEN_MASTER_PASSWORD="shared-password",
+            BITWARDEN_EMAIL=None,
+        ),
+    )
+    reads: list[tuple[str | None, bool]] = []
+
+    async def fake_get_secret_value_from_url(
+        client_id: str | None,
+        client_secret: str | None,
+        master_password: str,
+        bw_organization_id: str | None,
+        bw_collection_ids: list[str] | None,
+        url: str | None = None,
+        collection_id: str | None = None,
+        item_id: str | None = None,
+        email: str | None = None,
+        include_passkeys: bool = False,
+    ) -> BitwardenLoginSecret:
+        reads.append((email, include_passkeys))
+        if fallback and email is not None:
+            raise BitwardenListItemsError("TimeoutError")
+        return BitwardenLoginSecret(
+            {"BW_USERNAME": "test-user", "BW_PASSWORD": "test-password", "BW_TOTP": ""},
+            login_sites=sites,
+            item_id="12345678-1234-4234-8234-123456789abc",
+            passkeys=[passkey] if include_passkeys else [],
+        )
+
+    monkeypatch.setattr(cm.BitwardenService, "get_secret_value_from_url", fake_get_secret_value_from_url)
+    context = WorkflowRunContext(
+        workflow_title="title",
+        workflow_id="wf-1",
+        workflow_permanent_id="wfp-1",
+        workflow_run_id="wr-1",
+        aws_client=SimpleNamespace(),
+    )
+    context.values["target_url"] = "https://example.com/login"
+    parameter = BitwardenLoginCredentialParameter(
+        key="login",
+        bitwarden_login_credential_parameter_id="blc_1",
+        workflow_id="wf-1",
+        bitwarden_client_id_aws_secret_key="unused-client-id",
+        bitwarden_client_secret_aws_secret_key="unused-client-secret",
+        bitwarden_master_password_aws_secret_key="unused-password",
+        url_parameter_key=None if by_item_id else "target_url",
+        bitwarden_item_id=item_id if by_item_id else None,
+        created_at=datetime.now(UTC),
+        modified_at=datetime.now(UTC),
+    )
+    organization = SimpleNamespace(organization_id="org-1", bw_organization_id=None, bw_collection_ids=None)
+    with capture_logs() as logs:
+        await context.register_bitwarden_login_credential_parameter_value(parameter, organization)
+
+    assert reads == ([("test@example.com", True), (None, False)] if fallback else [("test@example.com", by_item_id)])
+    if by_item_id and not fallback:
+        register.assert_awaited_with(
+            workflow_run_id="wr-1",
+            organization_id="org-1",
+            source_id=item_id,
+            vault_passkeys=[passkey],
+            login_sites=sites,
+        )
+    else:
+        register.assert_not_awaited()
+    assert context.secrets[context.values["login"]["username"]] == "test-user"
+    assert context.secrets[context.values["login"]["password"]] == "test-password"
+    assert context.bitwarden_login_sites["login"] == sites
+    for material in (passkey.private_key.get_secret_value(), passkey.credential_id):
+        assert material not in repr(context.secrets)
+        assert material not in repr(context.values)
+        assert material not in repr(logs)

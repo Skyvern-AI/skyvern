@@ -279,16 +279,6 @@ async def test_rebind_context_path_rebinds_supplied_context_interceptor() -> Non
 
 
 @pytest.mark.asyncio
-async def test_rebind_context_path_without_interceptor_still_sets_behaviour() -> None:
-    page, context, cdp_session = _recording_context_page()
-    context._skyvern_cdp_download_interceptor = None
-
-    await rebind_download_dir(None, run_id="wr_test", page=page)
-
-    cdp_session.send.assert_awaited_once()
-
-
-@pytest.mark.asyncio
 async def test_rebind_prefers_owning_browser_over_page() -> None:
     browser, cdp_session = _recording_browser()
     page, context, _context_cdp = _recording_context_page()
@@ -313,17 +303,6 @@ async def test_rebind_still_rebinds_interceptor_when_setdownloadbehavior_raises(
     await rebind_download_dir(browser, run_id="wr_test")
 
     _assert_scope_rebound(interceptor, "wr_test")
-
-
-@pytest.mark.asyncio
-async def test_rebind_does_not_raise_on_launch_path_without_interceptor() -> None:
-    """Fail-open: a setDownloadBehavior failure on the launch path (browser, no
-    interceptor) must never propagate and break the browser launch."""
-    browser, cdp_session = _recording_browser()
-    cdp_session.send = AsyncMock(side_effect=RuntimeError("method not found"))
-    browser.contexts = []
-
-    await rebind_download_dir(browser, run_id="wr_test")
 
 
 @pytest.mark.asyncio

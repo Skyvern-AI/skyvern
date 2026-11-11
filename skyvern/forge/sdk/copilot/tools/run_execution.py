@@ -4924,7 +4924,7 @@ async def _run_blocks_with_minted_browser_claim(
         discard_build_test_prestart(ctx, "seeded")
 
     # Without a session, the workflow service launches the browser in-process,
-    # which only works in worker pods (cloakbrowser isn't in the API image).
+    # which only works in worker pods (the API image does not ship the browser runs use).
     if use_fresh_session:
         # The chat's browser holds whatever page scouting left open, so a run from the head is
         # given its own; the chat keeps its session and the minted id is threaded in explicitly.

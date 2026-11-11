@@ -26,7 +26,10 @@ export type DocBranch = {
   condition: string;
   check: "ai" | "exact" | null;
   children: DocItem[];
+  // Every step the branch holds, nested and unplaced ones included.
   stepCount: number;
+  // The branch's own numbered steps, which offset the numbers of the branches after it.
+  numberedCount: number;
   jumpTo?: string;
 };
 type DocPlacement = {
@@ -45,6 +48,15 @@ export type DocItem =
       ));
 export type DocTree = { items: DocItem[] };
 
+export type DocNumberedItem = Exclude<
+  DocItem,
+  DocNoteItem | { kind: "unplaced" }
+>;
+
+// Notes and steps the Doc cannot place take no step number.
+export const isNumberedItem = (item: DocItem): item is DocNumberedItem =>
+  item.kind !== "note" && item.kind !== "unplaced";
+
 const isBlock = (node: Node) =>
   node.type !== "start" && node.type !== "nodeAdder";
 const UNPLACED =
@@ -62,6 +74,30 @@ function branchCheck(branch: BranchCondition): DocBranch["check"] {
   return branch.criteria.criteria_type === BranchCriteriaTypes.Jinja2Template
     ? "exact"
     : "ai";
+}
+
+/** Each placed step's number: "3.1" inside step 3, a conditional's branches counted in tab order. */
+export function docStepNumbers(
+  items: DocItem[],
+  prefix = "",
+  start = 1,
+  into = new Map<string, string>(),
+): Map<string, string> {
+  items.filter(isNumberedItem).forEach((item, i) => {
+    const number = `${prefix}${i + start}`;
+    into.set(item.nodeId, number);
+    if (item.kind === "loop")
+      docStepNumbers(item.children, `${number}.`, 1, into);
+    if (item.kind === "conditional")
+      [
+        ...item.branches.filter((b) => b.kind !== "otherwise"),
+        ...item.branches.filter((b) => b.kind === "otherwise"),
+      ].reduce((next, branch) => {
+        docStepNumbers(branch.children, `${number}.`, next, into);
+        return next + branch.numberedCount;
+      }, 1);
+  });
+  return into;
 }
 
 export function countDocSteps(items: DocItem[]): number {
@@ -357,6 +393,7 @@ export function buildDocTree(
         check: branchCheck(definition),
         children,
         stepCount: countDocSteps(children),
+        numberedCount: children.filter(isNumberedItem).length,
         ...(firstShared !== -1 && { jumpTo: chain[firstShared] }),
       };
     });
@@ -369,6 +406,7 @@ export function buildDocTree(
         check: null,
         children: [],
         stepCount: 0,
+        numberedCount: 0,
       });
     const tailItems = placeSequence(rejoin?.tail ?? [], null, {
       reason: conditionalReason,

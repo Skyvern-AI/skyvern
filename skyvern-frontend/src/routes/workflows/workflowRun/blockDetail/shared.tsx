@@ -7,7 +7,7 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { formatDuration, toDuration } from "@/routes/workflows/utils";
+import { formatSeconds } from "@/util/timeFormat";
 import { workflowBlockTitle } from "@/routes/workflows/editor/nodes/types";
 import { StatusDot } from "../WorkflowRunTimelineBlockItem";
 import { WorkflowBlockIcon } from "@/routes/workflows/editor/nodes/WorkflowBlockIcon";
@@ -72,7 +72,7 @@ function BlockDetailHeader({
   runFinalized: boolean;
 }) {
   const duration =
-    block.duration !== null ? formatDuration(toDuration(block.duration)) : null;
+    block.duration !== null ? formatSeconds(block.duration) : null;
   const blockTypeTitle = workflowBlockTitle[block.block_type];
   // The backend mirrors current_index/current_value onto every block inside a
   // loop, but the timeline's "Iteration N · value" row one pane up already

@@ -1,5 +1,6 @@
 import { apiWorkflowToSettings } from "@/routes/workflows/editor/apiWorkflowToSettings";
 import { ReactFlowProvider } from "@xyflow/react";
+import { isAxiosError } from "axios";
 
 import { PendingGoalChangesPublisher } from "./PendingGoalChangesPublisher";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
@@ -8,6 +9,7 @@ import { useWorkflowQuery } from "../hooks/useWorkflowQuery";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import { getElements } from "./workflowEditorUtils";
 import { LogoMinimized } from "@/components/LogoMinimized";
+import { Status404 } from "@/components/Status404";
 import { useGlobalWorkflowsQuery } from "../hooks/useGlobalWorkflowsQuery";
 import { useBlockOutputStore } from "@/store/BlockOutputStore";
 import { useHydrateWorkflowParameters } from "@/store/WorkflowHasChangesStore";
@@ -28,6 +30,7 @@ function WorkflowEditor() {
     data: fetchedWorkflow,
     isLoading,
     isError: workflowQueryFailed,
+    error: workflowQueryError,
   } = useWorkflowQuery({
     workflowPermanentId,
   });
@@ -85,7 +88,10 @@ function WorkflowEditor() {
   }
 
   if (!effectiveWorkflow) {
-    return null;
+    return isAxiosError(workflowQueryError) &&
+      workflowQueryError.response?.status === 404 ? (
+      <Status404 />
+    ) : null;
   }
   const workflow = effectiveWorkflow;
   const workflowDeleted = Boolean(workflow.deleted_at);

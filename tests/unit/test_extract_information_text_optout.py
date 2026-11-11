@@ -492,3 +492,74 @@ def test_ai_extract_passes_small_schema_unchanged(monkeypatch) -> None:
     small_schema = {"type": "object", "properties": {"x": {"type": "string"}}}
     captured = _capture_ai_extract_kwargs_with_schema(monkeypatch, small_schema)
     assert captured["extracted_information_schema"] == small_schema
+
+
+def test_extract_action_refresh_preserves_synthetic_blank_opt_in(monkeypatch) -> None:
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    import pytest
+
+    from skyvern.exceptions import ScrapingFailedBlankPage
+    from skyvern.forge import app
+    from skyvern.forge.agent import ForgeAgent, ScrapeType
+    from skyvern.forge.sdk.workflow.models.block import ExtractionBlock
+    from skyvern.schemas.runs import RunEngine
+    from skyvern.webeye.actions import handler
+    from skyvern.webeye.actions.actions import ExtractAction
+    from skyvern.webeye.actions.responses import ActionSuccess
+    from skyvern.webeye.scraper import scraper
+    from skyvern.webeye.scraper.scraped_page import ScrapedPage
+    from tests.unit._task_block_fakes import output_parameter
+
+    _stub_downstream_extraction(monkeypatch)
+    monkeypatch.setattr(handler.app.AGENT_FUNCTION, "collect_virtualized_grid_rows", AsyncMock(return_value=None))
+    monkeypatch.setattr(object.__getattribute__(app, "_inst"), "scrape_exclude", None, raising=False)
+    monkeypatch.setattr(scraper.SkyvernFrame, "create_instance", AsyncMock(return_value=MagicMock()))
+    monkeypatch.setattr(scraper, "_wait_for_scrape_ready", AsyncMock())
+    page = MagicMock(url="about:blank")
+    page.main_frame.child_frames = []
+    browser_state = MagicMock()
+
+    async def scrape_website(**kwargs):
+        await scraper._prepare_scrape_frame(browser_state, page, None, kwargs["support_empty_page"])
+        return ScrapedPage(
+            elements=[],
+            element_tree=[],
+            element_tree_trimmed=[],
+            url="about:blank",
+            screenshots=[],
+            _browser_state=browser_state,
+            _clean_up_func=None,
+            _scrape_exclude=None,
+        )
+
+    browser_state.scrape_website = AsyncMock(side_effect=scrape_website)
+    block = ExtractionBlock(label="branch", data_extraction_goal="condition", output_parameter=output_parameter())
+    block._allow_blank_start = True
+    task = _make_task_for_extract_information(False)
+    task.url = "about:blank"
+    task.navigation_goal = None
+    step = MagicMock(retry_index=0)
+
+    async def run():
+        agent = ForgeAgent()
+        with pytest.raises(ScrapingFailedBlankPage):
+            await agent._scrape_with_type(task, step, browser_state, ScrapeType.NORMAL, RunEngine.skyvern_v1)
+        scraped = await agent._scrape_with_type(
+            task,
+            step,
+            browser_state,
+            ScrapeType.NORMAL,
+            RunEngine.skyvern_v1,
+            support_empty_page=block._allow_blank_start,
+        )
+        result = await handler.handle_extract_action(ExtractAction(), page, scraped, task, step)
+        assert isinstance(result[0], ActionSuccess)
+
+    asyncio.run(run())
+    assert [call.kwargs["support_empty_page"] for call in browser_state.scrape_website.await_args_list] == [
+        False,
+        True,
+        True,
+    ]

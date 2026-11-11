@@ -91,58 +91,125 @@ const chipFields = {
   completeOnDownload: "Complete on download",
 };
 
-export function getDocSettingsChips(
-  node: Node,
-): { key: string; label: string }[] {
+const BROWSER = [
+  "engine",
+  "continueOnFailure",
+  "nextLoopOnFailure",
+  "model",
+  "disableCache",
+];
+const ON_FAILURE = ["continueOnFailure", "nextLoopOnFailure"];
+// The settings above that each step type's own form edits; a type not listed edits none.
+const formSettings: Record<string, string[]> = {
+  task: [...BROWSER, "maxStepsOverride", "allowDownloads"],
+  navigation: [...BROWSER, "maxSteps", "maxStepsOverride", "allowDownloads"],
+  action: [...BROWSER, "allowDownloads"],
+  extraction: [...BROWSER, "maxStepsOverride"],
+  login: [...BROWSER, "maxStepsOverride"],
+  fileDownload: [...BROWSER, "maxStepsOverride"],
+  validation: BROWSER,
+  taskv2: ["maxSteps", "model", "disableCache"],
+  fileParser: [...ON_FAILURE, "model"],
+  loop: ON_FAILURE,
+  conditional: ON_FAILURE,
+  workflowTrigger: ON_FAILURE,
+  http_request: ["continueOnFailure"],
+  web_search: ["continueOnFailure", "model"],
+  textPrompt: ["model"],
+  pdfParser: ["model"],
+  pdfFill: ["model"],
+  splitPdf: ["model"],
+};
+
+export const customSettingsText = (count: number) =>
+  `${count} custom setting${count === 1 ? "" : "s"}`;
+
+export const customSettingsShortText = (count: number) => `${count} custom`;
+
+const engines: Record<string, string> = {
+  "skyvern-1.0": "Skyvern 1.0",
+  "skyvern-2.0": "Skyvern 2.0",
+  "skyvern-3.0": "Skyvern 3.0",
+  "openai-cua": "OpenAI CUA",
+  "anthropic-cua": "Anthropic CUA",
+};
+
+function formatSetting(key: string, value: unknown): string | null {
+  if (key === "model")
+    return typeof value === "object" &&
+      value !== null &&
+      "model_name" in value &&
+      typeof value.model_name === "string" &&
+      value.model_name
+      ? value.model_name
+      : null;
+  if (key === "engine")
+    return typeof value === "string" ? (engines[value] ?? null) : null;
+  if (typeof value === "boolean") return value ? "On" : "Off";
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  return null;
+}
+
+export type DocSettingRow = {
+  key: string;
+  label: string;
+  value: string;
+  custom: boolean;
+};
+
+/** The common settings the step's own form edits, with their values; `custom` when one differs from the default. */
+export const getDocSettingsRows = (node: Node) =>
+  settingRows(node).filter((row) =>
+    formSettings[node.type ?? ""]?.includes(row.key),
+  );
+
+function settingRows(node: Node): DocSettingRow[] {
   const baseline = defaults[node.type ?? ""];
   if (!baseline) return [];
-  const chips = Object.entries(chipFields).flatMap(([key, label]) => {
+  // Navigation keeps max steps in both keys; only the one its engine saves counts.
+  const unsaved =
+    node.type !== "navigation"
+      ? null
+      : node.data.engine === RunEngine.SkyvernV2
+        ? "maxStepsOverride"
+        : "maxSteps";
+  return Object.entries(chipFields).flatMap(([key, label]) => {
+    if (key === unsaved) return [];
     const value = node.data[key];
     const defaultValue =
       baseline[key] ?? (key === "nextLoopOnFailure" ? false : undefined);
-    if (
-      value == null ||
-      value === "" ||
-      value === defaultValue ||
-      value === serverDefaults[key]
-    )
-      return [];
-    let formatted: string;
-    if (key === "model") {
-      if (
-        typeof value !== "object" ||
-        !("model_name" in value) ||
-        typeof value.model_name !== "string"
-      )
-        return [];
-      formatted = value.model_name;
-      if (!formatted) return [];
-      if (
-        typeof defaultValue === "object" &&
-        defaultValue !== null &&
-        "model_name" in defaultValue &&
-        defaultValue.model_name === formatted
-      )
-        return [];
-    } else if (key === "engine") {
-      const engines: Record<string, string> = {
-        "skyvern-1.0": "Skyvern 1.0",
-        "skyvern-2.0": "Skyvern 2.0",
-        "skyvern-3.0": "Skyvern 3.0",
-        "openai-cua": "OpenAI CUA",
-        "anthropic-cua": "Anthropic CUA",
-      };
-      if (typeof value !== "string" || !engines[value]) return [];
-      formatted = engines[value]!;
-    } else if (typeof value === "boolean") formatted = value ? "On" : "Off";
-    else if (typeof value === "number" && Number.isFinite(value))
-      formatted = String(value);
-    else return [];
-    return [{ key, label: `${label}: ${formatted}` }];
+    const formatted = formatSetting(key, value);
+    // A model without a name (`{ model_name: "" }`) is not an override.
+    const empty =
+      value == null || value === "" || (key === "model" && !formatted);
+    if (empty && !(key in baseline)) return [];
+    // A value set but not in a known form shows as written, never as the default.
+    const raw = !empty && formatted === null;
+    const custom =
+      raw ||
+      (!empty &&
+        value !== defaultValue &&
+        value !== serverDefaults[key] &&
+        // A model object equal by name to the default is the default.
+        (key !== "model" || formatSetting(key, defaultValue) !== formatted));
+    const shown = raw
+      ? typeof value === "object"
+        ? JSON.stringify(value)
+        : String(value)
+      : (formatted ??
+        formatSetting(key, defaultValue ?? serverDefaults[key]) ??
+        "Default");
+    return [{ key, label, value: shown, custom }];
   });
-  if (node.type !== "navigation") return chips;
-  // Navigation keeps max steps in both keys; only the one its engine saves counts.
-  const unsaved =
-    node.data.engine === RunEngine.SkyvernV2 ? "maxStepsOverride" : "maxSteps";
-  return chips.filter((chip) => chip.key !== unsaved);
+}
+
+export function getDocSettingsChips(
+  node: Node,
+): { key: string; label: string }[] {
+  return settingRows(node)
+    .filter(
+      (row) =>
+        row.custom && formatSetting(row.key, node.data[row.key]) !== null,
+    )
+    .map((row) => ({ key: row.key, label: `${row.label}: ${row.value}` }));
 }

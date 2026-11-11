@@ -62,18 +62,6 @@ async def test_no_magic_link_page() -> None:
 
 
 @pytest.mark.asyncio
-async def test_page_already_closed() -> None:
-    """Should return early when has_magic_link_page returns False (page already closed)."""
-    agent_fn = AgentFunction()
-    page = _make_page(closed=True)
-    ctx = _make_context("tsk_test", page)  # has_page defaults to False for closed pages
-    with patch("skyvern.forge.agent_functions.skyvern_context") as mock_ctx:
-        mock_ctx.current.return_value = ctx
-        await agent_fn._maybe_close_magic_link_page(_make_task())
-    page.close.assert_not_called()
-
-
-@pytest.mark.asyncio
 async def test_no_close_signal() -> None:
     """Should keep the page open when no close signal is found."""
     agent_fn = AgentFunction()

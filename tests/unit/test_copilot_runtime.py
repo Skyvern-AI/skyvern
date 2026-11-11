@@ -1903,6 +1903,7 @@ _MANAGER_ENTRY_POINTS = frozenset(
         "get_browser_state",
         "create_session",
         "close_session",
+        "wait_for_browser_launch",
     }
 )
 

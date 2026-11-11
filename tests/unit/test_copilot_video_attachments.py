@@ -6,27 +6,33 @@ import json
 import threading
 import time
 from io import BytesIO
+from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock
 
 import litellm
 import pytest
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot import video_attachment as video_attachment_module
 from skyvern.forge.sdk.copilot.config import CopilotConfig
+from skyvern.forge.sdk.copilot.context import AgentResult
+from skyvern.forge.sdk.copilot.enforcement import is_attached_image_message
 from skyvern.forge.sdk.copilot.video_attachment import (
     MAX_VIDEO_ATTACHMENT_DURATION_SECONDS,
+    VIDEO_ATTACHMENT_SIZE_LIMIT_BYTES,
     VideoAttachmentArtifact,
     VideoAttachmentEvidence,
     VideoAttachmentFrame,
     build_video_attachment_message,
     create_video_evidence_artifacts,
+    image_attachment_frame,
     is_video_attachment,
     load_video_attachment_evidence,
     screen_video_frames_for_copilot,
+    screened_image_attachment_message,
     select_video_keyframes,
 )
 from skyvern.forge.sdk.schemas.workflow_copilot import (
@@ -35,7 +41,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     CopilotVideoObservation,
     WorkflowCopilotChatRequest,
 )
-from tests.unit.copilot_test_helpers import stub_copilot_agent_loop
+from tests.unit.copilot_test_helpers import image_parts, stub_copilot_agent_loop
 
 
 def _perception_result(description: str = "The user opens Settings.") -> dict[str, Any]:
@@ -1327,3 +1333,295 @@ async def test_video_timeline_can_fallback_across_vision_capabilities(
 
     assert run_with_enforcement.await_count == 2
     assert result.user_response
+
+
+_CLEAN_TEXT_SCREEN = {"version": "1", "state": "clean", "handling": "none", "citations": []}
+
+
+def _png_bytes(text: str) -> bytes:
+    image = Image.new("RGB", (640, 240), "white")
+    ImageDraw.Draw(image).text((20, 100), text, fill="black")
+    output = BytesIO()
+    image.save(output, format="PNG")
+    return output.getvalue()
+
+
+def _download_from(contents_by_file_id: dict[str, bytes], tmp_path: Path) -> AsyncMock:
+    async def download(file_id: str, **_kwargs: Any) -> str:
+        path = tmp_path / f"{file_id}.download"
+        path.write_bytes(contents_by_file_id[file_id])
+        return str(path)
+
+    return AsyncMock(side_effect=download)
+
+
+async def _run_turn_with_attached_images(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    attached_files: list[CopilotAttachedFile],
+    attached_file_ids: list[str],
+    safety_handler: AsyncMock,
+    product_action: Literal["demonstrate"] | None = None,
+    supports_vision: bool = True,
+) -> tuple[AgentResult, str | list[dict[str, Any]]]:
+    captured: dict[str, Any] = {}
+
+    async def capture_turn(**kwargs: Any) -> SimpleNamespace:
+        captured["initial_input"] = kwargs["initial_input"]
+        return SimpleNamespace(final_output=json.dumps({"type": "REPLY", "user_response": "ok"}), new_items=[])
+
+    stub_copilot_agent_loop(monkeypatch, capture_turn)
+    if not supports_vision:
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.model_resolver.resolve_model_config",
+            lambda _handler, *, copilot_config=None, llm_key_override=None: ("model-text", object(), "PRIMARY", False),
+        )
+    result = await agent_module.run_copilot_agent(
+        stream=MagicMock(),
+        organization_id="org-1",
+        chat_request=WorkflowCopilotChatRequest(
+            workflow_permanent_id="wfp-1",
+            workflow_id="wf-1",
+            workflow_copilot_chat_id="chat-1",
+            message="I keep getting this. What does it show?",
+            workflow_yaml="",
+            attached_file_ids=attached_file_ids,
+            product_action=product_action,
+            demonstration_id="demo-1" if product_action == "demonstrate" else None,
+        ),
+        chat_history=[],
+        global_llm_context=None,
+        llm_api_handler=SimpleNamespace(llm_key="PRIMARY"),
+        raw_secret_safety_handler=safety_handler,
+        api_key="sk-test",
+        attached_files=attached_files,
+    )
+    return result, captured["initial_input"]
+
+
+@pytest.mark.asyncio
+async def test_attached_image_reaches_the_vision_model_on_the_attaching_turn_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    download = _download_from({"file_new": _png_bytes("Popup blocked"), "file_old": _png_bytes("old")}, tmp_path)
+    monkeypatch.setattr(video_attachment_module, "download_file", download)
+    safety_handler = AsyncMock(side_effect=[_CLEAN_TEXT_SCREEN, {"unsafe_file_ids": []}])
+
+    _, initial_input = await _run_turn_with_attached_images(
+        monkeypatch,
+        attached_files=[
+            CopilotAttachedFile(file_id="file_old", filename="earlier.png"),
+            CopilotAttachedFile(file_id="file_new", filename="Capture.PNG"),
+        ],
+        attached_file_ids=["file_new"],
+        safety_handler=safety_handler,
+    )
+
+    assert [call.args[0] for call in download.await_args_list] == ["file_new"]
+    assert download.await_args_list[0].kwargs["organization_id"] == "org-1"
+    assert len(safety_handler.await_args_list[1].kwargs["screenshots"]) == 1
+    assert isinstance(initial_input, list)
+    image_message = initial_input[1]
+    assert image_message["role"] == "user"
+    assert is_attached_image_message(image_message)
+    assert "Capture.PNG (file_id=file_new)" in image_message["content"][1]["text"]
+    (image_part,) = image_parts(image_message)
+    assert image_part["image_url"].startswith("data:image/jpeg;base64,")
+    assert "earlier.png" not in json.dumps(image_message)
+    assert not list(tmp_path.glob("*.download"))
+
+
+@pytest.mark.asyncio
+async def test_secret_bearing_image_is_withheld_from_the_acting_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        video_attachment_module,
+        "download_file",
+        _download_from({"file_secret": _png_bytes("password: hunter2-raw-secret")}, tmp_path),
+    )
+    safety_handler = AsyncMock(side_effect=[_CLEAN_TEXT_SCREEN, {"unsafe_file_ids": ["file_secret"]}])
+
+    _, initial_input = await _run_turn_with_attached_images(
+        monkeypatch,
+        attached_files=[CopilotAttachedFile(file_id="file_secret", filename="login.png")],
+        attached_file_ids=["file_secret"],
+        safety_handler=safety_handler,
+    )
+
+    screened_frame = safety_handler.await_args_list[1].kwargs["screenshots"][0]
+    serialized_input = json.dumps(initial_input)
+    assert "input_image" not in serialized_input
+    assert base64.b64encode(screened_frame).decode() not in serialized_input
+    assert "hunter2-raw-secret" not in serialized_input
+    assert (
+        "Attached image login.png (file_id=file_secret) is not shown to you because the safety screen found it may "
+        "contain sensitive values. The file itself is still attached to this chat."
+    ) in serialized_input
+
+
+@pytest.mark.asyncio
+async def test_demonstration_uploads_keep_the_filename_only_input(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        video_attachment_module, "download_file", _download_from({"file_demo": _png_bytes("Upload me")}, tmp_path)
+    )
+    monkeypatch.setattr(agent_module, "replay_demonstration", AsyncMock(return_value=[]))
+
+    _, initial_input = await _run_turn_with_attached_images(
+        monkeypatch,
+        attached_files=[CopilotAttachedFile(file_id="file_demo", filename="invoice.png")],
+        attached_file_ids=["file_demo"],
+        safety_handler=AsyncMock(side_effect=[_CLEAN_TEXT_SCREEN, {"unsafe_file_ids": []}]),
+        product_action="demonstrate",
+    )
+
+    serialized_input = json.dumps(initial_input)
+    assert "invoice.png" in serialized_input
+    assert "input_image" not in serialized_input
+
+
+def _transparent_image(mode: str) -> Image.Image:
+    if mode == "P":
+        image = Image.new("P", (640, 240), 0)
+        image.putpalette([0, 0, 0, 255, 255, 255] + [0] * 762)
+        image.info["transparency"] = 0
+        ImageDraw.Draw(image).text((20, 100), "Popup blocked", fill=1)
+        image.putpalette([0, 0, 0, 0, 0, 0] + [0] * 762)
+        return image
+    image = Image.new(mode, (640, 240), (0, 0) if mode == "LA" else (0, 0, 0, 0))
+    ImageDraw.Draw(image).text((20, 100), "Popup blocked", fill=(0, 255) if mode == "LA" else (0, 0, 0, 255))
+    return image
+
+
+@pytest.mark.parametrize("mode", ["RGBA", "LA", "P"])
+def test_transparent_image_text_stays_visible_on_white(tmp_path: Path, mode: str) -> None:
+    path = tmp_path / "transparent.png"
+    image = _transparent_image(mode)
+    image.save(path)
+
+    frame = image_attachment_frame(str(path), file_id="file_1", filename="transparent.png")
+
+    with Image.open(BytesIO(base64.b64decode(frame.jpeg_base64))) as sent:
+        gray = sent.convert("L")
+        assert gray.getpixel((0, 0)) > 240
+        assert gray.getextrema()[0] < 64
+
+
+@pytest.mark.asyncio
+async def test_image_screen_without_a_safety_handler_withholds_the_image(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        video_attachment_module, "download_file", _download_from({"file_1": _png_bytes("token sk-raw")}, tmp_path)
+    )
+
+    message = await screened_image_attachment_message(
+        [CopilotAttachedFile(file_id="file_1", filename="token.png")], handler=None, organization_id="org-1"
+    )
+
+    assert not image_parts(message)
+    assert message is not None
+    assert (
+        "token.png (file_id=file_1) is not shown to you because its safety screen could not complete"
+        in (message["content"][1]["text"])
+    )
+
+
+@pytest.mark.asyncio
+async def test_unreadable_images_are_reported_by_filename_without_raising(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    disguised = BytesIO()
+    Image.new("RGB", (8, 8), "white").save(disguised, format="PPM")
+    contents = {"file_corrupt": b"not an image", "file_bomb": _png_bytes("big"), "file_ppm": disguised.getvalue()}
+
+    async def download(file_id: str, **_kwargs: Any) -> str:
+        if file_id == "file_broken":
+            raise RuntimeError("storage unavailable")
+        if file_id == "file_slow":
+            await asyncio.Event().wait()
+        path = tmp_path / f"{file_id}.download"
+        path.write_bytes(contents[file_id])
+        return str(path)
+
+    download_mock = AsyncMock(side_effect=download)
+    monkeypatch.setattr(video_attachment_module, "download_file", download_mock)
+    monkeypatch.setattr(video_attachment_module, "VIDEO_ATTACHMENT_PROCESSING_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setattr(video_attachment_module, "IMAGE_ATTACHMENT_MAX_PIXELS", 640 * 240 - 1)
+    safety_handler = AsyncMock()
+    filenames = {
+        "file_corrupt": "corrupt.png",
+        "file_broken": "broken.jpg",
+        "file_huge": "huge.webp",
+        "file_bomb": "bomb.png",
+        "file_ppm": "disguised.png",
+        "file_slow": "slow.gif",
+    }
+
+    message = await screened_image_attachment_message(
+        [
+            CopilotAttachedFile(
+                file_id=file_id,
+                filename=filename,
+                size_bytes=VIDEO_ATTACHMENT_SIZE_LIMIT_BYTES + 1 if file_id == "file_huge" else None,
+            )
+            for file_id, filename in filenames.items()
+        ],
+        handler=safety_handler,
+        organization_id="org-1",
+    )
+
+    assert message is not None
+    assert not image_parts(message)
+    notices = json.dumps(message)
+    for file_id, reason in {
+        "file_corrupt": "it could not be read as an image",
+        "file_broken": "it could not be downloaded",
+        "file_huge": "it is larger than",
+        "file_bomb": "it is 640x240 pixels, over the",
+        "file_ppm": "it could not be read as an image",
+        "file_slow": "preparing it timed out",
+    }.items():
+        assert f"{filenames[file_id]} (file_id={file_id}) is not shown to you because {reason}" in notices
+    assert "file_huge" not in [call.args[0] for call in download_mock.await_args_list]
+    assert download_mock.await_args_list[0].kwargs["limit_managed_file_size"] is True
+    assert not list(tmp_path.glob("*.download"))
+
+
+@pytest.mark.asyncio
+async def test_non_vision_model_keeps_filename_only_input_for_an_attached_image(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    download = AsyncMock()
+    monkeypatch.setattr(video_attachment_module, "download_file", download)
+
+    result, initial_input = await _run_turn_with_attached_images(
+        monkeypatch,
+        attached_files=[CopilotAttachedFile(file_id="file_1", filename="Capture.PNG")],
+        attached_file_ids=["file_1"],
+        safety_handler=AsyncMock(side_effect=[_CLEAN_TEXT_SCREEN]),
+        supports_vision=False,
+    )
+
+    assert result.user_response == "ok"
+    download.assert_not_awaited()
+    assert isinstance(initial_input, str)
+    assert "Capture.PNG" in initial_input
+    assert "input_image" not in initial_input
+
+
+def test_attached_image_is_upright_and_carries_no_comment_text(tmp_path: Path) -> None:
+    image = Image.new("RGB", (800, 400), "white")
+    exif = Image.Exif()
+    exif[0x0112] = 6
+    path = tmp_path / "phone.jpg"
+    image.save(path, exif=exif, comment=b"password: hunter2-raw-secret")
+
+    frame = image_attachment_frame(str(path), file_id="file_1", filename="phone.jpg")
+
+    sent_bytes = base64.b64decode(frame.jpeg_base64)
+    assert b"hunter2-raw-secret" not in sent_bytes
+    with Image.open(BytesIO(sent_bytes)) as sent:
+        assert sent.size == (400, 800)

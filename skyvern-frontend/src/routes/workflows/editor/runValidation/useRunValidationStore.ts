@@ -13,9 +13,9 @@ type RunValidationStore = {
   /** Problems the open Doc editor found in the draft; 0 when no Doc is open. */
   docProblemCount: number;
   setDocProblemCount: (count: number) => void;
-  /** Scrolls the open Doc to its first problem step; null when no Doc is open. */
-  docShowFirstProblem: (() => void) | null;
-  setDocShowFirstProblem: (show: (() => void) | null) => void;
+  /** Opens the open Doc's problems list; null when no Doc is open. */
+  docShowProblems: (() => void) | null;
+  setDocShowProblems: (show: (() => void) | null) => void;
 };
 
 function pathKey(path: Array<RunBlockingPathSegment>): string {
@@ -71,8 +71,8 @@ export const useRunValidationStore = create<RunValidationStore>((set, get) => ({
   setDocProblemCount: (count) => {
     if (get().docProblemCount !== count) set({ docProblemCount: count });
   },
-  docShowFirstProblem: null,
-  setDocShowFirstProblem: (show) => set({ docShowFirstProblem: show }),
+  docShowProblems: null,
+  setDocShowProblems: (show) => set({ docShowProblems: show }),
   setBlockingBlocks: (blocks) => {
     if (sameBlocks(get().blockingBlocks, blocks)) {
       return;

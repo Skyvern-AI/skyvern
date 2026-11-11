@@ -420,6 +420,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
     instance: DefaultPersistentSessionsManager | None = None
     _browser_sessions: dict[str, BrowserSession] = dict()
     _background_tasks: set[asyncio.Task[None]] = set()
+    _launch_tasks: dict[str, asyncio.Task[None]] = {}
     _close_cleanup_tasks: dict[tuple[str, str], asyncio.Task[None]] = {}
     _external_connect_locks: dict[str, asyncio.Lock] = {}
     _external_deadlines: dict[str, asyncio.Task[None]] = {}
@@ -869,8 +870,18 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             )
             self._background_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)
+            self._launch_tasks[session_id] = task
+            task.add_done_callback(lambda _: self._launch_tasks.pop(session_id, None))
 
         return session
+
+    async def wait_for_browser_launch(self, session_id: str, organization_id: str) -> bool:
+        launch = self._launch_tasks.get(session_id)
+        if launch is not None:
+            # asyncio.wait never cancels the launch, so a caller that stops waiting leaves it running.
+            await asyncio.wait({launch})
+        # A launch can finish while the caller's own lookup is still awaiting the database.
+        return launch is not None or session_id in self._browser_sessions
 
     async def _launch_browser_for_session(
         self,

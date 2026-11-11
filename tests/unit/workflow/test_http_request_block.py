@@ -687,6 +687,23 @@ class TestHttpRequestBlockCredentialSiteConfinement:
         requested.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_execute_refusal_keeps_a_credential_in_the_destination_host_out_of_the_reason_and_logs(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        context = _context_with_credential("https://login.example.com/login")
+        block = _http_block(url="https://{{ login_credentials.password }}.com/ingest")
+        monkeypatch.setattr(HttpRequestBlock, "get_workflow_run_context", lambda _self, _workflow_run_id: context)
+        monkeypatch.setattr(block_module, "aiohttp_request", MagicMock())
+        monkeypatch.setattr(block_module.app, "DATABASE", AsyncMock())
+
+        with capture_logs() as logs:
+            result = await block.execute(workflow_run_id="wr-1", workflow_run_block_id="wrb-1")
+
+        assert result.failure_reason is not None
+        assert "[redacted]" in result.failure_reason
+        assert not [text for text in (result.failure_reason, repr(logs)) if "hunter2-secret" in text]
+
+    @pytest.mark.asyncio
     async def test_execute_refuses_credential_in_a_header_to_another_site(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

@@ -6,7 +6,7 @@ import { TIPS, docTipIndex, type DocStarterProgress } from "./docStarterTips";
 import { docStarterDone } from "./useDocStarter";
 
 export const DOC_SAMPLE_NOTE =
-  "One thing per line. Lines without a tag, like this one, are notes the agent reads while it runs.";
+  "Type / to add a step. Plain text, like this line, is a note the agent reads while it runs.";
 
 /** Shown in place of the first line while a doc has no steps; it isn't saved. */
 export function DocStarterNote() {
@@ -67,7 +67,7 @@ export function DocGettingStarted({
   compact = false,
   clearOfPanel = false,
 }: {
-  // The side panel takes up to 24rem or 45% of the pane on its right; stay left of it.
+  // The side panel takes up to 22rem or 36% of the pane on its right; stay left of it.
   clearOfPanel?: boolean;
   // A narrow pane shows a small pill that opens the card, so it never covers the step being edited.
   compact?: boolean;
@@ -98,7 +98,7 @@ export function DocGettingStarted({
   const done = items.filter(([d]) => d).length;
   const position = cn(
     "absolute bottom-4 z-40",
-    clearOfPanel ? "right-[calc(min(24rem,45%)+1.25rem)]" : "right-5",
+    clearOfPanel ? "right-[calc(min(22rem,36%)+1.25rem)]" : "right-5",
   );
   if (asPill) {
     return (

@@ -1,5 +1,7 @@
 import base64
 import binascii
+import json
+import uuid
 from dataclasses import dataclass
 from datetime import timezone
 from email.utils import getaddresses, parseaddr, parsedate_to_datetime
@@ -356,16 +358,29 @@ def _accepted_message_id(response: httpx.Response) -> str | None:
 
 
 async def send_raw_message(
-    access_token: str, mime_bytes: bytes, client: httpx.AsyncClient | None = None
+    access_token: str, mime_bytes: bytes, client: httpx.AsyncClient | None = None, *, thread_id: str | None = None
 ) -> GmailSendResult:
     """Send one RFC 822 message with exactly one HTTP attempt."""
 
     async def _post(client_: httpx.AsyncClient) -> httpx.Response:
+        content = mime_bytes
+        content_type = "message/rfc822"
+        if thread_id:
+            boundary = f"skyvern_{uuid.uuid4().hex}"
+            metadata = json.dumps({"threadId": thread_id}).encode("utf-8")
+            content = (
+                f"--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n".encode()
+                + metadata
+                + f"\r\n--{boundary}\r\nContent-Type: message/rfc822\r\n\r\n".encode()
+                + mime_bytes
+                + f"\r\n--{boundary}--\r\n".encode()
+            )
+            content_type = f'multipart/related; boundary="{boundary}"'
         return await client_.post(
             GMAIL_SEND_URL,
-            params={"uploadType": "media"},
-            content=mime_bytes,
-            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "message/rfc822"},
+            params={"uploadType": "multipart" if thread_id else "media"},
+            content=content,
+            headers={"Authorization": f"Bearer {access_token}", "Content-Type": content_type},
             timeout=GMAIL_SEND_TIMEOUT_SECONDS,
         )
 

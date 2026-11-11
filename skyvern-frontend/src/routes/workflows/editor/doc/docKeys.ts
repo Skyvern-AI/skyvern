@@ -4,6 +4,21 @@ import { isMacPlatform } from "@/util/platform";
 
 /** Fired by the run-agent shortcut; the top-bar Run button opens its "Run with" box (or runs, if it is open). */
 export const DOC_RUN_AGENT_EVENT = "skyvern:doc-run-agent";
+/** Fired when Run is refused for problems; the Doc opens its problems list. */
+export const DOC_SHOW_PROBLEMS_EVENT = "skyvern:doc-show-problems";
+
+// A line's edit span is replaced when it loses focus, so a saved element can be gone: look the step's line up again.
+export function docStepLine(
+  root: ParentNode | null,
+  stepId: string | null,
+): HTMLElement | null {
+  if (!root || !stepId) return null;
+  return (
+    Array.from(root.querySelectorAll<HTMLElement>("[data-doc-node-id]"))
+      .find((el) => el.dataset.docNodeId === stepId)
+      ?.querySelector<HTMLElement>("[data-doc-line]") ?? null
+  );
+}
 
 /** What the caret split a line into. */
 export type LineSplit = { before: string; after: string };

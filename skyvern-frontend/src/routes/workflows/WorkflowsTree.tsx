@@ -916,8 +916,8 @@ function WorkflowsTree() {
             </Button>
           )}
         </header>
-        <div className="flex justify-between">
-          <div className="flex items-center gap-3">
+        <div className="flex flex-wrap justify-between gap-y-2">
+          <div className="flex flex-wrap items-center gap-3">
             <TableSearchInput
               value={search}
               onChange={(value) => {
@@ -944,7 +944,7 @@ function WorkflowsTree() {
               />
             ) : null}
           </div>
-          <div className="flex items-center gap-4">
+          <div className="flex flex-wrap items-center gap-4">
             <Link
               to="/discover"
               className="text-sm text-muted-foreground hover:text-foreground"
@@ -999,7 +999,7 @@ function WorkflowsTree() {
         </div>
         <WorkflowsListContext.Provider value={listContextValue}>
           <div className="overflow-hidden rounded-lg border border-border">
-            <Table className="table-fixed [&_td:last-child]:pr-6 [&_th:last-child]:pr-6">
+            <Table className="min-w-[960px] table-fixed [&_td:last-child]:pr-6 [&_th:last-child]:pr-6">
               <TableHeader>
                 <TableRow className="group/header">
                   {showCheckbox && (

@@ -19,9 +19,8 @@ import { Separator } from "@/components/ui/separator";
 import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 
-import { GoogleOAuthCredentialSelector } from "@/routes/workflows/components/GoogleOAuthCredentialSelector";
+import { CredentialSourceSelector } from "@/routes/workflows/components/CredentialSourceSelector";
 import { type EmailTransport } from "@/routes/workflows/types/workflowTypes";
-import { GOOGLE_GMAIL_SEND_REQUIRED_SCOPES } from "@/util/googleScopes";
 
 import {
   AI_IMPROVE_CONFIGS,
@@ -68,6 +67,8 @@ function SendEmailEditorBody({
     fileAttachments,
     transport,
     credentialId,
+    credentialSource,
+    connectionId,
     cc,
     bcc,
   } = data;
@@ -79,7 +80,14 @@ function SendEmailEditorBody({
   // restores them; a Gmail block is saved without them.
   const changeTransport = (next: EmailTransport) => {
     if (next !== "gmail") {
-      update({ transport: next, credentialId: "", cc: "", bcc: "" });
+      update({
+        transport: next,
+        credentialId: "",
+        credentialSource: "native",
+        connectionId: "",
+        cc: "",
+        bcc: "",
+      });
       return;
     }
     const namedPlatformSecrets = PLATFORM_SMTP_SECRET_FIELDS.filter(
@@ -123,12 +131,29 @@ function SendEmailEditorBody({
             </Label>
             <HelpTooltip content="The email is sent from this account. Only accounts connected for sending on the Integrations page are listed." />
           </div>
-          <GoogleOAuthCredentialSelector
+          <CredentialSourceSelector
+            provider="gmail"
+            purpose={data.replyToMessageId ? "reply" : "send"}
             nodeId={blockId}
-            value={credentialId}
-            onChange={(value) => update({ credentialId: value })}
-            requiredScopes={GOOGLE_GMAIL_SEND_REQUIRED_SCOPES}
-            gmailSendOnly
+            credentialId={credentialId}
+            credentialSource={credentialSource ?? "native"}
+            connectionId={connectionId ?? ""}
+            disabled={!editable}
+            onChange={(source, id) =>
+              update(
+                source === "native"
+                  ? {
+                      credentialSource: "native",
+                      connectionId: "",
+                      credentialId: id,
+                    }
+                  : {
+                      credentialSource: "nango",
+                      connectionId: id,
+                      credentialId: "",
+                    },
+              )
+            }
           />
         </div>
       ) : null}

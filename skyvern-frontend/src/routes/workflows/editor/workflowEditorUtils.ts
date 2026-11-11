@@ -1218,8 +1218,11 @@ function convertToNode(
           customSmtpPassword: block.custom_smtp_password ?? null,
           transport: block.transport ?? "smtp",
           credentialId: block.credential_id ?? "",
+          credentialSource: block.credential_source ?? "native",
+          connectionId: block.connection_id ?? "",
           cc: (block.cc ?? []).join(", "),
           bcc: (block.bcc ?? []).join(", "),
+          replyToMessageId: block.reply_to_message_id ?? "",
         },
       };
     }
@@ -1526,6 +1529,7 @@ function convertToNode(
           maxResults: block.max_results ?? 25,
           includeBody: block.include_body ?? true,
           downloadAttachments: block.download_attachments ?? false,
+          messageId: block.message_id ?? "",
           parameterKeys: (block.parameters ?? []).map((p) => p.key),
         },
       };
@@ -3740,6 +3744,12 @@ function getWorkflowBlock(
           block_type: "send_email",
           transport: "gmail",
           credential_id: node.data.credentialId || null,
+          ...(node.data.credentialSource === "nango"
+            ? {
+                credential_source: "nango",
+                connection_id: node.data.connectionId || null,
+              }
+            : {}),
           sender: "",
           recipients: splitEmailList(node.data.recipients),
           cc: splitEmailList(node.data.cc),
@@ -3750,6 +3760,7 @@ function getWorkflowBlock(
           file_attachments: splitEmailList(node.data.fileAttachments).filter(
             (attachment) => attachment !== SKYVERN_DOWNLOAD_DIRECTORY,
           ),
+          reply_to_message_id: node.data.replyToMessageId || null,
         };
       }
       return {
@@ -4008,6 +4019,7 @@ function getWorkflowBlock(
         max_results: node.data.maxResults,
         include_body: node.data.includeBody,
         download_attachments: node.data.downloadAttachments,
+        message_id: node.data.messageId || null,
         parameter_keys: node.data.parameterKeys,
       };
     }
@@ -4781,7 +4793,8 @@ function leavesBrowserState(node: AppNode, nodes: Array<AppNode>): boolean {
     case "navigation":
       return node.data.engine !== RunEngine.SkyvernV2;
     case "loop":
-      // A container itself navigates nothing; its children do.
+      // A container itself navigates nothing; its children do. A loop that runs zero times opens nothing
+      // either; counting it anyway is a deliberate approximation that can only hide this warning.
       return nodes.some(
         (child) =>
           child.parentId === node.id && leavesBrowserState(child, nodes),
@@ -4818,15 +4831,8 @@ function isFirstBrowserTaskBlock(
   });
 }
 
-// A run starts on about:blank, so the backend fails a first page-opening block that has no
-// URL (MissingStarterUrl).
-function isMissingRequiredStartUrl(
-  nodes: Array<AppNode>,
-  edges: Array<Edge>,
-  id: string,
-): boolean {
-  const node = nodes.find((node) => node.id === id);
-  if (!node) return false;
+// A page-opening block with an empty URL field starts on whatever page the run has open.
+function opensPageWithoutUrl(node: AppNode, nodes: Array<AppNode>): boolean {
   switch (node.type) {
     case "task":
     case "navigation":
@@ -4835,14 +4841,25 @@ function isMissingRequiredStartUrl(
     case "login":
     case "url":
     case "fileDownload":
-      return (
-        node.data.url.trim() === "" &&
-        leavesBrowserState(node, nodes) &&
-        isFirstBrowserTaskBlock(nodes, edges, id)
-      );
+      return node.data.url.trim() === "" && leavesBrowserState(node, nodes);
     default:
       return false;
   }
+}
+
+// A run starts on about:blank, so the backend fails a first page-opening block that has no
+// URL (MissingStarterUrl).
+function isMissingRequiredStartUrl(
+  nodes: Array<AppNode>,
+  edges: Array<Edge>,
+  id: string,
+): boolean {
+  const node = nodes.find((node) => node.id === id);
+  return (
+    node !== undefined &&
+    opensPageWithoutUrl(node, nodes) &&
+    isFirstBrowserTaskBlock(nodes, edges, id)
+  );
 }
 
 function convertParametersToParameterYAML(
@@ -5466,8 +5483,15 @@ function convertBlocksToBlockYAML(
             ? {
                 transport: block.transport,
                 credential_id: block.credential_id ?? null,
+                ...(block.credential_source === "nango"
+                  ? {
+                      credential_source: block.credential_source,
+                      connection_id: block.connection_id ?? null,
+                    }
+                  : {}),
                 cc: block.cc ?? [],
                 bcc: block.bcc ?? [],
+                reply_to_message_id: block.reply_to_message_id ?? null,
               }
             : {}),
         };
@@ -5582,6 +5606,7 @@ function convertBlocksToBlockYAML(
           max_results: block.max_results,
           include_body: block.include_body,
           download_attachments: block.download_attachments,
+          message_id: block.message_id ?? null,
           parameter_keys: (block.parameters ?? []).map((p) => p.key),
         };
         return blockYaml;
@@ -6389,6 +6414,7 @@ export {
   getAvailableOutputParameterKeys,
   isFirstBrowserTaskBlock,
   isMissingRequiredStartUrl,
+  opensPageWithoutUrl,
   urlMayBeGoogleDrive,
   getBlockNameOfOutputParameterKey,
   getDefaultValueForParameterType,

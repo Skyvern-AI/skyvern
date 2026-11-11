@@ -35,7 +35,7 @@ from skyvern import Skyvern
 
 client = Skyvern(api_key=os.environ["SKYVERN_API_KEY"])
 
-run = await client.get_run("tsk_v2_490440779503357994")
+run = await client.get_run("tsk_v2_123")
 print(run.status, run.failure_reason, run.errors, run.step_count, run.app_url)
 ```
 
@@ -44,12 +44,12 @@ import { Skyvern } from "@skyvern/client";
 
 const client = new Skyvern({ apiKey: process.env.SKYVERN_API_KEY! });
 
-const run = await client.getRun("tsk_v2_490440779503357994");
+const run = await client.getRun("tsk_v2_123");
 console.log(run.status, run.failure_reason, run.errors, run.step_count, run.app_url);
 ```
 
 ```bash cURL
-curl "https://api.skyvern.com/v1/runs/tsk_v2_490440779503357994" \
+curl "https://api.skyvern.com/v1/runs/tsk_v2_123" \
   -H "x-api-key: $SKYVERN_API_KEY" \
   | jq '{status, failure_reason, errors, step_count, app_url}'
 ```
@@ -249,7 +249,7 @@ Every run records what happened: a video, screenshots, the AI's prompts and answ
 <CodeGroup>
 ```python Python
 artifacts = await client.get_run_artifacts(
-    "tsk_v2_490440779503357994",
+    "tsk_v2_123",
     artifact_type=["recording", "screenshot_final", "skyvern_log"],
 )
 for artifact in artifacts:
@@ -257,7 +257,7 @@ for artifact in artifacts:
 ```
 
 ```typescript TypeScript
-const artifacts = await client.getRunArtifacts("tsk_v2_490440779503357994", {
+const artifacts = await client.getRunArtifacts("tsk_v2_123", {
   artifact_type: ["recording", "screenshot_final", "skyvern_log"],
 });
 for (const artifact of artifacts) {
@@ -266,7 +266,7 @@ for (const artifact of artifacts) {
 ```
 
 ```bash cURL
-curl "https://api.skyvern.com/v1/runs/tsk_v2_490440779503357994/artifacts?artifact_type=recording&artifact_type=screenshot_final" \
+curl "https://api.skyvern.com/v1/runs/tsk_v2_123/artifacts?artifact_type=recording&artifact_type=screenshot_final" \
   -H "x-api-key: $SKYVERN_API_KEY"
 ```
 </CodeGroup>
