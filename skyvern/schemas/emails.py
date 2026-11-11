@@ -19,6 +19,21 @@ class GmailHopRefusal(StrEnum):
     reconnect = "reconnect"
     run_not_supported = "run_not_supported"
     account_unavailable = "account_unavailable"
+    resave_required = "resave_required"
+    owner_unconfirmed = "owner_unconfirmed"
+
+
+# Shared by the inbox and send blocks, which word the rest of their refusal differently.
+CONNECTED_ACCOUNT_RESAVE_REASON = (
+    "This Gmail account can be used only by whoever last saved this workflow. Have the person this run belongs to "
+    "open and save it — for a schedule, whoever last created or changed the schedule; for an event trigger, whoever "
+    "last changed its mapping or secret."
+)
+CONNECTED_ACCOUNT_OWNER_UNCONFIRMED_REASON = (
+    "This Gmail account was not used because Skyvern could not confirm the person this run acts for. That person "
+    "(who started the run, or last changed its schedule or trigger) must still be a member, and a Trigger block may pass "
+    "this workflow only its own inputs. If both hold, run it again."
+)
 
 
 class GmailSendOutcome(StrEnum):

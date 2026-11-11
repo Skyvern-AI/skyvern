@@ -377,6 +377,8 @@ from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.browser_session_kind import BrowserSessionKind
 from skyvern.schemas.browser_settings import requested_timezone_id
 from skyvern.schemas.emails import (
+    CONNECTED_ACCOUNT_OWNER_UNCONFIRMED_REASON,
+    CONNECTED_ACCOUNT_RESAVE_REASON,
     EmailBodyFormat,
     EmailTransport,
     GmailHopRefusal,
@@ -13800,25 +13802,35 @@ GMAIL_SEND_FAILURE_MESSAGES: dict[GmailSendErrorCode, str] = {
     GmailSendErrorCode.INTERNAL_ERROR: "The email could not be prepared. Nothing was sent.",
 }
 
-# The only triggers a person starts directly; a connected account's capability is never prepared for the rest.
-_PERSON_TRIGGER_TYPES = frozenset(
-    {None, WorkflowRunTriggerType.manual, WorkflowRunTriggerType.mcp, WorkflowRunTriggerType.api}
+# The trigger kinds a connected account's capability may be prepared for; never for the rest. A child run carries
+# its chain root's kind, so admitting a kind admits that kind's children too.
+_CONNECTED_ACCOUNT_TRIGGER_TYPES = frozenset(
+    {
+        None,
+        WorkflowRunTriggerType.manual,
+        WorkflowRunTriggerType.mcp,
+        WorkflowRunTriggerType.api,
+        WorkflowRunTriggerType.scheduled,
+        WorkflowRunTriggerType.event,
+    }
 )
 
 
-async def _is_unattended_run(workflow_run_id: str, organization_id: str) -> bool:
-    """Whether the run is a child or was triggered without a person; an unreadable run reads as neither."""
+async def _is_unsupported_connected_account_run(workflow_run_id: str, organization_id: str) -> bool:
+    """Whether this run's trigger kind can never hold the capability; an unreadable run reads as neither."""
     try:
         run = await app.DATABASE.workflow_runs.get_workflow_run(workflow_run_id, organization_id=organization_id)
     except Exception:  # noqa: BLE001 - only the wording of a refusal depends on this.
         return False
-    return run is not None and (run.parent_workflow_run_id is not None or run.trigger_type not in _PERSON_TRIGGER_TYPES)
+    return run is not None and run.trigger_type not in _CONNECTED_ACCOUNT_TRIGGER_TYPES
 
 
 _CONNECTED_ACCOUNT_RECONNECT_MESSAGE = (
     "The selected Gmail account must be reconnected on the Integrations page and then selected again in this block "
     "before it can send email. Nothing was sent."
 )
+
+_CONNECTED_ACCOUNT_RESAVE_MESSAGE = f"{CONNECTED_ACCOUNT_RESAVE_REASON} Nothing was sent."
 
 _GMAIL_AUTHORIZATION_ERROR_CODES: dict[google_oauth_service.GmailSendAuthorizationStatus, GmailSendErrorCode] = {
     google_oauth_service.GmailSendAuthorizationStatus.CONFIGURATION: GmailSendErrorCode.CONFIGURATION,
@@ -14422,14 +14434,19 @@ class SendEmailBlock(Block):
             refusal = workflow_run_context.get_gmail_hop_refusal(self.label)
             if refusal == GmailHopRefusal.reconnect:
                 raise _GmailSendRefused(GmailSendErrorCode.RECONNECT, _CONNECTED_ACCOUNT_RECONNECT_MESSAGE)
+            if refusal == GmailHopRefusal.resave_required:
+                raise _GmailSendRefused(GmailSendErrorCode.CONFIGURATION, _CONNECTED_ACCOUNT_RESAVE_MESSAGE)
+            if refusal == GmailHopRefusal.owner_unconfirmed:
+                raise _GmailSendRefused(
+                    GmailSendErrorCode.CONFIGURATION, f"{CONNECTED_ACCOUNT_OWNER_UNCONFIRMED_REASON} Nothing was sent."
+                )
             if refusal == GmailHopRefusal.run_not_supported or (
-                refusal is None and await _is_unattended_run(workflow_run_id, organization_id)
+                refusal is None and await _is_unsupported_connected_account_run(workflow_run_id, organization_id)
             ):
                 raise _GmailSendRefused(
                     GmailSendErrorCode.CONFIGURATION,
-                    "This Gmail account can send only in runs a person starts. Scheduled, webhook, event, API-key "
-                    "and child workflow runs are not supported; use a natively connected Google account for those. "
-                    "Nothing was sent.",
+                    "This Gmail account cannot send in a run started with an API key, or in a webhook, job recipe or "
+                    "directory submission run; use a natively connected Google account for those. Nothing was sent.",
                 )
             raise _GmailSendRefused(GmailSendErrorCode.CONFIGURATION)
         to = self._resolve_recipient_entries(self.recipients, workflow_run_context)

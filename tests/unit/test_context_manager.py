@@ -209,6 +209,7 @@ async def test_powerbi_refusal_is_handed_to_run_context(monkeypatch: pytest.Monk
         cm.app,
         "AGENT_FUNCTION",
         SimpleNamespace(
+            request_gmail_hop_tokens=AsyncMock(),
             get_powerbi_query_hop_tokens=AsyncMock(return_value={}),
             get_powerbi_query_hop_refusals=AsyncMock(return_value={"query": "account_disconnected"}),
         ),

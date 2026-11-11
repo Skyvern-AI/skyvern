@@ -668,10 +668,7 @@ async def test_powerbi_offered_is_false_without_a_working_cloud_gate(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("code", "expected_category"),
-    [
-        ("event_trigger_run", FailureCategory.CREDENTIAL_ERROR),
-        ("trigger_parent_owner_mismatch", FailureCategory.CREDENTIAL_ERROR),
-    ],
+    [("trigger_parent_owner_mismatch", FailureCategory.CREDENTIAL_ERROR)],
 )
 async def test_refused_run_is_labeled_by_the_block_not_by_its_wording(
     monkeypatch: pytest.MonkeyPatch, code: str, expected_category: FailureCategory
@@ -740,12 +737,6 @@ async def test_powerbi_query_failures_are_safe_and_oss_hook_fails_closed(monkeyp
             "human_run_required",
             HUMAN_RUN_REQUIRED_REASON,
             None,
-        ),
-        (
-            "event_trigger_run",
-            "human_run_required",
-            HUMAN_RUN_REQUIRED_REASON,
-            FailureCategory.CREDENTIAL_ERROR,
         ),
         (
             "trigger_parent_owner_mismatch",
