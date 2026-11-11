@@ -15,6 +15,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     PersistentBrowserSession,
     PersistentBrowserType,
 )
+from skyvern.schemas.bot_protection import BotProtection
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.browser_session_kind import BrowserSessionKind
 from skyvern.schemas.browser_settings import BrowserSettings
@@ -239,6 +240,7 @@ class PersistentSessionsManager(Protocol):
         browser_settings: BrowserSettings | None = None,
         created_for_workflow_run_id: str | None = None,
         created_for_workflow_permanent_id: str | None = None,
+        bot_protection: BotProtection | None = None,
     ) -> PersistentBrowserSession:
         """Create a new browser session.
 
