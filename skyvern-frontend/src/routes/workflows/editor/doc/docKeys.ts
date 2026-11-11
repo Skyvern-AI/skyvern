@@ -6,22 +6,74 @@ import { isMacPlatform } from "@/util/platform";
 export const DOC_RUN_AGENT_EVENT = "skyvern:doc-run-agent";
 /** Fired by "Fix problems" in the Run confirmation; the Doc opens its problems list. */
 export const DOC_SHOW_PROBLEMS_EVENT = "skyvern:doc-show-problems";
-/** Where focus goes back to when the problems list closes: where it was when Run was pressed. */
-export type DocShowProblemsDetail = {
-  returnFocus: HTMLElement | null;
-  returnStepId: string | null;
+/**
+ * Where focus goes back to when Run's problems question or the Doc's problems list closes. A line's edit span is
+ * replaced when it loses focus, so the element can be gone; the line is then found again in its step by aria-label
+ * and its index among lines with that label (every Note is labelled "Note").
+ */
+export type DocReturnPoint = {
+  element: HTMLElement;
+  stepId: string | null;
+  lineLabel: string | null;
+  lineIndex: number;
 };
+/** Fired by "Fix problems" in the Run confirmation; null when focus was nowhere to return to. */
+export type DocShowProblemsDetail = { returnPoint: DocReturnPoint | null };
 
-// A line's edit span is replaced when it loses focus, so a saved element can be gone: look the step's line up again.
+function docStep(root: ParentNode, stepId: string): HTMLElement | undefined {
+  return Array.from(
+    root.querySelectorAll<HTMLElement>("[data-doc-node-id]"),
+  ).find((el) => el.dataset.docNodeId === stepId);
+}
+
+function linesLabelled(step: ParentNode, label: string): HTMLElement[] {
+  return Array.from(
+    step.querySelectorAll<HTMLElement>("[data-doc-line]"),
+  ).filter((line) => line.getAttribute("aria-label") === label);
+}
+
+export function captureReturnPoint(el: Element | null): DocReturnPoint | null {
+  if (!(el instanceof HTMLElement)) return null;
+  const step = el.closest<HTMLElement>("[data-doc-node-id]");
+  const line = el.closest<HTMLElement>("[data-doc-line]");
+  const lineLabel = line?.getAttribute("aria-label") ?? null;
+  return {
+    element: el,
+    stepId: step?.dataset.docNodeId ?? null,
+    lineLabel,
+    lineIndex:
+      step && line && lineLabel !== null
+        ? Math.max(0, linesLabelled(step, lineLabel).indexOf(line))
+        : 0,
+  };
+}
+
+export function resolveReturnPoint(
+  root: ParentNode | null,
+  point: DocReturnPoint | null,
+): HTMLElement | null {
+  if (!point) return null;
+  if (point.element.isConnected) return point.element;
+  const step = root && point.stepId ? docStep(root, point.stepId) : undefined;
+  if (!step) return null;
+  const labelled =
+    point.lineLabel === null ? [] : linesLabelled(step, point.lineLabel);
+  return (
+    labelled[point.lineIndex] ??
+    labelled[0] ??
+    step.querySelector<HTMLElement>("[data-doc-line]") ??
+    null
+  );
+}
+
+// A line's edit span is replaced when it loses focus, so a saved element can be gone: look up the step's first line.
 export function docStepLine(
   root: ParentNode | null,
   stepId: string | null,
 ): HTMLElement | null {
   if (!root || !stepId) return null;
   return (
-    Array.from(root.querySelectorAll<HTMLElement>("[data-doc-node-id]"))
-      .find((el) => el.dataset.docNodeId === stepId)
-      ?.querySelector<HTMLElement>("[data-doc-line]") ?? null
+    docStep(root, stepId)?.querySelector<HTMLElement>("[data-doc-line]") ?? null
   );
 }
 
