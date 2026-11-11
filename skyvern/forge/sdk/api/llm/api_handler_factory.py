@@ -26,7 +26,7 @@ from litellm.types.router import AllowedFailsPolicy
 # supports_tool_choice is not re-exported on the litellm module, whose __getattr__ raises for
 # un-exported names — reading it as litellm.supports_tool_choice would AttributeError.
 from litellm.utils import CustomStreamWrapper, ModelResponse, supports_tool_choice
-from openai import APIConnectionError, APIError, APIStatusError, AsyncOpenAI, RateLimitError
+from openai import APIConnectionError, APIError, APIStatusError, AsyncOpenAI, Omit, RateLimitError
 from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
 from opentelemetry import trace as otel_trace
 from pydantic import BaseModel
@@ -240,13 +240,30 @@ def _build_custom_llm_http_client(llm_key: str, llm_config: LLMConfig) -> AsyncO
 
     litellm_params = llm_config.litellm_params or {}
     if llm_config.model_name.startswith("openai/"):
+        api_key = litellm_params.get("api_key")
+        # A nonempty placeholder prevents SDK/LiteLLM fallback to server credentials.
+        # Omit removes only generated auth; explicit extra_headers still take precedence.
         return AsyncOpenAI(
-            api_key=litellm_params.get("api_key"),
+            api_key=api_key or "skyvern-keyless",
+            default_headers={} if api_key else {"Authorization": Omit()},
             base_url=litellm_params.get("api_base"),
             http_client=ForgeAsyncHttpxClientWrapper(follow_redirects=False),
         )
 
     return _NoRedirectAsyncHTTPHandler()
+
+
+def _configure_custom_llm_client(parameters: dict[str, Any], client: AsyncOpenAI | AsyncHTTPHandler) -> None:
+    parameters["client"] = client
+    if isinstance(client, AsyncOpenAI):
+        parameters["api_key"] = client.api_key
+        if isinstance(client.default_headers.get("Authorization"), Omit):
+            # Newer SDKs require the omission on the request as well as the client.
+            # Explicit custom headers still take precedence.
+            parameters["extra_headers"] = {
+                "Authorization": Omit(),
+                **(parameters.get("extra_headers") or {}),
+            }
 
 
 # Deduped once per process on purpose: the reasons are a fixed, low-cardinality set, and an
@@ -3220,7 +3237,7 @@ class LLMAPIHandlerFactory:
                     await _validate_custom_llm_api_base(llm_key, llm_config)
                     custom_http_client = _build_custom_llm_http_client(llm_key, llm_config)
                     if custom_http_client is not None:
-                        active_parameters["client"] = custom_http_client
+                        _configure_custom_llm_client(active_parameters, custom_http_client)
                     # TODO (kerem): add a retry mechanism to this call (acompletion_with_retries)
                     # TODO (kerem): use litellm fallbacks? https://litellm.vercel.app/docs/tutorials/fallbacks#how-does-completion_with_fallbacks-work
                     # num_retries>0 lets litellm back off + retry transient errors (429/timeout) instead of failing the run.
@@ -4720,14 +4737,28 @@ class LLMCaller:
         if self.llm_key and "UI_TARS" in self.llm_key:
             return await self._call_ui_tars(messages, tools, timeout, **active_parameters)
 
-        return await litellm.acompletion(
-            model=self.llm_config.model_name,
-            messages=messages,
-            tools=tools,
-            timeout=timeout,
-            drop_params=True,  # Drop unsupported parameters gracefully
-            **active_parameters,
+        custom_http_client = (
+            _build_custom_llm_http_client(self.original_llm_key, self.llm_config)
+            if isinstance(self.llm_config, LLMConfig)
+            else None
         )
+        try:
+            if custom_http_client is not None:
+                _configure_custom_llm_client(active_parameters, custom_http_client)
+            return await litellm.acompletion(
+                model=self.llm_config.model_name,
+                messages=messages,
+                tools=tools,
+                timeout=timeout,
+                drop_params=True,  # Drop unsupported parameters gracefully
+                **active_parameters,
+            )
+        finally:
+            if custom_http_client is not None:
+                try:
+                    await custom_http_client.close()
+                except Exception:
+                    LOG.warning("Failed to close custom LLM HTTP client", llm_key=self.original_llm_key, exc_info=True)
 
     async def _call_anthropic(
         self,
