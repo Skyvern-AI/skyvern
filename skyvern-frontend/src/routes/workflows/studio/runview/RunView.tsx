@@ -39,6 +39,8 @@ import {
 import { useRunViewStore } from "@/store/RunViewStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 import { useWorkflowBlockSearchStore } from "@/store/WorkflowBlockSearchStore";
+import { useDocOnScreen } from "../../editor/doc/useDocOnScreen";
+import { useLocateBlockStore } from "../../editor/runValidation/useLocateBlockStore";
 import {
   type WorkflowRunMilestoneCardProps,
   usePageSlots,
@@ -312,6 +314,7 @@ export function RunView({
     preserveNextEntry,
   } = useStudioPanes();
   const runPaneOpen = studioPanes.includes("overview");
+  const docOnScreen = useDocOnScreen();
   const navigate = useNavigate();
   const location = useLocation();
   const [searchParams] = useSearchParams();
@@ -920,9 +923,10 @@ export function RunView({
       targets: handle.getTargets(),
       label: block.label,
     });
-    if (nodeId) {
-      handle.focusBlock(nodeId);
-    }
+    if (!nodeId) return;
+    // The canvas stays mounted behind the Doc; the Doc scrolls to and flashes a located block instead.
+    if (docOnScreen) useLocateBlockStore.getState().requestLocate(nodeId);
+    else handle.focusBlock(nodeId);
   };
   const selectTimelineBlock = (block: WorkflowRunBlock) => {
     pinFrame(block.workflow_run_block_id);

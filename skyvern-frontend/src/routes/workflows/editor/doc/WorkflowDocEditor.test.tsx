@@ -35,6 +35,7 @@ import { isWorkflowBlockNode } from "../nodes";
 import { getElements } from "../workflowEditorUtils";
 import { useLocateBlockStore } from "../runValidation/useLocateBlockStore";
 import { DOC_SHOW_PROBLEMS_EVENT } from "./docKeys";
+import { docDetailsText } from "./docDetailsText";
 import { useDocRunCheckStore } from "./docRunCheckStore";
 import { WorkflowDocEditor } from "./WorkflowDocEditor";
 import { useDocUnfinishedStore } from "./docUnfinished";
@@ -117,6 +118,36 @@ function renderDoc(
     </QueryClientProvider>,
   );
   return nodes;
+}
+
+// A Doc whose edits change what it renders: rerender() shows the graph the last edit left.
+function renderLiveDoc(blocks: WorkflowBlock[]) {
+  let current = getElements(blocks, settings(), true) as DocGraph;
+  const client = new QueryClient();
+  const edits: DocGraphEdits = {
+    apply: (next) => {
+      current = next;
+    },
+    update: (change) => {
+      current = { ...current, nodes: change(current.nodes) };
+    },
+    addStep: () => null,
+    duplicate: () => {},
+  };
+  const view = () => (
+    <QueryClientProvider client={client}>
+      <MemoryRouter>
+        <ReactFlowProvider>
+          <WorkflowDocEditor {...current} edits={edits} />
+        </ReactFlowProvider>
+      </MemoryRouter>
+    </QueryClientProvider>
+  );
+  const rendered = render(view());
+  return {
+    graph: () => current,
+    rerender: () => rendered.rerender(view()),
+  };
 }
 
 // The count of problems (not warnings) on the Doc's problems button.
@@ -1250,8 +1281,122 @@ describe("WorkflowDocEditor navigation", () => {
     ).toBeNull();
   });
 
-  test("Details names its step, lists the step's settings, and its last item opens the side panel", () => {
-    renderDoc(
+  test("a step whose text is empty keeps its filled Terminate if in view with Details closed", () => {
+    const nodes = renderDoc(
+      [
+        block("validation", "check", null, {
+          complete_criterion: "",
+          terminate_criterion: "Stop when the page is blocked",
+        }),
+      ],
+      { apply: vi.fn(), update: vi.fn(), addStep: vi.fn(), duplicate: vi.fn() },
+    );
+    const step = within(
+      document.querySelector<HTMLElement>(
+        `[data-doc-node-id="${nodes.find((n) => n.data.label === "check")!.id}"]`,
+      )!,
+    );
+    expect(
+      step
+        .getByRole("button", { name: /^Details for/ })
+        .getAttribute("aria-expanded"),
+    ).toBe("false");
+    expect(step.getByText("Terminate if")).toBeTruthy();
+    expect(
+      step.getByRole("textbox", { name: "check terminateCriterion" }),
+    ).toBeTruthy();
+  });
+
+  test("a step's open Details stays open after a keyboard move remounts it", () => {
+    const doc = renderLiveDoc([
+      block("text_prompt", "first", "second", {
+        prompt: "Write A",
+        parameters: [],
+      }),
+      block("text_prompt", "second", null, {
+        prompt: "Write B",
+        parameters: [],
+      }),
+    ]);
+    const before = doc.graph();
+    const second = before.nodes.find((node) => node.data.label === "second")!;
+    const toggle = () =>
+      within(
+        document.querySelector<HTMLElement>(
+          `[data-doc-node-id="${second.id}"]`,
+        )!,
+      ).getByRole("button", { name: /^Details for/ });
+    fireEvent.click(toggle());
+    fireEvent.click(screen.getByText("Write B"));
+    fireEvent.keyDown(screen.getByRole("textbox", { name: "second prompt" }), {
+      key: "ArrowUp",
+      altKey: true,
+      shiftKey: true,
+    });
+    expect(doc.graph()).not.toBe(before);
+    doc.rerender();
+    expect(toggle().getAttribute("aria-expanded")).toBe("true");
+  });
+
+  test("clearing a step's text leaves its other lines where they are until the line is left", () => {
+    const doc = renderLiveDoc([
+      block("task", "read_page", null, {
+        navigation_goal: "Open the orders page",
+        data_extraction_goal: "Get the order total",
+        complete_criterion: "The total shows",
+      }),
+    ]);
+    const extract = () =>
+      screen.queryByRole("textbox", { name: "read_page dataExtractionGoal" });
+    expect(extract()).toBeNull();
+    const name = "read_page navigationGoal";
+    fireEvent.focus(screen.getByRole("textbox", { name }));
+    const box = screen.getByRole("textbox", { name });
+    // jsdom has no innerText; the line reads it on input.
+    Object.defineProperty(box, "innerText", { value: "", configurable: true });
+    fireEvent.input(box);
+    doc.rerender();
+    expect(
+      (
+        doc.graph().nodes.find(isWorkflowBlockNode)!.data as Record<
+          string,
+          unknown
+        >
+      ).navigationGoal,
+    ).toBe("");
+    expect(extract()).toBeNull();
+    // Focus moving within the line keeps the placement it started with.
+    fireEvent.focus(screen.getByRole("textbox", { name }));
+    expect(extract()).toBeNull();
+
+    fireEvent.blur(screen.getByRole("textbox", { name }));
+    expect(extract()).not.toBeNull();
+  });
+
+  test("a save lock during an edit drops the held placement, so the next edit starts from what the step shows", () => {
+    const doc = renderLiveDoc([
+      block("task", "read_page", null, {
+        navigation_goal: "Open the orders page",
+        data_extraction_goal: "Get the order total",
+      }),
+    ]);
+    const extract = () =>
+      screen.queryByRole("textbox", { name: "read_page dataExtractionGoal" });
+    const name = "read_page navigationGoal";
+    fireEvent.focus(screen.getByRole("textbox", { name }));
+    const box = screen.getByRole("textbox", { name });
+    Object.defineProperty(box, "innerText", { value: "", configurable: true });
+    fireEvent.input(box);
+    doc.rerender();
+    expect(extract()).toBeNull();
+    act(() => useWorkflowYamlEditorStore.setState({ commitInProgress: true }));
+    act(() => useWorkflowYamlEditorStore.setState({ commitInProgress: false }));
+    fireEvent.focus(screen.getByRole("textbox", { name }));
+    expect(extract()).not.toBeNull();
+  });
+
+  test("a step shows its type, title and text; Details lists its custom settings by name and value, and its last item opens the side panel", () => {
+    const nodes = renderDoc(
       [
         block("extraction", "find_prices", null, {
           data_extraction_goal: "Get the prices",
@@ -1261,7 +1406,11 @@ describe("WorkflowDocEditor navigation", () => {
       ],
       { apply: vi.fn(), update: vi.fn(), addStep: vi.fn(), duplicate: vi.fn() },
     );
-    expect(screen.getByText("Max retries: 3")).toBeTruthy();
+    const line = document.querySelector<HTMLElement>(
+      `[data-doc-node-id="${nodes.find(isWorkflowBlockNode)!.id}"]`,
+    )!;
+    expect(line.textContent).toContain("Get the prices");
+    expect(line.textContent).not.toMatch(/Max retries|Max steps|Saves|Uses/);
     const toggle = screen.getByRole("button", {
       name: "Details for Find prices",
     });
@@ -1271,15 +1420,15 @@ describe("WorkflowDocEditor navigation", () => {
     const options = within(
       document.getElementById(toggle.getAttribute("aria-controls")!)!,
     );
-    expect(options.queryByRole("listitem")).toBeNull();
+    expect(options.getByText("Custom settings")).toBeTruthy();
     expect(options.getByText("Max steps").nextElementSibling?.textContent).toBe(
       "12",
     );
-    // The extraction form has no max retries control, so the box leaves it out.
-    expect(options.queryByText("Max retries")).toBeNull();
     expect(
-      options.getByText("Continue on failure").nextElementSibling?.textContent,
-    ).toBe("Off (default)");
+      options.getByText("Max retries").nextElementSibling?.textContent,
+    ).toBe("3");
+    // Settings at their default appear only in the side panel.
+    expect(options.queryByText("Continue on failure")).toBeNull();
 
     fireEvent.click(
       options.getByRole("button", { name: "More details in the side panel" }),
@@ -1335,9 +1484,15 @@ describe("WorkflowDocEditor navigation", () => {
     expect(
       readOnlyBox.getByText("Max steps").nextElementSibling?.textContent,
     ).toBe("12");
+    // A read-only Doc's side panel cannot show the settings, so Details does not point there.
+    expect(
+      readOnlyBox.queryByRole("button", {
+        name: "More details in the side panel",
+      }),
+    ).toBeNull();
   });
 
-  test("Uses lists a step's declared inputs and its {{ }} reads, matching the input chips, and never a Code step's Python", () => {
+  test("Details lists a step's declared inputs and its {{ }} reads as Inputs, matching the input chips, and never a Code step's Python", () => {
     useWorkflowParametersStore.setState({
       parameters: [
         {
@@ -1384,11 +1539,29 @@ describe("WorkflowDocEditor navigation", () => {
           `[data-doc-node-id="${nodes.find((n) => n.data.label === label)!.id}"]`,
         )!,
       );
-    const uses = step("sign_in").getByText("Uses");
+    const details = (label: string, title: string) => {
+      expect(step(label).queryByText("Inputs")).toBeNull();
+      const toggle = step(label).getByRole("button", {
+        name: `Details for ${title}`,
+      });
+      fireEvent.click(toggle);
+      return within(
+        document.getElementById(toggle.getAttribute("aria-controls")!)!,
+      );
+    };
+    // A step's secondary lines (Complete if) wait in Details, as its inputs do.
+    expect(step("sign_in").queryByText("Complete if")).toBeNull();
+    const inputs = details("sign_in", "Sign in").getByText("Inputs");
+    expect(step("sign_in").getByText("Complete if")).toBeTruthy();
     expect(
-      Array.from(uses.querySelectorAll("span"), (pill) => pill.textContent),
+      Array.from(
+        inputs.nextElementSibling!.querySelectorAll("span"),
+        (pill) => pill.textContent,
+      ),
     ).toEqual(["site_login", "account_id"]);
-    expect(step("count_rows").queryByText("Uses")).toBeNull();
+    expect(
+      details("count_rows", "Count rows").queryByText("Inputs"),
+    ).toBeNull();
     const chip = (key: string) =>
       screen.getByRole("button", { name: new RegExp(`^Input ${key}`) });
     expect(chip("site_login").getAttribute("aria-label")).not.toMatch(
@@ -1436,11 +1609,73 @@ describe("WorkflowDocEditor navigation", () => {
       fireEvent.click(toggle);
       return within(
         document.getElementById(toggle.getAttribute("aria-controls")!)!,
-      ).getByText("Output fields").nextElementSibling?.textContent;
+      ).getByText(/^Fields:/).textContent;
     };
-    expect(fields("Summarize page")).toBe("title, price");
-    expect(fields("List orders")).toBe("order_id, total");
+    expect(fields("Summarize page")).toBe("Fields: title, price");
+    expect(fields("List orders")).toBe("Fields: order_id, total");
   });
+});
+
+test("a problem's Jump opens Details when the field it is about sits there", async () => {
+  vi.useFakeTimers();
+  const post = vi.fn().mockResolvedValue({
+    data: {
+      valid: true,
+      problems: [
+        {
+          code: "unknown_reference",
+          severity: "error",
+          block_label: "read_page",
+          field: "complete_criterion",
+          message: "Unknown reference: missing_value.",
+        },
+      ],
+    },
+  });
+  vi.spyOn(axiosClientModule, "getClient").mockResolvedValue({
+    post,
+  } as never);
+  const getSaveData = useWorkflowHasChangesStore.getState().getSaveData;
+  useWorkflowHasChangesStore.setState({ getSaveData: () => ({}) as never });
+  vi.stubGlobal(
+    "ResizeObserver",
+    class {
+      observe() {}
+      disconnect() {}
+    },
+  );
+  vi.stubGlobal("CSS", { escape: (value: string) => value });
+  try {
+    renderDoc([
+      block("task", "read_page", null, {
+        navigation_goal: "Open the page",
+        complete_criterion: "{{ missing_value }} shows",
+      }),
+    ]);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    const details = () =>
+      screen
+        .getByRole("button", { name: /^Details for/ })
+        .getAttribute("aria-expanded");
+    expect(details()).toBe("false");
+    fireEvent.click(
+      document.querySelector<HTMLElement>("[data-doc-problems]")!,
+    );
+    fireEvent.click(
+      within(screen.getByRole("dialog")).getByText(
+        /Unknown reference: missing_value/,
+      ),
+    );
+    expect(details()).toBe("true");
+  } finally {
+    useWorkflowHasChangesStore.setState({ getSaveData });
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    cleanup();
+  }
 });
 
 test("a step that reads an output only some branches produce shows the warning under it", async () => {
@@ -1539,15 +1774,34 @@ describe("a step that was just added", () => {
 
     fireEvent.pointerDown(document.body);
 
-    expect(
-      screen.getAllByText(
-        "This step has no saved credential. Open Details, then More details in the side panel to choose one.",
-      ),
-    ).toHaveLength(1);
+    expect(screen.getAllByText(docDetailsText.noCredential(true))).toHaveLength(
+      1,
+    );
     expect(document.querySelector("[data-doc-problems]")?.textContent).toBe(
       "1 problem",
     );
     expect(screen.queryByText(/need.* fixing/)).toBeNull();
+  });
+
+  test("a read-only Doc's credential line does not send the user to the side panel, and its Jump leaves Details closed", async () => {
+    useWorkflowYamlEditorStore.setState({ commitInProgress: true });
+    renderDoc([block("login", "sign_in", null, { url: "" })]);
+    expect(screen.getByText(docDetailsText.noCredential(false))).toBeTruthy();
+    expect(screen.queryByText(/side panel to choose/)).toBeNull();
+    fireEvent.click(
+      document.querySelector<HTMLElement>("[data-doc-problems]")!,
+    );
+    fireEvent.click(
+      within(await screen.findByRole("dialog")).getByText(
+        /no saved credential/,
+      ),
+    );
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(
+      screen
+        .getByRole("button", { name: /^Details for/ })
+        .getAttribute("aria-expanded"),
+    ).toBe("false");
   });
 
   test.each([
@@ -1686,6 +1940,23 @@ describe("a step that was just added", () => {
         document.querySelector(`[data-doc-node-id="${site.id}"]`),
       ),
     );
+    const details = (label: string) =>
+      within(
+        document.querySelector<HTMLElement>(
+          `[data-doc-node-id="${nodes.find((node) => node.data.label === label)!.id}"]`,
+        )!,
+      )
+        .getAllByRole("button", { name: /^Details for/ })[0]!
+        .getAttribute("aria-expanded");
+    // The URL is on the step's line; the credential is chosen from Details, so only that jump opens them.
+    expect(details("open_site")).toBe("false");
+    fireEvent.click(trigger);
+    fireEvent.click(
+      within(
+        await screen.findByRole("dialog", { name: "3 problems" }),
+      ).getAllByRole("button")[0]!,
+    );
+    await waitFor(() => expect(details("sign_in")).toBe("true"));
   });
 
   test("Fix problems from Run's question opens the list, and Escape returns focus to the line Run was pressed from", async () => {

@@ -67,6 +67,7 @@ import type { ParametersState } from "../types";
 import { toast, useToast } from "@/components/ui/use-toast";
 import {
   WorkflowDocActionsContext,
+  type DocGoToDetails,
   type DocPendingNote,
 } from "./WorkflowDocActionsContext";
 import { docBranchSelection } from "./docBranchSelection";
@@ -88,7 +89,11 @@ import {
 } from "./docEditApi";
 import { countReferences, findOutputUsers, textValues } from "./docGraphEdits";
 import { docStepTitle } from "./docStepRegistry";
-import { docProblemEntries, docStepProblems } from "./docProblems";
+import {
+  docProblemEntries,
+  docStepFixes,
+  type DocStepFix,
+} from "./docProblems";
 import { customSettingsShortText } from "./docSettingsChips";
 import { DocProblemsList } from "./DocProblemsList";
 import { docProblemStep } from "./docProblemStep";
@@ -262,6 +267,18 @@ export function WorkflowDocEditor({
   const [closedConditionals, setClosedConditionals] = useState<Set<string>>(
     () => new Set(),
   );
+  // Kept here, by step id, so a step's Details survives the remount a move causes and navigation can open it.
+  const [detailsOpen, setDetailsOpen] = useState<ReadonlyMap<string, boolean>>(
+    () => new Map(),
+  );
+  const setStepDetailsOpen = (id: string, open: boolean | undefined) =>
+    setDetailsOpen((current) => {
+      if (current.get(id) === open) return current;
+      const next = new Map(current);
+      if (open === undefined) next.delete(id);
+      else next.set(id, open);
+      return next;
+    });
   const [searchOpen, setSearchOpen] = useState(false);
   const touch = useDocTouch();
   const locateRequest = useLocateBlockStore((s) => s.request);
@@ -523,11 +540,11 @@ export function WorkflowDocEditor({
   // A step added a moment ago is unfinished, not wrong: its problems wait until the user leaves it, runs or saves.
   const unfinishedIds = useDocUnfinishedStore((s) => s.ids);
   const stepFixes = useMemo(() => {
-    if (proposal) return new Map<string, string[]>();
-    const found = docStepProblems(nodes);
+    if (proposal) return new Map<string, DocStepFix[]>();
+    const found = docStepFixes(nodes, editable);
     for (const id of unfinishedIds) found.delete(id);
     return found;
-  }, [nodes, proposal, unfinishedIds]);
+  }, [nodes, proposal, unfinishedIds, editable]);
   const unfinishedLabels = useMemo(
     () =>
       new Set(
@@ -550,8 +567,9 @@ export function WorkflowDocEditor({
         items: tree.items,
         fixes: stepFixes,
         problems: shownProblems,
+        editable,
       }),
-    [nodes, tree, stepFixes, shownProblems],
+    [nodes, tree, stepFixes, shownProblems, editable],
   );
   const problems = problemEntries.length;
   useEffect(() => {
@@ -608,10 +626,10 @@ export function WorkflowDocEditor({
         });
       }
     }
-    for (const [nodeId, messages] of stepFixes)
+    for (const [nodeId, fixes] of stepFixes)
       result.set(`${nodeId}:fix`, {
         code: "needs_setting",
-        message: messages.join("\n"),
+        message: fixes.map((fix) => fix.message).join("\n"),
       });
     return result;
   }, [nodes, shownProblems, stepFixes]);
@@ -781,7 +799,7 @@ export function WorkflowDocEditor({
       : (stepLine ?? learnButtonRef.current)
     )?.focus();
   };
-  const goTo = (id: string) => {
+  const goTo = (id: string, details?: DocGoToDetails) => {
     const path = revealPath(tree.items, id);
     if (path?.branches.length)
       setBranches((current) => ({
@@ -803,6 +821,9 @@ export function WorkflowDocEditor({
           next.delete(conditionalId);
         return next;
       });
+    // A step whose line is being typed in only moved (Tab).
+    if (details && focusIdRef.current !== id)
+      setStepDetailsOpen(id, details === "open" ? true : undefined);
     requestAnimationFrame(() => {
       const target = scrollRef.current?.querySelector<HTMLElement>(
         `[data-doc-node-id="${CSS.escape(id)}"]`,
@@ -968,6 +989,8 @@ export function WorkflowDocEditor({
             if (!next.delete(loopId)) next.add(loopId);
             return next;
           }),
+        detailsOpen: (id) => detailsOpen.get(id),
+        setDetailsOpen: setStepDetailsOpen,
         conditionalOpen: (conditionalId) =>
           !closedConditionals.has(conditionalId),
         toggleConditional: (conditionalId) =>

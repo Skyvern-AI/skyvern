@@ -24,7 +24,15 @@ import {
   useLocation,
   useSearchParams,
 } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  onTestFinished,
+  test,
+  vi,
+} from "vitest";
 import { type ReactNode } from "react";
 
 import {
@@ -40,6 +48,8 @@ import { useRunPaneViewStore } from "@/store/useRunPaneViewStore";
 import { useRunViewStore } from "@/store/RunViewStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 import { useWorkflowBlockSearchStore } from "@/store/WorkflowBlockSearchStore";
+import { useWorkflowPresentationStore } from "@/store/WorkflowPresentationStore";
+import { useLocateBlockStore } from "../../editor/runValidation/useLocateBlockStore";
 import type {
   WorkflowRunBlock,
   WorkflowRunTimelineItem,
@@ -2412,6 +2422,28 @@ describe("RunView timeline → editor jump", () => {
     clickBlock(container);
 
     expect(focusBlock).toHaveBeenCalledWith("node-jump");
+  });
+
+  test("with the Doc in the editor pane, clicking a timeline block locates it in the Doc, not the hidden canvas", () => {
+    seedRunWithBlock("jump-target-block");
+    const focusBlock = registerHandle();
+    useWorkflowPresentationStore.setState({
+      enabled: true,
+      presentation: "doc",
+      docMounted: true,
+    });
+    onTestFinished(() => {
+      useWorkflowPresentationStore.setState(
+        useWorkflowPresentationStore.getInitialState(),
+      );
+      useLocateBlockStore.getState().clearLocate();
+    });
+
+    const { container } = renderRunView({}, "/?wr=wr_1&panes=editor,overview");
+    clickBlock(container);
+
+    expect(useLocateBlockStore.getState().request?.nodeId).toBe("node-jump");
+    expect(focusBlock).not.toHaveBeenCalled();
   });
 
   test("clicking an action row jumps the editor to the action's block and keeps the action pinned", () => {

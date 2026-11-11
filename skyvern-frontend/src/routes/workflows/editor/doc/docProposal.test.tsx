@@ -44,6 +44,7 @@ import { buildDocProposal } from "./docProposal";
 import { DocProposalProvider } from "./DocProposalView";
 import { DocScope } from "./DocScope";
 import { WorkflowDocEditor } from "./WorkflowDocEditor";
+import { block } from "./docTestBlocks";
 
 // The run widgets need studio run contexts; this file tests the proposal, so they are stubbed.
 vi.mock("./DocRunStepButton", () => ({ DocRunStepButton: () => null }));
@@ -651,6 +652,214 @@ describe("Copilot proposal in the Doc view", () => {
     ).not.toBeNull();
     // No whole-turn verdict anywhere on the proposal.
     expect(card.textContent).not.toMatch(/Done|✓|Tested/);
+  });
+
+  test("a step changed only in what Details holds shows its Details open, and Jump opens it again", async () => {
+    const before = [
+      task("open_page", "read_total"),
+      task("read_total", null, { notes: "Totals sit at the bottom." }),
+    ];
+    useCopilotProposalStore.getState().setProposal({
+      proposed: workflow([
+        task("open_page", "read_total", {
+          complete_criterion: "The results show",
+        }),
+        task("read_total", null, { notes: "Totals sit lower." }),
+      ]),
+      baseline: workflow(before),
+      review: {
+        blocks: [
+          { label: "open_page", blockType: "navigation", change: "changed" },
+          { label: "read_total", blockType: "navigation", change: "changed" },
+        ],
+        duplicateWrites: [],
+        keptNotes: [],
+        keptDescriptions: [],
+      },
+      tested: false,
+      actionable: true,
+      acceptable: true,
+      decide: vi.fn(async () => true),
+    });
+    const live = getElements(before, settings, true);
+    await renderInStudio(
+      <WorkflowDocEditor nodes={live.nodes} edges={live.edges} />,
+    );
+    const details = (title: string) =>
+      screen.getByRole("button", { name: `Details for ${title}` });
+    expect(details("Open page").getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getByText("The results show")).not.toBeNull();
+    // A changed note shows in its own place, so it does not open Details.
+    expect(details("Read total").getAttribute("aria-expanded")).toBe("false");
+
+    fireEvent.click(details("Open page"));
+    expect(screen.queryByText("The results show")).toBeNull();
+    const card = screen.getByRole("region", { name: "Copilot proposal" });
+    fireEvent.click(within(card).getByRole("button", { expanded: false }));
+    fireEvent.click(within(card).getByText("Open Page"));
+    expect(details("Open page").getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getByText("The results show")).not.toBeNull();
+  });
+
+  const one = (blockType: string, fields: Record<string, unknown>) =>
+    block(blockType, "the_step", null, fields);
+  const whileLoop = (expression: string) =>
+    one("while_loop", {
+      loop_blocks: [],
+      condition: { criteria_type: "jinja2_template", expression },
+    });
+  // Details opens for a change it shows, and stays closed for one shown on the step's line or not shown at all.
+  test.each([
+    [
+      "only a Code step's code",
+      one("code", { code: "print(1)", parameters: [] }),
+      one("code", { code: "print(2)", parameters: [] }),
+      false,
+    ],
+    [
+      "only a Wait step's seconds",
+      one("wait", { wait_sec: 5 }),
+      one("wait", { wait_sec: 9 }),
+      false,
+    ],
+    [
+      "only a while loop's condition",
+      whileLoop("{{ more }}"),
+      whileLoop("{{ still_more }}"),
+      false,
+    ],
+    [
+      "the Goal and a line Details holds",
+      task("the_step", null, { complete_criterion: "The page loads" }),
+      task("the_step", null, {
+        navigation_goal: "A new goal",
+        complete_criterion: "The results show",
+      }),
+      true,
+    ],
+    [
+      "only the step's text",
+      task("the_step", null),
+      task("the_step", null, { navigation_goal: "A new goal" }),
+      false,
+    ],
+    [
+      "only a setting reset to its default",
+      task("the_step", null, { max_retries: 3 }),
+      task("the_step", null, { max_retries: 0 }),
+      true,
+    ],
+    [
+      "only a step's inputs",
+      task("the_step", null, { parameters: [] }),
+      task("the_step", null, {
+        parameters: [
+          {
+            parameter_type: "workflow",
+            key: "order_id",
+            workflow_parameter_type: "string",
+          },
+        ],
+      }),
+      true,
+    ],
+    [
+      "only a step's output schema",
+      one("extraction", {
+        data_extraction_goal: "Read the total",
+        data_schema: { type: "object", properties: { total: {} } },
+      }),
+      one("extraction", {
+        data_extraction_goal: "Read the total",
+        data_schema: { type: "object", properties: { amount: {} } },
+      }),
+      true,
+    ],
+    [
+      "only the agent of a trigger whose title is not known",
+      one("workflow_trigger", { workflow_permanent_id: "wpid_first" }),
+      one("workflow_trigger", { workflow_permanent_id: "wpid_second" }),
+      true,
+    ],
+  ])(
+    "a proposal that changes %s shows Details open: %s",
+    async (_case, before, after, open) => {
+      useCopilotProposalStore.getState().setProposal({
+        proposed: workflow([after]),
+        baseline: workflow([before]),
+        review: {
+          blocks: [
+            {
+              label: "the_step",
+              blockType: before.block_type,
+              change: "changed",
+            },
+          ],
+          duplicateWrites: [],
+          keptNotes: [],
+          keptDescriptions: [],
+        },
+        tested: false,
+        actionable: true,
+        acceptable: true,
+        decide: vi.fn(async () => true),
+      });
+      const live = getElements([before], settings, true);
+      await renderInStudio(
+        <WorkflowDocEditor nodes={live.nodes} edges={live.edges} />,
+      );
+      expect(
+        screen
+          .getByRole("button", { name: /^Details for/ })
+          .getAttribute("aria-expanded"),
+      ).toBe(String(open));
+      if (before.block_type === "workflow_trigger")
+        expect(screen.getByText("wpid_second")).not.toBeNull();
+    },
+  );
+
+  test.each([
+    [
+      "with a Complete if, opens Details so the criterion is seen before Accept",
+      { complete_criterion: "The results show", max_retries: 3 },
+      true,
+    ],
+    ["with nothing beyond its goal, leaves Details closed", {}, false],
+  ])("a step the proposal adds %s", async (_case, extra, open) => {
+    const before = [task("open_page", null)];
+    useCopilotProposalStore.getState().setProposal({
+      proposed: workflow([
+        task("open_page", "check_page"),
+        task("check_page", null, extra),
+      ]),
+      baseline: workflow(before),
+      review: {
+        blocks: [
+          { label: "check_page", blockType: "navigation", change: "added" },
+        ],
+        duplicateWrites: [],
+        keptNotes: [],
+        keptDescriptions: [],
+      },
+      tested: false,
+      actionable: true,
+      acceptable: true,
+      decide: vi.fn(async () => true),
+    });
+    const live = getElements(before, settings, true);
+    await renderInStudio(
+      <WorkflowDocEditor nodes={live.nodes} edges={live.edges} />,
+    );
+    expect(
+      screen
+        .getByRole("button", { name: "Details for Check page" })
+        .getAttribute("aria-expanded"),
+    ).toBe(String(open));
+    expect(
+      screen
+        .getByRole("button", { name: "Details for Open page" })
+        .getAttribute("aria-expanded"),
+    ).toBe("false");
   });
 
   test("Accept and Reject settle the whole proposal through the chat", async () => {
