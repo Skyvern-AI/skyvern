@@ -1047,6 +1047,10 @@ class AgentFunction:
     async def prepare_gmail_hop_tokens(self, *, workflow_run: WorkflowRun, workflow: Workflow) -> None:
         return None
 
+    async def request_gmail_hop_tokens(self, *, organization_id: str, workflow_run_id: str, workflow: Workflow) -> None:
+        """Ask whichever process may mint to issue this run's capabilities; a run can start where it cannot mint."""
+        return None
+
     async def execute_gmail_inbox_for_run(
         self,
         *,
