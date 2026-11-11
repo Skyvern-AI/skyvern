@@ -1,6 +1,3 @@
-import { filenameForDownloadedFileUrl } from "../../workflowRun/blockDownloadedFiles";
-import { docShortUrl, MAX_SHOWN } from "./docPromptUrl";
-
 export type DocValuePreview = { text: string; title?: string; href?: string };
 
 // A URL with a {{ }} template in it is not a real address yet, so it stays text.
@@ -89,30 +86,4 @@ export function docInputValuePreview(value: unknown): DocValuePreview | null {
   const shown = text.replace(/^https?:\/\//, "");
   // The chip cuts by width, not by characters, so every value keeps the whole of it on hover.
   return { text: shown, title: cappedTitle(text) };
-}
-
-function cellUrlText(url: URL, text: string): string {
-  if (url.searchParams.has("artifact_name")) {
-    return filenameForDownloadedFileUrl(text);
-  }
-  const last = pathSegments(url.pathname).pop();
-  if (!last || !/\.[a-z0-9]{1,8}$/i.test(last)) return docShortUrl(text);
-  // Two links that differ only by query must not read the same.
-  const named = `${last}${url.search}`;
-  return named.length <= MAX_SHOWN ? named : docShortUrl(text);
-}
-
-// A result cell has no editor or copy action, so a small object stays readable as compact JSON.
-export function docCellPreview(value: unknown): DocValuePreview {
-  if (value === null || value === undefined || value === "") {
-    return { text: "–" };
-  }
-  if (typeof value === "object") {
-    const compact = JSON.stringify(value);
-    return compact.length <= MAX_SHOWN ? { text: compact } : jsonPreview(value);
-  }
-  const text = String(value);
-  const url = webUrl(text);
-  if (url) return { text: cellUrlText(url, text), title: text, href: text };
-  return storagePreview(text) ?? { text };
 }

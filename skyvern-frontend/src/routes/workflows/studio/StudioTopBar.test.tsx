@@ -58,8 +58,16 @@ vi.mock("../editor/hooks/useSaveWorkflow", () => ({
   useSaveWorkflow: () => saveWorkflowSpy,
 }));
 vi.mock("@/api/AxiosClient", () => ({ getClient: getClientMock }));
-vi.mock("../editor/doc/DocRunButton", () => ({
-  DocRunButton: () => <div data-testid="doc-run" />,
+const docScreen = vi.hoisted(() => ({
+  onScreen: false,
+  panes: ["editor"] as string[],
+}));
+vi.mock("../editor/doc/useDocOnScreen", () => ({
+  useDocOnScreen: () => docScreen.onScreen,
+}));
+vi.mock("./useStudioPanes", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./useStudioPanes")>()),
+  useStudioPanes: () => ({ panes: docScreen.panes }),
 }));
 vi.mock("@/hooks/useCredentialGetter", () => ({
   useCredentialGetter: () => vi.fn(),
@@ -83,14 +91,12 @@ import { useAutoGenerateWorkflowTitle } from "../hooks/useAutoGenerateWorkflowTi
 import { taskNodeDefaultData } from "../editor/nodes/TaskNode/types";
 
 import { useRunValidationStore } from "../editor/runValidation/useRunValidationStore";
-import { useDocRunStore } from "../editor/doc/docRunStore";
-import { useWorkflowPresentationStore } from "@/store/WorkflowPresentationStore";
 import {
-  RunStopButton,
-  SaveButton,
-  TitleSection,
-  TopBarRunControl,
-} from "./StudioTopBar";
+  DOC_RUN_AGENT_EVENT,
+  DOC_SHOW_PROBLEMS_EVENT,
+} from "../editor/doc/docKeys";
+import { publishDocCriticalProblems } from "../editor/doc/docRunCheckStore";
+import { RunStopButton, SaveButton, TitleSection } from "./StudioTopBar";
 
 // jsdom lacks ResizeObserver, which Radix's tooltip popper constructs once a
 // tooltip opens. Install it for this suite only and restore afterward.
@@ -166,6 +172,11 @@ function mockRun(status: Status, overrides: Record<string, unknown> = {}) {
       ...overrides,
     },
   });
+}
+
+// RunStopButton reads this store, so touching it re-renders with the run mock's new value.
+function rerenderRun() {
+  act(() => useRunValidationStore.setState({ blockingBlocks: [] }));
 }
 
 function locationState() {
@@ -1052,71 +1063,206 @@ describe("RunStopButton on an agent with no blocks", () => {
   });
 });
 
-describe("RunStopButton while the Doc lists problems", () => {
+describe("RunStopButton from the Doc", () => {
   afterEach(() => {
-    useRunValidationStore.setState({
-      docProblemCount: 0,
-      docShowProblems: null,
-    });
+    useRunValidationStore.setState({ blockingBlocks: [] });
   });
 
-  test("Run stays enabled; a click says what to fix, jumps to it and starts nothing", () => {
+  test("Shift+Enter on a Doc line opens the run form, as Run does, and does nothing while Run is blocked", () => {
     workflowRunQueryMock.mockReturnValue({ data: undefined });
-    const showProblems = vi.fn();
     useRunValidationStore.setState({
-      docProblemCount: 2,
-      docShowProblems: showProblems,
+      blockingBlocks: [
+        { id: "n1", label: "Log in", ancestorIds: [], path: [] },
+      ],
     });
     renderAt("/workflows/wpid_1/studio");
+    act(() => {
+      window.dispatchEvent(new Event(DOC_RUN_AGENT_EVENT));
+    });
+    expect(screen.queryByTestId("location")).toBeNull();
 
-    const runButton = screen.getByRole("button", { name: "Run" });
-    expect(runButton.hasAttribute("disabled")).toBe(false);
-    fireEvent.click(runButton);
+    act(() => {
+      useRunValidationStore.setState({ blockingBlocks: [] });
+    });
+    act(() => {
+      window.dispatchEvent(new Event(DOC_RUN_AGENT_EVENT));
+    });
+    expect(screen.getByTestId("location").textContent).toBe(
+      "/agents/wpid_1/run",
+    );
+  });
+  test("Shift+Enter during a block run asks the same 'Start a full run?' question as the visible Run", () => {
+    renderAt("/workflows/wpid_1/studio?wr=wr_1&bl=Block%201");
+    act(() => {
+      window.dispatchEvent(new Event(DOC_RUN_AGENT_EVENT));
+    });
+    expect(screen.queryByText("Start a full run?")).not.toBeNull();
+    expect(screen.queryByTestId("location")).toBeNull();
 
-    expect(showProblems).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole("button", { name: "Start full run" }));
+    expect(screen.getByTestId("location").textContent).toBe(
+      "/agents/wpid_1/run",
+    );
+  });
+
+  test("a block run that ends with the full-run question open does not reopen it with the next block run", () => {
+    renderAt("/workflows/wpid_1/studio?wr=wr_1&bl=Block%201");
+    act(() => {
+      window.dispatchEvent(new Event(DOC_RUN_AGENT_EVENT));
+    });
+    expect(screen.queryByText("Start a full run?")).not.toBeNull();
+    mockRun(Status.Completed);
+    rerenderRun();
+    mockRun(Status.Running);
+    rerenderRun();
+    expect(screen.queryByText("Start a full run?")).toBeNull();
+  });
+
+  test("Shift+Enter during a full run starts nothing", () => {
+    renderAt("/workflows/wpid_1/studio?wr=wr_1");
+    act(() => {
+      window.dispatchEvent(new Event(DOC_RUN_AGENT_EVENT));
+    });
+    expect(screen.queryByText("Start a full run?")).toBeNull();
     expect(screen.queryByTestId("location")).toBeNull();
   });
 });
 
-describe("TopBarRunControl with the Doc as the editor", () => {
+describe("RunStopButton with critical Doc problems", () => {
+  const critical = [
+    {
+      key: "n1:fix:0",
+      step: "Go to URL · Open the site",
+      message: "This step has no URL. Type it on the line, or use @.",
+    },
+  ];
   beforeEach(() => {
-    useWorkflowPresentationStore.setState({
-      enabled: true,
-      presentation: "doc",
-    });
-    useDocRunStore.setState({ mounted: true });
+    workflowRunQueryMock.mockReturnValue({ data: undefined });
+    docScreen.onScreen = true;
+    publishDocCriticalProblems(critical);
   });
   afterEach(() => {
-    useWorkflowPresentationStore.setState({
-      enabled: false,
-      presentation: "visual",
-    });
-    useDocRunStore.setState({ mounted: false });
+    docScreen.onScreen = false;
+    docScreen.panes = ["editor"];
+    publishDocCriticalProblems([]);
   });
 
-  test("the Doc owns Run only while its pane is open and no block run is going", () => {
-    mockRun(Status.Completed);
-    renderAt("/workflows/wpid_1/studio?panes=editor", <TopBarRunControl />);
-    expect(screen.queryByTestId("doc-run")).not.toBeNull();
-    cleanup();
+  test("Escape returns focus to Run, and Fix problems hands the list where focus was", async () => {
+    const shown = vi.fn();
+    window.addEventListener(DOC_SHOW_PROBLEMS_EVENT, shown);
+    try {
+      renderAt("/workflows/wpid_1/studio");
+      const run = screen.getByRole("button", { name: /Run/ });
+      act(() => run.focus());
+      fireEvent.click(run);
+      fireEvent.keyDown(document.activeElement ?? document.body, {
+        key: "Escape",
+      });
+      expect(screen.queryByText("Run with 1 problem?")).toBeNull();
+      await waitFor(() => expect(document.activeElement).toBe(run));
 
-    // Watching a run with the editor pane closed: the hidden Doc must not take the shared control.
-    renderAt(
-      "/workflows/wpid_1/studio?wr=wr_1&panes=overview",
-      <TopBarRunControl />,
-    );
-    expect(screen.queryByTestId("doc-run")).toBeNull();
-    expect(screen.queryByRole("button", { name: /Re-run|Run/ })).not.toBeNull();
-    cleanup();
+      fireEvent.click(run);
+      fireEvent.click(screen.getByRole("button", { name: "Fix problems" }));
+      expect((shown.mock.calls[0]![0] as CustomEvent).detail.returnFocus).toBe(
+        run,
+      );
+    } finally {
+      window.removeEventListener(DOC_SHOW_PROBLEMS_EVENT, shown);
+    }
+  });
 
-    // A live block run keeps Stop with a full run beside it.
+  test("the question shows the problems at the click, even if the check changes while it is open", () => {
+    renderAt("/workflows/wpid_1/studio");
+    fireEvent.click(screen.getByRole("button", { name: /Run/ }));
+    act(() => publishDocCriticalProblems([]));
+    expect(screen.queryByText("Run with 1 problem?")).not.toBeNull();
+    expect(
+      screen.queryByText(
+        "This step has no URL. Type it on the line, or use @.",
+      ),
+    ).not.toBeNull();
+  });
+
+  test("a question left open when a run starts does not come back after it", () => {
+    renderAt("/workflows/wpid_1/studio?wr=wr_1");
+    fireEvent.click(screen.getByRole("button", { name: /Run/ }));
+    expect(screen.queryByText("Run with 1 problem?")).not.toBeNull();
     mockRun(Status.Running);
-    renderAt(
-      "/workflows/wpid_1/studio?panes=editor&wr=wr_1&bl=Block%201",
-      <TopBarRunControl />,
+    rerenderRun();
+    mockRun(Status.Completed);
+    rerenderRun();
+    expect(screen.queryByText("Run with 1 problem?")).toBeNull();
+  });
+
+  test("with the Editor pane closed, Run does not ask", () => {
+    docScreen.panes = ["run"];
+    renderAt("/workflows/wpid_1/studio");
+    fireEvent.click(screen.getByRole("button", { name: /Run/ }));
+    expect(screen.queryByText(/Run with/)).toBeNull();
+    expect(screen.getByTestId("location").textContent).toBe(
+      "/agents/wpid_1/run",
     );
-    expect(screen.queryByTestId("doc-run")).toBeNull();
-    expect(screen.queryByRole("button", { name: /Stop/ })).not.toBeNull();
-    expect(screen.queryByRole("button", { name: /Run/ })).not.toBeNull();
+  });
+
+  test("Run asks first and starts nothing; Run anyway opens the run form", () => {
+    renderAt("/workflows/wpid_1/studio");
+    fireEvent.click(screen.getByRole("button", { name: /Run/ }));
+    expect(screen.queryByText("Run with 1 problem?")).not.toBeNull();
+    expect(
+      screen.queryByText(
+        "This step has no URL. Type it on the line, or use @.",
+      ),
+    ).not.toBeNull();
+    expect(screen.queryByTestId("location")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Run anyway" }));
+    expect(screen.getByTestId("location").textContent).toBe(
+      "/agents/wpid_1/run",
+    );
+  });
+
+  test("Fix problems opens the Doc's problems list and starts nothing", () => {
+    const shown = vi.fn();
+    window.addEventListener(DOC_SHOW_PROBLEMS_EVENT, shown);
+    try {
+      renderAt("/workflows/wpid_1/studio");
+      fireEvent.click(screen.getByRole("button", { name: /Run/ }));
+      fireEvent.click(screen.getByRole("button", { name: "Fix problems" }));
+      expect(shown).toHaveBeenCalled();
+      expect(screen.queryByText("Run with 1 problem?")).toBeNull();
+      expect(screen.queryByTestId("location")).toBeNull();
+    } finally {
+      window.removeEventListener(DOC_SHOW_PROBLEMS_EVENT, shown);
+    }
+  });
+
+  test("Shift+Enter asks the same question", () => {
+    renderAt("/workflows/wpid_1/studio");
+    act(() => {
+      window.dispatchEvent(new Event(DOC_RUN_AGENT_EVENT));
+    });
+    expect(screen.queryByText("Run with 1 problem?")).not.toBeNull();
+    expect(screen.queryByTestId("location")).toBeNull();
+  });
+
+  test("with no critical problem, or with the Doc off screen, Run starts at once", () => {
+    publishDocCriticalProblems([]);
+    renderAt("/workflows/wpid_1/studio");
+    fireEvent.click(screen.getByRole("button", { name: /Run/ }));
+    expect(screen.queryByText(/Run with/)).toBeNull();
+    expect(screen.getByTestId("location").textContent).toBe(
+      "/agents/wpid_1/run",
+    );
+    cleanup();
+
+    // The Visual editor never asks, even while a hidden Doc holds problems.
+    publishDocCriticalProblems(critical);
+    docScreen.onScreen = false;
+    renderAt("/workflows/wpid_1/studio");
+    fireEvent.click(screen.getByRole("button", { name: /Run/ }));
+    expect(screen.queryByText(/Run with/)).toBeNull();
+    expect(screen.getByTestId("location").textContent).toBe(
+      "/agents/wpid_1/run",
+    );
   });
 });

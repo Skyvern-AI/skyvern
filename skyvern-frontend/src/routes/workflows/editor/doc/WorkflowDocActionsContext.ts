@@ -15,8 +15,6 @@ export type DocPendingNote = {
 export const WorkflowDocActionsContext = createContext<{
   editable: boolean;
   runControlsVisible: boolean;
-  // A run this browser started is going, a one-step run too: the insert lines between steps are hidden meanwhile.
-  runGoing: boolean;
   openSettings: (id: string) => void;
   openVisual: () => void;
   goTo: (id: string) => void;
@@ -54,7 +52,6 @@ export const WorkflowDocActionsContext = createContext<{
 }>({
   editable: false,
   runControlsVisible: false,
-  runGoing: false,
   openSettings: () => {},
   openVisual: () => {},
   goTo: () => {},

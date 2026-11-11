@@ -209,11 +209,25 @@ export function docStepProblems(nodes: AppNode[]): Map<string, string[]> {
   return problems;
 }
 
+// The server problems that ask before Run: certain to fail, or (a credential in a note) a run that would read it.
+// Any other code, including one added later, is listed without asking.
+const ASKING_SERVER_CODES = new Set([
+  "unknown_reference",
+  "forward_reference",
+  "empty_goal",
+  "empty_condition",
+  "bad_jump_target",
+  "duplicate_parameter_key",
+  "template_syntax",
+  "schema_error",
+  "credential_in_note",
+]);
+
 export type DocProblemEntry = {
   key: string;
   nodeId: string | null;
   message: string;
-  /** Holds Run; the Run toast counts exactly these entries. */
+  /** Critical: a Run click asks "Run with N problems?" for exactly these entries. */
   blocking: boolean;
 };
 
@@ -250,7 +264,7 @@ export function docProblemEntries({
   }>;
 }): DocProblemEntry[] {
   const idsByLabel = new Map(nodes.map((node) => [node.data.label, node.id]));
-  // A check that couldn't reach the server leaves problems from an older draft: shown, but not holding Run.
+  // A check that couldn't reach the server leaves problems from an older draft: shown, but Run does not ask about them.
   const checkFailed = problems.some(
     (problem) => problem.code === "validation_failed",
   );
@@ -268,12 +282,7 @@ export function docProblemEntries({
       key: `server:${i}`,
       nodeId: idsByLabel.get(problem.block_label ?? "") ?? null,
       message: problem.message,
-      // A credential named in a note is a save warning, but the run would read it, so it holds Run.
-      blocking:
-        !checkFailed &&
-        problem.code !== "validation_failed" &&
-        (problem.severity !== "warning" ||
-          problem.code === "credential_in_note"),
+      blocking: !checkFailed && ASKING_SERVER_CODES.has(problem.code),
     })),
   ]) {
     const id = `${entry.nodeId}\n${entry.message}`;

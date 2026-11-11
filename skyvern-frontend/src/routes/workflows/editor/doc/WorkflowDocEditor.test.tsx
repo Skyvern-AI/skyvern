@@ -1,5 +1,4 @@
 // @vitest-environment jsdom
-import { useRunValidationStore } from "../runValidation/useRunValidationStore";
 import { clearDocAnnouncement, docAnnouncement } from "./docAnnounce";
 import {
   act,
@@ -24,7 +23,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ReactFlowProvider } from "@xyflow/react";
 import { MemoryRouter } from "react-router-dom";
 
-import { ProxyLocation, Status } from "@/api/types";
+import { ProxyLocation } from "@/api/types";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 
 import {
@@ -35,7 +34,8 @@ import {
 import { isWorkflowBlockNode } from "../nodes";
 import { getElements } from "../workflowEditorUtils";
 import { useLocateBlockStore } from "../runValidation/useLocateBlockStore";
-import { useDocRunStore } from "./docRunStore";
+import { DOC_SHOW_PROBLEMS_EVENT } from "./docKeys";
+import { useDocRunCheckStore } from "./docRunCheckStore";
 import { WorkflowDocEditor } from "./WorkflowDocEditor";
 import { useDocUnfinishedStore } from "./docUnfinished";
 import { splitAtCaret } from "./docCaret";
@@ -47,14 +47,10 @@ import {
   useRecordingLauncherStore,
 } from "@/store/useRecordingLauncherStore";
 
-const docRun = vi.hoisted(() => ({ current: {} as Record<string, unknown> }));
-vi.mock("./useDocRun", () => ({
-  useDocRun: () => ({
-    unknownLabels: new Set(),
-    rowsLoaded: true,
-    ...docRun.current,
-  }),
+vi.mock("./useDocLatestRunCompleted", () => ({
+  useDocLatestRunCompleted: () => false,
 }));
+
 import type { DocGraph } from "./docGraphEdits";
 import * as axiosClientModule from "@/api/AxiosClient";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
@@ -64,8 +60,7 @@ vi.mock("../workflowYamlDocument", async (importOriginal) => ({
   buildWorkflowSaveRequest: () => ({}),
 }));
 
-// The run widgets need studio run contexts; this file tests navigation, so they are stubbed.
-vi.mock("./DocStepResult", () => ({ DocStepResult: () => null }));
+// The run button needs studio run contexts; this file tests navigation, so it is stubbed.
 vi.mock("./DocRunStepButton", () => ({ DocRunStepButton: () => null }));
 // The settings form is mocked because these tests check the side panel's header only.
 vi.mock("../panels/BlockConfigForm", () => ({ BlockConfigForm: () => null }));
@@ -124,9 +119,16 @@ function renderDoc(
   return nodes;
 }
 
+// The count of problems (not warnings) on the Doc's problems button.
+const blockingCount = () =>
+  Number(
+    document
+      .querySelector("[data-doc-problems]")
+      ?.textContent?.match(/(\d+) problem/)?.[1] ?? 0,
+  );
+
 describe("WorkflowDocEditor navigation", () => {
   beforeEach(() => {
-    docRun.current = { runId: null, blocksByLabel: new Map(), live: false };
     useWorkflowYamlEditorStore.setState(
       useWorkflowYamlEditorStore.getInitialState(),
     );
@@ -150,28 +152,6 @@ describe("WorkflowDocEditor navigation", () => {
     cleanup();
     useLocateBlockStore.getState().clearLocate();
     vi.unstubAllGlobals();
-  });
-
-  test("a run line above the steps says which run the results come from, and shows only with a run", () => {
-    renderDoc();
-    expect(screen.queryByTestId("doc-run-line")).toBeNull();
-    cleanup();
-    docRun.current = {
-      runId: "wr_1",
-      run: {
-        status: Status.Failed,
-        created_at: new Date().toISOString(),
-        workflow: { version: 2 },
-      },
-      currentVersion: 3,
-      earlierVersion: true,
-      blocksByLabel: new Map(),
-      live: false,
-    };
-    renderDoc();
-    expect(screen.getByTestId("doc-run-line").textContent).toContain(
-      "Run wr_1 · Failed · just now · an earlier version, v2",
-    );
   });
 
   describe("keyboard-first editing", () => {
@@ -268,36 +248,6 @@ describe("WorkflowDocEditor navigation", () => {
       fireEvent.keyDown(openLine("empty_one url", "", 0), { key: "/" });
       fireEvent.click(screen.getByText(/^Loop/));
       expect(docAnnouncement()).toBe("Added Loop step");
-    });
-
-    test("a one-step run leaves the text editable but shows no insert line until it ends", () => {
-      const steps = () => [
-        block("goto_url", "open_site", "write_it", { url: "https://a.test" }),
-        prompt(),
-      ];
-      docRun.current = {
-        runId: "wr_1",
-        blocksByLabel: new Map(),
-        live: true,
-        owned: true,
-      };
-      renderDoc(steps(), editsWithAdd(), "/?bl=open_site");
-      expect(
-        screen.queryByRole("button", { name: "Add a step here" }),
-      ).toBeNull();
-      fireEvent.focus(screen.getByRole("textbox", { name: "write_it prompt" }));
-      expect(
-        screen
-          .getByRole("textbox", { name: "write_it prompt" })
-          .getAttribute("contenteditable"),
-      ).toBe("plaintext-only");
-      cleanup();
-
-      docRun.current = { ...docRun.current, live: false };
-      renderDoc(steps(), editsWithAdd(), "/?bl=open_site");
-      expect(
-        screen.getByRole("button", { name: "Add a step here" }),
-      ).toBeTruthy();
     });
 
     test("Enter at the end of a step adds a step of the same type below", () => {
@@ -580,58 +530,6 @@ describe("WorkflowDocEditor navigation", () => {
       const nested = screen.getByRole("textbox", { name: "Note" });
       expect(nested.closest(".border-l")).toBeTruthy();
     });
-  });
-
-  test("Tab nests into the run branch displayed on screen without a manual selection", () => {
-    docRun.current = {
-      runId: "wr_1",
-      blocksByLabel: new Map([
-        [
-          "route",
-          { status: Status.Completed, executed_branch_id: "old_branch" },
-        ],
-        ["else_step", { status: Status.Completed }],
-      ]),
-      live: false,
-    };
-    const edits: DocGraphEdits = {
-      apply: vi.fn(),
-      update: vi.fn(),
-      addStep: vi.fn(),
-      duplicate: vi.fn(),
-    };
-    const nodes = renderDoc(
-      [
-        conditional("route", "after", [
-          { id: "yes", next: "if_step", when: "Check the condition" },
-          { id: "no", next: "else_step" },
-        ]),
-        code("if_step", "after"),
-        code("else_step", "after"),
-        block("text_prompt", "after", null, { prompt: "Do the next thing" }),
-      ],
-      edits,
-    );
-    expect(
-      screen
-        .getByRole("tab", { name: /Otherwise/ })
-        .getAttribute("aria-selected"),
-    ).toBe("true");
-    fireEvent.focus(screen.getByRole("textbox", { name: "after prompt" }));
-    fireEvent.keyDown(screen.getByRole("textbox", { name: "after prompt" }), {
-      key: "Tab",
-    });
-
-    expect(edits.apply).toHaveBeenCalledOnce();
-    const moved = vi
-      .mocked(edits.apply)
-      .mock.calls[0]![0].nodes.filter(isWorkflowBlockNode)
-      .find((n) => n.data.label === "after")!;
-    const route = nodes.find((n) => n.type === "conditional")!;
-    expect(moved.parentId).toBe(route.id);
-    expect(moved.data.conditionalBranchId).toBe(
-      route.data.branches.find((b) => b.is_default)!.id,
-    );
   });
 
   test.each([
@@ -950,7 +848,7 @@ describe("WorkflowDocEditor navigation", () => {
     ).toBeNull();
   });
 
-  test("counts server validation problems in the edit bar the same way Run counts them", async () => {
+  test("counts server validation problems in the edit bar", async () => {
     vi.useFakeTimers();
     const post = vi.fn().mockResolvedValue({
       data: {
@@ -978,6 +876,28 @@ describe("WorkflowDocEditor navigation", () => {
             severity: "warning",
             message: "The loop source isn't a known input.",
           },
+          {
+            code: "template_too_complex",
+            block_label: "inner_step",
+            message: "This expression is nested too deeply to check.",
+          },
+          {
+            code: "branch_only_reference",
+            block_label: "inner_step",
+            severity: "warning",
+            message:
+              "x is only produced on some branches of c, so it may be empty here.",
+          },
+          {
+            code: "invalid_draft",
+            block_label: null,
+            message: "The draft could not be read.",
+          },
+          {
+            code: "some_new_code",
+            block_label: "inner_step",
+            message: "A problem the Doc does not know yet.",
+          },
         ],
       },
     });
@@ -993,12 +913,20 @@ describe("WorkflowDocEditor navigation", () => {
         await vi.advanceTimersByTimeAsync(1000);
       });
 
-      // The same reference in two fields is one problem; the warning is listed but does not hold Run.
-      expect(screen.getByText("2 problems, 1 warning")).toBeTruthy();
-      expect(useRunValidationStore.getState().docProblemCount).toBe(2);
+      // The same reference in two fields is one problem; warnings and checks the server could not finish never ask before Run.
+      expect(screen.getByText("2 problems, 5 warnings")).toBeTruthy();
+      expect(blockingCount()).toBe(2);
       expect(
         screen.getByText(/This block has an invalid setting\./),
       ).toBeTruthy();
+      expect(
+        useDocRunCheckStore.getState().critical.map((p) => p.message),
+      ).toEqual([
+        "Unknown reference: missing_value.",
+        "This block has an invalid setting.",
+      ]);
+      cleanup();
+      expect(useDocRunCheckStore.getState().critical).toEqual([]);
     } finally {
       useWorkflowHasChangesStore.setState({ getSaveData });
       vi.useRealTimers();
@@ -1007,7 +935,7 @@ describe("WorkflowDocEditor navigation", () => {
     }
   });
 
-  test("a credential named in a note holds Run even though the server sends it as a warning", async () => {
+  test("a credential named in a note is a problem even though the server sends it as a warning", async () => {
     vi.useFakeTimers();
     const post = vi.fn().mockResolvedValue({
       data: {
@@ -1041,7 +969,7 @@ describe("WorkflowDocEditor navigation", () => {
       });
       // Named in the note above and the trailing note: one entry, and Run counts that one.
       expect(screen.getByText("1 problem")).toBeTruthy();
-      expect(useRunValidationStore.getState().docProblemCount).toBe(1);
+      expect(blockingCount()).toBe(1);
     } finally {
       useWorkflowHasChangesStore.setState({ getSaveData });
       vi.useRealTimers();
@@ -1086,7 +1014,7 @@ describe("WorkflowDocEditor navigation", () => {
         await vi.advanceTimersByTimeAsync(1000);
       });
       expect(screen.getByText("1 problem")).toBeTruthy();
-      expect(useRunValidationStore.getState().docProblemCount).toBe(1);
+      expect(blockingCount()).toBe(1);
       act(() => useWorkflowParametersStore.setState({ parameters: [] }));
       await act(async () => {
         await vi.advanceTimersByTimeAsync(1000);
@@ -1096,7 +1024,7 @@ describe("WorkflowDocEditor navigation", () => {
       );
       expect(screen.getByText("2 warnings")).toBeTruthy();
       // The earlier check's warning describes an older draft, so it no longer holds the run.
-      expect(useRunValidationStore.getState().docProblemCount).toBe(0);
+      expect(blockingCount()).toBe(0);
     } finally {
       useWorkflowHasChangesStore.setState({ getSaveData });
       vi.useRealTimers();
@@ -1134,7 +1062,8 @@ describe("WorkflowDocEditor navigation", () => {
       expect(screen.getByRole("alert").textContent).toContain(
         "Workflow validation supports at most 500 blocks.",
       );
-      expect(screen.getByText("1 problem")).toBeTruthy();
+      // The server could not finish the check, so Run does not ask about it.
+      expect(screen.getByText("1 warning")).toBeTruthy();
     } finally {
       useWorkflowHasChangesStore.setState({ getSaveData });
       vi.useRealTimers();
@@ -1143,7 +1072,7 @@ describe("WorkflowDocEditor navigation", () => {
     }
   });
 
-  test("a warning-only validation response shows the problem but doesn't hold Run", async () => {
+  test("a warning-only validation response shows the problem as a warning, not a problem", async () => {
     vi.useFakeTimers();
     const post = vi.fn().mockResolvedValue({
       data: {
@@ -1169,7 +1098,7 @@ describe("WorkflowDocEditor navigation", () => {
         await vi.advanceTimersByTimeAsync(1000);
       });
       expect(screen.getByText("1 warning")).toBeTruthy();
-      expect(useRunValidationStore.getState().docProblemCount).toBe(0);
+      expect(blockingCount()).toBe(0);
     } finally {
       useWorkflowHasChangesStore.setState({ getSaveData });
       vi.useRealTimers();
@@ -1283,166 +1212,6 @@ describe("WorkflowDocEditor navigation", () => {
     expect(number("only_else")).toBe("1.3");
   });
 
-  test("Details names its step, numbers the actions of the last run, lists the step's settings, and its last item opens the side panel", () => {
-    docRun.current = {
-      runId: "wr_1",
-      live: false,
-      blocksByLabel: new Map([
-        [
-          "find_prices",
-          {
-            status: Status.Completed,
-            // Newest first, as the run timeline sends them.
-            actions: [
-              {
-                action_id: "a2",
-                action_type: "extract",
-                status: Status.Failed,
-                intention: "Read every price",
-              },
-              {
-                action_id: "a1",
-                action_type: "click",
-                status: Status.Completed,
-                reasoning: "Open the price list",
-              },
-            ],
-          },
-        ],
-      ]),
-    };
-    renderDoc(
-      [
-        block("extraction", "find_prices", null, {
-          data_extraction_goal: "Get the prices",
-          max_retries: 3,
-          max_steps_per_run: 12,
-        }),
-      ],
-      { apply: vi.fn(), update: vi.fn(), addStep: vi.fn(), duplicate: vi.fn() },
-    );
-    expect(screen.getByText("Max retries: 3")).toBeTruthy();
-    const toggle = screen.getByRole("button", {
-      name: "Details for Find prices",
-    });
-    expect(toggle.getAttribute("aria-expanded")).toBe("false");
-    fireEvent.click(toggle);
-    expect(toggle.getAttribute("aria-expanded")).toBe("true");
-    const options = within(
-      document.getElementById(toggle.getAttribute("aria-controls")!)!,
-    );
-    expect(
-      options.getAllByRole("listitem").map((item) => item.textContent),
-    ).toEqual([
-      "Click Open the price list",
-      "Extract Data Read every price (failed)",
-    ]);
-    expect(options.getByText("Actions in the last run")).toBeTruthy();
-    expect(options.getByText("Max steps").nextElementSibling?.textContent).toBe(
-      "12",
-    );
-    // The extraction form has no max retries control, so the box leaves it out.
-    expect(options.queryByText("Max retries")).toBeNull();
-    expect(
-      options.getByText("Continue on failure").nextElementSibling?.textContent,
-    ).toBe("Off (default)");
-
-    fireEvent.click(
-      options.getByRole("button", { name: "More details in the side panel" }),
-    );
-    expect(toggle.getAttribute("aria-expanded")).toBe("false");
-    const selected = within(screen.getByLabelText("Selected step"));
-    expect(selected.getByText("Find prices")).toBeTruthy();
-    expect(selected.getByText("find_prices")).toBeTruthy();
-  });
-
-  test("Details of a step that ran several times in a loop says it shows the last of those runs", () => {
-    docRun.current = {
-      runId: "wr_1",
-      live: false,
-      blocksByLabel: new Map([
-        [
-          "find_prices",
-          {
-            status: Status.Completed,
-            actions: [
-              {
-                action_id: "a1",
-                action_type: "click",
-                status: Status.Completed,
-              },
-            ],
-          },
-        ],
-      ]),
-      runsByLabel: new Map([
-        ["find_prices", { count: 3, failed: 0, canceled: 0, withOutput: 0 }],
-      ]),
-    };
-    renderDoc([block("extraction", "find_prices", null, {})]);
-    fireEvent.click(
-      screen.getByRole("button", { name: "Details for Find prices" }),
-    );
-    expect(screen.getByText("Actions in the last of 3 runs")).toBeTruthy();
-  });
-
-  test("Details of a step outside a one-step run reads as no run, not as not reached", () => {
-    docRun.current = {
-      runId: "wr_step",
-      live: false,
-      blockRun: true,
-      blockRunTarget: "open_page",
-      blocksByLabel: new Map([
-        ["open_page", { status: Status.Completed, actions: [] }],
-      ]),
-    };
-    renderDoc([
-      block("navigation", "open_page", "find_prices", {}),
-      block("extraction", "find_prices", null, {}),
-    ]);
-    fireEvent.click(
-      screen.getByRole("button", { name: "Details for Find prices" }),
-    );
-    expect(
-      screen.getByText(
-        "No run yet. After a run, the actions it took show here.",
-      ),
-    ).toBeTruthy();
-    expect(screen.queryByText("The last run did not reach this.")).toBeNull();
-  });
-
-  test("Details keeps the failed mark of a long action outside the two-line clamp", () => {
-    docRun.current = {
-      runId: "wr_1",
-      live: false,
-      blocksByLabel: new Map([
-        [
-          "find_prices",
-          {
-            status: Status.Failed,
-            actions: [
-              {
-                action_id: "a1",
-                action_type: "extract",
-                status: Status.Failed,
-                intention: "Read every price on the page ".repeat(20),
-              },
-            ],
-          },
-        ],
-      ]),
-    };
-    renderDoc([block("extraction", "find_prices", null, {})]);
-    fireEvent.click(
-      screen.getByRole("button", { name: "Details for Find prices" }),
-    );
-    const item = screen.getByRole("listitem");
-    const clamped = item.querySelector(".line-clamp-2");
-    expect(clamped?.textContent).toContain("Read every price");
-    expect(clamped?.textContent).not.toContain("(failed)");
-    expect(item.textContent?.endsWith(" (failed)")).toBe(true);
-  });
-
   test("the side panel closes with its Close button and with Escape, and Details reopens it", () => {
     renderDoc(
       [
@@ -1481,7 +1250,47 @@ describe("WorkflowDocEditor navigation", () => {
     ).toBeNull();
   });
 
-  test("every step has Details: without a run it says so, and a form with none of the listed settings lists none", () => {
+  test("Details names its step, lists the step's settings, and its last item opens the side panel", () => {
+    renderDoc(
+      [
+        block("extraction", "find_prices", null, {
+          data_extraction_goal: "Get the prices",
+          max_retries: 3,
+          max_steps_per_run: 12,
+        }),
+      ],
+      { apply: vi.fn(), update: vi.fn(), addStep: vi.fn(), duplicate: vi.fn() },
+    );
+    expect(screen.getByText("Max retries: 3")).toBeTruthy();
+    const toggle = screen.getByRole("button", {
+      name: "Details for Find prices",
+    });
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    const options = within(
+      document.getElementById(toggle.getAttribute("aria-controls")!)!,
+    );
+    expect(options.queryByRole("listitem")).toBeNull();
+    expect(options.getByText("Max steps").nextElementSibling?.textContent).toBe(
+      "12",
+    );
+    // The extraction form has no max retries control, so the box leaves it out.
+    expect(options.queryByText("Max retries")).toBeNull();
+    expect(
+      options.getByText("Continue on failure").nextElementSibling?.textContent,
+    ).toBe("Off (default)");
+
+    fireEvent.click(
+      options.getByRole("button", { name: "More details in the side panel" }),
+    );
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    const selected = within(screen.getByLabelText("Selected step"));
+    expect(selected.getByText("Find prices")).toBeTruthy();
+    expect(selected.getByText("find_prices")).toBeTruthy();
+  });
+
+  test("every step has Details, a form with none of the listed settings lists none, and a read-only Doc lists the settings too", () => {
     const nodes = renderDoc(
       [
         block("wait", "pause", "open_site", { wait_sec: 5 }),
@@ -1509,33 +1318,10 @@ describe("WorkflowDocEditor navigation", () => {
     const box = within(
       document.getElementById(details[0]!.getAttribute("aria-controls")!)!,
     );
-    expect(
-      box.getByText("No run yet. After a run, the actions it took show here."),
-    ).toBeTruthy();
     expect(box.queryByRole("term")).toBeNull();
     expect(screen.queryByText(/Continue on failure|Model:/)).toBeNull();
 
-    // Read-only Details is intended: it still lists the run's actions, without the settings.
     cleanup();
-    docRun.current = {
-      runId: "wr_1",
-      live: false,
-      blocksByLabel: new Map([
-        [
-          "find_prices",
-          {
-            status: Status.Completed,
-            actions: [
-              {
-                action_id: "a1",
-                action_type: "click",
-                status: Status.Completed,
-              },
-            ],
-          },
-        ],
-      ]),
-    };
     renderDoc([
       block("extraction", "find_prices", null, { max_steps_per_run: 12 }),
     ]);
@@ -1546,8 +1332,9 @@ describe("WorkflowDocEditor navigation", () => {
     const readOnlyBox = within(
       document.getElementById(readOnly.getAttribute("aria-controls")!)!,
     );
-    expect(readOnlyBox.getAllByRole("listitem")).toHaveLength(1);
-    expect(readOnlyBox.queryByRole("term")).toBeNull();
+    expect(
+      readOnlyBox.getByText("Max steps").nextElementSibling?.textContent,
+    ).toBe("12");
   });
 
   test("Uses lists a step's declared inputs and its {{ }} reads, matching the input chips, and never a Code step's Python", () => {
@@ -1722,7 +1509,6 @@ test("a step that reads an output only some branches produce shows the warning u
 
 describe("a step that was just added", () => {
   beforeEach(() => {
-    docRun.current = { runId: null, blocksByLabel: new Map(), live: false };
     useWorkflowYamlEditorStore.setState(
       useWorkflowYamlEditorStore.getInitialState(),
     );
@@ -1749,7 +1535,7 @@ describe("a step that was just added", () => {
     act(() => useDocUnfinishedStore.getState().add(login.id));
     expect(document.querySelector("[data-doc-step-fix]")).toBeNull();
     expect(document.querySelector("[data-doc-problems]")).toBeNull();
-    expect(useRunValidationStore.getState().docProblemCount).toBe(0);
+    expect(blockingCount()).toBe(0);
 
     fireEvent.pointerDown(document.body);
 
@@ -1794,7 +1580,7 @@ describe("a step that was just added", () => {
     ["{{ }}", "nothing behind it", null],
     ["  ", "a stale list behind it", { key: "stale_topics" }],
   ])(
-    "a loop whose reference is %j with %s has no list and holds Run",
+    "a loop whose reference is %j with %s has no list and asks before Run",
     (reference, _, loopOver) => {
       renderDoc([
         forLoop("each_result", null, [code("open_result", null)], {
@@ -1803,9 +1589,7 @@ describe("a step that was just added", () => {
         }),
       ]);
       expect(document.querySelector("[data-doc-step-fix]")).toBeTruthy();
-      expect(useRunValidationStore.getState().docProblemCount).toBeGreaterThan(
-        0,
-      );
+      expect(blockingCount()).toBeGreaterThan(0);
       expect(screen.queryByText(/stale_topics/)).toBeNull();
     },
   );
@@ -1824,7 +1608,7 @@ describe("a step that was just added", () => {
     expect(document.querySelector('[data-doc-missing="URL"]')).toBeTruthy();
   });
 
-  test("a loop over a whole extraction result holds Run; the typed list path does not", () => {
+  test("a loop over a whole extraction result is a problem; the typed list path is not", () => {
     const steps = (reference: string) => [
       block("extraction", "extraction_1", "books", {
         data_extraction_goal: "List the titles",
@@ -1846,7 +1630,7 @@ describe("a step that was just added", () => {
         /^extraction_1 has no top-level list in its Data Schema/,
       ),
     ).toBeTruthy();
-    expect(useRunValidationStore.getState().docProblemCount).toBe(1);
+    expect(blockingCount()).toBe(1);
     fireEvent.click(
       screen.getByRole("button", { name: "Open extraction_1's Data Schema" }),
     );
@@ -1858,10 +1642,10 @@ describe("a step that was just added", () => {
     expect(
       screen.queryByText(/has no top-level list in its Data Schema/),
     ).toBeNull();
-    expect(useRunValidationStore.getState().docProblemCount).toBe(0);
+    expect(blockingCount()).toBe(0);
   });
 
-  test("the problems button lists every problem it counts, jumps to the step of the one picked, and a refused Run opens it in view", async () => {
+  test("the problems button lists every problem it counts, and jumps to the step of the one picked", async () => {
     // jsdom has no scrollIntoView, so vi.spyOn has nothing to wrap; the original is put back after the test.
     const original = Element.prototype.scrollIntoView;
     const scroll = vi.fn();
@@ -1902,31 +1686,9 @@ describe("a step that was just added", () => {
         document.querySelector(`[data-doc-node-id="${site.id}"]`),
       ),
     );
-
-    // A refused Run, from the Doc or the top bar, calls the callback the Doc registers.
-    // It brings the list's button into view instead of jumping, so the list is never anchored off screen.
-    scroll.mockClear();
-    act(() => {
-      useRunValidationStore.getState().docShowProblems?.();
-    });
-    expect(
-      await screen.findByRole("dialog", { name: "3 problems" }),
-    ).toBeTruthy();
-    expect(scroll.mock.contexts).toEqual([trigger]);
-    fireEvent.keyDown(document.activeElement ?? document.body, {
-      key: "Escape",
-    });
-    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
-    await waitFor(() =>
-      expect(
-        document.activeElement
-          ?.closest("[data-doc-node-id]")
-          ?.getAttribute("data-doc-node-id"),
-      ).toBe(site.id),
-    );
   });
 
-  test("Escape on a list a refused Run opened while typing returns focus to the line, not the page", async () => {
+  test("Fix problems from Run's question opens the list, and Escape returns focus to the line Run was pressed from", async () => {
     const nodes = renderDoc(
       [
         block("goto_url", "open_site", "write_it", { url: "" }),
@@ -1935,19 +1697,18 @@ describe("a step that was just added", () => {
       { apply: vi.fn(), update: vi.fn(), addStep: vi.fn(), duplicate: vi.fn() },
     );
     const site = nodes.find((node) => node.data.label === "write_it")!;
-    const step = document.querySelector<HTMLElement>(
-      `[data-doc-node-id="${site.id}"]`,
-    )!;
     act(() => screen.getByRole("textbox", { name: "write_it prompt" }).focus());
     const typing = document.activeElement as HTMLElement;
-    expect(typing.closest("[data-doc-node-id]")).toBe(step);
-    expect(typing.getAttribute("contenteditable")).toBe("plaintext-only");
-
+    // The Run question had focus when its Fix problems was pressed.
+    act(() => (document.activeElement as HTMLElement).blur());
     act(() => {
-      useRunValidationStore.getState().docShowProblems?.();
+      window.dispatchEvent(
+        new CustomEvent(DOC_SHOW_PROBLEMS_EVENT, {
+          detail: { returnFocus: typing, returnStepId: site.id },
+        }),
+      );
     });
     await screen.findByRole("dialog", { name: "1 problem" });
-    await waitFor(() => expect(typing.isConnected).toBe(false));
     fireEvent.keyDown(document.activeElement ?? document.body, {
       key: "Escape",
     });
@@ -1959,7 +1720,7 @@ describe("a step that was just added", () => {
     );
   });
 
-  test("a freshly added loop over a picked whole result holds Run once the user leaves it", () => {
+  test("a freshly added loop over a picked whole result is a problem once the user leaves it", () => {
     const nodes = renderDoc([
       block("extraction", "extraction_1", "books", {
         data_extraction_goal: "List the titles",
@@ -1975,7 +1736,7 @@ describe("a step that was just added", () => {
     expect(
       screen.queryByText(/has no top-level list in its Data Schema/),
     ).toBeNull();
-    expect(useRunValidationStore.getState().docProblemCount).toBe(0);
+    expect(blockingCount()).toBe(0);
 
     fireEvent.pointerDown(document.body);
 
@@ -1984,7 +1745,7 @@ describe("a step that was just added", () => {
         /^extraction_1 has no top-level list in its Data Schema/,
       ),
     ).toBeTruthy();
-    expect(useRunValidationStore.getState().docProblemCount).toBe(1);
+    expect(blockingCount()).toBe(1);
   });
 
   test("a click inside a floating menu does not count as leaving the new step", () => {
@@ -2013,7 +1774,6 @@ describe("A Browser Action that needs several actions", () => {
   } as unknown as WorkflowBlock;
 
   beforeEach(() => {
-    docRun.current = { runId: null, blocksByLabel: new Map(), live: false };
     useWorkflowYamlEditorStore.setState(
       useWorkflowYamlEditorStore.getInitialState(),
     );
@@ -2058,7 +1818,6 @@ describe("A Browser Action that needs several actions", () => {
 
 describe("Doc inputs", () => {
   beforeEach(() => {
-    docRun.current = { runId: null, blocksByLabel: new Map(), live: false };
     useWorkflowYamlEditorStore.setState(
       useWorkflowYamlEditorStore.getInitialState(),
     );
@@ -2085,24 +1844,6 @@ describe("Doc inputs", () => {
   afterEach(() => {
     cleanup();
     vi.unstubAllGlobals();
-  });
-
-  test("a credential input no step uses, with no saved credential, is not needed to run", () => {
-    useWorkflowParametersStore.setState({
-      parameters: [
-        {
-          key: "site_login",
-          parameterType: "credential",
-          dataType: WorkflowParameterValueType.CredentialId,
-          credentialId: "",
-          description: null,
-        } as never,
-      ],
-    });
-    renderDoc([code("tidy_up", null)]);
-    expect(
-      useDocRunStore.getState().inputs.map((input) => input.key),
-    ).not.toContain("site_login");
   });
 
   test("an input added, renamed and deleted in the Doc is the workflow's parameter and its mentions follow", () => {
@@ -2251,7 +1992,6 @@ describe("Demonstrate task in the step menu", () => {
   } as unknown as WorkflowBlock;
 
   beforeEach(() => {
-    docRun.current = { runId: null, blocksByLabel: new Map(), live: false };
     useWorkflowYamlEditorStore.setState(
       useWorkflowYamlEditorStore.getInitialState(),
     );

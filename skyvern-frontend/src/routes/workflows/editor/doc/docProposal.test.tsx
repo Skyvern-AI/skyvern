@@ -46,21 +46,11 @@ import { DocScope } from "./DocScope";
 import { WorkflowDocEditor } from "./WorkflowDocEditor";
 
 // The run widgets need studio run contexts; this file tests the proposal, so they are stubbed.
-vi.mock("./DocStepResult", () => ({ DocStepResult: () => null }));
 vi.mock("./DocRunStepButton", () => ({ DocRunStepButton: () => null }));
 
-vi.mock("./useDocRun", () => {
-  const blocksByLabel = new Map();
-  return {
-    useDocRun: () => ({
-      rowsLoaded: true,
-      runId: null,
-      blocksByLabel,
-      live: false,
-      unknownLabels: new Set(),
-    }),
-  };
-});
+vi.mock("./useDocLatestRunCompleted", () => ({
+  useDocLatestRunCompleted: () => false,
+}));
 
 async function renderInStudio(ui: ReactElement) {
   let view!: ReturnType<typeof render>;

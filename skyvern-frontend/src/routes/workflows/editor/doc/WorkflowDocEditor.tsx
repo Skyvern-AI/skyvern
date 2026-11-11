@@ -1,5 +1,4 @@
 import { graphNoteReadings } from "./noteSequences";
-import { useSearchParams } from "react-router-dom";
 import type { WorkflowCopilotDemonstrationInsertion } from "../../copilot/workflowCopilotTypes";
 import {
   type HTMLAttributes,
@@ -15,7 +14,6 @@ import type { Edge } from "@xyflow/react";
 import { GearIcon, QuestionMarkCircledIcon } from "@radix-ui/react-icons";
 import { usePostHog } from "posthog-js/react";
 import { cn } from "@/util/utils";
-import { Status } from "@/api/types";
 import { useWorkflowPresentationStore } from "@/store/WorkflowPresentationStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
@@ -61,7 +59,6 @@ import {
 import { DocInputEditor } from "./DocInputEditor";
 import {
   armNextCaretOffset,
-  DOC_SHOW_PROBLEMS_EVENT,
   docStepLine,
   takeReferenceLine,
   useDocTouch,
@@ -73,11 +70,7 @@ import {
   type DocPendingNote,
 } from "./WorkflowDocActionsContext";
 import { docBranchSelection } from "./docBranchSelection";
-import { useDocRun } from "./useDocRun";
-import { docRunFor } from "./useDocRunFor";
-import { useDocRunStore, type DocRunInput } from "./docRunStore";
 import { DocOutline } from "./DocOutline";
-import { DocRunLine } from "./DocRunLine";
 import { DocStepSearch } from "./DocStepSearch";
 import { DocAnnouncer } from "./DocAnnouncer";
 import { DocAddStep, DocScope, type DocNoteProblem } from "./DocScope";
@@ -98,11 +91,13 @@ import { docStepTitle } from "./docStepRegistry";
 import { docProblemEntries, docStepProblems } from "./docProblems";
 import { customSettingsShortText } from "./docSettingsChips";
 import { DocProblemsList } from "./DocProblemsList";
+import { docProblemStep } from "./docProblemStep";
+import { publishDocCriticalProblems } from "./docRunCheckStore";
 import { docPromptUrlOffer } from "./docPromptUrl";
 import { stepsLeftBy, useDocUnfinishedStore } from "./docUnfinished";
 import { DocGettingStarted, DocStarterNote, DocTip } from "./DocStarter";
 import { docTipIndex, type DocStarterProgress } from "./docStarterTips";
-import { useRunValidationStore } from "../runValidation/useRunValidationStore";
+import { useDocLatestRunCompleted } from "./useDocLatestRunCompleted";
 import {
   DocProposalCard,
   DocProposalProvider,
@@ -219,16 +214,11 @@ export function WorkflowDocEditor({
   const parameters = proposal?.parameters ?? liveParameters;
   const nodes = proposal?.nodes ?? liveNodes;
   const edges = proposal?.edges ?? liveEdges;
-  const docRun = useDocRun();
-  const [searchParams] = useSearchParams();
-  // A full run from the Doc holds the doc still (no adding or inserting); a one-step run doesn't.
-  const fullRunGoing = docRun.live && docRun.owned && !searchParams.has("bl");
   // A demonstration anchors its insertion by step labels, so the Doc holds still while one runs.
   const demonstrating = useRecordingLauncherStore(
     (s) => s.demonstration !== null,
   );
-  const editable =
-    !scopeReadOnly && !locked && !proposal && !fullRunGoing && !demonstrating;
+  const editable = !scopeReadOnly && !locked && !proposal && !demonstrating;
   const showingProposal = proposal !== null;
   const setDocMounted = useWorkflowPresentationStore((s) => s.setDocMounted);
   useEffect(() => {
@@ -400,24 +390,16 @@ export function WorkflowDocEditor({
       for (const item of items) {
         if (item.kind === "loop") visit(item.children);
         if (item.kind !== "conditional") continue;
-        const node = byId.get(item.nodeId);
-        if (node && isWorkflowBlockNode(node))
-          selected.set(
-            item.nodeId,
-            docBranchSelection(
-              item,
-              node.data.label,
-              branches[item.nodeId],
-              byId,
-              docRunFor(docRun, node.data.label).blocksByLabel,
-            ).selected.branchId,
-          );
+        selected.set(
+          item.nodeId,
+          docBranchSelection(item, branches[item.nodeId]).branchId,
+        );
         item.branches.forEach((branch) => visit(branch.children));
       }
     };
     visit(tree.items);
     return selected;
-  }, [tree, byId, docRun, branches]);
+  }, [tree, branches]);
   const selectBranch = (conditionalId: string, branchId: string) =>
     setBranches((current) => ({ ...current, [conditionalId]: branchId }));
   const startDemonstration = useRecordingLauncherStore(
@@ -572,6 +554,27 @@ export function WorkflowDocEditor({
     [nodes, tree, stepFixes, shownProblems],
   );
   const problems = problemEntries.length;
+  useEffect(() => {
+    const byNodeId = new Map(nodes.map((node) => [node.id, node]));
+    publishDocCriticalProblems(
+      problemEntries
+        .filter((entry) => entry.blocking)
+        .map((entry) => {
+          const node = entry.nodeId ? byNodeId.get(entry.nodeId) : undefined;
+          const step = node ? docProblemStep(node) : null;
+          return {
+            key: entry.key,
+            step: step
+              ? step.type
+                ? `${step.type} · ${step.name}`
+                : step.name
+              : null,
+            message: entry.message,
+          };
+        }),
+    );
+  }, [nodes, problemEntries]);
+  useEffect(() => () => publishDocCriticalProblems([]), []);
   const workflowProblems = useMemo(
     () => validationProblems.filter((problem) => !problem.block_label),
     [validationProblems],
@@ -618,14 +621,6 @@ export function WorkflowDocEditor({
   const noteProblemCount = [...noteProblems.keys()].filter(
     (key) => !key.endsWith(":step") && !key.endsWith(":fix"),
   ).length;
-  const runProblems = problemEntries.filter((entry) => entry.blocking).length;
-  useEffect(() => {
-    useRunValidationStore.getState().setDocProblemCount(runProblems);
-  }, [runProblems]);
-  useEffect(
-    () => () => useRunValidationStore.getState().setDocProblemCount(0),
-    [],
-  );
   // The panel is exempt from leave detection while it shows the step's settings; closing it or switching away is leaving.
   useEffect(() => {
     const { ids, settle } = useDocUnfinishedStore.getState();
@@ -657,6 +652,7 @@ export function WorkflowDocEditor({
       store().clear();
     };
   }, []);
+  const latestRunCompleted = useDocLatestRunCompleted(workflowId ?? null);
   const starter = useDocStarter(
     workflowId ?? null,
     Boolean(edit) && stepCount === 0 && !description?.trim(),
@@ -673,10 +669,7 @@ export function WorkflowDocEditor({
       (node) => node.type === "loop" || node.type === "conditional",
     ),
     problems,
-    ran:
-      docRun.run?.status === Status.Completed &&
-      !docRun.blockRun &&
-      !docRun.earlierVersion,
+    ran: latestRunCompleted,
   };
   // One onboarding aid at a time: the checklist waits while a tip is showing.
   const showTip =
@@ -834,74 +827,6 @@ export function WorkflowDocEditor({
   // The run-blocking panel's Locate lands here while the canvas is covered.
   const goToRef = useRef(goTo);
   goToRef.current = goTo;
-  // A refused Run opens the problems list without jumping: a jump could scroll the list's button out of view.
-  useEffect(() => {
-    const show = () => window.dispatchEvent(new Event(DOC_SHOW_PROBLEMS_EVENT));
-    useRunValidationStore.getState().setDocShowProblems(show);
-    return () => {
-      if (useRunValidationStore.getState().docShowProblems === show)
-        useRunValidationStore.getState().setDocShowProblems(null);
-    };
-  }, []);
-  const runInputs = useMemo<DocRunInput[]>(() => {
-    const used = new Set(
-      inputs.filter((input) => !input.unused).map((input) => input.key),
-    );
-    return parameters.flatMap((p) => {
-      // The editor keeps a credential_id run input as a Skyvern "credential" parameter; the server
-      // still takes it as a run input, with its saved credential as the default.
-      // A fixed credential (no dataType) is not a run input.
-      if (
-        p.parameterType === "credential" &&
-        "credentialId" in p &&
-        (p as { dataType?: string }).dataType ===
-          WorkflowParameterValueType.CredentialId
-      ) {
-        // The server runs without a credential an input names but no step uses.
-        if (!used.has(p.key)) return [];
-        const required = !p.credentialId;
-        return [
-          {
-            key: p.key,
-            type: WorkflowParameterValueType.CredentialId,
-            defaultValue: p.credentialId || null,
-            required,
-          },
-        ];
-      }
-      if (p.parameterType !== "workflow") return [];
-      const required =
-        p.defaultValue === null ||
-        p.defaultValue === undefined ||
-        p.defaultValue === "";
-      // The server refuses a run missing any input without a default, used or not.
-      if (!used.has(p.key) && !required) return [];
-      return [
-        {
-          key: p.key,
-          type: p.dataType,
-          defaultValue: p.defaultValue,
-          required,
-        },
-      ];
-    });
-  }, [inputs, parameters]);
-  useEffect(() => {
-    useDocRunStore.getState().publish({
-      inputs: proposal ? [] : runInputs,
-      stepCount,
-      mounted: true,
-    });
-  }, [runInputs, stepCount, proposal]);
-  useEffect(
-    () => () =>
-      useDocRunStore.getState().publish({
-        inputs: [],
-        stepCount: 0,
-        mounted: false,
-      }),
-    [],
-  );
   useEffect(() => {
     if (!locateRequest) return;
     if (
@@ -1026,8 +951,7 @@ export function WorkflowDocEditor({
     <WorkflowDocActionsContext.Provider
       value={{
         editable,
-        runControlsVisible: !scopeReadOnly && !proposal && !fullRunGoing,
-        runGoing: docRun.live && docRun.owned,
+        runControlsVisible: !scopeReadOnly && !proposal,
         openSettings: openStepSettings,
         openVisual: () =>
           useWorkflowPresentationStore.getState().setPresentation("visual"),
@@ -1185,7 +1109,6 @@ export function WorkflowDocEditor({
                 proposalPending={Boolean(proposal)}
               />
             </div>
-            <DocRunLine docRun={docRun} numbers={stepNumbers} byId={byId} />
             <div className="mb-[26px] flex flex-wrap items-center gap-1.5 border-b border-border pb-[18px]">
               <span className="mr-1 text-[12.5px] text-[hsl(0_0%_60%)] dark:text-[hsl(215_14%_52%)]">
                 Inputs
@@ -1425,7 +1348,7 @@ export function WorkflowDocEditor({
             kept={starter.done}
             onHide={starter.hide}
             folded={toastShowing}
-            compact={!wide || Boolean(docRun.runId)}
+            compact={!wide}
             clearOfPanel={panelOpen}
           />
         )}

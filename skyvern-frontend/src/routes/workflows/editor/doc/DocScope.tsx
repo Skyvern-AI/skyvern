@@ -43,7 +43,6 @@ import {
 import { DocEditableLine, DocInsertPopover } from "./DocEditing";
 import { NOTE_MAX_LENGTH, type DocScopeRef } from "./docGraphEdits";
 import { TOP_SCOPE, type DocPlace } from "./docEditApi";
-import { DocStepResult } from "./DocStepResult";
 import { DocDemonstrationLine } from "./DocDemonstrationLine";
 import { demonstrationLineIndex } from "./docDemonstration";
 import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
@@ -450,7 +449,6 @@ function DocNode({
           byId={byId}
           editable={editable}
         />
-        <DocStepResult label={node.data.label} />
       </div>
       {item.kind === "loop" && open && (
         <div className="mb-1 ml-[11px] mt-0.5 border-l border-border pl-4">
@@ -1024,8 +1022,7 @@ export function DocScope({
   // The insert line above a step goes above its note too, as the drop line does. The doc's first step has none:
   // the top of the doc is not between steps.
   const insertBefore = (index: number) => {
-    if (dropping || actions.runGoing || !structural || !editable || !scope)
-      return null;
+    if (dropping || !structural || !editable || !scope) return null;
     const item = items[index]!;
     const owner =
       item.kind === "note"
@@ -1197,7 +1194,6 @@ export function DocScope({
                       byId={byId}
                       editable={false}
                     />
-                    <DocStepResult label={node.data.label} />
                     {node.type === "loop" && (
                       <DocProposalLoopRemovals loopLabel={node.data.label} />
                     )}
