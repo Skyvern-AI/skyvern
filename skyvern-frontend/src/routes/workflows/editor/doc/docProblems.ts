@@ -202,7 +202,7 @@ export function docStepProblems(nodes: AppNode[]): Map<string, string[]> {
       })
     )
       found.push(
-        "This step has no saved credential. Open Step options, then Edit in side panel to choose one.",
+        "This step has no saved credential. Open Details, then More details in the side panel to choose one.",
       );
     if (found.length) problems.set(node.id, found);
   }

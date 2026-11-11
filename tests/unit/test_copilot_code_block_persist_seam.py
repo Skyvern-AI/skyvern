@@ -1753,6 +1753,26 @@ async def test_a_write_that_drops_and_retypes_prior_blocks_persists_and_names_bo
 
 
 @pytest.mark.asyncio
+async def test_a_write_linking_to_a_missing_block_names_the_dropped_link(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_successful_update(monkeypatch)
+    ctx = _ctx(_PRIOR_SIX_BLOCK_WORKFLOW, policy=BlockAuthoringPolicy.STANDARD)
+    submitted = (
+        _code_yaml('await page.goto("https://example.test/support")').replace(
+            "workflow_definition:\n", "workflow_definition:\n  parameters: []\n"
+        )
+        + "    next_block_label: never_added\n"
+    )
+
+    result = await _public_update(monkeypatch, ctx, submitted)
+
+    assert result["ok"] is True
+    dropped = [{"block": "submit_search", "branch_index": None, "target": "never_added", "now": None}]
+    assert result["data"]["dropped_next_block_links"] == dropped
+    run_result = {"ok": True, "data": {"workflow_run_id": "wr_x", "overall_status": "completed"}}
+    assert carry_author_time_findings(result, run_result)["data"]["dropped_next_block_links"] == dropped
+
+
+@pytest.mark.asyncio
 async def test_a_write_that_keeps_every_prior_block_names_no_drop_or_type_change(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -136,7 +136,8 @@ class DemonstrationRecord:
     replay_token: str | None = None
     recording_started_at: datetime | None = None
     value_chars: int = 0
-    # The person who started the demonstration; None for an organization key or a record from before this was kept.
+    # The person who started the demonstration; None for an organization key, a bare scoped key, or a record from before
+    # this was kept.
     human_user_id: str | None = None
 
 

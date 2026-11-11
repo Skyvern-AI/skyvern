@@ -53,20 +53,25 @@ export function DocSidePanel({
       aria-label="Document panel"
       className="absolute inset-0 z-20 overflow-y-auto bg-slate-elevation1 sm:relative sm:inset-auto sm:w-[22rem] sm:max-w-[36%] sm:shrink-0 sm:border-l sm:border-border"
     >
-      <button
-        type="button"
-        aria-label="Close document panel"
-        onClick={onClose}
-        className="absolute right-3 top-3 z-10 rounded p-1.5 text-muted-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
-      >
-        <Cross2Icon className="size-4" />
-      </button>
-      <Tabs value={tab} onValueChange={onTabChange} className="p-4">
-        <TabsList className="mb-4 mr-10">
-          <TabsTrigger value="settings">Settings</TabsTrigger>
-          <TabsTrigger value="learn">Learn</TabsTrigger>
-        </TabsList>
-        <TabsContent value="settings">
+      <Tabs value={tab} onValueChange={onTabChange}>
+        {/* Sticky: the panel scrolls as one, and a long settings form would carry the close control out of view. */}
+        <div className="sticky top-0 z-10 flex items-center gap-2 border-b border-border bg-slate-elevation1 px-4 py-2">
+          <TabsList>
+            <TabsTrigger value="settings">Settings</TabsTrigger>
+            <TabsTrigger value="learn">Learn</TabsTrigger>
+          </TabsList>
+          <button
+            type="button"
+            aria-label="Close document panel"
+            title="Close (Esc)"
+            onClick={onClose}
+            className="ml-auto inline-flex items-center gap-1 rounded px-2 py-1 text-[13px] text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            <Cross2Icon aria-hidden className="size-4" />
+            Close
+          </button>
+        </div>
+        <TabsContent value="settings" className="px-4 pb-4">
           {selectedStep && (
             <div className="mb-4 min-w-0 text-sm" aria-label="Selected step">
               <div className="flex min-w-0 items-center gap-2">
@@ -115,7 +120,7 @@ export function DocSidePanel({
             </p>
           )}
         </TabsContent>
-        <TabsContent value="learn">
+        <TabsContent value="learn" className="px-4 pb-4">
           <h2 className="mb-3 text-lg font-semibold">{learn.title}</h2>
           <p className="whitespace-pre-wrap text-sm leading-6 text-muted-foreground">
             {learn.description}

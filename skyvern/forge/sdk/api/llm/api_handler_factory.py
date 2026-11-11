@@ -368,6 +368,8 @@ LLM_REQUEST_COMPLETED_EVENT = "llm.request.completed"
 
 EXTRACT_ACTION_PROMPT_NAME = "extract-actions"
 CHECK_USER_GOAL_PROMPT_NAMES = {"check-user-goal", "check-user-goal-with-termination", "check-user-goal-after-click"}
+# Prompts whose system prompt is identical across calls, so Anthropic can serve it from the prompt cache.
+CACHED_SYSTEM_PROMPT_NAMES = {"failure_classifier_shadow"}
 # In the check-user-goal templates, everything from the first of these sections on changes between calls.
 _CHECK_USER_GOAL_PER_CALL_SECTIONS = (
     "\nAction History:\n",
@@ -1298,6 +1300,15 @@ class LLMAPIHandlerFactory:
         return False
 
     @staticmethod
+    def _system_message(
+        system_prompt: str, prompt_name: str, llm_config: LLMConfig | LLMRouterConfig
+    ) -> dict[str, Any]:
+        block: dict[str, Any] = {"type": "text", "text": system_prompt}
+        if prompt_name in CACHED_SYSTEM_PROMPT_NAMES and uses_only_anthropic_models(llm_config):
+            block["cache_control"] = {"type": "ephemeral"}
+        return {"role": "system", "content": [block]}
+
+    @staticmethod
     def _cache_check_user_goal_prefix_for_anthropic(messages: list[dict[str, Any]]) -> bool:
         user_message = next((message for message in messages if message.get("role") == "user"), None)
         content = user_message.get("content") if user_message else None
@@ -2202,11 +2213,7 @@ class LLMAPIHandlerFactory:
 
                 # Prepend system message for role separation (e.g., workflow copilot)
                 if system_prompt:
-                    system_message = {
-                        "role": "system",
-                        "content": [{"type": "text", "text": system_prompt}],
-                    }
-                    messages = [system_message] + messages
+                    messages = [LLMAPIHandlerFactory._system_message(system_prompt, prompt_name, llm_config)] + messages
 
                 async def _log_llm_request_artifact(model_label: str, vertex_cache_attached_flag: bool) -> str:
                     llm_request_payload = {
@@ -3085,11 +3092,7 @@ class LLMAPIHandlerFactory:
 
                 # Prepend system message for role separation (e.g., workflow copilot)
                 if system_prompt:
-                    system_message = {
-                        "role": "system",
-                        "content": [{"type": "text", "text": system_prompt}],
-                    }
-                    messages = [system_message] + messages
+                    messages = [LLMAPIHandlerFactory._system_message(system_prompt, prompt_name, llm_config)] + messages
 
                 # Inject context caching system message when available
                 # IMPORTANT: Only inject for extract-actions prompt to avoid contaminating other prompts

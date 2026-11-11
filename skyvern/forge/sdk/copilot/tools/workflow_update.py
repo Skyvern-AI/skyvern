@@ -119,6 +119,7 @@ from skyvern.forge.sdk.copilot.workflow_yaml import (
     _PRIVATE_WORKFLOW_SETTINGS_FIELDS,
     _canonicalize_copilot_proxy_location,
     _normalize_copilot_yaml,
+    _normalize_copilot_yaml_with_dropped_links,
     _process_workflow_yaml,
     dump_workflow_yaml,
     inherited_header_settings,
@@ -3537,6 +3538,7 @@ def carry_author_time_findings(update_result: dict[str, Any], result: dict[str, 
             "stored_code_rewritten",
             "dropped_prior_blocks",
             "block_type_changes",
+            "dropped_next_block_links",
             "stored_goal_kept",
             "stored_goal_kept_message",
             "stored_goal_dropped",
@@ -4766,6 +4768,13 @@ async def _update_workflow(
             prior_workflow_yaml, submitted_workflow_yaml, workflow_yaml
         )
         dropped_prior_blocks, block_type_changes = _block_definition_changes(prior_yaml, workflow_yaml)
+        # ponytail: re-normalizes the accepted text, repeating the drop log; thread the links out of
+        # _process_workflow_yaml if the second parse matters. Best-effort: the workflow is already persisted.
+        try:
+            dropped_next_block_links = _normalize_copilot_yaml_with_dropped_links(workflow_yaml)[1]
+        except Exception as normalize_err:  # noqa: BLE001 - normalization can raise validation and constructor errors.
+            LOG.warning("copilot_dropped_next_block_links_failed", error=str(normalize_err))
+            dropped_next_block_links = []
         written_diffs: list[CodeWriteDiff] = []
         if isinstance(ctx, CopilotContext):
             # Best-effort — the workflow is already persisted, so a narrative detail must never
@@ -4818,6 +4827,8 @@ async def _update_workflow(
             data["dropped_prior_blocks"] = dropped_prior_blocks
         if block_type_changes:
             data["block_type_changes"] = block_type_changes
+        if dropped_next_block_links:
+            data["dropped_next_block_links"] = dropped_next_block_links
         data.update(user_owned_goal_carry_disclosure(goal_carry))
         notes_visible = copilot_sees_notes(ctx)
         if kept_note_labels and notes_visible:

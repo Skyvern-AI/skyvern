@@ -73,6 +73,7 @@ import { DocRunStepButton } from "./DocRunStepButton";
 import { useBlockPlayRegistry } from "@/store/BlockPlayRegistryStore";
 import { docTagState, type DocTagState } from "./docRunState";
 import { useDocRunFor } from "./useDocRunFor";
+import { docStepActions, type DocStepAction } from "./docStepActions";
 import { DocText, docReferencePill } from "./DocText";
 import type { DocPlace } from "./docEditApi";
 import {
@@ -571,7 +572,7 @@ export function DocStepControls({
   node: WorkflowBlockNode;
   editable: boolean;
   showRunControl: boolean;
-  // A step's settings open from its "Step options" instead.
+  // A step's settings open from its "Details" instead.
   settings?: boolean;
 }) {
   return (
@@ -994,7 +995,6 @@ function DocStepSummary({
   const saves = docStepProducesData(node);
   const custom = getDocSettingsChips(node);
   const options = editable ? stepOptionRows(node) : [];
-  if (!refs.length && !saves && !custom.length && !options.length) return null;
   return (
     <>
       <div className="mt-1 flex flex-wrap items-baseline gap-x-2 gap-y-1 text-[12.5px] text-muted-foreground">
@@ -1034,34 +1034,36 @@ function DocStepSummary({
             {chip.label}
           </span>
         ))}
-        {options.length > 0 && (
-          <DocKeyTooltip
-            content={
-              custom.length ? customSettingsText(custom.length) : "Settings"
-            }
+        <DocKeyTooltip
+          content={
+            custom.length
+              ? customSettingsText(custom.length)
+              : editable
+                ? "Actions and settings"
+                : "Actions"
+          }
+        >
+          <button
+            type="button"
+            aria-label={`Details for ${docStepCaption(node) ?? node.data.label}`}
+            aria-expanded={open}
+            aria-controls={panelId}
+            onClick={() => setOpen(!open)}
+            className="inline-flex items-center gap-0.5 rounded px-1 text-[12.5px] text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
           >
-            <button
-              type="button"
-              aria-label={`Step options for ${docStepCaption(node) ?? node.data.label}`}
-              aria-expanded={open}
-              aria-controls={panelId}
-              onClick={() => setOpen(!open)}
-              className="inline-flex items-center gap-0.5 rounded px-1 text-[12.5px] text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
-            >
-              Step options
-              <ChevronDownIcon
-                aria-hidden
-                className={cn(
-                  "size-3 transition-transform",
-                  open && "rotate-180",
-                )}
-              />
-            </button>
-          </DocKeyTooltip>
-        )}
+            Details
+            <ChevronDownIcon
+              aria-hidden
+              className={cn(
+                "size-3 transition-transform",
+                open && "rotate-180",
+              )}
+            />
+          </button>
+        </DocKeyTooltip>
       </div>
-      {options.length > 0 && open && (
-        <DocStepOptions
+      {open && (
+        <DocStepDetails
           id={panelId}
           node={node}
           rows={options}
@@ -1100,7 +1102,94 @@ function stepOptionRows(node: WorkflowBlockNode): DocSettingRow[] {
   ];
 }
 
-function DocStepOptions({
+type DocStepRun =
+  | { state: "none" | "edited" | "notReached" | "notYet" }
+  | {
+      state: "ran";
+      shown: DocStepAction[];
+      more: number;
+      runCount: number;
+    };
+
+/** The actions this block took in the run its result line reads (a looped block's latest run). */
+function useDocStepRun(label: string): DocStepRun {
+  const {
+    runId,
+    blocksByLabel,
+    runsByLabel,
+    unknownLabels,
+    rowsLoaded,
+    live,
+    blockRun,
+  } = useDocRunFor(label);
+  if (!runId || !rowsLoaded) return { state: "none" };
+  if (unknownLabels.has(label)) return { state: "edited" };
+  const block = blocksByLabel.get(label);
+  // As on the result line: a one-step run says nothing about a step it has no row for.
+  if (blockRun && !block) return { state: "none" };
+  return block
+    ? {
+        state: "ran",
+        ...docStepActions(block.actions),
+        runCount: runsByLabel?.get(label)?.count ?? 1,
+      }
+    : { state: live ? "notYet" : "notReached" };
+}
+
+const RUN_NOTE: Record<Exclude<DocStepRun["state"], "ran">, string> = {
+  none: "No run yet. After a run, the actions it took show here.",
+  edited: "Edited since the last run. Run again to see its actions.",
+  notReached: "The last run did not reach this.",
+  notYet: "The run has not reached this yet.",
+};
+
+function DocStepRunActions({ label }: { label: string }) {
+  const run = useDocStepRun(label);
+  if (run.state !== "ran")
+    return <p className="text-muted-foreground">{RUN_NOTE[run.state]}</p>;
+  const many = run.runCount > 1;
+  if (!run.shown.length)
+    return (
+      <p className="text-muted-foreground">
+        {many
+          ? `The last of ${run.runCount} runs took no page actions here.`
+          : "The last run took no page actions here."}
+      </p>
+    );
+  const { more } = run;
+  return (
+    <>
+      <p className="text-[12px] text-muted-foreground">
+        {many
+          ? `Actions in the last of ${run.runCount} runs`
+          : "Actions in the last run"}
+      </p>
+      <ol className="mt-0.5 list-decimal space-y-0.5 pl-5">
+        {run.shown.map((action) => (
+          // The title carries text the clamp hides; 2000 characters keeps a huge reasoning out of the tooltip.
+          <li key={action.key} title={action.text?.slice(0, 2000)}>
+            <span className="line-clamp-2 [overflow-wrap:anywhere]">
+              <span className="font-medium">{action.type}</span>
+              {action.text && (
+                <span className="text-muted-foreground"> {action.text}</span>
+              )}
+            </span>
+            {action.failed && (
+              <span className="text-destructive"> (failed)</span>
+            )}
+          </li>
+        ))}
+      </ol>
+      {more > 0 && (
+        <p className="text-muted-foreground">
+          +{more} more in the run&rsquo;s timeline
+        </p>
+      )}
+    </>
+  );
+}
+
+function DocStepDetails({
   id,
   node,
   rows,
@@ -1117,25 +1206,28 @@ function DocStepOptions({
       id={id}
       className="mt-1 rounded-md border border-border px-3 py-2 text-[13px]"
     >
-      <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-0.5">
-        {rows.map((row) => (
-          <Fragment key={row.key}>
-            <dt className="text-muted-foreground">{row.label}</dt>
-            <dd
-              className={cn(
-                "min-w-0 [overflow-wrap:anywhere]",
-                !row.custom && "text-muted-foreground",
-              )}
-            >
-              {row.key === "url" && row.custom ? (
-                <DocText value={row.value} />
-              ) : (
-                row.value
-              )}
-            </dd>
-          </Fragment>
-        ))}
-      </dl>
+      <DocStepRunActions label={node.data.label} />
+      {rows.length > 0 && (
+        <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-4 gap-y-0.5 border-t border-border pt-2">
+          {rows.map((row) => (
+            <Fragment key={row.key}>
+              <dt className="text-muted-foreground">{row.label}</dt>
+              <dd
+                className={cn(
+                  "min-w-0 [overflow-wrap:anywhere]",
+                  !row.custom && "text-muted-foreground",
+                )}
+              >
+                {row.key === "url" && row.custom ? (
+                  <DocText value={row.value} />
+                ) : (
+                  row.value
+                )}
+              </dd>
+            </Fragment>
+          ))}
+        </dl>
+      )}
       <button
         type="button"
         onClick={() => {
@@ -1144,7 +1236,7 @@ function DocStepOptions({
         }}
         className="mt-1.5 rounded text-[12.5px] text-muted-foreground underline underline-offset-4 outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
       >
-        Edit in side panel
+        More details in the side panel
       </button>
     </div>
   );

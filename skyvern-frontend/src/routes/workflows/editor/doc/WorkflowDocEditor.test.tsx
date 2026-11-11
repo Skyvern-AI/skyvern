@@ -724,7 +724,7 @@ describe("WorkflowDocEditor navigation", () => {
     expect(document.querySelector('[data-doc-missing="URL"]')).toBeTruthy();
   });
 
-  test("a step offers its prompt's URL for its empty URL field after Step options, with the reason, and not while typing or read-only", () => {
+  test("a step offers its prompt's URL for its empty URL field after Details, with the reason, and not while typing or read-only", () => {
     const task = block("task", "search_step", "next_step", {
       url: "",
       navigation_goal: "Go to https://example.com/page and search for shoes",
@@ -762,7 +762,7 @@ describe("WorkflowDocEditor navigation", () => {
       screen.getByRole("textbox", { name: "search_step navigationGoal" }),
     );
 
-    // Forward Tab follows the DOM: the prompt, then Step options, then the offer.
+    // Forward Tab follows the DOM: the prompt, then Details, then the offer.
     const tabbable = [
       ...document.querySelectorAll<HTMLElement>('[role="textbox"], button'),
     ];
@@ -771,7 +771,7 @@ describe("WorkflowDocEditor navigation", () => {
       name: "search_step navigationGoal",
     });
     const options = screen.getByRole("button", {
-      name: /^Step options for .*search/i,
+      name: /^Details for .*search/i,
     });
     expect(at(prompt)).toBeLessThan(at(options));
     expect(at(options)).toBeLessThan(at(offer()!));
@@ -1283,7 +1283,34 @@ describe("WorkflowDocEditor navigation", () => {
     expect(number("only_else")).toBe("1.3");
   });
 
-  test("Step options names its step, lists the step's settings in place, and Edit in side panel opens the side panel", () => {
+  test("Details names its step, numbers the actions of the last run, lists the step's settings, and its last item opens the side panel", () => {
+    docRun.current = {
+      runId: "wr_1",
+      live: false,
+      blocksByLabel: new Map([
+        [
+          "find_prices",
+          {
+            status: Status.Completed,
+            // Newest first, as the run timeline sends them.
+            actions: [
+              {
+                action_id: "a2",
+                action_type: "extract",
+                status: Status.Failed,
+                intention: "Read every price",
+              },
+              {
+                action_id: "a1",
+                action_type: "click",
+                status: Status.Completed,
+                reasoning: "Open the price list",
+              },
+            ],
+          },
+        ],
+      ]),
+    };
     renderDoc(
       [
         block("extraction", "find_prices", null, {
@@ -1296,7 +1323,7 @@ describe("WorkflowDocEditor navigation", () => {
     );
     expect(screen.getByText("Max retries: 3")).toBeTruthy();
     const toggle = screen.getByRole("button", {
-      name: "Step options for Find prices",
+      name: "Details for Find prices",
     });
     expect(toggle.getAttribute("aria-expanded")).toBe("false");
     fireEvent.click(toggle);
@@ -1304,6 +1331,13 @@ describe("WorkflowDocEditor navigation", () => {
     const options = within(
       document.getElementById(toggle.getAttribute("aria-controls")!)!,
     );
+    expect(
+      options.getAllByRole("listitem").map((item) => item.textContent),
+    ).toEqual([
+      "Click Open the price list",
+      "Extract Data Read every price (failed)",
+    ]);
+    expect(options.getByText("Actions in the last run")).toBeTruthy();
     expect(options.getByText("Max steps").nextElementSibling?.textContent).toBe(
       "12",
     );
@@ -1314,7 +1348,7 @@ describe("WorkflowDocEditor navigation", () => {
     ).toBe("Off (default)");
 
     fireEvent.click(
-      options.getByRole("button", { name: "Edit in side panel" }),
+      options.getByRole("button", { name: "More details in the side panel" }),
     );
     expect(toggle.getAttribute("aria-expanded")).toBe("false");
     const selected = within(screen.getByLabelText("Selected step"));
@@ -1322,7 +1356,132 @@ describe("WorkflowDocEditor navigation", () => {
     expect(selected.getByText("find_prices")).toBeTruthy();
   });
 
-  test("a step whose form edits none of the listed settings has no Step options", () => {
+  test("Details of a step that ran several times in a loop says it shows the last of those runs", () => {
+    docRun.current = {
+      runId: "wr_1",
+      live: false,
+      blocksByLabel: new Map([
+        [
+          "find_prices",
+          {
+            status: Status.Completed,
+            actions: [
+              {
+                action_id: "a1",
+                action_type: "click",
+                status: Status.Completed,
+              },
+            ],
+          },
+        ],
+      ]),
+      runsByLabel: new Map([
+        ["find_prices", { count: 3, failed: 0, canceled: 0, withOutput: 0 }],
+      ]),
+    };
+    renderDoc([block("extraction", "find_prices", null, {})]);
+    fireEvent.click(
+      screen.getByRole("button", { name: "Details for Find prices" }),
+    );
+    expect(screen.getByText("Actions in the last of 3 runs")).toBeTruthy();
+  });
+
+  test("Details of a step outside a one-step run reads as no run, not as not reached", () => {
+    docRun.current = {
+      runId: "wr_step",
+      live: false,
+      blockRun: true,
+      blockRunTarget: "open_page",
+      blocksByLabel: new Map([
+        ["open_page", { status: Status.Completed, actions: [] }],
+      ]),
+    };
+    renderDoc([
+      block("navigation", "open_page", "find_prices", {}),
+      block("extraction", "find_prices", null, {}),
+    ]);
+    fireEvent.click(
+      screen.getByRole("button", { name: "Details for Find prices" }),
+    );
+    expect(
+      screen.getByText(
+        "No run yet. After a run, the actions it took show here.",
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText("The last run did not reach this.")).toBeNull();
+  });
+
+  test("Details keeps the failed mark of a long action outside the two-line clamp", () => {
+    docRun.current = {
+      runId: "wr_1",
+      live: false,
+      blocksByLabel: new Map([
+        [
+          "find_prices",
+          {
+            status: Status.Failed,
+            actions: [
+              {
+                action_id: "a1",
+                action_type: "extract",
+                status: Status.Failed,
+                intention: "Read every price on the page ".repeat(20),
+              },
+            ],
+          },
+        ],
+      ]),
+    };
+    renderDoc([block("extraction", "find_prices", null, {})]);
+    fireEvent.click(
+      screen.getByRole("button", { name: "Details for Find prices" }),
+    );
+    const item = screen.getByRole("listitem");
+    const clamped = item.querySelector(".line-clamp-2");
+    expect(clamped?.textContent).toContain("Read every price");
+    expect(clamped?.textContent).not.toContain("(failed)");
+    expect(item.textContent?.endsWith(" (failed)")).toBe(true);
+  });
+
+  test("the side panel closes with its Close button and with Escape, and Details reopens it", () => {
+    renderDoc(
+      [
+        block("extraction", "find_prices", null, {
+          data_extraction_goal: "Get the prices",
+        }),
+      ],
+      { apply: vi.fn(), update: vi.fn(), addStep: vi.fn(), duplicate: vi.fn() },
+    );
+    const toggle = screen.getByRole("button", {
+      name: "Details for Find prices",
+    });
+    const openPanel = () => {
+      fireEvent.click(toggle);
+      fireEvent.click(
+        screen.getByRole("button", { name: "More details in the side panel" }),
+      );
+      expect(
+        screen.getByRole("complementary", { name: "Document panel" }),
+      ).toBeTruthy();
+    };
+    openPanel();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Close document panel" }),
+    );
+    expect(
+      screen.queryByRole("complementary", { name: "Document panel" }),
+    ).toBeNull();
+    openPanel();
+    fireEvent.keyDown(
+      screen.getByRole("button", { name: "Close document panel" }),
+      { key: "Escape" },
+    );
+    expect(
+      screen.queryByRole("complementary", { name: "Document panel" }),
+    ).toBeNull();
+  });
+
+  test("every step has Details: without a run it says so, and a form with none of the listed settings lists none", () => {
     const nodes = renderDoc(
       [
         block("wait", "pause", "open_site", { wait_sec: 5 }),
@@ -1344,10 +1503,51 @@ describe("WorkflowDocEditor navigation", () => {
       "powerBIQuery",
       "terminate",
     ]);
+    const details = screen.getAllByRole("button", { name: /^Details for/ });
+    expect(details).toHaveLength(5);
+    fireEvent.click(details[0]!);
+    const box = within(
+      document.getElementById(details[0]!.getAttribute("aria-controls")!)!,
+    );
     expect(
-      screen.queryAllByRole("button", { name: /^Step options for/ }),
-    ).toEqual([]);
+      box.getByText("No run yet. After a run, the actions it took show here."),
+    ).toBeTruthy();
+    expect(box.queryByRole("term")).toBeNull();
     expect(screen.queryByText(/Continue on failure|Model:/)).toBeNull();
+
+    // Read-only Details is intended: it still lists the run's actions, without the settings.
+    cleanup();
+    docRun.current = {
+      runId: "wr_1",
+      live: false,
+      blocksByLabel: new Map([
+        [
+          "find_prices",
+          {
+            status: Status.Completed,
+            actions: [
+              {
+                action_id: "a1",
+                action_type: "click",
+                status: Status.Completed,
+              },
+            ],
+          },
+        ],
+      ]),
+    };
+    renderDoc([
+      block("extraction", "find_prices", null, { max_steps_per_run: 12 }),
+    ]);
+    const readOnly = screen.getByRole("button", {
+      name: "Details for Find prices",
+    });
+    fireEvent.click(readOnly);
+    const readOnlyBox = within(
+      document.getElementById(readOnly.getAttribute("aria-controls")!)!,
+    );
+    expect(readOnlyBox.getAllByRole("listitem")).toHaveLength(1);
+    expect(readOnlyBox.queryByRole("term")).toBeNull();
   });
 
   test("Uses lists a step's declared inputs and its {{ }} reads, matching the input chips, and never a Code step's Python", () => {
@@ -1413,7 +1613,7 @@ describe("WorkflowDocEditor navigation", () => {
     expect(chip("unused_input").getAttribute("aria-label")).toMatch(/not used/);
   });
 
-  test("Step options lists the output fields of a jsonSchema step and of an extraction that returns a list of rows", () => {
+  test("Details lists the output fields of a jsonSchema step and of an extraction that returns a list of rows", () => {
     renderDoc(
       [
         block("text_prompt", "summarize_page", "list_orders", {
@@ -1444,7 +1644,7 @@ describe("WorkflowDocEditor navigation", () => {
     );
     const fields = (title: string) => {
       const toggle = screen.getByRole("button", {
-        name: `Step options for ${title}`,
+        name: `Details for ${title}`,
       });
       fireEvent.click(toggle);
       return within(
@@ -1555,7 +1755,7 @@ describe("a step that was just added", () => {
 
     expect(
       screen.getAllByText(
-        "This step has no saved credential. Open Step options, then Edit in side panel to choose one.",
+        "This step has no saved credential. Open Details, then More details in the side panel to choose one.",
       ),
     ).toHaveLength(1);
     expect(document.querySelector("[data-doc-problems]")?.textContent).toBe(

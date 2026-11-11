@@ -35,14 +35,14 @@ If you're building automations visually instead, see [blocks reference](/referen
 | [`act`](#act) | Perform any action from a natural-language prompt | `None` |
 | [`extract`](#extract) | Pull structured data from the page | `dict`, `list`, `str`, or `None` |
 | [`validate`](#validate) | Assert a condition about the page | `bool` |
-| [`prompt`](#prompt) | Ask the LLM a question about the page | `dict`, `list`, `str`, or `None` |
+| [`prompt`](#prompt) | Send a prompt to the LLM (it does not see the page) | `dict`, `list`, `str`, or `None` |
 | [`click`](#click) | Click an element (selector, AI, or both) | `str \| None` |
 | [`fill`](#fill) | Fill an input field (selector, AI, or both) | `str` |
 | [`select_option`](#select_option) | Select a dropdown option (selector, AI, or both) | `str \| None` |
 | [`type`](#type) | Enter text into an input; same as `fill` (Python only) | `str` |
 | [`hover`](#hover) | Move mouse over an element (Python only) | `str` |
 | [`scroll`](#scroll) | Scroll the page by pixel offset (Python only) | `None` |
-| [`upload_file`](#upload_file) | Upload files to a file input (Python only) | `str` |
+| [`upload_file`](#upload_file) | Upload a file to a file input (Python only) | `str` |
 | [`locator`](#locator) | Locate an element with AI, returns a chainable Locator (Python only) | `Locator` |
 
 ### Agent methods
@@ -62,7 +62,7 @@ If you're building automations visually instead, see [blocks reference](/referen
 | [`fill_multipage_form`](#fill_multipage_form) | Form fill across multiple pages | `int` (pages filled) |
 | [`fill_from_mapping`](#fill_from_mapping) | Fill fields by index-to-value mapping | `None` |
 | [`extract_form_fields`](#extract_form_fields) | Extract all form field metadata | `list[dict]` |
-| [`validate_mapping`](#validate_mapping) | Check if a field mapping is valid | `bool` |
+| [`validate_mapping`](#validate_mapping) | Check a field mapping against your instructions | `bool` |
 | [`fill_autocomplete`](#fill_autocomplete) | Fill input with typeahead handling | `str` |
 
 ### iframe management (Python only)
@@ -96,8 +96,8 @@ await page.act("Scroll down to the pricing section")
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `prompt` | `str` | Yes | What action to perform |
-| `skip_refresh` | `bool` | No | Skip page refresh before acting |
-| `use_economy_tree` | `bool` | No | Use a smaller DOM tree for faster processing |
+| `skip_refresh` | `bool` | No | Skip page refresh before acting. Not forwarded by the SDK, so it has no effect here |
+| `use_economy_tree` | `bool` | No | Use a smaller DOM tree for faster processing. Not forwarded by the SDK, so it has no effect here |
 
 **Returns:** `None`
 
@@ -172,7 +172,7 @@ const isLoggedIn = await page.validate("The user is logged in")
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `prompt` | `str` | Yes | Condition to check |
-| `model` | `dict` | No | Override LLM model config |
+| `model` | `dict \| str` | No | Override LLM model config, or a model name as a string |
 
 **Returns:** `bool`
 
@@ -182,29 +182,29 @@ const isLoggedIn = await page.validate("The user is logged in")
 
 ### prompt
 
-Ask the LLM a question about the current page.
+Send a prompt to the LLM and get its answer. The model does not see the page: it gets only your prompt text. To read data from the page, use [`extract`](#extract).
 
 <CodeGroup>
 ```python Python
 result = await page.prompt(
-    "How many items are in the navigation menu?",
-    schema={"type": "object", "properties": {"count": {"type": "integer"}}}
+    "Classify this support message as billing, bug or other: 'I was charged twice this month'",
+    schema={"type": "object", "properties": {"category": {"type": "string"}}}
 )
 ```
 
 ```typescript TypeScript
 const result = await page.prompt(
-    "How many items are in the navigation menu?",
-    { schema: { type: "object", properties: { count: { type: "integer" } } } }
+    "Classify this support message as billing, bug or other: 'I was charged twice this month'",
+    { type: "object", properties: { category: { type: "string" } } }
 )
 ```
 </CodeGroup>
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `prompt` | `str` | Yes | Question to ask |
+| `prompt` | `str` | Yes | Prompt to send |
 | `schema` | `dict` | No | JSON Schema for structured response |
-| `model` | `dict` | No | Override LLM model config |
+| `model` | `dict \| str` | No | Override LLM model config, or a model name as a string |
 
 **Returns:** `dict`, `list`, `str`, or `None`. Without a `schema`, returns a `dict` of the form `{"llm_response": "..."}` (TypeScript: `{ llmResponse: "..." }`). With a `schema`, returns data shaped to your schema.
 
@@ -234,7 +234,8 @@ await page.click("#submit-button", { prompt: "Click the 'Submit' button" })  // 
 |-----------|------|----------|-------------|
 | `selector` | `str` | No | CSS selector |
 | `prompt` | `str` | No | AI prompt (fallback or primary) |
-| `ai` | `str` | No | AI mode: `"fallback"` (default) or `None` |
+| `ai` | `str` | No | AI mode: `"fallback"` (default) tries the selector first, then AI; `"proactive"` uses AI first; `None` uses the selector only. Python only |
+| `mode` | `str` | No | `"direct"` performs a plain Playwright click, with no AI fallback. Python only |
 
 **Returns:** `str | None` (resolved selector)
 
@@ -265,11 +266,12 @@ await page.fill("#email", "user@example.com", { prompt: "Fill email" })      // 
 | `selector` | `str` | No | CSS selector |
 | `value` | `str` | No | Value to fill |
 | `prompt` | `str` | No | AI prompt (fallback or primary) |
-| `ai` | `str` | No | AI mode: `"fallback"` (default) or `None` |
-| `totp_identifier` | `str` | No | TOTP identifier for 2FA fields |
-| `totp_url` | `str` | No | TOTP URL |
+| `ai` | `str` | No | AI mode: `"fallback"` (default) tries the selector first, then AI; `"proactive"` uses AI first; `None` uses the selector only. Python only |
+| `mode` | `str` | No | `"direct"` performs a plain Playwright fill, with no AI fallback. Python only |
+| `totp_identifier` | `str` | No | Identifier of the 2FA code to enter, when `value` is a TOTP placeholder. See [Two-factor authentication](/credentials#two-factor-authentication). Python only |
+| `totp_url` | `str` | No | Endpoint Skyvern calls to fetch the 2FA code, when `value` is a TOTP placeholder. Python only |
 
-**Returns:** `str` (resolved selector)
+**Returns:** `str` (the value entered)
 
 **SDK reference:** [fill](/sdk-reference/browser-automation/page#page-fill)
 
@@ -287,20 +289,20 @@ await page.select_option("#country", value="us", prompt="Select United States") 
 ```
 
 ```typescript TypeScript
-await page.selectOption("#country", { value: "us" })                                       // selector
+await page.selectOption("#country", "us")                                                  // selector
 await page.selectOption({ prompt: "Select 'United States' from the country dropdown" })    // AI
-await page.selectOption("#country", { value: "us", prompt: "Select United States" })        // both
+await page.selectOption("#country", "us", { prompt: "Select United States" })              // both
 ```
 </CodeGroup>
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `selector` | `str` | No | CSS selector |
-| `value` | `str \| list[str]` | No | Option value(s) to select |
+| `value` | `str` | No | Option value to select. In TypeScript, `selectOption(selector, values)` also accepts a `string[]` to select several options |
 | `prompt` | `str` | No | AI prompt (fallback or primary) |
-| `ai` | `str` | No | AI mode: `"fallback"` (default) or `None` |
+| `ai` | `str` | No | AI mode: `"fallback"` (default) tries the selector first, then AI; `"proactive"` uses AI first; `None` uses the selector only. Python only |
 
-**Returns:** `str | None` (resolved selector)
+**Returns:** `str | None` (the value selected)
 
 **SDK reference:** [select_option](/sdk-reference/browser-automation/page#page-select_option)
 
@@ -319,12 +321,6 @@ await page.type(prompt="Type 'hello' into the search box")
 
 # Selector with AI fallback
 await page.type("#search", value="query text", prompt="Type into the search field")
-
-# TOTP input from a stored secret
-await page.type("#otp", totp_identifier="my-app")
-
-# TOTP generated on the fly from an otpauth URI
-await page.type("#otp", totp_url="otpauth://totp/Example:alice?secret=JBSWY3DPEHPK3PXP")
 ```
 
 | Parameter | Type | Required | Description |
@@ -332,11 +328,11 @@ await page.type("#otp", totp_url="otpauth://totp/Example:alice?secret=JBSWY3DPEH
 | `selector` | `str` | No | CSS or XPath selector for the input field |
 | `value` | `str` | No | Text to enter |
 | `prompt` | `str` | No | Natural-language description of the target field |
-| `ai` | `str` | No | AI mode: `"fallback"` (default) tries the selector first, then AI |
-| `totp_identifier` | `str` | No | Identifier for a stored TOTP secret |
-| `totp_url` | `str` | No | `otpauth://` URI to generate a one-time password on the fly |
+| `ai` | `str` | No | AI mode: `"fallback"` (default) tries the selector first, then AI; `"proactive"` uses AI first; `None` uses the selector only |
+| `totp_identifier` | `str` | No | Identifier of the 2FA code to enter, when `value` is a TOTP placeholder. See [Two-factor authentication](/credentials#two-factor-authentication). |
+| `totp_url` | `str` | No | Endpoint Skyvern calls to fetch the 2FA code, when `value` is a TOTP placeholder |
 
-**Returns:** `str` (resolved selector)
+**Returns:** `str` (the value entered)
 
 **SDK reference:** [type](/sdk-reference/browser-automation/page#page-type)
 
@@ -397,15 +393,16 @@ Upload a file to a file input. Pass a selector for direct Playwright behavior, a
 
 ```python
 # Direct selector
-await page.upload_file("#file-input", files="/path/to/file.pdf")
+await page.upload_file("#file-input", files="https://example.com/resume.pdf")
 
 # AI-powered file input detection (no selector needed)
 await page.upload_file(prompt="Upload the resume to the file input")
 
-# Selector with AI fallback: try the selector first, use AI if it fails
+# Selector and prompt: the selector is tried first, then AI performs the upload,
+# using the selector only if it worked
 await page.upload_file(
     "#file-input",
-    files="/path/to/file.pdf",
+    files="https://example.com/resume.pdf",
     prompt="Upload the resume to the file input",
 )
 ```
@@ -413,11 +410,11 @@ await page.upload_file(
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `selector` | `str` | No | CSS or XPath selector for the file input |
-| `files` | `str \| list[str]` | No | File path or list of file paths to upload |
-| `prompt` | `str` | No | Natural-language description of the file input to target |
-| `ai` | `str` | No | AI mode: `"fallback"` (default) tries the selector first, then AI |
+| `files` | `str` | No | URL of the file to upload. One file per call |
+| `prompt` | `str` | No | Natural-language description of the file input to target. With the default `ai`, a prompt means AI performs the upload |
+| `ai` | `str` | No | AI mode: `"fallback"` (default) tries the selector first, then AI; `"proactive"` uses AI first when a `prompt` is given; `None` uses the selector only |
 
-**Returns:** `str` (resolved selector)
+**Returns:** `str` (the URL of the file uploaded)
 
 **SDK reference:** [upload_file](/sdk-reference/browser-automation/page#page-upload_file)
 
@@ -465,7 +462,7 @@ When `prompt` is provided, the returned `AILocator` supports all standard Playwr
 - **Queries:** `text_content()`, `inner_text()`, `inner_html()`, `get_attribute()`, `input_value()`, `count()`
 - **State:** `is_visible()`, `is_hidden()`, `is_enabled()`, `is_disabled()`, `is_editable()`, `is_checked()`
 - **Chaining:** `first()`, `last()`, `nth()`, `filter()`, `locator()`, `get_by_text()`, `get_by_role()`, `get_by_label()`, `get_by_placeholder()`
-- **Utilities:** `wait_for()`, `screenshot()`, `playwright_locator` (access raw `Locator`)
+- **Utilities:** `wait_for()`, `screenshot()`
 
 **SDK reference:** [locator](/sdk-reference/browser-automation/page#page-locator)
 
@@ -501,8 +498,12 @@ await page.agent.login("skyvern", {
 | `bitwarden_collection_id`, `bitwarden_item_id` | `str` | No | Bitwarden item to use (for `bitwarden` type) |
 | `onepassword_vault_id`, `onepassword_item_id` | `str` | No | 1Password item to use (for `1password` type) |
 | `azure_vault_name`, `azure_vault_username_key`, `azure_vault_password_key`, `azure_vault_totp_secret_key` | `str` | No | Azure Key Vault secrets to use (for `azure_vault` type) |
-| `url` | `str` | No | Login page URL |
+| `url` | `str` | No | Login page URL. Defaults to the current page URL |
 | `prompt` | `str` | No | Additional login instructions |
+| `webhook_url` | `str` | No | Callback URL for the run result. See [Webhooks](/developers/production#webhooks). |
+| `totp_identifier` | `str` | No | Identifier for push-based TOTP. See [Two-factor authentication](/credentials#two-factor-authentication). |
+| `totp_url` | `str` | No | Endpoint Skyvern calls to pull TOTP codes |
+| `extra_http_headers` | `dict[str, str]` | No | Additional HTTP headers to include in requests |
 | `timeout` | `float` | No | Max wait time in seconds (default: 1800) |
 
 **Returns:** [`WorkflowRunResponse`](/sdk-reference/agents#run_workflow)
@@ -552,7 +553,7 @@ console.log(result.output)
 | `prompt` | `str` | Yes | Multi-step goal description |
 | `data_extraction_schema` | `dict \| str` | No | JSON Schema for structured output. See [Extract Structured Data](/developers/browser-automation#extract-structured-data). |
 | `max_steps` | `int` | No | Cap AI steps. The run ends with status `failed` ("Reached the maximum steps") if hit. Controls cost; each step is one AI decision + action cycle. |
-| `engine` | `RunEngine` | No | AI engine. Defaults to `skyvern-1.0`. On Skyvern Cloud, blocks with no engine set run on Skyvern 3.0 in agents created since October 1, 2026, and the engine selector labels `skyvern-3.0` Recommended. `skyvern-2.0` remains available for existing Skyvern 2.0 agents and explicitly requested Skyvern 2.0 task runs. Other options: `skyvern-3.0`, `openai-cua`, `anthropic-cua`, `ui-tars`. |
+| `engine` | `RunEngine` | No | AI engine. Defaults to `skyvern-1.0`, which the SDK always sends. Other options: `skyvern-2.0`, `skyvern-3.0`, `openai-cua`, `anthropic-cua`, `ui-tars`. See [Engines](/concepts#engines). |
 | `model` | `dict` / `Record<string, unknown>` | No | Override LLM model configuration |
 | `url` | `str` / `string` | No | URL to navigate to (defaults to current page URL) |
 | `webhook_url` | `str` / `string` | No | Callback URL. Skyvern POSTs the full run result on completion or failure. See [Webhooks](/developers/production#webhooks). |
@@ -596,9 +597,14 @@ const result = await page.agent.downloadFiles(
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `prompt` | `str` | Yes | What to download |
+| `url` | `str` | No | Page to start from. Defaults to the current page URL |
 | `download_suffix` | `str` | No | Filename for the saved file. A name without an extension (e.g., `"invoice"`) gets the downloaded file's extension (`invoice.pdf`); a full name like `"invoice.pdf"` is used as is. Don't pass only an extension such as `".pdf"`: it becomes the whole name (`.pdf.pdf`). `{{ original_filename }}` inserts the site's own file name (`"archive_{{ original_filename }}"` → `archive_Q4 Report.pdf`). |
 | `download_timeout` | `float` | No | Soft hint (seconds) for how long to wait for a download. The overall `timeout` is what actually fails the run. |
 | `max_steps_per_run` | `int` | No | Cap AI steps |
+| `webhook_url` | `str` | No | Callback URL for the run result. See [Webhooks](/developers/production#webhooks). |
+| `totp_identifier` | `str` | No | Identifier for push-based TOTP. See [Two-factor authentication](/credentials#two-factor-authentication). |
+| `totp_url` | `str` | No | Endpoint Skyvern calls to pull TOTP codes |
+| `extra_http_headers` | `dict[str, str]` | No | Additional HTTP headers to include in requests |
 | `timeout` | `float` | No | Max wait in seconds (default: 1800) |
 
 **Returns:** [`WorkflowRunResponse`](/sdk-reference/agents#run_workflow)
@@ -692,7 +698,7 @@ print(f"Filled {pages_filled} pages")
 |-----------|------|----------|-------------|
 | `data` | `dict[str, Any]` | Yes | Key-value pairs of form data to fill across all pages |
 | `prompt` | `str` | No | Instruction for the AI. Defaults to `"Fill out the form"` |
-| `next_button` | `str` | No | Selector or description of the button to advance to the next page |
+| `next_button` | `str` | No | CSS selector for the button that moves to the next page. If it fails, AI looks for the save-and-continue button. Defaults to `button:has-text("Save and Continue"), button:has-text("Next"), button:has-text("Continue")` |
 | `max_pages` | `int` | No | Maximum number of pages to fill. Defaults to `10` |
 | `timeout_seconds` | `float` | No | Timeout in seconds for the entire operation. Defaults to `300` |
 
@@ -733,11 +739,16 @@ Extract all form fields with metadata from the current page. Use the output to d
 
 ```python
 fields = await page.extract_form_fields()
-# Returns a list of dicts with field name, type, options, and other metadata:
-# [{"name": "First Name", "type": "text", "index": 0, ...}, ...]
+# Returns one dict per field. A mapping refers to a field by its position in this list:
+# [{"label": "First Name", "selector": "...", "tag": "input", "type": "text", "name": "first_name", "required": True, ...}, ...]
 ```
 
-**Returns:** `list[dict[str, Any]]` where each dict contains field name, type, options, and other metadata.
+**Returns:** `list[dict[str, Any]]`. Each dict has `label`, `selector`, `tag`, `type`, `name` (the HTML `name` attribute), `required` and `placeholder`. Two more keys depend on the field:
+
+- `formatHint` is a string, or `None` when the field has no hint. It is missing from toggles (`type` of `toggle`), radio and checkbox groups, and ARIA checkboxes.
+- `options` is a list. It is present only on dropdowns (`type` of `select`) and on radio and checkbox groups (`type` of `radio_group` or `checkbox_group`).
+
+Read both with `field.get(...)`.
 
 **SDK reference:** [extract_form_fields](/sdk-reference/browser-automation/forms#page-extract_form_fields)
 
@@ -745,14 +756,14 @@ fields = await page.extract_form_fields()
 
 ### validate_mapping
 
-Check if a field mapping is correct for the current form.
+Check a field mapping against your instructions, for example a rule to stop when a required answer is missing.
 
 ```python
 fields = await page.extract_form_fields()
 is_valid = await page.validate_mapping(
     form_fields=fields,
     mapping={0: "John", 1: "Doe"},
-    prompt="Validate the name fields are filled correctly",
+    prompt="Fill in the applicant's name. Stop if the last name is missing.",
 )
 ```
 
@@ -760,9 +771,9 @@ is_valid = await page.validate_mapping(
 |-----------|------|----------|-------------|
 | `form_fields` | `list[dict[str, Any]]` | Yes | Field metadata returned by `extract_form_fields` |
 | `mapping` | `dict[int, str \| list \| bool \| None]` | Yes | Map of field index to the value to validate |
-| `prompt` | `str` | Yes | Instruction describing what to validate |
+| `prompt` | `str` | Yes | The instructions for this automation |
 
-**Returns:** `bool` (`True` if the mapping is valid, `False` otherwise)
+**Returns:** `bool` (`True` if the run should complete, `False` if it should terminate)
 
 **SDK reference:** [validate_mapping](/sdk-reference/browser-automation/forms#page-validate_mapping)
 
@@ -790,12 +801,12 @@ await page.fill_autocomplete(prompt="Fill 'San Francisco' in the city autocomple
 | `selector` | `str` | No | CSS selector for the input field |
 | `value` | `str` | No | The text value to type into the field |
 | `prompt` | `str` | No | Natural-language description of the field and value |
-| `ai` | `str` | No | AI mode: `"fallback"` (default) tries the selector first, then AI |
+| `ai` | `str` | No | AI mode: `"fallback"` (default) tries the selector first, then AI; `"proactive"` uses AI first; `None` uses the selector only |
 | `option_selector` | `str` | No | CSS selector for the autocomplete dropdown options |
 | `wait_seconds` | `float` | No | Seconds to wait for the dropdown to appear. Default `1.5` |
 | `**kwargs` |  | No | Standard Playwright fill options (e.g., `timeout`, `force`) |
 
-**Returns:** `str` (resolved selector)
+**Returns:** `str` (the option selected, or the value typed if no dropdown appeared)
 
 **SDK reference:** [fill_autocomplete](/sdk-reference/browser-automation/forms#page-fill_autocomplete)
 
@@ -854,7 +865,7 @@ List all frames on the current page with metadata.
 
 ```python
 frames = await page.frame_list()
-# [{"name": "checkout", "url": "...", "index": 0}, ...]
+# [{"index": 0, "name": "", "url": "...", "is_main": True}, {"index": 1, "name": "checkout", "url": "...", "is_main": False}, ...]
 ```
 
 **Returns:** `list[dict[str, Any]]` (metadata for each frame on the page)

@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import json
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -85,7 +86,8 @@ class WebhookSignature:
 def generate_skyvern_webhook_signature(payload: dict, api_key: str) -> WebhookSignature:
     payload_str = _normalize_json_dumps(payload)
     signature = generate_skyvern_signature(payload=payload_str, api_key=api_key)
-    timestamp = str(int(datetime.utcnow().timestamp()))
+    # Not datetime.utcnow().timestamp(): .timestamp() reads a naive datetime as local time, hours off outside UTC.
+    timestamp = str(int(time.time()))
     return WebhookSignature(
         timestamp=timestamp,
         signature=signature,

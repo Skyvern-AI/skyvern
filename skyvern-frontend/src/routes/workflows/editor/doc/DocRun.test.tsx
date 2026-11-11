@@ -1335,6 +1335,21 @@ describe("DocRunLine", () => {
     },
   );
 
+  it("ages a re-queued retry from when it was queued again, not from when the run was created", () => {
+    const shown = line(
+      { live: true, owned: true },
+      {
+        status: Status.Queued,
+        started_at: null,
+        created_at: ago(47),
+        queued_at: ago(1),
+      },
+    );
+    expect(shown?.textContent).toContain(
+      "Queued · queued 1 min ago · this version",
+    );
+  });
+
   it.each([
     [
       "a soft-deleted version",
@@ -1350,12 +1365,13 @@ describe("DocRunLine", () => {
       {},
       "a test run",
     ],
+
     [
       "a Copilot run whose proposal is pending",
       { deleted_at: null },
       { copilot_session_id: "wcc_1" },
       { proposalPending: true },
-      "a newer version, v7",
+      "a test run",
     ],
     ["a plain run", { deleted_at: null }, {}, {}, "a newer version, v7"],
   ])("names the version of %s", (_, workflow, run, overrides, words) => {
