@@ -1174,3 +1174,87 @@ def test_run_mcp_rejects_browser_extension_with_http_transport(
         run_commands.run_mcp(transport=transport, browser_extension=True)
 
     assert "BROWSER_TYPE" not in run_commands.os.environ
+
+
+@pytest.mark.asyncio
+async def test_broker_boot_warms_without_taking_place(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SKYVERN_BROWSER_EXTENSION_BROKER", "1")
+    started = asyncio.Event()
+    finished = asyncio.Event()
+    tasks: list[asyncio.Task] = []
+
+    async def warm() -> None:
+        tasks.append(asyncio.current_task())
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            finished.set()
+
+    async def serve() -> None:
+        await asyncio.wait_for(started.wait(), 1)
+        assert not finished.is_set()
+
+    get_or_start = AsyncMock(side_effect=AssertionError("boot took a client place"))
+    monkeypatch.setattr(BrowserExtensionRuntime, "get_or_start", get_or_start)
+    monkeypatch.setattr(BrowserExtensionRuntime, "_instance", None)
+    monkeypatch.setattr("skyvern.browser_extension.runtime.warm_broker_daemon", warm)
+    monkeypatch.setattr(run_commands, "_cleanup_mcp_resources", AsyncMock())
+    await run_commands._run_mcp_with_cleanup(serve, browser_extension=True)
+    get_or_start.assert_not_awaited()
+    assert len(tasks) == 1
+    assert tasks[0].done()
+    assert finished.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode,close_fails,release_fails",
+    [
+        pytest.param("extension", False, False, id="extension"),
+        pytest.param("extension", False, True, id="extension-release-fails"),
+        pytest.param("extension", True, False, id="extension-close-fails"),
+        pytest.param("cdp", False, False, id="cdp"),
+        pytest.param(None, False, False, id="no-session"),
+    ],
+)
+async def test_session_close_releases_extension_place_without_changing_result(
+    monkeypatch: pytest.MonkeyPatch, mode: str | None, close_fails: bool, release_fails: bool
+) -> None:
+    current = SimpleNamespace(
+        browser=object() if mode else None,
+        context=SimpleNamespace(mode=mode, session_id=None) if mode else None,
+    )
+    calls: list[str] = []
+
+    async def close() -> None:
+        calls.append("close")
+        if close_fails:
+            raise RuntimeError("close failed")
+
+    async def release() -> bool:
+        calls.append("release")
+        if release_fails:
+            raise RuntimeError("release failed")
+        return True
+
+    release_mock = AsyncMock(side_effect=release)
+    monkeypatch.setattr(mcp_session, "get_current_session", lambda: current)
+    monkeypatch.setattr(mcp_session, "close_current_session", close)
+    monkeypatch.setattr(mcp_session, "release_broker_place_after_session_close", release_mock)
+    monkeypatch.setattr(mcp_session, "drain_action_log_events", AsyncMock())
+    monkeypatch.setattr(mcp_session, "get_skyvern", lambda: None)
+    monkeypatch.setattr(mcp_session, "_fetch_session_recording_data", AsyncMock(return_value={}))
+    result = await mcp_session.skyvern_browser_session_close()
+    assert result["ok"] is (mode is not None and not close_fails)
+    if mode is None:
+        assert result["error"]["code"] == "NO_ACTIVE_BROWSER"
+    elif close_fails:
+        assert result["error"]["code"] == "SDK_ERROR"
+        assert "close failed" in result["error"]["message"]
+    if mode == "extension":
+        assert calls == ["close", "release"]
+    if mode == "cdp":
+        release_mock.assert_not_awaited()
+    else:
+        release_mock.assert_awaited_once()

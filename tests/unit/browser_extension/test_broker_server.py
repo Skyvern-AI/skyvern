@@ -48,7 +48,11 @@ from skyvern.browser_extension.errors import (
 )
 from skyvern.browser_extension.package_extension import EXTENSION_DIR, compute_extension_source_hash
 from skyvern.browser_extension.relay import ExtensionRelayServer
+from skyvern.browser_extension.runtime import BrowserExtensionRuntime, release_broker_place_after_session_close
+from skyvern.browser_extension.target_registry import VirtualTargetRegistry
+from skyvern.browser_extension.workstation_grant import workstation_grant_path, write_workstation_grant
 from tests.unit.browser_extension.home_guard import _test_broker_base_dir
+from tests.unit.browser_extension.test_runtime import StubAdapter
 
 
 class FakeExtension:
@@ -5088,4 +5092,68 @@ async def test_fixed_fill_obeys_tab_ownership_and_requires_shared_scope() -> Non
         await first.stop()
         await asyncio.wait_for(second_task, 1.0)
         await asyncio.wait_for(first_task, 1.0)
+        await server.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_grant", [True, False])
+async def test_release_broker_place_requires_grant_and_reenrolls(
+    monkeypatch: pytest.MonkeyPatch, with_grant: bool
+) -> None:
+    token = "release-test-token"
+    if with_grant:
+        write_workstation_grant(workstation_grant_path(), token, source="cli")
+    server = BrowserExtensionBrokerServer(19777, base_dir=_test_broker_base_dir())
+    server._broker_auth_token = token
+    server._relay = FakeRelay(token, 19777, server._handle_extension_event, server._handle_disconnect)
+    client = BrokerClient(19777, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
+    fresh = BrokerClient(19777, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
+    tasks = [await _connect_over_socketpair(server, client, auto_approve=False)]
+    runtime = BrowserExtensionRuntime(client, StubAdapter(VirtualTargetRegistry(), client, calls=[]))
+    monkeypatch.setattr(BrowserExtensionRuntime, "_instance", runtime)
+    try:
+        assert len(server._clients) == 1
+        assert await release_broker_place_after_session_close() is with_grant
+        if with_grant:
+            assert BrowserExtensionRuntime.instance() is None
+            await asyncio.wait_for(tasks[0], 1)
+            assert len(server._clients) == 0
+            tasks.append(await _connect_over_socketpair(server, fresh, auto_approve=False))
+            assert fresh._client_id != client._client_id
+            assert (await fresh.broker_status())["approved"] is True
+            assert server._credentials[fresh._client_id].approval_source == "grant"
+            assert server._pairing_owner is None
+        else:
+            assert BrowserExtensionRuntime.instance() is runtime
+            assert (await client.broker_status())["clientCount"] == 1
+            assert not tasks[0].done()
+    finally:
+        await runtime.shutdown()
+        await fresh.stop()
+        for task in tasks:
+            await asyncio.wait_for(task, 1)
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_operator_connection_answers_when_clients_fill_the_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(broker_server_module, "MAX_AUTHENTICATED_CLIENTS", 1)
+    server = BrowserExtensionBrokerServer(19777, base_dir=_test_broker_base_dir())
+    server._relay = FakeRelay("cap-test-token", 19777, server._handle_extension_event, server._handle_disconnect)
+    client = BrokerClient(19777, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
+    rejected = BrokerClient(19777, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
+    operator = BrokerClient(19777, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False, operator=True)
+    tasks = [await _connect_over_socketpair(server, client)]
+    try:
+        await _eventually(lambda: server._pending_connections == 0)
+        with pytest.raises(BrowserExtensionBrokerError) as error:
+            await _connect_over_socketpair(server, rejected)
+        assert error.value.code == "BROKER_BUSY"
+        tasks.append(await _connect_over_socketpair(server, operator))
+        assert (await operator.broker_status())["clientCount"] == 1
+    finally:
+        for broker_client in (client, rejected, operator):
+            await broker_client.stop()
+        for task in tasks:
+            await asyncio.wait_for(task, 1)
         await server.stop()
