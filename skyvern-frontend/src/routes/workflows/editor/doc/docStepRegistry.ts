@@ -385,6 +385,10 @@ const keyFields: Record<string, Array<[string, string]>> = {
   googleSheetsWrite: [["range", "Range"]],
 };
 
+/** Every key field of the type, filled or not. */
+export const docKeyFieldKeys = (type: string) =>
+  (keyFields[type] ?? []).map(([key]) => key);
+
 export function getDocKeyFields(node: Node): DocKeyField[] {
   return (keyFields[node.type ?? ""] ?? []).flatMap(([key, label]) => {
     const value = node.data[key];

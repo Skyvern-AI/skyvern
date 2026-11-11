@@ -12,12 +12,16 @@ export type DocPendingNote = {
   into?: DocScopeRef;
 };
 
+// How an arrival treats the step's Details: "open" shows what it holds (a problem that lives there), "proposal" lets
+// the proposal's changes decide again. Without it, the step's Details stay as they were.
+export type DocGoToDetails = "open" | "proposal";
+
 export const WorkflowDocActionsContext = createContext<{
   editable: boolean;
   runControlsVisible: boolean;
   openSettings: (id: string) => void;
   openVisual: () => void;
-  goTo: (id: string) => void;
+  goTo: (id: string, details?: DocGoToDetails) => void;
   selectedBranch: (conditionalId: string) => string | undefined;
   // The step that also reads this step's above note at run time: the one before it in its run sequence.
   previousNoteReader: (nodeId: string) => string | undefined;
@@ -30,6 +34,9 @@ export const WorkflowDocActionsContext = createContext<{
   toggleLoop: (loopId: string) => void;
   conditionalOpen: (conditionalId: string) => boolean;
   toggleConditional: (conditionalId: string) => void;
+  // Undefined until the user or a navigation opens or closes the step's Details.
+  detailsOpen: (id: string) => boolean | undefined;
+  setDetailsOpen: (id: string, open: boolean) => void;
   // Null when the doc is read-only (flag on but locked, a run going, or a read-only scope).
   edit: DocEditApi | null;
   destinations: () => DocDestination[];
@@ -64,6 +71,8 @@ export const WorkflowDocActionsContext = createContext<{
   toggleLoop: () => {},
   conditionalOpen: () => true,
   toggleConditional: () => {},
+  detailsOpen: () => undefined,
+  setDetailsOpen: () => {},
   edit: null,
   destinations: () => [],
   demonstrateAt: () => null,

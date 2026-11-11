@@ -249,17 +249,19 @@ function redactSecrets(key: string, value: unknown): unknown {
   return value;
 }
 
+/** A field value as the review card shows it: plain text, secrets hidden. */
+export const reviewFieldValue = (key: string, value: unknown) =>
+  formatValue(redactSecrets(key, value));
+
 function toReviewChange(
   change: RawFieldChange,
   label = humanizeKey(change.key),
   hidden = false,
 ): ReviewFieldChange {
   const shown = (value: unknown) =>
-    formatValue(
-      hidden && !isEmptyValue(value)
-        ? HIDDEN_VALUE
-        : redactSecrets(change.key, value),
-    );
+    hidden && !isEmptyValue(value)
+      ? formatValue(HIDDEN_VALUE)
+      : reviewFieldValue(change.key, value);
   return {
     key: change.key,
     label,

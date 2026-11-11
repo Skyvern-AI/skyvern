@@ -2,6 +2,8 @@ import { isLoginBlockMissingCredentials } from "../../runValidation";
 import { isWorkflowBlockNode, type AppNode } from "../nodes";
 import { docStepCaption, loopHasNoList } from "./docStepRegistry";
 import type { DocItem } from "./buildDocTree";
+import { docDetailsText } from "./docDetailsText";
+import { docStepLineKeys, docStepShowsKey } from "./docSettingsChips";
 
 const text = (value: unknown) =>
   typeof value === "string" ? value.trim() : "";
@@ -164,21 +166,41 @@ export function loopSchemaStepId(loop: AppNode, nodes: AppNode[]) {
   return found && hasNoSchemaList(found) ? found.source.id : null;
 }
 
+// A fix line and the saved key it is about; null where the step has nothing to show for it.
+export type DocStepFix = { message: string; field: string | null };
+
 /** What a step still needs before it can run, found from the draft as it is typed. */
-export function docStepProblems(nodes: AppNode[]): Map<string, string[]> {
-  const problems = new Map<string, string[]>();
+export function docStepProblems(
+  nodes: AppNode[],
+  editable = true,
+): Map<string, string[]> {
+  return new Map(
+    [...docStepFixes(nodes, editable)].map(([id, fixes]) => [
+      id,
+      fixes.map((fix) => fix.message),
+    ]),
+  );
+}
+
+export function docStepFixes(
+  nodes: AppNode[],
+  editable = true,
+): Map<string, DocStepFix[]> {
+  const problems = new Map<string, DocStepFix[]>();
   for (const node of nodes) {
     if (!isWorkflowBlockNode(node)) continue;
     const data = node.data as Record<string, unknown>;
-    const found: string[] = [];
+    const found: DocStepFix[] = [];
+    const listFix = (message: string) =>
+      found.push({ message, field: "loop_variable_reference" });
     if (node.type === "loop" && loopHasNoList(data))
-      found.push(
+      listFix(
         text(data.description)
           ? "This line names the list in words; the loop needs the list itself. Type @ on the line and pick it."
           : "This loop has no list to go through. Type @ on its line and pick a list.",
       );
     const wholeRecord = loopSource(node, nodes);
-    if (wholeRecord) found.push(wholeRecordProblem(wholeRecord));
+    if (wholeRecord) listFix(wholeRecordProblem(wholeRecord));
     // ASCII `\w` is enough here: only ASCII names are keywords or dict attributes.
     const methodField =
       node.type === "loop" && data.loopKind !== "while"
@@ -187,9 +209,12 @@ export function docStepProblems(nodes: AppNode[]): Map<string, string[]> {
           )?.[1]
         : undefined;
     if (methodField && !dottedFieldReadable(methodField))
-      found.push(renameListField(methodField));
+      listFix(renameListField(methodField));
     if (node.type === "url" && !text(data.url))
-      found.push("This step has no URL. Type it on the line, or use @.");
+      found.push({
+        message: "This step has no URL. Type it on the line, or use @.",
+        field: "url",
+      });
     if (
       node.type === "login" &&
       isLoginBlockMissingCredentials({
@@ -201,9 +226,11 @@ export function docStepProblems(nodes: AppNode[]): Map<string, string[]> {
           : [],
       })
     )
-      found.push(
-        "This step has no saved credential. Open Details, then More details in the side panel to choose one.",
-      );
+      found.push({
+        message: docDetailsText.noCredential(editable),
+        // A read-only Doc's Details has no way to choose a credential, so it is not opened for this.
+        field: editable ? "parameter_keys" : null,
+      });
     if (found.length) problems.set(node.id, found);
   }
   return problems;
@@ -229,6 +256,8 @@ export type DocProblemEntry = {
   message: string;
   /** Critical: a Run click asks "Run with N problems?" for exactly these entries. */
   blocking: boolean;
+  // What the fix needs sits in the step's Details, so a jump to it opens them.
+  inDetails: boolean;
 };
 
 function stepOrder(items: DocItem[], order: Map<string, number>) {
@@ -252,38 +281,55 @@ export function docProblemEntries({
   items,
   fixes,
   problems,
+  editable,
 }: {
   nodes: AppNode[];
   items: DocItem[];
-  fixes: ReadonlyMap<string, string[]>;
+  fixes: ReadonlyMap<string, DocStepFix[]>;
   problems: ReadonlyArray<{
     block_label: string | null;
+    field?: string | null;
     code: string;
     message: string;
     severity?: "error" | "warning";
   }>;
+  editable: boolean;
 }): DocProblemEntry[] {
   const idsByLabel = new Map(nodes.map((node) => [node.data.label, node.id]));
+  const byId = new Map(nodes.map((node) => [node.id, node]));
+  // A fix whose field is not on the step's lines is found in Details.
+  const inDetails = (nodeId: string | null, field: string | null) => {
+    const node = nodeId === null ? undefined : byId.get(nodeId);
+    return (
+      Boolean(node && field) &&
+      !docStepShowsKey(node!, field!, docStepLineKeys(node!, editable))
+    );
+  };
   // A check that couldn't reach the server leaves problems from an older draft: shown, but Run does not ask about them.
   const checkFailed = problems.some(
     (problem) => problem.code === "validation_failed",
   );
   const byIdentity = new Map<string, DocProblemEntry>();
   for (const entry of [
-    ...[...fixes].flatMap(([nodeId, messages]) =>
-      messages.map((message, i) => ({
+    ...[...fixes].flatMap(([nodeId, stepFixes]) =>
+      stepFixes.map(({ message, field }, i) => ({
         key: `${nodeId}:fix:${i}`,
         nodeId,
         message,
         blocking: true,
+        inDetails: inDetails(nodeId, field),
       })),
     ),
-    ...problems.map((problem, i) => ({
-      key: `server:${i}`,
-      nodeId: idsByLabel.get(problem.block_label ?? "") ?? null,
-      message: problem.message,
-      blocking: !checkFailed && ASKING_SERVER_CODES.has(problem.code),
-    })),
+    ...problems.map((problem, i) => {
+      const nodeId = idsByLabel.get(problem.block_label ?? "") ?? null;
+      return {
+        key: `server:${i}`,
+        nodeId,
+        message: problem.message,
+        blocking: !checkFailed && ASKING_SERVER_CODES.has(problem.code),
+        inDetails: inDetails(nodeId, problem.field ?? null),
+      };
+    }),
   ]) {
     const id = `${entry.nodeId}\n${entry.message}`;
     const previous = byIdentity.get(id);

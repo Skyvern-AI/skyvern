@@ -48,6 +48,7 @@ import {
   type DocRemovedStep,
 } from "./docProposal";
 import { DocText } from "./DocText";
+import type { DocGoToDetails } from "./WorkflowDocActionsContext";
 
 const DocProposalContext = createContext<DocProposal | null>(null);
 
@@ -62,6 +63,28 @@ export function useDocStepPending(node: AppNode | undefined): boolean {
     node &&
     isWorkflowBlockNode(node) &&
     proposal.marks.get(node.data.label) === "added",
+  );
+}
+
+/** The saved keys a proposal changes on this step; empty unless it is marked Changed. */
+// eslint-disable-next-line react-refresh/only-export-components
+export function useDocStepChangedKeys(node: AppNode): string[] {
+  const proposal = useContext(DocProposalContext);
+  if (!proposal || !isWorkflowBlockNode(node)) return [];
+  const label = node.data.label;
+  return proposal.marks.get(label) === "changed"
+    ? (proposal.changedKeys?.get(label) ?? [])
+    : [];
+}
+
+/** Whether the pending proposal adds this step. */
+// eslint-disable-next-line react-refresh/only-export-components
+export function useDocStepAdded(node: AppNode): boolean {
+  const proposal = useContext(DocProposalContext);
+  return (
+    Boolean(proposal) &&
+    isWorkflowBlockNode(node) &&
+    proposal!.marks.get(node.data.label) === "added"
   );
 }
 
@@ -198,7 +221,7 @@ export function DocProposalCard({
   goTo,
 }: {
   proposal: DocProposal;
-  goTo: (nodeId: string) => void;
+  goTo: (nodeId: string, details?: DocGoToDetails) => void;
 }) {
   const pending = useCopilotProposalStore((s) => s.proposal);
   const [open, setOpen] = useState(false);
@@ -330,7 +353,7 @@ export function DocProposalCard({
             <button
               key={label}
               type="button"
-              onClick={() => goTo(idByLabel.get(label)!)}
+              onClick={() => goTo(idByLabel.get(label)!, "proposal")}
               className="flex min-w-0 items-center gap-2 rounded text-left outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring"
             >
               <MarkChip mark={mark} />

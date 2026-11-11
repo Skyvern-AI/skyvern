@@ -13,6 +13,7 @@ import {
   docStepLine,
 } from "./docKeys";
 import { docProblemStep } from "./docProblemStep";
+import { type DocGoToDetails } from "./WorkflowDocActionsContext";
 
 export function DocProblemsList({
   entries,
@@ -21,7 +22,7 @@ export function DocProblemsList({
 }: {
   entries: DocProblemEntry[];
   byId: ReadonlyMap<string, AppNode>;
-  goTo: (id: string) => void;
+  goTo: (id: string, details?: DocGoToDetails) => void;
 }) {
   const [open, setOpen] = useState(false);
   const jumped = useRef(false);
@@ -139,7 +140,7 @@ export function DocProblemsList({
                     onClick={() => {
                       jumped.current = true;
                       setOpen(false);
-                      goTo(node.id);
+                      goTo(node.id, entry.inDetails ? "open" : undefined);
                     }}
                   >
                     {body}

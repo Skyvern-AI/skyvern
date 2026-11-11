@@ -44,10 +44,12 @@ import { workflowBlockTitle } from "../nodes/types";
 import { WorkflowDocActionsContext } from "./WorkflowDocActionsContext";
 import {
   customSettingsText,
-  getDocSettingsChips,
-  getDocSettingsRows,
+  docCustomSettings,
+  docStepShowsKey,
   type DocSettingRow,
+  yamlKey,
 } from "./docSettingsChips";
+import { docDetailsText } from "./docDetailsText";
 import {
   docBlockType,
   docStepCaption,
@@ -76,7 +78,11 @@ import {
   DocOutputName,
   DocStepPicker,
 } from "./DocEditing";
-import { useDocStepPending } from "./DocProposalView";
+import {
+  useDocStepAdded,
+  useDocStepChangedKeys,
+  useDocStepPending,
+} from "./DocProposalView";
 import { DocOneActionHint } from "./DocOneActionHint";
 import {
   docShortcut,
@@ -470,7 +476,7 @@ export function DocSettingsButton({
 }) {
   const actions = useContext(WorkflowDocActionsContext);
   if (!editable) return null;
-  const changed = getDocSettingsChips(node).length;
+  const changed = docCustomSettings(node)?.length ?? 0;
   // Without a changed count the gear is not rendered at rest (display: none), so nothing is reserved for it.
   return (
     <DocKeyTooltip
@@ -744,12 +750,83 @@ export function DocStepBody({
       }}
     />
   );
+  const restLines = rest.map((f) => (
+    <div
+      key={f.key}
+      className="flex gap-1.5 text-[13.5px] leading-[1.55] text-muted-foreground"
+    >
+      <span className="shrink-0">{f.label}</span>
+      {editable ? (
+        <span className="min-w-0 flex-1 text-foreground">
+          {line(f.key, f.value, "", "")}
+        </span>
+      ) : (
+        <DocText value={f.value} className="text-foreground" />
+      )}
+    </div>
+  ));
+  // With the step's text empty, a filled secondary line (Terminate if) is all the step says, so it stays in view.
+  // Held while the main line is focused, so clearing it and typing again does not move the lines mid-edit.
+  const liveRestInView = isProse && !main?.value.trim();
+  const [heldRestInView, setHeldRestInView] = useState<boolean | null>(null);
+  // Taking editing away (a save lock, a run) ends the edit, so its held placement goes too.
+  if (!editable && heldRestInView !== null) setHeldRestInView(null);
+  const restInView =
+    focusedMode === lineMode && heldRestInView !== null
+      ? heldRestInView
+      : liveRestInView;
+  const descriptionInDetails =
+    isProse && (description !== null || kept.includes("description"));
+  // The saved keys of the lines shown with Details closed.
+  const lineKeys = (
+    isProse
+      ? [
+          main?.key ?? fields[0]!.key,
+          ...(restInView ? rest.map((f) => f.key) : []),
+        ]
+      : ["description"]
+  ).map(yamlKey);
+  const keySettings = (
+    <>
+      {keyFields.length > 0 && (
+        <dl className="mb-1 grid grid-cols-[auto_1fr] gap-x-4 gap-y-0.5 text-[13px]">
+          {keyFields.map((f) => (
+            <Fragment key={f.key}>
+              <dt className="text-muted-foreground">{f.label}</dt>
+              <dd className="min-w-0 [overflow-wrap:anywhere]">
+                <DocText value={f.value} />
+              </dd>
+            </Fragment>
+          ))}
+        </dl>
+      )}
+      {!restInView && restLines}
+      {descriptionInDetails && (
+        <div className="flex gap-1.5 text-[13.5px] leading-[1.55] text-muted-foreground">
+          <span className="shrink-0">Description</span>
+          {editable ? (
+            <span className="min-w-0 flex-1 text-foreground">
+              {line("description", description ?? "", "", "")}
+            </span>
+          ) : (
+            <DocText value={description ?? ""} className="text-foreground" />
+          )}
+        </div>
+      )}
+    </>
+  );
   return (
     <>
       <div
         className="min-h-[1.55em] text-base font-normal leading-[1.55]"
-        onFocus={() => setFocusedMode(lineMode)}
-        onBlur={() => setFocusedMode(null)}
+        onFocus={() => {
+          setFocusedMode(lineMode);
+          setHeldRestInView((held) => held ?? liveRestInView);
+        }}
+        onBlur={() => {
+          setFocusedMode(null);
+          setHeldRestInView(null);
+        }}
       >
         {isProse ? (
           main ? (
@@ -783,33 +860,7 @@ export function DocStepBody({
           <DocText value={description ?? getDocStepSummary(node)} />
         )}
       </div>
-      {rest.map((f) => (
-        <div
-          key={f.key}
-          className="flex gap-1.5 text-[13.5px] leading-[1.55] text-muted-foreground"
-        >
-          <span className="shrink-0">{f.label}</span>
-          {editable ? (
-            <span className="min-w-0 flex-1 text-foreground">
-              {line(f.key, f.value, "", "")}
-            </span>
-          ) : (
-            <DocText value={f.value} className="text-foreground" />
-          )}
-        </div>
-      ))}
-      {isProse && (description || kept.includes("description")) && (
-        <div className="flex gap-1.5 text-[13.5px] leading-[1.55] text-muted-foreground">
-          <span className="shrink-0">Description</span>
-          {editable ? (
-            <span className="min-w-0 flex-1 text-foreground">
-              {line("description", description ?? "", "", "")}
-            </span>
-          ) : (
-            <DocText value={description ?? ""} className="text-foreground" />
-          )}
-        </div>
-      )}
+      {restInView && restLines}
       {node.type === "codeBlock" && (goalBuild || goalNotApplied) && (
         <div
           role="status"
@@ -840,29 +891,17 @@ export function DocStepBody({
           <DocText value={settingSummary} />
         </div>
       )}
-      {keyFields.length > 0 && (
-        <div className="mb-0.5 mt-1 flex flex-wrap gap-1.5">
-          {keyFields.map((f) => (
-            <span
-              key={f.key}
-              className="inline-flex max-w-full items-center gap-1.5 rounded-md border border-border px-2 py-px text-[12.5px]"
-            >
-              <span className="shrink-0 text-muted-foreground">{f.label}</span>
-              <DocText value={f.value} className="min-w-0" />
-            </span>
-          ))}
-        </div>
-      )}
       <DocStepSummary
         node={node}
-        renamable={renamable}
-        mainLine={
-          isProse
-            ? (main?.value ?? "")
-            : forEachLoop
-              ? (description ?? loopList(data))
-              : (description ?? getDocStepSummary(node))
+        lineKeys={lineKeys}
+        hasDetailsLines={
+          (!restInView && rest.length > 0) ||
+          descriptionInDetails ||
+          keyFields.length > 0
         }
+        editable={editableProp}
+        renamable={renamable}
+        keySettings={keySettings}
       />
       {editableProp && <DocOneActionHint node={node} urlOffer={urlOffer} />}
     </>
@@ -872,9 +911,8 @@ export function DocStepBody({
 // The Doc does not show a Code step's Python, so its reads are not listed.
 const CODE_SKIP_KEYS = new Set([...SKIP_KEYS_FOR_JINJA_CHECK, "code", "steps"]);
 
-// The inputs and results the step reads (declared keys, then `{{ }}` reads) that its main line does not show.
-function stepReferences(node: WorkflowBlockNode, mainLine: string): string[] {
-  const shown = new Set(codeBlockUses([], mainLine));
+// Every input and result the step reads: declared keys, then `{{ }}` reads, including those in its main line.
+function stepReferences(node: WorkflowBlockNode): string[] {
   const texts: string[] = [];
   transformStringFieldsInObject(
     node.data,
@@ -890,7 +928,7 @@ function stepReferences(node: WorkflowBlockNode, mainLine: string): string[] {
       ...(Array.isArray(declared) ? (declared as string[]) : []),
       ...texts.flatMap((text) => codeBlockUses([], text)),
     ]),
-  ].filter((ref) => !shown.has(ref));
+  ];
 }
 
 // Text Prompt, Web Search and the file and PDF parsers keep their output schema in jsonSchema.
@@ -914,77 +952,62 @@ function schemaFieldNames(raw: unknown): string[] {
     : [];
 }
 
-const MAX_SHOWN_REFERENCES = 4;
-
-/** One muted line: what the step uses and saves, its custom settings, and its options. */
+/** The Details disclosure: key settings, inputs and outputs, and the settings changed from their defaults. */
 function DocStepSummary({
   node,
+  lineKeys,
+  hasDetailsLines,
+  editable,
   renamable,
-  mainLine,
+  keySettings,
 }: {
   node: WorkflowBlockNode;
+  lineKeys: string[];
+  // Details holds a filled line or key setting of the step.
+  hasDetailsLines: boolean;
+  editable: boolean;
   renamable: boolean;
-  mainLine: string;
+  keySettings: ReactNode;
 }) {
-  const [open, setOpen] = useState(false);
+  const actions = useContext(WorkflowDocActionsContext);
+  const custom = docCustomSettings(node);
+  // A proposal that changes anything the step does not show with Details closed opens it, so the change is not
+  // hidden; a key Details may not list (a setting reset to its default, a new key) opens it too.
+  const changed = useDocStepChangedKeys(node);
+  // A step the proposal adds is all new: Details opens when it holds anything, so nothing is accepted unseen.
+  const added = useDocStepAdded(node);
+  const open =
+    actions.detailsOpen(node.id) ??
+    (added
+      ? hasDetailsLines ||
+        Boolean(custom?.length) ||
+        stepReferences(node).length > 0 ||
+        docStepProducesData(node) ||
+        outputFieldNames(node.data as Record<string, unknown>).length > 0
+      : changed.some((key) => !docStepShowsKey(node, key, lineKeys)));
+  const setOpen = (next: boolean) => actions.setDetailsOpen(node.id, next);
   const panelId = useId();
-  const refs = stepReferences(node, mainLine);
-  const saves = docStepProducesData(node);
-  const custom = getDocSettingsChips(node);
-  const options = stepOptionRows(node);
   return (
     <>
-      <div className="mt-1 flex flex-wrap items-baseline gap-x-2 gap-y-1 text-[12.5px] text-muted-foreground">
-        {refs.length > 0 && (
-          <span className="flex min-w-0 flex-wrap items-baseline gap-1">
-            Uses
-            {refs.slice(0, MAX_SHOWN_REFERENCES).map((ref) => (
-              <span key={ref} className={docReferencePill}>
-                {ref}
-              </span>
-            ))}
-            {refs.length > MAX_SHOWN_REFERENCES && (
-              <span>+{refs.length - MAX_SHOWN_REFERENCES}</span>
-            )}
-          </span>
-        )}
-        {saves && (
-          <span className="flex min-w-0 items-baseline gap-1">
-            Saves
-            {renamable ? (
-              <DocOutputName id={node.id} label={node.data.label} />
-            ) : (
-              <span
-                title={`${node.data.label}_output`}
-                className="inline-block min-w-0 max-w-full rounded bg-muted px-[5px] align-baseline font-medium leading-[1.25] [overflow-wrap:anywhere]"
-              >
-                {node.data.label}_output
-              </span>
-            )}
-          </span>
-        )}
-        {custom.map((chip) => (
-          <span
-            key={chip.key}
-            className="rounded-md border border-border px-1.5 leading-[1.5]"
-          >
-            {chip.label}
-          </span>
-        ))}
+      <div className="mt-1 text-[12.5px] text-muted-foreground">
         <DocKeyTooltip
           content={
-            custom.length ? customSettingsText(custom.length) : "Settings"
+            custom?.length
+              ? customSettingsText(custom.length)
+              : docDetailsText.tooltip
           }
         >
           <button
             type="button"
-            aria-label={`Details for ${docStepCaption(node) ?? node.data.label}`}
+            aria-label={docDetailsText.toggleFor(
+              docStepCaption(node) ?? node.data.label,
+            )}
             aria-expanded={open}
             aria-controls={panelId}
             onClick={() => setOpen(!open)}
-            className="inline-flex items-center gap-0.5 rounded px-1 text-[12.5px] text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+            className="-ml-1 inline-flex items-center gap-0.5 rounded px-1 text-[12.5px] text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
           >
-            Details
+            {docDetailsText.toggle}
             <ChevronDownIcon
               aria-hidden
               className={cn(
@@ -999,7 +1022,10 @@ function DocStepSummary({
         <DocStepDetails
           id={panelId}
           node={node}
-          rows={options}
+          editable={editable}
+          renamable={renamable}
+          keySettings={keySettings}
+          custom={custom}
           onClose={() => setOpen(false)}
         />
       )}
@@ -1007,82 +1033,98 @@ function DocStepSummary({
   );
 }
 
-function stepOptionRows(node: WorkflowBlockNode): DocSettingRow[] {
-  const data = node.data as Record<string, unknown>;
-  const url = typeof data.url === "string" ? data.url.trim() : "";
-  const fields = outputFieldNames(data);
-  return [
-    ...getDocSettingsRows(node).map((row) => ({
-      ...row,
-      value:
-        row.custom || row.value === "Default"
-          ? row.value
-          : `${row.value} (default)`,
-    })),
-    ...("url" in data && getDocProseFields(node)[0]?.key !== "url"
-      ? [{ key: "url", label: "URL", value: url || "Not set", custom: !!url }]
-      : []),
-    ...(fields.length
-      ? [
-          {
-            key: "dataSchema",
-            label: "Output fields",
-            value: fields.join(", "),
-            custom: true,
-          },
-        ]
-      : []),
-  ];
-}
-
 function DocStepDetails({
   id,
   node,
-  rows,
+  editable,
+  renamable,
+  keySettings,
+  custom,
   onClose,
 }: {
   id: string;
   node: WorkflowBlockNode;
-  rows: DocSettingRow[];
+  editable: boolean;
+  renamable: boolean;
+  keySettings: ReactNode;
+  custom: DocSettingRow[] | null;
   onClose: () => void;
 }) {
   const actions = useContext(WorkflowDocActionsContext);
+  const inputs = stepReferences(node);
+  const saves = docStepProducesData(node);
+  const fields = outputFieldNames(node.data as Record<string, unknown>);
+  const heading =
+    "mt-2 text-[12px] font-medium text-muted-foreground first:mt-0";
   return (
     <div
       id={id}
       className="mt-1 rounded-md border border-border px-3 py-2 text-[13px]"
     >
-      {rows.length > 0 && (
+      {keySettings}
+      {inputs.length > 0 && (
+        <>
+          <p className={heading}>{docDetailsText.inputs}</p>
+          <div className="flex flex-wrap items-baseline gap-1">
+            {inputs.map((ref) => (
+              <span key={ref} className={docReferencePill}>
+                {ref}
+              </span>
+            ))}
+          </div>
+        </>
+      )}
+      {(saves || fields.length > 0) && (
+        <>
+          <p className={heading}>{docDetailsText.outputs}</p>
+          <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+            {saves &&
+              (renamable ? (
+                <DocOutputName id={node.id} label={node.data.label} />
+              ) : (
+                <span
+                  title={`${node.data.label}_output`}
+                  className="inline-block min-w-0 max-w-full rounded bg-muted px-[5px] align-baseline font-medium leading-[1.25] [overflow-wrap:anywhere]"
+                >
+                  {node.data.label}_output
+                </span>
+              ))}
+            {fields.length > 0 && (
+              <span className="text-muted-foreground">
+                {docDetailsText.outputFields}: {fields.join(", ")}
+              </span>
+            )}
+          </div>
+        </>
+      )}
+      {custom && <p className={heading}>{docDetailsText.custom}</p>}
+      {custom === null ? null : custom.length > 0 ? (
         <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-0.5">
-          {rows.map((row) => (
+          {custom.map((row) => (
             <Fragment key={row.key}>
               <dt className="text-muted-foreground">{row.label}</dt>
-              <dd
-                className={cn(
-                  "min-w-0 [overflow-wrap:anywhere]",
-                  !row.custom && "text-muted-foreground",
-                )}
-              >
-                {row.key === "url" && row.custom ? (
-                  <DocText value={row.value} />
-                ) : (
-                  row.value
-                )}
+              <dd className="min-w-0 whitespace-pre-line [overflow-wrap:anywhere]">
+                {row.value}
               </dd>
             </Fragment>
           ))}
         </dl>
+      ) : (
+        <p className="text-muted-foreground">{docDetailsText.allDefault}</p>
       )}
-      <button
-        type="button"
-        onClick={() => {
-          onClose();
-          actions.openSettings(node.id);
-        }}
-        className="mt-1.5 rounded text-[12.5px] text-muted-foreground underline underline-offset-4 outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
-      >
-        More details in the side panel
-      </button>
+      {/* A read-only Doc's side panel cannot show a step's settings, so the link is left out. */}
+      {editable && (
+        <button
+          type="button"
+          onClick={() => {
+            onClose();
+            actions.openSettings(node.id);
+          }}
+          className="mt-1.5 rounded text-[12.5px] text-muted-foreground underline underline-offset-4 outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          {docDetailsText.morePanel}
+        </button>
+      )}
     </div>
   );
 }
