@@ -252,10 +252,17 @@ def _log_mcp_boot_timings(
 
 async def _start_browser_extension_bridge() -> None:
     from skyvern.browser_extension.errors import BrowserExtensionError  # noqa: PLC0415
-    from skyvern.browser_extension.runtime import BrowserExtensionRuntime  # noqa: PLC0415
+    from skyvern.browser_extension.runtime import (  # noqa: PLC0415
+        BrowserExtensionRuntime,
+        broker_mode_enabled,
+        warm_broker_daemon,
+    )
 
     try:
-        await BrowserExtensionRuntime.get_or_start()
+        if broker_mode_enabled():
+            await warm_broker_daemon()
+        else:
+            await BrowserExtensionRuntime.get_or_start()
     except BrowserExtensionError as exc:
         LOG.warning(
             "Browser extension bridge startup failed; the bridge will be retried on first browser-tool use",
