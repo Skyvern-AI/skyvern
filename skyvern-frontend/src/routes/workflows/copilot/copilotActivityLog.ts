@@ -5,6 +5,7 @@ import {
   AUTHORING_TOOLS,
   BlockState,
   RUN_TOOLS,
+  SINGLE_RUN_TOOL,
   ToolCallKind,
   TurnFacts,
   TurnNarrativeState,
@@ -244,12 +245,15 @@ export function rowIndexOfToolCall(
   );
 }
 
+const SAVED_RUN_TOOLS = new Set([ACCOUNT_GROUP_SUBMIT_TOOL, SINGLE_RUN_TOOL]);
+
 // A call whose card renders after its row ends that row, so work done after the
 // user answered or the plan changed never sits above the card.
 const CARD_TOOLS = new Set([
   "ask_user",
   "set_work_plan",
   ACCOUNT_GROUP_SUBMIT_TOOL,
+  SINGLE_RUN_TOOL,
   "cancel_account_group",
   "delete_saved_credentials",
 ]);
@@ -580,12 +584,20 @@ function kindPhrase(
       const groups = entries.filter(
         (e) => e.toolName === ACCOUNT_GROUP_SUBMIT_TOOL,
       ).length;
-      const tests = entries.length - groups;
+      const singles = entries.filter(
+        (e) => e.toolName === SINGLE_RUN_TOOL,
+      ).length;
+      const tests = entries.length - groups - singles;
       return [
         groups > 0
           ? live
             ? "reviewing account runs with you"
             : "reviewed account runs with you"
+          : null,
+        singles > 0
+          ? live
+            ? "reviewing a run with you"
+            : "reviewed a run with you"
           : null,
         tests === 0
           ? null
@@ -643,11 +655,11 @@ export function callRollup(
 // block with neither, or seen after every dated call returned, goes to the row's
 // last run call. Empty when the row made no run call.
 export function blocksByRunCall(row: ActivityRow): Map<string, BlockState[]> {
-  // An account group's runs are separate saved-workflow runs, never blocks of this row.
+  // Account group and single saved-workflow runs are separate runs, never blocks of this row.
   const runCalls = row.entries.filter(
     (entry) =>
       entry.toolName !== undefined &&
-      entry.toolName !== ACCOUNT_GROUP_SUBMIT_TOOL &&
+      !SAVED_RUN_TOOLS.has(entry.toolName) &&
       toolCallKind(entry.toolName) === "run",
   );
   const byCall = new Map<string, BlockState[]>();

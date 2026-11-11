@@ -8973,6 +8973,7 @@ export function WorkflowCopilotChat({
             credential_recovery_token: credentialRecoveryToken ?? undefined,
             supports_question_tool: true,
             supports_account_group_card: true,
+            supports_single_run_card: true,
             supports_credential_delete_card: true,
             supports_google_setup_card: true,
             supports_demonstration_offer:
