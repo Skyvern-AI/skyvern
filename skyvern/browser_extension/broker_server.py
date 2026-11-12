@@ -231,6 +231,7 @@ class _TabLease:
     origin: str  # "shared" (user-scoped tab adopted by an agent) or "created" (broker-created)
     granted_at: float = field(default_factory=time.time)
     draining: bool = False
+    scope_removed: bool = False
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -1328,13 +1329,15 @@ class BrowserExtensionBrokerServer:
             self._clear_pairing(relay, cancel_nonce=True)
             return {"cancelled": True}
         if op == "lease.acquire_default":
+            if set(args) - {"adopt_shared"} or type(args.get("adopt_shared", False)) is not bool:
+                raise BrowserExtensionBrokerError("INVALID_REQUEST", "Expected only an optional adopt_shared boolean")
             if self._extension_reset_quarantined:
                 raise BrowserExtensionBrokerError(
                     self._extension_reset_error or "EXTENSION_RESET_IN_PROGRESS",
                     "Extension state reset has not completed",
                     retry_after=0.1 if self._extension_reset_error in {None, "EXTENSION_RESET_IN_PROGRESS"} else None,
                 )
-            return {"tab": await self._acquire_default_lease(connection)}
+            return {"tab": await self._acquire_default_lease(connection, adopt_shared=args.get("adopt_shared", False))}
         if op == "broker.stop":
             return {"stopping": True}
         raise BrowserExtensionBrokerError("OP_NOT_ALLOWED", "Broker operation is not available")
@@ -1651,8 +1654,11 @@ class BrowserExtensionBrokerServer:
             return
         if lease.draining:
             # Scope removal proves cleanup completed, but an old request still keeps the fence armed.
-            if event == "scope.tabRemoved" and self._tab_request_counts.get(tab_id, 0) == 0:
-                await self._free_lease(tab_id)
+            if event == "scope.tabRemoved":
+                if self._tab_request_counts.get(tab_id, 0) == 0:
+                    await self._free_lease(tab_id)
+                else:
+                    lease.scope_removed = True
             return
         if event == "scope.tabRemoved":
             lease.draining = True
@@ -1845,7 +1851,7 @@ class BrowserExtensionBrokerServer:
         await self._wait_tab_idle(lease.tab_id)
         if self._leases.get(lease.tab_id) is not lease:
             return  # Freed by a reset sweep while draining.
-        if not cleanup:
+        if not cleanup or lease.scope_removed:
             await self._free_lease(lease.tab_id)
             return
         relay = self._relay
@@ -1856,7 +1862,7 @@ class BrowserExtensionBrokerServer:
             # (phase-1 consent semantics) without touching any other client's tabs.
             op = "tabs.remove" if lease.origin == "created" else "debugger.detach"
             try:
-                await relay.request(op, {"tabId": lease.tab_id}, 10.0)
+                result = await relay.request(op, {"tabId": lease.tab_id}, 10.0)
             except ExtensionRequestError as exc:
                 if op == "debugger.detach" and exc.code == "DEBUGGER_DETACHED":
                     cleanup_succeeded = True
@@ -1875,7 +1881,9 @@ class BrowserExtensionBrokerServer:
                 )
             else:
                 cleanup_succeeded = True
-                await_scope_removal = op == "debugger.detach"
+                await_scope_removal = op == "debugger.detach" or (
+                    op == "tabs.remove" and isinstance(result, dict) and result.get("kept") is True
+                )
         if cleanup_succeeded and not await_scope_removal and self._leases.get(lease.tab_id) is lease:
             await self._free_lease(lease.tab_id)
 
@@ -1885,14 +1893,16 @@ class BrowserExtensionBrokerServer:
         event = self._tab_idle_events.setdefault(tab_id, asyncio.Event())
         await event.wait()
 
-    async def _acquire_default_lease(self, connection: _ClientConnection) -> dict[str, Any]:
+    async def _acquire_default_lease(
+        self, connection: _ClientConnection, *, adopt_shared: bool = False
+    ) -> dict[str, Any]:
         relay = self._relay
         if relay is None:
             raise BrowserExtensionBrokerError("BROKER_STOPPING", "Browser-extension broker is stopping")
         async with self._create_lock:
             free = (
                 []
-                if self._legacy_create_fence_active()
+                if not adopt_shared or self._legacy_create_fence_active()
                 else [
                     tab
                     for tab in relay.scoped_tabs

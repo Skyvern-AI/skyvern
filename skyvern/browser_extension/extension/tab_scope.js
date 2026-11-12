@@ -22,6 +22,9 @@ const ANY_GROUP_ID = Symbol("anyGroupId");
 const TAB_OPERATION_TIMEOUT_MS = 28_000;
 const CREATION_TIMEOUT_MS = 3_000;
 const CREATION_QUEUE_KEY = Symbol("tabs.create");
+// Reserve two seconds each for Stay and cleanup, plus focus restoration, before the broker's cleanup deadline.
+const CLOSE_DIALOG_WINDOW_MS = 3_000;
+const CLOSE_CLEANUP_TIMEOUT_MS = 2_000;
 
 function creationError() {
   return new ProtocolError(
@@ -72,6 +75,7 @@ export class TabScope {
     this.scopeAdmissions = new Map();
     this.pendingReleases = new Map();
     this.quarantinedTabIds = new Set();
+    this.activeCloses = new Map();
     this.scopedGroupIds = new Map();
     this.createdTabIds = new Set();
     this.activeCreation = null;
@@ -130,6 +134,8 @@ export class TabScope {
       void this.handleTabCreated(tab);
     });
     chrome.tabs.onRemoved.addListener((tabId) => {
+      this.debuggerRouter?.closeWatchers?.get(tabId)?.disarm();
+      this.activeCloses.delete(tabId);
       this.observeCreation({ tabId, removed: true });
       this.cancelTabOperations(
         tabId,
@@ -276,6 +282,7 @@ export class TabScope {
   }
 
   async reset() {
+    for (const close of this.activeCloses.values()) close.watcher?.disarm();
     const scopedGroups = [...this.scopedGroupIds];
     const scopedTabIds = [...this.scopedTabIds];
     this.scopedTabIds.clear();
@@ -890,22 +897,88 @@ export class TabScope {
             "The requested tab is still being reconciled after reset.",
           );
         }
-        this.quarantinedTabIds.add(tabId);
         lease.assertCurrent();
+        const close = { watcher: null, nativeStarted: false };
+        this.activeCloses.set(tabId, close);
+        const endQuarantine = () => {
+          if (this.activeCloses.get(tabId) !== close) return;
+          this.activeCloses.delete(tabId);
+          this.quarantinedTabIds.delete(tabId);
+        };
+        lease.onCancel(() => {
+          close.watcher?.disarm();
+          if (!close.nativeStarted) endQuarantine();
+        });
+        let previousActiveTab = null;
+        if (this.debuggerRouter?.attachedTabs.has(tabId)) {
+          try {
+            previousActiveTab = await this.debuggerRouter.withTimeout(
+              async () => {
+                const tab = await chrome.tabs.get(tabId);
+                const activeTabs = await chrome.tabs.query({
+                  active: true,
+                  windowId: tab.windowId,
+                });
+                return activeTabs[0] ?? null;
+              },
+              500,
+            );
+          } catch {}
+          const dialogDeadlineMs = Date.now() + CLOSE_DIALOG_WINDOW_MS;
+          close.watcher = await this.debuggerRouter.watchCloseDialog(
+            tabId,
+            close,
+            lease,
+            dialogDeadlineMs,
+          );
+        }
+        lease.assertCurrent();
+        this.quarantinedTabIds.add(tabId);
         let removePromise;
         try {
+          close.nativeStarted = true;
           removePromise = chrome.tabs.remove(tabId);
         } catch (error) {
-          this.quarantinedTabIds.delete(tabId);
+          close.watcher?.disarm();
+          endQuarantine();
           throw error;
         }
-        const trackedRemove = Promise.resolve(removePromise).finally(() => {
-          this.quarantinedTabIds.delete(tabId);
-        });
+        const trackedRemove =
+          Promise.resolve(removePromise).finally(endQuarantine);
         void trackedRemove.catch(() => undefined);
+        let kept = false;
         try {
-          await trackedRemove;
+          const nativeOutcome = trackedRemove.then(
+            async () => {
+              if (await close.watcher?.handling) return { kept: true };
+              return {};
+            },
+            async (error) => {
+              if (await close.watcher?.handling) return { kept: true };
+              throw error;
+            },
+          );
+          let outcome;
+          try {
+            outcome = await Promise.race([
+              nativeOutcome,
+              ...(close.watcher ? [close.watcher.kept] : []),
+              lease.invalidated,
+            ]);
+          } catch (error) {
+            if (!close.kept) throw error;
+            outcome = { kept: true };
+          } finally {
+            close.watcher?.disarm();
+          }
+          kept = Boolean(outcome.kept);
+          if (kept) {
+            endQuarantine();
+          } else {
+            lease.assertCurrent();
+          }
         } catch {
+          lease.assertCurrent();
           if (!this.scopedTabIds.has(tabId)) {
             if (created) {
               try {
@@ -927,6 +1000,10 @@ export class TabScope {
             "The requested tab was not found.",
           );
         }
+        if (kept) {
+          await this.handBackKeptTab(tabId, previousActiveTab, lease);
+          return { kept: true };
+        }
         lease.assertCurrent();
         this.createdTabIds.delete(tabId);
         if (this.scopedTabIds.has(tabId)) {
@@ -938,6 +1015,66 @@ export class TabScope {
       });
     } finally {
       this.endRelease(tabId, release);
+    }
+  }
+
+  async handBackKeptTab(tabId, previousActiveTab, lease) {
+    this.createdTabIds.delete(tabId);
+    this.scopedTabIds.delete(tabId);
+    this.notifyScopeChange(tabId, false);
+    this.expectedGroupTransitions.delete(tabId);
+    const groupId = this.scopedGroupIds.get(tabId);
+    this.scopedGroupIds.delete(tabId);
+    const admission = this.scopeAdmission(tabId);
+    const stillHandedBack = () =>
+      this.scopeAdmission(tabId) === admission && !this.scopedTabIds.has(tabId);
+    // Scope revocation must reach the broker even if cleanup cancels this lease.
+    this.sendEvent(EVENTS.SCOPE_TAB_REMOVED, { tabId, reason: "unshared" });
+    const [{ value: persisted }] = await Promise.allSettled([
+      (async () => {
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            await this.debuggerRouter.withTimeout(
+              () => this.persistScope(),
+              CLOSE_CLEANUP_TIMEOUT_MS,
+            );
+            return true;
+          } catch {}
+        }
+        return false;
+      })(),
+      this.debuggerRouter.detachIfAttachedLocked(
+        tabId,
+        CLOSE_CLEANUP_TIMEOUT_MS / 2,
+      ),
+      this.debuggerRouter.withTimeout(
+        () => this.ungroupTabLocked(tabId, groupId, stillHandedBack),
+        CLOSE_CLEANUP_TIMEOUT_MS,
+      ),
+    ]);
+    if (previousActiveTab && previousActiveTab.id !== tabId) {
+      try {
+        await this.debuggerRouter.withTimeout(async () => {
+          const [kept, previous] = await Promise.all([
+            chrome.tabs.get(tabId),
+            chrome.tabs.get(previousActiveTab.id),
+          ]);
+          if (
+            stillHandedBack() &&
+            kept.active &&
+            kept.windowId === previousActiveTab.windowId &&
+            previous.windowId === kept.windowId
+          ) {
+            await chrome.tabs.update(previous.id, { active: true });
+          }
+        }, 500);
+      } catch {}
+    }
+    if (!persisted) {
+      throw new ProtocolError(
+        ERROR_CODES.INTERNAL,
+        "The tab stayed open with the user, but the extension could not save that it was handed back.",
+      );
     }
   }
 
@@ -1587,12 +1724,13 @@ export class TabScope {
     }
   }
 
-  async ungroupTabLocked(tabId, scopedGroupId) {
+  async ungroupTabLocked(tabId, scopedGroupId, isCurrent = () => true) {
     for (let attempt = 0; attempt < 3; attempt += 1) {
       let transition = null;
       let ungrouped = false;
       try {
         const tab = await chrome.tabs.get(tabId);
+        if (!isCurrent()) return false;
         if (tab.groupId === TAB_GROUP_ID_NONE) return true;
         if (
           !Number.isInteger(scopedGroupId) ||

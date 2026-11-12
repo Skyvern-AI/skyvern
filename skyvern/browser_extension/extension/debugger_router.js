@@ -22,6 +22,7 @@ export const FOREIGN_FRAME_RECOVERY_LIMITS = Object.freeze({
 });
 
 const CHILD_AUTO_ATTACH_TIMEOUT_MS = 2_000;
+const CLOSE_DIALOG_TIMEOUT_MS = 2_000;
 const ATTACH_TIMEOUT_MS = 10_000;
 const COMMAND_TIMEOUT_MS = 25_000;
 const RECOVERY_TIMEOUT_MS = 2_000;
@@ -77,6 +78,7 @@ export class DebuggerRouter {
     this.attachedTabs = new Set();
     this.attachStates = new Map();
     this.childTargets = new Map();
+    this.closeWatchers = new Map();
     this.attachTimeoutMs = attachTimeoutMs;
     this.commandTimeoutMs = commandTimeoutMs;
     this.recoveryTimeoutMs = recoveryTimeoutMs;
@@ -84,9 +86,12 @@ export class DebuggerRouter {
     this.stateSequence = 0;
 
     chrome.debugger.onEvent.addListener((source, method, params) => {
-      void this.handleDebuggerEvent(source, method, params);
+      void this.handleDebuggerEvent(source, method, params).catch(
+        () => undefined,
+      );
     });
     chrome.debugger.onDetach.addListener((source, reason) => {
+      this.closeWatchers.get(source.tabId)?.disarm();
       void this.handleDebuggerDetach(source, reason).catch(() => undefined);
       this.releaseCaptures(source.tabId);
     });
@@ -97,6 +102,7 @@ export class DebuggerRouter {
   }
 
   async reset() {
+    for (const watcher of this.closeWatchers.values()) watcher.disarm();
     const finishRelease = this.beginReleaseAll();
     this.commandFences.clear();
     this.recoveries.clear();
@@ -156,11 +162,11 @@ export class DebuggerRouter {
     }
   }
 
-  async isDebuggerStillAttached(tabId) {
+  async isDebuggerStillAttached(tabId, timeoutMs = this.recoveryTimeoutMs) {
     try {
       const targets = await this.withTimeout(
         () => chrome.debugger.getTargets(),
-        this.recoveryTimeoutMs,
+        timeoutMs,
       );
       return targets.some(
         (target) => target.tabId === tabId && target.attached,
@@ -673,7 +679,7 @@ export class DebuggerRouter {
     );
   }
 
-  async detachIfAttachedLocked(tabId) {
+  async detachIfAttachedLocked(tabId, timeoutMs = this.recoveryTimeoutMs) {
     if (!this.attachedTabs.has(tabId)) {
       if (
         !["attaching", "orphaned_attach"].includes(
@@ -693,7 +699,7 @@ export class DebuggerRouter {
     try {
       await this.withTimeout(
         () => detachPromise,
-        this.recoveryTimeoutMs,
+        timeoutMs,
         () => {
           timedOut = true;
           return new Error("timeout");
@@ -701,12 +707,14 @@ export class DebuggerRouter {
       );
     } catch {
       if (timedOut) {
+        if (this.attachStates.get(tabId)?.token !== token) return;
         this.quarantineTab(tabId, token, "detach_timeout");
         this.trackLateDetach(tabId, token, detachPromise);
-      } else if (!(await this.isDebuggerStillAttached(tabId))) {
-        this.clearDetachedState(tabId, token, "controllability_lost");
       } else {
-        this.quarantineTab(tabId, token, "detach_failed");
+        const attached = await this.isDebuggerStillAttached(tabId, timeoutMs);
+        if (this.attachStates.get(tabId)?.token !== token) return;
+        if (attached) this.quarantineTab(tabId, token, "detach_failed");
+        else this.clearDetachedState(tabId, token, "controllability_lost");
       }
       return;
     }
@@ -853,7 +861,105 @@ export class DebuggerRouter {
     );
   }
 
+  async watchCloseDialog(tabId, close, lease, deadlineMs) {
+    const attachment = this.attachStates.get(tabId);
+    if (!this.attachedTabs.has(tabId) || attachment?.status !== "attached") {
+      return null;
+    }
+    try {
+      await this.withTimeout(
+        () => chrome.debugger.sendCommand({ tabId }, "Page.enable", {}),
+        CLOSE_DIALOG_TIMEOUT_MS,
+      );
+    } catch {
+      return null;
+    }
+    lease.assertCurrent();
+    if (
+      this.attachStates.get(tabId) !== attachment ||
+      Date.now() >= deadlineMs
+    ) {
+      return null;
+    }
+    let signal;
+    const watcher = {
+      close,
+      attachment,
+      lease,
+      deadlineMs,
+      handling: null,
+      kept: new Promise((resolve) => {
+        signal = resolve;
+      }),
+      signal: () => {
+        close.kept = true;
+        signal({ kept: true });
+      },
+      disarm: () => {
+        clearTimeout(watcher.timer);
+        if (this.closeWatchers.get(tabId) === watcher) {
+          this.closeWatchers.delete(tabId);
+        }
+      },
+    };
+    this.closeWatchers.set(tabId, watcher);
+    watcher.timer = setTimeout(
+      watcher.disarm,
+      Math.max(0, deadlineMs - Date.now()),
+    );
+    lease.onCancel(watcher.disarm);
+    return watcher;
+  }
+
+  handleCloseDialog(source, method, params) {
+    const watcher = this.closeWatchers.get(source.tabId);
+    if (
+      !watcher ||
+      method !== "Page.javascriptDialogOpening" ||
+      params?.type !== "beforeunload" ||
+      source.sessionId !== undefined ||
+      !watcher.lease.isCurrent() ||
+      this.attachStates.get(source.tabId) !== watcher.attachment ||
+      this.tabScope.activeCloses.get(source.tabId) !== watcher.close
+    ) {
+      return false;
+    }
+    if (watcher.handling) return true;
+    if (Date.now() >= watcher.deadlineMs) {
+      watcher.disarm();
+      return false;
+    }
+    clearTimeout(watcher.timer);
+    // Native dispatch must bypass the tab queue occupied by tabs.remove.
+    watcher.handling = this.withTimeout(
+      () =>
+        chrome.debugger.sendCommand(
+          { tabId: source.tabId },
+          "Page.handleJavaScriptDialog",
+          { accept: false },
+        ),
+      CLOSE_DIALOG_TIMEOUT_MS,
+    )
+      .then(
+        () => {
+          if (
+            this.closeWatchers.get(source.tabId) !== watcher ||
+            !watcher.lease.isCurrent() ||
+            this.attachStates.get(source.tabId) !== watcher.attachment
+          )
+            return false;
+          watcher.signal();
+          return true;
+        },
+        () => false,
+      )
+      .finally(watcher.disarm);
+    void watcher.handling.catch(() => undefined);
+    return true;
+  }
+
   async handleDebuggerEvent(source, method, params) {
+    if (this.handleCloseDialog(source, method, params)) return;
     if (
       !Number.isInteger(source.tabId) ||
       !this.tabScope.isScoped(source.tabId) ||
