@@ -88,7 +88,7 @@ The names differ by place. `webhook_url` goes on a run request. `webhook_callbac
 
 ### Payload
 
-The body is the same run object that `get_run` returns. The fields you use most:
+The body is the run object that `get_run` returns. Agent-run webhooks also carry `failure_category`, which `get_run` does not. The fields you use most:
 
 ```json
 {
@@ -302,7 +302,7 @@ An error from a failed block also names it: `workflow_run_block_id`, `block_labe
 
 ### Failure categories
 
-Agent runs that end in `failed`, `terminated`, or `timed_out` get a `failure_category` list. Each entry has a `category`, a `confidence_float`, and `reasoning`. The first entry is the most likely cause. The app shows it as a badge on the run.
+Agent runs that end in `failed`, `terminated`, or `timed_out` get a `failure_category` list, sent in webhooks and the agent run lists (`GET /v1/agents/runs`, `GET /v1/agents/{workflow_id}/runs`) but not returned by `get_run`. Each entry has a `category`, a `confidence_float`, and `reasoning`. The first entry is the most likely cause. The app shows it as a badge on the run.
 
 | `category` | Usual next step |
 |---|---|

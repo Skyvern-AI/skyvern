@@ -245,7 +245,9 @@ To give the agent browser tools directly instead of writing SDK code, connect th
 1. Install the Skyvern Python SDK with the local extra (requires Python 3.11-3.14).
    The browser methods below need it, even with a cloud browser:
    pip install "skyvern[local]"
-   If you hit Python version errors, use: pipx install "skyvern[local]"
+   If that fails because your default Python is older than 3.11, create a virtual environment
+   with any Python 3.11-3.14 and run the install inside it, for example:
+   python3.12 -m venv .venv && source .venv/bin/activate && pip install "skyvern[local]"
 
 2. Install the Skyvern skills into this project:
    skyvern skill copy --output .claude/skills/
@@ -380,7 +382,7 @@ pip install "skyvern[local]"
 </Accordion>
 
 <Accordion title="Python version errors">
-The SDK requires Python 3.11 to 3.14. Check with `python3 --version`. To install into an isolated environment instead, use `pipx install "skyvern[local]"`.
+The SDK requires Python 3.11 to 3.14. Check with `python3 --version`. To keep it isolated, install it into a virtual environment made with a supported Python (for example `python3.12 -m venv .venv`; any Python 3.11-3.14 works), not with pipx: pipx exposes only the `skyvern` command, so `from skyvern import Skyvern` in your script fails.
 </Accordion>
 
 <Accordion title="401 or invalid API key">

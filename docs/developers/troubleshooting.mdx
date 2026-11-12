@@ -18,7 +18,7 @@ keywords:
 
 <Steps>
   <Step title="Read the run">
-    Call `get_run` and look at `status`, `failure_reason`, and `errors`. Agent runs also have `failure_category`.
+    Call `get_run` and look at `status`, `failure_reason`, and `errors`. For agent runs, `failure_category` is in the webhook payload and in the agent run lists (`GET /v1/agents/runs`, `GET /v1/agents/{workflow_id}/runs`), not in `get_run`.
   </Step>
   <Step title="Watch it">
     Open `app_url` in the app, or download the `recording`. Most failures are obvious once you see the page the agent saw.
@@ -59,7 +59,7 @@ What each status means, and whether to retry, is on [Going to production](/devel
 
 ## Failure categories
 
-When an agent run ends in `failed`, `terminated`, or `timed_out`, Skyvern classifies the cause. The app shows the label as a badge on the run. The API and webhooks return the code in `failure_category[0].category`.
+When an agent run ends in `failed`, `terminated`, or `timed_out`, Skyvern classifies the cause. The app shows the label as a badge on the run. Webhooks and the agent run lists (`GET /v1/agents/runs`, `GET /v1/agents/{workflow_id}/runs`) return the code in `failure_category[0].category`. `get_run` does not include it.
 
 | Code | Label in the app | Cause | Fix |
 |---|---|---|---|
@@ -228,11 +228,11 @@ Skyvern widens the target for you: when the proxy provider repeatedly reports th
 </Accordion>
 
 <Accordion title="UI is blank or can't reach the API">
-**Fix:** check `VITE_API_BASE_URL` and `VITE_WSS_BASE_URL` in `skyvern-frontend/.env`, then `docker compose restart skyvern-ui`.
+**Fix:** check `VITE_API_BASE_URL` and `VITE_WSS_BASE_URL` in `skyvern-frontend/.env`, then run `docker compose up -d skyvern-ui`. `docker compose restart` keeps the values the container started with.
 </Accordion>
 
 <Accordion title="Server keeps calling OpenAI after switching models">
-**Fix:** set `LLM_KEY` to your provider's key (for example `OLLAMA`) and enable that provider, then restart. See [Self-host](/developers/self-hosted/overview#use-a-local-model).
+**Fix:** set `LLM_KEY` to your provider's key (for example `OLLAMA`) and enable that provider, then restart the server (with Docker Compose, `docker compose up -d`). See [Self-host](/developers/self-hosted/overview#use-a-local-model).
 </Accordion>
 
 <Accordion title="Connection refused to a model or browser on the host">

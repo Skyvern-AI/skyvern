@@ -38,7 +38,7 @@ Everything in Skyvern (agents, runs, credentials, API keys, credits) belongs to 
 
 ## API keys
 
-Your API key authenticates every API, SDK, CLI and MCP request for your organization. Every Admin and Member can open this page, unless your organization enables [role-based access control](#roles) and withholds `api_key.list` from their role.
+Your API key authenticates every API, SDK, CLI and MCP request for your organization. Every Admin and Member can open this page, unless your organization enables [role-based access control](#roles) and withholds **API keys: View** from their role.
 
 <Steps>
   <Step title="Open API keys">
@@ -128,7 +128,7 @@ Access tokens expire and can be refreshed when you request `offline_access`. A r
 Every credential belongs to one organization and reaches only that organization's agents, runs, credentials and data. A request can't read or change another organization's resources.
 
 - The organization API key can call every endpoint your organization can reach. There are no read-only, per-endpoint or per-agent keys.
-- An OAuth token acts as the person who signed in, in their organization, with their [role](#roles). Its OAuth scopes (`profile`, `email` and the like) describe who signed in. They don't limit what the token can do.
+- An OAuth token acts as the person who signed in, in their organization, with their [role](#roles). Its OAuth scopes (`profile`, `email` and the like) describe who signed in. They don't limit what the token can do. An MCP client a Member signs in to gets a key bound to that Member, which can't read or rotate the organization's API key.
 - MCP tool scopes (`operate`, `build`, `browser`, `lean`, `all`) only change which tools a client sees. They are not a security boundary.
 - Usage from any credential is billed to the organization.
 
@@ -146,15 +146,15 @@ Each person in an organization is an **Admin**, a **Member** or a **Billing Admi
 
 **Role-based access control is opt-in and needs the Enterprise plan.** Until an Admin turns it on, a Member can access most organization actions. Managing member roles and SFTP and Concord fax adapter configuration remain Admin-only either way, including configuration reads and writes. A Member can't grant themselves more access or switch role-based access control on.
 
-Once an Admin enables it, each person's role decides what they can do and requests outside their role are refused with `403`. That covers event triggers, additional organization API keys, the 1Password connection, the [audit log](#audit-log) export and the rest of the organization's actions.
+Once an Admin enables it, each person's role decides what they can do and requests outside their role are refused with `403`. That covers event triggers, additional organization API keys, the 1Password connection, the [audit log](#audit-log) export and the rest of the organization's actions. On [Integrations](/cloud/integrations), a role without the grant sees **Admin required** or **Organization admin access is required** in place of the connect and configure buttons.
 
 These limits also apply whether or not you enable role-based access control:
 
-- An API key can't manage API keys, event triggers or member roles, so a leaked key can't create a replacement for itself.
+- An API key can't manage API keys, so a leaked key can't create a replacement for itself. The organization API key also can't manage event triggers or member roles.
 - A browser session alone can't perform admin-only actions; those need a signed-in session.
 
 <Warning>
-Every Admin and Member can get the organization API key: an Admin from **Settings → API keys**, a Member by signing in to the CLI. The key can do everything an Admin can except manage API keys, event triggers and member roles. Treat every Admin and Member as able to use the API with full access, and use separate organizations where people must be kept apart.
+Until an Admin turns on role-based access control, every Admin and Member can get the organization API key, from **Settings → API keys** or by signing in to the CLI. A Member's MCP sign-in doesn't return it. The key can do everything an Admin can except manage API keys, event triggers and member roles. Until then, treat every Admin and Member as able to use the API with full access, and use separate organizations where people must be kept apart.
 </Warning>
 
 ### API versions and deprecations

@@ -127,7 +127,7 @@ ANTHROPIC_API_KEY=sk-ant-...
 LLM_KEY=ANTHROPIC_CLAUDE4.7_OPUS
 ```
 
-`LLM_KEY` defaults to `OPENAI_GPT5_5`. `SECONDARY_LLM_KEY` sets a cheaper model for lighter calls. Azure OpenAI, Gemini, Vertex AI, Bedrock, OpenRouter, Groq, and others work the same way. The provider flags and every valid `LLM_KEY` are in [configuration](/reference/configuration). Restart the server after any change.
+`LLM_KEY` defaults to `OPENAI_GPT5_5`. `SECONDARY_LLM_KEY` sets a cheaper model for lighter calls. Azure OpenAI, Gemini, Vertex AI, Bedrock, OpenRouter, Groq, and others work the same way. The provider flags and every valid `LLM_KEY` are in [configuration](/reference/configuration). Restart the server after any change. With Docker Compose, run `docker compose up -d` so the container is recreated with the new values. `docker compose restart` keeps the old ones.
 
 ### Use a local model
 
