@@ -309,6 +309,20 @@ class NarrativeScreenshot(TypedDict):
     toolCallId: str | None
 
 
+class NarrativeTriggerFilter(TypedDict):
+    label: str
+    value: str
+
+
+class NarrativeCreatedTrigger(TypedDict):
+    eventTriggerId: str
+    sourceKind: str
+    filters: list[NarrativeTriggerFilter]
+    firesOnItsOwn: bool
+    # The account the source reads through, if any, so the card can name it without storing it here.
+    connectionId: str | None
+
+
 class CanonicalWorkflowUnavailableFacts(TypedDict):
     workflow_permanent_id: str
     candidate_published: NotRequired[Literal[False]]
@@ -341,6 +355,7 @@ class TurnNarrativePayload(TypedDict):
     outputFiles: NotRequired[list[NarrativeOutputFile]]
     connectionCards: NotRequired[list[ConnectionCardPayload]]
     demonstrationOffer: NotRequired[bool]
+    createdTriggers: NotRequired[list[NarrativeCreatedTrigger]]
     canonicalWorkflowUnavailable: NotRequired[CanonicalWorkflowUnavailableFacts]
     designStarted: bool
     designEnded: bool
@@ -1375,6 +1390,8 @@ class CopilotContext(AgentContext):
     demonstration_insertion: dict[str, str | None] | None = None
     demonstration_items: list[str] = field(default_factory=list)
     demonstration_offered: bool = False
+    # Each trigger created this turn gets a card that opens it, switched off, in the Studio Triggers panel.
+    created_triggers: list[NarrativeCreatedTrigger] = field(default_factory=list)
     # Set while a ``request_credential`` ask is open, so tool calls issued alongside it in the same
     # model response wait for the user's answer instead of racing it.
     credential_pause_settled: asyncio.Event | None = None

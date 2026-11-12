@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import functools
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, get_args
 
 import structlog
+from pydantic import BaseModel
 
 from skyvern.forge import app
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice
@@ -37,30 +38,47 @@ class _MarkedField:
     acts: bool
 
 
+def _marked_fields(model: type[BaseModel]) -> tuple[_MarkedField, ...]:
+    marked: list[_MarkedField] = []
+    for name, info in model.model_fields.items():
+        extra = info.json_schema_extra
+        if not isinstance(extra, dict) or extra.get(CONNECTED_ACCOUNT_SCHEMA_MARK) is not True:
+            continue
+        condition = extra.get(CONNECTED_ACCOUNT_CONDITION_MARK)
+        condition = dict(condition) if isinstance(condition, dict) else {}
+        if condition.get("credential_source") in _UNRESOLVED_CONNECTION_SOURCES:
+            continue
+        defaults = {key: model.model_fields[key].default for key in condition if key in model.model_fields}
+        marked.append(
+            _MarkedField(
+                name,
+                {key: (value, defaults.get(key)) for key, value in condition.items()},
+                extra.get(CONNECTED_ACCOUNT_ACTS_MARK) is True,
+            )
+        )
+    return tuple(marked)
+
+
 @functools.cache
 def _connected_account_fields() -> dict[str, tuple[_MarkedField, ...]]:
-    fields: dict[str, tuple[_MarkedField, ...]] = {}
-    for model in get_args(BLOCK_YAML_SUBCLASSES):
-        marked: list[_MarkedField] = []
-        for name, info in model.model_fields.items():
-            extra = info.json_schema_extra
-            if not isinstance(extra, dict) or extra.get(CONNECTED_ACCOUNT_SCHEMA_MARK) is not True:
-                continue
-            condition = extra.get(CONNECTED_ACCOUNT_CONDITION_MARK)
-            condition = dict(condition) if isinstance(condition, dict) else {}
-            if condition.get("credential_source") in _UNRESOLVED_CONNECTION_SOURCES:
-                continue
-            defaults = {key: model.model_fields[key].default for key in condition if key in model.model_fields}
-            marked.append(
-                _MarkedField(
-                    name,
-                    {key: (value, defaults.get(key)) for key, value in condition.items()},
-                    extra.get(CONNECTED_ACCOUNT_ACTS_MARK) is True,
-                )
-            )
-        if marked:
-            fields[BlockType(model.model_fields["block_type"].default).value] = tuple(marked)
-    return fields
+    return {
+        BlockType(model.model_fields["block_type"].default).value: marked
+        for model in get_args(BLOCK_YAML_SUBCLASSES)
+        if (marked := _marked_fields(model))
+    }
+
+
+def settable_connected_account_fields(
+    model: type[BaseModel], settable: Collection[str], *, acting_only: bool = False
+) -> tuple[str, ...]:
+    """The marked fields of `model` the block can read when a caller sets only the `settable` fields: each mark's
+    condition is met by a settable field or by its default. With `acting_only`, only those marked as acting."""
+    return tuple(
+        field.name
+        for field in _marked_fields(model)
+        if (field.acts or not acting_only)
+        and all(key in settable or default == value for key, (value, default) in field.condition.items())
+    )
 
 
 def connected_account_fields(block: Mapping[str, Any], *, acting_only: bool = False) -> tuple[str, ...]:

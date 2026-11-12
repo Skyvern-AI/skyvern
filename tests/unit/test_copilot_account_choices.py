@@ -2227,7 +2227,7 @@ async def test_an_account_an_agent_step_can_read_is_admitted_only_as_acting(
         "label": "agent",
         "block_type": "agent_step",
         "prompt": "send the report from {{ acct }}",
-        "tools": ["send_email"],
+        "tools": ["http_request"],
         "parameter_keys": ["acct"],
     }
     definition = {"parameters": [{"key": "acct", "parameter_type": "workflow"}], "blocks": [agent]}
@@ -2247,7 +2247,7 @@ async def test_an_agent_step_account_is_still_checked_when_a_provider_read_fails
         "label": "agent",
         "block_type": "agent_step",
         "prompt": f"send the report from {DRIVE_ACCOUNT_ID}",
-        "tools": ["send_email"],
+        "tools": ["http_request"],
     }
     ctx = _gate_ctx(monkeypatch, listed=[DRIVE_ACCOUNT_ID])
     _patch_visible_credentials(monkeypatch, RuntimeError("google read failed"))
@@ -2255,6 +2255,34 @@ async def test_an_agent_step_account_is_still_checked_when_a_provider_read_fails
     result = await run_credential_gate(ctx, {"parameters": [], "blocks": [agent]}, labels=None, run_parameters=None)
 
     assert result.blocker is not None
+
+
+@pytest.mark.asyncio
+async def test_an_agent_step_offered_an_account_tool_acts_on_every_offered_account(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = {
+        "label": "agent",
+        "block_type": "agent_step",
+        "prompt": "summarize the sheet",
+        "tools": ["google_sheets_read"],
+    }
+    definition = {"parameters": [], "blocks": [agent]}
+
+    sender = {**agent, "tools": ["send_email"]}
+    listed = [DRIVE_ACCOUNT_ID, OUTLOOK_ACCOUNT_ID]
+
+    unnamed = await _gate(monkeypatch, definition)
+    listed_reader = await _gate(monkeypatch, definition, listed=listed)
+    listed_sender = await _gate(monkeypatch, {"parameters": [], "blocks": [sender]}, listed=listed)
+    ctx = _gate_ctx(monkeypatch)
+    _patch_visible_credentials(monkeypatch, RuntimeError("google read failed"))
+    unreadable = await run_credential_gate(ctx, definition, labels=None, run_parameters=None)
+
+    assert unnamed.blocker is not None
+    assert listed_reader.blocker is None and listed_reader.error is None
+    assert listed_sender.blocker is not None
+    assert unreadable.error is not None and unreadable.blocker is None
 
 
 @pytest.mark.asyncio

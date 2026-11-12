@@ -25,7 +25,9 @@ CREATE_WEBHOOK_TRIGGER_DESCRIPTION = (
     "\n"
     "`source_kind` is a source below that can be created here; `settings` must fit that source's settings schema.\n"
     '`mapping` maps each workflow input key to a JSON Pointer into the event body, e.g. {"order_id": "/order_id"}.\n'
-    "Creating starts no run. A source that can't be created here is set up where its entry says."
+    "The trigger is created switched off and starts no run. A card shown in this chat lets the user turn it on (a\n"
+    "source that fires on its own) or open it in the Studio Triggers panel; no tool turns a trigger on. A source that\n"
+    "can't be created here is set up where its entry says."
 )
 TEST_TRIGGER_MAPPING_DESCRIPTION = (
     "Test a trigger mapping on a sample event body. Creates nothing: no trigger, delivery or run.\n"
@@ -94,8 +96,26 @@ async def create_webhook_trigger_tool(
         source_kind=source_kind,
         settings=settings or {},
         mapping=mapping,
+        # Copilot never turns a trigger on; the user does, from the chat card or the Studio Triggers panel.
+        enabled=False,
     )
-    data: dict[str, Any] = {"trigger": asdict(created.triggers[0])} if created.triggers else {}
+    if created.triggers:
+        trigger = created.triggers[0]
+        copilot_ctx.created_triggers.append(
+            {
+                "eventTriggerId": trigger.event_trigger_id,
+                "sourceKind": trigger.source_kind,
+                "filters": [{"label": row["label"], "value": row["value"]} for row in trigger.filters],
+                "firesOnItsOwn": trigger.fires_on_its_own,
+                "connectionId": trigger.account_id,
+            }
+        )
+    # `filters` restates the settings in words for the user's card; the model reads the settings themselves.
+    data: dict[str, Any] = (
+        {"trigger": {key: value for key, value in asdict(created.triggers[0]).items() if key != "filters"}}
+        if created.triggers
+        else {}
+    )
     if created.after_create:
         data["after_create"] = created.after_create
     result = _failure(created) or {"ok": True, "data": data}
