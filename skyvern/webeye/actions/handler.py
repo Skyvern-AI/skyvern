@@ -362,6 +362,10 @@ DOWNLOAD_OBSERVED_BUT_EMPTY_FOLLOWUP_MESSAGE = (
     "A file download was observed but no file could be saved from it. "
     "If the goal still requires this file, keep trying to download it rather than reporting the goal complete."
 )
+DOWNLOAD_TIMEOUT_FAILURE_MESSAGE = (
+    "This download started but did not finish within the download timeout, so no file was saved. "
+    "The file may be too large or the site may have stalled; try a smaller export or a different download link."
+)
 # Arming/tearing down blob URL retention is best-effort and must never stall a download action.
 _BLOB_RETENTION_ARMING_TIMEOUT_SECONDS = 5.0
 SENSITIVE_CLIPBOARD_CLEAR_FAILED_FOLLOWUP_MESSAGE = (
@@ -6190,37 +6194,54 @@ class ActionHandler:
             results[-1].download_triggered = True
             action.download_triggered = True
 
-            async with asyncio.timeout(_download_completion_timeout):
-                async with settle_browser_downloads_for_context(page.context):
-                    if action_download_observation is not None:
-                        # Mirror the mid-wait rule at finalize: poll the provider only when no local
-                        # artifact already accounts for this action. A file the CDP/local/session path
-                        # already saved must not be duplicated by a second, collision-suffixed provider
-                        # copy here. The listing is done only when a provider is attached, so the
-                        # legacy no-provider path issues no extra directory read.
-                        local_signal_accounts_for_action = bool(
-                            {_download_signal_identity(file) for file in await _list_download_signal_files()}
-                            - signal_file_identities_before
-                        )
-                        if not local_signal_accounts_for_action:
-                            await _provider_poll_and_measure(
-                                action_download_observation,
-                                provider_poll_phase,
-                                destination_dir=download_dir,
-                                deadline=download_wait_deadline,
-                                list_signal_files=_list_download_signal_files,
-                                signal_identity=_download_signal_identity,
-                                identities_before=signal_file_identities_before,
-                                poll_failure_log="Final provider download poll failed",
-                                measure=False,
+            try:
+                async with asyncio.timeout(_download_completion_timeout):
+                    async with settle_browser_downloads_for_context(page.context):
+                        if action_download_observation is not None:
+                            # Mirror the mid-wait rule at finalize: poll the provider only when no local
+                            # artifact already accounts for this action. A file the CDP/local/session path
+                            # already saved must not be duplicated by a second, collision-suffixed provider
+                            # copy here. The listing is done only when a provider is attached, so the
+                            # legacy no-provider path issues no extra directory read.
+                            local_signal_accounts_for_action = bool(
+                                {_download_signal_identity(file) for file in await _list_download_signal_files()}
+                                - signal_file_identities_before
                             )
-                    downloaded_file_names, new_file_paths = await _finalize_download_artifacts(
-                        download_dir=download_dir,
-                        task=task,
-                        list_files_before=list_files_before,
-                        list_observed_download_files=_list_final_download_files,
-                        attempt_started_at=attempt_started_at,
-                    )
+                            if not local_signal_accounts_for_action:
+                                await _provider_poll_and_measure(
+                                    action_download_observation,
+                                    provider_poll_phase,
+                                    destination_dir=download_dir,
+                                    deadline=download_wait_deadline,
+                                    list_signal_files=_list_download_signal_files,
+                                    signal_identity=_download_signal_identity,
+                                    identities_before=signal_file_identities_before,
+                                    poll_failure_log="Final provider download poll failed",
+                                    measure=False,
+                                )
+                        downloaded_file_names, new_file_paths = await _finalize_download_artifacts(
+                            download_dir=download_dir,
+                            task=task,
+                            list_files_before=list_files_before,
+                            list_observed_download_files=_list_final_download_files,
+                            attempt_started_at=attempt_started_at,
+                        )
+            except asyncio.TimeoutError:
+                # The settle budget and the budget inside the finalize wait are both the task's download
+                # timeout, and this one starts first, so the inner wait's own graceful timeout can never
+                # fire here. Without this the budget's TimeoutError leaves the download path entirely and
+                # the step runner's catch-all reports it as an unexpected exception.
+                LOG.warning(
+                    "Download did not finish within the download timeout; no file was saved",
+                    workflow_run_id=task.workflow_run_id,
+                    download_dir=download_dir,
+                    timeout_seconds=_download_completion_timeout,
+                )
+                results[-1] = ActionFailure(
+                    Exception(DOWNLOAD_TIMEOUT_FAILURE_MESSAGE),
+                    download_triggered=True,
+                )
+                return results
             if downloaded_file_names:
                 results[-1].downloaded_files = action.downloaded_files = downloaded_file_names
                 successful_download_bytes = 0
