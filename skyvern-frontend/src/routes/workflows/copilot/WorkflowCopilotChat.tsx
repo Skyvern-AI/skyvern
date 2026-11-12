@@ -7482,6 +7482,55 @@ export function WorkflowCopilotChat({
   const trayQuestion = questionInteractions.find(
     (item) => item.status === "pending",
   );
+  const trayDraftOwnerTurnId =
+    trayQuestion?.account_group_review?.saves_draft === true
+      ? trayQuestion.account_group_review.proposal_owner_turn_id
+      : null;
+  const trayDraftTurn = trayDraftOwnerTurnId
+    ? (messages.find(
+        (message) => message.narrative?.turnId === trayDraftOwnerTurnId,
+      )?.narrative ?? null)
+    : null;
+  const settledDraftSaves = useRef(new Set<string>());
+  const pendingDraftSaves = useRef(new Set<string>());
+  // Approving a draft run card saves the proposal as a new version, the same write Accept makes.
+  useEffect(() => {
+    for (const item of questionInteractions) {
+      const review = item.account_group_review;
+      if (
+        !review?.saves_draft ||
+        !review.proposal_owner_turn_id ||
+        review.proposal_revision == null
+      )
+        continue;
+      const token = `${review.proposal_owner_turn_id}:${review.proposal_revision}`;
+      if (review.saved_version == null) {
+        pendingDraftSaves.current.add(token);
+        continue;
+      }
+      // Only a card seen pending in this session moves the page to its run; reopening an old chat must not.
+      // The save is recorded before the run is linked, so this waits for the run id.
+      if (pendingDraftSaves.current.has(token) && review.workflow_run_id) {
+        pendingDraftSaves.current.delete(token);
+        focusTurnRun(review.workflow_run_id);
+      }
+      if (settledDraftSaves.current.has(token)) continue;
+      settledDraftSaves.current.add(token);
+      settleAcceptedProposal(review.proposal_owner_turn_id, token, null);
+      for (const queryKey of [
+        ["workflow", review.workflow_permanent_id],
+        ["workflows"],
+      ]) {
+        void queryClient.invalidateQueries({ queryKey });
+      }
+      onWorkflowPersisted?.(review.workflow_permanent_id);
+    }
+  }, [
+    questionInteractions,
+    settleAcceptedProposal,
+    onWorkflowPersisted,
+    focusTurnRun,
+  ]);
   // An account or deletion card is answered on the card alone, so the composer stays a message field.
   const composerQuestion =
     trayQuestion?.account_group_review ||
@@ -11816,6 +11865,7 @@ export function WorkflowCopilotChat({
           <AccountGroupReviewCard
             key={trayQuestion.interaction_id}
             review={trayQuestion.account_group_review}
+            draftTurn={trayDraftTurn}
             disabled={isSubmittingQuestion || acceptUnresolved}
             lockReason={acceptUnresolved ? acceptHoldReason : null}
             collapsed={questionTrayCollapsed}

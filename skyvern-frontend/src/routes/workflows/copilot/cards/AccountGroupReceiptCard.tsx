@@ -191,7 +191,27 @@ export function AccountGroupReceiptCard({
           TONE_CLASSES.answered.card,
         )}
       >
-        <Heading tone="answered" title="You approved one run" />
+        <Heading
+          tone="answered"
+          title={
+            review.saves_draft
+              ? "You approved saving the draft and one run"
+              : "You approved one run"
+          }
+        />
+        {review.saved_version != null ? (
+          <p className="pl-4 text-muted-foreground">
+            Saved as version {review.saved_version}.
+          </p>
+        ) : null}
+        {review.saves_draft &&
+        review.saved_version != null &&
+        review.workflow_run_id &&
+        !review.run_started ? (
+          <p className="pl-4 text-muted-foreground">
+            Starting the run raised an error, so it may or may not have started.
+          </p>
+        ) : null}
         {review.workflow_run_id ? (
           <a
             className="break-words pl-4 underline-offset-2 hover:underline"
@@ -203,10 +223,16 @@ export function AccountGroupReceiptCard({
             <span className="sr-only"> (opens in new tab)</span>
           </a>
         ) : turnLive ? (
-          <p className="pl-4 text-muted-foreground">Starting the run…</p>
+          <p className="pl-4 text-muted-foreground">
+            {review.saves_draft && review.saved_version == null
+              ? "Saving the draft and starting the run…"
+              : "Starting the run…"}
+          </p>
         ) : (
           <p className="pl-4 text-muted-foreground">
-            No run is linked to this approval.
+            {review.saved_version != null
+              ? "The run did not start."
+              : "No run is linked to this approval."}
           </p>
         )}
         {review.workflow_run_id ? (
