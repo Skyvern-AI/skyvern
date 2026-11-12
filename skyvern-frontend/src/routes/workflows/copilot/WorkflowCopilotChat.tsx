@@ -51,6 +51,7 @@ import {
 } from "axios";
 import { getClient, deleteUploadedFileOnPageExit } from "@/api/AxiosClient";
 import { queryClient } from "@/api/QueryClient";
+import { adoptDebugSession } from "@/routes/workflows/hooks/useDebugSessionQuery";
 import {
   ActionsApiResponse,
   ActionTypes,
@@ -4298,6 +4299,7 @@ export function WorkflowCopilotChat({
                 void queryClient.invalidateQueries({
                   queryKey: ["eventTriggers"],
                 });
+                adoptDebugSession(queryClient, workflowPermanentId);
               }
               if (holdingReservation) {
                 const narrative = hydrateHistoryNarrative(
@@ -9027,6 +9029,11 @@ export function WorkflowCopilotChat({
                 focusCopilotBrowser(payload.browser_session_id);
                 return false;
               case "tool_result":
+                applyStoredNarrativeEvent(payload);
+                if (payload.debug_session_id) {
+                  adoptDebugSession(queryClient, workflowPermanentId);
+                }
+                return false;
               case "narration":
                 applyStoredNarrativeEvent(payload);
                 return false;
@@ -9355,6 +9362,8 @@ export function WorkflowCopilotChat({
           // Backstop: a turn that ends without a terminal run_outcome (thrown
           // stream) would otherwise leave a live poll running past the run.
           stopAllRecordedActionsPolls();
+          // A turn cancelled while a fresh browser was becoming the Studio browser ends without its tool result.
+          adoptDebugSession(queryClient, workflowPermanentId);
           buildFollowEngaged.current = false;
           if (armRecovery) {
             startRecoveryPoll(

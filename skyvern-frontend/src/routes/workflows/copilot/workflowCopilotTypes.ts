@@ -758,6 +758,7 @@ export interface WorkflowCopilotToolResultUpdate {
   workflow_run_id?: string | null;
   // Keys and sources only; values are read from the run itself.
   test_inputs?: CopilotTestInput[] | null;
+  debug_session_id?: string | null;
   timestamp?: string | null;
 }
 
