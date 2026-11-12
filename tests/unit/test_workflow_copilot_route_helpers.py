@@ -25,6 +25,7 @@ from skyvern.forge.sdk.copilot.context import AgentResult, CopilotContext, Propo
 from skyvern.forge.sdk.copilot.interruption import UNTESTED_DRAFT_PRESERVED, cancel_notice
 from skyvern.forge.sdk.copilot.tools.run_execution import _record_executed_block_labels
 from skyvern.forge.sdk.copilot.workflow_credential_utils import workflow_credential_ids
+from skyvern.forge.sdk.copilot.workflow_yaml import _normalize_copilot_yaml
 from skyvern.forge.sdk.routes.workflow_copilot import (
     _assistant_execution_receipts,
     _attachment_filenames_from_history,
@@ -36,7 +37,6 @@ from skyvern.forge.sdk.routes.workflow_copilot import (
     _effective_auto_accept,
     _ensure_terminal_frame,
     _history_with_resolved_attachments,
-    _normalize_copilot_yaml,
     _preserved_draft_disposition,
     _prior_copilot_workflow_yaml,
     _prior_global_llm_context,
@@ -210,6 +210,7 @@ def _agent_result(
     # doesn't accidentally trigger the degraded-path branch in
     # `_should_restore_persisted_workflow`.
     r.canonical_was_persisted_due_to_param_change = canonical_was_persisted_due_to_param_change
+    r.run_card_saved_workflow = None
     for k, v in kwargs.items():
         setattr(r, k, v)
     return r
@@ -300,6 +301,7 @@ class TestEffectiveAutoAccept:
         validated = MagicMock()
         validated.proposal_disposition = "auto_applicable"
         validated.cancelled = False
+        validated.run_card_saved_workflow = None
 
         assert _effective_auto_accept(True, validated) is True
         assert _effective_auto_accept(False, validated) is False

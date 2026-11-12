@@ -5066,6 +5066,7 @@ async def test_persist_state_keeps_verified_review_tested_proposal(monkeypatch: 
         proposal_revision=None,
         proposal_adopted=False,
         proposal_workflow_run_id=None,
+        run_card_saved_workflow=None,
     )
     _, workflow_params = setup_new_copilot_mocks(
         monkeypatch, chat, fake_workflow(workflow_id="wf-canonical", title="Original"), agent_result
@@ -5096,6 +5097,7 @@ def _make_bypassed_proposal_agent_result(**overrides: object) -> SimpleNamespace
         "proposal_revision": None,
         "proposal_adopted": False,
         "proposal_workflow_run_id": None,
+        "run_card_saved_workflow": None,
     }
     fields.update(overrides)
     return SimpleNamespace(**fields)

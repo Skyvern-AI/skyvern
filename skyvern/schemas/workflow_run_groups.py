@@ -1,13 +1,15 @@
 from datetime import datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, NamedTuple
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from skyvern.constants import SCRUBBED_VALUE
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 
-MAX_WORKFLOW_RUN_GROUP_ITEMS = 25
+DEFAULT_MAX_WORKFLOW_RUN_GROUP_ITEMS = 25
+DEFAULT_MAX_CONCURRENCY = 1
+WORKFLOW_RUN_GROUP_ITEMS_CEILING = 1000
 SCRUBBED_SUBMISSION_KEY_PREFIX = "scrubbed:"
 
 
@@ -34,6 +36,14 @@ class WorkflowRunGroupItemState(StrEnum):
 
 
 IN_FLIGHT_ITEM_STATES = (WorkflowRunGroupItemState.dispatching, WorkflowRunGroupItemState.dispatched)
+
+
+class RunGroupLimits(NamedTuple):
+    max_items: int
+    max_concurrency: int
+
+
+DEFAULT_RUN_GROUP_LIMITS = RunGroupLimits(DEFAULT_MAX_WORKFLOW_RUN_GROUP_ITEMS, DEFAULT_MAX_CONCURRENCY)
 
 
 class WorkflowRunGroupItemOutcome(StrEnum):
@@ -92,7 +102,14 @@ class WorkflowRunGroupCreateRequest(BaseModel):
     workflow_id: str = Field(description="The workflow permanent id (wpid_...) every item runs against.")
     version: int | None = Field(default=None, ge=1)
     submission_key: str = Field(min_length=1, max_length=255)
-    items: list[WorkflowRunGroupItemRequest] = Field(min_length=1, max_length=MAX_WORKFLOW_RUN_GROUP_ITEMS)
+    # The organization's own item limit is enforced at submit; this ceiling only bounds the request body.
+    items: list[WorkflowRunGroupItemRequest] = Field(min_length=1, max_length=WORKFLOW_RUN_GROUP_ITEMS_CEILING)
+    max_concurrency: int = Field(
+        default=DEFAULT_MAX_CONCURRENCY,
+        ge=1,
+        le=WORKFLOW_RUN_GROUP_ITEMS_CEILING,
+        description="How many items may run at once, up to the organization's limit.",
+    )
 
     @model_validator(mode="after")
     def _validate_keys(self) -> "WorkflowRunGroupCreateRequest":

@@ -1259,6 +1259,8 @@ class AgentResult:
     # The turn took over another turn's stored candidate and authored nothing since, so it has no turn-end write.
     proposal_adopted: bool = False
     proposal_workflow_run_id: str | None = None
+    # The version a run card saved this turn: the turn's rollback target, and it rules out an auto-accept commit.
+    run_card_saved_workflow: Workflow | None = None
     code_artifact_metadata: dict[str, dict[str, Any]] | None = None
     executed_block_fingerprints: dict[str, set[str]] = field(default_factory=dict)
     # Legacy marker for turns that wrote canonical before snapshot isolation.
@@ -1590,6 +1592,7 @@ class CopilotContext(AgentContext):
     proposal_adoptions_seen_by_model: int = 0
     proposal_canonical_fingerprint: str | None = None
     proposal_workflow_run_id: str | None = None
+    run_card_saved_workflow: Workflow | None = None
     # A restored candidate whose request private settings differ from its own; its stored bytes cannot vouch
     # for what a test under this token would run, so binding a run to it is refused.
     settings_diverged_proposal_token: tuple[str, int] | None = None

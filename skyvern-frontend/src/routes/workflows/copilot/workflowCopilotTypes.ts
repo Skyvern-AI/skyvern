@@ -71,6 +71,14 @@ export interface AccountGroupReview {
   workflow_run_group_id: string | null;
   single_run?: boolean;
   workflow_run_id?: string | null;
+  saves_draft?: boolean;
+  proposal_owner_turn_id?: string | null;
+  proposal_revision?: number | null;
+  draft_tested?: boolean;
+  tested_workflow_run_id?: string | null;
+  saved_workflow_id?: string | null;
+  saved_version?: number | null;
+  run_started?: boolean | null;
   decision?: AccountGroupDecision | null;
 }
 

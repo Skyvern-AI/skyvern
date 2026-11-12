@@ -7,7 +7,9 @@ import type {
   AccountGroupOutcome,
   AccountGroupReview,
 } from "../workflowCopilotTypes";
+import type { TurnNarrativeState } from "../narrativeState";
 import { AttentionTray } from "./AttentionTray";
+import { DiffCard } from "./DiffCard";
 
 const PRIOR_EFFECT: Partial<Record<AccountGroupOutcome, string>> = {
   completed: "already completed last time",
@@ -33,6 +35,7 @@ type ReviewCardProps = {
   onApprove: (credentialIds: string[]) => void;
   onDecline: () => void;
   upNext?: string | null;
+  draftTurn?: TurnNarrativeState | null;
 };
 
 export function AccountGroupReviewCard(props: ReviewCardProps) {
@@ -112,13 +115,20 @@ function SingleRunReviewCard({
   onApprove,
   onDecline,
   upNext,
+  draftTurn,
 }: ReviewCardProps) {
   const titleId = useId();
+  const [showChanges, setShowChanges] = useState(false);
+  const savesDraft = Boolean(review.saves_draft);
   return (
     <AttentionTray
       aria-label="Run review"
       aria-describedby={titleId}
-      title="Review the run before it starts"
+      title={
+        savesDraft
+          ? "Saves this draft as a new version, then starts the run"
+          : "Review the run before it starts"
+      }
       titleId={titleId}
       wrapTitle
       collapsedTitle="Copilot is waiting on your review of a run"
@@ -131,10 +141,49 @@ function SingleRunReviewCard({
         <p className="whitespace-pre-wrap break-words text-[13.5px] font-medium leading-relaxed">
           {review.action_summary}
         </p>
-        <p className="text-muted-foreground">
-          {review.workflow_title} · version {review.version} · one real run of
-          the saved workflow. It keeps running after Copilot replies.
-        </p>
+        {savesDraft ? (
+          <>
+            <p className="text-muted-foreground">
+              {review.workflow_title} · saved as a new version · one real run of
+              that version. It keeps running after Copilot replies.
+            </p>
+            <p className="flex flex-wrap items-center gap-x-2 text-muted-foreground">
+              {review.draft_tested && review.tested_workflow_run_id ? (
+                <a
+                  className="underline-offset-2 hover:underline"
+                  href={`/runs/${review.tested_workflow_run_id}`}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  Tested in a test run
+                  <span className="sr-only"> (opens in new tab)</span>
+                </a>
+              ) : review.draft_tested ? (
+                <span>Tested in a test run</span>
+              ) : (
+                <span>This draft has not been tested.</span>
+              )}
+              {draftTurn ? (
+                <button
+                  type="button"
+                  className="underline underline-offset-2"
+                  aria-expanded={showChanges}
+                  onClick={() => setShowChanges((open) => !open)}
+                >
+                  {showChanges ? "Hide changes" : "Show changes"}
+                </button>
+              ) : null}
+            </p>
+            {showChanges && draftTurn ? (
+              <DiffCard turn={draftTurn} pendingProposal />
+            ) : null}
+          </>
+        ) : (
+          <p className="text-muted-foreground">
+            {review.workflow_title} · version {review.version} · one real run of
+            the saved workflow. It keeps running after Copilot replies.
+          </p>
+        )}
         <InputList inputs={review.common_inputs} />
         {review.rows.length > 0 ? (
           <div className="flex flex-col gap-1">
@@ -155,15 +204,16 @@ function SingleRunReviewCard({
           </div>
         ) : null}
         <p className="text-muted-foreground">
-          This runs the saved workflow the same way pressing Run does, with the
-          logins it&apos;s set up to use.
+          {savesDraft
+            ? "Approving saves the draft as a new version, as Accept does, then runs it the same way pressing Run does, with the logins it's set up to use."
+            : "This runs the saved workflow the same way pressing Run does, with the logins it's set up to use."}
         </p>
       </div>
       <ReviewActions
         disabled={disabled}
         lockReason={lockReason}
         approveDisabled={false}
-        approveLabel="Run once"
+        approveLabel={savesDraft ? "Save and run" : "Run once"}
         onApprove={() => onApprove(review.rows.map((row) => row.credential_id))}
         onDecline={onDecline}
       />
