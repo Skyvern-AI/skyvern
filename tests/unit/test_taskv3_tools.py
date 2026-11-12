@@ -47166,6 +47166,90 @@ async def test_type_reads_every_field_back_and_names_what_it_holds(
         assert f"'{held}'" in r.content, r.content
 
 
+# Fields carrying a jQuery UI datepicker's surface: the declared options, the picker's parser and formatter (which fall back
+# to their English defaults for any setting not passed in), and the keypress filter that drops every character a numeric
+# format does not use. `#localized` reads French month names and lowercases what is typed. `#ref` is no picker, only a
+# dash-stripping mask.
+_DATEPICKER_FIELDS_HTML = """
+<input id="iso" class="hasDatepicker" data-format="yy-mm-dd">
+<input id="compact" class="hasDatepicker" data-format="mmddyy">
+<input id="localized" class="hasDatepicker" data-format="dd MM yy"
+  data-months="janvier,février,mars,avril,mai,juin,juillet,août,septembre,octobre,novembre,décembre">
+<input id="ref">
+<script>
+  const pad = (n) => String(n).padStart(2, '0');
+  const ENGLISH_MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September',
+    'October', 'November', 'December'];
+  const months = (settings) => (settings && settings.monthNames) || ENGLISH_MONTHS;
+  const parse = (format, v, settings) => {
+    if (!v) return null;
+    if (format === 'dd MM yy') {
+      const m = /^(\\d{2}) (\\S+) (\\d{4})$/.exec(v);
+      const month = m ? months(settings).findIndex((name) => name.toLowerCase() === m[2].toLowerCase()) : -1;
+      if (month < 0) throw 'Unknown name at position 3';
+      return new Date(+m[3], month, +m[1]);
+    }
+    const m = format === 'yy-mm-dd' ? /^(\\d{4})-(\\d{2})-(\\d{2})$/.exec(v) : /^(\\d{2})(\\d{2})(\\d{4})$/.exec(v);
+    if (!m) throw 'Unexpected literal';
+    return format === 'yy-mm-dd' ? new Date(+m[1], m[2] - 1, +m[3]) : new Date(+m[3], m[1] - 1, +m[2]);
+  };
+  const format = (f, d, settings) => {
+    if (f === 'dd MM yy') return `${pad(d.getDate())} ${months(settings)[d.getMonth()]} ${d.getFullYear()}`;
+    return f === 'yy-mm-dd'
+      ? `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+      : `${pad(d.getMonth() + 1)}${pad(d.getDate())}${d.getFullYear()}`;
+  };
+  const option = (el, name) => {
+    if (name === 'dateFormat') return el.dataset.format;
+    if (name === 'monthNames' && el.dataset.months) return el.dataset.months.split(',');
+    return undefined;
+  };
+  window.jQuery = (el) => ({datepicker: (cmd, name) => (cmd === 'option' ? option(el, name) : null)});
+  window.jQuery.datepicker = {parseDate: parse, formatDate: format};
+  for (const el of document.querySelectorAll('#iso, #compact')) {
+    const allowed = el.dataset.format === 'yy-mm-dd' ? /[0-9-]/ : /[0-9]/;
+    el.addEventListener('keypress', (e) => { if (!allowed.test(e.key)) e.preventDefault(); });
+  }
+  document.querySelector('#localized').addEventListener('input', (e) => { e.target.value = e.target.value.toLowerCase(); });
+  document.querySelector('#ref').addEventListener('input', (e) => { e.target.value = e.target.value.replace(/-/g, ''); });
+</script>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("selector", "text", "ok_class", "held", "unreadable"),
+    [
+        ("#iso", "11/05/2026", "held_as", "11052026", True),
+        ("#iso", "November 5, 2026", "held_differs", "52026", True),
+        ("#iso", "2026-11-05", None, "2026-11-05", False),
+        ("#compact", "11/05/2026", "held_as", "11052026", False),
+        ("#localized", "31 JANVIER 2026", "held_as", "31 janvier 2026", False),
+        ("#ref", "2026-11-05", "held_as", "20261105", False),
+    ],
+    ids=[
+        "picker_drops_separators",
+        "picker_drops_month_name",
+        "picker_format_typed",
+        "compact_picker_reads_digits",
+        "localized_picker_reads_its_month_names",
+        "no_picker_mask",
+    ],
+)
+async def test_type_asks_a_datepicker_whether_it_reads_what_the_field_holds(
+    selector: str, text: str, ok_class: str | None, held: str, unreadable: bool
+) -> None:
+    async with _content_page(_DATEPICKER_FIELDS_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": selector, "text": text})
+        assert await page.eval_on_selector(selector, "el => el.value") == held
+    assert (r.status, r.ok_class, r.entry_unconfirmed) == ("ok", ok_class, ok_class == "held_differs"), r.content
+    assert ("cannot read" in r.content) is unreadable, r.content
+    if unreadable:
+        assert "'yy-mm-dd'" in r.content and "'2026-01-31'" in r.content, r.content
+
+
 # A text field in a canvas-drawn app's accessibility tree: the app owns the value, starts editing the field on the
 # first animation frame after it gains focus, and then writes its own copy over the input. Text that lands in the
 # input before that frame never reaches the app. Frames are paced slow, as on an app painting in software, so a
