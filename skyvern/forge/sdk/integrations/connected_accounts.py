@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import functools
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, get_args
 
 import structlog
 
+from skyvern.forge import app
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice
 from skyvern.forge.sdk.schemas.google_oauth import STATE_ACTIVE, GoogleOAuthCredentialBase
 from skyvern.forge.sdk.schemas.microsoft_oauth import MicrosoftOAuthCredentialBase
@@ -170,3 +171,107 @@ async def org_connections_by_id(organization_id: str, user_id: str | None = None
         return await org_connections(organization_id, user_id)
     except IncompleteConnectionRead as incomplete:
         return incomplete.connections
+
+
+@dataclass(frozen=True)
+class UseHop:
+    """The account's provider token stays behind the hop: the block calls its hop path instead of using a token."""
+
+    credential_source: Literal["nango"] = "nango"
+
+
+AccountAccess = str | UseHop | None
+AccessFn = Callable[[str, str, list[str] | None], Awaitable[AccountAccess]]
+# Each API's own backend is registered under the API's name.
+AccountApi = Literal["google", "microsoft"]
+
+
+@dataclass(frozen=True)
+class AccountBackend:
+    access: AccessFn
+    # The provider APIs a token from this backend can call; a block pinned to an API only reaches these backends.
+    apis: frozenset[AccountApi]
+
+
+async def _google_access(organization_id: str, account_id: str, required_scopes: list[str] | None) -> AccountAccess:
+    # Without scopes there is no grant gate, so a missing permission comes back as Google's own error at call time.
+    if required_scopes is None:
+        return await app.AGENT_FUNCTION.get_google_sheets_credentials(
+            organization_id=organization_id, credential_id=account_id
+        )
+    credentials = await app.AGENT_FUNCTION.get_google_workspace_credentials(
+        organization_id=organization_id, credential_id=account_id, required_scopes=required_scopes
+    )
+    return credentials.token if credentials else None
+
+
+async def _microsoft_access(organization_id: str, account_id: str, required_scopes: list[str] | None) -> AccountAccess:
+    return await app.AGENT_FUNCTION.get_microsoft_credentials(
+        organization_id=organization_id, credential_id=account_id, required_scopes=required_scopes
+    )
+
+
+async def _nango_access(organization_id: str, account_id: str, required_scopes: list[str] | None) -> AccountAccess:
+    return UseHop()
+
+
+# ponytail: Nango accounts are not among org_connections yet, so the lookup never reaches "nango" until a Nango
+# reader joins it. Its token never leaves the hop, so no block can call a provider API with it directly.
+ACCOUNT_BACKENDS: dict[str, AccountBackend] = {
+    "google": AccountBackend(_google_access, frozenset({"google"})),
+    "microsoft": AccountBackend(_microsoft_access, frozenset({"microsoft"})),
+    "nango": AccountBackend(_nango_access, frozenset()),
+}
+
+
+async def _known_account(organization_id: str, account_ref: str, api: AccountApi | None) -> OrgConnection | None:
+    ref = account_ref.strip()
+    return next(
+        (
+            connection
+            for connection in await org_connections_by_id(organization_id)
+            if connection.id == ref
+            and connection.provider in ACCOUNT_BACKENDS
+            and (api is None or api in ACCOUNT_BACKENDS[connection.provider].apis)
+        ),
+        None,
+    )
+
+
+async def resolve_account_access(
+    organization_id: str,
+    account_ref: str,
+    required_scopes: list[str] | None = None,
+    *,
+    api: AccountApi | None = None,
+) -> AccountAccess:
+    """What a block needs to use the connected account `account_ref`, from the backend its provider names.
+    A block that calls one provider's API passes `api`, so only an account whose token can call it resolves."""
+    if api is not None and [name for name, backend in ACCOUNT_BACKENDS.items() if api in backend.apis] == [api]:
+        # Only the API's own backend can serve it, so reading the org's accounts could not change the answer.
+        return await ACCOUNT_BACKENDS[api].access(organization_id, account_ref, required_scopes)
+    try:
+        account = await _known_account(organization_id, account_ref, api)
+    except Exception:
+        if api is None:
+            raise
+        LOG.warning("connected_account_lookup_failed", organization_id=organization_id, exc_info=True)
+        account = None
+    if account is not None:
+        return await ACCOUNT_BACKENDS[account.provider].access(organization_id, account.id, required_scopes)
+    if api is not None:
+        # Not a known id (a hand-written name or email, or an unreadable account list): the API's own backend
+        # resolves the reference itself.
+        return await ACCOUNT_BACKENDS[api].access(organization_id, account_ref, required_scopes)
+    LOG.info("connected_account_not_resolved", organization_id=organization_id)
+    return None
+
+
+async def resolve_account_token(
+    organization_id: str, account_ref: str, required_scopes: list[str] | None = None, *, api: AccountApi
+) -> str | None:
+    access = await resolve_account_access(organization_id, account_ref, required_scopes, api=api)
+    if isinstance(access, UseHop):
+        LOG.warning("connected_account_needs_hop", organization_id=organization_id, api=api)
+        return None
+    return access or None

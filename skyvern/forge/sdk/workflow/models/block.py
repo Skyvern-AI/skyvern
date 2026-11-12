@@ -236,6 +236,7 @@ from skyvern.forge.sdk.experimentation.workflow_block_engine import (
     workflow_block_engine_override,
 )
 from skyvern.forge.sdk.forge_log import exception_log_fields
+from skyvern.forge.sdk.integrations.connected_accounts import resolve_account_token
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Status
@@ -13000,14 +13001,12 @@ class FileDestinationBlock(Block):
                 raise ValueError("Google credential id is required")
 
             if google_access_token is None:
-                google_credentials = await app.AGENT_FUNCTION.get_google_workspace_credentials(
-                    organization_id=org_id,
-                    credential_id=google_credential_id,
-                    required_scopes=list(google_oauth_service.GOOGLE_DRIVE_SCOPES),
+                drive_access = await resolve_account_token(
+                    org_id, google_credential_id, list(google_oauth_service.GOOGLE_DRIVE_SCOPES), api="google"
                 )
-                if not google_credentials or not google_credentials.token:
+                if not drive_access:
                     raise ValueError("Google Drive credential is not connected or is missing required scopes")
-                google_access_token = google_credentials.token
+                google_access_token = drive_access
 
             folder_id = google_drive_service.extract_folder_id(self.google_drive_folder_id)
             for file_path in files_to_upload:
@@ -17431,17 +17430,15 @@ class FileDownloadBlock(BaseTaskBlock, FileDestinationBlock):
         if not google_credential_id:
             raise ValueError("Google credential id is required")
 
-        google_credentials = await app.AGENT_FUNCTION.get_google_workspace_credentials(
-            organization_id=org_id,
-            credential_id=google_credential_id,
-            required_scopes=list(google_oauth_service.GOOGLE_DRIVE_SCOPES),
+        drive_access = await resolve_account_token(
+            org_id, google_credential_id, list(google_oauth_service.GOOGLE_DRIVE_SCOPES), api="google"
         )
-        if not google_credentials or not google_credentials.token:
+        if not drive_access:
             raise ValueError("Google Drive credential is not connected or is missing required scopes")
 
         try:
             file_path = await google_drive_service.download_file(
-                access_token=google_credentials.token,
+                access_token=drive_access,
                 file_id=file_id,
                 resource_key=file_reference.resource_key,
                 output_dir=download_files_path,
@@ -17468,7 +17465,7 @@ class FileDownloadBlock(BaseTaskBlock, FileDestinationBlock):
         return (
             file_path,
             matching_files[:1] if matching_files is not None else None,
-            google_credentials.token,
+            drive_access,
         )
 
     async def _download_authenticated_sftp_source(
