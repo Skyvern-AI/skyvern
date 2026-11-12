@@ -4,6 +4,7 @@ import asyncio
 import copy
 import json
 import re
+import time
 import uuid
 from collections.abc import Mapping
 from contextvars import ContextVar
@@ -1272,6 +1273,8 @@ async def _navigate_post_hook(
         _release_scout_challenge_listeners(ctx)
 
 
+# Set by the pre-hook and read by the post-hook of the same call, which run in one task.
+_NAVIGATION_TARGET: ContextVar[tuple[str | None, float | None]] = ContextVar("navigation_target", default=(None, None))
 _NAVIGATE_READ_GUIDANCE = " Use {readers} when you need the page's structure or selectors before responding."
 
 
@@ -1310,13 +1313,16 @@ async def _navigate_post_hook_body(
             source_tool="navigate_browser",
             captured_url=source_url,
         )
-    return await attribute_navigation_failure(ctx, result)
+    target_url, started_wall = _NAVIGATION_TARGET.get()
+    return await attribute_navigation_failure(ctx, result, target_url=target_url, since_wall=started_wall)
 
 
 async def _navigate_pre_hook(
     params: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
+    url = params.get("url")
+    _NAVIGATION_TARGET.set((url if isinstance(url, str) else None, time.time()))
     await _capture_scout_source_url(ctx)
     await _arm_scout_challenge_listener(ctx)
     return None

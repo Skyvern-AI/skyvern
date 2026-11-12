@@ -60,6 +60,12 @@ from skyvern.forge.sdk.copilot.turn_origin import (
 )
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.enums import WorkflowRunStatus
+from skyvern.forge.sdk.schemas.debug_sessions import DebugSession
+from skyvern.forge.sdk.services.debug_session_browser import (
+    create_debug_browser_session,
+    debug_browser_supports_vnc,
+    record_debug_session,
+)
 from skyvern.library.skyvern_browser import SkyvernBrowser
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.browser_session_kind import COPILOT_PRESTART_RUNNABLE_TYPE, BrowserSessionKind
@@ -1389,6 +1395,20 @@ def end_minted_browser_renewals(ctx: AgentContext) -> None:
         end_minted_browser_renewal(ctx, session_id)
 
 
+async def _wait_until_attachable(ctx: AgentContext, session_id: str) -> None:
+    # DefaultPersistentSessionsManager returns from create_session before browser_context is set.
+    async with asyncio.timeout(_BROWSER_BOOT_WAIT_SECONDS):
+        while True:
+            state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
+                session_id=session_id,
+                organization_id=ctx.organization_id,
+            )
+            if state and _browser_context_is_attachable(state.browser_context):
+                record_attached_browser_driver(ctx, session_id, state)
+                return
+            await asyncio.sleep(_BROWSER_BOOT_POLL_INTERVAL_SECONDS)
+
+
 async def _provision_browser_session(
     ctx: AgentContext,
     *,
@@ -1495,19 +1515,7 @@ async def _provision_browser_session(
             # browser this turn is the only reader of.
             await _record_minted_browser(ctx, installed_session_id)
 
-        # DefaultPersistentSessionsManager schedules chromium in a background
-        # task and returns from create_session before browser_context is set,
-        # so the next mcp_browser_context lookup raises. Wait for it.
-        async with asyncio.timeout(_BROWSER_BOOT_WAIT_SECONDS):
-            while True:
-                state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
-                    session_id=ctx.browser_session_id,
-                    organization_id=ctx.organization_id,
-                )
-                if state and _browser_context_is_attachable(state.browser_context):
-                    record_attached_browser_driver(ctx, ctx.browser_session_id, state)
-                    break
-                await asyncio.sleep(_BROWSER_BOOT_POLL_INTERVAL_SECONDS)
+        await _wait_until_attachable(ctx, ctx.browser_session_id)
 
         sc = skyvern_context.current()
         if sc:
@@ -1745,29 +1753,223 @@ class BrowserSessionReplacement:
     old_session_id: str | None
     new_session_id: str
     old_closed: bool
-    pane_kept_old: bool
+    debug_session_id: str | None = None
+    # The old browser stays the Studio browser because it is in use, or because that could not be checked. None when
+    # whether the old browser was the Studio browser could not be read.
+    studio_browser_kept: bool | None = False
+
+    @property
+    def is_studio_browser(self) -> bool:
+        return self.debug_session_id is not None
 
 
-async def _browser_session_is_studio_pane(ctx: AgentContext, session_id: str) -> bool:
+def _record_browser_session_replacement(
+    ctx: AgentContext, replacement: BrowserSessionReplacement
+) -> BrowserSessionReplacement:
+    if replacement.old_session_id is not None:
+        ctx.browser_session_replacements[replacement.old_session_id] = replacement.new_session_id
+    ctx.browser_session_continuity_generation += 1
+    ctx.browser_session_continuity_disposition = "reestablished"
+    ctx.browser_session_continuity_deadline_expired = False
+    ctx.browser_session_continuity_acquisition_failure = None
+    LOG.info(
+        "Copilot replaced its browser session",
+        old_session_id=replacement.old_session_id,
+        new_session_id=replacement.new_session_id,
+        old_closed=replacement.old_closed,
+        studio_browser_replaced=replacement.is_studio_browser,
+        debug_session_id=replacement.debug_session_id,
+    )
+    return replacement
+
+
+class _StudioRowsNotCompleted(Exception):
+    pass
+
+
+async def _commit_studio_browser(
+    ctx: AgentContext, user_id: str, new_session: PersistentBrowserSession, vnc_streaming_supported: bool
+) -> tuple[DebugSession | None, bool, bool]:
+    """The active debug session if it now names the new browser, whether every completed row's browser closed, and
+    whether the row could not be read back. Raises _StudioRowsNotCompleted when no row changed."""
+    new_session_id = new_session.persistent_browser_session_id
     try:
-        debug_session = await app.DATABASE.debug.get_debug_session_by_browser_session_id(
-            browser_session_id=session_id,
+        completed = await app.DATABASE.debug.complete_debug_sessions(
             organization_id=ctx.organization_id,
+            user_id=user_id,
+            workflow_permanent_id=ctx.workflow_permanent_id,
+        )
+    except Exception as exc:
+        raise _StudioRowsNotCompleted from exc
+    debug_session: DebugSession | None = None
+    row_unknown = False
+    try:
+        debug_session = await record_debug_session(
+            new_session,
+            organization_id=ctx.organization_id,
+            user_id=user_id,
+            workflow_permanent_id=ctx.workflow_permanent_id,
+            vnc_streaming_supported=vnc_streaming_supported,
         )
     except Exception:
-        LOG.warning("Could not tell whether the studio pane streams this browser; keeping it", exc_info=True)
-        return True
-    return debug_session is not None
+        LOG.warning("Could not record the replacement studio browser", new_session_id=new_session_id, exc_info=True)
+        try:
+            # The insert can commit before it raises, so the row is read back rather than assumed missing.
+            debug_session = await app.DATABASE.debug.get_debug_session(
+                organization_id=ctx.organization_id,
+                user_id=user_id,
+                workflow_permanent_id=ctx.workflow_permanent_id,
+            )
+        except Exception:
+            LOG.warning(
+                "Could not tell whether the studio debug session moved to the new browser; keeping the new browser",
+                new_session_id=new_session_id,
+                exc_info=True,
+            )
+            row_unknown = True
+    # Like Restart browser, a completed row's browser is closed whatever the insert did.
+    closed = [
+        await close_browser_session_quietly(
+            ctx.organization_id, row.browser_session_id, reason=BrowserSessionCloseReason.user_requested
+        )
+        for row in completed
+        if row.browser_session_id != new_session_id
+    ]
+    if debug_session is not None and debug_session.browser_session_id != new_session_id:
+        debug_session = None
+    return debug_session, bool(closed) and all(closed), row_unknown
 
 
-async def replace_browser_session(ctx: AgentContext) -> BrowserSessionReplacement | BuildTestConnectFailure:
-    """Retire the chat's browser and provision a new one, keeping the old one when the new one cannot start."""
+async def _replace_studio_browser(
+    ctx: AgentContext,
+    old_session_id: str,
+    user_id: str,
+    in_use: Callable[[AgentContext, str], Awaitable[bool]],
+) -> BrowserSessionReplacement | BuildTestConnectFailure:
+    allocation_id = uuid.uuid4().hex
+
+    async def _start() -> PersistentBrowserSession:
+        if ctx.browser_allocation_recorder is not None:
+            await ctx.browser_allocation_recorder(allocation_id, None)
+        return await create_debug_browser_session(
+            organization_id=ctx.organization_id,
+            user_id=user_id,
+            workflow_permanent_id=ctx.workflow_permanent_id,
+        )
+
+    create = asyncio.ensure_future(_admitted_create(ctx.organization_id, _start))
+    try:
+        new_session = await asyncio.shield(create)
+    except asyncio.CancelledError:
+        _close_session_once_created(ctx.organization_id, create, lambda session: session.persistent_browser_session_id)
+        raise
+    except BrowserSessionCreditAdmissionRefusal:
+        return BuildTestConnectFailure(state="billing_credit_admission_refusal", retry_action=None)
+    except TooManyStartingBrowserSessions as refusal:
+        return _start_capacity_failure(refusal)
+    except Exception:
+        LOG.warning("Failed to create a replacement studio browser", exc_info=True)
+        return BuildTestConnectFailure(state="provisioning_unavailable")
+    new_session_id = new_session.persistent_browser_session_id
+    try:
+        if ctx.browser_allocation_recorder is not None:
+            await ctx.browser_allocation_recorder(allocation_id, new_session_id)
+        await _wait_until_attachable(ctx, new_session_id)
+        vnc_streaming_supported = await debug_browser_supports_vnc(new_session)
+        current = await app.DATABASE.debug.get_debug_session(
+            organization_id=ctx.organization_id,
+            user_id=user_id,
+            workflow_permanent_id=ctx.workflow_permanent_id,
+        )
+        # Checked last, just before the row moves: a person can take control while the new browser boots.
+        row_names_old = current is not None and current.browser_session_id == old_session_id
+        studio_browser_kept = row_names_old and await in_use(ctx, old_session_id)
+        still_studio = row_names_old and not studio_browser_kept
+    except asyncio.CancelledError:
+        await close_browser_session_quietly(ctx.organization_id, new_session_id)
+        raise
+    except Exception:
+        LOG.warning("Replacement studio browser did not become usable", new_session_id=new_session_id, exc_info=True)
+        await close_browser_session_quietly(ctx.organization_id, new_session_id)
+        return BuildTestConnectFailure(state="provisioning_unavailable", browser_session_id=new_session_id)
+    debug_session: DebugSession | None = None
+    old_closed = False
+    row_unknown = False
+    cancelled: asyncio.CancelledError | None = None
+    if still_studio:
+        # A cancel must not split the row move from the closes, or the rows and the browsers they name disagree.
+        commit = asyncio.ensure_future(_commit_studio_browser(ctx, user_id, new_session, vnc_streaming_supported))
+        try:
+            while not commit.done():
+                try:
+                    await asyncio.shield(commit)
+                except asyncio.CancelledError as exc:
+                    cancelled = exc
+            debug_session, old_closed, row_unknown = commit.result()
+        except _StudioRowsNotCompleted:
+            LOG.warning("Could not complete the studio debug sessions; keeping the studio browser", exc_info=True)
+            await close_browser_session_quietly(ctx.organization_id, new_session_id)
+            if cancelled is not None:
+                raise cancelled
+            return BuildTestConnectFailure(state="provisioning_unavailable", browser_session_id=new_session_id)
+    ctx.browser_session_id = new_session_id
+    sc = skyvern_context.current()
+    if sc:
+        sc.run_id = new_session_id
+    if debug_session is not None:
+        replacement = BrowserSessionReplacement(
+            old_session_id, new_session_id, old_closed, debug_session_id=debug_session.debug_session_id
+        )
+    else:
+        # A row that might name the new browser must outlive the turn, so only a browser no row names is minted.
+        # ponytail: an unknown row leaks the new browser until it times out; read the row back again if that matters.
+        if not row_unknown:
+            await _record_minted_browser(ctx, new_session_id)
+        replacement = BrowserSessionReplacement(
+            old_session_id, new_session_id, old_closed, studio_browser_kept=studio_browser_kept
+        )
+    _record_browser_session_replacement(ctx, replacement)
+    if cancelled is not None:
+        raise cancelled
+    return replacement
+
+
+async def replace_browser_session(
+    ctx: AgentContext, *, studio_browser_in_use: Callable[[AgentContext, str], Awaitable[bool]]
+) -> BrowserSessionReplacement | BuildTestConnectFailure:
+    """Retire the chat's browser and provision a new one, keeping the old one when the new one cannot start. The studio
+    debug browser is replaced the way Restart browser replaces it, unless studio_browser_in_use says it is in use."""
+    denial = _browser_session_denial(ctx)
+    if denial is not None:
+        return denial
     async with (
         browser_session_lock(ctx, session_id=ctx.browser_session_id),
         browser_evidence_commit_lock(ctx),
         browser_session_recovery(ctx),
     ):
         old_session_id = ctx.browser_session_id
+        pane_row: DebugSession | None = None
+        pane_unknown = False
+        if old_session_id:
+            try:
+                pane_row = await app.DATABASE.debug.get_debug_session_by_browser_session_id(
+                    browser_session_id=old_session_id,
+                    organization_id=ctx.organization_id,
+                )
+            except Exception:
+                LOG.warning("Could not tell whether the studio pane streams this browser; keeping it", exc_info=True)
+                pane_unknown = True
+        studio_browser_kept: bool | None = None if pane_unknown else False
+        if (
+            old_session_id
+            and pane_row is not None
+            and pane_row.status == "created"
+            and pane_row.user_id is not None
+            and pane_row.workflow_permanent_id == ctx.workflow_permanent_id
+        ):
+            studio_browser_kept = await studio_browser_in_use(ctx, old_session_id)
+            if not studio_browser_kept:
+                return await _replace_studio_browser(ctx, old_session_id, pane_row.user_id, studio_browser_in_use)
         await retire_browser_session_id(ctx, old_session_id)
         failure = await _provision_browser_session(ctx)
         new_session_id = ctx.browser_session_id
@@ -1775,27 +1977,20 @@ async def replace_browser_session(ctx: AgentContext) -> BrowserSessionReplacemen
             ctx.browser_session_id = old_session_id
             return failure or BuildTestConnectFailure(state="provisioning_unavailable")
         if old_session_id is None:
-            return BrowserSessionReplacement(None, new_session_id, old_closed=False, pane_kept_old=False)
+            return BrowserSessionReplacement(None, new_session_id, old_closed=False)
         # The studio pane streams its session and re-sends it next turn, so that session is left running.
-        pane_kept_old = await _browser_session_is_studio_pane(ctx, old_session_id)
-        old_closed = not pane_kept_old and await close_browser_session_quietly(
+        keep_old = pane_unknown or pane_row is not None
+        old_closed = not keep_old and await close_browser_session_quietly(
             ctx.organization_id,
             old_session_id,
             reason=BrowserSessionCloseReason.user_requested,
         )
-        ctx.browser_session_replacements[old_session_id] = new_session_id
-        ctx.browser_session_continuity_generation += 1
-        ctx.browser_session_continuity_disposition = "reestablished"
-        ctx.browser_session_continuity_deadline_expired = False
-        ctx.browser_session_continuity_acquisition_failure = None
-        LOG.info(
-            "Copilot replaced its browser session",
-            old_session_id=old_session_id,
-            new_session_id=new_session_id,
-            old_closed=old_closed,
-            pane_kept_old=pane_kept_old,
+        return _record_browser_session_replacement(
+            ctx,
+            BrowserSessionReplacement(
+                old_session_id, new_session_id, old_closed, studio_browser_kept=studio_browser_kept
+            ),
         )
-        return BrowserSessionReplacement(old_session_id, new_session_id, old_closed, pane_kept_old)
 
 
 async def verify_browser_session_by_attaching(ctx: AgentContext) -> dict[str, Any] | None:

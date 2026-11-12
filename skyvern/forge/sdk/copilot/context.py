@@ -81,6 +81,7 @@ UPDATE_WORKFLOW_TOOL_NAME = "update_workflow"
 RUN_BLOCKS_TOOL_NAME = "run_blocks_and_collect_debug"
 BLANK_BROWSER_TEST_TOOL_NAME = "test_workflow_from_blank_browser"
 CREATE_WEBHOOK_TRIGGER_TOOL_NAME = "create_webhook_trigger"
+FRESH_BROWSER_TOOL_NAME = "start_fresh_browser"
 BLOCK_RUNNING_TOOLS = frozenset(
     {RUN_BLOCKS_TOOL_NAME, UPDATE_AND_RUN_BLOCKS_TOOL_NAME, EDIT_BLOCK_AND_RUN_TOOL_NAME, BLANK_BROWSER_TEST_TOOL_NAME}
 )

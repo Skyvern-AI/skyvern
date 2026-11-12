@@ -21748,6 +21748,40 @@ def _copy_workflow_block(block: Any, updates: dict[str, Any]) -> Any:
     return {**block, **updates} if isinstance(block, Mapping) else block.model_copy(update=updates)
 
 
+def _conditional_branches(block: BlockTypeVar | Mapping[str, Any]) -> Sequence[BranchCondition | Mapping[str, Any]]:
+    branches = _workflow_block_field(block, "ordered_branches")
+    if branches is None:
+        branches = _workflow_block_field(block, "branch_conditions") or []
+    return branches
+
+
+def reachable_block_labels(
+    start_labels: Iterable[str | None],
+    label_to_block: Mapping[str, BlockTypeVar | Mapping[str, Any]],
+    default_next_map: Mapping[str, str | None],
+    *,
+    follow_conditional_next: bool = True,
+    seen: set[str] | None = None,
+) -> set[str]:
+    """A conditional counts as reaching every branch target, since it has not chosen one yet. With
+    follow_conditional_next=False it skips a conditional's own next label, as the block graph check does. Labels
+    already in `seen` are not walked again, and new ones are added to it."""
+    seen = set() if seen is None else seen
+    pending = list(start_labels)
+    while pending:
+        label = pending.pop()
+        if label is None or label in seen or label not in label_to_block:
+            continue
+        seen.add(label)
+        block = label_to_block[label]
+        if _workflow_block_field(block, "block_type") == BlockType.CONDITIONAL:
+            pending.extend(_workflow_block_field(branch, "next_block_label") for branch in _conditional_branches(block))
+            if not follow_conditional_next:
+                continue
+        pending.append(default_next_map.get(label))
+    return seen
+
+
 def strip_finally_block_references(blocks: Sequence[Any], finally_block_label: str) -> list[Any]:
     """Remove the finally block and nullify edges that point to it before building the run graph."""
     result: list[Any] = []
@@ -21770,30 +21804,29 @@ def strip_finally_block_references(blocks: Sequence[Any], finally_block_label: s
     return result
 
 
-def resolve_conditional_merge_edges(
-    blocks: Sequence[Any],
-    label_to_block: dict[str, Any],
-    default_next_map: dict[str, str | None],
-) -> None:
-    """Point each conditional branch chain's terminal block at the conditional's successor (merge point).
+# ponytail: the skip path walks reach about once per conditional, so a looping graph bigger than this keeps main's links
+# and its loop error. Share reach between walks if a real workflow needs more.
+_SKIP_PATH_WORK_LIMIT = 1_000_000
 
-    SKY-8571: iterates to convergence so an outer conditional patched on one pass can let an inner
-    conditional's branch terminals be patched on the next. Mutates default_next_map in place.
-    """
+
+def _link_branch_tails(
+    conditionals: Sequence[BlockTypeVar | Mapping[str, Any]],
+    label_to_block: Mapping[str, BlockTypeVar | Mapping[str, Any]],
+    default_next_map: dict[str, str | None],
+    skip_reached: bool,
+) -> set[str]:
+    skipped: set[str] = set()
+    # Links are only ever added, so each successor's reach only grows: extend it as links land instead of re-walking.
+    reach: dict[str, set[str]] = {}
     changed = True
     while changed:
         changed = False
-        for block in blocks:
-            if _workflow_block_field(block, "block_type") != BlockType.CONDITIONAL:
-                continue
+        for block in conditionals:
             label = _workflow_block_field(block, "label")
             successor = default_next_map.get(label)
             if not successor:
                 continue
-            branches = _workflow_block_field(block, "ordered_branches")
-            if branches is None:
-                branches = _workflow_block_field(block, "branch_conditions") or []
-            for branch in branches:
+            for branch in _conditional_branches(block):
                 target = _workflow_block_field(branch, "next_block_label")
                 if not target or target == successor:
                     continue
@@ -21805,10 +21838,115 @@ def resolve_conditional_merge_edges(
                     visited.add(cur)
                     nxt = default_next_map.get(cur)
                     if nxt is None:
+                        if skip_reached:
+                            if successor not in reach:
+                                reach[successor] = reachable_block_labels(
+                                    {successor}, label_to_block, default_next_map, follow_conditional_next=False
+                                )
+                            if cur in reach[successor]:
+                                skipped.add(label)
+                                break
                         default_next_map[cur] = successor
                         changed = True
+                        if skip_reached and _workflow_block_field(label_to_block[cur], "block_type") != (
+                            BlockType.CONDITIONAL
+                        ):
+                            for reached in reach.values():
+                                if cur in reached:
+                                    reachable_block_labels(
+                                        {successor},
+                                        label_to_block,
+                                        default_next_map,
+                                        follow_conditional_next=False,
+                                        seen=reached,
+                                    )
                         break
                     cur = nxt
+    return skipped
+
+
+def _has_loop(
+    label_to_block: Mapping[str, BlockTypeVar | Mapping[str, Any]], default_next_map: Mapping[str, str | None]
+) -> bool:
+    successors = {
+        label: [
+            target
+            for target in (
+                (_workflow_block_field(branch, "next_block_label") for branch in _conditional_branches(block))
+                if _workflow_block_field(block, "block_type") == BlockType.CONDITIONAL
+                else [default_next_map.get(label)]
+            )
+            if target in label_to_block
+        ]
+        for label, block in label_to_block.items()
+    }
+    state: dict[str, int] = {}
+    for root in successors:
+        if root in state:
+            continue
+        state[root] = 1
+        stack = [(root, iter(successors[root]))]
+        while stack:
+            label, pending = stack[-1]
+            target = next(pending, None)
+            if target is None:
+                state[label] = 2
+                stack.pop()
+            elif state.get(target) == 1:
+                return True
+            elif target not in state:
+                state[target] = 1
+                stack.append((target, iter(successors[target])))
+    return False
+
+
+def resolve_conditional_merge_edges(
+    blocks: Sequence[BlockTypeVar | Mapping[str, Any]],
+    label_to_block: Mapping[str, BlockTypeVar | Mapping[str, Any]],
+    default_next_map: dict[str, str | None],
+) -> bool:
+    """Point each conditional branch chain's terminal block at the conditional's successor, in place, repeating until
+    nothing changes. A terminal the successor already reaches stays unlinked; returns whether any link was skipped."""
+    conditionals = [block for block in blocks if _workflow_block_field(block, "block_type") == BlockType.CONDITIONAL]
+    resolved = dict(default_next_map)
+    _link_branch_tails(conditionals, label_to_block, resolved, skip_reached=False)
+    # Links are skipped only when resolving every link leaves a loop, so a graph the graph check accepts keeps them all.
+    edges = len(label_to_block) + sum(len(_conditional_branches(block)) for block in conditionals)
+    if not _has_loop(label_to_block, resolved) or len(conditionals) * edges > _SKIP_PATH_WORK_LIMIT:
+        default_next_map.update(resolved)
+        return False
+    resolved = dict(default_next_map)
+    skipped = _link_branch_tails(conditionals, label_to_block, resolved, skip_reached=True)
+    if skipped:
+        # Re-resolve conditionals nested in or enclosing one whose merge link was skipped, by descending reach then
+        # label, so the result does not depend on block order. Conditionals sharing or crossing a branch tail resolve
+        # in block order.
+        reach = {
+            _workflow_block_field(block, "label"): reachable_block_labels(
+                (_workflow_block_field(branch, "next_block_label") for branch in _conditional_branches(block)),
+                label_to_block,
+                default_next_map,
+                follow_conditional_next=False,
+            )
+            for block in conditionals
+        }
+        involved = skipped.union(*(reach[label] for label in skipped))
+        involved |= {label for label, reached in reach.items() if reached & skipped}
+        slots = [i for i, block in enumerate(conditionals) if _workflow_block_field(block, "label") in involved]
+        reordered = list(conditionals)
+        by_reach = sorted(
+            (conditionals[i] for i in slots),
+            key=lambda block: (
+                -len(reach[_workflow_block_field(block, "label")]),
+                _workflow_block_field(block, "label"),
+            ),
+        )
+        for slot, block in zip(slots, by_reach):
+            reordered[slot] = block
+        resolved = dict(default_next_map)
+        _link_branch_tails(reordered, label_to_block, resolved, skip_reached=True)
+    default_next_map.update(resolved)
+    return bool(skipped)
 
 
 def labels_only_on_untaken_branches(
@@ -21817,22 +21955,7 @@ def labels_only_on_untaken_branches(
     label_to_block: dict[str, BlockTypeVar],
     default_next_map: dict[str, str | None],
 ) -> set[str]:
-    """A nested conditional counts as reaching every branch target, since it has not chosen one yet."""
-
-    def reachable(start_labels: set[str | None]) -> set[str]:
-        seen: set[str] = set()
-        pending = list(start_labels)
-        while pending:
-            label = pending.pop()
-            if label is None or label in seen or label not in label_to_block:
-                continue
-            seen.add(label)
-            block = label_to_block[label]
-            if isinstance(block, ConditionalBlock):
-                pending.extend(branch.next_block_label for branch in block.ordered_branches)
-            pending.append(default_next_map.get(label))
-        return seen
-
     own_next = default_next_map.get(conditional.label)
     targets = {branch.next_block_label or own_next for branch in conditional.ordered_branches}
-    return reachable(targets - {taken_label}) - reachable({taken_label})
+    untaken_reach = reachable_block_labels(targets - {taken_label}, label_to_block, default_next_map)
+    return untaken_reach - reachable_block_labels({taken_label}, label_to_block, default_next_map)

@@ -7,13 +7,16 @@ import structlog
 from playwright.async_api import Page
 
 from skyvern.forge import app
+from skyvern.forge.sdk.copilot import demonstration_recorder
 from skyvern.forge.sdk.copilot.build_test_connect_failure import BuildTestConnectFailure
+from skyvern.forge.sdk.copilot.context import FRESH_BROWSER_TOOL_NAME
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     CopilotBrowserSessionUnavailable,
     _browser_session_acquisition_failure_result,
     replace_browser_session,
 )
+from skyvern.forge.sdk.streaming.user_control import user_controls_browser_session
 from skyvern.forge.sdk.workflow.models.block import CodeBlockCaptchaError, _code_block_solve_captcha_builtin
 from skyvern.webeye.utils.captcha_solver import MAX_IMAGE_CAPTCHA_READS, ChallengeStatus, solve_challenge
 
@@ -23,7 +26,6 @@ from .banned_blocks import CAPTCHA_IMAGE_ELEMENTS
 LOG = structlog.get_logger()
 
 SOLVE_TOOL_NAME = "solve_page_challenge"
-FRESH_BROWSER_TOOL_NAME = "start_fresh_browser"
 
 # The ladder bounds its own arms; this is the hard stop above them, matching Task V3's solve_captcha.
 SOLVE_CEILING_SECONDS = 120
@@ -150,8 +152,33 @@ async def _read_image(ctx: AgentContext, page: Page, session_id: str, image: str
     return {"ok": True, "outcome": "typed", "detail": _IMAGE_OUTCOME_TEXT["typed"]}
 
 
+async def studio_browser_in_use(ctx: AgentContext, browser_session_id: str) -> bool:
+    """A person holds take-control, demonstrates in it, or a run occupies it. Unreadable counts as in use."""
+    try:
+        if await user_controls_browser_session(ctx.organization_id, browser_session_id):
+            return True
+        session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(
+            session_id=browser_session_id, organization_id=ctx.organization_id
+        )
+        if session is not None and session.runnable_id:
+            return True
+        cache = demonstration_recorder.demonstration_cache()
+        if cache is None:
+            return False
+        demonstration = await demonstration_recorder.active_demonstration(
+            cache,
+            organization_id=ctx.organization_id,
+            workflow_permanent_id=ctx.workflow_permanent_id,
+            browser_session_id=browser_session_id,
+        )
+    except Exception:
+        LOG.warning("Could not tell whether the studio browser is in use; treating it as in use", exc_info=True)
+        return True
+    return demonstration is not None
+
+
 async def start_fresh_browser(ctx: AgentContext) -> dict[str, Any]:
-    replacement = await replace_browser_session(ctx)
+    replacement = await replace_browser_session(ctx, studio_browser_in_use=studio_browser_in_use)
     if isinstance(replacement, BuildTestConnectFailure):
         failure = _browser_session_acquisition_failure_result(replacement)
         return {**failure, "previous_browser_kept": True}
@@ -162,10 +189,9 @@ async def start_fresh_browser(ctx: AgentContext) -> dict[str, Any]:
             "and page are gone."
         ),
         "old_browser_closed": replacement.old_closed,
-        "pane_kept_old": replacement.pane_kept_old,
+        "is_studio_browser": replacement.is_studio_browser,
+        "studio_browser_kept": replacement.studio_browser_kept,
     }
-    if replacement.pane_kept_old:
-        result["pane_note"] = (
-            "The studio browser pane keeps showing the old browser; screenshots from your browser tools show the new one."
-        )
+    if replacement.debug_session_id is not None:
+        result["debug_session_id"] = replacement.debug_session_id
     return result
