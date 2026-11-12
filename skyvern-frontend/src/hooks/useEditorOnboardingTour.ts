@@ -1,8 +1,15 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type MutableRefObject,
+} from "react";
 import { driver, type DriveStep, type Config } from "driver.js";
 import { usePostHogFeatureFlagVariantKey as useFeatureFlagVariantKey } from "@/hooks/usePostHogFeatureFlag";
 import { useOnboardingStateOptional } from "@/store/onboarding/useOnboardingState";
 import { useProductTourStore } from "@/store/ProductTourStore";
+import { useWorkflowPresentationStore } from "@/store/WorkflowPresentationStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import { OnboardingTelemetry } from "@/util/onboarding/OnboardingTelemetry";
 import { EXPERIMENT, isABVariant } from "@/util/onboarding/experimentConfig";
@@ -97,6 +104,30 @@ function indexOfStep(steps: DriveStep[], step: DriveStep): number {
   return steps.findIndex((s) => s.element === step.element);
 }
 
+// The tour teaches the canvas, which sits inert under the Doc: show Visual for it, without remembering that.
+// The view comes back from the hold effect when a running tour ends, from startDriverOnCanvas when it cannot start, and from the unmount effect when the editor closes during the wait.
+function afterDocCloses(run: () => void, onHold: () => void): () => void {
+  const presentation = useWorkflowPresentationStore;
+  if (!presentation.getState().docMounted) {
+    run();
+    return () => {};
+  }
+  const unsubscribe = presentation.subscribe((state) => {
+    if (state.docMounted) return;
+    unsubscribe();
+    run();
+  });
+  if (presentation.getState().showVisualUnremembered()) onHold();
+  return unsubscribe;
+}
+
+// Only a view the tour switched is given back, so leaving an editor no tour touched re-reads nothing.
+function restoreIfHeld(held: MutableRefObject<boolean>) {
+  if (!held.current) return;
+  held.current = false;
+  useWorkflowPresentationStore.getState().restoreView();
+}
+
 function filterAvailableSteps(steps: DriveStep[]): DriveStep[] {
   return steps.filter((step) => {
     if (typeof step.element !== "string") return true;
@@ -127,6 +158,8 @@ function useEditorOnboardingTour(): UseEditorOnboardingTourReturn {
   const availableStepsRef = useRef<DriveStep[]>([]);
   const nodeAdderGateSatisfiedRef = useRef(false);
   const tourStartedEmittedRef = useRef(false);
+  const cancelDocWaitRef = useRef<() => void>(() => {});
+  const heldViewRef = useRef(false);
 
   const shouldAutoStart =
     onboarding !== null &&
@@ -167,11 +200,14 @@ function useEditorOnboardingTour(): UseEditorOnboardingTourReturn {
     [onboarding],
   );
 
-  const startDriver = useCallback(() => {
+  const startDriverOnCanvas = useCallback(() => {
     if (tourActiveRef.current) return;
 
     const availableSteps = filterAvailableSteps(TOUR_STEPS);
-    if (availableSteps.length === 0) return;
+    if (availableSteps.length === 0) {
+      restoreIfHeld(heldViewRef);
+      return;
+    }
 
     tourActiveRef.current = true;
     setTourActive(true);
@@ -240,10 +276,25 @@ function useEditorOnboardingTour(): UseEditorOnboardingTourReturn {
       driverRef.current = driverInstance;
     } catch {
       OnboardingTelemetry.tourError(SURFACE);
+      restoreIfHeld(heldViewRef);
       tourActiveRef.current = false;
       setTourActive(false);
     }
   }, [advanceFromStep, onboarding, flagVariant]);
+
+  const startDriver = useCallback(() => {
+    if (tourActiveRef.current) return;
+    cancelDocWaitRef.current();
+    cancelDocWaitRef.current = afterDocCloses(
+      () => {
+        cancelDocWaitRef.current = () => {};
+        startDriverOnCanvas();
+      },
+      () => {
+        heldViewRef.current = true;
+      },
+    );
+  }, [startDriverOnCanvas]);
 
   useEffect(() => {
     if (!shouldAutoStart || tourActiveRef.current) return;
@@ -297,6 +348,8 @@ function useEditorOnboardingTour(): UseEditorOnboardingTourReturn {
 
   useEffect(() => {
     return () => {
+      cancelDocWaitRef.current();
+      restoreIfHeld(heldViewRef);
       driverRef.current?.destroy();
     };
   }, []);
@@ -310,6 +363,22 @@ function useEditorOnboardingTour(): UseEditorOnboardingTourReturn {
       root.classList.remove("tour-paused");
     };
   }, [showExitDialog]);
+
+  // A late Doc flag, or a Doc not yet mounted when the tour began, would cover the canvas: hold Visual while the tour runs.
+  useEffect(() => {
+    if (!tourActive) return;
+    const presentation = useWorkflowPresentationStore;
+    const holdVisual = () => {
+      if (presentation.getState().showVisualUnremembered())
+        heldViewRef.current = true;
+    };
+    holdVisual();
+    const unsubscribe = presentation.subscribe(holdVisual);
+    return () => {
+      unsubscribe();
+      restoreIfHeld(heldViewRef);
+    };
+  }, [tourActive]);
 
   useEffect(() => {
     if (!tourActive) return;
