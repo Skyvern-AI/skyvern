@@ -15002,7 +15002,10 @@
               }
             ],
             "title": "Connection Id",
-            "x-skyvern-connected-account": true
+            "x-skyvern-connected-account": true,
+            "x-skyvern-connected-account-when": {
+              "credential_source": "nango"
+            }
           },
           "credential_id": {
             "anyOf": [
@@ -15014,7 +15017,10 @@
               }
             ],
             "title": "Credential Id",
-            "x-skyvern-connected-account": true
+            "x-skyvern-connected-account": true,
+            "x-skyvern-connected-account-when": {
+              "credential_source": "native"
+            }
           },
           "message_id": {
             "anyOf": [
@@ -16529,7 +16535,11 @@
               }
             ],
             "title": "Google Credential Id",
-            "x-skyvern-connected-account": true
+            "x-skyvern-connected-account": true,
+            "x-skyvern-connected-account-acts": true,
+            "x-skyvern-connected-account-when": {
+              "download_target": "google_drive"
+            }
           },
           "google_drive_folder_id": {
             "anyOf": [
@@ -17665,7 +17675,11 @@
               }
             ],
             "title": "Google Credential Id",
-            "x-skyvern-connected-account": true
+            "x-skyvern-connected-account": true,
+            "x-skyvern-connected-account-acts": true,
+            "x-skyvern-connected-account-when": {
+              "storage_type": "google_drive"
+            }
           },
           "google_drive_folder_id": {
             "anyOf": [
@@ -19116,7 +19130,8 @@
               }
             ],
             "title": "Credential Id",
-            "x-skyvern-connected-account": true
+            "x-skyvern-connected-account": true,
+            "x-skyvern-connected-account-acts": true
           },
           "write_mode": {
             "type": "string",
@@ -23330,7 +23345,10 @@
             "minLength": 1,
             "title": "Connection Id",
             "description": "Power BI connection ID for this user.",
-            "x-skyvern-connected-account": true
+            "x-skyvern-connected-account": true,
+            "x-skyvern-connected-account-when": {
+              "credential_source": "nango"
+            }
           },
           "credential_source": {
             "type": "string",
@@ -25017,7 +25035,11 @@
             ],
             "title": "Credential Id",
             "description": "ID of a connected Google account that has send permission. Used only with transport 'gmail'.",
-            "x-skyvern-connected-account": true
+            "x-skyvern-connected-account": true,
+            "x-skyvern-connected-account-acts": true,
+            "x-skyvern-connected-account-when": {
+              "transport": "gmail"
+            }
           },
           "credential_source": {
             "type": "string",
@@ -25039,7 +25061,11 @@
               }
             ],
             "title": "Connection Id",
-            "x-skyvern-connected-account": true
+            "x-skyvern-connected-account": true,
+            "x-skyvern-connected-account-acts": true,
+            "x-skyvern-connected-account-when": {
+              "credential_source": "nango"
+            }
           },
           "reply_to_message_id": {
             "anyOf": [
