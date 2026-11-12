@@ -6,6 +6,7 @@ import asyncio
 import json
 import typing as t
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -13,6 +14,8 @@ from fastapi import WebSocketDisconnect
 from starlette.websockets import WebSocketState
 
 from skyvern.config import settings
+from skyvern.forge import app
+from skyvern.forge.sdk.cache.local import LocalCache
 from skyvern.forge.sdk.routes.streaming.channels import execution as execution_module
 from skyvern.forge.sdk.routes.streaming.channels import message as message_module
 from skyvern.forge.sdk.routes.streaming.channels.execution import ExecutionChannel, LocalExecutionChannel
@@ -32,6 +35,7 @@ from skyvern.forge.sdk.routes.streaming.channels.message import (
     loop_stream_messages,
     reify_channel_message,
 )
+from skyvern.forge.sdk.streaming.user_control import user_controls_browser_session
 
 
 class TestReifyChannelMessage:
@@ -552,6 +556,40 @@ class TestMessageLoopPump:
             await asyncio.wait_for(loop_task, timeout=2)
 
         websocket.send_json.assert_any_await({"kind": "copied-text", "text": "hello clipboard"})
+
+
+@pytest.mark.asyncio
+async def test_vnc_take_control_is_visible_to_other_processes_until_the_message_socket_closes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The run ending clears the channel's browser_session before the socket closes; the hold must still be released.
+    cache = LocalCache()
+    cache.is_shared = True
+    monkeypatch.setattr(app, "CACHE", cache)
+    monkeypatch.setattr(message_module, "get_vnc_channel", lambda _client_id: SimpleNamespace(interactor="agent"))
+    websocket = _make_loop_websocket()
+    messages: list[dict[str, object]] = [{"kind": "take-control"}]
+    controlled_before: list[bool] = []
+
+    async def receive_json() -> dict[str, object]:
+        controlled_before.append(await user_controls_browser_session("org-1", "pbs_vnc"))
+        if messages:
+            return messages.pop(0)
+        message_channel.browser_session = None
+        raise WebSocketDisconnect(code=1000)
+
+    websocket.receive_json = receive_json
+    message_channel = MessageChannel(
+        client_id="client-1",
+        organization_id="org-1",
+        websocket=websocket,
+        browser_session=SimpleNamespace(persistent_browser_session_id="pbs_vnc"),  # type: ignore[arg-type]
+    )
+
+    await asyncio.wait_for(loop_stream_messages(message_channel), timeout=2)
+
+    assert controlled_before == [False, True]
+    assert await user_controls_browser_session("org-1", "pbs_vnc") is False
 
 
 class TestMessageToDictJsonSafety:
