@@ -23,6 +23,7 @@ import {
   ChevronDownIcon,
   ChevronRightIcon,
   GearIcon,
+  PlusIcon,
 } from "@radix-ui/react-icons";
 import {
   DropdownMenu,
@@ -619,11 +620,14 @@ export function DocStepBody({
   onBackspaceAtStart,
   onMove,
   onRunStep,
+  onAddNote,
   hasFix = false,
   renamable = false,
 }: {
   node: WorkflowBlockNode;
   editable?: boolean;
+  // Opens the note line below the step, as Enter at the end of a step that needs no text does.
+  onAddNote?: () => void;
   // The step's problem line (what it still needs before it can run) is on screen under it.
   hasFix?: boolean;
   // Whether the output name can be renamed here.
@@ -911,6 +915,7 @@ export function DocStepBody({
         editable={editableProp}
         renamable={renamable}
         keySettings={keySettings}
+        onAddNote={editableProp ? onAddNote : undefined}
       />
       {editableProp && <DocOneActionHint node={node} urlOffer={urlOffer} />}
     </>
@@ -969,8 +974,10 @@ function DocStepSummary({
   editable,
   renamable,
   keySettings,
+  onAddNote,
 }: {
   node: WorkflowBlockNode;
+  onAddNote?: () => void;
   lineKeys: string[];
   // Details holds a filled line or key setting of the step.
   hasDetailsLines: boolean;
@@ -1026,6 +1033,17 @@ function DocStepSummary({
             />
           </button>
         </DocKeyTooltip>
+        {onAddNote && (
+          <button
+            type="button"
+            aria-label={`Add note below ${docStepCaption(node) ?? node.data.label}`}
+            onClick={onAddNote}
+            className="ml-2 inline-flex items-center gap-0.5 rounded px-1 text-[12.5px] text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            <PlusIcon aria-hidden className="size-3" />
+            Note
+          </button>
+        )}
       </div>
       {open && (
         <DocStepDetails

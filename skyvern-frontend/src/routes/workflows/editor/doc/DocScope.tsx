@@ -244,6 +244,7 @@ function DocNode({
   place,
   number,
   onEnter,
+  onAddNote,
   noteProblems,
 }: {
   item: Exclude<PlacedItem, { kind: "unplaced" }>;
@@ -252,6 +253,7 @@ function DocNode({
   place?: DocStepPlace;
   number: string;
   onEnter?: (split: LineSplit | null, key?: string) => void;
+  onAddNote?: () => void;
   noteProblems: ReadonlyMap<string, DocNoteProblem>;
 }) {
   const [inserting, setInserting] = useState(false);
@@ -386,6 +388,7 @@ function DocNode({
               hasFix={noteProblems.has(`${node.id}:fix`)}
               renamable={editable && Boolean(place)}
               onEnter={onEnter}
+              onAddNote={item.kind === "step" ? onAddNote : undefined}
               onMove={
                 place && actions.edit && !place.isFinally
                   ? (delta) => {
@@ -890,6 +893,11 @@ export function DocScope({
       : { ownerNodeId: nodeId, placement: "trailing" as const };
     actions.setPendingNote(note);
   };
+  // A step's own note stays on screen right below it after a step is added under it, so + Note goes to that note.
+  const addNoteBelow = (nodeId: string) =>
+    notePresent(nodeId, "trailing")
+      ? actions.setPendingNote({ ownerNodeId: nodeId, placement: "trailing" })
+      : noteBelow(nodeId);
   // Enter on a step makes a step of the same type below, splitting its text at the caret. Enter on an empty step that
   // needs text turns it back into a note, as Enter leaves an empty list item. Loops, Ifs and steps that need no text
   // (Print Page, a Wait with its amount) keep the step and open an empty line below.
@@ -1240,6 +1248,11 @@ export function DocScope({
               onEnter={
                 editable
                   ? (split, key) => enterAfter(item.nodeId, split, key)
+                  : undefined
+              }
+              onAddNote={
+                editable && actions.edit
+                  ? () => addNoteBelow(item.nodeId)
                   : undefined
               }
               noteProblems={noteProblems}
