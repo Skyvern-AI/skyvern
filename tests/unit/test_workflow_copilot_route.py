@@ -2662,7 +2662,17 @@ async def test_a_stop_before_the_agent_names_only_a_draft_that_survives_it(
 
 
 @pytest.mark.asyncio
-async def test_chat_audio_upload_stores_artifact_for_existing_chat(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("content_type", "data"),
+    [
+        ("audio/webm", b"\x1a\x45\xdf\xa3webm-audio-bytes"),
+        # Browsers that record Ogg still name the file .webm.
+        ("audio/ogg", b"OggS\x00\x02ogg-audio-bytes"),
+    ],
+)
+async def test_chat_audio_upload_stores_artifact_for_existing_chat(
+    content_type: str, data: bytes, monkeypatch: pytest.MonkeyPatch
+) -> None:
     chat = SimpleNamespace(
         workflow_copilot_chat_id="chat-1",
         workflow_permanent_id="wpid-1",
@@ -2683,8 +2693,8 @@ async def test_chat_audio_upload_stores_artifact_for_existing_chat(monkeypatch: 
     monkeypatch.setattr(app, "ARTIFACT_MANAGER", artifact_manager)
     file = SimpleNamespace(
         filename="dictation.webm",
-        content_type="audio/webm",
-        read=AsyncMock(return_value=b"\x1a\x45\xdf\xa3webm-audio-bytes"),
+        content_type=content_type,
+        read=AsyncMock(return_value=data),
         close=AsyncMock(),
     )
 
@@ -2732,6 +2742,8 @@ async def test_chat_audio_upload_rejects_unsupported_audio_content_type() -> Non
     [
         ("note.webm", "audio/webm", b"<html><script>alert(1)</script></html>"),
         ("payload.js", "audio/mpeg", b"ID3:alert(1);"),
+        # Allowed on the generic upload route, but not a voice note.
+        ("note.txt", "audio/webm", b"\x1a\x45\xdf\xa3webm-audio-bytes"),
     ],
 )
 async def test_chat_audio_upload_rejects_restricted_content_declared_as_audio(
