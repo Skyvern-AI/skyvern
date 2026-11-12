@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from typing import Any
+
 import structlog
 from sqlalchemy.exc import IntegrityError
 
 from skyvern.exceptions import BROWSER_CONNECTION_LOST_ERROR_CODE, WorkflowNotFound
 from skyvern.forge import app
 from skyvern.forge.failure_classifier import (
+    FAILURE_CLASSIFIER_V2_REASON_CODE,
     classify_from_failure_reason,
 )
 from skyvern.forge.sdk.core import skyvern_context
@@ -67,7 +70,13 @@ async def _retry_enabled_for_organization(organization_id: str, workflow_run: Wo
 
 
 def _failure_category_names(workflow_run: WorkflowRun) -> set[str]:
-    categories = without_final_har_user_match(workflow_run.failure_category)
+    # The model classifier's entry is a label only (ADR 0028): dropped before the empty check, so the fallback reads the
+    # list it read before that entry existed, including the reclassification of a list that was empty.
+    categories: list[dict[str, Any]] | None = [
+        entry
+        for entry in without_final_har_user_match(workflow_run.failure_category) or []
+        if not (isinstance(entry, dict) and entry.get("reason_code") == FAILURE_CLASSIFIER_V2_REASON_CODE)
+    ]
     if not categories:
         categories = classify_from_failure_reason(workflow_run.failure_reason)
     return {

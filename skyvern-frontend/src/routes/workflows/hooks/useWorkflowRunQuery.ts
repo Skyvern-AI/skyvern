@@ -4,12 +4,14 @@ import { useCallback } from "react";
 import { type CredentialGetter, getClient } from "@/api/AxiosClient";
 import { isForbiddenError } from "@/api/forbidden";
 import {
+  FailureCategory,
   Status,
   WorkflowRunRetryFields,
   WorkflowRunStatusApiResponseWithWorkflow,
 } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useFirstParam } from "@/hooks/useFirstParam";
+import { normalizeUtcTimestamp } from "@/util/timeFormat";
 
 import {
   DefaultError,
@@ -29,6 +31,35 @@ const RUN_STATUS_POLL_INTERVAL_MS = 5000;
 // hidden-tab timer throttling, and retry backoff all widen that gap before an outage even starts.
 const POLL_OUTAGE_BUDGET_MS = 120000;
 const RUN_STATUS_OUTAGE_RETRY_INTERVAL_MS = 30000;
+// The model failure classifier can relabel a failed run up to about four minutes after it ends (its LLM tier), so a
+// run that just failed without its entry is re-read at a slow cadence until the entry lands or the window closes.
+const MODEL_LABEL_REASON_CODE = "failure_classifier_v2";
+const MODEL_LABEL_POLL_INTERVAL_MS = 15000;
+const MODEL_LABEL_WINDOW_MS = 300000;
+const MODEL_LABEL_STATUSES: ReadonlyArray<Status> = [
+  Status.Failed,
+  Status.Terminated,
+  Status.TimedOut,
+];
+
+function awaitsModelLabel(run: {
+  status: Status;
+  finished_at?: string | null;
+  failure_category?: Array<FailureCategory> | null;
+}): boolean {
+  if (!MODEL_LABEL_STATUSES.includes(run.status) || !run.finished_at) {
+    return false;
+  }
+  if (
+    run.failure_category?.some(
+      (entry) => entry?.reason_code === MODEL_LABEL_REASON_CODE,
+    )
+  ) {
+    return false;
+  }
+  const finishedAt = Date.parse(normalizeUtcTimestamp(run.finished_at));
+  return Date.now() - finishedAt < MODEL_LABEL_WINDOW_MS;
+}
 
 // Data from before a failed refetch is retained. Poll frequently through a
 // short outage, then retry at a quieter cadence until the run status resolves.
@@ -37,7 +68,11 @@ const RUN_STATUS_OUTAGE_RETRY_INTERVAL_MS = 30000;
 // fetchFailureCount, which query-core resets at the start of every fetch.
 function getRunStatusRefetchInterval(state: {
   status: "pending" | "error" | "success";
-  data?: { status: Status } & WorkflowRunRetryFields;
+  data?: {
+    status: Status;
+    finished_at?: string | null;
+    failure_category?: Array<FailureCategory> | null;
+  } & WorkflowRunRetryFields;
   dataUpdatedAt: number;
   errorUpdatedAt: number;
 }): number | false {
@@ -45,7 +80,7 @@ function getRunStatusRefetchInterval(state: {
     return false;
   }
   if (!runIsLogicallyActive(state.data)) {
-    return false;
+    return awaitsModelLabel(state.data) ? MODEL_LABEL_POLL_INTERVAL_MS : false;
   }
   if (
     state.status === "error" &&
@@ -180,6 +215,7 @@ function useWorkflowRunQueries(workflowRunIds: readonly string[]) {
 export {
   getRunStatusRefetchInterval,
   getWatchedRunRefetchInterval,
+  MODEL_LABEL_POLL_INTERVAL_MS,
   POLL_OUTAGE_BUDGET_MS,
   RUN_STATUS_OUTAGE_RETRY_INTERVAL_MS,
   RUN_STATUS_POLL_INTERVAL_MS,

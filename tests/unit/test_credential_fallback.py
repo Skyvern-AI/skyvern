@@ -8,6 +8,7 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 
 from skyvern.exceptions import InvalidCredentialId, SkyvernHTTPException
+from skyvern.forge.failure_classifier import FAILURE_CLASSIFIER_V2_REASON_CODE
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
@@ -252,6 +253,24 @@ def test_the_final_recording_match_claim_is_not_a_credential_category(categories
     )
 
     assert _trigger_matches(workflow_run, CREDENTIAL_FAILURES)
+
+
+@pytest.mark.parametrize(
+    ("model_label", "failure_reason", "matches"),
+    [
+        # The model's label alone never starts a fallback (ADR 0028)...
+        ("AUTH_FAILURE", "Timed out waiting for the page", False),
+        # ...and a list holding only the model's entry is reclassified from the failure reason, as an empty list is.
+        ("ELEMENT_NOT_FOUND", "The password was incorrect during login", True),
+    ],
+)
+def test_the_model_classifier_label_leaves_the_fallback_decision_unchanged(
+    model_label: str, failure_reason: str, matches: bool
+) -> None:
+    model = {"category": model_label, "confidence_float": 0.9, "reason_code": FAILURE_CLASSIFIER_V2_REASON_CODE}
+    workflow_run = _workflow_run(failure_category=[model], failure_reason=failure_reason)
+
+    assert _trigger_matches(workflow_run, CREDENTIAL_FAILURES) is matches
 
 
 @pytest.mark.parametrize(
