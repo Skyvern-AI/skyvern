@@ -1,6 +1,6 @@
 import asyncio
 from collections import defaultdict
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import asynccontextmanager, contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -20,14 +20,18 @@ from sqlalchemy import delete, func, select, update
 from skyvern.config import settings
 from skyvern.exceptions import SkyvernHTTPException, WorkflowPinnedByRunGroup
 from skyvern.forge import app
+from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot.ask_user import AccountGroupReview, QuestionInteraction
 from skyvern.forge.sdk.copilot.browser_ablation import resolve_copilot_tool_surface
+from skyvern.forge.sdk.copilot.canonical_ownership import workflow_content_fingerprint
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.secret_scrub import register_secret_scrub_value
 from skyvern.forge.sdk.copilot.tools import account_groups, copilot_native_tools
 from skyvern.forge.sdk.copilot.tools import credentials as credentials_module
+from skyvern.forge.sdk.copilot.tools import mcp_hooks, workflow_update
 from skyvern.forge.sdk.copilot.tools.account_groups import (
+    ACCOUNT_GROUP_MAX_ITEMS,
     AccountGroupRefusal,
     AccountGroupState,
     AccountGroupSubmission,
@@ -37,6 +41,11 @@ from skyvern.forge.sdk.copilot.tools.account_groups import (
     run_for_accounts,
     run_saved_workflow,
 )
+from skyvern.forge.sdk.copilot.tools.workflow_update import (
+    proposal_workflow_fingerprint,
+    proposal_workflow_fingerprint_matches,
+)
+from skyvern.forge.sdk.copilot.workflow_yaml import workflow_to_copilot_yaml
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
@@ -53,7 +62,14 @@ from skyvern.forge.sdk.db.models import (
 )
 from skyvern.forge.sdk.routes import workflow_copilot as routes
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
-from skyvern.forge.sdk.schemas.workflow_copilot import CopilotPendingTurn, WorkflowCopilotChatSender
+from skyvern.forge.sdk.schemas.workflow_copilot import (
+    CopilotPendingTurn,
+    WorkflowCopilotApplyProposedWorkflowRequest,
+    WorkflowCopilotChat,
+    WorkflowCopilotChatRequest,
+    WorkflowCopilotChatSender,
+    copilot_proposal_metadata,
+)
 from skyvern.forge.sdk.services import request_principal
 from skyvern.forge.sdk.services.request_principal import (
     AuthKind,
@@ -61,14 +77,22 @@ from skyvern.forge.sdk.services.request_principal import (
     RequestPrincipal,
     scoped_api_key_id_from_actor,
 )
-from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter, WorkflowParameterType
+from skyvern.forge.sdk.workflow.models.block import TaskBlock
+from skyvern.forge.sdk.workflow.models.google_sheets_blocks import GoogleSheetsReadBlock
+from skyvern.forge.sdk.workflow.models.parameter import (
+    AzureVaultCredentialParameter,
+    CredentialParameter,
+    OnePasswordCredentialParameter,
+    WorkflowParameter,
+    WorkflowParameterType,
+)
 from skyvern.forge.sdk.workflow.models.workflow import (
     COPILOT_TEST_WORKFLOW_CREATOR,
+    Workflow,
     WorkflowDefinition,
     WorkflowRunStatus,
 )
 from skyvern.schemas.workflow_run_groups import (
-    MAX_WORKFLOW_RUN_GROUP_ITEMS,
     WorkflowRunGroupCreateRequest,
     WorkflowRunGroupItemOutcome,
     WorkflowRunGroupItemRequest,
@@ -347,7 +371,7 @@ async def test_refused_selection_shows_no_card_and_submits_nothing(chat: Chat, c
         "duplicate": ["cred_1", "cred_2", "cred_1"],
         "other_org": ["cred_1", "cred_foreign"],
         "revoked": ["cred_1", "cred_revoked"],
-        "over_limit": [f"cred_{i}" for i in range(MAX_WORKFLOW_RUN_GROUP_ITEMS + 1)],
+        "over_limit": [f"cred_{i}" for i in range(ACCOUNT_GROUP_MAX_ITEMS + 1)],
     }[case]
 
     result = await asyncio.wait_for(_start(chat, credential_ids), 5)
@@ -436,11 +460,12 @@ async def _add_version(
     )
 
 
-async def _edit_in_place(chat: Chat) -> None:
+async def _edit_in_place(chat: Chat, version: int = 1) -> None:
     async with chat.env.database.Session() as session:
         await session.execute(
             update(WorkflowModel)
-            .where(WorkflowModel.workflow_id == "wf_1")
+            .where(WorkflowModel.workflow_permanent_id == RUN_GROUP_WPID)
+            .where(WorkflowModel.version == version)
             .values(modified_at=datetime.now(UTC).replace(tzinfo=None) + timedelta(seconds=5))
         )
         await session.commit()
@@ -467,9 +492,12 @@ async def test_decline_or_stale_approval_dispatches_nothing(chat: Chat, case: st
     if case == "decline":
         assert await _decide(chat, card, {"approved": False}) == 200
     else:
-        await {"new_version": _add_version, "edited_in_place": _edit_in_place, "param_retyped": _retype_param}[case](
-            chat
-        )
+        stale: dict[str, Callable[[Chat], Awaitable[None]]] = {
+            "new_version": _add_version,
+            "edited_in_place": _edit_in_place,
+            "param_retyped": _retype_param,
+        }
+        await stale[case](chat)
         assert await _decide(chat, card, {"approved": True, "credential_ids": ["cred_1", "cred_2"]}) == 200
 
     result = await asyncio.wait_for(task, 5)
@@ -800,6 +828,37 @@ async def _restored_review(chat: Chat) -> dict[str, Any]:
     return restored
 
 
+async def _end_turn_into_history(chat: Chat, snapshot: dict[str, Any], *, clear_pending: bool = True) -> None:
+    repo = chat.env.database.workflow_params
+    chat_id = chat.ctx.workflow_copilot_chat_id
+    assert chat_id is not None
+    await repo.create_workflow_copilot_chat_message(
+        organization_id=RUN_GROUP_ORG,
+        workflow_copilot_chat_id=chat_id,
+        sender=WorkflowCopilotChatSender.AI,
+        content="Stopped",
+        turn_outcome=TurnOutcome(response_kind=ResponseKind.RECOVER, copilot_turn_id="turn"),
+        narrative_payload={
+            "turnId": "turn",
+            "turnIndex": 0,
+            "questionInteractions": [snapshot],
+            "designStarted": False,
+            "designEnded": False,
+            "draft": None,
+            "blocks": [],
+            "terminal": "stopped",
+            "terminalMessage": None,
+            "narrativeSummary": None,
+            "priorBlockCount": None,
+            "designActivity": [],
+            "startedAt": None,
+            "endedAt": None,
+        },
+    )
+    if clear_pending:
+        await repo.clear_pending_copilot_turn(RUN_GROUP_ORG, chat_id, "turn")
+
+
 async def _save_profile_default_and_fixed_credential(chat: Chat) -> None:
     now = datetime.now(UTC)
     fixed = CredentialParameter(
@@ -1072,31 +1131,7 @@ async def test_a_turn_that_ends_after_the_link_leaves_the_saved_card_true_to_the
         snapshot = await _restored_review(chat)
         if start != "refused_then_turn_cleared":
             snapshot["account_group_review"].pop("workflow_run_id")
-        await repo.create_workflow_copilot_chat_message(
-            organization_id=RUN_GROUP_ORG,
-            workflow_copilot_chat_id=chat_id,
-            sender=WorkflowCopilotChatSender.AI,
-            content="Stopped",
-            turn_outcome=TurnOutcome(response_kind=ResponseKind.RECOVER, copilot_turn_id="turn"),
-            narrative_payload={
-                "turnId": "turn",
-                "turnIndex": 0,
-                "questionInteractions": [snapshot],
-                "designStarted": False,
-                "designEnded": False,
-                "draft": None,
-                "blocks": [],
-                "terminal": "stopped",
-                "terminalMessage": None,
-                "narrativeSummary": None,
-                "priorBlockCount": None,
-                "designActivity": [],
-                "startedAt": None,
-                "endedAt": None,
-            },
-        )
-        if start != "refused_then_turn_cleared":
-            await repo.clear_pending_copilot_turn(RUN_GROUP_ORG, chat_id, "turn")
+        await _end_turn_into_history(chat, snapshot, clear_pending=start != "refused_then_turn_cleared")
         if start != "succeeds":
             raise SkyvernHTTPException("Credential not accessible", status_code=403)
 
@@ -1185,3 +1220,852 @@ async def test_a_requester_who_may_not_run_workflows_starts_nothing(
         assert chat.frames.empty()
     assert await _run_count(chat) == before
     assert await _groups_from_this_chat(chat) == 0
+
+
+async def _stage_draft(
+    chat: Chat,
+    *,
+    login_default: str | None = None,
+    block_credential: str | None = None,
+    connected_account: str | None = None,
+    browser_profile_id: str | None = None,
+    tested: bool = True,
+    tested_run_id: str | None = "wr_tested",
+) -> None:
+    saved = await chat.env.database.workflows.get_workflow_by_permanent_id(RUN_GROUP_WPID, RUN_GROUP_ORG)
+    assert saved is not None
+    draft = saved.model_copy(deep=True)
+    parameters = await app.WORKFLOW_SERVICE.get_workflow_parameters(workflow_id=saved.workflow_id)
+    draft.workflow_definition.parameters = [
+        parameter.model_copy(update={"default_value": login_default}) if parameter.key == "login" else parameter
+        for parameter in parameters
+    ]
+    block = draft.workflow_definition.blocks[0]
+    assert isinstance(block, TaskBlock)
+    block.url = "https://example.com/statements"
+    if browser_profile_id is not None:
+        draft.browser_profile_id = browser_profile_id
+    if connected_account is not None:
+        draft.workflow_definition.blocks.append(
+            GoogleSheetsReadBlock(
+                label="read_sheet",
+                output_parameter=block.output_parameter,
+                spreadsheet_url="https://example.com/sheet",
+                credential_id=connected_account,
+            )
+        )
+    if block_credential is not None:
+        draft.workflow_definition.parameters.append(
+            CredentialParameter(
+                key="portal",
+                credential_parameter_id="cp_portal",
+                workflow_id=saved.workflow_id,
+                credential_id=block_credential,
+                created_at=saved.created_at,
+                modified_at=saved.modified_at,
+            )
+        )
+    repo = chat.env.database.workflow_params
+    chat_id = chat.ctx.workflow_copilot_chat_id
+    assert chat_id is not None
+    published = await repo.publish_workflow_copilot_candidate(
+        RUN_GROUP_ORG,
+        chat_id,
+        proposal={**draft.model_dump(mode="json"), "_copilot_yaml": workflow_to_copilot_yaml(draft)},
+        owner_turn_id="turn_draft",
+        canonical_fingerprint=proposal_workflow_fingerprint(saved),
+        canonical_title=saved.title,
+        disposition="review_tested" if tested else "review_untested",
+        expected_owner_turn_id=None,
+        expected_revision=None,
+    )
+    if tested_run_id is None:
+        return
+    proposal = dict(published.proposed_workflow or {})
+    proposal["_copilot_proposal"] = {**proposal["_copilot_proposal"], "workflow_run_id": tested_run_id}
+    await repo.update_workflow_copilot_chat(RUN_GROUP_ORG, chat_id, proposed_workflow=proposal)
+
+
+async def _versions(chat: Chat) -> list[int]:
+    async with chat.env.database.Session() as session:
+        rows = await session.scalars(
+            select(WorkflowModel.version).where(WorkflowModel.workflow_permanent_id == RUN_GROUP_WPID)
+        )
+        return sorted(rows)
+
+
+async def _chat_row(chat: Chat) -> WorkflowCopilotChat:
+    chat_id = chat.ctx.workflow_copilot_chat_id
+    assert chat_id is not None
+    row = await chat.env.database.workflow_params.get_workflow_copilot_chat_by_id(RUN_GROUP_ORG, chat_id)
+    assert row is not None
+    return row
+
+
+async def _saved_draft_update(chat: Chat) -> dict[str, Any]:
+    while True:
+        frame = await asyncio.wait_for(chat.frames.get(), 5)
+        if frame["type"] == "question_resolved" and "saved_version" in frame["interaction"]["account_group_review"]:
+            return frame["interaction"]["account_group_review"]
+
+
+@pytest.mark.asyncio
+async def test_approving_the_run_card_saves_the_draft_once_and_runs_that_version(chat: Chat) -> None:
+    await _stage_draft(chat)
+    # The turn read the draft's token, as a turn that picks up an earlier turn's draft does.
+    chat.ctx.proposal_owner_turn_id, chat.ctx.proposal_revision = "turn_draft", 1
+    auto_accept_before = (await _chat_row(chat)).auto_accept
+    before = await _run_count(chat)
+    task = _start_single_run(chat, {"login": "cred_3", "note": "May"})
+    card = await _card(chat)
+    review = card["account_group_review"]
+    assert review["saves_draft"] is True and review["draft_tested"] is True
+    assert review["tested_workflow_run_id"] == "wr_tested"
+    assert (review["proposal_owner_turn_id"], review["proposal_revision"]) == ("turn_draft", 1)
+    assert await _versions(chat) == [1]
+
+    assert await _decide(chat, card, {"approved": True, "credential_ids": ["cred_3"]}) == 200
+    result = await asyncio.wait_for(task, 5)
+
+    assert isinstance(result, SingleRunSubmission) and result.dispatched is True and result.saved_version == 2
+    assert await _versions(chat) == [1, 2]
+    assert await _run_count(chat) == before + 1
+    assert result.workflow_run_id is not None
+    run = await chat.env.database.workflow_runs.get_workflow_run(result.workflow_run_id, organization_id=RUN_GROUP_ORG)
+    saved = await chat.env.database.workflows.get_workflow_by_permanent_id(RUN_GROUP_WPID, RUN_GROUP_ORG)
+    assert run is not None and saved is not None and run.workflow_id == saved.workflow_id
+    block = saved.workflow_definition.blocks[0]
+    assert isinstance(block, TaskBlock) and block.url == "https://example.com/statements"
+    row = await _chat_row(chat)
+    assert row.proposed_workflow is None and row.auto_accept == auto_accept_before
+    restored = (await _restored_review(chat))["account_group_review"]
+    assert (restored["saved_version"], restored["run_started"], restored["workflow_run_id"]) == (
+        2,
+        True,
+        result.workflow_run_id,
+    )
+
+
+async def _url_of(chat: Chat, workflow_id: str) -> str | None:
+    workflow = await chat.env.database.workflows.get_workflow(workflow_id, RUN_GROUP_ORG)
+    assert workflow is not None
+    block = workflow.workflow_definition.blocks[0]
+    assert isinstance(block, TaskBlock)
+    return block.url
+
+
+async def _write_canonical_in_place(chat: Chat, workflow_id: str, url: str) -> None:
+    workflow = await chat.env.database.workflows.get_workflow(workflow_id, RUN_GROUP_ORG)
+    assert workflow is not None
+    definition = workflow.workflow_definition.model_copy(deep=True)
+    block = definition.blocks[0]
+    assert isinstance(block, TaskBlock)
+    block.url = url
+    await app.WORKFLOW_SERVICE.update_workflow_definition(
+        workflow_id=workflow_id, organization_id=RUN_GROUP_ORG, workflow_definition=definition
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("auto_accept", [False, True], ids=["manual", "auto_accept"])
+@pytest.mark.parametrize(
+    "case",
+    [
+        "run_started",
+        "run_finished",
+        "dispatch_refused",
+        "receipt_failed",
+        "adoption_failed",
+        "degraded_write",
+        "degraded_write_interrupted",
+    ],
+)
+async def test_an_edit_after_the_run_card_save_waits_for_accept_and_turn_end_keeps_the_saved_version(
+    chat: Chat, monkeypatch: pytest.MonkeyPatch, auto_accept: bool, case: str
+) -> None:
+    original = await chat.env.database.workflows.get_workflow_by_permanent_id(RUN_GROUP_WPID, RUN_GROUP_ORG)
+    assert original is not None
+    chat_id = chat.ctx.workflow_copilot_chat_id
+    assert chat_id is not None
+    await _stage_draft(chat)
+    chat.ctx.proposal_owner_turn_id, chat.ctx.proposal_revision = "turn_draft", 1
+    await chat.env.database.workflow_params.update_workflow_copilot_chat(
+        RUN_GROUP_ORG, chat_id, auto_accept=auto_accept
+    )
+    if case == "dispatch_refused":
+        monkeypatch.setattr(
+            app.WORKFLOW_SERVICE,
+            "_refuse_unusable_request_parameters",
+            AsyncMock(side_effect=[None, SkyvernHTTPException("Credential not accessible", status_code=403)]),
+        )
+    elif case == "receipt_failed":
+        monkeypatch.setattr(
+            chat.env.database.workflow_params,
+            "record_copilot_single_run_save",
+            AsyncMock(side_effect=RuntimeError("down")),
+        )
+    elif case == "adoption_failed":
+        monkeypatch.setattr(account_groups, "adopt_stored_workflow_candidate", AsyncMock(return_value="read_failed"))
+    task = _start_single_run(chat, {"login": "cred_3"})
+    assert await _decide(chat, await _card(chat), {"approved": True, "credential_ids": ["cred_3"]}) == 200
+    result = await asyncio.wait_for(task, 5)
+    saved = await chat.env.database.workflows.get_workflow_by_permanent_id(RUN_GROUP_WPID, RUN_GROUP_ORG)
+    assert isinstance(result, SingleRunSubmission) and saved is not None and result.saved_version == saved.version == 2
+    assert result.dispatched is (case not in ("dispatch_refused", "receipt_failed"))
+    if case == "run_finished":
+        async with chat.env.database.Session() as session:
+            await session.execute(
+                update(WorkflowRunModel)
+                .where(WorkflowRunModel.workflow_run_id == result.workflow_run_id)
+                .values(status=WorkflowRunStatus.completed)
+            )
+            await session.commit()
+
+    chat.ctx.proposal_adoptions_seen_by_model = chat.ctx.proposal_adoptions
+    edited = await workflow_update._update_workflow(
+        {
+            "workflow_yaml": chat.ctx.workflow_yaml.replace(
+                "https://example.com/statements", "https://example.com/invoices"
+            )
+        },
+        chat.ctx,
+    )
+    assert edited["ok"], edited
+    workflow_update._record_workflow_update_result(chat.ctx, edited)
+    if case.startswith("degraded_write"):
+        await _write_canonical_in_place(chat, saved.workflow_id, "https://example.com/degraded")
+        chat.ctx.workflow_persisted = True
+    if case == "degraded_write_interrupted":
+        current = await chat.env.database.workflows.get_workflow(saved.workflow_id, RUN_GROUP_ORG)
+        assert current is not None
+        await chat.env.database.workflow_params.record_pending_copilot_turn_canonical_write(
+            RUN_GROUP_ORG, chat_id, "turn", workflow_content_fingerprint(current.model_dump(mode="json"))
+        )
+        row = await _chat_row(chat)
+        await routes._recover_interrupted_copilot_turn(row, RUN_GROUP_ORG, row.pending_turns["turn"])
+    else:
+        turn_end = agent_module._make_agent_result(
+            chat.ctx,
+            user_response="Edited the statement URL.",
+            updated_workflow=chat.ctx.last_workflow,
+            workflow_yaml=chat.ctx.last_workflow_yaml,
+            workflow_was_persisted=chat.ctx.workflow_persisted,
+            has_staged_proposal=chat.ctx.has_staged_proposal,
+            staged_workflow_yaml=chat.ctx.staged_workflow_yaml,
+            staged_workflow=chat.ctx.staged_workflow,
+            proposal_disposition="auto_applicable" if auto_accept else "review_untested",
+            turn_id="turn",
+            narrative_payload=agent_module._build_narrative_payload(
+                chat.ctx, terminal="response", terminal_message="Edited the statement URL.", narrative_summary=None
+            ),
+        )
+        await routes._finalise_normal_turn(
+            stream=SimpleNamespace(send=AsyncMock(return_value=True), is_disconnected=AsyncMock(return_value=False)),
+            chat=await _chat_row(chat),
+            organization_id=RUN_GROUP_ORG,
+            original_workflow=original,
+            chat_request=WorkflowCopilotChatRequest(
+                workflow_id=original.workflow_id,
+                workflow_permanent_id=RUN_GROUP_WPID,
+                workflow_copilot_chat_id=chat_id,
+                message="Run it now",
+                workflow_yaml="",
+            ),
+            agent_result=turn_end,
+            turn_id="turn",
+        )
+
+    assert await _versions(chat) == [1, 2]
+    latest = await chat.env.database.workflows.get_workflow_by_permanent_id(RUN_GROUP_WPID, RUN_GROUP_ORG)
+    assert latest is not None and latest.workflow_id == saved.workflow_id
+    assert await _url_of(chat, saved.workflow_id) == "https://example.com/statements"
+    untouched = await chat.env.database.workflows.get_workflow(original.workflow_id, RUN_GROUP_ORG)
+    assert untouched is not None and untouched.modified_at == original.modified_at
+    original_block = original.workflow_definition.blocks[0]
+    assert isinstance(original_block, TaskBlock) and await _url_of(chat, original.workflow_id) == original_block.url
+    proposal = (await _chat_row(chat)).proposed_workflow
+    metadata = copilot_proposal_metadata(proposal)
+    assert proposal is not None and metadata is not None and metadata.owner_turn_id == "turn"
+    draft_block = Workflow.model_validate(proposal).workflow_definition.blocks[0]
+    assert isinstance(draft_block, TaskBlock) and draft_block.url == "https://example.com/invoices"
+    # A rollback rewrites the row with explicit empty browser settings, so only an untouched row keeps its fingerprint.
+    if not case.startswith("degraded_write"):
+        assert proposal_workflow_fingerprint_matches(latest, metadata.canonical_fingerprint)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change",
+    ["parameter_default", "fixed_credential", "connected_account", "browser_profile", "non_string_credential"],
+)
+async def test_a_draft_that_needs_accept_shows_no_card_and_saves_nothing(chat: Chat, change: str) -> None:
+    await _stage_draft(
+        chat,
+        login_default="cred_3" if change == "parameter_default" else None,
+        block_credential="cred_2" if change == "fixed_credential" else None,
+        connected_account="goac_other" if change == "connected_account" else None,
+        browser_profile_id="bp_other" if change == "browser_profile" else None,
+    )
+    inputs: dict[str, JsonValue] = {"login": 123} if change == "non_string_credential" else {}
+
+    result = await asyncio.wait_for(_start_single_run(chat, inputs), 5)
+
+    assert isinstance(result, AccountGroupRefusal) and result.dispatched is False
+    if change != "non_string_credential":
+        assert "Nothing was started" in result.error and "accepting it" in result.error
+    assert chat.frames.empty()
+    assert await _versions(chat) == [1]
+    assert copilot_proposal_metadata((await _chat_row(chat)).proposed_workflow) is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("draft_primary", "draft_fallbacks"),
+    [("cred_b", ["cred_a"]), ("cred_a", []), ("cred_a", ["cred_b", "cred_c"])],
+)
+async def test_reordering_or_moving_a_fallback_login_counts_as_a_binding_change(
+    chat: Chat, draft_primary: str, draft_fallbacks: list[str]
+) -> None:
+    saved = await chat.env.database.workflows.get_workflow_by_permanent_id(RUN_GROUP_WPID, RUN_GROUP_ORG)
+    assert saved is not None
+
+    def with_portal(primary: str, fallbacks: list[str]) -> Workflow:
+        workflow = saved.model_copy(deep=True)
+        workflow.workflow_definition.parameters.append(
+            CredentialParameter(
+                key="portal",
+                credential_parameter_id="cp_portal",
+                workflow_id=saved.workflow_id,
+                credential_id=primary,
+                fallback_credential_ids=fallbacks,
+                created_at=saved.created_at,
+                modified_at=saved.modified_at,
+            )
+        )
+        return workflow
+
+    base = account_groups._credential_bindings(with_portal("cred_a", ["cred_b"]))
+
+    assert base == account_groups._credential_bindings(with_portal("cred_a", ["cred_b"]))
+    assert base != account_groups._credential_bindings(with_portal(draft_primary, draft_fallbacks))
+
+
+@pytest.mark.asyncio
+async def test_changing_the_default_a_connected_account_field_reads_counts_as_a_binding_change(chat: Chat) -> None:
+    saved = await chat.env.database.workflows.get_workflow_by_permanent_id(RUN_GROUP_WPID, RUN_GROUP_ORG)
+    assert saved is not None
+    block = saved.workflow_definition.blocks[0]
+    assert isinstance(block, TaskBlock)
+
+    def with_account_default(default: str) -> Workflow:
+        workflow = saved.model_copy(deep=True)
+        workflow.workflow_definition.parameters.append(
+            WorkflowParameter(
+                key="account",
+                workflow_parameter_id="wp_account",
+                workflow_parameter_type=WorkflowParameterType.STRING,
+                workflow_id=saved.workflow_id,
+                default_value=default,
+                created_at=saved.created_at,
+                modified_at=saved.modified_at,
+            )
+        )
+        workflow.workflow_definition.blocks.append(
+            GoogleSheetsReadBlock(
+                label="read_sheet",
+                output_parameter=block.output_parameter,
+                spreadsheet_url="https://example.com/sheet",
+                credential_id="{{ account }}",
+            )
+        )
+        return workflow
+
+    base = account_groups._credential_bindings(with_account_default("goac_a"))
+
+    assert base == account_groups._credential_bindings(with_account_default("goac_a"))
+    assert base != account_groups._credential_bindings(with_account_default("goac_b"))
+
+
+@pytest.mark.asyncio
+async def test_changing_the_default_a_credential_parameter_names_counts_as_a_binding_change(chat: Chat) -> None:
+    saved = await chat.env.database.workflows.get_workflow_by_permanent_id(RUN_GROUP_WPID, RUN_GROUP_ORG)
+    assert saved is not None
+
+    def with_login_default(default: str, *, indirect: bool = True) -> Workflow:
+        workflow = saved.model_copy(deep=True)
+        workflow.workflow_definition.parameters += [
+            WorkflowParameter(
+                key="account_param",
+                workflow_parameter_id="wp_account",
+                workflow_parameter_type=WorkflowParameterType.STRING,
+                workflow_id=saved.workflow_id,
+                default_value=default,
+                created_at=saved.created_at,
+                modified_at=saved.modified_at,
+            ),
+            CredentialParameter(
+                key="portal",
+                credential_parameter_id="cp_portal",
+                workflow_id=saved.workflow_id,
+                credential_id="account_param" if indirect else default,
+                created_at=saved.created_at,
+                modified_at=saved.modified_at,
+            ),
+        ]
+        return workflow
+
+    base = account_groups._credential_bindings(with_login_default("cred_a"))
+
+    assert base != account_groups._credential_bindings(with_login_default("cred_b"))
+    assert base == account_groups._credential_bindings(with_login_default("cred_a", indirect=False))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("vault", ["onepassword", "azure"])
+async def test_changing_a_vault_login_parameter_counts_as_a_binding_change(chat: Chat, vault: str) -> None:
+    saved = await chat.env.database.workflows.get_workflow_by_permanent_id(RUN_GROUP_WPID, RUN_GROUP_ORG)
+    assert saved is not None
+
+    def with_vault_login(item: str, *, parameter_id: str = "vp_1") -> Workflow:
+        workflow = saved.model_copy(deep=True)
+        common = {"workflow_id": saved.workflow_id, "created_at": saved.created_at, "modified_at": saved.modified_at}
+        workflow.workflow_definition.parameters.append(
+            OnePasswordCredentialParameter(
+                key="vault_login",
+                onepassword_credential_parameter_id=parameter_id,
+                vault_id="v",
+                item_id=item,
+                **common,
+            )
+            if vault == "onepassword"
+            else AzureVaultCredentialParameter(
+                key="vault_login",
+                azure_vault_credential_parameter_id=parameter_id,
+                vault_name="v",
+                username_key=item,
+                password_key="pw",
+                **common,
+            )
+        )
+        return workflow
+
+    base = account_groups._credential_bindings(with_vault_login("item_a"))
+
+    assert base == account_groups._credential_bindings(with_vault_login("item_a", parameter_id="vp_regenerated"))
+    assert base != account_groups._credential_bindings(with_vault_login("item_b"))
+
+    def with_templated_vault_login(default: str) -> Workflow:
+        workflow = with_vault_login("{{ account }}")
+        workflow.workflow_definition.parameters.append(
+            WorkflowParameter(
+                key="account",
+                workflow_parameter_id="wp_account",
+                workflow_parameter_type=WorkflowParameterType.STRING,
+                workflow_id=saved.workflow_id,
+                default_value=default,
+                created_at=saved.created_at,
+                modified_at=saved.modified_at,
+            )
+        )
+        return workflow
+
+    templated = account_groups._credential_bindings(with_templated_vault_login("item_a"))
+
+    assert templated == account_groups._credential_bindings(with_templated_vault_login("item_a"))
+    assert templated != account_groups._credential_bindings(with_templated_vault_login("item_b"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("input_key", ["profile_segment", "账户"])
+async def test_changing_the_default_a_browser_profile_key_reads_counts_as_a_binding_change(
+    chat: Chat, input_key: str
+) -> None:
+    saved = await chat.env.database.workflows.get_workflow_by_permanent_id(RUN_GROUP_WPID, RUN_GROUP_ORG)
+    assert saved is not None
+
+    def with_profile_segment(default: str) -> Workflow:
+        workflow = saved.model_copy(deep=True, update={"browser_profile_key": f"{{{{ {input_key} }}}}"})
+        workflow.workflow_definition.parameters.append(
+            WorkflowParameter(
+                key=input_key,
+                workflow_parameter_id="wp_segment",
+                workflow_parameter_type=WorkflowParameterType.STRING,
+                workflow_id=saved.workflow_id,
+                default_value=default,
+                created_at=saved.created_at,
+                modified_at=saved.modified_at,
+            )
+        )
+        return workflow
+
+    base = account_groups._credential_bindings(with_profile_segment("team_a"))
+
+    assert base == account_groups._credential_bindings(with_profile_segment("team_a"))
+    assert base != account_groups._credential_bindings(with_profile_segment("team_b"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("switch", ["persist_browser_session", "reuse_browser_session"])
+async def test_turning_on_browser_memory_counts_as_a_binding_change(chat: Chat, switch: str) -> None:
+    saved = await chat.env.database.workflows.get_workflow_by_permanent_id(RUN_GROUP_WPID, RUN_GROUP_ORG)
+    assert saved is not None
+    assert not saved.persist_browser_session and not saved.reuse_browser_session
+    draft = saved.model_copy(deep=True, update={switch: True})
+
+    assert account_groups._credential_bindings(saved) != account_groups._credential_bindings(draft)
+
+
+async def _accept(chat: Chat, revision: int = 1) -> None:
+    chat_id = chat.ctx.workflow_copilot_chat_id
+    assert chat_id is not None
+    with _as_requester(ORG_KEY):
+        await routes.workflow_copilot_apply_proposed_workflow(
+            WorkflowCopilotApplyProposedWorkflowRequest(
+                workflow_copilot_chat_id=chat_id, owner_turn_id="turn_draft", revision=revision
+            ),
+            chat.env.organization,
+        )
+
+
+async def _restage(chat: Chat) -> None:
+    row = await _chat_row(chat)
+    metadata = copilot_proposal_metadata(row.proposed_workflow)
+    assert metadata is not None and row.proposed_workflow is not None
+    await chat.env.database.workflow_params.publish_workflow_copilot_candidate(
+        RUN_GROUP_ORG,
+        row.workflow_copilot_chat_id,
+        proposal={key: value for key, value in row.proposed_workflow.items() if key != "_copilot_proposal"},
+        owner_turn_id="turn_draft",
+        canonical_fingerprint=metadata.canonical_fingerprint,
+        canonical_title=metadata.canonical_title,
+        disposition="review_untested",
+        expected_owner_turn_id="turn_draft",
+        expected_revision=1,
+    )
+
+
+async def _run_of(chat: Chat, result: SingleRunSubmission | AccountGroupRefusal) -> tuple[str, str, int]:
+    assert isinstance(result, SingleRunSubmission) and result.dispatched is True and result.workflow_run_id
+    run = await chat.env.database.workflow_runs.get_workflow_run(result.workflow_run_id, organization_id=RUN_GROUP_ORG)
+    saved = await chat.env.database.workflows.get_workflow_by_permanent_id(RUN_GROUP_WPID, RUN_GROUP_ORG)
+    assert run is not None and saved is not None
+    return run.workflow_id, saved.workflow_id, saved.version
+
+
+@pytest.mark.asyncio
+async def test_a_login_change_saved_by_accept_then_runs_on_the_accepted_version(chat: Chat) -> None:
+    await _stage_draft(chat, login_default="cred_3")
+    refused = await asyncio.wait_for(_start_single_run(chat, {"login": "cred_3"}), 5)
+    assert isinstance(refused, AccountGroupRefusal) and await _versions(chat) == [1]
+    before = await _run_count(chat)
+
+    await _accept(chat)
+    task = _start_single_run(chat, {"login": "cred_3"})
+    card = await _card(chat)
+    assert "saves_draft" not in card["account_group_review"]
+    assert await _decide(chat, card, {"approved": True, "credential_ids": ["cred_3"]}) == 200
+    result = await asyncio.wait_for(task, 5)
+
+    run_workflow_id, saved_workflow_id, version = await _run_of(chat, result)
+    assert (run_workflow_id, version) == (saved_workflow_id, 2)
+    assert await _versions(chat) == [1, 2] and await _run_count(chat) == before + 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["while_pending", "after_approval", "after_a_declined_card"])
+async def test_accept_while_the_draft_run_card_waits_runs_the_accepted_version_without_another_save(
+    chat: Chat, case: str
+) -> None:
+    await _stage_draft(chat)
+    before = await _run_count(chat)
+    if case == "after_a_declined_card":
+        declined = _start_single_run(chat, {"login": "cred_3"})
+        assert await _decide(chat, await _card(chat), {"approved": False}) == 200
+        await asyncio.wait_for(declined, 5)
+    task = _start_single_run(chat, {"login": "cred_3"})
+    card = await _card(chat)
+    approval = {"approved": True, "credential_ids": ["cred_3"]}
+    if case == "after_approval":
+        # The approved card's dispatch waits on this lock, so Accept lands between the approval and the save.
+        async with chat.ctx.proposal_mutation_lock:
+            assert await _decide(chat, card, approval) == 200
+            await _accept(chat)
+    else:
+        await _accept(chat)
+        assert await _decide(chat, card, approval) == 200
+
+    result = await asyncio.wait_for(task, 5)
+
+    run_workflow_id, saved_workflow_id, version = await _run_of(chat, result)
+    assert (run_workflow_id, version) == (saved_workflow_id, 2)
+    assert isinstance(result, SingleRunSubmission) and result.saved_version == 2
+    assert await _versions(chat) == [1, 2] and await _run_count(chat) == before + 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    [
+        "restaged_then_accepted",
+        "edited_in_place_after_accept",
+        "rewritten_before_receipt",
+        "another_chat_saved",
+        "receipt_not_written",
+    ],
+)
+async def test_accept_of_anything_but_the_reviewed_draft_refuses_the_waiting_run_card(
+    chat: Chat, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    await _stage_draft(chat)
+    before = await _run_count(chat)
+    task = _start_single_run(chat, {"login": "cred_3"})
+    card = await _card(chat)
+    if case == "restaged_then_accepted":
+        await _restage(chat)
+        await _accept(chat, revision=2)
+    else:
+        if case == "receipt_not_written":
+            monkeypatch.setattr(
+                chat.env.database.workflow_params,
+                "record_copilot_draft_acceptance",
+                AsyncMock(side_effect=RuntimeError("down")),
+            )
+        elif case == "rewritten_before_receipt":
+            clear_candidate = chat.env.database.workflow_params.clear_workflow_copilot_candidate
+
+            async def clear_then_rewrite(*args: Any, **kwargs: Any) -> Any:
+                cleared = await clear_candidate(*args, **kwargs)
+                latest = await chat.env.database.workflows.get_workflow_by_permanent_id(RUN_GROUP_WPID, RUN_GROUP_ORG)
+                assert latest is not None
+                await _write_canonical_in_place(chat, latest.workflow_id, "https://example.com/other-chat")
+                return cleared
+
+            monkeypatch.setattr(
+                chat.env.database.workflow_params, "clear_workflow_copilot_candidate", clear_then_rewrite
+            )
+        await _accept(chat)
+        if case == "edited_in_place_after_accept":
+            await _edit_in_place(chat, version=2)
+        elif case == "another_chat_saved":
+            await _add_version(chat, "wf_3", 3)
+    versions = await _versions(chat)
+
+    assert await _decide(chat, card, {"approved": True, "credential_ids": ["cred_3"]}) == 200
+    result = await asyncio.wait_for(task, 5)
+
+    assert isinstance(result, AccountGroupRefusal) and result.dispatched is False
+    assert await _versions(chat) == versions and await _run_count(chat) == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    [
+        "decline",
+        "update_role_denied",
+        "run_role_denied",
+        "folder_denied",
+        "restaged_while_waiting",
+        "rejected_while_waiting",
+    ],
+)
+async def test_a_declined_or_stale_draft_run_card_saves_and_starts_nothing(
+    chat: Chat, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    await _stage_draft(chat)
+    before = await _run_count(chat)
+    task = _start_single_run(chat, {"login": "cred_3"})
+    card = await _card(chat)
+    decision: dict[str, Any] = {"approved": True, "credential_ids": ["cred_3"]}
+    chat_id = chat.ctx.workflow_copilot_chat_id
+    assert chat_id is not None
+    if case == "decline":
+        decision = {"approved": False}
+    elif case == "update_role_denied":
+
+        async def deny_update(_: RequestPrincipal, action: str | None, __: BearerIdentityStatus | None) -> None:
+            if action == "workflow.update":
+                raise HTTPException(status_code=403, detail="Forbidden")
+
+        monkeypatch.setattr(app.AGENT_FUNCTION, "enforce_request_role", deny_update)
+    elif case == "folder_denied":
+        monkeypatch.setattr(
+            app.AGENT_FUNCTION, "enforce_folder_access", AsyncMock(side_effect=HTTPException(status_code=403))
+        )
+    elif case == "run_role_denied":
+
+        async def deny_run(_: RequestPrincipal, action: str | None, __: BearerIdentityStatus | None) -> None:
+            if action == "workflow.run":
+                raise HTTPException(status_code=403, detail="Forbidden")
+
+        monkeypatch.setattr(app.AGENT_FUNCTION, "enforce_request_role", deny_run)
+    elif case == "restaged_while_waiting":
+        await _restage(chat)
+    elif case == "rejected_while_waiting":
+        await chat.env.database.workflow_params.clear_workflow_copilot_candidate(
+            organization_id=RUN_GROUP_ORG,
+            workflow_copilot_chat_id=chat_id,
+            expected_owner_turn_id="turn_draft",
+            expected_revision=1,
+        )
+    versions_before_decision = await _versions(chat)
+
+    assert await _decide(chat, card, decision) == 200
+    result = await asyncio.wait_for(task, 5)
+
+    assert result.dispatched is False
+    assert await _versions(chat) == versions_before_decision
+    assert await _run_count(chat) == before
+    if case in ("decline", "update_role_denied", "run_role_denied", "folder_denied"):
+        assert copilot_proposal_metadata((await _chat_row(chat)).proposed_workflow) is not None
+    if case in ("update_role_denied", "folder_denied"):
+        assert isinstance(result, AccountGroupRefusal) and "permission to save" in result.error
+    if case == "run_role_denied":
+        assert isinstance(result, AccountGroupRefusal) and "permission to run workflows" in result.error
+    if case == "rejected_while_waiting":
+        assert isinstance(result, AccountGroupRefusal) and "rejected" in result.error
+        assert "updated after the review" not in result.error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure", ["audit", "receipt", "start_refused", "start_raised", "start_unconfirmed", "rewritten_in_place"]
+)
+async def test_a_draft_saved_from_the_run_card_reports_its_version_when_the_run_does_not_start(
+    chat: Chat, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    await _stage_draft(chat)
+    if failure == "start_raised":
+        monkeypatch.setattr(
+            account_groups.workflow_service, "run_workflow", AsyncMock(side_effect=RuntimeError("service down"))
+        )
+    elif failure == "rewritten_in_place":
+        record_save = chat.env.database.workflow_params.record_copilot_single_run_save
+
+        async def record_then_rewrite(*args: Any, **kwargs: Any) -> Any:
+            recorded = await record_save(*args, **kwargs)
+            await _write_canonical_in_place(chat, kwargs["saved_workflow_id"], "https://example.com/other-chat")
+            return recorded
+
+        monkeypatch.setattr(chat.env.database.workflow_params, "record_copilot_single_run_save", record_then_rewrite)
+    elif failure == "audit":
+        monkeypatch.setattr(app.AGENT_FUNCTION, "record_audit_event", AsyncMock(side_effect=RuntimeError("down")))
+    elif failure == "receipt":
+        monkeypatch.setattr(
+            chat.env.database.workflow_params,
+            "record_copilot_single_run_save",
+            AsyncMock(side_effect=RuntimeError("down")),
+        )
+    elif failure == "start_refused":
+        monkeypatch.setattr(
+            app.WORKFLOW_SERVICE,
+            "_refuse_unusable_request_parameters",
+            AsyncMock(side_effect=[None, SkyvernHTTPException("Credential not accessible", status_code=403)]),
+        )
+    else:
+
+        async def executor_down(_: str) -> None:
+            raise RuntimeError("executor down")
+
+        chat.env.executor.before_queue = executor_down
+    before = await _run_count(chat)
+    task = _start_single_run(chat, {"login": "cred_3"})
+    card = await _card(chat)
+    assert await _decide(chat, card, {"approved": True, "credential_ids": ["cred_3"]}) == 200
+
+    result = await asyncio.wait_for(task, 5)
+
+    assert isinstance(result, SingleRunSubmission) and result.saved_version == 2
+    assert result.error is not None and "version 2" in result.error
+    assert await _versions(chat) == [1, 2]
+    if failure == "start_unconfirmed":
+        assert result.dispatched is None and await _run_count(chat) == before + 1
+    else:
+        assert result.dispatched is False and await _run_count(chat) == before
+    resolved = await _saved_draft_update(chat)
+    assert resolved["saved_version"] == 2 and "run_started" not in resolved
+
+
+@pytest.mark.asyncio
+async def test_a_draft_run_card_cancelled_after_approval_still_reports_and_saves_once(
+    chat: Chat, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _stage_draft(chat)
+    accept = account_groups.accept_copilot_proposal
+    tasks: list[asyncio.Task[SingleRunSubmission | AccountGroupRefusal]] = []
+
+    async def accept_then_cancel_the_tool_call(*args: Any, **kwargs: Any) -> tuple[Workflow, tuple[str, ...]]:
+        saved = await accept(*args, **kwargs)
+        tasks[0].cancel()
+        return saved
+
+    monkeypatch.setattr(account_groups, "accept_copilot_proposal", accept_then_cancel_the_tool_call)
+    tasks.append(_start_single_run(chat, {"login": "cred_3"}))
+    card = await _card(chat)
+    assert await _decide(chat, card, {"approved": True, "credential_ids": ["cred_3"]}) == 200
+    with pytest.raises(asyncio.CancelledError):
+        await tasks[0]
+
+    resolved = await _saved_draft_update(chat)
+
+    assert resolved["saved_version"] == 2 and resolved["run_started"] is True
+    retry = _start_single_run(chat, {"login": "cred_3"})
+    retry_card = await _card(chat)
+    assert "saves_draft" not in retry_card["account_group_review"]
+    assert await _decide(chat, retry_card, {"approved": False}) == 200
+    await asyncio.wait_for(retry, 5)
+    assert await _versions(chat) == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_a_draft_saved_after_the_turn_ended_is_recorded_in_the_saved_history(
+    chat: Chat, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _stage_draft(chat)
+    accept = account_groups.accept_copilot_proposal
+
+    async def accept_then_end_the_turn(*args: Any, **kwargs: Any) -> tuple[Workflow, tuple[str, ...]]:
+        saved = await accept(*args, **kwargs)
+        await _end_turn_into_history(chat, await _restored_review(chat))
+        return saved
+
+    monkeypatch.setattr(account_groups, "accept_copilot_proposal", accept_then_end_the_turn)
+    task = _start_single_run(chat, {"login": "cred_3"})
+    card = await _card(chat)
+    assert await _decide(chat, card, {"approved": True, "credential_ids": ["cred_3"]}) == 200
+    await asyncio.wait_for(task, 5)
+
+    assert await _versions(chat) == [1, 2]
+    assert (await _restored_review(chat))["account_group_review"]["saved_version"] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tested", [True, False])
+async def test_the_run_card_says_tested_from_the_proposal_disposition_without_a_recorded_run(
+    chat: Chat, tested: bool
+) -> None:
+    await _stage_draft(chat, tested=tested, tested_run_id=None)
+    chat.ctx.proposal_owner_turn_id, chat.ctx.proposal_revision = "turn_draft", 1
+    task = _start_single_run(chat, {"login": "cred_3"})
+    card = await _card(chat)
+    review = card["account_group_review"]
+
+    assert review["saves_draft"] is True
+    assert review.get("draft_tested", False) is tested
+    assert "tested_workflow_run_id" not in review
+    assert await _decide(chat, card, {"approved": False}) == 200
+    await asyncio.wait_for(task, 5)
+    assert await _versions(chat) == [1]
+
+
+@pytest.mark.asyncio
+async def test_group_schedule_and_run_refusals_state_the_same_fact_about_an_unsaved_change(chat: Chat) -> None:
+    chat.ctx.has_staged_proposal = True
+    run = await asyncio.wait_for(_start_single_run(chat, {"login": "cred_3"}), 5)
+    group = await asyncio.wait_for(_start(chat, ["cred_1"]), 5)
+    schedule = await mcp_hooks._create_workflow_schedule_pre_hook({}, chat.ctx)
+
+    assert isinstance(run, AccountGroupRefusal) and isinstance(group, AccountGroupRefusal) and schedule is not None
+    for error in (run.error, group.error, schedule["error"]):
+        assert error.endswith(mcp_hooks.PENDING_PROPOSAL_FACT)
+        assert "auto-accept" not in error

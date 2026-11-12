@@ -1376,6 +1376,7 @@ async def run_group_env(monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEng
     monkeypatch.setattr(app, "WORKFLOW_SERVICE", service)
     monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "is_feature_enabled_cached", AsyncMock(return_value=False))
     monkeypatch.setattr(app.AGENT_FUNCTION, "is_block_scoped_workflow_run", AsyncMock(return_value=False))
+    monkeypatch.setattr(app.AGENT_FUNCTION, "workflow_run_group_limits", AgentFunction().workflow_run_group_limits)
     monkeypatch.setattr(AsyncExecutorFactory, "get_executor", lambda: executor)
     monkeypatch.setattr(group_service, "_spawn", spawned.append)
     monkeypatch.setattr(service, "_schedule_workflow_run_terminal_hooks", lambda **_: None)
