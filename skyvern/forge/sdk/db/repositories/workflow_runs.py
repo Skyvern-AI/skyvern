@@ -1909,6 +1909,33 @@ class WorkflowRunsRepository(BaseRepository):
             await session.refresh(refreshed)
             return convert_to_workflow_run(refreshed)
 
+    @db_operation("merge_failure_classification")
+    async def merge_failure_classification(
+        self,
+        workflow_run_id: str,
+        status: WorkflowRunStatus,
+        finished_at: datetime | None,
+        merge: Callable[[list[dict[str, Any]] | None], list[dict[str, Any]] | None],
+    ) -> bool:
+        """Rewrite a finished run's category from the stored one under a row lock and re-derive its attribution.
+        Nothing is written when ``merge`` returns None, or when the run was reset or finished again since status and
+        finished_at were read."""
+        async with self.Session() as session:
+            row = (
+                await session.scalars(
+                    select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id).with_for_update()
+                )
+            ).one_or_none()
+            if row is None or row.status != status.value or to_naive_utc(row.finished_at) != to_naive_utc(finished_at):
+                return False
+            merged = merge(row.failure_category)
+            if merged is None:
+                return False
+            row.failure_category = merged
+            row.failure_attribution = derive_failure_attribution(merged)
+            await session.commit()
+            return True
+
     @db_operation("bulk_update_workflow_runs")
     async def bulk_update_workflow_runs(
         self,
