@@ -206,7 +206,7 @@ The Google Sheets, Gmail, and Google Drive integrations are off on a self-hosted
     In Google Cloud, enable the Google Sheets, Google Drive, and Gmail APIs. Configure the **OAuth consent screen**; for an External app, add each user as a test user (or publish the app) before they can connect. Then create an OAuth client ID of type **Web application**. Add `https://<your-ui-host>/integrations/google/callback` as an authorized redirect URI. For local use, that's `http://localhost:8080/integrations/google/callback`.
   </Step>
   <Step title="Add it to Skyvern">
-    In the app, open the **Google OAuth** form on **Integrations** or **Settings**. Fill in **Client ID** and **Client Secret**, set **Redirect Hosts** (host name only) and **App Origins** (for example `https://skyvern.example.com`), and click **Save Configuration**. Or set `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`, `GOOGLE_OAUTH_REDIRECT_HOSTS`, and `GOOGLE_OAUTH_APP_ORIGINS` on the server. The form wins over the variables.
+    In the app, open the **Google OAuth** form on **Integrations** or **Settings**. Fill in **Client ID** and **Client Secret**, set **Redirect URIs** (the full callback URL shown on the form, exactly as registered with Google) and **App Origins** (for example `https://skyvern.example.com`), and click **Save Configuration**. Or set `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`, `GOOGLE_OAUTH_REDIRECT_URIS`, and `GOOGLE_OAUTH_APP_ORIGINS` on the server. The form wins over the variables.
   </Step>
 </Steps>
 
@@ -221,7 +221,7 @@ Skyvern asks Google for the scopes each integration needs. If your consent scree
 
 `gmail.send` is a sensitive scope in Google Cloud. On the Gmail card, **Read inbox** is ticked by default and **Send email** is not; Google is asked only for what is ticked.
 
-Then click **Connect** on the integration card. If it fails, the redirect URI registered with Google must match **Redirect Hosts**, and **App Origins** must hold the exact origin the UI runs on.
+Then click **Connect** on the integration card. If it fails, the redirect URI registered with Google must appear, character for character, in **Redirect URIs**, and **App Origins** must hold the exact origin the UI runs on.
 
 ## Connect your code
 
