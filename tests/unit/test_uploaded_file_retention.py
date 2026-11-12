@@ -17,7 +17,10 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fastapi import HTTPException, UploadFile
 from fastapi.testclient import TestClient
+from starlette.datastructures import Headers
+from structlog.testing import capture_logs
 
 from skyvern.config import settings
 from skyvern.forge.sdk.api import files as files_api
@@ -433,65 +436,168 @@ def _ole_bytes(*entry_names: str, body: bytes = b"") -> bytes:
 
 _PE_HEAD = b"MZ" + b"\x90" * 58 + (64).to_bytes(4, "little") + b"PE\x00\x00" + b"\x00" * 64
 _OOXML_MEMBERS = ("[Content_Types].xml", "word/document.xml")
+_PNG_HEAD = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+_TIFF_HEAD = b"II*\x00" + b"\x00" * 20
+_HEIC_HEAD = b"\x00\x00\x00\x18ftypheic" + b"\x00" * 20
+_MP4_HEAD = b"\x00\x00\x00\x18ftypisom" + b"\x00" * 20
+_WEBM_HEAD = b"\x1a\x45\xdf\xa3" + b"\x00" * 20
+_OCTET = "application/octet-stream"
+_ODF_MEMBERS = ("mimetype", "META-INF/manifest.xml", "content.xml")
+_SPREADSHEETML = (
+    b'<?xml version="1.0"?>\n<?mso-application progid="Excel.Sheet"?>\n'
+    b'<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet"></Workbook>'
+)
+_WORD_2003_XML = (
+    b'<?xml version="1.0"?>\n<?mso-application progid="Word.Document"?>\n'
+    b'<w:wordDocument xmlns:w="http://schemas.microsoft.com/office/word/2003/wordml"></w:wordDocument>'
+)
+
+
+def _case(filename: str, content: bytes, expected_status: int, declared: str = _OCTET) -> tuple[str, bytes, str, int]:
+    return filename, content, declared, expected_status
 
 
 class TestUploadTypeRestrictions:
-    """Executables, scripts and browser-renderable markup are refused by name and by content; anything else passes."""
+    """The allowlist refuses anything outside the expected types; the denylist and sniffing then refuse
+    executables, scripts, browser-renderable markup and mislabeled content inside it."""
 
     @pytest.mark.parametrize(
-        ("filename", "content", "expected_status"),
+        ("filename", "content", "declared", "expected_status"),
         [
-            ("tool.exe", _PE_HEAD, 415),
-            ("invoice.pdf.exe", b"%PDF-1.7", 415),
-            ("setup.EXE. ", b"anything", 415),
-            ("page.html", b"hello", 415),
-            ("macro.docm", _zip_bytes(*_OOXML_MEMBERS), 415),
-            ("script.py", b"print(1)", 415),
-            ("report.txt", _PE_HEAD, 415),
-            ("notes.txt", b"\xef\xbb\xbf  <!DOCTYPE html><html></html>", 415),
-            ("logo.png", b'<?xml version="1.0"?>\n<svg xmlns="http://www.w3.org/2000/svg"></svg>', 415),
-            ("run.dat", b"#!/bin/sh\nrm -rf /", 415),
-            ("saved.dat", b"<!-- saved from url -->\n<!--x--><html><body></body></html>", 415),
-            ("icon.dat", b'<?xml version="1.0"?><?xml-stylesheet href="a.css"?><!--c--><svg></svg>', 415),
-            ("utf16.dat", "\ufeff<html><script></script></html>".encode("utf-16-le"), 415),
-            ("padded.txt", b" " * 9000 + b"<html></html>", 415),
-            ("comment.txt", b"<!--" + b"x" * 9000 + b"--><svg></svg>", 415),
-            ("page.shtml", b"hello", 415),
-            ("split_tag.txt", b" " * 8185 + b"<script>alert(1)</script>", 415),
-            ("split_comment.txt", b" " * 8189 + b"<!--x--><script></script>", 415),
-            ("split_doctype.txt", b" " * 8180 + b"<!doctype    html><p></p>", 415),
-            ("saved.bin", b"MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=x", 415),
-            ("binary.data", b"\x7fELF\x02\x01\x01", 415),
-            ("statement.pdf", b"<html>not a pdf</html>", 415),
-            ("statement.pdf", b"plain text", 415),
-            ("photo.jpg", b"not an image", 415),
-            ("budget.xlsx", _zip_bytes("[Content_Types].xml", "xl/vbaProject.bin"), 415),
-            ("bundle.zip", _zip_bytes("META-INF/MANIFEST.MF", "com/example/Main.class"), 415),
-            ("bundle.zip", _zip_bytes("AndroidManifest.xml", "classes.dex"), 415),
-            ("legacy.doc", _ole_bytes("Root Entry", "WordDocument", "Macros", "VBA", "_VBA_PROJECT"), 415),
-            ("ledger.xls", _ole_bytes("Workbook", "_VBA_PROJECT_CUR", "VBA", "_VBA_PROJECT"), 415),
-            ("renamed.docx", _ole_bytes("Root Entry", "WordDocument"), 415),
-            ("shortcut.lnk", b"anything", 415),
-            ("invoice.txt", b"L\x00\x00\x00\x01\x14\x02\x00\x00\x00\x00\x00\xc0\x00\x00\x00\x00\x00\x00F", 415),
-            ("report.weirdext", bytes(range(256)) * 16, 200),
-            ("no_extension", b"plain bytes", 200),
-            ("statement.pdf", b"%PDF-1.7\n%binary", 200),
-            ("letter.docx", _zip_bytes(*_OOXML_MEMBERS), 200),
-            ("locked.docx", _ole_bytes("Root Entry", "EncryptedInfo", "EncryptedPackage"), 200),
-            ("ledger.xls", _ole_bytes("Workbook", body=b"\x00" + "_VBA_PROJECT\0".encode("utf-16-le")), 200),
-            ("data.csv", b"name,email\nada,ada@example.com\n", 200),
-            ("forwarded.eml", b"MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=x", 200),
-            ("archive.zip", _zip_bytes("docs/readme.txt", "docs/tool.exe"), 200),
-            ("readme.md", b"# Title\n<p>inline html in markdown</p>", 200),
-            ("notes.md", b"<!-- generated -->\n# Title\n", 200),
-            ("indented.txt", b" " * 9000 + b"plain text", 200),
-            ("split_lt.txt", b" " * 8190 + b"<3 plain text", 200),
-            ("utf16.csv", "\ufeffname,email\n".encode("utf-16-le"), 200),
+            # Gate 1: allowlist by extension, declared type and (for extensionless files) sniffed type.
+            _case("report.weirdext", bytes(range(256)) * 16, 415),
+            _case("no_extension", b"plain bytes", 415),
+            _case("backup.7z", b"7z\xbc\xaf\x27\x1c" + b"\x00" * 20, 415),
+            _case("bundle.tar.gz", b"\x1f\x8b\x08" + b"\x00" * 20, 415),
+            _case("tool.exe", _PE_HEAD, 415),
+            _case("invoice.pdf.exe", b"%PDF-1.7", 415),
+            _case("setup.EXE. ", b"anything", 415),
+            _case("page.html", b"hello", 415),
+            _case("page.shtml", b"hello", 415),
+            _case("macro.docm", _zip_bytes(*_OOXML_MEMBERS), 415),
+            _case("script.py", b"print(1)", 415),
+            _case("shortcut.lnk", b"anything", 415),
+            _case("notes.txt", b"hello", 415, declared="text/html"),
+            _case("logo.png", _PNG_HEAD, 415, declared="image/svg+xml"),
+            _case("data.csv", b"a,b\n", 415, declared="application/javascript"),
+            # Gate 2: content sniffing inside the allowlist.
+            _case("report.txt", _PE_HEAD, 415),
+            _case("notes.txt", b"\xef\xbb\xbf  <!DOCTYPE html><html></html>", 415),
+            _case("logo.png", b'<?xml version="1.0"?>\n<svg xmlns="http://www.w3.org/2000/svg"></svg>', 415),
+            _case("run.txt", b"#!/bin/sh\nrm -rf /", 415),
+            _case("saved.txt", b"<!-- saved from url -->\n<!--x--><html><body></body></html>", 415),
+            _case("icon.xml", b'<?xml version="1.0"?><?xml-stylesheet href="a.css"?><!--c--><svg></svg>', 415),
+            _case("utf16.txt", "\ufeff<html><script></script></html>".encode("utf-16-le"), 415),
+            _case("padded.txt", b" " * 9000 + b"<html></html>", 415),
+            _case("comment.txt", b"<!--" + b"x" * 9000 + b"--><svg></svg>", 415),
+            _case("split_tag.txt", b" " * 8185 + b"<script>alert(1)</script>", 415),
+            _case("split_comment.txt", b" " * 8189 + b"<!--x--><script></script>", 415),
+            _case("split_doctype.txt", b" " * 8180 + b"<!doctype    html><p></p>", 415),
+            _case("saved.txt", b"MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=x", 415),
+            _case("binary.txt", b"\x7fELF\x02\x01\x01", 415),
+            _case("invoice.txt", b"L\x00\x00\x00\x01\x14\x02\x00\x00\x00\x00\x00\xc0\x00\x00\x00\x00\x00\x00F", 415),
+            # Gate 2: an allowed extension whose content does not carry the format's signature.
+            _case("statement.pdf", b"<html>not a pdf</html>", 415),
+            _case("statement.pdf", b"plain text", 415),
+            _case("photo.jpg", b"not an image", 415),
+            _case("scan.tif", b"not an image", 415),
+            _case("movie.mp4", b"not a video", 415),
+            _case("letter.odt", b"plain text", 415),
+            _case("memo.rtf", b"plain text", 415),
+            _case("renamed.docx", _ole_bytes("Root Entry", "WordDocument"), 415),
+            _case("resume.docx", _zip_bytes("notes.txt"), 415),
+            _case("letter.odt", _zip_bytes("notes.txt"), 415),
+            _case("broken.odt", b"PK\x03\x04" + b"\x00" * 40, 415),
+            # Gate 2: macro and package inspection of archives and compound files.
+            _case("budget.xlsx", _zip_bytes("[Content_Types].xml", "xl/vbaProject.bin"), 415),
+            _case("bundle.zip", _zip_bytes("META-INF/MANIFEST.MF", "com/example/Main.class"), 415),
+            _case("bundle.zip", _zip_bytes("AndroidManifest.xml", "classes.dex"), 415),
+            _case("legacy.doc", _ole_bytes("Root Entry", "WordDocument", "Macros", "VBA", "_VBA_PROJECT"), 415),
+            _case("ledger.xls", _ole_bytes("Workbook", "_VBA_PROJECT_CUR", "VBA", "_VBA_PROJECT"), 415),
+            _case("letter.odt", _zip_bytes(*_ODF_MEMBERS, "Basic/Standard/Module1.xml"), 415),
+            _case("sheet.ods", _zip_bytes(*_ODF_MEMBERS, "Scripts/python/macro.py"), 415),
+            _case("no_mimetype.odt", _zip_bytes("META-INF/manifest.xml", "Basic/Standard/Module1.xml"), 415),
+            # Formats without a positive signature check still get the executable sniff.
+            _case("ledger.xls", _PE_HEAD, 415),
+            _case("legacy.doc", b"\x7fELF\x02\x01\x01", 415),
+            _case("deck.ppt", b"#!/bin/sh\necho", 415),
+            _case("movie.mp4", _PE_HEAD, 415),
+            # Accepted: expected types whose content agrees with the name.
+            _case("statement.pdf", b"%PDF-1.7\n%binary", 200),
+            _case("no_extension_pdf", b"%PDF-1.7\n%binary", 200),
+            _case("no_extension_png", _PNG_HEAD, 200),
+            _case("letter.docx", _zip_bytes(*_OOXML_MEMBERS), 200),
+            _case("locked.docx", _ole_bytes("Root Entry", "EncryptedInfo", "EncryptedPackage"), 200),
+            _case("old.doc", _ole_bytes("Root Entry", "WordDocument"), 200),
+            _case("old.doc", b"{\\rtf1\\ansi saved as .doc}", 200),
+            _case("memo.rtf", b"{\\rtf1\\ansi hello}", 200),
+            _case("letter.odt", _zip_bytes("mimetype", "content.xml"), 200),
+            _case("ledger.xls", _ole_bytes("Workbook", body=b"\x00" + "_VBA_PROJECT\0".encode("utf-16-le")), 200),
+            _case("data.csv", b"name,email\nada,ada@example.com\n", 200),
+            _case("data.csv", b"name,email\n", 200, declared="application/vnd.ms-excel"),
+            _case("utf16.csv", "\ufeffname,email\n".encode("utf-16-le"), 200),
+            _case("report.txt", b"hello", 200, declared="text/plain"),
+            _case("readme.md", b"# Title\n<p>inline html in markdown</p>", 200),
+            _case("notes.md", b"<!-- generated -->\n# Title\n", 200),
+            _case("indented.txt", b" " * 9000 + b"plain text", 200),
+            _case("split_lt.txt", b" " * 8190 + b"<3 plain text", 200),
+            _case("config.yaml", b"retries: 3\n", 200),
+            _case("payload.json", b'{"a": 1}', 200, declared="application/json"),
+            _case("forwarded.eml", b"MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=x", 200),
+            _case("archive.zip", _zip_bytes("docs/readme.txt", "docs/tool.exe"), 200),
+            _case("scan.tiff", _TIFF_HEAD, 200),
+            _case("photo.heic", _HEIC_HEAD, 200),
+            _case("movie.mp4", _MP4_HEAD, 200, declared="video/mp4"),
+            _case("clip.webm", _WEBM_HEAD, 200),
+            _case("legacy.mov", b"\x00\x00\x00\x08wide\x00\x00\x00\x10mdat" + b"\x00" * 20, 200),
+            _case("fake.mov", _PNG_HEAD, 415),
+            # Real-world variants of the legacy, media, RTF and image formats.
+            _case("table.xls", b"<table><tr><td>1</td></tr></table>", 200),
+            _case("export.xls", b"name\temail\nada\tada@example.com\n", 200),
+            _case("workbook.xls", _SPREADSHEETML, 200),
+            _case("renamed.xls", _zip_bytes("[Content_Types].xml", "xl/workbook.xml"), 200),
+            _case("word2003.doc", _WORD_2003_XML, 200),
+            _case("renamed.doc", _zip_bytes(*_OOXML_MEMBERS), 200),
+            _case("deck.ppt", b"plain text", 200),
+            _case("moov_first.mp4", b"\x00\x00\x00\x08moov" + b"\x00" * 20, 200),
+            _case("free_first.mp4", b"\x00\x00\x00\x08free" + b"\x00" * 20, 200),
+            _case("wide_first.mp4", b"\x00\x00\x00\x08wide" + b"\x00" * 20, 200),
+            _case("bom.rtf", b"\xef\xbb\xbf{\\rtf1\\ansi hello}", 200),
+            _case("crlf.rtf", b"\r\n{\\rtf1\\ansi hello}", 200),
+            _case("heix.heic", b"\x00\x00\x00\x18ftypheix" + b"\x00" * 20, 200),
+            _case("mif1.heic", b"\x00\x00\x00\x18ftypmif1" + b"\x00" * 20, 200),
+            _case("big.tif", b"II+\x00\x08\x00\x00\x00" + b"\x00" * 20, 200),
+            _case(
+                "no_macros.odt", _zip_bytes(*_ODF_MEMBERS, "Basic/script-lc.xml", "Basic/Standard/script-lb.xml"), 200
+            ),
+            # Common non-standard declared types.
+            _case("photo.jpg", b"\xff\xd8\xff\xe0" + b"\x00" * 20, 200, declared="image/jpg"),
+            _case("data.csv", b"a,b\n", 200, declared="text/x-csv"),
+            _case("data.csv", b"a,b\n", 200, declared="application/x-csv"),
+            _case("archive.zip", _zip_bytes("docs/readme.txt"), 200, declared="multipart/x-zip"),
+            _case("clip.mov", _MP4_HEAD, 200, declared="video/x-quicktime"),
+            _case("memo.rtf", b"{\\rtf1 hi}", 200, declared="application/x-rtf"),
+            _case("scan.tif", _TIFF_HEAD, 200, declared="image/x-tiff"),
+            _case("data.csv", b"a,b\n", 200, declared="application/x-msexcel"),
+            _case("logo.png", _PNG_HEAD, 200, declared="image/x-png"),
+            _case("ledger.xls", _ole_bytes("Workbook"), 200, declared="application/x-excel"),
+            # Audio inputs a run may attach, and benign text and image types.
+            _case("song.mp3", b"ID3\x03" + b"\x00" * 20, 200, declared="audio/mpeg"),
+            _case("memo.wav", b"RIFF\x00\x00\x00\x00WAVE" + b"\x00" * 20, 200),
+            _case("memo.wav", b"RIFF\x00\x00\x00\x00WAVE" + b"\x00" * 20, 200, declared="audio/vnd.wave"),
+            _case("clip.ogg", b"OggS\x00\x02" + b"\x00" * 20, 200, declared="application/ogg"),
+            _case("meeting.ics", b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nEND:VCALENDAR\r\n", 200, declared="text/calendar"),
+            _case("contact.vcf", b"BEGIN:VCARD\r\nVERSION:3.0\r\nEND:VCARD\r\n", 200),
+            _case("server.log", b"2026-01-01 started\n", 200, declared="text/plain"),
+            _case("photo.avif", b"\x00\x00\x00\x1cftypavif" + b"\x00" * 20, 200),
+            _case("photo.jfif", b"\xff\xd8\xff\xe0\x00\x10JFIF" + b"\x00" * 20, 200),
+            _case("invite.ics", b"<html><script>alert(1)</script></html>", 415),
+            _case("song.mp3", _PE_HEAD, 415),
         ],
-        ids=lambda value: value if isinstance(value, str) else None,
+        ids=lambda value: value if isinstance(value, str) and "/" not in value else None,
     )
     def test_upload_type_is_enforced_at_the_upload_route(
-        self, filename: str, content: bytes, expected_status: int, monkeypatch: pytest.MonkeyPatch
+        self, filename: str, content: bytes, declared: str, expected_status: int, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         with (
             patch("skyvern.forge.sdk.routes.agent_protocol.app") as app_module,
@@ -515,13 +621,168 @@ class TestUploadTypeRestrictions:
             resp = _client(monkeypatch).post(
                 "/v1/upload_file",
                 headers={"x-api-key": "key"},
-                files={"file": (filename, io.BytesIO(content), "application/octet-stream")},
+                files={"file": (filename, io.BytesIO(content), declared)},
             )
 
             assert resp.status_code == expected_status, resp.text
             if expected_status == 415:
                 assert resp.json()["detail"].startswith("File type not allowed: ")
             assert app_module.STORAGE.save_legacy_file.await_count == (0 if expected_status == 415 else 1)
+
+    @pytest.mark.parametrize(
+        ("filename", "content"),
+        [("sop.docx", _zip_bytes(*_OOXML_MEMBERS)), ("sop.png", _PNG_HEAD)],
+    )
+    def test_pdf_import_refuses_types_the_generic_route_takes(
+        self, filename: str, content: bytes, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        with (
+            patch("skyvern.forge.sdk.routes.agent_protocol.app") as app_module,
+            patch(
+                "skyvern.forge.sdk.services.org_auth_service.get_current_org_cached",
+                new=AsyncMock(return_value=_make_org(VICTIM_ORG_ID)),
+            ),
+        ):
+            app_module.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE = settings.MAX_UPLOAD_FILE_SIZE
+
+            with capture_logs() as logs:
+                resp = _client(monkeypatch).post(
+                    "/api/v1/workflows/import-pdf",
+                    headers={"x-api-key": "key"},
+                    files={"file": (filename, io.BytesIO(content), _OCTET)},
+                )
+
+            assert resp.status_code == 415, resp.text
+            assert (
+                resp.json()["detail"] == f"File type not allowed: .{filename.rsplit('.', 1)[1]} files are not allowed"
+            )
+            [rejection] = [log for log in logs if log["event"] == "Rejected upload by file type"]
+            assert rejection["purpose"] == "import_pdf"
+            assert rejection["organization_id"] == VICTIM_ORG_ID
+
+    @pytest.mark.parametrize(
+        ("filename", "content", "declared", "expected_reason"),
+        [
+            ("dictation.webm", _MP4_HEAD, "", None),
+            ("dictation.mp4", _MP4_HEAD, "", None),
+            ("dictation.webm", b"OggS\x00\x02" + b"\x00" * 20, "", None),
+            ("dictation.webm", b"RIFF\x00\x00\x00\x00WAVE" + b"\x00" * 20, "", None),
+            ("dictation.webm", b"ID3\x03" + b"\x00" * 20, "", None),
+            ("dictation.webm", b"fLaC" + b"\x00" * 20, "", None),
+            ("dictation.mp3", b"ID3\x03" + b"\x00" * 20, "", None),
+            ("dictation.m4a", b"\x00\x00\x00\x08free" + b"\x00" * 20, "", None),
+            ("dictation.webm", _PNG_HEAD, "", "content does not match .webm"),
+            ("dictation.pdf", _MP4_HEAD, "", ".pdf files are not allowed"),
+        ],
+    )
+    def test_voice_notes_take_only_audio_types(
+        self, filename: str, content: bytes, declared: str, expected_reason: str | None
+    ) -> None:
+        """Browsers name every dictation .webm whatever container they record into, so the check is by family."""
+        file = UploadFile(file=io.BytesIO(content), filename=filename, headers=Headers({"content-type": declared}))
+        reason = uploaded_file_service._upload_type_rejection_reason(
+            file, uploaded_file_service.VOICE_NOTE_UPLOAD_EXTENSIONS, any_audio_container=True
+        )
+        assert reason == expected_reason
+
+    def test_upload_rejection_runs_after_auth_and_names_the_organization(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Unauthenticated callers never reach the content scan, and a refusal says who was refused where."""
+        with patch("skyvern.forge.sdk.routes.agent_protocol.app") as app_module:
+            app_module.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE = settings.MAX_UPLOAD_FILE_SIZE
+            client = _client(monkeypatch)
+            with patch.object(uploaded_file_service, "_upload_type_rejection_reason") as scan:
+                resp = client.post("/v1/upload_file", files={"file": ("tool.exe", io.BytesIO(_PE_HEAD), _OCTET)})
+            assert resp.status_code in (401, 403), resp.text
+            scan.assert_not_called()
+
+            with (
+                patch(
+                    "skyvern.forge.sdk.services.org_auth_service.get_current_org_cached",
+                    new=AsyncMock(return_value=_make_org(VICTIM_ORG_ID)),
+                ),
+                capture_logs() as logs,
+            ):
+                resp = client.post(
+                    "/v1/upload_file",
+                    headers={"x-api-key": "key"},
+                    files={"file": ("backup.7z", io.BytesIO(b"7z"), _OCTET)},
+                )
+            assert resp.status_code == 415, resp.text
+            [rejection] = [log for log in logs if log["event"] == "Rejected upload by file type"]
+            assert rejection["organization_id"] == VICTIM_ORG_ID
+            assert rejection["purpose"] == "upload_file"
+
+    @pytest.mark.parametrize(
+        ("extra", "filename", "content", "declared", "expected_reason"),
+        [
+            ([".ORG"], "todo.org", b"* TODO", "text/plain", None),
+            (["gz"], "bundle.gz", b"\x1f\x8b\x08" + b"\x00" * 20, "application/gzip", None),
+            ([], "todo.org", b"* TODO", "text/plain", ".org files are not allowed"),
+            (["exe"], "tool.exe", _PE_HEAD, "text/plain", ".exe files are not allowed"),
+            # Listing a built-in extension also reopens a declared-type refusal for it.
+            ([], "memo.rtf", b"{\\rtf1 hi}", "application/x-unknown-rtf", "declared type"),
+            (["rtf"], "memo.rtf", b"{\\rtf1 hi}", "application/x-unknown-rtf", None),
+        ],
+    )
+    def test_operators_can_widen_the_generic_allowlist_but_not_past_the_denylist(
+        self,
+        extra: list[str],
+        filename: str,
+        content: bytes,
+        declared: str,
+        expected_reason: str | None,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Through the public entry point, so the generic route's default allowlist is the one exercised."""
+        monkeypatch.setattr(settings, "UPLOAD_EXTRA_ALLOWED_EXTENSIONS", extra)
+        file = UploadFile(file=io.BytesIO(content), filename=filename, headers=Headers({"content-type": declared}))
+        if expected_reason is None:
+            uploaded_file_service.validate_upload_type(file, purpose="upload_file")
+            return
+        with pytest.raises(HTTPException) as refused:
+            uploaded_file_service.validate_upload_type(file, purpose="upload_file")
+        assert refused.value.status_code == 415
+        assert expected_reason in refused.value.detail
+
+    def test_operator_extensions_do_not_loosen_other_routes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(settings, "UPLOAD_EXTRA_ALLOWED_EXTENSIONS", ["pdf"])
+        file = UploadFile(
+            file=io.BytesIO(b"%PDF-1.7"), filename="sop.pdf", headers=Headers({"content-type": "image/png"})
+        )
+        with pytest.raises(HTTPException) as refused:
+            uploaded_file_service.validate_upload_type(
+                file, purpose="import_pdf", allowed=uploaded_file_service.PDF_UPLOAD_EXTENSIONS
+            )
+        assert "declared type image/png" in refused.value.detail
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("filename", "content", "logged_reason"),
+        [
+            ("capture.har", b'{"log": {}}', None),
+            ("setup.exe", b"not really", ".exe files are not allowed"),
+        ],
+    )
+    async def test_passthrough_logs_only_the_denylist(
+        self, filename: str, content: bytes, logged_reason: str | None
+    ) -> None:
+        """A third-party site may ask for any type, so pass-through files skip the allowlist but not the denylist."""
+        file = UploadFile(file=io.BytesIO(content), filename=filename, headers=Headers({"content-type": _OCTET}))
+        with capture_logs() as logs:
+            await uploaded_file_service.validate_passthrough_upload(file, max_size_bytes=None, purpose="test")
+        reasons = [log["reason"] for log in logs if log["event"] == "Accepted a restricted file type for pass-through"]
+        assert reasons == ([logged_reason] if logged_reason else [])
+
+    def test_every_route_allowlist_is_inside_the_declared_type_table(self) -> None:
+        """A route set outside the table would skip the declared-type check for those extensions."""
+        for allowed in (
+            uploaded_file_service.ALLOWED_UPLOAD_EXTENSIONS,
+            uploaded_file_service.PDF_UPLOAD_EXTENSIONS,
+            uploaded_file_service.RESUME_UPLOAD_EXTENSIONS,
+            uploaded_file_service.VOICE_NOTE_UPLOAD_EXTENSIONS,
+        ):
+            assert allowed <= uploaded_file_service.DECLARED_UPLOAD_TYPES.keys()
+        assert not uploaded_file_service.ALLOWED_UPLOAD_EXTENSIONS & uploaded_file_service.DENIED_UPLOAD_EXTENSIONS
 
 
 class TestExpirySweep:
