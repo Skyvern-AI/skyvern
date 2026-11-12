@@ -497,6 +497,17 @@ class BrowserExtensionRuntime:
         url = f"http://127.0.0.1:{embedded_relay.bound_port}/pair#{nonce}"
         return self.open_extension_url(url)
 
+    async def is_client_approved(self) -> bool:
+        """Broker-reported approval for this client. False outside broker mode or when the broker cannot answer."""
+        if not isinstance(self._relay, BrokerClient):
+            return False
+        try:
+            status = await self._relay.pairing_status()
+        except Exception as exc:  # noqa: BLE001 - An unanswered status check is not an approval.
+            LOG.debug("browser_extension_pairing_status_failed", error_type=type(exc).__name__)
+            return False
+        return status.get("approved") is True
+
     async def begin_pairing(self) -> bool:
         """Open this client's one-click pairing page after any current approval completes."""
         if not isinstance(self._relay, BrokerClient):

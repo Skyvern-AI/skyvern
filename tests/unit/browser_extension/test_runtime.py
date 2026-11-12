@@ -317,6 +317,30 @@ async def test_busy_pairing_waits_then_opens_this_clients_offer(monkeypatch: pyt
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("pairing_status", "expected"),
+    [
+        (AsyncMock(return_value={"active": False, "owned": False, "approved": True}), True),
+        (AsyncMock(return_value={"active": False, "owned": False, "approved": False}), False),
+        (AsyncMock(side_effect=BrowserExtensionBrokerError("BROKER_STOPPING", "Broker is stopping")), False),
+    ],
+)
+async def test_client_approval_comes_from_broker_pairing_status(
+    monkeypatch: pytest.MonkeyPatch,
+    pairing_status: AsyncMock,
+    expected: bool,
+) -> None:
+    async def ignore_event(_event: str, _params: dict) -> None:
+        return None
+
+    relay = BrokerClient(19777, ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
+    monkeypatch.setattr(relay, "pairing_status", pairing_status)
+    runtime = BrowserExtensionRuntime(relay, MagicMock())
+
+    assert await runtime.is_client_approved() is expected
+
+
+@pytest.mark.asyncio
 async def test_pairing_surfaces_extension_upgrade_requirement(monkeypatch: pytest.MonkeyPatch) -> None:
     async def ignore_event(_event: str, _params: dict) -> None:
         return None
