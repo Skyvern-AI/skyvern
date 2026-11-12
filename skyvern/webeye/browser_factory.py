@@ -471,7 +471,9 @@ def set_download_file_listener(
             # filesystem work, so it does not need to run under a timeout.
             resolved_path = await resolve_artifact_path(download, timeout_seconds)
             if resolved_path is None:
-                LOG.error(
+                # The action that owns this download reports the timeout as a typed failure, so this
+                # listener-side line is a duplicate of a condition the step already surfaces.
+                LOG.warning(
                     "timeout to download file, going to cancel the download",
                     workflow_run_id=workflow_run_id,
                     task_id=task_id,
