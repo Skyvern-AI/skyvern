@@ -38,6 +38,7 @@ from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.repositories.workflow_runs import WorkflowRunBlockErrorRow
 from skyvern.forge.sdk.executor.run_liveness import RunWriteAuthority
+from skyvern.forge.sdk.integrations import connected_accounts
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -1104,3 +1105,14 @@ async def register_download(
     artifact = await db.artifacts.get_artifact_by_id(artifact_id, organization_id)
     assert artifact is not None
     return artifact
+
+
+@contextmanager
+def connected_accounts_are(*accounts: connected_accounts.OrgConnection, agent_app: Any = None) -> Iterator[None]:
+    """The org's connected accounts are `accounts`, with backend hooks served from `agent_app` when a test patches a
+    module's `app`."""
+    with (
+        patch.object(connected_accounts, "org_connections", AsyncMock(return_value=list(accounts))),
+        patch.object(connected_accounts, "app", agent_app or app),
+    ):
+        yield
