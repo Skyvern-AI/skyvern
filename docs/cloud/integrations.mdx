@@ -97,6 +97,8 @@ The four **Credentials** tiles let agents log in with secrets you already keep e
 | Azure Key Vault | **Tenant ID**, **Client ID** and **Client Secret** of an app registration that can read the vault. |
 | Custom Credential Service | **API Base URL** and **API Token** of your service. Click **Test Connection** before you save. |
 
+For 1Password, Skyvern checks the token against 1Password before it saves it. A token that 1Password rejects, or that takes more than ten seconds to check, is not saved: the reason appears under **Service Account Token** and the token you had keeps working.
+
 For Bitwarden, **Email** and **Master Password** are the default. Add a **Personal API key** if Bitwarden asks Skyvern for a verification code (a new-device check or two-step login). Skyvern cannot enter these codes. Without a key, the run stops with a message that explains this.
 
 In the Bitwarden web app, open **Settings > Security > Keys > View API key**. Copy `client_id` (starts with `user.`) and `client_secret` into the form. Organization API keys do not work.
