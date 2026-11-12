@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from skyvern.forge.sdk.copilot.agent import (
+    _build_narrative_payload,
     _finalize_result_with_blocker_override,
     _make_agent_result,
     _terminal_failed_operation,
@@ -103,6 +104,25 @@ def test_backfill_adds_connection_cards_to_the_terminal_payload() -> None:
     assert result.narrative_payload["connectionCards"] == [card]
     assert empty.narrative_payload is not None
     assert "connectionCards" not in empty.narrative_payload
+
+
+def test_created_triggers_reach_the_persisted_payload_on_both_terminal_paths() -> None:
+    ctx = _ctx()
+    created = {
+        "eventTriggerId": "etr_1",
+        "sourceKind": "example_source",
+        "filters": [{"label": "Label", "value": "INBOX"}],
+        "firesOnItsOwn": True,
+        "connectionId": None,
+    }
+    ctx.created_triggers = [created]
+
+    result = _result(ctx, turn_outcome=_outcome(ResponseKind.BUILD), narrative_payload=_payload())
+    built = _build_narrative_payload(ctx, terminal="response", terminal_message="done", narrative_summary=None)
+
+    assert result.narrative_payload is not None
+    assert result.narrative_payload["createdTriggers"] == [created]
+    assert built["createdTriggers"] == [created]
 
 
 def test_a_legacy_outcome_with_google_setup_offers_still_loads() -> None:
