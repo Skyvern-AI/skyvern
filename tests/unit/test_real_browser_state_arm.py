@@ -25,7 +25,8 @@ def _rec(arm_result: bool = True) -> MagicMock:
 
 def _state(recorder: object, working_page: object) -> RealBrowserState:
     st = RealBrowserState.__new__(RealBrowserState)  # bypass __init__
-    st._disconnect_listener_contexts = weakref.WeakSet()  # constructor invariant the browser_context setter reads
+    st._disconnect_listener_contexts = weakref.WeakSet()  # constructor invariants the browser_context setter reads
+    st._run_released = False
     st.browser_context = MagicMock()  # non-None -> creation branch skipped
     st.browser_context.pages = []
     st.external_browser = False

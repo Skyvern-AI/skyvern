@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import random
 import time
+import uuid
 import weakref
 from collections import deque
 from collections.abc import Awaitable, Callable, Collection, Sequence
@@ -542,6 +543,7 @@ class RealBrowserState(BrowserState):
         self._browser_context = context
         if context is not None:
             self._watch_context_for_crashes(context)
+            self._set_run_http_cache()
 
     def add_on_close(self, callback: Callable[[], Awaitable[None]]) -> None:
         self._on_close_callbacks.append(callback)
@@ -552,6 +554,7 @@ class RealBrowserState(BrowserState):
             context,
             browser_session_id=context.browser_session_id or self._runtime_event_context.browser_session_id,
         ).with_browser_dimensions_of(self._runtime_event_context)
+        self._set_run_http_cache()
 
     @property
     def runtime_event_context(self) -> BrowserRuntimeLogContext:
@@ -559,7 +562,15 @@ class RealBrowserState(BrowserState):
 
     def mark_run_released(self) -> None:
         self._run_released = True
+        self._set_run_http_cache()
         app.AGENT_FUNCTION.on_browser_run_released(self.browser_context or self.browser_artifacts)
+
+    # Every bind gets a new generation and every release turns it off, so no response is reused across runs, even
+    # when a persistent or shared context outlives the run that filled it.
+    def _set_run_http_cache(self) -> None:
+        if self._browser_context is not None:
+            generation = None if self._run_released else uuid.uuid4().hex
+            app.AGENT_FUNCTION.set_browser_run_http_cache(self._browser_context, generation)
 
     @property
     def _run_phase(self) -> RunPhase:
