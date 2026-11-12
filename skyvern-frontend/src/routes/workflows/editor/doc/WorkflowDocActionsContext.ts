@@ -39,6 +39,9 @@ export const WorkflowDocActionsContext = createContext<{
   // Undefined until the user or a navigation opens or closes the step's Details.
   detailsOpen: (id: string) => boolean | undefined;
   setDetailsOpen: (id: string, open: boolean) => void;
+  // A long main text is folded until it is opened; held in memory by step id, never saved.
+  textOpen: (id: string) => boolean;
+  setTextOpen: (id: string, open: boolean) => void;
   // Null when the doc is read-only (flag on but locked, a run going, or a read-only scope).
   edit: DocEditApi | null;
   destinations: () => DocDestination[];
@@ -76,6 +79,8 @@ export const WorkflowDocActionsContext = createContext<{
   toggleConditional: () => {},
   detailsOpen: () => undefined,
   setDetailsOpen: () => {},
+  textOpen: () => false,
+  setTextOpen: () => {},
   edit: null,
   destinations: () => [],
   demonstrateAt: () => null,

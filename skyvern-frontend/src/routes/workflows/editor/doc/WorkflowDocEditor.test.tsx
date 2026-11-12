@@ -2863,3 +2863,217 @@ describe("the Add note button", () => {
     });
   });
 });
+
+describe("a long step text", () => {
+  const LONG =
+    "Open the report.\nCheck every row.\nNote each difference.\nWAIT_FOR_THE_LAST_LINE and stop.";
+  beforeEach(() => {
+    useWorkflowYamlEditorStore.setState(
+      useWorkflowYamlEditorStore.getInitialState(),
+    );
+    useWorkflowParametersStore.setState({ parameters: [] });
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      },
+    );
+    vi.stubGlobal("requestAnimationFrame", (cb: () => void) => {
+      cb();
+      return 0;
+    });
+    vi.stubGlobal("CSS", { escape: (value: string) => value });
+    Element.prototype.scrollIntoView = vi.fn();
+    // jsdom has no layout: a text with four lines measures four lines high (24.8px each at the default font). It has no
+    // innerText either, so the editing span of a long step is measured by that step's text.
+    Object.defineProperty(HTMLElement.prototype, "scrollHeight", {
+      configurable: true,
+      get(this: HTMLElement) {
+        const editingLong =
+          this.isContentEditable ||
+          this.getAttribute("contenteditable") === "plaintext-only"
+            ? /^(long_step|other_long) /.test(
+                this.getAttribute("aria-label") ?? "",
+              )
+            : false;
+        const text = editingLong ? LONG : (this.textContent ?? "");
+        return text.split("\n").length * 24.8;
+      },
+    });
+  });
+  afterEach(() => {
+    cleanup();
+    useLocateBlockStore.getState().clearLocate();
+    vi.unstubAllGlobals();
+    // @ts-expect-error removing the jsdom layout stub restores the prototype's own getter
+    delete HTMLElement.prototype.scrollHeight;
+  });
+
+  const steps = () => [
+    block("navigation", "long_step", "short_step", { navigation_goal: LONG }),
+    block("navigation", "short_step", "other_long", {
+      navigation_goal: "Click Next.\nWait.\nStop.",
+    }),
+    block("navigation", "other_long", null, {
+      navigation_goal: LONG.replace("Open the report.", "Read the terms."),
+    }),
+  ];
+  const textbox = (label: string) =>
+    screen.getByRole("textbox", { name: `${label} navigationGoal` });
+  const folded = (label: string) => textbox(label).style.overflow === "hidden";
+
+  test("folds only a text longer than three lines, keeps all of it in the page, and saves nothing", () => {
+    const live = renderLiveDoc(steps());
+    const before = live.graph();
+
+    const controls = screen.getAllByRole("button", { name: /^Show more/ });
+    expect(controls).toHaveLength(2);
+    expect(controls[0]!.getAttribute("aria-expanded")).toBe("false");
+    expect(controls[0]!.getAttribute("aria-controls")).toBe(
+      textbox("long_step").id,
+    );
+    expect(folded("long_step")).toBe(true);
+    expect(textbox("long_step").textContent).toContain(
+      "WAIT_FOR_THE_LAST_LINE",
+    );
+    expect(
+      within(textbox("short_step").parentElement!).queryByRole("button", {
+        name: /^Show/,
+      }),
+    ).toBeNull();
+
+    fireEvent.click(controls[0]!);
+    const less = screen.getByRole("button", { name: /^Show less/ });
+    expect(less.getAttribute("aria-expanded")).toBe("true");
+    expect(folded("long_step")).toBe(false);
+    expect(folded("other_long")).toBe(true);
+
+    fireEvent.click(less);
+    expect(folded("long_step")).toBe(true);
+    expect(live.graph()).toBe(before);
+  });
+
+  test("focusing the text opens it, and it stays open after the edit", () => {
+    renderLiveDoc(steps());
+    fireEvent.focus(textbox("long_step"));
+    const editing = textbox("long_step");
+    expect(editing.getAttribute("contenteditable")).toBe("plaintext-only");
+    fireEvent.blur(editing);
+    expect(folded("long_step")).toBe(false);
+    expect(screen.getAllByRole("button", { name: /^Show less/ })).toHaveLength(
+      1,
+    );
+    expect(folded("other_long")).toBe(true);
+  });
+
+  test("Show less stays mounted after the editing line and keeps focus as the line closes, then folds or opens it", () => {
+    renderLiveDoc(steps());
+    act(() => textbox("long_step").focus());
+    const editing = textbox("long_step");
+    expect(editing.getAttribute("contenteditable")).toBe("plaintext-only");
+    expect(document.activeElement).toBe(editing);
+    const control = screen.getByRole("button", { name: /^Show less: / });
+    expect(control.compareDocumentPosition(editing)).toBe(
+      Node.DOCUMENT_POSITION_PRECEDING,
+    );
+    // The line leaves Tab to the browser, which moves focus to the next control.
+    expect(fireEvent.keyDown(editing, { key: "Tab" })).toBe(true);
+    act(() => control.focus());
+    expect(textbox("long_step").getAttribute("contenteditable")).toBeNull();
+    expect(control.isConnected).toBe(true);
+    expect(document.activeElement).toBe(control);
+
+    fireEvent.click(control);
+    expect(folded("long_step")).toBe(true);
+    expect(document.activeElement).toBe(control);
+    expect(control.getAttribute("aria-label")).toMatch(/^Show more: /);
+    fireEvent.click(control);
+    expect(folded("long_step")).toBe(false);
+
+    act(() => textbox("long_step").focus());
+    expect(textbox("long_step").getAttribute("contenteditable")).toBe(
+      "plaintext-only",
+    );
+  });
+
+  test("read-only, a step whose first field is empty folds the long text that takes its place; an editable one does not", () => {
+    const promoted = () =>
+      block("task", "promoted_step", "primary_step", {
+        navigation_goal: "",
+        data_extraction_goal: LONG,
+      });
+    const primary = block("task", "primary_step", null, {
+      navigation_goal: LONG,
+    });
+    const { nodes, edges } = getElements(
+      [promoted(), primary],
+      settings(),
+      true,
+    );
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter>
+          <ReactFlowProvider>
+            <WorkflowScopeContext.Provider
+              value={{ workflowId: null, readOnly: true }}
+            >
+              <WorkflowDocEditor nodes={nodes} edges={edges} />
+            </WorkflowScopeContext.Provider>
+          </ReactFlowProvider>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    const controls = screen.getAllByRole("button", { name: /^Show more/ });
+    expect(controls.map((c) => c.getAttribute("aria-label"))).toEqual([
+      "Show more: Promoted step",
+      "Show more: Primary step",
+    ]);
+    for (const control of controls) {
+      const text = document.getElementById(
+        control.getAttribute("aria-controls")!,
+      )!;
+      expect(text.style.overflow).toBe("hidden");
+      expect(text.textContent).toContain("WAIT_FOR_THE_LAST_LINE");
+    }
+    cleanup();
+
+    // A task step is read-only in the Doc; a login step is the editable one with a second field.
+    renderLiveDoc([
+      block("login", "editable_step", null, {
+        navigation_goal: "",
+        complete_criterion: LONG,
+      }),
+    ]);
+    expect(
+      screen.getByRole("textbox", { name: "editable_step navigationGoal" })
+        .textContent,
+    ).not.toContain("WAIT_FOR_THE_LAST_LINE");
+    expect(screen.queryByRole("button", { name: /^Show/ })).toBeNull();
+  });
+
+  test("a Locate from the run lands on the whole text", () => {
+    const live = renderLiveDoc(steps());
+    const target = live
+      .graph()
+      .nodes.find((n) => n.data.label === "other_long")!;
+    act(() => useLocateBlockStore.getState().requestLocate(target.id));
+    expect(folded("other_long")).toBe(false);
+    expect(folded("long_step")).toBe(true);
+  });
+
+  test("a search result lands on the whole text", () => {
+    renderLiveDoc(steps());
+    fireEvent.keyDown(
+      screen.getByRole("region", { name: "Workflow document" }),
+      { key: "k", ctrlKey: true },
+    );
+    fireEvent.change(screen.getByPlaceholderText("Search steps…"), {
+      target: { value: "Read the terms" },
+    });
+    fireEvent.click(screen.getByRole("option"));
+    expect(folded("other_long")).toBe(false);
+    expect(folded("long_step")).toBe(true);
+  });
+});

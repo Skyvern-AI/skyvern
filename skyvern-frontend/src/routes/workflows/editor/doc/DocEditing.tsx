@@ -55,6 +55,7 @@ import {
   type PickerOpener,
 } from "./docKeys";
 import { DocText } from "./DocText";
+import { DocLongText, type DocTextCollapse } from "./DocLongText";
 import { saveAndReport, useDocSaveFailureStore } from "./docSaveState";
 import { WorkflowDocActionsContext } from "./WorkflowDocActionsContext";
 
@@ -309,6 +310,7 @@ export function DocEditableLine({
   caretAtStart,
   pickerOnStart,
   maxLength,
+  collapse,
 }: {
   value: string;
   editable: boolean;
@@ -339,11 +341,13 @@ export function DocEditableLine({
   // True when entering the line should open the step picker on it, as "/" would.
   pickerOnStart?: () => boolean;
   maxLength?: number;
+  // A step's main text folds to its first lines when it is long; notes and secondary lines leave this out.
+  collapse?: DocTextCollapse;
 }) {
   const [editing, setEditing] = useState(autoFocus);
   const [overLimit, setOverLimit] = useState(false);
   const { anchorRef, padding } = useDocBoundary();
-  const ref = useRef<HTMLSpanElement>(null);
+  const ref = useRef<HTMLSpanElement | null>(null);
   const emitted = useRef(value);
   const [referenceGroups, setReferenceGroups] = useState<
     DocReferenceGroup[] | null
@@ -451,42 +455,60 @@ export function DocEditableLine({
   useEffect(() => {
     if (autoFocus) setEditing(true);
   }, [autoFocus]);
+  // Every way into editing opens the text, including a line that starts in editing (a new step's autofocus).
+  // A layout effect, so the editing line is never painted folded. `collapse` stays out of the dependencies on purpose:
+  // a later open=false (Show less) must not re-open the text while the line is being edited.
+  useLayoutEffect(() => {
+    if (editing && editable) collapse?.setOpen(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editing, editable]);
 
-  // Distinct keys: the editing span holds browser-owned text React must not reuse.
+  const shownText = value.trim() ? (
+    <DocText value={value} />
+  ) : (
+    <DocText
+      value={placeholder ?? ""}
+      className="font-normal text-muted-foreground"
+    />
+  );
+  // Distinct keys: the editing span holds browser-owned text React must not reuse. One wrapper key across read-only,
+  // viewing and editing keeps Show less mounted, so it keeps focus when the line closes or the Doc locks.
   if (!editable)
     return (
-      <span key="read" className={className}>
-        {value.trim() ? (
-          <DocText value={value} />
-        ) : (
-          <DocText
-            value={placeholder ?? ""}
-            className="font-normal text-muted-foreground"
-          />
+      <DocLongText key="line" collapse={collapse} value={value}>
+        {(shown) => (
+          <span
+            ref={shown.ref}
+            id={shown.id}
+            style={shown.style}
+            className={cn(collapse && "block", className)}
+          >
+            {shownText}
+          </span>
         )}
-      </span>
+      </DocLongText>
     );
   if (!editing)
     return (
-      <span
-        key="view"
-        data-doc-line
-        role="textbox"
-        tabIndex={0}
-        aria-label={label}
-        onClick={() => setEditing(true)}
-        onFocus={() => setEditing(true)}
-        className={cn("block cursor-text rounded outline-none", className)}
-      >
-        {value.trim() ? (
-          <DocText value={value} />
-        ) : (
-          <DocText
-            value={placeholder ?? ""}
-            className="font-normal text-muted-foreground"
-          />
+      <DocLongText key="line" collapse={collapse} value={value}>
+        {(shown) => (
+          <span
+            key="view"
+            ref={shown.ref}
+            id={shown.id}
+            style={shown.style}
+            data-doc-line
+            role="textbox"
+            tabIndex={0}
+            aria-label={label}
+            onClick={() => setEditing(true)}
+            onFocus={() => setEditing(true)}
+            className={cn("block cursor-text rounded outline-none", className)}
+          >
+            {shownText}
+          </span>
         )}
-      </span>
+      </DocLongText>
     );
 
   // Opens the step picker for this line. The line stays open until the picker finishes: it can type the "/" after all,
@@ -652,123 +674,137 @@ export function DocEditableLine({
     }
   };
   return (
-    <Popover
-      key="edit"
-      open={referenceGroups !== null}
-      // Leaving the menu types nothing: the "@" only opened it.
-      onOpenChange={(open) => !open && closeReferences("")}
-    >
-      <PopoverAnchor asChild ref={anchorRef}>
-        <span
-          ref={ref}
-          role="textbox"
-          aria-label={label}
-          data-doc-line
-          aria-multiline={multiline}
-          contentEditable="plaintext-only"
-          suppressContentEditableWarning
-          data-placeholder={editingPlaceholder}
-          aria-placeholder={editingPlaceholder}
-          onInput={() => {
-            const el = ref.current;
-            let next = el?.innerText ?? "";
-            const tooLong = maxLength !== undefined && next.length > maxLength;
-            setOverLimit(tooLong);
-            if (el && tooLong) {
-              // Keep the text savable: cut it at the limit and say so under the line.
-              next = next.slice(0, maxLength);
-              el.innerText = next;
-              const range = document.createRange();
-              range.selectNodeContents(el);
-              range.collapse(false);
-              window.getSelection()?.removeAllRanges();
-              window.getSelection()?.addRange(range);
-            }
-            emitted.current = next;
-            onChange(next);
-          }}
-          onKeyDown={onKeyDown}
-          onBlur={() => {
-            if (caret.current || slashAt.current) return;
-            setEditing(false);
-            setOverLimit(false);
-            onDone?.(ref.current?.innerText ?? value);
-          }}
-          className={cn(
-            "block min-h-[1.55em] whitespace-pre-wrap rounded outline-none [overflow-wrap:anywhere] empty:before:font-normal empty:before:text-muted-foreground empty:before:content-[attr(data-placeholder)]",
-            className,
-          )}
-        />
-      </PopoverAnchor>
-      {/* At the limit too: a pending note remounts as the real one on its first input, which resets overLimit. */}
-      {(overLimit ||
-        (maxLength !== undefined && value.length >= maxLength)) && (
-        <span role="status" className="block text-xs text-destructive">
-          A note holds up to {maxLength?.toLocaleString("en-US")} characters.
-        </span>
-      )}
-      <PopoverContent
-        align="start"
-        collisionPadding={padding()}
-        sticky="always"
-        className={cn("w-[min(320px,calc(100vw-32px))] p-0", docMenuClass)}
-        onCloseAutoFocus={(e) => e.preventDefault()}
-      >
-        <Command loop className="min-h-0">
-          <CommandInput
-            autoFocus
-            placeholder="Insert a reference…"
-            value={referenceQuery}
-            onValueChange={setReferenceQuery}
-          />
-          <CommandList className="max-h-[min(300px,45vh)]">
-            <CommandEmpty>
-              {createInput
-                ? "Nothing to reference yet. Type a name to create an input."
-                : "Nothing to reference here."}
-            </CommandEmpty>
-            {(referenceGroups ?? []).map((group) => (
-              <CommandGroup key={group.name} heading={group.name}>
-                {group.items.map((item) => (
-                  <CommandItem
-                    key={item.key}
-                    value={`${item.key} ${group.name}`}
-                    onSelect={() => closeReferences(`{{ ${item.key} }}`)}
-                    className="flex items-baseline gap-2"
-                  >
-                    <span className="rounded bg-muted px-[5px] text-[13px] font-medium">
-                      {item.label ?? item.key}
-                    </span>
-                    <span className="min-w-0 truncate text-xs text-muted-foreground">
-                      {item.hint}
-                    </span>
-                  </CommandItem>
-                ))}
-              </CommandGroup>
-            ))}
-            {newInputKey && (
-              <CommandGroup heading="New">
-                <CommandItem
-                  value={`create input ${newInputKey}`}
-                  onSelect={() => {
-                    if (createInput?.(newInputKey))
-                      closeReferences(`{{ ${newInputKey} }}`);
-                  }}
-                  className="flex flex-col items-start gap-0"
-                >
-                  <span className="text-[13px]">
-                    Create input "{newInputKey}"
-                  </span>
-                  <span className="text-xs text-muted-foreground">
-                    Adds it to the inputs at the top
-                  </span>
-                </CommandItem>
-              </CommandGroup>
+    <DocLongText key="line" collapse={collapse} value={value}>
+      {(shown) => {
+        // The editing span is not measured: its raw text wraps unlike the view's reference pills, so the control
+        // keeps what the view measured last.
+        return (
+          <Popover
+            key="edit"
+            open={referenceGroups !== null}
+            // Leaving the menu types nothing: the "@" only opened it.
+            onOpenChange={(open) => !open && closeReferences("")}
+          >
+            <PopoverAnchor asChild ref={anchorRef}>
+              <span
+                ref={ref}
+                id={shown.id}
+                role="textbox"
+                aria-label={label}
+                data-doc-line
+                aria-multiline={multiline}
+                contentEditable="plaintext-only"
+                suppressContentEditableWarning
+                data-placeholder={editingPlaceholder}
+                aria-placeholder={editingPlaceholder}
+                onInput={() => {
+                  const el = ref.current;
+                  let next = el?.innerText ?? "";
+                  const tooLong =
+                    maxLength !== undefined && next.length > maxLength;
+                  setOverLimit(tooLong);
+                  if (el && tooLong) {
+                    // Keep the text savable: cut it at the limit and say so under the line.
+                    next = next.slice(0, maxLength);
+                    el.innerText = next;
+                    const range = document.createRange();
+                    range.selectNodeContents(el);
+                    range.collapse(false);
+                    window.getSelection()?.removeAllRanges();
+                    window.getSelection()?.addRange(range);
+                  }
+                  emitted.current = next;
+                  onChange(next);
+                }}
+                onKeyDown={onKeyDown}
+                onBlur={() => {
+                  if (caret.current || slashAt.current) return;
+                  setEditing(false);
+                  setOverLimit(false);
+                  onDone?.(ref.current?.innerText ?? value);
+                }}
+                className={cn(
+                  "block min-h-[1.55em] whitespace-pre-wrap rounded outline-none [overflow-wrap:anywhere] empty:before:font-normal empty:before:text-muted-foreground empty:before:content-[attr(data-placeholder)]",
+                  className,
+                )}
+              />
+            </PopoverAnchor>
+            {/* At the limit too: a pending note remounts as the real one on its first input, which resets overLimit. */}
+            {(overLimit ||
+              (maxLength !== undefined && value.length >= maxLength)) && (
+              <span role="status" className="block text-xs text-destructive">
+                A note holds up to {maxLength?.toLocaleString("en-US")}{" "}
+                characters.
+              </span>
             )}
-          </CommandList>
-        </Command>
-      </PopoverContent>
-    </Popover>
+            <PopoverContent
+              align="start"
+              collisionPadding={padding()}
+              sticky="always"
+              className={cn(
+                "w-[min(320px,calc(100vw-32px))] p-0",
+                docMenuClass,
+              )}
+              onCloseAutoFocus={(e) => e.preventDefault()}
+            >
+              <Command loop className="min-h-0">
+                <CommandInput
+                  autoFocus
+                  placeholder="Insert a reference…"
+                  value={referenceQuery}
+                  onValueChange={setReferenceQuery}
+                />
+                <CommandList className="max-h-[min(300px,45vh)]">
+                  <CommandEmpty>
+                    {createInput
+                      ? "Nothing to reference yet. Type a name to create an input."
+                      : "Nothing to reference here."}
+                  </CommandEmpty>
+                  {(referenceGroups ?? []).map((group) => (
+                    <CommandGroup key={group.name} heading={group.name}>
+                      {group.items.map((item) => (
+                        <CommandItem
+                          key={item.key}
+                          value={`${item.key} ${group.name}`}
+                          onSelect={() => closeReferences(`{{ ${item.key} }}`)}
+                          className="flex items-baseline gap-2"
+                        >
+                          <span className="rounded bg-muted px-[5px] text-[13px] font-medium">
+                            {item.label ?? item.key}
+                          </span>
+                          <span className="min-w-0 truncate text-xs text-muted-foreground">
+                            {item.hint}
+                          </span>
+                        </CommandItem>
+                      ))}
+                    </CommandGroup>
+                  ))}
+                  {newInputKey && (
+                    <CommandGroup heading="New">
+                      <CommandItem
+                        value={`create input ${newInputKey}`}
+                        onSelect={() => {
+                          if (createInput?.(newInputKey))
+                            closeReferences(`{{ ${newInputKey} }}`);
+                        }}
+                        className="flex flex-col items-start gap-0"
+                      >
+                        <span className="text-[13px]">
+                          Create input "{newInputKey}"
+                        </span>
+                        <span className="text-xs text-muted-foreground">
+                          Adds it to the inputs at the top
+                        </span>
+                      </CommandItem>
+                    </CommandGroup>
+                  )}
+                </CommandList>
+              </Command>
+            </PopoverContent>
+          </Popover>
+        );
+      }}
+    </DocLongText>
   );
 }
 

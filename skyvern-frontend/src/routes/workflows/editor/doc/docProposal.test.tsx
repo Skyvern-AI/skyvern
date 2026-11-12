@@ -1447,3 +1447,110 @@ test("a proposal's input chips do not open the live Inputs panel", async () => {
     false,
   );
 });
+
+describe("a long text in a Copilot proposal", () => {
+  const FIVE = (last: string) =>
+    `Open the report.\nCheck every row.\nNote each difference.\nSum the totals.\n${last}`;
+  beforeEach(() => {
+    // jsdom has no layout: a text measures one 24.8px line per line of its text.
+    Object.defineProperty(HTMLElement.prototype, "scrollHeight", {
+      configurable: true,
+      get(this: HTMLElement) {
+        return (this.textContent ?? "").split("\n").length * 24.8;
+      },
+    });
+  });
+  afterEach(() => {
+    // @ts-expect-error removing the jsdom layout stub restores the prototype's own getter
+    delete HTMLElement.prototype.scrollHeight;
+  });
+  const live = [
+    task("long_step", "other_step", { navigation_goal: FIVE("Stop.") }),
+    task("other_step", null, { navigation_goal: FIVE("Wait.") }),
+  ];
+  const propose = (blocks: WorkflowBlock[], base = live) =>
+    act(() =>
+      useCopilotProposalStore.getState().setProposal({
+        proposed: workflow(blocks),
+        baseline: workflow(base),
+        review: null,
+        actionable: true,
+        acceptable: true,
+        decide: vi.fn(async () => true),
+      }),
+    );
+  const textWith = (snippet: string) =>
+    Array.from(document.querySelectorAll<HTMLElement>("span[id]")).find((el) =>
+      el.textContent?.includes(snippet),
+    )!;
+  const folded = (snippet: string) =>
+    textWith(snippet).style.overflow === "hidden";
+  const control = (step: string) =>
+    screen.queryByRole("button", {
+      name: new RegExp(`^Show (more|less): ${step}$`),
+    });
+  const renderLive = async (base = live) => {
+    const { nodes, edges } = getElements(base, settings, true);
+    await renderInStudio(<WorkflowDocEditor nodes={nodes} edges={edges} />);
+  };
+
+  test("a change on the fifth line shows the whole text, and the fold returns when the proposal ends", async () => {
+    await propose([
+      task("long_step", "other_step", {
+        navigation_goal: FIVE("CHANGED_LINE"),
+      }),
+      live[1]!,
+    ]);
+    await renderLive();
+    expect(control("Long step")).toBeNull();
+    expect(folded("CHANGED_LINE")).toBe(false);
+    expect(folded("Wait.")).toBe(true);
+
+    act(() => useCopilotProposalStore.getState().setProposal(null));
+    expect(control("Long step")).not.toBeNull();
+    expect(folded("Stop.")).toBe(true);
+  });
+
+  test("an added step with a long text shows all of it", async () => {
+    await propose([
+      ...live.slice(0, 1),
+      task("other_step", "new_step", { navigation_goal: FIVE("Wait.") }),
+      task("new_step", null, { navigation_goal: FIVE("ADDED_LINE") }),
+    ]);
+    await renderLive();
+    expect(control("New step")).toBeNull();
+    expect(folded("ADDED_LINE")).toBe(false);
+    expect(folded("Stop.")).toBe(true);
+  });
+
+  test("a change to the text shown in place of an empty first field shows all of it", async () => {
+    const check = (last: string) =>
+      task("check_step", null, {
+        navigation_goal: "",
+        complete_criterion: FIVE(last),
+      });
+    const base = [
+      task("other_step", "check_step", { navigation_goal: FIVE("Wait.") }),
+      check("Done."),
+    ];
+    await propose([base[0]!, check("PROMOTED_CHANGE")], base);
+    await renderLive(base);
+    expect(control("Check step")).toBeNull();
+    expect(folded("PROMOTED_CHANGE")).toBe(false);
+    expect(folded("Wait.")).toBe(true);
+  });
+
+  test("a change to another setting of the step leaves its long text folded", async () => {
+    await propose([
+      task("long_step", "other_step", {
+        navigation_goal: FIVE("Stop."),
+        max_retries: 3,
+      }),
+      live[1]!,
+    ]);
+    await renderLive();
+    expect(screen.getAllByText("Changed").length).toBeGreaterThanOrEqual(1);
+    expect(control("Long step")).not.toBeNull();
+    expect(folded("Stop.")).toBe(true);
+  });
+});
