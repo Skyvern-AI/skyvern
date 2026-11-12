@@ -17,9 +17,11 @@ from pydantic import JsonValue, ValidationError
 from sqlalchemy.ext.asyncio import AsyncEngine
 from structlog.testing import capture_logs
 
+from skyvern.config import settings
 from skyvern.forge import app as forge_app
 from skyvern.forge.failure_classifier import with_sign_in_form_visible
 from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.cache.local import LocalCache
 from skyvern.forge.sdk.copilot import runtime
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.agent import (
@@ -103,6 +105,7 @@ from skyvern.forge.sdk.copilot.secret_scrub import clear_session_scrub_values, r
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools import workflow_update as workflow_update_module
 from skyvern.forge.sdk.copilot.tools.composition_capture import store_post_run_page_evidence
+from skyvern.forge.sdk.copilot.tools.credentials import CredentialGateResult
 from skyvern.forge.sdk.copilot.tools.run_execution import (
     COPILOT_PROPOSAL_SETTINGS_CHANGED_ERROR,
     _authored_literal_locator_selectors,
@@ -131,6 +134,7 @@ from skyvern.forge.sdk.copilot.workflow_yaml import runner_code_block_associatio
 from skyvern.forge.sdk.db.base_alchemy_db import BaseAlchemyDB
 from skyvern.forge.sdk.db.exceptions import CopilotProposalConflictError
 from skyvern.forge.sdk.db.repositories.workflow_parameters import WorkflowParametersRepository
+from skyvern.forge.sdk.integrations.connected_accounts import OrgConnection, run_connection_ids
 from skyvern.forge.sdk.routes import workflow_copilot as workflow_copilot_route
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.forge.sdk.schemas.workflow_copilot import (
@@ -5935,6 +5939,68 @@ async def test_candidate_run_bind_uses_the_call_owned_source_and_token(
     assert captured["expected_revision"] == 3
     assert captured["expected_workflow_yaml"] == HANDBACK_WORKFLOW_YAML
     assert (ctx.proposal_owner_turn_id, ctx.proposal_revision, ctx.staged_workflow) == captured["ctx_at_bind"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("record_fails", "narrowing_on"),
+    [(False, True), (True, True), (True, False)],
+    ids=["recorded", "record_failed", "record_failed_narrowing_off"],
+)
+async def test_a_test_run_records_the_approved_accounts_for_its_run_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch, record_fails: bool, narrowing_on: bool
+) -> None:
+    monkeypatch.setattr(settings, "COPILOT_NARROW_AGENT_STEP_ACCOUNTS", narrowing_on)
+    harness = await install_run_blocks_harness(
+        monkeypatch,
+        workflow_yaml=HANDBACK_WORKFLOW_YAML,
+        polled_status="completed",
+        terminal_blocks=[terminal_extraction_block("completed")],
+    )
+    gate_calls: list[dict[str, object]] = []
+
+    async def gate(*_args: object, **kwargs: object) -> CredentialGateResult:
+        gate_calls.append(kwargs)
+        return CredentialGateResult(agent_step_connection_ids=("goac_a",))
+
+    cache = LocalCache()
+    if record_fails:
+        cache.set = AsyncMock(side_effect=RuntimeError("cache down"))  # type: ignore[method-assign]
+    monkeypatch.setattr(run_execution_module, "run_credential_gate", gate)
+    monkeypatch.setattr(forge_app, "CACHE", cache)
+    monkeypatch.setattr(forge_app.WORKFLOW_SERVICE, "mark_workflow_run_as_failed_if_not_final", AsyncMock())
+    accounts = [
+        OrgConnection(account_id, "google", account_id, f"{account_id}@example.com", "active", ())
+        for account_id in ("goac_a", "goac_b")
+    ]
+    # The worker reads accounts as the run's creator; only what it can select is reported.
+    copilot_run = workflow_service_module.prepare_workflow.return_value.model_copy(update={"created_by": "copilot"})
+    monkeypatch.setattr(workflow_service_module, "prepare_workflow", AsyncMock(return_value=copilot_run))
+    monkeypatch.setattr(
+        run_execution_module,
+        "org_connections_by_id",
+        AsyncMock(side_effect=lambda organization_id, user_id=None: accounts if user_id == "copilot" else []),
+    )
+    ctx = make_copilot_ctx(browser_session_id="pbs_chat")
+    ctx.frontier_resume_session_id = "pbs_run"
+
+    result = await _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
+
+    assert [call["narrow_agent_step_accounts"] for call in gate_calls] == [True]
+    if record_fails and narrowing_on:
+        assert result["ok"] is False and "approved accounts could not be recorded" in result["error"]
+        forge_app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final.assert_awaited()
+        forge_app.WORKFLOW_SERVICE.execute_workflow.assert_not_awaited()
+    elif record_fails:
+        # Off, a failed record changes nothing: the worker offers every account without one.
+        assert result["ok"] is True, result
+        assert "agent_step_accounts" not in result["data"]
+    else:
+        assert result["ok"] is True, result
+        assert await run_connection_ids(ctx.organization_id, "wr_paused") == {"goac_a"}
+        # The model sees which account the steps got, so it can raise the card for a switch.
+        assert [account["connection_id"] for account in result["data"]["agent_step_accounts"]] == ["goac_a"]
+    assert harness["executor_cancelled"] is False
 
 
 @pytest.mark.asyncio

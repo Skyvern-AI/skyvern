@@ -290,6 +290,9 @@ class Settings(BaseSettings):
     # Experimental Workflow Copilot code-first authoring mode.
     # Off = standard block authoring. On = prefer code blocks for browser work.
     WORKFLOW_COPILOT_CODE_BLOCK_MODE: bool = False
+    # Offer a Copilot test run's agent steps only the accounts the chat approved. Turn on for every worker fleet
+    # before any API (and off in the reverse order): a worker that is off offers every account when a record is lost.
+    COPILOT_NARROW_AGENT_STEP_ACCOUNTS: bool = False
     WORKFLOW_COPILOT_QA_TOKEN_BUDGET: int | None = Field(default=None, gt=0)
     # Process-global override of the per-turn copilot deadline, read once at import;
     # changing it needs a hard restart. QA/debug only -- unset keeps the 900s default.

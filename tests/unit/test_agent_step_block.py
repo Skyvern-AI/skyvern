@@ -37,6 +37,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 from structlog.testing import capture_logs
 
+from skyvern.config import settings
 from skyvern.core.script_generations import real_skyvern_page_ai
 from skyvern.core.script_generations.real_skyvern_page_ai import _render_template_with_label
 from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
@@ -46,11 +47,13 @@ from skyvern.forge.sdk.api.llm.copilot_model_usage import CopilotModelUsageEvent
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.artifact.storage.local import LocalStorage
+from skyvern.forge.sdk.cache.local import LocalCache
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.models import GoogleOAuthCredentialModel, WorkflowRunBlockModel, WorkflowRunModel
 from skyvern.forge.sdk.experimentation.providers import NoOpExperimentationProvider
+from skyvern.forge.sdk.integrations.connected_accounts import _run_accounts_key, record_run_connection_ids
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
@@ -1030,6 +1033,138 @@ async def _google_accounts(database: AgentDB) -> None:
         await session.commit()
 
 
+@pytest.mark.asyncio
+async def test_a_copilot_run_offers_and_accepts_only_the_account_the_chat_approved(
+    monkeypatch: pytest.MonkeyPatch, database: AgentDB
+) -> None:
+    async with database.Session() as session:
+        for account_id in ("goc_a", "goc_b", "goc_c"):
+            session.add(
+                GoogleOAuthCredentialModel(
+                    id=account_id,
+                    organization_id=ORG,
+                    credential_name=account_id,
+                    email_address=f"{account_id}@example.com",
+                    state="active",
+                    scopes_granted=[SHEETS_SCOPE],
+                )
+            )
+        await session.execute(
+            update(WorkflowRunModel).where(WorkflowRunModel.workflow_run_id == RUN).values(created_by="copilot")
+        )
+        await session.commit()
+    monkeypatch.setattr(app, "CACHE", LocalCache())
+    # With no record, narrowing off keeps every account (an older API required them all); on offers none.
+    assert {account.id for account in await agent_step_loop._connected_accounts(ORG, RUN)} == {
+        "goc_a",
+        "goc_b",
+        "goc_c",
+    }
+    monkeypatch.setattr(settings, "COPILOT_NARROW_AGENT_STEP_ACCOUNTS", True)
+    assert await agent_step_loop._connected_accounts(ORG, RUN) == []
+    await record_run_connection_ids(ORG, RUN, ["goc_a"])
+    monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
+    sheet = {"spreadsheet_url": "https://docs.google.com/spreadsheets/d/x"}
+    model = _ScriptedModel(
+        [
+            [
+                scripted_call(
+                    "run_block",
+                    {"block_type": "google_sheets_read", "arguments": {**sheet, "credential_id": account}},
+                    call_id=account,
+                )
+            ]
+            for account in ("goc_b", "goc_a")
+        ]
+        + [[scripted_call("finish", {"answer": "done"}, call_id="f")]]
+    )
+
+    await _run_agent_block(monkeypatch, LUNA_MEDIUM, model, tools=["google_sheets_read"])
+
+    (run_block,) = (tool for tool in model.tools[0] if isinstance(tool, FunctionTool) and tool.name == "run_block")
+    assert run_block.params_json_schema["$defs"][agent_step_loop._ACCOUNT_DEF]["enum"] == ["goc_a"]
+    async with database.Session() as session:
+        session.add(
+            WorkflowRunModel(
+                workflow_run_id="wr_child",
+                workflow_id="w_1",
+                workflow_permanent_id=WPID,
+                organization_id=ORG,
+                status="running",
+                parent_workflow_run_id=RUN,
+            )
+        )
+        await session.commit()
+    assert [account.id for account in await agent_step_loop._connected_accounts(ORG, "wr_child")] == ["goc_a"]
+    (refused,) = tool_outputs_for(model.inputs[1][1], "goc_b")
+    (accepted,) = tool_outputs_for(model.inputs[2][1], "goc_a")
+    assert "invalid_arguments" in refused and "goc_b@" not in refused
+    assert "invalid_arguments" not in accepted
+
+
+@pytest.mark.asyncio
+async def test_a_copilot_runs_record_holds_whatever_the_workers_setting_and_a_broken_chain_offers_none(
+    monkeypatch: pytest.MonkeyPatch, database: AgentDB
+) -> None:
+    async with database.Session() as session:
+        for account_id in ("goc_a", "goc_b"):
+            session.add(
+                GoogleOAuthCredentialModel(
+                    id=account_id,
+                    organization_id=ORG,
+                    credential_name=account_id,
+                    email_address=f"{account_id}@example.com",
+                    state="active",
+                    scopes_granted=[SHEETS_SCOPE],
+                )
+            )
+        await session.execute(
+            update(WorkflowRunModel).where(WorkflowRunModel.workflow_run_id == RUN).values(created_by="copilot")
+        )
+        # wr_hop_1 is RUN's child, and each wr_hop_n the child of wr_hop_{n-1}; wr_dangling's parent is gone.
+        for hop in range(1, agent_step_loop._MAX_PARENT_RUN_HOPS + 2):
+            session.add(
+                WorkflowRunModel(
+                    workflow_run_id=f"wr_hop_{hop}",
+                    workflow_id="w_1",
+                    workflow_permanent_id=WPID,
+                    organization_id=ORG,
+                    status="running",
+                    parent_workflow_run_id=RUN if hop == 1 else f"wr_hop_{hop - 1}",
+                )
+            )
+        session.add(
+            WorkflowRunModel(
+                workflow_run_id="wr_dangling",
+                workflow_id="w_1",
+                workflow_permanent_id=WPID,
+                organization_id=ORG,
+                status="running",
+                parent_workflow_run_id="wr_deleted",
+            )
+        )
+        await session.commit()
+    cache = LocalCache()
+    monkeypatch.setattr(app, "CACHE", cache)
+    await record_run_connection_ids(ORG, RUN, ["goc_a"])
+
+    async def offered(run_id: str) -> list[str]:
+        return sorted(account.id for account in await agent_step_loop._connected_accounts(ORG, run_id))
+
+    # Narrowing off on this worker: a record is still enforced, and an unreadable one offers none.
+    assert await offered(RUN) == ["goc_a"]
+    assert await offered(f"wr_hop_{agent_step_loop._MAX_PARENT_RUN_HOPS}") == ["goc_a"]
+    await cache.set(_run_accounts_key(ORG, RUN), "not json")
+    assert await offered(RUN) == []
+    monkeypatch.setattr(cache, "get", AsyncMock(side_effect=RuntimeError("cache down")))
+    assert await offered(RUN) == []
+    assert await offered("wr_dangling") == ["goc_a", "goc_b"]
+
+    monkeypatch.setattr(settings, "COPILOT_NARROW_AGENT_STEP_ACCOUNTS", True)
+    assert await offered("wr_dangling") == []
+    assert await offered(f"wr_hop_{agent_step_loop._MAX_PARENT_RUN_HOPS + 1}") == []
+
+
 class _SheetsWithBackupAccount(GoogleSheetsReadBlockYAML):
     backup_credential_id: str | None = Field(default=None, json_schema_extra=_connected_account_field())
 
@@ -1040,7 +1175,7 @@ async def test_a_newly_marked_block_field_becomes_a_choice_of_the_runs_active_ac
     state = _bare_state()
     unconnected = agent_step_loop._dedicated_tool(BlockType.GOOGLE_SHEETS_READ, tool, state).params_json_schema
     account = unconnected["$defs"][agent_step_loop._ACCOUNT_DEF]
-    assert "enum" not in account and "no active connected accounts" in account["description"]
+    assert "enum" not in account and "no connected account is available" in account["description"]
 
     await _google_accounts(database)
     state.connected_accounts = await agent_step_loop._connected_accounts(ORG, RUN)

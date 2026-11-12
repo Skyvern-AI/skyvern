@@ -34,6 +34,8 @@ from openai.types.responses import ResponseFunctionToolCall, ResponseOutputMessa
 from openai.types.shared import Reasoning
 from pydantic import JsonValue, ValidationError
 
+from skyvern.config import settings
+from skyvern.exceptions import WorkflowRunNotFound
 from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.copilot_model_usage import copilot_usage_observer
@@ -48,8 +50,10 @@ from skyvern.forge.sdk.copilot.model_telemetry import (
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.executor.run_liveness import run_write_authority
 from skyvern.forge.sdk.integrations.connected_accounts import (
+    COPILOT_RUN_CREATOR,
     OrgConnection,
     org_connections_by_id,
+    run_connection_ids,
     settable_connected_account_fields,
 )
 from skyvern.forge.sdk.models import Step, StepStatus
@@ -68,7 +72,7 @@ from skyvern.forge.sdk.workflow.models.agent_step_tools import (
     block_description,
     run_block_description,
 )
-from skyvern.forge.sdk.workflow.models.block import Block, _validate_response_against_json_schema
+from skyvern.forge.sdk.workflow.models.block import Block, WorkflowTriggerBlock, _validate_response_against_json_schema
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
     AWSSecretParameter,
@@ -508,7 +512,7 @@ _ACCOUNT_DEF = "ConnectedAccountId"
 
 def _account_choices(state: _RunState) -> str:
     if not state.connected_accounts:
-        return "a connected account, and the run's owner has no active connected accounts that could be read"
+        return "a connected account, and no connected account is available to this run"
     choices = [{k: v for k, v in a.facts().items() if k != "state"} for a in state.connected_accounts]
     return f"one of the run's connected accounts: {json.dumps(choices)}"
 
@@ -1034,13 +1038,54 @@ def _credential_keys(parameters: list[PARAMETER_TYPE]) -> list[str]:
     ]
 
 
+# Above the trigger block's own depth limit, so a chain it allows is always followed to its top.
+_MAX_PARENT_RUN_HOPS = 2 * WorkflowTriggerBlock.MAX_TRIGGER_DEPTH
+
+
 async def _connected_accounts(organization_id: str | None, workflow_run_id: str) -> list[OrgConnection]:
     """The accounts the run's owner may use, which every block tool's connected-account argument chooses from."""
     if organization_id is None:
         return []
-    workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(workflow_run_id, organization_id)
+    workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
+        workflow_run_id=workflow_run_id, organization_id=organization_id
+    )
+    if workflow_run is None:
+        raise WorkflowRunNotFound(workflow_run_id)
+    # A run a workflow_trigger block started is held to the record of the run at the top of its chain.
+    root = workflow_run
+    chain_unresolved = True
+    for _ in range(_MAX_PARENT_RUN_HOPS + 1):
+        if not root.parent_workflow_run_id:
+            chain_unresolved = False
+            break
+        parent = await app.DATABASE.workflow_runs.get_workflow_run(
+            workflow_run_id=root.parent_workflow_run_id, organization_id=organization_id
+        )
+        if parent is None:
+            break
+        root = parent
+    if chain_unresolved and settings.COPILOT_NARROW_AGENT_STEP_ACCOUNTS:
+        # The top run's creator is unknown, so whether a record holds this run is too.
+        LOG.warning(
+            "agent_step_run_chain_unresolved", workflow_run_id=workflow_run_id, last_run_id=root.workflow_run_id
+        )
+        return []
     connections = await org_connections_by_id(organization_id, workflow_run.created_by)
-    # An author access setting on the step would narrow this list here.
+    if root.created_by == COPILOT_RUN_CREATOR:
+        allowed = await run_connection_ids(organization_id, root.workflow_run_id)
+        # A record is always enforced. Without one, narrowing on means none; off, the dispatching API predates
+        # the record and required every account, so every account stays offered. That is why every worker turns
+        # the setting on before any API does.
+        if allowed is None:
+            # Also what a worker without the API's shared cache sees, so this is the misconfiguration signal.
+            LOG.warning(
+                "agent_step_run_accounts_missing",
+                workflow_run_id=workflow_run_id,
+                record_run_id=root.workflow_run_id,
+                cache_shared=app.CACHE.is_shared,
+            )
+        if allowed is not None or settings.COPILOT_NARROW_AGENT_STEP_ACCOUNTS:
+            connections = [connection for connection in connections if connection.id in (allowed or set())]
     return [connection for connection in connections if connection.active]
 
 

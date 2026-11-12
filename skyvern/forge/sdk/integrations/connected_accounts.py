@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import json
 from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, get_args
@@ -181,6 +182,40 @@ async def org_connections(organization_id: str, user_id: str | None = None) -> l
     if failure is not None:
         raise IncompleteConnectionRead(connections) from failure
     return connections
+
+
+# A run Copilot starts offers its agent steps only the accounts the chat approved, recorded here at dispatch.
+_RUN_ACCOUNTS_TTL_SECONDS = 3 * 24 * 60 * 60
+COPILOT_RUN_CREATOR = "copilot"
+
+
+def _run_accounts_key(organization_id: str, workflow_run_id: str) -> str:
+    return f"agent_step_run_accounts:{organization_id}:{workflow_run_id}"
+
+
+async def record_run_connection_ids(organization_id: str, workflow_run_id: str, connection_ids: Sequence[str]) -> None:
+    await app.CACHE.set(
+        _run_accounts_key(organization_id, workflow_run_id),
+        json.dumps(list(connection_ids)),
+        ex=_RUN_ACCOUNTS_TTL_SECONDS,
+    )
+
+
+async def run_connection_ids(organization_id: str, workflow_run_id: str) -> set[str] | None:
+    """The accounts recorded for a Copilot run; None only when nothing was recorded. A record that cannot be read
+    offers no account, whatever the reader's own setting."""
+    try:
+        raw = await app.CACHE.get(_run_accounts_key(organization_id, workflow_run_id))
+    except Exception:
+        LOG.warning("agent_step_run_accounts_read_failed", workflow_run_id=workflow_run_id, exc_info=True)
+        return set()
+    if not raw:
+        return None
+    try:
+        ids = json.loads(raw)
+    except (TypeError, ValueError):
+        return set()
+    return {i for i in ids if isinstance(i, str)} if isinstance(ids, list) else set()
 
 
 async def org_connections_by_id(organization_id: str, user_id: str | None = None) -> list[OrgConnection]:
