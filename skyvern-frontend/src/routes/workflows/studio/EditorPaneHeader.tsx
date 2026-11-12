@@ -66,7 +66,8 @@ export function EditorPaneModeToggle() {
   const committing = useWorkflowYamlEditorStore((s) => s.committing);
   const enterYamlMode = useWorkflowYamlEditorStore((s) => s.enterYamlMode);
   const switchPresentation = async (next: WorkflowPresentation) => {
-    if (committing || (!active && storedPresentation === next)) return;
+    // The pressed segment is a no-op: during a comparison Visual shows pressed, and a click must not store it.
+    if (committing || (!active && presentation === next)) return;
     const generation = useWorkflowPresentationStore.getState().generation;
     if (active && !(await commitYamlDraft(false))) return;
     const state = useWorkflowPresentationStore.getState();
@@ -76,6 +77,41 @@ export function EditorPaneModeToggle() {
   if (!enterYamlMode) {
     return null;
   }
+  // Doc first where the Doc is available; without it the control reads as it always did.
+  const docToggle = (
+    <ViewToggle
+      active={!active && presentation === "doc"}
+      onClick={() => void switchPresentation("doc")}
+      disabled={committing}
+      compact={compact}
+      label="Doc"
+      icon={<FileTextIcon className="h-3 w-3" />}
+    />
+  );
+  const yamlToggle = (
+    <ViewToggle
+      active={active}
+      onClick={() => {
+        if (!active) {
+          enterYamlMode();
+        }
+      }}
+      disabled={committing}
+      compact={compact}
+      label="YAML"
+      icon={<CodeIcon className="h-3 w-3" />}
+    />
+  );
+  const visualToggle = (
+    <ViewToggle
+      active={!active && (!docEnabled || presentation === "visual")}
+      onClick={() => void switchPresentation("visual")}
+      disabled={committing}
+      compact={compact}
+      label="Visual"
+      icon={<EyeOpenIcon className="h-3 w-3" />}
+    />
+  );
   return (
     <>
       <div
@@ -83,35 +119,17 @@ export function EditorPaneModeToggle() {
         aria-label="Editor view"
         className="flex shrink-0 items-center gap-1"
       >
-        <ViewToggle
-          active={!active && (!docEnabled || presentation === "visual")}
-          onClick={() => void switchPresentation("visual")}
-          disabled={committing}
-          compact={compact}
-          label="Visual"
-          icon={<EyeOpenIcon className="h-3 w-3" />}
-        />
-        <ViewToggle
-          active={active}
-          onClick={() => {
-            if (!active) {
-              enterYamlMode();
-            }
-          }}
-          disabled={committing}
-          compact={compact}
-          label="YAML"
-          icon={<CodeIcon className="h-3 w-3" />}
-        />
-        {docEnabled && !comparing && (
-          <ViewToggle
-            active={!active && presentation === "doc"}
-            onClick={() => void switchPresentation("doc")}
-            disabled={committing}
-            compact={compact}
-            label="Doc"
-            icon={<FileTextIcon className="h-3 w-3" />}
-          />
+        {docEnabled ? (
+          <>
+            {!comparing && docToggle}
+            {yamlToggle}
+            {visualToggle}
+          </>
+        ) : (
+          <>
+            {visualToggle}
+            {yamlToggle}
+          </>
         )}
       </div>
     </>
