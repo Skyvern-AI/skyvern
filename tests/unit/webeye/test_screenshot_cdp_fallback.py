@@ -994,11 +994,15 @@ async def test_health_silent_early_raw_miss_gets_one_playwright_attempt_on_the_r
     monkeypatch: pytest.MonkeyPatch, geometry: Exception | dict, timeout_ms: int
 ) -> None:
     _production_rescue_timeouts(monkeypatch)
+    spent: list[float] = []
+    _on_a_virtual_clock(monkeypatch, spent)
+    raw_attempt_ms = 100
     page = _page()
     page.screenshot.side_effect = PlaywrightTimeoutError("taking page screenshot")
     session = page.context.new_cdp_session.return_value
 
     async def send(method: str, params: dict) -> dict:
+        spent.append(raw_attempt_ms / 1000)
         if isinstance(geometry, Exception):
             raise geometry
         return {"result": {"value": geometry}}
@@ -1017,7 +1021,8 @@ async def test_health_silent_early_raw_miss_gets_one_playwright_attempt_on_the_r
 
     page.context.new_cdp_session.assert_awaited_once()
     page.screenshot.assert_awaited_once()
-    assert page.screenshot.await_args.kwargs["timeout"] > timeout_ms * page_module._PRIMARY_CAPTURE_SHARE
+    rest_of_the_deadline = timeout_ms - raw_attempt_ms
+    assert rest_of_the_deadline - 1 <= page.screenshot.await_args.kwargs["timeout"] <= rest_of_the_deadline
     assert page.screenshot.await_args.kwargs["animations"] == "allow"
 
 
