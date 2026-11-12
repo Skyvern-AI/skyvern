@@ -19,12 +19,7 @@ import {
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { goalChangeIsPending } from "../workflowEditorUtils";
 import type { CodeBlockNodeData } from "../nodes/CodeBlockNode/types";
-import {
-  ChevronDownIcon,
-  ChevronRightIcon,
-  GearIcon,
-  PlusIcon,
-} from "@radix-ui/react-icons";
+import { ChevronRightIcon, GearIcon, PlusIcon } from "@radix-ui/react-icons";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -1024,7 +1019,7 @@ function DocStepSummary({
   const panelId = useId();
   return (
     <>
-      <div className="mt-1 text-[12.5px] text-muted-foreground">
+      <div className="mt-1 flex items-center gap-2 text-[12.5px] text-muted-foreground">
         <DocKeyTooltip
           content={
             custom?.length
@@ -1042,14 +1037,11 @@ function DocStepSummary({
             onClick={() => setOpen(!open)}
             className="-ml-1 inline-flex items-center gap-0.5 rounded px-1 text-[12.5px] text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
           >
-            {docDetailsText.toggle}
-            <ChevronDownIcon
+            <ChevronRightIcon
               aria-hidden
-              className={cn(
-                "size-3 transition-transform",
-                open && "rotate-180",
-              )}
+              className={cn("size-3 transition-transform", open && "rotate-90")}
             />
+            {docDetailsText.toggle}
           </button>
         </DocKeyTooltip>
         {onAddNote && (
@@ -1057,7 +1049,7 @@ function DocStepSummary({
             type="button"
             aria-label={`Add note below ${docStepCaption(node) ?? node.data.label}`}
             onClick={onAddNote}
-            className="ml-2 inline-flex items-center gap-0.5 rounded px-1 text-[12.5px] text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+            className="inline-flex items-center gap-0.5 rounded px-1 text-[12.5px] text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
           >
             <PlusIcon aria-hidden className="size-3" />
             Note
