@@ -25,6 +25,7 @@ import { useExecutingBlockRun } from "@/routes/workflows/studio/useExecutingBloc
 import { useStudioRunSignals } from "@/routes/workflows/studio/useStudioRunSignals";
 
 import {
+  MODEL_LABEL_POLL_INTERVAL_MS,
   getRunStatusRefetchInterval,
   getWatchedRunRefetchInterval,
   POLL_OUTAGE_BUDGET_MS,
@@ -188,6 +189,52 @@ describe("getRunStatusRefetchInterval", () => {
         data: { status: Status.Completed },
         dataUpdatedAt: now,
         errorUpdatedAt: 0,
+      }),
+    ).toBe(false);
+  });
+
+  test("a run that just failed is re-read until the model classifier's label lands", () => {
+    const finishedSecondsAgo = (seconds: number) =>
+      new Date(Date.now() - seconds * 1000).toISOString().replace("Z", "");
+    const interval = (data: object) =>
+      getRunStatusRefetchInterval({
+        status: "success",
+        data: data as Parameters<typeof getRunStatusRefetchInterval>[0]["data"],
+        dataUpdatedAt: Date.now(),
+        errorUpdatedAt: 0,
+      });
+    const rule = [
+      { category: "WEBSITE_ERROR", confidence_float: 0.6, reasoning: "" },
+    ];
+    expect(
+      interval({
+        status: Status.Failed,
+        finished_at: finishedSecondsAgo(30),
+        failure_category: rule,
+      }),
+    ).toBe(MODEL_LABEL_POLL_INTERVAL_MS);
+    expect(
+      interval({
+        status: Status.Failed,
+        finished_at: finishedSecondsAgo(30),
+        failure_category: [
+          { category: "AUTH_FAILURE", reason_code: "failure_classifier_v2" },
+          ...rule,
+        ],
+      }),
+    ).toBe(false);
+    expect(
+      interval({
+        status: Status.Failed,
+        finished_at: finishedSecondsAgo(600),
+        failure_category: rule,
+      }),
+    ).toBe(false);
+    expect(
+      interval({
+        status: Status.Canceled,
+        finished_at: finishedSecondsAgo(30),
+        failure_category: null,
       }),
     ).toBe(false);
   });
