@@ -303,6 +303,12 @@ class CopilotTriggerSummary:
     enabled: bool
     created_at: str
     note: str | None = None
+    # Whether its source starts runs by itself once on (a poller), so switching it on is the only step left.
+    fires_on_its_own: bool = False
+    # The connected account the source reads through, when it has one, so the card can name it.
+    account_id: str | None = None
+    # The source's settings as {"label", "value"} rows in plain words, for the user-facing trigger card.
+    filters: list[dict[str, str]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -2010,6 +2016,7 @@ class AgentFunction:
         source_kind: str,
         settings: dict[str, JsonValue],
         mapping: dict[str, str],
+        enabled: bool,
     ) -> CopilotTriggerResult:
         return CopilotTriggerResult(error=COPILOT_TRIGGERS_UNAVAILABLE)
 
