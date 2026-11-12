@@ -25,13 +25,22 @@ from skyvern.forge.sdk.schemas.google_oauth import (
     UpdateGoogleOAuthCredentialRequest,
 )
 from skyvern.forge.sdk.schemas.organizations import Organization
-from skyvern.forge.sdk.services import google_gmail_service, google_oauth_service, org_auth_service
+from skyvern.forge.sdk.services import (
+    google_gmail_service,
+    google_oauth_service,
+    oauth_redirect_uri,
+    org_auth_service,
+)
 from skyvern.forge.sdk.services.google_oauth_service import InvalidAppOriginError
 from skyvern.forge.sdk.services.route_authorization import require_request_actions
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.utils.email_validation import normalize_email_address
 
 LOG = structlog.get_logger()
+REDIRECT_URIS_REQUIRED_MESSAGE = (
+    "Enter the exact redirect URIs registered for this Google OAuth client, for example "
+    "https://app.example.com/integrations/google/callback. Host-only redirect entries are no longer accepted."
+)
 
 google_oauth_router = APIRouter()
 
@@ -378,6 +387,12 @@ async def update_google_oauth_client_config(
 ) -> GoogleOAuthClientConfigResponse:
     """Store an organization-level Google OAuth client configuration."""
     _require_organization_client_config_enabled()
+    if not request.redirect_uris:
+        raise HTTPException(status_code=400, detail=REDIRECT_URIS_REQUIRED_MESSAGE)
+    for redirect_uri in request.redirect_uris:
+        rejection = oauth_redirect_uri.registration_rejection(redirect_uri)
+        if rejection:
+            raise HTTPException(status_code=422, detail=f"Invalid redirect URI {redirect_uri}: {rejection}")
     try:
         resolved = await google_oauth_service.resolve_client_config(current_org.organization_id)
     except google_oauth_service.OrganizationClientConfigUnavailableError:
@@ -397,7 +412,7 @@ async def update_google_oauth_client_config(
     config = GoogleOAuthClientConfig(
         client_id=request.client_id,
         client_secret=client_secret,
-        redirect_hosts=request.redirect_hosts,
+        redirect_uris=request.redirect_uris,
         app_origins=request.app_origins,
     )
     try:

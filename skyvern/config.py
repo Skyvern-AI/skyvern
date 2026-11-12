@@ -994,13 +994,13 @@ class Settings(BaseSettings):
     # Google OAuth settings (used by the Google Sheets connector)
     GOOGLE_OAUTH_CLIENT_ID: str | None = None
     GOOGLE_OAUTH_CLIENT_SECRET: str | None = None
-    # Hostnames allowed as the OAuth ``redirect_uri`` sent to Google. Defense-in-depth
-    # alongside Google's own redirect_uri allowlist (which is the real enforcement
-    # gate — it validates the full URI against its registered list). This setting is
-    # intentionally host-only: any path or port on an approved host passes. Empty
-    # list means no redirect_uri may be supplied at all (the route layer rejects
-    # with 400) when CLIENT_ID is set.
-    GOOGLE_OAUTH_REDIRECT_HOSTS: list[str] = Field(default_factory=list)
+    # Full redirect URIs accepted as the OAuth ``redirect_uri`` sent to Google, e.g.
+    # ``https://app.example.com/integrations/google/callback``. A request must equal an
+    # entry character for character (https unless loopback; no query or fragment).
+    # Mirror the list registered on the Google client. Empty list means no
+    # redirect_uri may be supplied at all (the route layer rejects with 400) when
+    # CLIENT_ID is set.
+    GOOGLE_OAUTH_REDIRECT_URIS: list[str] = Field(default_factory=list)
     # Origins allowed as the bounce-back destination after OAuth callback.
     # Never sent to Google. Two entry shapes — port handling differs:
     #   - Exact-match: ``https://host:port`` matches that exact origin (port included).
@@ -1018,7 +1018,8 @@ class Settings(BaseSettings):
     MICROSOFT_OAUTH_CLIENT_ID: str | None = None
     MICROSOFT_OAUTH_CLIENT_SECRET: str | None = None
     MICROSOFT_OAUTH_TENANT: str = "common"
-    MICROSOFT_OAUTH_REDIRECT_HOSTS: list[str] = Field(default_factory=list)
+    # Same contract as GOOGLE_OAUTH_REDIRECT_URIS.
+    MICROSOFT_OAUTH_REDIRECT_URIS: list[str] = Field(default_factory=list)
     MICROSOFT_OAUTH_APP_ORIGINS: list[str] = Field(default_factory=list)
 
     # Google Sheets API runtime tuning

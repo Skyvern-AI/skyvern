@@ -46,14 +46,12 @@ export function GoogleOAuthClientConfigForm({ onSuccess }: Props = {}) {
   const queryClient = useQueryClient();
   const { toast } = useToast();
   const callbackUrl = useMemo(() => buildGoogleOAuthRedirectUri(), []);
-  const defaultRedirectHost =
-    typeof window !== "undefined" ? window.location.hostname : "localhost";
   const defaultAppOrigin =
     typeof window !== "undefined" ? window.location.origin : "";
 
   const [clientId, setClientId] = useState("");
   const [clientSecret, setClientSecret] = useState("");
-  const [redirectHosts, setRedirectHosts] = useState(defaultRedirectHost);
+  const [redirectUris, setRedirectUris] = useState(callbackUrl);
   const [appOrigins, setAppOrigins] = useState(defaultAppOrigin);
 
   const { data, isLoading } = useQuery({
@@ -70,17 +68,17 @@ export function GoogleOAuthClientConfigForm({ onSuccess }: Props = {}) {
   useEffect(() => {
     setClientId(config?.client_id ?? "");
     setClientSecret("");
-    setRedirectHosts(
+    setRedirectUris(
       config?.configured
-        ? (config.redirect_hosts ?? []).join("\n")
-        : joinList(config?.redirect_hosts, defaultRedirectHost),
+        ? (config.redirect_uris ?? []).join("\n")
+        : joinList(config?.redirect_uris, callbackUrl),
     );
     setAppOrigins(
       config?.configured
         ? (config.app_origins ?? []).join("\n")
         : joinList(config?.app_origins, defaultAppOrigin),
     );
-  }, [config, defaultAppOrigin, defaultRedirectHost]);
+  }, [config, defaultAppOrigin, callbackUrl]);
 
   const saveMutation = useMutation({
     mutationFn: async (request: UpdateGoogleOAuthClientConfigRequest) => {
@@ -143,7 +141,7 @@ export function GoogleOAuthClientConfigForm({ onSuccess }: Props = {}) {
     saveMutation.mutate({
       client_id: clientId,
       client_secret: clientSecret || undefined,
-      redirect_hosts: splitList(redirectHosts),
+      redirect_uris: splitList(redirectUris),
       app_origins: splitList(appOrigins),
     });
   };
@@ -211,11 +209,11 @@ export function GoogleOAuthClientConfigForm({ onSuccess }: Props = {}) {
 
       <div className="grid gap-4 md:grid-cols-2">
         <div className="space-y-2">
-          <Label htmlFor="google-redirect-hosts">Redirect Hosts</Label>
+          <Label htmlFor="google-redirect-uris">Redirect URIs</Label>
           <Textarea
-            id="google-redirect-hosts"
-            value={redirectHosts}
-            onChange={(event) => setRedirectHosts(event.target.value)}
+            id="google-redirect-uris"
+            value={redirectUris}
+            onChange={(event) => setRedirectUris(event.target.value)}
             disabled={isLoading || isMutating}
             className="min-h-24"
           />

@@ -1,8 +1,8 @@
-Skyvern signs every webhook and TOTP request with your API key using HMAC-SHA256, so you can verify the request actually came from Skyvern before acting on it.
+Skyvern signs every webhook and TOTP request with HMAC-SHA256 and one of your organization's API keys, so you can verify the request actually came from Skyvern before acting on it. That key is either the API key that started the run or your organization's default API key. A webhook you replay through the API is signed with the key that sent the replay request. If you use more than one key, run the verifier with each one and accept the request when any check passes.
 
 **Headers sent with every request:**
-- `x-skyvern-signature`: HMAC-SHA256 signature of the payload, hex-encoded
-- `x-skyvern-timestamp`: Unix timestamp when the request was sent
+- `x-skyvern-signature`: HMAC-SHA256 signature of the raw request body, hex-encoded
+- `x-skyvern-timestamp`: Unix time when Skyvern signed the request. It is not part of the signature, so don't rely on it to detect replayed requests. Within one delivery, Skyvern tries up to 3 times with the same value; a later redelivery or a replay is signed again, with a new timestamp.
 - `Content-Type: application/json`
 
 Copy the verifier for your language and reject the request whenever it returns false.
@@ -52,6 +52,8 @@ async def handle_webhook(request: Request):
 ```typescript TypeScript
 import crypto from "crypto";
 import express from "express";
+
+const app = express();
 
 function verifySkyvernSignature(rawBody: Buffer, signature: unknown): boolean {
   if (typeof signature !== "string" || signature.length === 0) {
@@ -118,6 +120,11 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
 
     // Process the request...
     w.WriteHeader(http.StatusOK)
+}
+
+func main() {
+    http.HandleFunc("/webhook", webhookHandler)
+    http.ListenAndServe(":8080", nil)
 }
 ```
 </CodeGroup>

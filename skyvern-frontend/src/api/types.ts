@@ -445,7 +445,7 @@ export interface GoogleOAuthCredentialListResponse {
 
 export interface GoogleOAuthClientConfigSafe {
   client_id: string | null;
-  redirect_hosts: string[];
+  redirect_uris: string[];
   app_origins: string[];
   client_secret_configured: boolean;
   configured: boolean;
@@ -460,7 +460,7 @@ export interface GoogleOAuthClientConfigResponse {
 export interface UpdateGoogleOAuthClientConfigRequest {
   client_id: string;
   client_secret?: string | null;
-  redirect_hosts: string[];
+  redirect_uris: string[];
   app_origins: string[];
 }
 
