@@ -12742,8 +12742,19 @@ class ForgeAgent:
             or settings.MAX_STEPS_PER_RUN
         )
 
-        # HACK: action block only have one step to execute without complete action, so we consider the task is completed as long as the step is completed
-        if isinstance(task_block, ActionBlock) and step.is_success() and not recovery_only:
+        # ActionBlocks skip goal verification, but a tolerated failure can still complete a step.
+        # Require a successful final action result before declaring the block completed.
+        if (
+            isinstance(task_block, ActionBlock)
+            and step.is_success()
+            and not recovery_only
+            and step.output is not None
+            and any(
+                action_results[-1].success
+                for _, action_results in step.output.actions_and_results or []
+                if action_results
+            )
+        ):
             LOG.info(
                 "Step completed for the action block, marking task as completed",
                 step_order=step.order,
