@@ -22,6 +22,7 @@ from skyvern.forge.sdk.copilot.context import AgentResult
 from skyvern.forge.sdk.copilot.enforcement import is_attached_image_message
 from skyvern.forge.sdk.copilot.video_attachment import (
     MAX_VIDEO_ATTACHMENT_DURATION_SECONDS,
+    VIDEO_ATTACHMENT_PROCESSING_TIMEOUT_SECONDS,
     VIDEO_ATTACHMENT_SIZE_LIMIT_BYTES,
     VideoAttachmentArtifact,
     VideoAttachmentEvidence,
@@ -42,6 +43,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatRequest,
 )
 from tests.unit.copilot_test_helpers import image_parts, stub_copilot_agent_loop
+from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
 def _perception_result(description: str = "The user opens Settings.") -> dict[str, Any]:
@@ -1536,11 +1538,20 @@ async def test_unreadable_images_are_reported_by_filename_without_raising(
     disguised = BytesIO()
     Image.new("RGB", (8, 8), "white").save(disguised, format="PPM")
     contents = {"file_corrupt": b"not an image", "file_bomb": _png_bytes("big"), "file_ppm": disguised.getvalue()}
+    preparation_budgets: list[asyncio.Timeout] = []
+
+    def preparation_budget(delay: float | None) -> asyncio.Timeout:
+        assert delay == VIDEO_ATTACHMENT_PROCESSING_TIMEOUT_SECONDS
+        preparation_budgets.append(asyncio.timeout(None))
+        return preparation_budgets[-1]
 
     async def download(file_id: str, **_kwargs: Any) -> str:
         if file_id == "file_broken":
             raise RuntimeError("storage unavailable")
         if file_id == "file_slow":
+            # The product prepares files one at a time, so expiring the budget as this last download starts lets the
+            # earlier files finish on any runner.
+            preparation_budgets[-1].reschedule(asyncio.get_running_loop().time())
             await asyncio.Event().wait()
         path = tmp_path / f"{file_id}.download"
         path.write_bytes(contents[file_id])
@@ -1548,7 +1559,7 @@ async def test_unreadable_images_are_reported_by_filename_without_raising(
 
     download_mock = AsyncMock(side_effect=download)
     monkeypatch.setattr(video_attachment_module, "download_file", download_mock)
-    monkeypatch.setattr(video_attachment_module, "VIDEO_ATTACHMENT_PROCESSING_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setattr(video_attachment_module, "asyncio", ScopedAsyncio(timeout=preparation_budget))
     monkeypatch.setattr(video_attachment_module, "IMAGE_ATTACHMENT_MAX_PIXELS", 640 * 240 - 1)
     safety_handler = AsyncMock()
     filenames = {
