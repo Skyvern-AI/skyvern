@@ -332,8 +332,15 @@ async def build_file_tree(
                         continue
                     artifact = await app.DATABASE.artifacts.get_artifact_by_id(script_file.artifact_id, organization_id)
                     if artifact:
-                        # override the actual file in the storage
-                        asyncio.create_task(app.STORAGE.store_artifact(artifact, content_bytes))
+                        # override the actual file in the storage, then record the new hash:
+                        # content_hash drives the dedup check in generate_script, so a stale
+                        # value makes a later save of the previous content skip its upload.
+                        await app.STORAGE.store_artifact(artifact, content_bytes)
+                        await app.DATABASE.scripts.update_script_file(
+                            script_file_id=script_file.file_id,
+                            organization_id=organization_id,
+                            content_hash=f"sha256:{content_hash}",
+                        )
                     else:
                         artifact_id = await app.ARTIFACT_MANAGER.create_script_file_artifact(
                             organization_id=organization_id,
