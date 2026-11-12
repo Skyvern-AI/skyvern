@@ -699,6 +699,13 @@ export function DocStepBody({
   const emptyText = getDocMainPlaceholder(node, editable);
   const forEachLoop = node.type === "loop" && data.loopKind !== "while";
   const mainKey = isProse ? fields[0]!.key : "description";
+  // Read-only, an empty first field gives the main line to the next filled one; that line is the one that folds.
+  const shownMainKey = isProse ? (main?.key ?? mainKey) : mainKey;
+  // A proposal that adds the step or changes its shown text keeps that text whole, so nothing is accepted unseen.
+  const proposalChanged = useDocStepChangedKeys(node);
+  const proposalAdded = useDocStepAdded(node);
+  const revealText =
+    proposalAdded || proposalChanged.includes(yamlKey(shownMainKey));
   // Hidden while the main line is being typed in, so a half-typed URL ("https://exa") is not offered. Focus is kept per
   // rendering of the line, because React fires no blur when the focused line unmounts; a run or a demonstration that
   // takes editing away clears it, so the same rendering coming back is not read as still focused.
@@ -709,6 +716,11 @@ export function DocStepBody({
     editable && actions.edit && focusedMode !== lineMode
       ? actions.promptUrlOffer(node)
       : null;
+  const textCollapse = {
+    open: actions.textOpen(node.id),
+    setOpen: (open: boolean) => actions.setTextOpen(node.id, open),
+    name: docStepCaption(node) ?? node.data.label,
+  };
   const line = (
     key: string,
     value: string,
@@ -738,6 +750,7 @@ export function DocStepBody({
         key === mainKey ? () => takeCaretAtStart(node.id) : undefined
       }
       multiline
+      collapse={key === shownMainKey && !revealText ? textCollapse : undefined}
       onChange={(v) => {
         if (!v.trim() && !kept.includes(key)) setKept([...kept, key]);
         actions.edit?.setText(node.id, key, v);
@@ -832,11 +845,13 @@ export function DocStepBody({
     <>
       <div
         className="min-h-[1.55em] text-base font-normal leading-[1.55]"
-        onFocus={() => {
+        onFocus={(event) => {
+          if (isCollapseControl(event.target)) return;
           setFocusedMode(lineMode);
           setHeldRestInView((held) => held ?? liveRestInView);
         }}
-        onBlur={() => {
+        onBlur={(event) => {
+          if (isCollapseControl(event.target)) return;
           setFocusedMode(null);
           setHeldRestInView(null);
         }}
@@ -921,6 +936,10 @@ export function DocStepBody({
     </>
   );
 }
+
+// Show more is not the step's text: focusing it neither hides the URL offer nor holds the lines in place.
+const isCollapseControl = (target: EventTarget) =>
+  target instanceof HTMLElement && target.dataset.docCollapse !== undefined;
 
 // The Doc does not show a Code step's Python, so its reads are not listed.
 const CODE_SKIP_KEYS = new Set([...SKIP_KEYS_FOR_JINJA_CHECK, "code", "steps"]);

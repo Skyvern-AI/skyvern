@@ -295,6 +295,17 @@ export function WorkflowDocEditor({
       else next.set(id, open);
       return next;
     });
+  const [openTexts, setOpenTexts] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  const setStepTextOpen = (id: string, open: boolean) =>
+    setOpenTexts((current) => {
+      if (current.has(id) === open) return current;
+      const next = new Set(current);
+      if (open) next.add(id);
+      else next.delete(id);
+      return next;
+    });
   const [searchOpen, setSearchOpen] = useState(false);
   const touch = useDocTouch();
   const locateRequest = useLocateBlockStore((s) => s.request);
@@ -872,6 +883,8 @@ export function WorkflowDocEditor({
           next.delete(conditionalId);
         return next;
       });
+    // A jump to a step (search, outline, problems, Locate, the proposal card, a step or output link) opens its text.
+    setStepTextOpen(id, true);
     // A step whose line is being typed in only moved (Tab).
     if (details && focusIdRef.current !== id)
       setStepDetailsOpen(id, details === "open" ? true : undefined);
@@ -1043,6 +1056,8 @@ export function WorkflowDocEditor({
           }),
         detailsOpen: (id) => detailsOpen.get(id),
         setDetailsOpen: setStepDetailsOpen,
+        textOpen: (id) => openTexts.has(id),
+        setTextOpen: setStepTextOpen,
         conditionalOpen: (conditionalId) =>
           !closedConditionals.has(conditionalId),
         toggleConditional: (conditionalId) =>
