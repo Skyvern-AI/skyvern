@@ -17,7 +17,12 @@ from skyvern.browser_extension.runtime import (
 from skyvern.cli.core.action_log import drain_action_log_events
 from skyvern.cli.core.api_key_hash import hash_api_key_for_cache
 from skyvern.cli.core.client import get_active_api_key
-from skyvern.cli.core.session_manager import BrowserSessionConnectionError, is_stateless_http_mode
+from skyvern.cli.core.session_manager import (
+    BrowserSessionConnectionError,
+    _extension_browser_is_connected,
+    _matches_current,
+    is_stateless_http_mode,
+)
 from skyvern.cli.core.session_ops import (
     coerce_proxy_location,
     do_session_arm_generate_browser_profile,
@@ -250,6 +255,15 @@ async def skyvern_browser_session_create(
     ] = None,
     local: Annotated[bool, Field(description="Launch local browser instead of cloud")] = False,
     headless: Annotated[bool, Field(description="Run local browser in headless mode")] = False,
+    use_shared_tab: Annotated[
+        bool,
+        Field(
+            description=(
+                "Browser-extension mode only: start in a tab that the user shared with Skyvern "
+                "(the lowest-numbered free shared tab) instead of a new tab."
+            )
+        ),
+    ] = False,
 ) -> dict[str, Any]:
     """Create a new browser session to start interacting with websites. Cloud session results include app_url to watch the run live. Creates a cloud-hosted browser by default with geographic proxy support. This must be called before using any browser tools (navigate, click, extract, etc.).
 
@@ -340,6 +354,13 @@ async def skyvern_browser_session_create(
                 )
 
             try:
+                current = get_current_session()
+                if not (
+                    _matches_current(current, extension_runtime=runtime)
+                    and current.browser is not None
+                    and _extension_browser_is_connected(current.browser)
+                ):
+                    runtime.set_shared_tab_start(use_shared_tab)
                 _browser, ctx = await resolve_browser(extension_runtime=runtime)
                 timer.mark("sdk")
             except Exception as e:

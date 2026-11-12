@@ -19,7 +19,7 @@ import structlog
 from skyvern.browser_extension.auth import load_or_create_pairing_token
 from skyvern.browser_extension.broker_client import BrokerClient
 from skyvern.browser_extension.cdp_adapter import TabReconnectEvent
-from skyvern.browser_extension.errors import BrowserExtensionError
+from skyvern.browser_extension.errors import BrowserExtensionError, ExtensionRequestError
 from skyvern.browser_extension.event_order import EventHold
 from skyvern.browser_extension.relay import ExtensionRelayServer
 from skyvern.browser_extension.target_registry import VirtualTargetRegistry
@@ -205,6 +205,10 @@ class BrowserExtensionRuntime:
     @property
     def extension_connected(self) -> bool:
         return self._relay.connected
+
+    def set_shared_tab_start(self, enabled: bool) -> None:
+        if isinstance(self._relay, BrokerClient):
+            self._relay.shared_tab_start = enabled
 
     async def wait_for_extension(self, timeout: float = 10.0) -> bool:
         return await self._relay.wait_connected(timeout)
@@ -428,6 +432,32 @@ class BrowserExtensionRuntime:
     def describe_reported_build_hash(status: dict[str, Any]) -> str:
         return status.get("extensionReportedBuildHash") or "no hash reported (pre-dates this check)"
 
+    async def close_page_tab(self, page: Page) -> dict[str, Any]:
+        if self._page_is_closed(page) or not self._runtime_is_connected():
+            raise BrowserExtensionError("The selected page is no longer available")
+        target_id = await self._target_id_for_page(page)
+        tab_id = self._adapter.scoped_tab_id_for_target(target_id) if target_id is not None else None
+        if tab_id is None or self._page_is_closed(page):
+            raise BrowserExtensionError("The selected page is no longer in the controlled scope")
+        closed = asyncio.Event()
+
+        def on_close(*_: object) -> None:
+            closed.set()
+
+        page.once("close", on_close)
+        try:
+            try:
+                result = await self._relay.request("tabs.remove", {"tabId": tab_id})
+            except ExtensionRequestError as exc:
+                if exc.code != "TAB_NOT_FOUND":
+                    raise
+                result = {}
+            if result.get("kept") is not True and not self._page_is_closed(page):
+                await closed.wait()
+            return result
+        finally:
+            page.remove_listener("close", on_close)
+
     async def fill_input(self, page: Any, selector: str, text: str, *, timeout: float = 5.0) -> dict[str, Any]:
         """Send fixed input data to the selected page; never evaluate caller source."""
         deadline = int(time.time() * 1000 + min(timeout, 30.0) * 1000)
@@ -554,6 +584,7 @@ class BrowserExtensionRuntime:
             if self._stopped:
                 return
             self._stopped = True
+            self.set_shared_tab_start(False)
             self._clear_page_bindings()
             try:
                 await self._relay.stop()

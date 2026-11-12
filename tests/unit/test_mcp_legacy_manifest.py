@@ -32,8 +32,7 @@ LEGACY_TOOL_MANIFEST_DIGESTS = {
     "skyvern_browser_profile_update": "e83c3227ef13e827bd0c7d6e23bb0e03fefe2fe83e73bfa4b3ca696d151b2b61",
     "skyvern_browser_session_close": "d0923948805b1bbccd7803df1a3748426263a8bf630cf9fcbee5a21f2f463825",
     "skyvern_browser_session_connect": "7c21d99fbb35dc0199e59367373387dca0e8f8d9dd4615303a3f09f579db2d06",
-    # Re-frozen for SKY-17978: adds the optional `browser_type` param the REST API and SDK already accept.
-    "skyvern_browser_session_create": "34ef250f51908bd925929f0fc9bd7097ac266982d1d9725fffa74ff9f9af704a",
+    "skyvern_browser_session_create": "9843bb190f19b417014477771612286039de972d1830fc583cdf2da6a8a6dd84",
     "skyvern_browser_session_get": "fdf579ac23ce28eea5e243a407a8f810fdcca6ed491c2da7fbe56836b1474109",
     "skyvern_browser_session_list": "dac429184440a1f76d2a787fb81793e37220408d749f0d3cacfbd29222e55f19",
     "skyvern_clear_local_storage": "8a6b80bfdbe3b1e2e36f7f485cb5bb7ff527594e37536816c2f6b614852078f5",

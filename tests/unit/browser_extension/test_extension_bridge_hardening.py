@@ -564,12 +564,20 @@ globalThis.chrome = {{
     }},
     async query(values) {{
       return [...tabs.values()]
+        .filter((tab) => values.windowId === undefined || tab.windowId === values.windowId)
         .filter((tab) => !values.active || tab.active === true)
         .filter((tab) => !values.lastFocusedWindow || tab.windowId === lastFocusedWindowId)
         .map((tab) => ({{ ...tab }}));
     }},
     async remove(tabId) {{ tabs.delete(tabId); }},
-    async update(tabId, values) {{ Object.assign(tabs.get(tabId), values); }},
+    async update(tabId, values) {{
+      const target = tabs.get(tabId);
+      if (!target) throw new Error("missing tab");
+      if (values.active) for (const tab of tabs.values()) {{
+        if (tab.windowId === target.windowId) tab.active = false;
+      }}
+      Object.assign(target, values);
+    }},
   }},
   tabGroups: {{
     async query() {{ return []; }},
@@ -1552,6 +1560,214 @@ const markAttached = (tabId, url) => {{
   debuggerAttached.add(tabId);
 }};
 
+
+const closeOriginalSendEvent = scope.sendEvent;
+const closeOriginalTimeout = scope.operationTimeoutMs;
+const closeOriginalRemove = chrome.tabs.remove;
+const closeOriginalWindowUpdate = chrome.windows.update;
+const closeFrames = [];
+const closeCommands = [];
+const closeWindowFocusCalls = [];
+const closeBridge = new BridgeConnection({{
+  onRequest: (op, args) => scope.remove(args),
+  onAuthenticated: async () => undefined,
+  onReset: async () => ({{ executed: true, ok: true, failedTabCount: 0 }}),
+  onStateChange: () => undefined,
+}});
+closeBridge.authenticated = true;
+closeBridge.connectionGeneration = 1;
+const closeSocket = {{ readyState: WebSocket.OPEN, send: (raw) => closeFrames.push(JSON.parse(raw)) }};
+closeBridge.socket = closeSocket;
+scope.sendEvent = (event, params) => closeBridge.sendEvent(event, params);
+scope.operationTimeoutMs = 7_500;
+chrome.windows.update = async (...args) => {{ closeWindowFocusCalls.push(args); }};
+const emitCloseDialog = (tabId, type = "beforeunload") => {{
+  listeners.debuggerEvent.forEach((listener) =>
+    listener({{ tabId }}, "Page.javascriptDialogOpening", {{ type }}),
+  );
+}};
+const prepareCloseTab = () => {{
+  markAttached(80, "https://unsaved.example");
+  tabs.get(80).active = false;
+  scope.createdTabIds.add(80);
+  tabs.set(81, {{ id: 81, windowId: 1, groupId: -1, url: "https://previous.example", active: true }});
+  tabs.set(82, {{ id: 82, windowId: 2, groupId: -1, url: "https://other-window.example", active: true }});
+}};
+for (const settlement of ["resolves", "rejects", "never", "resolves_during_stay", "rejects_during_stay"]) {{
+  prepareCloseTab();
+  closeFrames.length = 0;
+  closeCommands.length = 0;
+  const removals = [];
+  chrome.tabs.remove = (tabId) => {{
+    assert.equal(tabId, 80);
+    assert(closeCommands.some((command) => command.method === "Page.enable"));
+    return new Promise((resolve, reject) => removals.push({{ resolve, reject }}));
+  }};
+  chrome.debugger.sendCommand = async (source, method, params) => {{
+    closeCommands.push({{ source, method, params }});
+    if (method === "Page.handleJavaScriptDialog" && removals.length === 1) {{
+      if (settlement === "resolves_during_stay") removals[0].resolve();
+      if (settlement === "rejects_during_stay") removals[0].reject(new Error("Stayed"));
+    }}
+    return {{}};
+  }};
+  const started = Date.now();
+  const closeRequest = closeBridge.handleRequest(
+    {{ id: "keep-" + settlement, op: "tabs.remove", args: {{ tabId: 80 }} }}, 1, closeSocket,
+  );
+  await waitUntil(() => removals.length === 1);
+  assert(scope.isQuarantined(80));
+  emitCloseDialog(80, "alert");
+  emitCloseDialog(82);
+  assert(!closeCommands.some((command) => command.method === "Page.handleJavaScriptDialog"));
+  await chrome.tabs.update(80, {{ active: true }});
+  emitCloseDialog(80);
+  emitCloseDialog(80);
+  await settleWithin(closeRequest, 250);
+  assert(Date.now() - started < 8_000, "kept close must meet the cleanup deadline");
+  assert.deepEqual(closeFrames.at(-1).result, {{ kept: true }});
+  assert.equal(closeFrames.at(-1).ok, true);
+  const removalIndex = closeFrames.findIndex((frame) => frame.event === "scope.tabRemoved");
+  const responseIndex = closeFrames.findIndex((frame) => frame.type === "response");
+  assert(removalIndex >= 0 && removalIndex < responseIndex);
+  assert.deepEqual(closeFrames[removalIndex].params, {{ tabId: 80, reason: "unshared" }});
+  assert(tabs.has(80));
+  assert(!scope.isScoped(80));
+  assert(!scope.createdTabIds.has(80));
+  assert(!scope.isQuarantined(80));
+  assert.equal(tabs.get(80).groupId, -1);
+  assert(!router.attachedTabs.has(80));
+  assert(!router.closeWatchers.has(80));
+  assert(!sessionState.scopedTabIds.includes(80));
+  assert(!sessionState.createdTabIds.includes(80));
+  assert.equal(tabs.get(81).active, true);
+  assert.equal(tabs.get(80).active, false);
+  assert.equal(tabs.get(82).active, true);
+  assert.deepEqual(closeWindowFocusCalls, [], "a close must never focus a window");
+  assert.deepEqual(closeCommands.filter((command) => command.method === "Page.handleJavaScriptDialog"), [
+    {{ source: {{ tabId: 80 }}, method: "Page.handleJavaScriptDialog", params: {{ accept: false }} }},
+  ]);
+
+  await scope.shareTab(80);
+  router.attachedTabs.add(80);
+  router.attachStates.set(80, {{ status: "attached" }});
+  debuggerAttached.add(80);
+  scope.createdTabIds.add(80);
+  const successorAdmission = scope.scopeAdmission(80);
+  const successorClose = scope.remove({{ tabId: 80 }});
+  await waitUntil(() => removals.length === 2);
+  const successor = scope.activeCloses.get(80);
+  if (settlement === "resolves") removals[0].resolve();
+  if (settlement === "rejects") removals[0].reject(new Error("late native rejection"));
+  await delay(2);
+  assert(scope.isScoped(80));
+  assert(scope.createdTabIds.has(80));
+  assert(scope.isQuarantined(80), "old native completion must not clear the next close's quarantine");
+  assert.equal(scope.activeCloses.get(80), successor);
+  assert.equal(scope.scopeAdmission(80), successorAdmission);
+  emitCloseDialog(80);
+  assert.deepEqual(await settleWithin(successorClose, 250), {{ kept: true }});
+  removals[1].resolve();
+  await delay(2);
+  assert(tabs.has(80) && !scope.isScoped(80) && !scope.createdTabIds.has(80));
+  for (const id of [80, 81, 82]) tabs.delete(id);
+}}
+
+for (const failure of ["enable", "stay", "enable_timeout", "stay_timeout"]) {{
+  prepareCloseTab();
+  const commands = [];
+  let finishNative;
+  chrome.tabs.remove = () => new Promise((resolve) => {{ finishNative = resolve; }});
+  chrome.debugger.sendCommand = async (source, method) => {{
+    commands.push(method);
+    if ((failure.startsWith("enable") && method === "Page.enable") ||
+        (failure.startsWith("stay") && method === "Page.handleJavaScriptDialog")) {{
+      if (failure.endsWith("timeout")) return new Promise(() => undefined);
+      throw new Error("native command failed");
+    }}
+    return {{}};
+  }};
+  const failureClose = scope.remove({{ tabId: 80 }});
+  await waitUntil(() => finishNative !== undefined, 2_500);
+  emitCloseDialog(80);
+  if (failure.startsWith("stay")) await waitUntil(() => !router.closeWatchers.has(80), 2_500);
+  else assert(!router.closeWatchers.has(80));
+  assert(scope.isScoped(80) && scope.createdTabIds.has(80) && scope.isQuarantined(80));
+  if (failure.startsWith("enable")) assert(!commands.includes("Page.handleJavaScriptDialog"));
+  tabs.delete(80);
+  finishNative();
+  assert.deepEqual(await settleWithin(failureClose, 250), {{}});
+  assert(!scope.isScoped(80) && !scope.isQuarantined(80));
+  router.attachedTabs.delete(80);
+  router.attachStates.delete(80);
+  debuggerAttached.delete(80);
+  tabs.delete(81);
+  tabs.delete(82);
+}}
+
+for (const cancellation of ["reset", "removed", "lease", "attachment"]) {{
+  prepareCloseTab();
+  let finishNative;
+  const commands = [];
+  chrome.tabs.remove = () => new Promise((resolve) => {{ finishNative = resolve; }});
+  chrome.debugger.sendCommand = async (source, method) => {{ commands.push(method); return {{}}; }};
+  const cancelledClose = scope.remove({{ tabId: 80 }}).then(() => null, (error) => error);
+  await waitUntil(() => router.closeWatchers.has(80));
+  if (cancellation === "reset") {{
+    await scope.prepareForReset();
+    await router.reset();
+    scope.finishReset();
+  }} else if (cancellation === "removed") {{
+    tabs.delete(80);
+    listeners.removed.forEach((listener) => listener(80));
+  }} else {{
+    if (cancellation === "attachment") {{
+      router.attachStates.set(80, {{ status: "attached" }});
+      emitCloseDialog(80);
+      assert(!commands.includes("Page.handleJavaScriptDialog"));
+    }}
+    scope.cancelTabOperations(80, new Error("cancel close"));
+  }}
+  emitCloseDialog(80);
+  assert(!router.closeWatchers.has(80));
+  assert(!commands.includes("Page.handleJavaScriptDialog"));
+  assert(await settleWithin(cancelledClose));
+  finishNative();
+  await waitUntil(() => !scope.isQuarantined(80));
+  await waitUntil(() => !scope.tabOperations.has(80));
+  if (scope.isScoped(80)) await scope.unshareTab(80);
+  await router.detachIfAttachedLocked(80);
+  for (const id of [80, 81, 82]) tabs.delete(id);
+}}
+
+prepareCloseTab();
+chrome.tabs.remove = () => new Promise(() => undefined);
+chrome.debugger.sendCommand = async () => ({{}});
+let scopeRemovalDelivered = false;
+const keptSessionSet = chrome.storage.session.set;
+chrome.storage.session.set = async (values) => {{
+  if (!values.scopedTabIds.includes(80)) scope.cancelTabOperations(80, new Error("cancel cleanup"));
+  return keptSessionSet(values);
+}};
+scope.sendEvent = (event, params) => {{
+  if (event === "scope.tabRemoved" && params.tabId === 80) scopeRemovalDelivered = true;
+}};
+const cancelledCleanup = scope.remove({{ tabId: 80 }}).catch((error) => error);
+await waitUntil(() => router.closeWatchers.has(80));
+void router.closeWatchers.get(80).kept.then(() =>
+  scope.cancelTabOperations(80, new Error("cancel after Stay")),
+);
+emitCloseDialog(80);
+await settleWithin(cancelledCleanup, 250);
+await waitUntil(() => tabs.get(80).groupId === -1 && !router.attachedTabs.has(80));
+assert(scopeRemovalDelivered && !scope.isScoped(80) && !scope.createdTabIds.has(80));
+chrome.storage.session.set = keptSessionSet;
+for (const id of [80, 81, 82]) tabs.delete(id);
+scope.sendEvent = closeOriginalSendEvent;
+scope.operationTimeoutMs = closeOriginalTimeout;
+chrome.tabs.remove = closeOriginalRemove;
+chrome.windows.update = closeOriginalWindowUpdate;
+
 // Page.navigate accepts its only non-restricted committed URL event.
 markAttached(34, "https://before.example");
 let releaseRedirectNavigation;
@@ -1989,7 +2205,7 @@ await waitUntil(() => !router.attachedTabs.has(21) && !router.attachStates.has(2
         capture_output=True,
         text=True,
         check=False,
-        timeout=10,
+        timeout=20,
     )
 
     assert result.returncode == 0, result.stderr

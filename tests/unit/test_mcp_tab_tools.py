@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from skyvern.browser_extension.runtime import BrowserExtensionRuntime
 from skyvern.cli.core import copilot_sessions, session_manager
 from skyvern.cli.core.browser_ops import NavigateResult
 from skyvern.cli.core.result import BrowserContext
@@ -741,6 +742,55 @@ async def test_tab_switch_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
 # ═══════════════════════════════════════════════════
 # skyvern_tab_close
 # ═══════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kept", [False, True])
+async def test_tab_close_extension_reports_kept_tab(monkeypatch: pytest.MonkeyPatch, kept: bool) -> None:
+    target = _make_mock_page()
+    browser = _make_mock_browser(target)
+    ctx = BrowserContext(mode="extension")
+    _patch_get_page(monkeypatch, target, ctx)
+    state = _make_session_state(browser)
+    state.context = ctx
+    state._active_page = target
+    state._working_frame = MagicMock()
+    state._hooked_page_ids.add(id(target))
+    _patch_session(monkeypatch, state)
+
+    def close_reply(op: str, args: dict) -> dict:
+        if kept:
+            return {"kept": True}
+        target.is_closed.return_value = True
+        browser._browser_context.pages.remove(target)
+        return {}
+
+    relay = SimpleNamespace(connected=True, request=AsyncMock(side_effect=close_reply))
+    adapter = MagicMock()
+    adapter.scoped_tab_id_for_target.return_value = 17
+    runtime = BrowserExtensionRuntime(relay, adapter)
+    runtime._page_target_ids[target] = "target-17"
+    monkeypatch.setattr(BrowserExtensionRuntime, "instance", lambda: runtime)
+
+    result = await mcp_tabs.skyvern_tab_close()
+
+    relay.request.assert_awaited_once_with("tabs.remove", {"tabId": 17})
+    adapter.scoped_tab_id_for_target.assert_called_once_with("target-17")
+    target.close.assert_not_awaited()
+    assert state._active_page is None
+    assert state._working_frame is None
+    assert id(target) not in state._hooked_page_ids
+    if kept:
+        assert result["ok"] is False
+        assert result["error"]["code"] == "ACTION_FAILED"
+        assert result["error"]["message"] == (
+            f"Tab {id(target)} was not closed: the page asked to keep unsaved changes. "
+            "It stays open and is back with the user."
+        )
+        assert "closed_tab_id" not in (result.get("data") or {})
+    else:
+        assert result["ok"] is True
+        assert result["data"]["closed_tab_id"] == str(id(target))
 
 
 @pytest.mark.asyncio
