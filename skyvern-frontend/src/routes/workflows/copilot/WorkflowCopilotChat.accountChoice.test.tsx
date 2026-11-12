@@ -20,7 +20,7 @@ type StreamBody = {
   mode?: "build";
   idempotency_key?: string | null;
   selected_connected_account_id?: string | null;
-  supports_google_setup_card?: boolean;
+  supports_connection_card?: boolean;
 };
 type StreamCall = {
   body: StreamBody;
@@ -93,18 +93,18 @@ vi.mock("react-router-dom", async (importOriginal) => {
   };
 });
 
-vi.mock("./cards/GoogleReconnectCard", () => ({
-  GoogleReconnectCard: ({
-    notice,
+vi.mock("./cards/ConnectionCard", () => ({
+  ConnectionCard: ({
+    card,
     disabled,
     onSelect,
   }: {
-    notice: { scopeProfile: string };
+    card: { integrationId: string };
     disabled?: boolean;
     onSelect?: (id: string) => void;
   }) => (
-    <div data-testid={`notice-${notice.scopeProfile}`}>
-      Connection notice
+    <div data-testid={`card-${card.integrationId}`}>
+      Connection card
       <button disabled={disabled} onClick={() => onSelect?.("goac_notice")}>
         Select notice account
       </button>
@@ -260,7 +260,7 @@ afterEach(() => {
 });
 
 describe("WorkflowCopilotChat connected account choices", () => {
-  it("restores separate Gmail and Sheets setup cards after reload and advertises the card", async () => {
+  it("restores separate connection cards after reload and advertises the card", async () => {
     historyResponse.data = {
       workflow_copilot_chat_id: "chat-1",
       proposed_workflow: null,
@@ -272,22 +272,22 @@ describe("WorkflowCopilotChat connected account choices", () => {
           created_at: "2026-08-15T00:00:01Z",
           narrative_payload: {
             ...narrativePayload(false),
-            googleConnectionNotices: [
+            connectionCards: [
               {
+                integrationId: "gmail",
+                integrationName: "Gmail",
                 provider: "google",
-                connectionId: null,
-                condition: "unbound",
                 scopeProfile: "gmail",
-                origin: "setup",
-                choices: [],
+                requiredScopes: [],
+                reconnectConnectionId: null,
               },
               {
-                provider: "google",
-                connectionId: null,
-                condition: "unbound",
-                scopeProfile: "google_sheets",
-                origin: "setup",
-                choices: [],
+                integrationId: "outlook",
+                integrationName: "Outlook",
+                provider: "microsoft",
+                scopeProfile: "outlook",
+                requiredScopes: [],
+                reconnectConnectionId: null,
               },
             ],
           },
@@ -296,47 +296,12 @@ describe("WorkflowCopilotChat connected account choices", () => {
     };
     await renderChat();
 
-    expect(screen.getByTestId("notice-gmail")).toBeTruthy();
-    expect(screen.getByTestId("notice-google_sheets")).toBeTruthy();
+    expect(screen.getByTestId("card-gmail")).toBeTruthy();
+    expect(screen.getByTestId("card-outlook")).toBeTruthy();
 
     await submit("connect them");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-    expect(streamCalls[0]?.body.supports_google_setup_card).toBe(true);
-  });
-
-  it("renders a readable receipt from notice-only account metadata", async () => {
-    historyResponse.data = {
-      workflow_copilot_chat_id: "chat-1",
-      proposed_workflow: null,
-      auto_accept: false,
-      chat_history: [
-        {
-          sender: "ai",
-          content: "Connect",
-          created_at: "2026-08-15T00:00:01Z",
-          narrative_payload: {
-            ...narrativePayload(false),
-            googleConnectionNotices: [
-              {
-                provider: "google",
-                connectionId: null,
-                condition: "unbound",
-                choices,
-              },
-            ],
-          },
-        },
-        {
-          sender: "user",
-          content: "goac_1",
-          created_at: "2026-08-15T00:00:02Z",
-        },
-      ],
-    };
-    await renderChat();
-    expect(
-      screen.getByText("Selected Google Sheets — Connection …goac_1"),
-    ).toBeTruthy();
+    expect(streamCalls[0]?.body.supports_connection_card).toBe(true);
   });
 
   it("renders a readable receipt for a connection made after the card's turn", async () => {
@@ -351,34 +316,39 @@ describe("WorkflowCopilotChat connected account choices", () => {
           created_at: "2026-08-15T00:00:01Z",
           narrative_payload: {
             ...narrativePayload(false),
-            googleConnectionNotices: [
+            connectionCards: [
               {
-                provider: "google",
-                connectionId: null,
-                condition: "unbound",
-                scopeProfile: "gmail",
-                origin: "setup",
-                choices: [],
+                integrationId: "outlook",
+                integrationName: "Outlook",
+                provider: "microsoft",
+                scopeProfile: "outlook",
+                requiredScopes: [],
+                reconnectConnectionId: null,
               },
             ],
           },
         },
         {
           sender: "user",
-          content: "goac_587307069786375772",
+          content: "moac_587307069786375772",
           created_at: "2026-08-15T00:00:02Z",
+        },
+        {
+          sender: "user",
+          content: "continue",
+          created_at: "2026-08-15T00:00:03Z",
         },
       ],
     };
     await renderChat();
-    expect(
-      screen.getByText("Selected Google connection …86375772"),
-    ).toBeTruthy();
-    expect(screen.queryByText("goac_587307069786375772")).toBeNull();
+    expect(screen.getByText("Selected connection …86375772")).toBeTruthy();
+    expect(screen.queryByText("moac_587307069786375772")).toBeNull();
+    // A one-word reply that is not a connection id keeps its own text.
+    expect(screen.getByText("continue")).toBeTruthy();
   });
 
   it.each([false, true])(
-    "preserves the question alongside an unbound notice (account question: %s)",
+    "preserves the question alongside a connection card (account question: %s)",
     async (accountQuestion) => {
       historyResponse.data = {
         workflow_copilot_chat_id: "chat-1",
@@ -412,12 +382,14 @@ describe("WorkflowCopilotChat connected account choices", () => {
             created_at: "2026-08-15T00:00:01Z",
             narrative_payload: {
               ...narrativePayload(accountQuestion),
-              googleConnectionNotices: [
+              connectionCards: [
                 {
+                  integrationId: "google_sheets",
+                  integrationName: "Google Sheets",
                   provider: "google",
-                  connectionId: null,
-                  condition: "unbound",
-                  choices: [],
+                  scopeProfile: "google_sheets",
+                  requiredScopes: [],
+                  reconnectConnectionId: null,
                 },
               ],
             },
@@ -425,11 +397,11 @@ describe("WorkflowCopilotChat connected account choices", () => {
         ],
       };
       await renderChat();
-      expect(screen.getByText("Connection notice")).toBeTruthy();
+      expect(screen.getByText("Connection card")).toBeTruthy();
       expect(screen.getByText("Which range?")).toBeTruthy();
       expect(
         screen.getByText(
-          "Answer or cancel the pending question before choosing a Google account.",
+          "Answer or cancel the pending question before choosing an account.",
         ),
       ).toBeTruthy();
       expect(
