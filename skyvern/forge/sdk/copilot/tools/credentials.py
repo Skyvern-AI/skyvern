@@ -74,7 +74,9 @@ from skyvern.forge.sdk.services.credential.credential_vault_service import (
     VaultLoginListing,
 )
 from skyvern.forge.sdk.services.request_principal import get_request_principal, human_user_id
+from skyvern.forge.sdk.workflow.models.agent_step_tools import ACCOUNT_TOOL_NAMES, ACTING_ACCOUNT_TOOL_NAMES
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
+from skyvern.schemas.agent_step_tool_names import current_tool_names
 from skyvern.schemas.google_sheets import extract_sheet_gid, extract_spreadsheet_id, is_plain_cell_range
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
@@ -675,20 +677,33 @@ async def _agent_step_connection_ids(
     *,
     selected_labels: set[str] | None,
     run_parameters: dict[str, Any] | None,
-) -> list[str]:
+) -> tuple[list[str], bool]:
+    """The account ids executing agent steps can use, and whether that use may act (send, write, upload)."""
+    agent_tools = {
+        name
+        for block in workflow_blocks(parsed, selected_labels=selected_labels)
+        if block.get("block_type") == "agent_step"
+        for name in current_tool_names(list(block.get("tools") or []))
+    }
+    if agent_tools & ACCOUNT_TOOL_NAMES:
+        # Raises IncompleteConnectionRead when a provider cannot be read, so the caller refuses.
+        connections = await org_connections(organization_id, request_user_id(organization_id))
+        return [connection.id for connection in connections if connection.active], bool(
+            agent_tools & ACTING_ACCOUNT_TOOL_NAMES
+        )
     text = agent_step_account_text(parsed, selected_labels=selected_labels, run_parameters=run_parameters)
     if text is None:
-        return []
+        return [], True
     try:
         connections = await org_connections(organization_id, request_user_id(organization_id))
     except IncompleteConnectionRead:
         # A provider that could not be read may hold any id-shaped token, so every one is checked.
-        return list(dict.fromkeys(_ACCOUNT_ID_RE.findall(text)))
+        return list(dict.fromkeys(_ACCOUNT_ID_RE.findall(text))), True
     return [
         connection.id
         for connection in connections
         if re.search(rf"(?<![\w-]){re.escape(connection.id)}(?![\w-])", text)
-    ]
+    ], True
 
 
 @dataclass(frozen=True)
@@ -722,14 +737,19 @@ async def run_credential_gate(
     resolved_labels = {block.get("label") for block in workflow_blocks(parsed, selected_labels=selected)}
     executing_labels = selected if selected and selected <= resolved_labels else None
     executing_refs = workflow_connection_refs(parsed, selected_labels=executing_labels, run_parameters=parameters)
-    agent_refs = await _agent_step_connection_ids(
-        ctx.organization_id, parsed, selected_labels=executing_labels, run_parameters=parameters
-    )
+    try:
+        agent_refs, agent_acts = await _agent_step_connection_ids(
+            ctx.organization_id, parsed, selected_labels=executing_labels, run_parameters=parameters
+        )
+    except IncompleteConnectionRead:
+        return CredentialGateResult(
+            error="The organization's connected accounts could not be read, so the accounts this agent step can "
+            "use cannot be checked. Try again."
+        )
     executing_refs = list(dict.fromkeys(executing_refs + agent_refs))
-    acting_refs = (
-        workflow_connection_refs(parsed, selected_labels=executing_labels, run_parameters=parameters, acting_only=True)
-        + agent_refs
-    )
+    acting_refs = workflow_connection_refs(
+        parsed, selected_labels=executing_labels, run_parameters=parameters, acting_only=True
+    ) + (agent_refs if agent_acts else [])
     policy = ctx.request_policy if isinstance(ctx.request_policy, RequestPolicy) else None
     admitted = await admitted_connection_ids(
         executing_refs,

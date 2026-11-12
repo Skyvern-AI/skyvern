@@ -47,6 +47,11 @@ from skyvern.forge.sdk.copilot.model_telemetry import (
 )
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.executor.run_liveness import run_write_authority
+from skyvern.forge.sdk.integrations.connected_accounts import (
+    OrgConnection,
+    org_connections_by_id,
+    settable_connected_account_fields,
+)
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import AgentStepToolCall, WorkflowRunBlock
@@ -124,6 +129,7 @@ class _RunState:
     run_context: WorkflowRunContext
     credential_keys: list[str]
     ignore_workflow_system_prompt: bool
+    connected_accounts: list[OrgConnection] = field(default_factory=list)
     workflow_system_prompt: str | None = None
     tools: list[str] | None = None
     file_keys: list[str] = field(default_factory=list)
@@ -458,7 +464,7 @@ def _pseudo_fields(tool: BlockTool) -> set[str]:
     return {"credential", "files"} & set(tool.fields) - set(tool.yaml_class.model_fields)
 
 
-def _arguments_schema(tool: BlockTool, credential_keys: list[str]) -> dict[str, Any]:
+def _arguments_schema(tool: BlockTool, state: _RunState) -> dict[str, Any]:
     schema = tool.yaml_class.model_json_schema()
     pseudo = _pseudo_fields(tool)
     params: dict[str, Any] = {
@@ -468,10 +474,17 @@ def _arguments_schema(tool: BlockTool, credential_keys: list[str]) -> dict[str, 
         "additionalProperties": False,
     }
     if "credential" in pseudo:
-        params["properties"]["credential"] = {"type": "string", "enum": credential_keys}
+        params["properties"]["credential"] = {"type": "string", "enum": state.credential_keys}
         params["required"].append("credential")
     if "files" in pseudo:
         params["properties"]["files"] = {"type": "array", "items": {"type": "string"}, "description": FILES_DESCRIPTION}
+    account_fields = settable_connected_account_fields(tool.yaml_class, tool.fields)
+    for name in account_fields:
+        described = schema["properties"][name].get("description")
+        params["properties"][name] = {
+            "$ref": f"#/$defs/{_ACCOUNT_DEF}",
+            **({"description": described} if described else {}),
+        }
     # Only the definitions a kept field reaches; the rest describe fields the model never sees.
     defs = schema.get("$defs", {})
     used: dict[str, Any] = {}
@@ -479,15 +492,36 @@ def _arguments_schema(tool: BlockTool, credential_keys: list[str]) -> dict[str, 
     while names := [name for name in defs if name not in used and f'"#/$defs/{name}"' in reached]:
         used |= {name: defs[name] for name in names}
         reached = json.dumps([defs[name] for name in names])
+    if account_fields:
+        used[_ACCOUNT_DEF] = {
+            "type": "string",
+            "description": f"The id of {_account_choices(state)}",
+            **({"enum": [account.id for account in state.connected_accounts]} if state.connected_accounts else {}),
+        }
     if used:
         params["$defs"] = used
     return params
 
 
+_ACCOUNT_DEF = "ConnectedAccountId"
+
+
+def _account_choices(state: _RunState) -> str:
+    if not state.connected_accounts:
+        return "a connected account, and the run's owner has no active connected accounts that could be read"
+    choices = [{k: v for k, v in a.facts().items() if k != "state"} for a in state.connected_accounts]
+    return f"one of the run's connected accounts: {json.dumps(choices)}"
+
+
 def _yaml_arguments(tool: BlockTool, written: dict[str, Any], state: _RunState) -> dict[str, Any]:
-    if unknown := sorted(set(written) - set(tool.fields)):
-        raise ValueError(f"Unknown arguments {unknown}; the allowed arguments are {list(tool.fields)}.")
+    if unknown := sorted(set(written) - set(tool.arguments)):
+        raise ValueError(f"Unknown arguments {unknown}; the allowed arguments are {list(tool.arguments)}.")
     arguments = dict(written)
+    account_ids = {account.id for account in state.connected_accounts}
+    for name in settable_connected_account_fields(tool.yaml_class, tool.fields):
+        value = arguments.get(name)
+        if value is not None and not (isinstance(value, str) and value in account_ids):
+            raise ValueError(f"{name} must be the id of {_account_choices(state)}.")
     pseudo = _pseudo_fields(tool)
     parameter_keys: list[str] = []
     if "credential" in pseudo:
@@ -519,18 +553,18 @@ def _dedicated_tool(block_type: BlockType, tool: BlockTool, state: _RunState) ->
     return FunctionTool(
         name=name,
         description=block_description(block_type, tool),
-        params_json_schema=_arguments_schema(tool, state.credential_keys),
+        params_json_schema=_arguments_schema(tool, state),
         on_invoke_tool=_in_turn(state, invoke, lambda written: (block_type, written)),
         strict_json_schema=False,
     )
 
 
-def _run_block_schema(credential_keys: list[str], block_types: list[str]) -> dict[str, Any]:
+def _run_block_schema(state: _RunState, block_types: list[str]) -> dict[str, Any]:
     branches: list[dict[str, Any]] = []
     # Each block's references read "#/$defs/X", which resolve against this tool's root, not the branch.
     defs: dict[str, Any] = {}
     for name in block_types:
-        branch = _arguments_schema(RUN_BLOCK_TYPES[name][1], credential_keys)
+        branch = _arguments_schema(RUN_BLOCK_TYPES[name][1], state)
         defs.update(branch.pop("$defs", {}))
         branches.append(branch)
     return {
@@ -564,7 +598,7 @@ def _run_block_tool(state: _RunState, block_types: list[str]) -> FunctionTool:
     return FunctionTool(
         name="run_block",
         description=run_block_description(block_types),
-        params_json_schema=_run_block_schema(state.credential_keys, block_types),
+        params_json_schema=_run_block_schema(state, block_types),
         on_invoke_tool=_in_turn(state, invoke, describe),
         strict_json_schema=False,
     )
@@ -863,7 +897,7 @@ async def _run_child_block(
             )
             if isinstance(e, ValidationError)
             else str(e),
-            "argument_schema": _arguments_schema(tool, state.credential_keys),
+            "argument_schema": _arguments_schema(tool, state),
         }
     else:
         block = _redacted_json(state, block_yaml.model_dump(mode="json", exclude_none=True))
@@ -1000,6 +1034,16 @@ def _credential_keys(parameters: list[PARAMETER_TYPE]) -> list[str]:
     ]
 
 
+async def _connected_accounts(organization_id: str | None, workflow_run_id: str) -> list[OrgConnection]:
+    """The accounts the run's owner may use, which every block tool's connected-account argument chooses from."""
+    if organization_id is None:
+        return []
+    workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(workflow_run_id, organization_id)
+    connections = await org_connections_by_id(organization_id, workflow_run.created_by)
+    # An author access setting on the step would narrow this list here.
+    return [connection for connection in connections if connection.active]
+
+
 async def run_agent_step(
     block: AgentStepBlock,
     llm_key: str,
@@ -1030,6 +1074,11 @@ async def run_agent_step(
         workflow_system_prompt=block.workflow_system_prompt,
         tools=block.tools,
     )
+    if any(
+        _offers(state, name) and settable_connected_account_fields(tool.yaml_class, tool.fields)
+        for name, (_, tool) in {**DEDICATED_BLOCK_TOOLS, **RUN_BLOCK_TYPES}.items()
+    ):
+        state.connected_accounts = await _connected_accounts(organization_id, workflow_run_id)
     effort = LLMConfigRegistry.get_config(llm_key).reasoning_effort
     model, run_config = resolve_agent_model(llm_key)
     finish = _finish_tool(block.data_schema, state)

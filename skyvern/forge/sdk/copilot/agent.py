@@ -2255,6 +2255,8 @@ def _make_agent_result(
             payload_updates["connectionCards"] = list(ctx.connection_cards)
         if ctx is not None and ctx.demonstration_offered and "demonstrationOffer" not in narrative_payload:
             payload_updates["demonstrationOffer"] = True
+        if ctx is not None and ctx.created_triggers and "createdTriggers" not in narrative_payload:
+            payload_updates["createdTriggers"] = list(ctx.created_triggers)
         if (
             ctx is not None
             and "canonicalWorkflowUnavailable" not in narrative_payload
@@ -2428,6 +2430,8 @@ def _build_narrative_payload(
         payload["connectionCards"] = list(ctx.connection_cards)
     if ctx.demonstration_offered:
         payload["demonstrationOffer"] = True
+    if ctx.created_triggers:
+        payload["createdTriggers"] = list(ctx.created_triggers)
     if ctx.canonical_workflow_unavailable is not None:
         payload["canonicalWorkflowUnavailable"] = ctx.canonical_workflow_unavailable
     if ctx.demonstration_items:

@@ -153,6 +153,10 @@ export default {
           from: { boxShadow: "0 0 0 0 hsl(var(--foreground) / 0.35)" },
           to: { boxShadow: "0 0 0 8px hsl(var(--foreground) / 0)" },
         },
+        "switch-focus-pulse": {
+          from: { boxShadow: "0 0 0 0 rgb(56 189 248 / 0.65)" },
+          to: { boxShadow: "0 0 0 10px rgb(56 189 248 / 0)" },
+        },
         "copilot-row-flash-success": {
           "0%, 30%": { backgroundColor: "rgba(16, 185, 129, 0.22)" },
           "100%": { backgroundColor: "transparent" },
@@ -178,6 +182,7 @@ export default {
         glow: "glow 2.5s ease-in-out infinite",
         "run-blocking-locate": "glow 0.85s ease-in-out 3",
         "analytics-pulse": "analytics-pulse-ring 0.6s ease-out 1",
+        "switch-focus-pulse": "switch-focus-pulse 1.2s ease-out 3",
         "copilot-row-flash-success": "copilot-row-flash-success 0.6s ease-out",
         "copilot-row-flash-error": "copilot-row-flash-error 0.6s ease-out",
       },
