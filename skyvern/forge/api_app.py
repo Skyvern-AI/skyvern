@@ -55,6 +55,7 @@ from skyvern.forge.sdk.routes.microsoft_oauth import microsoft_oauth_router
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router, legacy_v2_router
 from skyvern.forge.sdk.routes.sms_inbound import sms_inbound_router
 from skyvern.forge.sdk.routes.twilio_integration import twilio_integration_router
+from skyvern.forge.sdk.services import oauth_redirect_uri
 from skyvern.forge.sdk.services.local_org_auth_token_service import (
     ensure_local_api_key,
     ensure_local_org,
@@ -476,6 +477,7 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
     """Lifespan context manager for FastAPI app startup and shutdown."""
 
     LOG.info("Server started")
+    oauth_redirect_uri.warn_removed_redirect_host_settings()
 
     # Initialize tracing eagerly so OTel spans (`@traced(...)`) ship from the
     # first request. Without this, the tracer provider is configured lazily on

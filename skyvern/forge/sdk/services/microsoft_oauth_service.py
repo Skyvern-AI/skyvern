@@ -30,7 +30,7 @@ from skyvern.forge.sdk.db.repositories.microsoft_oauth import (  # noqa: F401
 from skyvern.forge.sdk.encrypt import encryptor
 from skyvern.forge.sdk.encrypt.base import DEFAULT_ENCRYPT_METHOD, EncryptMethod
 from skyvern.forge.sdk.schemas.microsoft_oauth import MicrosoftOAuthCredentialBase
-from skyvern.forge.sdk.services import oauth_consent
+from skyvern.forge.sdk.services import oauth_consent, oauth_redirect_uri
 from skyvern.forge.sdk.workflow import secret_encryption
 from skyvern.utils.email_validation import SAFE_EMAIL_ADDRESS_PATTERN
 
@@ -284,27 +284,17 @@ def identity_from_id_token(id_token: str | None) -> tuple[str | None, str | None
     )
 
 
-_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
-
-
 def _validate_redirect_uri(redirect_uri: str) -> None:
-    allowlist = settings.MICROSOFT_OAUTH_REDIRECT_HOSTS
-    if not allowlist:
+    registered = settings.MICROSOFT_OAUTH_REDIRECT_URIS
+    if not registered:
         if settings.MICROSOFT_OAUTH_CLIENT_ID:
             raise InvalidRedirectURIError(
-                "MICROSOFT_OAUTH_REDIRECT_HOSTS must be configured when MICROSOFT_OAUTH_CLIENT_ID is set"
+                "MICROSOFT_OAUTH_REDIRECT_URIS must be configured when MICROSOFT_OAUTH_CLIENT_ID is set"
             )
         return
-    try:
-        parsed = urlparse(redirect_uri)
-        scheme = parsed.scheme
-        host = parsed.hostname or ""
-    except Exception as exc:
-        raise InvalidRedirectURIError(f"Invalid redirect_uri: {exc}") from exc
-    if host not in {h.strip().lower() for h in allowlist if h and h.strip()}:
-        raise InvalidRedirectURIError(f"redirect_uri host not allowed: {host}")
-    if scheme != "https" and host not in _LOOPBACK_HOSTS:
-        raise InvalidRedirectURIError(f"redirect_uri must use https for non-loopback host: {host}")
+    rejection = oauth_redirect_uri.redirect_uri_rejection(redirect_uri, registered)
+    if rejection:
+        raise InvalidRedirectURIError(rejection)
 
 
 def _validate_app_origin(app_origin: str) -> None:
