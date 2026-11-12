@@ -30,6 +30,9 @@ type WorkflowPanelState = {
     version1?: WorkflowVersion;
     version2?: WorkflowVersion;
     showComparison?: boolean;
+    // For triggers panel
+    focusTriggerId?: string;
+    focusRequest?: number;
     mode?: "history" | "copilot";
     onCopilotReviewClose?: (
       status: CopilotReviewStatus,

@@ -1,3 +1,4 @@
+import type { CreatedTrigger } from "@/routes/workflows/copilot/narrativeState";
 import type { WorkflowReliability } from "@/routes/workflows/types/reliabilityTypes";
 import { createContext, useContext } from "react";
 import type { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
@@ -10,6 +11,14 @@ export type WorkflowAnalyticsPanelProps = {
 export type WorkflowTriggersPanelProps = Readonly<{
   workflowPermanentId: string;
   onClose: () => void;
+  // Opens this trigger's detail with its on switch highlighted.
+  focusTriggerId?: string;
+  // Changes on every request to focus, so asking again for the same trigger reopens it.
+  focusRequest?: number;
+}>;
+export type TriggerCreatedCardSlotProps = Readonly<{
+  trigger: CreatedTrigger;
+  onOpen?: () => void;
 }>;
 export type WorkflowRunMilestoneCardProps = Readonly<{
   workflowRunId: string;
@@ -52,6 +61,8 @@ export type PermissionsResponse = Readonly<{
   org_role: string | null;
   role: "admin" | "member" | "billing_admin" | null;
   capabilities: ReadonlyArray<PermissionCapability>;
+  // When the organization enforces app roles, effective_role overrides the Clerk role above.
+  rbac?: Readonly<{ enforce: boolean; effective_role: string | null }>;
 }>;
 
 export type PermissionsState =
@@ -95,6 +106,8 @@ export type PageSlots = {
   >;
   workflowAnalyticsPanel?: React.ComponentType<WorkflowAnalyticsPanelProps>;
   workflowTriggersPanel?: React.ComponentType<WorkflowTriggersPanelProps>;
+  // The Copilot trigger card with the trigger's live state and a Turn on switch.
+  triggerCreatedCard?: React.ComponentType<TriggerCreatedCardSlotProps>;
   workflowRunsFilterControls?: React.ComponentType;
   workflowRunMilestoneCard?: React.ComponentType<WorkflowRunMilestoneCardProps>;
   firstRunWaitCard?: React.ComponentType<FirstRunWaitCardProps>;

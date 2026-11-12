@@ -505,6 +505,7 @@ export interface TurnNarrativeState {
   outputFiles: DeliveredOutputFile[];
   connectionCards: ConnectionCard[];
   demonstrationOffer: boolean;
+  createdTriggers: CreatedTrigger[];
   canonicalWorkflowUnavailable: CanonicalWorkflowUnavailable | null;
   review: ReviewProjection | null;
   turnFacts: TurnFacts | null;
@@ -535,6 +536,22 @@ export interface ConnectionCard {
 
 export function connectionCardKey(card: ConnectionCard): string {
   return `${card.integrationId}:${card.reconnectConnectionId ?? "new"}`;
+}
+
+export interface TriggerFilter {
+  label: string;
+  value: string;
+}
+
+export interface CreatedTrigger {
+  eventTriggerId: string;
+  sourceKind: string;
+  // The trigger's settings in plain words, e.g. { label: "From contains", value: "billing@" }.
+  filters: TriggerFilter[];
+  // Its source starts runs by itself once on, so switching it on is the only step left.
+  firesOnItsOwn: boolean;
+  // The account its source reads through, if any; the card names it from the live account list.
+  connectionId: string | null;
 }
 
 export interface CanonicalWorkflowUnavailable {
@@ -570,6 +587,7 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   outputFiles: [],
   connectionCards: [],
   demonstrationOffer: false,
+  createdTriggers: [],
   canonicalWorkflowUnavailable: null,
   review: null,
   turnFacts: null,
@@ -2293,6 +2311,7 @@ export function hydrateNarrativeFromPayload(
     outputFiles: parseOutputFiles(payload.outputFiles),
     connectionCards: parseConnectionCards(payload.connectionCards),
     demonstrationOffer: payload.demonstrationOffer === true,
+    createdTriggers: parseCreatedTriggers(payload.createdTriggers),
     canonicalWorkflowUnavailable: parseCanonicalWorkflowUnavailable(
       payload.canonicalWorkflowUnavailable,
     ),
@@ -2302,6 +2321,35 @@ export function hydrateNarrativeFromPayload(
     steerMessages: parseSteerMessages(payload.steerMessages),
     screenshots: parseScreenshots(payload.screenshots),
   };
+}
+
+function parseCreatedTriggers(value: unknown): CreatedTrigger[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) =>
+    typeof item === "object" &&
+    item !== null &&
+    typeof item.eventTriggerId === "string" &&
+    typeof item.sourceKind === "string"
+      ? [
+          {
+            eventTriggerId: item.eventTriggerId,
+            sourceKind: item.sourceKind,
+            filters: Array.isArray(item.filters)
+              ? item.filters.filter(
+                  (filter: unknown): filter is TriggerFilter =>
+                    typeof filter === "object" &&
+                    filter !== null &&
+                    typeof (filter as TriggerFilter).label === "string" &&
+                    typeof (filter as TriggerFilter).value === "string",
+                )
+              : [],
+            firesOnItsOwn: item.firesOnItsOwn === true,
+            connectionId:
+              typeof item.connectionId === "string" ? item.connectionId : null,
+          },
+        ]
+      : [],
+  );
 }
 
 function parseScreenshots(value: unknown): TurnScreenshot[] {

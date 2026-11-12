@@ -248,6 +248,9 @@ import { CardFooter, CardHeader, CopilotCard } from "./cards/cardChrome";
 import { type AttentionTrayPresentation } from "./cards/AttentionTray";
 import { TestRunOutputCard } from "./cards/TestRunOutputCard";
 import { ConnectionCard } from "./cards/ConnectionCard";
+import { TriggerCreatedCard } from "./cards/TriggerCreatedCard";
+import { usePageSlots } from "@/store/PageSlots";
+import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import {
   CredentialAskMarker,
   CredentialCard,
@@ -1625,6 +1628,23 @@ export function WorkflowCopilotChat({
   portalTarget,
 }: WorkflowCopilotChatProps = {}) {
   const workflowPermanentId = useWorkflowPermanentId();
+  const {
+    workflowTriggersPanel,
+    triggerCreatedCard: LiveTriggerCreatedCard = TriggerCreatedCard,
+  } = usePageSlots();
+  const hasTriggersPanel = Boolean(workflowTriggersPanel);
+  const setWorkflowPanelState = useWorkflowPanelStore(
+    (state) => state.setWorkflowPanelState,
+  );
+  const openTriggerInPanel = (eventTriggerId: string) => {
+    // The panel's trigger list may be cached from before Copilot created this one.
+    void queryClient.invalidateQueries({ queryKey: ["eventTriggers"] });
+    setWorkflowPanelState({
+      active: true,
+      content: "triggers",
+      data: { focusTriggerId: eventTriggerId, focusRequest: Date.now() },
+    });
+  };
   const docEditorEnabled = useWorkflowDocEditorFlag();
   const logging = useLogging();
   useLayoutEffect(() => {
@@ -11239,6 +11259,17 @@ export function WorkflowCopilotChat({
                                 connectionId,
                               );
                           }}
+                        />
+                      ))}
+                      {message.narrative.createdTriggers.map((trigger) => (
+                        <LiveTriggerCreatedCard
+                          key={trigger.eventTriggerId}
+                          trigger={trigger}
+                          onOpen={
+                            hasTriggersPanel
+                              ? () => openTriggerInPanel(trigger.eventTriggerId)
+                              : undefined
+                          }
                         />
                       ))}
                       {message.narrative.demonstrationOffer ? (
