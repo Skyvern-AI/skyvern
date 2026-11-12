@@ -9,9 +9,13 @@ from skyvern.forge.sdk.encrypt.base import DEFAULT_ENCRYPT_METHOD, EncryptMethod
 from skyvern.forge.sdk.encrypt.bootstrap import PLACEHOLDER_SECRET_KEY, register_aes_encryptor
 
 SECRET_KEY = "self-hosted-secret-key-000"
-# "refresh-token" as the retired CBC writer stored it under SECRET_KEY; pinned so a reader derivation change fails here.
+# "refresh-token" as the retired CBC writer stored it under SECRET_KEY with each kind of salt/IV a deployment
+# could hold.
 LEGACY_PUBLIC_DEFAULT_CIPHERTEXT = "TmO1Ph6RwR1dVoSl7iLZ9g=="
 LEGACY_EXPLICIT_CIPHERTEXT = "wPXE7jBaF8hk9AZgVPP6rQ=="
+# Written under the salt/IV derived from SECRET_KEY while ENCRYPTOR_AES_SALT / ENCRYPTOR_AES_IV were unset. Only the
+# derivation reads it (no fallback does), so a derivation change fails here.
+LEGACY_DERIVED_CIPHERTEXT = "HiAexXnV+9rKTiIGzNrrig=="
 
 
 @pytest.fixture(autouse=True)
@@ -61,6 +65,13 @@ async def test_register_aes_encryptor_decrypts_ciphertext_created_with_legacy_pa
     register_aes_encryptor(secret_key=SECRET_KEY, salt=salt, iv=iv)
 
     assert await encryptor.decrypt(ciphertext, EncryptMethod.AES) == "refresh-token"
+
+
+@pytest.mark.asyncio
+async def test_rows_written_under_the_secret_key_derived_salt_and_iv_stay_readable() -> None:
+    register_aes_encryptor(secret_key=SECRET_KEY)
+
+    assert await encryptor.decrypt(LEGACY_DERIVED_CIPHERTEXT, EncryptMethod.AES) == "refresh-token"
 
 
 @pytest.mark.asyncio
