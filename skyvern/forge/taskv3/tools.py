@@ -7914,6 +7914,30 @@ _FIELD_VALUE_IS_SECRET_JS = (
     "(el) => {" + OTP_INPUT_PRIVACY_JS + "return el.type === 'password' || isOtpInputValueSecret(el);}"
 )
 
+# A jQuery UI datepicker attached to the field declares the format and names it reads, and its own parser says whether
+# the field's value is a date in that format. Null for a field without one.
+_DATEPICKER_READING_JS = r"""(el) => {
+  const $ = el.ownerDocument.defaultView.jQuery;
+  if (!$ || !$.datepicker || !el.classList.contains('hasDatepicker')) return null;
+  let format, settings;
+  try {
+    const option = (name) => $(el).datepicker('option', name);
+    format = option('dateFormat');
+    // The parser and formatter fall back to the page-wide defaults for any setting not passed, so a picker with its
+    // own month or day names would be read in another language.
+    settings = {};
+    for (const name of ['shortYearCutoff', 'dayNamesShort', 'dayNames', 'monthNamesShort', 'monthNames']) {
+      settings[name] = option(name);
+    }
+  } catch (e) { return null; }
+  if (typeof format !== 'string' || !format) return null;
+  let reads;
+  try { reads = $.datepicker.parseDate(format, el.value, settings) !== null; } catch (e) { reads = false; }
+  let example = null;
+  try { example = $.datepicker.formatDate(format, new Date(2026, 0, 31), settings); } catch (e) {}
+  return {format: format, reads: reads, example: example};
+}"""
+
 
 # The element focus actually went to -- followed into shadow roots -- when it takes typed text and sits at
 # or inside the target (or is the target label's control): the only place type()'s keystrokes can land.
@@ -21334,7 +21358,24 @@ def build_browser_tools(
             held = await _read_field_value(page, selector)
             match = compare_text(text, held, before, exact=exact)
         shown = _masked_echo(held) if held is not None and not exact else None
-        return entry_outcome(selector, match, shown=shown)
+        result = entry_outcome(selector, match, shown=shown)
+        if held and not exact and match in (EntryMatch.REFORMATTED, EntryMatch.DIFFERENT):
+            # A datepicker's keystroke filter can drop what its format does not use ("11/05/2026" -> "11052026"). Its
+            # parser's verdict is evidence for the model, not a guard: held_as stays ok, so a queued submit or Enter runs.
+            try:
+                reading = await page.locator(selector).first.evaluate(_DATEPICKER_READING_JS, timeout=2000)
+            except Exception:
+                reading = None
+            if reading and not reading.get("reads"):
+                example = reading.get("example")
+                written_as = f" (31 January 2026 is written {example!r})" if example else ""
+                result = dataclasses.replace(
+                    result,
+                    content=f"{result.content} The field is a date picker that reads dates as "
+                    f"{reading.get('format')!r}{written_as}, and its own parser cannot read {_masked_echo(held)!r} "
+                    "as a date.",
+                )
+        return result
 
     async def _value_changed_by_page_error(
         page: Any, selector: str, typed: str, held: str, *, echo: bool
