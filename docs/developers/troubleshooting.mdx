@@ -82,6 +82,7 @@ When an agent run ends in `failed`, `terminated`, or `timed_out`, Skyvern classi
 | `WEBSITE_ERROR` | Website error | The site failed on its side, such as a 502 or maintenance. | Retry later. Nothing is wrong with your agent. |
 | `INFRASTRUCTURE_ERROR` | Temporary system issue | A network or capacity problem on Skyvern's side. | Retry. |
 | `PARAMETER_BINDING_ERROR` | Parameter setup failed | An internal setup step for the run's inputs failed. | Retry, then contact support. |
+| `BUSINESS_OUTCOME` | Stopped for a business reason | A real condition on the site or in the inputs, such as a record that doesn't exist or a closed posting. | Check `failure_reason` and the run's inputs. |
 | `UNKNOWN` | Unknown failure | Skyvern couldn't tell. | Read `failure_reason` and watch the recording. |
 
 A category that isn't in this table is one of your own `error_code_mapping` codes, shown as is.
