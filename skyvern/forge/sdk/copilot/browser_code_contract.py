@@ -71,6 +71,8 @@ class BrowserCodeOperation:
     input_value: str | None = None
     source_url: str | None = None
     result_url: str | None = None
+    # The URL a goto was asked to open; a failed goto's result_url is the browser's error page instead.
+    target_url: str | None = None
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -81,6 +83,7 @@ class BrowserCodeOperation:
             "input_value": self.input_value,
             "source_url": self.source_url,
             "result_url": self.result_url,
+            "target_url": self.target_url,
         }
 
     @classmethod
@@ -93,6 +96,7 @@ class BrowserCodeOperation:
             input_value=payload.get("input_value"),
             source_url=payload.get("source_url"),
             result_url=payload.get("result_url"),
+            target_url=payload.get("target_url"),
         )
 
 

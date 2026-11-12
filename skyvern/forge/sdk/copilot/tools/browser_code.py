@@ -51,6 +51,7 @@ from skyvern.forge.sdk.copilot.mcp_adapter import (
     is_redaction_withheld,
     scrub_model_facing_tool_result,
 )
+from skyvern.forge.sdk.copilot.nav_attribution import proxy_owns_nav_codes
 from skyvern.forge.sdk.copilot.reached_download_target import DownloadClaimHelperContract
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
@@ -66,8 +67,9 @@ from skyvern.forge.sdk.copilot.runtime import (
 from skyvern.forge.sdk.copilot.screenshot_utils import capturing_tool_call_id, withdraw_frame_captured_before
 from skyvern.utils.contained_effects import contained_effect
 from skyvern.webeye.browser_errors import BrowserAutomationError
+from skyvern.webeye.navigation import driver_nav_error_code
 
-from ._shared import _DISCOVERY_PER_CALL_TIMEOUT_SECONDS
+from ._shared import _DISCOVERY_PER_CALL_TIMEOUT_SECONDS, provider_refusal_fact
 from .errors import reporting_withheld_browser
 from .guardrails import _authority_tool_error
 from .scouting import (
@@ -312,6 +314,24 @@ def _operation_fact(operation: BrowserCodeOperation) -> dict[str, Any]:
     if operation.error:
         fact["error"] = operation.error
     return fact
+
+
+async def _failed_goto_provider_refusal(
+    cell: BrowserCodeCellResult, browser_session_id: str | None, since_wall: float
+) -> str | None:
+    if cell.ok or browser_session_id is None:
+        return None
+    failed_goto = next(
+        (op for op in reversed(cell.operations) if op.operation == "goto" and op.succeeded is False),
+        None,
+    )
+    if failed_goto is None or failed_goto.error is None:
+        return None
+    if not proxy_owns_nav_codes([driver_nav_error_code(failed_goto.error)]):
+        return None
+    return await provider_refusal_fact(
+        browser_session_id=browser_session_id, url=failed_goto.target_url, since_wall=since_wall
+    )
 
 
 def _cell_payload(cell: BrowserCodeCellResult) -> dict[str, Any]:
@@ -587,6 +607,7 @@ async def _run_bound_cell(
         browser_session_recovery(copilot_ctx),
     ):
         cell_started = time.monotonic()
+        cell_started_wall = time.time()
         notes = _take_interruption_note(host)
         session_to_reset = host.session if fresh_namespace else None
         browser_session_id = effective_browser_session_id(copilot_ctx)
@@ -714,10 +735,12 @@ async def _run_bound_cell(
                 if last.succeeded is None:
                     ended["page_after_call"] = "unknown: that operation reached the browser without a reply"
                 notes["session_ended_during_call"] = ended
+        payload = _cell_payload(cell)
+        provider_refusal = await _failed_goto_provider_refusal(cell, browser_session_id, cell_started_wall)
+        if provider_refusal is not None and payload.get("error"):
+            payload["error"] = f"{payload['error']} {provider_refusal}"
         try:
-            result = finish(
-                {**_cell_payload(cell), "executed_source_reference": source_reference, **notes, **binding.provenance()}
-            )
+            result = finish({**payload, "executed_source_reference": source_reference, **notes, **binding.provenance()})
             _record_outcome(copilot_ctx, cell, result, browser_session_id=browser_session_id, generation=generation)
             try:
                 await _stage_cell_frame(

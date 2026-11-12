@@ -1018,6 +1018,12 @@ async def _convert_css_shape_to_string(
 
 
 @dataclass(frozen=True)
+class ProxyProviderRefusal:
+    status: int
+    reason: str
+
+
+@dataclass(frozen=True)
 class RecordingVideoSizeResolution:
     """Outcome of resolving the recording resolution for a run.
 
@@ -1588,6 +1594,13 @@ class AgentFunction:
     async def proxy_unreachable_target_status(self, *, host: str, since: float) -> int | None:
         """The upstream status the run's proxy provider refused a CONNECT to ``host`` with at or after ``since``
         (``time.monotonic()``), when that status says the host did not accept the provider's connection."""
+        return None
+
+    async def proxy_provider_refusal(
+        self, *, browser_session_id: str, host: str, since_wall: float
+    ) -> ProxyProviderRefusal | None:
+        """The refusal, with the reason it stated, the proxy provider gave this browser's connection to ``host`` at
+        or after ``since_wall`` (``time.time()``)."""
         return None
 
     async def capture_workflow_run_created(

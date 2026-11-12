@@ -6,7 +6,6 @@ import contextlib
 import functools
 import json
 import mimetypes
-import os
 import secrets
 import time
 from collections.abc import Awaitable, Callable, Coroutine
@@ -26,6 +25,7 @@ from skyvern.exceptions import BlockedHost, SkyvernHTTPException
 from skyvern.forge import app
 from skyvern.forge.sdk.cache.base import BaseCache
 from skyvern.forge.sdk.cache.process_local import ProcessLocalCache
+from skyvern.forge.sdk.cache.server_processes import server_runs_one_process
 from skyvern.forge.sdk.copilot.agent_context import ScoutedInteraction
 from skyvern.forge.sdk.copilot.config import ALL_BLOCK_FAMILIES, AuthoringCapability
 from skyvern.forge.sdk.copilot.context import CopilotContext
@@ -81,13 +81,7 @@ def demonstration_cache() -> BaseCache | None:
     """Where demonstrations live: the shared cache, or this process when it is the server's only one."""
     if app.CACHE is not None and app.CACHE.is_shared:
         return app.CACHE
-    # uvicorn reads the same variable for its worker count.
-    try:
-        workers = int(os.environ.get("WEB_CONCURRENCY") or 1)
-    except ValueError:
-        LOG.warning("Copilot demonstrations refused: WEB_CONCURRENCY is not a number")
-        return None
-    if workers > 1:
+    if not server_runs_one_process():
         return None
     _log_process_demonstration_cache()
     return _PROCESS_DEMONSTRATION_CACHE

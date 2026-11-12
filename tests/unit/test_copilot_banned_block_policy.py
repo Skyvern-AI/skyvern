@@ -1521,6 +1521,69 @@ def test_agent_step_neighbours_follow_conditional_branches_not_list_order() -> N
     }
 
 
+def test_agent_step_neighbours_in_a_loop_body_keep_the_merge_an_empty_branch_cannot_loop_back_from() -> None:
+    final = _yaml(
+        {
+            "block_type": "for_loop",
+            "label": "each_item",
+            "loop_over_parameter_key": "items",
+            "loop_blocks": [
+                {
+                    "block_type": "conditional",
+                    "label": "route",
+                    "next_block_label": "submit",
+                    "branch_conditions": [
+                        {"criteria": {"expression": "{{ true }}"}, "next_block_label": "prepare"},
+                        {"is_default": True, "next_block_label": "submit"},
+                    ],
+                },
+                {"block_type": "agent_step", "label": "prepare", "prompt": "p", "data_schema": {}},
+                {"block_type": "code", "label": "submit", "next_block_label": "settle", "code": "return {}"},
+                {
+                    "block_type": "conditional",
+                    "label": "settle",
+                    "next_block_label": "prepare",
+                    "branch_conditions": [
+                        {"criteria": {"expression": "{{ true }}"}, "next_block_label": None},
+                        {"is_default": True, "next_block_label": None},
+                    ],
+                },
+            ],
+        },
+    )
+
+    assert authoring_turn_summary(None, final)["agent_step_blocks"] == {
+        "prepare": {"before": ["conditional"], "after": ["code"]},
+    }
+
+
+def test_agent_step_neighbours_in_a_loop_body_skip_a_conditional_reached_only_by_an_empty_branch() -> None:
+    final = _yaml(
+        {
+            "block_type": "for_loop",
+            "label": "each_item",
+            "loop_over_parameter_key": "items",
+            "loop_blocks": [
+                {
+                    "block_type": "conditional",
+                    "label": "check",
+                    "next_block_label": "summarize",
+                    "branch_conditions": [
+                        {"criteria": {"expression": "{{ true }}"}, "next_block_label": "prep"},
+                        {"is_default": True, "next_block_label": None},
+                    ],
+                },
+                {"block_type": "code", "label": "prep", "next_block_label": "summarize", "code": "return {}"},
+                {"block_type": "agent_step", "label": "summarize", "prompt": "p", "data_schema": {}},
+            ],
+        },
+    )
+
+    assert authoring_turn_summary(None, final)["agent_step_blocks"] == {
+        "summarize": {"before": ["code"], "after": []},
+    }
+
+
 def test_repeated_same_family_rewrites_after_failed_tests_are_counted() -> None:
     """Under-switching is a block rewritten in its own family after each failed test; the type never
     changes, so only a count of those rewrites makes it visible."""

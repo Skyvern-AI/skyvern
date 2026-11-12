@@ -392,8 +392,9 @@ async def test_workflow_run_route_authorizes_only_resolved_persistent_sessions(
         assert agent_functions.authorize_browser_session_stream.await_count == 0
         return object()
 
-    async def run_input_loop(*_args: object, **_kwargs: object) -> None:
+    async def run_input_loop(*_args: object, **kwargs: object) -> None:
         assert agent_functions.authorize_browser_session_stream.await_count == int(has_initial_session)
+        assert kwargs["controlled_browser_session_id"] == (browser_session_id if has_initial_session else None)
         if expects_reauthorization:
             await disconnect.wait()
         raise WebSocketDisconnect()

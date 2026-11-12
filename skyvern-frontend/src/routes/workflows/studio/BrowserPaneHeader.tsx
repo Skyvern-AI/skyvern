@@ -10,6 +10,7 @@ import { AxiosError } from "axios";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useRef, useState } from "react";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
+import { adoptDebugSession } from "@/routes/workflows/hooks/useDebugSessionQuery";
 import { runIsRetryWaiting } from "@/routes/workflows/workflowRun/runRetryState";
 import type { StreamState } from "@/routes/streaming/streamState";
 import { EXTERNAL_BROWSER_DIAGNOSTIC } from "@/routes/streaming/StreamDiagnostics";
@@ -312,13 +313,7 @@ export function BrowserPaneActions() {
       );
     },
     onSuccess: (response) => {
-      queryClient.setQueryData(
-        ["debugSession", workflowPermanentId],
-        response.data,
-      );
-      void queryClient.invalidateQueries({
-        queryKey: ["debugSession", workflowPermanentId],
-      });
+      adoptDebugSession(queryClient, workflowPermanentId, response.data);
       setConfirmRestart(false);
       toast({
         variant: "success",

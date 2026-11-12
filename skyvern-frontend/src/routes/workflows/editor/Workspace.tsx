@@ -71,6 +71,7 @@ import { useBrowserSessionRateLimit } from "../hooks/useBrowserSessionRateLimit"
 import { useActiveRunSessionQuery } from "../hooks/useActiveRunSessionQuery";
 import {
   shouldPollDebugSessionInvalidation,
+  adoptDebugSession,
   useDebugSessionQuery,
 } from "../hooks/useDebugSessionQuery";
 import { useIsGlobalWorkflow } from "../hooks/useIsGlobalWorkflow";
@@ -1580,16 +1581,8 @@ function Workspace({
       return client.post<DebugSessionApiResponse>(`/debug-session/${id}/new`);
     },
     onSuccess: (response) => {
-      const newDebugSession = response.data;
       resetOnSuccess();
-
-      queryClient.setQueryData(
-        ["debugSession", workflowPermanentId],
-        newDebugSession,
-      );
-      void queryClient.invalidateQueries({
-        queryKey: ["debugSession", workflowPermanentId],
-      });
+      adoptDebugSession(queryClient, workflowPermanentId, response.data);
 
       toast({
         title: "Browser cycled",

@@ -2060,9 +2060,10 @@ async def start_fresh_browser_tool(ctx: RunContextWrapper) -> str:
 
     The new session has no cookies, storage, sign-ins or challenge history, so a site that challenged
     or blocked the old browser may not challenge it. Everything in the old browser is lost, including
-    open tabs and the current page. When the studio browser pane streams the old browser, it stays
-    open and the pane keeps showing it while your browser tools act in the new one. If the new
-    browser cannot start, the old one stays in use.
+    open tabs and the current page. When the old browser is the studio browser, the new one replaces it
+    there and the old one closes, unless a person has Take control, a demonstration is recording in it,
+    a run occupies it, or that cannot be checked; then the old one stays the studio browser and the
+    pane keeps showing it. If the new browser cannot start, the old one stays in use.
     """
     authority_error = _authority_tool_error(ctx.context, FRESH_BROWSER_TOOL_NAME)
     if authority_error:

@@ -12113,7 +12113,7 @@ class WorkflowService:
                         default_next_map[block.label] = blocks[idx + 1].label
 
         # connect conditional branch terminals to the conditional's merge-point successor.
-        resolve_conditional_merge_edges(all_blocks, label_to_block, default_next_map)
+        skipped_merge_link = resolve_conditional_merge_edges(all_blocks, label_to_block, default_next_map)
 
         adjacency: dict[str, set[str]] = {label: set() for label in label_to_block}
         incoming: dict[str, int] = {label: 0 for label in label_to_block}
@@ -12133,6 +12133,12 @@ class WorkflowService:
             if isinstance(block, ConditionalBlock):
                 for branch in block.ordered_branches:
                     _add_edge(label, branch.next_block_label)
+                # A skipped merge link can hide a loop closed by the run falling back to the conditional's own next, which
+                # it does on an empty branch or a continued failure. Without a skipped link the edge is left out.
+                if skipped_merge_link and (
+                    block.continue_on_failure or any(not branch.next_block_label for branch in block.ordered_branches)
+                ):
+                    _add_edge(label, default_next_map.get(label))
             else:
                 _add_edge(label, default_next_map.get(label))
 

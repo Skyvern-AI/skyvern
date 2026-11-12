@@ -35,6 +35,7 @@ from skyvern.forge.sdk.copilot.browser_target import (
 )
 from skyvern.forge.sdk.copilot.code_write_diff import CODE_WRITE_TOOL_NAMES, CodeWriteDiff
 from skyvern.forge.sdk.copilot.context import (
+    FRESH_BROWSER_TOOL_NAME,
     REPLY_TOOL_NAME,
     USER_FACING_REASON_PARAM,
     CopilotContext,
@@ -596,6 +597,7 @@ async def stream_to_sse(
                                 detail=detail,
                                 workflow_run_id=workflow_run_id,
                                 test_inputs=test_inputs,
+                                debug_session_id=_tool_result_debug_session_id(tool_name, parsed),
                                 executed_source_reference=_tool_result_executed_source_reference(tool_name, parsed),
                                 timestamp=tool_result_ts,
                             )
@@ -675,6 +677,13 @@ def _tool_result_workflow_run_id(tool_name: str, parsed: dict[str, Any]) -> str 
     data = parsed.get("data")
     run_id = data.get("workflow_run_id") if isinstance(data, dict) else None
     return run_id if isinstance(run_id, str) else None
+
+
+def _tool_result_debug_session_id(tool_name: str, parsed: dict[str, Any]) -> str | None:
+    if tool_name != FRESH_BROWSER_TOOL_NAME:
+        return None
+    debug_session_id = parsed.get("debug_session_id")
+    return debug_session_id if isinstance(debug_session_id, str) else None
 
 
 def _tool_result_work_plan(tool_name: str, parsed: dict[str, Any]) -> list[str] | None:
@@ -839,6 +848,7 @@ async def _send_pending_tool_result(
             ),
             workflow_run_id=workflow_run_id,
             test_inputs=test_inputs,
+            debug_session_id=_tool_result_debug_session_id(pending.tool_name, parsed),
             executed_source_reference=_tool_result_executed_source_reference(pending.tool_name, parsed),
             timestamp=flush_ts,
         )

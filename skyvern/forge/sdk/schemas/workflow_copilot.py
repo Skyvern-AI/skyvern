@@ -976,6 +976,10 @@ class WorkflowCopilotToolResultUpdate(BaseModel):
         None,
         description="Where each input of the run this result dispatched came from. Keys and sources only, never values",
     )
+    debug_session_id: str | None = Field(
+        None,
+        description="The debug session a start_fresh_browser result moved the Studio browser to; None otherwise.",
+    )
     executed_source_reference: str | None = Field(
         None,
         description=(
