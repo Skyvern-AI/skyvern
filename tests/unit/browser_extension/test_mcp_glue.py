@@ -47,6 +47,10 @@ _BROKER_PAIRING_FALLBACK_GUIDANCE = (
     "Skyvern browser extension is not connected. Keep Chrome and the Skyvern extension open, then retry. "
     "To open the one-click pairing page, run `skyvern browser extension-pair`."
 )
+_BROKER_APPROVED_CLIENT_GUIDANCE = (
+    "Skyvern browser extension is not connected. This agent is already approved, so no pairing is needed. "
+    "Keep Chrome open with the Skyvern Agent extension enabled, then retry."
+)
 
 
 @pytest.fixture(autouse=True)
@@ -195,6 +199,7 @@ async def test_broker_session_opens_one_step_pairing_inline(
 ) -> None:
     runtime = SimpleNamespace(
         wait_for_extension=AsyncMock(return_value=False),
+        is_client_approved=AsyncMock(return_value=False),
         begin_pairing=AsyncMock(return_value=pairing_opened),
     )
     monkeypatch.setenv("BROWSER_TYPE", "extension-connect")
@@ -208,6 +213,43 @@ async def test_broker_session_opens_one_step_pairing_inline(
     assert "extension-token" not in result["error"]["message"]
     runtime.begin_pairing.assert_awaited_once_with()
     assert runtime.wait_for_extension.await_args_list == [call(8.0), call(remaining_wait)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("extension_reconnects", [True, False])
+async def test_broker_session_approved_client_waits_for_reconnect_without_pairing(
+    monkeypatch: pytest.MonkeyPatch,
+    extension_reconnects: bool,
+) -> None:
+    """An approved client's extension is only in its reconnect backoff, so a pairing
+    page cannot help: it must wait the full broker window and never open a tab."""
+    runtime = SimpleNamespace(
+        wait_for_extension=AsyncMock(side_effect=[False, extension_reconnects]),
+        is_client_approved=AsyncMock(return_value=True),
+        begin_pairing=AsyncMock(return_value=True),
+    )
+    monkeypatch.setenv("BROWSER_TYPE", "extension-connect")
+    monkeypatch.delenv("SKYVERN_BROWSER_EXTENSION_BROKER")
+    monkeypatch.setattr(mcp_session.BrowserExtensionRuntime, "get_or_start", AsyncMock(return_value=runtime))
+    monkeypatch.setattr(
+        mcp_session,
+        "resolve_browser",
+        AsyncMock(return_value=(MagicMock(), BrowserContext(mode="extension"))),
+    )
+
+    result = await mcp_session.skyvern_browser_session_create()
+
+    runtime.begin_pairing.assert_not_awaited()
+    assert runtime.wait_for_extension.await_args_list == [call(8.0), call(27.0)]
+    if extension_reconnects:
+        assert result["ok"] is True
+        assert result["data"]["browser"] == "extension"
+        return
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_session.ErrorCode.BROWSER_NOT_FOUND
+    assert result["error"]["message"] == _BROKER_APPROVED_CLIENT_GUIDANCE
+    assert "extension-pair" not in result["error"]["message"]
+    assert "Approve pairing" not in result["error"]["message"]
 
 
 @pytest.mark.asyncio
