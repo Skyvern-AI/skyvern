@@ -176,7 +176,7 @@ export function CustomCredentialServiceConfigForm({ onSuccess }: Props = {}) {
             )}
           />
 
-          <div className="flex items-center gap-4">
+          <div className="flex flex-wrap items-center gap-4">
             <Button
               type="submit"
               disabled={isLoading || isMutating || isTesting}

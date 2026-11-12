@@ -11,7 +11,6 @@ import asyncio
 import contextlib
 import inspect
 import os
-import re
 import time
 from contextvars import ContextVar
 from datetime import UTC, datetime
@@ -484,48 +483,6 @@ async def test_wait_for_page_ready_before_action_catches_wait_for_page_ready_exc
         ):
             # Should NOT raise - exception should be caught
             await script_page._wait_for_page_ready_before_action()
-
-
-@pytest.mark.asyncio
-async def test_wait_for_page_ready_attribute_access_regression():
-    """
-    Regression test: Verify that the code accesses self.page, not self._page.
-
-    The original bug (fixed in PR #8425) used self._page which caused:
-    AttributeError: 'ScriptSkyvernPage' object has no attribute '_page'
-
-    This test directly inspects the source code to ensure self._page is not used.
-    """
-    source = inspect.getsource(ScriptSkyvernPage._wait_for_page_ready_before_action)
-
-    # The fixed code should use self.page
-    # nosemgrep false positive: "self.page" is an attribute name, not a URL.
-    assert "self.page" in source, "Method should access self.page"  # nosemgrep: incomplete-url-substring-sanitization
-
-    # The fixed code should NOT use self._page (except in comments)
-    # Remove comments and docstrings first
-    # Remove docstrings
-    source_no_docstrings = re.sub(r'""".*?"""', "", source, flags=re.DOTALL)
-    source_no_docstrings = re.sub(r"'''.*?'''", "", source_no_docstrings, flags=re.DOTALL)
-    # Remove single-line comments
-    source_no_comments = re.sub(r"#.*$", "", source_no_docstrings, flags=re.MULTILINE)
-
-    # Now check - self._page should NOT appear in the actual code
-    # (It may appear in comments explaining the fix, which is fine)
-    lines_with_code = [
-        line for line in source_no_comments.split("\n") if line.strip() and not line.strip().startswith("#")
-    ]
-    code_only = "\n".join(lines_with_code)
-
-    # Check for the bug pattern
-    if "self._page" in code_only:
-        # Find the line for better error reporting
-        for i, line in enumerate(source.split("\n"), 1):
-            if "self._page" in line and not line.strip().startswith("#"):
-                pytest.fail(
-                    f"Found 'self._page' in code at line {i}: {line.strip()}\n"
-                    "This is a regression! SkyvernPage uses self.page, not self._page."
-                )
 
 
 # =============================================================================

@@ -9,6 +9,7 @@ import dataclasses
 import json
 import time
 import typing as t
+import uuid
 from pathlib import PurePath
 
 import structlog
@@ -35,6 +36,7 @@ from skyvern.forge.sdk.streaming.registries import (
     stream_ref_dec,
     try_stream_ref_inc,
 )
+from skyvern.forge.sdk.streaming.user_control import mark_user_control, release_user_control
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.utils.url_validators import prepend_scheme_and_validate_url
 from skyvern.webeye.browser_errors import is_target_closed_message
@@ -596,12 +598,14 @@ async def _run_input_loop(
     input_session: ActivePageCdpInputSession,
     log_id_key: str,
     log_id_value: str,
+    controlled_browser_session_id: str | None = None,
 ) -> None:
     dropped_log_count = 0
     no_active_page_log_count = 0
     dispatch_semaphore = asyncio.Semaphore(_MAX_IN_FLIGHT_INPUT_DISPATCHES)
     dispatch_tasks: set[asyncio.Task[None]] = set()
     dispatch_failure_close_started = False
+    control_holder = uuid.uuid4().hex
 
     async def dispatch_pipelined_event(
         cdp_session: CDPSession,
@@ -659,10 +663,14 @@ async def _run_input_loop(
             if kind == "take-control":
                 channel.interactor = "user"
                 LOG.info("CDP input: take-control received", **{log_id_key: log_id_value}, client_id=channel.client_id)
+                if controlled_browser_session_id is not None:
+                    await mark_user_control(channel.organization_id, controlled_browser_session_id, control_holder)
                 continue
             if kind == "cede-control":
                 channel.interactor = "agent"
                 LOG.info("CDP input: cede-control received", **{log_id_key: log_id_value}, client_id=channel.client_id)
+                if controlled_browser_session_id is not None:
+                    await release_user_control(channel.organization_id, controlled_browser_session_id, control_holder)
                 continue
 
             if channel.interactor != "user":
@@ -737,6 +745,8 @@ async def _run_input_loop(
             task.cancel()
         if pending_tasks:
             await asyncio.gather(*pending_tasks, return_exceptions=True)
+        if controlled_browser_session_id is not None and channel.interactor == "user":
+            await release_user_control(channel.organization_id, controlled_browser_session_id, control_holder)
 
 
 @legacy_base_router.websocket("/stream/cdp_input/workflow_run/{workflow_run_id}")
@@ -895,7 +905,14 @@ async def cdp_input_stream(
         LOG.info("CDP input channel ready", workflow_run_id=workflow_run_id, client_id=client_id)
         await websocket.send_json({"kind": "ready"})
 
-        await _run_input_loop(websocket, channel, input_session, "workflow_run_id", workflow_run_id)
+        await _run_input_loop(
+            websocket,
+            channel,
+            input_session,
+            "workflow_run_id",
+            workflow_run_id,
+            controlled_browser_session_id=last_browser_session_id,
+        )
 
     except ConnectionClosedOK:
         LOG.info("CDP input: WS closed cleanly", workflow_run_id=workflow_run_id)
@@ -1035,7 +1052,14 @@ async def cdp_input_browser_session_stream(
         LOG.info("CDP input channel ready", browser_session_id=browser_session_id, client_id=client_id)
         await websocket.send_json({"kind": "ready"})
 
-        await _run_input_loop(websocket, channel, input_session, "browser_session_id", browser_session_id)
+        await _run_input_loop(
+            websocket,
+            channel,
+            input_session,
+            "browser_session_id",
+            browser_session_id,
+            controlled_browser_session_id=browser_session_id,
+        )
 
     except ConnectionClosedOK:
         LOG.info("CDP input: WS closed cleanly", browser_session_id=browser_session_id)

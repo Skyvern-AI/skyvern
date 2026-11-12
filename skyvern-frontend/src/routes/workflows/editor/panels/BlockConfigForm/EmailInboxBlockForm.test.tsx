@@ -217,7 +217,7 @@ describe("EmailInboxBlockForm", () => {
     });
   });
 
-  test("allows a saved unavailable Gmail account to switch to native without enabling attachments", async () => {
+  test("allows a saved unavailable Gmail account to switch to native", async () => {
     mockNodes.set("email-1", {
       id: "email-1",
       type: "emailInbox",
@@ -250,16 +250,13 @@ describe("EmailInboxBlockForm", () => {
       connection_id: null,
       credential_id: "{{ gmail_credential_id }}",
     });
-    expect(
-      (
-        screen.getByRole("switch", {
-          name: "Download Attachments",
-        }) as HTMLButtonElement
-      ).disabled,
-    ).toBe(true);
   });
 
-  test("enables attachment downloads from the block editor", () => {
+  test.each([
+    {},
+    { emailClient: "gmail", credentialSource: "nango", connectionId: "nc_x" },
+  ])("enables attachment downloads from the block editor: %o", (overrides) => {
+    Object.assign(mockNodes.get("email-1")!.data!, overrides);
     render(<EmailInboxBlockForm blockId="email-1" />);
 
     const toggle = screen.getByRole("switch", { name: "Download Attachments" });

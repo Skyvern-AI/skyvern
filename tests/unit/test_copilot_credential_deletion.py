@@ -1,6 +1,6 @@
 import asyncio
 import copy
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Collection
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -518,9 +518,11 @@ async def test_a_claim_whose_outcomes_never_arrive_fails_every_entry_after_its_l
     elif seen_by == "history_while_turn_pending":
         refresh = repo.refresh_copilot_question_client
 
-        async def lease_lapses_after_refresh(organization_id: str, chat_id: str) -> dict[str, CopilotPendingTurn]:
+        async def lease_lapses_after_refresh(
+            organization_id: str, chat_id: str, seen_turn_ids: Collection[str] | None = None
+        ) -> dict[str, CopilotPendingTurn]:
             await _age_claim(chat, CREDENTIAL_DELETE_CLAIM_LEASE - timedelta(seconds=5))
-            entries = await refresh(organization_id, chat_id)
+            entries = await refresh(organization_id, chat_id, seen_turn_ids)
             await _age_claim(chat, CREDENTIAL_DELETE_CLAIM_LEASE + timedelta(seconds=1))
             entries["turn"].question_interactions = [await _stored_question(chat)]
             return entries

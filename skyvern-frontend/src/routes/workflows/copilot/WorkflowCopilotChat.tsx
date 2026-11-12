@@ -51,6 +51,7 @@ import {
 } from "axios";
 import { getClient, deleteUploadedFileOnPageExit } from "@/api/AxiosClient";
 import { queryClient } from "@/api/QueryClient";
+import { adoptDebugSession } from "@/routes/workflows/hooks/useDebugSessionQuery";
 import {
   ActionsApiResponse,
   ActionTypes,
@@ -246,7 +247,7 @@ import { TURN_ROW_INSET } from "./cards/cardLayout";
 import { CardFooter, CardHeader, CopilotCard } from "./cards/cardChrome";
 import { type AttentionTrayPresentation } from "./cards/AttentionTray";
 import { TestRunOutputCard } from "./cards/TestRunOutputCard";
-import { GoogleReconnectCard } from "./cards/GoogleReconnectCard";
+import { ConnectionCard } from "./cards/ConnectionCard";
 import {
   CredentialAskMarker,
   CredentialCard,
@@ -258,7 +259,7 @@ import {
 import {
   CopilotBlockActionsEvent,
   EMPTY_NARRATIVE,
-  googleConnectionNoticeKey,
+  connectionCardKey,
   NarrativeEvent,
   RecordedActionSummary,
   TurnNarrativeState,
@@ -861,27 +862,19 @@ function connectedAccountSelectionReceipt(
   ) {
     return null;
   }
-  const choiceSets = [
-    prior.narrative.connectedAccountChoices,
-    ...prior.narrative.googleConnectionNotices.map(
-      (notice) => notice.choices ?? [],
-    ),
-  ];
-  for (const choices of choiceSets) {
-    const selected = choices.find(
-      (choice) => choice.connection_id === message.content,
-    );
-    if (selected) {
-      return `Selected ${selected.name} — ${connectedAccountChoiceLabel(selected, choices)}`;
-    }
-  }
-  // A Google card can list a connection made after its turn ended, which no stored choice set holds.
-  const fromGoogleCard = prior.narrative.googleConnectionNotices.some(
-    (notice) =>
-      notice.condition === "unbound" || notice.connectionId === message.content,
+  const choices = prior.narrative.connectedAccountChoices;
+  const selected = choices.find(
+    (choice) => choice.connection_id === message.content,
   );
-  if (fromGoogleCard && /^goac_\w+$/.test(message.content)) {
-    return `Selected Google connection …${message.content.slice(-8)}`;
+  if (selected) {
+    return `Selected ${selected.name} — ${connectedAccountChoiceLabel(selected, choices)}`;
+  }
+  // A connection card lists accounts made after its turn ended, which no stored choice set holds.
+  if (
+    prior.narrative.connectionCards.length > 0 &&
+    /^(goac|moac)_[A-Za-z0-9]+$/.test(message.content)
+  ) {
+    return `Selected connection …${message.content.slice(-8)}`;
   }
   return null;
 }
@@ -4298,6 +4291,7 @@ export function WorkflowCopilotChat({
                 void queryClient.invalidateQueries({
                   queryKey: ["eventTriggers"],
                 });
+                adoptDebugSession(queryClient, workflowPermanentId);
               }
               if (holdingReservation) {
                 const narrative = hydrateHistoryNarrative(
@@ -8973,8 +8967,9 @@ export function WorkflowCopilotChat({
             credential_recovery_token: credentialRecoveryToken ?? undefined,
             supports_question_tool: true,
             supports_account_group_card: true,
+            supports_single_run_card: true,
             supports_credential_delete_card: true,
-            supports_google_setup_card: true,
+            supports_connection_card: true,
             supports_demonstration_offer:
               Boolean(onRecordTask) &&
               !authoringUnavailableReason &&
@@ -9026,6 +9021,11 @@ export function WorkflowCopilotChat({
                 focusCopilotBrowser(payload.browser_session_id);
                 return false;
               case "tool_result":
+                applyStoredNarrativeEvent(payload);
+                if (payload.debug_session_id) {
+                  adoptDebugSession(queryClient, workflowPermanentId);
+                }
+                return false;
               case "narration":
                 applyStoredNarrativeEvent(payload);
                 return false;
@@ -9354,6 +9354,8 @@ export function WorkflowCopilotChat({
           // Backstop: a turn that ends without a terminal run_outcome (thrown
           // stream) would otherwise leave a live poll running past the run.
           stopAllRecordedActionsPolls();
+          // A turn cancelled while a fresh browser was becoming the Studio browser ends without its tool result.
+          adoptDebugSession(queryClient, workflowPermanentId);
           buildFollowEngaged.current = false;
           if (armRecovery) {
             startRecoveryPoll(
@@ -10764,7 +10766,9 @@ export function WorkflowCopilotChat({
     !onRecordTask || !canRecordTask || demonstrationUnavailable;
   const recordTaskUnavailableReason =
     authoringUnavailableReason ??
-    "Demonstrate task is available when the browser is ready";
+    (demonstrationUnavailable
+      ? "Run this server as one process to record demonstrations."
+      : "Demonstrate task is available when the browser is ready");
   const startRecordTask = () => {
     if (refuseMutationDuringYamlCommit()) return;
     onRecordTask?.();
@@ -11167,12 +11171,10 @@ export function WorkflowCopilotChat({
                       {isLastMessage &&
                       hasPendingQuestion &&
                       (choices.length > 0 ||
-                        message.narrative.googleConnectionNotices.some(
-                          (notice) => notice.condition === "unbound",
-                        )) ? (
+                        message.narrative.connectionCards.length > 0) ? (
                         <p className="text-xs text-muted-foreground">
                           Answer or cancel the pending question before choosing
-                          a Google account.
+                          an account.
                         </p>
                       ) : null}
                       {turnId !== null &&
@@ -11213,34 +11215,32 @@ export function WorkflowCopilotChat({
                           </Button>
                         </div>
                       ) : null}
-                      {message.narrative.googleConnectionNotices.map(
-                        (notice) => (
-                          <GoogleReconnectCard
-                            key={googleConnectionNoticeKey(notice)}
-                            notice={notice}
-                            selectedConnectionId={
-                              adjacentMessage?.sender === "user"
-                                ? adjacentMessage.content
-                                : null
-                            }
-                            disabled={
-                              !isLastMessage ||
-                              isLoading ||
-                              hasPendingQuestion ||
-                              turnId === null ||
-                              acceptUnresolved ||
-                              connectedAccountChoicePendingTurnId === turnId
-                            }
-                            onSelect={(connectionId) => {
-                              if (turnId !== null)
-                                handleConnectedAccountChoice(
-                                  turnId,
-                                  connectionId,
-                                );
-                            }}
-                          />
-                        ),
-                      )}
+                      {message.narrative.connectionCards.map((card) => (
+                        <ConnectionCard
+                          key={connectionCardKey(card)}
+                          card={card}
+                          selectedConnectionId={
+                            adjacentMessage?.sender === "user"
+                              ? adjacentMessage.content
+                              : null
+                          }
+                          disabled={
+                            !isLastMessage ||
+                            isLoading ||
+                            hasPendingQuestion ||
+                            turnId === null ||
+                            acceptUnresolved ||
+                            connectedAccountChoicePendingTurnId === turnId
+                          }
+                          onSelect={(connectionId) => {
+                            if (turnId !== null)
+                              handleConnectedAccountChoice(
+                                turnId,
+                                connectionId,
+                              );
+                          }}
+                        />
+                      ))}
                       {message.narrative.demonstrationOffer ? (
                         <DemonstrationOfferCard
                           disabled={

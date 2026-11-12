@@ -23,6 +23,7 @@ from skyvern.browser_extension.errors import BrowserExtensionError
 from skyvern.browser_extension.event_order import EventHold
 from skyvern.browser_extension.relay import ExtensionRelayServer
 from skyvern.browser_extension.target_registry import VirtualTargetRegistry
+from skyvern.browser_extension.workstation_grant import workstation_grant_path
 from skyvern.utils.contained_effects import contained_effect
 
 LOG = structlog.get_logger(__name__)
@@ -607,3 +608,23 @@ def _broker_requested() -> bool:
 
 def _broker_platform_supported() -> bool:
     return os.name == "posix" and sys.platform != "win32"
+
+
+async def warm_broker_daemon(port: int | None = None) -> None:
+    async def ignore_event(event: str, params: dict) -> None:
+        pass
+
+    client = BrokerClient(_resolve_port(port), ignore_event, auto_spawn=True, operator=True)
+    try:
+        await client.start()
+    finally:
+        await client.stop()
+
+
+async def release_broker_place_after_session_close() -> bool:
+    instance = BrowserExtensionRuntime.instance()
+    if instance is None or not isinstance(instance._relay, BrokerClient) or not workstation_grant_path().exists():
+        return False
+    await instance.shutdown()
+    LOG.info("browser_extension_broker_place_released")
+    return True

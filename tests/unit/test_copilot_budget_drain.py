@@ -664,7 +664,7 @@ _DRAIN_KEPT_NATIVE_TOOLS = {
     "read_google_sheet",
     "reply",
     "request_credential",
-    "request_google_connection",
+    "request_connection",
     "offer_demonstration",
     "run_browser_code",
     "search_web",
@@ -736,6 +736,7 @@ async def test_budget_drain_offers_no_tool_that_changes_or_runs_the_workflow(
 
     first_call, *drain_calls = model.served_tool_names_by_call
     assert first_call - drain_calls[0] == first_call & BUDGET_DRAIN_EXCLUDED_TOOLS
+    assert "run_saved_workflow" in first_call - drain_calls[0]
     assert all(served == _DRAIN_KEPT_NATIVE_TOOLS | {"probe"} for served in drain_calls)
     assert CODE_WRITE_TOOL_NAMES <= BUDGET_DRAIN_EXCLUDED_TOOLS
     assert len(model.inputs) == len(script)

@@ -6,7 +6,7 @@ import { TIPS, docTipIndex, type DocStarterProgress } from "./docStarterTips";
 import { docStarterDone } from "./useDocStarter";
 
 export const DOC_SAMPLE_NOTE =
-  "One thing per line. Lines without a tag, like this one, are notes the agent reads while it runs.";
+  "Type / to add a step. Plain text, like this line, is a note the agent reads while it runs.";
 
 /** Shown in place of the first line while a doc has no steps; it isn't saved. */
 export function DocStarterNote() {
@@ -17,6 +17,51 @@ export function DocStarterNote() {
     >
       {DOC_SAMPLE_NOTE}
     </p>
+  );
+}
+
+export const DOC_COPILOT_NUDGE = {
+  tip: "copilot",
+  text: "Starting a new agent? Copilot can build it from a description of the task. The Doc is best for reading and fixing an agent.",
+  // Copilot is already on screen beside the Doc, so the note points at it instead of offering to open it.
+  textBeside:
+    "Starting a new agent? Copilot, next to this page, can build it from a description of the task. The Doc is best for reading and fixing an agent.",
+  action: "Try Copilot",
+  dismiss: "Dismiss",
+} as const;
+
+/** A suggestion to build with Copilot, for a Doc that is empty or nearly so; the Doc stays usable around it. */
+export function DocCopilotNudge({
+  onTry,
+  onDismiss,
+}: {
+  // Null while Copilot is already on screen.
+  onTry: (() => void) | null;
+  onDismiss: () => void;
+}) {
+  return (
+    <div
+      role="note"
+      data-doc-copilot-nudge
+      className="mb-3 flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-md border border-border px-3 py-2 text-[13.5px] leading-[1.45]"
+    >
+      <span className="min-w-0 flex-1">
+        {onTry ? DOC_COPILOT_NUDGE.text : DOC_COPILOT_NUDGE.textBeside}
+      </span>
+      {onTry && (
+        <Button size="sm" variant="outline" className="h-7" onClick={onTry}>
+          {DOC_COPILOT_NUDGE.action}
+        </Button>
+      )}
+      <button
+        type="button"
+        aria-label={DOC_COPILOT_NUDGE.dismiss}
+        onClick={onDismiss}
+        className="rounded p-0.5 text-muted-foreground outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        <Cross2Icon aria-hidden className="size-3.5" />
+      </button>
+    </div>
   );
 }
 
@@ -67,7 +112,7 @@ export function DocGettingStarted({
   compact = false,
   clearOfPanel = false,
 }: {
-  // The side panel takes up to 24rem or 45% of the pane on its right; stay left of it.
+  // The side panel takes up to 22rem or 36% of the pane on its right; stay left of it.
   clearOfPanel?: boolean;
   // A narrow pane shows a small pill that opens the card, so it never covers the step being edited.
   compact?: boolean;
@@ -98,7 +143,7 @@ export function DocGettingStarted({
   const done = items.filter(([d]) => d).length;
   const position = cn(
     "absolute bottom-4 z-40",
-    clearOfPanel ? "right-[calc(min(24rem,45%)+1.25rem)]" : "right-5",
+    clearOfPanel ? "right-[calc(min(22rem,36%)+1.25rem)]" : "right-5",
   );
   if (asPill) {
     return (

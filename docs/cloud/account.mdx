@@ -38,7 +38,7 @@ Everything in Skyvern (agents, runs, credentials, API keys, credits) belongs to 
 
 ## API keys
 
-Your API key authenticates every API, SDK, CLI and MCP request for your organization. Every Admin and Member can open this page, unless your organization enables [role-based access control](#roles) and withholds `api_key.list` from their role.
+Your API key authenticates every API, SDK, CLI and MCP request for your organization. Every Admin and Member can open this page, unless your organization enables [role-based access control](#roles) and withholds **API keys: View** from their role.
 
 <Steps>
   <Step title="Open API keys">
@@ -119,7 +119,7 @@ curl https://api.skyvern.com/.well-known/oauth-protected-resource
 
 The server advertises the scopes `openid`, `profile`, `email`, `public_metadata`, `private_metadata`, `offline_access` and `user:org:read`; the MCP server's metadata narrows them to `profile` and `email`. These are identity scopes, not API permissions (see [Permissions](#permissions)).
 
-Access tokens expire and can be refreshed when you request `offline_access`. A refresh token works once and is replaced on every exchange; replaying an old one revokes the whole token family. Revoking the organization's API key also invalidates tokens issued against it.
+Access tokens expire and can be refreshed when you request `offline_access`. A refresh token works once and is replaced on every exchange; replaying an old one revokes the whole token family. Every refresh also re-checks the role of the person who authorized the client: once they leave the organization or their role changes, the refresh fails with `invalid_grant`, the whole token family is revoked, and the client has to sign in again. Revoking the organization's API key also invalidates tokens issued against it.
 
 ### Permissions
 
@@ -128,7 +128,7 @@ Access tokens expire and can be refreshed when you request `offline_access`. A r
 Every credential belongs to one organization and reaches only that organization's agents, runs, credentials and data. A request can't read or change another organization's resources.
 
 - The organization API key can call every endpoint your organization can reach. There are no read-only, per-endpoint or per-agent keys.
-- An OAuth token acts as the person who signed in, in their organization, with their [role](#roles). Its OAuth scopes (`profile`, `email` and the like) describe who signed in. They don't limit what the token can do.
+- An OAuth token acts as the person who signed in, in their organization, with their [role](#roles). Its OAuth scopes (`profile`, `email` and the like) describe who signed in. They don't limit what the token can do. An MCP client a Member signs in to gets a key bound to that Member, which can't read or rotate the organization's API key.
 - MCP tool scopes (`operate`, `build`, `browser`, `lean`, `all`) only change which tools a client sees. They are not a security boundary.
 - Usage from any credential is billed to the organization.
 
@@ -136,24 +136,25 @@ To keep production and staging apart, or one team or customer from another, use 
 
 #### Roles
 
-Each person in an organization is an **Admin** or a **Member**, set on [Members](#members).
+Each person in an organization is an **Admin**, a **Member** or a **Billing Admin**, set on [Members](#members).
 
 | Role | What it can do |
 |---|---|
 | **Admin** | Everything in the organization, and the only role that can manage member roles and turn role-based access control on. |
 | **Member** | Build, run and edit agents, manage credentials, view runs and results, and reach Billing and API keys, subject to the limits below. |
+| **Billing Admin** | The same access as a Member until role-based access control is on. After that, only Billing, unless an Admin gives them another role. |
 
-**Role-based access control is opt-in.** Until an Admin turns it on, a Member can access most organization actions. Managing member roles and SFTP and Concord fax adapter configuration remain Admin-only either way, including configuration reads and writes. A Member can't grant themselves more access or switch role-based access control on.
+**Role-based access control is opt-in and needs the Enterprise plan.** Until an Admin turns it on, a Member can access most organization actions. Managing member roles and SFTP and Concord fax adapter configuration remain Admin-only either way, including configuration reads and writes. A Member can't grant themselves more access or switch role-based access control on.
 
-Once an Admin enables it, each person's role decides what they can do and requests outside their role are refused with `403`. That covers event triggers, additional organization API keys, the 1Password connection, the [audit log](#audit-log) export and the rest of the organization's actions.
+Once an Admin enables it, each person's role decides what they can do and requests outside their role are refused with `403`. That covers event triggers, additional organization API keys, the 1Password connection, the [audit log](#audit-log) export and the rest of the organization's actions. On [Integrations](/cloud/integrations), a role without the grant sees **Admin required** or **Organization admin access is required** in place of the connect and configure buttons. Elsewhere the control stays visible but disabled, and hovering it shows **Organization admin access is required for this action.** That covers the trash icon and the bulk **Delete** button on Credentials, both cards on **Settings → Models**, and the fields and **Save** button on **Settings → Limits**. A Copilot card that would delete credentials reads **Ask an Admin to delete this credential.** for one credential or **Ask an Admin to delete these credentials.** for several, and offers only **Cancel**. While Skyvern is still checking your role, the control is disabled and the tooltip reads **Checking permissions…**.
 
 These limits also apply whether or not you enable role-based access control:
 
-- An API key can't manage API keys, event triggers or member roles, so a leaked key can't create a replacement for itself.
+- An API key can't manage API keys, so a leaked key can't create a replacement for itself. The organization API key also can't manage event triggers or member roles.
 - A browser session alone can't perform admin-only actions; those need a signed-in session.
 
 <Warning>
-Every Admin and Member can get the organization API key: an Admin from **Settings → API keys**, a Member by signing in to the CLI. The key can do everything an Admin can except manage API keys, event triggers and member roles. Treat every Admin and Member as able to use the API with full access, and use separate organizations where people must be kept apart.
+Until an Admin turns on role-based access control, every Admin and Member can get the organization API key, from **Settings → API keys** or by signing in to the CLI. A Member's MCP sign-in doesn't return it. The key can do everything an Admin can except manage API keys, event triggers and member roles. Until then, treat every Admin and Member as able to use the API with full access, and use separate organizations where people must be kept apart.
 </Warning>
 
 ### API versions and deprecations
@@ -258,8 +259,6 @@ Questions about a migration: [support@skyvern.com](mailto:support@skyvern.com).
 
 Open **Settings → Billing**. On the Trial and Hobby plans, the **Upgrade plan** link at the bottom of the sidebar opens the same page; on other plans it reads **Plan & usage**. Every Admin and Member can reach Billing, unless your organization enables [role-based access control](#roles) and withholds the billing actions from their role.
 
-<img src="/images/cloud/settings-billing-overview.png" alt="Billing page with a current Free plan card, Hobby, Pro, and Enterprise plan cards, and a Credit Usage meter showing 3,948 of 5,000 one-time credits used" />
-
 ### How credits are used
 
 One credit is $0.001. Credits are charged for what the browser does:
@@ -284,16 +283,16 @@ Specific prompts use fewer actions. "Extract the monthly price from the pricing 
 
 ### Your 14-day trial
 
-New accounts start with a 14-day trial: 30,000 credits and Hobby plan limits. When you sign up, pick the plan you want after the trial, Hobby ($29/month) or Pro ($149/month), and add a card. Nothing is charged during the trial. On day 14 we charge the plan you picked and it renews monthly. To switch plans, start your plan early, or cancel, open Settings → Billing. Cancelling turns off the day-14 charge: you keep the trial until day 14 and are not charged. You can resume the trial any time before then, or pick a plan to keep running agents after it ends.
+New accounts start with a 14-day free trial: 30,000 credits and Hobby plan limits. When you sign up, pick the plan you want after the trial, Hobby ($29/month) or Pro ($149/month), and add a card. Nothing is charged during the trial. On day 14 we charge the plan you picked and it renews monthly. To switch plans, start your plan early, or cancel, open Settings → Billing. Cancelling turns off the day-14 charge: you keep the trial until day 14 and are not charged. You can resume the trial any time before then, or pick a plan to keep running agents after it ends.
 
 ### Plans
 
-| Plan | Price | Credits | Concurrent runs |
+| Plan | Price | Credits | Concurrent agents |
 |---|---|---|---|
-| **Trial** | $0 for 14 days | 30,000 for the trial (about 1,000 actions) | 10 |
-| **Hobby** | $29/month | 30,000/month (about 1,000 actions) | 10 |
-| **Pro** | $149/month | 150,000/month (about 5,000 actions) | 25 |
-| **Enterprise** | Custom | Unlimited | Unlimited |
+| **Trial** | $0 for 14 days | 30,000 for the trial | 10 |
+| **Hobby** | $29/month | 30,000/month | 10 |
+| **Pro** | $149/month | 150,000/month | 25 |
+| **Enterprise** | Custom | Custom | Unlimited |
 
 Trial credits don't reset and end with the trial. Click **Subscribe** on the Hobby or Pro card to start a plan. Once you're subscribed, the cards read **Upgrade** or **Downgrade** and the page shows your current plan, with **Manage Subscription** to change or cancel it. For Enterprise, click **Book a Demo**. For a full feature comparison, see [skyvern.com/pricing](https://www.skyvern.com/pricing).
 
@@ -315,9 +314,7 @@ Skyvern checks credits before it starts a run and returns `402` if they don't co
 
 Go to **Settings → Members** to invite teammates by email and manage their roles. **Invite teammates** in the organization menu at the top of the sidebar opens the same page. Members share the organization's agents, runs, credentials, API key and credits.
 
-Pick a role when you invite someone, and change it later from the member list: **Admin** or **Member**. [Roles](#roles) explains what each one can do.
-
-**Your role in this organization** at the top of the page shows the role Skyvern recognizes for your session. It reads **Role information unavailable** when no role comes back.
+Pick a role when you invite someone, and change it later from the member list: **Admin**, **Member** or **Billing Admin**. [Roles](#roles) explains what each one can do.
 
 <img src="/images/cloud/cloud-settings-members.png" alt="Settings, Members page showing No organization yet and the Create organization button" />
 

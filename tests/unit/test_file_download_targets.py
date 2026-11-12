@@ -15,6 +15,7 @@ import pytest
 from skyvern.config import settings
 from skyvern.exceptions import AzureConfigurationError, BlockedHost, DownloadSaveIncompleteError, UnresolvableHost
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
+from skyvern.forge.sdk.integrations.connected_accounts import OrgConnection
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.services import google_drive_service, google_oauth_service, sftp_service
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, FileDownloadBlock
@@ -28,7 +29,7 @@ from skyvern.schemas.workflows import (
     FileDownloadTarget,
     FileStorageType,
 )
-from tests.unit.helpers import make_pdf
+from tests.unit.helpers import connected_accounts_are, make_pdf
 
 
 def _output_parameter() -> OutputParameter:
@@ -96,6 +97,7 @@ async def _execute_file_download(
     blocked_endpoint_hosts: tuple[str, ...] = (),
     unresolvable_endpoint_hosts: tuple[str, ...] = (),
     endpoint_host_ips: tuple[str, ...] = ("203.0.113.10",),
+    accounts: tuple[OrgConnection, ...] = (),
 ) -> SimpleNamespace:
     workflow_run_context = MagicMock()
     workflow_run_context.organization_id = "organization-id"
@@ -177,6 +179,7 @@ async def _execute_file_download(
         ) as resolve_endpoint_host,
         patch.object(google_drive_service, "download_file", drive_download),
         patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+        connected_accounts_are(*accounts, agent_app=mock_app),
     ):
         mock_app.AGENT_FUNCTION.upload_file_to_customer_storage = upload
         mock_app.AGENT_FUNCTION.get_google_workspace_credentials = AsyncMock(
@@ -217,6 +220,30 @@ async def test_website_target_returns_browser_result_without_dispatch(tmp_path: 
     assert execution.result is browser_result
     execution.browser_execute.assert_awaited_once()
     execution.upload.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_google_drive_source_asks_only_google_for_a_non_google_account(tmp_path: Path) -> None:
+    block = _file_download_block(
+        FileDownloadTarget.GOOGLE_DRIVE,
+        url="https://drive.google.com/file/d/file_123/view",
+        google_credential_id="msac_1",
+        google_drive_folder_id="folder-id",
+    )
+
+    execution = await _execute_file_download(
+        block,
+        _browser_result(block),
+        tmp_path / "downloads",
+        accounts=(OrgConnection("msac_1", "microsoft", "Work", None, "active", ()),),
+        drive_download_side_effect=RuntimeError("download not under test"),
+    )
+
+    execution.get_google_workspace_credentials.assert_awaited_once_with(
+        organization_id="organization-id",
+        credential_id="msac_1",
+        required_scopes=list(google_oauth_service.GOOGLE_DRIVE_SCOPES),
+    )
 
 
 @pytest.mark.asyncio

@@ -1,7 +1,4 @@
-import {
-  availableNodeLibraryItems,
-  nodeLibraryItems,
-} from "../panels/nodeLibraryItems";
+import { availableNodeLibraryItems } from "../panels/nodeLibraryItems";
 import type { IntegrationCatalogEntry } from "@/hooks/useIntegrationCatalogQuery";
 import { docBlockType, docTagColor } from "./docStepRegistry";
 
@@ -39,7 +36,3 @@ export function docStepChoices({
     { name: "More", items: items.filter((i) => !known.has(i.color)) },
   ].filter((g) => g.items.length > 0);
 }
-
-/** A step type's name from the full library, so a type the picker hides today (Agent, Power BI) still has its title. */
-export const nodeLibraryTitle = (type: string) =>
-  nodeLibraryItems.find((item) => item.nodeType === type)?.title ?? type;

@@ -13,10 +13,14 @@ from skyvern.forge.failure_classifier import FailureCategory, classify_from_fail
 from skyvern.forge.sdk.services.powerbi_query_service import PowerBIQueryError
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType, WorkflowParameter
 from skyvern.forge.sdk.workflow.models.powerbi_query_block import (
+    ACCOUNT_DISCONNECTED_REASON,
     HUMAN_RUN_REQUIRED_REASON,
     INTEGRATION_UNAVAILABLE_REASON,
     INTERNAL_ERROR_REASON,
-    NO_ACCESS_REASON,
+    MANUAL_RUN_REQUIRED_REASON,
+    PLAN_REQUIRED_REASON,
+    UNSAFE_QUERY_INPUT_REASON,
+    PowerBIHopRefusal,
     PowerBIQueryBlock,
 )
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
@@ -84,11 +88,14 @@ async def _execute(
     context: FakeWorkflowRunContext | None = None,
     with_hop_token: bool = True,
     powerbi_offered: bool = False,
+    refusal: str | None = None,
 ) -> BlockResult:
     context = context or FakeWorkflowRunContext(values={})
     context.organization_id = "org_test"
     if with_hop_token:
         context._powerbi_hop_tokens[block.label] = "test-hop-token"
+    if refusal is not None:
+        context._powerbi_hop_refusals[block.label] = refusal
 
     async def build_result(self: PowerBIQueryBlock, **kwargs: object) -> BlockResult:
         return _block_result(self, **kwargs)
@@ -598,17 +605,53 @@ async def test_powerbi_input_shape_is_checked_before_missing_capability(
 
 
 @pytest.mark.asyncio
-async def test_run_without_a_capability_on_a_live_deployment_names_the_editor_remedy(
+@pytest.mark.parametrize(
+    ("refusal", "expected_error", "expected_reason", "expected_category"),
+    [
+        (PowerBIHopRefusal.plan_required.value, "plan_required", PLAN_REQUIRED_REASON, None),
+        (
+            PowerBIHopRefusal.account_disconnected.value,
+            "account_disconnected",
+            ACCOUNT_DISCONNECTED_REASON,
+            FailureCategory.CREDENTIAL_ERROR,
+        ),
+        (
+            PowerBIHopRefusal.run_not_supported.value,
+            "manual_run_required",
+            MANUAL_RUN_REQUIRED_REASON,
+            None,
+        ),
+        (
+            PowerBIHopRefusal.unsafe_query_input_source.value,
+            "unsafe_query_input_source",
+            UNSAFE_QUERY_INPUT_REASON,
+            None,
+        ),
+        (
+            PowerBIHopRefusal.integration_unavailable.value,
+            "integration_unavailable",
+            INTEGRATION_UNAVAILABLE_REASON,
+            None,
+        ),
+        (None, "integration_unavailable", INTEGRATION_UNAVAILABLE_REASON, None),
+        ("something_a_newer_mint_recorded", "integration_unavailable", INTEGRATION_UNAVAILABLE_REASON, None),
+    ],
+)
+async def test_each_recorded_reason_for_no_capability_gets_its_own_message(
     monkeypatch: pytest.MonkeyPatch,
+    refusal: str | None,
+    expected_error: str,
+    expected_reason: str,
+    expected_category: FailureCategory | None,
 ) -> None:
     run_query = AsyncMock()
     monkeypatch.setattr(app, "AGENT_FUNCTION", SimpleNamespace(execute_powerbi_query_for_run=run_query))
 
-    result = await _execute(_block(), with_hop_token=False, powerbi_offered=True)
+    result = await _execute(_block(), with_hop_token=False, powerbi_offered=True, refusal=refusal)
 
     assert result.success is False
-    _assert_safe_denial(result, "human_run_required")
-    assert result.failure_reason == NO_ACCESS_REASON
+    _assert_safe_denial(result, expected_error, expected_category)
+    assert result.failure_reason == expected_reason
     run_query.assert_not_awaited()
 
 
@@ -625,10 +668,7 @@ async def test_powerbi_offered_is_false_without_a_working_cloud_gate(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("code", "expected_category"),
-    [
-        ("event_trigger_run", FailureCategory.CREDENTIAL_ERROR),
-        ("trigger_parent_owner_mismatch", FailureCategory.CREDENTIAL_ERROR),
-    ],
+    [("trigger_parent_owner_mismatch", FailureCategory.CREDENTIAL_ERROR)],
 )
 async def test_refused_run_is_labeled_by_the_block_not_by_its_wording(
     monkeypatch: pytest.MonkeyPatch, code: str, expected_category: FailureCategory
@@ -697,12 +737,6 @@ async def test_powerbi_query_failures_are_safe_and_oss_hook_fails_closed(monkeyp
             "human_run_required",
             HUMAN_RUN_REQUIRED_REASON,
             None,
-        ),
-        (
-            "event_trigger_run",
-            "human_run_required",
-            HUMAN_RUN_REQUIRED_REASON,
-            FailureCategory.CREDENTIAL_ERROR,
         ),
         (
             "trigger_parent_owner_mismatch",

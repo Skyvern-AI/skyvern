@@ -34,6 +34,7 @@ export type DocProposal = {
   edges: Edge[];
   // The same version diff used by the workflow comparison panel.
   marks: Map<string, DocProposalStepMark>;
+  changedKeys?: Map<string, string[]>;
   removed: DocRemovedStep[];
   // What Accept would save, so the Doc's description and Inputs show the proposal, not the live editor.
   description: string | null;
@@ -236,10 +237,16 @@ export function buildDocProposal({
   collect(baselineBlocks as BlockLike[], baseline);
 
   const marks = new Map<string, DocProposalStepMark>();
+  const changedKeys = new Map<string, string[]>();
   for (const [label, block] of diff.after) {
     if (block.status === "new" || block.status === "changed") {
       marks.set(label, block.status === "new" ? "added" : "changed");
     }
+    if (block.status === "changed")
+      changedKeys.set(
+        label,
+        block.changes.map((change) => change.key),
+      );
   }
 
   const removed: DocRemovedStep[] = [];
@@ -303,6 +310,7 @@ export function buildDocProposal({
     nodes,
     edges,
     marks,
+    changedKeys,
     removed: matchedBranchRemovals,
     description,
     descriptionChange: descriptionDiff

@@ -4,6 +4,7 @@ import json
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Sequence
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple
@@ -153,6 +154,20 @@ RUNS_LIST_STATEMENT_TIMEOUT_SECONDS = 30
 # A budget this far gone cannot answer anything; spend it provoking the cancellation that ends the
 # request rather than adding a branch that reports the same condition a second way.
 _RUNS_LIST_EXHAUSTED_BUDGET_SECONDS = 0.25
+
+
+@dataclass(frozen=True)
+class RunInputSearchAccess:
+    run_inputs: bool = False
+    agent_definition: bool = False
+
+
+# A search over run inputs lets a caller rebuild what it matches a few characters at a time, so each arm is off unless
+# the list route grants it: parameter values, headers, webhook URL and credential picks need run read; parameter names
+# and the agent's credential binding need agent read.
+RUN_INPUT_SEARCH_ACCESS: ContextVar[RunInputSearchAccess] = ContextVar(
+    "run_input_search_access", default=RunInputSearchAccess()
+)
 
 
 def _runs_list_search_id_prefix(search_key: str) -> str | None:
@@ -1894,6 +1909,33 @@ class WorkflowRunsRepository(BaseRepository):
             await session.refresh(refreshed)
             return convert_to_workflow_run(refreshed)
 
+    @db_operation("merge_failure_classification")
+    async def merge_failure_classification(
+        self,
+        workflow_run_id: str,
+        status: WorkflowRunStatus,
+        finished_at: datetime | None,
+        merge: Callable[[list[dict[str, Any]] | None], list[dict[str, Any]] | None],
+    ) -> bool:
+        """Rewrite a finished run's category from the stored one under a row lock and re-derive its attribution.
+        Nothing is written when ``merge`` returns None, or when the run was reset or finished again since status and
+        finished_at were read."""
+        async with self.Session() as session:
+            row = (
+                await session.scalars(
+                    select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id).with_for_update()
+                )
+            ).one_or_none()
+            if row is None or row.status != status.value or to_naive_utc(row.finished_at) != to_naive_utc(finished_at):
+                return False
+            merged = merge(row.failure_category)
+            if merged is None:
+                return False
+            row.failure_category = merged
+            row.failure_attribution = derive_failure_attribution(merged)
+            await session.commit()
+            return True
+
     @db_operation("bulk_update_workflow_runs")
     async def bulk_update_workflow_runs(
         self,
@@ -2485,6 +2527,24 @@ class WorkflowRunsRepository(BaseRepository):
 
             ordered = sorted(candidates.values(), key=lambda r: (r.queued_at, r.workflow_run_id))
             return [convert_to_workflow_run(candidate) for candidate in ordered]
+
+    @db_operation("get_unfinished_run_id_on_version")
+    async def get_unfinished_run_id_on_version(
+        self, organization_id: str, workflow_permanent_id: str, workflow_id: str
+    ) -> str | None:
+        async with self.Session() as session:
+            return await session.scalar(
+                select(WorkflowRunModel.workflow_run_id)
+                .where(WorkflowRunModel.organization_id == organization_id)
+                .where(WorkflowRunModel.workflow_permanent_id == workflow_permanent_id)
+                .where(WorkflowRunModel.workflow_id == workflow_id)
+                # The worker reads the version row at start and again for each retry attempt; a paused run resumes from
+                # memory, and a run waiting out a retry delay keeps the final status its retry rule matched until its
+                # next attempt queues, so it is not held. A subset of ix_workflow_runs_nonterminal_status's predicate,
+                # so that partial index applies.
+                .where(WorkflowRunModel.status.in_(["created", "queued", "running"]))
+                .limit(1)
+            )
 
     @db_operation("get_last_queued_workflow_run")
     async def get_last_queued_workflow_run(
@@ -3274,7 +3334,11 @@ class WorkflowRunsRepository(BaseRepository):
             extra_http_headers_col.isnot(None),
             func.cast(extra_http_headers_col, Text()).icontains(search_key, autoescape=True),
         )
-        return [param_key_desc_exists, param_value_exists, extra_headers_match]
+        access = RUN_INPUT_SEARCH_ACCESS.get()
+        return [
+            *([param_key_desc_exists] if access.agent_definition else []),
+            *([param_value_exists, extra_headers_match] if access.run_inputs else []),
+        ]
 
     def _run_identifier_search_clauses(
         self,
@@ -3290,9 +3354,10 @@ class WorkflowRunsRepository(BaseRepository):
         credential can also reach a run as a plain input value, so these arms stay ORed with the input
         search instead of replacing it the way ``_indexed_identifier_run_ids`` does.
         """
-        clauses: list[ColumnElement[bool]] = [
-            WorkflowRunModel.webhook_callback_url.icontains(search_key, autoescape=True)
-        ]
+        access = RUN_INPUT_SEARCH_ACCESS.get()
+        clauses: list[ColumnElement[bool]] = (
+            [WorkflowRunModel.webhook_callback_url.icontains(search_key, autoescape=True)] if access.run_inputs else []
+        )
         if _runs_list_search_id_prefix(search_key) == CREDENTIAL_PREFIX:
             selection_run_id = WorkflowRunCredentialSelectionModel.workflow_run_id
             # Retries retain prior picks as <run_id>:attempt:<n>; include those picks in the run's history.
@@ -3336,11 +3401,14 @@ class WorkflowRunsRepository(BaseRepository):
                 )
                 .where(~overriding_selection)
             )
-            clauses += [
-                WorkflowRunModel.sequential_credential_id == search_key,
-                workflow_run_id_col.in_(selected_runs),
-                and_(WorkflowRunModel.workflow_id.in_(bound_workflows), bound_when_created),
-            ]
+            # The run's own credential picks are run settings; the definition's binding is agent content.
+            if access.run_inputs:
+                clauses += [
+                    WorkflowRunModel.sequential_credential_id == search_key,
+                    workflow_run_id_col.in_(selected_runs),
+                ]
+            if access.agent_definition:
+                clauses.append(and_(WorkflowRunModel.workflow_id.in_(bound_workflows), bound_when_created))
         return clauses
 
     @staticmethod

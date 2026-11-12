@@ -1218,8 +1218,11 @@ function convertToNode(
           customSmtpPassword: block.custom_smtp_password ?? null,
           transport: block.transport ?? "smtp",
           credentialId: block.credential_id ?? "",
+          credentialSource: block.credential_source ?? "native",
+          connectionId: block.connection_id ?? "",
           cc: (block.cc ?? []).join(", "),
           bcc: (block.bcc ?? []).join(", "),
+          replyToMessageId: block.reply_to_message_id ?? "",
         },
       };
     }
@@ -1526,6 +1529,7 @@ function convertToNode(
           maxResults: block.max_results ?? 25,
           includeBody: block.include_body ?? true,
           downloadAttachments: block.download_attachments ?? false,
+          messageId: block.message_id ?? "",
           parameterKeys: (block.parameters ?? []).map((p) => p.key),
         },
       };
@@ -2189,6 +2193,7 @@ function reconstructConditionalStructure(
             conditionalLabel: block.label,
             conditionalNodeId: conditionalNode.id,
             conditionalMergeLabel: block.next_block_label ?? null,
+            loadedNextLabel: blocksByLabel.get(label)?.next_block_label ?? null,
           };
           targetNode.parentId = conditionalNode.id;
         }
@@ -3326,12 +3331,119 @@ function serializeLoopNodeToYAML(
   };
 }
 
-function findNextBlockLabel(
+// A branch's last block in `visiting` has its inherited merge decided further
+// up the call stack, so it counts as having none. `decided` reuses a merge only
+// while none of the blocks it consulted is in `visiting`.
+type InheritedMergeWalk = {
+  visiting: Set<string>;
+  consulted: Set<string>;
+  decided: Map<string, { label: string | null; consulted: Set<string> }>;
+  index?: GraphIndex;
+};
+
+type GraphIndex = {
+  nodes: Array<AppNode>;
+  edges: Array<Edge>;
+  byId: Map<string, AppNode>;
+  byLabel: Map<string, AppNode>;
+  outgoing: Map<string, Array<Edge>>;
+  branchHeads: Map<string, string | null>;
+};
+
+function newInheritedMergeWalk(): InheritedMergeWalk {
+  return { visiting: new Set(), consulted: new Set(), decided: new Map() };
+}
+
+// The index keeps reach checks from rescanning nodes and edges at every step,
+// which would make saving a long chain of conditionals cubic.
+function graphIndex(
+  walk: InheritedMergeWalk,
+  nodes: Array<AppNode>,
+  edges: Array<Edge>,
+): GraphIndex {
+  if (walk.index?.nodes === nodes && walk.index.edges === edges) {
+    return walk.index;
+  }
+  const byLabel = new Map<string, AppNode>();
+  for (const n of nodes) {
+    if (isWorkflowBlockNode(n) && !byLabel.has(n.data.label)) {
+      byLabel.set(n.data.label, n);
+    }
+  }
+  const outgoing = new Map<string, Array<Edge>>();
+  for (const e of edges) {
+    const list = outgoing.get(e.source);
+    if (list) {
+      list.push(e);
+    } else {
+      outgoing.set(e.source, [e]);
+    }
+  }
+  walk.index = {
+    nodes,
+    edges,
+    byId: new Map(nodes.map((n) => [n.id, n])),
+    byLabel,
+    outgoing,
+    branchHeads: new Map(),
+  };
+  return walk.index;
+}
+
+// Follows the links the backend follows when deciding to skip a merge link:
+// each block's next, including the merge a branch's last block inherits, and a
+// conditional's branch heads but not its own next.
+function labelReachesNode(
+  startLabel: string,
   nodeId: string,
   nodes: Array<AppNode>,
   edges: Array<Edge>,
+  walk: InheritedMergeWalk,
+): boolean {
+  const index = graphIndex(walk, nodes, edges);
+  const seen = new Set<string>();
+  const pending: Array<string | null> = [startLabel];
+  while (pending.length > 0) {
+    const label = pending.pop();
+    const node = label == null ? undefined : index.byLabel.get(label);
+    if (!node || seen.has(node.id)) {
+      continue;
+    }
+    if (node.id === nodeId) {
+      return true;
+    }
+    seen.add(node.id);
+    if (node.type === "conditional") {
+      for (const branch of (node as ConditionalNode).data.branches) {
+        const key = `${node.id}\u0000${branch.id}`;
+        if (!index.branchHeads.has(key)) {
+          index.branchHeads.set(
+            key,
+            getConditionalBranchNodeSequence(
+              node.id,
+              branch.id,
+              nodes,
+              edges,
+            )[0]?.data.label ?? null,
+          );
+        }
+        pending.push(index.branchHeads.get(key) ?? null);
+      }
+      continue;
+    }
+    pending.push(findNextBlockLabel(node.id, nodes, edges, walk));
+  }
+  return false;
+}
+
+export function findNextBlockLabel(
+  nodeId: string,
+  nodes: Array<AppNode>,
+  edges: Array<Edge>,
+  walk: InheritedMergeWalk = newInheritedMergeWalk(),
 ): string | null {
-  const currentNode = nodes.find((n) => n.id === nodeId);
+  const index = graphIndex(walk, nodes, edges);
+  const currentNode = index.byId.get(nodeId);
 
   // Helper: get conditional node's merge label
   const getConditionalMergeLabel = (): string | null => {
@@ -3353,23 +3465,60 @@ function findNextBlockLabel(
     if (!conditionalNodeId) {
       return null;
     }
-
-    // Find the conditional node itself
-    const conditionalNode = nodes.find((n) => n.id === conditionalNodeId);
-    if (!conditionalNode || !isWorkflowBlockNode(conditionalNode)) {
+    walk.consulted.add(nodeId);
+    if (walk.visiting.has(nodeId)) {
       return null;
     }
+    const cached = walk.decided.get(nodeId);
+    if (cached && ![...cached.consulted].some((id) => walk.visiting.has(id))) {
+      cached.consulted.forEach((id) => walk.consulted.add(id));
+      return cached.label;
+    }
 
-    // Use the conditional node's next_block_label (computed from edges)
-    return findNextBlockLabel(conditionalNodeId, nodes, edges);
+    // A merge point that already reaches this block would close a loop, so
+    // fall back to the merge of the conditional enclosing that one.
+    const outerConsulted = walk.consulted;
+    walk.consulted = new Set();
+    let label: string | null = null;
+    let enclosingId: string | null | undefined = conditionalNodeId;
+    while (enclosingId) {
+      const conditionalNode = index.byId.get(enclosingId);
+      if (!conditionalNode || !isWorkflowBlockNode(conditionalNode)) {
+        break;
+      }
+      const mergeLabel = findNextBlockLabel(enclosingId, nodes, edges, walk);
+      if (!mergeLabel) {
+        break;
+      }
+      // The backend never skips an explicit next, so an authored link to this merge stays even if it loops.
+      if (mergeLabel === currentNode.data.loadedNextLabel) {
+        label = mergeLabel;
+        break;
+      }
+      walk.visiting.add(nodeId);
+      const reaches = labelReachesNode(mergeLabel, nodeId, nodes, edges, walk);
+      walk.visiting.delete(nodeId);
+      if (!reaches) {
+        label = mergeLabel;
+        break;
+      }
+      enclosingId = conditionalNode.data.conditionalNodeId;
+    }
+    const consulted = walk.consulted;
+    walk.consulted = outerConsulted;
+    consulted.forEach((id) => outerConsulted.add(id));
+    if (![...consulted].some((id) => walk.visiting.has(id))) {
+      walk.decided.set(nodeId, { label, consulted });
+    }
+    return label;
   };
 
   // Find the outgoing edge from this node. Synthetic edges are display-only
   // (see the finally-block chaining in getElements) and must never become a
   // real next_block_label.
-  const outgoingEdge = edges.find(
-    (edge) => edge.source === nodeId && !isSyntheticEdge(edge),
-  );
+  const outgoingEdge = index.outgoing
+    .get(nodeId)
+    ?.find((edge) => !isSyntheticEdge(edge));
 
   if (!outgoingEdge) {
     // No outgoing edge - check if this node is inside a conditional branch
@@ -3391,7 +3540,7 @@ function findNextBlockLabel(
     visited.add(currentTargetId);
     iterations++;
 
-    const targetNode = nodes.find((n) => n.id === currentTargetId);
+    const targetNode = index.byId.get(currentTargetId);
 
     if (!targetNode) {
       return null;
@@ -3404,7 +3553,7 @@ function findNextBlockLabel(
 
     // If it's a utility node (NodeAdder, Start), keep following edges
     if (targetNode.type === "nodeAdder" || targetNode.type === "start") {
-      const nextEdge = edges.find((edge) => edge.source === currentTargetId);
+      const nextEdge = index.outgoing.get(currentTargetId)?.[0];
       if (!nextEdge) {
         // Reached end of edges at a utility node
         // If the original node is inside a conditional branch, look up the conditional's merge point
@@ -3432,9 +3581,10 @@ function getWorkflowBlock(
   node: WorkflowBlockNode,
   nodes: Array<AppNode>,
   edges: Array<Edge>,
+  walk: InheritedMergeWalk,
 ): BlockYAML {
   // Compute next_block_label from edges/graph structure
-  const nextBlockLabel = findNextBlockLabel(node.id, nodes, edges);
+  const nextBlockLabel = findNextBlockLabel(node.id, nodes, edges, walk);
 
   const base = {
     label: node.data.label,
@@ -3740,6 +3890,12 @@ function getWorkflowBlock(
           block_type: "send_email",
           transport: "gmail",
           credential_id: node.data.credentialId || null,
+          ...(node.data.credentialSource === "nango"
+            ? {
+                credential_source: "nango",
+                connection_id: node.data.connectionId || null,
+              }
+            : {}),
           sender: "",
           recipients: splitEmailList(node.data.recipients),
           cc: splitEmailList(node.data.cc),
@@ -3750,6 +3906,7 @@ function getWorkflowBlock(
           file_attachments: splitEmailList(node.data.fileAttachments).filter(
             (attachment) => attachment !== SKYVERN_DOWNLOAD_DIRECTORY,
           ),
+          reply_to_message_id: node.data.replyToMessageId || null,
         };
       }
       return {
@@ -4008,6 +4165,7 @@ function getWorkflowBlock(
         max_results: node.data.maxResults,
         include_body: node.data.includeBody,
         download_attachments: node.data.downloadAttachments,
+        message_id: node.data.messageId || null,
         parameter_keys: node.data.parameterKeys,
       };
     }
@@ -4091,6 +4249,7 @@ function getOrderedChildrenBlocks(
   nodes: Array<AppNode>,
   edges: Array<Edge>,
   parentId: string,
+  walk: InheritedMergeWalk = newInheritedMergeWalk(),
 ): Array<BlockYAML> {
   const nodesById = new Map(nodes.map((n) => [n.id, n]));
   const includedIds = new Set<string>();
@@ -4144,12 +4303,12 @@ function getOrderedChildrenBlocks(
       children.push(
         serializeLoopNodeToYAML(
           node as LoopNode,
-          getOrderedChildrenBlocks(nodes, edges, node.id),
-          findNextBlockLabel(node.id, nodes, edges),
+          getOrderedChildrenBlocks(nodes, edges, node.id, walk),
+          findNextBlockLabel(node.id, nodes, edges, walk),
         ),
       );
     } else {
-      children.push(getWorkflowBlock(node, nodes, edges));
+      children.push(getWorkflowBlock(node, nodes, edges, walk));
     }
   };
   let currentNode: WorkflowBlockNode | undefined = firstChild;
@@ -4190,6 +4349,7 @@ function getWorkflowBlocksUtil(
   edges: Array<Edge>,
 ): Array<BlockYAML> {
   const nodesById = new Map(nodes.map((n) => [n.id, n]));
+  const walk = newInheritedMergeWalk();
 
   const isInsideLoop = (nodeId: string): boolean => {
     let current = nodesById.get(nodeId);
@@ -4205,15 +4365,15 @@ function getWorkflowBlocksUtil(
 
   const emit = (node: AppNode): BlockYAML | null => {
     if (node.type === "loop") {
-      const nextBlockLabel = findNextBlockLabel(node.id, nodes, edges);
+      const nextBlockLabel = findNextBlockLabel(node.id, nodes, edges, walk);
       return serializeLoopNodeToYAML(
         node as LoopNode,
-        getOrderedChildrenBlocks(nodes, edges, node.id),
+        getOrderedChildrenBlocks(nodes, edges, node.id, walk),
         nextBlockLabel,
       );
     }
     if (isWorkflowBlockNode(node)) {
-      return getWorkflowBlock(node as WorkflowBlockNode, nodes, edges);
+      return getWorkflowBlock(node as WorkflowBlockNode, nodes, edges, walk);
     }
     return null;
   };
@@ -4602,6 +4762,9 @@ function getUpdatedNodesAfterLabelUpdateForParameterKeys(
               ? newLabel
               : node.data.inferredMergeLabel,
         }),
+        ...(node.data.loadedNextLabel === oldLabel && {
+          loadedNextLabel: newLabel,
+        }),
         // Update the label for the node being renamed
         label: node.id === id ? newLabel : node.data.label,
       },
@@ -4781,7 +4944,8 @@ function leavesBrowserState(node: AppNode, nodes: Array<AppNode>): boolean {
     case "navigation":
       return node.data.engine !== RunEngine.SkyvernV2;
     case "loop":
-      // A container itself navigates nothing; its children do.
+      // A container itself navigates nothing; its children do. A loop that runs zero times opens nothing
+      // either; counting it anyway is a deliberate approximation that can only hide this warning.
       return nodes.some(
         (child) =>
           child.parentId === node.id && leavesBrowserState(child, nodes),
@@ -4818,15 +4982,8 @@ function isFirstBrowserTaskBlock(
   });
 }
 
-// A run starts on about:blank, so the backend fails a first page-opening block that has no
-// URL (MissingStarterUrl).
-function isMissingRequiredStartUrl(
-  nodes: Array<AppNode>,
-  edges: Array<Edge>,
-  id: string,
-): boolean {
-  const node = nodes.find((node) => node.id === id);
-  if (!node) return false;
+// A page-opening block with an empty URL field starts on whatever page the run has open.
+function opensPageWithoutUrl(node: AppNode, nodes: Array<AppNode>): boolean {
   switch (node.type) {
     case "task":
     case "navigation":
@@ -4835,14 +4992,25 @@ function isMissingRequiredStartUrl(
     case "login":
     case "url":
     case "fileDownload":
-      return (
-        node.data.url.trim() === "" &&
-        leavesBrowserState(node, nodes) &&
-        isFirstBrowserTaskBlock(nodes, edges, id)
-      );
+      return node.data.url.trim() === "" && leavesBrowserState(node, nodes);
     default:
       return false;
   }
+}
+
+// A run starts on about:blank, so the backend fails a first page-opening block that has no
+// URL (MissingStarterUrl).
+function isMissingRequiredStartUrl(
+  nodes: Array<AppNode>,
+  edges: Array<Edge>,
+  id: string,
+): boolean {
+  const node = nodes.find((node) => node.id === id);
+  return (
+    node !== undefined &&
+    opensPageWithoutUrl(node, nodes) &&
+    isFirstBrowserTaskBlock(nodes, edges, id)
+  );
 }
 
 function convertParametersToParameterYAML(
@@ -5466,8 +5634,15 @@ function convertBlocksToBlockYAML(
             ? {
                 transport: block.transport,
                 credential_id: block.credential_id ?? null,
+                ...(block.credential_source === "nango"
+                  ? {
+                      credential_source: block.credential_source,
+                      connection_id: block.connection_id ?? null,
+                    }
+                  : {}),
                 cc: block.cc ?? [],
                 bcc: block.bcc ?? [],
+                reply_to_message_id: block.reply_to_message_id ?? null,
               }
             : {}),
         };
@@ -5582,6 +5757,7 @@ function convertBlocksToBlockYAML(
           max_results: block.max_results,
           include_body: block.include_body,
           download_attachments: block.download_attachments,
+          message_id: block.message_id ?? null,
           parameter_keys: (block.parameters ?? []).map((p) => p.key),
         };
         return blockYaml;
@@ -6389,6 +6565,7 @@ export {
   getAvailableOutputParameterKeys,
   isFirstBrowserTaskBlock,
   isMissingRequiredStartUrl,
+  opensPageWithoutUrl,
   urlMayBeGoogleDrive,
   getBlockNameOfOutputParameterKey,
   getDefaultValueForParameterType,

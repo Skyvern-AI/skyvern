@@ -4,11 +4,16 @@ import os
 import re
 from typing import Annotated, Any, Literal
 
+import structlog
 from pydantic import Field
 
 from skyvern.browser_extension.errors import BrowserExtensionBrokerError
 from skyvern.browser_extension.protocol import ERROR_CODES
-from skyvern.browser_extension.runtime import BrowserExtensionRuntime, broker_mode_enabled
+from skyvern.browser_extension.runtime import (
+    BrowserExtensionRuntime,
+    broker_mode_enabled,
+    release_broker_place_after_session_close,
+)
 from skyvern.cli.core.action_log import drain_action_log_events
 from skyvern.cli.core.api_key_hash import hash_api_key_for_cache
 from skyvern.cli.core.client import get_active_api_key
@@ -35,6 +40,15 @@ from ._session import (
     resolve_browser,
     set_current_session,
 )
+
+LOG = structlog.get_logger(__name__)
+
+
+async def _release_extension_broker_place() -> None:
+    try:
+        await release_broker_place_after_session_close()
+    except Exception:
+        LOG.warning("browser_extension_broker_place_release_failed", exc_info=True)
 
 
 def _extension_not_connected_guidance(*, pairing_opened: bool) -> str:
@@ -85,6 +99,11 @@ def _browser_extension_start_hint(error: Exception) -> str:
             return (
                 "Inspect ~/.skyvern/run/browser-extension/<port>/startup.log, stop any stale Skyvern MCP "
                 "process, and retry."
+            )
+        if error.code == "BROKER_BUSY":
+            return (
+                "The Chrome bridge is busy, or other agent sessions hold every place. "
+                "Close browser sessions you no longer need, or end idle agent sessions, then retry."
             )
         if error.code == "PORT_IN_USE":
             return (
@@ -621,6 +640,8 @@ async def skyvern_browser_session_close(
                 )
 
             if current.browser is None:
+                # A failed session_create can leave a connected broker client with no session.
+                await _release_extension_broker_place()
                 return make_result(
                     "skyvern_browser_session_close",
                     ok=False,
@@ -632,7 +653,12 @@ async def skyvern_browser_session_close(
                 )
 
             closed_id = current.context.session_id if current.context else None
-            await close_current_session()
+            is_extension_session = current.context is not None and current.context.mode == "extension"
+            try:
+                await close_current_session()
+            finally:
+                if is_extension_session:
+                    await _release_extension_broker_place()
             timer.mark("sdk")
 
         except Exception as e:

@@ -464,7 +464,9 @@ def _get_browser_state_for_cleanup(task: Task) -> BrowserState | None:
     return browser_state
 
 
-async def resolve_inherited_workflow_task_page(browser_state: BrowserState, workflow_run_id: str) -> Page:
+async def resolve_inherited_workflow_task_page(
+    browser_state: BrowserState, workflow_run_id: str, support_empty_page: bool = False
+) -> Page:
     working_page = await browser_state.get_working_page()
     if not working_page:
         LOG.error(
@@ -477,7 +479,7 @@ async def resolve_inherited_workflow_task_page(browser_state: BrowserState, work
             detected_at=datetime.now(UTC),
         )
 
-    if working_page.url not in BLANK_WORKFLOW_TASK_URLS:
+    if working_page.url not in BLANK_WORKFLOW_TASK_URLS or (support_empty_page and working_page.url == "about:blank"):
         return working_page
 
     if working_page.url not in RECOVERABLE_BLANK_WORKFLOW_TASK_URLS:
@@ -756,7 +758,8 @@ _PAGE_FINGERPRINT_PROBE_JS = (
     "| data-tv3=\"t\\d+(?:-\\d+)?\"/gi, '');"
     # Each sample scores every element's own text, capped at 2: +1 when rewritten, -1 when unchanged, 0 when it grew.
     # From 2 until back at 0 it is a ticker, and the settle check (maskTicks) ignores a ticker's change only to a
-    # text whose digit-masked shape it has shown before: a countdown, a clock or a carousel, never a new word.
+    # text whose digit-masked shape it has shown before (a countdown, a clock or a carousel, never a new word),
+    # decided whole on the sample where the text changed, so a still page hashes the same on every sample.
     " let seen = window.__tv3_settle_text;"
     " if (!(seen instanceof WeakMap)) seen = window.__tv3_settle_text = new WeakMap();"
     " const own = (n) => { let t = ''; for (const c of n.childNodes) if (c.nodeType === 3) t += c.nodeValue; return t; };"
@@ -764,9 +767,12 @@ _PAGE_FINGERPRINT_PROBE_JS = (
     " const all = root.querySelectorAll('*'); elems += all.length;"
     " for (const el of [root, ...all]) { const t = own(el); const r = seen.get(el); if (!r && !t.trim()) continue;"
     " const shape = t.replace(/[0-9]+/g, '#');"
+    " let moved = false;"
     " if (!r) seen.set(el, { t: t, n: 0, s: new Set([shape]) }); else if (r.t === t) r.n = Math.max(0, r.n - 1);"
-    " else { r.n = t.length > r.t.length && t.startsWith(r.t.slice(0, -3)) ? 0 : Math.min(2, r.n + 1); r.t = t; }"
-    " if (r) r.k = r.n >= 2 || (!!r.k && r.n > 0); if (!(r && r.k && r.s.has(shape))) text = mix('|' + t, text);"
+    " else { r.n = t.length > r.t.length && t.startsWith(r.t.slice(0, -3)) ? 0 : Math.min(2, r.n + 1); r.t = t;"
+    " moved = true; }"
+    " if (r) { r.k = r.n >= 2 || (!!r.k && r.n > 0); if (moved) r.m = r.k && r.s.has(shape); }"
+    " if (!(r && r.m)) text = mix('|' + t, text);"
     " if (r && r.s.size < 16) r.s.add(shape); }"
     " h = mix(maskTicks ? ('>' + html + '<').replace(/>[^<]*</g, '><') + ':' + text : html, h);"
     " for (const el of root.querySelectorAll('input, textarea, select'))"
@@ -2554,8 +2560,13 @@ class ForgeAgent:
                     will_rename=local_basename != desired_name,
                 )
                 recorded_path = os.path.join(workflow_download_directory, local_file_name)
+                unnamed_path = recorded_path
                 if local_basename != desired_name:
                     recorded_path = rename_file(recorded_path, desired_name)
+                # rename_file returns the old path when it fails, so only a rename that took effect records a receipt.
+                download_run_id = resolve_run_download_id(context, fallback_run_id=task.workflow_run_id)
+                if context is not None and download_run_id and recorded_path != unnamed_path:
+                    await context.record_configured_download(recorded_path, download_run_id)
                 if recorded_into is not None:
                     recorded_into.append(recorded_path)
                 continue
@@ -2835,6 +2846,7 @@ class ForgeAgent:
                 working_page = await resolve_inherited_workflow_task_page(
                     browser_state=browser_state,
                     workflow_run_id=workflow_run.workflow_run_id,
+                    support_empty_page=task_block._allow_blank_start,
                 )
                 task_url = working_page.url
             else:
@@ -4381,7 +4393,11 @@ class ForgeAgent:
             # A page-bound goal cannot have been met on a tab with no document, and reporting it
             # completed pins the failure on the next block instead (SKY-16924). A download already
             # delivered the goal, and the tab it opens is routinely left blank.
-            elif not page_free_validation and not download_finalized:
+            elif (
+                not page_free_validation
+                and not download_finalized
+                and not (task_block and task_block._allow_blank_start)
+            ):
                 blank_page = None
                 try:
                     first_sample = gate_page
@@ -6178,6 +6194,7 @@ class ForgeAgent:
                         step,
                         browser_state,
                         engine,
+                        support_empty_page=bool(task_block and task_block._allow_blank_start),
                     )
                 except ScrapingFailedBlankPage:
                     # The working page is a dead blank after the scrape ladder. If a survivor exists,
@@ -8454,6 +8471,7 @@ class ForgeAgent:
         scrape_type: ScrapeType,
         engine: RunEngine,
         navigation_deadline: float | None = None,
+        support_empty_page: bool = False,
     ) -> ScrapedPage:
         if scrape_type == ScrapeType.NORMAL:
             pass
@@ -8479,7 +8497,7 @@ class ForgeAgent:
             max_screenshot_number = 1
             scroll = False
 
-        return await browser_state.scrape_website(
+        scraped_page = await browser_state.scrape_website(
             url=task.url,
             cleanup_element_tree=app.AGENT_FUNCTION.cleanup_element_tree_factory(
                 task=task,
@@ -8493,8 +8511,11 @@ class ForgeAgent:
             # Only this agent-step scrape opts into transient-UI scroll suppression (SKY-12735);
             # verification / extraction / error-detection scrapes keep legacy scrolling.
             allow_transient_ui_suppression=True,
+            support_empty_page=support_empty_page,
             navigation_deadline=navigation_deadline,
         )
+        scraped_page._support_empty_page = support_empty_page
+        return scraped_page
 
     async def _observe_claimed_download_within_grace(
         self,
@@ -8772,6 +8793,7 @@ class ForgeAgent:
         engine: RunEngine,
         *,
         persist_artifacts: bool = True,
+        support_empty_page: bool = False,
     ) -> StepPromptResult:
         _scrape_span = otel_trace.get_current_span()
         _scrape_span.set_attribute("engine", str(engine))
@@ -8883,6 +8905,7 @@ class ForgeAgent:
                         scrape_type=scrape_type,
                         engine=engine,
                         navigation_deadline=navigation_deadline,
+                        support_empty_page=support_empty_page,
                     )
                     break
                 except (FailedToTakeScreenshot, ScrapingFailed, FailedToReloadPage) as e:
@@ -10330,8 +10353,8 @@ class ForgeAgent:
                                 for file in exc.skipped_files
                             )
                         # Reconcile session-scoped DOWNLOAD rows the watcher left unbound, so
-                        # GET /v1/runs/{id} surfaces them (see
-                        # cloud_docs/BROWSER_SESSION_DOWNLOAD_ARTIFACTS.md).
+                        # GET /v1/runs/{id} surfaces them (see the browser session download
+                        # artifacts doc).
                         browser_session_id = context.browser_session_id if context else None
                         if browser_session_id and task.organization_id and finalization_run_id:
                             try:

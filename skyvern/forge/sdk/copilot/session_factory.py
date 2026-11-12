@@ -34,10 +34,12 @@ from skyvern.forge.sdk.copilot.enforcement import (
     NUDGE_SENTINEL,
     SCREENSHOT_PLACEHOLDER,
     TOKEN_BUDGET,
+    _strip_input_images,
     _summarize_tool_arguments,
     _summarize_tool_output,
     aggressive_prune,
     estimate_tokens,
+    is_attached_image_message,
     is_paired_observation_message,
     is_screenshot_message,
     is_synthetic_user_message,
@@ -238,6 +240,9 @@ def _copilot_call_model_input_filter(data: CallModelData[Any], *, token_budget: 
     # Compacted up front so the sharp-copy budget check below sees the input the budget filter will.
     items = _compact_tool_items([item for item in data.model_data.input if not _is_unsent_reasoning(item)])
     ctx = _run_context(data)
+    # A fallback to a non-vision model replays session history that may already hold attached or captured images.
+    if not (isinstance(ctx, AgentContext) and ctx.supports_vision):
+        items = list(_strip_input_images(items)[0])
     # Read-only peek: the end-of-turn drain in enforcement stays the only clear, so a provider
     # retry or model fallback re-running this filter still carries the frame.
     screenshot_msg = pending_screenshot_message(ctx)
@@ -267,8 +272,12 @@ def _copilot_call_model_input_filter(data: CallModelData[Any], *, token_budget: 
             )
     if screenshot_msg is not None:
         sharp_msg = pending_screenshot_message(ctx, sharp=True)
-        # The sharp copy may cost older screenshots, which budget pruning drops first anyway, but nothing else.
-        if sharp_msg is not None and estimate_tokens(_drop_older_screenshots([*items, sharp_msg])) <= token_budget:
+        # The sharp copy may cost older screenshots and attached images, which budget pruning drops first anyway,
+        # but nothing else.
+        if (
+            sharp_msg is not None
+            and estimate_tokens(_drop_attached_images(_drop_older_screenshots([*items, sharp_msg]))) <= token_budget
+        ):
             screenshot_msg = sharp_msg
         else:
             LOG.info("copilot_sharp_frame_over_budget")
@@ -380,7 +389,7 @@ def _filter_to_budget(items: list[Any], instructions: str | None, *, token_budge
     Graduated pruning:
     1. Compact older tool outputs + function-call arguments using the
        KEEP_RECENT_TOOL_OUTPUTS rule (mirrors ``enforcement._prune_input_list``).
-    2. If still over budget: drop all screenshots except the most recent,
+    2. If still over budget: drop all screenshots except the most recent, then attached images,
        then replace the latest unread outputs that do not fit with a notice that the call ran.
     3. If still over budget: truncate ALL tool outputs — first to 2000 chars,
        then to 300 only if the softer pass was not enough.
@@ -412,6 +421,14 @@ def _filter_to_budget(items: list[Any], instructions: str | None, *, token_budge
     if est <= token_budget:
         LOG.info("Within budget after screenshot drop", tokens=est)
         return ModelInputData(input=items, instructions=instructions)
+
+    stripped = _drop_attached_images(items)
+    if stripped != items:
+        items = stripped
+        est = estimate_tokens(items)
+        LOG.warning("copilot_attached_images_dropped_for_budget", tokens=est)
+        if est <= token_budget:
+            return ModelInputData(input=items, instructions=instructions)
 
     # Layer 2b: split an unread batch that does not fit. Outputs stay whole in call order; the rest become a
     # notice that the call ran, so nothing the model has not read is summarized or cut.
@@ -511,6 +528,10 @@ def _drop_older_screenshots(items: list[Any]) -> list[Any]:
         {"role": "user", "content": SCREENSHOT_PLACEHOLDER} if i in drop_indices else item
         for i, item in enumerate(items)
     ]
+
+
+def _drop_attached_images(items: list[Any]) -> list[Any]:
+    return [_strip_input_images([item])[0][0] if is_attached_image_message(item) else item for item in items]
 
 
 def _truncate_tool_output(item: Any, max_chars: int) -> Any:

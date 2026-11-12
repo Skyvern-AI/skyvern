@@ -5,11 +5,13 @@ import builtins
 import datetime
 import hashlib
 import html
+import os
 import re
+import threading
 import time
 import unicodedata
 from bisect import bisect_left, bisect_right
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -704,6 +706,28 @@ def compute_org_age(created_at: datetime.datetime | None, *, now: datetime.datet
     return max(0, (reference - created).days)
 
 
+def _file_identity(path: str) -> tuple[int, int, int, int]:
+    stat = os.stat(path)
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+
+def _receipt_digest(path: str, identity: tuple[int, int, int, int], stop: threading.Event) -> str | None:
+    """SHA-256 of ``path`` while it still has ``identity`` from before the read to after it; None once stopped."""
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as file:
+            opened = os.fstat(file.fileno())
+            if (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns) != identity:
+                return None
+            while not stop.is_set() and (chunk := file.read(1024 * 1024)):
+                digest.update(chunk)
+        if stop.is_set() or _file_identity(path) != identity:
+            return None
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
 @dataclass
 class SkyvernContext:
     request_id: str | None = None
@@ -770,6 +794,11 @@ class SkyvernContext:
     download_completed_task_ids: set[str] = field(default_factory=builtins.set)
     # Keep source names with exact CDP targets; finalization must not infer provenance from affixes.
     download_suffix_applied_files: dict[str, tuple[str, str]] = field(default_factory=dict, repr=False)
+    # Files Skyvern finished writing or renaming under a configured download name, by resolved path: org, run, the
+    # file's identity and the SHA-256 of the bytes named. Any later change to the file voids the receipt.
+    configured_downloads: dict[str, tuple[str | None, str, tuple[int, int, int, int], str]] = field(
+        default_factory=dict, repr=False
+    )
     totp_codes: dict[str, str | None] = field(default_factory=dict)
     # Polled codes placed in totp_codes that no plan has typed yet. Only the single-field polling
     # path records one, so every other producer keeps the historical discard-after-planning behavior.
@@ -1610,6 +1639,48 @@ class SkyvernContext:
 
     def cleanup_downloads_recorded(self, task_id: str) -> bool:
         return task_id in self.cleanup_downloads_recorded_task_ids
+
+    async def record_configured_download(self, path: str, workflow_run_id: str) -> None:
+        # The file, owner and identity are fixed before the first await; the worker only reads, and only this task
+        # publishes, so a cancelled, replaced or re-owned recording grants nothing.
+        resolved = os.path.realpath(path)
+        self.configured_downloads.pop(resolved, None)
+        organization_id = self.organization_id
+        try:
+            identity = _file_identity(resolved)
+        except OSError:
+            return
+        stop = threading.Event()
+        worker = asyncio.ensure_future(asyncio.to_thread(_receipt_digest, resolved, identity, stop))
+        try:
+            digest = await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            stop.set()
+            while not worker.done():
+                with suppress(asyncio.CancelledError):
+                    await asyncio.wait({worker})
+            raise
+        try:
+            unchanged = _file_identity(resolved) == identity
+        except OSError:
+            unchanged = False
+        if digest is not None and unchanged and self.organization_id == organization_id:
+            self.configured_downloads[resolved] = (organization_id, workflow_run_id, identity, digest)
+
+    def configured_download_digest(self, path: str, organization_id: str, workflow_run_id: str | None) -> str | None:
+        resolved = os.path.realpath(path)
+        recorded = self.configured_downloads.get(resolved)
+        if recorded is None or recorded[:2] != (organization_id, workflow_run_id):
+            return None
+        try:
+            unchanged = _file_identity(resolved) == recorded[2]
+        except OSError:
+            unchanged = False
+        if not unchanged:
+            # Consumed: restored bytes or an equal replacement were never named by Skyvern.
+            self.configured_downloads.pop(resolved, None)
+            return None
+        return recorded[3]
 
     def record_download_failure(self, task_id: str, reason: str, failure_key: str | None = None) -> None:
         if failure_key is not None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
@@ -14,6 +15,7 @@ from typing_extensions import TypedDict
 
 from skyvern.cli.core.js_dispatch import outer_cap_seconds
 from skyvern.cli.core.session_manager import ensure_browser_hooks, get_current_session
+from skyvern.exceptions import InvalidUrl
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, stash_blocker_signal
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
@@ -71,6 +73,7 @@ from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerification
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.proxy_location import ProxyLocationInput
 from skyvern.schemas.workflows import BlockType
+from skyvern.utils.url_validators import canonical_navigation_host
 from skyvern.utils.yaml_loader import safe_load_no_dates
 from skyvern.webeye.browser_errors import BrowserAutomationError
 
@@ -668,6 +671,7 @@ async def _discovery_navigate(
         # loop settles anything still hydrating.
         nav_args["wait_until"] = wait_until
     cap_seconds = outer_cap_seconds(nav_args["timeout"])
+    started_wall = time.time()
     try:
         result = await asyncio.wait_for(
             server.call_internal_tool("skyvern_navigate", nav_args),
@@ -675,7 +679,7 @@ async def _discovery_navigate(
         )
     except TimeoutError:
         return {"ok": False, "error": f"skyvern_navigate timed out after {cap_seconds:g}s"}
-    return await attribute_navigation_failure(ctx, result)
+    return await attribute_navigation_failure(ctx, result, target_url=url, since_wall=started_wall)
 
 
 async def browser_session_hop_proxy(
@@ -702,7 +706,33 @@ async def browser_session_hop_proxy(
     return True, session.proxy_location if session is not None else None
 
 
-async def attribute_navigation_failure(ctx: AgentContext, result: dict[str, Any]) -> dict[str, Any]:
+async def provider_refusal_fact(*, browser_session_id: str, url: str | None, since_wall: float) -> str | None:
+    """The proxy provider's stated refusal of this browser's connection to ``url``'s host, recorded no earlier than
+    the proxy's clock-skew allowance before ``since_wall``."""
+    try:
+        host = canonical_navigation_host(url) if url else None
+    except InvalidUrl:
+        host = None
+    if not host:
+        return None
+    refusal = await app.AGENT_FUNCTION.proxy_provider_refusal(
+        browser_session_id=browser_session_id, host=host, since_wall=since_wall
+    )
+    if refusal is None:
+        return None
+    return (
+        f"The proxy provider recently refused this browser's connection to {host} "
+        f"(status {refusal.status}, reason {refusal.reason})."
+    )
+
+
+async def attribute_navigation_failure(
+    ctx: AgentContext,
+    result: dict[str, Any],
+    *,
+    target_url: str | None = None,
+    since_wall: float | None = None,
+) -> dict[str, Any]:
     """Name Skyvern's proxy hop in a failed navigation before anything downstream renders it.
 
     Scouting has no run row to read codes from, so the code comes off the call that failed and the
@@ -719,7 +749,8 @@ async def attribute_navigation_failure(ctx: AgentContext, result: dict[str, Any]
     # for a session lookup, and a lookup that fails cannot replace a failure it was only labelling.
     if not proxy_owns_nav_codes([result.get("nav_error_code")]):
         return result
-    if not effective_browser_session_id(ctx):
+    browser_session_id = effective_browser_session_id(ctx)
+    if not browser_session_id:
         return result
     try:
         browser_state = await resolve_browser_state_for_context(ctx)
@@ -734,6 +765,12 @@ async def attribute_navigation_failure(ctx: AgentContext, result: dict[str, Any]
         browser_state.built_with_proxy_location if browser_state is not None else None,
         session_made_hop=True,
     )
+    if since_wall is not None:
+        refusal = await provider_refusal_fact(
+            browser_session_id=browser_session_id, url=target_url, since_wall=since_wall
+        )
+        if refusal is not None:
+            attributed = f"{attributed} {refusal}"
     return {**result, "error": attributed}
 
 

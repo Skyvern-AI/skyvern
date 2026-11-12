@@ -4,18 +4,27 @@ import asyncio
 import copy
 import re
 from collections.abc import Collection, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import structlog
 import yaml
 from fastapi import HTTPException
+from pydantic import BaseModel
 
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
     clear_tool_blocker_signals_for_reason_codes,
+    stash_blocker_signal,
 )
-from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.connected_accounts import (
+    connection_is_cited,
+    listed_connection_ids,
+    reference_is_cited,
+    request_user_id,
+    resolve_connection_reference,
+)
 from skyvern.forge.sdk.copilot.credential_resolution import (
     credential_reference_spans,
     grounded_references,
@@ -32,6 +41,7 @@ from skyvern.forge.sdk.copilot.vault_logins import (
 )
 from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     LEGACY_BITWARDEN_PARAM_ID_PREFIX,
+    agent_step_account_text,
     bitwarden_login_parameter_credential_id,
     bitwarden_secret_bindings,
     block_credential_ids,
@@ -41,14 +51,22 @@ from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     saved_credential_ids,
     url_origin,
     workflow_blocks,
+    workflow_connection_refs,
     workflow_credential_ids_from_parsed,
 )
 from skyvern.forge.sdk.copilot.workflow_yaml import dump_workflow_yaml
 from skyvern.forge.sdk.credential_site_policy import describe_login_sites
+from skyvern.forge.sdk.db.id import GOOGLE_OAUTH_CREDENTIAL_PREFIX, MICROSOFT_OAUTH_CREDENTIAL_PREFIX
+from skyvern.forge.sdk.integrations.connected_accounts import (
+    IncompleteConnectionRead,
+    OrgConnection,
+    connected_account_fields,
+    org_connections,
+    org_connections_by_id,
+)
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice
 from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType, CredentialVaultType, TotpType
-from skyvern.forge.sdk.schemas.google_oauth import GoogleOAuthCredentialBase
-from skyvern.forge.sdk.services import google_oauth_service, google_sheets_service
+from skyvern.forge.sdk.services import google_sheets_service
 from skyvern.forge.sdk.services.credential.credential_creation_service import VaultItemImport, import_vault_items
 from skyvern.forge.sdk.services.credential.credential_vault_service import (
     LISTED_VAULT_TYPES,
@@ -76,12 +94,6 @@ def _extract_credential_ids_from_tool_value(value: Any) -> list[str]:
     def visit(item: Any) -> None:
         if isinstance(item, str):
             found.extend(_CREDENTIAL_ID_RE.findall(item))
-            # Google connection IDs are accepted only as an exact structured slot value. Do not
-            # search prose for them: account authority comes from a verified click, a persisted
-            # workflow binding, or a selected native Sheets binding cited from this turn's
-            # server-owned integration result. This extractor is only the later validation seam.
-            if item.startswith("goac_"):
-                found.append(item)
         elif isinstance(item, dict):
             for nested in item.values():
                 visit(nested)
@@ -143,7 +155,6 @@ def _extract_credential_ids_from_workflow_definition(workflow_definition: Any) -
     found = _extract_credential_ids_from_workflow_parameters(definition.get("parameters"))
     for block in workflow_blocks({"workflow_definition": definition}):
         found.extend(_extract_credential_ids_from_workflow_parameters(block.get("parameters")))
-        found.extend(_extract_credential_ids_from_tool_value(block.get("credential_id")))
     return list(dict.fromkeys(found))
 
 
@@ -188,227 +199,100 @@ def _extract_credential_ids_for_labels(
     return list(dict.fromkeys(found))
 
 
-def _google_sheet_connection_bindings_from_workflow_definition(
-    workflow_definition: Any,
-    *,
-    selected_labels: Collection[str] | None = None,
-) -> list[tuple[str, str]]:
-    definition = _workflow_definition_as_dict(workflow_definition)
-    return [
-        (label, connection_id)
-        for block in workflow_blocks(
-            {"workflow_definition": definition},
-            selected_labels=set(selected_labels) if selected_labels is not None else None,
-        )
-        if block.get("block_type") in {"google_sheets_read", "google_sheets_write"}
-        and isinstance((label := block.get("label")), str)
-        and isinstance((connection_id := block.get("credential_id")), str)
-    ]
-
-
 _GOOGLE_SHEETS_BLOCK_TYPES = {"google_sheets_read", "google_sheets_write"}
-_UNRESOLVED_GOOGLE_SLOT_NOTE = (
+_UNRESOLVED_CONNECTION_SLOT_NOTE = (
     "The slot was left as written, and a slot still holding an unresolved reference cannot run."
 )
-_UNRESOLVED_GOOGLE_CONNECTION_TEXT = {
-    "ambiguous": "More than one of the organization's Google connections matches this reference.",
-    "not_found": "None of the organization's Google connections matches this reference.",
-    "ineligible": (
-        "This reference matches one Google connection, but that connection is not an active one with Google "
-        "Sheets access."
-    ),
+_UNRESOLVED_CONNECTION_TEXT = {
+    "ambiguous": "More than one of the organization's connected accounts matches this reference.",
+    "not_found": "None of the organization's connected accounts matches this reference.",
+    "inactive": "This reference matches one connected account, but that account is not active.",
     "not_cited": "The user's message for this turn does not name this reference on its own, so it was not resolved.",
     "lookup_failed": (
-        "The organization's Google connections could not be read, so this is not evidence that the connection "
-        "is missing."
+        "The organization's connected accounts could not be read, so this is not evidence that the account is missing."
     ),
 }
-_GOOGLE_CONNECTION_PREFIX = "goac_"
-_UNAPPROVED_GOOGLE_CONNECTION_REASON_CODE = "unapproved_google_connection_reference"
+UNAPPROVED_CONNECTION_REASON_CODE = "unapproved_connected_account_reference"
 
 
 def _is_templated_credential_value(value: str) -> bool:
     return "{{" in value or "{%" in value
 
 
-_TEMPLATE_KEY_RE = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
-
-
-def _connection_labels(connections: Sequence[GoogleOAuthCredentialBase]) -> list[str]:
-    return [
-        label.casefold()
-        for connection in connections
-        for label in (connection.credential_name, connection.email_address)
-        if label
-    ]
-
-
-def _google_connection_reference_is_cited(message: str, reference: str, labels: Sequence[str]) -> bool:
-    """Verify a citation; never interpret one. The exact literal must stand as its own token in the
-    current turn, compared the way the resolver matches rows: casefold. A label that only occurs
-    inside a longer sibling label ("Marketing" within "Marketing Archive") is not cited on its own."""
-    if not message or not reference:
-        return False
-    return reference.casefold() in grounded_references(message.casefold(), [reference.casefold(), *labels])
-
-
-def _named_google_sheet_blocks(
-    parsed: dict[str, Any],
-    *,
-    selected_labels: set[str] | None = None,
-) -> list[dict[str, Any]]:
-    """Sheets blocks whose `credential_id` still holds an unresolved connection reference.
-    Saved-credential ids are excluded because they carry the saved-credential approval error instead."""
-    return [
-        block
-        for block in workflow_blocks(parsed, selected_labels=selected_labels)
-        if block.get("block_type") in _GOOGLE_SHEETS_BLOCK_TYPES
-        and isinstance((reference := block.get("credential_id")), str)
-        and reference.strip()
-        and not reference.startswith(_GOOGLE_CONNECTION_PREFIX)
-        and not _is_templated_credential_value(reference)
-        and not _CREDENTIAL_ID_RE.fullmatch(reference.strip())
-    ]
-
-
-def _unbacked_templated_google_sheet_slots(parsed: dict[str, Any], selected_labels: set[str] | None) -> list[str]:
-    """Templated Sheets `credential_id` slots not backed by credential-typed workflow parameters.
-    A slot is backed only when it is a bare `{{ key }}` for such a parameter; a dotted path, a
-    filter, or a `{% %}` expression names no parameter the boundary can vouch for, so it renders at
-    run time with no citation, approval, state, or scope check and carries no authority of its own."""
-    definition = parsed.get("workflow_definition")
-    parameters = definition.get("parameters") if isinstance(definition, dict) else None
-    credential_keys = {
-        key
-        for key, ids in credential_param_ids(parameters).items()
-        if not any(credential_id.startswith(LEGACY_BITWARDEN_PARAM_ID_PREFIX) for credential_id in ids)
-    }
-    return [
-        reference
-        for block in workflow_blocks(parsed, selected_labels=selected_labels)
-        if block.get("block_type") in _GOOGLE_SHEETS_BLOCK_TYPES
-        and isinstance((reference := block.get("credential_id")), str)
-        and _is_templated_credential_value(reference)
-        and not (
-            _TEMPLATE_KEY_RE.fullmatch(reference.strip())
-            and set(_TEMPLATE_KEY_RE.findall(reference)) <= credential_keys
-        )
-    ]
-
-
-def _google_connection_reference_ids(workflow_definition: Any, labels: Collection[str] | None) -> list[str]:
-    """Unresolved Google connection references; `labels=None` reads the whole workflow definition."""
-    parsed = {"workflow_definition": _workflow_definition_as_dict(workflow_definition)}
-    selected_labels = set(labels) if labels is not None else None
-    return list(
-        dict.fromkeys(
-            [
-                *(
-                    str(block["credential_id"]).strip()
-                    for block in _named_google_sheet_blocks(parsed, selected_labels=selected_labels)
-                ),
-                *_unbacked_templated_google_sheet_slots(parsed, selected_labels),
-            ]
-        )
-    )
-
-
-def _connection_row_facts(credential: GoogleOAuthCredentialBase) -> dict[str, Any]:
-    return {
-        "connection_id": credential.id,
-        "name": credential.credential_name,
-        "email_address": credential.email_address,
-        "state": credential.state,
-        "scopes_granted": list(credential.scopes_granted),
-    }
-
-
-def _eligible_sheets_connections(
-    connections: Sequence[GoogleOAuthCredentialBase],
-) -> list[GoogleOAuthCredentialBase]:
-    return [
-        credential
-        for credential in connections
-        if credential.state == google_oauth_service.STATE_ACTIVE
-        and google_oauth_service.GOOGLE_SHEETS_DATA_SCOPE in credential.scopes_granted
-    ]
-
-
-async def canonicalize_named_google_sheet_bindings(
+async def canonicalize_named_connection_bindings(
     workflow_yaml: str,
     ctx: AgentContext,
 ) -> tuple[str, list[dict[str, Any]]]:
-    """Rewrite a cited Google connection name in a Sheets `credential_id` slot to its stored id.
-
-    Only a literal the current user turn contains, resolving to exactly one active Sheets-scoped
-    row, is rewritten; every other reference is left in place and reported as facts."""
+    """Rewrite a name or email the user cited in this turn to the id of the one active connection it resolves to;
+    every other reference is left in place and reported as facts."""
     try:
         parsed = safe_load_no_dates(workflow_yaml)
     except yaml.YAMLError:
         return workflow_yaml, []
     if not isinstance(parsed, dict):
         return workflow_yaml, []
-    named_blocks = _named_google_sheet_blocks(parsed)
-    if not named_blocks:
+    slots = [
+        (block, field)
+        for block in workflow_blocks(parsed)
+        for field in connected_account_fields(block)
+        if isinstance((value := block.get(field)), str) and value.strip() and not _is_templated_credential_value(value)
+    ]
+    if not slots:
         return workflow_yaml, []
 
     policy = ctx.request_policy
     message = policy.canonical_user_message if isinstance(policy, RequestPolicy) else ""
     try:
-        visible: list[GoogleOAuthCredentialBase] | None = await google_oauth_service.get_visible_credentials_for_org(
-            ctx.organization_id
+        connections: list[OrgConnection] | None = await org_connections(
+            ctx.organization_id, request_user_id(ctx.organization_id)
         )
     except Exception:
         LOG.warning(
-            "copilot_google_connection_canonicalization_lookup_failed",
-            organization_id=ctx.organization_id,
-            exc_info=True,
+            "copilot_connection_canonicalization_lookup_failed", organization_id=ctx.organization_id, exc_info=True
         )
-        visible = None
-
-    eligible = _eligible_sheets_connections(visible or [])
-    eligible_ids = {credential.id for credential in eligible}
+        connections = None
+    known_ids = {connection.id for connection in connections or []}
 
     facts: list[dict[str, Any]] = []
     changed = False
-    for block in named_blocks:
-        reference = str(block["credential_id"]).strip()
+    for block, field in slots:
+        reference = str(block[field]).strip()
+        if reference in known_ids:
+            continue
         label = block.get("label")
         fact: dict[str, Any] = {
             "label": label if isinstance(label, str) else None,
-            "provider": "google",
+            "field": field,
             "reference": reference,
             "canonicalized": False,
         }
-        if visible is None:
+        if connections is None:
             fact["status"] = "lookup_failed"
-        elif not _google_connection_reference_is_cited(message, reference, _connection_labels(visible)):
+        elif not reference_is_cited(message, reference, connections):
             fact["status"] = "not_cited"
         else:
-            resolution = google_oauth_service.resolve_connection_reference(visible, reference)
+            resolution = resolve_connection_reference(connections, reference)
             fact["status"] = resolution.status
-            fact["candidates"] = [_connection_row_facts(candidate) for candidate in resolution.candidates]
-            credential = resolution.credential
-            if credential is not None:
-                fact["connection_id"] = credential.id
-                fact["state"] = credential.state
-                fact["scopes_granted"] = list(credential.scopes_granted)
-                if credential.id in eligible_ids:
-                    block["credential_id"] = credential.id
+            fact["candidates"] = [candidate.facts() for candidate in resolution.candidates]
+            connection = resolution.connection
+            if connection is not None:
+                fact.update(connection.facts())
+                if connection.active:
+                    block[field] = connection.id
                     fact["canonicalized"] = True
                     changed = True
                 else:
-                    fact["status"] = "ineligible"
+                    fact["status"] = "inactive"
         if not fact["canonicalized"]:
-            fact["eligible_connections"] = [_connection_row_facts(candidate) for candidate in eligible]
-            text = _UNRESOLVED_GOOGLE_CONNECTION_TEXT.get(fact["status"])
-            fact["detail"] = f"{text} {_UNRESOLVED_GOOGLE_SLOT_NOTE}" if text else _UNRESOLVED_GOOGLE_SLOT_NOTE
+            fact["active_connections"] = [connection.facts() for connection in connections or [] if connection.active]
+            text = _UNRESOLVED_CONNECTION_TEXT.get(fact["status"])
+            fact["detail"] = f"{text} {_UNRESOLVED_CONNECTION_SLOT_NOTE}" if text else _UNRESOLVED_CONNECTION_SLOT_NOTE
         facts.append(fact)
 
     if changed:
         workflow_yaml = dump_workflow_yaml(parsed)
         LOG.info(
-            "copilot_google_connection_name_canonicalized",
+            "copilot_connection_name_canonicalized",
             organization_id=ctx.organization_id,
             connection_ids=[fact["connection_id"] for fact in facts if fact["canonicalized"]],
         )
@@ -451,22 +335,21 @@ async def resolve_google_sheet_tabs_from_gid(
         return workflow_yaml, []
 
     try:
-        eligible_ids: set[str] | None = {
-            credential.id
-            for credential in _eligible_sheets_connections(
-                await google_oauth_service.get_visible_credentials_for_org(ctx.organization_id)
-            )
+        active_ids: set[str] | None = {
+            connection.id
+            for connection in await org_connections_by_id(ctx.organization_id, request_user_id(ctx.organization_id))
+            if connection.active
         }
     except Exception:
         LOG.warning("copilot_google_sheet_tab_lookup_failed", organization_id=ctx.organization_id, exc_info=True)
-        eligible_ids = None
+        active_ids = None
 
     # Reading tab titles discloses spreadsheet metadata, so it needs the same turn approval dispatch requires.
     policy = ctx.request_policy if isinstance(ctx.request_policy, RequestPolicy) else None
-    approved_ids = set(policy.run_approved_google_connection_ids) if policy is not None else set()
+    approved_ids = set(policy.run_approved_connection_ids) if policy is not None else set()
     approved_ids.update(
-        await _approve_server_verified_google_sheet_bindings(
-            [(str(block.get("label")), str(block.get("credential_id"))) for block, _, _ in candidates],
+        await admitted_connection_ids(
+            [str(block.get("credential_id")) for block, _, _ in candidates],
             tool_activity=ctx.tool_activity,
             organization_id=ctx.organization_id,
             request_policy=policy,
@@ -493,11 +376,11 @@ async def resolve_google_sheet_tabs_from_gid(
         if _is_templated_credential_value(credential_id):
             fact.update(status="ineligible", reason="templated_credential")
             continue
-        if eligible_ids is None:
+        if active_ids is None:
             fact["status"] = "lookup_failed"
             continue
-        if credential_id not in eligible_ids:
-            fact.update(status="ineligible", reason="not_eligible_connection")
+        if credential_id not in active_ids:
+            fact.update(status="ineligible", reason="not_active_connection")
             continue
         if credential_id not in approved_ids:
             fact.update(status="ineligible", reason="connection_not_approved")
@@ -668,111 +551,43 @@ def _approved_run_credential_ids(request_policy: RequestPolicy | None) -> set[st
         for credential in request_policy.resolved_credentials
         if isinstance(getattr(credential, "credential_id", None), str)
     }
-    return (
-        resolved
-        | _saved_workflow_credential_ids(request_policy)
-        | set(request_policy.run_approved_google_connection_ids)
-    )
+    return resolved | _saved_workflow_credential_ids(request_policy) | set(request_policy.run_approved_connection_ids)
 
 
-async def _approve_server_verified_google_sheet_bindings(
-    bindings: Collection[tuple[str, str]],
+async def admitted_connection_ids(
+    refs: Collection[str],
     *,
     tool_activity: Sequence[dict[str, Any]],
     organization_id: str,
     request_policy: RequestPolicy | None,
-) -> list[str]:
-    """Admit selected Sheets citations backed by this turn's server-owned listing or user citation."""
+    listing_admits: Collection[str] | None = None,
+) -> set[str]:
+    """Bound connections this turn's listing returned or the user named, that belong to the org and are active.
+    A listing admits only the refs in `listing_admits` when given; every other ref needs the user to name it."""
     if request_policy is None:
-        return []
-
-    listed_ids = _same_turn_listed_google_sheet_ids(tool_activity)
-    canonical_message = request_policy.canonical_user_message
-    already_approved = set(request_policy.run_approved_google_connection_ids)
-    candidates = [
-        connection_id
-        for connection_id in dict.fromkeys(connection_id for _, connection_id in bindings)
-        if connection_id not in already_approved
-    ]
-    if not candidates or (not listed_ids and not canonical_message):
-        return []
+        return set()
+    already_approved = set(request_policy.run_approved_connection_ids) - set(request_policy.reads_only_connection_ids)
+    candidates = [ref for ref in dict.fromkeys(refs) if ref not in already_approved]
+    listed = listed_connection_ids(tool_activity)
+    if listing_admits is not None:
+        listed &= set(listing_admits)
+    message = request_policy.canonical_user_message
+    if not candidates or (not listed and not message):
+        return set()
+    complete = True
     try:
-        visible_connections = await google_oauth_service.get_visible_credentials_for_org(organization_id)
+        connections = await org_connections(organization_id, request_user_id(organization_id))
+    except IncompleteConnectionRead as incomplete:
+        connections, complete = incomplete.connections, False
     except Exception:
-        LOG.warning(
-            "copilot cited Google Sheets binding authority lookup failed",
-            organization_id=organization_id,
-            exc_info=True,
-        )
-        return []
-
-    # Citation is judged against every visible row, the same set author time sees, so a longer
-    # sibling name in the error state still shadows the shorter one; only active rows are eligible.
-    eligible = _eligible_sheets_connections(visible_connections)
-    eligible_ids = {connection.id for connection in eligible}
-    return [
-        connection_id
-        for connection_id in candidates
-        if connection_id in eligible_ids
-        and (
-            connection_id in listed_ids
-            or _connection_is_cited_by_the_user(connection_id, eligible, visible_connections, canonical_message)
-        )
-    ]
-
-
-def _same_turn_listed_google_sheet_ids(tool_activity: Sequence[dict[str, Any]]) -> set[str]:
-    # A connection the server just used to open the sheet is one it would have listed, so it counts as listed.
-    opened = {
-        connection_id
-        for activity in tool_activity
-        if activity.get("tool") == "read_google_sheet" and isinstance(activity.get("opened_connection_ids"), list)
-        for connection_id in activity["opened_connection_ids"]
-        if isinstance(connection_id, str)
+        LOG.warning("copilot_connection_authority_lookup_failed", organization_id=organization_id, exc_info=True)
+        return set()
+    active = {connection.id: connection for connection in connections if connection.active}
+    return {
+        ref
+        for ref in candidates
+        if ref in active and (ref in listed or (complete and connection_is_cited(message, active[ref], connections)))
     }
-    return _latest_listing_google_sheet_ids(tool_activity) | opened
-
-
-def _latest_listing_google_sheet_ids(tool_activity: Sequence[dict[str, Any]]) -> set[str]:
-    for activity in reversed(tool_activity):
-        if activity.get("tool") != "list_integrations":
-            continue
-        integrations = activity.get("integrations")
-        if not isinstance(integrations, list):
-            return set()
-        return {
-            connection_id
-            for integration in integrations
-            if isinstance(integration, dict)
-            and integration.get("provider") == "google"
-            and integration.get("state") == "active"
-            and isinstance((connection_id := integration.get("connection_id")), str)
-            and isinstance(integration.get("scopes_granted"), list)
-            and google_oauth_service.GOOGLE_SHEETS_DATA_SCOPE in integration["scopes_granted"]
-        }
-    return set()
-
-
-def _connection_is_cited_by_the_user(
-    connection_id: str,
-    eligible: Sequence[GoogleOAuthCredentialBase],
-    known: Sequence[GoogleOAuthCredentialBase],
-    canonical_message: str,
-) -> bool:
-    """The user's own verbatim naming of a connection stands in for a same-turn listing, but only
-    when that literal resolves to this one row across every known row: a name shared with a
-    connection that merely lacks the Sheets scope is still ambiguous, and admits nothing."""
-    bound = next((connection for connection in eligible if connection.id == connection_id), None)
-    if bound is None:
-        return False
-    labels = _connection_labels(known)
-    for label in (bound.credential_name, bound.email_address):
-        if not label or not _google_connection_reference_is_cited(canonical_message, label, labels):
-            continue
-        resolution = google_oauth_service.resolve_connection_reference(known, label)
-        if resolution.credential is not None and resolution.credential.id == connection_id:
-            return True
-    return False
 
 
 def _credential_run_approval_error(
@@ -790,127 +605,174 @@ def _credential_run_approval_error(
     return _unapproved_credential_reference_tool_error(unapproved_ids)
 
 
-def _credential_run_approval_blocker_signal(
-    credential_ids: list[str],
+def _connection_approval_blocker_signal(
+    refs: Collection[str],
     request_policy: RequestPolicy | None,
     *,
-    additional_approved_ids: Collection[str] = (),
-    google_reference_ids: Collection[str] = (),
-    action: str = "run the workflow",
-    blocked_tool: str = "update_and_run_blocks",
+    admitted_ids: Collection[str],
+    action: str,
+    blocked_tool: str,
+    acting_refs: Collection[str] = (),
 ) -> CopilotToolBlockerSignal | None:
-    approved_ids = _approved_run_credential_ids(request_policy) | set(additional_approved_ids)
-    references = [
-        *(credential_id for credential_id in credential_ids if credential_id.startswith(_GOOGLE_CONNECTION_PREFIX)),
-        *google_reference_ids,
+    """`acting_refs` need a citation, a card pick or the saved workflow; a reads-only approval does not cover them."""
+    approved_ids = _approved_run_credential_ids(request_policy) | set(admitted_ids)
+    reads_only = set(request_policy.reads_only_connection_ids) - set(admitted_ids) if request_policy else set()
+    unapproved = [
+        ref for ref in dict.fromkeys(refs) if ref not in approved_ids or (ref in reads_only and ref in acting_refs)
     ]
-    unapproved_google_ids = [reference for reference in dict.fromkeys(references) if reference not in approved_ids]
-    if not unapproved_google_ids:
+    if not unapproved:
         return None
     return CopilotToolBlockerSignal(
         blocker_kind="authority_denied",
-        agent_steering_text="Ask the user to choose one of the server-provided connected Google accounts.",
-        user_facing_reason=(
-            f"Choose one of the connected Google accounts below so I can {action}. "
-            "Reconnect any unavailable account on the Integrations page first."
-        ),
+        agent_steering_text="Ask the user to choose one of the server-provided connected accounts.",
+        user_facing_reason=f"Choose one of the connected accounts below so I can {action}.",
         recovery_hint="ask_user_clarifying",
         preserves_workflow_draft=True,
-        internal_reason_code=_UNAPPROVED_GOOGLE_CONNECTION_REASON_CODE,
+        internal_reason_code=UNAPPROVED_CONNECTION_REASON_CODE,
         blocked_tool=blocked_tool,
-        # The id list is the opaque subset; the count covers every reference, including named
-        # connections and template expressions the trace deliberately does not carry.
-        extra={
-            "unapproved_google_connection_ids": [
-                reference
-                for reference in unapproved_google_ids
-                if reference.startswith(_GOOGLE_CONNECTION_PREFIX) and not _is_templated_credential_value(reference)
-            ],
-            "unapproved_google_reference_count": len(unapproved_google_ids),
-        },
+        # A count, not the references: an unresolved one can be a name or a template the trace does not carry.
+        extra={"unapproved_connection_reference_count": len(unapproved)},
     )
 
 
-def _workflow_wide_unapproved_google_references(workflow_definition: Any, approved_ids: set[str]) -> set[str]:
-    google_ids = {
-        credential_id
-        for credential_id in _extract_credential_ids_from_workflow_definition(workflow_definition)
-        if credential_id.startswith(_GOOGLE_CONNECTION_PREFIX)
-    }
-    return (google_ids | set(_google_connection_reference_ids(workflow_definition, None))) - approved_ids
-
-
-def _non_sheets_google_connection_ids(workflow_definition: Any) -> set[str]:
-    definition = _workflow_definition_as_dict(workflow_definition)
-    return {
-        credential_id
-        for block in workflow_blocks({"workflow_definition": definition})
-        if block.get("block_type") not in _GOOGLE_SHEETS_BLOCK_TYPES
-        for credential_id in _extract_credential_ids_from_tool_value(block.get("credential_id"))
-        if credential_id.startswith(_GOOGLE_CONNECTION_PREFIX)
-    }
-
-
-def _saved_unapproved_google_connection_ids(request_policy: RequestPolicy | None, approved_ids: set[str]) -> set[str]:
-    if request_policy is None:
-        return set()
-    return {
-        credential_id
-        for credential_id in request_policy.persisted_workflow_credential_ids
-        if not _CREDENTIAL_ID_RE.fullmatch(credential_id.strip())
-        and not credential_id.startswith(LEGACY_BITWARDEN_PARAM_ID_PREFIX)
-    } - approved_ids
-
-
-def _retire_stale_google_connection_denial(
-    ctx: CopilotContext,
-    *,
-    workflow_definition: Any,
-    additional_approved_ids: Collection[str] = (),
+def _retire_stale_connection_denial(
+    ctx: AgentContext, *, workflow_refs: Collection[str], admitted_ids: set[str]
 ) -> None:
-    """Drop an earlier attempt's denial once nothing it could have named is unapproved any more.
-    The clear removes every signal holding this reason code, including a later dispatch's live
-    denial, so any Google reference still unapproved in the executing or the saved definition
-    keeps them all standing."""
+    """Drop an earlier attempt's denial once nothing it could have named is unapproved any more. The clear removes
+    every signal holding this reason code, so any reference still unapproved in the definition or the saved
+    workflow keeps them all standing."""
     stale = ctx.blocker_signal
-    if not isinstance(stale, CopilotToolBlockerSignal):
+    if (
+        not isinstance(stale, CopilotToolBlockerSignal)
+        or stale.internal_reason_code != UNAPPROVED_CONNECTION_REASON_CODE
+    ):
         return
-    if stale.internal_reason_code != _UNAPPROVED_GOOGLE_CONNECTION_REASON_CODE:
+    policy = ctx.request_policy if isinstance(ctx.request_policy, RequestPolicy) else None
+    saved_refs = set(policy.persisted_workflow_connection_ids) if policy is not None else set()
+    if (set(workflow_refs) | saved_refs) - _approved_run_credential_ids(policy) - admitted_ids:
         return
-    durably_approved = _approved_run_credential_ids(ctx.request_policy)
-    approved = durably_approved | set(additional_approved_ids)
-    if _workflow_wide_unapproved_google_references(workflow_definition, approved):
-        return
-    if _non_sheets_google_connection_ids(workflow_definition) - durably_approved:
-        return
-    if _saved_unapproved_google_connection_ids(ctx.request_policy, approved):
-        return
-    clear_tool_blocker_signals_for_reason_codes(ctx, frozenset({_UNAPPROVED_GOOGLE_CONNECTION_REASON_CODE}))
+    clear_tool_blocker_signals_for_reason_codes(ctx, frozenset({UNAPPROVED_CONNECTION_REASON_CODE}))
     ctx.connected_account_recovery_choices = []
 
 
-async def _server_verified_google_account_choices(
-    organization_id: str,
-) -> list[ConnectedAccountChoice] | None:
+async def connected_account_choices(organization_id: str) -> list[ConnectedAccountChoice] | None:
     try:
-        visible = await google_oauth_service.get_visible_credentials_for_org(organization_id)
+        connections = await org_connections_by_id(organization_id, request_user_id(organization_id))
     except Exception:
-        LOG.warning(
-            "copilot_connected_account_recovery_lookup_failed",
-            organization_id=organization_id,
-            exc_info=True,
-        )
+        LOG.warning("copilot_connected_account_recovery_lookup_failed", organization_id=organization_id, exc_info=True)
         return None
-    choices = [
-        ConnectedAccountChoice(
-            connection_id=credential.id,
-            name=credential.credential_name,
-            state=credential.state,
-            email_address=credential.email_address,
-        )
-        for credential in visible
+    return [connection.choice() for connection in connections] or None
+
+
+_ACCOUNT_ID_RE = re.compile(
+    rf"(?<![\w-])(?:{GOOGLE_OAUTH_CREDENTIAL_PREFIX}|{MICROSOFT_OAUTH_CREDENTIAL_PREFIX})_[A-Za-z0-9]+(?![\w-])"
+)
+
+
+async def _agent_step_connection_ids(
+    organization_id: str,
+    parsed: dict[str, Any],
+    *,
+    selected_labels: set[str] | None,
+    run_parameters: dict[str, Any] | None,
+) -> list[str]:
+    text = agent_step_account_text(parsed, selected_labels=selected_labels, run_parameters=run_parameters)
+    if text is None:
+        return []
+    try:
+        connections = await org_connections(organization_id, request_user_id(organization_id))
+    except IncompleteConnectionRead:
+        # A provider that could not be read may hold any id-shaped token, so every one is checked.
+        return list(dict.fromkeys(_ACCOUNT_ID_RE.findall(text)))
+    return [
+        connection.id
+        for connection in connections
+        if re.search(rf"(?<![\w-]){re.escape(connection.id)}(?![\w-])", text)
     ]
-    return choices or None
+
+
+@dataclass(frozen=True)
+class CredentialGateResult:
+    error: str | None = None
+    blocker: CopilotToolBlockerSignal | None = None
+    # Saved-credential ids the executing blocks and run parameters carry, and those the whole definition carries.
+    credential_ids: tuple[str, ...] = ()
+    definition_credential_ids: tuple[str, ...] = ()
+
+
+async def run_credential_gate(
+    ctx: AgentContext,
+    workflow_definition: BaseModel | dict[str, Any],
+    *,
+    labels: Collection[str] | None,
+    run_parameters: dict[str, Any] | None,
+    action: str = "run the workflow",
+    blocked_tool: str = "update_and_run_blocks",
+    listing_admits_reads: bool = True,
+) -> CredentialGateResult:
+    """Every credential and connected account a dispatch would run with must carry this chat's approval. `labels`
+    names the blocks that may execute; None means the whole definition. This turn's listing admits an account only
+    for fields that read, and not at all without `listing_admits_reads`. An account id an executing agent step can
+    read counts as acting, since the step can send through it."""
+    definition = _workflow_definition_as_dict(workflow_definition)
+    parsed = {"workflow_definition": definition}
+    parameters = run_parameters if isinstance(run_parameters, dict) else None
+    workflow_refs = workflow_connection_refs(parsed, run_parameters=parameters)
+    selected = set(labels or ())
+    resolved_labels = {block.get("label") for block in workflow_blocks(parsed, selected_labels=selected)}
+    executing_labels = selected if selected and selected <= resolved_labels else None
+    executing_refs = workflow_connection_refs(parsed, selected_labels=executing_labels, run_parameters=parameters)
+    agent_refs = await _agent_step_connection_ids(
+        ctx.organization_id, parsed, selected_labels=executing_labels, run_parameters=parameters
+    )
+    executing_refs = list(dict.fromkeys(executing_refs + agent_refs))
+    acting_refs = (
+        workflow_connection_refs(parsed, selected_labels=executing_labels, run_parameters=parameters, acting_only=True)
+        + agent_refs
+    )
+    policy = ctx.request_policy if isinstance(ctx.request_policy, RequestPolicy) else None
+    admitted = await admitted_connection_ids(
+        executing_refs,
+        tool_activity=ctx.tool_activity,
+        organization_id=ctx.organization_id,
+        request_policy=policy,
+        listing_admits=set(executing_refs) - set(acting_refs) if listing_admits_reads else (),
+    )
+    blocker = _connection_approval_blocker_signal(
+        executing_refs,
+        policy,
+        admitted_ids=admitted,
+        action=action,
+        blocked_tool=blocked_tool,
+        acting_refs=acting_refs if listing_admits_reads else executing_refs,
+    )
+    if blocker is not None:
+        ctx.connected_account_recovery_choices = await connected_account_choices(ctx.organization_id) or []
+        return CredentialGateResult(error=stash_blocker_signal(ctx, blocker), blocker=blocker)
+    _retire_stale_connection_denial(ctx, workflow_refs=workflow_refs, admitted_ids=admitted)
+
+    # An id an executing connected-account field resolves to was gated above, even when a credential parameter
+    # carries it; a field in a block that does not run gates nothing, so its id still needs credential approval.
+    gated_refs = set(executing_refs)
+    connection_refs = set(workflow_refs)
+    tool_ids = _extract_credential_ids_from_tool_value(run_parameters or {})
+    definition_ids = (
+        _extract_credential_ids_for_labels(definition, labels)
+        if labels is not None
+        else _extract_credential_ids_from_workflow_definition(definition)
+    )
+    approval_ids = [i for i in dict.fromkeys(tool_ids + definition_ids) if i not in gated_refs]
+    approval_error = _credential_run_approval_error(approval_ids, policy)
+    if approval_error is not None:
+        return CredentialGateResult(error=approval_error)
+    return CredentialGateResult(
+        credential_ids=tuple(approval_ids),
+        definition_credential_ids=tuple(
+            i
+            for i in dict.fromkeys(tool_ids + _extract_credential_ids_from_workflow_definition(definition))
+            if i not in connection_refs
+        ),
+    )
 
 
 async def import_vault_login(organization_id: str, login: VaultLogin) -> str:
@@ -1107,21 +969,17 @@ async def run_input_vault_placement_error(
 async def _credential_ids_validation_error(credential_ids: list[str], ctx: AgentContext) -> str | None:
     if not credential_ids:
         return None
-    google_connection_ids = [credential_id for credential_id in credential_ids if credential_id.startswith("goac_")]
     # A `bitwarden_login_credential` parameter binds a vault item, not a row; the run gate decides it.
     password_credential_ids = [
         credential_id
         for credential_id in credential_ids
-        if not credential_id.startswith(("goac_", LEGACY_BITWARDEN_PARAM_ID_PREFIX))
+        if not credential_id.startswith(LEGACY_BITWARDEN_PARAM_ID_PREFIX)
     ]
     try:
         existing_credentials = (
             await load_credentials(ctx.organization_id, credential_ids=password_credential_ids)
             if password_credential_ids
             else []
-        )
-        active_google_connections = (
-            await google_oauth_service.get_credentials_for_org(ctx.organization_id) if google_connection_ids else []
         )
     except Exception:
         LOG.warning(
@@ -1141,13 +999,6 @@ async def _credential_ids_validation_error(credential_ids: list[str], ctx: Agent
     ]
     if missing_password_ids:
         return _missing_credential_reference_tool_error(missing_password_ids)
-    active_google_ids = {connection.id for connection in active_google_connections}
-    if any(connection_id not in active_google_ids for connection_id in google_connection_ids):
-        return (
-            "The selected Google account is unavailable or needs to be reconnected. "
-            "Stop before running the workflow and ask the user to reconnect or select an active account "
-            "on the Integrations page."
-        )
     return None
 
 
@@ -1163,9 +1014,13 @@ def bitwarden_binding_change_error(workflow_yaml: str, policy: RequestPolicy | N
 
 
 async def _credential_reference_validation_error(value: Any, ctx: AgentContext) -> str | None:
-    if isinstance(value, str):
-        return await _credential_ids_validation_error(_extract_credential_ids_from_workflow_yaml(value), ctx)
-    return await _credential_ids_validation_error(_extract_credential_ids_from_tool_value(value), ctx)
+    if not isinstance(value, str):
+        return await _credential_ids_validation_error(_extract_credential_ids_from_tool_value(value), ctx)
+    parsed = parse_workflow_yaml(value)
+    connection_refs = set(workflow_connection_refs(parsed)) if isinstance(parsed, dict) else set()
+    return await _credential_ids_validation_error(
+        [i for i in _extract_credential_ids_from_workflow_yaml(value) if i not in connection_refs], ctx
+    )
 
 
 def _serialize_credential(credential: Credential) -> dict[str, Any]:

@@ -233,7 +233,12 @@ def _size_limit_failure(identifier: str, pypdf_error: Exception) -> PDFParsingEr
 
 
 def _run_parser_child(
-    func: Callable[[Unpack[_Ts]], _T], *args: Unpack[_Ts], result: _ResultLimit, log_identifier: str, started_at: float
+    func: Callable[[Unpack[_Ts]], _T],
+    *args: Unpack[_Ts],
+    result: _ResultLimit,
+    log_identifier: str,
+    started_at: float,
+    budget_seconds: float | None = None,
 ) -> _T:
     # A crafted document can grow a parser's memory until the pod is OOM-killed (pdfminer decodes PDF streams with no
     # size limit, and a .docx is a zip). The child is capped and gets what is left of the caller's parse budget.
@@ -243,7 +248,11 @@ def _run_parser_child(
         memory_limit_bytes=settings.PDFPLUMBER_MAX_MEMORY_BYTES,
         max_result_bytes=result.max_bytes,
         result_memory_factor=result.memory_factor,
-        timeout_seconds=max(1.0, FILE_PARSE_STEP_TIMEOUT_SECONDS - (time.monotonic() - started_at)),
+        timeout_seconds=max(
+            1.0,
+            (FILE_PARSE_STEP_TIMEOUT_SECONDS if budget_seconds is None else budget_seconds)
+            - (time.monotonic() - started_at),
+        ),
         log_fields={"file_identifier": log_identifier},
     )
 
@@ -554,6 +563,7 @@ def render_pdf_pages_as_images(
     file_identifier: str | None = None,
     max_pages: int | None = MAX_PDF_OCR_PAGES,
     resolution: int = 150,
+    timeout_seconds: float | None = None,
 ) -> list[bytes]:
     """Render PDF pages as PNG images using pdfplumber.
 
@@ -573,6 +583,7 @@ def render_pdf_pages_as_images(
         result=_ResultLimit(settings.PDFPLUMBER_MAX_RESULT_BYTES, _PAGE_IMAGES_MEMORY_FACTOR),
         log_identifier=log_identifier,
         started_at=time.monotonic(),
+        budget_seconds=timeout_seconds,
     )
     if len(page_images) < total_pages:
         LOG.warning(

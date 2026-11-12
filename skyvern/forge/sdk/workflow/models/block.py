@@ -37,6 +37,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time
 from email.message import EmailMessage
 from email.policy import SMTP as SMTP_EMAIL_POLICY
+from email.utils import getaddresses
 from enum import StrEnum
 from functools import partial
 from pathlib import Path, PurePosixPath
@@ -67,6 +68,7 @@ import aiofiles
 import aiohttp
 import docx
 import filetype
+import httpx
 import pandas as pd
 import structlog
 from charset_normalizer import from_bytes
@@ -105,7 +107,11 @@ from skyvern.constants import (
     MAX_PDF_OCR_PAGES,
     MAX_UPLOAD_FILE_COUNT,
     NAVIGATION_MAX_RETRY_TIME,
+    PDF_OCR_FALLBACK_RENDER_RESOLUTION,
+    PDF_OCR_MAX_PAGE_IMAGE_BYTES,
+    PDF_OCR_MAX_PAGE_IMAGE_EDGE_PX,
     PDF_OCR_PAGE_CONCURRENCY,
+    PDF_OCR_RENDER_RESOLUTION,
     PDF_OCR_TOTAL_TIMEOUT_SECONDS,
     PROXY_TRANSPORT_NAV_ERRORS,
     SAVE_DOWNLOADED_FILES_TIMEOUT,
@@ -210,9 +216,9 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
-from skyvern.forge.sdk.credential_site_policy import LoginSite, describe_release_scope, origin_of
+from skyvern.forge.sdk.credential_site_policy import LoginSite, describe_release_scope
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
-from skyvern.forge.sdk.db.enums import TaskType
+from skyvern.forge.sdk.db.enums import TaskType, WorkflowRunTriggerType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.id import generate_action_id, generate_workflow_run_id
 from skyvern.forge.sdk.db.repositories.google_oauth import DISPATCH_ACCEPTED, DISPATCH_FAILED, GmailSendDispatch
@@ -230,6 +236,7 @@ from skyvern.forge.sdk.experimentation.workflow_block_engine import (
     workflow_block_engine_override,
 )
 from skyvern.forge.sdk.forge_log import exception_log_fields
+from skyvern.forge.sdk.integrations.connected_accounts import resolve_account_token
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Status
@@ -240,6 +247,7 @@ from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants, generate_totp_code
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import traced
+from skyvern.forge.sdk.utils.capped_subprocess import CappedSubprocessError
 from skyvern.forge.sdk.utils.pdf_parser import (
     PdfExtractStats,
     extract_pdf_file,
@@ -337,7 +345,9 @@ from skyvern.forge.sdk.workflow.models.code_block_recording import CodeBlockActi
 from skyvern.forge.sdk.workflow.models.credential_release import (
     CodeBlockCredentialReleaseError,
     CredentialReleaseGuard,
+    describe_refused_target,
     login_release_sites,
+    redact_secrets,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
@@ -367,7 +377,15 @@ from skyvern.forge.taskv3.handoff_redaction import pin_caller_authored_block_url
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.browser_session_kind import BrowserSessionKind
 from skyvern.schemas.browser_settings import requested_timezone_id
-from skyvern.schemas.emails import EmailBodyFormat, EmailTransport, GmailSendErrorCode, GmailSendOutcome
+from skyvern.schemas.emails import (
+    CONNECTED_ACCOUNT_OWNER_UNCONFIRMED_REASON,
+    CONNECTED_ACCOUNT_RESAVE_REASON,
+    EmailBodyFormat,
+    EmailTransport,
+    GmailHopRefusal,
+    GmailSendErrorCode,
+    GmailSendOutcome,
+)
 from skyvern.schemas.runs import RunEngine, read_browser_type
 from skyvern.schemas.self_heal import HealClassification, HealSkipReason, HealStatus, OutputObligation
 from skyvern.schemas.workflows import (
@@ -394,6 +412,7 @@ from skyvern.schemas.workflows import (
 )
 from skyvern.services import otp_email, otp_service, planner_levers
 from skyvern.services.email.gmail import GMAIL_MAX_MESSAGE_BYTES, GmailSendResult, send_raw_message
+from skyvern.services.email.gmail_client import GMAIL_API_BASE, GMAIL_RATE_LIMIT_REASONS, GmailAPIError, get_json
 from skyvern.services.error_detection_service import detect_user_defined_errors_for_task
 from skyvern.utils.contained_effects import contained_effect
 from skyvern.utils.parquet_export import ParquetExportError, export_parquet_records
@@ -450,6 +469,7 @@ from skyvern.webeye.navigation import (
 )
 from skyvern.webeye.playwright_input import playwright_input_defaults_for_page
 from skyvern.webeye.real_browser_state import RealBrowserState, is_external_browser_state
+from skyvern.webeye.scraper.scraper import page_is_dead_blank
 from skyvern.webeye.utils.captcha_solver import (
     MAX_IMAGE_CAPTCHA_READS,
     ChallengeStatus,
@@ -2657,6 +2677,7 @@ class BaseTaskBlock(Block):
     # synthetic block follows the run's arm. Private so an internal experiment toggle stays out of
     # the published block schemas and out of stored workflow definitions.
     _exclude_from_engine_ab: bool = PrivateAttr(default=False)
+    _allow_blank_start: bool = PrivateAttr(default=False)
 
     def resolve_engine(self, workflow_run_id: str | None) -> RunEngine:
         """The engine this block dispatches to, after the per-run A/B.
@@ -3192,7 +3213,11 @@ class BaseTaskBlock(Block):
                     raise e
 
                 # Validate starter URL before downstream scraping on a blank page
-                if not (self.url and self.url.strip()) and working_page.url in ("about:blank", "", ":"):
+                if (
+                    not self._allow_blank_start
+                    and not (self.url and self.url.strip())
+                    and working_page.url in ("about:blank", "", ":")
+                ):
                     missing_url_exc = MissingStarterUrl(block_label=self.label)
                     LOG.warning(
                         "First browser block has no starter URL",
@@ -3273,6 +3298,9 @@ class BaseTaskBlock(Block):
                             organization_id=workflow_run.organization_id,
                         )
                         raise e
+
+            if self._allow_blank_start:
+                self._allow_blank_start = page_is_dead_blank(working_page)
 
             try:
                 current_context = skyvern_context.ensure_context()
@@ -11748,6 +11776,22 @@ def _log_safe_url(value: str | None) -> str | None:
     return urlunsplit((split.scheme, split.netloc, split.path, "", ""))
 
 
+class _OcrPageValidationError(ValueError):
+    """An OCR answer that failed validation; its message is written by this module and quotes no page text."""
+
+
+def _content_free_ocr_error(error: BaseException) -> str:
+    if isinstance(error, _OcrPageValidationError):
+        return str(error)
+    description = type(error).__name__
+    if error.__cause__ is not None:
+        cause_name = type(error.__cause__).__name__
+        description += f" caused by {cause_name}"
+        if "RateLimit" in cause_name:
+            description += ", an LLM rate limit"
+    return description
+
+
 def _llm_response_format_failure_reason(error: Exception) -> str:
     return f"LLM response could not be parsed or coerced into the required JSON shape ({type(error).__name__})."
 
@@ -12957,14 +13001,12 @@ class FileDestinationBlock(Block):
                 raise ValueError("Google credential id is required")
 
             if google_access_token is None:
-                google_credentials = await app.AGENT_FUNCTION.get_google_workspace_credentials(
-                    organization_id=org_id,
-                    credential_id=google_credential_id,
-                    required_scopes=list(google_oauth_service.GOOGLE_DRIVE_SCOPES),
+                drive_access = await resolve_account_token(
+                    org_id, google_credential_id, list(google_oauth_service.GOOGLE_DRIVE_SCOPES), api="google"
                 )
-                if not google_credentials or not google_credentials.token:
+                if not drive_access:
                     raise ValueError("Google Drive credential is not connected or is missing required scopes")
-                google_access_token = google_credentials.token
+                google_access_token = drive_access
 
             folder_id = google_drive_service.extract_folder_id(self.google_drive_folder_id)
             for file_path in files_to_upload:
@@ -13759,6 +13801,36 @@ GMAIL_SEND_FAILURE_MESSAGES: dict[GmailSendErrorCode, str] = {
     GmailSendErrorCode.INTERNAL_ERROR: "The email could not be prepared. Nothing was sent.",
 }
 
+# The trigger kinds a connected account's capability may be prepared for; never for the rest. A child run carries
+# its chain root's kind, so admitting a kind admits that kind's children too.
+_CONNECTED_ACCOUNT_TRIGGER_TYPES = frozenset(
+    {
+        None,
+        WorkflowRunTriggerType.manual,
+        WorkflowRunTriggerType.mcp,
+        WorkflowRunTriggerType.api,
+        WorkflowRunTriggerType.scheduled,
+        WorkflowRunTriggerType.event,
+    }
+)
+
+
+async def _is_unsupported_connected_account_run(workflow_run_id: str, organization_id: str) -> bool:
+    """Whether this run's trigger kind can never hold the capability; an unreadable run reads as neither."""
+    try:
+        run = await app.DATABASE.workflow_runs.get_workflow_run(workflow_run_id, organization_id=organization_id)
+    except Exception:  # noqa: BLE001 - only the wording of a refusal depends on this.
+        return False
+    return run is not None and run.trigger_type not in _CONNECTED_ACCOUNT_TRIGGER_TYPES
+
+
+_CONNECTED_ACCOUNT_RECONNECT_MESSAGE = (
+    "The selected Gmail account must be reconnected on the Integrations page and then selected again in this block "
+    "before it can send email. Nothing was sent."
+)
+
+_CONNECTED_ACCOUNT_RESAVE_MESSAGE = f"{CONNECTED_ACCOUNT_RESAVE_REASON} Nothing was sent."
+
 _GMAIL_AUTHORIZATION_ERROR_CODES: dict[google_oauth_service.GmailSendAuthorizationStatus, GmailSendErrorCode] = {
     google_oauth_service.GmailSendAuthorizationStatus.CONFIGURATION: GmailSendErrorCode.CONFIGURATION,
     google_oauth_service.GmailSendAuthorizationStatus.MISSING_SCOPE: GmailSendErrorCode.MISSING_SCOPE,
@@ -13837,7 +13909,7 @@ def _add_file_attachment(msg: EmailMessage, path: str) -> None:
 
 def _build_gmail_message_bytes(
     *,
-    from_address: str,
+    from_address: str | None,
     to: list[str],
     cc: list[str],
     bcc: list[str],
@@ -13845,9 +13917,17 @@ def _build_gmail_message_bytes(
     body: str,
     body_format: EmailBodyFormat,
     attachment_paths: list[str],
+    in_reply_to: str | None = None,
+    references: str | None = None,
 ) -> bytes:
     msg = EmailMessage()
-    msg["From"] = from_address
+    msg["X-Skyvern-Automation"] = "send-email-block"
+    if in_reply_to:
+        msg["In-Reply-To"] = in_reply_to
+    if references:
+        msg["References"] = references
+    if from_address is not None:
+        msg["From"] = from_address
     for header, addresses in (("To", to), ("Cc", cc), ("Bcc", bcc)):
         if addresses:
             msg[header] = ", ".join(addresses)
@@ -13903,6 +13983,10 @@ class SendEmailBlock(Block):
     # credential_id; sender and the smtp_* settings are not used.
     transport: EmailTransport | None = None
     credential_id: str | None = None
+    # With nango, the message is sent from the connected account named by connection_id instead of credential_id.
+    credential_source: Literal["native", "nango"] = "native"
+    connection_id: str | None = None
+    reply_to_message_id: str | None = None
     cc: list[str] = []
     bcc: list[str] = []
 
@@ -13915,6 +13999,7 @@ class SendEmailBlock(Block):
             "custom_smtp_username",
             "file_attachments",
             "recipients",
+            "reply_to_message_id",
             "sender",
             "subject",
         }
@@ -13955,7 +14040,12 @@ class SendEmailBlock(Block):
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
         if self.transport != EmailTransport.GMAIL:
             self.sender = self.render_templatable_field("sender", self.sender, workflow_run_context)
-        self.subject = self.render_templatable_field("subject", self.subject, workflow_run_context)
+        if self.reply_to_message_id:
+            self.reply_to_message_id = self.render_templatable_field(
+                "reply_to_message_id", self.reply_to_message_id, workflow_run_context
+            ).strip()
+        if not self.reply_to_message_id:
+            self.subject = self.render_templatable_field("subject", self.subject, workflow_run_context)
         self.body = self.render_templatable_field("body", self.body, workflow_run_context)
 
         # Format recipients
@@ -14157,6 +14247,7 @@ class SendEmailBlock(Block):
         organization_id: str | None = None,
     ) -> EmailMessage:
         msg = EmailMessage()
+        msg["X-Skyvern-Automation"] = "send-email-block"
         # Flattened after Jinja rendering: a substituted value carrying a newline would otherwise
         # be rejected by the email header policy and fail the send.
         msg["Subject"] = self.subject.strip().replace("\n", "").replace("\r", "")
@@ -14326,12 +14417,111 @@ class SendEmailBlock(Block):
         except Exception as exc:
             raise _gmail_template_refusal(exc, self.secret_redactor(workflow_run_context)) from None
 
-        credential_id = (self.credential_id or "").strip()
-        if not credential_id:
+        is_connected_account = self.credential_source == "nango"
+        credential_id = ((self.connection_id if is_connected_account else self.credential_id) or "").strip()
+        if not credential_id or (
+            is_connected_account
+            and (len(credential_id) > 64 or any(marker in credential_id for marker in ("{{", "{%", "{#")))
+        ):
+            raise _GmailSendRefused(GmailSendErrorCode.CONFIGURATION)
+        if is_connected_account and self.reply_to_message_id:
+            raise _GmailSendRefused(
+                GmailSendErrorCode.CONFIGURATION,
+                "Replying to a message needs a Google account connected on the Integrations page. Nothing was sent.",
+            )
+        if is_connected_account and not workflow_run_context.get_gmail_hop_token(self.label):
+            refusal = workflow_run_context.get_gmail_hop_refusal(self.label)
+            if refusal == GmailHopRefusal.reconnect:
+                raise _GmailSendRefused(GmailSendErrorCode.RECONNECT, _CONNECTED_ACCOUNT_RECONNECT_MESSAGE)
+            if refusal == GmailHopRefusal.resave_required:
+                raise _GmailSendRefused(GmailSendErrorCode.CONFIGURATION, _CONNECTED_ACCOUNT_RESAVE_MESSAGE)
+            if refusal == GmailHopRefusal.owner_unconfirmed:
+                raise _GmailSendRefused(
+                    GmailSendErrorCode.CONFIGURATION, f"{CONNECTED_ACCOUNT_OWNER_UNCONFIRMED_REASON} Nothing was sent."
+                )
+            if refusal == GmailHopRefusal.run_not_supported or (
+                refusal is None and await _is_unsupported_connected_account_run(workflow_run_id, organization_id)
+            ):
+                raise _GmailSendRefused(
+                    GmailSendErrorCode.CONFIGURATION,
+                    "This Gmail account cannot send in a run started with an API key, or in a webhook, job recipe or "
+                    "directory submission run; use a natively connected Google account for those. Nothing was sent.",
+                )
             raise _GmailSendRefused(GmailSendErrorCode.CONFIGURATION)
         to = self._resolve_recipient_entries(self.recipients, workflow_run_context)
         cc = self._resolve_recipient_entries(self.cc, workflow_run_context)
         bcc = self._resolve_recipient_entries(self.bcc, workflow_run_context)
+        thread_id = None
+        in_reply_to = None
+        references = None
+        reply_authorization = None
+        if self.reply_to_message_id:
+            row = await app.DATABASE.google_oauth.get_credential(organization_id, credential_id)
+            if row is None:
+                raise _GmailSendRefused(GmailSendErrorCode.CONFIGURATION)
+            if google_oauth_service.GOOGLE_GMAIL_READONLY_SCOPE not in (row.scopes_granted or []):
+                raise _GmailSendRefused(
+                    GmailSendErrorCode.RECONNECT,
+                    "Reconnect the Gmail account to grant read permission before replying.",
+                )
+            reply_authorization = await google_oauth_service.resolve_gmail_send_authorization(
+                organization_id, credential_id
+            )
+            if (
+                reply_authorization.status != google_oauth_service.GmailSendAuthorizationStatus.READY
+                or not reply_authorization.access_token
+            ):
+                raise _GmailSendRefused(
+                    _GMAIL_AUTHORIZATION_ERROR_CODES.get(reply_authorization.status, GmailSendErrorCode.INTERNAL_ERROR)
+                )
+            try:
+                async with httpx.AsyncClient() as client:
+                    original = await get_json(
+                        client,
+                        f"{GMAIL_API_BASE}/users/me/messages/{quote(self.reply_to_message_id, safe='')}",
+                        access_token=reply_authorization.access_token,
+                        params={
+                            "format": "metadata",
+                            "metadataHeaders": ["Message-ID", "References", "Subject", "Reply-To", "From", "To"],
+                        },
+                    )
+            except GmailAPIError as exc:
+                if exc.status == 401 or exc.code == "reconnect_required":
+                    raise _GmailSendRefused(GmailSendErrorCode.RECONNECT) from None
+                if exc.status == 429 or (exc.status == 403 and exc.code in GMAIL_RATE_LIMIT_REASONS):
+                    raise _GmailSendRefused(GmailSendErrorCode.RATE_LIMITED) from None
+                if exc.status >= 500:
+                    raise _GmailSendRefused(
+                        GmailSendErrorCode.INTERNAL_ERROR,
+                        "Gmail could not read the original message. Nothing was sent; try again later.",
+                    ) from None
+                raise _GmailSendRefused(GmailSendErrorCode.PROVIDER_REJECTED) from None
+            payload = original.get("payload") or {}
+            headers = {
+                h["name"].lower(): re.sub(r"\r?\n[ \t]+", " ", h["value"])
+                .replace("\x00", "")
+                .encode("utf-8", "replace")
+                .decode("utf-8")
+                for h in payload.get("headers", [])
+                if isinstance(h, dict) and isinstance(h.get("name"), str) and isinstance(h.get("value"), str)
+            }
+            in_reply_to = headers.get("message-id", "").strip()
+            thread_id = original.get("threadId")
+            if not in_reply_to or not isinstance(thread_id, str) or not thread_id:
+                raise _GmailSendRefused(GmailSendErrorCode.INVALID_HEADER)
+            references = " ".join(filter(None, [headers.get("references", "").strip(), in_reply_to]))
+            self.subject = "Re: " + re.sub(r"^(?:re:\s*)+", "", headers.get("subject", "").strip(), flags=re.IGNORECASE)
+            if not to:
+                original_senders = getaddresses([headers.get("from", "")])
+                sent_by_account = any(
+                    address.casefold() == (reply_authorization.from_address or "").casefold()
+                    for _, address in original_senders
+                    if address
+                )
+                recipient_header = (
+                    headers.get("to", "") if sent_by_account else headers.get("reply-to") or headers.get("from", "")
+                )
+                to = [address for _, address in getaddresses([recipient_header]) if address]
         if not (to or cc or bcc):
             raise _GmailSendRefused(GmailSendErrorCode.NO_RECIPIENTS)
         try:
@@ -14352,15 +14542,20 @@ class SendEmailBlock(Block):
                 workflow_run_context, workflow_run_id, organization_id, staging_dir
             )
 
-            authorization = await google_oauth_service.resolve_gmail_send_authorization(organization_id, credential_id)
-            if (
-                authorization.status != google_oauth_service.GmailSendAuthorizationStatus.READY
-                or not authorization.access_token
-                or not authorization.from_address
-            ):
-                raise _GmailSendRefused(
-                    _GMAIL_AUTHORIZATION_ERROR_CODES.get(authorization.status, GmailSendErrorCode.INTERNAL_ERROR)
+            # A connected account is authorized server-side, which also sets From to its verified address.
+            authorization = None
+            if not is_connected_account:
+                authorization = reply_authorization or await google_oauth_service.resolve_gmail_send_authorization(
+                    organization_id, credential_id
                 )
+                if (
+                    authorization.status != google_oauth_service.GmailSendAuthorizationStatus.READY
+                    or not authorization.access_token
+                    or not authorization.from_address
+                ):
+                    raise _GmailSendRefused(
+                        _GMAIL_AUTHORIZATION_ERROR_CODES.get(authorization.status, GmailSendErrorCode.INTERNAL_ERROR)
+                    )
 
             body = self.body
             if body and workflow_run_context.has_parameter(body) and workflow_run_context.has_value(body):
@@ -14368,7 +14563,7 @@ class SendEmailBlock(Block):
             try:
                 mime_bytes = await asyncio.to_thread(
                     _build_gmail_message_bytes,
-                    from_address=authorization.from_address,
+                    from_address=authorization.from_address if authorization else None,
                     to=to,
                     cc=cc,
                     bcc=bcc,
@@ -14376,6 +14571,8 @@ class SendEmailBlock(Block):
                     body=body,
                     body_format=self.body_format,
                     attachment_paths=attachment_paths,
+                    in_reply_to=in_reply_to,
+                    references=references,
                 )
             except ValueError:
                 raise _GmailSendRefused(GmailSendErrorCode.INVALID_HEADER) from None
@@ -14412,7 +14609,19 @@ class SendEmailBlock(Block):
 
         # From here the claim row is the record: a cancellation or crash leaves it unresolved, which reads as unknown.
         try:
-            result = await send_raw_message(authorization.access_token, mime_bytes)
+            if authorization is None:
+                result = await app.AGENT_FUNCTION.send_gmail_for_run(
+                    organization_id=organization_id,
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    connection_id=credential_id,
+                    hop_token=workflow_run_context.get_gmail_hop_token(self.label),
+                    mime_bytes=mime_bytes,
+                )
+            elif thread_id:
+                result = await send_raw_message(authorization.access_token or "", mime_bytes, thread_id=thread_id)
+            else:
+                result = await send_raw_message(authorization.access_token or "", mime_bytes)
         except Exception:
             result = GmailSendResult(GmailSendOutcome.UNKNOWN, error_code=GmailSendErrorCode.OUTCOME_UNKNOWN)
         try:
@@ -14467,6 +14676,9 @@ class SendEmailBlock(Block):
             result = GmailSendResult(GmailSendOutcome.FAILED, error_code=GmailSendErrorCode.INTERNAL_ERROR)
 
         accepted = result.outcome == GmailSendOutcome.ACCEPTED
+        # Reconnecting a connected account creates a new connection, so the block has to be pointed at it again.
+        if result.error_code == GmailSendErrorCode.RECONNECT and self.credential_source == "nango":
+            refusal_reason = refusal_reason or _CONNECTED_ACCOUNT_RECONNECT_MESSAGE
         LOG.info(
             "SendEmailBlock Gmail send finished",
             workflow_run_id=workflow_run_id,
@@ -14613,6 +14825,7 @@ async def _run_blocking_parse_step(
     func: Callable[..., _ParseStepResult],
     *args: Any,
     executor: Executor | None = None,
+    step_timeout_seconds: float | None = None,
     **kwargs: Any,
 ) -> _ParseStepResult:
     """Run a blocking file-parse step in a worker thread under a wall-clock ceiling.
@@ -14627,17 +14840,27 @@ async def _run_blocking_parse_step(
         if executor is None
         else asyncio.get_running_loop().run_in_executor(executor, partial(copy_context().run, func, *args, **kwargs))
     )
+    if step_timeout_seconds is None:
+        step_timeout_seconds = FILE_PARSE_STEP_TIMEOUT_SECONDS
     try:
         # With an executor, time spent queued behind its busy workers counts against the ceiling too.
-        return await asyncio.wait_for(work, timeout=FILE_PARSE_STEP_TIMEOUT_SECONDS)
+        return await asyncio.wait_for(work, timeout=step_timeout_seconds)
     except asyncio.TimeoutError:
         LOG.warning(
             "File parse step exceeded its time budget",
             step=step,
-            file_url=file_url,
-            timeout_seconds=FILE_PARSE_STEP_TIMEOUT_SECONDS,
+            file_url=_log_safe_url(file_url),
+            timeout_seconds=step_timeout_seconds,
         )
-        raise FileParseTimeout(file_url=file_url, step=step, timeout_seconds=FILE_PARSE_STEP_TIMEOUT_SECONDS)
+        raise FileParseTimeout(
+            file_url=_log_safe_url(file_url) or file_url, step=step, timeout_seconds=step_timeout_seconds
+        )
+
+
+def _page_image_over_ocr_caps(png: bytes) -> bool:
+    # A PNG's IHDR chunk holds the width and height at bytes 16 to 24.
+    width, height = int.from_bytes(png[16:20], "big"), int.from_bytes(png[20:24], "big")
+    return len(png) > PDF_OCR_MAX_PAGE_IMAGE_BYTES or max(width, height) > PDF_OCR_MAX_PAGE_IMAGE_EDGE_PX
 
 
 PDF_EMPTY_TEXT_LAYER_REASON = "PDF text extraction returned empty content"
@@ -15201,18 +15424,11 @@ class FileParserBlock(Block):
         # or two.
         LOG.info(
             "Falling back to vision LLM OCR for the PDF text layer",
-            file_url=self.file_url,
+            file_url=_log_safe_url(self.file_url),
             ocr_reason=ocr_reason,
         )
         try:
-            page_images = await _run_blocking_parse_step(
-                "PDF page rendering",
-                self.file_url,
-                render_pdf_pages_as_images,
-                file_path,
-                file_identifier=self.file_url,
-                max_pages=MAX_PDF_OCR_PAGES,
-            )
+            page_images = await self._render_pdf_pages_for_ocr(file_path)
             if not page_images:
                 return extracted_text
             return await self._ocr_pdf_pages(
@@ -15223,9 +15439,60 @@ class FileParserBlock(Block):
         except Exception:
             LOG.exception(
                 "Failed to extract text from PDF via vision LLM fallback",
-                file_url=self.file_url,
+                file_url=_log_safe_url(self.file_url),
             )
             raise
+
+    async def _render_pdf_pages_for_ocr(self, file_path: str) -> list[bytes]:
+        # Both resolutions share one step budget, so a slow failed first render cannot double the step's time.
+        started_at = monotonic()
+        has_fallback = PDF_OCR_FALLBACK_RENDER_RESOLUTION < PDF_OCR_RENDER_RESOLUTION
+        try:
+            page_images = await self._render_pdf_pages(
+                file_path, PDF_OCR_RENDER_RESOLUTION, FILE_PARSE_STEP_TIMEOUT_SECONDS
+            )
+        except CappedSubprocessError as exc:
+            # A timeout has used the step's budget and no_headroom reserves the same memory at any resolution; the
+            # other failures (page images over the result cap, PageImagesTooLarge as kind error, out of memory) are
+            # what the lower resolution avoids.
+            remaining_seconds = FILE_PARSE_STEP_TIMEOUT_SECONDS - (monotonic() - started_at)
+            if not has_fallback or exc.kind in ("timeout", "no_headroom") or remaining_seconds <= 0:
+                raise
+            failure_kind: str = exc.kind
+        else:
+            # The provider refuses a page image over its byte or pixel limit and the page is then skipped, so one such
+            # page sends the whole document to the lower resolution. A fallback still over a cap is used as it is.
+            if not has_fallback or not any(_page_image_over_ocr_caps(image) for image in page_images):
+                return page_images
+            remaining_seconds = FILE_PARSE_STEP_TIMEOUT_SECONDS - (monotonic() - started_at)
+            if remaining_seconds <= 0:
+                return page_images
+            # These images are discarded either way; held during the second render, they would shrink its child's
+            # memory headroom by their size.
+            del page_images
+            failure_kind = "page_image_over_cap"
+        LOG.warning(
+            "PDF pages could not be rendered for OCR at the higher resolution, rendering them at the lower one",
+            file_url=_log_safe_url(self.file_url),
+            failure_kind=failure_kind,
+            resolution=PDF_OCR_RENDER_RESOLUTION,
+            fallback_resolution=PDF_OCR_FALLBACK_RENDER_RESOLUTION,
+            remaining_seconds=round(remaining_seconds, 1),
+        )
+        return await self._render_pdf_pages(file_path, PDF_OCR_FALLBACK_RENDER_RESOLUTION, remaining_seconds)
+
+    async def _render_pdf_pages(self, file_path: str, resolution: int, budget_seconds: float) -> list[bytes]:
+        return await _run_blocking_parse_step(
+            "PDF page rendering",
+            self.file_url,
+            render_pdf_pages_as_images,
+            file_path,
+            step_timeout_seconds=budget_seconds,
+            file_identifier=self.file_url,
+            max_pages=MAX_PDF_OCR_PAGES,
+            resolution=resolution,
+            timeout_seconds=budget_seconds,
+        )
 
     async def _resolve_file_parser_handler(
         self, prompt_type: str, distinct_id: str | None, organization_id: str | None
@@ -15290,14 +15557,14 @@ class FileParserBlock(Block):
                         will_retry = attempt + 1 < self.ocr_validation_max_attempts
                         LOG.warning(
                             "FileParserBlock PDF OCR LLM response failed response-format validation",
-                            file_url=self.file_url,
+                            file_url=_log_safe_url(self.file_url),
                             attempt=attempt + 1,
                             max_attempts=self.ocr_validation_max_attempts,
                             will_retry=will_retry,
                             error_type=type(e).__name__,
                         )
                         if not will_retry:
-                            raise ValueError(failure_reason) from e
+                            raise _OcrPageValidationError(failure_reason) from e
                         prompt_for_attempt = self._build_ocr_validation_retry_prompt(llm_prompt, failure_reason)
                         continue
 
@@ -15308,14 +15575,14 @@ class FileParserBlock(Block):
                     will_retry = attempt + 1 < self.ocr_validation_max_attempts
                     LOG.warning(
                         "FileParserBlock PDF OCR LLM response failed schema validation",
-                        file_url=self.file_url,
+                        file_url=_log_safe_url(self.file_url),
                         attempt=attempt + 1,
                         max_attempts=self.ocr_validation_max_attempts,
                         will_retry=will_retry,
                         failure_reason=ocr_failure_reason,
                     )
                     if not will_retry:
-                        raise ValueError(ocr_failure_reason)
+                        raise _OcrPageValidationError(ocr_failure_reason)
                     prompt_for_attempt = self._build_ocr_validation_retry_prompt(llm_prompt, ocr_failure_reason)
                 raise RuntimeError("OCR retry loop exhausted without returning or raising.")
 
@@ -15348,7 +15615,16 @@ class FileParserBlock(Block):
         # prior single-call path, which propagated OCR errors. Partial failures are skipped below.
         errors = [r for r in page_results if isinstance(r, BaseException)]
         if errors and len(errors) == len(page_results):
-            raise errors[0]
+            # Cancellation and other control-flow exceptions must propagate as they are, not as a failed block.
+            control_flow = [e for e in errors if not isinstance(e, Exception)]
+            if control_flow:
+                raise control_flow[0]
+            # The provider's error text can quote the page and would reach the failure log and traceback. The
+            # failure classifier reads this reason, so a rate limit is named in words it matches.
+            raise RuntimeError(
+                f"The model could not transcribe any of the PDF's {len(page_results)} pages "
+                f"({_content_free_ocr_error(errors[0])})."
+            ) from None
 
         page_chunks: list[str] = []
         current_tokens = 0
@@ -15356,9 +15632,10 @@ class FileParserBlock(Block):
             if isinstance(result, BaseException):
                 LOG.warning(
                     "Failed to OCR a PDF page via vision LLM, skipping it",
-                    file_url=self.file_url,
+                    file_url=_log_safe_url(self.file_url),
                     page_number=page_number,
-                    error=str(result),
+                    # The provider's error text can quote the page, so only its type is logged.
+                    error_type=type(result).__name__,
                 )
                 continue
             page_text = result.strip()
@@ -17153,17 +17430,15 @@ class FileDownloadBlock(BaseTaskBlock, FileDestinationBlock):
         if not google_credential_id:
             raise ValueError("Google credential id is required")
 
-        google_credentials = await app.AGENT_FUNCTION.get_google_workspace_credentials(
-            organization_id=org_id,
-            credential_id=google_credential_id,
-            required_scopes=list(google_oauth_service.GOOGLE_DRIVE_SCOPES),
+        drive_access = await resolve_account_token(
+            org_id, google_credential_id, list(google_oauth_service.GOOGLE_DRIVE_SCOPES), api="google"
         )
-        if not google_credentials or not google_credentials.token:
+        if not drive_access:
             raise ValueError("Google Drive credential is not connected or is missing required scopes")
 
         try:
             file_path = await google_drive_service.download_file(
-                access_token=google_credentials.token,
+                access_token=drive_access,
                 file_id=file_id,
                 resource_key=file_reference.resource_key,
                 output_dir=download_files_path,
@@ -17190,7 +17465,7 @@ class FileDownloadBlock(BaseTaskBlock, FileDestinationBlock):
         return (
             file_path,
             matching_files[:1] if matching_files is not None else None,
-            google_credentials.token,
+            drive_access,
         )
 
     async def _download_authenticated_sftp_source(
@@ -18436,20 +18711,24 @@ class HttpRequestBlock(Block):
         off_site_release = self._off_site_credential_release()
         if off_site_release is not None:
             parameter_key, sites, destination = off_site_release
+            # The rendered destination can carry any of the run's secrets in its host.
+            secret_labels = [
+                (value, "[redacted]") for value in workflow_run_context.secrets.values() if isinstance(value, str)
+            ]
+            # Never fall back to the stored URL itself: it can carry basic-auth credentials or a token.
+            site_scopes = {describe_release_scope(site.url, whole_site=site.whole_site) for site in sites}
             allowed_scope = (
-                ", ".join(
-                    sorted({describe_release_scope(site.url, whole_site=site.whole_site) or site.url for site in sites})
-                )
+                redact_secrets(", ".join(sorted(scope for scope in site_scopes if scope)), secret_labels)
                 or "no website a scope can be read from"
             )
-            actual_scope = describe_release_scope(destination) or "a destination whose site could not be identified"
-            actual_origin = origin_of(destination)
+            actual_scope, actual_host = describe_refused_target(destination, secret_labels)
+            actual_scope = actual_scope or "a destination whose site could not be identified"
             LOG.warning(
                 "http_request_credential_release_refused",
                 parameter_key=parameter_key,
                 allowed_scope=allowed_scope,
                 actual_scope=actual_scope,
-                actual_host=actual_origin.host if actual_origin is not None else None,
+                actual_host=actual_host,
                 workflow_run_id=workflow_run_id,
                 block_label=self.label,
             )
@@ -20174,6 +20453,7 @@ async def _evaluate_prompt_branch_conditions_batch(
         # Unlike the loop-value synthetic, this block is NOT excluded from the engine A/B:
         # eligibility vets prompt-branch conditionals (v3_ab_ineligibility_reason), so the run's
         # resolved arm covers branch evaluation too.
+        extraction_block._allow_blank_start = True
         extraction_block.mark_data_extraction_goal_prerendered()
         extraction_block.mark_internal_evaluation()
 
@@ -21465,6 +21745,40 @@ def _copy_workflow_block(block: Any, updates: dict[str, Any]) -> Any:
     return {**block, **updates} if isinstance(block, Mapping) else block.model_copy(update=updates)
 
 
+def _conditional_branches(block: BlockTypeVar | Mapping[str, Any]) -> Sequence[BranchCondition | Mapping[str, Any]]:
+    branches = _workflow_block_field(block, "ordered_branches")
+    if branches is None:
+        branches = _workflow_block_field(block, "branch_conditions") or []
+    return branches
+
+
+def reachable_block_labels(
+    start_labels: Iterable[str | None],
+    label_to_block: Mapping[str, BlockTypeVar | Mapping[str, Any]],
+    default_next_map: Mapping[str, str | None],
+    *,
+    follow_conditional_next: bool = True,
+    seen: set[str] | None = None,
+) -> set[str]:
+    """A conditional counts as reaching every branch target, since it has not chosen one yet. With
+    follow_conditional_next=False it skips a conditional's own next label, as the block graph check does. Labels
+    already in `seen` are not walked again, and new ones are added to it."""
+    seen = set() if seen is None else seen
+    pending = list(start_labels)
+    while pending:
+        label = pending.pop()
+        if label is None or label in seen or label not in label_to_block:
+            continue
+        seen.add(label)
+        block = label_to_block[label]
+        if _workflow_block_field(block, "block_type") == BlockType.CONDITIONAL:
+            pending.extend(_workflow_block_field(branch, "next_block_label") for branch in _conditional_branches(block))
+            if not follow_conditional_next:
+                continue
+        pending.append(default_next_map.get(label))
+    return seen
+
+
 def strip_finally_block_references(blocks: Sequence[Any], finally_block_label: str) -> list[Any]:
     """Remove the finally block and nullify edges that point to it before building the run graph."""
     result: list[Any] = []
@@ -21487,30 +21801,29 @@ def strip_finally_block_references(blocks: Sequence[Any], finally_block_label: s
     return result
 
 
-def resolve_conditional_merge_edges(
-    blocks: Sequence[Any],
-    label_to_block: dict[str, Any],
-    default_next_map: dict[str, str | None],
-) -> None:
-    """Point each conditional branch chain's terminal block at the conditional's successor (merge point).
+# ponytail: the skip path walks reach about once per conditional, so a looping graph bigger than this keeps main's links
+# and its loop error. Share reach between walks if a real workflow needs more.
+_SKIP_PATH_WORK_LIMIT = 1_000_000
 
-    SKY-8571: iterates to convergence so an outer conditional patched on one pass can let an inner
-    conditional's branch terminals be patched on the next. Mutates default_next_map in place.
-    """
+
+def _link_branch_tails(
+    conditionals: Sequence[BlockTypeVar | Mapping[str, Any]],
+    label_to_block: Mapping[str, BlockTypeVar | Mapping[str, Any]],
+    default_next_map: dict[str, str | None],
+    skip_reached: bool,
+) -> set[str]:
+    skipped: set[str] = set()
+    # Links are only ever added, so each successor's reach only grows: extend it as links land instead of re-walking.
+    reach: dict[str, set[str]] = {}
     changed = True
     while changed:
         changed = False
-        for block in blocks:
-            if _workflow_block_field(block, "block_type") != BlockType.CONDITIONAL:
-                continue
+        for block in conditionals:
             label = _workflow_block_field(block, "label")
             successor = default_next_map.get(label)
             if not successor:
                 continue
-            branches = _workflow_block_field(block, "ordered_branches")
-            if branches is None:
-                branches = _workflow_block_field(block, "branch_conditions") or []
-            for branch in branches:
+            for branch in _conditional_branches(block):
                 target = _workflow_block_field(branch, "next_block_label")
                 if not target or target == successor:
                     continue
@@ -21522,10 +21835,115 @@ def resolve_conditional_merge_edges(
                     visited.add(cur)
                     nxt = default_next_map.get(cur)
                     if nxt is None:
+                        if skip_reached:
+                            if successor not in reach:
+                                reach[successor] = reachable_block_labels(
+                                    {successor}, label_to_block, default_next_map, follow_conditional_next=False
+                                )
+                            if cur in reach[successor]:
+                                skipped.add(label)
+                                break
                         default_next_map[cur] = successor
                         changed = True
+                        if skip_reached and _workflow_block_field(label_to_block[cur], "block_type") != (
+                            BlockType.CONDITIONAL
+                        ):
+                            for reached in reach.values():
+                                if cur in reached:
+                                    reachable_block_labels(
+                                        {successor},
+                                        label_to_block,
+                                        default_next_map,
+                                        follow_conditional_next=False,
+                                        seen=reached,
+                                    )
                         break
                     cur = nxt
+    return skipped
+
+
+def _has_loop(
+    label_to_block: Mapping[str, BlockTypeVar | Mapping[str, Any]], default_next_map: Mapping[str, str | None]
+) -> bool:
+    successors = {
+        label: [
+            target
+            for target in (
+                (_workflow_block_field(branch, "next_block_label") for branch in _conditional_branches(block))
+                if _workflow_block_field(block, "block_type") == BlockType.CONDITIONAL
+                else [default_next_map.get(label)]
+            )
+            if target in label_to_block
+        ]
+        for label, block in label_to_block.items()
+    }
+    state: dict[str, int] = {}
+    for root in successors:
+        if root in state:
+            continue
+        state[root] = 1
+        stack = [(root, iter(successors[root]))]
+        while stack:
+            label, pending = stack[-1]
+            target = next(pending, None)
+            if target is None:
+                state[label] = 2
+                stack.pop()
+            elif state.get(target) == 1:
+                return True
+            elif target not in state:
+                state[target] = 1
+                stack.append((target, iter(successors[target])))
+    return False
+
+
+def resolve_conditional_merge_edges(
+    blocks: Sequence[BlockTypeVar | Mapping[str, Any]],
+    label_to_block: Mapping[str, BlockTypeVar | Mapping[str, Any]],
+    default_next_map: dict[str, str | None],
+) -> bool:
+    """Point each conditional branch chain's terminal block at the conditional's successor, in place, repeating until
+    nothing changes. A terminal the successor already reaches stays unlinked; returns whether any link was skipped."""
+    conditionals = [block for block in blocks if _workflow_block_field(block, "block_type") == BlockType.CONDITIONAL]
+    resolved = dict(default_next_map)
+    _link_branch_tails(conditionals, label_to_block, resolved, skip_reached=False)
+    # Links are skipped only when resolving every link leaves a loop, so a graph the graph check accepts keeps them all.
+    edges = len(label_to_block) + sum(len(_conditional_branches(block)) for block in conditionals)
+    if not _has_loop(label_to_block, resolved) or len(conditionals) * edges > _SKIP_PATH_WORK_LIMIT:
+        default_next_map.update(resolved)
+        return False
+    resolved = dict(default_next_map)
+    skipped = _link_branch_tails(conditionals, label_to_block, resolved, skip_reached=True)
+    if skipped:
+        # Re-resolve conditionals nested in or enclosing one whose merge link was skipped, by descending reach then
+        # label, so the result does not depend on block order. Conditionals sharing or crossing a branch tail resolve
+        # in block order.
+        reach = {
+            _workflow_block_field(block, "label"): reachable_block_labels(
+                (_workflow_block_field(branch, "next_block_label") for branch in _conditional_branches(block)),
+                label_to_block,
+                default_next_map,
+                follow_conditional_next=False,
+            )
+            for block in conditionals
+        }
+        involved = skipped.union(*(reach[label] for label in skipped))
+        involved |= {label for label, reached in reach.items() if reached & skipped}
+        slots = [i for i, block in enumerate(conditionals) if _workflow_block_field(block, "label") in involved]
+        reordered = list(conditionals)
+        by_reach = sorted(
+            (conditionals[i] for i in slots),
+            key=lambda block: (
+                -len(reach[_workflow_block_field(block, "label")]),
+                _workflow_block_field(block, "label"),
+            ),
+        )
+        for slot, block in zip(slots, by_reach):
+            reordered[slot] = block
+        resolved = dict(default_next_map)
+        _link_branch_tails(reordered, label_to_block, resolved, skip_reached=True)
+    default_next_map.update(resolved)
+    return bool(skipped)
 
 
 def labels_only_on_untaken_branches(
@@ -21534,22 +21952,7 @@ def labels_only_on_untaken_branches(
     label_to_block: dict[str, BlockTypeVar],
     default_next_map: dict[str, str | None],
 ) -> set[str]:
-    """A nested conditional counts as reaching every branch target, since it has not chosen one yet."""
-
-    def reachable(start_labels: set[str | None]) -> set[str]:
-        seen: set[str] = set()
-        pending = list(start_labels)
-        while pending:
-            label = pending.pop()
-            if label is None or label in seen or label not in label_to_block:
-                continue
-            seen.add(label)
-            block = label_to_block[label]
-            if isinstance(block, ConditionalBlock):
-                pending.extend(branch.next_block_label for branch in block.ordered_branches)
-            pending.append(default_next_map.get(label))
-        return seen
-
     own_next = default_next_map.get(conditional.label)
     targets = {branch.next_block_label or own_next for branch in conditional.ordered_branches}
-    return reachable(targets - {taken_label}) - reachable({taken_label})
+    untaken_reach = reachable_block_labels(targets - {taken_label}, label_to_block, default_next_map)
+    return untaken_reach - reachable_block_labels({taken_label}, label_to_block, default_next_map)

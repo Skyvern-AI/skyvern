@@ -16,6 +16,7 @@ from skyvern.forge.sdk.copilot.ask_user import (
     ACCOUNT_GROUP_STATUS_TOOL_NAME,
     ACCOUNT_GROUP_SUBMIT_TOOL_NAME,
     CREDENTIAL_DELETE_TOOL_NAME,
+    SINGLE_RUN_TOOL_NAME,
 )
 from skyvern.forge.sdk.copilot.code_write_diff import CodeWriteDiff
 from skyvern.forge.sdk.copilot.context import (
@@ -61,7 +62,7 @@ _TOOL_ACTIVITY_DISPLAY_LABELS = {
     "get_block_schema": "Checking workflow block options",
     "get_workflow_knowledge": "Looking up workflow guidance",
     "list_integrations": "Checking connected integrations",
-    "request_google_connection": "Preparing a Google connection",
+    "request_connection": "Preparing an account connection",
     "offer_demonstration": "Offering a demonstration",
     "read_google_sheet": "Reading the Google Sheet",
     "get_organization_usage_quota": "Checking account usage",
@@ -112,6 +113,7 @@ _TOOL_ACTIVITY_DISPLAY_LABELS = {
     "request_credential": "Requesting a credential",
     "ask_user": "Asking you",
     ACCOUNT_GROUP_SUBMIT_TOOL_NAME: "Reviewing the accounts with you",
+    SINGLE_RUN_TOOL_NAME: "Reviewing the run with you",
     ACCOUNT_GROUP_STATUS_TOOL_NAME: "Checking the account runs",
     ACCOUNT_GROUP_CANCEL_TOOL_NAME: "Reviewing a cancel with you",
     CREDENTIAL_DELETE_TOOL_NAME: "Reviewing a credential deletion with you",

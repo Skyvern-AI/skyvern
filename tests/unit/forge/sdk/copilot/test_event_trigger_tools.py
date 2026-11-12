@@ -20,8 +20,8 @@ async def test_trigger_tools_report_triggers_unavailable_without_a_cloud_deploym
     monkeypatch.setattr(app, "AGENT_FUNCTION", AgentFunction())
     ctx = make_copilot_context()
     calls = [
-        (create_webhook_trigger_tool, {"mapping": {"order_id": "/order_id"}}),
-        (test_trigger_mapping_tool, {"mapping": {"order_id": "/order_id"}, "sample_payload": {"order_id": "1"}}),
+        (create_webhook_trigger_tool, {"source_kind": "a", "mapping": {"order_id": "/order_id"}}),
+        (test_trigger_mapping_tool, {"source_kind": "a", "mapping": {"order_id": "/order_id"}}),
         (list_workflow_triggers_tool, {}),
     ]
 

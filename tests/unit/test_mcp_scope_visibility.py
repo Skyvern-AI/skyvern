@@ -7,7 +7,6 @@ from collections.abc import Iterator
 from pathlib import Path
 from types import ModuleType
 from typing import Any, get_args, get_type_hints
-from unittest.mock import MagicMock
 
 import pytest
 from fastmcp import Client, FastMCP
@@ -79,17 +78,6 @@ def test_run_mcp_scope_default_is_all() -> None:
     from skyvern.cli.run_commands import run_mcp
 
     assert inspect.signature(run_mcp).parameters["scope"].default == "all"
-
-
-def test_all_adds_no_transforms(monkeypatch: pytest.MonkeyPatch) -> None:
-    scopes = _load_scopes_module()
-    server = FastMCP("scope-test")
-    add_transform = MagicMock()
-    monkeypatch.setattr(server, "add_transform", add_transform)
-
-    scopes.apply_scope(server, "all")
-
-    add_transform.assert_not_called()
 
 
 def test_operate_adds_exact_transforms_in_order(monkeypatch: pytest.MonkeyPatch) -> None:

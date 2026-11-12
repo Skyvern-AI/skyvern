@@ -54,6 +54,7 @@ export interface AccountGroupRow {
   label: string;
   prior_outcome: AccountGroupOutcome | null;
   preselected: boolean;
+  parameter_key?: string;
 }
 
 export interface AccountGroupReview {
@@ -68,6 +69,8 @@ export interface AccountGroupReview {
   credential_parameter_used_by?: string[];
   rows: AccountGroupRow[];
   workflow_run_group_id: string | null;
+  single_run?: boolean;
+  workflow_run_id?: string | null;
   decision?: AccountGroupDecision | null;
 }
 
@@ -220,8 +223,9 @@ export interface WorkflowCopilotChatRequest {
   supports_credential_pause_recovery?: boolean;
   supports_question_tool?: boolean;
   supports_account_group_card?: boolean;
+  supports_single_run_card?: boolean;
   supports_credential_delete_card?: boolean;
-  supports_google_setup_card?: boolean;
+  supports_connection_card?: boolean;
   supports_demonstration_offer?: boolean;
 }
 
@@ -754,6 +758,7 @@ export interface WorkflowCopilotToolResultUpdate {
   workflow_run_id?: string | null;
   // Keys and sources only; values are read from the run itself.
   test_inputs?: CopilotTestInput[] | null;
+  debug_session_id?: string | null;
   timestamp?: string | null;
 }
 

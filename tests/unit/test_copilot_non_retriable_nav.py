@@ -1389,6 +1389,7 @@ def _scout_ctx(
         built_with_proxy_location=session_proxy,
     )
     monkeypatch.setattr(shared_module, "resolve_browser_state_for_context", AsyncMock(return_value=browser_state))
+    monkeypatch.setattr(shared_module.app.AGENT_FUNCTION, "proxy_provider_refusal", AsyncMock(return_value=None))
     return ctx
 
 

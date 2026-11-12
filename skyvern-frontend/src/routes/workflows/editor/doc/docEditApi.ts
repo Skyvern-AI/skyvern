@@ -12,7 +12,6 @@ import {
   type AppNode,
   type WorkflowBlockNode,
 } from "../nodes";
-import { nodeLibraryTitle } from "./docStepChoices";
 import type { AddNodeProps } from "../Workspace";
 import { demonstrationInsertionFromNodes } from "../workspaceAuthoringActions";
 import type { WorkflowCopilotDemonstrationInsertion } from "../../copilot/workflowCopilotTypes";
@@ -25,6 +24,8 @@ import {
   docMainIsSetting,
   docStepIsNoteOnly,
   getDocProseFields,
+  labelStem,
+  nodeLibraryTitle,
 } from "./docStepRegistry";
 import { withLineSetting } from "./docLineSettings";
 import { useDocUnfinishedStore } from "./docUnfinished";
@@ -36,7 +37,6 @@ import {
   moveBlock,
   moveBranch,
   newStepLabel,
-  labelStem,
   branchMembers,
   contextInputsFedBy,
   findOutputUsers,

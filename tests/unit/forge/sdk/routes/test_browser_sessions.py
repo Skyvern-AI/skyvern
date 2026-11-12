@@ -249,6 +249,28 @@ async def test_create_browser_session_forwards_whether_the_session_will_be_watch
 
 
 @pytest.mark.asyncio
+async def test_create_browser_session_forwards_the_target_site_and_bot_protection() -> None:
+    """Dropped here, the session is still created normally, just never on the infrastructure its target needs."""
+    app_mock = MagicMock()
+    app_mock.AGENT_FUNCTION.validate_enterprise_feature_access = AsyncMock()
+    app_mock.PERSISTENT_SESSIONS_MANAGER.create_session = AsyncMock(return_value=MagicMock())
+
+    with (
+        patch.object(browser_sessions_mod, "app", app_mock),
+        patch.object(browser_sessions_mod.BrowserSessionResponse, "from_browser_session", AsyncMock()),
+        patch.object(browser_sessions_mod, "_redact_browser_session_addresses", AsyncMock()),
+    ):
+        await browser_sessions_mod.create_browser_session(
+            browser_sessions_mod.CreateBrowserSessionRequest(url="https://example.com/form", bot_protection="hcaptcha"),
+            current_org=SimpleNamespace(organization_id="org_1"),
+        )
+
+    forwarded = app_mock.PERSISTENT_SESSIONS_MANAGER.create_session.await_args.kwargs
+    assert forwarded["url"] == "https://example.com/form"
+    assert forwarded["bot_protection"] == "hcaptcha"
+
+
+@pytest.mark.asyncio
 async def test_create_browser_session_preserves_typed_credit_refusal_http_contract() -> None:
     app_mock = MagicMock()
     app_mock.AGENT_FUNCTION.validate_enterprise_feature_access = AsyncMock()

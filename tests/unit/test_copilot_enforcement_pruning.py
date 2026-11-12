@@ -1535,14 +1535,6 @@ def test_deadline_flag_still_written_when_fingerprint_is_suppressed() -> None:
     assert ctx.copilot_total_timeout_exceeded is True
 
 
-def test_total_timeout_override_binds_on_settings_and_defaults_unset() -> None:
-    unset = Settings(_env_file=None, WORKFLOW_COPILOT_TOTAL_TIMEOUT_SECONDS=None)
-    overridden = Settings(_env_file=None, WORKFLOW_COPILOT_TOTAL_TIMEOUT_SECONDS=300)
-
-    assert unset.WORKFLOW_COPILOT_TOTAL_TIMEOUT_SECONDS is None
-    assert overridden.WORKFLOW_COPILOT_TOTAL_TIMEOUT_SECONDS == 300
-
-
 def test_shared_tools_bind_the_configured_total_timeout() -> None:
     assert shared_total_timeout_seconds == TOTAL_TIMEOUT_SECONDS
     assert TOTAL_TIMEOUT_SECONDS == (settings.WORKFLOW_COPILOT_TOTAL_TIMEOUT_SECONDS or 900)

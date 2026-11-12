@@ -18,7 +18,7 @@ keywords:
 
 <Steps>
   <Step title="Read the run">
-    Call `get_run` and look at `status`, `failure_reason`, and `errors`. Agent runs also have `failure_category`.
+    Call `get_run` and look at `status`, `failure_reason`, and `errors`. For agent runs, `failure_category` is in the webhook payload and in the agent run lists (`GET /v1/agents/runs`, `GET /v1/agents/{workflow_id}/runs`), not in `get_run`.
   </Step>
   <Step title="Watch it">
     Open `app_url` in the app, or download the `recording`. Most failures are obvious once you see the page the agent saw.
@@ -35,7 +35,7 @@ from skyvern import Skyvern
 
 client = Skyvern(api_key=os.environ["SKYVERN_API_KEY"])
 
-run = await client.get_run("tsk_v2_490440779503357994")
+run = await client.get_run("tsk_v2_123")
 print(run.status, run.failure_reason, run.errors, run.step_count, run.app_url)
 ```
 
@@ -44,12 +44,12 @@ import { Skyvern } from "@skyvern/client";
 
 const client = new Skyvern({ apiKey: process.env.SKYVERN_API_KEY! });
 
-const run = await client.getRun("tsk_v2_490440779503357994");
+const run = await client.getRun("tsk_v2_123");
 console.log(run.status, run.failure_reason, run.errors, run.step_count, run.app_url);
 ```
 
 ```bash cURL
-curl "https://api.skyvern.com/v1/runs/tsk_v2_490440779503357994" \
+curl "https://api.skyvern.com/v1/runs/tsk_v2_123" \
   -H "x-api-key: $SKYVERN_API_KEY" \
   | jq '{status, failure_reason, errors, step_count, app_url}'
 ```
@@ -59,7 +59,7 @@ What each status means, and whether to retry, is on [Going to production](/devel
 
 ## Failure categories
 
-When an agent run ends in `failed`, `terminated`, or `timed_out`, Skyvern classifies the cause. The app shows the label as a badge on the run. The API and webhooks return the code in `failure_category[0].category`.
+When an agent run ends in `failed`, `terminated`, or `timed_out`, Skyvern classifies the cause. The app shows the label as a badge on the run. Webhooks and the agent run lists (`GET /v1/agents/runs`, `GET /v1/agents/{workflow_id}/runs`) return the code in `failure_category[0].category`. `get_run` does not include it.
 
 | Code | Label in the app | Cause | Fix |
 |---|---|---|---|
@@ -82,6 +82,7 @@ When an agent run ends in `failed`, `terminated`, or `timed_out`, Skyvern classi
 | `WEBSITE_ERROR` | Website error | The site failed on its side, such as a 502 or maintenance. | Retry later. Nothing is wrong with your agent. |
 | `INFRASTRUCTURE_ERROR` | Temporary system issue | A network or capacity problem on Skyvern's side. | Retry. |
 | `PARAMETER_BINDING_ERROR` | Parameter setup failed | An internal setup step for the run's inputs failed. | Retry, then contact support. |
+| `BUSINESS_OUTCOME` | Stopped for a business reason | A real condition on the site or in the inputs, such as a record that doesn't exist or a closed posting. | Check `failure_reason` and the run's inputs. |
 | `UNKNOWN` | Unknown failure | Skyvern couldn't tell. | Read `failure_reason` and watch the recording. |
 
 A category that isn't in this table is one of your own `error_code_mapping` codes, shown as is.
@@ -228,11 +229,11 @@ Skyvern widens the target for you: when the proxy provider repeatedly reports th
 </Accordion>
 
 <Accordion title="UI is blank or can't reach the API">
-**Fix:** check `VITE_API_BASE_URL` and `VITE_WSS_BASE_URL` in `skyvern-frontend/.env`, then `docker compose restart skyvern-ui`.
+**Fix:** check `VITE_API_BASE_URL` and `VITE_WSS_BASE_URL` in `skyvern-frontend/.env`, then run `docker compose up -d skyvern-ui`. `docker compose restart` keeps the values the container started with.
 </Accordion>
 
 <Accordion title="Server keeps calling OpenAI after switching models">
-**Fix:** set `LLM_KEY` to your provider's key (for example `OLLAMA`) and enable that provider, then restart. See [Self-host](/developers/self-hosted/overview#use-a-local-model).
+**Fix:** set `LLM_KEY` to your provider's key (for example `OLLAMA`) and enable that provider, then restart the server (with Docker Compose, `docker compose up -d`). See [Self-host](/developers/self-hosted/overview#use-a-local-model).
 </Accordion>
 
 <Accordion title="Connection refused to a model or browser on the host">
@@ -249,7 +250,7 @@ Every run records what happened: a video, screenshots, the AI's prompts and answ
 <CodeGroup>
 ```python Python
 artifacts = await client.get_run_artifacts(
-    "tsk_v2_490440779503357994",
+    "tsk_v2_123",
     artifact_type=["recording", "screenshot_final", "skyvern_log"],
 )
 for artifact in artifacts:
@@ -257,7 +258,7 @@ for artifact in artifacts:
 ```
 
 ```typescript TypeScript
-const artifacts = await client.getRunArtifacts("tsk_v2_490440779503357994", {
+const artifacts = await client.getRunArtifacts("tsk_v2_123", {
   artifact_type: ["recording", "screenshot_final", "skyvern_log"],
 });
 for (const artifact of artifacts) {
@@ -266,7 +267,7 @@ for (const artifact of artifacts) {
 ```
 
 ```bash cURL
-curl "https://api.skyvern.com/v1/runs/tsk_v2_490440779503357994/artifacts?artifact_type=recording&artifact_type=screenshot_final" \
+curl "https://api.skyvern.com/v1/runs/tsk_v2_123/artifacts?artifact_type=recording&artifact_type=screenshot_final" \
   -H "x-api-key: $SKYVERN_API_KEY"
 ```
 </CodeGroup>

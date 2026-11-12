@@ -2,6 +2,7 @@ import asyncio
 import os
 from pathlib import Path
 from typing import Any, ClassVar, Literal
+from urllib.parse import quote
 
 import httpx
 import structlog
@@ -22,8 +23,15 @@ from skyvern.forge.sdk.workflow.models.block import (
     sanitize_filename,
 )
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE
+from skyvern.schemas.emails import (
+    CONNECTED_ACCOUNT_OWNER_UNCONFIRMED_REASON,
+    CONNECTED_ACCOUNT_RESAVE_REASON,
+    GmailHopRefusal,
+)
 from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType
 from skyvern.services import email
+from skyvern.services.email.gmail import _message_from_gmail
+from skyvern.services.email.gmail_client import GMAIL_API_BASE, get_json
 
 LOG = structlog.get_logger()
 
@@ -35,6 +43,7 @@ class EmailInboxBlock(Block):
     credential_source: Literal["native", "nango"] = "native"
     connection_id: str | None = None
     credential_id: str | None = None
+    message_id: str | None = None
     folder: str | None = None
     prompt: str | None = None
     sender: str | None = None
@@ -45,7 +54,9 @@ class EmailInboxBlock(Block):
     download_attachments: bool = False
     parameters: list[PARAMETER_TYPE] = []
 
-    TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset({"credential_id", "folder", "prompt", "sender", "subject"})
+    TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset(
+        {"credential_id", "folder", "prompt", "sender", "subject", "message_id"}
+    )
 
     def get_all_parameters(self, workflow_run_id: str) -> list[PARAMETER_TYPE]:
         return self.parameters
@@ -55,6 +66,8 @@ class EmailInboxBlock(Block):
             self.credential_id = self.render_templatable_field(
                 "credential_id", self.credential_id, workflow_run_context
             )
+        if self.message_id:
+            self.message_id = self.render_templatable_field("message_id", self.message_id, workflow_run_context).strip()
         if self.folder:
             self.folder = self.render_templatable_field("folder", self.folder, workflow_run_context)
         if self.prompt:
@@ -105,7 +118,7 @@ class EmailInboxBlock(Block):
         self,
         messages: list[email.EmailMessage],
         *,
-        access_token: str,
+        access_token: str | None,
         organization_id: str,
         workflow_run_context: WorkflowRunContext,
         workflow_run_id: str,
@@ -166,15 +179,21 @@ class EmailInboxBlock(Block):
                             attachment_output["download_error"] = "run_size_limit"
                             continue
 
+                    # None means the bytes are streamed from a connected account straight into the file below.
+                    content: bytes | None = None
                     try:
                         if attachment.embedded_data is not None:
                             content = email.gmail.decode_attachment_data(
                                 attachment.embedded_data, max_size_bytes=file_limit
                             )
+                        elif self.credential_source == "nango":
+                            if not attachment.download_grant:
+                                attachment_output["download_error"] = "missing_attachment_id"
+                                continue
                         else:
                             content = await email.download_attachment(
                                 email_client=self.email_client,
-                                access_token=access_token,
+                                access_token=access_token or "",
                                 message_id=message.id,
                                 attachment_id=attachment.attachment_id or "",
                                 max_size_bytes=file_limit,
@@ -193,12 +212,13 @@ class EmailInboxBlock(Block):
                         )
                         continue
 
-                    if len(content) > file_limit:
+                    if content is not None and len(content) > file_limit:
                         attachment_output["download_error"] = "file_size_limit"
                         continue
-                    if run_size + len(content) > run_limit:
+                    if content is not None and run_size + len(content) > run_limit:
                         attachment_output["download_error"] = "run_size_limit"
                         continue
+                    max_bytes = min(file_limit, run_limit - run_size)
 
                     # Split before sanitizing: its 200-character cap would otherwise cut off a long name's extension.
                     raw_stem, raw_extension = os.path.splitext(attachment.name)
@@ -222,13 +242,41 @@ class EmailInboxBlock(Block):
                         try:
                             with path.open("xb") as file:
                                 file_created = True
-                                file.write(content)
+                                if content is None:
+                                    written = await app.AGENT_FUNCTION.download_gmail_attachment_for_run(
+                                        organization_id=organization_id,
+                                        workflow_run_id=workflow_run_id,
+                                        workflow_run_block_id=workflow_run_block_id,
+                                        connection_id=self.connection_id or "",
+                                        hop_token=workflow_run_context.get_gmail_hop_token(self.label),
+                                        message_id=message.id,
+                                        attachment_id=attachment.attachment_id or "",
+                                        download_grant=attachment.download_grant or "",
+                                        max_bytes=max_bytes,
+                                        destination=file,
+                                    )
+                                    # A stream cut short can still end cleanly; the listed size catches it.
+                                    if attachment.size is not None and written != attachment.size:
+                                        raise email.GmailAPIError(
+                                            status=502, code="download_failed", message="Incomplete attachment"
+                                        )
+                                else:
+                                    file.write(content)
+                                    written = len(content)
                             saved_path = path
                             break
                         except FileExistsError:
                             suffix += 1
-                        except OSError:
-                            attachment_output["download_error"] = "save_failed"
+                        except (OSError, email.GmailAPIError) as exc:
+                            if not isinstance(exc, email.GmailAPIError):
+                                attachment_output["download_error"] = "save_failed"
+                            elif exc.code == "file_size_limit":
+                                # ponytail: the stream stops at the tighter bound, so name the limit that set it.
+                                attachment_output["download_error"] = (
+                                    "file_size_limit" if max_bytes == file_limit else "run_size_limit"
+                                )
+                            else:
+                                attachment_output["download_error"] = "download_failed"
                             if file_created:
                                 try:
                                     path.unlink()
@@ -239,11 +287,29 @@ class EmailInboxBlock(Block):
                                         "Failed to remove incomplete email attachment download",
                                         workflow_run_block_id=workflow_run_block_id,
                                     )
+                            if isinstance(exc, email.GmailAPIError) and exc.code == "reconnect_required":
+                                raise email.GmailAPIError(
+                                    status=exc.status,
+                                    code=exc.code,
+                                    message="Reconnect the Gmail account to download attachments",
+                                ) from exc
                             break
+                        except BaseException:
+                            # A cancelled run must not leave a partial file under a final name: run cleanup
+                            # would persist it as a complete download.
+                            if file_created:
+                                try:
+                                    path.unlink(missing_ok=True)
+                                except OSError:
+                                    LOG.warning(
+                                        "Failed to remove incomplete email attachment download",
+                                        workflow_run_block_id=workflow_run_block_id,
+                                    )
+                            raise
                     if saved_path is None:
                         continue
                     file_count += 1
-                    run_size += len(content)
+                    run_size += written
                     saved_names.add(saved_path.name)
                     attachment_output["file_name"] = saved_path.name
                     attachment_output["file_path"] = str(saved_path)
@@ -297,6 +363,12 @@ class EmailInboxBlock(Block):
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
             )
+        if self.message_id and (self.email_client != "gmail" or self.credential_source != "native"):
+            return await self._failure(
+                failure_reason="Fetching by message ID requires a native Gmail connection",
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
         if self.credential_source == "native" and not self.credential_id:
             return await self._failure(
                 failure_reason="credential_id is required",
@@ -313,18 +385,34 @@ class EmailInboxBlock(Block):
             )
 
         access_token: str | None = None
-        folder_used = self.folder or ("INBOX" if self.email_client == "gmail" else "inbox")
+        folder_used = None if self.message_id else self.folder or ("INBOX" if self.email_client == "gmail" else "inbox")
         try:
             if self.credential_source == "nango":
                 if (
                     self.email_client != "gmail"
-                    or self.download_attachments
                     or not self.connection_id
                     or any(marker in self.connection_id for marker in ("{{", "{%", "{#"))
                 ):
                     raise email.GmailAPIError(
                         status=404, code="integration_unavailable", message="Gmail integration unavailable"
                     )
+                assert folder_used is not None
+                if not workflow_run_context.get_gmail_hop_token(self.label):
+                    refusal = workflow_run_context.get_gmail_hop_refusal(self.label)
+                    if refusal == GmailHopRefusal.reconnect:
+                        raise email.GmailAPIError(
+                            status=403,
+                            code="reconnect_required",
+                            message="reconnect it on the Integrations page, then select it again in this block",
+                        )
+                    if refusal == GmailHopRefusal.resave_required:
+                        raise email.GmailAPIError(
+                            status=403, code="resave_required", message=CONNECTED_ACCOUNT_RESAVE_REASON
+                        )
+                    if refusal == GmailHopRefusal.owner_unconfirmed:
+                        raise email.GmailAPIError(
+                            status=403, code="owner_unconfirmed", message=CONNECTED_ACCOUNT_OWNER_UNCONFIRMED_REASON
+                        )
                 data = await app.AGENT_FUNCTION.execute_gmail_inbox_for_run(
                     organization_id=effective_org_id,
                     workflow_run_id=workflow_run_id,
@@ -337,6 +425,7 @@ class EmailInboxBlock(Block):
                     newer_than_days=max(1, self.newer_than_days) if self.newer_than_days is not None else None,
                     max_results=max(1, min(self.max_results, 100)),
                     include_body=self.include_body,
+                    include_attachments=self.download_attachments,
                 )
                 try:
                     candidates = [email.EmailMessage.model_validate(item) for item in data]
@@ -367,17 +456,31 @@ class EmailInboxBlock(Block):
                         workflow_run_block_id=workflow_run_block_id,
                         organization_id=organization_id,
                     )
-                candidates = await email.list_folder_messages(
-                    email_client=self.email_client,
-                    access_token=access_token,
-                    folder=folder_used,
-                    sender=self.sender,
-                    subject=self.subject,
-                    newer_than_days=self.newer_than_days,
-                    max_results=self.max_results,
-                    include_body=self.include_body,
-                    include_attachments=self.download_attachments,
-                )
+                if self.message_id:
+                    async with httpx.AsyncClient() as client:
+                        raw = await get_json(
+                            client,
+                            f"{GMAIL_API_BASE}/users/me/messages/{quote(self.message_id, safe='')}",
+                            access_token=access_token,
+                            params={"format": "full" if self.include_body or self.download_attachments else "metadata"},
+                        )
+                    message = _message_from_gmail(raw, self.include_body, include_attachments=self.download_attachments)
+                    if message is None:
+                        raise email.GmailAPIError(status=502, code=None, message="Invalid Gmail response")
+                    candidates = [message]
+                else:
+                    assert folder_used is not None
+                    candidates = await email.list_folder_messages(
+                        email_client=self.email_client,
+                        access_token=access_token,
+                        folder=folder_used,
+                        sender=self.sender,
+                        subject=self.subject,
+                        newer_than_days=self.newer_than_days,
+                        max_results=self.max_results,
+                        include_body=self.include_body,
+                        include_attachments=self.download_attachments,
+                    )
         except email.GmailAPIError as e:
             return await self._api_failure(
                 provider="Gmail",
@@ -397,6 +500,17 @@ class EmailInboxBlock(Block):
                 organization_id=organization_id,
             )
 
+        # A connected-account message too large to read in full is left out, but named in the output so the skip
+        # is visible; the id stays out of logs.
+        candidate_count = len(candidates)
+        skipped = [c for c in candidates if c.attachment_list_error == "message_too_large"]
+        if skipped:
+            LOG.warning(
+                "Skipped Gmail messages over the connected-account read limit",
+                workflow_run_block_id=workflow_run_block_id,
+                skipped_count=len(skipped),
+            )
+            candidates = [c for c in candidates if c.attachment_list_error != "message_too_large"]
         criteria = self.prompt.strip() if self.prompt else ""
         matched = (
             await self._match_emails(candidates, criteria=criteria, organization_id=effective_org_id)
@@ -406,7 +520,7 @@ class EmailInboxBlock(Block):
         emails = [message.model_dump(mode="json") for message in matched]
         downloaded_files: list[FileInfo] = []
         if self.download_attachments:
-            assert access_token is not None
+            assert access_token is not None or self.credential_source == "nango"
             try:
                 emails, downloaded_files = await self._download_matched_attachments(
                     matched,
@@ -437,10 +551,12 @@ class EmailInboxBlock(Block):
         output_data: dict[str, Any] = {
             "email_client": self.email_client,
             "folder": folder_used,
-            "candidate_count": len(candidates),
+            "candidate_count": candidate_count,
             "matched_count": len(matched),
             "emails": emails,
         }
+        if skipped:
+            output_data["skipped_messages"] = [{"id": c.id, "reason": "message_too_large"} for c in skipped]
         if self.download_attachments:
             output_data["downloaded_files"] = [file.model_dump() for file in downloaded_files]
             output_data["downloaded_file_urls"] = [file.url for file in downloaded_files]
@@ -468,6 +584,8 @@ class EmailInboxBlock(Block):
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, error_data)
         if exc.code == "reconnect_required":
             failure_reason = f"Reconnect the {provider} account: {exc.message}"
+        elif exc.code in {"resave_required", "owner_unconfirmed"}:
+            failure_reason = exc.message
         else:
             failure_reason = f"{provider} email fetch failed (HTTP {exc.status}): {exc.message}"
         return await self._failure(

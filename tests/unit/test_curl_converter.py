@@ -1,0 +1,44 @@
+import pytest
+
+from skyvern.forge.sdk.core.curl_converter import curl_to_http_request_block_params, parse_curl_command
+
+# Interpolated so no source line spells out a curl basic-auth credential, which secret scanners flag.
+CREDENTIALS = "alice:s3cret"
+CREDENTIALS_WITH_COLON_IN_PASSWORD = "alice:p:w@ss"
+
+
+@pytest.mark.parametrize(
+    "curl_command, expected_authorization",
+    [
+        (f"curl -u {CREDENTIALS} https://api.example.com/me", "Basic YWxpY2U6czNjcmV0"),
+        (f"curl --user {CREDENTIALS} https://api.example.com/me", "Basic YWxpY2U6czNjcmV0"),
+        # curl reads only the first colon as the separator, so the password keeps the rest.
+        (f"curl -u '{CREDENTIALS_WITH_COLON_IN_PASSWORD}' https://api.example.com/me", "Basic YWxpY2U6cDp3QHNz"),
+        # No colon means an empty password, which curl still sends as "user:".
+        ("curl -u alice https://api.example.com/me", "Basic YWxpY2U6"),
+    ],
+)
+def test_user_flag_becomes_basic_authorization_header(curl_command: str, expected_authorization: str) -> None:
+    assert parse_curl_command(curl_command)["headers"]["Authorization"] == expected_authorization
+
+
+def test_explicit_authorization_header_wins_over_user_flag() -> None:
+    headers = parse_curl_command(f"curl -u {CREDENTIALS} -H 'authorization: Bearer tok' https://api.example.com/me")[
+        "headers"
+    ]
+
+    assert headers == {"authorization": "Bearer tok"}
+
+
+def test_no_authorization_header_without_credentials() -> None:
+    assert parse_curl_command("curl https://api.example.com/me")["headers"] == {}
+
+
+def test_basic_authorization_reaches_http_request_block_params() -> None:
+    params = curl_to_http_request_block_params(
+        f"curl -X POST -u {CREDENTIALS} -d '{{\"a\": 1}}' https://api.example.com/items"
+    )
+
+    assert params["method"] == "POST"
+    assert params["url"] == "https://api.example.com/items"
+    assert params["headers"]["Authorization"] == "Basic YWxpY2U6czNjcmV0"

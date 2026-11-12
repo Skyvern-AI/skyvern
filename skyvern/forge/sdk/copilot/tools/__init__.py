@@ -10,7 +10,7 @@ import time
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import asdict
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any
 
 import structlog
 from agents import FunctionTool, function_tool
@@ -22,11 +22,13 @@ from openai.types.responses import ResponseFunctionToolCall
 from pydantic import Field, JsonValue
 
 from skyvern.forge import app as app
+from skyvern.forge.agent_functions import CopilotTriggerSource
 from skyvern.forge.sdk.copilot.ask_user import (
     ACCOUNT_GROUP_CANCEL_TOOL_NAME,
     ACCOUNT_GROUP_STATUS_TOOL_NAME,
     ACCOUNT_GROUP_SUBMIT_TOOL_NAME,
     CREDENTIAL_DELETE_TOOL_NAME,
+    SINGLE_RUN_TOOL_NAME,
     AskUserArguments,
     QuestionInput,
 )
@@ -90,6 +92,9 @@ from skyvern.forge.sdk.copilot.screenshot_utils import (
 )
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.tools.account_groups import (
+    SINGLE_RUN_TOOL_DESCRIPTION,
+)
+from skyvern.forge.sdk.copilot.tools.account_groups import (
     SUBMIT_TOOL_DESCRIPTION as ACCOUNT_GROUP_SUBMIT_TOOL_DESCRIPTION,
 )
 from skyvern.forge.sdk.copilot.tools.account_groups import (
@@ -97,6 +102,8 @@ from skyvern.forge.sdk.copilot.tools.account_groups import (
     account_group_submit_enabled,
     cancel_account_group,
     run_for_accounts,
+    run_saved_workflow,
+    single_run_submit_enabled,
 )
 from skyvern.forge.sdk.copilot.tools.credential_deletion import (
     DELETE_TOOL_DESCRIPTION as CREDENTIAL_DELETE_TOOL_DESCRIPTION,
@@ -108,6 +115,7 @@ from skyvern.forge.sdk.copilot.tools.credential_deletion import (
 from skyvern.forge.sdk.copilot.tools.event_triggers import (
     create_webhook_trigger_tool,
     list_workflow_triggers_tool,
+    render_trigger_sources,
     test_trigger_mapping_tool,
 )
 from skyvern.forge.sdk.copilot.tools.locator_inspection import TOOL_DESCRIPTION as LOCATOR_INSPECTION_TOOL_DESCRIPTION
@@ -258,7 +266,7 @@ from .guardrails import _parameter_binding_invariant_error as _parameter_binding
 from .integrations import (
     _list_integrations,
     _read_google_sheet,
-    _request_google_connection,
+    _request_connection,
 )
 from .mcp_hooks import _build_skyvern_mcp_overlays as _build_skyvern_mcp_overlays
 from .mcp_hooks import _click_post_hook as _click_post_hook
@@ -1202,6 +1210,24 @@ async def run_workflow_for_accounts_tool(
     return result.model_dump_json(exclude_none=True, exclude={"repeated_after_prior_effect": {"__all__": {"identity"}}})
 
 
+@function_tool(
+    failure_error_function=copilot_tool_failure,
+    name_override=SINGLE_RUN_TOOL_NAME,
+    description_override=SINGLE_RUN_TOOL_DESCRIPTION,
+    strict_mode=False,
+)
+async def run_saved_workflow_tool(
+    ctx: ToolContext[CopilotContext], action_summary: str, inputs: dict[str, JsonValue] | None = None
+) -> str:
+    authority_error = _authority_tool_error(ctx.context, SINGLE_RUN_TOOL_NAME)
+    if authority_error is not None:
+        return json.dumps({"ok": False, "dispatched": False, "error": authority_error})
+    result = await run_saved_workflow(
+        ctx.context, tool_call_id=ctx.tool_call_id, inputs=inputs or {}, action_summary=action_summary
+    )
+    return result.model_dump_json()
+
+
 @function_tool(failure_error_function=copilot_tool_failure, name_override=ACCOUNT_GROUP_STATUS_TOOL_NAME)
 async def get_account_group_status_tool(ctx: ToolContext[CopilotContext], workflow_run_group_id: str) -> str:
     """Read each account's run id, status and outcome for a group started by run_workflow_for_accounts.
@@ -1231,7 +1257,7 @@ async def delete_saved_credentials_tool(ctx: ToolContext[CopilotContext], creden
 
 
 # This description is measured, not prose: a storage-fidelity sentence in it took authoring from 15/20 to 3/20.
-# Re-measure with the arms in cloud_docs/workflow-copilot/architecture/offline-replay.md before editing.
+# Re-measure with the arms of the copilot offline-replay harness before editing.
 @function_tool(failure_error_function=copilot_tool_failure, name_override="set_work_plan")
 async def set_work_plan_tool(ctx: ToolContext[CopilotContext], items: list[str]) -> str:
     """Replace your own work plan for this chat with `items`, in the order you mean to do them.
@@ -1267,10 +1293,9 @@ async def list_integrations_tool(ctx: RunContextWrapper) -> str:
     lists are disjoint, so check this one before concluding the user has no Google
     or Microsoft access.
     Prefer a purpose-built native integration block over automating that connected
-    service through its browser UI. For Google Sheets, author a `google_sheets_read`
-    or `google_sheets_write` block and pass an active compatible connection's
-    `connection_id` as its `credential_id`. Not paginated; one call returns every
-    entry and connection.
+    service through its browser UI, and pass an active compatible connection's
+    `connection_id` in the block's account field. Not paginated; one call returns
+    every entry and connection.
 
     Match on `scopes_granted`, not on `provider` alone: connections are granted per
     product, so a Sheets connection cannot read Gmail and binding it to a mail block
@@ -1284,9 +1309,10 @@ async def list_integrations_tool(ctx: RunContextWrapper) -> str:
     If the requested account remains ambiguous or no compatible active row exists,
     use a grounded ordinary-language clarification instead.
 
-    A `credential_id` may instead be the connection `name` or `email_address`
+    An account field may instead hold the connection `name` or `email_address`
     exactly as the user wrote it in this turn. The server resolves it when the
-    workflow is saved, and the save result says what happened to that slot.
+    workflow is saved, and `connection_resolution` in the save result says what
+    happened to that slot.
     """
     copilot_ctx = ctx.context
     arguments: dict[str, Any] = {}
@@ -1302,7 +1328,7 @@ async def list_integrations_tool(ctx: RunContextWrapper) -> str:
     return json.dumps(sanitized)
 
 
-GOOGLE_SETUP_TOOL_NAME = "request_google_connection"
+CONNECTION_CARD_TOOL_NAME = "request_connection"
 DEMONSTRATION_OFFER_TOOL_NAME = "offer_demonstration"
 
 
@@ -1320,35 +1346,32 @@ async def offer_demonstration_tool(ctx: RunContextWrapper) -> str:
     return json.dumps(result)
 
 
-@function_tool(failure_error_function=copilot_tool_failure, name_override=GOOGLE_SETUP_TOOL_NAME)
-async def request_google_connection_tool(
+@function_tool(failure_error_function=copilot_tool_failure, name_override=CONNECTION_CARD_TOOL_NAME)
+async def request_connection_tool(
     ctx: RunContextWrapper,
-    scope_profile: Literal["gmail", "google_sheets"],
+    integration_id: str,
     connection_id: str | None = None,
 ) -> str:
-    """Show the user a card in this chat for connecting a Google account under one existing scope
-    profile: `gmail` reads mail (gmail.readonly, no sending) and `google_sheets` reads and writes
-    spreadsheets. The two are separate grants and separate connections, so a workflow that needs
-    both needs one card per profile.
+    """Show the user a card in this chat for connecting an account to one `list_integrations` entry,
+    named by its `id`. The card asks for that entry's `required_scopes`.
 
-    The card appears with your reply. The user clicks Connect, finishes Google consent in a popup,
-    and then picks the account on the card; that pick reaches you on the next turn as
-    CONNECTED ACCOUNT CHOICE FACTS. This call does not start consent, does not wait for it and does
-    not change the workflow, so nothing is connected when it returns (`status` is `offered`).
+    The card appears with your reply. The user connects through the provider's consent and then picks
+    the account on the card; that pick reaches you on the next turn as CONNECTED ACCOUNT CHOICE FACTS
+    and is approved for runs. This call does not start consent, does not wait for it and does not
+    change the workflow, so nothing is connected when it returns (`status` is `offered`). An entry
+    that is not `live` gets no card (`status` is `not_offered`).
 
-    `compatible_connections` lists the active connections that already hold this profile's scope;
-    the card offers them for selection without new consent. With `connection_id`, a connection that
-    was granted for this same profile but is not active gets a reconnect card that keeps its ID
-    (`reconnect_connection_id`); any other ID is not used and comes back as `ignored_connection_id`.
+    With `connection_id`, the card reauthorizes that connection in place when `reconnect_in_place`
+    is true: its id stays the same. Otherwise the user connects a new account, which gets a new id.
     """
     copilot_ctx = ctx.context
-    arguments: dict[str, Any] = {"scope_profile": scope_profile, "connection_id": connection_id}
-    authority_error = _authority_tool_error(copilot_ctx, GOOGLE_SETUP_TOOL_NAME)
+    arguments: dict[str, Any] = {"integration_id": integration_id, "connection_id": connection_id}
+    authority_error = _authority_tool_error(copilot_ctx, CONNECTION_CARD_TOOL_NAME)
     if authority_error:
         result: dict[str, Any] = {"ok": False, "error": authority_error}
     else:
-        result = await _request_google_connection(scope_profile, connection_id, copilot_ctx)
-    record_tool_step_result_for_ctx(copilot_ctx, GOOGLE_SETUP_TOOL_NAME, arguments, result)
+        result = await _request_connection(integration_id, connection_id, copilot_ctx)
+    record_tool_step_result_for_ctx(copilot_ctx, CONNECTION_CARD_TOOL_NAME, arguments, result)
     return json.dumps(result)
 
 
@@ -1584,12 +1607,12 @@ its size, a preview and child_count, and its iterations are readable as their ow
 If workflow_run_id is omitted, fetches the run this chat carries: its last
 successful test run, else the last run it tested or was opened about. When
 it carries none, fetches the most recently created finished run
-({join_phrases([status.value for status in _FINAL_RUN_STATUSES], "or")}) not started by a
-Copilot chat. selected_by says which of these happened ("carried_from_chat",
+({join_phrases([status.value for status in _FINAL_RUN_STATUSES], "or")}) that is not a
+Copilot test run. selected_by says which of these happened ("carried_from_chat",
 "latest_for_workflow", or "explicit" when workflow_run_id was passed), and
 created_at and trigger_type describe the returned run.
 newer_finished_runs lists finished runs of this workflow created after the
-returned run, excluding runs started by any Copilot chat, newest first; it
+returned run, excluding Copilot test runs, newest first; it
 holds at most {_NEWER_FINISHED_RUNS_LIMIT}, so more may exist. When that lookup fails the result has
 newer_finished_runs_unavailable instead, so a missing list is not "none".
 execution_source with source_kind run_version describes the saved version the run executed, which may
@@ -2036,9 +2059,10 @@ async def start_fresh_browser_tool(ctx: RunContextWrapper) -> str:
 
     The new session has no cookies, storage, sign-ins or challenge history, so a site that challenged
     or blocked the old browser may not challenge it. Everything in the old browser is lost, including
-    open tabs and the current page. When the studio browser pane streams the old browser, it stays
-    open and the pane keeps showing it while your browser tools act in the new one. If the new
-    browser cannot start, the old one stays in use.
+    open tabs and the current page. When the old browser is the studio browser, the new one replaces it
+    there and the old one closes, unless a person has Take control, a demonstration is recording in it,
+    a run occupies it, or that cannot be checked; then the old one stays the studio browser and the
+    pane keeps showing it. If the new browser cannot start, the old one stays in use.
     """
     authority_error = _authority_tool_error(ctx.context, FRESH_BROWSER_TOOL_NAME)
     if authority_error:
@@ -2440,7 +2464,7 @@ NATIVE_TOOLS = [
     delete_block_tool,
     list_credentials_tool,
     list_integrations_tool,
-    request_google_connection_tool,
+    request_connection_tool,
     offer_demonstration_tool,
     read_google_sheet_tool,
     get_organization_usage_quota_tool,
@@ -2465,6 +2489,7 @@ NATIVE_TOOLS = [
     read_attached_pdf_tool,
     read_chat_history_tool,
     run_workflow_for_accounts_tool,
+    run_saved_workflow_tool,
     get_account_group_status_tool,
     cancel_account_group_tool,
     delete_saved_credentials_tool,
@@ -2487,6 +2512,7 @@ BROWSER_BOUND_TOOL_NAMES = BLOCK_RUNNING_TOOLS | frozenset(
         SESSION_EXTENSION_TOOL_NAME,
         UPLOAD_TOOL_NAME,
         ACCOUNT_GROUP_SUBMIT_TOOL_NAME,
+        SINGLE_RUN_TOOL_NAME,
     }
 )
 
@@ -2498,6 +2524,7 @@ _PAGE_STATE_TOOL_NAMES = (
     - {
         SESSION_EXTENSION_TOOL_NAME,
         ACCOUNT_GROUP_SUBMIT_TOOL_NAME,
+        SINGLE_RUN_TOOL_NAME,
     }
 )
 
@@ -2628,12 +2655,15 @@ def copilot_native_tools(
     authoring_capability: AuthoringCapability | BlockAuthoringPolicy | str | None = None,
     run_tools_available: bool,
     supports_account_group_card: bool = False,
+    supports_single_run_card: bool = False,
     supports_credential_delete_card: bool = False,
-    supports_google_setup_card: bool = False,
+    supports_connection_card: bool = False,
     supports_demonstration_offer: bool = False,
     browser_pattern_accepting_calls: tuple[str, ...] = (),
+    trigger_sources: list[CopilotTriggerSource] | None = None,
 ) -> list[FunctionTool]:
     capability = _normalized_authoring_capability(authoring_capability)
+    trigger_sources_text = render_trigger_sources(trigger_sources or [])
     both_families = capability.code_blocks and capability.agent_blocks
     appended = SCHEMA_FIRST_GUIDANCE if not both_families else f"{AUTHORING_FAMILY_GUIDANCE}\n\n{SCHEMA_FIRST_GUIDANCE}"
     tools: list[FunctionTool] = []
@@ -2642,9 +2672,10 @@ def copilot_native_tools(
             (tool.name == "ask_user" and not supports_question_tool)
             or (tool.name == BROWSER_CODE_TOOL_NAME and not browser_code_available)
             or (tool.name in ACCOUNT_GROUP_TOOL_NAMES and not supports_account_group_card)
-            or (tool.name == GOOGLE_SETUP_TOOL_NAME and not supports_google_setup_card)
+            or (tool.name == CONNECTION_CARD_TOOL_NAME and not supports_connection_card)
             or (tool.name == DEMONSTRATION_OFFER_TOOL_NAME and not supports_demonstration_offer)
             or (tool.name == ACCOUNT_GROUP_SUBMIT_TOOL_NAME and not account_group_submit_enabled())
+            or (tool.name == SINGLE_RUN_TOOL_NAME and not (supports_single_run_card and single_run_submit_enabled()))
             or (
                 tool.name == CREDENTIAL_DELETE_TOOL_NAME
                 and not (supports_credential_delete_card and credential_delete_enabled())
@@ -2662,6 +2693,8 @@ def copilot_native_tools(
             tool = _with_executed_source_param(tool, browser_code_available=browser_code_available)
         if tool.name in _BUILD_TEST_TOOL_NAMES:
             tool = dataclasses.replace(tool, description=f"{tool.description}\n\n{BUILD_TEST_BROWSER_START}")
+        if tool.name == create_webhook_trigger_tool.name and trigger_sources_text:
+            tool = dataclasses.replace(tool, description=f"{tool.description}\n\n{trigger_sources_text}")
         if tool.name == list_integrations_tool.name and run_tools_available:
             tool = dataclasses.replace(tool, description=f"{tool.description}\n\n{_LIST_INTEGRATIONS_RUN_GUIDANCE}")
         if tool.name in AUTHORING_GUIDANCE_TOOL_NAMES:

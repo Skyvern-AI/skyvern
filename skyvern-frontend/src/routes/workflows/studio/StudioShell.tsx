@@ -972,6 +972,15 @@ function StudioStage(props: StudioWorkspaceProps) {
     (id: StudioPaneId) => collapsedPanesRef.current.includes(id),
     [],
   );
+  // Keyed on the lists' contents, so consumers re-render when what is on screen changes.
+  const visibleKey = visiblePanes.join(",");
+  // The row stays mounted under a pane that is still growing over the stage.
+  const isPaneOnScreen = useCallback(
+    (id: StudioPaneId) =>
+      visibleKey.split(",").includes(id) &&
+      (activeExpandedPaneId === null || activeExpandedPaneId === id),
+    [visibleKey, activeExpandedPaneId],
+  );
   // Resolved after the render that applies the open, so a pane that was
   // closed and folds as it opens (the Doc leaves no room) is shown too.
   const [pendingShow, setPendingShow] = useState<{ id: StudioPaneId } | null>(
@@ -1055,6 +1064,7 @@ function StudioStage(props: StudioWorkspaceProps) {
       restoreExpandedPane,
       showPane,
       isPaneFolded,
+      isPaneOnScreen,
     }),
     [
       copilotPortalEl,
@@ -1063,6 +1073,7 @@ function StudioStage(props: StudioWorkspaceProps) {
       restoreExpandedPane,
       showPane,
       isPaneFolded,
+      isPaneOnScreen,
     ],
   );
 

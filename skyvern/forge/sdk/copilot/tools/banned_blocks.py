@@ -1076,7 +1076,7 @@ def _record_authored_families(
         entries.append({"block_type": block_type, "family": family, "after_failed_test": after_failed_test})
 
 
-def _agent_step_neighbours(blocks: list[Any]) -> dict[str, dict[str, list[str]]]:
+def _agent_step_neighbours(blocks: list[Any], *, in_loop: bool = False) -> dict[str, dict[str, list[str]]]:
     """Each agent_step's label with the types of the blocks that run just before and after it, following the
     run's edges (next_block_label, the sequential default, conditional branches and merge points) within the
     list that holds it."""
@@ -1099,7 +1099,7 @@ def _agent_step_neighbours(blocks: list[Any]) -> dict[str, dict[str, list[str]]]
     for label, block in by_label.items():
         targets = (
             [
-                branch.get("next_block_label") or default_next[label]
+                branch.get("next_block_label") or (None if in_loop else default_next[label])
                 for branch in block.get("branch_conditions") or []
                 if isinstance(branch, Mapping)
             ]
@@ -1118,7 +1118,7 @@ def _agent_step_neighbours(blocks: list[Any]) -> dict[str, dict[str, list[str]]]
     for block in listed:
         loop_blocks = block.get("loop_blocks")
         if isinstance(loop_blocks, list):
-            neighbours.update(_agent_step_neighbours(loop_blocks))
+            neighbours.update(_agent_step_neighbours(loop_blocks, in_loop=True))
     return neighbours
 
 

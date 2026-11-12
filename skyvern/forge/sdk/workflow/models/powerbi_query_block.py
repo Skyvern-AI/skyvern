@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from enum import StrEnum
 from typing import Any, ClassVar, Literal
 from uuid import UUID
 
@@ -22,14 +23,49 @@ HUMAN_RUN_REQUIRED_REASON = (
     "workflow editor. Open this workflow in the editor and run it there."
 )
 INTEGRATION_UNAVAILABLE_REASON = "Power BI queries are not currently available."
-
 PLAN_REQUIRED_REASON = "Power BI is available on Enterprise plans."
 
-NO_ACCESS_REASON = (
-    "This run wasn't given access to Power BI. Power BI queries run only when the person who connected the "
-    "account starts the run from the workflow editor, with that connection still active."
+ACCOUNT_DISCONNECTED_REASON = (
+    "This Power BI account was disconnected. Reconnect it, then select it again in this block."
 )
+MANUAL_RUN_REQUIRED_REASON = "Power BI blocks run only when you start the workflow manually."
+UNSAFE_QUERY_INPUT_REASON = "Power BI dataset_id and query may use only workflow input parameters or literals."
 INTERNAL_ERROR_REASON = "Power BI query couldn't run because of an internal error. Retry the run."
+
+
+class PowerBIHopRefusal(StrEnum):
+    """Why a run was issued no Power BI capability, recorded per block wherever a capability is prepared."""
+
+    plan_required = "plan_required"
+    account_disconnected = "account_disconnected"
+    run_not_supported = "run_not_supported"
+    unsafe_query_input_source = "unsafe_query_input_source"
+    integration_unavailable = "integration_unavailable"
+
+
+_REFUSAL_DENIALS: dict[PowerBIHopRefusal, tuple[str, str, FailureCategory | None]] = {
+    PowerBIHopRefusal.plan_required: ("plan_required", PLAN_REQUIRED_REASON, None),
+    PowerBIHopRefusal.account_disconnected: (
+        "account_disconnected",
+        ACCOUNT_DISCONNECTED_REASON,
+        FailureCategory.CREDENTIAL_ERROR,
+    ),
+    PowerBIHopRefusal.run_not_supported: (
+        "manual_run_required",
+        MANUAL_RUN_REQUIRED_REASON,
+        None,
+    ),
+    PowerBIHopRefusal.unsafe_query_input_source: (
+        "unsafe_query_input_source",
+        UNSAFE_QUERY_INPUT_REASON,
+        None,
+    ),
+    PowerBIHopRefusal.integration_unavailable: (
+        "integration_unavailable",
+        INTEGRATION_UNAVAILABLE_REASON,
+        None,
+    ),
+}
 
 
 def normalize_powerbi_query(query: str) -> str:
@@ -175,6 +211,35 @@ class PowerBIQueryBlock(Block):
             organization_id=organization_id,
         )
 
+    async def _no_capability_failure(
+        self,
+        *,
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None,
+    ) -> BlockResult:
+        recorded = workflow_run_context.get_powerbi_hop_refusal(self.label)
+        try:
+            refusal: PowerBIHopRefusal | None = PowerBIHopRefusal(recorded) if recorded else None
+        except ValueError:
+            refusal = None
+
+        if refusal is not None:
+            error_code, failure_reason, category = _REFUSAL_DENIALS[refusal]
+        else:
+            error_code, failure_reason, category = "integration_unavailable", INTEGRATION_UNAVAILABLE_REASON, None
+
+        return await self._failure(
+            workflow_run_context=workflow_run_context,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+            error_code=error_code,
+            failure_reason=failure_reason,
+            category=category,
+        )
+
     async def execute(
         self,
         workflow_run_id: str,
@@ -209,31 +274,16 @@ class PowerBIQueryBlock(Block):
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=effective_org_id,
                 error_code="unsafe_query_input_source",
-                failure_reason="Power BI dataset_id and query may use only workflow input parameters or literals.",
+                failure_reason=UNSAFE_QUERY_INPUT_REASON,
             )
 
         hop_token = workflow_run_context.get_powerbi_hop_token(self.label)
         if not hop_token:
-            # Minting skips a run for several reasons (not owner-started, inactive connection, mint failure), so
-            # the wording states the rule without guessing which one applied here and records no category.
-            refused_by_design = effective_org_id is not None and await self._powerbi_offered(effective_org_id)
-            # Only a confirmed non-Enterprise plan gets the plan message; an unreadable plan keeps the generic one.
-            if refused_by_design and effective_org_id and await self._powerbi_plan_allows(effective_org_id) is False:
-                return await self._failure(
-                    workflow_run_context=workflow_run_context,
-                    workflow_run_id=workflow_run_id,
-                    workflow_run_block_id=workflow_run_block_id,
-                    organization_id=effective_org_id,
-                    error_code="plan_required",
-                    failure_reason=PLAN_REQUIRED_REASON,
-                )
-            return await self._failure(
+            return await self._no_capability_failure(
                 workflow_run_context=workflow_run_context,
                 workflow_run_id=workflow_run_id,
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=effective_org_id,
-                error_code="human_run_required" if refused_by_design else "integration_unavailable",
-                failure_reason=NO_ACCESS_REASON if refused_by_design else INTEGRATION_UNAVAILABLE_REASON,
             )
 
         if "{{" in self.connection_id or "{%" in self.connection_id:
@@ -293,7 +343,7 @@ class PowerBIQueryBlock(Block):
                 failure_reason="Power BI queries are not supported in this runtime.",
             )
         except PowerBIQueryError as exc:
-            if exc.code in {"principal_unavailable", "event_trigger_run"}:
+            if exc.code == "principal_unavailable":
                 return await self._failure(
                     workflow_run_context=workflow_run_context,
                     workflow_run_id=workflow_run_id,
@@ -301,9 +351,6 @@ class PowerBIQueryBlock(Block):
                     organization_id=effective_org_id,
                     error_code="human_run_required",
                     failure_reason=HUMAN_RUN_REQUIRED_REASON,
-                    # principal_unavailable also stands for a failed principal lookup, so only the event-trigger
-                    # fact is labeled.
-                    category=FailureCategory.CREDENTIAL_ERROR if exc.code == "event_trigger_run" else None,
                 )
             if exc.code == "copilot_test_run_unsupported":
                 return await self._failure(
@@ -358,7 +405,7 @@ class PowerBIQueryBlock(Block):
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=effective_org_id,
                     error_code="unsafe_query_input_source",
-                    failure_reason="Power BI dataset_id and query may use only workflow input parameters or literals.",
+                    failure_reason=UNSAFE_QUERY_INPUT_REASON,
                 )
             return await self._failure(
                 workflow_run_context=workflow_run_context,

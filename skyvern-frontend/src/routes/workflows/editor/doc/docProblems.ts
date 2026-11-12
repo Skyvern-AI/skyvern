@@ -1,5 +1,9 @@
 import { isLoginBlockMissingCredentials } from "../../runValidation";
 import { isWorkflowBlockNode, type AppNode } from "../nodes";
+import { docStepCaption, loopHasNoList } from "./docStepRegistry";
+import type { DocItem } from "./buildDocTree";
+import { docDetailsText } from "./docDetailsText";
+import { docStepLineKeys, docStepShowsKey } from "./docSettingsChips";
 
 const text = (value: unknown) =>
   typeof value === "string" ? value.trim() : "";
@@ -43,29 +47,58 @@ const recordListPaths: Record<string, string> = {
 export const stepResultIsRecord = (type: string | undefined) =>
   type !== undefined && recordListPaths[type] !== undefined;
 
-/** The array fields of a step's data schema a loop can go through as `<label>_output.extracted_information.<name>`. */
-export function recordListFields(node: AppNode): string[] {
-  if (!isWorkflowBlockNode(node) || !node.type) return [];
-  if (!EXTRACTED_INFORMATION_STEPS.has(node.type)) return [];
+function dataSchemaOf(
+  node: AppNode,
+): { type?: unknown; properties?: unknown } | null {
+  if (!isWorkflowBlockNode(node) || !node.type) return null;
+  if (!EXTRACTED_INFORMATION_STEPS.has(node.type)) return null;
   const raw = (node.data as Record<string, unknown>).dataSchema;
-  let schema: unknown;
   try {
-    schema = typeof raw === "string" ? JSON.parse(raw) : raw;
+    const schema = typeof raw === "string" ? JSON.parse(raw) : raw;
+    return schema && typeof schema === "object" ? schema : null;
   } catch {
-    return [];
+    return null;
   }
-  const properties = (schema as { properties?: unknown } | null)?.properties;
+}
+
+const schemaUnparsable = (node: AppNode) => {
+  const raw = (node.data as Record<string, unknown>).dataSchema;
+  if (typeof raw !== "string" || !raw.trim()) return false;
+  try {
+    JSON.parse(raw);
+    return false;
+  } catch {
+    return true;
+  }
+};
+
+// Like the backend's `resolve_schema_type`, a union takes its first non-null type: `["array", "null"]` is an array.
+const isArrayType = (type: unknown) =>
+  (Array.isArray(type)
+    ? type.find((t) => String(t).toLowerCase() !== "null")
+    : type
+  )
+    ?.toString()
+    .toLowerCase() === "array";
+
+const schemaIsList = (node: AppNode) => isArrayType(dataSchemaOf(node)?.type);
+
+function arrayFields(node: AppNode): string[] {
+  const properties = dataSchemaOf(node)?.properties;
   if (!properties || typeof properties !== "object") return [];
-  // Only names a `{{ }}` path can hold without quoting.
   return Object.entries(properties as Record<string, { type?: unknown }>)
-    .filter(
-      ([name, field]) =>
-        dottedFieldReadable(name) &&
-        (field?.type === "array" ||
-          (Array.isArray(field?.type) && field.type.includes("array"))),
-    )
+    .filter(([, field]) => isArrayType(field?.type))
     .map(([name]) => name);
 }
+
+/** The array fields of a step's data schema a loop can go through as `<label>_output.extracted_information.<name>`. */
+export function recordListFields(node: AppNode): string[] {
+  // Only names a `{{ }}` path can hold without quoting.
+  return arrayFields(node).filter(dottedFieldReadable);
+}
+
+const renameListField = (field: string) =>
+  `Rename the list field "${field}" in the earlier step's data schema. A loop can't go through a field with that name.`;
 
 // The run strips spaces and braces from the reference (block.py `strip(' {}')`), so `{{ X_output }}`,
 // `{{X_output}}`, `X_output`, `{{ X }}` and `X` all resolve to X's whole result record.
@@ -89,38 +122,85 @@ function wholeRecordLoopSource(reference: string, nodes: AppNode[]) {
       : source?.type
         ? recordListPaths[source.type]
         : undefined;
-  return label && path ? { label, path } : null;
+  return label && source && path ? { label, path, source } : null;
 }
 
-function wholeRecordProblem({
-  label,
-  path,
-}: NonNullable<ReturnType<typeof wholeRecordLoopSource>>) {
-  const example = `${label}_output.${path}`;
-  if (path === "extracted_information.<field>")
-    return `Pick the list inside ${label}_output, for example ${example}, with <field> listed in ${label}'s data schema. Use ${label}_output.extracted_information only if that data schema is an array.`;
-  return `Pick the list inside ${label}_output, for example ${example}.`;
+type WholeRecordSource = NonNullable<ReturnType<typeof wholeRecordLoopSource>>;
+
+// A step with a Data Schema field but no top-level list in it leaves `@` nothing to offer but the whole result.
+const hasNoSchemaList = ({ path, source }: WholeRecordSource) =>
+  path === "extracted_information.<field>" &&
+  source.type !== "navigation" &&
+  !schemaUnparsable(source) &&
+  !schemaIsList(source) &&
+  arrayFields(source).length === 0;
+
+function wholeRecordProblem(found: WholeRecordSource) {
+  const { label, path, source } = found;
+  const name = docStepCaption(source) ?? label;
+  if (hasNoSchemaList(found))
+    return `${name} has no top-level list in its Data Schema, so the loop has nothing to go through. Add a list field at the top level of its Data Schema, then pick it here with @.`;
+  const whole = `${label}_output is the whole result of ${name}, not a list`;
+  if (source.type === "navigation")
+    return `${whole}, and this step's result usually holds no list. Pick a list from an earlier extraction with @.`;
+  if (path !== "extracted_information.<field>")
+    return `${whole}. Pick the list inside it, for example ${label}_output.${path}.`;
+  if (schemaIsList(source))
+    return `${whole}. Its Data Schema is a list, so use ${label}_output.extracted_information.`;
+  const unreadable = arrayFields(source)[0];
+  if (unreadable !== undefined && !recordListFields(source).length)
+    return renameListField(unreadable);
+  return `${whole}. Pick one of its list fields with @.`;
 }
+
+const loopSource = (node: AppNode, nodes: AppNode[]) => {
+  const data = node.data as Record<string, unknown>;
+  return node.type === "loop" && data.loopKind !== "while"
+    ? wholeRecordLoopSource(text(data.loopVariableReference), nodes)
+    : null;
+};
+
+/** The earlier step whose Data Schema needs a list field before this loop can go through it, if that is the loop's problem. */
+export function loopSchemaStepId(loop: AppNode, nodes: AppNode[]) {
+  const found = loopSource(loop, nodes);
+  return found && hasNoSchemaList(found) ? found.source.id : null;
+}
+
+// A fix line and the saved key it is about; null where the step has nothing to show for it.
+export type DocStepFix = { message: string; field: string | null };
 
 /** What a step still needs before it can run, found from the draft as it is typed. */
-export function docStepProblems(nodes: AppNode[]): Map<string, string[]> {
-  const problems = new Map<string, string[]>();
+export function docStepProblems(
+  nodes: AppNode[],
+  editable = true,
+): Map<string, string[]> {
+  return new Map(
+    [...docStepFixes(nodes, editable)].map(([id, fixes]) => [
+      id,
+      fixes.map((fix) => fix.message),
+    ]),
+  );
+}
+
+export function docStepFixes(
+  nodes: AppNode[],
+  editable = true,
+): Map<string, DocStepFix[]> {
+  const problems = new Map<string, DocStepFix[]>();
   for (const node of nodes) {
     if (!isWorkflowBlockNode(node)) continue;
     const data = node.data as Record<string, unknown>;
-    const found: string[] = [];
-    if (
-      node.type === "loop" &&
-      data.loopKind !== "while" &&
-      !text(data.loopVariableReference) &&
-      !text(data.loopValue)
-    )
-      found.push("Pick the list to go through with @");
-    const wholeRecord =
-      node.type === "loop" && data.loopKind !== "while"
-        ? wholeRecordLoopSource(text(data.loopVariableReference), nodes)
-        : null;
-    if (wholeRecord) found.push(wholeRecordProblem(wholeRecord));
+    const found: DocStepFix[] = [];
+    const listFix = (message: string) =>
+      found.push({ message, field: "loop_variable_reference" });
+    if (node.type === "loop" && loopHasNoList(data))
+      listFix(
+        text(data.description)
+          ? "This line names the list in words; the loop needs the list itself. Type @ on the line and pick it."
+          : "This loop has no list to go through. Type @ on its line and pick a list.",
+      );
+    const wholeRecord = loopSource(node, nodes);
+    if (wholeRecord) listFix(wholeRecordProblem(wholeRecord));
     // ASCII `\w` is enough here: only ASCII names are keywords or dict attributes.
     const methodField =
       node.type === "loop" && data.loopKind !== "while"
@@ -129,11 +209,12 @@ export function docStepProblems(nodes: AppNode[]): Map<string, string[]> {
           )?.[1]
         : undefined;
     if (methodField && !dottedFieldReadable(methodField))
-      found.push(
-        `Rename the list field "${methodField}" in the earlier step's data schema. A loop can't go through a field with that name.`,
-      );
+      listFix(renameListField(methodField));
     if (node.type === "url" && !text(data.url))
-      found.push("Set the URL: type it on the line, or use @");
+      found.push({
+        message: "This step has no URL. Type it on the line, or use @.",
+        field: "url",
+      });
     if (
       node.type === "login" &&
       isLoginBlockMissingCredentials({
@@ -145,8 +226,132 @@ export function docStepProblems(nodes: AppNode[]): Map<string, string[]> {
           : [],
       })
     )
-      found.push("Choose a saved credential in this step's settings");
+      found.push({
+        message: docDetailsText.noCredential(editable),
+        // A read-only Doc's Details has no way to choose a credential, so it is not opened for this.
+        field: editable ? "parameter_keys" : null,
+      });
     if (found.length) problems.set(node.id, found);
   }
   return problems;
+}
+
+// The server problems that ask before Run: certain to fail, or (a credential in a note) a run that would read it.
+// Any other code, including one added later, is listed without asking.
+const ASKING_SERVER_CODES = new Set([
+  "unknown_reference",
+  "forward_reference",
+  "empty_goal",
+  "empty_condition",
+  "bad_jump_target",
+  "duplicate_parameter_key",
+  "template_syntax",
+  "schema_error",
+  "credential_in_note",
+]);
+
+export type DocProblemEntry = {
+  key: string;
+  nodeId: string | null;
+  message: string;
+  /** Critical: a Run click asks "Run with N problems?" for exactly these entries. */
+  blocking: boolean;
+  // What the fix needs sits in the step's Details, so a jump to it opens them.
+  inDetails: boolean;
+};
+
+function stepOrder(items: DocItem[], order: Map<string, number>) {
+  for (const item of items) {
+    if (item.kind === "note") continue;
+    if (item.kind === "unplaced") {
+      for (const id of item.nodeIds) order.set(id, order.size);
+      continue;
+    }
+    order.set(item.nodeId, order.size);
+    if (item.kind === "loop") stepOrder(item.children, order);
+    if (item.kind === "conditional")
+      for (const branch of item.branches) stepOrder(branch.children, order);
+  }
+  return order;
+}
+
+/** One entry per distinct fix line and server problem of a step, in reading order; the header, list and Run all count these. */
+export function docProblemEntries({
+  nodes,
+  items,
+  fixes,
+  problems,
+  editable,
+}: {
+  nodes: AppNode[];
+  items: DocItem[];
+  fixes: ReadonlyMap<string, DocStepFix[]>;
+  problems: ReadonlyArray<{
+    block_label: string | null;
+    field?: string | null;
+    code: string;
+    message: string;
+    severity?: "error" | "warning";
+  }>;
+  editable: boolean;
+}): DocProblemEntry[] {
+  const idsByLabel = new Map(nodes.map((node) => [node.data.label, node.id]));
+  const byId = new Map(nodes.map((node) => [node.id, node]));
+  // A fix whose field is not on the step's lines is found in Details.
+  const inDetails = (nodeId: string | null, field: string | null) => {
+    const node = nodeId === null ? undefined : byId.get(nodeId);
+    return (
+      Boolean(node && field) &&
+      !docStepShowsKey(node!, field!, docStepLineKeys(node!, editable))
+    );
+  };
+  // A check that couldn't reach the server leaves problems from an older draft: shown, but Run does not ask about them.
+  const checkFailed = problems.some(
+    (problem) => problem.code === "validation_failed",
+  );
+  const byIdentity = new Map<string, DocProblemEntry>();
+  for (const entry of [
+    ...[...fixes].flatMap(([nodeId, stepFixes]) =>
+      stepFixes.map(({ message, field }, i) => ({
+        key: `${nodeId}:fix:${i}`,
+        nodeId,
+        message,
+        blocking: true,
+        inDetails: inDetails(nodeId, field),
+      })),
+    ),
+    ...problems.map((problem, i) => {
+      const nodeId = idsByLabel.get(problem.block_label ?? "") ?? null;
+      return {
+        key: `server:${i}`,
+        nodeId,
+        message: problem.message,
+        blocking: !checkFailed && ASKING_SERVER_CODES.has(problem.code),
+        inDetails: inDetails(nodeId, problem.field ?? null),
+      };
+    }),
+  ]) {
+    const id = `${entry.nodeId}\n${entry.message}`;
+    const previous = byIdentity.get(id);
+    if (previous) previous.blocking ||= entry.blocking;
+    else byIdentity.set(id, entry);
+  }
+  const entries = [...byIdentity.values()];
+  const order = stepOrder(items, new Map());
+  const rank = (entry: DocProblemEntry) =>
+    entry.nodeId === null ? -1 : (order.get(entry.nodeId) ?? order.size);
+  return entries.sort((a, b) => rank(a) - rank(b));
+}
+
+export function docProblemsTitle(entries: DocProblemEntry[]) {
+  const blocking = entries.filter((entry) => entry.blocking).length;
+  const warnings = entries.length - blocking;
+  const plural = (n: number, word: string) =>
+    `${n} ${word}${n === 1 ? "" : "s"}`;
+  return [
+    blocking && plural(blocking, "problem"),
+    warnings && plural(warnings, "warning"),
+  ]
+    .filter(Boolean)
+    .join(", ");
 }

@@ -99,6 +99,7 @@ class Artifact(BaseModel):
     uri: str
     bundle_key: str | None = None
     checksum: str | None = None
+    configured_name_sha256: str | None = Field(default=None, exclude=True)
     file_size: int | None = None
     task_id: str | None = None
     step_id: str | None = None

@@ -9,7 +9,14 @@ import {
   runIsCancellable,
   runIsLogicallyFinal,
 } from "@/routes/workflows/workflowRun/runRetryState";
-import { type ReactNode, useMemo, useState } from "react";
+import {
+  type ReactNode,
+  type RefObject,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { AxiosError } from "axios";
 import {
   CalendarIcon,
@@ -85,8 +92,19 @@ import { isAuthoringLayout } from "./panes";
 import { useStudioPanes } from "./useStudioPanes";
 import { useStudioRunId } from "./useStudioRunId";
 import { useStudioWorkflowDeletedAt } from "./StudioShellContext";
-import { DocRunButton } from "../editor/doc/DocRunButton";
-import { useDocRunOwnsTopBar } from "../editor/doc/useDocRunOwnsTopBar";
+import {
+  DOC_RUN_AGENT_EVENT,
+  DOC_SHOW_PROBLEMS_EVENT,
+  type DocReturnPoint,
+  type DocShowProblemsDetail,
+  captureReturnPoint,
+  resolveReturnPoint,
+} from "../editor/doc/docKeys";
+import {
+  type DocRunCheckProblem,
+  useDocRunCheckStore,
+} from "../editor/doc/docRunCheckStore";
+import { useDocOnScreen } from "../editor/doc/useDocOnScreen";
 
 export function TitleSection({ editable = true }: { editable?: boolean }) {
   const title = useWorkflowTitleStore((state) => state.title);
@@ -419,6 +437,8 @@ function PhoneTopBarItems({ triggers }: { triggers: boolean }) {
   );
 }
 
+const NO_DOC_PROBLEMS: DocRunCheckProblem[] = [];
+
 const NO_BLOCKS_RUN_TOOLTIP =
   "Add a block or ask Copilot to build the agent before running";
 
@@ -435,7 +455,6 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
   const credentialGetter = useCredentialGetter();
   const blockingBlocks = useRunValidationStore((s) => s.blockingBlocks);
   const hasBlockingBlocks = blockingBlocks.length > 0;
-  const docProblemCount = useRunValidationStore((s) => s.docProblemCount);
   const {
     data: retainedRun,
     isError: statusUnavailable,
@@ -455,23 +474,12 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
   const hasNoBlocks = useWorkflowHasChangesStore(
     (s) => s.editorHasBlocks === false,
   );
-  // While the Doc lists problems Run stays normal: a click explains and jumps to the first one.
-  const docHasProblems = docProblemCount > 0;
-  const runBlocked = hasNoBlocks || (hasBlockingBlocks && !docHasProblems);
+  const runBlocked = hasNoBlocks || hasBlockingBlocks;
   const runBlockedReason = hasBlockingBlocks
     ? getRunBlockingTooltipText(blockingBlocks)
     : hasNoBlocks
       ? NO_BLOCKS_RUN_TOOLTIP
       : "Run workflow";
-  const showDocProblems = (event?: { preventDefault: () => void }) => {
-    if (runBlocked || !docHasProblems) return false;
-    event?.preventDefault();
-    toast({
-      title: `Fix ${docProblemCount} problem${docProblemCount === 1 ? "" : "s"} before running`,
-    });
-    useRunValidationStore.getState().docShowFirstProblem?.();
-    return true;
-  };
   const rerunEligible = Boolean(
     workflowRun &&
     runIsLogicallyFinal(workflowRun) &&
@@ -526,6 +534,68 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
     }
     navigate(path);
   };
+  // The Doc's problems count only while the Doc is what the Editor pane shows.
+  const docOnScreen = useDocOnScreen();
+  const editorOpen = useStudioPanes().panes.includes("editor");
+  const docCritical = useDocRunCheckStore((s) => s.critical);
+  const critical = docOnScreen && editorOpen ? docCritical : NO_DOC_PROBLEMS;
+  // What was true at the click: a check landing while the dialog is open does not change it.
+  const [problemsAsked, setProblemsAsked] = useState<DocProblemsAsked | null>(
+    null,
+  );
+  const runButton = useRef<HTMLButtonElement>(null);
+  const requestFullRun = () => {
+    if (critical.length > 0) {
+      const active = document.activeElement;
+      // Asked from the "Start a full run?" question, which closes as this one opens: focus goes back to Run.
+      setProblemsAsked({
+        problems: critical,
+        returnPoint: captureReturnPoint(
+          active instanceof HTMLElement && !active.closest('[role="dialog"]')
+            ? active
+            : runButton.current,
+        ),
+      });
+      return;
+    }
+    startFullRun();
+  };
+  const [fullRunConfirmOpen, setFullRunConfirmOpen] = useState(false);
+  const blockRunActive = running && Boolean(activeRunId) && isBlockRun;
+  // The dialogs are rendered by the run state's branch below; a dialog left open when the branch
+  // changes (a block run ends) must not come back open with the next run.
+  const runBranch = !(running && activeRunId)
+    ? "idle"
+    : isBlockRun
+      ? "block"
+      : "full";
+  useEffect(() => {
+    setFullRunConfirmOpen(false);
+    setProblemsAsked(null);
+  }, [runBranch]);
+  // Shift+Enter on a Doc line presses whichever Run is visible.
+  const startFromDoc = useRef<(() => void) | null>(null);
+  startFromDoc.current = runBlocked
+    ? null
+    : blockRunActive
+      ? () => setFullRunConfirmOpen(true)
+      : running
+        ? null
+        : requestFullRun;
+  const problemsDialog = (
+    <DocProblemsRunDialog
+      asked={problemsAsked}
+      runButton={runButton}
+      onClose={() => setProblemsAsked(null)}
+      onRunAnyway={startFullRun}
+    />
+  );
+  useEffect(() => {
+    if (stopOnly) return;
+    const start = () => startFromDoc.current?.();
+    window.addEventListener(DOC_RUN_AGENT_EVENT, start);
+    return () => window.removeEventListener(DOC_RUN_AGENT_EVENT, start);
+  }, [stopOnly]);
 
   if (running && activeRunId) {
     const stopDialog = (
@@ -572,14 +642,14 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
     return (
       <>
         {stopDialog}
-        <Dialog>
+        <Dialog open={fullRunConfirmOpen} onOpenChange={setFullRunConfirmOpen}>
           <ControlTooltip content={runBlockedReason} blocked={runBlocked}>
             <DialogTrigger asChild>
               <Button
+                ref={runButton}
                 size="default"
                 className="h-8 border border-transparent px-3 disabled:pointer-events-none"
                 disabled={runBlocked}
-                onClick={showDocProblems}
               >
                 <PlayIcon className="mr-2 size-4" /> Run
               </Button>
@@ -599,11 +669,12 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
                 <Button variant="secondary">Not now</Button>
               </DialogClose>
               <DialogClose asChild>
-                <Button onClick={startFullRun}>Start full run</Button>
+                <Button onClick={requestFullRun}>Start full run</Button>
               </DialogClose>
             </DialogFooter>
           </DialogContent>
         </Dialog>
+        {problemsDialog}
       </>
     );
   }
@@ -612,48 +683,130 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
   }
   // The label alone doesn't say what a re-run carries; the tooltip does.
   return (
-    <ControlTooltip
-      content={
-        runBlocked
-          ? runBlockedReason
-          : rerunEligible
-            ? "Re-run with this run's inputs (opens the run form pre-filled)"
-            : "Run workflow"
-      }
-      blocked={runBlocked}
-    >
-      <Button
-        size="default"
-        className="h-8 border border-transparent px-3 disabled:pointer-events-none"
-        disabled={runBlocked}
-        onClick={() => {
-          if (!showDocProblems()) startFullRun();
-        }}
+    <>
+      <ControlTooltip
+        content={
+          runBlocked
+            ? runBlockedReason
+            : rerunEligible
+              ? "Re-run with this run's inputs (opens the run form pre-filled)"
+              : "Run workflow"
+        }
+        blocked={runBlocked}
       >
-        <PlayIcon className="mr-2 size-4" />
-        {rerunEligible ? "Re-run" : "Run"}
-      </Button>
-    </ControlTooltip>
+        <Button
+          ref={runButton}
+          size="default"
+          className="h-8 border border-transparent px-3 disabled:pointer-events-none"
+          disabled={runBlocked}
+          onClick={requestFullRun}
+        >
+          <PlayIcon className="mr-2 size-4" />
+          {rerunEligible ? "Re-run" : "Run"}
+        </Button>
+      </ControlTooltip>
+      {problemsDialog}
+    </>
   );
 }
 
-// The Doc's Run only while the Doc is on screen. A live block run keeps the shared control, which
-// offers a full run next to Stop.
-export function TopBarRunControl() {
-  const docShowing = useDocRunOwnsTopBar();
-  const { panes } = useStudioPanes();
-  const [searchParams] = useSearchParams();
-  const runId = useStudioRunId();
-  const isBlockRun = searchParams.has("bl");
-  const { data: run, isPlaceholderData } = useWorkflowRunWithWorkflowQuery({
-    workflowRunId: isBlockRun ? runId : undefined,
-  });
-  const blockRunGoing =
-    isBlockRun && !isPlaceholderData && Boolean(run && runIsCancellable(run));
-  return docShowing && panes.includes("editor") && !blockRunGoing ? (
-    <DocRunButton />
-  ) : (
-    <RunStopButton />
+type DocProblemsAsked = {
+  problems: DocRunCheckProblem[];
+  returnPoint: DocReturnPoint | null;
+};
+
+function DocProblemsRunDialog({
+  asked,
+  runButton,
+  onClose,
+  onRunAnyway,
+}: {
+  asked: DocProblemsAsked | null;
+  runButton: RefObject<HTMLButtonElement | null>;
+  onClose: () => void;
+  onRunAnyway: () => void;
+}) {
+  // Fix problems hands focus to the Doc's problems list instead of the element Run was pressed from.
+  const handedOff = useRef(false);
+  // Closing clears `asked` before the close focus runs, and the closing frame still shows the last list.
+  const last = useRef(asked);
+  if (asked) last.current = asked;
+  const shown = asked ?? last.current;
+  const problems = shown?.problems ?? NO_DOC_PROBLEMS;
+  const count = problems.length;
+  return (
+    <Dialog
+      open={asked !== null}
+      onOpenChange={(open) => {
+        if (!open) onClose();
+      }}
+    >
+      <DialogContent
+        onCloseAutoFocus={(event) => {
+          // The Doc can remount the line Run was pressed from while the question is open; Run takes over when
+          // nothing in the Doc does (a top-level note), or the Run button that asked is gone.
+          const target =
+            resolveReturnPoint(document, last.current?.returnPoint ?? null) ??
+            runButton.current;
+          if (handedOff.current) event.preventDefault();
+          else if (target) {
+            event.preventDefault();
+            target.focus({ preventScroll: true });
+          }
+          handedOff.current = false;
+        }}
+      >
+        <DialogHeader>
+          <DialogTitle>
+            Run with {count} problem{count === 1 ? "" : "s"}?
+          </DialogTitle>
+          <DialogDescription>
+            The run may fail, or do something you do not intend, at{" "}
+            {count === 1 ? "this" : "these"}. Fix first, or run anyway.
+          </DialogDescription>
+        </DialogHeader>
+        <ul
+          data-doc-run-problems
+          className="flex max-h-64 flex-col gap-2 overflow-y-auto text-sm"
+        >
+          {problems.map((problem) => (
+            <li key={problem.key}>
+              {problem.step && (
+                <span className="block text-xs text-muted-foreground">
+                  {problem.step}
+                </span>
+              )}
+              <span className="block whitespace-pre-line [overflow-wrap:anywhere]">
+                {problem.message}
+              </span>
+            </li>
+          ))}
+        </ul>
+        <DialogFooter>
+          <DialogClose asChild>
+            <Button
+              variant="secondary"
+              onClick={() => {
+                handedOff.current = true;
+                window.dispatchEvent(
+                  new CustomEvent<DocShowProblemsDetail>(
+                    DOC_SHOW_PROBLEMS_EVENT,
+                    {
+                      detail: { returnPoint: asked?.returnPoint ?? null },
+                    },
+                  ),
+                );
+              }}
+            >
+              Fix problems
+            </Button>
+          </DialogClose>
+          <DialogClose asChild>
+            <Button onClick={onRunAnyway}>Run anyway</Button>
+          </DialogClose>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -747,7 +900,7 @@ export function StudioTopBar() {
           ) : null}
           <div className="flex items-center gap-2">
             {authoring ? <InputsToggle /> : null}
-            <TopBarRunControl />
+            <RunStopButton />
           </div>
         </div>
       )}

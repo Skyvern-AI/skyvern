@@ -134,9 +134,9 @@ function TaskHistory() {
 
   return (
     <div className="space-y-4">
-      <header className="flex items-center justify-between">
+      <header className="flex flex-wrap items-center justify-between gap-y-2">
         <h1 className="text-2xl">Task Runs</h1>
-        <div className="flex gap-2">
+        <div className="flex flex-wrap gap-2">
           <StatusFilterDropdown
             values={statusFilters}
             onChange={(values) => {

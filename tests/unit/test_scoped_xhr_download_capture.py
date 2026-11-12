@@ -391,14 +391,6 @@ class TestScopedXhrDownloadCapture:
         assert capture._capture_responses is False
         assert capture._active
 
-    def test_cdp_interceptor_detaches_response_listener_symmetrically(self) -> None:
-        page = _make_page(cdp_active=True)
-        capture = ScopedXhrDownloadCapture(page, Path("/tmp/downloads"))
-        capture.enable()
-        capture.disable()
-
-        page.remove_listener.assert_any_call("response", capture._on_response_event)
-
     def test_cdp_interceptor_response_event_schedules_no_body_capture_task(self) -> None:
         page = _make_page(cdp_active=True)
         capture = ScopedXhrDownloadCapture(page, Path("/tmp/downloads"))

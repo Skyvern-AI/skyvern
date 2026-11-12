@@ -29,11 +29,13 @@ from agents import (
 from agents.items import TResponseOutputItem
 from agents.models.interface import Model
 from agents.tool_context import ToolContext
+from jsonschema import Draft202012Validator
 from litellm.types.utils import ModelResponse as LitellmResponse
 from openai.types.responses import ResponseFunctionToolCall
 from pydantic import JsonValue, ValidationError
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
+from structlog.testing import capture_logs
 
 from skyvern.core.script_generations import real_skyvern_page_ai
 from skyvern.core.script_generations.real_skyvern_page_ai import _render_template_with_label
@@ -60,6 +62,7 @@ from skyvern.forge.sdk.workflow.models import agent_step_loop, agent_step_tools
 from skyvern.forge.sdk.workflow.models.agent_step_block import AgentStepBlock
 from skyvern.forge.sdk.workflow.models.block import (
     ConditionalBlock,
+    DownloadToS3Block,
     ExtractionBlock,
     HttpRequestBlock,
     LoginBlock,
@@ -561,6 +564,81 @@ async def test_a_stored_step_listing_pdf_parser_is_offered_file_url_parser(
     assert "pdf_parser" not in json.dumps(offered)
 
 
+SHEET_URL = "https://docs.google.com/spreadsheets/d/sheet_id/edit"
+
+
+def _sheets_write(values: JsonValue, call_id: str = "sheet") -> list[TResponseOutputItem]:
+    arguments = {
+        "spreadsheet_url": SHEET_URL,
+        "sheet_name": "Sheet1",
+        "range": "A1",
+        "credential_id": "goac_test",
+        "write_mode": "update",
+        "values": values,
+    }
+    return [scripted_call("run_block", {"block_type": "google_sheets_write", "arguments": arguments}, call_id=call_id)]
+
+
+@pytest.fixture
+def sheets_writes(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+    monkeypatch.setattr(app.AGENT_FUNCTION, "get_google_sheets_credentials", AsyncMock(return_value="token"))
+    write = AsyncMock(return_value={"updatedRange": "Sheet1!A1", "updatedRows": 1})
+    monkeypatch.setattr(app.AGENT_FUNCTION, "google_sheets_values_update", write)
+    return write
+
+
+def _offered_run_block(model: _ScriptedModel) -> FunctionTool:
+    return next(tool for tool in model.tools[0] if isinstance(tool, FunctionTool) and tool.name == "run_block")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tools", [["google_sheets_write"], ["google_sheets_write", "text_prompt"]])
+async def test_run_block_offers_each_listed_blocks_argument_schema_before_the_first_call(
+    monkeypatch: pytest.MonkeyPatch, database: AgentDB, sheets_writes: AsyncMock, tools: list[str]
+) -> None:
+    monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
+    (sheet_call,) = (json.loads(call.arguments)["arguments"] for call in _sheets_write(json.dumps([["12.5%"]])))
+    calls = {
+        "google_sheets_write": (sheet_call, {**sheet_call, "values": [["12.5%"]]}),
+        "text_prompt": ({"prompt": "Hi"}, {"prompt": ["Hi"]}),
+    }
+    invalid = [
+        [scripted_call("run_block", {"block_type": name, "arguments": calls[name][1]}, call_id=name)] for name in tools
+    ]
+    model = _ScriptedModel([*invalid, _sheets_write(json.dumps([["12.5%"]]), call_id="write"), VALID_FINISH])
+
+    await _run_agent_block(monkeypatch, LUNA_MEDIUM, model, tools=tools)
+
+    write = json.loads(tool_outputs_for(model.inputs[-1][1], "write")[0])
+    assert write["status"] == "completed"
+    assert write["output"]["updated_range"] == "Sheet1!A1"
+    sheets_writes.assert_awaited_once()
+    assert sheets_writes.await_args is not None
+    assert sheets_writes.await_args.kwargs["values"] == [["12.5%"]]
+    offer = _offered_run_block(model).params_json_schema
+    listed = offer["properties"]["block_type"]["enum"]
+    arguments = offer["properties"]["arguments"]
+    branches = [arguments] if len(listed) == 1 else arguments["anyOf"]
+    for name, branch in zip(listed, branches, strict=True):
+        report = json.loads(tool_outputs_for(model.inputs[-1][1], name)[0])
+        assert report["status"] == "invalid_arguments", name
+        recovery = report["argument_schema"]
+        recovery_defs = recovery.pop("$defs", {})
+        assert branch == recovery, name
+        assert recovery_defs.items() <= offer.get("$defs", {}).items(), name
+        recovery["$defs"] = recovery_defs
+        good, bad = calls[name]
+        for schema in ({**branch, "$defs": offer.get("$defs", {})}, recovery):
+            assert Draft202012Validator(schema).is_valid(good), name
+            assert not Draft202012Validator(schema).is_valid(bad), name
+    assert set(re.findall(r'"#/\$defs/(\w+)"', json.dumps(offer))) <= set(offer.get("$defs", {}))
+    assert branches[listed.index("google_sheets_write")]["properties"]["values"]["type"] == "string"
+    validator = Draft202012Validator(offer)
+    written = {"block_type": "google_sheets_write", "arguments": sheet_call}
+    assert validator.is_valid(written)
+    assert not validator.is_valid({**written, "arguments": calls["google_sheets_write"][1]})
+
+
 def test_a_saved_list_naming_pdf_parser_reads_as_file_url_parser() -> None:
     block = AgentStepBlockYAML(label="agent", prompt="Find the answer.", tools=["pdf_parser", "file_url_parser"])
 
@@ -585,6 +663,58 @@ async def test_a_run_block_call_for_an_unlisted_block_type_runs_no_child(
     assert [row.block_type for row in rows] == [BlockType.AGENT_STEP]
     assert child_prompts == []
     assert "['http_request']" in tool_outputs_for(model.inputs[1][1], "t")[0]
+
+
+@pytest.mark.asyncio
+async def test_a_call_to_an_unoffered_tool_name_returns_the_right_call_and_the_step_continues(
+    monkeypatch: pytest.MonkeyPatch, database: AgentDB, tmp_path: Path
+) -> None:
+    monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
+    downloaded = tmp_path / "report.pdf"
+    downloaded.write_bytes(b"%PDF")
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.workflow.models.block.resolve_local_or_download_file",
+        AsyncMock(return_value=str(downloaded)),
+    )
+    monkeypatch.setattr(DownloadToS3Block, "_upload_file_to_s3", AsyncMock())
+    url = "https://example.com/report.pdf"
+    model = _ScriptedModel(
+        [
+            [
+                scripted_call("run_block", {}, call_id="n").model_copy(update={"namespace": "other"}),
+                scripted_call("download_to_s3", {"url": url}, call_id="u"),
+                scripted_call("run_block", {"block_type": "download_to_s3", "arguments": {"url": url}}, call_id="r"),
+            ],
+            [scripted_call("open_file", {}, call_id="o")],
+            VALID_FINISH,
+        ]
+    )
+
+    with capture_logs() as logs:
+        async with asyncio.timeout(10):
+            result, _ = await _run_agent_block(monkeypatch, LUNA_MEDIUM, model)
+
+    assert (result.status, result.failure_reason) == (BlockStatus.completed, None)
+    assert isinstance(result.output_parameter_value, dict)
+    assert result.output_parameter_value["stop_reason"] == "completed"
+    (hint,) = tool_outputs_for(model.inputs[1][1], "u")
+    assert "run_block" in hint and 'block_type="download_to_s3"' in hint
+    (unknown,) = tool_outputs_for(model.inputs[2][1], "o")
+    assert all(repr(name) in unknown for name in ALL_TOOLS)
+    rows = await database.observer.get_workflow_run_blocks(workflow_run_id=RUN, organization_id=ORG)
+    (agent_row,) = (row for row in rows if row.block_type == BlockType.AGENT_STEP)
+    children = [row for row in rows if row.parent_workflow_run_block_id == agent_row.workflow_run_block_id]
+    assert [(row.block_type, row.status) for row in children] == [(BlockType.DOWNLOAD_TO_S3, "completed")]
+    assert all(names == ALL_TOOLS for names in model.tool_names)
+    assert [
+        (log["label"], log["tool_name"], log["workflow_run_id"], log["workflow_run_block_id"])
+        for log in logs
+        if log["event"] == "Agent step model called a tool it was not given"
+    ] == [
+        ("agent", "other.run_block", RUN, agent_row.workflow_run_block_id),
+        ("agent", "download_to_s3", RUN, agent_row.workflow_run_block_id),
+        ("agent", "open_file", RUN, agent_row.workflow_run_block_id),
+    ]
 
 
 @pytest.mark.parametrize("name", ["run_block", "update_workflow", "create_schedule", "not_a_tool"])
@@ -829,12 +959,21 @@ async def test_the_agent_block_sends_its_pinned_effort_on_a_bare_gpt_5_name(monk
 
 
 def test_every_block_tool_schema_defines_exactly_the_definitions_it_references() -> None:
-    state = cast(agent_step_loop._RunState, SimpleNamespace(credential_keys=["login_credential"]))
-    for tool in agent_step_tools.AGENT_BLOCK_TOOLS.values():
-        if isinstance(tool, agent_step_tools.BlockTool):
-            schema = agent_step_loop._arguments_schema(tool, state)
-            references = set(re.findall(r'"#/\$defs/(\w+)"', json.dumps(schema)))
-            assert references == set(schema.get("$defs", {})), tool.yaml_class.__name__
+    keys = ["login_credential"]
+    schemas = [
+        (tool.yaml_class.__name__, agent_step_loop._arguments_schema(tool, keys))
+        for tool in agent_step_tools.AGENT_BLOCK_TOOLS.values()
+        if isinstance(tool, agent_step_tools.BlockTool)
+    ]
+    schemas.append(("run_block", agent_step_loop._run_block_schema(keys, list(agent_step_tools.RUN_BLOCK_TYPES))))
+    for name, schema in schemas:
+        references = set(re.findall(r'"#/\$defs/(\w+)"', json.dumps(schema)))
+        assert references == set(schema.get("$defs", {})), name
+    # run_block hoists every listed block's $defs into one root, so a shared name must mean the same thing.
+    shared: dict[str, Any] = {}
+    for _, tool in agent_step_tools.RUN_BLOCK_TYPES.values():
+        for key, definition in agent_step_loop._arguments_schema(tool, keys).get("$defs", {}).items():
+            assert shared.setdefault(key, definition) == definition, key
 
 
 def test_every_block_type_is_an_agent_tool_or_says_why_not() -> None:

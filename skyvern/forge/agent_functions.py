@@ -10,7 +10,7 @@ from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, AbstractContextManager, asynccontextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Callable, Literal, TypedDict
+from typing import TYPE_CHECKING, Any, BinaryIO, Callable, Literal, TypedDict
 
 import httpx
 import structlog
@@ -51,6 +51,7 @@ from skyvern.forge.sdk.copilot.config import (
     authoring_capability_for_request,
 )
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.credential_site_policy import LoginSite
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.experimentation.billing_tier import BillingTier
 from skyvern.forge.sdk.models import Step, StepStatus
@@ -63,6 +64,7 @@ from skyvern.forge.sdk.schemas.credentials import (
     NonEmptyCreditCardCredential,
     NonEmptyPasswordCredential,
     SecretCredential,
+    VaultPasskey,
 )
 from skyvern.forge.sdk.schemas.feedback import AgentFeedback, FeedbackEvent
 from skyvern.forge.sdk.schemas.files import FileInfo
@@ -90,8 +92,11 @@ from skyvern.forge.sdk.services.request_principal import (
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, BlockTypeVar, CodeFailure
 from skyvern.forge.sdk.workflow.retry_policy import WORKFLOW_WEBHOOK_HTTP_TIMEOUT_SECONDS
+from skyvern.schemas.emails import GmailSendErrorCode, GmailSendOutcome
 from skyvern.schemas.run_enums import RunEngine, RunType
 from skyvern.schemas.workflows import BlockResult, CodeBlockFailureKind, FileStorageType, FileUploadDestination
+from skyvern.services.email.gmail import GmailSendResult
+from skyvern.services.email.gmail_client import GmailAPIError
 from skyvern.services.otp_email import EmailOTPSearchError, EmailOTPVerificationContext, build_email_otp_sources
 from skyvern.services.webhook_delivery import WebhookDeliveryAttempts, bound_webhook_request
 from skyvern.services.workflow_run_group_service import schedule_advance_after_terminal
@@ -119,6 +124,7 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.db.models import FolderModel
     from skyvern.forge.sdk.integrations.catalog import AccountsById, IntegrationEntry
     from skyvern.forge.sdk.schemas.totp_codes import OTPType
+    from skyvern.forge.sdk.schemas.workflow_copilot import CopilotTurnControl
     from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
     from skyvern.forge.sdk.workflow.code_block_authorized_files import (
         AuthorizedFileMaterialization,
@@ -293,12 +299,31 @@ class CopilotTriggerSummary:
     workflow_permanent_id: str
     source_kind: str
     mapping: dict[str, str]
+    settings: dict[str, JsonValue]
     enabled: bool
     created_at: str
+    note: str | None = None
+
+
+@dataclass(frozen=True)
+class CopilotTriggerSource:
+    source_kind: str
+    description: str
+    # Adapter-managed sources are set up outside Copilot; `set_up_in` names where.
+    creatable_in_copilot: bool
+    settings_schema: dict[str, JsonValue]
+    example_event: dict[str, JsonValue]
+    fires_on_its_own: bool
+    set_up_in: str | None = None
 
 
 TriggerMappingReasonCode = Literal[
-    "mapping_path_missing", "invalid_mapping", "invalid_parameters", "owner_lookup_failed", "owner_not_authorized"
+    "mapping_path_missing",
+    "invalid_mapping",
+    "invalid_parameters",
+    "owner_lookup_failed",
+    "owner_not_authorized",
+    "email_not_mapped",
 ]
 
 
@@ -308,6 +333,7 @@ class CopilotTriggerResult:
     triggers: list[CopilotTriggerSummary] = field(default_factory=list)
     resolved_parameters: dict[str, JsonValue] | None = None
     reason_code: TriggerMappingReasonCode | None = None
+    after_create: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1007,6 +1033,12 @@ async def _convert_css_shape_to_string(
 
 
 @dataclass(frozen=True)
+class ProxyProviderRefusal:
+    status: int
+    reason: str
+
+
+@dataclass(frozen=True)
 class RecordingVideoSizeResolution:
     """Outcome of resolving the recording resolution for a run.
 
@@ -1036,6 +1068,10 @@ class AgentFunction:
     async def prepare_gmail_hop_tokens(self, *, workflow_run: WorkflowRun, workflow: Workflow) -> None:
         return None
 
+    async def request_gmail_hop_tokens(self, *, organization_id: str, workflow_run_id: str, workflow: Workflow) -> None:
+        """Ask whichever process may mint to issue this run's capabilities; a run can start where it cannot mint."""
+        return None
+
     async def execute_gmail_inbox_for_run(
         self,
         *,
@@ -1050,13 +1086,46 @@ class AgentFunction:
         newer_than_days: int | None,
         max_results: int,
         include_body: bool,
+        include_attachments: bool = False,
     ) -> list[dict[str, object]]:
-        from skyvern.services.email import GmailAPIError
-
         raise GmailAPIError(status=404, code="integration_unavailable", message="Gmail integration unavailable")
+
+    async def download_gmail_attachment_for_run(
+        self,
+        *,
+        organization_id: str,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        connection_id: str,
+        hop_token: str | None,
+        message_id: str,
+        attachment_id: str,
+        download_grant: str,
+        max_bytes: int,
+        destination: BinaryIO,
+    ) -> int:
+        """Stream one attachment of a connected account into destination and return the bytes written."""
+        raise GmailAPIError(status=404, code="integration_unavailable", message="Gmail integration unavailable")
+
+    async def send_gmail_for_run(
+        self,
+        *,
+        organization_id: str,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        connection_id: str,
+        hop_token: str | None,
+        mime_bytes: bytes,
+    ) -> GmailSendResult:
+        """Send one message from a connected account; mime_bytes carries no From header."""
+        return GmailSendResult(GmailSendOutcome.FAILED, error_code=GmailSendErrorCode.CONFIGURATION)
 
     async def nango_powerbi_catalog_available(self, organization_id: str) -> bool:
         return False
+
+    async def hidden_integration_ids(self, organization_id: str) -> frozenset[str]:
+        """Catalog entries this organization must not see at all, not even as coming soon."""
+        return frozenset()
 
     async def powerbi_plan_allows(self, organization_id: str) -> bool | None:
         """None when the plan could not be read."""
@@ -1068,6 +1137,12 @@ class AgentFunction:
     async def get_powerbi_query_hop_tokens(
         self, *, organization_id: str, workflow_run_id: str, block_labels: list[str]
     ) -> dict[str, str]:
+        return {}
+
+    async def get_powerbi_query_hop_refusals(
+        self, *, organization_id: str, workflow_run_id: str, block_labels: list[str]
+    ) -> dict[str, str]:
+        """Per-block ``PowerBIHopRefusal`` values recorded when a run was issued no capability."""
         return {}
 
     async def ensure_email_forwarding_available(
@@ -1140,6 +1215,10 @@ class AgentFunction:
     async def can_access_browser_session_artifacts(
         self, principal: RequestPrincipal | None, organization_id: str, browser_session_id: str
     ) -> bool:
+        return True
+
+    async def role_allows(self, principal: RequestPrincipal | None, action: str) -> bool:
+        """Whether an enforced role grant allows ``action``; deployments without roles allow everything."""
         return True
 
     async def can_access_sessionless_artifacts(
@@ -1532,6 +1611,13 @@ class AgentFunction:
         (``time.monotonic()``), when that status says the host did not accept the provider's connection."""
         return None
 
+    async def proxy_provider_refusal(
+        self, *, browser_session_id: str, host: str, since_wall: float
+    ) -> ProxyProviderRefusal | None:
+        """The refusal, with the reason it stated, the proxy provider gave this browser's connection to ``host`` at
+        or after ``since_wall`` (``time.time()``)."""
+        return None
+
     async def capture_workflow_run_created(
         self,
         *,
@@ -1566,7 +1652,7 @@ class AgentFunction:
     def get_cloud_integration_entries(self) -> list[IntegrationEntry]:
         return []
 
-    async def get_cloud_integration_accounts(self, organization_id: str) -> AccountsById:
+    async def get_cloud_integration_accounts(self, organization_id: str, user_id: str | None = None) -> AccountsById:
         return {}
 
     def onepassword_instance_default_policy_mode(self) -> str:
@@ -1913,8 +1999,17 @@ class AgentFunction:
         del organization_id
         return CopilotOrganizationUsage(credits_note="This deployment does not track billing.")
 
-    async def create_copilot_webhook_trigger(
-        self, *, organization_id: str, workflow_permanent_id: str, mapping: dict[str, str]
+    def copilot_trigger_sources(self) -> list[CopilotTriggerSource]:
+        return []
+
+    async def create_copilot_trigger(
+        self,
+        *,
+        organization_id: str,
+        workflow_permanent_id: str,
+        source_kind: str,
+        settings: dict[str, JsonValue],
+        mapping: dict[str, str],
     ) -> CopilotTriggerResult:
         return CopilotTriggerResult(error=COPILOT_TRIGGERS_UNAVAILABLE)
 
@@ -1923,8 +2018,9 @@ class AgentFunction:
         *,
         organization_id: str,
         workflow_permanent_id: str,
+        source_kind: str,
         mapping: dict[str, str],
-        payload: dict[str, JsonValue],
+        payload: dict[str, JsonValue] | None,
     ) -> CopilotTriggerResult:
         return CopilotTriggerResult(error=COPILOT_TRIGGERS_UNAVAILABLE)
 
@@ -2159,6 +2255,22 @@ class AgentFunction:
         """Return an org-scoped API key; returns None in the base implementation."""
         return None
 
+    async def resolve_copilot_loopback_api_key(
+        self, principal: RequestPrincipal | None, organization_id: str, request_key: str | None
+    ) -> str | None:
+        """The key Copilot's tools send to the API on behalf of the chat user; raises HTTPException to refuse."""
+        return request_key
+
+    async def copilot_turn_control_allowed(
+        self,
+        principal: RequestPrincipal | None,
+        organization_id: str,
+        starter_user_id: str | None,
+        control: CopilotTurnControl,
+    ) -> bool:
+        """Whether the caller may steer, answer or cancel a running Copilot turn."""
+        return True
+
     async def browser_context_route_handlers_allowed(self, **_: Any) -> bool:
         return True
 
@@ -2185,8 +2297,21 @@ class AgentFunction:
     def note_browser_relaunch(self, browser_state: BrowserState | None, reason: str) -> None:
         """The next browser creation in this task replaces an earlier one of the same run. OSS no-op."""
 
+    def note_working_page_ready(self, browser_context: BrowserContext, page: Page) -> None:
+        """The state's working page is in place: its other pages are closed and any first navigation has run.
+        An override may only schedule work, never wait on it. OSS no-op."""
+
     def on_browser_run_released(self, browser_context: BrowserContext | BrowserArtifacts | None) -> None:
         """A run released a browser that no other run shares. OSS no-op."""
+
+    def set_browser_run_http_cache(self, browser_context: BrowserContext, generation: str | None) -> None:
+        """Start a fresh run-scoped static response store on this context, or turn it off with None. OSS no-op."""
+
+    def on_browser_context_retired(self, browser_context: BrowserContext) -> None:
+        """A replacement took over from this context, which no run uses again; it may never emit close. OSS no-op."""
+
+    def on_browser_context_abandoned(self, browser_context: BrowserContext) -> None:
+        """Creation failed after this context was created, so no run ever acquired it. OSS no-op."""
 
     async def on_run_har_captured(
         self,
@@ -2342,6 +2467,17 @@ class AgentFunction:
         vault_type: CredentialVaultType,
     ) -> bool:
         return False
+
+    async def register_bitwarden_passkeys(
+        self,
+        *,
+        workflow_run_id: str,
+        organization_id: str,
+        source_id: str,
+        vault_passkeys: list[VaultPasskey],
+        login_sites: list[LoginSite] | None,
+    ) -> None:
+        return None
 
     async def process_registered_credential_item(
         self,

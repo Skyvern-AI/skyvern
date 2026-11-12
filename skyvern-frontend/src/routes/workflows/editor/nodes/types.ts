@@ -31,6 +31,8 @@ export type NodeBaseData = {
   conditionalLabel?: string | null;
   conditionalNodeId?: string | null;
   conditionalMergeLabel?: string | null;
+  // The block's next_block_label as loaded. An explicit next equal to an enclosing merge is kept on save.
+  loadedNextLabel?: string | null;
 };
 
 export const errorMappingExampleValue = {

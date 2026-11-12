@@ -9264,7 +9264,8 @@
                 "type": "null"
               }
             ],
-            "title": "Max Steps Per Run"
+            "title": "Max Steps Per Run",
+            "description": "Action-step budget for one run, not an exact stop. On the skyvern-3.0 (Task V3) engine, except on action and validation blocks, the effective budget is never below 24: a positive value under 24 runs as 24, and a run still making progress can be granted steps past the budget."
           },
           "parameter_keys": {
             "anyOf": [
@@ -10489,15 +10490,18 @@
           },
           "bitwarden_client_id_aws_secret_key": {
             "type": "string",
-            "title": "Bitwarden Client Id Aws Secret Key"
+            "title": "Bitwarden Client Id Aws Secret Key",
+            "default": "SKYVERN_BITWARDEN_CLIENT_ID"
           },
           "bitwarden_client_secret_aws_secret_key": {
             "type": "string",
-            "title": "Bitwarden Client Secret Aws Secret Key"
+            "title": "Bitwarden Client Secret Aws Secret Key",
+            "default": "SKYVERN_BITWARDEN_CLIENT_SECRET"
           },
           "bitwarden_master_password_aws_secret_key": {
             "type": "string",
-            "title": "Bitwarden Master Password Aws Secret Key"
+            "title": "Bitwarden Master Password Aws Secret Key",
+            "default": "SKYVERN_BITWARDEN_MASTER_PASSWORD"
           },
           "bitwarden_collection_id": {
             "type": "string",
@@ -10511,9 +10515,6 @@
         "type": "object",
         "required": [
           "key",
-          "bitwarden_client_id_aws_secret_key",
-          "bitwarden_client_secret_aws_secret_key",
-          "bitwarden_master_password_aws_secret_key",
           "bitwarden_collection_id",
           "bitwarden_item_id"
         ],
@@ -10667,15 +10668,18 @@
           },
           "bitwarden_client_id_aws_secret_key": {
             "type": "string",
-            "title": "Bitwarden Client Id Aws Secret Key"
+            "title": "Bitwarden Client Id Aws Secret Key",
+            "default": "SKYVERN_BITWARDEN_CLIENT_ID"
           },
           "bitwarden_client_secret_aws_secret_key": {
             "type": "string",
-            "title": "Bitwarden Client Secret Aws Secret Key"
+            "title": "Bitwarden Client Secret Aws Secret Key",
+            "default": "SKYVERN_BITWARDEN_CLIENT_SECRET"
           },
           "bitwarden_master_password_aws_secret_key": {
             "type": "string",
-            "title": "Bitwarden Master Password Aws Secret Key"
+            "title": "Bitwarden Master Password Aws Secret Key",
+            "default": "SKYVERN_BITWARDEN_MASTER_PASSWORD"
           },
           "url_parameter_key": {
             "anyOf": [
@@ -10724,10 +10728,7 @@
         },
         "type": "object",
         "required": [
-          "key",
-          "bitwarden_client_id_aws_secret_key",
-          "bitwarden_client_secret_aws_secret_key",
-          "bitwarden_master_password_aws_secret_key"
+          "key"
         ],
         "title": "BitwardenLoginCredentialParameterYAML"
       },
@@ -10853,15 +10854,18 @@
           },
           "bitwarden_client_id_aws_secret_key": {
             "type": "string",
-            "title": "Bitwarden Client Id Aws Secret Key"
+            "title": "Bitwarden Client Id Aws Secret Key",
+            "default": "SKYVERN_BITWARDEN_CLIENT_ID"
           },
           "bitwarden_client_secret_aws_secret_key": {
             "type": "string",
-            "title": "Bitwarden Client Secret Aws Secret Key"
+            "title": "Bitwarden Client Secret Aws Secret Key",
+            "default": "SKYVERN_BITWARDEN_CLIENT_SECRET"
           },
           "bitwarden_master_password_aws_secret_key": {
             "type": "string",
-            "title": "Bitwarden Master Password Aws Secret Key"
+            "title": "Bitwarden Master Password Aws Secret Key",
+            "default": "SKYVERN_BITWARDEN_MASTER_PASSWORD"
           },
           "bitwarden_collection_id": {
             "type": "string",
@@ -10882,9 +10886,6 @@
         "type": "object",
         "required": [
           "key",
-          "bitwarden_client_id_aws_secret_key",
-          "bitwarden_client_secret_aws_secret_key",
-          "bitwarden_master_password_aws_secret_key",
           "bitwarden_collection_id",
           "bitwarden_identity_key",
           "bitwarden_identity_fields"
@@ -10957,6 +10958,17 @@
           "file"
         ],
         "title": "Body_upload_file_v1_upload_file_post"
+      },
+      "BotProtection": {
+        "type": "string",
+        "enum": [
+          "recaptcha",
+          "hcaptcha",
+          "cloudflare",
+          "akamai"
+        ],
+        "title": "BotProtection",
+        "description": "A service a site uses to tell people from automated browsers, such as a captcha."
       },
       "BranchCondition": {
         "properties": {
@@ -12913,6 +12925,17 @@
             "title": "Needs Live View",
             "description": "Whether a person will watch this session's browser live. Defaults to false, which suits unattended automation; the Skyvern app sets it because a session opened in the UI is watched. It requests a capability, not a particular browser, and cannot be used to select where the session runs.",
             "default": false
+          },
+          "bot_protection": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BotProtection"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The bot protection the target site uses, such as a captcha, when known. Together with url, it can determine where the session runs."
           }
         },
         "type": "object",
@@ -14752,6 +14775,17 @@
             ],
             "title": "Credential Id"
           },
+          "message_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Message Id"
+          },
           "folder": {
             "anyOf": [
               {
@@ -14968,7 +15002,10 @@
               }
             ],
             "title": "Connection Id",
-            "x-skyvern-connected-account": true
+            "x-skyvern-connected-account": true,
+            "x-skyvern-connected-account-when": {
+              "credential_source": "nango"
+            }
           },
           "credential_id": {
             "anyOf": [
@@ -14980,7 +15017,21 @@
               }
             ],
             "title": "Credential Id",
-            "x-skyvern-connected-account": true
+            "x-skyvern-connected-account": true,
+            "x-skyvern-connected-account-when": {
+              "credential_source": "native"
+            }
+          },
+          "message_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Message Id"
           },
           "folder": {
             "anyOf": [
@@ -15695,7 +15746,8 @@
                 "type": "null"
               }
             ],
-            "title": "Max Steps Per Run"
+            "title": "Max Steps Per Run",
+            "description": "Action-step budget for one run, not an exact stop. On the skyvern-3.0 (Task V3) engine, except on action and validation blocks, the effective budget is never below 24: a positive value under 24 runs as 24, and a run still making progress can be granted steps past the budget."
           },
           "parameter_keys": {
             "anyOf": [
@@ -16483,7 +16535,11 @@
               }
             ],
             "title": "Google Credential Id",
-            "x-skyvern-connected-account": true
+            "x-skyvern-connected-account": true,
+            "x-skyvern-connected-account-acts": true,
+            "x-skyvern-connected-account-when": {
+              "download_target": "google_drive"
+            }
           },
           "google_drive_folder_id": {
             "anyOf": [
@@ -16686,7 +16742,8 @@
                 "type": "null"
               }
             ],
-            "title": "Max Steps Per Run"
+            "title": "Max Steps Per Run",
+            "description": "Action-step budget for one run, not an exact stop. On the skyvern-3.0 (Task V3) engine, except on action and validation blocks, the effective budget is never below 24: a positive value under 24 runs as 24, and a run still making progress can be granted steps past the budget."
           },
           "parameter_keys": {
             "anyOf": [
@@ -17618,7 +17675,11 @@
               }
             ],
             "title": "Google Credential Id",
-            "x-skyvern-connected-account": true
+            "x-skyvern-connected-account": true,
+            "x-skyvern-connected-account-acts": true,
+            "x-skyvern-connected-account-when": {
+              "storage_type": "google_drive"
+            }
           },
           "google_drive_folder_id": {
             "anyOf": [
@@ -19069,7 +19130,8 @@
               }
             ],
             "title": "Credential Id",
-            "x-skyvern-connected-account": true
+            "x-skyvern-connected-account": true,
+            "x-skyvern-connected-account-acts": true
           },
           "write_mode": {
             "type": "string",
@@ -20848,7 +20910,8 @@
                 "type": "null"
               }
             ],
-            "title": "Max Steps Per Run"
+            "title": "Max Steps Per Run",
+            "description": "Action-step budget for one run, not an exact stop. On the skyvern-3.0 (Task V3) engine, except on action and validation blocks, the effective budget is never below 24: a positive value under 24 runs as 24, and a run still making progress can be granted steps past the budget."
           },
           "parameter_keys": {
             "anyOf": [
@@ -21667,7 +21730,8 @@
                 "type": "null"
               }
             ],
-            "title": "Max Steps Per Run"
+            "title": "Max Steps Per Run",
+            "description": "Action-step budget for one run, not an exact stop. On the skyvern-3.0 (Task V3) engine, except on action and validation blocks, the effective budget is never below 24: a positive value under 24 runs as 24, and a run still making progress can be granted steps past the budget."
           },
           "parameter_keys": {
             "anyOf": [
@@ -23281,7 +23345,10 @@
             "minLength": 1,
             "title": "Connection Id",
             "description": "Power BI connection ID for this user.",
-            "x-skyvern-connected-account": true
+            "x-skyvern-connected-account": true,
+            "x-skyvern-connected-account-when": {
+              "credential_source": "nango"
+            }
           },
           "credential_source": {
             "type": "string",
@@ -24702,6 +24769,37 @@
             ],
             "title": "Credential Id"
           },
+          "credential_source": {
+            "type": "string",
+            "enum": [
+              "native",
+              "nango"
+            ],
+            "title": "Credential Source",
+            "default": "native"
+          },
+          "connection_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connection Id"
+          },
+          "reply_to_message_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reply To Message Id"
+          },
           "cc": {
             "items": {
               "type": "string"
@@ -24937,7 +25035,49 @@
             ],
             "title": "Credential Id",
             "description": "ID of a connected Google account that has send permission. Used only with transport 'gmail'.",
-            "x-skyvern-connected-account": true
+            "x-skyvern-connected-account": true,
+            "x-skyvern-connected-account-acts": true,
+            "x-skyvern-connected-account-when": {
+              "transport": "gmail"
+            }
+          },
+          "credential_source": {
+            "type": "string",
+            "enum": [
+              "native",
+              "nango"
+            ],
+            "title": "Credential Source",
+            "description": "'nango' sends from the connected account named by connection_id instead of credential_id.",
+            "default": "native"
+          },
+          "connection_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connection Id",
+            "x-skyvern-connected-account": true,
+            "x-skyvern-connected-account-acts": true,
+            "x-skyvern-connected-account-when": {
+              "credential_source": "nango"
+            }
+          },
+          "reply_to_message_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reply To Message Id",
+            "description": "Gmail message ID to reply to in its original thread; requires send and read permissions."
           },
           "cc": {
             "items": {
@@ -26507,7 +26647,8 @@
                 "type": "null"
               }
             ],
-            "title": "Max Steps Per Run"
+            "title": "Max Steps Per Run",
+            "description": "Action-step budget for one run, not an exact stop. On the skyvern-3.0 (Task V3) engine, except on action and validation blocks, the effective budget is never below 24: a positive value under 24 runs as 24, and a run still making progress can be granted steps past the budget."
           },
           "parameter_keys": {
             "anyOf": [
@@ -26838,7 +26979,7 @@
               }
             ],
             "title": "Max Steps",
-            "description": "\nMaximum number of steps the task can take. Task will fail if it exceeds this number. Cautions: you are charged per step so please set this number to a reasonable value. Contact sales@skyvern.com for custom pricing.\n",
+            "description": "\nMaximum number of steps the task can take. Task will fail if it exceeds this number. Cautions: a run that takes more steps can cost more, so please set this number to a reasonable value. Contact sales@skyvern.com for custom pricing.\n",
             "examples": [
               10,
               25
@@ -27179,7 +27320,7 @@
               }
             ],
             "title": "Max Steps",
-            "description": "\nMaximum number of steps the task can take. Task will fail if it exceeds this number. Cautions: you are charged per step so please set this number to a reasonable value. Contact sales@skyvern.com for custom pricing.\n",
+            "description": "\nMaximum number of steps the task can take. Task will fail if it exceeds this number. Cautions: a run that takes more steps can cost more, so please set this number to a reasonable value. Contact sales@skyvern.com for custom pricing.\n",
             "examples": [
               10,
               25
@@ -30077,7 +30218,8 @@
                 "type": "null"
               }
             ],
-            "title": "Max Steps Per Run"
+            "title": "Max Steps Per Run",
+            "description": "Action-step budget for one run, not an exact stop. On the skyvern-3.0 (Task V3) engine, except on action and validation blocks, the effective budget is never below 24: a positive value under 24 runs as 24, and a run still making progress can be granted steps past the budget."
           },
           "parameter_keys": {
             "anyOf": [

@@ -19,7 +19,11 @@ import {
   runIsLogicallyActive,
 } from "../workflowRun/runRetryState";
 import { isRecord } from "@/util/utils";
-import { basicLocalTimeFormat, normalizeUtcTimestamp } from "@/util/timeFormat";
+import {
+  basicLocalTimeFormat,
+  formatSeconds,
+  normalizeUtcTimestamp,
+} from "@/util/timeFormat";
 
 export type RunOutcome = "idle" | "running" | "failed" | "success";
 
@@ -44,19 +48,7 @@ export function formatElapsed(
     ? new Date(normalizeUtcTimestamp(endIso)).getTime()
     : Date.now();
   const end = Number.isNaN(endMs) ? Date.now() : endMs;
-  const sec = Math.max(0, Math.round((end - start) / 1000));
-  if (sec < 60) {
-    return `${sec}s`;
-  }
-  if (sec < 3600) {
-    return `${Math.floor(sec / 60)}m ${sec % 60}s`;
-  }
-  // Without these, a long run reads as raw minutes — a 40-day run rendered
-  // "58403m 52s", which is unreadable exactly when elapsed matters most.
-  if (sec < 86400) {
-    return `${Math.floor(sec / 3600)}h ${Math.floor((sec % 3600) / 60)}m`;
-  }
-  return `${Math.floor(sec / 86400)}d ${Math.floor((sec % 86400) / 3600)}h`;
+  return formatSeconds((end - start) / 1000);
 }
 
 // The elapsed value's hover tooltip supplements the visible Created timestamp

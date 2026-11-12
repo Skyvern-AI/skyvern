@@ -144,6 +144,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowYAMLConversionRequest,
     copilot_proposal_metadata,
 )
+from skyvern.forge.sdk.services.request_principal import AuthKind, RequestPrincipal
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
 from skyvern.schemas.workflows import WorkflowCreateYAMLRequest
@@ -225,7 +226,7 @@ def _make_chat_request(
 
 
 @pytest.mark.asyncio
-async def test_demonstration_requires_shared_cache_for_record_control_and_done(
+async def test_multi_process_server_without_shared_cache_refuses_record_control_and_done(
     monkeypatch: pytest.MonkeyPatch,
     api_key_request: MagicMock,
     organization: SimpleNamespace,
@@ -233,6 +234,7 @@ async def test_demonstration_requires_shared_cache_for_record_control_and_done(
     cache = _FakeCache()
     cache.is_shared = False
     monkeypatch.setattr(app, "CACHE", cache)
+    monkeypatch.setenv("WEB_CONCURRENCY", "4")
 
     calls = (
         workflow_copilot_demonstration_record(
@@ -259,7 +261,7 @@ async def test_demonstration_requires_shared_cache_for_record_control_and_done(
     for call in calls:
         with pytest.raises(HTTPException) as exc_info:
             await call
-        assert exc_info.value.status_code == 403
+        assert exc_info.value.status_code == 501
 
 
 @pytest.mark.asyncio
@@ -874,11 +876,13 @@ async def test_finalise_normal_turn_applies_a_verified_proposal_with_auto_accept
         (WorkflowPinnedByRunGroup("wf-canonical"), "_AUTO_ACCEPT_DEFERRED_FOR_RUN_GROUP"),
         # A folder check refuses before any write, so the draft must stay reviewable rather than fail the turn.
         (HTTPException(status_code=403, detail="folder"), "_AUTO_ACCEPT_DEFERRED_FOR_FOLDER_ACCESS"),
+        # An unfinished run reads the version row when its worker starts, so nothing may write it in place.
+        (None, "_AUTO_ACCEPT_DEFERRED_FOR_UNFINISHED_RUN"),
     ],
 )
 @pytest.mark.asyncio
 async def test_auto_accept_refused_before_any_write_leaves_the_draft_pending(
-    monkeypatch: pytest.MonkeyPatch, refusal: Exception, reason: str
+    monkeypatch: pytest.MonkeyPatch, refusal: Exception | None, reason: str
 ) -> None:
     chat = SimpleNamespace(
         organization_id="org-1",
@@ -901,27 +905,35 @@ async def test_auto_accept_refused_before_any_write_leaves_the_draft_pending(
         has_staged_proposal=True,
     )
     restore, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
-    monkeypatch.setattr(
-        workflow_copilot_route,
-        "_commit_staged_workflow",
-        AsyncMock(side_effect=refusal),
-    )
+    commit = AsyncMock(side_effect=refusal)
+    monkeypatch.setattr(workflow_copilot_route, "_commit_staged_workflow", commit)
+    holding_run = AsyncMock(return_value="wr_queued" if refusal is None else None)
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "get_unfinished_run_id_on_version", holding_run)
     stream = MagicMock(send=AsyncMock(return_value=True))
+    chat_request = _make_chat_request()
 
     await workflow_copilot_route._finalise_normal_turn(
         stream=stream,
         chat=chat,
         organization_id="org-1",
         original_workflow=original_workflow,
-        chat_request=_make_chat_request(),
+        chat_request=chat_request,
         agent_result=agent_result,
     )
 
     response_frame = stream.send.await_args.args[0]
     assert response_frame.workflow_applied is False
     assert response_frame.proposal_disposition == "review_tested"
-    assert getattr(workflow_copilot_route, reason) in response_frame.message
+    expected = getattr(workflow_copilot_route, reason)
+    if refusal is None:
+        expected = expected.format(workflow_run_id="wr_queued")
+    assert expected in response_frame.message
     restore.assert_not_awaited()
+    assert commit.await_count == (0 if refusal is None else 1)
+    # The hold must ask about the version row this turn would overwrite.
+    holding_run.assert_awaited_once_with("org-1", "wpid-1", chat_request.workflow_id)
+    if commit.await_args is not None:
+        assert commit.await_args.kwargs["workflow_id"] == chat_request.workflow_id
     publication = workflow_params.publish_workflow_copilot_candidate.await_args
     assert publication is not None
     assert publication.kwargs["proposal"] is not None
@@ -5832,7 +5844,6 @@ async def test_request_webhook_is_validated_before_staging_once(
         )
         await workflow_update.restore_pending_workflow_proposal(ctx)
         ctx.workflow_copilot_chat_id = None
-        ctx.google_connection_turn_start_bindings = ()
         contexts.append(ctx)
         updates.append(await workflow_update._update_workflow({"workflow_yaml": ctx.workflow_yaml}, ctx))
         edited = yaml.safe_load(ctx.workflow_yaml)
@@ -9073,8 +9084,8 @@ async def test_test_end_to_end_route_hands_the_proposal_bound_account_to_the_age
         "  Cookie: synthetic-proposal-cookie\n"
         "workflow_definition:\n"
         "  blocks:\n"
-        "    - label: write_visitor_count_to_sheet\n"
-        "      block_type: google_sheets_write\n"
+        "    - label: read_visitor_count_from_sheet\n"
+        "      block_type: google_sheets_read\n"
         "      credential_id: goac_route_bound\n"
         "    - label: sign_in\n"
         "      block_type: login\n"
@@ -9602,6 +9613,7 @@ async def test_a_staged_commit_that_landed_before_the_write_failed_is_not_denied
     _restore, workflow_params = setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
     commit = AsyncMock()
     monkeypatch.setattr(workflow_copilot_route, "_commit_staged_workflow", commit)
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "get_unfinished_run_id_on_version", AsyncMock(return_value=None))
     reads = 0
 
     async def history(workflow_copilot_chat_id: str) -> list[Any]:
@@ -10320,3 +10332,59 @@ async def test_convert_route_stitches_only_a_version_2_top_level(version_line: s
 
     blocks = response.workflow_definition["blocks"]
     assert [block["next_block_label"] for block in blocks] == [first_next, None]
+
+
+@pytest.mark.asyncio
+async def test_copilot_loopback_key_is_the_request_key_unless_the_hook_replaces_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(workflow_copilot_route, "get_request_principal", lambda: None)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "resolve_org_api_key", AsyncMock(return_value="org-key"))
+    with_key = SimpleNamespace(headers={"x-api-key": "ui-key"})
+    without_key = SimpleNamespace(headers={})
+
+    assert await workflow_copilot_route._resolve_copilot_api_key(with_key, "o_1") == "ui-key"  # type: ignore[arg-type]
+    assert await workflow_copilot_route._resolve_copilot_api_key(without_key, "o_1") == "org-key"  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("auth_kind", "recorded"),
+    [
+        (AuthKind.ui_session_and_bearer, "user_starter"),
+        (AuthKind.member_api_key, "user_starter"),
+        (AuthKind.api_key_and_bearer, None),
+        (AuthKind.scoped_api_key, None),
+    ],
+)
+async def test_a_copilot_turn_records_the_person_who_started_it(
+    monkeypatch: pytest.MonkeyPatch,
+    api_key_request: MagicMock,
+    copilot_stream: MagicMock,
+    organization: SimpleNamespace,
+    auth_kind: AuthKind,
+    recorded: str | None,
+) -> None:
+    captured = install_fake_create(monkeypatch)
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(
+        workflow_id="wf-canonical", title="Original", description="Original description", workflow_definition=None
+    )
+    result = AgentResult(user_response="done", updated_workflow=None, global_llm_context=None)
+    setup_new_copilot_mocks(monkeypatch, chat, original_workflow, result)
+    monkeypatch.setattr(workflow_copilot_route, "run_copilot_agent", AsyncMock(return_value=result))
+    # An organization key sent with a bearer acts for the organization, so it records no person.
+    starter = RequestPrincipal("org-1", auth_kind, "user_starter", "org:member")
+    monkeypatch.setattr(workflow_copilot_route, "get_request_principal", lambda: starter)
+
+    await workflow_copilot_chat_post(api_key_request, _make_chat_request(), organization)
+    await captured["handler"](copilot_stream)
+
+    pending_turn = app.DATABASE.workflow_params.start_copilot_turn.await_args.kwargs["pending_turn"]
+    assert pending_turn.starter_user_id == recorded

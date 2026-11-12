@@ -1281,6 +1281,21 @@ class SkyvernElement:
                 raise InvalidElementForTextInput(element_id=self.get_id(), tag_name=self.get_tag_name())
             raise
 
+    async def commit_input_value(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
+        # An atomic fill emits only `input`, so a form that tracks edits on `change`/`blur` keeps its own state
+        # empty and leaves its submit disabled while the field visibly holds the value. Best effort: a dispatch
+        # failure must not fail a write that already landed.
+        locator = self.get_locator()
+        for event_name in ("change", "blur"):
+            try:
+                await locator.dispatch_event(event_name, timeout=timeout)
+            except Exception:
+                LOG.debug(
+                    "Failed to dispatch commit event after an atomic fill",
+                    event_name=event_name,
+                    element_id=self.get_id(),
+                )
+
     async def input_clear(self, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
         locator = self.get_locator()
         try:

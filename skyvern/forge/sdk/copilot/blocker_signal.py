@@ -89,7 +89,7 @@ _INTERNAL_TOOL_NAME_TOKENS: tuple[str, ...] = (
     "get_browser_screenshot",
     "list_credentials",
     "list_integrations",
-    "request_google_connection",
+    "request_connection",
     "offer_demonstration",
     "read_google_sheet",
     "list_workflow_triggers",

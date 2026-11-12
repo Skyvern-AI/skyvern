@@ -53,7 +53,17 @@ vi.mock("./panes", async (importOriginal) => {
   };
 });
 vi.mock("./BrowserTab", () => ({ BrowserTab: () => null }));
-vi.mock("./EditorTab", () => ({ EditorTab: () => null }));
+// The Editor reports whether the shell has Copilot on screen, as the Doc's Copilot note reads it.
+vi.mock("./EditorTab", async () => {
+  const { useStudioShellContext } = await import("./StudioShellContext");
+  return {
+    EditorTab: () => (
+      <span data-testid="copilot-on-screen">
+        {String(useStudioShellContext().isPaneOnScreen?.("copilot"))}
+      </span>
+    ),
+  };
+});
 vi.mock("./RunTab", () => ({ RunTab: () => null }));
 vi.mock("./runview/RunPaneHeader", () => ({
   RunPaneActions: () => null,
@@ -200,6 +210,53 @@ describe("StudioShell with a pane folded for the Doc", () => {
     expect(shown()).toEqual(["Browser"]);
   });
 
+  const copilotOnScreen = () =>
+    screen.getAllByTestId("copilot-on-screen")[0]!.textContent;
+
+  test("Copilot folded into a strip is not on screen", () => {
+    const open = renderDoc("editor,copilot");
+    expect(copilotOnScreen()).toBe("true");
+    open.unmount();
+    docFold.folded = ["copilot"];
+    renderDoc("editor,copilot");
+    expect(copilotOnScreen()).toBe("false");
+  });
+
+  test("the Editor growing over the stage leaves Copilot not on screen", () => {
+    // A measurable pane and an animation that has not finished: the row is still mounted under the Editor.
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({
+      left: 0,
+      top: 0,
+      width: 800,
+      height: 600,
+    } as DOMRect);
+    Object.defineProperty(HTMLElement.prototype, "animate", {
+      configurable: true,
+      value: () => ({ cancel: () => {}, onfinish: null }),
+    });
+    try {
+      renderDoc("editor,copilot");
+      expect(copilotOnScreen()).toBe("true");
+      fireEvent.click(
+        screen.getByRole("button", {
+          name: `Expand ${paneAccessibleName("editor")} pane`,
+        }),
+      );
+      expect(copilotOnScreen()).toBe("false");
+    } finally {
+      vi.restoreAllMocks();
+      Reflect.deleteProperty(HTMLElement.prototype, "animate");
+    }
+  });
+
+  test("a folded Copilot opened over the stage is on screen", () => {
+    docFold.folded = ["copilot"];
+    renderDoc("editor,copilot");
+    expect(copilotOnScreen()).toBe("false");
+    fireEvent.click(screen.getByRole("button", { name: /^Show Copilot pane/ }));
+    expect(copilotOnScreen()).toBe("true");
+  });
+
   test("signing in yourself shows a folded Browser", () => {
     docFold.folded = ["browser"];
     renderDoc("editor,browser");
@@ -308,6 +365,17 @@ describe("StudioShell at phone width", () => {
         .getByRole("button", { name: "Browser" })
         .getAttribute("aria-pressed"),
     ).toBe("true");
+  });
+
+  test("Copilot behind the shown pane is not on screen", () => {
+    renderPhone();
+    const onScreen = () =>
+      screen.getAllByTestId("copilot-on-screen")[0]!.textContent;
+    expect(onScreen()).toBe("true");
+    fireEvent.click(
+      within(paneSwitch()).getByRole("button", { name: "Editor" }),
+    );
+    expect(onScreen()).toBe("false");
   });
 
   test("picking another run while Run is already open shows Run", () => {

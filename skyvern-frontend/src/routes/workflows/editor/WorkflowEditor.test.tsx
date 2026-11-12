@@ -26,7 +26,7 @@ import {
 } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
-import { AxiosError } from "axios";
+import { AxiosError, AxiosHeaders } from "axios";
 import { parse, stringify } from "yaml";
 
 import {
@@ -581,6 +581,25 @@ describe("WorkflowEditor deleted-agent run fallback", () => {
 
     expect(screen.queryByTestId("run-view-body")).toBeNull();
     expect(screen.queryByText(/Agent deleted on/)).toBeNull();
+  });
+
+  test("shows the 404 page when the workflow query 404s and no run can stand in", () => {
+    workflowQueryMock.mockReturnValue({
+      data: undefined,
+      isLoading: false,
+      isError: true,
+      error: new AxiosError("Not Found", "404", undefined, undefined, {
+        status: 404,
+        statusText: "Not Found",
+        data: {},
+        headers: {},
+        config: { headers: new AxiosHeaders() },
+      }),
+    });
+
+    renderStudioAt("/agents/wpid_missing/studio");
+
+    expect(screen.getByText("Not Found")).toBeTruthy();
   });
 
   test("a healthy workflow keeps the full studio (no deleted degradation)", () => {

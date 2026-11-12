@@ -8,9 +8,10 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Iterator, Sequence
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from playwright.async_api import Error as PlaywrightError
 from pytest import MonkeyPatch  # type: ignore[import-not-found]
@@ -23,6 +24,7 @@ from skyvern.forge.failure_classifier import classify_from_failure_reason
 from skyvern.forge.sdk.api.llm import api_handler_factory
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.models import LLMRouterConfig, LLMRouterModelConfig
+from skyvern.forge.sdk.artifact import manager as artifact_manager_module
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.artifact.storage.base import (
     StoredObjectChangedError,
@@ -30,9 +32,13 @@ from skyvern.forge.sdk.artifact.storage.base import (
     StreamingArtifactStorage,
 )
 from skyvern.forge.sdk.artifact.storage.unique_pdfs import unique_pdf_file_infos
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.repositories.workflow_runs import WorkflowRunBlockErrorRow
 from skyvern.forge.sdk.executor.run_liveness import RunWriteAuthority
+from skyvern.forge.sdk.integrations import connected_accounts
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -1074,3 +1080,39 @@ def merge_block_error_reasons(
     """The merged errors rows without the per-block facts, for tests that pin codes and reasoning."""
     errors = _merge_workflow_run_errors(task_errors, [WorkflowRunBlockErrorRow(*row) for row in rows], **kwargs)
     return [{key: value for key, value in error.items() if key not in BLOCK_ERROR_FACT_KEYS} for error in errors]
+
+
+async def register_download(
+    db: AgentDB, path: Path, context: SkyvernContext, organization_id: str | None = None, prefix: str = ""
+) -> Artifact:
+    """``path`` registered by the real manager as a download of ``context``'s run, read back from ``db``."""
+    organization_id, run_id = organization_id or context.organization_id, context.run_id
+    assert organization_id and run_id
+    skyvern_context.set(context)
+    try:
+        with patch.object(artifact_manager_module, "app", SimpleNamespace(DATABASE=db)):
+            artifact_id = await artifact_manager_module.ArtifactManager().create_download_artifact(
+                organization_id=organization_id,
+                run_id=run_id,
+                uri=f"s3://uploads/{organization_id}/{run_id}/{prefix}{path.name}",
+                filename=path.name,
+                checksum=hashlib.sha256(path.read_bytes()).hexdigest(),
+                file_size=path.stat().st_size,
+                source_path=str(path),
+            )
+    finally:
+        skyvern_context.reset()
+    artifact = await db.artifacts.get_artifact_by_id(artifact_id, organization_id)
+    assert artifact is not None
+    return artifact
+
+
+@contextmanager
+def connected_accounts_are(*accounts: connected_accounts.OrgConnection, agent_app: Any = None) -> Iterator[None]:
+    """The org's connected accounts are `accounts`, with backend hooks served from `agent_app` when a test patches a
+    module's `app`."""
+    with (
+        patch.object(connected_accounts, "org_connections", AsyncMock(return_value=list(accounts))),
+        patch.object(connected_accounts, "app", agent_app or app),
+    ):
+        yield

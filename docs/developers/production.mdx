@@ -88,11 +88,11 @@ The names differ by place. `webhook_url` goes on a run request. `webhook_callbac
 
 ### Payload
 
-The body is the same run object that `get_run` returns. The fields you use most:
+The body is the run object that `get_run` returns. Agent-run webhooks also carry `failure_category`, which `get_run` does not. The fields you use most:
 
 ```json
 {
-  "run_id": "tsk_v2_490440779503357994",
+  "run_id": "tsk_v2_123",
   "status": "completed",
   "output": { "top_post_title": "Show HN: A tiny Lisp in 200 lines" },
   "failure_reason": null,
@@ -102,7 +102,7 @@ The body is the same run object that `get_run` returns. The fields you use most:
   "recording_url": "https://.../recording.webm",
   "screenshot_urls": ["https://.../screenshot_final.png"],
   "downloaded_files": [],
-  "app_url": "https://app.skyvern.com/runs/wr_490440779503358000",
+  "app_url": "https://app.skyvern.com/runs/wr_123",
   "created_at": "2026-09-30T15:20:42.160725",
   "finished_at": "2026-09-30T15:23:34.992815"
 }
@@ -147,17 +147,17 @@ Keep a fallback: if you expect a run to be done and have no webhook, call `get_r
 
 <CodeGroup>
 ```python Python
-run = await client.get_run("tsk_v2_490440779503357994")
+run = await client.get_run("tsk_v2_123")
 print(run.status, run.output)
 ```
 
 ```typescript TypeScript
-const run = await client.getRun("tsk_v2_490440779503357994");
+const run = await client.getRun("tsk_v2_123");
 console.log(run.status, run.output);
 ```
 
 ```bash cURL
-curl "https://api.skyvern.com/v1/runs/tsk_v2_490440779503357994" \
+curl "https://api.skyvern.com/v1/runs/tsk_v2_123" \
   -H "x-api-key: $SKYVERN_API_KEY"
 ```
 </CodeGroup>
@@ -170,28 +170,28 @@ After you fix the endpoint, send the payload again with `retry_run_webhook`. Pas
 ```python Python
 from skyvern.client import RetryRunWebhookRequest
 
-result = await client.retry_run_webhook("tsk_v2_490440779503357994")
+result = await client.retry_run_webhook("tsk_v2_123")
 
 # Or to a different URL
 result = await client.retry_run_webhook(
-    "tsk_v2_490440779503357994",
+    "tsk_v2_123",
     request=RetryRunWebhookRequest(webhook_url="https://your-server.example.com/new-hook"),
 )
 print(result.status_code, result.error)
 ```
 
 ```typescript TypeScript
-const result = await client.retryRunWebhook("tsk_v2_490440779503357994");
+const result = await client.retryRunWebhook("tsk_v2_123");
 
 // Or to a different URL
-const redirected = await client.retryRunWebhook("tsk_v2_490440779503357994", {
+const redirected = await client.retryRunWebhook("tsk_v2_123", {
   webhook_url: "https://your-server.example.com/new-hook",
 });
 console.log(redirected.status_code, redirected.error);
 ```
 
 ```bash cURL
-curl -X POST "https://api.skyvern.com/v1/runs/tsk_v2_490440779503357994/retry_webhook" \
+curl -X POST "https://api.skyvern.com/v1/runs/tsk_v2_123/retry_webhook" \
   -H "x-api-key: $SKYVERN_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"webhook_url": "https://your-server.example.com/new-hook"}'
@@ -302,7 +302,7 @@ An error from a failed block also names it: `workflow_run_block_id`, `block_labe
 
 ### Failure categories
 
-Agent runs that end in `failed`, `terminated`, or `timed_out` get a `failure_category` list. Each entry has a `category`, a `confidence_float`, and `reasoning`. The first entry is the most likely cause. The app shows it as a badge on the run.
+Agent runs that end in `failed`, `terminated`, or `timed_out` get a `failure_category` list, sent in webhooks and the agent run lists (`GET /v1/agents/runs`, `GET /v1/agents/{workflow_id}/runs`) but not returned by `get_run`. Each entry has a `category`, a `confidence_float`, and `reasoning`. The first entry is the most likely cause. The app shows it as a badge on the run.
 
 | `category` | Usual next step |
 |---|---|
@@ -428,7 +428,7 @@ const run = await client.runWorkflow({
 ```
 </CodeGroup>
 
-Plans and credit prices are on [skyvern.com/pricing](https://www.skyvern.com/pricing). Self-hosted servers set the default step limit with `MAX_STEPS_PER_RUN` and choose the model with `LLM_KEY`. See [configuration](/reference/configuration).
+Plans are on [skyvern.com/pricing](https://www.skyvern.com/pricing). What each action costs in credits is in [How credits are used](/cloud/account#how-credits-are-used). Self-hosted servers set the default step limit with `MAX_STEPS_PER_RUN` and choose the model with `LLM_KEY`. See [configuration](/reference/configuration).
 
 ### Pre-flight check
 

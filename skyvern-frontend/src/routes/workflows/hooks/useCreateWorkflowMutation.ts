@@ -3,6 +3,7 @@ import { WorkflowCreateYAMLRequest } from "../types/workflowYamlTypes";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { getClient } from "@/api/AxiosClient";
 import { useNavigate } from "react-router-dom";
+import { useCallback, useRef } from "react";
 import { stringify as convertToYAML } from "yaml";
 import { WorkflowApiResponse } from "../types/workflowTypes";
 import { toast } from "@/components/ui/use-toast";
@@ -60,7 +61,9 @@ function useCreateWorkflowMutation({
   const credentialGetter = useCredentialGetter();
   const navigate = useNavigate();
   const studioEnabled = useWorkflowStudioEnabled();
-  return useMutation({
+  // isPending only flips after a re-render, so a double click sends two POSTs without this ref.
+  const inFlight = useRef(false);
+  const mutation = useMutation({
     mutationFn: async (input: CreateWorkflowInput) => {
       const { _via: _, _agentCreationAttempt: __, ...workflow } = input;
       void _;
@@ -127,7 +130,20 @@ function useCreateWorkflowMutation({
         description: getCreateWorkflowErrorMessage(error),
       });
     },
+    onSettled: () => {
+      inFlight.current = false;
+    },
   });
+  const { mutate } = mutation;
+  const guardedMutate = useCallback<typeof mutate>(
+    (variables, options) => {
+      if (inFlight.current) return;
+      inFlight.current = true;
+      mutate(variables, options);
+    },
+    [mutate],
+  );
+  return { ...mutation, mutate: guardedMutate };
 }
 
 export { useCreateWorkflowMutation };

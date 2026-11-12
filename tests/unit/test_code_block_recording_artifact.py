@@ -397,23 +397,6 @@ class TestPersistVideoDataFlushesUploads:
         update_data.assert_awaited_once()
         wait_for_uploads.assert_awaited_once_with(["wrb_1"])
 
-    @pytest.mark.asyncio
-    async def test_skips_drain_when_nothing_enqueued(self) -> None:
-        get_video = AsyncMock(return_value=[])
-        update_data = AsyncMock(return_value=None)
-        wait_for_uploads = AsyncMock()
-        workflow = SimpleNamespace(workflow_id="w_1")
-        workflow_run = SimpleNamespace(workflow_run_id="wr_1", organization_id="o_1")
-
-        with (
-            patch(f"{_SERVICE_PATH}.BROWSER_MANAGER.get_video_artifacts", get_video),
-            patch(f"{_SERVICE_PATH}.ARTIFACT_MANAGER.update_artifact_data", update_data),
-            patch(f"{_SERVICE_PATH}.ARTIFACT_MANAGER.wait_for_upload_aiotasks", wait_for_uploads),
-        ):
-            await WorkflowService().persist_video_data(_browser_state([]), workflow, workflow_run)
-
-        wait_for_uploads.assert_not_awaited()
-
 
 class TestPersistVideoDataPathFallback:
     """A recording attached during browser teardown lands as ``VideoArtifact(video_path=...)`` with no

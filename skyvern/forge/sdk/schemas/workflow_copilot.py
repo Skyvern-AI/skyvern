@@ -187,6 +187,8 @@ class CopilotPendingTurn(BaseModel):
     question_heartbeat_at: datetime | None = None
     question_client_seen_at: datetime | None = None
     cancel_token: str | None = None
+    # The person who started the turn; None for a turn started by an organization API key or before this was recorded.
+    starter_user_id: str | None = None
     request_browser_allocations: CopilotRequestBrowserAllocations | None = None
     # Build-test runs this turn ended so it could take the chat's browser. Copilot owns this list;
     # the run row's failure_reason carries the same fact but a later finalizer can overwrite it.
@@ -195,6 +197,9 @@ class CopilotPendingTurn(BaseModel):
     # Each draft frame overwrites this, never appends, so an entry holds at most one workflow.
     latest_draft: ClientVisibleProposedWorkflow | None = None
     latest_draft_at: datetime | None = None
+
+
+CopilotTurnControl = Literal["steer", "answer", "cancel"]
 
 
 class CopilotInFlightTurn(BaseModel):
@@ -502,11 +507,14 @@ class WorkflowCopilotChatRequest(BaseModel):
     supports_account_group_card: bool = Field(
         False, description="The client can display account group review and receipt cards."
     )
+    supports_single_run_card: bool = Field(
+        False, description="The client can display the single saved-workflow run review and its receipt."
+    )
     supports_credential_delete_card: bool = Field(
         False, description="The client can display the credential deletion card and post its confirmation."
     )
-    supports_google_setup_card: bool = Field(
-        False, description="The client can display Gmail and Google Sheets connection cards with a scope profile."
+    supports_connection_card: bool = Field(
+        False, description="The client can display the account connection card for an integration list entry."
     )
     supports_demonstration_offer: bool = Field(
         False, description="The client can display the demonstration offer card and start a demonstration from it."
@@ -967,6 +975,10 @@ class WorkflowCopilotToolResultUpdate(BaseModel):
     test_inputs: list[CopilotTestInput] | None = Field(
         None,
         description="Where each input of the run this result dispatched came from. Keys and sources only, never values",
+    )
+    debug_session_id: str | None = Field(
+        None,
+        description="The debug session a start_fresh_browser result moved the Studio browser to; None otherwise.",
     )
     executed_source_reference: str | None = Field(
         None,

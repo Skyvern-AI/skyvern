@@ -228,6 +228,10 @@ def _fitted_jpeg_b64(img: Image.Image, box: tuple[int, int]) -> tuple[str, tuple
     return base64.b64encode(buf.getvalue()).decode("ascii"), fitted.size
 
 
+def sharp_jpeg_b64(img: Image.Image) -> str:
+    return _fitted_jpeg_b64(img, (COPILOT_SHARP_MAX_WIDTH, COPILOT_SHARP_MAX_HEIGHT))[0]
+
+
 def resize_screenshot_b64(
     b64_png: str,
     *,

@@ -48,6 +48,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     unusable_browser_session_error,
 )
 from skyvern.forge.sdk.streaming.registries import stream_tombstone_holds_session_lease
+from skyvern.schemas.bot_protection import BotProtection
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.browser_session_kind import BrowserSessionKind
 from skyvern.schemas.browser_session_timeouts import (
@@ -420,6 +421,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
     instance: DefaultPersistentSessionsManager | None = None
     _browser_sessions: dict[str, BrowserSession] = dict()
     _background_tasks: set[asyncio.Task[None]] = set()
+    _launch_tasks: dict[str, asyncio.Task[None]] = {}
     _close_cleanup_tasks: dict[tuple[str, str], asyncio.Task[None]] = {}
     _external_connect_locks: dict[str, asyncio.Lock] = {}
     _external_deadlines: dict[str, asyncio.Task[None]] = {}
@@ -816,6 +818,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         browser_settings: BrowserSettings | None = None,
         created_for_workflow_run_id: str | None = None,
         created_for_workflow_permanent_id: str | None = None,
+        bot_protection: BotProtection | None = None,
     ) -> PersistentBrowserSession:
         """Create a new browser session for an organization and return its ID with the browser state."""
         # The browser launches after this returns, so a dialed CDP browser that cannot take a timezone is refused now.
@@ -869,8 +872,18 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             )
             self._background_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)
+            self._launch_tasks[session_id] = task
+            task.add_done_callback(lambda _: self._launch_tasks.pop(session_id, None))
 
         return session
+
+    async def wait_for_browser_launch(self, session_id: str, organization_id: str) -> bool:
+        launch = self._launch_tasks.get(session_id)
+        if launch is not None:
+            # asyncio.wait never cancels the launch, so a caller that stops waiting leaves it running.
+            await asyncio.wait({launch})
+        # A launch can finish while the caller's own lookup is still awaiting the database.
+        return launch is not None or session_id in self._browser_sessions
 
     async def _launch_browser_for_session(
         self,

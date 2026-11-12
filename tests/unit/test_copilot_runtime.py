@@ -31,6 +31,7 @@ from skyvern.cli.core import session_manager
 from skyvern.cli.mcp_tools import tabs as mcp_tabs
 from skyvern.config import settings
 from skyvern.exceptions import TooManyStartingBrowserSessions
+from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.cache.local import LocalCache
 from skyvern.forge.sdk.copilot import agent as copilot_agent
@@ -43,6 +44,7 @@ from skyvern.forge.sdk.copilot.build_test_connect_failure import (
 from skyvern.forge.sdk.copilot.build_test_outcome import connect_failure_from_run_blocks_result
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.demonstration_recorder import claim_demonstration_recording
 from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
 from skyvern.forge.sdk.copilot.mcp_adapter import (
     HeldPageFacts,
@@ -66,13 +68,16 @@ from skyvern.forge.sdk.copilot.runtime import (
     replace_browser_session,
 )
 from skyvern.forge.sdk.copilot.tools import mcp_hooks, run_execution
+from skyvern.forge.sdk.copilot.tools.page_challenge import start_fresh_browser, studio_browser_in_use
 from skyvern.forge.sdk.copilot.tools.scouting import PageState
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.unrecoverable_tool_error import (
     PAGE_CRASHES_KEY,
     _is_unrecoverable_browser_session_error,
 )
+from skyvern.forge.sdk.schemas.debug_sessions import DebugSession
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession, export_profile_storage_id
+from skyvern.forge.sdk.streaming.user_control import mark_user_control
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.sdk.workflow.service import BROWSER_SESSION_RENEWAL_INTERVAL_SECONDS
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
@@ -968,7 +973,6 @@ async def test_a_duplicate_session_from_a_creation_race_closes_cleanly(monkeypat
 async def _replace_held_browser(
     monkeypatch: pytest.MonkeyPatch,
     *,
-    pane_session: object = None,
     close_error: Exception | None = None,
     create_error: Exception | None = None,
 ) -> tuple[AgentContext, MagicMock, object]:
@@ -978,33 +982,334 @@ async def _replace_held_browser(
         manager.create_session = AsyncMock(side_effect=create_error)
     mock_app = MagicMock()
     mock_app.PERSISTENT_SESSIONS_MANAGER = manager
-    mock_app.DATABASE.debug.get_debug_session_by_browser_session_id = AsyncMock(return_value=pane_session)
+    mock_app.DATABASE.debug.get_debug_session_by_browser_session_id = AsyncMock(return_value=None)
     monkeypatch.setattr(runtime, "app", mock_app)
     ctx = _make_ctx()
     ctx.browser_session_id = "pbs_old"
-    return ctx, manager, await replace_browser_session(ctx)
+    return ctx, manager, await replace_browser_session(ctx, studio_browser_in_use=studio_browser_in_use)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("pane_session", "close_error", "expected_closed"),
-    [(None, None, True), (SimpleNamespace(debug_session_id="ds_1"), None, False), (None, RuntimeError("down"), False)],
-    ids=["copilot_owned", "studio_pane_keeps_it", "close_failed"],
+    ("close_error", "expected_closed"),
+    [(None, True), (RuntimeError("down"), False)],
+    ids=["copilot_owned", "close_failed"],
 )
-async def test_a_replaced_browser_is_recorded_and_closed_only_when_nothing_else_streams_it(
-    monkeypatch: pytest.MonkeyPatch, pane_session: object, close_error: Exception | None, expected_closed: bool
+async def test_a_replaced_copilot_browser_is_recorded_and_closed(
+    monkeypatch: pytest.MonkeyPatch, close_error: Exception | None, expected_closed: bool
 ) -> None:
-    ctx, manager, replacement = await _replace_held_browser(
-        monkeypatch, pane_session=pane_session, close_error=close_error
-    )
+    ctx, manager, replacement = await _replace_held_browser(monkeypatch, close_error=close_error)
 
-    assert replacement == BrowserSessionReplacement(
-        "pbs_old", "pbs_fresh", old_closed=expected_closed, pane_kept_old=pane_session is not None
-    )
+    assert replacement == BrowserSessionReplacement("pbs_old", "pbs_fresh", old_closed=expected_closed)
     assert ctx.browser_session_id == "pbs_fresh"
     assert ctx.browser_session_replacements == {"pbs_old": "pbs_fresh"}
     assert ctx.browser_session_continuity_generation == 1
-    assert (manager.close_session.await_count == 0) is (pane_session is not None)
+    manager.close_session.assert_awaited_once()
+
+
+class _FakeDebugSessions:
+    def __init__(
+        self,
+        rows: list[DebugSession],
+        *,
+        create_error: Exception | None = None,
+        insert_before_error: bool = False,
+        reread_error: Exception | None = None,
+        complete_error: Exception | None = None,
+        complete_hook: Callable[[], Awaitable[None]] | None = None,
+        pane_error: Exception | None = None,
+    ) -> None:
+        self.rows = rows
+        self.pane_error = pane_error
+        self.complete_error = complete_error
+        self.complete_hook = complete_hook
+        self.create_error = create_error
+        self.insert_before_error = insert_before_error
+        self.reread_error = reread_error
+        self.create_attempted = False
+
+    async def get_debug_session_by_browser_session_id(
+        self, browser_session_id: str, organization_id: str
+    ) -> DebugSession | None:
+        if self.pane_error is not None:
+            raise self.pane_error
+        return next((row for row in self.rows if row.browser_session_id == browser_session_id), None)
+
+    async def get_debug_session(
+        self, *, organization_id: str, user_id: str, workflow_permanent_id: str
+    ) -> DebugSession | None:
+        if self.reread_error is not None and self.create_attempted:
+            raise self.reread_error
+        return self.active(user_id)
+
+    def active(self, user_id: str) -> DebugSession | None:
+        return next((row for row in reversed(self.rows) if row.status == "created" and row.user_id == user_id), None)
+
+    async def complete_debug_sessions(
+        self, *, organization_id: str, user_id: str, workflow_permanent_id: str
+    ) -> list[DebugSession]:
+        if self.complete_hook is not None:
+            await self.complete_hook()
+        if self.complete_error is not None:
+            raise self.complete_error
+        completed = [row for row in self.rows if row.status == "created" and row.user_id == user_id]
+        for row in completed:
+            row.status = "completed"
+        return completed
+
+    async def create_debug_session(
+        self,
+        *,
+        browser_session_id: str,
+        organization_id: str,
+        user_id: str,
+        workflow_permanent_id: str,
+        vnc_streaming_supported: bool,
+    ) -> DebugSession:
+        self.create_attempted = True
+        if self.create_error is not None and not self.insert_before_error:
+            raise self.create_error
+        row = _debug_row(f"ds_{len(self.rows) + 1}", browser_session_id)
+        self.rows.append(row)
+        if self.create_error is not None:
+            raise self.create_error
+        return row
+
+
+def _debug_row(debug_session_id: str, browser_session_id: str) -> DebugSession:
+    now = datetime.now(UTC)
+    return DebugSession(
+        debug_session_id=debug_session_id,
+        browser_session_id=browser_session_id,
+        workflow_permanent_id="wpid_1",
+        user_id="user_1",
+        created_at=now,
+        modified_at=now,
+        status="created",
+    )
+
+
+Drive = Callable[[_FakeDebugSessions, MagicMock, pytest.MonkeyPatch], Awaitable[None]]
+
+
+async def _take_control(debug: _FakeDebugSessions, manager: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
+    await mark_user_control("org_1", "pbs_studio", "holder_1")
+
+
+async def _demonstrate(debug: _FakeDebugSessions, manager: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
+    await claim_demonstration_recording(
+        app.CACHE,
+        organization_id="org_1",
+        workflow_permanent_id="wpid_1",
+        browser_session_id="pbs_studio",
+        demonstration_id=None,
+    )
+
+
+async def _run_occupies(debug: _FakeDebugSessions, manager: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
+    manager.get_session.return_value = SimpleNamespace(runnable_id="wr_1")
+
+
+async def _unshared_cache_on_several_workers(
+    debug: _FakeDebugSessions, manager: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app.CACHE.is_shared = False
+    monkeypatch.setenv("WEB_CONCURRENCY", "2")
+
+
+async def _restart(debug: _FakeDebugSessions, manager: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
+    await debug.complete_debug_sessions(organization_id="org_1", user_id="user_1", workflow_permanent_id="wpid_1")
+    debug.rows.append(_debug_row("ds_restart", "pbs_restart"))
+
+
+async def _nobody_drives(debug: _FakeDebugSessions, manager: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
+    return None
+
+
+def _install_studio_browser(
+    monkeypatch: pytest.MonkeyPatch, debug: _FakeDebugSessions, on_create: Callable[[], Awaitable[None]] | None = None
+) -> tuple[AgentContext, MagicMock]:
+    cache = LocalCache()
+    cache.is_shared = True
+    debug.rows.append(_debug_row("ds_studio", "pbs_studio"))
+    manager = _manager_reporting_fixed_deadline(None)
+    manager.get_session = AsyncMock(return_value=SimpleNamespace(runnable_id=None))
+
+    async def create_session(**kwargs: object) -> SimpleNamespace:
+        # A kept browser has no debug row, so folder access can hide it only by the workflow it was created for.
+        assert kwargs["created_for_workflow_permanent_id"] == "wpid_1"
+        if on_create is not None:
+            await on_create()
+        return SimpleNamespace(
+            persistent_browser_session_id="pbs_fresh", ip_address=None, browser_address=None, browser_profile_id=None
+        )
+
+    manager.create_session = AsyncMock(side_effect=create_session)
+    monkeypatch.setattr(app, "CACHE", cache)
+    monkeypatch.setattr(app, "PERSISTENT_SESSIONS_MANAGER", manager)
+    monkeypatch.setattr(app.DATABASE, "debug", debug, raising=False)
+    monkeypatch.setattr(
+        app.WORKFLOW_SERVICE,
+        "get_workflow_by_permanent_id",
+        AsyncMock(return_value=SimpleNamespace(proxy_location=None)),
+    )
+    monkeypatch.setenv("WEB_CONCURRENCY", "1")
+    ctx = make_copilot_ctx(organization_id="org_1", workflow_permanent_id="wpid_1", browser_session_id="pbs_studio")
+    return ctx, manager
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("drive", "at_boot", "make_debug", "row_browser", "closed", "minted"),
+    [
+        (_nobody_drives, False, lambda: _FakeDebugSessions([]), "pbs_fresh", ["pbs_studio"], False),
+        (_take_control, False, lambda: _FakeDebugSessions([]), "pbs_studio", ["pbs_fresh"], True),
+        (_demonstrate, False, lambda: _FakeDebugSessions([]), "pbs_studio", ["pbs_fresh"], True),
+        (_run_occupies, False, lambda: _FakeDebugSessions([]), "pbs_studio", ["pbs_fresh"], True),
+        (_unshared_cache_on_several_workers, False, lambda: _FakeDebugSessions([]), "pbs_studio", ["pbs_fresh"], True),
+        (_take_control, True, lambda: _FakeDebugSessions([]), "pbs_studio", ["pbs_fresh"], True),
+        (_restart, True, lambda: _FakeDebugSessions([]), "pbs_restart", ["pbs_fresh"], True),
+        (
+            _nobody_drives,
+            False,
+            lambda: _FakeDebugSessions([], complete_error=RuntimeError("complete")),
+            "pbs_studio",
+            ["pbs_fresh"],
+            False,
+        ),
+        (
+            _nobody_drives,
+            False,
+            lambda: _FakeDebugSessions([], create_error=RuntimeError("insert")),
+            None,
+            ["pbs_studio", "pbs_fresh"],
+            True,
+        ),
+        (
+            _nobody_drives,
+            False,
+            lambda: _FakeDebugSessions([], create_error=RuntimeError("insert"), insert_before_error=True),
+            "pbs_fresh",
+            ["pbs_studio"],
+            False,
+        ),
+        (
+            _nobody_drives,
+            False,
+            lambda: _FakeDebugSessions([], create_error=RuntimeError("insert"), reread_error=RuntimeError("reread")),
+            None,
+            ["pbs_studio"],
+            False,
+        ),
+        (
+            _nobody_drives,
+            False,
+            lambda: _FakeDebugSessions([], pane_error=RuntimeError("pane")),
+            "pbs_studio",
+            ["pbs_fresh"],
+            True,
+        ),
+    ],
+    ids=[
+        "nobody_driving",
+        "take_control",
+        "demonstrating",
+        "run_occupies",
+        "unshared_cache_several_workers",
+        "take_control_during_boot",
+        "restart_during_boot",
+        "complete_raises",
+        "row_insert_failed",
+        "insert_raised_after_commit",
+        "insert_raised_and_reread_failed",
+        "pane_row_unreadable",
+    ],
+)
+async def test_replace_browser_session_moves_the_studio_browser_unless_it_is_in_use(
+    monkeypatch: pytest.MonkeyPatch,
+    drive: Drive,
+    at_boot: bool,
+    make_debug: Callable[[], _FakeDebugSessions],
+    row_browser: str | None,
+    closed: list[str],
+    minted: bool,
+) -> None:
+    debug = make_debug()
+    manager: MagicMock | None = None
+
+    async def drive_at_boot() -> None:
+        assert manager is not None
+        await drive(debug, manager, monkeypatch)
+
+    ctx, manager = _install_studio_browser(monkeypatch, debug, drive_at_boot if at_boot else None)
+    if not at_boot:
+        await drive(debug, manager, monkeypatch)
+
+    result = await start_fresh_browser(ctx)
+    was_minted = "pbs_fresh" in ctx.minted_browser_sessions
+    await run_execution.close_minted_browser_sessions(ctx)
+
+    active = debug.active("user_1")
+    replaced = row_browser == "pbs_fresh"
+    kept = debug.complete_error is not None
+    assert ctx.browser_session_id == ("pbs_studio" if kept else "pbs_fresh")
+    assert (active.browser_session_id if active else None) == row_browser
+    assert [call.args[1] for call in manager.close_session.await_args_list] == closed
+    assert was_minted is minted
+    assert result.get("previous_browser_kept", False) is kept
+    assert result.get("is_studio_browser", False) is replaced
+    studio_kept = None if debug.pane_error else row_browser == "pbs_studio" and not kept
+    assert result.get("studio_browser_kept", False) is studio_kept
+    assert result.get("old_browser_closed", False) is ("pbs_studio" in closed)
+    assert result.get("debug_session_id") == (active.debug_session_id if replaced and active else None)
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_during_the_studio_commit_finishes_the_move_before_it_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def hold_the_commit() -> None:
+        entered.set()
+        await release.wait()
+
+    debug = _FakeDebugSessions([], complete_hook=hold_the_commit)
+    ctx, manager = _install_studio_browser(monkeypatch, debug)
+
+    task = asyncio.create_task(start_fresh_browser(ctx))
+    await entered.wait()
+    task.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    active = debug.active("user_1")
+    assert active is not None and active.browser_session_id == "pbs_fresh"
+    assert [call.args[1] for call in manager.close_session.await_args_list] == ["pbs_studio"]
+    assert "pbs_fresh" not in ctx.minted_browser_sessions
+    assert ctx.browser_session_id == "pbs_fresh"
+
+
+@pytest.mark.asyncio
+async def test_replace_browser_session_leaves_the_studio_browser_when_browser_tools_are_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    debug = _FakeDebugSessions([_debug_row("ds_studio", "pbs_studio")])
+    manager = _manager_reporting_fixed_deadline(None)
+    monkeypatch.setattr(app, "PERSISTENT_SESSIONS_MANAGER", manager)
+    monkeypatch.setattr(app.DATABASE, "debug", debug, raising=False)
+    ctx = make_copilot_ctx(organization_id="org_1", workflow_permanent_id="wpid_1", browser_session_id="pbs_studio")
+    ctx.copilot_config = CopilotConfig(browser_tools_available=False)
+
+    result = await start_fresh_browser(ctx)
+
+    assert result["previous_browser_kept"] is True
+    assert ctx.browser_session_id == "pbs_studio"
+    assert [row.browser_session_id for row in debug.rows if row.status == "created"] == ["pbs_studio"]
+    manager.create_session.assert_not_awaited()
+    manager.close_session.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1903,6 +2208,7 @@ _MANAGER_ENTRY_POINTS = frozenset(
         "get_browser_state",
         "create_session",
         "close_session",
+        "wait_for_browser_launch",
     }
 )
 

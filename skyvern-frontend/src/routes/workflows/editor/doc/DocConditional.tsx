@@ -1,7 +1,6 @@
 import { useContext, useEffect, useRef, useState, type ReactNode } from "react";
 import {
   ArrowRightIcon,
-  CheckIcon,
   ChevronDownIcon,
   ChevronRightIcon,
   CodeIcon,
@@ -20,13 +19,17 @@ import { type AppNode, type WorkflowBlockNode } from "../nodes";
 import type { DocBranch, DocItem } from "./buildDocTree";
 import { WorkflowDocActionsContext } from "./WorkflowDocActionsContext";
 import { docStepTitle } from "./docStepRegistry";
-import { DocStepResult } from "./DocStepResult";
-import { DocStepControls, DocTag, type DocStepPlace } from "./DocStep";
+import {
+  DocStepCaption,
+  DocStepControls,
+  DocStepNumber,
+  DocTag,
+  type DocStepPlace,
+} from "./DocStep";
 import { runStepByKey, type LineSplit } from "./docKeys";
 import type { DocScopeRef } from "./docGraphEdits";
 import { DocText } from "./DocText";
 import { DocDeleteConfirm, DocEditableLine } from "./DocEditing";
-import { useDocRunFor } from "./useDocRunFor";
 import { docBranchSelection, selectedStepIds } from "./docBranchSelection";
 
 const MAX_VISIBLE_CONDITIONS = 3;
@@ -42,12 +45,10 @@ const HOVER_TO_OPEN_MS = 500;
 function BranchTab({
   branch,
   selected,
-  ran,
   onSelect,
 }: {
   branch: DocBranch;
   selected: boolean;
-  ran: boolean;
   onSelect: () => void;
 }) {
   const { dragId } = useContext(WorkflowDocActionsContext);
@@ -92,7 +93,9 @@ function BranchTab({
       <span className="shrink-0 font-semibold text-[#8456A8] dark:text-[#B793DA]">
         {kindLabel[branch.kind]}
       </span>
+      {/* The selected branch's condition is in full on its Condition line, so its tab names only the kind. */}
       {branch.kind !== "otherwise" &&
+        !selected &&
         (label ? (
           <span className="min-w-0 truncate">{label}</span>
         ) : (
@@ -102,16 +105,7 @@ function BranchTab({
         ))}
       {branch.stepCount > 0 && (
         <span className="text-[11px] text-muted-foreground">
-          {branch.stepCount}
-        </span>
-      )}
-      {ran && (
-        <span
-          title="This branch ran"
-          className="inline-flex shrink-0 items-center text-[11px] font-medium text-green-700 dark:text-green-400"
-        >
-          <CheckIcon className="size-3" aria-hidden />
-          ran
+          · {branch.stepCount} step{branch.stepCount === 1 ? "" : "s"}
         </span>
       )}
     </button>
@@ -153,6 +147,7 @@ export function DocConditional({
   editable,
   showRunControl = editable,
   place,
+  number,
   onEnter,
   renderChildren,
 }: {
@@ -162,6 +157,7 @@ export function DocConditional({
   editable: boolean;
   showRunControl?: boolean;
   place?: DocStepPlace;
+  number?: string;
   // Enter on the If line starts the line after the conditional.
   onEnter?: (split: LineSplit | null, key?: string) => void;
   renderChildren: (
@@ -174,20 +170,7 @@ export function DocConditional({
   const open = actions.conditionalOpen(node.id);
   const conditions = item.branches.filter((b) => b.kind !== "otherwise");
   const otherwise = item.branches.find((b) => b.kind === "otherwise");
-  const { blocksByLabel, unknownLabels } = useDocRunFor(node.data.label);
-  const {
-    selected,
-    ranBranch: ranOnRun,
-    selectedRan,
-  } = docBranchSelection(
-    item,
-    node.data.label,
-    actions.selectedBranch(node.id),
-    byId,
-    blocksByLabel,
-  );
-  // A conditional edited since the run cannot say which branch ran.
-  const ranBranch = unknownLabels.has(node.data.label) ? undefined : ranOnRun;
+  const selected = docBranchSelection(item, actions.selectedBranch(node.id));
   let visible = conditions;
   let overflow: DocBranch[] = [];
   if (conditions.length > MAX_VISIBLE_CONDITIONS) {
@@ -230,7 +213,9 @@ export function DocConditional({
     <div className="rounded py-[3px]">
       {/* The hover group is the header only: the steps inside a branch show their own controls. */}
       <div className="group/line relative flex min-h-[26px] flex-wrap items-center gap-2">
+        <DocStepNumber number={number} />
         <DocTag node={node} place={editable ? place : undefined} />
+        <DocStepCaption node={node} />
         <button
           type="button"
           aria-label={`${open ? "Collapse" : "Expand"} ${docStepTitle(node)}`}
@@ -245,8 +230,9 @@ export function DocConditional({
           )}
         </button>
         <span className="text-[12.5px] text-muted-foreground">
-          {conditions.length} condition{conditions.length === 1 ? "" : "s"} +
-          Otherwise · checked left to right
+          {conditions.length === 1
+            ? "If the condition holds, its steps run; otherwise the fallback branch runs"
+            : "Runs the first branch whose condition matches, checked left to right"}
         </span>
         <DocStepControls
           node={node}
@@ -256,17 +242,9 @@ export function DocConditional({
       </div>
       {open && (
         <>
-          <DocStepResult
-            label={node.data.label}
-            completedText={
-              ranBranch
-                ? `Took ${ranBranch.kind === "otherwise" ? "Otherwise" : `${kindLabel[ranBranch.kind]} ${shortLabel(ranBranch.condition)}`.trim()}`
-                : undefined
-            }
-          />
           {typeof node.data.description === "string" &&
             node.data.description.trim() && (
-              <p className="mb-1.5 text-base font-medium leading-[1.55]">
+              <p className="mb-1.5 text-base font-normal leading-[1.55]">
                 <DocText value={node.data.description} />
               </p>
             )}
@@ -280,7 +258,6 @@ export function DocConditional({
                 key={branch.branchId}
                 branch={branch}
                 selected={branch === selected}
-                ran={branch === ranBranch}
                 onSelect={() => select(branch)}
               />
             ))}
@@ -317,7 +294,6 @@ export function DocConditional({
               <BranchTab
                 branch={otherwise}
                 selected={otherwise === selected}
-                ran={otherwise === ranBranch}
                 onSelect={() => select(otherwise)}
               />
             )}
@@ -396,14 +372,14 @@ export function DocConditional({
             )}
           </div>
           <div role="tabpanel" data-doc-branch-id={selected.branchId}>
-            <p className="text-base font-medium leading-[1.55]">
+            <p className="flex gap-1.5 text-[13.5px] leading-[1.55] text-muted-foreground">
               {selected.kind === "otherwise" ? (
-                "Otherwise"
+                "Runs when no condition before it matches."
               ) : (
                 <>
-                  {kindLabel[selected.kind]}{" "}
+                  <span className="shrink-0">Condition</span>
                   {conditionEditable && branchEdits ? (
-                    <span className="inline-block min-w-[12ch] align-baseline">
+                    <span className="min-w-[12ch] flex-1 text-base text-foreground">
                       <DocEditableLine
                         key={selected.branchId}
                         value={selected.condition}
@@ -431,7 +407,10 @@ export function DocConditional({
                       />
                     </span>
                   ) : selected.condition ? (
-                    <DocText value={selected.condition} />
+                    <DocText
+                      value={selected.condition}
+                      className="text-base text-foreground"
+                    />
                   ) : (
                     <span className="font-normal italic text-[#B45B0A] dark:text-[#E79A55]">
                       no condition
@@ -441,9 +420,7 @@ export function DocConditional({
               )}
             </p>
             <div className="my-0.5 flex items-center gap-[5px] text-xs leading-[1.55] text-muted-foreground">
-              {selected.kind === "otherwise" ? (
-                "Runs when no condition before it matches."
-              ) : selected.check === "exact" ? (
+              {selected.check === "exact" ? (
                 <>
                   <CodeIcon className="size-[11px]" />
                   Exact check, no AI
@@ -456,19 +433,6 @@ export function DocConditional({
               ) : null}
             </div>
             <div className="mb-1 ml-[11px] mt-0.5 border-l border-border pl-4">
-              {ranBranch &&
-                selected !== ranBranch &&
-                !selectedRan &&
-                selected.stepCount > 0 && (
-                  <p
-                    className="my-1 text-[13px] text-muted-foreground"
-                    data-testid="doc-branch-skipped"
-                  >
-                    {selected.kind === "otherwise"
-                      ? "Not taken, so these steps were skipped"
-                      : "No, so these steps were skipped"}
-                  </p>
-                )}
               {renderChildren(
                 selected.children,
                 selected.synthetic || selected.jumpTo

@@ -6338,7 +6338,7 @@ async def test_stale_proposal_token_adoption_keeps_the_saved_completion_contract
     else:
         await _publish_from_another_turn(chat_id)
         sibling_adopted = asyncio.Event()
-        real_canonicalize = workflow_update_module.canonicalize_named_google_sheet_bindings
+        real_canonicalize = workflow_update_module.canonicalize_named_connection_bindings
 
         async def canonicalize_after_the_sibling_adopts(workflow_yaml: str, call_ctx: object) -> object:
             # Holds the contract-dropping edit past its entry check until its sibling has adopted.
@@ -6347,7 +6347,7 @@ async def test_stale_proposal_token_adoption_keeps_the_saved_completion_contract
             return await real_canonicalize(workflow_yaml, call_ctx)
 
         monkeypatch.setattr(
-            workflow_update_module, "canonicalize_named_google_sheet_bindings", canonicalize_after_the_sibling_adopts
+            workflow_update_module, "canonicalize_named_connection_bindings", canonicalize_after_the_sibling_adopts
         )
 
         async def sibling_edit() -> dict[str, Any]:

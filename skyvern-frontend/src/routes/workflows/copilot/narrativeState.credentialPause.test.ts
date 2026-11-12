@@ -8,7 +8,7 @@ import {
   parseCredentialPause,
   parseCredentialPrompt,
   parseCanonicalWorkflowUnavailable,
-  parseGoogleConnectionNotices,
+  parseConnectionCards,
 } from "./narrativeState";
 import type {
   WorkflowCopilotStreamErrorUpdate,
@@ -220,111 +220,34 @@ describe("hydrateNarrativeFromPayload — credential signals", () => {
   });
 });
 
-describe("Google connection notice hydration", () => {
-  it("rehydrates an unbound notice with its account choices", () => {
-    const unbound = {
-      provider: "google",
-      connectionId: null,
-      displayName: null,
-      condition: "unbound",
-      scopeProfile: "google_sheets",
-      origin: "workflow",
-      choices: [
-        {
-          connection_id: "goac_active",
-          name: "Sheets",
-          state: "active",
-          email_address: null,
-        },
-      ],
+describe("connection card hydration", () => {
+  it("keeps valid cards across reload, deduplicates, and drops malformed rows", () => {
+    const outlook = {
+      integrationId: "outlook",
+      integrationName: "Outlook",
+      provider: "microsoft",
+      scopeProfile: "outlook_mail",
+      requiredScopes: ["Mail.Read"],
+      reconnectConnectionId: null,
     };
-    expect(
-      hydrateNarrativeFromPayload(
-        basePayload({ googleConnectionNotices: [unbound] }),
-      )?.googleConnectionNotices,
-    ).toEqual([unbound]);
-    expect(
-      parseGoogleConnectionNotices([{ ...unbound, condition: "missing" }]),
-    ).toEqual([]);
-  });
-  it("keeps valid notices, deduplicates ids, and survives reload hydration", () => {
     const raw = [
-      {
-        provider: "google",
-        connectionId: "goac_error",
-        displayName: "Work Sheets",
-        condition: "unusable",
-      },
-      {
-        provider: "google",
-        connectionId: "goac_error",
-        displayName: "duplicate",
-        condition: "missing",
-      },
-      { provider: "microsoft", connectionId: "m1", condition: "missing" },
+      outlook,
+      { ...outlook, integrationName: "duplicate" },
+      { ...outlook, provider: "dropbox" },
+      { integrationId: "gmail" },
     ];
 
-    expect(parseGoogleConnectionNotices(raw)).toEqual([
-      {
-        provider: "google",
-        connectionId: "goac_error",
-        displayName: "Work Sheets",
-        condition: "unusable",
-        scopeProfile: "google_sheets",
-        origin: "workflow",
-      },
-    ]);
+    expect(parseConnectionCards(raw)).toEqual([outlook]);
     expect(
-      hydrateNarrativeFromPayload(basePayload({ googleConnectionNotices: raw }))
-        ?.googleConnectionNotices,
-    ).toEqual(parseGoogleConnectionNotices(raw));
-  });
-
-  it("keys notices by profile so unbound Gmail and Sheets setup cards both survive", () => {
-    const unbound = (scopeProfile?: string) => ({
-      provider: "google",
-      connectionId: null,
-      displayName: null,
-      condition: "unbound",
-      ...(scopeProfile ? { scopeProfile, origin: "setup" } : {}),
-      choices: [],
-    });
-
-    const parsed = parseGoogleConnectionNotices([
-      unbound("gmail"),
-      unbound("google_sheets"),
-      unbound(),
-      unbound("gmail_send"),
-    ]);
-
+      hydrateNarrativeFromPayload(basePayload({ connectionCards: raw }))
+        ?.connectionCards,
+    ).toEqual([outlook]);
     expect(
-      parsed.map((notice) => [notice.scopeProfile, notice.origin]),
-    ).toEqual([
-      ["gmail", "setup"],
-      ["google_sheets", "setup"],
-    ]);
-    expect(parseGoogleConnectionNotices([unbound()])).toEqual([
-      {
-        provider: "google",
-        connectionId: null,
-        displayName: null,
-        condition: "unbound",
-        scopeProfile: "google_sheets",
-        origin: "workflow",
-        choices: [],
-      },
-    ]);
-  });
-
-  it("defaults absent and malformed notice payloads to an empty list", () => {
-    expect(EMPTY_NARRATIVE.googleConnectionNotices).toEqual([]);
-    expect(parseGoogleConnectionNotices(null)).toEqual([]);
-    expect(parseGoogleConnectionNotices({})).toEqual([]);
-    expect(
-      parseGoogleConnectionNotices([
-        { provider: "google", connectionId: "", condition: "unusable" },
-      ]),
+      hydrateNarrativeFromPayload(
+        basePayload({ googleConnectionNotices: [{ provider: "google" }] }),
+      )?.connectionCards,
     ).toEqual([]);
+    expect(EMPTY_NARRATIVE.connectionCards).toEqual([]);
   });
 });
 

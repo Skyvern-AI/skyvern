@@ -5,7 +5,6 @@ import copy
 import hashlib
 import json
 import keyword
-import os
 import re
 import textwrap
 from collections.abc import Iterable, Iterator, Mapping, Sequence
@@ -69,12 +68,6 @@ from skyvern.forge.sdk.copilot.context import (
     record_kept_note_texts,
 )
 from skyvern.forge.sdk.copilot.credential_fill_fields import CredentialFillField
-from skyvern.forge.sdk.copilot.google_connection_notice import (
-    collect_google_connection_notices,
-    google_sheet_connection_bindings,
-    retain_notices_after_lookup_failure,
-    write_google_connection_notice_capture,
-)
 from skyvern.forge.sdk.copilot.narration import CODE_REPAIR_PROGRESS_SURFACE_KIND, CODE_REPAIR_PROGRESS_TEXT
 from skyvern.forge.sdk.copilot.output_contracts import (
     code_block_available_contracts_by_label,
@@ -119,6 +112,7 @@ from skyvern.forge.sdk.copilot.workflow_yaml import (
     _PRIVATE_WORKFLOW_SETTINGS_FIELDS,
     _canonicalize_copilot_proxy_location,
     _normalize_copilot_yaml,
+    _normalize_copilot_yaml_with_dropped_links,
     _process_workflow_yaml,
     dump_workflow_yaml,
     inherited_header_settings,
@@ -141,7 +135,6 @@ from skyvern.forge.sdk.copilot.workflow_yaml import (
 )
 from skyvern.forge.sdk.db.exceptions import CopilotProposalConflictError, CopilotProposalConflictReason
 from skyvern.forge.sdk.schemas.workflow_copilot import COPILOT_PRIVATE_SETTINGS_KEY, copilot_proposal_metadata
-from skyvern.forge.sdk.services import google_oauth_service
 from skyvern.forge.sdk.workflow.block_notes import (
     carry_block_notes_from_versions,
     drop_submitted_note_fields,
@@ -179,7 +172,7 @@ from .credentials import (
     _credential_id_misbinding_findings,
     _credential_reference_validation_error,
     bitwarden_binding_change_error,
-    canonicalize_named_google_sheet_bindings,
+    canonicalize_named_connection_bindings,
     import_bound_vault_logins,
     resolve_google_sheet_tabs_from_gid,
 )
@@ -3537,6 +3530,7 @@ def carry_author_time_findings(update_result: dict[str, Any], result: dict[str, 
             "stored_code_rewritten",
             "dropped_prior_blocks",
             "block_type_changes",
+            "dropped_next_block_links",
             "stored_goal_kept",
             "stored_goal_kept_message",
             "stored_goal_dropped",
@@ -3546,7 +3540,7 @@ def carry_author_time_findings(update_result: dict[str, Any], result: dict[str, 
             "stored_notes_dropped",
             "stored_notes_dropped_text",
             "stored_notes_dropped_message",
-            "google_connection_resolution",
+            "connection_resolution",
             "persistence",
             "persistence_message",
             "google_sheet_tab_resolution",
@@ -4543,7 +4537,7 @@ async def _update_workflow(
     try:
         # Before redaction: a connection name equal to a registered scrub value would otherwise
         # reach the resolver already replaced by the placeholder.
-        workflow_yaml, google_connection_resolution = await canonicalize_named_google_sheet_bindings(workflow_yaml, ctx)
+        workflow_yaml, connection_resolution = await canonicalize_named_connection_bindings(workflow_yaml, ctx)
         workflow_yaml, google_sheet_tab_resolution = await resolve_google_sheet_tabs_from_gid(workflow_yaml, ctx)
         # Ahead of redaction: this copies stored Goal bytes into the candidate, so they have to
         # pass the scrub seam like any other submitted text.
@@ -4697,59 +4691,6 @@ async def _update_workflow(
                 prior_associations=ctx.runner_code_block_associations_by_label,
                 preserve_existing=params.get("_preserve_code_block_associations") is True,
             )
-            current_google_connection_bindings = google_sheet_connection_bindings(workflow)
-            turn_start_workflow = prior_workflow
-            if ctx.google_connection_turn_start_bindings is None:
-                baseline_ready = True
-                turn_start_workflow_yaml = ctx.turn_start_workflow_yaml
-                if turn_start_workflow_yaml:
-                    try:
-                        turn_start_workflow = await _process_workflow_yaml(
-                            workflow_id=ctx.workflow_id,
-                            workflow_permanent_id=ctx.workflow_permanent_id,
-                            organization_id=ctx.organization_id,
-                            workflow_yaml=turn_start_workflow_yaml,
-                            private_workflow_settings=ctx.private_workflow_settings,
-                        )
-                    except Exception as baseline_err:
-                        baseline_ready = False
-                        LOG.warning("copilot_google_connection_notice_baseline_failed", error=str(baseline_err))
-                if baseline_ready:
-                    ctx.google_connection_turn_start_bindings = google_sheet_connection_bindings(turn_start_workflow)
-            current_google_connection_ids = tuple(
-                dict.fromkeys(connection_id for _, connection_id in current_google_connection_bindings)
-            )
-            if ctx.google_connection_turn_start_bindings is not None:
-                try:
-                    visible_google_credentials = await google_oauth_service.get_visible_credentials_for_org(
-                        ctx.organization_id
-                    )
-                    next_google_connection_notices = collect_google_connection_notices(
-                        turn_start_bindings=ctx.google_connection_turn_start_bindings,
-                        current_bindings=current_google_connection_bindings,
-                        visible_credentials=visible_google_credentials,
-                    )
-                    capture_root = os.environ.get("COPILOT_DUMP_GOOGLE_CONNECTION_NOTICE_INPUTS")
-                    if capture_root and current_google_connection_bindings:
-                        try:
-                            write_google_connection_notice_capture(
-                                output_root=capture_root,
-                                turn_id=ctx.turn_id,
-                                turn_start_workflow=turn_start_workflow,
-                                final_workflow=workflow,
-                                accepted_workflow_yaml=workflow_yaml,
-                                visible_credentials=visible_google_credentials,
-                                observed_notices=next_google_connection_notices,
-                            )
-                        except Exception as capture_err:
-                            LOG.warning("copilot_google_connection_notice_capture_failed", error=str(capture_err))
-                    ctx.google_connection_notices = next_google_connection_notices
-                except Exception as lookup_err:
-                    ctx.google_connection_notices = retain_notices_after_lookup_failure(
-                        current_connection_ids=current_google_connection_ids,
-                        notices=ctx.google_connection_notices,
-                    )
-                    LOG.warning("copilot_google_connection_notice_lookup_failed", error=str(lookup_err))
         _clear_code_authoring_repair_context(ctx)
         accepted_metadata = ctx.code_artifact_metadata
         if isinstance(accepted_metadata, dict) and accepted_metadata:
@@ -4766,6 +4707,13 @@ async def _update_workflow(
             prior_workflow_yaml, submitted_workflow_yaml, workflow_yaml
         )
         dropped_prior_blocks, block_type_changes = _block_definition_changes(prior_yaml, workflow_yaml)
+        # ponytail: re-normalizes the accepted text, repeating the drop log; thread the links out of
+        # _process_workflow_yaml if the second parse matters. Best-effort: the workflow is already persisted.
+        try:
+            dropped_next_block_links = _normalize_copilot_yaml_with_dropped_links(workflow_yaml)[1]
+        except Exception as normalize_err:  # noqa: BLE001 - normalization can raise validation and constructor errors.
+            LOG.warning("copilot_dropped_next_block_links_failed", error=str(normalize_err))
+            dropped_next_block_links = []
         written_diffs: list[CodeWriteDiff] = []
         if isinstance(ctx, CopilotContext):
             # Best-effort — the workflow is already persisted, so a narrative detail must never
@@ -4818,6 +4766,8 @@ async def _update_workflow(
             data["dropped_prior_blocks"] = dropped_prior_blocks
         if block_type_changes:
             data["block_type_changes"] = block_type_changes
+        if dropped_next_block_links:
+            data["dropped_next_block_links"] = dropped_next_block_links
         data.update(user_owned_goal_carry_disclosure(goal_carry))
         notes_visible = copilot_sees_notes(ctx)
         if kept_note_labels and notes_visible:
@@ -4872,12 +4822,10 @@ async def _update_workflow(
             data["findings"] = findings
         if authoring_validation.legacy_engine_blocks:
             data["legacy_engine_blocks"] = list(authoring_validation.legacy_engine_blocks)
-        if google_connection_resolution:
-            data["google_connection_resolution"] = google_connection_resolution
+        if connection_resolution:
+            data["connection_resolution"] = connection_resolution
         if google_sheet_tab_resolution:
             data["google_sheet_tab_resolution"] = google_sheet_tab_resolution
-        if isinstance(ctx, CopilotContext) and ctx.google_connection_notices:
-            data["google_connection_notices"] = [notice.to_payload() for notice in ctx.google_connection_notices]
         return {
             "ok": True,
             "data": data,

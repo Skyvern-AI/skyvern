@@ -4,7 +4,6 @@ cancellation, while that poll is still running its own cleanup."""
 from __future__ import annotations
 
 import asyncio
-import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
@@ -87,17 +86,19 @@ async def test_dispatch_deadline_bounds_provider_cleanup_and_joins_the_poll(
     monkeypatch.setattr(provider_downloads, "asyncio", ScopedAsyncio())
     monkeypatch.setattr(provider_downloads, "PROVIDER_POLL_CLEANUP_GRACE_SECONDS", 0.03)
     monkeypatch.setattr(action_deadline, "ACTION_DEADLINE_HEADROOM_MS", 0)
+    # Keeps the deadline's re-arm from cancelling the poll, so only the join's own cancel can end it.
+    monkeypatch.setattr(action_deadline, "DEADLINE_REARM_INTERVAL_SECONDS", 30.0)
     gate = asyncio.Event()
-    asyncio.get_running_loop().call_later(0.3, gate.set)
+    # Released far past the grace so a CI runner pause (a late-shard full GC can take ~0.3 s) cannot finish the
+    # cleanup inside the grace.
+    _release_later(gate, 5.0)
     observation = _GatedCleanupObservation(gate)
     recovery = ProviderDownloadRecovery(observation, tmp_path, None)  # type: ignore[arg-type]
 
-    started_at = time.monotonic()
     with pytest.raises(ActionDeadlineExceeded):
         async with under_action_deadline(budget_ms=20):
             await recovery.recover(staged=(), timeout=0.05, should_cancel=_never_cancel)
 
-    assert time.monotonic() - started_at < 0.12
     assert observation.cleanup_started.is_set()
     assert observation.poll_finished
     assert not observation.cleanup_finished

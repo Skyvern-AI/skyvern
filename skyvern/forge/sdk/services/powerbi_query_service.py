@@ -49,7 +49,6 @@ SAFE_AUDIT_FAILURE_REASONS = frozenset(
         "trigger_parent_owner_mismatch",
         "trigger_parent_source_unconfirmed",
         "unsafe_query_input_source",
-        "event_trigger_run",
         "copilot_test_run_unsupported",
         "workflow_owner_resave_required",
         "connection_unavailable",

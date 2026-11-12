@@ -249,6 +249,14 @@ class StepArchiveAccumulator:
     # (organization_id, action_id, artifact_id)
 
 
+def _configured_name(organization_id: str, run_id: str, checksum: str | None, source_path: str | None) -> str | None:
+    """``checksum`` when this run's context saw a configured name given to exactly these bytes at ``source_path``."""
+    context = skyvern_context.current()
+    if context is None or checksum is None or source_path is None:
+        return None
+    return checksum if context.configured_download_digest(source_path, organization_id, run_id) == checksum else None
+
+
 class ArtifactManager:
     def __init__(self) -> None:
         # task_id -> list of aio_tasks for uploading artifacts
@@ -493,6 +501,28 @@ class ArtifactManager:
             path=path,
         )
 
+    async def record_unchanged_download(
+        self, *, organization_id: str, run_id: str, uri: str, checksum: str, source_path: str
+    ) -> None:
+        """Credit a configured name earned since ``uri``'s unchanged bytes were last saved."""
+        configured = _configured_name(organization_id, run_id, checksum, source_path)
+        if configured is None:
+            return
+        # The bytes are already saved, so a failed credit only leaves the name unproven; the save goes on.
+        try:
+            existing = await app.DATABASE.artifacts.find_download_artifact(
+                organization_id=organization_id, run_id=run_id, uri=uri
+            )
+            if existing is not None and existing.configured_name_sha256 != configured:
+                await app.DATABASE.artifacts.promote_configured_name(existing.artifact_id, organization_id, configured)
+        except Exception as error:
+            LOG.warning(
+                "Could not credit a configured download name to unchanged bytes",
+                organization_id=organization_id,
+                run_id=run_id,
+                error_type=type(error).__name__,
+            )
+
     async def create_download_artifact(
         self,
         *,
@@ -503,6 +533,7 @@ class ArtifactManager:
         workflow_run_id: str | None = None,
         checksum: str | None = None,
         file_size: int | None = None,
+        source_path: str | None = None,
     ) -> str:
         """Register a downloaded file as an Artifact row without re-uploading.
 
@@ -511,6 +542,7 @@ class ArtifactManager:
         endpoint.
         """
         context = skyvern_context.current()
+        configured = _configured_name(organization_id, run_id, checksum, source_path)
         # Retry uploads use attempt-specific URIs; reuse within one attempt keeps loop URLs stable.
         existing = await app.DATABASE.artifacts.find_download_artifact(
             organization_id=organization_id,
@@ -524,7 +556,10 @@ class ArtifactManager:
                     organization_id=organization_id,
                     checksum=checksum,
                     file_size=file_size,
+                    configured_name_sha256=configured,
                 )
+            elif configured is not None and existing.configured_name_sha256 != configured:
+                await app.DATABASE.artifacts.promote_configured_name(existing.artifact_id, organization_id, configured)
             return existing.artifact_id
 
         artifact_id = generate_artifact_id()
@@ -539,6 +574,7 @@ class ArtifactManager:
             workflow_run_id=workflow_run_id,
             checksum=checksum,
             file_size=file_size,
+            configured_name_sha256=configured,
         )
         LOG.debug(
             "Registered downloaded file as artifact",

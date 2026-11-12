@@ -41,6 +41,11 @@ _OTP_KEYWORD_PATTERN = re.compile(
     r"sign(?:[\s-]+)in|signin|log(?:[\s-]+)in|login|(?:magic|access)(?:[\s-]+)link)(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
+# Plus addresses usually serve one site, so broader terms are less likely to match unrelated mail.
+_PLUS_ADDRESS_OTP_KEYWORD_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])(?:activate|activation|confirm|confirmation)(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
 # Only EOP-stripped headers are trusted for recipient matching.
 _DELIVERY_HEADER_NAMES = {
     "x-ms-exchange-organization-originalenveloperecipient",
@@ -556,6 +561,7 @@ def _otp_candidate(
     *,
     message_id: str,
     received_datetime: datetime,
+    allow_activation_keywords: bool = False,
 ) -> tuple[OutlookMessageCandidate, set[str]] | None:
     raw_subject = message.get("subject")
     subject = raw_subject if isinstance(raw_subject, str) else ""
@@ -564,7 +570,11 @@ def _otp_candidate(
     raw_body = message.get("body")
     body = raw_body.get("content") if isinstance(raw_body, dict) else ""
     body_content = body if isinstance(body, str) else ""
-    if not _OTP_KEYWORD_PATTERN.search("\n".join((subject, preview, body_content))):
+    searchable_content = f"{subject}\n{preview}\n{body_content}"
+    if not (
+        _OTP_KEYWORD_PATTERN.search(searchable_content)
+        or (allow_activation_keywords and _PLUS_ADDRESS_OTP_KEYWORD_PATTERN.search(searchable_content))
+    ):
         return None
     content = "\n".join(
         part
@@ -636,6 +646,7 @@ async def search_recent_otp_messages(
     identifier = totp_identifier.strip()
     if not _SAFE_EMAIL_IDENTIFIER.fullmatch(identifier):
         return []
+    allow_activation_keywords = "+" in identifier.split("@", 1)[0]
     cutoff = _as_utc(created_after) if created_after else datetime.now(UTC) - timedelta(hours=24)
     excluded_ids = set(excluded_message_ids or ())
     max_results_clamped = max(1, min(max_results, 20))
@@ -728,6 +739,7 @@ async def search_recent_otp_messages(
                     item,
                     message_id=message_id,
                     received_datetime=received_datetime,
+                    allow_activation_keywords=allow_activation_keywords,
                 )
                 if candidate_match is None:
                     continue

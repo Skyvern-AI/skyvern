@@ -1,7 +1,14 @@
 // @vitest-environment jsdom
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { MemoryRouter, useNavigate } from "react-router-dom";
 import { afterEach, expect, it, vi } from "vitest";
 
@@ -127,4 +134,53 @@ it("does not carry unfiltered rows into a held ?tags= link", async () => {
   expect(agentListRequests()).toEqual([
     "page=1&page_size=10&only_workflows=true",
   ]);
+});
+
+it("filters agents by a folder picked from the View all dialog", async () => {
+  // More folders than the five shown on the page, so "Folder 15" only exists
+  // in the dialog — the case where selecting it used to be a no-op.
+  const folders = Array.from({ length: 30 }, (_, index) => ({
+    folder_id: `fld_${index + 1}`,
+    organization_id: "o_1",
+    title: `Folder ${index + 1}`,
+    description: null,
+    workflow_count: 1,
+    created_at: "2026-10-01T00:00:00Z",
+    modified_at: `2026-10-01T00:00:${String(30 - index).padStart(2, "0")}Z`,
+  }));
+  getMock.mockImplementation((url: string, config?: { params?: unknown }) => {
+    const params = new URLSearchParams(
+      (config?.params ?? {}) as Record<string, string>,
+    );
+    if (url !== "/folders") {
+      return Promise.resolve({ data: [] });
+    }
+    const page = Number(params.get("page") ?? "1");
+    const pageSize = Number(params.get("page_size") ?? "10");
+    return Promise.resolve({
+      data: folders.slice((page - 1) * pageSize, page * pageSize),
+    });
+  });
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+
+  render(
+    <QueryClientProvider client={client}>
+      <FeatureFlagContext.Provider value={() => undefined}>
+        <MemoryRouter initialEntries={["/agents"]}>
+          <WorkflowsFlat />
+        </MemoryRouter>
+      </FeatureFlagContext.Provider>
+    </QueryClientProvider>,
+  );
+
+  fireEvent.click(await screen.findByRole("button", { name: "View all" }));
+  fireEvent.click(await screen.findByText("Folder 15"));
+
+  await waitFor(() =>
+    expect(
+      agentListRequests().some((query) => query.includes("folder_id=fld_15")),
+    ).toBe(true),
+  );
 });

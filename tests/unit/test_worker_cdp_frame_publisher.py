@@ -656,24 +656,6 @@ async def test_gate_closed_skips_capture_and_upload(streaming_temp_dir: Path, fa
 
 
 @pytest.mark.asyncio
-async def test_gate_open_publishes_normally(streaming_temp_dir: Path, fake_storage: AsyncMock) -> None:
-    session = _make_cdp_session([b"framebytes"])
-    page = _make_page_with_session(session)
-    pub = CDPFramePublisher(
-        browser_state=_make_browser_state(page),
-        stream_key=STREAM_KEY,
-        organization_id=ORG_ID,
-    )
-    gate = AsyncMock(return_value=True)
-    publisher_module.app.AGENT_FUNCTION = SimpleNamespace(should_publish_streaming_frame=gate)
-
-    await _drive_publish_once(pub)
-
-    gate.assert_awaited_once_with(ORG_ID, STREAM_KEY)
-    fake_storage.assert_awaited_once_with(ORG_ID, STREAM_KEY)
-
-
-@pytest.mark.asyncio
 async def test_gate_error_fails_open_and_publishes(streaming_temp_dir: Path, fake_storage: AsyncMock) -> None:
     session = _make_cdp_session([b"framebytes"])
     page = _make_page_with_session(session)

@@ -426,6 +426,7 @@ CONNECTED_ACCOUNT_FIELDS = {
     ("file_upload", "google_credential_id"),
     ("file_download", "google_credential_id"),
     ("send_email", "credential_id"),
+    ("send_email", "connection_id"),
     ("google_sheets_read", "credential_id"),
     ("email_inbox", "connection_id"),
     ("email_inbox", "credential_id"),

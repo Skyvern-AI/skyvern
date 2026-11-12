@@ -5,7 +5,10 @@ import {
   type WorkflowBlockType,
 } from "../../types/workflowTypes";
 import { blockTypeFromNode } from "../nodes/blockTypeFromNode";
+import { workflowBlockTitle } from "../nodes/types";
+import { humanizeBlockLabel } from "../../copilot/blockLabel";
 import { stripJinjaReferences } from "./docTextUtils";
+import { nodeLibraryItems } from "../panels/nodeLibraryItems";
 
 export type DocTagColor = "blue" | "green" | "purple" | "orange" | "brown";
 
@@ -147,14 +150,18 @@ const proseFields: Record<string, DocProseField[]> = {
   fileDownload: [field("navigationGoal", "Download goal")],
 };
 
-// The source is loopVariableReference when set (it wins at run time), else loopValue; a new loop uses the first.
-export function loopSourceKey(
-  node: Node,
+// As at run time, any nonempty loopVariableReference wins over loopValue, even one naming no list (`{{ }}`); a new loop uses it too.
+function loopSourceField(
+  data: Record<string, unknown>,
 ): "loopVariableReference" | "loopValue" {
-  return !text(node, "loopVariableReference") && text(node, "loopValue")
+  return !data.loopVariableReference &&
+    typeof data.loopValue === "string" &&
+    data.loopValue.trim()
     ? "loopValue"
     : "loopVariableReference";
 }
+
+export const loopSourceKey = (node: Node) => loopSourceField(node.data);
 
 export function getDocProseFields(node: Node): DocProseField[] {
   // "Complete if" isn't saved for 2.0 navigation, so it isn't shown there.
@@ -170,6 +177,18 @@ export function getDocProseFields(node: Node): DocProseField[] {
       ? [field("whileConditionExpression", "Condition")]
       : [];
   return proseFields[node.type ?? ""] ?? [];
+}
+
+/** The prose fields with text, in order; the first is the line the Doc shows as the step's prompt. */
+export function getDocFilledProseFields(
+  node: Node,
+  keep: readonly string[] = [],
+): (DocProseField & { value: string })[] {
+  return getDocProseFields(node).flatMap((f) => {
+    const value =
+      typeof node.data[f.key] === "string" ? (node.data[f.key] as string) : "";
+    return value.trim() || keep.includes(f.key) ? [{ ...f, value }] : [];
+  });
 }
 
 // Steps whose main line is a setting (a URL, a file), not an instruction; their title stays the summary.
@@ -201,23 +220,22 @@ export function docStepIsNoteOnly(node: Node): boolean {
   );
 }
 
-/** What an empty main line shows: the step's own summary when its field is a setting or short prompt. */
-export function getDocMainPlaceholder(node: Node): string {
-  const type = node.type ?? "";
-  const isPrompt = [
-    "task",
-    "taskv2",
-    "navigation",
-    "action",
-    "extraction",
-    "login",
-    "validation",
-    "human_interaction",
-    "textPrompt",
-    "agentStep",
-    "fileDownload",
-  ].includes(type);
-  return isPrompt ? "No instructions yet" : getDocStepSummary(node);
+const NO_INSTRUCTIONS = "No instructions yet";
+const REFERENCE_HINT = "Type @ to use an input or an earlier step's result.";
+const editingHints: Record<string, string> = {
+  validation: `Write what must be true for this check to pass. ${REFERENCE_HINT}`,
+  human_interaction: `Write what the approver should look at before deciding. ${REFERENCE_HINT}`,
+};
+
+/** What an empty main line shows: the step's own summary when it has one, else an editing hint while editing. */
+export function getDocMainPlaceholder(node: Node, editable: boolean): string {
+  return (
+    fixedStepSummary(node) ??
+    (editable
+      ? (editingHints[node.type ?? ""] ??
+        `Write what the agent should do. ${REFERENCE_HINT}`)
+      : NO_INSTRUCTIONS)
+  );
 }
 
 // Settings a step cannot run without; Doc shows each as a chip while it is empty.
@@ -254,7 +272,22 @@ function settingIsSet(node: Node, key: string): boolean {
 const text = (node: Node, key: string) =>
   typeof node.data[key] === "string" ? (node.data[key] as string).trim() : "";
 
+// The list a for-each loop goes through, or "" when its source names none.
+export function loopList(data: Record<string, unknown>): string {
+  const source = data[loopSourceField(data)];
+  const list = typeof source === "string" ? source.trim() : "";
+  return stripJinjaReferences(list).trim() ? list : "";
+}
+
+export const loopHasNoList = (data: Record<string, unknown>) =>
+  data.loopKind !== "while" && loopList(data) === "";
+
 export function getDocStepSummary(node: Node): string {
+  return fixedStepSummary(node) ?? NO_INSTRUCTIONS;
+}
+
+// Null for a step driven by its prompt, which has no summary of its own.
+function fixedStepSummary(node: Node): string | null {
   switch (node.type) {
     case "url":
       return text(node, "url") ? `Go to ${text(node, "url")}` : "Go to a URL";
@@ -296,6 +329,8 @@ export function getDocStepSummary(node: Node): string {
       return text(node, "query")
         ? `Search the web for ${text(node, "query")}`
         : "Search the web";
+    case "powerBIQuery":
+      return "Run a Power BI query";
     case "emailInbox":
       return text(node, "prompt") || "Find an email";
     case "terminate":
@@ -307,11 +342,11 @@ export function getDocStepSummary(node: Node): string {
     case "loop":
       return node.data.loopKind === "while"
         ? `Repeat while ${text(node, "whileConditionExpression") || "a condition holds"}`
-        : text(node, "loopVariableReference") || text(node, "loopValue")
-          ? `For each of ${text(node, "loopVariableReference") || text(node, "loopValue")}`
+        : loopList(node.data)
+          ? `For each of ${loopList(node.data)}`
           : "For each item";
     default:
-      return "No instructions yet";
+      return null;
   }
 }
 
@@ -334,32 +369,6 @@ export function getDocSettingSummary(node: Node): string | null {
   return SUMMARY_IS_SETTING.has(node.type ?? "")
     ? getDocStepSummary(node)
     : null;
-}
-
-export type DocKeyField = { key: string; label: string; value: string };
-
-const keyFields: Record<string, Array<[string, string]>> = {
-  http_request: [["method", "Method"]],
-  sendEmail: [
-    ["recipients", "Recipients"],
-    ["subject", "Subject"],
-  ],
-  fileParser: [["fileType", "Type"]],
-  workflowTrigger: [["workflowTitle", "Agent"]],
-  googleSheetsRead: [["range", "Range"]],
-  googleSheetsWrite: [["range", "Range"]],
-};
-
-export function getDocKeyFields(node: Node): DocKeyField[] {
-  return (keyFields[node.type ?? ""] ?? []).flatMap(([key, label]) => {
-    const value = node.data[key];
-    const shown = Array.isArray(value)
-      ? value.filter((v) => typeof v === "string" && v).join(", ")
-      : typeof value === "string" || typeof value === "number"
-        ? String(value).trim()
-        : "";
-    return shown ? [{ key, label, value: shown }] : [];
-  });
 }
 
 /** One line naming a step, for the outline and Jump buttons. */
@@ -392,6 +401,49 @@ export function docStepTitle(node: Node): string {
       ? String(node.data.label)
       : getDocStepSummary(node));
   return clip(title);
+}
+
+/** A step type's name from the full library, so a type the picker hides today (Agent, Power BI) still has its title. */
+export const nodeLibraryTitle = (type: string) =>
+  nodeLibraryItems.find((item) => item.nodeType === type)?.title ?? type;
+
+/** The name stem for a step type: "Go to URL Block" gives go_to_url. */
+export function labelStem(title: string): string {
+  return (
+    title
+      .replace(/ Block$/, "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "_")
+      .replace(/^_+|_+$/g, "")
+      .replace(/^(?=\d)/, "step_") || "step"
+  );
+}
+
+/** The step's label in words, or null for a default name (block_3, extraction_1) that says no more than its type. */
+export function docStepCaption(node: Node): string | null {
+  const label = typeof node.data.label === "string" ? node.data.label : "";
+  const blockType = docBlockType(node);
+  const stems = [
+    "block",
+    labelStem(nodeLibraryTitle(node.type ?? "")),
+    ...(blockType ? [labelStem(workflowBlockTitle[blockType])] : []),
+  ];
+  const unversioned = label.replace(/_v\d+$/, "");
+  const generic = stems.some(
+    (stem) =>
+      unversioned.startsWith(stem) &&
+      /^(_\d+)?$/.test(unversioned.slice(stem.length)),
+  );
+  if (!label.trim() || generic) return null;
+  // Sentence case reads as a title; a word with capitals after its first letter (PDF) keeps them.
+  return humanizeBlockLabel(label)
+    .split(" ")
+    .map((word, i) =>
+      i > 0 && word.slice(1) === word.slice(1).toLowerCase()
+        ? word.toLowerCase()
+        : word,
+    )
+    .join(" ");
 }
 
 function clip(title: string): string {

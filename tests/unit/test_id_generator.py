@@ -19,7 +19,6 @@ from skyvern.forge.sdk.db.id import (
     TIMESTAMP_BITS,
     TOTP_CODE_PREFIX,
     USER_PREFIX,
-    VERSION,
     VERSION_BITS,
     WORKER_ID_BITS,
     WORKFLOW_PREFIX,
@@ -53,10 +52,6 @@ class TestConstants:
     def test_base_epoch(self):
         """BASE_EPOCH should be June 20, 2022 12:00 AM UTC."""
         assert BASE_EPOCH == 1655683200
-
-    def test_version(self):
-        """Version should be 0."""
-        assert VERSION == 0
 
     def test_bit_allocation(self):
         """Total bits should add up to 64."""

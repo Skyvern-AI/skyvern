@@ -40,6 +40,10 @@ Every integration with a **Connect**, **Configure** or **Set up →** button is 
 
 Don't see what you need? Click **Request →** on the **Request another integration** card and name the service.
 
+<Note>
+Every Admin and Member can connect a Google or Microsoft account or configure a password vault, unless your organization enables [role-based access control](/cloud/account#roles). With it on, these follow what the person's role has been granted, and by default only the **Admin** role has them. Without the grant, the Google Sheets, Google Drive, Gmail and Outlook tiles show **Admin required** in place of **Connect**, and the **Credentials** tiles show **Organization admin access is required** in place of **Configure** or **Edit**. A Member can still pick an already connected account in an agent's blocks.
+</Note>
+
 ## Google and Microsoft accounts
 
 Google Sheets, Google Drive, Gmail and Outlook connect through Google or Microsoft sign-in.
@@ -76,6 +80,8 @@ Each connected card lists its accounts. From there you can:
 - **Turn on reading or sending** (Gmail): the account row shows **Read inbox** and **Send email**. Click the one that isn't on yet and approve the extra permission. Sending needs the account's address, so an older connection may ask you to reconnect first.
 - **Reconnect** (Google only): if the card shows **Needs reconnect**, the authorization expired or you didn't approve every permission. Click **Reconnect** and approve again. Agents that use the account resume without edits.
 
+With role-based access control on, these controls follow the same grants. Without them, you see the account list without **Add another account**, the **...** menu or the Sheets and Drive **Reconnect** button, and Gmail's **Read inbox**, **Send email** and **Reconnect** buttons are disabled.
+
 <Warning>
 Disconnecting cannot be undone. Agents that use the account fail on their next run until you reconnect it or pick another account in their blocks.
 </Warning>
@@ -91,6 +97,8 @@ The four **Credentials** tiles let agents log in with secrets you already keep e
 | Azure Key Vault | **Tenant ID**, **Client ID** and **Client Secret** of an app registration that can read the vault. |
 | Custom Credential Service | **API Base URL** and **API Token** of your service. Click **Test Connection** before you save. |
 
+For 1Password, Skyvern checks the token against 1Password before it saves it. A token that 1Password rejects, or that takes more than ten seconds to check, is not saved: the reason appears under **Service Account Token** and the token you had keeps working.
+
 For Bitwarden, **Email** and **Master Password** are the default. Add a **Personal API key** if Bitwarden asks Skyvern for a verification code (a new-device check or two-step login). Skyvern cannot enter these codes. Without a key, the run stops with a message that explains this.
 
 In the Bitwarden web app, open **Settings > Security > Keys > View API key**. Copy `client_id` (starts with `user.`) and `client_secret` into the form. Organization API keys do not work.
@@ -105,7 +113,7 @@ How agents pick a vault item at run time, and how to reference items in an agent
 
 ## MCP
 
-Click **Set up →** on the **MCP** tile, or **Integrations → MCP** in the sidebar, to open **Connect Skyvern with MCP** at `/integrations/mcp`. Pick your client: **Claude Code**, **Cursor**, **Codex CLI**, **ChatGPT**, **Claude Desktop**, **Windsurf**, **Hermes** or **OpenClaw**. The page shows the recommended setup for that client, with commands you can copy. Browser sign-in (OAuth) methods need no API key. API key methods come pre-filled with your key.
+Click **Set up →** on the **MCP** tile, or **Integrations → MCP** in the sidebar, to open **Connect Skyvern with MCP** at `/integrations/mcp`. Pick your client: **Claude Code**, **Cursor**, **Codex CLI**, **ChatGPT**, **Claude Desktop**, **Windsurf**, **Hermes** or **OpenClaw**. The page shows the recommended setup for that client, with commands you can copy. Browser sign-in (OAuth) methods need no API key. API key methods come pre-filled with your key, unless your organization enables [role-based access control](/cloud/account#roles) and withholds **API keys: View** from your role. You then read **An organization admin manages API keys. Use an OAuth method for this client, or ask an admin for a key.**
 
 <img src="/images/cloud/cloud-integrations-mcp.png" alt="Connect Skyvern with MCP with Claude Code selected and the Browser sign-in steps" />
 

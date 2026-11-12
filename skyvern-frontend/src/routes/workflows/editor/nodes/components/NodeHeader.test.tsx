@@ -46,7 +46,6 @@ import {
 
 import { useWorkflowPresentationStore } from "@/store/WorkflowPresentationStore";
 import { useRunCompletionToast } from "@/routes/workflows/workflowRun/useRunCompletionToast";
-import { useDocRunStore } from "../../doc/docRunStore";
 
 vi.mock("@/routes/workflows/workflowRun/useRunCompletionToast", () => ({
   useRunCompletionToast: vi.fn(),
@@ -327,17 +326,16 @@ describe("the run-completion toast from a step header", () => {
     expect(lastToastedRun()).toMatchObject({ workflow_run_id: "wr_step" });
   });
 
-  test("stays silent while the Doc is showing, which states a step run's outcome on its own line", () => {
+  test("watches the run while the Doc is showing, as in the Visual editor", () => {
     useWorkflowPresentationStore.setState({
       enabled: true,
       presentation: "doc",
+      docMounted: true,
     });
-    useDocRunStore.setState({ mounted: true });
-    expect(lastToastedRun()).toBeUndefined();
+    expect(lastToastedRun()).toMatchObject({ workflow_run_id: "wr_step" });
     useWorkflowPresentationStore.setState(
       useWorkflowPresentationStore.getInitialState(),
     );
-    useDocRunStore.setState({ mounted: false });
   });
 });
 

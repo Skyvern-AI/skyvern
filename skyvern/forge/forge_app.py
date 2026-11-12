@@ -286,7 +286,7 @@ def create_forge_app() -> ForgeApp:
     app.WORKFLOW_COPILOT_LITE_LLM_API_HANDLER = (
         LLMAPIHandlerFactory.get_llm_api_handler(settings.WORKFLOW_COPILOT_LITE_LLM_KEY)
         if settings.WORKFLOW_COPILOT_LITE_LLM_KEY
-        else None
+        else app.WORKFLOW_COPILOT_LLM_API_HANDLER
     )
     app.WORKFLOW_CONTEXT_MANAGER = WorkflowContextManager()
     app.WORKFLOW_SERVICE = WorkflowService()

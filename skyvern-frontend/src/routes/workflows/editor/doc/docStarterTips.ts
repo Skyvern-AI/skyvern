@@ -30,7 +30,7 @@ export const TIPS: Array<{
   {
     id: "problems",
     when: (p) => p.problems > 0,
-    text: "What a step still needs is flagged in red as you go. Run waits until it's fixed.",
+    text: "What a step still needs is shown under it as you go. Run asks first while something is missing.",
   },
   {
     id: "run",
