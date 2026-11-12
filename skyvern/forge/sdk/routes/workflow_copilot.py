@@ -147,7 +147,7 @@ from skyvern.forge.sdk.copilot.turn_outcome import (
     build_minimal_turn_outcome,
     with_copilot_code_mode_metadata,
 )
-from skyvern.forge.sdk.copilot.workflow_credential_utils import workflow_credential_ids
+from skyvern.forge.sdk.copilot.workflow_credential_utils import workflow_connection_ids
 from skyvern.forge.sdk.copilot.workflow_yaml import _normalize_copilot_yaml as _normalize_copilot_yaml
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml as _copilot_process_workflow_yaml
 from skyvern.forge.sdk.copilot.workflow_yaml import _repair_next_block_label_chain as _repair_next_block_label_chain
@@ -2508,13 +2508,12 @@ def _prior_copilot_workflow_yaml(
 
 
 def _pending_proposal_connected_account_id(pending_proposal_yaml: str) -> str | None:
-    """Zero or several bound accounts leave the choice to the picker rather than guessing one."""
-    bound = [
-        credential_id
-        for credential_id in workflow_credential_ids(pending_proposal_yaml)
-        if credential_id.startswith("goac_")
-    ]
-    return bound[0] if len(bound) == 1 else None
+    """Zero or several bound accounts leave the choice to the picker rather than guessing one. An account a
+    sending or uploading field uses is never picked by the button: the user names or picks it on the card."""
+    bound = workflow_connection_ids(pending_proposal_yaml)
+    if len(bound) != 1 or bound[0] in workflow_connection_ids(pending_proposal_yaml, acting_only=True):
+        return None
+    return bound[0]
 
 
 def _apply_test_end_to_end_action(chat_request: WorkflowCopilotChatRequest, pending_proposal_yaml: str) -> None:

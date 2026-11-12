@@ -29,7 +29,6 @@ from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.agent_context import ScoutedDragDestination, ScoutedInteraction, ScoutedSelectorCandidate
 from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
-from skyvern.forge.sdk.copilot.blocker_signal import stash_blocker_signal
 from skyvern.forge.sdk.copilot.composition_browser_expressions import scout_control_state_expression
 from skyvern.forge.sdk.copilot.config import (
     AuthoringCapability,
@@ -131,12 +130,9 @@ from .banned_blocks import (
     workflow_run_names,
 )
 from .credentials import (
-    _credential_run_approval_blocker_signal,
     _credential_run_approval_error,
     _extract_credential_ids_from_tool_value,
-    _extract_credential_ids_from_workflow_definition,
-    _google_connection_reference_ids,
-    _server_verified_google_account_choices,
+    run_credential_gate,
 )
 from .page_observation import (
     _record_composition_page_observation,
@@ -2409,8 +2405,6 @@ async def _schedule_parameters_credential_pre_hook(
                 if value != SECRET_HEADER_MASK or key in stored
             }
             params["parameters"] = parameters
-    credential_ids = _extract_credential_ids_from_tool_value(parameters or {})
-    google_reference_ids: list[str] = []
     workflow = (
         await app.DATABASE.workflows.get_workflow_by_permanent_id(
             workflow_permanent_id=ctx.workflow_permanent_id, organization_id=ctx.organization_id
@@ -2418,31 +2412,22 @@ async def _schedule_parameters_credential_pre_hook(
         if ctx.workflow_permanent_id
         else None
     )
-    if workflow is not None:
-        credential_ids = list(
-            dict.fromkeys(
-                credential_ids + _extract_credential_ids_from_workflow_definition(workflow.workflow_definition)
-            )
+    if workflow is None:
+        error = _credential_run_approval_error(
+            _extract_credential_ids_from_tool_value(parameters or {}), ctx.request_policy
         )
-        # ponytail: no same-turn Sheets listing admission like the run path; schedule turns rarely list sheets.
-        google_reference_ids = _google_connection_reference_ids(workflow.workflow_definition, None)
-    google_approval_blocker = _credential_run_approval_blocker_signal(
-        credential_ids,
-        ctx.request_policy,
-        google_reference_ids=google_reference_ids,
+        return {"ok": False, "error": error} if error is not None else None
+    gate = await run_credential_gate(
+        ctx,
+        workflow.workflow_definition,
+        labels=None,
+        run_parameters=parameters if isinstance(parameters, dict) else None,
         action="schedule the workflow",
         blocked_tool="workflow_schedule",
+        # ADR 0038: a schedule runs unattended, so only an account the user cited, picked or saved may bind.
+        listing_admits_reads=False,
     )
-    if google_approval_blocker is not None:
-        ctx.connected_account_recovery_choices = (
-            await _server_verified_google_account_choices(ctx.organization_id) or []
-        )
-        tool_error = stash_blocker_signal(ctx, google_approval_blocker)
-        return {"ok": False, "error": tool_error}
-    credential_approval_error = _credential_run_approval_error(credential_ids, ctx.request_policy)
-    if credential_approval_error is not None:
-        return {"ok": False, "error": credential_approval_error}
-    return None
+    return {"ok": False, "error": gate.error} if gate.error is not None else None
 
 
 async def _chat_has_pending_proposal(ctx: AgentContext) -> bool:

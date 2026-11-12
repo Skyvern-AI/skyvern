@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 
 from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
 from skyvern.forge.sdk.copilot.workflow_block_traversal import workflow_block_locations
+from skyvern.forge.sdk.integrations.connected_accounts import block_connection_refs
 from skyvern.forge.sdk.workflow.models.parameter import BITWARDEN_AWS_KEY_DEFAULTS, ParameterType
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
@@ -206,10 +207,74 @@ def block_credential_ids(block: dict[str, Any], credential_params_by_key: Mappin
                     credential_ids.add(ids)
                 else:
                     credential_ids.update(ids)
-    direct_credential_id = block.get("credential_id")
-    if isinstance(direct_credential_id, str):
-        credential_ids.add(direct_credential_id)
     return credential_ids
+
+
+_BARE_TEMPLATE_RE = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
+
+
+def _literal_parameter_values(parsed: dict[str, Any], run_parameters: Mapping[str, Any] | None) -> dict[str, str]:
+    """What dispatch binds a declared parameter to: a credential parameter's literal ID, which a run value never
+    overrides, or a workflow parameter's run value. A default is not used: a test run may fill it from elsewhere."""
+    run_values = run_parameters or {}
+    values: dict[str, str] = {}
+    for parameter in declared_parameters(parsed):
+        if not isinstance(parameter, dict) or not isinstance(key := parameter.get("key"), str):
+            continue
+        parameter_type = str(parameter.get("parameter_type") or "").lower()
+        if parameter_type == ParameterType.CREDENTIAL:
+            value = parameter.get("credential_id")
+            if isinstance(value, str) and value.strip():
+                values[key] = value.strip()
+        elif parameter_type == ParameterType.WORKFLOW:
+            value = run_values.get(key)
+            if isinstance(value, str) and value.strip():
+                values.setdefault(key, value.strip())
+    return values
+
+
+def workflow_connection_refs(
+    parsed: dict[str, Any],
+    *,
+    selected_labels: set[str] | None = None,
+    run_parameters: Mapping[str, Any] | None = None,
+    acting_only: bool = False,
+) -> list[str]:
+    """Connected-account references the selected blocks run with. A bare `{{ key }}` resolves only through a
+    declared parameter; a loop variable, block output or any other template stays as written, so it matches no
+    connection."""
+    values = _literal_parameter_values(parsed, run_parameters)
+    refs: list[str] = []
+    for block in workflow_blocks(parsed, selected_labels=selected_labels):
+        for ref in block_connection_refs(block, acting_only=acting_only):
+            match = _BARE_TEMPLATE_RE.fullmatch(ref)
+            refs.append(values.get(match.group(1), ref) if match else ref)
+    return list(dict.fromkeys(refs))
+
+
+def agent_step_account_text(
+    parsed: dict[str, Any],
+    *,
+    selected_labels: set[str] | None = None,
+    run_parameters: Mapping[str, Any] | None = None,
+) -> str | None:
+    """Text an executing agent step can take an account id from: its prompt, what a bare `{{ key }}` in the prompt
+    resolves to, and every run value, which the step can read. None when no agent step runs."""
+    prompts = [
+        str(block.get("prompt") or "")
+        for block in workflow_blocks(parsed, selected_labels=selected_labels)
+        if block.get("block_type") == "agent_step"
+    ]
+    if not prompts:
+        return None
+    values = _literal_parameter_values(parsed, run_parameters)
+    resolved = [values[key] for prompt in prompts for key in _BARE_TEMPLATE_RE.findall(prompt) if key in values]
+    return "\n".join([*prompts, *resolved, json.dumps(run_parameters or {}, default=str)])
+
+
+def workflow_connection_ids(workflow_yaml: str, *, acting_only: bool = False) -> list[str]:
+    parsed = parse_workflow_yaml(workflow_yaml) if workflow_yaml else None
+    return workflow_connection_refs(parsed, acting_only=acting_only) if isinstance(parsed, dict) else []
 
 
 def workflow_credential_ids(workflow_yaml: str) -> set[str]:
