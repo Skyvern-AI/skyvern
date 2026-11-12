@@ -24,6 +24,8 @@ Runs are asynchronous. A production integration starts a run, gets told when it 
 
 Pass `webhook_url` when you start a run. Skyvern sends one POST to that URL when the run reaches a terminal status: `completed`, `failed`, `terminated`, `timed_out`, or `canceled`.
 
+The webhook for a canceled agent run on Skyvern Cloud can arrive after the cancel call returns. If the run was still executing, Skyvern usually waits until it has finished shutting down, so the payload includes the run's recording and downloaded files. Otherwise, for example when the run was still `queued`, Skyvern sends the webhook as soon as the cancel completes, so don't rely on the recording being present.
+
 Job recipe runs (the [Apply](/api-reference/recipes/apply-to-a-job) and [Extract](/api-reference/recipes/extract-a-job-application-posting) recipe endpoints) take the same top-level `webhook_url`, and `proxy_location` too. A recipe request without `webhook_url` sends no webhook; blank or null counts as absent.
 
 <CodeGroup>
