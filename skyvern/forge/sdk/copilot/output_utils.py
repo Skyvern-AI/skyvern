@@ -2405,21 +2405,22 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
             summary = " → ".join(steps)
         return f"{summary} at {url[:80]}" if isinstance(url, str) and url else summary
     if tool_name == "create_webhook_trigger":
-        return (
-            "Created a webhook trigger. It rejects every event until you click Rotate secret on it in the "
-            "Triggers panel and give your sender the new secret."
-        )
+        after_create = data.get("after_create")
+        return f"Created a trigger. {after_create}" if isinstance(after_create, str) else "Created a trigger."
     if tool_name == "test_trigger_mapping":
+        sample_label = (
+            "the source's made-up example event" if data.get("sample") == "source_example_event" else "the sample"
+        )
         resolved = data.get("resolved_parameters")
         if not data.get("accepted") or not isinstance(resolved, dict):
             reason_code = cast("TriggerMappingReasonCode", data.get("reason_code"))
             reason = _TRIGGER_MAPPING_REASON_LABELS.get(reason_code, "Mapping was rejected")
-            return f"The mapping did not resolve on the sample: {reason}"
+            return f"The mapping did not resolve on {sample_label}: {reason}"
         pairs = ", ".join(
             f"{sanitize_block_label_for_display(str(key))} = {sanitize_block_label_for_display(str(value), 80)}"
             for key, value in resolved.items()
         )
-        return f"Mapping resolved on the sample: {pairs}" if pairs else "Mapping resolved on the sample"
+        return f"Mapping resolved on {sample_label}: {pairs}" if pairs else f"Mapping resolved on {sample_label}"
     if tool_name == "list_workflow_triggers":
         triggers = data.get("triggers")
         return f"Found {len(triggers) if isinstance(triggers, list) else 0} trigger(s) on this workflow"

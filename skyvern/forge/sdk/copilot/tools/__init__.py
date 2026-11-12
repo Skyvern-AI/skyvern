@@ -22,6 +22,7 @@ from openai.types.responses import ResponseFunctionToolCall
 from pydantic import Field, JsonValue
 
 from skyvern.forge import app as app
+from skyvern.forge.agent_functions import CopilotTriggerSource
 from skyvern.forge.sdk.copilot.ask_user import (
     ACCOUNT_GROUP_CANCEL_TOOL_NAME,
     ACCOUNT_GROUP_STATUS_TOOL_NAME,
@@ -114,6 +115,7 @@ from skyvern.forge.sdk.copilot.tools.credential_deletion import (
 from skyvern.forge.sdk.copilot.tools.event_triggers import (
     create_webhook_trigger_tool,
     list_workflow_triggers_tool,
+    render_trigger_sources,
     test_trigger_mapping_tool,
 )
 from skyvern.forge.sdk.copilot.tools.locator_inspection import TOOL_DESCRIPTION as LOCATOR_INSPECTION_TOOL_DESCRIPTION
@@ -2661,8 +2663,10 @@ def copilot_native_tools(
     supports_google_setup_card: bool = False,
     supports_demonstration_offer: bool = False,
     browser_pattern_accepting_calls: tuple[str, ...] = (),
+    trigger_sources: list[CopilotTriggerSource] | None = None,
 ) -> list[FunctionTool]:
     capability = _normalized_authoring_capability(authoring_capability)
+    trigger_sources_text = render_trigger_sources(trigger_sources or [])
     both_families = capability.code_blocks and capability.agent_blocks
     appended = SCHEMA_FIRST_GUIDANCE if not both_families else f"{AUTHORING_FAMILY_GUIDANCE}\n\n{SCHEMA_FIRST_GUIDANCE}"
     tools: list[FunctionTool] = []
@@ -2692,6 +2696,8 @@ def copilot_native_tools(
             tool = _with_executed_source_param(tool, browser_code_available=browser_code_available)
         if tool.name in _BUILD_TEST_TOOL_NAMES:
             tool = dataclasses.replace(tool, description=f"{tool.description}\n\n{BUILD_TEST_BROWSER_START}")
+        if tool.name == create_webhook_trigger_tool.name and trigger_sources_text:
+            tool = dataclasses.replace(tool, description=f"{tool.description}\n\n{trigger_sources_text}")
         if tool.name == list_integrations_tool.name and run_tools_available:
             tool = dataclasses.replace(tool, description=f"{tool.description}\n\n{_LIST_INTEGRATIONS_RUN_GUIDANCE}")
         if tool.name in AUTHORING_GUIDANCE_TOOL_NAMES:
