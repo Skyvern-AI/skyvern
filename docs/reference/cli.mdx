@@ -28,6 +28,12 @@ The `skyvern browser …`, `skyvern setup` and `skyvern mcp …` commands also n
 pip install "skyvern[local]"
 ```
 
+`skyvern run server` and `skyvern run mcp` need the server extra instead, which includes everything in the local extra:
+
+```bash
+pip install "skyvern[server]"
+```
+
 Set your API key and target:
 
 ```bash
@@ -52,7 +58,7 @@ skyvern run server            # Start the local API server
 skyvern run mcp               # Start the MCP server (stdio transport)
 skyvern run mcp --transport streamable-http  # Start the MCP server (HTTP transport)
 skyvern status                # Check if services are running
-skyvern stop                  # Stop running services
+skyvern stop all              # Stop the services on ports 8000, 8080 and 9090
 ```
 
 ### Browser automation
@@ -99,7 +105,7 @@ skyvern browser login --url https://app.example.com --credential-id cred_xxx
 ```
 
 <Tip>
-Every browser command supports `--json` for machine-readable output, and `--session` / `--cdp` to target a specific session. If omitted, the CLI uses the last active session automatically.
+Most browser commands support `--json` for machine-readable output. Commands that act on a page also take `--session` or `--cdp` to target a specific session. If you omit both, the CLI uses the session saved by `session create` or `session connect`, for up to 24 hours.
 </Tip>
 
 ### Connect your local browser to Skyvern Cloud
@@ -113,8 +119,8 @@ skyvern browser serve --tunnel --use-local-profile
 # Use a specific Chrome profile
 skyvern browser serve --tunnel --use-local-profile --chrome-profile-name "Profile 2"
 
-# Headless mode with JSON output (for scripting)
-skyvern browser serve --tunnel --headless --json
+# Headless mode (--json cannot be combined with --tunnel)
+skyvern browser serve --tunnel --headless
 ```
 
 The `--use-local-profile` flag clones cookies and saved passwords from your Chrome profile into the served browser. Your original profile is never modified, and it works while Chrome is open.
@@ -210,27 +216,29 @@ skyvern setup cursor             # Register with Cursor
 skyvern setup windsurf           # Register with Windsurf
 skyvern setup openclaw           # Register with OpenClaw
 skyvern setup opencode           # Register with OpenCode (API key auth; avoids OAuth timeouts)
-skyvern setup hermes             # Register with Hermes (all ~/.hermes configs, including profiles)
+skyvern setup hermes             # Register with Hermes (~/.hermes/config.yaml and each profile that has a config.yaml)
 skyvern mcp switch                    # Interactively switch existing Skyvern MCP configs
 skyvern mcp switch --dry-run          # Preview changes without writing files
 skyvern mcp profile list              # List saved switch sources
 skyvern mcp profile save work-prod --api-key YOUR_KEY --base-url https://api.skyvern.com
 ```
 
-For the local self-hosted path, `skyvern quickstart` or `skyvern init` can also configure Claude Code during the interactive MCP step. In a project directory that flow writes `.mcp.json`, installs `.claude/skills/qa`, and keeps the MCP connection fully local for localhost testing.
+For the local self-hosted path, `skyvern quickstart` or `skyvern init` can also configure Claude Code during the interactive MCP step. In a project directory that flow writes `.mcp.json`, installs the bundled skills (including `/qa`) into `.claude/skills/`, and keeps the MCP connection fully local for localhost testing.
 
-`skyvern mcp switch` updates existing Skyvern entries in Claude Code, Claude Desktop, Cursor, Windsurf, Codex, Hermes, and OpenClaw configs. It lets you choose a source from env, saved profiles, existing configs already on disk, or manual entry; creates backups before writing; and preserves the config's current transport shape. If a tool has no Skyvern entry yet, run `skyvern setup` first.
+`skyvern mcp switch` updates existing Skyvern entries in Claude Code, Claude Desktop, Cursor, Windsurf, Codex, Hermes, OpenClaw, and OpenCode configs. It lets you choose a source from env, saved profiles, existing configs already on disk, or manual entry; creates backups before writing; and preserves the config's current transport shape. If a tool has no Skyvern entry yet, run `skyvern setup` first.
 
 ### Other
 
 ```bash
 skyvern docs                     # Open documentation in your browser
 skyvern quickstart               # One-command setup + start
-skyvern init                     # Interactive setup without starting services
+skyvern init                     # Interactive setup wizard (does not start the Skyvern server)
 skyvern init browser             # Initialize browser configuration only
 skyvern doctor                   # Check the installation (--fix tries to repair what fails)
 skyvern doctor streaming         # Check that local browser streaming works (--base-url, --browser-session-id, --timeout)
 ```
+
+For a local server, `skyvern init` uses PostgreSQL if it is already running, or offers to start a container in Docker (`--no-postgres` skips the offer, and `--database-string` points it at your own database). It then runs the database migrations. Start Skyvern afterwards with `skyvern run server`.
 
 ## CLI vs MCP: when to use which
 
@@ -281,7 +289,7 @@ mkdir -p ~/.hermes/profiles/<your-profile>/skills/skyvern-browser-automation
 skyvern skill copy skyvern -o /tmp/skyvern-skill
 ```
 
-Replace the frontmatter in the copied `SKILL.md` with:
+The copy lands in `/tmp/skyvern-skill/skyvern/`. Replace the frontmatter in its `SKILL.md` with:
 
 ```yaml
 ---
@@ -294,7 +302,7 @@ metadata:
 ---
 ```
 
-Then move it into place: `cp /tmp/skyvern-skill/SKILL.md ~/.hermes/profiles/<your-profile>/skills/skyvern-browser-automation/SKILL.md`
+Then move it into place: `cp /tmp/skyvern-skill/skyvern/SKILL.md ~/.hermes/profiles/<your-profile>/skills/skyvern-browser-automation/SKILL.md`
 
 Verify with `hermes skills list | grep skyvern`.
 

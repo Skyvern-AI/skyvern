@@ -883,7 +883,7 @@ aws s3 sync ./artifacts s3://acme-skyvern-artifacts/
 # Azure
 azcopy copy './artifacts/*' 'https://acmeskyvern.blob.core.windows.net/skyvern-artifacts' --recursive
 
-docker compose restart skyvern
+docker compose up -d skyvern
 ```
 
 If artifacts don't appear, check `docker compose logs skyvern | grep -i storage`.
