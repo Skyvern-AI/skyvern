@@ -2279,6 +2279,9 @@ class AgentFunction:
     def on_browser_run_released(self, browser_context: BrowserContext | BrowserArtifacts | None) -> None:
         """A run released a browser that no other run shares. OSS no-op."""
 
+    def set_browser_run_http_cache(self, browser_context: BrowserContext, generation: str | None) -> None:
+        """Start a fresh run-scoped static response store on this context, or turn it off with None. OSS no-op."""
+
     def on_browser_context_retired(self, browser_context: BrowserContext) -> None:
         """A replacement took over from this context, which no run uses again; it may never emit close. OSS no-op."""
 
