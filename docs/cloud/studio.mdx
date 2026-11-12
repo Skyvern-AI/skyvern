@@ -38,7 +38,7 @@ The right side of the top bar holds the agent's controls:
 
 | Control | What it does |
 |---|---|
-| Save (disk icon) | Saves your hand edits. A dot on the icon means unsaved changes. |
+| Save (disk icon) | Saves your hand edits. A dot on the icon means unsaved changes. It is disabled, and its tooltip says why, while Copilot is working on a request or applying changes and while YAML edits are being applied. When Copilot pauses saving so you don't overwrite a newer change (for example, the agent changed after Copilot proposed its changes), Save stays clickable and opens **Save is paused**, which explains why and offers **Reload and discard my edits**. |
 | **Schedule** (calendar icon) | Lists this agent's schedules and adds new ones. See [Runs and schedules](/cloud/runs#schedule-an-agent). |
 | **Triggers** (lightning icon) | Starts this agent from a signed HTTP request. See [Event triggers](/developers/event-triggers). |
 | **More actions** (⋯) | **Code**, **Version history**, **Save as Template**, **Take a tour** |

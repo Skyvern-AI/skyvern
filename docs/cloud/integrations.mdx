@@ -99,6 +99,8 @@ The four **Credentials** tiles let agents log in with secrets you already keep e
 
 For 1Password, Skyvern checks the token against 1Password before it saves it. A token that 1Password rejects, or that takes more than ten seconds to check, is not saved: the reason appears under **Service Account Token** and the token you had keeps working.
 
+Once the 1Password tile reads **Status: Active**, it also offers **Import from 1Password**, which adds selected vault items to your credential list. See [Import 1Password items as credentials](/credentials#import-1password-items-as-credentials).
+
 For Bitwarden, **Email** and **Master Password** are the default. Add a **Personal API key** if Bitwarden asks Skyvern for a verification code (a new-device check or two-step login). Skyvern cannot enter these codes. Without a key, the run stops with a message that explains this.
 
 In the Bitwarden web app, open **Settings > Security > Keys > View API key**. Copy `client_id` (starts with `user.`) and `client_secret` into the form. Organization API keys do not work.
