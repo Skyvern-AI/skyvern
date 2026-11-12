@@ -119,7 +119,7 @@ curl https://api.skyvern.com/.well-known/oauth-protected-resource
 
 The server advertises the scopes `openid`, `profile`, `email`, `public_metadata`, `private_metadata`, `offline_access` and `user:org:read`; the MCP server's metadata narrows them to `profile` and `email`. These are identity scopes, not API permissions (see [Permissions](#permissions)).
 
-Access tokens expire and can be refreshed when you request `offline_access`. A refresh token works once and is replaced on every exchange; replaying an old one revokes the whole token family. Revoking the organization's API key also invalidates tokens issued against it.
+Access tokens expire and can be refreshed when you request `offline_access`. A refresh token works once and is replaced on every exchange; replaying an old one revokes the whole token family. Every refresh also re-checks the role of the person who authorized the client: once they leave the organization or their role changes, the refresh fails with `invalid_grant`, the whole token family is revoked, and the client has to sign in again. Revoking the organization's API key also invalidates tokens issued against it.
 
 ### Permissions
 
@@ -146,7 +146,7 @@ Each person in an organization is an **Admin**, a **Member** or a **Billing Admi
 
 **Role-based access control is opt-in and needs the Enterprise plan.** Until an Admin turns it on, a Member can access most organization actions. Managing member roles and SFTP and Concord fax adapter configuration remain Admin-only either way, including configuration reads and writes. A Member can't grant themselves more access or switch role-based access control on.
 
-Once an Admin enables it, each person's role decides what they can do and requests outside their role are refused with `403`. That covers event triggers, additional organization API keys, the 1Password connection, the [audit log](#audit-log) export and the rest of the organization's actions. On [Integrations](/cloud/integrations), a role without the grant sees **Admin required** or **Organization admin access is required** in place of the connect and configure buttons.
+Once an Admin enables it, each person's role decides what they can do and requests outside their role are refused with `403`. That covers event triggers, additional organization API keys, the 1Password connection, the [audit log](#audit-log) export and the rest of the organization's actions. On [Integrations](/cloud/integrations), a role without the grant sees **Admin required** or **Organization admin access is required** in place of the connect and configure buttons. Elsewhere the control stays visible but disabled, and hovering it shows **Organization admin access is required for this action.** That covers the trash icon and the bulk **Delete** button on Credentials, both cards on **Settings → Models**, and the fields and **Save** button on **Settings → Limits**. A Copilot card that would delete credentials reads **Ask an Admin to delete this credential.** for one credential or **Ask an Admin to delete these credentials.** for several, and offers only **Cancel**. While Skyvern is still checking your role, the control is disabled and the tooltip reads **Checking permissions…**.
 
 These limits also apply whether or not you enable role-based access control:
 
