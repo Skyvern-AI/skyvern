@@ -2736,3 +2736,130 @@ describe("Demonstrate task in the step menu", () => {
     });
   });
 });
+
+describe("the Add note button", () => {
+  beforeEach(() => {
+    useWorkflowYamlEditorStore.setState(
+      useWorkflowYamlEditorStore.getInitialState(),
+    );
+    useWorkflowParametersStore.setState({ parameters: [] });
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      },
+    );
+    vi.stubGlobal("requestAnimationFrame", (cb: () => void) => {
+      cb();
+      return 0;
+    });
+    vi.stubGlobal("CSS", { escape: (value: string) => value });
+    Element.prototype.scrollIntoView = vi.fn();
+  });
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  const steps = () => [
+    block("wait", "open_site", "read_page", { wait_sec: 5 }),
+    block("navigation", "read_page", null, {
+      navigation_goal: "Read the page",
+    }),
+  ];
+  const typeNote = (text: string) => {
+    const note = screen.getByRole("textbox", { name: "Note" });
+    expect(document.activeElement).toBe(note);
+    Object.defineProperty(note, "innerText", {
+      value: text,
+      configurable: true,
+    });
+    fireEvent.input(note);
+  };
+  const notesOf = (doc: ReturnType<typeof renderLiveDoc>) =>
+    Object.fromEntries(
+      doc
+        .graph()
+        .nodes.filter(isWorkflowBlockNode)
+        .map((n) => {
+          const data = n.data as Record<string, unknown>;
+          return [n.data.label, [data.notes ?? "", data.trailingNotes ?? ""]];
+        }),
+    );
+  const addNote = (step: string) =>
+    screen.getByRole("button", { name: `Add note below ${step}` });
+  const addNoteButtons = () =>
+    screen.queryAllByRole("button", { name: /^Add note below / });
+  const firstLine = () => screen.getByRole("textbox", { name: /^open_site / });
+
+  test("is on every step without hovering, and saves the same note as Enter at the end of a step", () => {
+    const byEnter = renderLiveDoc(steps());
+    expect(addNoteButtons().map((b) => b.getAttribute("aria-label"))).toEqual([
+      "Add note below Open site",
+      "Add note below Read page",
+    ]);
+    fireEvent.focus(firstLine());
+    fireEvent.keyDown(firstLine(), { key: "Enter" });
+    typeNote("Check the total");
+    const expected = notesOf(byEnter);
+    cleanup();
+
+    const byButton = renderLiveDoc(steps());
+    fireEvent.click(addNote("Open site"));
+    typeNote("Check the total");
+    expect(notesOf(byButton)).toEqual(expected);
+    expect(expected.read_page).toEqual(["Check the total", ""]);
+  });
+
+  test("after the last step it adds the note that trails it", () => {
+    const doc = renderLiveDoc(steps());
+    fireEvent.click(addNote("Read page"));
+    typeNote("Done here");
+    expect(notesOf(doc).read_page).toEqual(["", "Done here"]);
+  });
+
+  test("where a note already follows the step it goes to that note", () => {
+    const doc = renderLiveDoc([
+      steps()[0]!,
+      block("navigation", "read_page", null, {
+        navigation_goal: "Read the page",
+        notes: "Look closely",
+      }),
+    ]);
+    fireEvent.click(addNote("Open site"));
+    expect(screen.getAllByRole("textbox", { name: "Note" })).toHaveLength(1);
+    expect(document.activeElement).toBe(
+      screen.getByRole("textbox", { name: "Note" }),
+    );
+    expect(notesOf(doc).read_page).toEqual(["Look closely", ""]);
+  });
+
+  test("is not offered on a loop or a read-only Doc", () => {
+    renderLiveDoc([forLoop("each_row", null, [code("inner_step", null)])]);
+    expect(addNoteButtons()).toHaveLength(1);
+    cleanup();
+    renderDoc([steps()[1]!]);
+    expect(addNoteButtons()).toHaveLength(0);
+  });
+
+  test("on a step that keeps a note under it and has a step after it, it goes to that note", () => {
+    const doc = renderLiveDoc([
+      block("wait", "open_site", "read_page", {
+        wait_sec: 5,
+        trailing_notes: "Wait for the banner",
+      }),
+      steps()[1]!,
+    ]);
+    fireEvent.click(addNote("Open site"));
+    const notes = screen.getAllByRole("textbox", { name: "Note" });
+    expect(notes).toHaveLength(1);
+    expect(document.activeElement).toBe(notes[0]);
+    expect(notes[0]!.getAttribute("contenteditable")).toBe("plaintext-only");
+    expect(notesOf(doc)).toEqual({
+      open_site: ["", "Wait for the banner"],
+      read_page: ["", ""],
+    });
+  });
+});
