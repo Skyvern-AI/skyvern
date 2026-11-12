@@ -12,6 +12,7 @@ import yaml
 from fastapi import HTTPException
 from pydantic import BaseModel
 
+from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
@@ -75,6 +76,7 @@ from skyvern.forge.sdk.services.credential.credential_vault_service import (
 )
 from skyvern.forge.sdk.services.request_principal import get_request_principal, human_user_id
 from skyvern.forge.sdk.workflow.models.agent_step_tools import ACCOUNT_TOOL_NAMES, ACTING_ACCOUNT_TOOL_NAMES
+from skyvern.forge.sdk.workflow.models.block import WorkflowTriggerBlock
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
 from skyvern.schemas.agent_step_tool_names import current_tool_names
 from skyvern.schemas.google_sheets import extract_sheet_gid, extract_spreadsheet_id, is_plain_cell_range
@@ -671,20 +673,67 @@ _ACCOUNT_ID_RE = re.compile(
 )
 
 
-async def _agent_step_connection_ids(
-    organization_id: str,
-    parsed: dict[str, Any],
-    *,
-    selected_labels: set[str] | None,
-    run_parameters: dict[str, Any] | None,
-) -> tuple[list[str], bool]:
-    """The account ids executing agent steps can use, and whether that use may act (send, write, upload)."""
-    agent_tools = {
+def _agent_step_tool_names(parsed: dict[str, Any], selected_labels: set[str] | None) -> set[str]:
+    return {
         name
         for block in workflow_blocks(parsed, selected_labels=selected_labels)
         if block.get("block_type") == "agent_step"
         for name in current_tool_names(list(block.get("tools") or []))
     }
+
+
+async def _triggered_agent_tool_names(
+    organization_id: str, parsed: dict[str, Any], selected_labels: set[str] | None, visited: set[str], depth: int = 1
+) -> set[str]:
+    """Agent-step tools in the workflows that executing workflow_trigger blocks start, followed down their own
+    triggers to the trigger block's own depth limit. A target that cannot be read, or one past that depth, is assumed
+    to take accounts it can act through."""
+    tools: set[str] = set()
+    for block in workflow_blocks(parsed, selected_labels=selected_labels):
+        if block.get("block_type") != "workflow_trigger":
+            continue
+        target = block.get("workflow_permanent_id")
+        if not isinstance(target, str) or "{{" in target or "{%" in target:
+            return tools | ACTING_ACCOUNT_TOOL_NAMES
+        if target in visited:
+            continue
+        if depth > WorkflowTriggerBlock.MAX_TRIGGER_DEPTH:
+            return tools | ACTING_ACCOUNT_TOOL_NAMES
+        visited.add(target)
+        try:
+            workflow = await app.DATABASE.workflows.get_workflow_by_permanent_id(
+                workflow_permanent_id=target, organization_id=organization_id
+            )
+        except Exception:
+            LOG.warning("copilot_triggered_workflow_read_failed", workflow_permanent_id=target, exc_info=True)
+            workflow = None
+        if workflow is None:
+            return tools | ACTING_ACCOUNT_TOOL_NAMES
+        child = {"workflow_definition": workflow.workflow_definition.model_dump(mode="json")}
+        tools |= _agent_step_tool_names(child, None)
+        tools |= await _triggered_agent_tool_names(organization_id, child, None, visited, depth + 1)
+    return tools
+
+
+async def _executing_agent_tool_names(
+    organization_id: str, parsed: dict[str, Any], selected_labels: set[str] | None, *, narrow: bool
+) -> set[str]:
+    tools = _agent_step_tool_names(parsed, selected_labels)
+    # A narrowed test run's triggered children are held to its record, so their account need is gated here.
+    if narrow:
+        tools |= await _triggered_agent_tool_names(organization_id, parsed, selected_labels, set())
+    return tools
+
+
+async def _agent_step_connection_ids(
+    organization_id: str,
+    parsed: dict[str, Any],
+    agent_tools: set[str],
+    *,
+    selected_labels: set[str] | None,
+    run_parameters: dict[str, Any] | None,
+) -> tuple[list[str], bool]:
+    """The account ids executing agent steps can use, and whether that use may act (send, write, upload)."""
     if agent_tools & ACCOUNT_TOOL_NAMES:
         # Raises IncompleteConnectionRead when a provider cannot be read, so the caller refuses.
         connections = await org_connections(organization_id, request_user_id(organization_id))
@@ -706,6 +755,12 @@ async def _agent_step_connection_ids(
     ], True
 
 
+_ACCOUNTS_UNREADABLE = (
+    "The organization's connected accounts could not be read, so the accounts this agent step can use cannot be "
+    "checked. Try again."
+)
+
+
 @dataclass(frozen=True)
 class CredentialGateResult:
     error: str | None = None
@@ -713,6 +768,8 @@ class CredentialGateResult:
     # Saved-credential ids the executing blocks and run parameters carry, and those the whole definition carries.
     credential_ids: tuple[str, ...] = ()
     definition_credential_ids: tuple[str, ...] = ()
+    # With narrow_agent_step_accounts: the accounts the run's agent steps may be offered; None when none can be.
+    agent_step_connection_ids: tuple[str, ...] | None = None
 
 
 async def run_credential_gate(
@@ -724,11 +781,13 @@ async def run_credential_gate(
     action: str = "run the workflow",
     blocked_tool: str = "update_and_run_blocks",
     listing_admits_reads: bool = True,
+    narrow_agent_step_accounts: bool = False,
 ) -> CredentialGateResult:
     """Every credential and connected account a dispatch would run with must carry this chat's approval. `labels`
     names the blocks that may execute; None means the whole definition. This turn's listing admits an account only
     for fields that read, and not at all without `listing_admits_reads`. An account id an executing agent step can
-    read counts as acting, since the step can send through it."""
+    read counts as acting, since the step can send through it. `narrow_agent_step_accounts` is for a test-run
+    dispatch, which records `agent_step_connection_ids` for the run; schedules and account checks keep every account."""
     definition = _workflow_definition_as_dict(workflow_definition)
     parsed = {"workflow_definition": definition}
     parameters = run_parameters if isinstance(run_parameters, dict) else None
@@ -737,20 +796,57 @@ async def run_credential_gate(
     resolved_labels = {block.get("label") for block in workflow_blocks(parsed, selected_labels=selected)}
     executing_labels = selected if selected and selected <= resolved_labels else None
     executing_refs = workflow_connection_refs(parsed, selected_labels=executing_labels, run_parameters=parameters)
+    narrowing_on = narrow_agent_step_accounts and settings.COPILOT_NARROW_AGENT_STEP_ACCOUNTS
+    agent_tools = await _executing_agent_tool_names(ctx.organization_id, parsed, executing_labels, narrow=narrowing_on)
     try:
         agent_refs, agent_acts = await _agent_step_connection_ids(
-            ctx.organization_id, parsed, selected_labels=executing_labels, run_parameters=parameters
+            ctx.organization_id, parsed, agent_tools, selected_labels=executing_labels, run_parameters=parameters
         )
     except IncompleteConnectionRead:
-        return CredentialGateResult(
-            error="The organization's connected accounts could not be read, so the accounts this agent step can "
-            "use cannot be checked. Try again."
+        return CredentialGateResult(error=_ACCOUNTS_UNREADABLE)
+    policy = ctx.request_policy if isinstance(ctx.request_policy, RequestPolicy) else None
+    agent_step_offer: tuple[str, ...] | None = None
+    if narrow_agent_step_accounts and agent_tools & ACCOUNT_TOOL_NAMES:
+        # The run is offered only the accounts this chat approved, so only those need approval; with none
+        # approved, every account stays below and the blocker asks for one.
+        # Only typed approvals (a card pick or a saved binding) narrow the offer; a mention in the message does
+        # not, so it leaves every account below and the card. A reads-only approval does not cover a step that acts.
+        approved = set(policy.run_approved_connection_ids) if policy else set()
+        if agent_acts and policy:
+            approved -= set(policy.reads_only_connection_ids)
+        approved &= set(agent_refs)
+        if approved and narrowing_on:
+            # An account the current request names (or lists, for a read) stays offered next to an earlier pick,
+            # so the step can act on what the user just asked; a mention never removes an account.
+            approved |= await admitted_connection_ids(
+                agent_refs,
+                tool_activity=ctx.tool_activity,
+                organization_id=ctx.organization_id,
+                request_policy=policy,
+                listing_admits=() if agent_acts or not listing_admits_reads else agent_refs,
+            )
+            agent_refs = [ref for ref in agent_refs if ref in approved]
+        # What the gate below lets through is what the run is offered; anything it does not admit blocks.
+        agent_step_offer = tuple(agent_refs)
+    elif (
+        narrow_agent_step_accounts
+        and not narrowing_on
+        and any(
+            block.get("block_type") == "workflow_trigger"
+            for block in workflow_blocks(parsed, selected_labels=executing_labels)
         )
+    ):
+        # Off, the gate does not read triggered workflows, so it records every account: a worker already on then
+        # still offers a triggered child what main did. What needs approval is unchanged.
+        try:
+            connections = await org_connections(ctx.organization_id, request_user_id(ctx.organization_id))
+        except IncompleteConnectionRead:
+            return CredentialGateResult(error=_ACCOUNTS_UNREADABLE)
+        agent_step_offer = tuple(connection.id for connection in connections if connection.active)
     executing_refs = list(dict.fromkeys(executing_refs + agent_refs))
     acting_refs = workflow_connection_refs(
         parsed, selected_labels=executing_labels, run_parameters=parameters, acting_only=True
     ) + (agent_refs if agent_acts else [])
-    policy = ctx.request_policy if isinstance(ctx.request_policy, RequestPolicy) else None
     admitted = await admitted_connection_ids(
         executing_refs,
         tool_activity=ctx.tool_activity,
@@ -786,6 +882,7 @@ async def run_credential_gate(
     if approval_error is not None:
         return CredentialGateResult(error=approval_error)
     return CredentialGateResult(
+        agent_step_connection_ids=agent_step_offer,
         credential_ids=tuple(approval_ids),
         definition_credential_ids=tuple(
             i

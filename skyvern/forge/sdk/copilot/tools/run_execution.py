@@ -27,6 +27,7 @@ from urllib.parse import urlparse
 import structlog
 from fastapi import HTTPException
 
+from skyvern.config import settings
 from skyvern.constants import SCRUBBED_VALUE
 from skyvern.exceptions import (
     BrowserSessionClosed,
@@ -268,6 +269,11 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.enums import BrowserSeedSource
 from skyvern.forge.sdk.db.exceptions import CopilotProposalConflictError, CopilotProposalConflictReason
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
+from skyvern.forge.sdk.integrations.connected_accounts import (
+    COPILOT_RUN_CREATOR,
+    org_connections_by_id,
+    record_run_connection_ids,
+)
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import DeliveredOutputFile
 from skyvern.forge.sdk.schemas.credentials import CredentialVaultType
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
@@ -4650,6 +4656,7 @@ async def _run_blocks_with_minted_browser_claim(
         workflow.workflow_definition,
         labels=labels_that_may_execute,
         run_parameters=params.get("parameters"),
+        narrow_agent_step_accounts=True,
     )
     if credential_gate.blocker is not None:
         stash_turn_halt_from_blocker_signal(ctx, credential_gate.blocker, source="run_execution")
@@ -5198,7 +5205,7 @@ async def _run_blocks_with_minted_browser_claim(
                     app.AGENT_FUNCTION.resolve_copilot_dispatch_trigger_type() if dispatch_to_worker else None
                 ),
                 copilot_session_id=ctx.workflow_copilot_chat_id,
-                created_by="copilot",
+                created_by=COPILOT_RUN_CREATOR,
                 requested_by=requesting_user_id(ctx.organization_id),
             )
         except (BrowserSessionClosed, BrowserSessionStartupTimeout) as refused:
@@ -5257,6 +5264,48 @@ async def _run_blocks_with_minted_browser_claim(
                 workflow_run_id=workflow_run.workflow_run_id,
                 browser_seed_source=browser_seed_source,
             )
+
+        agent_step_accounts: list[dict[str, Any]] | None = None
+        if credential_gate.agent_step_connection_ids is not None:
+            try:
+                await record_run_connection_ids(
+                    ctx.organization_id, workflow_run.workflow_run_id, credential_gate.agent_step_connection_ids
+                )
+            except Exception:
+                LOG.warning(
+                    "copilot_agent_step_run_accounts_record_failed",
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    exc_info=True,
+                )
+                # Off, the record holds every account and a worker without one offers every account anyway.
+                if settings.COPILOT_NARROW_AGENT_STEP_ACCOUNTS:
+                    await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final(
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        failure_reason="The test run's approved accounts could not be recorded.",
+                    )
+                    if dispatch_draft_workflow_id is not None:
+                        await _delete_dispatch_draft(dispatch_draft_workflow_id, ctx.organization_id)
+                        dispatch_draft_workflow_id = None
+                    return {
+                        "ok": False,
+                        "error": "The test run's approved accounts could not be recorded; execution was not started.",
+                    }
+            if settings.COPILOT_NARROW_AGENT_STEP_ACCOUNTS:
+                # The result names the accounts the agent steps got, so a switch the model read can raise the card.
+                offered = set(credential_gate.agent_step_connection_ids)
+                try:
+                    agent_step_accounts = [
+                        {key: value for key, value in connection.facts().items() if key != "state"}
+                        # Read as the worker reads them, so the list is what the step can select.
+                        for connection in await org_connections_by_id(ctx.organization_id, workflow_run.created_by)
+                        if connection.id in offered and connection.active
+                    ]
+                except Exception:
+                    LOG.warning(
+                        "copilot_agent_step_accounts_read_failed",
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        exc_info=True,
+                    )
 
         if (
             ctx.workflow_copilot_chat_id
@@ -5769,6 +5818,8 @@ async def _run_blocks_with_minted_browser_claim(
                 if execution.reused_origin_input_keys:
                     result["data"]["reused_origin_input_keys"] = list(execution.reused_origin_input_keys)
                 _attach_reused_origin_outputs(result["data"], execution)
+                if agent_step_accounts is not None:
+                    result["data"]["agent_step_accounts"] = agent_step_accounts
                 if new_exit_receipt is not None:
                     result["data"]["new_exit"] = new_exit_receipt.model_dump(mode="json")
                 if run_cancelled_by_watchdog:
@@ -5967,6 +6018,8 @@ async def _run_blocks_with_minted_browser_claim(
         if execution.reused_origin_input_keys:
             result_data["reused_origin_input_keys"] = list(execution.reused_origin_input_keys)
         _attach_reused_origin_outputs(result_data, execution)
+        if agent_step_accounts is not None:
+            result_data["agent_step_accounts"] = agent_step_accounts
         if not run_ok and run and run.failure_reason:
             result_data["failure_reason"] = redact_totp_runtime_values(_without_typed_input(run.failure_reason))
         if not run_ok and run and run.failure_category:
