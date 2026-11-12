@@ -381,6 +381,9 @@ class Settings(BaseSettings):
     # S3/AWS settings
     AWS_REGION: str = "us-east-1"
     MAX_UPLOAD_FILE_SIZE: int = 30 * 1024 * 1024  # 30 MB
+    # Extensions added to the /v1/upload_file allowlist. Set it as a JSON list, e.g. '["gz","epub"]';
+    # a bare comma list fails at startup. The executable and markup denylist still applies.
+    UPLOAD_EXTRA_ALLOWED_EXTENSIONS: list[str] = []
     MAX_HTTP_DOWNLOAD_FILE_SIZE: int = 500 * 1024 * 1024  # 500 MB
     # Most memory a pdfplumber child may add (RLIMIT_AS on Linux, an RSS watchdog everywhere); rendering a 300 dpi A0
     # or A1 scan for OCR can need more than 512 MiB. A pod with less free memory than this, after a 256 MiB margin and

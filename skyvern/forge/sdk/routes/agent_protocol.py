@@ -1441,10 +1441,27 @@ async def create_workflow_from_prompt(
     return workflow.model_dump(by_alias=True)
 
 
-async def _validate_upload(file: UploadFile) -> UploadFile:
+# Depending on the organization makes auth run before any upload bytes are inspected.
+async def _validate_upload(
+    file: UploadFile, current_org: Organization = Depends(org_auth_service.get_current_org)
+) -> UploadFile:
     return await uploaded_file_service.validate_upload(
         file,
+        purpose="upload_file",
+        organization_id=current_org.organization_id,
         max_size_bytes=app.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE,
+    )
+
+
+async def _validate_pdf_upload(
+    file: UploadFile, current_org: Organization = Depends(org_auth_service.get_current_org)
+) -> UploadFile:
+    return await uploaded_file_service.validate_upload(
+        file,
+        purpose="import_pdf",
+        organization_id=current_org.organization_id,
+        max_size_bytes=app.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE,
+        allowed=uploaded_file_service.PDF_UPLOAD_EXTENSIONS,
     )
 
 
@@ -1482,9 +1499,9 @@ async def _validate_upload(file: UploadFile) -> UploadFile:
 )
 async def import_workflow_from_pdf(
     background_tasks: BackgroundTasks,
-    file: UploadFile = Depends(_validate_upload),
-    folder_id: str | None = Query(None, description="Optional folder ID to assign the imported workflow to"),
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    file: UploadFile = Depends(_validate_pdf_upload),
+    folder_id: str | None = Query(None, description="Optional folder ID to assign the imported workflow to"),
     user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
     x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> dict[str, Any]:
@@ -7307,6 +7324,7 @@ async def get_api_keys(
 @legacy_base_router.post("/upload_file", include_in_schema=False)
 @legacy_base_router.post("/upload_file/", include_in_schema=False)
 async def upload_file(
+    current_org: Organization = Depends(org_auth_service.get_current_org),
     file: UploadFile = Depends(_validate_upload),
     retention_days: Annotated[
         int | None,
@@ -7317,7 +7335,6 @@ async def upload_file(
             ),
         ),
     ] = None,
-    current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> UploadFileResponse:
     # Validated before the upload so a rejected retention period never leaves bytes behind.
     try:

@@ -3851,16 +3851,6 @@ async def _validate_copilot_audio_artifact_id(
     return audio_artifact_id
 
 
-def _has_audio_container_signature(data: bytes) -> bool:
-    """The declared content type is client-controlled, so the bytes must open as a container browsers record into."""
-    return (
-        data.startswith((b"\x1a\x45\xdf\xa3", b"OggS", b"ID3", b"fLaC"))
-        or (data[:4] == b"RIFF" and data[8:12] == b"WAVE")
-        or data[4:8] == b"ftyp"
-        or (len(data) > 1 and data[0] == 0xFF and data[1] & 0xE0 == 0xE0)
-    )
-
-
 @base_router.post("/workflow/copilot/chat-audio", include_in_schema=False)
 async def workflow_copilot_chat_audio(
     workflow_permanent_id: str = Form(...),
@@ -3893,12 +3883,18 @@ async def workflow_copilot_chat_audio(
             detail=f"Audio file exceeds the maximum allowed size ({max_upload_bytes / 1024 / 1024:.0f} MB)",
         )
 
-    if not _has_audio_container_signature(audio_bytes):
+    # The declared content type is client-controlled, so the bytes must open as a container browsers record into.
+    if not uploaded_file_service.has_audio_container_signature(audio_bytes):
         raise HTTPException(
             status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="File content is not a supported audio format"
         )
     await asyncio.to_thread(
-        uploaded_file_service.validate_upload_type, UploadFile(file=io.BytesIO(audio_bytes), filename=file.filename)
+        uploaded_file_service.validate_upload_type,
+        UploadFile(file=io.BytesIO(audio_bytes), filename=file.filename),
+        purpose="copilot_dictation",
+        organization_id=organization.organization_id,
+        allowed=uploaded_file_service.VOICE_NOTE_UPLOAD_EXTENSIONS,
+        any_audio_container=True,
     )
 
     chat = await _get_or_create_workflow_copilot_chat(

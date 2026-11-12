@@ -120,7 +120,121 @@ async def validate_file_size(file: UploadFile, *, max_size_bytes: int | None = N
 
 _SNIFF_BYTES = 8192
 
-# Anything the OS or a browser would execute; unknown and bespoke extensions are allowed on purpose.
+# The expected upload types: each extension lists the MIME types a client may declare for it. Extensions
+# outside a route's allowlist are refused before any content is read; signatures are checked below.
+DOCUMENT_UPLOAD_TYPES: dict[str, tuple[str, ...]] = {
+    "pdf": ("application/pdf", "application/x-pdf"),
+    "doc": ("application/msword", "application/vnd.ms-word"),
+    "docx": ("application/vnd.openxmlformats-officedocument.wordprocessingml.document",),
+    "odt": ("application/vnd.oasis.opendocument.text",),
+    "rtf": ("application/rtf", "application/x-rtf", "text/rtf"),
+    "txt": ("text/plain",),
+    "log": ("text/plain", "text/x-log"),
+    "ics": ("text/calendar", "text/plain"),
+    "vcf": ("text/vcard", "text/x-vcard", "text/directory", "text/plain"),
+    "md": ("text/markdown", "text/x-markdown", "text/plain"),
+    "eml": ("message/rfc822", "text/plain"),
+    "msg": ("application/vnd.ms-outlook",),
+}
+SPREADSHEET_UPLOAD_TYPES: dict[str, tuple[str, ...]] = {
+    "xls": ("application/vnd.ms-excel", "application/excel", "application/x-excel"),
+    "xlsx": ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",),
+    "ods": ("application/vnd.oasis.opendocument.spreadsheet",),
+    "csv": (
+        "text/csv",
+        "text/x-csv",
+        "application/csv",
+        "application/x-csv",
+        "text/comma-separated-values",
+        "application/vnd.ms-excel",
+        "application/x-msexcel",
+        "text/plain",
+    ),
+    "tsv": ("text/tab-separated-values", "text/tsv", "text/plain"),
+}
+PRESENTATION_UPLOAD_TYPES: dict[str, tuple[str, ...]] = {
+    "ppt": ("application/vnd.ms-powerpoint",),
+    "pptx": ("application/vnd.openxmlformats-officedocument.presentationml.presentation",),
+    "odp": ("application/vnd.oasis.opendocument.presentation",),
+}
+IMAGE_UPLOAD_TYPES: dict[str, tuple[str, ...]] = {
+    "png": ("image/png", "image/x-png"),
+    "jpg": ("image/jpeg", "image/jpg", "image/pjpeg"),
+    "jpeg": ("image/jpeg", "image/jpg", "image/pjpeg"),
+    "gif": ("image/gif",),
+    "webp": ("image/webp",),
+    "bmp": ("image/bmp", "image/x-ms-bmp", "image/x-bmp"),
+    "tif": ("image/tiff", "image/x-tiff", "image/tif"),
+    "tiff": ("image/tiff", "image/x-tiff", "image/tif"),
+    "heic": ("image/heic", "image/heif", "image/heic-sequence"),
+    "avif": ("image/avif",),
+    "jfif": ("image/jpeg", "image/jpg", "image/pjpeg"),
+}
+DATA_UPLOAD_TYPES: dict[str, tuple[str, ...]] = {
+    "json": ("application/json", "application/x-json", "text/json", "text/plain"),
+    "xml": ("application/xml", "text/xml", "text/plain"),
+    "yaml": ("application/yaml", "application/x-yaml", "text/yaml", "text/x-yaml", "text/plain"),
+    "yml": ("application/yaml", "application/x-yaml", "text/yaml", "text/x-yaml", "text/plain"),
+}
+ARCHIVE_UPLOAD_TYPES: dict[str, tuple[str, ...]] = {
+    "zip": ("application/zip", "application/x-zip-compressed", "application/x-zip", "multipart/x-zip"),
+}
+# Copilot chat attachments include screen recordings the model watches.
+VIDEO_UPLOAD_TYPES: dict[str, tuple[str, ...]] = {
+    "mp4": ("video/mp4",),
+    "webm": ("video/webm",),
+    "mov": ("video/quicktime", "video/x-quicktime"),
+}
+# Dictation is recorded in the browser and always named .webm, whatever container the browser produced.
+AUDIO_UPLOAD_TYPES: dict[str, tuple[str, ...]] = {
+    "webm": ("audio/webm", "video/webm"),
+    "mp4": ("audio/mp4", "video/mp4"),
+    "m4a": ("audio/mp4", "audio/x-m4a", "audio/m4a", "audio/mp4a-latm"),
+    "mp3": ("audio/mpeg", "audio/mp3", "audio/x-mpeg"),
+    "ogg": ("audio/ogg", "application/ogg", "video/ogg"),
+    "oga": ("audio/ogg", "application/ogg", "video/ogg"),
+    "wav": ("audio/wav", "audio/wave", "audio/x-wav", "audio/vnd.wave"),
+    "flac": ("audio/flac", "audio/x-flac"),
+}
+
+
+def _merge_declared_types(*tables: dict[str, tuple[str, ...]]) -> dict[str, tuple[str, ...]]:
+    merged: dict[str, tuple[str, ...]] = {}
+    for table in tables:
+        for extension, mime_types in table.items():
+            merged[extension] = tuple(dict.fromkeys(merged.get(extension, ()) + mime_types))
+    return merged
+
+
+DECLARED_UPLOAD_TYPES = _merge_declared_types(
+    DOCUMENT_UPLOAD_TYPES,
+    SPREADSHEET_UPLOAD_TYPES,
+    PRESENTATION_UPLOAD_TYPES,
+    IMAGE_UPLOAD_TYPES,
+    DATA_UPLOAD_TYPES,
+    ARCHIVE_UPLOAD_TYPES,
+    VIDEO_UPLOAD_TYPES,
+    AUDIO_UPLOAD_TYPES,
+)
+# Per-route allowlists. The generic route takes everything a run may hand to a third-party form.
+ALLOWED_UPLOAD_EXTENSIONS = frozenset(
+    DOCUMENT_UPLOAD_TYPES
+    | SPREADSHEET_UPLOAD_TYPES
+    | PRESENTATION_UPLOAD_TYPES
+    | IMAGE_UPLOAD_TYPES
+    | DATA_UPLOAD_TYPES
+    | ARCHIVE_UPLOAD_TYPES
+    | VIDEO_UPLOAD_TYPES
+    | AUDIO_UPLOAD_TYPES
+)
+PDF_UPLOAD_EXTENSIONS = frozenset({"pdf"})
+# What the resume parser reads: PDF, DOCX and its image branch.
+RESUME_UPLOAD_EXTENSIONS = frozenset({"pdf", "docx", "png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff"})
+VOICE_NOTE_UPLOAD_EXTENSIONS = frozenset(AUDIO_UPLOAD_TYPES)
+# Clients that do not know a type send a generic one; anything more specific must agree with the extension.
+_GENERIC_DECLARED_TYPES = frozenset({"", "application/octet-stream", "binary/octet-stream"})
+
+# Second gate: anything the OS or a browser would execute, whatever the allowlist says.
 DENIED_UPLOAD_EXTENSIONS = frozenset(
     {
         "app", "apk", "bat", "cmd", "com", "cpl", "deb", "dll", "dmg", "docm", "exe", "hta", "htm", "html", "jar",
@@ -168,7 +282,17 @@ _OLE_ENCRYPTED_PACKAGE_ENTRY = "EncryptedPackage\0".encode("utf-16-le")
 _OLE_SCAN_CHUNK = 1 << 20
 _WINDOWS_SHORTCUT_MAGIC = b"L\x00\x00\x00\x01\x14\x02\x00\x00\x00\x00\x00\xc0\x00\x00\x00\x00\x00\x00F"
 _OOXML_EXTENSIONS = frozenset({"docx", "xlsx", "pptx"})
-_IMAGE_EXTENSIONS = frozenset({"png", "jpg", "jpeg", "gif", "webp"})
+_ODF_EXTENSIONS = frozenset({"odt", "ods", "odp"})
+# filetype recognizes these reliably; HEIF brands and BigTIFF it does not.
+_SNIFFED_IMAGE_EXTENSIONS = frozenset({"png", "jpg", "jpeg", "jfif", "gif", "webp"})
+_TIFF_MAGICS = (b"II*\x00", b"MM\x00*", b"II+\x00", b"MM\x00+")
+_MEDIA_CONTAINER_EXTENSIONS = frozenset({"mp4", "mov", "webm", "m4a"})
+_EBML_MAGIC = b"\x1a\x45\xdf\xa3"
+# ISO-BMFF files from older encoders may open with an atom other than ftyp.
+_ISO_BMFF_LEAD_ATOMS = frozenset({b"ftyp", b"moov", b"mdat", b"wide", b"free", b"skip", b"pnot"})
+_RTF_MAGIC = b"{\\rtf"
+# An OpenDocument package keeps Basic macros under Basic/<library>/ and other script languages under Scripts/.
+_ODF_MACRO_INDEX_FILES = frozenset({"script-lc.xml", "script-lb.xml", "dialog-lc.xml", "dialog-lb.xml"})
 
 
 def upload_extension(filename: str | None) -> str:
@@ -224,17 +348,33 @@ def _dangerous_content_reason(head: bytes, extension: str) -> str | None:
     return None
 
 
+def _is_odf_macro_member(name: str) -> bool:
+    if name.endswith("/"):
+        return False
+    if name.startswith("Scripts/"):
+        return True
+    # LibreOffice writes empty library indexes into documents that have no macros.
+    return name.startswith("Basic/") and os.path.basename(name) not in _ODF_MACRO_INDEX_FILES
+
+
 def _zip_member_reason(file: UploadFile, extension: str) -> str | None:
     # ZipFile reads only the central directory here, never member data.
     try:
         with zipfile.ZipFile(file.file) as archive:
             names = archive.namelist()
     except (zipfile.BadZipFile, OSError, ValueError):
-        return f"content does not match .{extension}" if extension in _OOXML_EXTENSIONS else None
+        return f"content does not match .{extension}" if extension in _OOXML_EXTENSIONS | _ODF_EXTENSIONS else None
     finally:
         file.file.seek(0)
+    # Every real OOXML package has a content-types part and every ODF package a manifest or mimetype entry.
+    if extension in _OOXML_EXTENSIONS and "[Content_Types].xml" not in names:
+        return f"content does not match .{extension}"
+    if extension in _ODF_EXTENSIONS and not {"mimetype", "META-INF/manifest.xml"} & set(names):
+        return f"content does not match .{extension}"
     if "[Content_Types].xml" in names and any(name.lower().endswith("vbaproject.bin") for name in names):
         return "Office document with macros"
+    if {"mimetype", "META-INF/manifest.xml"} & set(names) and any(_is_odf_macro_member(n) for n in names):
+        return "OpenDocument file with macros"
     if "AndroidManifest.xml" in names and "classes.dex" in names:
         return "Android package"
     if "META-INF/MANIFEST.MF" in names and any(name.endswith(".class") for name in names):
@@ -271,34 +411,102 @@ def _ole_reason(file: UploadFile, extension: str) -> str | None:
     return None
 
 
-def _declared_type_mismatch(head: bytes, extension: str) -> bool:
+def _is_media_container(head: bytes) -> bool:
+    return head.startswith(_EBML_MAGIC) or head[4:8] in _ISO_BMFF_LEAD_ATOMS
+
+
+def has_audio_container_signature(head: bytes) -> bool:
+    return (
+        _is_media_container(head)
+        or head.startswith((b"OggS", b"ID3", b"fLaC"))
+        or (head[:4] == b"RIFF" and head[8:12] == b"WAVE")
+        or (len(head) > 1 and head[0] == 0xFF and head[1] & 0xE0 == 0xE0)
+    )
+
+
+def _declared_type_mismatch(head: bytes, extension: str, any_audio_container: bool) -> bool:
+    """True when the content contradicts a format whose signature is reliable.
+
+    Formats with common unsigned variants (legacy .doc/.xls/.ppt saved as text, XML or a renamed zip) have no
+    positive check; the denylist, markup sniff and macro scans still apply to them.
+    """
     if extension == "pdf":
         # Readers accept a PDF header anywhere in the first KiB.
         return b"%PDF-" not in head[:1024]
-    if extension == "zip":
+    if extension == "zip" or extension in _ODF_EXTENSIONS:
         return not head.startswith(_ZIP_MAGICS)
     if extension in _OOXML_EXTENSIONS:
         return not head.startswith(_ZIP_MAGICS + (_OLE_MAGIC,))
-    if extension in _IMAGE_EXTENSIONS:
+    if extension == "rtf":
+        return not head.removeprefix(b"\xef\xbb\xbf").lstrip().startswith(_RTF_MAGIC)
+    if extension in _SNIFFED_IMAGE_EXTENSIONS:
         return not filetype.is_image(head)
+    if extension == "bmp":
+        return not head.startswith(b"BM")
+    if extension in {"tif", "tiff"}:
+        return not head.startswith(_TIFF_MAGICS)
+    if extension in {"heic", "avif"}:
+        return head[4:8] != b"ftyp"
+    if any_audio_container:
+        # Dictation is named .webm whatever container the browser recorded into.
+        return not has_audio_container_signature(head)
+    if extension in _MEDIA_CONTAINER_EXTENSIONS:
+        return not _is_media_container(head)
     return False
 
 
-def _upload_type_rejection_reason(file: UploadFile) -> str | None:
-    extension = upload_extension(file.filename)
-    if extension in DENIED_UPLOAD_EXTENSIONS:
-        return f".{extension} files are not allowed"
+def _declared_mime_type(file: UploadFile) -> str:
+    return (file.content_type or "").split(";", 1)[0].strip().lower()
+
+
+def _sniff_head(file: UploadFile) -> bytes:
     try:
         head = file.file.read(_SNIFF_BYTES)
         if len(head) == _SNIFF_BYTES and _markup_preamble_unfinished(head):
             head += file.file.read(_MARKUP_PREAMBLE_LIMIT - _SNIFF_BYTES)
-            if len(head) == _MARKUP_PREAMBLE_LIMIT and _markup_preamble_unfinished(head):
-                return "markup preamble too long to inspect"
     finally:
         file.file.seek(0)
+    return head
+
+
+def _operator_extra_extensions() -> frozenset[str]:
+    extra = (extension.strip().lstrip(".").lower() for extension in settings.UPLOAD_EXTRA_ALLOWED_EXTENSIONS)
+    return frozenset(extension for extension in extra if extension)
+
+
+def _upload_type_rejection_reason(
+    file: UploadFile,
+    allowed: frozenset[str],
+    *,
+    enforce_allowlist: bool = True,
+    any_declared_type: frozenset[str] = frozenset(),
+    any_audio_container: bool = False,
+) -> str | None:
+    # Gate 1: the allowlist, by extension and declared MIME type. No bytes are read for a refused extension.
+    # Pass-through files skip it, because a third-party site may ask for any type.
+    extension = upload_extension(file.filename)
+    if enforce_allowlist and extension and extension not in allowed:
+        return f".{extension} files are not allowed"
+    head = _sniff_head(file)
+    if enforce_allowlist:
+        if not extension:
+            sniffed = filetype.guess(head)
+            extension = sniffed.extension if sniffed is not None else ""
+            if extension not in allowed:
+                return "no file extension and the content is not a recognized type"
+        declared = _declared_mime_type(file)
+        # An operator-listed extension takes any declared type, so the setting can also reopen an alias refusal.
+        expected_types = None if extension in any_declared_type else DECLARED_UPLOAD_TYPES.get(extension)
+        if declared not in _GENERIC_DECLARED_TYPES and expected_types is not None and declared not in expected_types:
+            return f"declared type {declared} does not match .{extension}"
+    # Gate 2: the denylist and content sniffing, for renamed executables, markup and macro documents.
+    if extension in DENIED_UPLOAD_EXTENSIONS:
+        return f".{extension} files are not allowed"
+    if len(head) == _MARKUP_PREAMBLE_LIMIT and _markup_preamble_unfinished(head):
+        return "markup preamble too long to inspect"
     if reason := _dangerous_content_reason(head, extension):
         return reason
-    if _declared_type_mismatch(head, extension):
+    if _declared_type_mismatch(head, extension, any_audio_container):
         return f"content does not match .{extension}"
     if head.startswith(_ZIP_MAGICS):
         return _zip_member_reason(file, extension)
@@ -307,22 +515,53 @@ def _upload_type_rejection_reason(file: UploadFile) -> str | None:
     return None
 
 
-def validate_upload_type(file: UploadFile) -> UploadFile:
-    """Reject executables, installers, scripts, browser-renderable markup and mislabeled documents.
+def validate_upload_type(
+    file: UploadFile,
+    *,
+    purpose: str,
+    organization_id: str | None = None,
+    allowed: frozenset[str] | None = None,
+    any_audio_container: bool = False,
+) -> UploadFile:
+    """Allow only the route's expected types, then refuse executable, scripted, renderable or mislabeled content.
 
-    A denylist rather than an allowlist: customers upload niche formats that must keep working.
+    The allowlist is by extension and declared MIME type (a file without an extension must sniff as an allowed
+    type); the denylist and content sniffing stay as the second gate for renamed executables and macro documents.
+    ``allowed`` defaults to the generic route's set, the only one ``UPLOAD_EXTRA_ALLOWED_EXTENSIONS`` widens.
     """
-    reason = _upload_type_rejection_reason(file)
+    operator_extra = _operator_extra_extensions() if allowed is None else frozenset()
+    reason = _upload_type_rejection_reason(
+        file,
+        ALLOWED_UPLOAD_EXTENSIONS | operator_extra if allowed is None else allowed,
+        any_declared_type=operator_extra,
+        any_audio_container=any_audio_container,
+    )
     if reason is not None:
-        LOG.info("Rejected upload by file type", extension=upload_extension(file.filename), reason=reason)
+        LOG.info(
+            "Rejected upload by file type",
+            purpose=purpose,
+            organization_id=organization_id,
+            extension=upload_extension(file.filename),
+            declared_type=_declared_mime_type(file),
+            reason=reason,
+        )
         raise HTTPException(status_code=415, detail=f"File type not allowed: {reason}")
     return file
 
 
-async def validate_upload(file: UploadFile, *, max_size_bytes: int | None = None) -> UploadFile:
+async def validate_upload(
+    file: UploadFile,
+    *,
+    purpose: str,
+    organization_id: str | None = None,
+    max_size_bytes: int | None = None,
+    allowed: frozenset[str] | None = None,
+) -> UploadFile:
     await validate_file_size(file, max_size_bytes=max_size_bytes)
     # The OLE macro scan reads the whole file, so it runs off the event loop.
-    return await asyncio.to_thread(validate_upload_type, file)
+    return await asyncio.to_thread(
+        validate_upload_type, file, purpose=purpose, organization_id=organization_id, allowed=allowed
+    )
 
 
 async def validate_passthrough_upload(file: UploadFile, *, max_size_bytes: int | None, purpose: str) -> UploadFile:
@@ -331,7 +570,7 @@ async def validate_passthrough_upload(file: UploadFile, *, max_size_bytes: int |
     The type rules are logged rather than enforced; the stored copy is only ever served as an attachment.
     """
     await validate_file_size(file, max_size_bytes=max_size_bytes)
-    reason = await asyncio.to_thread(_upload_type_rejection_reason, file)
+    reason = await asyncio.to_thread(_upload_type_rejection_reason, file, frozenset(), enforce_allowlist=False)
     if reason is not None:
         LOG.info(
             "Accepted a restricted file type for pass-through",
