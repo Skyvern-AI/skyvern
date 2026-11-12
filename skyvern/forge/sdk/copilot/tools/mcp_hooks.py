@@ -2371,11 +2371,12 @@ def get_skyvern_mcp_alias_map() -> dict[str, str]:
     }
 
 
-_PENDING_PROPOSAL_SCHEDULE_ERROR = (
-    "No schedule was created: this chat has a workflow proposal that is not saved yet, and a schedule "
-    "runs the saved workflow. Ask the user to accept the proposal, which saves it, or to reject it to "
-    "schedule the saved version as it is; then create the schedule."
+PENDING_PROPOSAL_FACT = (
+    "this chat has a workflow change that is not saved yet, and only the saved version runs. The user saves the "
+    "change by accepting it, or rejects it to keep the saved version."
 )
+
+_PENDING_PROPOSAL_SCHEDULE_ERROR = f"No schedule was created: {PENDING_PROPOSAL_FACT}"
 
 
 async def _schedule_parameters_credential_pre_hook(

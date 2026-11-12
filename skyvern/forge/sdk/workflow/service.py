@@ -4122,8 +4122,14 @@ class WorkflowService:
         organization: Organization,
         request_data: dict[str, Any] | None,
         credential_use_principal: RequestPrincipal | None = None,
+        *,
+        workflow_parameters: list[WorkflowParameter] | None = None,
     ) -> None:
-        all_workflow_parameters = await self.get_workflow_parameters(workflow_id=workflow.workflow_id)
+        all_workflow_parameters = (
+            workflow_parameters
+            if workflow_parameters is not None
+            else await self.get_workflow_parameters(workflow_id=workflow.workflow_id)
+        )
         schedule_parameters = [
             cast(WorkflowParameter, workflow_parameter)
             for workflow_parameter in all_workflow_parameters

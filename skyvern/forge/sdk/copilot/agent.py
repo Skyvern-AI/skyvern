@@ -2103,6 +2103,7 @@ def _make_agent_result(
     """
     final_context = global_llm_context
     if ctx is not None:
+        kwargs.setdefault("run_card_saved_workflow", ctx.run_card_saved_workflow)
         final_context = finalize_observation_context(ctx, global_llm_context)
         final_context = record_approved_credentials_in_global_llm_context(ctx, final_context)
     if ctx is not None and turn_outcome is not None:

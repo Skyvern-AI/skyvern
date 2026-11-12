@@ -94,6 +94,7 @@ from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, BlockTypeVar,
 from skyvern.forge.sdk.workflow.retry_policy import WORKFLOW_WEBHOOK_HTTP_TIMEOUT_SECONDS
 from skyvern.schemas.emails import GmailSendErrorCode, GmailSendOutcome
 from skyvern.schemas.run_enums import RunEngine, RunType
+from skyvern.schemas.workflow_run_groups import DEFAULT_RUN_GROUP_LIMITS, RunGroupLimits
 from skyvern.schemas.workflows import BlockResult, CodeBlockFailureKind, FileStorageType, FileUploadDestination
 from skyvern.services.email.gmail import GmailSendResult
 from skyvern.services.email.gmail_client import GmailAPIError
@@ -1516,6 +1517,10 @@ class AgentFunction:
     # offered the codes either way. The setting forces it on; where it is off, cloud gates this per organization.
     async def task_v3_error_code_on_finish(self, *, organization_id: str) -> bool:
         return settings.TASK_V3_ERROR_CODE_ON_FINISH
+
+    # Read once when a run group is submitted; the group stores its bound, so a later change never reaches it.
+    async def workflow_run_group_limits(self, *, organization_id: str) -> RunGroupLimits:
+        return DEFAULT_RUN_GROUP_LIMITS
 
     # Whether a v3 run holds its first terminated verdict once for what prevents the task. Read once per run.
     async def task_v3_justify_hold_enabled(self, *, task_id: str | None, organization_id: str | None) -> bool:

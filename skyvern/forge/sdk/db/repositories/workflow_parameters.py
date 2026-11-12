@@ -1312,6 +1312,23 @@ class WorkflowParametersRepository(BaseRepository):
         raise NotFoundError("Unknown pending Copilot question")
 
     @staticmethod
+    async def _saved_history_questions(
+        session: AsyncSession, organization_id: str, chat_id: str, interaction_id: str
+    ) -> list[QuestionInteraction]:
+        saved = await session.scalars(
+            select(WorkflowCopilotChatMessageModel.narrative_payload)
+            .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
+            .where(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id == chat_id)
+            .where(WorkflowCopilotChatMessageModel.narrative_payload.is_not(None))
+        )
+        return [
+            QuestionInteraction.model_validate(raw)
+            for payload in saved
+            for raw in (payload or {}).get("questionInteractions", [])
+            if raw.get("interaction_id") == interaction_id
+        ]
+
+    @staticmethod
     def _store_question_turn(chat: WorkflowCopilotChatModel, entry: CopilotPendingTurn) -> None:
         chat.pending_turns = {**(chat.pending_turns or {}), entry.turn_id: entry.model_dump(mode="json")}
 
@@ -1489,6 +1506,85 @@ class WorkflowParametersRepository(BaseRepository):
             self._store_question_turn(chat, entry)
             await session.commit()
 
+    @db_operation("record_copilot_single_run_save")
+    async def record_copilot_single_run_save(
+        self,
+        organization_id: str,
+        chat_id: str,
+        interaction_id: str,
+        *,
+        saved_workflow_id: str,
+        saved_version: int,
+        run_started: bool | None = None,
+        rollback_workflow: dict[str, Any] | None = None,
+    ) -> None:
+        async with self.Session() as session:
+            chat = await self._locked_question_chat(session, organization_id, chat_id)
+            try:
+                entry, item = self._question_in_pending(chat, interaction_id)
+            except NotFoundError:
+                # The turn ended while the shielded save ran; the version exists, so the saved history records it.
+                saved = await self._saved_history_questions(session, organization_id, chat_id, interaction_id)
+                for item in saved:
+                    if item.account_group_review is None or not item.account_group_review.saves_draft:
+                        raise ValueError("This question has no draft-saving single-run review")
+                    item.account_group_review.saved_workflow_id = saved_workflow_id
+                    item.account_group_review.saved_version = saved_version
+                    item.account_group_review.run_started = run_started
+                if not saved:
+                    raise
+                await self._patch_narrative_questions(session, organization_id, chat_id, saved)
+                await session.commit()
+                return
+            review = item.account_group_review
+            if review is None or not review.saves_draft:
+                raise ValueError("This question has no draft-saving single-run review")
+            review.saved_workflow_id = saved_workflow_id
+            review.saved_version = saved_version
+            review.run_started = run_started
+            if rollback_workflow is not None:
+                # An interrupted turn rolls back to the saved version, and a write before the save has nothing to undo.
+                entry.pre_turn_workflow = rollback_workflow
+                entry.canonical_write_fingerprint = None
+            self._store_question_turn(chat, entry)
+            await session.commit()
+
+    @db_operation("record_copilot_draft_acceptance")
+    async def record_copilot_draft_acceptance(
+        self,
+        organization_id: str,
+        chat_id: str,
+        *,
+        owner_turn_id: str,
+        revision: int,
+        workflow_id: str,
+        version: int,
+        modified_at: datetime,
+    ) -> None:
+        async with self.Session() as session:
+            chat = await self._locked_question_chat(session, organization_id, chat_id)
+            for raw in list((chat.pending_turns or {}).values()):
+                entry = CopilotPendingTurn.model_validate(raw)
+                stamped = False
+                for item in entry.question_interactions:
+                    review = item.account_group_review
+                    if (
+                        review is None
+                        or not review.saves_draft
+                        or (review.proposal_owner_turn_id, review.proposal_revision) != (owner_turn_id, revision)
+                        or (review.decision is not None and not review.decision.approved)
+                        or review.saved_workflow_id is not None
+                        or review.workflow_run_id is not None
+                    ):
+                        continue
+                    review.accepted_workflow_id = workflow_id
+                    review.accepted_version = version
+                    review.accepted_modified_at = modified_at
+                    stamped = True
+                if stamped:
+                    self._store_question_turn(chat, entry)
+            await session.commit()
+
     @db_operation("unlink_copilot_single_run")
     async def unlink_copilot_single_run(
         self, organization_id: str, chat_id: str, interaction_id: str, workflow_run_id: str
@@ -1499,18 +1595,11 @@ class WorkflowParametersRepository(BaseRepository):
                 entry, item = self._question_in_pending(chat, interaction_id)
             except NotFoundError:
                 # The turn ended after the link was written, and turn end copied the link into the saved history.
-                saved = await session.scalars(
-                    select(WorkflowCopilotChatMessageModel.narrative_payload)
-                    .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
-                    .where(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id == chat_id)
-                    .where(WorkflowCopilotChatMessageModel.narrative_payload.is_not(None))
-                )
                 linked = [
-                    QuestionInteraction.model_validate(raw)
-                    for payload in saved
-                    for raw in (payload or {}).get("questionInteractions", [])
-                    if raw.get("interaction_id") == interaction_id
-                    and (raw.get("account_group_review") or {}).get("workflow_run_id") == workflow_run_id
+                    item
+                    for item in await self._saved_history_questions(session, organization_id, chat_id, interaction_id)
+                    if item.account_group_review is not None
+                    and item.account_group_review.workflow_run_id == workflow_run_id
                 ]
                 for item in linked:
                     if item.account_group_review is not None:

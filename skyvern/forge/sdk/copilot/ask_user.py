@@ -128,6 +128,19 @@ class AccountGroupReview(BaseModel):
     single_run: bool = Field(default=False, exclude_if=lambda single_run: not single_run)
     credential_inputs: dict[str, str] = Field(default_factory=dict, exclude_if=lambda inputs: not inputs)
     workflow_run_id: str | None = Field(default=None, exclude_if=lambda run_id: run_id is None)
+    # A single run that first saves the chat's unsaved draft, bound to the proposal token the user reviewed.
+    saves_draft: bool = Field(default=False, exclude_if=lambda saves_draft: not saves_draft)
+    proposal_owner_turn_id: str | None = Field(default=None, exclude_if=lambda turn_id: turn_id is None)
+    proposal_revision: int | None = Field(default=None, exclude_if=lambda revision: revision is None)
+    draft_tested: bool = Field(default=False, exclude_if=lambda tested: not tested)
+    tested_workflow_run_id: str | None = Field(default=None, exclude_if=lambda run_id: run_id is None)
+    saved_workflow_id: str | None = Field(default=None, exclude_if=lambda workflow_id: workflow_id is None)
+    saved_version: int | None = Field(default=None, exclude_if=lambda version: version is None)
+    run_started: bool | None = Field(default=None, exclude_if=lambda started: started is None)
+    # The version an Accept of this card's exact proposal token saved while the card waited.
+    accepted_workflow_id: str | None = Field(default=None, exclude_if=lambda workflow_id: workflow_id is None)
+    accepted_version: int | None = Field(default=None, exclude_if=lambda version: version is None)
+    accepted_modified_at: datetime | None = Field(default=None, exclude_if=lambda modified_at: modified_at is None)
     clean_group_run_id: str | None = None
     credential_parameter_used_by: list[str] = Field(default_factory=list)
     rows: list[AccountGroupRow]
@@ -266,16 +279,20 @@ class QuestionInteraction(BaseModel):
         if self.account_group_review is not None and self.account_group_review.single_run:
             decision = self.account_group_decision
             approved = decision is not None and decision.approved
-            run_id = self.account_group_review.workflow_run_id
-            return {
+            review = self.account_group_review
+            run_id = review.workflow_run_id
+            result: dict[str, Any] = {
                 "ok": True,
                 "interaction_id": self.interaction_id,
                 "tool_call_id": self.tool_call_id,
                 "approved": approved,
                 # The link is written before the run is created, so a linked run may not exist.
-                "dispatched": None if run_id is not None else False,
+                "dispatched": True if review.run_started else None if run_id is not None else False,
                 "workflow_run_id": run_id,
             }
+            if review.saved_version is not None:
+                result["saved_version"] = review.saved_version
+            return result
         if self.account_group_review is not None:
             decision = self.account_group_decision
             approved_ids = decision.credential_ids if decision is not None and decision.approved else []

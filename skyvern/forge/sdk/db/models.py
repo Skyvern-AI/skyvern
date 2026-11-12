@@ -897,6 +897,7 @@ class WorkflowRunGroupModel(Base):
     status = Column(String, nullable=False, default="active")
     created_by = Column(String, nullable=True)
     requested_by = Column(String, nullable=True)
+    max_concurrency = Column(Integer, nullable=True, server_default="1")
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,
