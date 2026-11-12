@@ -97,6 +97,9 @@ from skyvern.forge.sdk.copilot.tools import (
     NATIVE_TOOLS,
     _with_action_reason,
     _with_page_state,
+)
+from skyvern.forge.sdk.copilot.tools import credentials as credentials_module
+from skyvern.forge.sdk.copilot.tools import (
     mcp_hooks,
     run_execution,
 )
@@ -3475,15 +3478,20 @@ async def test_schedule_parameters_need_the_same_credential_approval_as_a_run(
     asks_for_account: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(mcp_hooks, "_server_verified_google_account_choices", AsyncMock(return_value=None))
+    monkeypatch.setattr(credentials_module, "connected_account_choices", AsyncMock(return_value=None))
     ctx = make_copilot_ctx(
         workflow_permanent_id="wpid_chat",
         request_policy=RequestPolicy(
             persisted_workflow_credential_ids=["cred_saved"],
-            run_approved_google_connection_ids=["goac_chosen"],
+            run_approved_connection_ids=["goac_chosen"],
         ),
     )
-    server = _schedule_server(monkeypatch, ctx, {"ok": True, "data": {"schedule": {"workflow_schedule_id": "wfs_1"}}})
+    server = _schedule_server(
+        monkeypatch,
+        ctx,
+        {"ok": True, "data": {"schedule": {"workflow_schedule_id": "wfs_1"}}},
+        definition=_sheets_definition("{{ login }}") if asks_for_account else None,
+    )
     args = {"workflow_schedule_id": "wfs_1", "cron_expression": "0 9 * * *", "timezone": "America/Los_Angeles"}
 
     refused = await server.call_tool(tool_name, {**args, "parameters": {"login": unapproved_id}})
@@ -3500,7 +3508,7 @@ async def test_schedule_parameters_need_the_same_credential_approval_as_a_run(
 
 def _sheets_definition(credential_id: str) -> dict[str, Any]:
     return {
-        "parameters": [],
+        "parameters": [{"key": "login", "parameter_type": "workflow"}],
         "blocks": [{"label": "write", "block_type": "google_sheets_write", "credential_id": credential_id}],
     }
 
@@ -3509,11 +3517,11 @@ def _sheets_definition(credential_id: str) -> dict[str, Any]:
 @pytest.mark.parametrize(
     "tool_name", ["create_workflow_schedule", "update_workflow_schedule", "enable_workflow_schedule"]
 )
-async def test_schedule_needs_approval_for_google_references_in_the_saved_workflow(
+async def test_schedule_needs_approval_for_account_references_in_the_saved_workflow(
     tool_name: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(mcp_hooks, "_server_verified_google_account_choices", AsyncMock(return_value=None))
+    monkeypatch.setattr(credentials_module, "connected_account_choices", AsyncMock(return_value=None))
     ctx = make_copilot_ctx(workflow_permanent_id="wpid_chat", request_policy=RequestPolicy())
     args = {"workflow_schedule_id": "wfs_1", "cron_expression": "0 9 * * *", "timezone": "America/Los_Angeles"}
     payload = {"ok": True, "data": {"schedule": {"workflow_schedule_id": "wfs_1"}}}

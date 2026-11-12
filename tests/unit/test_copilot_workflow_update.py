@@ -285,7 +285,6 @@ workflow_definition:
     )
     ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
     ctx.request_policy = RequestPolicy(allow_update_workflow=True, allow_run_blocks=True)
-    ctx.google_connection_turn_start_bindings = ()
 
     result = await _update_workflow({"workflow_yaml": edited}, ctx)
 
@@ -335,7 +334,6 @@ async def _staged_update(
     )
     ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
     ctx.request_policy = RequestPolicy(allow_update_workflow=True, allow_run_blocks=True)
-    ctx.google_connection_turn_start_bindings = ()
     ctx.auto_accept = auto_accept
     ctx.canonical_was_persisted_due_to_param_change = canonical_param_write
 
@@ -369,7 +367,6 @@ async def test_a_rename_that_omits_a_saved_note_reports_its_text_so_copilot_can_
     )
     ctx.persisted_workflow_yaml = workflow("open_page", "      notes: Never click Delete.\n")
     ctx.request_policy = RequestPolicy(allow_update_workflow=True, allow_run_blocks=True)
-    ctx.google_connection_turn_start_bindings = ()
     ctx.doc_editor_enabled = True
     ctx.auto_accept = False
 
@@ -422,7 +419,6 @@ async def test_a_same_label_type_change_reports_the_saved_note_as_dropped(monkey
         "      url: https://example.com\n      navigation_goal: Open the page\n"
     )
     ctx.request_policy = RequestPolicy(allow_update_workflow=True, allow_run_blocks=True)
-    ctx.google_connection_turn_start_bindings = ()
     ctx.doc_editor_enabled = True
     ctx.auto_accept = False
     submitted = (
@@ -461,7 +457,6 @@ async def test_flag_off_says_nothing_about_dropped_notes(
         "      url: https://example.com\n      navigation_goal: Open the page\n"
     )
     ctx.request_policy = RequestPolicy(allow_update_workflow=True, allow_run_blocks=True)
-    ctx.google_connection_turn_start_bindings = ()
     ctx.doc_editor_enabled = False
     ctx.auto_accept = False
 
@@ -522,7 +517,6 @@ workflow_definition:
     ctx.persisted_workflow_yaml = saved_yaml
     ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
     ctx.request_policy = RequestPolicy(allow_update_workflow=True, allow_run_blocks=True)
-    ctx.google_connection_turn_start_bindings = ()
     ctx.auto_accept = False
     ctx.doc_editor_enabled = True
 
@@ -596,7 +590,7 @@ def test_combined_tool_result_carries_every_submission_rewrite_disclosure() -> N
         "data": {
             "stored_code_rewritten": ["login"],
             **goal_disclosure,
-            "google_connection_resolution": [{"label": "write_row", "resolved_to": "cred_1"}],
+            "connection_resolution": [{"label": "write_row", "resolved_to": "cred_1"}],
         },
     }
     run_result: dict[str, Any] = {"ok": True, "data": {"message": "Ran 1 block."}}
@@ -807,7 +801,6 @@ async def test_update_carried_invalid_url_is_not_disclosed(
         browser_session_id=None,
         stream=AsyncMock(),
     )
-    ctx.google_connection_turn_start_bindings = ()
     monkeypatch.setattr(workflow_update_module, "_get_prior_workflow", AsyncMock(return_value=None))
     document = yaml.safe_load(_STAGED_WORKFLOW_YAML)
     if authored:
@@ -850,7 +843,6 @@ async def test_update_explicit_private_settings_are_absent_from_readback(
         browser_session_id=None,
         stream=None,
     )
-    ctx.google_connection_turn_start_bindings = ()
     monkeypatch.setattr(workflow_update_module, "_get_prior_workflow", AsyncMock(return_value=None))
     params = {"workflow_yaml": yaml.safe_dump(document)}
     result = await _update_workflow(params, ctx)
@@ -900,7 +892,6 @@ async def test_workflow_write_preserves_label_equal_to_private_value(
         browser_session_id=None,
         stream=None,
     )
-    ctx.google_connection_turn_start_bindings = ()
     monkeypatch.setattr(workflow_update_module, "_get_prior_workflow", AsyncMock(return_value=None))
     result = await _update_workflow({"workflow_yaml": workflow_yaml}, ctx)
     assert result["ok"], result
@@ -931,7 +922,6 @@ def _authoring_ctx(workflow_yaml: str = "") -> CopilotContext:
     ctx = make_copilot_ctx(workflow_yaml=workflow_yaml, stream=None)
     ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
     ctx.request_policy = RequestPolicy(allow_update_workflow=True, allow_run_blocks=True)
-    ctx.google_connection_turn_start_bindings = ()
     return ctx
 
 
@@ -1615,7 +1605,6 @@ workflow_definition:
     ctx.persisted_workflow_yaml = workflow("      notes: Totals include shipping.\n")
     ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
     ctx.request_policy = RequestPolicy(allow_update_workflow=True, allow_run_blocks=True)
-    ctx.google_connection_turn_start_bindings = ()
     ctx.auto_accept = False
 
     submitted = workflow("      notes: Click Delete first.\n      description: Reads the total.\n")

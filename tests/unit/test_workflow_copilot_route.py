@@ -5844,7 +5844,6 @@ async def test_request_webhook_is_validated_before_staging_once(
         )
         await workflow_update.restore_pending_workflow_proposal(ctx)
         ctx.workflow_copilot_chat_id = None
-        ctx.google_connection_turn_start_bindings = ()
         contexts.append(ctx)
         updates.append(await workflow_update._update_workflow({"workflow_yaml": ctx.workflow_yaml}, ctx))
         edited = yaml.safe_load(ctx.workflow_yaml)
@@ -9085,8 +9084,8 @@ async def test_test_end_to_end_route_hands_the_proposal_bound_account_to_the_age
         "  Cookie: synthetic-proposal-cookie\n"
         "workflow_definition:\n"
         "  blocks:\n"
-        "    - label: write_visitor_count_to_sheet\n"
-        "      block_type: google_sheets_write\n"
+        "    - label: read_visitor_count_from_sheet\n"
+        "      block_type: google_sheets_read\n"
         "      credential_id: goac_route_bound\n"
         "    - label: sign_in\n"
         "      block_type: login\n"
