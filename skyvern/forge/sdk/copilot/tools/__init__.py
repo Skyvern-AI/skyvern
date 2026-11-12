@@ -10,7 +10,7 @@ import time
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import asdict
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any
 
 import structlog
 from agents import FunctionTool, function_tool
@@ -266,7 +266,7 @@ from .guardrails import _parameter_binding_invariant_error as _parameter_binding
 from .integrations import (
     _list_integrations,
     _read_google_sheet,
-    _request_google_connection,
+    _request_connection,
 )
 from .mcp_hooks import _build_skyvern_mcp_overlays as _build_skyvern_mcp_overlays
 from .mcp_hooks import _click_post_hook as _click_post_hook
@@ -1293,10 +1293,9 @@ async def list_integrations_tool(ctx: RunContextWrapper) -> str:
     lists are disjoint, so check this one before concluding the user has no Google
     or Microsoft access.
     Prefer a purpose-built native integration block over automating that connected
-    service through its browser UI. For Google Sheets, author a `google_sheets_read`
-    or `google_sheets_write` block and pass an active compatible connection's
-    `connection_id` as its `credential_id`. Not paginated; one call returns every
-    entry and connection.
+    service through its browser UI, and pass an active compatible connection's
+    `connection_id` in the block's account field. Not paginated; one call returns
+    every entry and connection.
 
     Match on `scopes_granted`, not on `provider` alone: connections are granted per
     product, so a Sheets connection cannot read Gmail and binding it to a mail block
@@ -1310,9 +1309,10 @@ async def list_integrations_tool(ctx: RunContextWrapper) -> str:
     If the requested account remains ambiguous or no compatible active row exists,
     use a grounded ordinary-language clarification instead.
 
-    A `credential_id` may instead be the connection `name` or `email_address`
+    An account field may instead hold the connection `name` or `email_address`
     exactly as the user wrote it in this turn. The server resolves it when the
-    workflow is saved, and the save result says what happened to that slot.
+    workflow is saved, and `connection_resolution` in the save result says what
+    happened to that slot.
     """
     copilot_ctx = ctx.context
     arguments: dict[str, Any] = {}
@@ -1328,7 +1328,7 @@ async def list_integrations_tool(ctx: RunContextWrapper) -> str:
     return json.dumps(sanitized)
 
 
-GOOGLE_SETUP_TOOL_NAME = "request_google_connection"
+CONNECTION_CARD_TOOL_NAME = "request_connection"
 DEMONSTRATION_OFFER_TOOL_NAME = "offer_demonstration"
 
 
@@ -1346,35 +1346,32 @@ async def offer_demonstration_tool(ctx: RunContextWrapper) -> str:
     return json.dumps(result)
 
 
-@function_tool(failure_error_function=copilot_tool_failure, name_override=GOOGLE_SETUP_TOOL_NAME)
-async def request_google_connection_tool(
+@function_tool(failure_error_function=copilot_tool_failure, name_override=CONNECTION_CARD_TOOL_NAME)
+async def request_connection_tool(
     ctx: RunContextWrapper,
-    scope_profile: Literal["gmail", "google_sheets"],
+    integration_id: str,
     connection_id: str | None = None,
 ) -> str:
-    """Show the user a card in this chat for connecting a Google account under one existing scope
-    profile: `gmail` reads mail (gmail.readonly, no sending) and `google_sheets` reads and writes
-    spreadsheets. The two are separate grants and separate connections, so a workflow that needs
-    both needs one card per profile.
+    """Show the user a card in this chat for connecting an account to one `list_integrations` entry,
+    named by its `id`. The card asks for that entry's `required_scopes`.
 
-    The card appears with your reply. The user clicks Connect, finishes Google consent in a popup,
-    and then picks the account on the card; that pick reaches you on the next turn as
-    CONNECTED ACCOUNT CHOICE FACTS. This call does not start consent, does not wait for it and does
-    not change the workflow, so nothing is connected when it returns (`status` is `offered`).
+    The card appears with your reply. The user connects through the provider's consent and then picks
+    the account on the card; that pick reaches you on the next turn as CONNECTED ACCOUNT CHOICE FACTS
+    and is approved for runs. This call does not start consent, does not wait for it and does not
+    change the workflow, so nothing is connected when it returns (`status` is `offered`). An entry
+    that is not `live` gets no card (`status` is `not_offered`).
 
-    `compatible_connections` lists the active connections that already hold this profile's scope;
-    the card offers them for selection without new consent. With `connection_id`, a connection that
-    was granted for this same profile but is not active gets a reconnect card that keeps its ID
-    (`reconnect_connection_id`); any other ID is not used and comes back as `ignored_connection_id`.
+    With `connection_id`, the card reauthorizes that connection in place when `reconnect_in_place`
+    is true: its id stays the same. Otherwise the user connects a new account, which gets a new id.
     """
     copilot_ctx = ctx.context
-    arguments: dict[str, Any] = {"scope_profile": scope_profile, "connection_id": connection_id}
-    authority_error = _authority_tool_error(copilot_ctx, GOOGLE_SETUP_TOOL_NAME)
+    arguments: dict[str, Any] = {"integration_id": integration_id, "connection_id": connection_id}
+    authority_error = _authority_tool_error(copilot_ctx, CONNECTION_CARD_TOOL_NAME)
     if authority_error:
         result: dict[str, Any] = {"ok": False, "error": authority_error}
     else:
-        result = await _request_google_connection(scope_profile, connection_id, copilot_ctx)
-    record_tool_step_result_for_ctx(copilot_ctx, GOOGLE_SETUP_TOOL_NAME, arguments, result)
+        result = await _request_connection(integration_id, connection_id, copilot_ctx)
+    record_tool_step_result_for_ctx(copilot_ctx, CONNECTION_CARD_TOOL_NAME, arguments, result)
     return json.dumps(result)
 
 
@@ -2467,7 +2464,7 @@ NATIVE_TOOLS = [
     delete_block_tool,
     list_credentials_tool,
     list_integrations_tool,
-    request_google_connection_tool,
+    request_connection_tool,
     offer_demonstration_tool,
     read_google_sheet_tool,
     get_organization_usage_quota_tool,
@@ -2660,7 +2657,7 @@ def copilot_native_tools(
     supports_account_group_card: bool = False,
     supports_single_run_card: bool = False,
     supports_credential_delete_card: bool = False,
-    supports_google_setup_card: bool = False,
+    supports_connection_card: bool = False,
     supports_demonstration_offer: bool = False,
     browser_pattern_accepting_calls: tuple[str, ...] = (),
     trigger_sources: list[CopilotTriggerSource] | None = None,
@@ -2675,7 +2672,7 @@ def copilot_native_tools(
             (tool.name == "ask_user" and not supports_question_tool)
             or (tool.name == BROWSER_CODE_TOOL_NAME and not browser_code_available)
             or (tool.name in ACCOUNT_GROUP_TOOL_NAMES and not supports_account_group_card)
-            or (tool.name == GOOGLE_SETUP_TOOL_NAME and not supports_google_setup_card)
+            or (tool.name == CONNECTION_CARD_TOOL_NAME and not supports_connection_card)
             or (tool.name == DEMONSTRATION_OFFER_TOOL_NAME and not supports_demonstration_offer)
             or (tool.name == ACCOUNT_GROUP_SUBMIT_TOOL_NAME and not account_group_submit_enabled())
             or (tool.name == SINGLE_RUN_TOOL_NAME and not (supports_single_run_card and single_run_submit_enabled()))

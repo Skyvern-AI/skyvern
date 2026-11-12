@@ -53,9 +53,6 @@ from skyvern.forge.sdk.copilot.agent_context import (
     RegisteredDownloadTextError,
 )
 from skyvern.forge.sdk.copilot.authoring_parameter_binding import _literal_locator_selector
-from skyvern.forge.sdk.copilot.blocker_signal import (
-    stash_blocker_signal,
-)
 from skyvern.forge.sdk.copilot.budget_expiry import (
     BudgetExpiryState,
     RecordedBlockState,
@@ -361,17 +358,9 @@ from .composition_capture import (
     store_post_run_page_evidence,
 )
 from .credentials import (
-    _approve_server_verified_google_sheet_bindings,
     _credential_ids_validation_error,
-    _credential_run_approval_blocker_signal,
     _credential_run_approval_error,
-    _extract_credential_ids_for_labels,
-    _extract_credential_ids_from_tool_value,
-    _extract_credential_ids_from_workflow_definition,
-    _google_connection_reference_ids,
-    _google_sheet_connection_bindings_from_workflow_definition,
-    _retire_stale_google_connection_denial,
-    _server_verified_google_account_choices,
+    run_credential_gate,
     run_input_vault_placement_error,
 )
 from .frontier import (
@@ -4656,60 +4645,22 @@ async def _run_blocks_with_minted_browser_claim(
         selected_labels=set(labels_that_may_execute),
     )
 
-    tool_credential_ids = _extract_credential_ids_from_tool_value(params.get("parameters") or {})
-    credential_ids = list(
-        dict.fromkeys(
-            tool_credential_ids + _extract_credential_ids_from_workflow_definition(workflow.workflow_definition)
-        )
-    )
-    definition_credential_ids = _extract_credential_ids_for_labels(
-        workflow.workflow_definition, labels_that_may_execute
-    )
-    approval_credential_ids = list(dict.fromkeys(tool_credential_ids + definition_credential_ids))
-    admitted_sheet_ids = await _approve_server_verified_google_sheet_bindings(
-        _google_sheet_connection_bindings_from_workflow_definition(
-            workflow.workflow_definition,
-            selected_labels=labels_that_may_execute,
-        ),
-        tool_activity=ctx.tool_activity,
-        organization_id=ctx.organization_id,
-        request_policy=ctx.request_policy,
-    )
-    non_sheet_credential_ids = set(tool_credential_ids) | set(
-        _extract_credential_ids_for_labels(
-            workflow.workflow_definition,
-            labels_that_may_execute,
-            excluded_block_types={"google_sheets_read", "google_sheets_write"},
-        )
-    )
-    dispatch_scoped_sheet_ids = set(admitted_sheet_ids) - non_sheet_credential_ids
-    google_approval_blocker = _credential_run_approval_blocker_signal(
-        approval_credential_ids,
-        ctx.request_policy,
-        additional_approved_ids=dispatch_scoped_sheet_ids,
-        google_reference_ids=_google_connection_reference_ids(workflow.workflow_definition, labels_that_may_execute),
-    )
-    if google_approval_blocker is not None:
-        ctx.connected_account_recovery_choices = (
-            await _server_verified_google_account_choices(ctx.organization_id) or []
-        )
-        tool_error = stash_blocker_signal(ctx, google_approval_blocker)
-        stash_turn_halt_from_blocker_signal(ctx, google_approval_blocker, source="run_execution")
-        return _refused_before_dispatch(ctx, tool_error, user_reason=google_approval_blocker.user_facing_reason)
-    _retire_stale_google_connection_denial(
+    credential_gate = await run_credential_gate(
         ctx,
-        workflow_definition=workflow.workflow_definition,
-        additional_approved_ids=dispatch_scoped_sheet_ids,
+        workflow.workflow_definition,
+        labels=labels_that_may_execute,
+        run_parameters=params.get("parameters"),
     )
-    credential_approval_error = _credential_run_approval_error(
-        approval_credential_ids,
-        ctx.request_policy,
-        additional_approved_ids=dispatch_scoped_sheet_ids,
-    )
-    if credential_approval_error is not None:
-        return _refused_before_dispatch(ctx, credential_approval_error, user_reason=_UNCONFIRMED_LOGIN_REASON)
-
-    credential_error = await _credential_ids_validation_error(credential_ids, ctx)
+    if credential_gate.blocker is not None:
+        stash_turn_halt_from_blocker_signal(ctx, credential_gate.blocker, source="run_execution")
+    if credential_gate.error is not None:
+        user_reason = (
+            credential_gate.blocker.user_facing_reason
+            if credential_gate.blocker is not None
+            else _UNCONFIRMED_LOGIN_REASON
+        )
+        return _refused_before_dispatch(ctx, credential_gate.error, user_reason=user_reason)
+    credential_error = await _credential_ids_validation_error(list(credential_gate.definition_credential_ids), ctx)
     if credential_error is not None:
         return _refused_before_dispatch(ctx, credential_error)
     placement_error = await run_input_vault_placement_error(workflow.workflow_definition, params.get("parameters"), ctx)
@@ -5414,7 +5365,7 @@ async def _run_blocks_with_minted_browser_claim(
             ctx,
             workflow_run_id=workflow_run.workflow_run_id,
             parameter_values=data,
-            credential_ids=approval_credential_ids,
+            credential_ids=list(credential_gate.credential_ids),
             sensitive_parameter_keys=_sensitive_parameter_keys_requiring_resolved_values(snapshot.workflow),
         )
         if origin_registry.contains_sensitive_values and run_session_id:

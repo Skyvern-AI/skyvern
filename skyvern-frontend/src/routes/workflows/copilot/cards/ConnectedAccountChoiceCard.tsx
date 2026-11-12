@@ -15,17 +15,26 @@ type ConnectedAccountChoiceCardProps = {
   selectedConnectionId: string | null;
   disabled: boolean;
   onSelect: (connectionId: string) => void;
+  // The provider or integration the accounts belong to, as in "Choose an Outlook account".
+  accountKind?: string;
   // Set when the chat docks this picker above the composer instead of in the transcript.
   tray?: AttentionTrayPresentation;
 };
+
+function withArticle(word: string): string {
+  return `${/^[aeiou]/i.test(word) ? "an" : "a"} ${word}`;
+}
 
 export function ConnectedAccountChoiceCard({
   choices,
   selectedConnectionId,
   disabled,
   onSelect,
+  accountKind = "Google",
   tray,
 }: ConnectedAccountChoiceCardProps) {
+  const chooseTitle = `Choose ${withArticle(accountKind)} account`;
+  const groupLabel = `Connected ${accountKind} accounts`;
   // Only active rows send a choice; an inactive one is a link to reconnect it.
   const keyed = tray
     ? choices
@@ -112,10 +121,10 @@ export function ConnectedAccountChoiceCard({
     };
     return (
       <AttentionTray
-        aria-label="Connected Google accounts"
+        aria-label={groupLabel}
         onKeyDown={onKeyDown}
-        title="Choose a Google account"
-        collapsedTitle="Choose a Google account"
+        title={chooseTitle}
+        collapsedTitle={chooseTitle}
         collapsed={tray.collapsed}
         onCollapsedChange={tray.onCollapsedChange}
         minimizeLabel="Minimize account choice"
@@ -130,14 +139,14 @@ export function ConnectedAccountChoiceCard({
     <div
       className="overflow-hidden rounded-lg border border-border bg-slate-elevation2"
       role="group"
-      aria-label="Connected Google accounts"
+      aria-label={groupLabel}
     >
       <div className="flex items-center gap-2 border-b border-border px-3 py-2">
         <span className="flex size-6 flex-none items-center justify-center rounded-md bg-background">
           <Link2Icon className="size-4 text-muted-foreground" />
         </span>
         <span className="text-xs font-semibold text-foreground">
-          Choose a Google account
+          {chooseTitle}
         </span>
       </div>
       {rows}

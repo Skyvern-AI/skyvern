@@ -23,8 +23,10 @@ from skyvern.forge import app
 from skyvern.forge.sdk.copilot.ask_user import AccountGroupReview, QuestionInteraction
 from skyvern.forge.sdk.copilot.browser_ablation import resolve_copilot_tool_surface
 from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.secret_scrub import register_secret_scrub_value
 from skyvern.forge.sdk.copilot.tools import account_groups, copilot_native_tools
+from skyvern.forge.sdk.copilot.tools import credentials as credentials_module
 from skyvern.forge.sdk.copilot.tools.account_groups import (
     AccountGroupRefusal,
     AccountGroupState,
@@ -81,6 +83,7 @@ from tests.unit.conftest import (
     run_group_definition,
     run_group_task_block,
 )
+from tests.unit.copilot_test_helpers import make_copilot_ctx
 
 SECRET = "vault-password-fixture-81723"
 ORG_KEY = RequestPrincipal(RUN_GROUP_ORG, AuthKind.api_key)
@@ -736,6 +739,29 @@ async def test_only_a_saved_version_after_the_recheck_refuses_at_group_creation(
         assert await _groups_from_this_chat(chat) == 0
     else:
         assert isinstance(result, AccountGroupSubmission) and result.dispatched
+
+
+@pytest.mark.asyncio
+async def test_a_common_input_cannot_bind_an_unapproved_connected_account(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(credentials_module, "connected_account_choices", AsyncMock(return_value=None))
+    workflow = SimpleNamespace(
+        workflow_definition={
+            "parameters": [{"key": "note", "parameter_type": "workflow", "default_value": "none"}],
+            "blocks": [
+                {
+                    "label": "read",
+                    "block_type": "google_sheets_read",
+                    "spreadsheet_url": "https://example.com",
+                    "credential_id": "{{ note }}",
+                }
+            ],
+        }
+    )
+    ctx = make_copilot_ctx(request_policy=RequestPolicy(run_approved_connection_ids=["goac_approved"]))
+
+    with pytest.raises(account_groups.AccountGroupRefused):
+        await account_groups._check_connected_accounts(ctx, workflow, {"note": "goac_unapproved"})
+    await account_groups._check_connected_accounts(ctx, workflow, {"note": "goac_approved"})
 
 
 async def _run_count(chat: Chat) -> int:

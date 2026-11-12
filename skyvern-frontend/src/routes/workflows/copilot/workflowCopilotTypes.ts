@@ -225,7 +225,7 @@ export interface WorkflowCopilotChatRequest {
   supports_account_group_card?: boolean;
   supports_single_run_card?: boolean;
   supports_credential_delete_card?: boolean;
-  supports_google_setup_card?: boolean;
+  supports_connection_card?: boolean;
   supports_demonstration_offer?: boolean;
 }
 

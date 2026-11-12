@@ -21,6 +21,7 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
 from skyvern.forge.sdk.copilot.ask_user import QuestionInteraction
 from skyvern.forge.sdk.copilot.config import CopilotConfig
+from skyvern.forge.sdk.copilot.connected_accounts import request_user_id
 from skyvern.forge.sdk.copilot.context import ProposedCredential, StructuredContext
 from skyvern.forge.sdk.copilot.credential_resolution import (
     CredentialResolution,
@@ -61,12 +62,13 @@ from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     URL_CANDIDATE_RE,
     bitwarden_secret_bindings,
     parse_workflow_yaml,
+    workflow_connection_ids,
     workflow_credential_ids,
     workflow_credential_origins,
 )
 from skyvern.forge.sdk.credential_site_policy import same_release_scope, same_site
+from skyvern.forge.sdk.integrations.connected_accounts import OrgConnection, org_connections_by_id
 from skyvern.forge.sdk.schemas.credentials import Credential, TotpType
-from skyvern.forge.sdk.schemas.google_oauth import STATE_ACTIVE
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     TURN_OPENER_SENDERS,
     CopilotSteerMessage,
@@ -74,7 +76,6 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatSender,
 )
-from skyvern.forge.sdk.services import google_oauth_service
 from skyvern.forge.sdk.services.credential.credential_vault_service import VaultLogin, VaultLoginListing
 from skyvern.forge.sdk.workflow.models.credential_release import saved_site_urls
 from skyvern.forge.sdk.workflow.models.parameter import ParameterType
@@ -92,9 +93,6 @@ def _parse_final_response(raw: str) -> dict[str, Any]:
 
 
 _TESTING_INTENTS = {"require_test", "skip_test", "unspecified"}
-_SELECTABLE_GOOGLE_DATA_SCOPES = frozenset(
-    {google_oauth_service.GOOGLE_SHEETS_DATA_SCOPE, google_oauth_service.GOOGLE_GMAIL_READONLY_SCOPE}
-)
 _AUTHORING_INTENTS = {"author_now", "defer_authoring"}
 DEFER_AUTHORING_DURABLE_FILL_CRITERION_ID = "defer_authoring_durable_fill"
 _KINDS = {"none", "raw_secret", "credential_id", "credential_name", "website_stored_credential", "placeholder"}
@@ -230,14 +228,13 @@ def _screen_unavailable(
 
 async def _saved_credential_ids(citations: list[str], organization_id: str) -> set[str]:
     credential_ids = [citation for citation in citations if citation.startswith("cred_")]
-    connection_ids = {citation for citation in citations if citation.startswith("goac_")}
     verified_ids: set[str] = set()
     if credential_ids:
         credentials = await _load_credentials(organization_id, credential_ids=credential_ids)
         verified_ids.update(credential.credential_id for credential in credentials)
-    if connection_ids:
-        connections = await google_oauth_service.get_visible_credentials_for_org(organization_id)
-        verified_ids.update(connection.id for connection in connections if connection.id in connection_ids)
+    if other_citations := set(citations) - verified_ids:
+        connections = await org_connections_by_id(organization_id, request_user_id(organization_id))
+        verified_ids.update(connection.id for connection in connections if connection.id in other_citations)
     return verified_ids
 
 
@@ -1105,10 +1102,12 @@ class RequestPolicy:
     # Spreadsheet ids from every URL the user wrote, not one per origin: two sheets share an origin.
     user_provided_spreadsheet_ids: list[str] = field(default_factory=list)
     existing_workflow_credential_ids: list[str] = field(default_factory=list)
+    existing_workflow_connection_ids: list[str] = field(default_factory=list)
     existing_bitwarden_secret_bindings: set[str] = field(default_factory=set)
     # Read from the saved workflow row, never from the submitted YAML. The submission is the live
     # canvas, which carries a copilot proposal the user has not accepted, so it cannot grant a run.
     persisted_workflow_credential_ids: list[str] = field(default_factory=list)
+    persisted_workflow_connection_ids: list[str] = field(default_factory=list)
     persisted_workflow_browser_profile_id: str | None = None
     # The profile saved from the user's own sign-in on this turn's credential card, and its site. It may
     # seed this turn's test runs before Accept saves it as the workflow's pick.
@@ -1117,18 +1116,19 @@ class RequestPolicy:
     # Every login a credential card or a demonstrated fill connected on this turn; each stays the user's own pick
     # after a later one.
     credential_pause_connected_credential_ids: set[str] = field(default_factory=set)
-    # Active Google OAuth connections admitted only for workflow execution. These never enter
+    # Active connected accounts admitted only for workflow execution. These never enter
     # resolved_credentials, which remains the password-fill authority plane from ADR 0002.
-    run_approved_google_connection_ids: list[str] = field(default_factory=list)
-    # The connection the user picked from the account card on this turn, if any. Recorded as
-    # durable approval at turn end. A draft binding alone is never a substitute; the dispatch
-    # seam may separately admit a selected native Sheets citation for that dispatch only when it
-    # is backed by this turn's server-owned list_integrations result.
+    run_approved_connection_ids: list[str] = field(default_factory=list)
+    # The subset approved only by Test end to end deriving it from the pending proposal: these admit fields that read,
+    # never one that acts. A citation, a card pick or the saved workflow lifts the limit.
+    reads_only_connection_ids: list[str] = field(default_factory=list)
+    # The account card pick on this turn, recorded as durable approval at turn end. A draft binding is never a
+    # substitute; the dispatch seam separately admits one this turn listed or the user named.
     selected_connected_account_id: str | None = None
-    # Any validated Google pick, reported to the model as a fact. Only a Sheets pick also becomes
-    # selected_connected_account_id; a Gmail pick never widens run authority.
-    picked_connected_account_id: str | None = None
-    picked_connected_account_scopes: list[str] = field(default_factory=list)
+    selected_connected_account_scopes: list[str] = field(default_factory=list)
+    # Test end to end derived the pick from the pending proposal, so it is recorded as reads-only whatever else
+    # approves the account this turn: a saved binding stops approving once it is removed.
+    selected_connected_account_from_pending_proposal: bool = False
     # Sorted at the trace/JSON boundary; YAML traversal uses sets.
     existing_workflow_credential_origins: dict[str, list[str]] = field(default_factory=dict)
     classifier_status: str = "not_run"
@@ -1253,7 +1253,7 @@ class RequestPolicy:
             "allow_update_workflow": self.allow_update_workflow,
             "allow_run_blocks": self.allow_run_blocks,
             "resolved_credential_count": len(self.resolved_credentials),
-            "run_approved_google_connection_count": len(self.run_approved_google_connection_ids),
+            "run_approved_connection_count": len(self.run_approved_connection_ids),
             "has_completion_contract": bool(self.completion_contract),
             "completion_criteria_count": len(self.graded_completion_criteria()),
             "completion_criteria_implicit_count": sum(
@@ -4542,10 +4542,11 @@ def _ground_user_provided_sites(
     _project_user_provided_sites(policy, url_texts, reset=True)
 
 
-def _prior_approved_connection_ids(global_llm_context: str) -> set[str]:
-    structured = StructuredContext.from_json_str(global_llm_context)
+def _prior_approved_connection_ids(global_llm_context: str, *, reads_only: bool = False) -> set[str]:
     return {
-        record.credential_id for record in structured.approved_connections if record.credential_id.startswith("goac_")
+        record.credential_id
+        for record in StructuredContext.from_json_str(global_llm_context).approved_connections
+        if record.reads_only is reads_only
     }
 
 
@@ -5040,6 +5041,7 @@ async def _build_request_policy_bootstrap(
     prior_user_messages: Sequence[WorkflowCopilotChatHistoryMessage] = (),
     persisted_workflow_yaml: str | None = None,
     selected_connected_account_id: str | None = None,
+    selected_connected_account_from_pending_proposal: bool = False,
     _preclassified_policy: RequestPolicy | None = None,
 ) -> RequestPolicy:
     """Build the deterministic request safety record without model-backed policy inference."""
@@ -5068,44 +5070,42 @@ async def _build_request_policy_bootstrap(
     policy.existing_workflow_credential_origins = {
         credential_id: sorted(origins) for credential_id, origins in workflow_credential_origins(workflow_yaml).items()
     }
-    google_connection_candidates = {
-        credential_id for credential_id in policy.persisted_workflow_credential_ids if credential_id.startswith("goac_")
-    }
-    google_connection_candidates |= _prior_approved_connection_ids(global_llm_context)
+    policy.persisted_workflow_connection_ids = workflow_connection_ids(persisted_workflow_yaml or "")
+    policy.existing_workflow_connection_ids = workflow_connection_ids(workflow_yaml)
+    full_approvals = set(policy.persisted_workflow_connection_ids) | _prior_approved_connection_ids(global_llm_context)
+    reads_only_approvals = _prior_approved_connection_ids(global_llm_context, reads_only=True)
+    connection_candidates = full_approvals | reads_only_approvals
     policy.selected_connected_account_id = None
-    policy.picked_connected_account_id = None
-    policy.picked_connected_account_scopes = []
-    if google_connection_candidates or selected_connected_account_id is not None:
+    policy.selected_connected_account_scopes = []
+    policy.selected_connected_account_from_pending_proposal = False
+    if connection_candidates or selected_connected_account_id is not None:
+        connections: list[OrgConnection] | None
         try:
-            active_connections = await google_oauth_service.get_credentials_for_org(organization_id)
+            connections = await org_connections_by_id(organization_id, request_user_id(organization_id))
         except Exception:
             LOG.warning(
-                "request-policy Google connection authority lookup failed",
+                "request-policy connected account authority lookup failed",
                 organization_id=organization_id,
                 exc_info=True,
             )
-        else:
-            active_ids = {connection.id for connection in active_connections}
-            # Picker metadata can refresh after OAuth, independently of the previous turn.
-            # Validate the explicit selection before it becomes durable run authority.
-            selected = next(
-                (
-                    connection
-                    for connection in active_connections
-                    if connection.id == selected_connected_account_id
-                    and connection.organization_id == organization_id
-                    and connection.state == STATE_ACTIVE
-                    and not _SELECTABLE_GOOGLE_DATA_SCOPES.isdisjoint(connection.scopes_granted)
-                ),
-                None,
-            )
+            connections = None
+        if connections is not None:
+            # Picker metadata can refresh after OAuth, independently of the previous turn, so the
+            # selection is validated against the org's active rows before it becomes run authority.
+            active = {connection.id: connection for connection in connections if connection.active}
+            selected = active.get(selected_connected_account_id or "")
             if selected is not None:
-                policy.picked_connected_account_id = selected.id
-                policy.picked_connected_account_scopes = list(selected.scopes_granted)
-                if google_oauth_service.GOOGLE_SHEETS_DATA_SCOPE in selected.scopes_granted:
-                    policy.selected_connected_account_id = selected.id
-                    google_connection_candidates.add(selected.id)
-            policy.run_approved_google_connection_ids = sorted(google_connection_candidates & active_ids)
+                policy.selected_connected_account_id = selected.id
+                policy.selected_connected_account_scopes = list(selected.scopes_granted)
+                policy.selected_connected_account_from_pending_proposal = (
+                    selected_connected_account_from_pending_proposal
+                )
+                connection_candidates.add(selected.id)
+                (reads_only_approvals if selected_connected_account_from_pending_proposal else full_approvals).add(
+                    selected.id
+                )
+            policy.run_approved_connection_ids = sorted(connection_candidates & active.keys())
+            policy.reads_only_connection_ids = sorted((reads_only_approvals - full_approvals) & active.keys())
     _ground_user_provided_sites(policy, user_message, prior_user_messages or chat_history)
     try:
         await _seed_prior_approved_credentials(
@@ -5182,6 +5182,7 @@ async def build_request_policy_trust_floor(
     prior_user_messages: Sequence[WorkflowCopilotChatHistoryMessage] = (),
     persisted_workflow_yaml: str | None = None,
     selected_connected_account_id: str | None = None,
+    selected_connected_account_from_pending_proposal: bool = False,
 ) -> RequestPolicy:
     del config
     safety = await screen_raw_secret_safety(user_message, handler, organization_id=organization_id)
@@ -5223,6 +5224,7 @@ async def build_request_policy_trust_floor(
         prior_user_messages=prior_user_messages,
         persisted_workflow_yaml=persisted_workflow_yaml,
         selected_connected_account_id=selected_connected_account_id,
+        selected_connected_account_from_pending_proposal=selected_connected_account_from_pending_proposal,
         _preclassified_policy=policy,
     )
     LOG.info("raw-secret safety screen", **raw_secret_safety_log_fields(safety, "chat_turn"))

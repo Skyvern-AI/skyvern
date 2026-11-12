@@ -8,21 +8,14 @@ from typing import Any, Literal
 import structlog
 
 from skyvern.forge import app
+from skyvern.forge.sdk.copilot.connected_accounts import ConnectionCardPayload, request_user_id
 from skyvern.forge.sdk.copilot.context import CopilotContext
-from skyvern.forge.sdk.copilot.google_connection_notice import (
-    GoogleSetupScopeProfile,
-    google_setup_notice,
-    google_setup_ready_connections,
-)
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
-from skyvern.forge.sdk.integrations.catalog import (
-    copilot_payload,
-    integration_is_live,
-    integrations_for_org,
-    serialize_oauth_account,
-)
+from skyvern.forge.sdk.integrations.catalog import copilot_payload, integrations_for_org
+from skyvern.forge.sdk.integrations.connected_accounts import OrgConnection, org_connections_by_id
+from skyvern.forge.sdk.schemas.google_oauth import STATE_ACTIVE, GoogleOAuthCredentialBase
 from skyvern.forge.sdk.services import google_oauth_service, google_sheets_service
 from skyvern.forge.sdk.services.request_principal import get_request_principal, human_user_id
 from skyvern.schemas.google_sheets import (
@@ -33,8 +26,6 @@ from skyvern.schemas.google_sheets import (
     extract_spreadsheet_id,
     is_plain_cell_range,
 )
-
-from .credentials import _eligible_sheets_connections
 
 LOG = structlog.get_logger()
 
@@ -54,36 +45,65 @@ SheetConnectionStatus = Literal["opened", "no_access", "token_unavailable", "err
 async def _list_integrations(params: dict[str, Any], ctx: AgentContext) -> dict[str, Any]:
     user_id = human_user_id(get_request_principal(), ctx.organization_id)
     integrations = [
-        copilot_payload(entry)
-        for entry in await integrations_for_org(ctx.organization_id, user_id=user_id)
-        if entry.id != "powerbi" or integration_is_live("powerbi")
+        copilot_payload(entry) for entry in await integrations_for_org(ctx.organization_id, user_id=user_id)
     ]
     return {"ok": True, "data": {"integrations": integrations, "count": len(integrations)}}
 
 
-async def _request_google_connection(
-    scope_profile: GoogleSetupScopeProfile, connection_id: str | None, ctx: CopilotContext
-) -> dict[str, Any]:
-    visible = await google_oauth_service.get_visible_credentials_for_org(ctx.organization_id)
-    notice = google_setup_notice(scope_profile=scope_profile, connection_id=connection_id, visible_credentials=visible)
-    ctx.google_setup_notices = [
-        *(existing for existing in ctx.google_setup_notices if existing.scopeProfile != scope_profile),
-        notice,
-    ]
+async def _request_connection(integration_id: str, connection_id: str | None, ctx: CopilotContext) -> dict[str, Any]:
+    user_id = human_user_id(get_request_principal(), ctx.organization_id)
+    entry = next(
+        (
+            entry
+            for entry in await integrations_for_org(ctx.organization_id, user_id=user_id)
+            if entry.id == integration_id
+        ),
+        None,
+    )
+    if entry is None:
+        return {
+            "ok": False,
+            "error": f"No integration has the id `{integration_id}`; use an `id` from list_integrations.",
+        }
+    if entry.status != "live" or entry.oauth_provider is None:
+        return {"ok": True, "data": {"status": "not_offered", "integration_status": entry.status, "kind": entry.kind}}
+    required_scopes = list(entry.required_scopes or [])
+    target: OrgConnection | None = None
+    if connection_id is not None:
+        connections = await org_connections_by_id(ctx.organization_id, request_user_id(ctx.organization_id))
+        target = next((connection for connection in connections if connection.id == connection_id), None)
+    # A Google reconnect keeps the row and adds the entry's profile to its grants; Microsoft has no in-place
+    # reconnect from chat.
+    reconnect_in_place = target is not None and target.provider == entry.oauth_provider == "google"
+    card: ConnectionCardPayload = {
+        "integrationId": entry.id,
+        "integrationName": entry.name,
+        "provider": entry.oauth_provider,
+        "scopeProfile": entry.oauth_scope_profile,
+        "requiredScopes": list(entry.capability_scopes or required_scopes),
+        "reconnectConnectionId": connection_id if reconnect_in_place else None,
+    }
+    ctx.connection_cards = [*(c for c in ctx.connection_cards if c["integrationId"] != entry.id), card]
     data: dict[str, Any] = {
         "status": "offered",
-        "scope_profile": scope_profile,
-        "card": "reconnect" if notice.connectionId else "connect",
-        "compatible_connections": [
-            serialize_oauth_account(credential, "google")
-            for credential in google_setup_ready_connections(scope_profile, visible)
-        ],
+        "integration_id": entry.id,
+        "provider": entry.oauth_provider,
+        "required_scopes": required_scopes,
+        "reconnect_in_place": reconnect_in_place,
+        "accounts": copilot_payload(entry)["accounts"],
     }
-    if notice.connectionId:
-        data["reconnect_connection_id"] = notice.connectionId
-    elif connection_id:
-        data["ignored_connection_id"] = connection_id
+    if connection_id is not None:
+        data["connection"] = target.facts() if target is not None else {"connection_id": connection_id, "found": False}
     return {"ok": True, "data": data}
+
+
+def _sheets_capable(connections: list[GoogleOAuthCredentialBase]) -> list[GoogleOAuthCredentialBase]:
+    return [
+        connection
+        for connection in connections
+        if connection.state == STATE_ACTIVE
+        and google_oauth_service.GOOGLE_SHEETS_DATA_SCOPE in connection.scopes_granted
+    ]
 
 
 @dataclass(frozen=True)
@@ -258,15 +278,20 @@ async def _read_google_sheet(params: dict[str, Any], ctx: AgentContext) -> dict[
             "error": "This spreadsheet is not in a URL the user wrote in this chat, so it was not read.",
         }
 
-    eligible = _eligible_sheets_connections(
-        await google_oauth_service.get_visible_credentials_for_org(ctx.organization_id)
-    )
+    visible = await google_oauth_service.get_visible_credentials_for_org(ctx.organization_id)
     requested_connection_id = params.get("connection_id")
     connections: list[dict[str, Any]] = []
     if requested_connection_id:
-        if all(connection.id != requested_connection_id for connection in eligible):
+        # A named connection is tried whatever its scopes, so the result is Google's answer, not a scope guess.
+        eligible = [
+            connection
+            for connection in visible
+            if connection.id == requested_connection_id and connection.state == STATE_ACTIVE
+        ]
+        if not eligible:
             connections.append({"connection_id": str(requested_connection_id), "status": "not_eligible"})
-        eligible = [connection for connection in eligible if connection.id == requested_connection_id]
+    else:
+        eligible = _sheets_capable(visible)
 
     attempts = await asyncio.gather(
         *(_bounded_sheet_open(ctx.organization_id, connection.id, spreadsheet_id) for connection in eligible)

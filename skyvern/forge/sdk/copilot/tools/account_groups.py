@@ -33,6 +33,7 @@ from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure,
 from skyvern.forge.sdk.copilot.tools.credentials import (
     _credential_run_approval_error,
     _extract_credential_ids_from_tool_value,
+    run_credential_gate,
 )
 from skyvern.forge.sdk.copilot.tools.mcp_hooks import _chat_has_pending_proposal
 from skyvern.forge.sdk.copilot.workflow_credential_utils import parse_workflow_yaml, workflow_blocks
@@ -405,6 +406,21 @@ def _check_common_inputs(ctx: CopilotContext, common_inputs: dict[str, JsonValue
         raise AccountGroupRefused(approval_error)
 
 
+async def _check_connected_accounts(
+    ctx: CopilotContext, workflow: Workflow, common_inputs: dict[str, JsonValue]
+) -> None:
+    gate = await run_credential_gate(
+        ctx,
+        workflow.workflow_definition,
+        labels=None,
+        run_parameters=dict(common_inputs),
+        action="run the workflow for these accounts",
+        blocked_tool="run_workflow_for_accounts",
+    )
+    if gate.error is not None:
+        raise AccountGroupRefused(gate.error)
+
+
 async def build_review(
     ctx: CopilotContext,
     *,
@@ -431,6 +447,7 @@ async def build_review(
     if await _chat_has_pending_proposal(ctx):
         raise AccountGroupRefused(_PENDING_PROPOSAL_REFUSAL)
     workflow = await _saved_workflow(ctx)
+    await _check_connected_accounts(ctx, workflow, common_inputs)
     if reason := workflow_run_group_service.non_fresh_browser_reason(workflow):
         raise AccountGroupRefused(f"The saved workflow cannot run as a group because it has {reason}.")
     credential_parameter = await _require_credential_parameter(workflow, credential_parameter_key)
@@ -489,6 +506,7 @@ async def _recheck_approval(ctx: CopilotContext, review: AccountGroupReview, app
             "Propose the group again so the user can review the current version."
         )
     _check_common_inputs(ctx, review.common_inputs)
+    await _check_connected_accounts(ctx, workflow, review.common_inputs)
     await _require_credential_parameter(workflow, review.credential_parameter_key)
     credentials = await _resolve_credentials(ctx, approved_ids)
     shown = {row.credential_id: row.identity for row in review.rows}

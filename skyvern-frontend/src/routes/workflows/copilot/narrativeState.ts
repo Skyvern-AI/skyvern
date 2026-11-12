@@ -503,7 +503,7 @@ export interface TurnNarrativeState {
   workPlan?: TurnWorkPlan | null;
   connectedAccountChoices: ConnectedAccountChoice[];
   outputFiles: DeliveredOutputFile[];
-  googleConnectionNotices: GoogleConnectionNotice[];
+  connectionCards: ConnectionCard[];
   demonstrationOffer: boolean;
   canonicalWorkflowUnavailable: CanonicalWorkflowUnavailable | null;
   review: ReviewProjection | null;
@@ -524,22 +524,17 @@ export interface TurnScreenshot {
   toolCallId: string | null;
 }
 
-export type GoogleSetupScopeProfile = "gmail" | "google_sheets";
-
-export interface GoogleConnectionNotice {
-  provider: "google";
-  connectionId: string | null;
-  displayName: string | null;
-  condition: "missing" | "unusable" | "unbound";
-  scopeProfile: GoogleSetupScopeProfile;
-  origin: "setup" | "workflow";
-  choices?: ConnectedAccountChoice[];
+export interface ConnectionCard {
+  integrationId: string;
+  integrationName: string;
+  provider: "google" | "microsoft";
+  scopeProfile: string | null;
+  requiredScopes: string[];
+  reconnectConnectionId: string | null;
 }
 
-export function googleConnectionNoticeKey(
-  notice: GoogleConnectionNotice,
-): string {
-  return `${notice.scopeProfile}:${notice.connectionId ?? "unbound"}`;
+export function connectionCardKey(card: ConnectionCard): string {
+  return `${card.integrationId}:${card.reconnectConnectionId ?? "new"}`;
 }
 
 export interface CanonicalWorkflowUnavailable {
@@ -573,7 +568,7 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   credentialAutoBound: null,
   connectedAccountChoices: [],
   outputFiles: [],
-  googleConnectionNotices: [],
+  connectionCards: [],
   demonstrationOffer: false,
   canonicalWorkflowUnavailable: null,
   review: null,
@@ -825,51 +820,42 @@ export function parseCanonicalWorkflowUnavailable(
     : null;
 }
 
-export function parseGoogleConnectionNotices(
-  value: unknown,
-): GoogleConnectionNotice[] {
+export function parseConnectionCards(value: unknown): ConnectionCard[] {
   if (!Array.isArray(value)) return [];
-  const notices: GoogleConnectionNotice[] = [];
+  const cards: ConnectionCard[] = [];
   const seen = new Set<string>();
   for (const item of value) {
     if (!item || typeof item !== "object") continue;
     const row = item as Record<string, unknown>;
     if (
-      row.provider !== "google" ||
-      (row.condition === "unbound"
-        ? row.connectionId !== null
-        : typeof row.connectionId !== "string" ||
-          row.connectionId.length === 0) ||
-      (row.condition !== "missing" &&
-        row.condition !== "unusable" &&
-        row.condition !== "unbound") ||
-      (row.scopeProfile !== undefined &&
-        row.scopeProfile !== "gmail" &&
-        row.scopeProfile !== "google_sheets")
+      typeof row.integrationId !== "string" ||
+      typeof row.integrationName !== "string" ||
+      (row.provider !== "google" && row.provider !== "microsoft") ||
+      !Array.isArray(row.requiredScopes)
     ) {
       continue;
     }
-    const notice: GoogleConnectionNotice = {
-      provider: "google",
-      connectionId:
-        row.condition === "unbound" ? null : (row.connectionId as string),
-      displayName:
-        typeof row.displayName === "string" && row.displayName.length > 0
-          ? row.displayName
+    const card: ConnectionCard = {
+      integrationId: row.integrationId,
+      integrationName: row.integrationName,
+      provider: row.provider,
+      scopeProfile:
+        typeof row.scopeProfile === "string" ? row.scopeProfile : null,
+      requiredScopes: row.requiredScopes.filter(
+        (scope): scope is string => typeof scope === "string",
+      ),
+      reconnectConnectionId:
+        typeof row.reconnectConnectionId === "string" &&
+        row.reconnectConnectionId.length > 0
+          ? row.reconnectConnectionId
           : null,
-      condition: row.condition,
-      scopeProfile: row.scopeProfile === "gmail" ? "gmail" : "google_sheets",
-      origin: row.origin === "setup" ? "setup" : "workflow",
-      ...(row.condition === "unbound"
-        ? { choices: parseConnectedAccountChoices(row.choices) }
-        : {}),
     };
-    const key = googleConnectionNoticeKey(notice);
+    const key = connectionCardKey(card);
     if (seen.has(key)) continue;
     seen.add(key);
-    notices.push(notice);
+    cards.push(card);
   }
-  return notices;
+  return cards;
 }
 
 // Tool calls that write the workflow definition. update_workflow only
@@ -989,7 +975,7 @@ const TOOL_CALL_KINDS: Record<string, ToolCallKind> = {
   validate_block: "other",
   inspect_current_workflow: "other",
   list_integrations: "other",
-  request_google_connection: "other",
+  request_connection: "other",
   offer_demonstration: "other",
   read_google_sheet: "other",
   read_attached_pdf: "other",
@@ -2305,9 +2291,7 @@ export function hydrateNarrativeFromPayload(
       payload.connectedAccountChoices,
     ),
     outputFiles: parseOutputFiles(payload.outputFiles),
-    googleConnectionNotices: parseGoogleConnectionNotices(
-      payload.googleConnectionNotices,
-    ),
+    connectionCards: parseConnectionCards(payload.connectionCards),
     demonstrationOffer: payload.demonstrationOffer === true,
     canonicalWorkflowUnavailable: parseCanonicalWorkflowUnavailable(
       payload.canonicalWorkflowUnavailable,

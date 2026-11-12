@@ -62,7 +62,7 @@ _TOOL_ACTIVITY_DISPLAY_LABELS = {
     "get_block_schema": "Checking workflow block options",
     "get_workflow_knowledge": "Looking up workflow guidance",
     "list_integrations": "Checking connected integrations",
-    "request_google_connection": "Preparing a Google connection",
+    "request_connection": "Preparing an account connection",
     "offer_demonstration": "Offering a demonstration",
     "read_google_sheet": "Reading the Google Sheet",
     "get_organization_usage_quota": "Checking account usage",

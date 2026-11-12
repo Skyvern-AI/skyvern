@@ -664,7 +664,7 @@ _DRAIN_KEPT_NATIVE_TOOLS = {
     "read_google_sheet",
     "reply",
     "request_credential",
-    "request_google_connection",
+    "request_connection",
     "offer_demonstration",
     "run_browser_code",
     "search_web",
