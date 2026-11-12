@@ -299,8 +299,22 @@ class CopilotTriggerSummary:
     workflow_permanent_id: str
     source_kind: str
     mapping: dict[str, str]
+    settings: dict[str, JsonValue]
     enabled: bool
     created_at: str
+    note: str | None = None
+
+
+@dataclass(frozen=True)
+class CopilotTriggerSource:
+    source_kind: str
+    description: str
+    # Adapter-managed sources are set up outside Copilot; `set_up_in` names where.
+    creatable_in_copilot: bool
+    settings_schema: dict[str, JsonValue]
+    example_event: dict[str, JsonValue]
+    fires_on_its_own: bool
+    set_up_in: str | None = None
 
 
 TriggerMappingReasonCode = Literal[
@@ -319,6 +333,7 @@ class CopilotTriggerResult:
     triggers: list[CopilotTriggerSummary] = field(default_factory=list)
     resolved_parameters: dict[str, JsonValue] | None = None
     reason_code: TriggerMappingReasonCode | None = None
+    after_create: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1984,8 +1999,17 @@ class AgentFunction:
         del organization_id
         return CopilotOrganizationUsage(credits_note="This deployment does not track billing.")
 
-    async def create_copilot_webhook_trigger(
-        self, *, organization_id: str, workflow_permanent_id: str, mapping: dict[str, str]
+    def copilot_trigger_sources(self) -> list[CopilotTriggerSource]:
+        return []
+
+    async def create_copilot_trigger(
+        self,
+        *,
+        organization_id: str,
+        workflow_permanent_id: str,
+        source_kind: str,
+        settings: dict[str, JsonValue],
+        mapping: dict[str, str],
     ) -> CopilotTriggerResult:
         return CopilotTriggerResult(error=COPILOT_TRIGGERS_UNAVAILABLE)
 
@@ -1994,8 +2018,9 @@ class AgentFunction:
         *,
         organization_id: str,
         workflow_permanent_id: str,
+        source_kind: str,
         mapping: dict[str, str],
-        payload: dict[str, JsonValue],
+        payload: dict[str, JsonValue] | None,
     ) -> CopilotTriggerResult:
         return CopilotTriggerResult(error=COPILOT_TRIGGERS_UNAVAILABLE)
 

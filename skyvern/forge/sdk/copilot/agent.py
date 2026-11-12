@@ -5840,6 +5840,7 @@ async def _run_copilot_turn_impl(
             browser_code_available=browser_code_mode != CopilotBrowserCodeMode.OFF
             and copilot_config.authoring_capability.code_blocks,
             browser_pattern_accepting_calls=app.AGENT_FUNCTION.copilot_browser_pattern_accepting_calls(),
+            trigger_sources=app.AGENT_FUNCTION.copilot_trigger_sources(),
             authoring_capability=copilot_config.authoring_capability,
             run_tools_available=surface_runs_blocks(
                 mode=eval_mode, browser_tools_available=copilot_config.browser_tools_available
