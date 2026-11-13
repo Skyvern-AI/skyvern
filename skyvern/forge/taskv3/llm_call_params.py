@@ -6,15 +6,7 @@ summary), never what it is told.
 
 from __future__ import annotations
 
-import re
 from typing import Any
-
-from skyvern.schemas.llm import LLMRouterConfig
-
-# The text litellm 1.89.7's router appends to the primary leg's exception when a fallback leg also failed.
-_FALLBACK_ERROR_MARKER = "Error doing the fallback:"
-_LITELLM_ERROR_CLASS = re.compile(r"litellm\.(\w+)")
-_REJECTION_CLASSES = frozenset({"BadRequestError", "NotFoundError"})
 
 
 def build_call_kwargs(step: Any, llm_caller: Any) -> dict[str, Any] | None:
@@ -49,45 +41,3 @@ def reasoning_effort_with_summary(llm_caller: Any) -> dict[str, str] | None:
     if effort is None or bridge_check is None or not bridge_check():
         return None
     return {"effort": effort, "summary": "auto"}
-
-
-def carry_reasoning_route(llm_caller: Any) -> str:
-    """``carries`` when this caller's calls go through litellm's Responses bridge to OpenAI from a main group whose
-    deployments are interchangeable, else why not. A fallback group that cannot read the reasoning fails the call, and
-    the loop retries without it."""
-    bridge_check = getattr(llm_caller, "uses_openai_responses_bridge", None)
-    if bridge_check is None or not bridge_check():
-        return "not_responses_bridge"
-    llm_config = llm_caller.llm_config
-    if not isinstance(llm_config, LLMRouterConfig):
-        return "azure" if llm_config.model_name.startswith("azure/") else "carries"
-    main = [d.litellm_params for d in llm_config.model_list if d.model_name == llm_config.main_model_group]
-    if not main:
-        return "no_main_group"
-    if any(str(params.get("model") or "").startswith("azure/") for params in main):
-        return "azure"
-    # A reasoning reference resolves only where it was made; deployments whose parameters differ in any way may not be
-    # the same place, so the main group carries only when they are identical.
-    return "carries" if all(params == main[0] for params in main) else "main_group_differs"
-
-
-def carries_reasoning(llm_caller: Any) -> bool:
-    return carry_reasoning_route(llm_caller) == "carries"
-
-
-def fallback_error_class(error: BaseException) -> str | None:
-    """The class of the last fallback leg's error, which litellm's router records only in the text of the primary
-    leg's exception it re-raises; None when no fallback leg ran."""
-    _, marker, tail = str(error).partition(_FALLBACK_ERROR_MARKER)
-    found = _LITELLM_ERROR_CLASS.search(tail) if marker else None
-    return found.group(1) if found else None
-
-
-def rejects_carried_reasoning(error: BaseException) -> bool:
-    """Whether an error is a deterministic rejection (400 or 404) from the leg that served or from the last fallback
-    leg, which a retry with the same carried reasoning would only repeat."""
-    return (
-        getattr(error, "status_code", None) in (400, 404)
-        or type(error).__name__ in _REJECTION_CLASSES
-        or fallback_error_class(error) in _REJECTION_CLASSES
-    )
