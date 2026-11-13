@@ -4188,8 +4188,7 @@ def proposal_conflict_result(
     if adoption == "adopted":
         result["error"] = f"{lost} Another change replaced the pending proposal, and this turn now works on it."
         adopted_yaml = redact_raw_secrets_for_prompt(ctx.staged_workflow_yaml or "")
-        if not copilot_sees_notes(ctx):
-            adopted_yaml = drop_submitted_note_fields(adopted_yaml)
+        adopted_yaml = drop_submitted_note_fields(adopted_yaml, keep_notes=copilot_sees_notes(ctx))
         if len(adopted_yaml) > _BUILD_TEST_WORKFLOW_MAX_CHARS:
             result["adopted_workflow_yaml"] = adopted_yaml[: _BUILD_TEST_WORKFLOW_MAX_CHARS - 3] + "..."
             result["next_step"] = (
@@ -4552,9 +4551,8 @@ async def _update_workflow(
             goal_rewritten_labels=goal_rewritten_labels,
         )
         workflow_yaml = goal_carry.workflow_yaml
-        if not copilot_sees_notes(ctx):
-            # Without the Doc editor the user cannot see notes, so Copilot keeps the saved ones untouched.
-            workflow_yaml = drop_submitted_note_fields(workflow_yaml)
+        # Copilot never writes images, and writes notes only with the Doc editor; saved values are carried.
+        workflow_yaml = drop_submitted_note_fields(workflow_yaml, keep_notes=copilot_sees_notes(ctx))
         workflow_yaml, kept_note_labels, dropped_note_labels = carry_block_notes_from_versions(
             workflow_yaml, prior_yaml, ctx.persisted_workflow_yaml if isinstance(ctx, CopilotContext) else None
         )

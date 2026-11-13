@@ -396,12 +396,14 @@ from skyvern.schemas.emails import (
 from skyvern.schemas.runs import RunEngine, read_browser_type
 from skyvern.schemas.self_heal import HealClassification, HealSkipReason, HealStatus, OutputObligation
 from skyvern.schemas.workflows import (
+    BLOCK_IMAGE_FIELDS,
     ERROR_CODE_MAPPING_MAX_ENTRIES,
     ERROR_CODE_MAPPING_MAX_UTF8_BYTES,
     ERROR_CODE_MAX_LENGTH,
     ERROR_CODE_REASONING_MAX_LENGTH,
     FORCE_OCR_DESCRIPTION,
     AIFallbackMode,
+    BlockImage,
     BlockResult,
     BlockStatus,
     BlockType,
@@ -1291,6 +1293,18 @@ class Block(BaseModel, abc.ABC):
         json_schema_extra={"x-internal": True},
         description="What this block does, for people. Never read by the agent.",
     )
+    doc_images: list[BlockImage] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        json_schema_extra={"x-internal": True},
+        description="Uploaded images shown with this block, for people. Never sent to the agent.",
+    )
+    prompt_images: list[BlockImage] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        json_schema_extra={"x-internal": True},
+        description="Uploaded images reserved for this block's prompt; no block reads them yet.",
+    )
     block_type: BlockType
     output_parameter: OutputParameter
     continue_on_failure: bool = False
@@ -1339,7 +1353,7 @@ class Block(BaseModel, abc.ABC):
     def _preserve_explicit_note_clears(self, handler: SerializerFunctionWrapHandler):  # type: ignore[no-untyped-def]
         data = handler(self)
         if isinstance(data, dict):
-            for field in ("notes", "trailing_notes", "description"):
+            for field in ("notes", "trailing_notes", "description", *BLOCK_IMAGE_FIELDS):
                 if field in self.model_fields_set and getattr(self, field) is None:
                     data[field] = None
         return data

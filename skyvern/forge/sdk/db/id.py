@@ -3,6 +3,7 @@ import itertools
 import os
 import platform
 import random
+import re
 import time
 
 # 6/20/2022 12AM
@@ -326,6 +327,19 @@ def generate_tag_value_id() -> str:
 def generate_uploaded_file_id() -> str:
     int_id = generate_id()
     return f"{UPLOADED_FILE_PREFIX}_{int_id}"
+
+
+# Ids are generated from a 64-bit int, so a real one never exceeds 20 digits.
+_UPLOADED_FILE_ID_PATTERN = re.compile(rf"^{UPLOADED_FILE_PREFIX}_[0-9]{{1,20}}$")
+
+
+def is_uploaded_file_id(value: str) -> bool:
+    """Whether a value names a file uploaded through ``POST /v1/upload_file``.
+
+    Distinguishable from a URL by construction: an id carries no scheme, and ``file_`` is not
+    a parsable URL scheme, so this can never shadow a ``file://`` path.
+    """
+    return bool(_UPLOADED_FILE_ID_PATTERN.match(value.strip()))
 
 
 def generate_run_feedback_id() -> str:

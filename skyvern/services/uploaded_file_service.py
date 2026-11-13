@@ -657,6 +657,17 @@ async def assert_files_attachable(*, file_ids: list[str], organization_id: str) 
         raise FileNotAttachable(unattachable)
 
 
+async def live_uploaded_files(*, file_ids: list[str], organization_id: str) -> dict[str, UploadedFile]:
+    """The live files this organization uploaded among ``file_ids``, by id."""
+    requested = list(dict.fromkeys(file_ids))
+    if not requested:
+        return {}
+    live = await app.DATABASE.uploaded_files.get_uploaded_files_by_ids(
+        file_ids=requested, organization_id=organization_id
+    )
+    return {uploaded_file.file_id: uploaded_file for uploaded_file in live if not is_past_retention(uploaded_file)}
+
+
 async def attach_files_to_run(*, file_ids: list[str], organization_id: str, run_id: str) -> list[UploadedFile]:
     """Bind uploaded files to a run so the run's terminal handler deletes them.
 
@@ -788,16 +799,32 @@ async def resolve_file_reference(*, file_id: str, organization_id: str) -> str |
     uploaded_file = await app.DATABASE.uploaded_files.get_uploaded_file(
         file_id=file_id, organization_id=organization_id
     )
-    if uploaded_file is None:
+    if uploaded_file is None or is_past_retention(uploaded_file):
         return None
+    return uploaded_file.storage_uri
+
+
+# The only upload types a block image may name: raster images render inline and run no script.
+BLOCK_IMAGE_MEDIA_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
+# The uploads bucket moves objects over 4 MiB to Deep Archive after 92 days, where they cannot be read.
+BLOCK_IMAGE_MAX_BYTES = 4 * 1024 * 1024
+
+
+def is_block_image_upload(uploaded_file: UploadedFile) -> bool:
+    # The row records no content type, so the extension decides; the upload routes accept a renamed BMP, TIFF or ICO
+    # under a .png name, and the signed-URL route, which sniffs the stored bytes, is the real gate.
+    media_types = IMAGE_UPLOAD_TYPES.get(upload_extension(uploaded_file.filename), ())
+    return bool(media_types) and media_types[0] in BLOCK_IMAGE_MEDIA_TYPES
+
+
+def is_past_retention(uploaded_file: UploadedFile) -> bool:
     # The purge runs hourly, so an expired row can still name live bytes. The retention the caller
     # was promised governs the dereference, not when the sweep happens to run.
     expires_at = uploaded_file.expires_at
-    if expires_at is not None:
-        expiry = expires_at if expires_at.tzinfo else expires_at.replace(tzinfo=timezone.utc)
-        if expiry <= datetime.now(timezone.utc):
-            return None
-    return uploaded_file.storage_uri
+    if expires_at is None:
+        return False
+    expiry = expires_at if expires_at.tzinfo else expires_at.replace(tzinfo=timezone.utc)
+    return expiry <= datetime.now(timezone.utc)
 
 
 async def purge_expired_files(*, limit: int = 500) -> dict[str, int]:

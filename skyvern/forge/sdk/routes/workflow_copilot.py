@@ -2377,6 +2377,8 @@ async def _restore_workflow_definition(original_workflow: Workflow | None, organ
     await app.WORKFLOW_SERVICE.update_workflow_definition(
         workflow_id=original_workflow.workflow_id,
         organization_id=organization_id,
+        # A rollback restores a state that saved; a file deleted since must not block it.
+        validate_block_image_files=False,
         title=restored_title,
         description=original_workflow.description,
         workflow_definition=restored_definition,

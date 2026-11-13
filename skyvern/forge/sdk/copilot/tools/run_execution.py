@@ -8526,8 +8526,8 @@ def build_test_evidence_packet(
         workflow_yaml = result.execution.workflow_yaml
         workflow_source = f"{result.execution.snapshot.provenance}_execution_snapshot"
     workflow_yaml = strip_copilot_yaml_headers(workflow_yaml)
-    if workflow_yaml is not None and not copilot_sees_notes(copilot_ctx):
-        workflow_yaml = drop_submitted_note_fields(workflow_yaml)
+    if workflow_yaml is not None:
+        workflow_yaml = drop_submitted_note_fields(workflow_yaml, keep_notes=copilot_sees_notes(copilot_ctx))
     if workflow_yaml is None:
         omission_notices.append(
             "canonical_workflow_yaml omitted: no accepted or turn-start persistence readback exists."

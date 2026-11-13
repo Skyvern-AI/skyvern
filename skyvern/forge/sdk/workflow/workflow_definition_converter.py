@@ -95,6 +95,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
 )
 from skyvern.schemas.emails import EmailTransport
 from skyvern.schemas.workflows import (
+    BLOCK_IMAGE_FIELDS,
     BLOCK_YAML_TYPES,
     BlockType,
     ForLoopBlockYAML,
@@ -434,7 +435,7 @@ def _build_block_kwargs(
         "model": block_yaml.model,
         "ignore_workflow_system_prompt": block_yaml.ignore_workflow_system_prompt,
     }
-    for field in ("notes", "trailing_notes", "description"):
+    for field in ("notes", "trailing_notes", "description", *BLOCK_IMAGE_FIELDS):
         if field in block_yaml.model_fields_set:
             kwargs[field] = getattr(block_yaml, field)
     return kwargs

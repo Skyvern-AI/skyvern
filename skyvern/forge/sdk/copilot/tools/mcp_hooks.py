@@ -99,7 +99,12 @@ from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.sdk.workflow.schedules import MIN_SCHEDULE_INTERVAL_SECONDS
 from skyvern.forge.sdk.workflow.web_search import WEB_SEARCH_HELPER_CONTRACT
 from skyvern.forge.sdk.workflow.web_search_client import SearchProvider, SearchResponse, SearchResult
-from skyvern.schemas.workflows import AGENT_STEP_BLOCK_SUMMARY, AgentStepBlockYAML, TaskBlockYAML
+from skyvern.schemas.workflows import (
+    AGENT_STEP_BLOCK_SUMMARY,
+    BLOCK_IMAGE_FIELDS,
+    AgentStepBlockYAML,
+    TaskBlockYAML,
+)
 from skyvern.utils.secret_headers import SECRET_HEADER_MASK
 from skyvern.webeye.dialog_handler import DIALOG_POLICY_HELPER_CONTRACT
 
@@ -384,19 +389,29 @@ def _bound_failed_click_result(ctx: AgentContext, result: dict[str, Any]) -> Non
         bound_enrichment_text(container, key, max(minimum_chars, len(value) // 2))
 
 
-def _without_note_fields(value: Any) -> Any:
+def _without_note_fields(value: Any, fields: tuple[str, ...]) -> Any:
     if isinstance(value, dict):
         properties = value.get("properties")
         if isinstance(properties, dict):
-            for name in CARRIED_FIELDS:
+            for name in fields:
                 if isinstance(properties.get(name), dict) and properties[name].get("x-internal"):
                     del properties[name]
         for child in value.values():
-            _without_note_fields(child)
+            _without_note_fields(child, fields)
     elif isinstance(value, list):
         for child in value:
-            _without_note_fields(child)
+            _without_note_fields(child, fields)
     return value
+
+
+def _without_unreferenced_internal_defs(schema: dict[str, Any]) -> None:
+    definitions = schema.get("$defs")
+    if not isinstance(definitions, dict):
+        return
+    for name in [name for name, item in definitions.items() if isinstance(item, dict) and item.get("x-internal")]:
+        definition = definitions.pop(name)
+        if f'"#/$defs/{name}"' in json.dumps(schema):
+            definitions[name] = definition
 
 
 def _note_field_properties() -> dict[str, Any]:
@@ -418,15 +433,20 @@ def _block_property_maps(schema: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _note_fields_for_doc_editor(result: dict[str, Any] | None, ctx: AgentContext) -> dict[str, Any] | None:
-    """The MCP block schema leaves note fields out for every client; Copilot sees them only with the Doc editor."""
+    """The MCP block schema leaves note fields out for every client; Copilot sees them only with the Doc editor.
+
+    Image fields are not shown to the model, and a model-written image id is stripped before the carry.
+    """
     if result is None:
         return result
     data = result.get("data")
     schema = data.get("schema") if isinstance(data, dict) else None
     if not isinstance(schema, dict):
         return result
-    if not copilot_sees_notes(ctx):
-        _without_note_fields(schema)
+    notes_visible = copilot_sees_notes(ctx)
+    _without_note_fields(schema, BLOCK_IMAGE_FIELDS if notes_visible else (*CARRIED_FIELDS, *BLOCK_IMAGE_FIELDS))
+    _without_unreferenced_internal_defs(schema)
+    if not notes_visible:
         return result
     note_properties = _note_field_properties()
     for properties in _block_property_maps(schema):
@@ -944,8 +964,8 @@ async def _get_org_workflow_post_hook(
     data = result.get("data")
     definition = data.get("workflow_definition") if isinstance(data, dict) else None
     blocks = definition.get("blocks") if isinstance(definition, dict) else None
-    if isinstance(blocks, list) and not copilot_sees_notes(ctx):
-        remove_note_fields(blocks)
+    if isinstance(blocks, list):
+        remove_note_fields(blocks, keep_notes=copilot_sees_notes(ctx))
     return result
 
 

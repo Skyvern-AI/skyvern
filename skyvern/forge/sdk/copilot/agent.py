@@ -1037,7 +1037,7 @@ def _transcript_anchor_for_turn(packet: TurnContextPacket | None, chat_history_l
 
 def _workflow_yaml_for_prompt(ctx: CopilotContext, workflow_yaml: str | None) -> str:
     safe_yaml = redact_raw_secrets_for_prompt(workflow_yaml or "")
-    return safe_yaml if copilot_sees_notes(ctx) else drop_submitted_note_fields(safe_yaml)
+    return drop_submitted_note_fields(safe_yaml, keep_notes=copilot_sees_notes(ctx))
 
 
 def _store_turn_context_packet_on_context(
@@ -3981,9 +3981,8 @@ async def _translate_to_agent_result(
             workflow_yaml = goal_carry.workflow_yaml
             for goal_note in _user_owned_goal_notes(goal_carry.kept, goal_carry.dropped):
                 user_response = f"{user_response}\n\n(Note: {goal_note})"
-            if not copilot_sees_notes(ctx):
-                # Without the Doc editor the user cannot see notes, so the saved ones stay untouched.
-                workflow_yaml = drop_submitted_note_fields(workflow_yaml)
+            # Copilot never writes images, and writes notes only with the Doc editor; saved values are carried.
+            workflow_yaml = drop_submitted_note_fields(workflow_yaml, keep_notes=copilot_sees_notes(ctx))
             workflow_yaml, kept_note_labels, dropped_note_labels = carry_block_notes_from_versions(
                 workflow_yaml, ctx.last_workflow_yaml or ctx.workflow_yaml, ctx.persisted_workflow_yaml
             )
