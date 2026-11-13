@@ -599,8 +599,8 @@ def resolve_copilot_run_lane(*, rollout_dispatches: bool, inline_opt_in: bool) -
 
     The rollout decides where a run *may* execute; an explicit inline opt-in decides where this one
     does. Honouring the opt-in under an enrolled runner is what lets a developer stack exercise a
-    workflow whose target is host-local, which the runner's egress guard refuses. Only a developer
-    checkout reaches it: the hook returns False for cloud and packaged deployments.
+    workflow whose target is host-local, which the runner's egress guard refuses. Open source always
+    opts in, having no sandbox; a cloud image opts in only from a developer checkout.
     """
     if inline_opt_in:
         return False, True
@@ -5464,11 +5464,10 @@ async def _run_blocks_with_minted_browser_claim(
                     block_outputs=block_outputs_to_seed or None,
                 )
         else:
-            if allow_inline_code_execution:
-                LOG.error(
-                    "UNSANDBOXED: executing copilot workflow code in the API process because "
-                    "COPILOT_ALLOW_INLINE_CODE_EXECUTION is enabled. This is a local-development path "
-                    "with no sandbox isolation; the run below is NOT a sandboxed run.",
+            if allow_inline_code_execution and requires_sandbox:
+                LOG.warning(
+                    "UNSANDBOXED: executing copilot workflow code in the API process because no sandbox "
+                    "can take this run; the run below is NOT a sandboxed run.",
                     workflow_run_id=workflow_run.workflow_run_id,
                     workflow_permanent_id=ctx.workflow_permanent_id,
                     organization_id=ctx.organization_id,

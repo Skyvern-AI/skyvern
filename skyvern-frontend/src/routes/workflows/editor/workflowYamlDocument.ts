@@ -44,16 +44,19 @@ function parseHeaders(
   );
 }
 
+const DOC_FIELD_KEYS = [
+  "notes",
+  "trailing_notes",
+  "description",
+  "doc_images",
+  "prompt_images",
+] as const;
+type SavedDocFields = Pick<WorkflowBlock, (typeof DOC_FIELD_KEYS)[number]>;
+
 function savedDocFieldsByLabel(
   blocks: WorkflowBlock[],
-): Map<
-  string,
-  Pick<WorkflowBlock, "notes" | "trailing_notes" | "description">
-> {
-  const saved = new Map<
-    string,
-    Pick<WorkflowBlock, "notes" | "trailing_notes" | "description">
-  >();
+): Map<string, SavedDocFields> {
+  const saved = new Map<string, SavedDocFields>();
   for (const block of blocks) {
     saved.set(block.label, block);
     if ("loop_blocks" in block && Array.isArray(block.loop_blocks)) {
@@ -70,20 +73,16 @@ function savedDocFieldsByLabel(
 // Omitted fields keep the saved value; send null only when this draft cleared a loaded annotation.
 function withClearedDocFields(
   blocks: BlockYAML[],
-  saved: Map<
-    string,
-    Pick<WorkflowBlock, "notes" | "trailing_notes" | "description">
-  >,
+  saved: Map<string, SavedDocFields>,
 ): BlockYAML[] {
   return blocks.map((block) => {
     const previous = saved.get(block.label);
+    const cleared = DOC_FIELD_KEYS.filter(
+      (key) => block[key] == null && previous?.[key] != null,
+    );
     return {
       ...block,
-      ...(block.notes == null && previous?.notes != null && { notes: null }),
-      ...(block.trailing_notes == null &&
-        previous?.trailing_notes != null && { trailing_notes: null }),
-      ...(block.description == null &&
-        previous?.description != null && { description: null }),
+      ...Object.fromEntries(cleared.map((key) => [key, null])),
       ...("loop_blocks" in block && Array.isArray(block.loop_blocks)
         ? { loop_blocks: withClearedDocFields(block.loop_blocks, saved) }
         : {}),

@@ -110,6 +110,15 @@ describe("docCustomSettings", () => {
     ).toEqual([]);
   });
 
+  test("screenshots and prompt images are not custom settings", () => {
+    const shot = { file_id: "file_1", caption: null, placement: "block" };
+    expect(
+      docCustomSettings(
+        extraction({ docImages: [shot], promptImages: [shot] }),
+      ),
+    ).toEqual([]);
+  });
+
   const node = (type: string, data: Record<string, unknown>) =>
     ({ id: "n", position: { x: 0, y: 0 }, type, data }) as AppNode;
   const keys = (n: AppNode) => docCustomSettings(n)?.map((row) => row.key);

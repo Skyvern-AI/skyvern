@@ -55,6 +55,7 @@ import {
   type PickerOpener,
 } from "./docKeys";
 import { DocText } from "./DocText";
+import { pastedFiles } from "./docImageUploads";
 import { DocLongText, type DocTextCollapse } from "./DocLongText";
 import { saveAndReport, useDocSaveFailureStore } from "./docSaveState";
 import { WorkflowDocActionsContext } from "./WorkflowDocActionsContext";
@@ -311,6 +312,7 @@ export function DocEditableLine({
   pickerOnStart,
   maxLength,
   collapse,
+  onFiles,
 }: {
   value: string;
   editable: boolean;
@@ -343,6 +345,8 @@ export function DocEditableLine({
   maxLength?: number;
   // A step's main text folds to its first lines when it is long; notes and secondary lines leave this out.
   collapse?: DocTextCollapse;
+  // Files pasted into the line; without it a paste is the browser's own.
+  onFiles?: (files: File[]) => void;
 }) {
   const [editing, setEditing] = useState(autoFocus);
   const [overLimit, setOverLimit] = useState(false);
@@ -717,6 +721,12 @@ export function DocEditableLine({
                   onChange(next);
                 }}
                 onKeyDown={onKeyDown}
+                onPaste={(event) => {
+                  const files = onFiles ? pastedFiles(event.clipboardData) : [];
+                  if (!files.length) return;
+                  event.preventDefault();
+                  onFiles?.(files);
+                }}
                 onBlur={() => {
                   if (caret.current || slashAt.current) return;
                   setEditing(false);

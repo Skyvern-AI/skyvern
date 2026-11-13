@@ -255,6 +255,9 @@ describe("buildWorkflowYamlDocument", () => {
             notes: "Old note",
             trailing_notes: "Old trailing note",
             description: "Old description",
+            doc_images: [
+              { file_id: "file_old", caption: null, placement: "above" },
+            ],
           },
           {
             block_type: "for_loop",
@@ -322,6 +325,7 @@ describe("buildWorkflowYamlDocument", () => {
       notes: "Pick the cheapest option",
       trailing_notes: null,
       description: null,
+      doc_images: null,
     });
     expect(loop).toHaveProperty("notes", null);
     for (const key of ["trailing_notes", "description"] as const) {

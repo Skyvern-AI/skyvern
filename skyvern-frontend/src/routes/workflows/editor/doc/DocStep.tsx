@@ -78,6 +78,9 @@ import {
   DocOutputName,
   DocStepPicker,
 } from "./DocEditing";
+import { DocImages } from "./DocImages";
+import { docImageDropProps, useDocImageFiles } from "./useDocImageFiles";
+import { docImagesOf } from "./docGraphEdits";
 import {
   useDocStepAdded,
   useDocStepChangedKeys,
@@ -710,6 +713,12 @@ export function DocStepBody({
     setOpen: (open: boolean) => actions.setTextOpen(node.id, open),
     name: docStepCaption(node) ?? node.data.label,
   };
+  // A screenshot pasted into the step's text goes under the text, never inside it.
+  const imageFiles = useDocImageFiles({
+    ownerNodeId: node.id,
+    placement: "block",
+  });
+  const addFiles = editable && actions.edit ? imageFiles.addFiles : null;
   const line = (
     key: string,
     value: string,
@@ -717,6 +726,7 @@ export function DocStepBody({
     className: string,
   ) => (
     <DocEditableLine
+      onFiles={addFiles ?? undefined}
       value={value}
       editable={editable}
       placeholder={placeholder}
@@ -848,6 +858,7 @@ export function DocStepBody({
       <DocStepMeta node={node} rows={metaRows} />
       <div
         className="min-h-[1.55em] text-base font-normal leading-[1.55]"
+        {...docImageDropProps(addFiles)}
         onFocus={(event) => {
           if (isCollapseControl(event.target)) return;
           setFocusedMode(lineMode);
@@ -891,6 +902,14 @@ export function DocStepBody({
           <DocText value={description ?? getDocStepSummary(node)} />
         )}
       </div>
+      <DocImages
+        slot={{ ownerNodeId: node.id, placement: "block" }}
+        images={docImagesOf(node).filter(
+          (image) => image.placement === "block",
+        )}
+        editable={editable && Boolean(actions.edit)}
+        onRetry={imageFiles.retry}
+      />
       {restInView && restLines}
       {node.type === "codeBlock" && (goalBuild || goalNotApplied) && (
         <div

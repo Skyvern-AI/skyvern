@@ -80,6 +80,9 @@ const SHOWN_ELSEWHERE = new Set<string>([
   "parameters",
   "data_schema",
   "json_schema",
+  // Screenshots show under their lines; prompt images are carried through untouched.
+  "doc_images",
+  "prompt_images",
 ]);
 
 export const yamlKey = (key: string) =>
