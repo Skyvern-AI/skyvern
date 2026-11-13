@@ -100,7 +100,14 @@ describe("Doc step header", () => {
     const { row, tag } = header("sample_login", nodes);
     expect(row.textContent).toMatch(/^1Login/);
     expectTitleBelow(row, "Sample login");
+    // The title's text names both the heading and its button, as a browser computes it; Rename is the description.
     expect(screen.getByRole("heading", { name: "Sample login" })).toBeTruthy();
+    expect(
+      screen.getByRole("button", {
+        name: "Sample login",
+        description: "Rename",
+      }),
+    ).toBeTruthy();
     // The type label carries no icon.
     expect(tag.querySelector("svg")).toBeNull();
     expect(tag).toBe(
@@ -110,11 +117,16 @@ describe("Doc step header", () => {
     expect(screen.getByRole("menuitem", { name: /Settings/ })).toBeTruthy();
   });
 
-  test("a default name has no title row", () => {
-    const nodes = renderDoc([login("login_1")]);
-    const { step, row } = header("login_1", nodes);
-    expect(row.nextElementSibling).toBeNull();
+  test("a default name has no title: editable, the title row offers Name this step; read-only, there is no title row", () => {
+    let nodes = renderDoc([login("login_1")]);
+    let { step, row } = header("login_1", nodes);
+    expect(row.nextElementSibling?.textContent).toBe("Name this step");
     expect(step.textContent).not.toMatch(/login_1|Login 1/);
+    cleanup();
+    nodes = renderDoc([login("login_1")], true);
+    ({ step, row } = header("login_1", nodes));
+    expect(row.nextElementSibling).toBeNull();
+    expect(step.textContent).not.toMatch(/login_1|Login 1|Name this step/);
   });
 
   test("the read-only Doc shows the same rows, with a plain type label", () => {
