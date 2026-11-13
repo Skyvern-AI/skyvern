@@ -12,6 +12,7 @@ import type {
 } from "../workflowCopilotTypes";
 import { useWorkflowRunByIdQuery } from "../../hooks/useWorkflowRunQuery";
 import { runIsLogicallyFinal } from "../../workflowRun/runRetryState";
+import { RunCostFactList } from "./AccountGroupReviewCard";
 import { AttentionMarker } from "./AttentionTray";
 import { TONE_CLASSES, type Tone } from "./receiptTone";
 
@@ -238,6 +239,14 @@ export function AccountGroupReceiptCard({
         {review.workflow_run_id ? (
           <SingleRunStatus workflowRunId={review.workflow_run_id} />
         ) : null}
+        <RunCostFactList
+          cost={review.cost}
+          basedOnInputs={review.based_on_inputs}
+          runs={review.workflow_run_id && review.run_started !== false ? 1 : 0}
+          receipt
+          testedRunId={review.tested_workflow_run_id}
+          className="pl-4"
+        />
       </div>
     );
   }
@@ -307,6 +316,13 @@ export function AccountGroupReceiptCard({
           the runs started.
         </p>
       )}
+      <RunCostFactList
+        cost={review.cost}
+        basedOnInputs={review.based_on_inputs}
+        runs={review.workflow_run_group_id ? decision.credential_ids.length : 0}
+        receipt
+        className="pl-4"
+      />
     </div>
   );
 }

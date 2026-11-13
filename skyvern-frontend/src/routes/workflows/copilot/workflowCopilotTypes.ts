@@ -76,10 +76,24 @@ export interface AccountGroupReview {
   proposal_revision?: number | null;
   draft_tested?: boolean;
   tested_workflow_run_id?: string | null;
+  cost?: RunCostFacts | null;
+  based_on_inputs?: Record<string, unknown> | null;
   saved_workflow_id?: string | null;
   saved_version?: number | null;
   run_started?: boolean | null;
   decision?: AccountGroupDecision | null;
+}
+
+export interface RunCostFacts {
+  runs_to_start?: number;
+  based_on_run_id?: string;
+  based_on_credits?: number;
+  blocks_completed?: number;
+  blocks_total?: number;
+  estimate_from_one_run?: number;
+  balance_credits?: number;
+  credits_note?: string;
+  stop_rule?: string;
 }
 
 export interface AccountGroupRunRow {
