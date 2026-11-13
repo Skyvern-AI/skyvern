@@ -88,6 +88,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  for (const stop of studioStops.splice(0)) stop();
   cleanup();
   rerenderDoc = null;
   releaseDocImageUploads();
@@ -101,7 +102,11 @@ afterEach(() => {
     saveIsPending: false,
     getSaveData: () => null,
   });
-  useWorkflowYamlEditorStore.setState({ active: false, stale: false });
+  useWorkflowYamlEditorStore.setState({
+    active: false,
+    stale: false,
+    copilotAcceptance: null,
+  });
   useWorkflowSnapshotStore.getState().clearSnapshot();
   imagesFlag.on = true;
 });
@@ -281,6 +286,27 @@ function silenceToasts() {
   return vi
     .spyOn(toastModule, "toast")
     .mockReturnValue({ id: "t", dismiss: vi.fn(), update: vi.fn() });
+}
+
+const studioStops: Array<() => void> = [];
+
+// FlowRenderer's part in the Studio: the baseline goes whenever the unsaved mark is off, the next click or key takes
+// one, and each change to the save data is checked against it.
+function studioBaseline() {
+  studioStops.push(
+    useWorkflowHasChangesStore.subscribe((state) => {
+      if (!state.hasChanges)
+        useWorkflowSnapshotStore.getState().clearSnapshot();
+    }),
+  );
+  return {
+    gesture: () => {
+      if (useWorkflowSnapshotStore.getState().snapshot === null)
+        useWorkflowSnapshotStore.getState().captureSnapshot();
+    },
+    recheck: () =>
+      act(() => useWorkflowSnapshotStore.getState().noteDraftChange(true)),
+  };
 }
 
 // The rendered Doc's rerender: FlowRenderer renders the Doc again after each graph change, the harness on a paste.
@@ -472,6 +498,11 @@ describe("Doc screenshots", () => {
 
     post.mockResolvedValueOnce({ data: { file_id: "file_retry" } });
     const retry = screen.getByRole("button", { name: "Retry" });
+    // A press must not blur the line: a staged note ends on blur and its rows move before the click lands.
+    expect(fireEvent.mouseDown(retry)).toBe(false);
+    expect(
+      fireEvent.mouseDown(screen.getByRole("button", { name: "Dismiss" })),
+    ).toBe(false);
     retry.focus();
     fireEvent.click(retry);
     await waitFor(() =>
@@ -532,11 +563,11 @@ describe("Doc screenshots", () => {
     const doc = renderImageDoc({ doc_images: [image("file_saved")] });
     await screen.findByRole("img", { name: "screenshot 1 of 1" });
 
-    fireEvent.click(
-      screen.getByRole("button", {
-        name: "Remove screenshot 1 of 1 from the note above step 1",
-      }),
-    );
+    const remove = screen.getByRole("button", {
+      name: "Remove screenshot 1 of 1 from the note above step 1",
+    });
+    expect(fireEvent.mouseDown(remove)).toBe(false);
+    fireEvent.click(remove);
     expect(doc.images()).toBeUndefined();
     doc.rerender();
     expect(screen.queryByRole("img", { name: "screenshot 1 of 1" })).toBeNull();
@@ -588,6 +619,26 @@ describe("Doc screenshots", () => {
     const sent = (post.mock.calls[0]![1] as FormData).get("file") as File;
     expect(sent.size).toBeLessThanOrEqual(LIMIT);
     expect([sent.name, sent.type]).toEqual(["big.webp", "image/webp"]);
+  });
+
+  test("a small file whose header says over 80 megapixels is refused in its row, never decoded or uploaded", async () => {
+    const decode = vi.fn();
+    vi.stubGlobal("createImageBitmap", decode);
+    const doc = renderImageDoc({});
+    // 56 bytes of WebP that declare 16384 by 16384.
+    const bytes = new Uint8Array(56);
+    bytes.set(new TextEncoder().encode("RIFF"), 0);
+    bytes.set(new TextEncoder().encode("WEBPVP8X"), 8);
+    bytes.set([0xff, 0x3f, 0x00, 0xff, 0x3f, 0x00], 24);
+    pasteInto(await openNote(), {
+      files: [new File([bytes], "tiny.webp", { type: "image/webp" })],
+    });
+    expect((await screen.findByRole("alert")).textContent).toMatch(
+      /tiny\.webp is over 80 megapixels/,
+    );
+    expect(decode).not.toHaveBeenCalled();
+    expect(post).not.toHaveBeenCalled();
+    expect(doc.images()).toBeUndefined();
   });
 
   test("leaving the Doc mid-upload and coming back keeps the upload: the screenshot arrives", async () => {
@@ -725,6 +776,151 @@ describe("Doc screenshots", () => {
     expect(useWorkflowSnapshotStore.getState().contentDirty).toBe(true);
     doc.rerender();
     expect(screen.getByText("Unsaved changes")).toBeTruthy();
+  });
+
+  describe("the Studio's baseline, which it clears whenever the unsaved mark is off", () => {
+    const saved = () =>
+      act(() =>
+        useWorkflowHasChangesStore.setState((state) => ({
+          saveIsPending: false,
+          hasChanges: false,
+          saveGeneration: state.saveGeneration + 1,
+        })),
+      );
+
+    // After the upload: unsaved, and still unsaved after one more edit and its revert, so Cmd+S sends the file.
+    const staysUnsaved = (
+      doc: ReturnType<typeof renderImageDoc>,
+      studio: ReturnType<typeof studioBaseline>,
+      fileId: string,
+    ) => {
+      expect(useWorkflowSnapshotStore.getState().contentDirty).toBe(true);
+      doc.rerender();
+      expect(screen.getByText("Unsaved changes")).toBeTruthy();
+      studio.gesture();
+      doc.setNotes("Read the plan?");
+      studio.recheck();
+      doc.setNotes("Read the plan");
+      studio.recheck();
+      doc.rerender();
+      expect(useWorkflowSnapshotStore.getState().contentDirty).toBe(true);
+      expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
+      expect(screen.getByText("Unsaved changes")).toBeTruthy();
+      expect(doc.images()).toEqual([image(fileId)]);
+    };
+
+    const pendingUpload = () => {
+      let finish: (value: unknown) => void = () => {};
+      post.mockReturnValue(new Promise((resolve) => (finish = resolve)));
+      return (fileId: string) =>
+        act(async () => finish({ data: { file_id: fileId } }));
+    };
+
+    test("an edit typed and deleted during the upload", async () => {
+      const finish = pendingUpload();
+      const doc = renderImageDoc({});
+      const studio = studioBaseline();
+      studio.gesture();
+      pasteInto(await openNote(), { files: [shot()] });
+      await waitFor(() => expect(post).toHaveBeenCalled());
+      doc.setNotes("Read the plan!");
+      studio.recheck();
+      doc.setNotes("Read the plan");
+      studio.recheck();
+      await waitFor(() =>
+        expect(useWorkflowSnapshotStore.getState().snapshot).toBeNull(),
+      );
+      await finish("file_typed");
+      staysUnsaved(doc, studio, "file_typed");
+    });
+
+    test("a save that ran during the upload", async () => {
+      const finish = pendingUpload();
+      const doc = renderImageDoc({});
+      const studio = studioBaseline();
+      studio.gesture();
+      pasteInto(await openNote(), { files: [shot()] });
+      await waitFor(() => expect(post).toHaveBeenCalled());
+      saved();
+      expect(useWorkflowSnapshotStore.getState().snapshot).toBeNull();
+      await finish("file_saved_during");
+      staysUnsaved(doc, studio, "file_saved_during");
+    });
+
+    test("a desktop drop with no click or key since the load", async () => {
+      const finish = pendingUpload();
+      const doc = renderImageDoc({});
+      const studio = studioBaseline();
+      fireEvent.drop(await openNote(), {
+        dataTransfer: { files: [shot()], types: ["Files"] },
+      });
+      await waitFor(() => expect(post).toHaveBeenCalled());
+      expect(useWorkflowSnapshotStore.getState().snapshot).toBeNull();
+      await finish("file_dropped");
+      staysUnsaved(doc, studio, "file_dropped");
+    });
+
+    test("a key pressed in the YAML view while the upload's end waits for it", async () => {
+      const finish = pendingUpload();
+      const doc = renderImageDoc({});
+      const studio = studioBaseline();
+      pasteInto(await openNote(), { files: [shot()] });
+      await waitFor(() => expect(post).toHaveBeenCalled());
+      saved();
+      act(() => useWorkflowYamlEditorStore.setState({ active: true }));
+      await finish("file_yaml_key");
+      // The key would take a baseline that holds the file, had the end of the upload not kept one without it.
+      studio.gesture();
+      act(() => useWorkflowYamlEditorStore.setState({ active: false }));
+      await waitFor(() =>
+        expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true),
+      );
+      staysUnsaved(doc, studio, "file_yaml_key");
+    });
+
+    test("an upload that ends during a Copilot acceptance gives no toast and marks unsaved once it ends", async () => {
+      const finish = pendingUpload();
+      const doc = renderImageDoc({});
+      const studio = studioBaseline();
+      const notify = silenceToasts();
+      pasteInto(await openNote(), { files: [shot()] });
+      await waitFor(() => expect(post).toHaveBeenCalled());
+      saved();
+      act(() =>
+        useWorkflowYamlEditorStore.setState({
+          copilotAcceptance: Symbol("copilot"),
+        }),
+      );
+      await finish("file_copilot");
+      expect(notify).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          title: "Wait for the Copilot change to finish",
+        }),
+      );
+      act(() =>
+        useWorkflowYamlEditorStore.setState({ copilotAcceptance: null }),
+      );
+      await waitFor(() =>
+        expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true),
+      );
+      staysUnsaved(doc, studio, "file_copilot");
+    });
+
+    test("an upload that ends while a save runs is marked unsaved once that save is done", async () => {
+      const finish = pendingUpload();
+      const doc = renderImageDoc({});
+      const studio = studioBaseline();
+      pasteInto(await openNote(), { files: [shot()] });
+      await waitFor(() => expect(post).toHaveBeenCalled());
+      act(() => useWorkflowHasChangesStore.setState({ saveIsPending: true }));
+      await finish("file_pending_save");
+      // The save sent the draft from before the file, and its end clears the mark.
+      saved();
+      await waitFor(() =>
+        expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true),
+      );
+      staysUnsaved(doc, studio, "file_pending_save");
+    });
   });
 
   test("an upload that ends while the YAML view is open marks that view stale, so its commit can't drop the screenshot", async () => {
@@ -1661,18 +1857,40 @@ describe("fitDocImage", () => {
         v.setUint16(111, 10000);
       },
     ],
+    [
+      "a GIF",
+      "image/gif",
+      (b: Uint8Array) => {
+        b.set(new TextEncoder().encode("GIF89a"), 0);
+        // 10000 by 8001, 16-bit little-endian.
+        b.set([0x10, 0x27, 0x41, 0x1f], 6);
+      },
+    ],
   ])(
-    "%s whose header says over 80 megapixels is refused before it is decoded",
+    "%s whose header says over 80 megapixels is refused before it is decoded, at any size",
     async (_name, type, write) => {
-      const bytes = new Uint8Array(4194305);
-      write(bytes, new DataView(bytes.buffer));
-      const decode = vi.fn();
-      vi.stubGlobal("createImageBitmap", decode);
-      const file = new File([bytes], "huge", { type });
-      expect(await fitDocImage(file)).toMatch(/over 80 megapixels/);
-      expect(decode).not.toHaveBeenCalled();
+      // Over 4 MiB, and a few hundred bytes, which a highly compressible image can be.
+      for (const size of [4194305, 256]) {
+        const bytes = new Uint8Array(size);
+        write(bytes, new DataView(bytes.buffer));
+        const decode = vi.fn();
+        vi.stubGlobal("createImageBitmap", decode);
+        const file = new File([bytes], "huge", { type });
+        expect(await fitDocImage(file)).toMatch(/over 80 megapixels/);
+        expect(decode).not.toHaveBeenCalled();
+      }
     },
   );
+
+  test("a small image whose header is under 80 megapixels is taken untouched", async () => {
+    const bytes = new Uint8Array(256);
+    bytes.set(new TextEncoder().encode("IHDR"), 12);
+    new DataView(bytes.buffer).setUint32(16, 4000);
+    new DataView(bytes.buffer).setUint32(20, 3000);
+    const file = new File([bytes], "small.png", { type: "image/png" });
+    expect(await fitDocImage(file)).toBe(file);
+    expect(tries).toEqual([]);
+  });
 
   test("a browser without a WebP encoder gets a JPEG on a white backing", async () => {
     answer = (_w, type) =>

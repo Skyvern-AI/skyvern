@@ -816,9 +816,9 @@ def _changed_blocks_in(
 
 
 _RENAME_IGNORED_FIELDS = frozenset(
-    {"label", "next_block_label", "loop_blocks", "description", "notes", "trailing_notes"}
+    {"label", "next_block_label", "loop_blocks", "description", "doc_images", "notes", "trailing_notes"}
 )
-_NEW_CONTENT_IGNORED_FIELDS = frozenset({"label", "next_block_label", "loop_blocks", "description"})
+_NEW_CONTENT_IGNORED_FIELDS = frozenset({"label", "next_block_label", "loop_blocks", "description", "doc_images"})
 
 
 def _rename_identity(block: Mapping[str, object]) -> str:

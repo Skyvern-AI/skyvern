@@ -6,6 +6,7 @@ import { useWorkflowDocImagesFlag } from "@/hooks/useWorkflowDocEditorFlag";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowSnapshotStore } from "@/store/WorkflowSnapshotStore";
 import { reconcileYamlDraftAfterGraphChange } from "@/store/WorkflowYamlEditorStore";
+import { snapshotOf } from "../workflowChangesSummary";
 import { announceDoc } from "./docAnnounce";
 import { DOC_IMAGES_CAP_MESSAGE, DOC_IMAGES_MAX } from "./docGraphEdits";
 import { newDocImageHandle, resolveDocImageHandle } from "./docImageHandles";
@@ -23,10 +24,25 @@ import {
 } from "./docImageUploads";
 import { WorkflowDocActionsContext } from "./WorkflowDocActionsContext";
 
-// Whether the live graph names the file; a done handle is saved as its file, so the save data shows it. Save data
-// that can't be built is read as naming it, so an unsaved mark is never lost.
 const BELOW_TEXT = "Screenshots go under the step's text.";
 
+const saveDataNow = () => {
+  try {
+    return useWorkflowHasChangesStore.getState().getSaveData();
+  } catch {
+    return null;
+  }
+};
+
+// The Studio clears the baseline whenever the unsaved mark is off and takes the next one at a click or key, which
+// would then hold the file; the draft from before the file resolved is the baseline it is unsaved against.
+const keepBaselineWithout = (before: ReturnType<typeof saveDataNow>) => {
+  if (before && useWorkflowSnapshotStore.getState().snapshot === null)
+    useWorkflowSnapshotStore.setState({ snapshot: snapshotOf(before) });
+};
+
+// Whether the live graph names the file; a done handle is saved as its file, so the save data shows it. Save data
+// that can't be built is read as naming it, so an unsaved mark is never lost.
 const inLiveGraph = (fileId: string) => {
   try {
     const blocks = useWorkflowHasChangesStore.getState().getSaveData()?.blocks;
@@ -86,17 +102,20 @@ export function useDocImageFiles(slot: DocImageSlot) {
     }
     if (!live()) return;
     rememberLocalImage(fileId, fit);
+    const before = saveDataNow();
     // Resolved before the row goes, so the render that drops the row shows the tile.
     resolveDocImageHandle(upload.id, fileId);
     drop(upload.id);
     // Dismissed, undone, or replaced by a Copilot accept, a restore or a YAML commit: nothing to announce.
     if (!inLiveGraph(fileId)) return;
+    keepBaselineWithout(before);
     announceDoc("Screenshot added");
     // The file is new save data that no graph change announces: an open YAML draft lacks it, and the unsaved mark
     // may have been cleared while the draft matched the saved workflow without it.
     reconcileYamlDraftAfterGraphChange();
     await whenNoSaveOrYamlView();
     if (!live() || !inLiveGraph(fileId)) return;
+    keepBaselineWithout(before);
     useWorkflowHasChangesStore.getState().setHasChanges(true);
     useWorkflowSnapshotStore.getState().noteDraftChange(true);
   };

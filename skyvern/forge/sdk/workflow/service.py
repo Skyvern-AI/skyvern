@@ -2408,6 +2408,14 @@ async def _delete_backend_schedule(backend_schedule_id: str, slots: asyncio.Sema
             await app.AGENT_FUNCTION.delete_workflow_schedule(backend_schedule_id)
 
 
+def _block_image_ids(blocks: list[BLOCK_YAML_TYPES] | list[BlockTypeVar]) -> list[tuple[str, str]]:
+    return [
+        (block.label, image.file_id)
+        for block in get_all_blocks(blocks)
+        for image in [*(block.doc_images or []), *(block.prompt_images or [])]
+    ]
+
+
 class WorkflowService:
     def __init__(self) -> None:
         # Per-instance so a fire-and-forget task created under one event loop cannot leak into
@@ -13016,6 +13024,7 @@ class WorkflowService:
         preserve_completion_contract: bool = True,
         created_via: str | None = None,
         validate_code_block_templates: bool = True,
+        validate_block_image_files: bool = True,
         preserve_redacted_credential_references_from: Workflow | None = None,
         preserved_credential_references: set[tuple[str, str, str]] | None = None,
         prior_definition: WorkflowDefinition | None = None,
@@ -13054,6 +13063,17 @@ class WorkflowService:
             )
             if validate_code_block_templates:
                 self._validate_code_block_templates(workflow_definition)
+            if validate_block_image_files and _block_image_ids(workflow_definition.blocks):
+                image_organization_id = organization_id
+                if image_organization_id is None:
+                    owner = await app.DATABASE.workflows.get_workflow(workflow_id=workflow_id)
+                    if owner is None:
+                        raise InvalidWorkflowDefinition("Block images need the workflow's organization.")
+                    image_organization_id = owner.organization_id
+                replaced = await self._replaced_definition(workflow_id, image_organization_id, prior_definition)
+                await self._validate_block_image_files(
+                    workflow_definition.blocks, replaced.blocks if replaced is not None else [], image_organization_id
+                )
             self._validate_block_engines(workflow_definition)
             if preserved_credential_references is None:
                 preserved_credential_references = await self._preserve_redacted_credential_references(
@@ -18930,6 +18950,8 @@ class WorkflowService:
             except WorkflowNotFound:
                 pass
 
+            # A retry returns the version the first call made even if its images have since expired.
+            await self._validate_block_image_files(request.workflow_definition.blocks, [], organization_id)
             created_workflow = await self._create_initial_workflow_from_request(
                 organization_id=organization_id,
                 request=request,
@@ -18979,6 +19001,32 @@ class WorkflowService:
             organization_id=organization_id,
         )
         return latest.version, settings_base
+
+    @staticmethod
+    async def _validate_block_image_files(
+        blocks: list[BLOCK_YAML_TYPES] | list[BlockTypeVar],
+        previous_blocks: list[BlockTypeVar],
+        organization_id: str,
+    ) -> None:
+        """Every image a save adds must be a live upload of the saving organization; saved ones were checked."""
+        saved = {file_id for _, file_id in _block_image_ids(previous_blocks)}
+        added = [(label, file_id) for label, file_id in _block_image_ids(blocks) if file_id not in saved]
+        live = await uploaded_file_service.live_uploaded_files(
+            file_ids=[file_id for _, file_id in added], organization_id=organization_id
+        )
+        for label, file_id in added:
+            uploaded_file = live.get(file_id)
+            if uploaded_file is None:
+                raise InvalidWorkflowDefinition(
+                    f"Block {label} references image {file_id}, which is not a file uploaded by this organization."
+                )
+            if not uploaded_file_service.is_block_image_upload(uploaded_file):
+                raise InvalidWorkflowDefinition(f"Block {label}: file {file_id} is not a png, jpeg, gif or webp image.")
+            if (
+                uploaded_file.size_bytes is not None
+                and uploaded_file.size_bytes > uploaded_file_service.BLOCK_IMAGE_MAX_BYTES
+            ):
+                raise InvalidWorkflowDefinition(f"Block {label}: image {file_id} is larger than 4 MiB.")
 
     @overload
     async def create_workflow_from_request(
@@ -19110,6 +19158,11 @@ class WorkflowService:
                     organization_id=organization_id,
                     kept_note_labels=list(kept_note_labels),
                 )
+        await self._validate_block_image_files(
+            request.workflow_definition.blocks,
+            existing_latest_workflow.workflow_definition.blocks if existing_latest_workflow else [],
+            organization_id,
+        )
         await self._validate_and_normalize_credential_rotation_parameters(
             request.workflow_definition.parameters,
             organization,
@@ -19184,6 +19237,8 @@ class WorkflowService:
                     created_via=created_via,
                     notify_workflow_saved=False,
                     validate_code_block_templates=validate_code_block_templates,
+                    # create_workflow_from_request checked the images above; another caller must not skip the check.
+                    validate_block_image_files=False,
                     preserved_credential_references=preserved_credential_references,
                     prior_definition=(
                         existing_latest_workflow.workflow_definition if existing_latest_workflow else None

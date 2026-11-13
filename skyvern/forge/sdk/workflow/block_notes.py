@@ -10,6 +10,7 @@ from collections.abc import Collection, Iterator, Mapping, Sequence
 from itertools import pairwise
 from typing import Any
 
+from skyvern.schemas.workflows import BLOCK_IMAGE_FIELDS
 from skyvern.utils.yaml_loader import dump_workflow_yaml, safe_load_no_dates
 
 NOTE_FIELDS = ("notes", "trailing_notes")
@@ -154,7 +155,7 @@ def format_notes_section(notes: str | None) -> str | None:
 
 def strip_inert_block_fields(value: Any) -> Any:
     """Copy a definition, block list or block dump without what a run never reads: block-level
-    ``description`` and empty ``notes``/``trailing_notes`` (an empty note and an absent one run alike).
+    ``description`` and ``doc_images``, and empty ``notes``/``trailing_notes``/``prompt_images``.
 
     Only block dicts are touched: data schemas, branch conditions, code steps and parameters
     carry their own ``description`` keys, and those change what a run does.
@@ -166,9 +167,12 @@ def strip_inert_block_fields(value: Any) -> Any:
     result = dict(value)
     if _is_block(result):
         result.pop("description", None)
+        result.pop("doc_images", None)
         for key in NOTE_FIELDS:
             if key in result and not _note_text(result, key):
                 result.pop(key)
+        if "prompt_images" in result and not result["prompt_images"]:
+            result.pop("prompt_images")
         if isinstance(result.get("loop_blocks"), list):
             result["loop_blocks"] = strip_inert_block_fields(result["loop_blocks"])
         return result
@@ -239,7 +243,7 @@ def carry_forward_block_notes(
             continue
         present = _present_fields(block)
         prior_present = _present_fields(prior)
-        for key in CARRIED_FIELDS:
+        for key in (*CARRIED_FIELDS, *BLOCK_IMAGE_FIELDS):
             if key in present:
                 continue
             value = _field(prior, key)
@@ -327,20 +331,24 @@ def carry_block_notes_from_versions(
     return (dump_workflow_yaml(submitted) if changed else workflow_yaml), dict(sorted(kept.items())), dropped
 
 
-def remove_note_fields(blocks: Sequence[Any]) -> bool:
-    """Delete note and description fields from block dicts at every depth; True when one was removed."""
+def remove_note_fields(blocks: Sequence[Any], *, keep_notes: bool = False) -> bool:
+    """Delete image fields, and note and description fields unless ``keep_notes``, from block dicts at every depth.
+
+    True when one was removed.
+    """
+    fields = BLOCK_IMAGE_FIELDS if keep_notes else (*CARRIED_FIELDS, *BLOCK_IMAGE_FIELDS)
     changed = False
     for block in _walk_blocks(blocks):
         if isinstance(block, dict):
-            for field in CARRIED_FIELDS:
+            for field in fields:
                 if field in block:
                     del block[field]
                     changed = True
     return changed
 
 
-def drop_submitted_note_fields(workflow_yaml: str) -> str:
-    """Remove note and description fields from submitted YAML, so the saved values are carried instead."""
+def drop_submitted_note_fields(workflow_yaml: str, *, keep_notes: bool = False) -> str:
+    """Remove image fields, and note and description fields unless ``keep_notes``, so saved values are carried."""
     try:
         submitted = safe_load_no_dates(workflow_yaml)
     except Exception:  # noqa: BLE001 - PyYAML constructors can raise non-YAML exceptions.
@@ -348,7 +356,7 @@ def drop_submitted_note_fields(workflow_yaml: str) -> str:
     blocks = _definition_blocks(submitted)
     if blocks is None:
         return workflow_yaml
-    return dump_workflow_yaml(submitted) if remove_note_fields(blocks) else workflow_yaml
+    return dump_workflow_yaml(submitted) if remove_note_fields(blocks, keep_notes=keep_notes) else workflow_yaml
 
 
 def stored_notes_for_labels(labels: Collection[str], *workflow_yamls: str | None) -> dict[str, dict[str, str]]:

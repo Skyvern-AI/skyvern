@@ -346,8 +346,11 @@ def test_the_direct_test_handoff_keeps_download_text_omission_notices() -> None:
     assert handoff.downloads[0].text == _statement_download(1).text
 
 
-def test_packet_workflow_readback_hides_saved_notes_with_doc_editor_off() -> None:
-    ctx = make_copilot_ctx(doc_editor_enabled=False)
+@pytest.mark.parametrize("doc_editor_enabled", [False, True])
+def test_packet_workflow_readback_hides_saved_notes_with_doc_editor_off_and_images_always(
+    doc_editor_enabled: bool,
+) -> None:
+    ctx = make_copilot_ctx(doc_editor_enabled=doc_editor_enabled)
     ctx.last_workflow_yaml = (
         "title: Notes draft\n"
         "workflow_definition:\n"
@@ -360,6 +363,8 @@ def test_packet_workflow_readback_hides_saved_notes_with_doc_editor_off() -> Non
         "      notes: SAVED_NOTE_TEXT\n"
         "      trailing_notes: SAVED_TRAILING_TEXT\n"
         "      description: SAVED_DESCRIPTION_TEXT\n"
+        "      doc_images: [{file_id: file_901}]\n"
+        "      prompt_images: [{file_id: file_902}]\n"
     )
     result = {
         "ok": True,
@@ -376,8 +381,9 @@ def test_packet_workflow_readback_hides_saved_notes_with_doc_editor_off() -> Non
 
     assert packet.canonical_workflow_yaml is not None
     assert "label: open" in packet.canonical_workflow_yaml
-    for hidden in ("SAVED_NOTE_TEXT", "SAVED_TRAILING_TEXT", "SAVED_DESCRIPTION_TEXT"):
-        assert hidden not in packet.canonical_workflow_yaml
+    notes = ("SAVED_NOTE_TEXT", "SAVED_TRAILING_TEXT", "SAVED_DESCRIPTION_TEXT")
+    assert all((text in packet.canonical_workflow_yaml) is doc_editor_enabled for text in notes)
+    assert "file_90" not in packet.canonical_workflow_yaml
     assert "SAVED_NOTE_TEXT" in ctx.last_workflow_yaml
 
 

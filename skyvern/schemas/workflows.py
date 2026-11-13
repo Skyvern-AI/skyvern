@@ -12,7 +12,9 @@ import structlog
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
 from pydantic import (
+    AfterValidator,
     BaseModel,
+    ConfigDict,
     Field,
     SerializerFunctionWrapHandler,
     StrictInt,
@@ -29,6 +31,7 @@ from pydantic_core import to_jsonable_python
 from skyvern.config import settings
 from skyvern.constants import ERROR_CODE_REASONING_MAX_LENGTH, MAX_PDF_OCR_PAGES
 from skyvern.forge.sdk.api.llm.custom_llm_registry import is_custom_llm_key
+from skyvern.forge.sdk.db.id import is_uploaded_file_id
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.browser_profile_key import validate_browser_profile_key
 from skyvern.forge.sdk.workflow.models.parameter import (
@@ -862,6 +865,26 @@ class OutputParameterYAML(ParameterYAML):
 
 
 BLOCK_NOTE_MAX_LENGTH = 2000
+BLOCK_IMAGE_CAPTION_MAX_LENGTH = 200
+BLOCK_DOC_IMAGES_MAX = 10
+BLOCK_PROMPT_IMAGES_MAX = 3
+
+
+def _uploaded_file_id(value: str) -> str:
+    if not is_uploaded_file_id(value):
+        raise ValueError(f"{value!r} is not an uploaded file id")
+    return value.strip()
+
+
+class BlockImage(BaseModel):
+    model_config = ConfigDict(json_schema_extra={"x-internal": True})
+
+    file_id: Annotated[str, AfterValidator(_uploaded_file_id)]
+    caption: str | None = Field(default=None, max_length=BLOCK_IMAGE_CAPTION_MAX_LENGTH)
+    placement: Literal["above", "trailing", "block"] = "block"
+
+
+BLOCK_IMAGE_FIELDS = ("doc_images", "prompt_images")
 
 
 class BlockYAML(BaseModel, abc.ABC):
@@ -895,6 +918,23 @@ class BlockYAML(BaseModel, abc.ABC):
         "changing it never clears cached scripts. Omitting it on an update keeps the saved description; send null "
         "or an empty string to delete it.",
     )
+    doc_images: list[BlockImage] | None = Field(
+        default=None,
+        max_length=BLOCK_DOC_IMAGES_MAX,
+        exclude_if=lambda value: value is None,
+        json_schema_extra={"x-internal": True},
+        description="Uploaded images shown with this block, for people reading the workflow. The agent never sees "
+        "them, and changing them never clears cached scripts. Omit to keep the saved images; send null or [] to "
+        "delete them.",
+    )
+    prompt_images: list[BlockImage] | None = Field(
+        default=None,
+        max_length=BLOCK_PROMPT_IMAGES_MAX,
+        exclude_if=lambda value: value is None,
+        json_schema_extra={"x-internal": True},
+        description="Uploaded images reserved for this block's prompt; no block reads them yet. Omit to keep the "
+        "saved images; send null or [] to delete them.",
+    )
     next_block_label: str | None = Field(
         default=None,
         description="Optional pointer to the label of the next block. "
@@ -914,7 +954,7 @@ class BlockYAML(BaseModel, abc.ABC):
     def _preserve_explicit_note_clears(self, handler: SerializerFunctionWrapHandler):  # type: ignore[no-untyped-def]
         data = handler(self)
         if isinstance(data, dict):
-            for field in ("notes", "trailing_notes", "description"):
+            for field in ("notes", "trailing_notes", "description", *BLOCK_IMAGE_FIELDS):
                 if field in self.model_fields_set and getattr(self, field) is None:
                     data[field] = None
         return data

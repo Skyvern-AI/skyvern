@@ -1185,6 +1185,25 @@ def test_renaming_a_legacy_block_while_adding_notes_is_refused(note_field: str) 
     assert "sign_in_step" in validation.reject.error
 
 
+def test_renaming_a_legacy_block_that_drops_its_doc_images_is_not_a_re_authoring() -> None:
+    prior = _yaml({**_GOAL, "engine": "skyvern-1.0", "doc_images": [{"file_id": "file_1", "placement": "block"}]})
+    submitted = _yaml({**_GOAL, "label": "sign_in_step", "engine": "skyvern-1.0"})
+
+    validation = _accepted(CODE_BLOCKS_ONLY, submitted, prior)
+
+    assert validation.reject is None
+
+
+@pytest.mark.parametrize(("image_field", "refused"), [("doc_images", False), ("prompt_images", True)])
+def test_only_prompt_images_are_new_content_on_a_grandfathered_banned_block(image_field: str, refused: bool) -> None:
+    prior = _yaml({**_GOAL, "engine": "skyvern-1.0", image_field: [{"file_id": "file_1", "placement": "block"}]})
+    submitted = _yaml({**_GOAL, "engine": "skyvern-1.0", image_field: [{"file_id": "file_2", "placement": "block"}]})
+
+    validation = _accepted(CODE_BLOCKS_ONLY, submitted, prior)
+
+    assert (validation.reject is not None) is refused
+
+
 def test_replacing_a_legacy_block_with_an_unrelated_one_of_the_same_type_is_not_a_rename() -> None:
     """Rename detection may only match on the block's content. Type and engine alone would let a
     rewrite delete legacy block A and add unrelated block B of the same type without the engine pin."""
