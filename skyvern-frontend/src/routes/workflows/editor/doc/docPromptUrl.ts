@@ -76,6 +76,27 @@ export function docPromptUrlOffer(
 
 export const MAX_SHOWN = 40;
 
+// A scheme with `//`, or a protocol-relative `//`, before the authority.
+const AUTHORITY_START = /^(?:[a-z][a-z0-9+.-]*:)?\/\//i;
+
+// The URL without a `user:password@` part, for the summary line's text, tooltip and accessible name. Userinfo that is
+// one `{{ }}` reference by itself is kept, since it may hold the whole URL; any other userinfo is dropped.
+export function docUrlWithoutUserinfo(url: string): string {
+  const value = url.trim();
+  const prefix = AUTHORITY_START.exec(value)?.[0] ?? "";
+  const userinfo = /^([^/?#]*)@/.exec(value.slice(prefix.length));
+  if (!userinfo || /^\{\{[^{}]*\}\}$/.test(userinfo[1]!.trim())) return value;
+  return prefix + value.slice(prefix.length + userinfo[0].length);
+}
+
+// The host alone, for the summary line; a value with a `{{ }}` reference is returned whole for DocText to render.
+export function docUrlHost(url: string): string {
+  const value = docUrlWithoutUserinfo(url);
+  if (value.includes("{{")) return value;
+  const host = value.replace(AUTHORITY_START, "").split(/[/?#]/)[0];
+  return host || value;
+}
+
 // The scheme and host are always shown in full, so a long subdomain cannot hide the real host.
 export function docShortUrl(url: string): string {
   const [, origin = url, rawPath = ""] =

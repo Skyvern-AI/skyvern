@@ -13,9 +13,11 @@ export const docDetailsText = {
   allDefault: "Every other setting is at its default.",
   notSet: "Not set",
   morePanel,
-  // A read-only Doc's Details has no side-panel link, so its fix line does not point there.
-  noCredential: (editable: boolean) =>
-    editable
-      ? `This step has no saved credential. Open ${toggle}, then ${morePanel} to choose one.`
-      : "This step has no saved credential.",
+  // The fix line names the Credential chip only where the step shows one.
+  noCredential: (editable: boolean, chip: boolean) =>
+    !editable
+      ? "This step has no saved credential."
+      : chip
+        ? "This step has no saved credential. Click Credential under the step's title to choose one."
+        : "This step has no saved credential. Open this step's settings and choose a credential.",
 } as const;

@@ -80,6 +80,8 @@ import {
   useDocStepPending,
 } from "./DocProposalView";
 import { DocOneActionHint } from "./DocOneActionHint";
+import { DocStepMeta } from "./DocStepMeta";
+import { useDocStepMetaRows } from "./useDocStepMetaRows";
 import {
   docShortcut,
   takeCaretAtStart,
@@ -397,6 +399,7 @@ function DocStepMenu({
             type="button"
             ref={tagRef}
             data-doc-tag
+            data-testid="doc-step-tag"
             aria-haspopup="menu"
             aria-expanded={menuAt === "tag"}
             onClick={() => toggleFrom("tag")}
@@ -442,7 +445,7 @@ export function DocTag({
       <DocStepMenu node={node} place={place} besideChevron={besideChevron} />
     );
   return (
-    <span className={tagClass(blockType, pending)}>
+    <span data-testid="doc-step-tag" className={tagClass(blockType, pending)}>
       {blockType ? workflowBlockTitle[blockType] : node.type}
     </span>
   );
@@ -525,9 +528,9 @@ export function DocStepNumber({ number }: { number?: string }) {
 export function DocStepCaption({ node }: { node: WorkflowBlockNode }) {
   const caption = docStepCaption(node);
   return caption ? (
-    <div className="mt-0.5 break-words text-lg font-semibold leading-snug text-foreground">
+    <h3 className="mt-0.5 break-words text-lg font-semibold leading-snug text-foreground">
       {caption}
-    </div>
+    </h3>
   ) : null;
 }
 
@@ -661,8 +664,15 @@ export function DocStepBody({
     () => docKeySettings(node, actions.loginCredentialKeys),
     [node, actions.loginCredentialKeys],
   );
+  const settingRows = useDocStepMetaRows(node, keyFields);
+  const metaRows = settingRows.line;
   const unfinished = useDocUnfinishedStore((state) => state.ids.has(node.id));
-  const missing = unfinished ? [] : getDocMissingSettings(node);
+  // A dashed chip already asks for the setting, so it is not also listed as required.
+  const missing = unfinished
+    ? []
+    : getDocMissingSettings(node, (key) =>
+        metaRows.some((row) => row.unset && row.key === yamlKey(key)),
+      );
   // A description sits under a prompt-driven step's text; on other steps it is the main line, with the setting it would hide underneath.
   // A loop's line that already names its list says what "For each of …" would, so the summary is left out.
   const loopSource = stripJinjaReferences(loopList(data));
@@ -688,6 +698,14 @@ export function DocStepBody({
   const proposalAdded = useDocStepAdded(node);
   const revealText =
     proposalAdded || proposalChanged.includes(yamlKey(shownMainKey));
+  // The summary line shows a URL's host only and cuts long values, so a value the proposal sets is listed whole in
+  // Details, which opens for it; so is every value of a step whose settings cannot be opened.
+  const lineTouched = settingRows.proposed;
+  const detailsFields = keyFields.filter(
+    (f) =>
+      settingRows.details.includes(f) ||
+      (metaRows.includes(f) && (lineTouched(f.key) || !settingRows.editable)),
+  );
   // Hidden while the main line is being typed in, so a half-typed URL ("https://exa") is not offered. Focus is kept per
   // rendering of the line, because React fires no blur when the focused line unmounts; a run or a demonstration that
   // takes editing away clears it, so the same rendering coming back is not read as still focused.
@@ -788,12 +806,14 @@ export function DocStepBody({
           ...(restInView ? rest.map((f) => f.key) : []),
         ]
       : ["description"]
-  ).map(yamlKey);
+  )
+    .map(yamlKey)
+    .concat(metaRows.filter((f) => !lineTouched(f.key)).map((f) => f.key));
   const keySettings = (
     <>
-      {keyFields.length > 0 && (
+      {detailsFields.length > 0 && (
         <dl className="mb-1 grid grid-cols-[auto_1fr] gap-x-4 gap-y-0.5 text-[13px]">
-          {keyFields.map((f) => (
+          {detailsFields.map((f) => (
             <Fragment key={f.key}>
               <dt className="text-muted-foreground">{f.label}</dt>
               <dd
@@ -825,6 +845,7 @@ export function DocStepBody({
   );
   return (
     <>
+      <DocStepMeta node={node} rows={metaRows} />
       <div
         className="min-h-[1.55em] text-base font-normal leading-[1.55]"
         onFocus={(event) => {
@@ -907,7 +928,7 @@ export function DocStepBody({
         hasDetailsLines={
           (!restInView && rest.length > 0) ||
           descriptionInDetails ||
-          keyFields.some((f) => f.changed)
+          detailsFields.some((f) => f.changed)
         }
         editable={editableProp}
         renamable={renamable}

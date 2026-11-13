@@ -201,6 +201,38 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+// `lead` runs before the step: give it a step that opens a page and `the_step` no longer opens the first one.
+async function renderProposal(
+  before: WorkflowBlock,
+  after: WorkflowBlock,
+  lead: WorkflowBlock[] = [],
+) {
+  useCopilotProposalStore.getState().setProposal({
+    proposed: workflow([...lead, after]),
+    baseline: workflow([...lead, before]),
+    review: {
+      blocks: [
+        {
+          label: "the_step",
+          blockType: before.block_type,
+          change: "changed",
+        },
+      ],
+      duplicateWrites: [],
+      keptNotes: [],
+      keptDescriptions: [],
+    },
+    tested: false,
+    actionable: true,
+    acceptable: true,
+    decide: vi.fn(async () => true),
+  });
+  const live = getElements([...lead, before], settings, true);
+  await renderInStudio(
+    <WorkflowDocEditor nodes={live.nodes} edges={live.edges} />,
+  );
+}
+
 describe("Copilot proposal in the Doc view", () => {
   test("the banner says Tested when Copilot ran the proposal and Untested when it did not", async () => {
     await renderDoc(true, true, true);
@@ -776,6 +808,7 @@ describe("Copilot proposal in the Doc view", () => {
       true,
     ],
     [
+      // The line shows the agent's id, and Details lists it too.
       "only the agent of a trigger whose title is not known",
       one("workflow_trigger", { workflow_permanent_id: "wpid_first" }),
       one("workflow_trigger", { workflow_permanent_id: "wpid_second" }),
@@ -784,17 +817,93 @@ describe("Copilot proposal in the Doc view", () => {
   ])(
     "a proposal that changes %s shows Details open: %s",
     async (_case, before, after, open) => {
+      await renderProposal(before, after);
+      expect(
+        screen
+          .getByRole("button", { name: /^Details for/ })
+          .getAttribute("aria-expanded"),
+      ).toBe(String(open));
+      if (before.block_type === "workflow_trigger")
+        expect(screen.getAllByText("wpid_second").length).toBeGreaterThan(0);
+    },
+  );
+
+  const recipients = (count: number) =>
+    one("send_email", {
+      subject: "Weekly summary",
+      body: "The summary is attached.",
+      file_attachments: [],
+      recipients: Array.from(
+        { length: count },
+        (_, i) => `person${i + 1}@example.com`,
+      ),
+    });
+  // The summary line shows a URL's host and cuts a long list, so a proposal that sets one lists it whole in Details.
+  test.each([
+    [
+      "a login's page host",
+      one("login", { url: "https://example.com/a", parameter_keys: [] }),
+      one("login", { url: "https://example.org/b", parameter_keys: [] }),
+      "https://example.org/b",
+    ],
+    [
+      "only a login's page path",
+      one("login", { url: "https://example.com/login", parameter_keys: [] }),
+      one("login", {
+        url: "https://example.com/admin/reset",
+        parameter_keys: [],
+      }),
+      "https://example.com/admin/reset",
+    ],
+    [
+      "only a Browser Task's page query",
+      task("the_step", null, { url: "https://example.com/list" }),
+      task("the_step", null, { url: "https://example.com/list?page=2" }),
+      "https://example.com/list?page=2",
+    ],
+    [
+      "a long recipients list",
+      recipients(1),
+      recipients(8),
+      "person8@example.com",
+    ],
+    [
+      "a login's page cleared",
+      one("login", { url: "https://example.com/a", parameter_keys: [] }),
+      one("login", { url: "", parameter_keys: [] }),
+      "Not set",
+    ],
+  ])(
+    "a read-only proposal that changes %s opens Details and shows the new value",
+    async (_case, before, after, shown) => {
+      await renderProposal(before, after);
+      const toggle = screen.getByRole("button", { name: /^Details for/ });
+      expect(toggle.getAttribute("aria-expanded")).toBe("true");
+      const details = document.getElementById(
+        toggle.getAttribute("aria-controls")!,
+      )!;
+      expect(details.textContent).toContain(shown);
+    },
+  );
+
+  // A step after one that opens a page needs no URL, so an unset one is hidden; a proposal that clears it still shows it.
+  test.each([
+    ["extraction", { data_extraction_goal: "Read the total" }],
+    ["action", { navigation_goal: "Click Next" }],
+    ["task", { navigation_goal: "Read the list" }],
+  ])(
+    "a proposal that adds a later %s step with no URL lists no URL row for it",
+    async (blockType, extra) => {
+      const open = (next: string | null) =>
+        task("open_page", next, { url: "https://example.com" });
       useCopilotProposalStore.getState().setProposal({
-        proposed: workflow([after]),
-        baseline: workflow([before]),
+        proposed: workflow([
+          open("the_step"),
+          block(blockType, "the_step", null, { ...extra, url: "" }),
+        ]),
+        baseline: workflow([open(null)]),
         review: {
-          blocks: [
-            {
-              label: "the_step",
-              blockType: before.block_type,
-              change: "changed",
-            },
-          ],
+          blocks: [{ label: "the_step", blockType, change: "added" }],
           duplicateWrites: [],
           keptNotes: [],
           keptDescriptions: [],
@@ -804,17 +913,60 @@ describe("Copilot proposal in the Doc view", () => {
         acceptable: true,
         decide: vi.fn(async () => true),
       });
-      const live = getElements([before], settings, true);
+      const live = getElements([open(null)], settings, true);
       await renderInStudio(
         <WorkflowDocEditor nodes={live.nodes} edges={live.edges} />,
       );
+      const toggle = screen.getByRole("button", {
+        name: "Details for The step",
+      });
+      if (toggle.getAttribute("aria-expanded") !== "true")
+        fireEvent.click(toggle);
       expect(
-        screen
-          .getByRole("button", { name: /^Details for/ })
-          .getAttribute("aria-expanded"),
-      ).toBe(String(open));
-      if (before.block_type === "workflow_trigger")
-        expect(screen.getByText("wpid_second")).not.toBeNull();
+        within(
+          document.getElementById(toggle.getAttribute("aria-controls")!)!,
+        ).queryByText("URL"),
+      ).toBeNull();
+    },
+  );
+
+  test.each([
+    ["navigation", { navigation_goal: "Read the list" }],
+    ["extraction", { data_extraction_goal: "Read the total" }],
+  ])(
+    "a read-only proposal that clears the URL of a later %s step lists it as not set",
+    async (blockType, extra) => {
+      const lead = [
+        task("open_page", "the_step", { url: "https://example.com" }),
+      ];
+      const step = (url: string) =>
+        block(blockType, "the_step", null, { ...extra, url });
+      await renderProposal(step("https://example.com/list"), step(""), lead);
+      const toggle = screen.getByRole("button", {
+        name: "Details for The step",
+      });
+      expect(toggle.getAttribute("aria-expanded")).toBe("true");
+      const details = within(
+        document.getElementById(toggle.getAttribute("aria-controls")!)!,
+      );
+      expect(details.getByText("URL").nextElementSibling?.textContent).toBe(
+        "Not set",
+      );
+      cleanup();
+      useCopilotProposalStore.getState().setProposal(null);
+      const live = getElements([...lead, step("")], settings, true);
+      await renderInStudio(
+        <WorkflowDocEditor nodes={live.nodes} edges={live.edges} />,
+      );
+      const plain = screen.getByRole("button", {
+        name: "Details for The step",
+      });
+      fireEvent.click(plain);
+      expect(
+        within(
+          document.getElementById(plain.getAttribute("aria-controls")!)!,
+        ).queryByText("URL"),
+      ).toBeNull();
     },
   );
 
@@ -833,6 +985,11 @@ describe("Copilot proposal in the Doc view", () => {
     [
       "as an Action that continues on failure, opens Details",
       { block_type: "action", continue_on_failure: true },
+      true,
+    ],
+    [
+      "with a page URL that has a path, opens Details listing it",
+      { url: "https://example.com/admin/reset" },
       true,
     ],
   ])("a step the proposal adds %s", async (_case, extra, open) => {
@@ -860,11 +1017,15 @@ describe("Copilot proposal in the Doc view", () => {
     await renderInStudio(
       <WorkflowDocEditor nodes={live.nodes} edges={live.edges} />,
     );
-    expect(
-      screen
-        .getByRole("button", { name: "Details for Check page" })
-        .getAttribute("aria-expanded"),
-    ).toBe(String(open));
+    const toggle = screen.getByRole("button", {
+      name: "Details for Check page",
+    });
+    expect(toggle.getAttribute("aria-expanded")).toBe(String(open));
+    if ("url" in extra)
+      expect(
+        document.getElementById(toggle.getAttribute("aria-controls")!)!
+          .textContent,
+      ).toContain(extra.url);
     expect(
       screen
         .getByRole("button", { name: "Details for Open page" })

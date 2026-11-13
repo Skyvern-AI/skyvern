@@ -4,6 +4,7 @@ import {
   type HTMLAttributes,
   type Ref,
   forwardRef,
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -102,7 +103,10 @@ import {
 import {
   customSettingsShortText,
   docLoginCredentialKeys,
+  docEditableStepIds,
+  docMetaLineKeys,
 } from "./docSettingsChips";
+import { startUrlRequiredIds } from "../workflowEditorUtils";
 import { DocProblemsList } from "./DocProblemsList";
 import { docProblemStep } from "./docProblemStep";
 import { publishDocCriticalProblems } from "./docRunCheckStore";
@@ -570,12 +574,41 @@ export function WorkflowDocEditor({
   // What steps still need before they can run, found as the draft is typed; the server's check follows.
   // A step added a moment ago is unfinished, not wrong: its problems wait until the user leaves it, runs or saves.
   const unfinishedIds = useDocUnfinishedStore((s) => s.ids);
+  const startUrlIds = useMemo(
+    () => startUrlRequiredIds(nodes, edges),
+    [nodes, edges],
+  );
+  // One boolean: `edits` is a new object on every parent render.
+  const linesEditable = editable && Boolean(edits);
+  const editableStepIds = useMemo(
+    () => docEditableStepIds(tree.items, byId, linesEditable),
+    [tree, byId, linesEditable],
+  );
+  const metaKeys = useCallback(
+    (node: AppNode) =>
+      docMetaLineKeys(
+        node,
+        loginCredentialKeys,
+        editableStepIds.has(node.id),
+        startUrlIds.has(node.id),
+      ),
+    [loginCredentialKeys, editableStepIds, startUrlIds],
+  );
+  // A step's settings open without `edits`, so its fix line names them unless its section is read-only.
+  const settingsEditableIds = useMemo(
+    () => docEditableStepIds(tree.items, byId, editable),
+    [tree, byId, editable],
+  );
+  const stepEditable = useCallback(
+    (id: string) => settingsEditableIds.has(id),
+    [settingsEditableIds],
+  );
   const stepFixes = useMemo(() => {
     if (proposal) return new Map<string, DocStepFix[]>();
-    const found = docStepFixes(nodes, editable);
+    const found = docStepFixes(nodes, stepEditable, metaKeys);
     for (const id of unfinishedIds) found.delete(id);
     return found;
-  }, [nodes, proposal, unfinishedIds, editable]);
+  }, [nodes, proposal, unfinishedIds, stepEditable, metaKeys]);
   const unfinishedLabels = useMemo(
     () =>
       new Set(
@@ -598,9 +631,10 @@ export function WorkflowDocEditor({
         items: tree.items,
         fixes: stepFixes,
         problems: shownProblems,
-        editable,
+        editable: stepEditable,
+        metaKeys,
       }),
-    [nodes, tree, stepFixes, shownProblems, editable],
+    [nodes, tree, stepFixes, shownProblems, stepEditable, metaKeys],
   );
   const problems = problemEntries.length;
   useEffect(() => {
@@ -1045,6 +1079,8 @@ export function WorkflowDocEditor({
         selectedBranch: (conditionalId) => branchSelections.get(conditionalId),
         previousNoteReader,
         promptUrlOffer: (node) => docPromptUrlOffer({ nodes, edges }, node),
+        opensFirstPage: (id) => startUrlIds.has(id),
+        stepLinesEditable: (id) => editableStepIds.has(id),
         stepNumbers,
         selectBranch,
         loopOpen: (loopId) => !closedLoops.has(loopId),

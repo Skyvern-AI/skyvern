@@ -80,7 +80,7 @@ function header(label: string, nodes: ReturnType<typeof renderDoc>) {
   const id = nodes.find((n) => n.data.label === label)!.id;
   const step = document.querySelector(`[data-doc-node-id="${id}"]`)!;
   const number = step.querySelector('[data-testid="doc-step-number"]')!;
-  const tag = step.querySelector("[data-doc-tag], span[class*='h-[21px]']")!;
+  const tag = step.querySelector('[data-testid="doc-step-tag"]')!;
   let row = number.parentElement!;
   while (!row.contains(tag)) row = row.parentElement!;
   return { step, row, tag };
@@ -95,13 +95,19 @@ function expectTitleBelow(row: Element, title: string) {
 }
 
 describe("Doc step header", () => {
-  test("the number and type are on the first row and the title is the row below", () => {
+  test("the number and type are on the first row, the title is a heading below, and the type label opens the step's actions", () => {
     const nodes = renderDoc([login("sample_login")]);
     const { row, tag } = header("sample_login", nodes);
     expect(row.textContent).toMatch(/^1Login/);
     expectTitleBelow(row, "Sample login");
+    expect(screen.getByRole("heading", { name: "Sample login" })).toBeTruthy();
     // The type label carries no icon.
     expect(tag.querySelector("svg")).toBeNull();
+    expect(tag).toBe(
+      screen.getByRole("button", { name: "Login step sample_login, actions" }),
+    );
+    fireEvent.click(tag);
+    expect(screen.getByRole("menuitem", { name: /Settings/ })).toBeTruthy();
   });
 
   test("a default name has no title row", () => {
@@ -117,16 +123,6 @@ describe("Doc step header", () => {
     expect(tag.tagName).toBe("SPAN");
     expect(tag.querySelector("svg")).toBeNull();
     expectTitleBelow(row, "Sample login");
-  });
-
-  test("the type label is still the button that opens the step's actions", () => {
-    renderDoc([login("sample_login")]);
-    const tag = screen.getByRole("button", {
-      name: "Login step sample_login, actions",
-    });
-    expect(tag.hasAttribute("data-doc-tag")).toBe(true);
-    fireEvent.click(tag);
-    expect(screen.getByRole("menuitem", { name: /Settings/ })).toBeTruthy();
   });
 
   test("a loop keeps its arrow on the first row, above its title", () => {

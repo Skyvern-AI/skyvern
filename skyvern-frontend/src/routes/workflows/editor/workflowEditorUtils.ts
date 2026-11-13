@@ -5013,6 +5013,67 @@ function isMissingRequiredStartUrl(
   );
 }
 
+/** The ids `isMissingRequiredStartUrl` holds for, found in one pass over the graph. */
+function startUrlRequiredIds(
+  nodes: Array<AppNode>,
+  edges: Array<Edge>,
+): Set<string> {
+  const byId = new Map(nodes.map((node) => [node.id, node]));
+  // `getPreviousNodeIds` follows the first edge into each node.
+  const sourceOf = new Map<string, string>();
+  for (const edge of edges)
+    if (!sourceOf.has(edge.target)) sourceOf.set(edge.target, edge.source);
+  const leaves = new Map<string, boolean>();
+  const leavesById = (id: string) => {
+    let value = leaves.get(id);
+    if (value === undefined) {
+      const node = byId.get(id);
+      value = node !== undefined && leavesBrowserState(node, nodes);
+      leaves.set(id, value);
+    }
+    return value;
+  };
+  // Whether a page is open before `id` runs: its predecessors, then its container's. Walked with an explicit stack, as
+  // a chain of thousands of steps would overflow a recursive walk.
+  const opened = new Map<string, boolean>();
+  const visiting = new Set<string>();
+  const openedBefore = (first: string): boolean => {
+    const stack = [first];
+    while (stack.length) {
+      const id = stack[stack.length - 1]!;
+      const source = sourceOf.get(id);
+      const parentId = byId.get(id)?.parentId;
+      if (visiting.has(id)) {
+        visiting.delete(id);
+        opened.set(
+          id,
+          (source !== undefined &&
+            (leavesById(source) || opened.get(source) === true)) ||
+            (parentId !== undefined && opened.get(parentId) === true),
+        );
+        stack.pop();
+      } else if (opened.has(id)) {
+        stack.pop();
+      } else {
+        // A cycle is an invalid graph (it would loop forever in `getPreviousNodeIds`). This provisional false is
+        // memoized for the nodes visited mid-cycle, so there the result can depend on iteration order.
+        opened.set(id, false);
+        visiting.add(id);
+        if (parentId !== undefined && !opened.has(parentId))
+          stack.push(parentId);
+        if (source !== undefined && !leavesById(source) && !opened.has(source))
+          stack.push(source);
+      }
+    }
+    return opened.get(first) === true;
+  };
+  const ids = new Set<string>();
+  for (const node of nodes)
+    if (opensPageWithoutUrl(node, nodes) && !openedBefore(node.id))
+      ids.add(node.id);
+  return ids;
+}
+
 function convertParametersToParameterYAML(
   parameters: Array<Exclude<Parameter, OutputParameter>>,
 ): Array<ParameterYAML> {
@@ -6566,6 +6627,7 @@ export {
   isFirstBrowserTaskBlock,
   isMissingRequiredStartUrl,
   opensPageWithoutUrl,
+  startUrlRequiredIds,
   urlMayBeGoogleDrive,
   getBlockNameOfOutputParameterKey,
   getDefaultValueForParameterType,
