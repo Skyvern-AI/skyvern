@@ -35,7 +35,6 @@ import {
 import { cn } from "@/util/utils";
 import { DocKeyLabel, DocKeyTooltip } from "./DocKeyLabel";
 import type { WorkflowBlockNode } from "../nodes";
-import { WorkflowBlockIcon } from "../nodes/WorkflowBlockIcon";
 import { announceDoc, announceMoved, announceTurnedInto } from "./docAnnounce";
 import { workflowBlockTitle } from "../nodes/types";
 import { WorkflowDocActionsContext } from "./WorkflowDocActionsContext";
@@ -96,24 +95,11 @@ const tagClass = (
   pending = false,
 ) =>
   cn(
-    "inline-flex h-[21px] shrink-0 items-center gap-1 whitespace-nowrap rounded px-[6px] text-[12.5px] font-semibold leading-none",
+    "inline-flex h-[21px] shrink-0 items-center whitespace-nowrap rounded px-[6px] text-[12.5px] font-semibold leading-none",
     docTagClasses[docTagColor(blockType)],
     pending &&
       "border border-dashed border-current bg-transparent px-[5px] opacity-80 dark:bg-transparent",
   );
-
-function DocTagIcon({
-  blockType,
-}: {
-  blockType: ReturnType<typeof docBlockType>;
-}) {
-  return blockType ? (
-    <WorkflowBlockIcon
-      workflowBlockType={blockType}
-      className="size-3 shrink-0"
-    />
-  ) : null;
-}
 
 // The six dots of the Visual editor's node grip.
 function GripDots() {
@@ -422,7 +408,6 @@ function DocStepMenu({
               "outline-none hover:brightness-95 focus-visible:ring-2 focus-visible:ring-ring",
             )}
           >
-            <DocTagIcon blockType={blockType} />
             {blockType ? workflowBlockTitle[blockType] : node.type}
           </button>
           {menu("tag")}
@@ -458,7 +443,6 @@ export function DocTag({
     );
   return (
     <span className={tagClass(blockType, pending)}>
-      <DocTagIcon blockType={blockType} />
       {blockType ? workflowBlockTitle[blockType] : node.type}
     </span>
   );
@@ -541,9 +525,9 @@ export function DocStepNumber({ number }: { number?: string }) {
 export function DocStepCaption({ node }: { node: WorkflowBlockNode }) {
   const caption = docStepCaption(node);
   return caption ? (
-    <span className="min-w-0 truncate text-[13px] font-medium text-foreground">
+    <div className="mt-0.5 break-words text-lg font-semibold leading-snug text-foreground">
       {caption}
-    </span>
+    </div>
   ) : null;
 }
 
@@ -565,43 +549,46 @@ export function DocStepHeader({
   number?: string;
 }) {
   return (
-    <div className="relative flex min-h-[26px] flex-wrap items-center gap-2">
-      {disclosure && (
-        <button
-          type="button"
-          aria-expanded={disclosure.open}
-          aria-label={`${disclosure.open ? "Collapse" : "Expand"} ${node.data.label}`}
-          onClick={disclosure.onToggle}
-          className={cn(
-            "absolute -left-[26px] top-0.5 grid h-[22px] w-[22px] place-items-center rounded text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring",
-            // On touch the grip shows at rest, so from sm up the arrow moves out to its left: arrow, grip, label.
-            editable &&
-              place &&
-              "sm:max-[719px]:-left-[54px] [@media(hover:none)_and_(min-width:640px)]:-left-[54px]",
-          )}
-        >
-          <ChevronRightIcon
+    <div>
+      {/* The grip and the loop arrow are placed against this row, so they stay beside the number. */}
+      <div className="relative flex min-h-[26px] flex-wrap items-center gap-2">
+        {disclosure && (
+          <button
+            type="button"
+            aria-expanded={disclosure.open}
+            aria-label={`${disclosure.open ? "Collapse" : "Expand"} ${node.data.label}`}
+            onClick={disclosure.onToggle}
             className={cn(
-              "size-4 transition-transform",
-              disclosure.open && "rotate-90",
+              "absolute -left-[26px] top-0.5 grid h-[22px] w-[22px] place-items-center rounded text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring",
+              // On touch the grip shows at rest, so from sm up the arrow moves out to its left: arrow, grip, label.
+              editable &&
+                place &&
+                "sm:max-[719px]:-left-[54px] [@media(hover:none)_and_(min-width:640px)]:-left-[54px]",
             )}
-          />
-        </button>
-      )}
-      <DocStepNumber number={number} />
-      <DocTag
-        node={node}
-        place={editable ? place : undefined}
-        besideChevron={Boolean(disclosure)}
-      />
+          >
+            <ChevronRightIcon
+              className={cn(
+                "size-4 transition-transform",
+                disclosure.open && "rotate-90",
+              )}
+            />
+          </button>
+        )}
+        <DocStepNumber number={number} />
+        <DocTag
+          node={node}
+          place={editable ? place : undefined}
+          besideChevron={Boolean(disclosure)}
+        />
+        {extra}
+        <DocStepControls
+          node={node}
+          editable={editable}
+          showRunControl={showRunControl}
+          settings={false}
+        />
+      </div>
       <DocStepCaption node={node} />
-      {extra}
-      <DocStepControls
-        node={node}
-        editable={editable}
-        showRunControl={showRunControl}
-        settings={false}
-      />
     </div>
   );
 }
