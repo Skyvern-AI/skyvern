@@ -766,6 +766,7 @@ Whoever can start a task chooses the URLs Skyvern fetches. With validation off, 
 | `VIDEO_PATH`, `HAR_PATH`, `LOG_PATH` | `./video`, `./har`, `./log` | All. Recordings are written here, then uploaded to the backend. |
 | `PRESIGNED_URL_EXPIRATION` | `86400` (24 hours) | `s3`, `azureblob`, `gcs`. Lifetime of the signed links in run responses (`recording_url`, `screenshot_urls`). |
 | `MAX_UPLOAD_FILE_SIZE` | `31457280` (30 MB) | All |
+| `UPLOAD_EXTRA_ALLOWED_EXTENSIONS` | `[]` | All. Extensions to accept on file upload beyond the built-in list of document, spreadsheet, presentation, image, data, archive, video and audio types. Set it as a JSON list, for example `'["gz","epub"]'`. A comma-separated value fails at startup. Executable and markup types (such as `.exe`, `.sh`, `.html` and `.svg`) are still refused. A refused file returns `415` with `File type not allowed: <reason>`. The setting widens only the general file upload, not PDF workflow import or Copilot voice notes. |
 
 Each cloud backend uses four buckets (containers on Azure). The defaults are `skyvern-artifacts`, `skyvern-screenshots`, `skyvern-browser-sessions` and `skyvern-uploads`.
 
