@@ -20,7 +20,7 @@ from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION,
     COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION,
 )
-from skyvern.forge.sdk.copilot.enforcement import _RECENT_TOOL_OUTPUT_CHAR_CAP, _prune_input_list
+from skyvern.forge.sdk.copilot.enforcement import _RECENT_TOOL_OUTPUT_CHAR_CAP, _cap_tool_outputs
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, _ground_user_provided_sites
 from skyvern.forge.sdk.copilot.runtime import (
     _browser_session_acquisition_failure_result,
@@ -627,7 +627,7 @@ async def test_dense_inspect_packet_sheds_only_select_options_before_recent_tool
     result = await _inspect_page_for_composition_impl(ctx, "current_page")
     serialized = json.dumps(result)
     with structlog.testing.capture_logs() as logs:
-        pruned = _prune_input_list([{"type": "function_call_output", "call_id": "dense-inspect", "output": serialized}])
+        pruned = _cap_tool_outputs([{"type": "function_call_output", "call_id": "dense-inspect", "output": serialized}])
 
     assert result["ok"] is True
     assert len(serialized) < _RECENT_TOOL_OUTPUT_CHAR_CAP

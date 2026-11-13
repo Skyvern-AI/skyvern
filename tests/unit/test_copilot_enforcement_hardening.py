@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import litellm
 import pytest
 from agents import GuardrailFunctionOutput, OutputGuardrail, function_tool, output_guardrail
 from agents.exceptions import ModelBehaviorError, OutputGuardrailTripwireTriggered
@@ -18,7 +19,6 @@ from skyvern.forge.sdk.copilot.enforcement import (
     SCREENSHOT_PLACEHOLDER,
     SCREENSHOT_SENTINEL,
     _is_context_window_error,
-    _prune_input_list,
     _recover_from_context_overflow,
     _strip_input_images,
     enforcement_decision,
@@ -26,6 +26,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
 )
 from skyvern.forge.sdk.copilot.llm_errors import CopilotEmptyCompletionError
 from skyvern.forge.sdk.copilot.output_utils import extract_final_text, parse_final_response
+from skyvern.forge.sdk.copilot.session_factory import _summarize_older_tool_items
 from skyvern.forge.sdk.copilot.tools import reply_tool
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotStreamMessageType
 from tests.unit.conftest import make_copilot_context as _fresh_context
@@ -55,7 +56,7 @@ def test_enforcement_decision_on_fresh_agent_context_returns_none() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_prune_input_list_summarizes_old_tool_call_arguments() -> None:
+def test_over_budget_summary_summarizes_old_tool_call_arguments() -> None:
     huge_yaml = "workflow:\n" + "  - block: x\n" * 2000  # ~18 KB
     old_call = {
         "type": "function_call",
@@ -73,7 +74,7 @@ def test_prune_input_list_summarizes_old_tool_call_arguments() -> None:
     ]
     items = [old_call] + recent_calls
 
-    pruned = _prune_input_list(items)
+    pruned = _summarize_older_tool_items(items)
 
     # Oldest call's arguments should be compacted; recent ones untouched.
     pruned_args = json.loads(pruned[0]["arguments"])
@@ -82,16 +83,6 @@ def test_prune_input_list_summarizes_old_tool_call_arguments() -> None:
     assert "truncated" in pruned_args["workflow_yaml"]
     for item in pruned[-3:]:
         assert "truncated" not in item["arguments"]
-
-
-def test_prune_input_list_preserves_small_arguments() -> None:
-    small_call = {
-        "type": "function_call",
-        "name": "navigate_browser",
-        "arguments": json.dumps({"url": "https://example.com"}),
-    }
-    pruned = _prune_input_list([small_call])
-    assert pruned[0]["arguments"] == small_call["arguments"]
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +193,16 @@ async def test_recover_from_context_overflow_with_session_strips_current_input()
 )
 def test_is_context_window_error_matches_only_overflow_variants(msg: str, expected: bool) -> None:
     assert _is_context_window_error(Exception(msg)) is expected
+
+
+def test_is_context_window_error_matches_an_anthropic_overflow() -> None:
+    error = litellm.ContextWindowExceededError(
+        message="prompt is too long: 900000 tokens > 872000 maximum",
+        model="claude-sonnet-5-5",
+        llm_provider="anthropic",
+    )
+
+    assert _is_context_window_error(error)
 
 
 def test_workflow_edit_clears_recorded_persisted_run_latch() -> None:

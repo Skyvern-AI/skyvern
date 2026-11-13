@@ -7,7 +7,7 @@ import copy
 import hashlib
 import json
 import random
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping, Sequence
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -36,11 +36,17 @@ from skyvern.forge.sdk.copilot.ask_user import (
 )
 from skyvern.forge.sdk.copilot.config import SCREENSHOT_DROPPED_NUDGE, BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.enforcement import (
+    _RECENT_TOOL_OUTPUT_CHAR_CAP,
+    _TOOL_OUTPUT_HEAD_TRUNCATION_SUFFIX,
+    _TOOL_OUTPUT_SUMMARIZE_THRESHOLD,
     IMAGE_REMOVED_PLACEHOLDER,
     NUDGE_SENTINEL,
+    TOKEN_BUDGET,
+    TOOL_WINDOW_SUMMARIZED,
     estimate_tokens,
     is_screenshot_message,
     pending_screenshot_message,
+    stable_prefix_anchors,
 )
 from skyvern.forge.sdk.copilot.model_resolver import CopilotLitellmProvider
 from skyvern.forge.sdk.copilot.screenshot_utils import (
@@ -49,6 +55,9 @@ from skyvern.forge.sdk.copilot.screenshot_utils import (
     ScreenshotProvenance,
 )
 from skyvern.forge.sdk.copilot.session_factory import (
+    _drop_older_screenshots,
+    _filter_to_budget,
+    _summarize_older_tool_items,
     copilot_call_model_input_filter,
     copilot_session_input_callback,
     make_copilot_call_model_input_filter,
@@ -76,6 +85,92 @@ def _unread_run_results_batch() -> list[dict[str, Any]]:
     return [{"type": "reasoning", "summary": []}, *calls, *outputs]
 
 
+def _resolved_ask_user_output() -> str:
+    interaction = QuestionInteraction(
+        interaction_id="q-1",
+        turn_id="turn-1",
+        tool_call_id="call-ask",
+        parts=[
+            QuestionPart(
+                part_id="p-1",
+                prompt="Which report should the workflow retrieve, and for what date range? "
+                "Please also provide the dashboard URL if you have it.",
+                choices=[
+                    QuestionChoice(choice_id="c-7", text="Last 7 days"),
+                    QuestionChoice(choice_id="c-30", text="Last 30 days"),
+                ],
+            )
+        ],
+        status="resolved",
+        response=QuestionResponse(
+            answers=[QuestionAnswer(part_id="p-1", choice_id="c-30")],
+            text="https://ads.example.com/account/123/dashboard",
+        ),
+    )
+    return json.dumps(interaction.tool_result())
+
+
+def _scouting_turn() -> list[dict[str, Any]]:
+    """An over-cap page read, an answered question, then real-shaped search and browser-code reads."""
+    page_text = "Pricing tier details. " * 2_600
+    script = "rows = await page.locator('table tr').all_inner_texts()\n" * 8 + "return rows"
+    results: list[tuple[str, str, dict[str, Any]]] = [
+        (
+            "run_browser_code",
+            json.dumps({"code": script}),
+            {
+                "ok": True,
+                "value": page_text,
+                "stdout": "",
+                "executed_source_reference": "src_0001",
+            },
+        ),
+        ("ask_user", "{}", {}),
+    ]
+    for index in range(3):
+        results.append(
+            (
+                "search_web",
+                json.dumps({"query": f"plan pricing page {index}", "max_results": 10}),
+                {
+                    "ok": True,
+                    "data": {
+                        "query": f"plan pricing page {index}",
+                        "results": [
+                            {
+                                "title": f"Result {index}-{hit}",
+                                "url": f"https://site{index}.example.com/pricing/{hit}",
+                                "snippet": f"Plan {hit} costs ${10 * (hit + 1)} per seat per month. " * 3,
+                            }
+                            for hit in range(5)
+                        ],
+                    },
+                    "error": None,
+                },
+            )
+        )
+        results.append(
+            (
+                "run_browser_code",
+                json.dumps({"code": f"return await page.inner_text('#plan-{index}')"}),
+                {
+                    "ok": True,
+                    "value": f"Plan {index}: $49 per seat, billed annually. " * 20,
+                    "stdout": f"read #plan-{index}\n" * 10,
+                    "executed_source_reference": f"src_00{index + 2}",
+                },
+            )
+        )
+    items: list[dict[str, Any]] = [{"role": "user", "content": "compare the pricing of these plans"}]
+    for index, (name, arguments, result) in enumerate(results):
+        call_id = "call-ask" if name == "ask_user" else f"call-{index}"
+        output = _resolved_ask_user_output() if name == "ask_user" else json.dumps(result)
+        items.append({"type": "function_call", "call_id": call_id, "name": name, "arguments": arguments})
+        items.append({"type": "function_call_output", "call_id": call_id, "output": output})
+        items.append({"type": "reasoning", "summary": [{"type": "summary_text", "text": "Read it."}]})
+    return items
+
+
 def _ctx_with_staged_frame(*, supports_vision: bool = True) -> SimpleNamespace:
     return SimpleNamespace(
         pending_screenshots=[
@@ -98,43 +193,194 @@ def _ctx_with_staged_frame(*, supports_vision: bool = True) -> SimpleNamespace:
     )
 
 
-class TestFirstTurnCompaction:
-    """CORR-3 regression guards: first-turn transcripts (one real user +
-    long tool chain) must compact older tool outputs / function-call args
-    using the KEEP_RECENT_TOOL_OUTPUTS rule, not a user-boundary fallback.
-    """
+def _tool_round(index: int) -> list[dict[str, Any]]:
+    output = json.dumps({"ok": True, "data": {"value": f"page {index} " * 400}})
+    return [
+        {"type": "function_call", "call_id": f"c{index}", "name": "run_browser_code", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": f"c{index}", "output": output},
+        {"type": "reasoning", "summary": [{"type": "summary_text", "text": "Read it."}]},
+    ]
 
-    def test_filter_compacts_older_tool_outputs_on_first_turn(self) -> None:
-        from skyvern.forge.sdk.copilot.session_factory import copilot_call_model_input_filter
 
-        large_output = "x" * 5000
-        small_summary_marker = "_summarized"
+_LADDER_RUNG_EVENTS = {
+    "Within budget, outputs whole",
+    "Within budget after tool trim",
+    "Within budget after screenshot drop",
+    "Within budget after soft emergency truncation",
+    "Within budget after emergency truncation",
+}
 
-        items: list[dict[str, Any]] = [
-            {"role": "user", "content": "please build me a workflow"},
-            # six function_call_output items; the last 3 stay raw, older 3 compact.
-            *(
-                item
-                for i in range(6)
-                for item in (
-                    {
-                        "type": "function_call_output",
-                        "call_id": f"call-{i}",
-                        "output": json.dumps({"ok": True, "data": {"blob": large_output}}),
-                    },
-                    {"type": "reasoning", "summary": [{"type": "summary_text", "text": "Read it."}]},
-                )
-            ),
-        ]
-        result = copilot_call_model_input_filter(_mk_input_data(items))
+
+class TestModelInputBudget:
+    def test_under_budget_every_output_and_argument_reaches_the_model_whole(self) -> None:
+        items = _scouting_turn()
+        assert len(items[2]["output"]) > _RECENT_TOOL_OUTPUT_CHAR_CAP
+        assert any(
+            it.get("type") == "function_call" and len(it["arguments"]) > _TOOL_OUTPUT_SUMMARIZE_THRESHOLD
+            for it in items
+        )
+
+        result = copilot_call_model_input_filter(_mk_input_data(copilot_session_input_callback(items, [])))
+
+        def payloads(source: Sequence[Mapping[str, Any]]) -> list[tuple[str, str, str]]:
+            return [
+                (it["type"], it["call_id"], it["output"] if "output" in it else it["arguments"])
+                for it in source
+                if it.get("type") in ("function_call", "function_call_output")
+            ]
+
+        oldest = items[2]["output"]
+        expected = payloads(items)
+        expected[1] = (
+            "function_call_output",
+            "call-0",
+            oldest[:_RECENT_TOOL_OUTPUT_CHAR_CAP] + _TOOL_OUTPUT_HEAD_TRUNCATION_SUFFIX,
+        )
+        assert payloads(result.input) == expected
+
+    def test_over_budget_older_outputs_and_arguments_are_summarized_first(self) -> None:
+        items = _scouting_turn()
+        whole = copilot_call_model_input_filter(_mk_input_data(items)).input
+        budget = estimate_tokens(whole) - 1
+
+        with capture_logs() as logs:
+            result = make_copilot_call_model_input_filter(token_budget=budget)(_mk_input_data(items))
+
+        assert estimate_tokens(result.input) <= budget
+        assert "Within budget after tool trim" in [entry["event"] for entry in logs]
         outputs = [it for it in result.input if it.get("type") == "function_call_output"]
-        assert len(outputs) == 6
-        older_three = outputs[:3]
-        recent_three = outputs[3:]
-        for older in older_three:
-            assert small_summary_marker in older["output"]
-        for recent in recent_three:
-            assert small_summary_marker not in recent["output"]
+        calls = [it for it in result.input if it.get("type") == "function_call"]
+        oldest = json.loads(outputs[0]["output"])
+        assert "_summarized" in oldest and oldest["ok"] is True
+        answer = json.loads(next(it["output"] for it in outputs if it["call_id"] == "call-ask"))
+        assert answer["text"] == "https://ads.example.com/account/123/dashboard"
+        assert answer["parts"][0]["choice"]["text"] == "Last 30 days"
+        original_outputs = [it for it in items if it.get("type") == "function_call_output"]
+        assert [it["output"] for it in outputs[-3:]] == [it["output"] for it in original_outputs[-3:]]
+        assert "_summarized" in calls[0]["arguments"]
+        original_calls = [it for it in items if it.get("type") == "function_call"]
+        assert [it["arguments"] for it in calls[-3:]] == [it["arguments"] for it in original_calls[-3:]]
+
+    def test_over_budget_a_json_output_over_the_cap_still_gets_a_structured_synopsis(self) -> None:
+        big = json.dumps(
+            {"ok": True, "data": {"workflow_run_id": "wr_big", "blob": "z" * _RECENT_TOOL_OUTPUT_CHAR_CAP}}
+        )
+        items: list[dict[str, Any]] = [
+            {"role": "user", "content": "goal"},
+            {"type": "function_call", "call_id": "c_big", "name": "get_run_results", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "c_big", "output": big},
+            {"type": "reasoning", "summary": []},
+        ]
+        for i in range(3):
+            items += [
+                {"type": "function_call", "call_id": f"c{i}", "name": "get_run_results", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": f"c{i}", "output": json.dumps({"ok": True})},
+                {"type": "reasoning", "summary": []},
+            ]
+
+        result = make_copilot_call_model_input_filter(token_budget=2000)(_mk_input_data(items))
+
+        synopsis = json.loads(result.input[2]["output"])
+        assert synopsis["_summarized"] and synopsis["workflow_run_id"] == "wr_big"
+
+    def test_over_budget_an_output_the_summarizer_keeps_whole_is_still_capped(self) -> None:
+        group = json.dumps(
+            {
+                "workflow_run_group_id": "g1",
+                "rows": [{"workflow_run_id": f"wr_{i}", "status": "ok"} for i in range(2000)],
+            }
+        )
+        assert len(group) > _RECENT_TOOL_OUTPUT_CHAR_CAP
+        items: list[dict[str, Any]] = [
+            {"role": "user", "content": "goal"},
+            {"type": "function_call", "call_id": "c_group", "name": "get_run_group", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "c_group", "output": group},
+            {"type": "reasoning", "summary": []},
+        ]
+        for i in range(4):
+            items += [
+                {"type": "function_call", "call_id": f"c{i}", "name": "get_run_results", "arguments": "{}"},
+                {
+                    "type": "function_call_output",
+                    "call_id": f"c{i}",
+                    "output": json.dumps({"ok": True, "v": "r" * 8000}),
+                },
+                {"type": "reasoning", "summary": []},
+            ]
+        budget = estimate_tokens(copilot_call_model_input_filter(_mk_input_data(items)).input) - 1
+
+        with capture_logs() as logs:
+            result = make_copilot_call_model_input_filter(token_budget=budget)(_mk_input_data(items))
+
+        assert "Within budget after tool trim" in [entry["event"] for entry in logs]
+        assert result.input[2]["output"] == group[:_RECENT_TOOL_OUTPUT_CHAR_CAP] + _TOOL_OUTPUT_HEAD_TRUNCATION_SUFFIX
+
+    def test_over_budget_cache_anchor_prefix_is_resent_unchanged_on_the_next_over_budget_call(self) -> None:
+        history = [{"role": "user", "content": "goal"}, *(item for i in range(6) for item in _tool_round(i))]
+        flt = make_copilot_call_model_input_filter(token_budget=estimate_tokens(history) // 2)
+
+        first = flt(_mk_input_data(history)).input
+        anchor = stable_prefix_anchors(first)[-1]
+        second = flt(_mk_input_data([*history, *_tool_round(6)])).input
+
+        assert "_summarized" in first[2]["output"] and "_summarized" in second[2]["output"]
+        assert first[anchor]["call_id"] == "c2"
+        assert first[: anchor + 1] == second[: anchor + 1]
+
+    def test_under_budget_cache_anchor_is_the_newest_read_output_and_its_prefix_is_resent_unchanged(self) -> None:
+        history = [{"role": "user", "content": "goal"}, *(item for i in range(6) for item in _tool_round(i))]
+
+        first = copilot_call_model_input_filter(_mk_input_data(history)).input
+        anchor = stable_prefix_anchors(first)[-1]
+        second = copilot_call_model_input_filter(_mk_input_data([*history, *_tool_round(6)])).input
+
+        assert first == history
+        assert first[anchor]["call_id"] == "c5"
+        assert first[: anchor + 1] == second[: anchor + 1]
+
+    def test_every_ladder_rung_keeps_the_whole_answer_and_ends_within_budget(self) -> None:
+        frame = pending_screenshot_message(make_copilot_ctx(pending_screenshots=[captured_frame_entry()]))
+        turn = _scouting_turn()
+        items = [
+            turn[0],
+            frame,
+            *turn[1:7],
+            frame,
+            *turn[7:],
+            {"type": "function_call", "call_id": "call-big", "name": "run_browser_code", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call-big", "output": "Plan text. " * 800},
+            {"type": "reasoning", "summary": []},
+        ]
+        ctx = make_copilot_ctx(supports_vision=True)
+        resolved_at: set[str] = set()
+        pruned = False
+
+        for budget in range(estimate_tokens(items), 0, -100):
+            with capture_logs() as logs:
+                result = make_copilot_call_model_input_filter(token_budget=budget)(_mk_input_data(items, context=ctx))
+            events = {entry["event"] for entry in logs}
+            sent = [it for it in result.input if it.get("call_id") == "call-ask"]
+            assert [it["type"] for it in sent] == ["function_call", "function_call_output"]
+            assert sent[1]["output"] == _resolved_ask_user_output()
+            if "Aggressive prune needed" in events:
+                pruned = True
+                break
+            resolved_at |= events & _LADDER_RUNG_EVENTS
+            assert estimate_tokens(result.input) <= budget
+
+        assert pruned and resolved_at == _LADDER_RUNG_EVENTS
+
+    def test_an_answer_in_an_unread_batch_over_budget_is_never_deferred(self) -> None:
+        batch = _unread_run_results_batch()
+        batch[5] = {"type": "function_call", "call_id": "call-ask", "name": "ask_user", "arguments": "{}"}
+        batch[-1] = {"type": "function_call_output", "call_id": "call-ask", "output": _resolved_ask_user_output()}
+        items = [{"role": "user", "content": "please build me a workflow"}, *batch]
+
+        result = make_copilot_call_model_input_filter(token_budget=estimate_tokens(items) - 100)(_mk_input_data(items))
+
+        sent = {it["call_id"]: it["output"] for it in result.input if it.get("type") == "function_call_output"}
+        assert sent["call-ask"] == _resolved_ask_user_output()
+        assert "already_ran" in sent["call_3"]
 
     def test_filter_keeps_every_unread_output_of_a_parallel_batch_whole(self) -> None:
         batch = _unread_run_results_batch()
@@ -203,9 +449,6 @@ class TestFirstTurnCompaction:
         assert json.loads(sent[1])["already_ran"] is True
 
     def test_recent_code_sized_output_survives_session_compaction(self) -> None:
-        from skyvern.forge.sdk.copilot.enforcement import _RECENT_TOOL_OUTPUT_CHAR_CAP
-        from skyvern.forge.sdk.copilot.session_factory import copilot_call_model_input_filter
-
         code_sized = json.dumps({"ok": True, "data": {"code": "await page.click()\n" * 400}})
         assert 2000 < len(code_sized) < _RECENT_TOOL_OUTPUT_CHAR_CAP
         items: list[dict[str, Any]] = [
@@ -217,21 +460,16 @@ class TestFirstTurnCompaction:
         assert outputs[0]["output"] == code_sized
 
     def test_recent_overcap_output_truncates_and_warns_on_session_path(self) -> None:
-        import structlog.testing
-
-        from skyvern.forge.sdk.copilot.enforcement import _RECENT_TOOL_OUTPUT_CHAR_CAP
-        from skyvern.forge.sdk.copilot.session_factory import copilot_call_model_input_filter
-
         oversized = "x" * (_RECENT_TOOL_OUTPUT_CHAR_CAP + 1000)
         items: list[dict[str, Any]] = [
             {"role": "user", "content": "please build me a workflow"},
             {"type": "function_call", "call_id": "call-big", "name": "get_run_results", "arguments": "{}"},
             {"type": "function_call_output", "call_id": "call-big", "output": oversized},
         ]
-        with structlog.testing.capture_logs() as logs:
+        with capture_logs() as logs:
             result = copilot_call_model_input_filter(_mk_input_data(items))
         outputs = [it for it in result.input if it.get("type") == "function_call_output"]
-        assert outputs[0]["output"].endswith("... [truncated]")
+        assert outputs[0]["output"].endswith(_TOOL_OUTPUT_HEAD_TRUNCATION_SUFFIX)
         truncated = [entry for entry in logs if entry["event"] == "copilot_recent_tool_output_truncated"]
         assert [entry["tool_name"] for entry in truncated] == [["get_run_results"]]
 
@@ -300,81 +538,6 @@ class TestFirstTurnCompaction:
         outputs = [it for it in result.input if it.get("type") == "function_call_output"]
         assert 2000 <= len(outputs[0]["output"]) <= 2020
 
-    def test_filter_summarizes_older_function_call_args_on_first_turn(self) -> None:
-        """F3/CORR-2 guard: older `function_call` items get their bulky
-        ``arguments`` payload (e.g. a full workflow YAML) compacted, exactly
-        as ``_prune_input_list`` does today in the non-session path."""
-        from skyvern.forge.sdk.copilot.session_factory import copilot_call_model_input_filter
-
-        huge_yaml = "title: workflow\n" + ("  block: xxxxxxxxxxxxxxxxxxxx\n" * 500)
-        items: list[dict[str, Any]] = [
-            {"role": "user", "content": "build a workflow"},
-            # six function_call items; the last 3 stay raw, older 3 get summarized.
-            *(
-                {
-                    "type": "function_call",
-                    "name": "update_workflow",
-                    "call_id": f"fc-{i}",
-                    "arguments": json.dumps({"workflow_yaml": huge_yaml}),
-                }
-                for i in range(6)
-            ),
-        ]
-        result = copilot_call_model_input_filter(_mk_input_data(items))
-        calls = [it for it in result.input if it.get("type") == "function_call"]
-        assert len(calls) == 6
-        older_three = calls[:3]
-        recent_three = calls[3:]
-        for older in older_three:
-            assert "_summarized" in older["arguments"]
-            assert len(older["arguments"]) < len(huge_yaml)
-        for recent in recent_three:
-            assert "_summarized" not in recent["arguments"]
-            assert json.loads(recent["arguments"])["workflow_yaml"] == huge_yaml
-
-    def test_filter_keeps_ask_user_answers_behind_newer_tool_outputs(self) -> None:
-        interaction = QuestionInteraction(
-            interaction_id="q-1",
-            turn_id="turn-1",
-            tool_call_id="call-ask",
-            parts=[
-                QuestionPart(
-                    part_id="p-1",
-                    prompt="Which report should the workflow retrieve, and for what date range? "
-                    "Please also provide the dashboard URL if you have it.",
-                    choices=[
-                        QuestionChoice(choice_id="c-7", text="Last 7 days"),
-                        QuestionChoice(choice_id="c-30", text="Last 30 days"),
-                    ],
-                )
-            ],
-            status="resolved",
-            response=QuestionResponse(
-                answers=[QuestionAnswer(part_id="p-1", choice_id="c-30")],
-                text="https://ads.example.com/account/123/dashboard",
-            ),
-        )
-        page_result = json.dumps({"ok": True, "data": {"url": "https://ads.example.com", "body": "x" * 400}})
-        items: list[dict[str, Any]] = [
-            {"role": "user", "content": "fetch my ad data"},
-            {"type": "function_call", "name": "ask_user", "call_id": "call-ask", "arguments": "{}"},
-            {"type": "function_call_output", "call_id": "call-ask", "output": json.dumps(interaction.tool_result())},
-        ]
-        for i in range(3):
-            items.append(
-                {"type": "function_call", "name": "navigate_browser", "call_id": f"call-{i}", "arguments": "{}"}
-            )
-            items.append({"type": "function_call_output", "call_id": f"call-{i}", "output": page_result})
-
-        result = copilot_call_model_input_filter(_mk_input_data(items))
-
-        answer = next(
-            it for it in result.input if it.get("type") == "function_call_output" and it["call_id"] == "call-ask"
-        )
-        delivered = json.loads(answer["output"])
-        assert delivered["text"] == "https://ads.example.com/account/123/dashboard"
-        assert delivered["parts"][0]["choice"]["text"] == "Last 30 days"
-
 
 class TestSessionInputCallback:
     def test_empty_history_returns_new_items(self) -> None:
@@ -421,12 +584,7 @@ class TestSessionInputCallback:
 
         assert combined[1] == generic
 
-    def test_preserves_original_goal_and_applies_compaction_to_middle(self) -> None:
-        """First-turn shape (one real user, several tool iterations): the
-        goal at index 0 is preserved; older function_call_output items get
-        compacted; the last KEEP_RECENT_TOOL_OUTPUTS stay raw."""
-        from skyvern.forge.sdk.copilot.session_factory import copilot_session_input_callback
-
+    def test_merge_passes_older_tool_outputs_through_whole(self) -> None:
         goal = {"role": "user", "content": "please build me a workflow"}
         tool_items = [
             item
@@ -443,14 +601,8 @@ class TestSessionInputCallback:
         new = [{"role": "user", "content": "[copilot:nudge] please finish"}]
 
         combined = copilot_session_input_callback([goal, *tool_items], new)
-        assert combined[0] == goal
-        # older items (first 2 of 5) compact; last 3 stay raw.
-        tool_outputs_in_combined = [it for it in combined if it.get("type") == "function_call_output"]
-        assert len(tool_outputs_in_combined) == 5
-        assert "_summarized" in tool_outputs_in_combined[0]["output"]
-        assert "_summarized" in tool_outputs_in_combined[1]["output"]
-        for recent in tool_outputs_in_combined[2:]:
-            assert "_summarized" not in recent["output"]
+
+        assert combined == [goal, *tool_items, *new]
 
     def test_unread_batch_at_the_end_of_the_middle_is_not_summarized(self) -> None:
         goal = {"role": "user", "content": "please build me a workflow"}
@@ -545,6 +697,7 @@ class TestModelInputCapture:
         assert payload["instructions"] == "SYSTEM PROMPT"
         assert payload["input"] == items
         assert payload["capture_case_id"] == "ask_or_build"
+        assert payload["token_budget"] == TOKEN_BUDGET
         # A context the derivation helper cannot read must not cost the run its model call.
         assert payload["requested_output_paths"] == []
         assert payload["tool_surface"] == {
@@ -785,6 +938,72 @@ class TestStagedScreenshotBinding:
             assert [sent_image_px(item) for item in result.input] == [[], [], [], [], [new_frame_px]]
             assert result.input[2:4] == items[2:4]
 
+    def test_over_budget_the_sharp_frame_is_weighed_against_the_summarized_input(self) -> None:
+        items: list[dict[str, Any]] = [{"role": "user", "content": "what does the page say"}]
+        for i in range(6):
+            items += [
+                {"type": "function_call", "call_id": f"read-{i}", "name": "get_run_results", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": f"read-{i}", "output": json.dumps({"v": f"{i} " * 4000})},
+                {"type": "reasoning", "summary": []},
+            ]
+        sharp = pending_screenshot_message(make_copilot_ctx(pending_screenshots=[captured_frame_entry()]), sharp=True)
+        budget = estimate_tokens([*_summarize_older_tool_items(items), sharp])
+        assert estimate_tokens(items) > budget
+
+        ctx = make_copilot_ctx(pending_screenshots=[captured_frame_entry()])
+        result = make_copilot_call_model_input_filter(token_budget=budget)(_mk_input_data(items, context=ctx))
+
+        assert estimate_tokens(result.input) <= budget
+        assert sent_image_px(result.input[-1]) == [(1600, 789)]
+
+    def test_the_sharp_frame_never_costs_whole_tool_outputs(self) -> None:
+        older_frame = pending_screenshot_message(make_copilot_ctx(pending_screenshots=[captured_frame_entry()]))
+        items: list[dict[str, Any]] = [{"role": "user", "content": "what does the page say"}, older_frame]
+        for i in range(6):
+            items += [
+                {"type": "function_call", "call_id": f"read-{i}", "name": "get_run_results", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": f"read-{i}", "output": json.dumps({"v": f"{i} " * 1500})},
+            ]
+        frame_ctx = make_copilot_ctx(pending_screenshots=[captured_frame_entry()])
+        small, sharp = pending_screenshot_message(frame_ctx), pending_screenshot_message(frame_ctx, sharp=True)
+        whole_with_small = estimate_tokens([*items, small])
+        sharp_if_older_dropped = estimate_tokens(_drop_older_screenshots([*items, sharp]))
+        assert whole_with_small <= sharp_if_older_dropped < estimate_tokens([*items, sharp])
+
+        def call(token_budget: int) -> ModelInputData:
+            ctx = make_copilot_ctx(pending_screenshots=[captured_frame_entry()])
+            return make_copilot_call_model_input_filter(token_budget=token_budget)(_mk_input_data(items, context=ctx))
+
+        fits_whole_with_small = call(sharp_if_older_dropped)
+        assert sent_image_px(fits_whole_with_small.input[-1]) == [(1024, 505)]
+        assert "_summarized" not in json.dumps(fits_whole_with_small.input)
+        assert TOOL_WINDOW_SUMMARIZED.get() is False
+
+        summarized_budget = estimate_tokens(_drop_older_screenshots([*_summarize_older_tool_items(items), sharp]))
+        assert summarized_budget < whole_with_small
+        over_either_way = call(summarized_budget)
+        assert sent_image_px(over_either_way.input[-1]) == [(1600, 789)]
+        assert estimate_tokens(over_either_way.input) <= summarized_budget
+
+    def test_the_sharp_frame_never_costs_chat_history(self) -> None:
+        items: list[dict[str, Any]] = [{"role": "user", "content": "what does the page say"}]
+        for i in range(12):
+            items += [
+                {"role": "user", "content": f"note {i}: " + "detail " * 80},
+                {"role": "assistant", "content": f"noted {i}"},
+            ]
+        frame_ctx = make_copilot_ctx(pending_screenshots=[captured_frame_entry()])
+        small, sharp = pending_screenshot_message(frame_ctx), pending_screenshot_message(frame_ctx, sharp=True)
+        budget = estimate_tokens([*items, small])
+        assert estimate_tokens([*items, sharp]) > budget
+        assert estimate_tokens(_filter_to_budget([*items, sharp], None, token_budget=budget).input) <= budget
+
+        ctx = make_copilot_ctx(pending_screenshots=[captured_frame_entry()])
+        result = make_copilot_call_model_input_filter(token_budget=budget)(_mk_input_data(items, context=ctx))
+
+        assert sent_image_px(result.input[-1]) == [(1024, 505)]
+        assert result.input[:-1] == items
+
     def test_attached_images_do_not_cost_the_pending_frame_its_sharp_copy(self) -> None:
         jpeg = BytesIO()
         Image.new("RGB", (1600, 1200), "white").save(jpeg, format="JPEG")
@@ -1024,7 +1243,7 @@ def _skill_session_history() -> tuple[list[dict[str, Any]], list[dict[str, Any]]
 def test_a_loaded_skill_outside_the_recent_outputs_is_sent_byte_identical() -> None:
     items, skill, read_output = _skill_session_history()
 
-    result = copilot_call_model_input_filter(_mk_input_data(items))
+    result = make_copilot_call_model_input_filter(token_budget=estimate_tokens(items) - 1)(_mk_input_data(items))
 
     outputs = {it["call_id"]: it["output"] for it in result.input if it.get("type") == "function_call_output"}
     assert outputs["call_skill"] == skill[2]["output"]
