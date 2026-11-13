@@ -444,7 +444,7 @@ from skyvern.utils.url_validators import (
 )
 from skyvern.webeye import dialog_handler
 from skyvern.webeye.actions.action_types import ActionType
-from skyvern.webeye.actions.actions import Action, ActionStatus, KeypressAction
+from skyvern.webeye.actions.actions import Action, ActionStatus, GotoUrlAction, KeypressAction, WebAction
 from skyvern.webeye.browser_artifacts import DownloadBinding
 from skyvern.webeye.browser_driver_errors import is_driver_error
 from skyvern.webeye.browser_engine import is_any_engine_error
@@ -5914,17 +5914,40 @@ def _withhold_typed_keys(action: Action, description: str) -> str:
     return description
 
 
+_CALL_METHOD = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+")
+
+
+def _call_shape(action: Action) -> str:
+    """A call as the recovery sees it: the method, the target selector, and a URL's scheme, host and path.
+    The argument is never read: the recorder appends it to the description, and credentials arrive encoded in it."""
+    description = action.description or ""
+    head = description.split(" ", 1)[0]
+    method = head if _CALL_METHOD.fullmatch(head) else action.action_type.value
+    if isinstance(action, GotoUrlAction):
+        try:
+            url = urlsplit(action.url)
+            port = f":{url.port}" if url.port else ""
+        except ValueError:
+            return method
+        return f"{method} {url.scheme}://{url.hostname}{port}{url.path}" if url.scheme and url.hostname else method
+    if isinstance(action, KeypressAction):
+        return _withhold_typed_keys(action, description)
+    if isinstance(action, WebAction) and action.element_id:
+        return f"{method} {action.element_id}"
+    return method
+
+
 def _base64_alignments(secret: str) -> set[str]:
     """The base64 runs a secret produces inside a longer encoded string, whichever byte offset it starts at.
-    Unfloored like the plain screen, so a short secret fails closed."""
+    A one-character run is skipped because it matches most selectors, so a one-byte secret is not found this way."""
     raw = secret.encode()
     runs: set[str] = set()
     for offset, leading_mixed_chars in ((0, 0), (1, 2), (2, 3)):
         encoded = base64.b64encode(b"\0" * offset + raw).decode()
-        # The last character mixes in padding bits, so only the characters before it are the same inside a longer string.
+        # The last character mixes in padding bits, so only the characters before it repeat inside a longer string.
         run = encoded.rstrip("=")[:-1] if encoded.endswith("=") else encoded
         run = run[leading_mixed_chars:]
-        if run:
+        if len(run) >= 2:
             runs.update((run, run.replace("+", "-").replace("/", "_")))
     return runs
 
@@ -8649,28 +8672,28 @@ async def wrapper({default_args}):
         redaction_parameters: dict[str, Any],
     ) -> tuple[CodeExecutedCall, ...]:
         secrets = self._secret_screen_forms(workflow_run_context)
+        link_secrets = {secret for secret in secrets if len(secret) >= MIN_SECRET_LENGTH}
         for secret in self._registered_secret_values(workflow_run_context):
             secrets |= _base64_alignments(secret)
         calls: list[CodeExecutedCall] = []
         for action in recorded_actions:
-            raw = action.description or ""
-            decoded_forms = (raw, unquote(raw), unquote_plus(raw))
-            # The recorder cuts a call's argument before anything masks it, so a secret split at the cut survives
-            # masking as a prefix at the end of the description.
-            if any(secret in text for text in decoded_forms for secret in secrets) or any(
-                raw.endswith(secret[:length])
-                for secret in secrets
-                for length in range(MIN_SECRET_LENGTH, min(len(secret), len(raw) + 1))
-            ):
+            shape = _call_shape(action)
+            # The shape drops a URL's query and fragment, so a registered link whose token sits in the path is whole
+            # only in the original URL.
+            original = (
+                (action.url, unquote(action.url), unquote_plus(action.url)) if isinstance(action, GotoUrlAction) else ()
+            )
+            if any(
+                secret in form for form in (shape, unquote(shape), unquote_plus(shape)) for secret in secrets
+            ) or any(secret in form for form in original for secret in link_secrets):
                 description: object = _WITHHELD_CALL_DESCRIPTION
             else:
                 redacted = redact_recorded_action_payload(
-                    action.model_dump(mode="json", warnings=False), workflow_run_context, redaction_parameters
+                    {"description": shape}, workflow_run_context, redaction_parameters
                 )
                 description = redacted.get("description")
             if not isinstance(description, str) or not description:
                 description = _WITHHELD_CALL_DESCRIPTION
-            description = _withhold_typed_keys(action, description)
             line = action.output.get("code_line") if isinstance(action.output, dict) else None
             calls.append(
                 CodeExecutedCall(
