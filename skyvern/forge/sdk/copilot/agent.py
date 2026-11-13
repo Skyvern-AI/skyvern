@@ -40,6 +40,7 @@ from pydantic import JsonValue, TypeAdapter, ValidationError
 from skyvern.exceptions import NO_ADDRESS_RECORD_NAV_ERROR_MARKER
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.agents.skills import LOAD_SKILL_TOOL_NAME, SkillSession
 from skyvern.forge.sdk.copilot.agent_naming import schedule_agent_naming
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
@@ -287,6 +288,7 @@ from skyvern.forge.sdk.copilot.tools.scouting import (
     hydrate_prior_carried_trajectory,
     read_page_state_on_page,
 )
+from skyvern.forge.sdk.copilot.tools.skills import render_skills_catalog
 from skyvern.forge.sdk.copilot.tools.workflow_update import (
     CANONICAL_WORKFLOW_UNAVAILABLE_ERROR,
     CopilotCanonicalWorkflowUnavailableError,
@@ -1671,6 +1673,24 @@ def _reusable_origin_inputs_text(workflow_run_id: str | None, keys: list[str]) -
     )
 
 
+async def _copilot_skill_session(ctx: CopilotContext) -> SkillSession:
+    skills = (
+        []
+        if ctx.turn_origin == TurnOrigin.code_block_ai_fallback
+        else await app.AGENT_FUNCTION.agent_skills(
+            organization_id=ctx.organization_id,
+            workflow_permanent_id=ctx.workflow_permanent_id,
+            agent="copilot",
+        )
+    )
+    return SkillSession(
+        skills,
+        agent="copilot",
+        organization_id=ctx.organization_id,
+        workflow_copilot_chat_id=ctx.workflow_copilot_chat_id,
+    )
+
+
 def _build_user_context(
     workflow_yaml: str,
     chat_history_text: str,
@@ -1682,6 +1702,7 @@ def _build_user_context(
     user_goal_summary: str = "",
     attached_files_summary: str = "",
     scope_check: str = "",
+    skills_catalog: str = "",
 ) -> str:
     """Render untrusted context into the user message with code fencing.
 
@@ -1707,6 +1728,7 @@ def _build_user_context(
         attached_files_summary=escape_code_fences(redact_raw_secrets_for_prompt(attached_files_summary or "")),
         video_attachment_formats="/".join(VIDEO_ATTACHMENT_FORMAT_NAMES.values()),
         scope_check=scope_check,
+        skills_catalog=escape_code_fences(skills_catalog),
     )
 
 
@@ -5785,6 +5807,7 @@ async def _run_copilot_turn_impl(
         organization_id=organization_id,
         workflow_permanent_id=chat_request.workflow_permanent_id,
     )
+    ctx.skill_session = await _copilot_skill_session(ctx)
     surface = resolve_copilot_tool_surface(
         mode=eval_mode,
         native_tools=copilot_native_tools(
@@ -5802,6 +5825,7 @@ async def _run_copilot_turn_impl(
             run_tools_available=surface_runs_blocks(
                 mode=eval_mode, browser_tools_available=copilot_config.browser_tools_available
             ),
+            skills_available=bool(ctx.skill_session.catalog_lines()),
         ),
         alias_map=alias_map,
         overlays=overlays,
@@ -5903,6 +5927,9 @@ async def _run_copilot_turn_impl(
         user_goal_summary=user_goal_summary,
         attached_files_summary=attached_files_summary,
         scope_check=copilot_config.scope_check,
+        skills_catalog=(
+            render_skills_catalog(ctx.skill_session) if LOAD_SKILL_TOOL_NAME in surface.ordered_native_names else ""
+        ),
     )
     initial_input: str | list[dict[str, Any]] = user_message
     if video_attachment_message is not None or image_attachment_message is not None or direct_test_handoff is not None:

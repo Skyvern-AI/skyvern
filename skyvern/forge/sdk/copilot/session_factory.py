@@ -38,6 +38,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _summarize_tool_arguments,
     _summarize_tool_output,
     aggressive_prune,
+    aggressive_prune_skill_pairs,
     estimate_tokens,
     is_attached_image_message,
     is_paired_observation_message,
@@ -46,6 +47,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     log_recent_tool_output_truncation,
     pending_screenshot_entry,
     pending_screenshot_message,
+    skill_output_indices,
     unread_tool_output_indices,
 )
 from skyvern.forge.sdk.copilot.model_input_capture import (
@@ -68,7 +70,8 @@ TOOL_OUTPUT_TRUNCATE_EMERGENCY = 300
 
 
 def _emergency_truncate_all(items: list[Any], cap: int) -> list[Any]:
-    truncated_items = [_truncate_tool_output(item, cap) for item in items]
+    kept = skill_output_indices(items)
+    truncated_items = [item if i in kept else _truncate_tool_output(item, cap) for i, item in enumerate(items)]
     truncated = {i for i, (old, new) in enumerate(zip(items, truncated_items)) if new is not old}
     if truncated:
         LOG.warning(
@@ -89,17 +92,22 @@ _DEFERRED_ARGUMENTS_MAX_CHARS = 2_000
 
 
 def _defer_unread_outputs_over_budget(items: list[Any], token_budget: int) -> tuple[list[Any], list[str]]:
-    """Swap the latest unread outputs for a notice that the call ran until the input fits; the first stays whole."""
+    """Swap the latest unread outputs for a notice that the call ran until the input fits; one stays whole."""
     calls = {
         get_agent_message_field(item, "call_id"): item
         for item in items
         if get_agent_message_field(item, "type") == "function_call"
     }
     unread = sorted(unread_tool_output_indices(items))
+    skill_indices = skill_output_indices(items)
+    # A loaded skill is never deferred and already gives the batch one whole result, so every other output may go.
+    keep_whole = 0 if skill_indices.intersection(unread) else 1
     items = list(items)
     deferred: list[str] = []
-    while len(unread) > 1 and estimate_tokens(items) > token_budget:
+    while len(unread) > keep_whole and estimate_tokens(items) > token_budget:
         index = unread.pop()
+        if index in skill_indices:
+            continue
         call = calls.get(get_agent_message_field(items[index], "call_id"))
         tool_name = get_agent_message_field(call, "name") if call is not None else None
         arguments = get_agent_message_field(call, "arguments") if call is not None else None
@@ -123,7 +131,7 @@ def _defer_unread_outputs_over_budget(items: list[Any], token_budget: int) -> tu
 def _compact_tool_items(items: list[Any]) -> list[Any]:
     return compact_agent_messages_for_llm(
         items,
-        keep_whole_output_indices=unread_tool_output_indices(items),
+        keep_whole_output_indices=unread_tool_output_indices(items) | skill_output_indices(items),
         keep_recent_tool_outputs=KEEP_RECENT_TOOL_OUTPUTS,
         max_recent_tool_output_chars=_RECENT_TOOL_OUTPUT_CHAR_CAP,
         summarize_tool_output=_summarize_tool_output,
@@ -391,8 +399,8 @@ def _filter_to_budget(items: list[Any], instructions: str | None, *, token_budge
        KEEP_RECENT_TOOL_OUTPUTS rule (mirrors ``enforcement._prune_input_list``).
     2. If still over budget: drop all screenshots except the most recent, then attached images,
        then replace the latest unread outputs that do not fit with a notice that the call ran.
-    3. If still over budget: truncate ALL tool outputs — first to 2000 chars,
-       then to 300 only if the softer pass was not enough.
+    3. If still over budget: truncate every tool output except loaded skill bodies — first to 2000 chars,
+       then to 300 only if the softer pass was not enough. Every layer keeps loaded skill bodies whole.
     4. If still over budget: aggressive prune as last resort, keeping the most recent screenshot unless
        it predates every step the prune keeps.
     """
@@ -476,12 +484,16 @@ def _filter_to_budget(items: list[Any], instructions: str | None, *, token_budge
         and get_agent_message_field(item, "type") == "function_call"
     }
     frame = next((item for item in reversed(items[1:]) if _screenshot_with_image(item)), None)
+    reinserted_skill_items = {id(item) for item in aggressive_prune_skill_pairs(items)}
     pruned = aggressive_prune(items)
     # The prune drops every screenshot and appends a re-take note, or keeps an earlier note instead of adding one.
     # A frame newer than the oldest kept step goes back in its input position without any note older than it; an
     # older frame stays dropped because the steps taken after it were cut.
     position = {id(item): index for index, item in enumerate(items)}
-    oldest_kept = next((position[id(item)] for item in pruned[1:] if id(item) in position), None)
+    oldest_kept = next(
+        (position[id(item)] for item in pruned[1:] if id(item) in position and id(item) not in reinserted_skill_items),
+        None,
+    )
     if frame is not None and (oldest_kept is None or position[id(frame)] > oldest_kept):
         retake_note = NUDGE_SENTINEL + SCREENSHOT_DROPPED_NUDGE
         pruned = sorted(

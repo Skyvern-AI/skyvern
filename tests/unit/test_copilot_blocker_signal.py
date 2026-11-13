@@ -315,3 +315,16 @@ def test_inline_sequential_credential_fence_relays_an_id_free_reason() -> None:
         assert_clean_user_facing_text(text)
 
     assert "wr_1234567890" in result["error"]
+
+
+@pytest.mark.parametrize(
+    ("text", "leaks"),
+    [
+        ("Click download_skills to export the list", False),
+        ("Open the preload_skill_resources page", False),
+        ("Call load_skill next", True),
+        ("Then read_skill_resource for the form", True),
+    ],
+)
+def test_skill_tool_names_count_as_leaks_only_as_whole_identifiers(text: str, leaks: bool) -> None:
+    assert contains_internal_machinery_leak(text) is leaks

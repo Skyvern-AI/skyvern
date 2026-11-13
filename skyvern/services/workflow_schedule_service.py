@@ -98,6 +98,64 @@ async def one_time_dispatch_outcome(claimed: WorkflowSchedule, workflow_run_id: 
     await _record_one_time_dispatch(claimed, workflow_run_id, succeeded=True)
 
 
+EMPTY_WORKFLOW_SCHEDULED_RUN_FAILURE_REASON = (
+    "This workflow has no blocks, so the scheduled run had nothing to do. Add at least one block to the workflow "
+    "and check the schedule before its next fire."
+)
+
+
+async def pause_schedule_after_refused_fire(schedule: WorkflowSchedule, reason: str) -> bool:
+    """Pause a recurring schedule whose fire was refused for a state only the customer can fix.
+
+    A refusal that happens before the run exists leaves the schedule firing forever, so this stops the
+    fires until the customer resumes it. Only the execution backend actually stops a fire, so a backend
+    failure rolls the row back rather than leaving a schedule the dashboard calls paused and that keeps
+    running; the next fire retries the pause. A one-time schedule cannot be disabled and has no later
+    fire, so it is left to its dispatch outcome.
+    """
+    if schedule.is_one_time:
+        return False
+    paused = await app.DATABASE.schedules.update_workflow_schedule_enabled(
+        workflow_schedule_id=schedule.workflow_schedule_id,
+        organization_id=schedule.organization_id,
+        enabled=False,
+    )
+    if paused is None:
+        return False
+    backend_schedule_id = schedule.backend_schedule_id
+    try:
+        backend_schedule_id = backend_schedule_id or app.AGENT_FUNCTION.build_workflow_schedule_id(
+            schedule.workflow_schedule_id
+        )
+        if backend_schedule_id is None:
+            raise RuntimeError("Cannot determine backend schedule ID")
+        await app.AGENT_FUNCTION.set_workflow_schedule_enabled(backend_schedule_id, False)
+    except (Exception, asyncio.CancelledError) as exc:
+        LOG.warning(
+            "Could not pause the execution backend schedule after a refused fire; restoring its enabled state",
+            workflow_schedule_id=schedule.workflow_schedule_id,
+            organization_id=schedule.organization_id,
+            backend_schedule_id=backend_schedule_id,
+            exc_info=True,
+        )
+        await app.DATABASE.schedules.update_workflow_schedule_enabled(
+            workflow_schedule_id=schedule.workflow_schedule_id,
+            organization_id=schedule.organization_id,
+            enabled=schedule.enabled,
+        )
+        if isinstance(exc, asyncio.CancelledError):
+            raise
+        return False
+    LOG.warning(
+        "Paused a workflow schedule after a refused fire",
+        workflow_schedule_id=schedule.workflow_schedule_id,
+        organization_id=schedule.organization_id,
+        workflow_permanent_id=schedule.workflow_permanent_id,
+        reason=reason,
+    )
+    return True
+
+
 class LocalWorkflowScheduleScheduler:
     def __init__(self, *, poll_interval_seconds: float, max_concurrent_runs: int) -> None:
         self.poll_interval_seconds = poll_interval_seconds

@@ -17,6 +17,12 @@ from pydantic import JsonValue
 
 from skyvern.forge.failure_classifier import without_output_only_labels
 from skyvern.forge.sdk.agents.context import sanitize_agent_tool_result_for_llm as sanitize_generic_tool_result_for_llm
+from skyvern.forge.sdk.agents.skills import (
+    EVERYONE_SKILL_LABEL,
+    LOAD_SKILL_TOOL_NAME,
+    READ_SKILL_RESOURCE_TOOL_NAME,
+    SKILL_TOOL_NAMES,
+)
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, assert_clean_user_facing_text
 from skyvern.forge.sdk.copilot.build_test_connect_failure import BuildTestConnectFailure
 from skyvern.forge.sdk.copilot.build_test_outcome import (
@@ -2236,6 +2242,30 @@ _TRIGGER_MAPPING_REASON_LABELS: dict[TriggerMappingReasonCode, str] = {
 }
 
 
+_SKILL_FAILURE_TEXT = {
+    LOAD_SKILL_TOOL_NAME: "Could not load that skill",
+    READ_SKILL_RESOURCE_TOOL_NAME: "Could not read that skill file",
+}
+
+
+def _skill_result_summary(tool_name: str, result: dict[str, Any]) -> str:
+    """Names a skill only when it belongs to the organization or workflow; never shows its body or file text."""
+    if not result.get("ok", False):
+        return _SKILL_FAILURE_TEXT[tool_name]
+    data = _result_data(result)
+    if data.get("owner") not in ("organization", "workflow"):
+        if tool_name == READ_SKILL_RESOURCE_TOOL_NAME:
+            return f"Read a file from {EVERYONE_SKILL_LABEL}"
+        loaded = "Already loaded" if data.get("status") == "already_loaded" else "Loaded"
+        return f"{loaded} {EVERYONE_SKILL_LABEL}"
+    label = f"skill {sanitize_block_label_for_display(str(data.get('name')), max_chars=64)}"
+    if tool_name == READ_SKILL_RESOURCE_TOOL_NAME:
+        return f"Read {sanitize_block_label_for_display(str(data.get('path')), max_chars=80)} from {label}"
+    if data.get("status") == "already_loaded":
+        return f"Already loaded {label}"
+    return f"Loaded {label}"
+
+
 def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display: bool = False) -> str:
     """Summarize a tool result. ``for_display`` clamps LLM-authored block labels for
     the activity feed; the default leaves them verbatim because this string is parsed
@@ -2246,6 +2276,8 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
 
     if _is_unconfirmed_extension(result):
         return "Requested more browser session time; not confirmed and not retried"
+    if tool_name in SKILL_TOOL_NAMES:
+        return _skill_result_summary(tool_name, result)
     if not result.get("ok", False):
         message = _extract_failure_message(result)
         reason = _result_data(result).get("reason")
@@ -2454,6 +2486,8 @@ def summarize_tool_result_detail(
         return None
     if tool_name == "read_chat_history":
         return _USER_FACING_CHAT_HISTORY_FAILURE
+    if tool_name in _SKILL_FAILURE_TEXT:
+        return _SKILL_FAILURE_TEXT[tool_name]
     structured = _structured_failure_summary_for_user(result, blocker_signal=blocker_signal, blocked_tool=tool_name)
     if structured is not None:
         return structured
@@ -2542,6 +2576,8 @@ def format_tool_result_for_user(
     if not result.get("ok", False):
         if tool_name == "read_chat_history":
             return _USER_FACING_CHAT_HISTORY_FAILURE
+        if tool_name in _SKILL_FAILURE_TEXT:
+            return _SKILL_FAILURE_TEXT[tool_name]
         structured = _structured_failure_summary_for_user(result, blocker_signal=blocker_signal, blocked_tool=tool_name)
         if structured is not None:
             return structured

@@ -55,7 +55,7 @@ from skyvern.forge.sdk.copilot.session_factory import (
 )
 from skyvern.forge.sdk.copilot.video_attachment import VideoAttachmentFrame, build_image_attachment_message
 from skyvern.forge.sdk.schemas.workflow_copilot import CopilotAttachedFile
-from tests.unit.copilot_test_helpers import captured_frame_entry, image_parts, make_copilot_ctx
+from tests.unit.copilot_test_helpers import captured_frame_entry, image_parts, load_skill_items, make_copilot_ctx
 from tests.unit.copilot_test_helpers import make_model_input_data as _mk_input_data
 from tests.unit.copilot_test_helpers import sent_image_px
 
@@ -904,6 +904,22 @@ class TestStagedScreenshotBinding:
         assert not any(image_parts(item) for item in without_frame.input)
         assert [item.get("content") for item in without_frame.input].count(retake_note) == 1
 
+    def test_last_resort_prune_drops_an_old_frame_even_when_an_older_skill_load_is_kept(self) -> None:
+        skill = load_skill_items("call_skill", "example-portal-login", "Tick it.\n" * 50)
+        items: list[dict[str, Any]] = [
+            {"role": "user", "content": "build me a workflow"},
+            *skill,
+            pending_screenshot_message(make_copilot_ctx(pending_screenshots=[captured_frame_entry()])),
+        ]
+        for i in range(12):
+            items.append({"type": "function_call", "call_id": f"call-{i}", "name": "observe", "arguments": "{}"})
+            items.append({"type": "function_call_output", "call_id": f"call-{i}", "output": "y" * 4000})
+
+        result = make_copilot_call_model_input_filter(1)(_mk_input_data(items, context=make_copilot_ctx()))
+
+        assert skill[2] in result.input
+        assert not any(image_parts(item) for item in result.input)
+
     def test_aggressive_prune_reports_omitted_demonstration_fact_packets(self) -> None:
         items: list[dict[str, Any]] = [{"role": "user", "content": "build the demonstrated workflow"}]
         for i in range(12):
@@ -985,3 +1001,76 @@ async def test_signature_only_claude_thinking_does_not_use_up_the_model_input_bu
     second_request = json.dumps(requests[1])
     assert json.dumps(page_text) in second_request
     assert signature not in second_request
+
+
+def _skill_session_history() -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
+    skill = load_skill_items("call_skill", "example-portal-login", "Tick 'Remember this device' first.\n" * 400)
+    read_output = json.dumps({"ok": True, "data": {"name": "example-portal-login", "path": "a.md", "text": "y" * 5000}})
+    items: list[dict[str, Any]] = [
+        {"role": "user", "content": "please build me a workflow"},
+        *skill,
+        {"type": "function_call", "call_id": "call_read", "name": "read_skill_resource", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "call_read", "output": read_output},
+    ]
+    for index in range(6):
+        items += [
+            {"type": "function_call", "call_id": f"call_{index}", "name": "get_run_results", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": f"call_{index}", "output": "x" * 5000},
+        ]
+    items.append({"type": "reasoning", "summary": [{"type": "summary_text", "text": "Read them."}]})
+    return items, skill, read_output
+
+
+def test_a_loaded_skill_outside_the_recent_outputs_is_sent_byte_identical() -> None:
+    items, skill, read_output = _skill_session_history()
+
+    result = copilot_call_model_input_filter(_mk_input_data(items))
+
+    outputs = {it["call_id"]: it["output"] for it in result.input if it.get("type") == "function_call_output"}
+    assert outputs["call_skill"] == skill[2]["output"]
+    assert outputs["call_read"] != read_output
+
+
+def test_a_loaded_skill_survives_every_budget_rung_whole_and_paired() -> None:
+    items, skill, read_output = _skill_session_history()
+
+    with capture_logs() as logs:
+        result = make_copilot_call_model_input_filter(token_budget=200)(_mk_input_data(items))
+
+    assert {"copilot_tool_output_emergency_truncated", "copilot_aggressive_prune_pair_validity"} <= {
+        entry["event"] for entry in logs
+    }
+    sent = list(result.input)
+    skill_outputs = [it for it in sent if it.get("call_id") == "call_skill" and it["type"] == "function_call_output"]
+    assert [it["output"] for it in skill_outputs] == [skill[2]["output"]]
+    assert sent.index(skill[1]) < sent.index(skill_outputs[0])
+    assert read_output not in [it.get("output") for it in sent]
+    call_ids = [it["call_id"] for it in sent if it.get("type") == "function_call"]
+    assert len(call_ids) == len(set(call_ids))
+
+
+@pytest.mark.parametrize("skill_first", [True, False])
+def test_an_over_budget_batch_never_defers_a_loaded_skill_and_still_defers_its_sibling(skill_first: bool) -> None:
+    reasoning, skill_call, skill_output = load_skill_items("call_skill", "example-portal-login", "Tick it.\n" * 200)
+    run_call = {"type": "function_call", "call_id": "call_run", "name": "get_run_results", "arguments": "{}"}
+    run_output = {"type": "function_call_output", "call_id": "call_run", "output": json.dumps({"data": "x" * 8000})}
+    seen_call = {"type": "function_call", "call_id": "call_seen", "name": "get_run_results", "arguments": "{}"}
+    seen_output = {"type": "function_call_output", "call_id": "call_seen", "output": json.dumps({"data": "s" * 10_000})}
+    pairs = [(skill_call, skill_output), (run_call, run_output)]
+    if not skill_first:
+        pairs.reverse()
+    items = [
+        {"role": "user", "content": "please build me a workflow"},
+        seen_call,
+        seen_output,
+        reasoning,
+        *(call for call, _ in pairs),
+        *(output for _, output in pairs),
+    ]
+
+    result = make_copilot_call_model_input_filter(token_budget=estimate_tokens(items) - 100)(_mk_input_data(items))
+
+    sent = {it["call_id"]: it["output"] for it in result.input if it.get("type") == "function_call_output"}
+    assert sent["call_skill"] == skill_output["output"]
+    assert json.loads(sent["call_run"])["already_ran"] is True
+    assert sent["call_seen"] == seen_output["output"]
