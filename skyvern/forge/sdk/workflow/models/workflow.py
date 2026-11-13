@@ -35,6 +35,7 @@ from skyvern.forge.sdk.workflow.models.block import BlockTypeVar, ForLoopBlock, 
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, OutputParameter
 from skyvern.forge.sdk.workflow.models.run_limits import (
     WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES,
+    MaxScrapeScreenshots,
     MaxScreenshotScrolls,
     reject_bool_max_elapsed_time_minutes,
 )
@@ -73,6 +74,7 @@ class WorkflowRequestBody(BaseModel):
     browser_profile_id: str | None = None
     start_fresh_browser: bool = False
     reuse_browser_session: bool | None = None
+    max_scrape_screenshots: MaxScrapeScreenshots = None
     max_screenshot_scrolls: MaxScreenshotScrolls = Field(default=None)
     max_elapsed_time_minutes: int | None = Field(default=None, ge=1, le=WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES)
     extra_http_headers: dict[str, str] | None = None
@@ -394,6 +396,7 @@ class WorkflowRun(BaseModel):
     fallback_attempt: int | None = None
     parent_workflow_run_id: str | None = None
     workflow_title: str | None = None
+    max_scrape_screenshots: MaxScrapeScreenshots = None
     max_screenshot_scrolls: int | None = None
     max_elapsed_time_minutes: int | None = None
     browser_address: str | None = None
@@ -628,6 +631,7 @@ class WorkflowRunResponseBase(BaseModel):
     browser_profile_id: str | None = None
     browser_seed_source: BrowserSeedSource | None = None
     browser_sink_profile_id: str | None = None
+    max_scrape_screenshots: MaxScrapeScreenshots = None
     max_screenshot_scrolls: int | None = None
     browser_address: str | None = None
     run_with: str = "agent"

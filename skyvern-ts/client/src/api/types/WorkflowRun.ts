@@ -23,6 +23,8 @@ export interface WorkflowRun {
     parent_workflow_run_id?: string;
     workflow_title?: string;
     max_screenshot_scrolls?: number;
+    /** Maximum screenshots per scrape; omitted uses the server default. */
+    max_scrape_screenshots?: number;
     max_elapsed_time_minutes?: number;
     browser_address?: string;
     run_with?: string;

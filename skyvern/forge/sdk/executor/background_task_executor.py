@@ -789,6 +789,7 @@ class BackgroundTaskExecutor(AsyncExecutor):
             context.organization_id = organization_id
             context.max_steps_override = max_steps_override
             context.max_screenshot_scrolls = task.max_screenshot_scrolls
+            context.max_scrape_screenshots = task.max_scrape_screenshots
 
             await prepare_org_llm_runtime(app.DATABASE, organization_id, organization)
             await initialize_skyvern_state_file(task_id=task_id, organization_id=organization_id)

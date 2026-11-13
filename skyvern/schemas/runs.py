@@ -24,6 +24,7 @@ from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.workflow.models.run_limits import (
     WORKFLOW_RUN_DEFAULT_MAX_ELAPSED_TIME_MINUTES,
     WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES,
+    MaxScrapeScreenshots,
     MaxScreenshotScrolls,
     reject_bool_max_elapsed_time_minutes,
 )
@@ -314,6 +315,7 @@ class TaskRunRequest(BaseModel):
     include_action_history_in_verification: bool | None = Field(
         default=False, description="Whether to include action history when verifying that the task is complete"
     )
+    max_scrape_screenshots: MaxScrapeScreenshots = None
     max_screenshot_scrolls: MaxScreenshotScrolls = Field(
         default=None,
         description="The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.",
@@ -462,6 +464,7 @@ class WorkflowRunRequest(BaseModel):
             "the credential's saved login."
         ),
     )
+    max_scrape_screenshots: MaxScrapeScreenshots = None
     max_screenshot_scrolls: MaxScreenshotScrolls = Field(
         default=None,
         description="The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.",
@@ -752,6 +755,7 @@ class BaseRunResponse(BaseModel):
         description="ID of the browser profile used for this run",
         examples=["bp_123"],
     )
+    max_scrape_screenshots: MaxScrapeScreenshots = None
     max_screenshot_scrolls: int | None = Field(
         default=None,
         description="The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot",

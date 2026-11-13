@@ -96,6 +96,8 @@ export interface TaskRunRequestOutput {
     include_action_history_in_verification?: boolean;
     /** The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot. */
     max_screenshot_scrolls?: number;
+    /** Maximum screenshots per scrape; omitted uses the server default. */
+    max_scrape_screenshots?: number;
     /** The CDP address for the task. */
     browser_address?: string;
     /** Whether to run the task with agent or code. Null means use the default. */

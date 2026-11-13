@@ -390,6 +390,10 @@ async def scrape_website(
     :raises Exception: When scraping fails after maximum retries.
     """
 
+    context = skyvern_context.current()
+    if context is not None and context.max_scrape_screenshots is not None:
+        max_screenshot_number = min(max_screenshot_number, context.max_scrape_screenshots)
+
     async def scrape_once() -> ScrapedPage:
         return await scrape_web_unsafe(
             browser_state=browser_state,

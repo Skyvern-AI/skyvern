@@ -597,6 +597,14 @@ Set these in `.env` (or the backend secret on Kubernetes) and restart the server
 | `EXTENSIONS_BASE_PATH` | `./extensions` | Folder that holds unpacked Chrome extensions |
 | `EXTENSIONS` | `[]` | Extension folder names inside `EXTENSIONS_BASE_PATH` to load into every browser, as a JSON list: `EXTENSIONS='["my-extension"]'` |
 
+For an individual task or workflow run, pass `max_scrape_screenshots` in the API
+request or SDK call (for example, `max_scrape_screenshots=1` in Python). This caps
+screenshots on each scrape, including extraction refreshes. Omit it to keep the
+server's `MAX_NUM_SCREENSHOTS` default (10). The value must be a positive integer;
+it can lower the server or engine limit, but cannot raise it. It does not change
+`max_screenshot_scrolls` (post-action screenshots) or final artifact screenshots.
+Fewer screenshots reduce capture work but can reduce visual coverage of long pages.
+
 Match `BROWSER_LOCALE` and `BROWSER_TIMEZONE` to the region the site expects. A mismatch can trigger bot detection.
 
 | Region | `BROWSER_LOCALE` | `BROWSER_TIMEZONE` |

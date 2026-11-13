@@ -18201,6 +18201,7 @@ class TaskV2Block(Block):
                 totp_identifier=resolved_totp_identifier,
                 totp_verification_url=resolved_totp_verification_url,
                 max_screenshot_scrolling_times=workflow_run.max_screenshot_scrolls,
+                max_scrape_screenshots=workflow_run.max_scrape_screenshots,
                 workflow_system_prompt=self.workflow_system_prompt,
                 trigger_type=inherited_v2_trigger_type,
                 # Pin the child to the parent's remote browser (CDP address + the
