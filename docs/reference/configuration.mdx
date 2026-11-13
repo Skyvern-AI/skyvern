@@ -81,7 +81,7 @@ LLM_KEY=OPENAI_GPT5_5
 | `OPENAI_GPT5_4` | |
 | `OPENAI_GPT5` | |
 | `OPENAI_GPT5_MINI` | |
-| `OPENAI_GPT5_MINI_FLEX` | Flex service tier, 15min timeout |
+| `OPENAI_GPT5_MINI_FLEX` | Flex service tier, 180-second timeout per call |
 | `OPENAI_GPT5_NANO` | |
 | `OPENAI_GPT5_1` | |
 | `OPENAI_GPT5_2` | |
@@ -132,7 +132,7 @@ LLM_KEY=XAI_GROK_4_5
 # Override the default API endpoint
 XAI_API_BASE=https://api.x.ai/v1
 
-# Supported values: low, medium, high. Unset to use xAI's default.
+# Supported values: low, medium, high. Defaults to medium. Set it empty to use xAI's default.
 XAI_REASONING_EFFORT=medium
 ```
 
@@ -565,7 +565,7 @@ For fine-grained control, you can override models for specific operations:
 # Model for data extraction from pages (defaults to LLM_KEY if not set)
 EXTRACTION_LLM_KEY=ANTHROPIC_CLAUDE4.5_SONNET
 
-# Model for generating code/scripts in code blocks (defaults to LLM_KEY if not set)
+# Model a cached script uses to work out the values it types (defaults to SECONDARY_LLM_KEY, then LLM_KEY)
 SCRIPT_GENERATION_LLM_KEY=OPENAI_GPT5
 ```
 
@@ -590,7 +590,6 @@ Set these in `.env` (or the backend secret on Kubernetes) and restart the server
 | `BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS` | `60000` | Wait for DOM analysis on large pages |
 | `BROWSER_MAX_PAGES_NUMBER` | `10` | Open tabs per browser. Lower it to save memory. |
 | `BROWSER_LOGS_ENABLED` | `true` | Save the browser console log as an artifact |
-| `BROWSER_POLICY_FILE` | `/etc/chromium/policies/managed/policies.json` | Chrome enterprise policy file |
 | `VIDEO_PATH` | `./video` (`.env.example` sets `./videos`) | Where recordings are written while the browser runs |
 | `MAX_STEPS_PER_RUN` | `10` (`.env.example` sets `50`) | Step limit per run |
 | `MAX_SCRAPING_RETRIES` | `0` | Extra attempts when reading a page fails |
@@ -733,7 +732,7 @@ Never change `ENCRYPTOR_AES_SECRET_KEY`, `ENCRYPTOR_AES_SALT` or `ENCRYPTOR_AES_
 | Variable | Default | What it does |
 |---|---|---|
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL`. Any other value means `INFO`. |
-| `CODE_BLOCK_MODE` | `enabled` | `disabled` rejects [Code blocks](/reference/blocks) in runs |
+| `CODE_BLOCK_MODE` | `enabled` | `enabled`, `disabled` or `entitlement`. On a self-hosted server, `disabled` and `entitlement` both reject [Code blocks](/reference/blocks) in runs. While it is unset, the older `DISABLE_CODE_BLOCK_EXECUTION=true` or `ENABLE_CODE_BLOCK=false` still turns them off. |
 | `TOTP_LIFESPAN_MINUTES` | `10` | How long a 2FA code sent to Skyvern stays usable. Older codes are ignored. |
 | `RUN_HEARTBEAT_TIMEOUT_MINUTES` | `30` | Minutes without a heartbeat from the server process that executes a run. After this time, a server marks the run `failed` and sends its failure webhook, or starts a retry under the workflow's retry policy. This can be the same server after a restart, or another server on the same database. This check applies when the API server executes runs itself (the default). |
 | `ENABLE_URL_VALIDATION` | `false` | `true` makes Skyvern refuse URLs that point at loopback, private-network or cloud-metadata addresses. Off by default. See [URL validation](#url-validation). |
