@@ -652,6 +652,14 @@ class Settings(BaseSettings):
     # keys set only for the Search block are not spent by code blocks and the Copilot.
     ENABLE_SEARCH_WEB: bool = False
 
+    # Nace Drex Max: opt-in decision model for Skyvern's bounded-choice prompts (goal
+    # verification, page classification, action-type inference, auto-completion choice).
+    # It does not replace LLM_KEY.
+    ENABLE_NACE: bool = False
+    NACE_API_KEY: str | None = None
+    NACE_API_BASE: str = "https://console.nace.ai"
+    NACE_MODEL: str = "drex-max"
+
     # OPENAI COMPATIBLE
     OPENAI_COMPATIBLE_MODEL_NAME: str | None = None
     OPENAI_COMPATIBLE_API_KEY: str | None = None
