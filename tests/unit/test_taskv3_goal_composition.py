@@ -18,14 +18,19 @@ from skyvern.forge.sdk.workflow.models.block import ExtractionBlock, FileDownloa
 from skyvern.forge.sdk.workflow.page_derived_templates import OPEN, PageDerivedRender
 from skyvern.forge.taskv3.goal_composition import (
     DOWNLOAD_BLOCK_FACT,
+    EXECUTED_CALLS_HEADER,
+    EXECUTED_CALLS_TOKEN_BUDGET,
+    CodeExecutedCall,
     CodeProgressRecord,
     CodeTypedValue,
     GoalDirectives,
     compose_goal,
+    executed_call_rows,
     present_page_derived,
     render_block_context,
     typed_value_rows,
 )
+from skyvern.utils.token_counter import count_tokens
 from tests.unit._taskv3_block_fakes import make_block as _make_block
 from tests.unit._taskv3_block_fakes import output_param
 from tests.unit.helpers import make_organization, make_task
@@ -313,6 +318,57 @@ def test_the_code_outline_is_one_labelled_section_after_everything_else_and_only
     assert [line for line in lines if line.startswith("- Later in the code: ")] == ["- Later in the code: save"]
     assert lines[-1] == "- Later in the code: save"
     assert "Code outline" not in compose_goal("Apply", directives)
+
+
+def test_executed_calls_come_before_the_outline_in_start_order_and_mark_the_one_that_raised() -> None:
+    calls = (
+        CodeExecutedCall(line=3, description="locator.click #size-m", failed=False),
+        CodeExecutedCall(line=None, description='locator.click #add "now"', failed=False),
+        CodeExecutedCall(line=7, description="locator.click #open-panel", failed=True),
+    )
+    record = CodeProgressRecord(
+        before=("pick size", "add", "open panel"),
+        failed_step="read panel",
+        failed_line=9,
+        after=(),
+        executed_calls=calls,
+    )
+
+    goal = compose_goal("Apply", GoalDirectives(code_progress=record))
+    calls_section, outline = goal.split("\n\n")[1:]
+    rows = calls_section.removeprefix(EXECUTED_CALLS_HEADER).strip().split("\n")
+
+    assert [calls[i].description.split()[-1].strip('"') in rows[i] for i in range(3)] == [True, True, True]
+    assert rows[0].split()[-1] == rows[1].split()[-1] != rows[2].split()[-1]
+    assert outline.startswith("Code outline")
+
+
+def test_with_no_failing_line_only_the_calls_are_shown() -> None:
+    record = CodeProgressRecord(
+        before=(),
+        failed_step=None,
+        failed_line=None,
+        after=(),
+        executed_calls=(CodeExecutedCall(line=None, description="locator.click #only-call", failed=False),),
+    )
+
+    goal = compose_goal("Apply", GoalDirectives(code_progress=record))
+
+    assert "#only-call" in goal
+    assert "Code outline" not in goal
+
+
+def test_executed_calls_over_the_cap_keep_the_newest_whole_rows_and_count_the_rest_first() -> None:
+    calls = tuple(CodeExecutedCall(line=n, description=f"locator.click #row-{n}", failed=False) for n in range(1, 400))
+    calls += (CodeExecutedCall(line=500, description="locator.click #next", failed=True),)
+
+    rows = executed_call_rows(calls)
+
+    withheld = len(calls) - (len(rows) - 1)
+    assert withheld > 0 and str(withheld) in rows[0]
+    assert "#next" in rows[-1] and f"#row-{withheld}" not in "\n".join(rows)
+    assert f"#row-{withheld + 1}" in rows[1]
+    assert count_tokens("\n".join(rows)) <= EXECUTED_CALLS_TOKEN_BUDGET
 
 
 @pytest.mark.parametrize(
