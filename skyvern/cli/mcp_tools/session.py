@@ -259,8 +259,8 @@ async def skyvern_browser_session_create(
         bool,
         Field(
             description=(
-                "Browser-extension mode only: start in a tab that the user shared with Skyvern "
-                "(the lowest-numbered free shared tab) instead of a new tab."
+                "Browser-extension broker mode only; the legacy relay ignores it. Start in a tab that the user shared "
+                "with Skyvern (the lowest-numbered free shared tab) instead of a new tab."
             )
         ),
     ] = False,
