@@ -156,6 +156,9 @@ def test_google_drive_upload_omits_parents_without_folder_id(builder_name: str, 
     [
         ("file_123", "file_123"),
         ("https://drive.google.com/file/d/file_123/view?usp=sharing", "file_123"),
+        ("https://docs.google.com/document/d/doc_123", "doc_123"),
+        ("https://docs.google.com/document/d/doc_123/edit?tab=t.0#heading=h.1", "doc_123"),
+        ("https://docs.google.com/document/u/1/d/doc_123/edit", "doc_123"),
     ],
 )
 def test_google_drive_extract_file_id(value: str, expected: str) -> None:
@@ -169,6 +172,20 @@ def test_google_drive_extract_file_reference_preserves_resource_key() -> None:
 
     assert reference.file_id == "file_123"
     assert reference.resource_key == "resource_key_123"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://docs.google.com/spreadsheets/d/sheet_123/edit",
+        "https://docs.google.com/document/d/e/2PACX-public_123/pub",
+        "https://docs.google.com/file/d/file_123/view",
+        "https://drive.google.com/document/d/doc_123/edit",
+    ],
+)
+def test_google_drive_extract_file_id_rejects_non_drive_docs_links(value: str) -> None:
+    with pytest.raises(ValueError):
+        google_drive_service.extract_file_id(value)
 
 
 def test_google_drive_extract_file_id_rejects_non_drive_host() -> None:
@@ -452,7 +469,82 @@ async def test_google_drive_download_uses_unique_name_for_sanitized_collision(
 
 
 @pytest.mark.asyncio
-async def test_google_drive_download_reports_native_document_as_not_downloadable(
+async def test_google_drive_download_exports_google_doc_as_markdown(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.endswith("/export"):
+            return httpx.Response(200, content=b"# Plan\n")
+        return httpx.Response(
+            200,
+            json={"id": "doc_123", "name": "Plan", "mimeType": "application/vnd.google-apps.document"},
+        )
+
+    _install_google_drive_transport(monkeypatch, handler)
+    output_dir = tmp_path / "downloads"
+
+    downloaded_path = await google_drive_service.download_file(
+        access_token="at-1",
+        file_id="doc_123",
+        output_dir=str(output_dir),
+        max_size_mb=1,
+    )
+
+    assert Path(downloaded_path) == output_dir / "Plan.md"
+    assert Path(downloaded_path).read_bytes() == b"# Plan\n"
+    assert requests[-1].url.path == "/drive/v3/files/doc_123/export"
+    assert requests[-1].url.params["mimeType"] == "text/markdown"
+    assert requests[-1].headers["Authorization"] == "Bearer at-1"
+
+
+@pytest.mark.asyncio
+async def test_google_drive_download_surfaces_doc_export_size_limit_without_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    export_attempts = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal export_attempts
+        if request.url.path.endswith("/export"):
+            export_attempts += 1
+            return httpx.Response(
+                403,
+                json={
+                    "error": {
+                        "code": 403,
+                        "message": "This file is too large to be exported.",
+                        "errors": [{"reason": "exportSizeLimitExceeded"}],
+                    }
+                },
+            )
+        return httpx.Response(
+            200,
+            json={"id": "doc_123", "name": "Big", "mimeType": "application/vnd.google-apps.document"},
+        )
+
+    _install_google_drive_transport(monkeypatch, handler)
+
+    with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
+        await google_drive_service.download_file(
+            access_token="at-1",
+            file_id="doc_123",
+            output_dir=str(tmp_path / "downloads"),
+            max_size_mb=1,
+        )
+
+    assert exc_info.value.code == "exportSizeLimitExceeded"
+    assert "too large to be exported" in str(exc_info.value)
+    assert export_attempts == 1
+    assert not any((tmp_path / "downloads").iterdir())
+
+
+@pytest.mark.asyncio
+async def test_google_drive_download_reports_other_native_files_as_not_downloadable(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -464,8 +556,8 @@ async def test_google_drive_download_reports_native_document_as_not_downloadable
             200,
             json={
                 "id": "native_123",
-                "name": "Native document",
-                "mimeType": "application/vnd.google-apps.document",
+                "name": "Native sheet",
+                "mimeType": "application/vnd.google-apps.spreadsheet",
             },
         )
 
