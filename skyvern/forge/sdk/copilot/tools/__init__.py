@@ -23,6 +23,7 @@ from pydantic import Field, JsonValue
 
 from skyvern.forge import app as app
 from skyvern.forge.agent_functions import CopilotTriggerSource
+from skyvern.forge.sdk.agents.skills import LOAD_SKILL_TOOL_NAME, READ_SKILL_RESOURCE_TOOL_NAME, SKILL_TOOL_NAMES
 from skyvern.forge.sdk.copilot.ask_user import (
     ACCOUNT_GROUP_CANCEL_TOOL_NAME,
     ACCOUNT_GROUP_STATUS_TOOL_NAME,
@@ -345,6 +346,7 @@ from .scouting import _register_scout_interaction_observation as _register_scout
 from .scouting import _resolve_scout_role_name as _resolve_scout_role_name
 from .scouting import _role_name_from_selector as _role_name_from_selector
 from .scouting import read_page_state_on_page as read_page_state_on_page
+from .skills import LOAD_SKILL_DESCRIPTION, READ_SKILL_RESOURCE_DESCRIPTION, load_skill, read_skill_resource
 from .web_search import _search_web_impl as _search_web_impl
 from .workflow_update import BlockObservationRef as BlockObservationRef
 from .workflow_update import CodeArtifactMetadata as CodeArtifactMetadata
@@ -2154,6 +2156,34 @@ async def read_chat_history_tool(
 
 
 @function_tool(
+    failure_error_function=copilot_tool_failure,
+    name_override=LOAD_SKILL_TOOL_NAME,
+    description_override=LOAD_SKILL_DESCRIPTION,
+)
+async def load_skill_tool(ctx: RunContextWrapper, name: str) -> str:
+    authority_error = _authority_tool_error(ctx.context, LOAD_SKILL_TOOL_NAME)
+    if authority_error:
+        return _diagnosis_repair_tool_error(ctx.context, LOAD_SKILL_TOOL_NAME, authority_error)
+    result = load_skill(ctx.context.skill_session, name)
+    record_tool_step_result_for_ctx(ctx.context, LOAD_SKILL_TOOL_NAME, {"name": name}, result)
+    return json.dumps(result, ensure_ascii=False)
+
+
+@function_tool(
+    failure_error_function=copilot_tool_failure,
+    name_override=READ_SKILL_RESOURCE_TOOL_NAME,
+    description_override=READ_SKILL_RESOURCE_DESCRIPTION,
+)
+async def read_skill_resource_tool(ctx: RunContextWrapper, name: str, path: str) -> str:
+    authority_error = _authority_tool_error(ctx.context, READ_SKILL_RESOURCE_TOOL_NAME)
+    if authority_error:
+        return _diagnosis_repair_tool_error(ctx.context, READ_SKILL_RESOURCE_TOOL_NAME, authority_error)
+    result = read_skill_resource(ctx.context.skill_session, name, path)
+    record_tool_step_result_for_ctx(ctx.context, READ_SKILL_RESOURCE_TOOL_NAME, {"name": name, "path": path}, result)
+    return json.dumps(result, ensure_ascii=False)
+
+
+@function_tool(
     failure_error_function=copilot_tool_failure, name_override="inspect_page_for_composition", strict_mode=False
 )
 async def inspect_page_for_composition_tool(
@@ -2488,6 +2518,8 @@ NATIVE_TOOLS = [
     upload_attached_file_tool,
     read_attached_pdf_tool,
     read_chat_history_tool,
+    load_skill_tool,
+    read_skill_resource_tool,
     run_workflow_for_accounts_tool,
     run_saved_workflow_tool,
     get_account_group_status_tool,
@@ -2661,6 +2693,7 @@ def copilot_native_tools(
     supports_demonstration_offer: bool = False,
     browser_pattern_accepting_calls: tuple[str, ...] = (),
     trigger_sources: list[CopilotTriggerSource] | None = None,
+    skills_available: bool = False,
 ) -> list[FunctionTool]:
     capability = _normalized_authoring_capability(authoring_capability)
     trigger_sources_text = render_trigger_sources(trigger_sources or [])
@@ -2674,6 +2707,7 @@ def copilot_native_tools(
             or (tool.name in ACCOUNT_GROUP_TOOL_NAMES and not supports_account_group_card)
             or (tool.name == CONNECTION_CARD_TOOL_NAME and not supports_connection_card)
             or (tool.name == DEMONSTRATION_OFFER_TOOL_NAME and not supports_demonstration_offer)
+            or (tool.name in SKILL_TOOL_NAMES and not skills_available)
             or (tool.name == ACCOUNT_GROUP_SUBMIT_TOOL_NAME and not account_group_submit_enabled())
             or (tool.name == SINGLE_RUN_TOOL_NAME and not (supports_single_run_card and single_run_submit_enabled()))
             or (

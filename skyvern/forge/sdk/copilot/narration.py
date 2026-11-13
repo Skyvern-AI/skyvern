@@ -106,6 +106,8 @@ _TOOL_ACTIVITY_DISPLAY_LABELS = {
     "upload_attached_file": "Attaching your file to the page",
     "read_attached_pdf": "Reading your attached document",
     "read_chat_history": "Reading earlier messages in this chat",
+    "load_skill": "Loading a skill",
+    "read_skill_resource": "Reading a skill file",
     "run_browser_code": "Working in the browser",
     "edit_block": "Editing block",
     "add_block": "Adding block",

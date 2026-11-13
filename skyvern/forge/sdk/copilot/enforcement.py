@@ -30,6 +30,7 @@ from PIL import Image
 from pydantic import JsonValue
 
 from skyvern.forge.sdk.agents.context import get_agent_message_field
+from skyvern.forge.sdk.agents.skills import LOAD_SKILL_TOOL_NAME
 from skyvern.forge.sdk.copilot import streaming_adapter
 from skyvern.forge.sdk.copilot.ask_user import ACCOUNT_GROUP_SUBMIT_TOOL_NAME, SINGLE_RUN_TOOL_NAME
 from skyvern.forge.sdk.copilot.budget_expiry import (
@@ -1116,6 +1117,33 @@ def unread_tool_output_indices(items: Sequence[Any]) -> set[int]:
     return unread
 
 
+def _carries_skill_body(output: object) -> bool:
+    if not isinstance(output, str):
+        return False
+    try:
+        parsed = json.loads(output)
+    except ValueError:
+        return False
+    data = parsed.get("data") if isinstance(parsed, dict) else None
+    return isinstance(data, dict) and isinstance(data.get("body"), str)
+
+
+def skill_output_indices(items: Sequence[Any]) -> set[int]:
+    """Indices of load_skill outputs that carry a body; every trimming layer keeps them and their calls whole."""
+    load_call_ids = {
+        _item_field(item, "call_id")
+        for item in items
+        if _item_field(item, "type") == "function_call" and _item_field(item, "name") == LOAD_SKILL_TOOL_NAME
+    }
+    return {
+        index
+        for index, item in enumerate(items)
+        if _item_field(item, "type") == "function_call_output"
+        and _item_field(item, "call_id") in load_call_ids
+        and _carries_skill_body(_item_field(item, "output"))
+    }
+
+
 def stable_prefix_anchors(items: Sequence[TResponseInputItem], *, append_only: bool = False) -> list[int]:
     """Return, oldest first, the index of every tool output or real user message that later model calls resend
     unchanged: all of them when nothing rewrites the input, else those before both the compaction window and every
@@ -1160,6 +1188,7 @@ def _prune_input_list(items: list[Any]) -> list[Any]:
     recent_fco_set = set(fco_indices[-KEEP_RECENT_TOOL_OUTPUTS:])
 
     recent_fco_set |= unread_tool_output_indices(items)
+    recent_fco_set |= skill_output_indices(items)
 
     fc_indices = [i for i, item in enumerate(items) if _item_field(item, "type") == "function_call"]
     recent_fc_set = set(fc_indices[-KEEP_RECENT_TOOL_OUTPUTS:])
@@ -1262,13 +1291,7 @@ def estimate_tokens(items: list[Any]) -> int:
 _AGGRESSIVE_PRUNE_TAIL = 7
 
 
-def aggressive_prune(items: list[Any]) -> list[Any]:
-    """Emergency prune: drop ALL screenshots, keep original message + last ~3
-    tool call/output pairs + latest nudge, prioritizing pair-valid history."""
-    if not items:
-        return items
-
-    screenshot_dropped = any(is_screenshot_message(item) for item in items[1:])
+def _aggressive_prune_tail(items: list[Any]) -> list[Any]:
     tail: list[Any] = []
     for item in reversed(items[1:]):
         if is_screenshot_message(item):
@@ -1277,6 +1300,50 @@ def aggressive_prune(items: list[Any]) -> list[Any]:
         if len(tail) >= _AGGRESSIVE_PRUNE_TAIL:
             break
     tail.reverse()
+    return tail
+
+
+def aggressive_prune_skill_pairs(items: list[Any]) -> list[Any]:
+    """Body-carrying load_skill calls before the prune's tail, each with its output and the reasoning item just
+    before the call, in input order."""
+    tail_ids = {id(item) for item in _aggressive_prune_tail(items)}
+    call_indices = {
+        _item_field(item, "call_id"): index
+        for index, item in enumerate(items)
+        if index > 0 and _item_field(item, "type") == "function_call"
+    }
+    kept: set[int] = set()
+    for output_index in skill_output_indices(items):
+        call_index = call_indices.get(_item_field(items[output_index], "call_id"))
+        if call_index is None or id(items[call_index]) in tail_ids:
+            continue
+        kept |= {call_index, output_index}
+        # Parallel calls share one reasoning item that precedes the whole group of calls.
+        reasoning_index = call_index - 1
+        while reasoning_index > 0 and _item_field(items[reasoning_index], "type") == "function_call":
+            reasoning_index -= 1
+        if reasoning_index > 0 and _item_field(items[reasoning_index], "type") == "reasoning":
+            kept.add(reasoning_index)
+    return [items[index] for index in sorted(kept)]
+
+
+def aggressive_prune(items: list[Any]) -> list[Any]:
+    """Emergency prune: drop ALL screenshots, keep original message + last ~3
+    tool call/output pairs + latest nudge, prioritizing pair-valid history.
+    Body-carrying load_skill pairs from before the tail go back right after the original message."""
+    if not items:
+        return items
+
+    screenshot_dropped = any(is_screenshot_message(item) for item in items[1:])
+    skill_pairs = aggressive_prune_skill_pairs(items)
+    skill_call_ids = {
+        _item_field(item, "call_id") for item in skill_pairs if _item_field(item, "type") == "function_call"
+    }
+    tail = [
+        item
+        for item in _aggressive_prune_tail(items)
+        if not (_item_field(item, "type") == "function_call_output" and _item_field(item, "call_id") in skill_call_ids)
+    ]
     opening = items[0]
     opening_call_id = _item_field(opening, "call_id")
     seen_call_ids: set[str] = (
@@ -1284,6 +1351,7 @@ def aggressive_prune(items: list[Any]) -> list[Any]:
         if _item_field(opening, "type") == "function_call" and isinstance(opening_call_id, str)
         else set()
     )
+    seen_call_ids |= skill_call_ids
     retained_tail: list[Any] = []
     orphaned_output_dropped = False
     for item in tail:
@@ -1299,9 +1367,10 @@ def aggressive_prune(items: list[Any]) -> list[Any]:
     LOG.info(
         "copilot_aggressive_prune_pair_validity",
         retained_tail=[_item_field(item, "type") for item in retained_tail],
+        retained_skill_pairs=len(skill_call_ids),
         orphaned_output_dropped=orphaned_output_dropped,
     )
-    retained_items = [opening, *retained_tail]
+    retained_items = [opening, *skill_pairs, *retained_tail]
     screenshot_dropped_signal = _assemble_enforcement_messages(None, _nudge(None, "screenshot_dropped"))
     signal_content = _item_field(screenshot_dropped_signal[0], "content")
     if not screenshot_dropped or any(_item_field(item, "content") == signal_content for item in retained_items):

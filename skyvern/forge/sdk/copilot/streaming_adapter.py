@@ -26,6 +26,7 @@ from skyvern.forge import app
 # Reuse the HTTP-logging redactor so SSE tool inputs and request-body logs
 # share one exact-match sensitive-key policy.
 from skyvern.forge.log_redaction import redact_sensitive_fields
+from skyvern.forge.sdk.agents.skills import SKILL_TOOL_NAMES
 from skyvern.forge.sdk.artifact.models import ArtifactType, LogEntityType
 from skyvern.forge.sdk.copilot.browser_target import (
     BROWSER_TARGET_PARAM_NAME,
@@ -450,6 +451,11 @@ async def stream_to_sse(
                     tool_input = dict(raw_args)
 
                 reason = normalize_action_reason(tool_input.pop(USER_FACING_REASON_PARAM, None))
+                if tool_name in SKILL_TOOL_NAMES:
+                    # The model's reason can name the skill, so a call whose name is hidden gets no reason line.
+                    if not ctx.skill_session.shows_name(tool_input.get("name")):
+                        reason = None
+                    tool_input = ctx.skill_session.public_arguments(tool_input)
                 if reason is not None:
                     reason = _scrub_actor_text(ctx, reason)
                 display_label = tool_activity_display_label(tool_name, tool_input)

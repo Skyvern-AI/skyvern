@@ -17,6 +17,7 @@ import structlog
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError, field_validator
 from typing_extensions import NotRequired, TypedDict
 
+from skyvern.forge.sdk.agents.skills import SkillSession
 from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
 from skyvern.forge.sdk.copilot.agent_context import AgentContext
 from skyvern.forge.sdk.copilot.browser_ablation import (
@@ -1360,6 +1361,7 @@ class CopilotContext(AgentContext):
     earlier_chat_history_rows: Callable[[], tuple[ChatHistoryRow, ...]] = tuple
     chat_history_oldest_shown_id: str | None = None
     earlier_chat_history_unavailable: bool = False
+    skill_session: SkillSession = field(default_factory=lambda: SkillSession([], agent="copilot"))
     prior_turn_outcome: TurnOutcome | None = None
     # Server-verified display data for recovering from a model-staged connected
     # account that has no run authority. This never grants authority itself.

@@ -11,6 +11,8 @@ from typing import Any, Literal, Protocol
 import structlog
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
 
+from skyvern.forge.sdk.agents.skills import SKILL_TOOL_NAMES
+
 BlockerKind = Literal[
     "authority_denied",
     "tool_error",
@@ -63,6 +65,8 @@ _LEAK_DENY_TOKENS: tuple[str, ...] = (
 # Raw workflow-run and browser-session identifiers are internal; user-facing
 # text must reference runs by what they did, never by id.
 _RUN_ID_LEAK_RE = re.compile(r"\b(?:wr|pbs)_[a-z0-9_]+", re.IGNORECASE)
+# Whole identifiers only: page text such as "download_skills" contains "load_skill".
+_SKILL_TOOL_NAME_RE = re.compile(rf"\b(?:{'|'.join(sorted(SKILL_TOOL_NAMES))})\b")
 
 _INTERNAL_GUARD_TOKENS: tuple[str, ...] = (
     "per_tool_budget",
@@ -107,6 +111,8 @@ def contains_internal_machinery_leak(value: str | None) -> bool:
         return True
     lowered = value.lower()
     if any(token in lowered for token in _INTERNAL_GUARD_TOKENS):
+        return True
+    if _SKILL_TOOL_NAME_RE.search(lowered):
         return True
     return any(token in lowered for token in _INTERNAL_TOOL_NAME_TOKENS)
 

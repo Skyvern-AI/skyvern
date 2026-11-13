@@ -101,6 +101,16 @@ If there's a failure, analyze the failure reason, the error code and the failing
 {% else %}
 No debugger run information available. The workflow hasn't been run yet, or no run data is accessible.
 {% endif %}
+{%- if skills_catalog %}
+
+AVAILABLE SKILLS:
+
+load_skill(name) returns a skill's instructions and file list.
+
+```
+{{ skills_catalog }}
+```
+{%- endif %}
 
 USER MESSAGE:
 

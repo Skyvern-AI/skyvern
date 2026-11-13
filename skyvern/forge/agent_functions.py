@@ -34,6 +34,7 @@ from skyvern.exceptions import (
 from skyvern.forge import app
 from skyvern.forge.async_operations import AsyncOperation
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.agents.skills import AvailableSkill
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
 from skyvern.forge.sdk.api.azure import AzureClientFactory
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
@@ -1986,6 +1987,11 @@ class AgentFunction:
 
     def copilot_browser_pattern_accepting_calls(self) -> tuple[str, ...]:
         return ()
+
+    async def agent_skills(
+        self, *, organization_id: str, workflow_permanent_id: str | None, agent: str
+    ) -> list[AvailableSkill]:
+        return []
 
     async def open_copilot_browser_code_session(
         self,
