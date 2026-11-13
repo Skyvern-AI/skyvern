@@ -4204,9 +4204,26 @@ async def test_closed_value_parameters_carry_the_enforced_values_as_a_schema_enu
 _NOTE_FIELDS = {"notes", "trailing_notes", "description"}
 
 
+_IMAGE_FIELDS = ("doc_images", "prompt_images")
+
+
 def _saved_workflow_with_notes() -> dict[str, Any]:
-    child = {"label": "open", "block_type": "navigation", "notes": "use the left menu", "description": "people only"}
-    loop = {"label": "each", "block_type": "for_loop", "loop_blocks": [child], "trailing_notes": "stop at ten"}
+    image = [{"file_id": "file_901", "caption": None, "placement": "block"}]
+    child = {
+        "label": "open",
+        "block_type": "navigation",
+        "notes": "use the left menu",
+        "description": "people only",
+        "doc_images": image,
+        "prompt_images": image,
+    }
+    loop = {
+        "label": "each",
+        "block_type": "for_loop",
+        "loop_blocks": [child],
+        "trailing_notes": "stop at ten",
+        "doc_images": image,
+    }
     return {
         "ok": True,
         "data": {"description": "workflow summary", "workflow_definition": {"parameters": [], "blocks": [loop]}},
@@ -4225,6 +4242,7 @@ async def test_copilot_reads_notes_only_with_the_doc_editor(doc_editor_enabled: 
         asked = await call("get_workflow_knowledge", {"topics": ["notes_between_blocks", "for_loop_block"]})
         asked_only_notes = await call("get_workflow_knowledge", {"topics": ["notes_between_blocks"]})
         loop_schema = (await call("get_block_schema", {"block_type": "for_loop"}))["data"]["schema"]
+        task_schema = (await call("get_block_schema", {"block_type": "task"}))["data"]["schema"]
     saved = await _build_skyvern_mcp_overlays(ALL_BLOCK_FAMILIES, notes_visible=doc_editor_enabled)[
         "get_org_workflow"
     ].post_hook(_saved_workflow_with_notes(), {}, make_copilot_ctx(doc_editor_enabled=doc_editor_enabled))
@@ -4235,6 +4253,9 @@ async def test_copilot_reads_notes_only_with_the_doc_editor(doc_editor_enabled: 
         if {"label", "block_type"} <= set(definition.get("properties", {}))
     ]
     saved_loop = saved["data"]["workflow_definition"]["blocks"][0]
+    for schema in (loop_schema, task_schema):
+        assert not any(name in json.dumps(schema) for name in (*_IMAGE_FIELDS, "BlockImage", "file_id"))
+    assert "file_901" not in json.dumps(saved)
     if doc_editor_enabled:
         assert "notes_between_blocks" in catalog and "notes_between_blocks" in asked["data"]["sections"]
         assert set(asked_only_notes["data"]["sections"]) == {"notes_between_blocks"}

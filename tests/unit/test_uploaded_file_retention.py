@@ -29,123 +29,11 @@ from skyvern.forge.sdk.schemas.files import UploadedFile
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.schemas.runs import RunEngine
 from skyvern.services import uploaded_file_service
+from tests.unit._uploaded_files_fake import FakeUploadedFilesRepository, uploaded_file_uri
 from tests.unit.shared_route_app import shared_route_app
 
 VICTIM_ORG_ID = "o_victim"
 ATTACKER_ORG_ID = "o_attacker"
-
-
-def _uri(organization_id: str, filename: str = "secret.pdf") -> str:
-    return f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{settings.ENV}/{organization_id}/2026-08-15/{filename}"
-
-
-class FakeUploadedFilesRepository:
-    """In-memory stand-in with the same org-scoping and soft-delete semantics as the real one."""
-
-    def __init__(self) -> None:
-        self.rows: dict[str, UploadedFile] = {}
-        self._next_id = 0
-
-    def seed(
-        self,
-        organization_id: str,
-        expires_at: datetime | None = None,
-        filename: str = "secret.pdf",
-        run_id: str | None = None,
-    ) -> str:
-        self._next_id += 1
-        file_id = f"file_{self._next_id}"
-        now = datetime.now(timezone.utc)
-        self.rows[file_id] = UploadedFile(
-            file_id=file_id,
-            organization_id=organization_id,
-            storage_uri=_uri(organization_id, filename),
-            filename=filename,
-            expires_at=expires_at,
-            run_id=run_id,
-            created_at=now,
-            modified_at=now,
-        )
-        return file_id
-
-    def live_ids(self) -> set[str]:
-        return {file_id for file_id, row in self.rows.items() if row.deleted_at is None}
-
-    async def create_uploaded_file(
-        self,
-        file_id: str,
-        organization_id: str,
-        storage_uri: str,
-        filename: str,
-        size_bytes: int | None = None,
-        expires_at: datetime | None = None,
-    ) -> UploadedFile:
-        now = datetime.now(timezone.utc)
-        for row in self.rows.values():
-            if row.organization_id == organization_id and row.storage_uri == storage_uri and row.deleted_at is None:
-                row.deleted_at = now
-        self.rows[file_id] = UploadedFile(
-            file_id=file_id,
-            organization_id=organization_id,
-            storage_uri=storage_uri,
-            filename=filename,
-            size_bytes=size_bytes,
-            expires_at=expires_at,
-            created_at=now,
-            modified_at=now,
-        )
-        return self.rows[file_id]
-
-    async def get_uploaded_file(self, file_id: str, organization_id: str) -> UploadedFile | None:
-        row = self.rows.get(file_id)
-        if row is None or row.organization_id != organization_id or row.deleted_at is not None:
-            return None
-        return row
-
-    async def claim_uploaded_file_for_deletion(self, file_id: str, organization_id: str) -> UploadedFile | None:
-        row = await self.get_uploaded_file(file_id, organization_id)
-        if row is None:
-            return None
-        row.deleted_at = datetime.now(timezone.utc)
-        return row
-
-    async def get_expired_uploaded_files(self, before: datetime, limit: int = 500) -> list[UploadedFile]:
-        return [
-            row
-            for row in self.rows.values()
-            if row.deleted_at is None and row.expires_at is not None and row.expires_at <= before
-        ][:limit]
-
-    async def get_uploaded_files_by_ids(self, file_ids: list[str], organization_id: str) -> list[UploadedFile]:
-        return [
-            row
-            for file_id in file_ids
-            if (row := self.rows.get(file_id)) is not None
-            and row.organization_id == organization_id
-            and row.deleted_at is None
-        ]
-
-    async def get_uploaded_files_for_run(self, run_id: str) -> list[UploadedFile]:
-        return [row for row in self.rows.values() if row.run_id == run_id and row.deleted_at is None]
-
-    async def attach_uploaded_files_to_run(
-        self,
-        file_ids: list[str],
-        organization_id: str,
-        run_id: str,
-        expires_at: datetime,
-    ) -> list[UploadedFile]:
-        attached = []
-        for file_id in file_ids:
-            row = self.rows.get(file_id)
-            if row is None or row.organization_id != organization_id or row.deleted_at is not None:
-                continue
-            if row.run_id is not None and row.run_id != run_id:
-                continue
-            row.run_id = run_id
-            row.expires_at = min(row.expires_at, expires_at) if row.expires_at else expires_at
-            attached.append(row)
-        return attached
 
 
 class FakeStorage:
@@ -225,9 +113,9 @@ async def test_a_file_past_its_expiry_no_longer_dereferences(
     live = repo.seed(VICTIM_ORG_ID, expires_at=now + timedelta(days=1), filename="live.csv")
 
     assert await uploaded_file_service.resolve_file_reference(file_id=expired, organization_id=VICTIM_ORG_ID) is None
-    assert await uploaded_file_service.resolve_file_reference(file_id=live, organization_id=VICTIM_ORG_ID) == _uri(
-        VICTIM_ORG_ID, "live.csv"
-    )
+    assert await uploaded_file_service.resolve_file_reference(
+        file_id=live, organization_id=VICTIM_ORG_ID
+    ) == uploaded_file_uri(VICTIM_ORG_ID, "live.csv")
 
 
 class TestDeleteEndpoint:
@@ -254,7 +142,7 @@ class TestDeleteEndpoint:
         resp = self._request(client, file_id, VICTIM_ORG_ID, storage)
 
         assert resp.status_code == 204  # type: ignore[attr-defined]
-        assert storage.deleted == [_uri(VICTIM_ORG_ID)]
+        assert storage.deleted == [uploaded_file_uri(VICTIM_ORG_ID)]
         assert repo.live_ids() == set()
 
     def test_another_orgs_file_id_is_a_404_that_deletes_nothing(
@@ -304,7 +192,7 @@ class TestDeleteEndpoint:
 
         assert self._request(client, file_id, VICTIM_ORG_ID, storage).status_code == 204  # type: ignore[attr-defined]
         assert self._request(client, file_id, VICTIM_ORG_ID, storage).status_code == 404  # type: ignore[attr-defined]
-        assert storage.deleted == [_uri(VICTIM_ORG_ID)]
+        assert storage.deleted == [uploaded_file_uri(VICTIM_ORG_ID)]
 
 
 class TestDeleteFailureHandling:
@@ -389,7 +277,7 @@ class TestStorageUriUniqueness:
                 # storage key. The per-upload id must survive that normalization.
                 storage_key = os.path.basename(filename)
                 storage_keys.append(storage_key)
-                return ("https://presigned.example/x", _uri(organization_id, storage_key))
+                return ("https://presigned.example/x", uploaded_file_uri(organization_id, storage_key))
 
             async def fake_create_uploaded_file(**kwargs: object) -> UploadedFile:
                 now = datetime.now(timezone.utc)
@@ -614,7 +502,7 @@ class TestUploadTypeRestrictions:
                 return UploadedFile(created_at=now, modified_at=now, **kwargs)  # type: ignore[arg-type]
 
             app_module.STORAGE.save_legacy_file = AsyncMock(
-                return_value=("https://presigned.example/x", _uri(VICTIM_ORG_ID, "stored"))
+                return_value=("https://presigned.example/x", uploaded_file_uri(VICTIM_ORG_ID, "stored"))
             )
             app_module.DATABASE.uploaded_files.create_uploaded_file = AsyncMock(side_effect=fake_create_uploaded_file)
 
@@ -800,7 +688,7 @@ class TestExpirySweep:
         result = await uploaded_file_service.purge_expired_files()
 
         assert result == {"examined": 1, "deleted": 1, "failed": 0}
-        assert storage.deleted == [_uri(VICTIM_ORG_ID, "expired.csv")]
+        assert storage.deleted == [uploaded_file_uri(VICTIM_ORG_ID, "expired.csv")]
         assert repo.live_ids() == {not_yet_expired, no_expiry}
         assert expired not in repo.live_ids()
 
@@ -828,7 +716,7 @@ class TestExpirySweep:
         """
         past = datetime.now(timezone.utc) - timedelta(days=1)
         file_id = repo.seed(VICTIM_ORG_ID, expires_at=past, filename="lifecycle-expired.csv")
-        storage.absent.add(_uri(VICTIM_ORG_ID, "lifecycle-expired.csv"))
+        storage.absent.add(uploaded_file_uri(VICTIM_ORG_ID, "lifecycle-expired.csv"))
 
         result = await uploaded_file_service.purge_expired_files()
 
@@ -854,7 +742,7 @@ class TestRunAttachment:
         deleted = await uploaded_file_service.delete_files_attached_to_run(run_id="wr_1")
 
         assert deleted == 1
-        assert storage.deleted == [_uri(VICTIM_ORG_ID, "cv.pdf")]
+        assert storage.deleted == [uploaded_file_uri(VICTIM_ORG_ID, "cv.pdf")]
         assert repo.live_ids() == {other_run, unattached}
 
     @pytest.mark.asyncio
@@ -961,7 +849,9 @@ class TestFileIdAsFileReference:
     ) -> None:
         file_id = repo.seed(VICTIM_ORG_ID, filename="cv.pdf")
 
-        assert await files_api.resolve_uploaded_file_id(file_id, VICTIM_ORG_ID) == _uri(VICTIM_ORG_ID, "cv.pdf")
+        assert await files_api.resolve_uploaded_file_id(file_id, VICTIM_ORG_ID) == uploaded_file_uri(
+            VICTIM_ORG_ID, "cv.pdf"
+        )
         with pytest.raises(FileNotFoundError):
             await files_api.resolve_uploaded_file_id(file_id, ATTACKER_ORG_ID)
 
@@ -990,7 +880,7 @@ class TestStorageGuard:
         s3_storage.async_client = MagicMock(delete_file=AsyncMock())
 
         with pytest.raises(PermissionError):
-            await s3_storage.delete_legacy_file(organization_id=ATTACKER_ORG_ID, uri=_uri(VICTIM_ORG_ID))
+            await s3_storage.delete_legacy_file(organization_id=ATTACKER_ORG_ID, uri=uploaded_file_uri(VICTIM_ORG_ID))
 
         s3_storage.async_client.delete_file.assert_not_awaited()
 
@@ -1003,4 +893,4 @@ class TestStorageGuard:
 
     def test_the_orgs_own_file_is_still_reachable(self) -> None:
         """The traversal guard must not reject ordinary keys."""
-        S3Storage().assert_managed_file_access(_uri(ATTACKER_ORG_ID), ATTACKER_ORG_ID)
+        S3Storage().assert_managed_file_access(uploaded_file_uri(ATTACKER_ORG_ID), ATTACKER_ORG_ID)

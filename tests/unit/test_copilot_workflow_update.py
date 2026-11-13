@@ -377,6 +377,9 @@ async def test_a_rename_that_omits_a_saved_note_reports_its_text_so_copilot_can_
     assert result["data"]["stored_notes_dropped_text"] == {"open_page": {"notes": "Never click Delete."}}
 
 
+_IMAGE_FIELDS = ("doc_images", "prompt_images")
+
+
 @pytest.mark.parametrize("doc_editor_enabled", [False, True])
 def test_adopted_proposal_yaml_hides_notes_without_the_doc_editor(doc_editor_enabled: bool) -> None:
     ctx = make_copilot_ctx()
@@ -385,6 +388,7 @@ def test_adopted_proposal_yaml_hides_notes_without_the_doc_editor(doc_editor_ena
         "title: Lookup\nworkflow_definition:\n  parameters: []\n  blocks:\n"
         "    - block_type: navigation\n      label: lookup\n      notes: Check the official page.\n"
         "      trailing_notes: Confirm the result.\n      description: Opens the lookup page.\n"
+        "      doc_images: [{file_id: file_901}]\n      prompt_images: [{file_id: file_902}]\n"
         "      url: https://example.com\n      navigation_goal: Open the page\n"
     )
 
@@ -393,9 +397,54 @@ def test_adopted_proposal_yaml_hides_notes_without_the_doc_editor(doc_editor_ena
     )
     block = safe_load_no_dates(result["adopted_workflow_yaml"])["workflow_definition"]["blocks"][0]
 
-    assert {key for key in ("notes", "trailing_notes", "description") if key in block} == (
+    assert {key for key in ("notes", "trailing_notes", "description", *_IMAGE_FIELDS) if key in block} == (
         {"notes", "trailing_notes", "description"} if doc_editor_enabled else set()
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("doc_editor_enabled", [False, True])
+async def test_a_copilot_write_never_sets_block_images_and_the_saved_ones_stay(
+    monkeypatch: pytest.MonkeyPatch, doc_editor_enabled: bool
+) -> None:
+    def workflow(images: str) -> str:
+        return (
+            "title: Lookup\nworkflow_definition:\n  parameters: []\n  blocks:\n"
+            f"    - block_type: navigation\n      label: lookup\n{images}"
+            "      url: https://example.com\n      navigation_goal: Open the page\n"
+            "    - block_type: navigation\n      label: confirm\n"
+            "      url: https://example.com\n      navigation_goal: Confirm\n"
+        )
+
+    async def prior(_ctx: CopilotContext) -> None:
+        return None
+
+    monkeypatch.setattr(app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", AsyncMock(return_value=None))
+    monkeypatch.setattr(workflow_update_module, "_get_prior_workflow", prior)
+    saved = workflow("      doc_images: [{file_id: file_901}]\n      prompt_images: [{file_id: file_902}]\n")
+    ctx = CopilotContext(
+        organization_id="o",
+        workflow_id="w",
+        workflow_permanent_id="wp",
+        workflow_yaml=saved,
+        browser_session_id=None,
+        stream=None,
+    )
+    ctx.persisted_workflow_yaml = saved
+    ctx.request_policy = RequestPolicy(allow_update_workflow=True, allow_run_blocks=True)
+    ctx.doc_editor_enabled = doc_editor_enabled
+    ctx.auto_accept = False
+    foreign = workflow("      doc_images: [{file_id: file_666}]\n      prompt_images: []\n").replace(
+        "label: confirm\n", "label: confirm\n      prompt_images: [{file_id: file_667}]\n"
+    )
+
+    result = await _update_workflow({"workflow_yaml": foreign}, ctx)
+
+    assert result["ok"] is True
+    lookup, confirm = safe_load_no_dates(ctx.staged_workflow_yaml)["workflow_definition"]["blocks"]
+    assert [lookup[field][0]["file_id"] for field in _IMAGE_FIELDS] == ["file_901", "file_902"]
+    assert not any(field in confirm for field in _IMAGE_FIELDS)
+    assert "file_66" not in ctx.staged_workflow_yaml
 
 
 @pytest.mark.asyncio

@@ -34,16 +34,11 @@ from skyvern.forge.sdk.utils.capped_subprocess import CappedSubprocessError, Cap
 from skyvern.forge.sdk.utils.capped_subprocess_child import ResultTooLarge
 from skyvern.services import uploaded_file_service
 from skyvern.webeye.browser_errors import BrowserCdpAcquisitionError
+from tests.unit._uploaded_files_fake import FakeUploadedFilesRepository, uploaded_file_uri
 from tests.unit.conftest import make_copilot_context
 from tests.unit.copilot_test_helpers import skip_no_browser
 from tests.unit.test_copilot_runtime import _make_ctx
-from tests.unit.test_uploaded_file_retention import (
-    ATTACKER_ORG_ID,
-    VICTIM_ORG_ID,
-    FakeStorage,
-    FakeUploadedFilesRepository,
-    _uri,
-)
+from tests.unit.test_uploaded_file_retention import ATTACKER_ORG_ID, VICTIM_ORG_ID, FakeStorage
 
 CHAT_ORG_ID = ATTACKER_ORG_ID
 PAGE_URL = "https://upload.fixture.test/"
@@ -118,7 +113,7 @@ def _attach(
     expires_at: datetime | None = None,
 ) -> CopilotAttachedFile:
     file_id = repo.seed(organization_id, expires_at=expires_at, filename=filename)
-    storage.objects[_uri(organization_id, filename)] = data
+    storage.objects[uploaded_file_uri(organization_id, filename)] = data
     return CopilotAttachedFile(file_id=file_id, filename=filename, size_bytes=len(data))
 
 

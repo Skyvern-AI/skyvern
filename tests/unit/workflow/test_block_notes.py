@@ -1,28 +1,51 @@
 import json
-from datetime import UTC, datetime
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from typing import Any, cast
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import pytest_asyncio
 from pydantic import ValidationError
 
+from skyvern.forge import app
+from skyvern.forge.sdk.db.agent_db import AgentDB, _build_engine
 from skyvern.forge.sdk.workflow.block_notes import (
     carry_block_notes_from_versions,
     carry_forward_block_notes,
     definition_step_notes,
+    drop_submitted_note_fields,
 )
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
+from skyvern.forge.sdk.workflow.exceptions import InvalidWorkflowDefinition
 from skyvern.forge.sdk.workflow.models.block import Block
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
-from skyvern.forge.sdk.workflow.service import WorkflowService, _get_workflow_definition_core_data
+from skyvern.forge.sdk.workflow.service import (
+    WorkflowService,
+    _get_workflow_definition_core_data,
+)
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
-from skyvern.schemas.workflows import WorkflowDefinitionYAML
+from skyvern.schemas.workflows import WorkflowCreateYAMLRequest, WorkflowDefinitionYAML
+from skyvern.services import uploaded_file_service
+from skyvern.services.uploaded_file_service import BLOCK_IMAGE_MAX_BYTES
 from skyvern.utils.yaml_loader import dump_workflow_yaml, safe_load_no_dates
+from tests.unit._uploaded_files_fake import FakeUploadedFilesRepository
+from tests.unit.conftest import SqliteEngineFactory
 
 
 def _nav(label: str, **extra: Any) -> dict[str, Any]:
     return {"block_type": "navigation", "label": label, "url": "https://example.com", "navigation_goal": label, **extra}
+
+
+def _loop(*blocks: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "block_type": "for_loop",
+        "label": "loop",
+        "loop_variable_reference": "{{ items }}",
+        "loop_blocks": list(blocks),
+    }
 
 
 def _definition(blocks: list[dict[str, Any]], **extra: Any) -> WorkflowDefinition:
@@ -426,3 +449,311 @@ def test_a_blank_saved_note_is_not_reported_as_kept() -> None:
     submitted = WorkflowDefinitionYAML.model_validate({"parameters": [], "blocks": [_nav("a")]})
 
     assert carry_forward_block_notes(submitted.blocks, previous.blocks) == {}
+
+
+def _image(file_id: str, caption: str | None = None) -> dict[str, Any]:
+    return {"file_id": file_id, "caption": caption, "placement": "block"}
+
+
+def test_block_images_survive_conversion_and_a_save_while_unknown_keys_are_dropped() -> None:
+    submitted = WorkflowDefinitionYAML.model_validate(
+        {
+            "parameters": [],
+            "blocks": [
+                _nav("a", doc_images=[_image("file_901", "The total")], prompt_images=[_image("file_902")], extra=1)
+            ],
+        }
+    )
+    saved = convert_workflow_definition(workflow_definition_yaml=submitted, workflow_id="w_test")
+    stored = saved.model_dump(mode="json")["blocks"][0]
+    reloaded = WorkflowDefinition.model_validate(saved.model_dump(mode="json")).blocks[0]
+
+    assert "extra" not in stored
+    assert stored["doc_images"] == [_image("file_901", "The total")]
+    assert stored["prompt_images"] == [_image("file_902")]
+    assert [image.file_id for image in reloaded.doc_images or []] == ["file_901"]
+    assert [image.file_id for image in reloaded.prompt_images or []] == ["file_902"]
+
+
+def test_doc_images_never_change_the_cache_key_and_prompt_images_do() -> None:
+    def key(**images: Any) -> dict[str, Any]:
+        return _get_workflow_definition_core_data(_definition([_nav("a", **images), _nav("b")]))
+
+    assert key(doc_images=[_image("file_1")]) == key() == key(doc_images=[_image("file_2", "other")])
+    assert key(prompt_images=[]) == key()
+    assert key(prompt_images=[_image("file_1")]) != key()
+    assert key(prompt_images=[_image("file_1")]) != key(prompt_images=[_image("file_2")])
+
+
+@pytest.mark.parametrize(("field", "cap"), [("doc_images", 10), ("prompt_images", 3)])
+def test_block_image_lists_are_capped(field: str, cap: int) -> None:
+    def submit_ids(*file_ids: str) -> WorkflowDefinitionYAML:
+        images = [_image(file_id) for file_id in file_ids]
+        return WorkflowDefinitionYAML.model_validate({"parameters": [], "blocks": [_nav("a", **{field: images})]})
+
+    def submit(count: int) -> WorkflowDefinitionYAML:
+        return submit_ids(*(f"file_{index}" for index in range(count)))
+
+    assert len(getattr(submit(cap).blocks[0], field)) == cap
+    with pytest.raises(ValidationError, match=f"at most {cap} items"):
+        submit(cap + 1)
+    assert getattr(submit_ids("file_123").blocks[0], field)[0].file_id == "file_123"
+    for not_an_upload in ("https://example.com/x.png", "file_doc", "file_"):
+        with pytest.raises(ValidationError, match="is not an uploaded file id"):
+            submit_ids(not_an_upload)
+
+
+def test_omitted_block_images_carry_forward_and_an_explicit_clear_wins() -> None:
+    previous = _definition([_nav("a", doc_images=[_image("file_901")], prompt_images=[_image("file_902")])])
+    silent = WorkflowDefinitionYAML.model_validate({"parameters": [], "blocks": [_nav("a")]})
+    cleared = WorkflowDefinitionYAML.model_validate({"parameters": [], "blocks": [_nav("a", doc_images=None)]})
+
+    carry_forward_block_notes(silent.blocks, previous.blocks, same_step_labels={"a"})
+    carry_forward_block_notes(cleared.blocks, previous.blocks, same_step_labels={"a"})
+    kept = convert_workflow_definition(workflow_definition_yaml=silent, workflow_id="w_test").blocks[0]
+    dropped = convert_workflow_definition(workflow_definition_yaml=cleared, workflow_id="w_test").blocks[0]
+
+    assert [image.file_id for image in kept.doc_images or []] == ["file_901"]
+    assert [image.file_id for image in kept.prompt_images or []] == ["file_902"]
+    assert dropped.doc_images is None
+    assert [image.file_id for image in dropped.prompt_images or []] == ["file_902"]
+
+
+def test_a_copilot_that_cannot_see_notes_submits_no_image_fields_so_the_saved_ones_are_kept() -> None:
+    blocks = [_nav("a", doc_images=[], prompt_images=[_image("file_903")])]
+    submitted = dump_workflow_yaml({"title": "t", "workflow_definition": {"parameters": [], "blocks": blocks}})
+
+    block = safe_load_no_dates(drop_submitted_note_fields(submitted))["workflow_definition"]["blocks"][0]
+
+    assert "doc_images" not in block
+    assert "prompt_images" not in block
+
+
+class _PastImageCheck(Exception):
+    pass
+
+
+@pytest.mark.asyncio
+async def test_an_upload_past_its_retention_counts_as_unknown_before_the_purge_retires_it() -> None:
+    repo = FakeUploadedFilesRepository()
+    expired = repo.seed("o_saver", expires_at=datetime.now(UTC) - timedelta(minutes=1))
+    live = repo.seed("o_saver", expires_at=datetime.now(UTC) + timedelta(days=1))
+    kept = repo.seed("o_saver")
+    with patch.object(uploaded_file_service, "app", SimpleNamespace(DATABASE=SimpleNamespace(uploaded_files=repo))):
+        found = await uploaded_file_service.live_uploaded_files(
+            file_ids=[expired, live, kept], organization_id="o_saver"
+        )
+    assert set(found) == {live, kept}
+
+
+@pytest.mark.asyncio
+async def test_an_update_without_an_organization_checks_images_against_the_workflow_owner() -> None:
+    repo = FakeUploadedFilesRepository()
+    own = repo.seed("o_saver")
+    other = repo.seed("o_other")
+
+    async def update(file_id: str, owner: Any) -> None:
+        definition = _definition([_nav("a", doc_images=[_image(file_id)])])
+        workflows = SimpleNamespace(get_workflow=AsyncMock(return_value=owner))
+        database = SimpleNamespace(uploaded_files=repo, workflows=workflows)
+        with (
+            patch.object(uploaded_file_service, "app", SimpleNamespace(DATABASE=database)),
+            patch("skyvern.forge.sdk.workflow.service.app", SimpleNamespace(DATABASE=database)),
+            patch.object(WorkflowService, "_validate_block_engines", side_effect=_PastImageCheck),
+        ):
+            await WorkflowService().update_workflow_definition(
+                workflow_id="w_test",
+                organization_id=None,
+                workflow_definition=definition,
+                prior_definition=_definition([]),
+            )
+
+    with pytest.raises(InvalidWorkflowDefinition, match=f"Block a references image {other}"):
+        await update(other, SimpleNamespace(organization_id="o_saver"))
+    with pytest.raises(InvalidWorkflowDefinition, match="need the workflow's organization"):
+        await update(own, None)
+    with pytest.raises(_PastImageCheck):
+        await update(own, SimpleNamespace(organization_id="o_saver"))
+
+
+@pytest_asyncio.fixture
+async def image_save_lab(
+    monkeypatch: pytest.MonkeyPatch, sqlite_engine_factory: SqliteEngineFactory
+) -> AsyncIterator[SimpleNamespace]:
+    database = AgentDB(str((engine := sqlite_engine_factory(build_engine=_build_engine)).url), db_engine=engine)
+    organization = await database.organizations.create_organization(organization_name="t", organization_id="o_saver")
+    repo = FakeUploadedFilesRepository()
+    database.uploaded_files = cast(Any, repo)
+    service = WorkflowService()
+    lookups = AsyncMock(side_effect=uploaded_file_service.live_uploaded_files)
+    monkeypatch.setattr(app, "DATABASE", database)
+    monkeypatch.setattr(app, "WORKFLOW_SERVICE", service)
+    monkeypatch.setattr(uploaded_file_service, "live_uploaded_files", lookups)
+    try:
+        yield SimpleNamespace(service=service, organization=organization, repo=repo, lookups=lookups)
+    finally:
+        await database.engine.dispose()
+
+
+def _image_request(*file_ids: str) -> WorkflowCreateYAMLRequest:
+    return WorkflowCreateYAMLRequest(
+        title="t",
+        workflow_definition=WorkflowDefinitionYAML.model_validate(
+            {"parameters": [], "blocks": [_loop(_nav("a", doc_images=[_image(file_id) for file_id in file_ids]))]}
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_create_and_an_update_that_adds_an_image_each_look_their_images_up_once(
+    image_save_lab: SimpleNamespace,
+) -> None:
+    lab = image_save_lab
+    own = lab.repo.seed("o_saver")
+    created = await lab.service.create_workflow_from_request(organization=lab.organization, request=_image_request(own))
+    assert lab.lookups.await_count == 1
+
+    added = lab.repo.seed("o_saver")
+    await lab.service.update_workflow_definition(
+        workflow_id=created.workflow_id,
+        organization_id="o_saver",
+        workflow_definition=convert_workflow_definition(
+            workflow_definition_yaml=_image_request(own, added).workflow_definition, workflow_id=created.workflow_id
+        ),
+    )
+    assert lab.lookups.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retire", ["expire", "delete"])
+async def test_a_retried_create_returns_the_first_workflow_after_its_image_is_gone(
+    image_save_lab: SimpleNamespace, retire: str
+) -> None:
+    lab = image_save_lab
+    own = lab.repo.seed("o_saver")
+
+    async def create() -> tuple[Workflow, tuple[str, ...]]:
+        return await lab.service.create_workflow_from_request(
+            organization=lab.organization,
+            request=_image_request(own),
+            new_workflow_permanent_id="wpid_new",
+            return_write_result=True,
+        )
+
+    first, first_writes = await create()
+    if retire == "expire":
+        lab.repo.rows[own].expires_at = datetime.now(UTC) - timedelta(minutes=1)
+    else:
+        await lab.repo.claim_uploaded_file_for_deletion(own, "o_saver")
+    retried, retried_writes = await create()
+
+    assert (first_writes, retried_writes) == (("workflow_definition",), ())
+    assert retried.workflow_id == first.workflow_id
+    assert lab.lookups.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("permanent_id", [None, "wpid_new"])
+async def test_a_create_with_an_unknown_image_raises_and_writes_no_workflow(
+    image_save_lab: SimpleNamespace, permanent_id: str | None
+) -> None:
+    lab = image_save_lab
+    other = lab.repo.seed("o_other")
+    for rejected in (other, "file_904"):
+        with pytest.raises(InvalidWorkflowDefinition, match=f"Block a references image {rejected}"):
+            await lab.service.create_workflow_from_request(
+                organization=lab.organization, request=_image_request(rejected), new_workflow_permanent_id=permanent_id
+            )
+    assert await lab.service.get_workflows_by_organization_id(organization_id="o_saver") == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("size_bytes", "accepted"),
+    [(BLOCK_IMAGE_MAX_BYTES, True), (BLOCK_IMAGE_MAX_BYTES + 1, False), (None, True)],
+)
+async def test_a_save_rejects_a_new_image_larger_than_4_mib(
+    image_save_lab: SimpleNamespace, size_bytes: int | None, accepted: bool
+) -> None:
+    lab = image_save_lab
+    image = lab.repo.seed("o_saver", size_bytes=size_bytes)
+    create = lab.service.create_workflow_from_request(organization=lab.organization, request=_image_request(image))
+    if accepted:
+        await create
+    else:
+        with pytest.raises(InvalidWorkflowDefinition, match=f"image {image} is larger than 4 MiB"):
+            await create
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("filename", "accepted"),
+    [
+        *((name, True) for name in ("a.png", "a.jpg", "a.JPG", "a.jpeg", "a.jfif", "a.gif", "a.webp")),
+        *((name, False) for name in ("a.svg", "a.bmp", "a.tiff", "a.pdf", "a.mp4", "screenshot", "a.png.gz", "a.xyz")),
+    ],
+)
+async def test_a_save_rejects_a_new_image_that_is_not_a_raster_upload(
+    image_save_lab: SimpleNamespace, filename: str, accepted: bool
+) -> None:
+    lab = image_save_lab
+    image = lab.repo.seed("o_saver", filename=filename)
+    create = lab.service.create_workflow_from_request(organization=lab.organization, request=_image_request(image))
+    if accepted:
+        await create
+    else:
+        with pytest.raises(InvalidWorkflowDefinition, match=f"file {image} is not a png, jpeg, gif or webp image"):
+            await create
+
+
+@pytest.mark.asyncio
+async def test_a_large_non_image_is_refused_for_its_type_first(image_save_lab: SimpleNamespace) -> None:
+    lab = image_save_lab
+    image = lab.repo.seed("o_saver", filename="a.pdf", size_bytes=BLOCK_IMAGE_MAX_BYTES + 1)
+    with pytest.raises(InvalidWorkflowDefinition, match="is not a png, jpeg, gif or webp image"):
+        await lab.service.create_workflow_from_request(organization=lab.organization, request=_image_request(image))
+
+
+@pytest.mark.asyncio
+async def test_an_update_checks_only_the_images_it_adds(image_save_lab: SimpleNamespace) -> None:
+    lab = image_save_lab
+    oversized, deleted = lab.repo.seed("o_saver"), lab.repo.seed("o_saver")
+    created = await lab.service.create_workflow_from_request(
+        organization=lab.organization, request=_image_request(oversized, deleted)
+    )
+    lab.repo.rows[oversized].size_bytes = BLOCK_IMAGE_MAX_BYTES + 1
+    await lab.repo.claim_uploaded_file_for_deletion(deleted, "o_saver")
+    other = lab.repo.seed("o_other")
+
+    async def update(*file_ids: str) -> None:
+        await lab.service.update_workflow_definition(
+            workflow_id=created.workflow_id,
+            organization_id="o_saver",
+            workflow_definition=convert_workflow_definition(
+                workflow_definition_yaml=_image_request(*file_ids).workflow_definition,
+                workflow_id=created.workflow_id,
+            ),
+        )
+
+    with pytest.raises(InvalidWorkflowDefinition, match=f"Block a references image {other}"):
+        await update(oversized, deleted, other)
+    await update(oversized, deleted)
+
+
+def test_image_fields_inside_a_loop_are_stripped_carried_and_dropped() -> None:
+    def key(**images: Any) -> dict[str, Any]:
+        return _get_workflow_definition_core_data(_definition([_loop(_nav("a", **images))]))
+
+    previous = _definition([_loop(_nav("a", doc_images=[_image("file_901")]))])
+    silent = WorkflowDefinitionYAML.model_validate({"parameters": [], "blocks": [_loop(_nav("a"))]})
+    carry_forward_block_notes(silent.blocks, previous.blocks, same_step_labels={"loop", "a"})
+    kept = convert_workflow_definition(workflow_definition_yaml=silent, workflow_id="w_test").blocks[0]
+    submitted = dump_workflow_yaml(
+        {"title": "t", "workflow_definition": {"parameters": [], "blocks": [_loop(_nav("a", doc_images=[]))]}}
+    )
+    dropped = safe_load_no_dates(drop_submitted_note_fields(submitted))["workflow_definition"]["blocks"][0]
+
+    assert key(doc_images=[_image("file_1")]) == key()
+    assert key(prompt_images=[_image("file_1")]) != key()
+    assert [image.file_id for image in kept.loop_blocks[0].doc_images or []] == ["file_901"]
+    assert "doc_images" not in dropped["loop_blocks"][0]
