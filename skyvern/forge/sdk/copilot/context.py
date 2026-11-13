@@ -161,6 +161,7 @@ class NarrativeBlock(TypedDict):
     label: str
     workflowRunBlockId: NotRequired[str]
     workflowRunId: NotRequired[str]
+    parentWorkflowRunBlockId: NotRequired[str]
     blockType: str
     state: str
     lastSeenIteration: int
@@ -181,6 +182,7 @@ MAX_NARRATIVE_BLOCK_ATTEMPTS = 200
 class NarrativeBlockAttempt(TypedDict):
     workflowRunBlockId: str
     workflowRunId: str | None
+    parentWorkflowRunBlockId: NotRequired[str]
     label: str
     blockType: str
     rawStatus: str
@@ -211,6 +213,7 @@ def upsert_narrative_block_attempt(
     iteration: int,
     started_at: str | None,
     ended_at: str | None,
+    parent_workflow_run_block_id: str | None = None,
 ) -> NarrativeBlockAttempt:
     attempt = archive.get(workflow_run_block_id)
     if attempt is None:
@@ -224,12 +227,16 @@ def upsert_narrative_block_attempt(
             "startedAt": started_at,
             "endedAt": ended_at,
         }
+        if parent_workflow_run_block_id:
+            attempt["parentWorkflowRunBlockId"] = parent_workflow_run_block_id
         archive[workflow_run_block_id] = attempt
         while len(archive) > MAX_NARRATIVE_BLOCK_ATTEMPTS:
             del archive[next(iter(archive))]
         return attempt
 
     attempt["workflowRunId"] = workflow_run_id or attempt["workflowRunId"]
+    if parent_workflow_run_block_id:
+        attempt["parentWorkflowRunBlockId"] = parent_workflow_run_block_id
     attempt["label"] = label or attempt["label"]
     attempt["blockType"] = block_type or attempt["blockType"]
     attempt["rawStatus"] = status

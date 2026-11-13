@@ -2402,6 +2402,8 @@ def _build_narrative_payload(
         }
         if workflow_run_id := attempt["workflowRunId"]:
             block_entry["workflowRunId"] = workflow_run_id
+        if "parentWorkflowRunBlockId" in attempt:
+            block_entry["parentWorkflowRunBlockId"] = attempt["parentWorkflowRunBlockId"]
         if "outcome" in attempt:
             block_entry["outcome"] = attempt["outcome"]
         if "outcomeRole" in attempt:
