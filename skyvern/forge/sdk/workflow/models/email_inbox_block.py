@@ -24,9 +24,12 @@ from skyvern.forge.sdk.workflow.models.block import (
 )
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE
 from skyvern.schemas.emails import (
+    CONNECTED_ACCOUNT_COPILOT_TEST_RUN_REASON,
+    CONNECTED_ACCOUNT_IN_CREDENTIAL_ID_REASON,
     CONNECTED_ACCOUNT_OWNER_UNCONFIRMED_REASON,
     CONNECTED_ACCOUNT_RESAVE_REASON,
     GmailHopRefusal,
+    is_connected_gmail_id,
 )
 from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType
 from skyvern.services import email
@@ -413,6 +416,12 @@ class EmailInboxBlock(Block):
                         raise email.GmailAPIError(
                             status=403, code="owner_unconfirmed", message=CONNECTED_ACCOUNT_OWNER_UNCONFIRMED_REASON
                         )
+                    if refusal == GmailHopRefusal.copilot_test_run:
+                        raise email.GmailAPIError(
+                            status=403,
+                            code="copilot_test_run_unsupported",
+                            message=CONNECTED_ACCOUNT_COPILOT_TEST_RUN_REASON,
+                        )
                 data = await app.AGENT_FUNCTION.execute_gmail_inbox_for_run(
                     organization_id=effective_org_id,
                     workflow_run_id=workflow_run_id,
@@ -450,6 +459,12 @@ class EmailInboxBlock(Block):
                         required_scopes=["Mail.Read"],
                     )
                     reconnect_label = "Outlook"
+                if not access_token and self.email_client == "gmail" and is_connected_gmail_id(self.credential_id):
+                    return await self._failure(
+                        failure_reason=CONNECTED_ACCOUNT_IN_CREDENTIAL_ID_REASON,
+                        workflow_run_block_id=workflow_run_block_id,
+                        organization_id=organization_id,
+                    )
                 if not access_token:
                     return await self._failure(
                         failure_reason=f"Reconnect the {reconnect_label} account: no valid access token",

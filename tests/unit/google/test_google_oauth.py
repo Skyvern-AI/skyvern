@@ -14,6 +14,7 @@ from pydantic import ValidationError
 from sqlalchemy.sql.elements import BindParameter
 
 from skyvern.exceptions import DownloadFileMaxSizeExceeded
+from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.encrypt.base import DEFAULT_ENCRYPT_METHOD, EncryptMethod
@@ -2511,6 +2512,66 @@ async def test_authorize_route_forwards_credential_id_for_reconnect(monkeypatch:
     assert response.authorize_url == "https://auth"
     assert start_mock.await_args.kwargs["credential_id"] == "goac_existing"
     assert start_mock.await_args.kwargs["initiator_id"] == "user_1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("changes", "refused"),
+    [
+        ({}, True),
+        ({"scope_profile": "gmail_read_send"}, True),
+        ({"credential_id": "goac_existing"}, False),
+        ({"scope_profile": "google_sheets"}, False),
+        ({"connected_gmail": False}, False),
+        ({"native_gmail_scopes": ["https://www.googleapis.com/auth/gmail.readonly"]}, False),
+        ({"user_id": None}, False),
+        ({"native_list_fails": True}, False),
+    ],
+)
+async def test_authorize_route_sends_a_new_gmail_connection_to_connected_gmail(
+    monkeypatch: pytest.MonkeyPatch, changes: dict[str, Any], refused: bool
+) -> None:
+    case = {
+        "scope_profile": "gmail",
+        "credential_id": None,
+        "connected_gmail": True,
+        "native_gmail_scopes": None,
+        "user_id": "user_1",
+        "native_list_fails": False,
+        **changes,
+    }
+    start_mock = AsyncMock(
+        return_value=google_oauth_service.GoogleAuthorizationStart(authorize_url="https://auth", state="st")
+    )
+    monkeypatch.setattr(google_oauth_routes.google_oauth_service, "start_authorization", start_mock)
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION, "nango_gmail_catalog_available", AsyncMock(return_value=case["connected_gmail"])
+    )
+    sheets = SimpleNamespace(scopes_requested=list(google_oauth_service.GOOGLE_SHEETS_SCOPES), scopes_granted=[])
+    visible = [sheets]
+    if case["native_gmail_scopes"]:
+        visible.append(SimpleNamespace(scopes_requested=[], scopes_granted=case["native_gmail_scopes"]))
+    monkeypatch.setattr(
+        google_oauth_routes.google_oauth_service,
+        "get_visible_credentials_for_org",
+        AsyncMock(side_effect=RuntimeError("db down"))
+        if case["native_list_fails"]
+        else AsyncMock(return_value=visible),
+    )
+
+    request = CreateGoogleOAuthAuthorizeRequest(
+        redirect_uri="https://x/cb", scope_profile=case["scope_profile"], credential_id=case["credential_id"]
+    )
+    call_route = google_oauth_routes.google_oauth_authorize(
+        request=request, current_org=SimpleNamespace(organization_id="org_1"), current_user_id=case["user_id"]
+    )
+    if refused:
+        with pytest.raises(HTTPException) as exc_info:
+            await call_route
+        assert exc_info.value.status_code == 409
+        start_mock.assert_not_awaited()
+    else:
+        assert (await call_route).authorize_url == "https://auth"
 
 
 @pytest.mark.asyncio

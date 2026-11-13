@@ -586,7 +586,9 @@ async def test_org_visible_connection_id_citation_is_exonerated(
 ) -> None:
     rows = [OrgConnection(connection_id, "google", "Account", None, "active", ())]
     lookup = (
-        AsyncMock(side_effect=IncompleteConnectionRead(rows)) if other_provider_failed else AsyncMock(return_value=rows)
+        AsyncMock(side_effect=IncompleteConnectionRead(rows, frozenset({"microsoft"})))
+        if other_provider_failed
+        else AsyncMock(return_value=rows)
     )
     with patch("skyvern.forge.sdk.integrations.connected_accounts.org_connections", new=lookup):
         policy, _ = await _build(

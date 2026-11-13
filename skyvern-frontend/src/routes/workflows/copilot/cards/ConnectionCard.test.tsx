@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import type { GoogleOAuthCredential } from "@/api/types";
+import { type ConnectedGmailFlow, PageSlotsProvider } from "@/store/PageSlots";
 
 import { ConnectionCard } from "./ConnectionCard";
 import { googleConnectionChanged } from "./googleConnectionChanged";
@@ -24,6 +25,8 @@ vi.mock("@/hooks/useGoogleOAuthCredentials", async (importOriginal) => ({
     startAuthorize,
   }),
 }));
+
+vi.mock("@/hooks/useCurrentOrgId", () => ({ useCurrentOrgId: () => "o_1" }));
 
 vi.mock("@/hooks/useMicrosoftOAuthCredentials", async (importOriginal) => ({
   ...(await importOriginal()),
@@ -249,5 +252,314 @@ describe("ConnectionCard", () => {
     expect(screen.getByText("Choose an Outlook account")).toBeTruthy();
     expect(screen.queryByText(/Google/)).toBeNull();
     microsoftCredentials.current = [];
+  });
+  it("starts Connected Gmail for a new Gmail card, and keeps a reconnect on the native sign-in", () => {
+    startAuthorize.mockClear();
+    const start = vi.fn();
+    const flow: ConnectedGmailFlow = {
+      status: "default",
+      canConnect: true,
+      busy: false,
+      failure: null,
+      connections: [],
+      start,
+    };
+    const gmailCard = {
+      integrationId: "gmail",
+      integrationName: "Gmail",
+      provider: "google" as const,
+      scopeProfile: "gmail",
+      requiredScopes: [GMAIL],
+      reconnectConnectionId: null,
+    };
+    const slots = {
+      connectedGmailFlow: ({
+        children,
+      }: {
+        children: (value: ConnectedGmailFlow) => React.ReactNode;
+      }) => <>{children(flow)}</>,
+    };
+    const open = vi.spyOn(window, "open");
+    const { unmount } = render(
+      <PageSlotsProvider value={slots}>
+        <ConnectionCard card={gmailCard} />
+      </PageSlotsProvider>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+    expect(start).toHaveBeenCalledOnce();
+    expect(open).not.toHaveBeenCalled();
+    expect(startAuthorize).not.toHaveBeenCalled();
+    unmount();
+
+    googleCredentials.current = [row("goac_gmail", [GMAIL], "error")];
+    render(
+      <PageSlotsProvider value={slots}>
+        <ConnectionCard
+          card={{ ...gmailCard, reconnectConnectionId: "goac_gmail" }}
+        />
+      </PageSlotsProvider>,
+    );
+    open.mockReturnValue(null);
+    fireEvent.click(screen.getByRole("button", { name: "Reconnect" }));
+    expect(start).toHaveBeenCalledOnce();
+    expect(open).toHaveBeenCalledOnce();
+    open.mockRestore();
+    googleCredentials.current = [];
+  });
+  it("offers an existing Connected Gmail account without reading it as just connected", () => {
+    const flowWith = (ids: string[]): ConnectedGmailFlow => ({
+      status: "default",
+      canConnect: true,
+      busy: false,
+      failure: null,
+      connections: ids.map((id) => ({ connection_id: id, name: id })),
+      start: vi.fn(),
+    });
+    let flow = flowWith(["nc_existing"]);
+    const slots = {
+      connectedGmailFlow: ({
+        children,
+      }: {
+        children: (value: ConnectedGmailFlow) => React.ReactNode;
+      }) => <>{children(flow)}</>,
+    };
+    const card = (
+      <PageSlotsProvider value={slots}>
+        <ConnectionCard
+          card={{
+            integrationId: "gmail",
+            integrationName: "Gmail",
+            provider: "google",
+            scopeProfile: "gmail",
+            requiredScopes: [GMAIL],
+            reconnectConnectionId: null,
+          }}
+        />
+      </PageSlotsProvider>
+    );
+    const { rerender } = render(card);
+    expect(screen.queryByText("Connected")).toBeNull();
+    expect(screen.getByText("nc_existing")).toBeTruthy();
+
+    flow = flowWith(["nc_existing", "nc_new"]);
+    rerender(
+      <PageSlotsProvider value={{ ...slots }}>
+        {card.props.children}
+      </PageSlotsProvider>,
+    );
+    expect(screen.getByText("Connected")).toBeTruthy();
+  });
+  it("still offers an existing Connected Gmail account when a native credential makes native the default", () => {
+    const flow: ConnectedGmailFlow = {
+      status: "unavailable",
+      canConnect: true,
+      busy: false,
+      failure: null,
+      connections: [{ connection_id: "nc_existing", name: "nc_existing" }],
+      start: vi.fn(),
+    };
+    render(
+      <PageSlotsProvider
+        value={{
+          connectedGmailFlow: ({
+            children,
+          }: {
+            children: (value: ConnectedGmailFlow) => React.ReactNode;
+          }) => <>{children(flow)}</>,
+        }}
+      >
+        <ConnectionCard
+          card={{
+            integrationId: "gmail",
+            integrationName: "Gmail",
+            provider: "google",
+            scopeProfile: "gmail",
+            requiredScopes: [GMAIL],
+            reconnectConnectionId: null,
+          }}
+        />
+      </PageSlotsProvider>,
+    );
+
+    expect(screen.getByText("nc_existing")).toBeTruthy();
+  });
+  it("settles on a user's one Connected Gmail account instead of offering Connect", () => {
+    const flow: ConnectedGmailFlow = {
+      status: "default",
+      canConnect: false,
+      busy: false,
+      failure: null,
+      connections: [
+        { connection_id: "ngc_existing", name: "o***@example.com" },
+      ],
+      start: vi.fn(),
+    };
+    render(
+      <PageSlotsProvider
+        value={{
+          connectedGmailFlow: ({
+            children,
+          }: {
+            children: (value: ConnectedGmailFlow) => React.ReactNode;
+          }) => <>{children(flow)}</>,
+        }}
+      >
+        <ConnectionCard
+          card={{
+            integrationId: "gmail",
+            integrationName: "Gmail",
+            provider: "google",
+            scopeProfile: "gmail",
+            requiredScopes: [GMAIL],
+            reconnectConnectionId: null,
+          }}
+        />
+      </PageSlotsProvider>,
+    );
+
+    expect(screen.getByText("Connected")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Connect" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Admin required" })).toBeNull();
+  });
+  it("switches to Connected Gmail when native sign-in is refused because Connected Gmail is the way", async () => {
+    startAuthorize.mockReset();
+    startAuthorize.mockRejectedValue({ response: { status: 409 } });
+    const popup = {
+      location: { assign: vi.fn() },
+      close: vi.fn(),
+      closed: false,
+      opener: null,
+    };
+    const open = vi
+      .spyOn(window, "open")
+      .mockReturnValue(popup as unknown as Window);
+    const start = vi.fn();
+    const flow: ConnectedGmailFlow = {
+      status: "unavailable",
+      canConnect: true,
+      busy: false,
+      failure: null,
+      connections: [],
+      start,
+    };
+    render(
+      <PageSlotsProvider
+        value={{
+          connectedGmailFlow: ({
+            children,
+          }: {
+            children: (value: ConnectedGmailFlow) => React.ReactNode;
+          }) => <>{children(flow)}</>,
+        }}
+      >
+        <ConnectionCard
+          card={{
+            integrationId: "gmail",
+            integrationName: "Gmail",
+            provider: "google",
+            scopeProfile: "gmail",
+            requiredScopes: [GMAIL],
+            reconnectConnectionId: null,
+          }}
+        />
+      </PageSlotsProvider>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+
+    await waitFor(() => expect(start).toHaveBeenCalledOnce());
+    expect(popup.close).toHaveBeenCalled();
+    expect(screen.queryByText("Could not start the connection.")).toBeNull();
+    open.mockRestore();
+    startAuthorize.mockReset();
+  });
+  it("shows a running Connected Gmail sign-in even when native is the card's default", () => {
+    const flow: ConnectedGmailFlow = {
+      status: "unavailable",
+      canConnect: true,
+      busy: true,
+      failure: null,
+      connections: [],
+      start: vi.fn(),
+    };
+    render(
+      <PageSlotsProvider
+        value={{
+          connectedGmailFlow: ({
+            children,
+          }: {
+            children: (value: ConnectedGmailFlow) => React.ReactNode;
+          }) => <>{children(flow)}</>,
+        }}
+      >
+        <ConnectionCard
+          card={{
+            integrationId: "gmail",
+            integrationName: "Gmail",
+            provider: "google",
+            scopeProfile: "gmail",
+            requiredScopes: [GMAIL],
+            reconnectConnectionId: null,
+          }}
+        />
+      </PageSlotsProvider>,
+    );
+
+    const button = screen.getByRole("button", { name: "Waiting for sign-in…" });
+    expect((button as HTMLButtonElement).disabled).toBe(true);
+  });
+  it("keeps the start failure visible when a 409 meets a Connected Gmail flow that cannot connect", async () => {
+    startAuthorize.mockReset();
+    startAuthorize.mockRejectedValue({ response: { status: 409 } });
+    const popup = {
+      location: { assign: vi.fn() },
+      close: vi.fn(),
+      closed: false,
+      opener: null,
+    };
+    const open = vi
+      .spyOn(window, "open")
+      .mockReturnValue(popup as unknown as Window);
+    const start = vi.fn();
+    const flow: ConnectedGmailFlow = {
+      status: "unavailable",
+      canConnect: false,
+      busy: false,
+      failure: null,
+      connections: [],
+      start,
+    };
+    render(
+      <PageSlotsProvider
+        value={{
+          connectedGmailFlow: ({
+            children,
+          }: {
+            children: (value: ConnectedGmailFlow) => React.ReactNode;
+          }) => <>{children(flow)}</>,
+        }}
+      >
+        <ConnectionCard
+          card={{
+            integrationId: "gmail",
+            integrationName: "Gmail",
+            provider: "google",
+            scopeProfile: "gmail",
+            requiredScopes: [GMAIL],
+            reconnectConnectionId: null,
+          }}
+        />
+      </PageSlotsProvider>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+
+    expect(
+      await screen.findByText("Could not start the connection."),
+    ).toBeTruthy();
+    expect(start).not.toHaveBeenCalled();
+    open.mockRestore();
+    startAuthorize.mockReset();
   });
 });

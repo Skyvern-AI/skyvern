@@ -43,6 +43,7 @@ def connected_account_choice_context(
     *,
     explicit_selected_connection_id: str | None = None,
     explicit_selected_connection_scopes: Sequence[str] = (),
+    explicit_selected_connection_provider: str | None = None,
     from_pending_proposal: bool = False,
 ) -> str:
     """Expose the validated picker selection as context; authorization remains in request policy."""
@@ -57,8 +58,12 @@ def connected_account_choice_context(
         payload["selected_connection_id"] = explicit_selected_connection_id
         payload["selected_connection"] = {
             "connection_id": explicit_selected_connection_id,
+            "provider": explicit_selected_connection_provider,
             "state": "active",
-            "scopes_granted": list(explicit_selected_connection_scopes),
+            # A Nango account reports no scopes, so they read as unknown rather than none.
+            "scopes_granted": None
+            if explicit_selected_connection_provider == "nango"
+            else list(explicit_selected_connection_scopes),
         }
     return json.dumps(payload, separators=(",", ":"))
 

@@ -1307,6 +1307,9 @@ async def list_integrations_tool(ctx: RunContextWrapper) -> str:
 
     When the current request identifies one active, scope-compatible row, bind its
     exact `connection_id` as the native block's `credential_id` and continue.
+    A `provider` `nango` row is a Connected Gmail account: it reports no scopes, and
+    its `connection_id` goes in the Gmail block's `connection_id` with
+    `credential_source: nango`, never in `credential_id`.
     Never require an opaque ID already present in this tool result to be repeated.
     If the requested account remains ambiguous or no compatible active row exists,
     use a grounded ordinary-language clarification instead.

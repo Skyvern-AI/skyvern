@@ -1086,7 +1086,7 @@ async def _connected_accounts(organization_id: str | None, workflow_run_id: str)
             )
         if allowed is not None or settings.COPILOT_NARROW_AGENT_STEP_ACCOUNTS:
             connections = [connection for connection in connections if connection.id in (allowed or set())]
-    return [connection for connection in connections if connection.active]
+    return [connection for connection in connections if connection.active and connection.agent_step_usable]
 
 
 async def run_agent_step(

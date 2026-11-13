@@ -53,7 +53,11 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.models import GoogleOAuthCredentialModel, WorkflowRunBlockModel, WorkflowRunModel
 from skyvern.forge.sdk.experimentation.providers import NoOpExperimentationProvider
-from skyvern.forge.sdk.integrations.connected_accounts import _run_accounts_key, record_run_connection_ids
+from skyvern.forge.sdk.integrations.connected_accounts import (
+    OrgConnection,
+    _run_accounts_key,
+    record_run_connection_ids,
+)
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
@@ -1163,6 +1167,37 @@ async def test_a_copilot_runs_record_holds_whatever_the_workers_setting_and_a_br
     monkeypatch.setattr(settings, "COPILOT_NARROW_AGENT_STEP_ACCOUNTS", True)
     assert await offered("wr_dangling") == []
     assert await offered(f"wr_hop_{agent_step_loop._MAX_PARENT_RUN_HOPS + 1}") == []
+
+
+@pytest.mark.asyncio
+async def test_a_run_creators_connected_gmail_account_is_never_offered_to_the_agent_step(
+    monkeypatch: pytest.MonkeyPatch, database: AgentDB
+) -> None:
+    async with database.Session() as session:
+        session.add(
+            GoogleOAuthCredentialModel(
+                id="goc_a",
+                organization_id=ORG,
+                credential_name="goc_a",
+                email_address="goc_a@example.com",
+                state="active",
+                scopes_granted=[SHEETS_SCOPE],
+            )
+        )
+        await session.execute(
+            update(WorkflowRunModel).where(WorkflowRunModel.workflow_run_id == RUN).values(created_by="user-1")
+        )
+        await session.commit()
+
+    async def own_connected_gmail(organization_id: str, user_id: str) -> list[OrgConnection]:
+        return (
+            [OrgConnection("ngc_owned", "nango", "Connected Gmail", None, "active", ())] if user_id == "user-1" else []
+        )
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "own_connected_gmail_connections", own_connected_gmail)
+
+    # A Nango hop token exists only for a saved block, so the agent step cannot use the account (ADR 0033).
+    assert [account.id for account in await agent_step_loop._connected_accounts(ORG, RUN)] == ["goc_a"]
 
 
 class _SheetsWithBackupAccount(GoogleSheetsReadBlockYAML):

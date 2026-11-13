@@ -1126,6 +1126,7 @@ class RequestPolicy:
     # substitute; the dispatch seam separately admits one this turn listed or the user named.
     selected_connected_account_id: str | None = None
     selected_connected_account_scopes: list[str] = field(default_factory=list)
+    selected_connected_account_provider: str | None = None
     # Test end to end derived the pick from the pending proposal, so it is recorded as reads-only whatever else
     # approves the account this turn: a saved binding stops approving once it is removed.
     selected_connected_account_from_pending_proposal: bool = False
@@ -5077,6 +5078,7 @@ async def _build_request_policy_bootstrap(
     connection_candidates = full_approvals | reads_only_approvals
     policy.selected_connected_account_id = None
     policy.selected_connected_account_scopes = []
+    policy.selected_connected_account_provider = None
     policy.selected_connected_account_from_pending_proposal = False
     if connection_candidates or selected_connected_account_id is not None:
         connections: list[OrgConnection] | None
@@ -5097,6 +5099,7 @@ async def _build_request_policy_bootstrap(
             if selected is not None:
                 policy.selected_connected_account_id = selected.id
                 policy.selected_connected_account_scopes = list(selected.scopes_granted)
+                policy.selected_connected_account_provider = selected.provider
                 policy.selected_connected_account_from_pending_proposal = (
                     selected_connected_account_from_pending_proposal
                 )

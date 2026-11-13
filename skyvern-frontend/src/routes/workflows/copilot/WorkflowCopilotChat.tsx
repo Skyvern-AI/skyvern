@@ -875,7 +875,7 @@ function connectedAccountSelectionReceipt(
   // A connection card lists accounts made after its turn ended, which no stored choice set holds.
   if (
     prior.narrative.connectionCards.length > 0 &&
-    /^(goac|moac)_[A-Za-z0-9]+$/.test(message.content)
+    /^(goac|moac|ngc)_[A-Za-z0-9]+$/.test(message.content)
   ) {
     return `Selected connection …${message.content.slice(-8)}`;
   }

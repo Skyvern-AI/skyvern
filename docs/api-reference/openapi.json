@@ -25038,6 +25038,7 @@
             "x-skyvern-connected-account": true,
             "x-skyvern-connected-account-acts": true,
             "x-skyvern-connected-account-when": {
+              "credential_source": "native",
               "transport": "gmail"
             }
           },

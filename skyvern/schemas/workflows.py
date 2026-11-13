@@ -1354,7 +1354,9 @@ class SendEmailBlockYAML(BlockYAML):
     credential_id: str | None = Field(
         default=None,
         description="ID of a connected Google account that has send permission. Used only with transport 'gmail'.",
-        json_schema_extra=_connected_account_field(acts=True, transport=EmailTransport.GMAIL.value),
+        json_schema_extra=_connected_account_field(
+            acts=True, transport=EmailTransport.GMAIL.value, credential_source="native"
+        ),
     )
     credential_source: Literal["native", "nango"] = Field(
         default="native",

@@ -5884,6 +5884,7 @@ async def _run_copilot_turn_impl(
         prior_turn_outcome,
         explicit_selected_connection_id=request_policy.selected_connected_account_id,
         explicit_selected_connection_scopes=request_policy.selected_connected_account_scopes,
+        explicit_selected_connection_provider=request_policy.selected_connected_account_provider,
         from_pending_proposal=chat_request.selected_connected_account_from_pending_proposal,
     )
     if prior_choice_context:

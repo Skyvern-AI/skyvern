@@ -61,6 +61,7 @@ from skyvern.forge.sdk.db.id import GOOGLE_OAUTH_CREDENTIAL_PREFIX, MICROSOFT_OA
 from skyvern.forge.sdk.integrations.connected_accounts import (
     IncompleteConnectionRead,
     OrgConnection,
+    agent_step_org_connections,
     connected_account_fields,
     org_connections,
     org_connections_by_id,
@@ -736,7 +737,7 @@ async def _agent_step_connection_ids(
     """The account ids executing agent steps can use, and whether that use may act (send, write, upload)."""
     if agent_tools & ACCOUNT_TOOL_NAMES:
         # Raises IncompleteConnectionRead when a provider cannot be read, so the caller refuses.
-        connections = await org_connections(organization_id, request_user_id(organization_id))
+        connections = await agent_step_org_connections(organization_id, request_user_id(organization_id))
         return [connection.id for connection in connections if connection.active], bool(
             agent_tools & ACTING_ACCOUNT_TOOL_NAMES
         )
@@ -744,7 +745,7 @@ async def _agent_step_connection_ids(
     if text is None:
         return [], True
     try:
-        connections = await org_connections(organization_id, request_user_id(organization_id))
+        connections = await agent_step_org_connections(organization_id, request_user_id(organization_id))
     except IncompleteConnectionRead:
         # A provider that could not be read may hold any id-shaped token, so every one is checked.
         return list(dict.fromkeys(_ACCOUNT_ID_RE.findall(text))), True
@@ -839,7 +840,7 @@ async def run_credential_gate(
         # Off, the gate does not read triggered workflows, so it records every account: a worker already on then
         # still offers a triggered child what main did. What needs approval is unchanged.
         try:
-            connections = await org_connections(ctx.organization_id, request_user_id(ctx.organization_id))
+            connections = await agent_step_org_connections(ctx.organization_id, request_user_id(ctx.organization_id))
         except IncompleteConnectionRead:
             return CredentialGateResult(error=_ACCOUNTS_UNREADABLE)
         agent_step_offer = tuple(connection.id for connection in connections if connection.active)
