@@ -123,6 +123,29 @@ export function toolCallSummary(call: AgentStepToolCall): string {
   return first ? first[1] : "";
 }
 
+const HEADLINE_MAX_CHARS = 200;
+
+function firstGoal(call: AgentStepToolCall): string {
+  const parsed = parsedArguments(call);
+  if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+    const fields = parsed as Record<string, unknown>;
+    for (const key of ["navigation_goal", "data_extraction_goal"]) {
+      const value = fields[key];
+      if (typeof value === "string" && value.trim()) {
+        return value;
+      }
+    }
+  }
+  return toolCallSummary(call);
+}
+
+export function toolCallHeadline(call: AgentStepToolCall): string {
+  const text = firstGoal(call).replace(/\s+/g, " ").trim();
+  return text.length > HEADLINE_MAX_CHARS
+    ? `${text.slice(0, HEADLINE_MAX_CHARS)}…`
+    : text;
+}
+
 // The column holds the child block's workflow YAML as JSON, written by the agent step loop.
 export function toolCallBlock(
   blockJson: string | null | undefined,

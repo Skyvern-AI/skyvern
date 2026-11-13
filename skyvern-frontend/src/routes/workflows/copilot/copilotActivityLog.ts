@@ -336,6 +336,19 @@ export function deriveActivityLog(turn: TurnNarrativeState): ActivityLog {
       anchor.blocks.push(condensedBlock(block));
       continue;
     }
+    // A Test button run has no run call until it returns, so a block its agent step ran joins that
+    // step's own row; otherwise it could not nest in the step's card while the run is live.
+    const stepRow = rows.find(
+      (row) =>
+        row.entries.length === 0 &&
+        [...agentStepChildren([...row.blocks, block]).values()].some(
+          (children) => children.includes(block),
+        ),
+    );
+    if (stepRow) {
+      stepRow.blocks.push(condensedBlock(block));
+      continue;
+    }
     // Drafted blocks, and any block in a turn that never ran, get a row of
     // their own so folding the log never strands a card outside one.
     rows.push({
@@ -692,6 +705,34 @@ export interface BlockAttempt {
 
 export function blockIdentity(block: BlockState): string {
   return block.workflowRunBlockId || block.label;
+}
+
+// Within one card group, each block an agent step ran, keyed by the step's run-block id. Matched by id
+// only (loop iterations reuse labels); every block stays in state, so counts and pins still see it.
+export function agentStepChildren(
+  group: BlockState[],
+): Map<string, BlockState[]> {
+  const steps = group.filter(
+    (block) => block.blockType === "agent_step" && block.workflowRunBlockId,
+  );
+  const children = new Map<string, BlockState[]>();
+  if (steps.length === 0) return children;
+  for (const block of group) {
+    const id = block.workflowRunBlockId;
+    if (!id) continue;
+    const parent = steps.find(
+      (step) =>
+        step !== block &&
+        (block.parentWorkflowRunBlockId === step.workflowRunBlockId ||
+          (step.agentStepCalls ?? []).some(
+            (call) => call.childWorkflowRunBlockId === id,
+          )),
+    );
+    if (parent === undefined) continue;
+    const key = parent.workflowRunBlockId;
+    children.set(key, [...(children.get(key) ?? []), block]);
+  }
+  return children;
 }
 
 // Keyed by blockIdentity over the turn's own block order, so every view numbers a run alike. A turn

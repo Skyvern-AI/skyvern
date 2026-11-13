@@ -108,6 +108,13 @@ export interface RecordedActionSummary {
   response: string | null;
 }
 
+// One agent step call, read from the step's tool_calls in the same timeline
+// response. Client-only like recorded actions: never saved with the turn.
+export interface AgentStepCallSummary extends RecordedActionSummary {
+  state: "running" | "completed" | "failed" | "skipped";
+  childWorkflowRunBlockId: string | null;
+}
+
 // Client-synthesized event (never sent by the backend) that carries the
 // fetched recorded actions into the reducer so the reveal schedule can be
 // derived the same way as every other narrative update.
@@ -116,6 +123,8 @@ export interface CopilotBlockActionsEvent {
   blocks: Array<{
     workflowRunBlockId: string;
     actions: RecordedActionSummary[];
+    // Present only for an agent step; the latest applied response replaces the list.
+    calls?: AgentStepCallSummary[];
   }>;
   receivedAtMs: number;
 }
@@ -317,6 +326,8 @@ export interface ReviewProjection {
 export interface BlockState {
   workflowRunBlockId: string;
   workflowRunId?: string;
+  // The run block that ran this one (an agent step, loop or code-block fallback).
+  parentWorkflowRunBlockId?: string;
   label: string;
   blockType: string;
   state: BlockUIState;
@@ -341,6 +352,7 @@ export interface BlockState {
   // Epoch ms this block's reveal schedule starts counting from — staggered
   // past preceding blocks' schedules so a multi-block run reveals in order.
   recordedActionsAt?: number;
+  agentStepCalls?: AgentStepCallSummary[];
 }
 
 export function hasObservedBlockEvidence(block: BlockState): boolean {
@@ -1608,6 +1620,9 @@ export function applyNarrativeEvent(
       const baseEntry: BlockState = {
         workflowRunBlockId: event.workflow_run_block_id,
         workflowRunId: runId || previousBlock?.workflowRunId,
+        parentWorkflowRunBlockId:
+          event.parent_workflow_run_block_id ||
+          previousBlock?.parentWorkflowRunBlockId,
         label: event.block_label,
         blockType: event.block_type,
         state: incomingState,
@@ -1620,6 +1635,7 @@ export function applyNarrativeEvent(
         skippedBefore: previousBlock?.skippedBefore ?? pendingSkipped,
         recordedActions: previousBlock?.recordedActions,
         recordedActionsAt: previousBlock?.recordedActionsAt,
+        agentStepCalls: previousBlock?.agentStepCalls,
         lastSeenIteration: event.iteration,
         activity: previousBlock?.activity ?? [],
         startedAt,
@@ -1715,11 +1731,20 @@ export function applyNarrativeEvent(
       // id from the live blocks (see the `response` case), so a post-terminal
       // fetch still matches by id — and a different run's ids never collide with
       // this turn's, keeping late fetches from cross-contaminating prior turns.
-      const blocks = prev.blocks.map((b) => {
+      const blocks = prev.blocks.map((block) => {
         const match = event.blocks.find(
-          (entry) => entry.workflowRunBlockId === b.workflowRunBlockId,
+          (entry) => entry.workflowRunBlockId === block.workflowRunBlockId,
         );
-        if (!match || match.actions.length === 0) return b;
+        if (!match) return block;
+        let b = block;
+        if (
+          match.calls !== undefined &&
+          JSON.stringify(match.calls) !== JSON.stringify(b.agentStepCalls)
+        ) {
+          changed = true;
+          b = { ...b, agentStepCalls: match.calls };
+        }
+        if (match.actions.length === 0) return b;
         const existing = b.recordedActions;
         if (existing === undefined) {
           changed = true;
@@ -1861,8 +1886,11 @@ export function applyNarrativeEvent(
           return {
             ...b,
             workflowRunBlockId: live.workflowRunBlockId,
+            parentWorkflowRunBlockId:
+              b.parentWorkflowRunBlockId ?? live.parentWorkflowRunBlockId,
             recordedActions: live.recordedActions,
             recordedActionsAt: live.recordedActionsAt,
+            agentStepCalls: live.agentStepCalls,
           };
         });
         return {
@@ -2189,6 +2217,11 @@ export function hydrateNarrativeFromPayload(
         workflowRunId:
           typeof obj.workflowRunId === "string" && obj.workflowRunId
             ? obj.workflowRunId
+            : undefined,
+        parentWorkflowRunBlockId:
+          typeof obj.parentWorkflowRunBlockId === "string" &&
+          obj.parentWorkflowRunBlockId
+            ? obj.parentWorkflowRunBlockId
             : undefined,
         label: typeof obj.label === "string" ? obj.label : "",
         blockType: typeof obj.blockType === "string" ? obj.blockType : "task",

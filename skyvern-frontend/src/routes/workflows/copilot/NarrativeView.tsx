@@ -1,6 +1,7 @@
 import {
   Fragment,
   useCallback,
+  useContext,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -27,6 +28,7 @@ import {
   revealedCharsAt,
   revealedCountAt,
 } from "./actionReveal";
+import { AgentStepCallsLoaderContext } from "./agentStepCallsLoader";
 import { humanizeBlockLabel } from "./blockLabel";
 import { fitSteps, STEP_SEPARATOR } from "./fitSteps";
 import { CopilotMarkdown } from "./CopilotMarkdown";
@@ -36,6 +38,7 @@ import {
   ActivityRow as ActivityRowModel,
   BlockAttempt,
   FinishedTurnSummary,
+  agentStepChildren,
   blockAttempts,
   blockIdentity,
   blocksByRunCall,
@@ -61,6 +64,7 @@ import { RunFieldValue } from "../studio/runview/RunFieldValue";
 import { WorkflowParameterValueType } from "../types/workflowTypes";
 import {
   ActivityEntry,
+  AgentStepCallSummary,
   BlockState,
   BudgetExpiryState,
   RecordedActionSummary,
@@ -1359,6 +1363,86 @@ function FCardActionRow({
   );
 }
 
+function FCardCallRow({
+  call,
+  cardRunning,
+  childNested,
+  failureText,
+}: {
+  call: AgentStepCallSummary;
+  cardRunning: boolean;
+  // The nested child card carries this call's status, so the row shows none.
+  childNested: boolean;
+  failureText: string | null;
+}) {
+  const failed = call.failed && !childNested;
+  const unfinished =
+    call.state === "skipped" || (call.state === "running" && !cardRunning);
+  const duration =
+    call.state === "running" ? null : formatActionDuration(call.durationMs);
+  const row = (
+    <div
+      data-testid="copilot-agent-step-call"
+      className="flex items-start gap-2 text-[12px] leading-[1.5]"
+    >
+      <span className="flex h-[18px] w-3.5 shrink-0 items-center justify-center">
+        {childNested ? null : call.state === "running" && cardRunning ? (
+          <Spinner small />
+        ) : unfinished ? (
+          <span aria-hidden="true" className="text-muted-foreground">
+            –
+          </span>
+        ) : failed ? (
+          <Cross2Icon
+            aria-hidden="true"
+            className="size-[13px] text-rose-600 dark:text-rose-500"
+          />
+        ) : (
+          <CheckIcon
+            aria-hidden="true"
+            className="size-[13px] text-emerald-600 dark:text-emerald-500"
+          />
+        )}
+      </span>
+      <span
+        className={`shrink-0 ${
+          failed
+            ? "font-semibold text-rose-700 dark:text-rose-300"
+            : "text-foreground"
+        }`}
+      >
+        {call.label}
+      </span>
+      <span className="min-w-0 flex-1 break-words text-muted-foreground [overflow-wrap:anywhere]">
+        {call.summary}
+      </span>
+      {duration === null ? null : (
+        <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground">
+          {duration}
+        </span>
+      )}
+      <span className="sr-only">
+        {childNested
+          ? ""
+          : failed
+            ? " · failed"
+            : call.state === "running" && cardRunning
+              ? " · running"
+              : unfinished
+                ? " · not finished"
+                : ""}
+      </span>
+    </div>
+  );
+  if (!failed) return row;
+  return (
+    <div className="-mx-1.5 flex flex-col gap-1.5 rounded-md bg-rose-500/[0.08] px-1.5 py-2">
+      {row}
+      {failureText === null ? null : <FFailureText text={failureText} />}
+    </div>
+  );
+}
+
 // One card per block run of a test. The header says where the block stands;
 // the body holds the code change that block got and the steps its run took.
 const SKIPPED_PREFIX_NOTE: Record<SkippedPrefixBlock["kind"], string> = {
@@ -1416,6 +1500,9 @@ function FTestRunCard({
   open,
   onToggle,
   onSelect,
+  canvasLabel,
+  nested,
+  renderNested,
 }: {
   block: BlockState;
   diff: CodeWriteDiff | null;
@@ -1433,6 +1520,11 @@ function FTestRunCard({
   open: boolean;
   onToggle: () => void;
   onSelect?: (label: string) => void;
+  // The canvas node this card highlights: a nested child's generated label is not one.
+  canvasLabel: string;
+  // Blocks this agent step ran, each rendered as its own card under the call that ran it.
+  nested: BlockState[];
+  renderNested: (child: BlockState) => React.ReactNode;
 }) {
   const status = testCardStatus(block, turnEnded, attempt);
   const tone = TEST_CARD_TONE[status.tone];
@@ -1443,10 +1535,45 @@ function FTestRunCard({
     ? liveElapsed(block.startedAt)
     : formatElapsed(block.startedAt, block.endedAt);
 
+  const loadAgentStepCalls = useContext(AgentStepCallsLoaderContext);
+  const isAgentStep = block.blockType === "agent_step";
+  const hasCalls = block.agentStepCalls !== undefined;
+  const readsCallsOnMount = isAgentStep && !hasCalls;
+  const runId = block.workflowRunId;
+  useEffect(() => {
+    if (readsCallsOnMount && runId) loadAgentStepCalls?.(runId, false);
+  }, [loadAgentStepCalls, readsCallsOnMount, runId]);
+  // Starts closed so a card that mounts already open (a reopened row) reads like a header open.
+  const wasOpen = useRef(false);
+  useEffect(() => {
+    const opening = open && !wasOpen.current;
+    wasOpen.current = open;
+    if (opening && isAgentStep && runId) loadAgentStepCalls?.(runId, hasCalls);
+  }, [hasCalls, isAgentStep, loadAgentStepCalls, open, runId]);
+
+  const calls = block.agentStepCalls ?? [];
+  const nestedById = new Map(
+    nested.map((child) => [child.workflowRunBlockId, child] as const),
+  );
+  const nestedFor = (call: AgentStepCallSummary) =>
+    call.childWorkflowRunBlockId === null
+      ? undefined
+      : nestedById.get(call.childWorkflowRunBlockId);
+  const placed = new Set(
+    calls.map(nestedFor).filter((child) => child !== undefined),
+  );
+  const unplaced = nested.filter((child) => !placed.has(child));
   const actions = reveal.visible;
+  // Failure text reads over the card's rows: its calls when it has them, else its actions. A block
+  // call's error stays in its nested child card.
+  const rows: RecordedActionSummary[] = calls.length > 0 ? calls : actions;
   let lastFailed = -1;
-  actions.forEach((action, i) => {
-    if (action.failed && i !== reveal.revealingIndex) lastFailed = i;
+  rows.forEach((row, i) => {
+    const skip =
+      calls.length > 0
+        ? nestedFor(calls[i]!) !== undefined
+        : i === reveal.revealingIndex;
+    if (row.failed && !skip) lastFailed = i;
   });
   const failed = block.state === "failed";
   // A failed block's run reason survives a reload; recorded actions and the call's detail do not.
@@ -1463,22 +1590,25 @@ function FTestRunCard({
   };
   // A failed block whose run recorded no failed step still says why. It stays
   // put while actions replay above it, then moves onto the step that failed.
-  const recordedFailure = (block.recordedActions ?? []).some((a) => a.failed);
+  const recordedFailure = (
+    calls.length > 0 ? calls : (block.recordedActions ?? [])
+  ).some((a) => a.failed);
   const blockFailure =
     failed && lastFailed === -1
       ? (failure ?? (recordedFailure ? null : "Halted — see run details."))
       : null;
 
+  const hasRows = rows.length > 0 || nested.length > 0;
   const hasBody =
     diff !== null ||
-    actions.length > 0 ||
+    hasRows ||
     blockFailure !== null ||
     block.activity.length > 0;
   const expanded = hasBody && open;
   // A failed card's error reads once: in its body when open, on this line when not.
   const foldedFailure =
     runReason ??
-    (lastFailed === -1 ? null : firstLine(actions[lastFailed]!.response)) ??
+    (lastFailed === -1 ? null : firstLine(rows[lastFailed]!.response)) ??
     failure;
   const reason = failed
     ? expanded || foldedFailure === null
@@ -1491,9 +1621,11 @@ function FTestRunCard({
         ? `Outcome not confirmed — ${outcomeReason}`
         : null;
   const summary = [
-    reveal.total > 0
-      ? `${reveal.total} ${reveal.total === 1 ? "action" : "actions"}`
-      : null,
+    calls.length > 0
+      ? `${calls.length} ${calls.length === 1 ? "tool call" : "tool calls"}`
+      : reveal.total > 0
+        ? `${reveal.total} ${reveal.total === 1 ? "action" : "actions"}`
+        : null,
     elapsed,
   ]
     .filter((part) => part !== null)
@@ -1541,9 +1673,9 @@ function FTestRunCard({
         type="button"
         className={headerClass}
         aria-expanded={hasBody ? expanded : undefined}
-        title={`Highlight ${block.label} on canvas`}
+        title={`Highlight ${canvasLabel} on canvas`}
         onClick={() => {
-          onSelect?.(block.label);
+          onSelect?.(canvasLabel);
           if (hasBody) onToggle();
         }}
       >
@@ -1568,20 +1700,40 @@ function FTestRunCard({
             />
           )}
           {diff !== null &&
-          (actions.length > 0 ||
-            blockFailure !== null ||
-            block.activity.length > 0) ? (
+          (hasRows || blockFailure !== null || block.activity.length > 0) ? (
             <div aria-hidden="true" className="h-px bg-border" />
           ) : null}
-          {actions.map((action, i) => (
-            <FCardActionRow
-              key={action.actionId}
-              action={action}
-              revealing={i === reveal.revealingIndex}
-              flash={reveal.flashing(i)}
-              failureText={failureOf(action, i)}
-            />
-          ))}
+          {calls.length > 0
+            ? calls.map((call, i) => {
+                const child = nestedFor(call);
+                return (
+                  <Fragment key={call.actionId}>
+                    <FCardCallRow
+                      call={call}
+                      cardRunning={isRunning}
+                      childNested={child !== undefined}
+                      failureText={failureOf(call, i)}
+                    />
+                    {child === undefined ? null : (
+                      <div className="ml-[22px]">{renderNested(child)}</div>
+                    )}
+                  </Fragment>
+                );
+              })
+            : actions.map((action, i) => (
+                <FCardActionRow
+                  key={action.actionId}
+                  action={action}
+                  revealing={i === reveal.revealingIndex}
+                  flash={reveal.flashing(i)}
+                  failureText={failureOf(action, i)}
+                />
+              ))}
+          {unplaced.length === 0 ? null : (
+            <div className="ml-[22px] flex flex-col gap-1.5">
+              {unplaced.map(renderNested)}
+            </div>
+          )}
           {blockFailure === null ? null : (
             <div className="-mx-1.5 flex flex-col gap-1.5 rounded-md bg-rose-500/[0.08] px-1.5 py-2">
               <div className="flex items-start gap-2 text-[12px] leading-[1.5]">
@@ -2067,17 +2219,43 @@ function FActivityLogRow({
     const hosted = blocksByCall.get(toolCallIdOf(entry) ?? "");
     if (hosted !== undefined) claimDiffs(hosted);
   }
+  // Nesting is per card group: a child whose agent step sits in another group stays flat.
+  const childrenOfStep = new Map<string, BlockState[]>();
+  const stepOfChild = new Map<string, BlockState>();
+  const topLevel = (group: BlockState[]) => {
+    const nested = new Set<BlockState>();
+    for (const [stepId, children] of agentStepChildren(group)) {
+      childrenOfStep.set(stepId, children);
+      const step = group.find((block) => block.workflowRunBlockId === stepId)!;
+      for (const child of children) {
+        stepOfChild.set(child.workflowRunBlockId, step);
+        nested.add(child);
+      }
+    }
+    return group.filter((block) => !nested.has(block));
+  };
+  const nestedOf = (block: BlockState) =>
+    (block.workflowRunBlockId &&
+      childrenOfStep.get(block.workflowRunBlockId)) ||
+    [];
   const isCardOpen = (block: BlockState) =>
     cardOpen(
       blockIdentity(block),
-      block.state === "running" || block.state === "failed",
+      block.state === "running" ||
+        block.state === "failed" ||
+        nestedOf(block).some(
+          (child) =>
+            child.state === "failed" ||
+            blockIdentity(child) === outcomeOwnerKey,
+        ),
     );
   // A run call's error reads once: on the last card whose block failed.
   const cardNode = (
     block: BlockState,
     host: ActivityEntry | undefined,
-    carriesCallFailure: boolean,
-  ) => {
+    callFailureCarrier: BlockState | undefined,
+  ): React.ReactNode => {
+    const carriesCallFailure = block === callFailureCarrier;
     const key = blockIdentity(block);
     const diff =
       diffCardKey.get(block.label) === key
@@ -2118,6 +2296,9 @@ function FActivityLogRow({
         open={cardIsOpen}
         onToggle={() => onCardToggle(key, cardIsOpen)}
         onSelect={onBlockSelect}
+        canvasLabel={(stepOfChild.get(block.workflowRunBlockId) ?? block).label}
+        nested={nestedOf(block)}
+        renderNested={(child) => cardNode(child, host, callFailureCarrier)}
       />
     );
     if (!block.skippedBefore) return card;
@@ -2161,7 +2342,9 @@ function FActivityLogRow({
       <div className="flex flex-col">
         {reasonNode}
         {cardStack(
-          row.blocks.map((block) => cardNode(block, undefined, false)),
+          topLevel(row.blocks).map((block) =>
+            cardNode(block, undefined, undefined),
+          ),
         )}
         {open && diffNodes.length > 0 ? diffEvidence : null}
       </div>
@@ -2236,24 +2419,6 @@ function FActivityLogRow({
         </span>
       )}
     </span>
-  );
-  // An open row's running card already carries the loader.
-  const cardShowsLive =
-    open &&
-    row.blocks.some((block) => block.state === "running" && isCardOpen(block));
-  const line = (
-    <>
-      <span className="flex h-[19px] w-3 shrink-0 items-center">
-        {hasDetail ? <Chevron open={open} /> : null}
-      </span>
-      {row.live && !cardShowsLive ? (
-        <span className="flex h-[19px] shrink-0 items-center">
-          <Spinner small />
-          <span className="sr-only">in progress</span>
-        </span>
-      ) : null}
-      {lineText}
-    </>
   );
   const lineClass =
     "flex w-full min-w-0 items-start gap-1.5 py-px text-left text-[12.5px] leading-[1.5]";
@@ -2354,8 +2519,8 @@ function FActivityLogRow({
       const lastFailedHosted = hosted.map((b) => b.state).lastIndexOf("failed");
       segments.push(
         cardStack(
-          hosted.map((block, blockIndex) =>
-            cardNode(block, entry, blockIndex === lastFailedHosted),
+          topLevel(hosted).map((block) =>
+            cardNode(block, entry, hosted[lastFailedHosted]),
           ),
           `cards-${toolCallIdOf(entry) ?? entry.id}`,
         ),
@@ -2370,12 +2535,39 @@ function FActivityLogRow({
   if (uncarded.length > 0) {
     segments.push(
       cardStack(
-        uncarded.map((block) => cardNode(block, undefined, false)),
+        topLevel(uncarded).map((block) =>
+          cardNode(block, undefined, undefined),
+        ),
         "cards-rest",
       ),
     );
   }
   const body = <>{segments}</>;
+  // An open row's running card already carries the loader, unless it sits in a closed parent card.
+  const cardShowsLive =
+    open &&
+    row.blocks.some((block) => {
+      const step = stepOfChild.get(block.workflowRunBlockId);
+      return (
+        block.state === "running" &&
+        isCardOpen(block) &&
+        (step === undefined || isCardOpen(step))
+      );
+    });
+  const line = (
+    <>
+      <span className="flex h-[19px] w-3 shrink-0 items-center">
+        {hasDetail ? <Chevron open={open} /> : null}
+      </span>
+      {row.live && !cardShowsLive ? (
+        <span className="flex h-[19px] shrink-0 items-center">
+          <Spinner small />
+          <span className="sr-only">in progress</span>
+        </span>
+      ) : null}
+      {lineText}
+    </>
+  );
 
   return (
     <div

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  AgentStepCallSummary,
   CopilotBlockActionsEvent,
   EMPTY_NARRATIVE,
   RecordedActionSummary,
@@ -489,6 +490,93 @@ describe("applyNarrativeEvent — client_block_actions", () => {
     expect(first.recordedActionsAt).toBe(5_000);
     // second block starts after the first block's own (clamped) 200ms total
     expect(second.recordedActionsAt).toBe(5_200);
+  });
+
+  it("applies an agent step's calls with no actions and keeps them and the child's parent id through the terminal swap", () => {
+    const call = (state: AgentStepCallSummary["state"]) => ({
+      ...recordedAction({ actionId: "wrb_step#0", label: "#0 Browser Task" }),
+      state,
+      childWorkflowRunBlockId: "wrb_child",
+    });
+    const live = reduce([
+      turnStart(),
+      blockProgress({
+        block_label: "step",
+        block_type: "agent_step",
+        status: "running",
+      }),
+      blockProgress({
+        block_label: "step_task_1",
+        workflow_run_block_id: "wrb_child",
+        parent_workflow_run_block_id: "wrb_step",
+        status: "running",
+      }),
+      blockActions({
+        blocks: [
+          {
+            workflowRunBlockId: "wrb_step",
+            actions: [],
+            calls: [call("running")],
+          },
+        ],
+      }),
+    ]);
+    const updated = applyNarrativeEvent(
+      live,
+      blockActions({
+        blocks: [
+          {
+            workflowRunBlockId: "wrb_step",
+            actions: [],
+            calls: [call("completed")],
+          },
+        ],
+      }),
+    );
+    expect(updated).not.toBe(live);
+    const after = applyNarrativeEvent(updated, {
+      type: "response",
+      workflow_copilot_chat_id: "chat_1",
+      message: "Done",
+      response_time: "2026-06-10T00:01:00Z",
+      proposal_disposition: "no_proposal",
+      turn_id: "turn-1",
+      narrative_payload: {
+        turnId: "turn-1",
+        turnIndex: 0,
+        terminal: "response",
+        blocks: [
+          {
+            label: "step",
+            workflowRunBlockId: "wrb_step",
+            blockType: "agent_step",
+            state: "completed",
+            lastSeenIteration: 0,
+            activity: [],
+            startedAt: "2026-06-10T00:00:04Z",
+            endedAt: "2026-06-10T00:01:00Z",
+          },
+          {
+            label: "step_task_1",
+            workflowRunBlockId: "wrb_child",
+            parentWorkflowRunBlockId: "wrb_step",
+            blockType: "code",
+            state: "completed",
+            lastSeenIteration: 0,
+            activity: [],
+            startedAt: "2026-06-10T00:00:05Z",
+            endedAt: "2026-06-10T00:00:30Z",
+          },
+        ],
+      },
+    });
+    const step = after.blocks.find((b) => b.workflowRunBlockId === "wrb_step")!;
+    const child = after.blocks.find(
+      (b) => b.workflowRunBlockId === "wrb_child",
+    )!;
+    expect(step.agentStepCalls?.map((c) => c.state)).toEqual(["completed"]);
+    expect(child.parentWorkflowRunBlockId).toBe("wrb_step");
+    expect(after.blocks).toHaveLength(2);
   });
 });
 

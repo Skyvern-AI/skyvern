@@ -108,6 +108,7 @@ import { reviewBaselineFromSaveData } from "@/routes/workflows/editor/workflowVe
 import { describeRecordedAction } from "@/routes/workflows/workflowBlockUtils";
 import {
   isBlockItem,
+  type WorkflowRunBlock,
   WorkflowRunTimelineItem,
 } from "@/routes/workflows/types/workflowRunTypes";
 import { toast } from "@/components/ui/use-toast";
@@ -187,6 +188,7 @@ import {
   InstantAckPlaceholder,
   NarrativeView,
 } from "./NarrativeView";
+import { AgentStepCallsLoaderContext } from "./agentStepCallsLoader";
 import { credentialAnchorToolCallId } from "./turnCardPlacement";
 import { CopilotMarkdown } from "./CopilotMarkdown";
 import { FeedbackThumbs } from "@/components/feedback/FeedbackThumbs";
@@ -260,6 +262,7 @@ import {
   UPDATE_ASK_REASONS,
 } from "./cards/CredentialCard";
 import {
+  AgentStepCallSummary,
   CopilotBlockActionsEvent,
   EMPTY_NARRATIVE,
   connectionCardKey,
@@ -301,6 +304,14 @@ import {
 } from "@/routes/workflows/editor/workspaceAuthoringActions";
 import { useWorkflowBlockSearchStore } from "@/store/WorkflowBlockSearchStore";
 import { resolveTimelineBlockJumpNodeId } from "@/routes/workflows/studio/runview/timelineBlockJump";
+import {
+  type AgentStepTrailEntry,
+  agentStepCallActions,
+  agentStepTrail,
+  toolCallHeadline,
+  toolCallTitle,
+} from "@/routes/workflows/studio/agentStepTrail";
+import { statusIsNotFinalized } from "@/routes/tasks/types";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useLogging } from "@/hooks/useLogging";
 import { getCopilotFailureLogFields } from "./copilotFailureLogFields";
@@ -576,20 +587,77 @@ function toRecordedActionSummary(
   };
 }
 
+function callState(entry: AgentStepTrailEntry): AgentStepCallSummary["state"] {
+  if (entry.running) return "running";
+  if (entry.status === Status.Completed) return "completed";
+  if (entry.status === Status.Skipped || entry.status === Status.Canceled) {
+    return "skipped";
+  }
+  return "failed";
+}
+
+function toAgentStepCallSummary(
+  step: WorkflowRunBlock,
+  entry: AgentStepTrailEntry,
+): AgentStepCallSummary {
+  const { call } = entry;
+  const state = callState(entry);
+  const startedMs = parseUtcIsoMs(call.started_at);
+  const finishedMs = parseUtcIsoMs(call.finished_at);
+  const failedAction =
+    state === "failed"
+      ? agentStepCallActions(step, call)
+          .filter((action) => action.status === Status.Failed)
+          .pop()
+      : undefined;
+  return {
+    actionId: `${step.workflow_run_block_id}#${call.index}`,
+    label: `#${call.index} ${toolCallTitle(call)}`,
+    summary: toolCallHeadline(call) || null,
+    durationMs:
+      startedMs !== null && finishedMs !== null ? finishedMs - startedMs : null,
+    failed: state === "failed",
+    codeLine: null,
+    response: failedAction?.response?.trim() || null,
+    state,
+    childWorkflowRunBlockId:
+      entry.child?.block.workflow_run_block_id ??
+      call.child_workflow_run_block_id ??
+      null,
+  };
+}
+
 // Timeline items nest branch/loop children; walk the whole tree so a
 // conditional or loop body's blocks are not missed.
 function collectTimelineBlockActions(
   items: ReadonlyArray<WorkflowRunTimelineItem>,
-): Array<{ workflowRunBlockId: string; actions: ActionsApiResponse[] }> {
+): Array<{
+  workflowRunBlockId: string;
+  actions: ActionsApiResponse[];
+  calls?: AgentStepCallSummary[];
+  finished: boolean;
+}> {
   const out: Array<{
     workflowRunBlockId: string;
     actions: ActionsApiResponse[];
+    calls?: AgentStepCallSummary[];
+    finished: boolean;
   }> = [];
   for (const item of items) {
     if (isBlockItem(item)) {
+      const block = item.block;
       out.push({
-        workflowRunBlockId: item.block.workflow_run_block_id,
-        actions: item.block.actions ?? [],
+        workflowRunBlockId: block.workflow_run_block_id,
+        actions: block.actions ?? [],
+        calls:
+          block.block_type === "agent_step"
+            ? agentStepTrail(block, item.children).map((entry) =>
+                toAgentStepCallSummary(block, entry),
+              )
+            : undefined,
+        finished:
+          block.status !== null &&
+          !statusIsNotFinalized({ status: block.status }),
       });
     }
     if (item.children.length > 0) {
@@ -2245,6 +2313,14 @@ export function WorkflowCopilotChat({
   // a run from being polled twice and from restarting after it finalized.
   const actionPollRef = useRef<Map<string, number>>(new Map());
   const finalizedActionRunIds = useRef<Set<string>>(new Set());
+  // Runs whose last applied timeline read showed every agent step finished;
+  // only these may skip the read when a step card mounts.
+  const agentStepsReadFinished = useRef<Set<string>>(new Set());
+  // Per-run timeline request numbers: interval fetches can resolve out of
+  // order, and only a response newer than the last applied one may land.
+  const actionFetchSeq = useRef<
+    Map<string, { issued: number; settled: number; applied: number }>
+  >(new Map());
   // Run ids the copilot claimed via run_outcome — the turn narrates these
   // itself, so useRunLifecycleAnnouncements suppresses their lifecycle lines by
   // identity (an unrelated run seen in the same window must still be narrated).
@@ -2480,19 +2556,49 @@ export function WorkflowCopilotChat({
   // The reducer merges by actionId (idempotent + grow), so re-fetching the same
   // growing set never duplicates rows and the terminal fetch just converges.
   const fetchRecordedActions = useCallback(
-    async (runId: string) => {
+    async (runId: string, options?: { revealed?: boolean }) => {
       if (!workflowPermanentId) return;
+      const seqs = actionFetchSeq.current;
+      const seq = seqs.get(runId) ?? { issued: 0, settled: 0, applied: 0 };
+      seqs.set(runId, seq);
+      for (const [id, entry] of seqs) {
+        if (seqs.size <= MAX_TURN_SNAPSHOTS) break;
+        if (id !== runId && entry.issued === entry.settled) seqs.delete(id);
+      }
+      const requestNumber = ++seq.issued;
       try {
         const client = await getClient(credentialGetter);
         const response = await client.get<WorkflowRunTimelineItem[]>(
           `/workflows/${workflowPermanentId}/runs/${runId}/timeline`,
         );
-        const blocks = collectTimelineBlockActions(response.data ?? [])
-          .filter((entry) => entry.actions.length > 0)
+        if (requestNumber <= seq.applied) return;
+        seq.applied = requestNumber;
+        const entries = collectTimelineBlockActions(response.data ?? []);
+        const steps = entries.filter((entry) => entry.calls);
+        const finished = agentStepsReadFinished.current;
+        if (steps.some((entry) => !entry.finished)) {
+          finished.delete(runId);
+        } else if (steps.length > 0) {
+          finished.add(runId);
+          while (finished.size > MAX_TURN_SNAPSHOTS) {
+            const oldest = finished.values().next().value;
+            if (oldest === undefined) break;
+            finished.delete(oldest);
+          }
+        }
+        // A revealed read restores only agent step calls, so every other card renders as it does on main.
+        const revealed = options?.revealed === true;
+        const blocks = entries
+          .filter(
+            (entry) => entry.calls || (!revealed && entry.actions.length > 0),
+          )
           .map((entry) => ({
             workflowRunBlockId: entry.workflowRunBlockId,
             // The API returns actions newest-first; replay must run oldest-first.
-            actions: [...entry.actions].reverse().map(toRecordedActionSummary),
+            actions: revealed
+              ? []
+              : [...entry.actions].reverse().map(toRecordedActionSummary),
+            calls: entry.calls,
           }));
         if (blocks.length === 0) return;
         const event: CopilotBlockActionsEvent = {
@@ -2517,9 +2623,26 @@ export function WorkflowCopilotChat({
         // Best-effort enrichment — the card already shows the real run
         // outcome without a recorded-action replay if this fails.
         console.error("Failed to fetch recorded actions:", error);
+      } finally {
+        seq.settled += 1;
       }
     },
     [applyStoredNarrativeEvent, credentialGetter, workflowPermanentId],
+  );
+  const loadAgentStepCalls = useCallback(
+    (runId: string, cardHasCalls: boolean) => {
+      const seq = actionFetchSeq.current.get(runId);
+      if (
+        actionPollRef.current.has(runId) ||
+        (seq !== undefined && seq.issued > seq.settled)
+      ) {
+        return;
+      }
+      // A card re-hydrated from history has no calls even when this run was already read in full.
+      if (cardHasCalls && agentStepsReadFinished.current.has(runId)) return;
+      void fetchRecordedActions(runId, { revealed: true });
+    },
+    [fetchRecordedActions],
   );
   const finalizeRecordedActionsPoll = useCallback((runId: string) => {
     const timer = actionPollRef.current.get(runId);
@@ -11216,12 +11339,16 @@ export function WorkflowCopilotChat({
                       role="status"
                       aria-live="polite"
                     >
-                      <NarrativeView
-                        turn={message.narrative}
-                        onBlockSelect={onBlockSelect}
-                        workingRowActive={showWorkingRow}
-                        anchored={anchored}
-                      />
+                      <AgentStepCallsLoaderContext.Provider
+                        value={loadAgentStepCalls}
+                      >
+                        <NarrativeView
+                          turn={message.narrative}
+                          onBlockSelect={onBlockSelect}
+                          workingRowActive={showWorkingRow}
+                          anchored={anchored}
+                        />
+                      </AgentStepCallsLoaderContext.Provider>
                       {message.narrative.outputFiles.length > 0 ? (
                         <div className="flex flex-wrap gap-2">
                           {message.narrative.outputFiles.map((file) => (
@@ -11641,12 +11768,16 @@ export function WorkflowCopilotChat({
                 role="status"
                 aria-live="polite"
               >
-                <NarrativeView
-                  turn={narrative}
-                  onBlockSelect={onBlockSelect}
-                  workingRowActive={showWorkingRow}
-                  anchored={liveAnchored}
-                />
+                <AgentStepCallsLoaderContext.Provider
+                  value={loadAgentStepCalls}
+                >
+                  <NarrativeView
+                    turn={narrative}
+                    onBlockSelect={onBlockSelect}
+                    workingRowActive={showWorkingRow}
+                    anchored={liveAnchored}
+                  />
+                </AgentStepCallsLoaderContext.Provider>
               </div>
             )}
             {questionInteractions

@@ -12,6 +12,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Status } from "@/api/types";
 import { NarrativeView } from "./NarrativeView";
 import {
+  AgentStepCallSummary,
   BlockState,
   EMPTY_NARRATIVE,
   NarrativeEvent,
@@ -1141,5 +1142,286 @@ describe("NarrativeView test run cost", () => {
       (list) => !list.textContent?.trim(),
     );
     expect(emptyLists).toHaveLength(0);
+  });
+});
+
+const stepFrame = (
+  runBlockId: string,
+  label: string,
+  blockType: string,
+  status: string,
+  second: number,
+  parentId?: string,
+): NarrativeEvent => ({
+  type: "block_progress",
+  workflow_run_id: "wr_1",
+  workflow_run_block_id: runBlockId,
+  parent_workflow_run_block_id: parentId,
+  block_label: label,
+  block_type: blockType,
+  status,
+  iteration: second,
+  timestamp: at(second),
+});
+
+const stepCall = (
+  index: number,
+  state: AgentStepCallSummary["state"],
+  overrides: Partial<AgentStepCallSummary> = {},
+): AgentStepCallSummary => ({
+  actionId: `wrb_step#${index}`,
+  label: `#${index} Go to URL`,
+  summary: "https://example.com/",
+  durationMs: state === "running" ? null : 900,
+  failed: state === "failed",
+  codeLine: null,
+  response: null,
+  state,
+  childWorkflowRunBlockId: null,
+  ...overrides,
+});
+
+const stepCalls = (calls: AgentStepCallSummary[]): NarrativeEvent => ({
+  type: "client_block_actions",
+  blocks: [{ workflowRunBlockId: "wrb_step", actions: [], calls }],
+  receivedAtMs: 0,
+});
+
+const enclosingCard = (card: HTMLElement): HTMLElement | null =>
+  card.parentElement?.closest('[data-testid="copilot-test-card"]') ?? null;
+
+describe("NarrativeView agent step card", () => {
+  afterEach(cleanup);
+
+  const running = [
+    runCall("call-1", 1),
+    stepFrame("wrb_step", "research", "agent_step", "running", 2),
+    stepFrame("wrb_a", "research_task", "task_v2", "running", 3, "wrb_step"),
+    stepFrame("wrb_b", "research_task", "task_v2", "running", 4),
+  ];
+
+  it("nests each child under the call that ran it, by id, without letting a call glyph set the tone", () => {
+    const withoutCalls = render(<NarrativeView turn={playTurn(running)} />);
+    const toneOnMain = testCards()[0]!.dataset.tone;
+    withoutCalls.unmount();
+
+    render(
+      <NarrativeView
+        turn={playTurn([
+          ...running,
+          stepCalls([
+            stepCall(0, "completed"),
+            stepCall(1, "running", {
+              label: "#1 Browser Task",
+              summary: "Click Start",
+              childWorkflowRunBlockId: "wrb_a",
+            }),
+            stepCall(2, "failed", {
+              label: "#2 Click",
+              response: "Element was not visible",
+            }),
+            stepCall(3, "running", {
+              label: "#3 Browser Task",
+              summary: "Read the heading",
+              childWorkflowRunBlockId: "wrb_b",
+            }),
+          ]),
+        ])}
+      />,
+    );
+
+    const [step, ...children] = testCards();
+    expect(step!.dataset.tone).toBe(toneOnMain);
+    expect(children).toHaveLength(2);
+    children.forEach((child) => expect(enclosingCard(child)).toBe(step));
+    expect(
+      within(children[0]!).getAllByRole("button")[0]!.getAttribute("title"),
+    ).toBe("Highlight research on canvas");
+    const order = Array.from(
+      step!.querySelectorAll<HTMLElement>(
+        '[data-testid="copilot-agent-step-call"], [data-testid="copilot-test-card"]',
+      ),
+    ).map((node) =>
+      node.dataset.testid === "copilot-test-card"
+        ? `card:${testCards().indexOf(node)}`
+        : node.textContent?.split(" ")[0],
+    );
+    expect(order).toEqual(["#0", "#1", "card:1", "#2", "#3", "card:2"]);
+    const rows = within(step!).getAllByTestId("copilot-agent-step-call");
+    expect(rows[1]!.firstElementChild!.childElementCount).toBe(0);
+    expect(rows[3]!.firstElementChild!.childElementCount).toBe(0);
+    expect(step!.textContent).toContain("Element was not visible");
+  });
+
+  it("leaves a loop's child a top-level card", () => {
+    render(
+      <NarrativeView
+        turn={playTurn([
+          runCall("call-1", 1),
+          stepFrame("wrb_loop", "each_row", "for_loop", "running", 2),
+          stepFrame(
+            "wrb_row",
+            "open_row",
+            "navigation",
+            "running",
+            3,
+            "wrb_loop",
+          ),
+        ])}
+      />,
+    );
+    const cards = testCards();
+    expect(cards).toHaveLength(2);
+    cards.forEach((card) => expect(enclosingCard(card)).toBeNull());
+  });
+
+  it("shows a still-running call as not finished once its card stopped, and folds to its call count", () => {
+    const turn = ended(
+      playTurn([
+        runCall("call-1", 1),
+        stepFrame("wrb_step", "research", "agent_step", "running", 2),
+        stepFrame("wrb_step", "research", "agent_step", "completed", 9),
+        stepCalls([stepCall(0, "completed"), stepCall(1, "running")]),
+      ]),
+    );
+    render(<NarrativeView turn={turn} />);
+    const fold = screen.queryByRole("button", { name: /^Worked through/ });
+    if (fold !== null) fireEvent.click(fold);
+    activityLines()
+      .filter((line) => line.getAttribute("aria-expanded") === "false")
+      .forEach((line) => fireEvent.click(line));
+    const step = testCards()[0]!;
+    expect(step.textContent).toContain("2 tool calls");
+    fireEvent.click(within(step).getAllByRole("button")[0]!);
+    const unfinished = within(step).getAllByTestId(
+      "copilot-agent-step-call",
+    )[1]!;
+    expect(unfinished.textContent).toContain("not finished");
+    expect(unfinished.querySelector(".animate-spin")).toBeNull();
+  });
+
+  it("shows no call spinner when the turn ends mid block call, leaving the unfinished state to the nested child", () => {
+    const live = playTurn([
+      ...running.slice(0, 3),
+      stepCalls([
+        stepCall(0, "completed"),
+        stepCall(1, "running", {
+          label: "#1 Browser Task",
+          childWorkflowRunBlockId: "wrb_a",
+        }),
+      ]),
+    ]);
+    const unfinishedBlock = (
+      id: string,
+      label: string,
+      blockType: string,
+      parentId?: string,
+    ) => ({
+      label,
+      workflowRunBlockId: id,
+      workflowRunId: "wr_1",
+      parentWorkflowRunBlockId: parentId,
+      blockType,
+      state: "unfinished",
+      lastSeenIteration: 3,
+      activity: [],
+      startedAt: at(2),
+      endedAt: null,
+    });
+    const after = applyNarrativeEvent(live, {
+      type: "response",
+      workflow_copilot_chat_id: "chat_1",
+      message: "",
+      response_time: at(30),
+      proposal_disposition: "no_proposal",
+      turn_id: "turn-1",
+      narrative_payload: {
+        turnId: "turn-1",
+        turnIndex: 0,
+        terminal: "response",
+        designActivity: live.designActivity,
+        blocks: [
+          unfinishedBlock("wrb_step", "research", "agent_step"),
+          unfinishedBlock("wrb_a", "research_task", "task_v2", "wrb_step"),
+        ],
+      },
+    });
+    render(<NarrativeView turn={after} />);
+    const fold = screen.queryByRole("button", { name: /^Worked through/ });
+    if (fold !== null) fireEvent.click(fold);
+    activityLines()
+      .filter((line) => line.getAttribute("aria-expanded") === "false")
+      .forEach((line) => fireEvent.click(line));
+    const step = testCards()[0]!;
+    if (within(step).queryAllByTestId("copilot-agent-step-call").length === 0)
+      fireEvent.click(within(step).getAllByRole("button")[0]!);
+    const child = testCards()[1];
+    const rows = within(step).getAllByTestId("copilot-agent-step-call");
+    rows.forEach((row) =>
+      expect(row.querySelector(".animate-spin")).toBeNull(),
+    );
+    expect(rows[1]!.firstElementChild!.childElementCount).toBe(0);
+    expect(enclosingCard(child!)).toBe(step);
+    expect(child!.textContent).toContain("Unfinished");
+  });
+
+  it("nests a child first seen in the terminal response, and opens the step when that child failed", () => {
+    const live = playTurn([
+      ...running.slice(0, 2),
+      stepCalls([
+        stepCall(0, "completed", {
+          label: "#0 Browser Task",
+          childWorkflowRunBlockId: "wrb_late",
+        }),
+      ]),
+    ]);
+    const after = applyNarrativeEvent(live, {
+      type: "response",
+      workflow_copilot_chat_id: "chat_1",
+      message: "",
+      response_time: at(30),
+      proposal_disposition: "no_proposal",
+      turn_id: "turn-1",
+      narrative_payload: {
+        turnId: "turn-1",
+        turnIndex: 0,
+        terminal: "response",
+        designActivity: live.designActivity,
+        blocks: [
+          {
+            label: "research",
+            workflowRunBlockId: "wrb_step",
+            workflowRunId: "wr_1",
+            blockType: "agent_step",
+            state: "completed",
+            lastSeenIteration: 2,
+            activity: [],
+            startedAt: at(2),
+            endedAt: at(20),
+          },
+          {
+            label: "research_task",
+            workflowRunBlockId: "wrb_late",
+            workflowRunId: "wr_1",
+            parentWorkflowRunBlockId: "wrb_step",
+            blockType: "task_v2",
+            state: "failed",
+            lastSeenIteration: 2,
+            activity: [],
+            startedAt: at(5),
+            endedAt: at(15),
+          },
+        ],
+      },
+    });
+    render(<NarrativeView turn={after} />);
+    const fold = screen.queryByRole("button", { name: /^Worked through/ });
+    if (fold !== null) fireEvent.click(fold);
+    activityLines()
+      .filter((line) => line.getAttribute("aria-expanded") === "false")
+      .forEach((line) => fireEvent.click(line));
+    const [step, child] = testCards();
+    expect(child).toBeDefined();
+    expect(enclosingCard(child!)).toBe(step);
   });
 });

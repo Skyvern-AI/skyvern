@@ -14,6 +14,7 @@ import {
   agentStepTrail,
   findAgentStepItem,
   toolCallArgumentFields,
+  toolCallHeadline,
 } from "./agentStepTrail";
 
 function blockItem(
@@ -268,5 +269,30 @@ describe("agentStepCallFrameId", () => {
     expect(
       agentStepCallActions(shared.block, second!).map((a) => a.action_id),
     ).toEqual(["act_edge"]);
+  });
+});
+
+describe("toolCallHeadline", () => {
+  test("leads with a goal, collapses whitespace and cuts at 200 characters", () => {
+    const browserTask = call(0, {
+      tool: "browser_task",
+      arguments: JSON.stringify({
+        url: "https://example.com/",
+        data_extraction_goal: "read the heading",
+        navigation_goal: `click   Start\n${"x".repeat(300)}`,
+      }),
+    });
+    const headline = toolCallHeadline(browserTask);
+    expect(headline.startsWith("click Start x")).toBe(true);
+    expect(headline).toHaveLength(201);
+    expect(headline.endsWith("…")).toBe(true);
+    expect(
+      toolCallHeadline(
+        call(1, {
+          arguments: JSON.stringify({ url: "", data_extraction_goal: "rows" }),
+        }),
+      ),
+    ).toBe("rows");
+    expect(toolCallHeadline(call(2))).toBe("https://example.com/");
   });
 });

@@ -777,6 +777,33 @@ describe("deriveActivityLog", () => {
     expect(log.rows[0]?.entries[2]?.text).toBe("Browse step 2");
   });
 
+  it("puts an agent step's child in the step's row while a Test button run has no run call yet", () => {
+    const log = deriveActivityLog(
+      turnWith(
+        [],
+        [
+          block({
+            workflowRunBlockId: "wrb_step",
+            label: "research",
+            blockType: "agent_step",
+            state: "running",
+            startedAt: at(1),
+          }),
+          block({
+            workflowRunBlockId: "wrb_child",
+            label: "research_task_1",
+            blockType: "task",
+            state: "running",
+            startedAt: at(2),
+            parentWorkflowRunBlockId: "wrb_step",
+          }),
+        ],
+      ),
+    );
+
+    expect(labelsPerRow(log)).toEqual([["research", "research_task_1"]]);
+  });
+
   it("renders a narration that arrives before any call as its own line", () => {
     const log = deriveActivityLog(
       turnWith([
