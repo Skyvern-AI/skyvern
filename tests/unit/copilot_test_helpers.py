@@ -1688,7 +1688,9 @@ async def run_turn_to_exit(
         )
         monkeypatch.setattr(copilot_agent, "seed_repair_origin_run", AsyncMock(return_value=origin))
 
-        async def hydrate_and_exit(ctx: CopilotContext, *, workflow_run_id: str | None) -> None:
+        async def hydrate_and_exit(
+            ctx: CopilotContext, *, workflow_run_id: str | None, queue_failure_frame: bool = False
+        ) -> None:
             await copilot_runtime.resolve_browser_state_for_context(ctx, session_id=session_id)
             await _exit(ctx)
 

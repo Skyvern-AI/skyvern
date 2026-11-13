@@ -86,10 +86,10 @@ from skyvern.forge.sdk.copilot.runtime import (
     resolve_browser_state_for_context,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import (
-    ScreenshotActionRelation,
-    ScreenshotProvenance,
     capturing_tool_call,
     enqueue_screenshot_from_result,
+    run_result_screenshot_provenance,
+    stored_run_frame_provenance,
 )
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.tools.account_groups import (
@@ -1544,7 +1544,7 @@ async def run_blocks_tool(
             enqueue_screenshot_from_result(
                 copilot_ctx,
                 result,
-                provenance=_run_result_screenshot_provenance(result, source_tool="run_blocks_and_collect_debug"),
+                provenance=run_result_screenshot_provenance(result, source_tool="run_blocks_and_collect_debug"),
             )
 
     sanitized = _stamp_turn_budget_on_result(
@@ -1587,7 +1587,7 @@ async def test_workflow_from_blank_browser_tool(
     enqueue_screenshot_from_result(
         copilot_ctx,
         result,
-        provenance=_run_result_screenshot_provenance(result, source_tool="test_workflow_from_blank_browser"),
+        provenance=run_result_screenshot_provenance(result, source_tool="test_workflow_from_blank_browser"),
     )
     sanitized = sanitize_tool_result_for_llm("test_workflow_from_blank_browser", result)
     return json.dumps(_stamp_turn_budget_on_result(copilot_ctx, sanitized))
@@ -1660,9 +1660,18 @@ async def get_run_results_tool(
                 {"ok": False, "error": f"row_keys holds {len(row_keys)} keys; pass at most {RUN_RESULTS_MAX_ROW_KEYS}."}
             )
     first_page = block_cursor is None and row_keys is None
+    # Stamped before the read so a frame queued while it awaits counts as newer and is kept.
+    started = time.monotonic()
     result = await _get_run_results(params, copilot_ctx, read_live_page=first_page, skip_page_evidence=not first_page)
     record_tool_step_result_for_ctx(copilot_ctx, "get_run_results", params, result)
     if result.get("ok") is not False:
+        if first_page:
+            enqueue_screenshot_from_result(
+                copilot_ctx,
+                result,
+                provenance=stored_run_frame_provenance(result),
+                captured_at=started,
+            )
         # Exact-match scrubbing has to see whole strings, before any preview cuts or re-serializes them.
         result = scrub_secrets_from_structure(copilot_ctx, result)
         run_rows = await _chronological_run_block_rows(result["data"]["workflow_run_id"], copilot_ctx.organization_id)
@@ -1917,38 +1926,12 @@ async def _run_updated_workflow_blocks(
             enqueue_screenshot_from_result(
                 copilot_ctx,
                 run_result,
-                provenance=_run_result_screenshot_provenance(run_result, source_tool=tool_name),
+                provenance=run_result_screenshot_provenance(run_result, source_tool=tool_name),
             )
     sanitized = _stamp_turn_budget_on_result(
         copilot_ctx, sanitize_tool_result_for_llm("run_blocks_and_collect_debug", run_result)
     )
     return json.dumps(sanitized)
-
-
-def _run_result_screenshot_provenance(result: dict[str, Any], *, source_tool: str) -> ScreenshotProvenance:
-    """Bind a run-result frame to the facts carried by the run payload.
-
-    Run execution returns its identity fields under ``data``. Some older call
-    sites and error paths still expose them at the top level, so retain that as
-    a factual fallback rather than stamping the frame as unidentified.
-    """
-    data = result.get("data")
-    facts = data if isinstance(data, dict) else {}
-
-    def _string_fact(key: str) -> str | None:
-        value = facts.get(key)
-        if not isinstance(value, str) or not value:
-            value = result.get(key)
-        return value if isinstance(value, str) and value else None
-
-    return ScreenshotProvenance(
-        source_tool=source_tool,
-        captured_url=_string_fact("current_url"),
-        observation_step=None,
-        browser_session_id=_string_fact("browser_session_id"),
-        workflow_run_id=_string_fact("workflow_run_id"),
-        action_relation=ScreenshotActionRelation.WORKFLOW_RUN_RESULT,
-    )
 
 
 @function_tool(

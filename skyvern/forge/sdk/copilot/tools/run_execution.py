@@ -244,6 +244,8 @@ from skyvern.forge.sdk.copilot.screenshot_utils import (
     ScreenshotActionRelation,
     ScreenshotProvenance,
     enqueue_screenshot,
+    enqueue_screenshot_from_result,
+    stored_run_frame_provenance,
 )
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt, redact_totp_runtime_values
 from skyvern.forge.sdk.copilot.secret_scrub import (
@@ -6407,6 +6409,14 @@ async def _get_run_results(
         "action_trace_summary": action_trace_summary,
         "action_observations": action_observations,
     }
+    run_status = WorkflowRunStatus(run.status)
+    at_failure_screenshot_b64 = _resolve_run_screenshot_b64(
+        live_capture=None,
+        results=results,
+        run_ok=not run_status.is_final() or run_status == WorkflowRunStatus.completed,
+    )
+    if at_failure_screenshot_b64 is not None:
+        result_data["screenshot_base64"] = at_failure_screenshot_b64
     if workflow_run_id == ctx.proposal_workflow_run_id:
         if run_workflow is not None:
             result_data["execution_source"] = _execution_source_facts(run_workflow, provenance="staged")
@@ -8792,6 +8802,7 @@ async def hydrate_prior_run_packet(
     copilot_ctx: CopilotContext,
     *,
     workflow_run_id: str | None,
+    queue_failure_frame: bool = False,
 ) -> dict[str, Any] | None:
     """The persisted facts of a run this turn did not perform, as the one shared packet. Diagnosis
     shadow recording is off: nothing was diagnosed here, the run already happened."""
@@ -8828,6 +8839,11 @@ async def hydrate_prior_run_packet(
     except Exception:
         LOG.warning("copilot prior-run packet unavailable", workflow_run_id=workflow_run_id, exc_info=True)
         return None
+    if queue_failure_frame:
+        try:
+            enqueue_screenshot_from_result(copilot_ctx, result, provenance=stored_run_frame_provenance(result))
+        except Exception:
+            LOG.warning("copilot prior-run frame not queued", workflow_run_id=workflow_run_id, exc_info=True)
     # The prompt already carries the workflow in its own section; a second copy here would sit
     # unlabelled beside it, and disagree with it whenever the editor holds an unsaved draft.
     for field in ("canonical_workflow_yaml", "canonical_workflow_yaml_complete", "canonical_workflow_source"):
