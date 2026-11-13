@@ -1,4 +1,10 @@
-import { useContext, useEffect, useRef, useState } from "react";
+import {
+  useContext,
+  useEffect,
+  useRef,
+  useState,
+  type MouseEvent,
+} from "react";
 import { useQuery } from "@tanstack/react-query";
 import { isAxiosError } from "axios";
 import { Cross2Icon, ImageIcon } from "@radix-ui/react-icons";
@@ -34,6 +40,9 @@ function useDocImagePlace(slot: DocImageSlot): string {
   if (slot.placement === "block") return step;
   return `the note ${slot.placement === "above" ? "above" : "after"} ${step}`;
 }
+
+// A press that blurs the line would end a staged note, which moves the row away before the click lands.
+const keepLineFocus = (event: MouseEvent) => event.preventDefault();
 
 export function DocImagePicker({
   slot,
@@ -171,6 +180,7 @@ export function DocImages({
             {upload?.status === "failed" && upload.file && (
               <button
                 type="button"
+                onMouseDown={keepLineFocus}
                 onClick={() => thenFocusLine(() => onRetry(upload))}
                 className="shrink-0 rounded px-1 text-foreground underline underline-offset-4 outline-none focus-visible:ring-2 focus-visible:ring-ring"
               >
@@ -181,6 +191,7 @@ export function DocImages({
               <button
                 type="button"
                 aria-label="Dismiss"
+                onMouseDown={keepLineFocus}
                 onClick={() => remove(entry.key, "Screenshot dismissed")}
                 className="shrink-0 rounded p-0.5 text-muted-foreground outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
               >
@@ -316,6 +327,7 @@ function DocImageTile({
         <button
           type="button"
           aria-label={`Remove ${name} from ${place}`}
+          onMouseDown={keepLineFocus}
           onClick={onRemove}
           className="absolute right-1 top-1 flex size-6 items-center justify-center rounded bg-background/90 text-muted-foreground opacity-0 shadow-sm outline-none hover:text-foreground focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-ring group-hover:opacity-100 [@media(hover:none)]:opacity-100"
         >

@@ -3,7 +3,10 @@ import { create } from "zustand";
 
 import { getClient, type CredentialGetter } from "@/api/AxiosClient";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
-import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
+import {
+  selectEditorMutationLocked,
+  useWorkflowYamlEditorStore,
+} from "@/store/WorkflowYamlEditorStore";
 import { ATTACHMENT_SIZE_LIMIT_BYTES } from "../../copilot/attachmentLimits";
 import type { WorkflowBlockImage } from "../../types/workflowTypes";
 
@@ -62,12 +65,13 @@ export const useDocImageUploadStore = create<DocImageUploadStore>((set) => ({
     set((state) => ({ uploads: state.uploads.filter((u) => u.id !== id) })),
 }));
 
-// A save or a YAML commit sets the unsaved mark itself, and a change while the YAML view is open marks the YAML stale.
+// A save, a YAML commit or a Copilot acceptance sets the unsaved mark itself (the last two refuse one meanwhile, with a
+// toast), and a change while the YAML view is open marks the YAML stale.
 const saveOrYamlBusy = () => {
   const yaml = useWorkflowYamlEditorStore.getState();
   return (
     yaml.active ||
-    yaml.commitInProgress ||
+    selectEditorMutationLocked(yaml) ||
     useWorkflowHasChangesStore.getState().saveIsPending
   );
 };
@@ -220,6 +224,8 @@ async function headerPixels(file: File): Promise<number | null> {
     }
     return null;
   }
+  if (file.type === "image/gif" && tagAt(head, 0) === "GIF8")
+    return (head[6]! | (head[7]! << 8)) * (head[8]! | (head[9]! << 8));
   if (file.type === "image/jpeg" && head[0] === 0xff && head[1] === 0xd8) {
     // Segments follow the start marker; a start-of-frame (C0 to CF, less C4, C8 and CC) holds the size.
     let at = 2;
@@ -294,10 +300,7 @@ async function encode(
  */
 export async function fitDocImage(file: File): Promise<File | string> {
   if (!isDocImageType(file.type)) return unreadableMessage(file);
-  if (file.size <= DOC_IMAGE_MAX_BYTES)
-    return asDocImage(file, file.name, file.type);
-  const animated = await animatedRefusal(file);
-  if (animated) return animated;
+  // Checked at any size: a few bytes can declare an image whose preview decode takes gigabytes.
   let pixels: number | null = null;
   try {
     pixels = await headerPixels(file);
@@ -306,6 +309,10 @@ export async function fitDocImage(file: File): Promise<File | string> {
   }
   if (pixels !== null && pixels > DOC_IMAGE_MAX_PIXELS)
     return tooManyPixelsMessage(file);
+  if (file.size <= DOC_IMAGE_MAX_BYTES)
+    return asDocImage(file, file.name, file.type);
+  const animated = await animatedRefusal(file);
+  if (animated) return animated;
   let bitmap: ImageBitmap;
   try {
     bitmap = await createImageBitmap(file);
