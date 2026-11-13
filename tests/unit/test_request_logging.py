@@ -71,6 +71,16 @@ def test_onboarding_bodies_are_opaque_even_when_malformed(method: str, path: str
     assert _sanitize_response_body(request, body, "application/json") == REDACTED
 
 
+@pytest.mark.parametrize(
+    "body", ['{"type":"session.removed","data":{"user":{"email_addresses":[{"email_address":"user@example.com"}]}}}']
+)
+def test_identity_provider_webhook_bodies_are_opaque(body: str) -> None:
+    request = Request(
+        {"type": "http", "method": "POST", "path": "/api/v1/clerk-webhook", "headers": [], "query_string": b""}
+    )
+    assert _sanitize_body(request, body.encode(), "application/json") == REDACTED
+
+
 class TestClientIpFromHeaders:
     def test_extracts_first_hop_from_x_forwarded_for(self) -> None:
         headers = {"x-forwarded-for": "203.0.113.10, 10.0.0.1"}
