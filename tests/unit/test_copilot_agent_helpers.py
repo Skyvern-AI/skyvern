@@ -492,7 +492,7 @@ async def test_interrupted_draft_turn_restoration_and_run_hydration_stay_coheren
 
     restored_run_ids: list[str | None] = []
     seeded: list[tuple[str | None, str, str | None]] = []
-    hydrated: list[tuple[str, str, str | None]] = []
+    hydrated: list[tuple[str, str, str | None, bool]] = []
 
     async def restore_proposal(ctx: CopilotContext, *, required_workflow_run_id: str | None = None) -> None:
         restored_run_ids.append(required_workflow_run_id)
@@ -505,8 +505,10 @@ async def test_interrupted_draft_turn_restoration_and_run_hydration_stay_coheren
         ctx.repair_origin_input_values = (origin_run_input("resume", "s3://bucket/resume.pdf"),)
         return SimpleNamespace(finished=True, run=None)
 
-    async def hydrate_run(ctx: CopilotContext, *, workflow_run_id: str) -> dict[str, dict[str, str]]:
-        hydrated.append((workflow_run_id, ctx.workflow_yaml, ctx.proposal_workflow_run_id))
+    async def hydrate_run(
+        ctx: CopilotContext, *, workflow_run_id: str, queue_failure_frame: bool = False
+    ) -> dict[str, dict[str, str]]:
+        hydrated.append((workflow_run_id, ctx.workflow_yaml, ctx.proposal_workflow_run_id, queue_failure_frame))
         return {"run": {"workflow_run_id": workflow_run_id, "status": "failed"}}
 
     monkeypatch.setattr(agent_module, "restore_pending_workflow_proposal", restore_proposal)
@@ -556,7 +558,7 @@ async def test_interrupted_draft_turn_restoration_and_run_hydration_stay_coheren
     assert result.user_response == "ok"
     assert restored_run_ids == [expected_restore_run_id]
     assert seeded == [(expected_seed_run_id, expected_workflow_yaml, expected_proposal_run_id)]
-    assert hydrated == [(expected_run_id, expected_workflow_yaml, expected_proposal_run_id)]
+    assert hydrated == [(expected_run_id, expected_workflow_yaml, expected_proposal_run_id, True)]
     assert build_context.call_args.kwargs["workflow_yaml"] == expected_workflow_yaml
     run_packet_text = build_context.call_args.kwargs["debug_run_info_text"]
     assert (
