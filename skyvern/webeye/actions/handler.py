@@ -53,6 +53,7 @@ from skyvern.core.script_generations.fuzzy_matcher import match_option_exact_or_
 from skyvern.errors.errors import UserDefinedError, filter_to_user_defined_codes
 from skyvern.exceptions import (
     BROWSER_CONNECTION_LOST_ERROR_CODE,
+    ActionDeadlineExceeded,
     ActionExecutionTimeout,
     BlockedHost,
     CaptchaSolveError,
@@ -183,6 +184,7 @@ from skyvern.utils.prompt_engine import (
 )
 from skyvern.utils.prompt_truncation import truncate_extraction_schema, truncate_previous_extracted_information
 from skyvern.utils.url_validators import redacted_url_origin, signed_url_ttl_remaining_seconds, validate_fetch_url
+from skyvern.webeye.action_deadline import under_action_deadline
 from skyvern.webeye.actions import action_phase, actions, handler_utils
 from skyvern.webeye.actions.action_phase import ActionPhase
 from skyvern.webeye.actions.action_types import ActionType
@@ -435,6 +437,12 @@ class CustomSelectFamilyOutcome(StrEnum):
 # calendar stepped one month per click) while stopping a walk that cannot finish inside the action
 # execution deadline — the deadline cancels the action, which skips every recovery below.
 DATEPICKER_WALK_BUDGET_SECONDS = 300.0
+# A click that reveals a whole document (a modal holding a long filing, say) can add thousands of
+# elements; rescraping and resolving them one by one once ran into the 20-minute action cap.
+# under_action_deadline adds its headroom, so the scan ends about 35 s in.
+DROPDOWN_SCAN_BUDGET_MS = 30_000
+# Checked after the rescrape; it skips the menu search over a reveal no menu could be.
+DROPDOWN_SCAN_MAX_NEW_ELEMENTS = 5000
 DOWNLOAD_EVENT_ACTIVE_DIR_GRACE_SECONDS = 60
 DOWNLOAD_IN_FLIGHT_EXTENSION_MAX_SECONDS = 120
 DOWNLOAD_IN_FLIGHT_POLL_INTERVAL_SECONDS = 1.0
@@ -8222,6 +8230,25 @@ async def handle_sequential_click_with_submit_bypass(
     )
 
 
+async def _scan_elements_revealed_by_click(scraped_page: ScrapedPage) -> tuple[ScrapedPage, set[str], list[str]] | None:
+    scraped_page_after_open = await scraped_page.generate_scraped_page_without_screenshots()
+    new_element_ids = set(scraped_page_after_open.id_to_css_dict.keys()) - set(scraped_page.id_to_css_dict.keys())
+    candidate_ids = [
+        element_id
+        for element_id in new_element_ids
+        if scraped_page_after_open.id_to_element_dict.get(element_id, {}).get("interactable", False)
+    ]
+    if len(candidate_ids) > DROPDOWN_SCAN_MAX_NEW_ELEMENTS:
+        LOG.warning(
+            "Click revealed more interactable elements than any menu holds; exiting the sequential click logic",
+            new_interactable_elements=len(candidate_ids),
+            limit=DROPDOWN_SCAN_MAX_NEW_ELEMENTS,
+        )
+        return None
+
+    return scraped_page_after_open, new_element_ids, candidate_ids
+
+
 @traced(name="skyvern.agent.action.click_dropdown_sequential")
 async def handle_sequential_click_for_dropdown(
     action: actions.ClickAction,
@@ -8256,15 +8283,30 @@ async def handle_sequential_click_for_dropdown(
         return None
 
     LOG.info("Detected new element after clicking", action=action, sampling=True)
-    scraped_page_after_open = await scraped_page.generate_scraped_page_without_screenshots()
-    new_element_ids = set(scraped_page_after_open.id_to_css_dict.keys()) - set(scraped_page.id_to_css_dict.keys())
-
-    dom_after_open = DomUtil(scraped_page=scraped_page_after_open, page=page)
-    new_interactable_element_ids = [
-        element_id
-        for element_id in new_element_ids
-        if (await dom_after_open.get_skyvern_element_by_id(element_id)).is_interactable()
-    ]
+    scan_started = time.monotonic()
+    try:
+        # Used as an overall cap on the rescrape, which issues many driver calls.
+        async with under_action_deadline(budget_ms=DROPDOWN_SCAN_BUDGET_MS):
+            scanned = await _scan_elements_revealed_by_click(scraped_page)
+    except ActionDeadlineExceeded as exc:
+        # Also reached by a timeout inside the rescrape itself; the error says which.
+        LOG.warning(
+            "Post-click dropdown scan timed out; treating the click as not opening a menu",
+            budget_ms=DROPDOWN_SCAN_BUDGET_MS,
+            error=str(exc),
+            element_id=anchor_element.get_id(),
+        )
+        return None
+    if scanned is None:
+        return None
+    scraped_page_after_open, new_element_ids, new_interactable_element_ids = scanned
+    LOG.info(
+        "Post-click dropdown scan finished",
+        duration_seconds=round(time.monotonic() - scan_started, 2),
+        new_elements=len(new_element_ids),
+        new_interactable_elements=len(new_interactable_element_ids),
+        sampling=True,
+    )
 
     if len(new_interactable_element_ids) == 0:
         LOG.info("No new interactable elements found, exiting the sequential click logic")
