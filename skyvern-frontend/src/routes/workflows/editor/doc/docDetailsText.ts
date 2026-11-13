@@ -1,6 +1,6 @@
 // Every word the Details disclosure shows, so a naming decision is one edit.
 const toggle = "Details";
-const morePanel = "More details in the side panel";
+const morePanel = "All settings";
 
 export const docDetailsText = {
   toggle,
@@ -10,7 +10,6 @@ export const docDetailsText = {
   outputs: "Outputs",
   outputFields: "Fields",
   custom: "Custom settings",
-  allDefault: "Every other setting is at its default.",
   notSet: "Not set",
   morePanel,
   // The fix line names the Credential chip only where the step shows one.

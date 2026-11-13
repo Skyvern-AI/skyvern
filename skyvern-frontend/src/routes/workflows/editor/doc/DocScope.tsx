@@ -885,7 +885,13 @@ export function DocScope({
         i.ownerNodeId === owner &&
         i.placement === placement,
     );
+  // A step's own note stays on screen right below it after a step is added under it, so a new note goes to that note.
   const noteBelow = (nodeId: string) => {
+    if (notePresent(nodeId, "trailing"))
+      return actions.setPendingNote({
+        ownerNodeId: nodeId,
+        placement: "trailing",
+      });
     const at = steps.findIndex((s) => s.nodeId === nodeId);
     const next = steps[at + 1];
     const note = next
@@ -893,11 +899,6 @@ export function DocScope({
       : { ownerNodeId: nodeId, placement: "trailing" as const };
     actions.setPendingNote(note);
   };
-  // A step's own note stays on screen right below it after a step is added under it, so + Note goes to that note.
-  const addNoteBelow = (nodeId: string) =>
-    notePresent(nodeId, "trailing")
-      ? actions.setPendingNote({ ownerNodeId: nodeId, placement: "trailing" })
-      : noteBelow(nodeId);
   // Enter on a step makes a step of the same type below, splitting its text at the caret. Enter on an empty step that
   // needs text turns it back into a note, as Enter leaves an empty list item. Loops, Ifs and steps that need no text
   // (Print Page, a Wait with its amount) keep the step and open an empty line below.
@@ -1252,7 +1253,7 @@ export function DocScope({
               }
               onAddNote={
                 editable && actions.edit
-                  ? () => addNoteBelow(item.nodeId)
+                  ? () => noteBelow(item.nodeId)
                   : undefined
               }
               noteProblems={noteProblems}

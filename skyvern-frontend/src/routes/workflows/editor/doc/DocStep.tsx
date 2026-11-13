@@ -19,7 +19,12 @@ import {
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { goalChangeIsPending } from "../workflowEditorUtils";
 import type { CodeBlockNodeData } from "../nodes/CodeBlockNode/types";
-import { ChevronRightIcon, GearIcon, PlusIcon } from "@radix-ui/react-icons";
+import {
+  ChevronRightIcon,
+  GearIcon,
+  PlusIcon,
+  ViewVerticalIcon,
+} from "@radix-ui/react-icons";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -823,6 +828,17 @@ export function DocStepBody({
                 )}
               >
                 <DocText value={f.value} />
+                {f.unset && f.addLabel && editableProp && actions.edit && (
+                  <button
+                    type="button"
+                    data-doc-add-row={f.key}
+                    onClick={() => actions.openSettings(node.id)}
+                    className="ml-2 inline-flex items-center gap-0.5 rounded px-1 text-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    <PlusIcon aria-hidden className="size-3" />
+                    Add {f.addLabel}
+                  </button>
+                )}
               </dd>
             </Fragment>
           ))}
@@ -1025,6 +1041,25 @@ function DocStepSummary({
       : changed.some((key) => !docStepShowsKey(node, key, lineKeys)));
   const setOpen = (next: boolean) => actions.setDetailsOpen(node.id, next);
   const panelId = useId();
+  const noteButton = useRef<HTMLButtonElement>(null);
+  // Escape on the empty note this button opened leaves focus on the page, so it comes back here.
+  const [noteOpened, setNoteOpened] = useState(false);
+  const pendingNote = actions.pendingNote;
+  const escaped = useRef(false);
+  useEffect(() => {
+    if (!noteOpened) return;
+    if (pendingNote) {
+      escaped.current = false;
+      const onKey = (event: globalThis.KeyboardEvent) => {
+        if (event.key === "Escape") escaped.current = true;
+      };
+      document.addEventListener("keydown", onKey, true);
+      return () => document.removeEventListener("keydown", onKey, true);
+    }
+    setNoteOpened(false);
+    if (escaped.current)
+      requestAnimationFrame(() => noteButton.current?.focus());
+  }, [noteOpened, pendingNote]);
   return (
     <>
       <div className="mt-1 flex items-center gap-2 text-[12.5px] text-muted-foreground">
@@ -1055,8 +1090,12 @@ function DocStepSummary({
         {onAddNote && (
           <button
             type="button"
+            ref={noteButton}
             aria-label={`Add note below ${docStepCaption(node) ?? node.data.label}`}
-            onClick={onAddNote}
+            onClick={() => {
+              onAddNote?.();
+              setNoteOpened(true);
+            }}
             className="inline-flex items-center gap-0.5 rounded px-1 text-[12.5px] text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
           >
             <PlusIcon aria-hidden className="size-3" />
@@ -1143,8 +1182,10 @@ function DocStepDetails({
           </div>
         </>
       )}
-      {custom && <p className={heading}>{docDetailsText.custom}</p>}
-      {custom === null ? null : custom.length > 0 ? (
+      {custom && custom.length > 0 && (
+        <p className={heading}>{docDetailsText.custom}</p>
+      )}
+      {custom && custom.length > 0 && (
         <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-0.5">
           {custom.map((row) => (
             <Fragment key={row.key}>
@@ -1155,8 +1196,6 @@ function DocStepDetails({
             </Fragment>
           ))}
         </dl>
-      ) : (
-        <p className="text-muted-foreground">{docDetailsText.allDefault}</p>
       )}
       {/* A read-only Doc's side panel cannot show a step's settings, so the link is left out. */}
       {editable && (
@@ -1166,9 +1205,10 @@ function DocStepDetails({
             onClose();
             actions.openSettings(node.id);
           }}
-          className="mt-1.5 rounded text-[12.5px] text-muted-foreground underline underline-offset-4 outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+          className="ml-auto mt-1.5 flex w-fit items-center gap-1.5 rounded px-1 text-[12.5px] text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
         >
           {docDetailsText.morePanel}
+          <ViewVerticalIcon aria-hidden className="size-3.5" />
         </button>
       )}
     </div>
