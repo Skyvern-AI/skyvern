@@ -103,9 +103,16 @@ function ConnectionCardBody({
   onSelect,
   connectedGmail,
 }: ConnectionCardProps & { connectedGmail?: ConnectedGmailFlow }) {
+  // Once the server answers native sign-in with 409, Connected Gmail is the card's flow while it can connect, so its
+  // failure and retry show; a flow that can no longer connect falls back to native sign-in like any non-live flow.
+  const [switchedToConnectedGmail, setSwitchedToConnectedGmail] =
+    useState(false);
   // An existing Connected Gmail account stays a choice even when a native credential makes it no longer the default.
   const gmailFlow =
-    connectedGmail?.status === "default" ? connectedGmail : undefined;
+    connectedGmail?.status === "default" ||
+    (switchedToConnectedGmail && connectedGmail?.canConnect)
+      ? connectedGmail
+      : undefined;
   const gmailFlowLoading = connectedGmail?.status === "loading";
   // A Connected Gmail sign-in can run after a 409 switch even when native is the card's default, so its progress shows either way.
   const postHog = usePostHog();
@@ -291,6 +298,7 @@ function ConnectionCardBody({
       // The server found Connected Gmail is the way for this org after this card fell back to native (409).
       if (responseStatus(startError) === 409 && connectedGmail?.canConnect) {
         setAttempt("idle");
+        setSwitchedToConnectedGmail(true);
         connectedGmail.start();
         return;
       }

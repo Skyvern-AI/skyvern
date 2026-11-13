@@ -435,7 +435,7 @@ describe("ConnectionCard", () => {
       .spyOn(window, "open")
       .mockReturnValue(popup as unknown as Window);
     const start = vi.fn();
-    const flow: ConnectedGmailFlow = {
+    let flow: ConnectedGmailFlow = {
       status: "unavailable",
       canConnect: true,
       busy: false,
@@ -443,14 +443,16 @@ describe("ConnectionCard", () => {
       connections: [],
       start,
     };
-    render(
+    // One slot component across rerenders, as in the app, so the card keeps its state.
+    const Slot = ({
+      children,
+    }: {
+      children: (value: ConnectedGmailFlow) => React.ReactNode;
+    }) => <>{children(flow)}</>;
+    const tree = () => (
       <PageSlotsProvider
         value={{
-          connectedGmailFlow: ({
-            children,
-          }: {
-            children: (value: ConnectedGmailFlow) => React.ReactNode;
-          }) => <>{children(flow)}</>,
+          connectedGmailFlow: Slot,
         }}
       >
         <ConnectionCard
@@ -463,14 +465,27 @@ describe("ConnectionCard", () => {
             reconnectConnectionId: null,
           }}
         />
-      </PageSlotsProvider>,
+      </PageSlotsProvider>
     );
+    const { rerender } = render(tree());
 
     fireEvent.click(screen.getByRole("button", { name: "Connect" }));
 
     await waitFor(() => expect(start).toHaveBeenCalledOnce());
     expect(popup.close).toHaveBeenCalled();
     expect(screen.queryByText("Could not start the connection.")).toBeNull();
+    // After the switch, a failed Connected Gmail sign-in shows its reason and Connect retries it, not native.
+    flow = { ...flow, failure: "Sign-in did not finish." };
+    rerender(tree());
+    expect(screen.getByText("Sign-in did not finish.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Connect again" }));
+    expect(start).toHaveBeenCalledTimes(2);
+    expect(startAuthorize).toHaveBeenCalledOnce();
+    // A flow that can no longer connect (catalog unreadable) falls back to native sign-in, not an admin note.
+    flow = { ...flow, failure: null, canConnect: false };
+    rerender(tree());
+    expect(screen.queryByRole("button", { name: "Admin required" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Connect" })).toBeTruthy();
     open.mockRestore();
     startAuthorize.mockReset();
   });

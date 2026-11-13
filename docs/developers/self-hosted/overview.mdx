@@ -18,9 +18,11 @@ Self-hosted Skyvern runs the API server, the browser, and the database on your i
 
 | You get | You run yourself |
 |---|---|
-| Data, recordings, and credentials stay on your infrastructure, except what goes to the LLM provider you configure | Servers, scaling, backups, upgrades |
+| Data, recordings, and credentials stay on your infrastructure, except what goes to the LLM provider you configure and the usage telemetry below | Servers, scaling, backups, upgrades |
 | Any LLM provider, including local models | LLM bills, paid to your provider |
 | Full control of the browser and extensions | Proxies. Skyvern Cloud's proxy network and CAPTCHA solving are not included. |
+
+Telemetry is on by default. Skyvern sends usage events to its product analytics, including the URL each task starts on and your analytics ID. [`SKYVERN_TELEMETRY`](/reference/configuration#other-server-settings) summarizes what the events contain; set it to `false` to turn telemetry off.
 
 ## Pick a path
 
@@ -141,7 +143,7 @@ OLLAMA_MODEL=qwen2.5vl:7b
 OLLAMA_SUPPORTS_VISION=true
 ```
 
-Set `OLLAMA_SUPPORTS_VISION=true` only for a model that reads images. Skyvern works from screenshots, so a vision model gives much better results.
+Set `OLLAMA_SUPPORTS_VISION=true` only for a model that reads images. Without it, Skyvern sends the model no screenshots and works from the page's elements alone, so a vision model gives better results on complex pages.
 
 **Any OpenAI-compatible endpoint** (LiteLLM, vLLM, LM Studio):
 
@@ -214,7 +216,7 @@ Skyvern asks Google for the scopes each integration needs. If your consent scree
 
 | Integration | Scopes |
 |---|---|
-| Google Sheets | `https://www.googleapis.com/auth/spreadsheets`, `https://www.googleapis.com/auth/drive.file`, `https://www.googleapis.com/auth/drive.metadata.readonly` |
+| Google Sheets | `https://www.googleapis.com/auth/spreadsheets`, `https://www.googleapis.com/auth/drive.metadata.readonly` |
 | Gmail, Read inbox | `https://www.googleapis.com/auth/gmail.readonly` |
 | Gmail, Send email | `https://www.googleapis.com/auth/gmail.send`, `openid`, `email` |
 | Google Drive | `https://www.googleapis.com/auth/drive` |
@@ -241,7 +243,7 @@ const client = new Skyvern({ baseUrl: "http://localhost:8000", apiKey: "YOUR_LOC
 ```
 </CodeGroup>
 
-The API answers on both `/v1/` and `/api/v1/`.
+API paths start with `/v1/`. The older `/api/v1/` prefix serves only some endpoints.
 
 ## Upgrade
 
