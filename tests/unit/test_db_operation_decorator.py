@@ -7,6 +7,7 @@ from sqlalchemy.exc import OperationalError, ProgrammingError, SQLAlchemyError
 
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.exceptions import NotFoundError
+from tests.unit.statement_timeout_fakes import statement_timeout_error
 
 
 class FakeDB:
@@ -243,6 +244,56 @@ async def test_db_operation_expected_error_still_reraises_unchanged() -> None:
     with pytest.raises(ProgrammingError) as caught:
         await ReraiseDB().raise_declared()
     assert caught.value is raised
+
+
+class _StatementTimeoutDB:
+    """One operation whose callers handle a cancellation themselves; the rest stay loud."""
+
+    @db_operation("handled_timeout_op", warn_on_statement_timeout=True)
+    async def raise_cancellation(self) -> None:
+        raise statement_timeout_error()
+
+    @db_operation("handled_timeout_op", warn_on_statement_timeout=True)
+    async def raise_other_operational_error(self) -> None:
+        raise OperationalError("SELECT 1", {}, Exception("connection does not exist"))
+
+    @db_operation("loud_timeout_op")
+    async def raise_cancellation_without_opt_in(self) -> None:
+        raise statement_timeout_error()
+
+
+@pytest.mark.asyncio
+async def test_warn_on_statement_timeout_keeps_the_event_name_and_drops_the_error_level() -> None:
+    # The production monitor keys on the "SQLAlchemyError" message with no status filter, so the
+    # name has to survive the level change for its count to stay the same.
+    db = _StatementTimeoutDB()
+    with patch("skyvern.forge.sdk.db._error_handling.LOG") as mock_log:
+        with pytest.raises(OperationalError):
+            await db.raise_cancellation()
+        mock_log.warning.assert_called_once_with("SQLAlchemyError", operation="handled_timeout_op", exc_info=True)
+        mock_log.exception.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_warn_on_statement_timeout_leaves_a_real_outage_at_error() -> None:
+    """The opt-in must not quiet the rest of the operation's failures: OperationalError is wider."""
+    db = _StatementTimeoutDB()
+    with patch("skyvern.forge.sdk.db._error_handling.LOG") as mock_log:
+        with pytest.raises(OperationalError):
+            await db.raise_other_operational_error()
+        mock_log.exception.assert_called_once_with("SQLAlchemyError", operation="handled_timeout_op")
+        mock_log.warning.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_statement_timeout_stays_at_error_without_the_opt_in() -> None:
+    """Operations whose callers do not handle a cancellation keep asking for action."""
+    db = _StatementTimeoutDB()
+    with patch("skyvern.forge.sdk.db._error_handling.LOG") as mock_log:
+        with pytest.raises(OperationalError):
+            await db.raise_cancellation_without_opt_in()
+        mock_log.exception.assert_called_once_with("SQLAlchemyError", operation="loud_timeout_op")
+        mock_log.warning.assert_not_called()
 
 
 @pytest.mark.asyncio
