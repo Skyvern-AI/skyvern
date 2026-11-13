@@ -4,18 +4,19 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import copy
 import functools
 import io
 import json
 import math
 import re
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, TypeVar
 from urllib.parse import urlparse
 
+import litellm
 import structlog
 from agents.exceptions import MaxTurnsExceeded, ModelBehaviorError, OutputGuardrailTripwireTriggered
 from agents.items import TResponseInputItem
@@ -29,10 +30,10 @@ from openai.types.responses import ResponseFunctionToolCall
 from PIL import Image
 from pydantic import JsonValue
 
-from skyvern.forge.sdk.agents.context import get_agent_message_field
+from skyvern.forge.sdk.agents.context import compact_agent_messages_for_llm, get_agent_message_field
 from skyvern.forge.sdk.agents.skills import LOAD_SKILL_TOOL_NAME
 from skyvern.forge.sdk.copilot import streaming_adapter
-from skyvern.forge.sdk.copilot.ask_user import ACCOUNT_GROUP_SUBMIT_TOOL_NAME, SINGLE_RUN_TOOL_NAME
+from skyvern.forge.sdk.copilot.ask_user import ACCOUNT_GROUP_SUBMIT_TOOL_NAME, ASK_USER_TOOL_NAME, SINGLE_RUN_TOOL_NAME
 from skyvern.forge.sdk.copilot.budget_expiry import (
     BudgetExpiredReplyObservation,
     BudgetExpirySource,
@@ -214,9 +215,12 @@ _PRE_RUN_UNGATED_EVIDENCE_SOURCES = frozenset(
 # Charged for an image whose pixel size cannot be read.
 TOKENS_PER_RESIZED_IMAGE = 765
 
-# Keep the last N function_call_output items at full (head-truncated) size.
-# Older outputs collapse to a compact synopsis so context doesn't grow linearly.
+# Over the token budget only, _filter_to_budget keeps the last N tool outputs and arguments whole (head-truncated)
+# and collapses older ones to a synopsis.
 KEEP_RECENT_TOOL_OUTPUTS = 3
+# Whether this call's model input filter summarized older tool items; the next such call shifts that window and
+# rewrites what it covers, so stable_prefix_anchors must anchor before it.
+TOOL_WINDOW_SUMMARIZED: ContextVar[bool] = ContextVar("copilot_tool_window_summarized", default=False)
 # Older tool-call arguments that fail to summarize keep only this much; that channel
 # exists to shrink replayed context and must not follow the recent-window cap.
 _SUMMARIZED_TOOL_ARGUMENT_CHAR_CAP = 2000
@@ -916,7 +920,7 @@ def _summarize_tool_output(output: str) -> str:
 
     # An ask_user result is the user's own answer; reduced to {"ok": true}, the model re-asks what
     # the user just told it. MCP results are excluded so a server cannot opt out of compaction.
-    if MCP_RESULT_PROVENANCE_KEY not in parsed and "interaction_id" in parsed and isinstance(parsed.get("parts"), list):
+    if _carries_user_answer(parsed):
         return output
     # An account group result is the only record of which runs exist and what each did.
     if (
@@ -1035,33 +1039,6 @@ def _summarize_tool_output(output: str) -> str:
         return _truncated_output_fallback(output)
 
 
-def _replace_item_field(item: Any, name: str, new_value: Any) -> Any:
-    """Return a copy of *item* with its *name* field replaced.
-
-    For dicts and attr-style objects, always returns a new object — never
-    mutates *item* in place. `_prune_input_list` runs over input lists that
-    may share references with SDK-owned state (e.g. `result.to_input_list()`
-    and `model_data.input`); in-place mutation there would corrupt shared
-    state.
-    """
-    if isinstance(item, dict):
-        return {**item, name: new_value}
-    try:
-        dup = copy.copy(item)
-        setattr(dup, name, new_value)
-        return dup
-    except (AttributeError, TypeError):
-        LOG.debug(
-            "Could not rewrite input-list item field; leaving untouched",
-            field=name,
-        )
-        return item
-
-
-def _replace_item_output(item: Any, new_output: str) -> Any:
-    return _replace_item_field(item, "output", new_output)
-
-
 def _summarize_tool_arguments(args_json: str) -> str:
     """Compact the arguments payload of an older tool call so that massive
     inputs (e.g. the full workflow YAML passed to `update_workflow`) don't keep
@@ -1117,45 +1094,63 @@ def unread_tool_output_indices(items: Sequence[Any]) -> set[int]:
     return unread
 
 
-def _carries_skill_body(output: object) -> bool:
+def _parsed_output(output: object) -> dict[str, Any] | None:
     if not isinstance(output, str):
-        return False
+        return None
     try:
         parsed = json.loads(output)
     except ValueError:
-        return False
-    data = parsed.get("data") if isinstance(parsed, dict) else None
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _carries_skill_body(parsed: dict[str, Any]) -> bool:
+    data = parsed.get("data")
     return isinstance(data, dict) and isinstance(data.get("body"), str)
 
 
-def skill_output_indices(items: Sequence[Any]) -> set[int]:
-    """Indices of load_skill outputs that carry a body; every trimming layer keeps them and their calls whole."""
-    load_call_ids = {
-        _item_field(item, "call_id")
+def _carries_user_answer(parsed: dict[str, Any]) -> bool:
+    return (
+        MCP_RESULT_PROVENANCE_KEY not in parsed and "interaction_id" in parsed and isinstance(parsed.get("parts"), list)
+    )
+
+
+_WHOLE_OUTPUT_CHECKS = {LOAD_SKILL_TOOL_NAME: _carries_skill_body, ASK_USER_TOOL_NAME: _carries_user_answer}
+
+
+def whole_output_indices(items: Sequence[Any]) -> set[int]:
+    """Indices of loaded skill bodies and answered ask_user results; every trimming layer keeps them and their calls
+    whole."""
+    call_checks = {
+        _item_field(item, "call_id"): _WHOLE_OUTPUT_CHECKS[_item_field(item, "name")]
         for item in items
-        if _item_field(item, "type") == "function_call" and _item_field(item, "name") == LOAD_SKILL_TOOL_NAME
+        if _item_field(item, "type") == "function_call" and _item_field(item, "name") in _WHOLE_OUTPUT_CHECKS
     }
-    return {
-        index
-        for index, item in enumerate(items)
-        if _item_field(item, "type") == "function_call_output"
-        and _item_field(item, "call_id") in load_call_ids
-        and _carries_skill_body(_item_field(item, "output"))
-    }
+    kept: set[int] = set()
+    for index, item in enumerate(items):
+        if _item_field(item, "type") != "function_call_output":
+            continue
+        check = call_checks.get(_item_field(item, "call_id"))
+        parsed = _parsed_output(_item_field(item, "output")) if check else None
+        if check and parsed is not None and check(parsed):
+            kept.add(index)
+    return kept
 
 
 def stable_prefix_anchors(items: Sequence[TResponseInputItem], *, append_only: bool = False) -> list[int]:
     """Return, oldest first, the index of every tool output or real user message that later model calls resend
-    unchanged: all of them when nothing rewrites the input, else those before both the compaction window and every
-    unpruned screenshot."""
-    fc_indices = [i for i, item in enumerate(items) if _item_field(item, "type") == "function_call"]
-    fco_indices = [i for i, item in enumerate(items) if _item_field(item, "type") == "function_call_output"]
+    unchanged: all of them when nothing rewrites the input, else those before every unread output, every unpruned
+    screenshot and, when this call summarized older tool items, the window it kept whole."""
+    window: set[int] = set()
+    if TOOL_WINDOW_SUMMARIZED.get():
+        fc_indices = [i for i, item in enumerate(items) if _item_field(item, "type") == "function_call"]
+        fco_indices = [i for i, item in enumerate(items) if _item_field(item, "type") == "function_call_output"]
+        window = {*fc_indices[-KEEP_RECENT_TOOL_OUTPUTS:], *fco_indices[-KEEP_RECENT_TOOL_OUTPUTS:]}
     unstable = (
         set()
         if append_only
         else {
-            *fc_indices[-KEEP_RECENT_TOOL_OUTPUTS:],
-            *fco_indices[-KEEP_RECENT_TOOL_OUTPUTS:],
+            *window,
             *unread_tool_output_indices(items),
             *(
                 i
@@ -1172,65 +1167,40 @@ def stable_prefix_anchors(items: Sequence[TResponseInputItem], *, append_only: b
     ]
 
 
-def _prune_input_list(items: list[Any]) -> list[Any]:
-    """Drop all but the most recent screenshot, compress older tool outputs,
-    and summarize the arguments of older tool CALLS so bulky payloads (like
-    the full workflow YAML) don't accumulate in replayed context.
+def _compact_tool_items(
+    items: list[TResponseInputItem],
+    *,
+    keep_recent_tool_outputs: int,
+    on_recent_truncation: Callable[[int, int, list[str]], None] | None = None,
+) -> list[TResponseInputItem]:
+    return compact_agent_messages_for_llm(
+        items,
+        keep_whole_output_indices=unread_tool_output_indices(items) | whole_output_indices(items),
+        keep_recent_tool_outputs=keep_recent_tool_outputs,
+        max_recent_tool_output_chars=_RECENT_TOOL_OUTPUT_CHAR_CAP,
+        summarize_tool_output=_summarize_tool_output,
+        summarize_tool_arguments=_summarize_tool_arguments,
+        tool_output_truncation_suffix=_TOOL_OUTPUT_HEAD_TRUNCATION_SUFFIX,
+        on_recent_truncation=on_recent_truncation,
+    )
 
-    Screenshots collapse to a short text placeholder. function_call_output and
-    function_call items keep the last KEEP_RECENT_TOOL_OUTPUTS at full size
-    (head-truncated); older ones collapse to JSON synopses.
-    """
+
+def _cap_tool_outputs(items: list[TResponseInputItem]) -> list[TResponseInputItem]:
+    """Head-cut every tool output at the recent-output cap and summarize nothing."""
+    return _compact_tool_items(
+        items, keep_recent_tool_outputs=len(items), on_recent_truncation=log_recent_tool_output_truncation
+    )
+
+
+def _prune_input_list(items: list[TResponseInputItem]) -> list[TResponseInputItem]:
+    """Replace all but the newest screenshot with a placeholder. Tool outputs and arguments stay whole: the run
+    config's per-call model input filter caps and budgets them."""
     screenshot_indices = [i for i, item in enumerate(items) if is_screenshot_message(item)]
     drop_indices = set(screenshot_indices[:-1])
-
-    fco_indices = [i for i, item in enumerate(items) if _item_field(item, "type") == "function_call_output"]
-    recent_fco_set = set(fco_indices[-KEEP_RECENT_TOOL_OUTPUTS:])
-
-    recent_fco_set |= unread_tool_output_indices(items)
-    recent_fco_set |= skill_output_indices(items)
-
-    fc_indices = [i for i, item in enumerate(items) if _item_field(item, "type") == "function_call"]
-    recent_fc_set = set(fc_indices[-KEEP_RECENT_TOOL_OUTPUTS:])
-    tool_names = {_item_field(items[i], "call_id"): _item_field(items[i], "name") for i in fc_indices}
-
-    result: list[Any] = []
-    recent_truncated_count = 0
-    recent_truncated_largest = 0
-    recent_truncated_names: list[str] = []
-    for i, item in enumerate(items):
-        if i in drop_indices:
-            result.append({"role": "user", "content": SCREENSHOT_PLACEHOLDER})
-            continue
-
-        item_type = _item_field(item, "type")
-        if item_type == "function_call_output":
-            output = _item_field(item, "output")
-            if isinstance(output, str):
-                if i in recent_fco_set:
-                    if len(output) > _RECENT_TOOL_OUTPUT_CHAR_CAP:
-                        new_output = output[:_RECENT_TOOL_OUTPUT_CHAR_CAP] + _TOOL_OUTPUT_HEAD_TRUNCATION_SUFFIX
-                        if new_output != output:
-                            recent_truncated_count += 1
-                            recent_truncated_largest = max(recent_truncated_largest, len(output))
-                            recent_truncated_names.append(tool_names.get(_item_field(item, "call_id")) or "unknown")
-                    else:
-                        new_output = output
-                else:
-                    new_output = _summarize_tool_output(output)
-                if new_output != output:
-                    item = _replace_item_output(item, new_output)
-        elif item_type == "function_call" and i not in recent_fc_set:
-            args = _item_field(item, "arguments")
-            if isinstance(args, str):
-                new_args = _summarize_tool_arguments(args)
-                if new_args != args:
-                    item = _replace_item_field(item, "arguments", new_args)
-
-        result.append(item)
-    if recent_truncated_count:
-        log_recent_tool_output_truncation(recent_truncated_count, recent_truncated_largest, recent_truncated_names)
-    return result
+    return [
+        {"role": "user", "content": SCREENSHOT_PLACEHOLDER} if i in drop_indices else item
+        for i, item in enumerate(items)
+    ]
 
 
 @functools.lru_cache(maxsize=16)
@@ -1303,8 +1273,8 @@ def _aggressive_prune_tail(items: list[Any]) -> list[Any]:
     return tail
 
 
-def aggressive_prune_skill_pairs(items: list[Any]) -> list[Any]:
-    """Body-carrying load_skill calls before the prune's tail, each with its output and the reasoning item just
+def aggressive_prune_whole_pairs(items: list[Any]) -> list[Any]:
+    """Calls before the prune's tail whose outputs stay whole, each with its output and the reasoning item just
     before the call, in input order."""
     tail_ids = {id(item) for item in _aggressive_prune_tail(items)}
     call_indices = {
@@ -1313,7 +1283,7 @@ def aggressive_prune_skill_pairs(items: list[Any]) -> list[Any]:
         if index > 0 and _item_field(item, "type") == "function_call"
     }
     kept: set[int] = set()
-    for output_index in skill_output_indices(items):
+    for output_index in whole_output_indices(items):
         call_index = call_indices.get(_item_field(items[output_index], "call_id"))
         if call_index is None or id(items[call_index]) in tail_ids:
             continue
@@ -1330,19 +1300,19 @@ def aggressive_prune_skill_pairs(items: list[Any]) -> list[Any]:
 def aggressive_prune(items: list[Any]) -> list[Any]:
     """Emergency prune: drop ALL screenshots, keep original message + last ~3
     tool call/output pairs + latest nudge, prioritizing pair-valid history.
-    Body-carrying load_skill pairs from before the tail go back right after the original message."""
+    Pairs whose outputs stay whole from before the tail go back right after the original message."""
     if not items:
         return items
 
     screenshot_dropped = any(is_screenshot_message(item) for item in items[1:])
-    skill_pairs = aggressive_prune_skill_pairs(items)
-    skill_call_ids = {
-        _item_field(item, "call_id") for item in skill_pairs if _item_field(item, "type") == "function_call"
+    whole_pairs = aggressive_prune_whole_pairs(items)
+    whole_call_ids = {
+        _item_field(item, "call_id") for item in whole_pairs if _item_field(item, "type") == "function_call"
     }
     tail = [
         item
         for item in _aggressive_prune_tail(items)
-        if not (_item_field(item, "type") == "function_call_output" and _item_field(item, "call_id") in skill_call_ids)
+        if not (_item_field(item, "type") == "function_call_output" and _item_field(item, "call_id") in whole_call_ids)
     ]
     opening = items[0]
     opening_call_id = _item_field(opening, "call_id")
@@ -1351,7 +1321,7 @@ def aggressive_prune(items: list[Any]) -> list[Any]:
         if _item_field(opening, "type") == "function_call" and isinstance(opening_call_id, str)
         else set()
     )
-    seen_call_ids |= skill_call_ids
+    seen_call_ids |= whole_call_ids
     retained_tail: list[Any] = []
     orphaned_output_dropped = False
     for item in tail:
@@ -1367,10 +1337,10 @@ def aggressive_prune(items: list[Any]) -> list[Any]:
     LOG.info(
         "copilot_aggressive_prune_pair_validity",
         retained_tail=[_item_field(item, "type") for item in retained_tail],
-        retained_skill_pairs=len(skill_call_ids),
+        retained_skill_pairs=len(whole_call_ids),
         orphaned_output_dropped=orphaned_output_dropped,
     )
-    retained_items = [opening, *skill_pairs, *retained_tail]
+    retained_items = [opening, *whole_pairs, *retained_tail]
     screenshot_dropped_signal = _assemble_enforcement_messages(None, _nudge(None, "screenshot_dropped"))
     signal_content = _item_field(screenshot_dropped_signal[0], "content")
     if not screenshot_dropped or any(_item_field(item, "content") == signal_content for item in retained_items):
@@ -1379,6 +1349,9 @@ def aggressive_prune(items: list[Any]) -> list[Any]:
 
 
 def _is_context_window_error(exc: BaseException) -> bool:
+    # LiteLLM maps Anthropic's "prompt is too long" to this type without any of the OpenAI phrases below.
+    if isinstance(exc, litellm.ContextWindowExceededError):
+        return True
     msg = str(exc).lower()
     # Match OpenAI's explicit code/phrase variants. Avoid loose substrings like
     # "max_tokens" which also appear in max_tokens_per_request quota errors.
@@ -2379,7 +2352,7 @@ async def run_with_enforcement(
         # input filter cannot protect us — the payload is in current_input,
         # not in session history. Estimate regardless of session.
         if isinstance(current_input, list):
-            est = estimate_tokens(current_input)
+            est = estimate_tokens(_cap_tool_outputs(current_input))
             LOG.info("Token estimate before model call", tokens=est, iteration=iteration)
             if est > token_budget:
                 LOG.warning(

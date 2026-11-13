@@ -19,7 +19,6 @@ from pydantic import BaseModel
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.agents.context import (
-    compact_agent_messages_for_llm,
     get_agent_message_field,
     pair_tool_calls_with_outputs,
     replace_agent_message_field,
@@ -28,27 +27,26 @@ from skyvern.forge.sdk.copilot.browser_ablation import prompt_sha256
 from skyvern.forge.sdk.copilot.cache_envelope import is_replayable_reasoning
 from skyvern.forge.sdk.copilot.config import SCREENSHOT_DROPPED_NUDGE
 from skyvern.forge.sdk.copilot.enforcement import (
-    _RECENT_TOOL_OUTPUT_CHAR_CAP,
     _TOOL_OUTPUT_HEAD_TRUNCATION_SUFFIX,
     KEEP_RECENT_TOOL_OUTPUTS,
     NUDGE_SENTINEL,
     SCREENSHOT_PLACEHOLDER,
     TOKEN_BUDGET,
+    TOOL_WINDOW_SUMMARIZED,
+    _cap_tool_outputs,
+    _compact_tool_items,
     _strip_input_images,
-    _summarize_tool_arguments,
-    _summarize_tool_output,
     aggressive_prune,
-    aggressive_prune_skill_pairs,
+    aggressive_prune_whole_pairs,
     estimate_tokens,
     is_attached_image_message,
     is_paired_observation_message,
     is_screenshot_message,
     is_synthetic_user_message,
-    log_recent_tool_output_truncation,
     pending_screenshot_entry,
     pending_screenshot_message,
-    skill_output_indices,
     unread_tool_output_indices,
+    whole_output_indices,
 )
 from skyvern.forge.sdk.copilot.model_input_capture import (
     clear_pending_model_input_capture,
@@ -70,7 +68,7 @@ TOOL_OUTPUT_TRUNCATE_EMERGENCY = 300
 
 
 def _emergency_truncate_all(items: list[Any], cap: int) -> list[Any]:
-    kept = skill_output_indices(items)
+    kept = whole_output_indices(items)
     truncated_items = [item if i in kept else _truncate_tool_output(item, cap) for i, item in enumerate(items)]
     truncated = {i for i, (old, new) in enumerate(zip(items, truncated_items)) if new is not old}
     if truncated:
@@ -99,14 +97,14 @@ def _defer_unread_outputs_over_budget(items: list[Any], token_budget: int) -> tu
         if get_agent_message_field(item, "type") == "function_call"
     }
     unread = sorted(unread_tool_output_indices(items))
-    skill_indices = skill_output_indices(items)
-    # A loaded skill is never deferred and already gives the batch one whole result, so every other output may go.
-    keep_whole = 0 if skill_indices.intersection(unread) else 1
+    whole_indices = whole_output_indices(items)
+    # A loaded skill or answer is never deferred and already gives the batch one whole result, so every other may go.
+    keep_whole = 0 if whole_indices.intersection(unread) else 1
     items = list(items)
     deferred: list[str] = []
     while len(unread) > keep_whole and estimate_tokens(items) > token_budget:
         index = unread.pop()
-        if index in skill_indices:
+        if index in whole_indices:
             continue
         call = calls.get(get_agent_message_field(items[index], "call_id"))
         tool_name = get_agent_message_field(call, "name") if call is not None else None
@@ -128,17 +126,15 @@ def _defer_unread_outputs_over_budget(items: list[Any], token_budget: int) -> tu
     return items, deferred
 
 
-def _compact_tool_items(items: list[Any]) -> list[Any]:
-    return compact_agent_messages_for_llm(
-        items,
-        keep_whole_output_indices=unread_tool_output_indices(items) | skill_output_indices(items),
-        keep_recent_tool_outputs=KEEP_RECENT_TOOL_OUTPUTS,
-        max_recent_tool_output_chars=_RECENT_TOOL_OUTPUT_CHAR_CAP,
-        summarize_tool_output=_summarize_tool_output,
-        summarize_tool_arguments=_summarize_tool_arguments,
-        tool_output_truncation_suffix=_TOOL_OUTPUT_HEAD_TRUNCATION_SUFFIX,
-        on_recent_truncation=log_recent_tool_output_truncation,
-    )
+def _items_besides_frames(items: list[TResponseInputItem]) -> list[TResponseInputItem]:
+    return [item for item in _drop_attached_images(items) if not is_screenshot_message(item)]
+
+
+def _summarize_older_tool_items(items: list[TResponseInputItem]) -> list[TResponseInputItem]:
+    # Summarized before the cap so an over-cap JSON output still parses into a synopsis. The cap then reaches outputs
+    # the summarizer keeps whole, unlogged because the caller already logged this call's cuts.
+    summarized = _compact_tool_items(items, keep_recent_tool_outputs=KEEP_RECENT_TOOL_OUTPUTS)
+    return _compact_tool_items(summarized, keep_recent_tool_outputs=len(summarized))
 
 
 def _screenshot_with_image(item: Any) -> bool:
@@ -156,32 +152,13 @@ def copilot_session_input_callback(
     history_items: list[Any],
     new_items: list[Any],
 ) -> list[Any]:
-    """Combine session history with new input, pruning older tool output/call
-    payloads in the middle region.
-
-    Keeps the original goal (first item) at full fidelity and preserves the
-    last ``RECENT_REAL_TURNS`` real user turns — besides the goal, only messages
-    the user sent into the running turn are real, so the post-goal history is
-    usually all middle region. Within it, older ``function_call_output`` / ``function_call`` items
-    are compacted using the same ``KEEP_RECENT_TOOL_OUTPUTS`` rule that
-    ``enforcement._prune_input_list`` uses in the non-session path, and the
-    newest screenshot survives unless a newer one rides in recent/new items.
-    """
+    """Combine session history with new input, keeping the goal and only the newest screenshot of the middle region."""
     if not history_items:
         return new_items
 
     boundary = _find_real_user_boundary(history_items, recent_turns=RECENT_REAL_TURNS)
-    # Partitioning rules:
-    # * boundary >= 1 — the helper found ``recent_turns`` real user messages.
-    #   items[1:boundary] is the "middle" to compact; items[boundary:] is the
-    #   recent region we keep as-is. When boundary == 1 the middle slice is
-    #   empty, which is correct (no items between the goal and the recent
-    #   region). The prior form also appended history_items[1:] to recent,
-    #   which double-emitted every non-goal item — fixed here.
-    # * boundary == 0 — first-turn shape (fewer real users than recent_turns).
-    #   Treat everything after the goal as "middle" so the KEEP_RECENT_TOOL_OUTPUTS
-    #   compaction inside compact_agent_messages_for_llm can still fire on the long tool
-    #   chain. Recent is empty.
+    # boundary == 0 means fewer real user turns than RECENT_REAL_TURNS, so everything after the goal is middle and
+    # screenshot retention still reaches a first turn's long tool chain.
     if boundary >= 1:
         middle = history_items[1:boundary]
         recent = history_items[boundary:]
@@ -189,30 +166,29 @@ def copilot_session_input_callback(
         middle = history_items[1:]
         recent = []
 
-    pruned_middle = _compact_tool_items(middle)
     # The newest frame must survive the merge: with every injected message classified
     # synthetic, the whole post-goal history is middle, and blanket-replacing would
     # blind the agent to the frame it just captured once it rotates into history.
     trailing_items = list(recent) + list(new_items)
     stale_paired_screenshots = {
         i
-        for i, item in enumerate(pruned_middle)
+        for i, item in enumerate(middle)
         if is_paired_observation_message(item)
-        and any(not is_synthetic_user_message(following) for following in list(pruned_middle[i + 1 :]) + trailing_items)
+        and any(not is_synthetic_user_message(following) for following in list(middle[i + 1 :]) + trailing_items)
     }
     middle_screenshots = [
-        i for i, item in enumerate(pruned_middle) if _screenshot_with_image(item) and i not in stale_paired_screenshots
+        i for i, item in enumerate(middle) if _screenshot_with_image(item) and i not in stale_paired_screenshots
     ]
     has_newer_screenshot = any(_screenshot_with_image(item) for item in list(recent) + list(new_items))
     keep_screenshot = middle_screenshots[-1] if middle_screenshots and not has_newer_screenshot else None
-    pruned_middle = [
+    middle = [
         {"role": "user", "content": SCREENSHOT_PLACEHOLDER}
         if is_screenshot_message(item) and (i != keep_screenshot or i in stale_paired_screenshots)
         else item
-        for i, item in enumerate(pruned_middle)
+        for i, item in enumerate(middle)
     ]
 
-    return [history_items[0]] + pruned_middle + list(recent) + list(new_items)
+    return [history_items[0]] + middle + list(recent) + list(new_items)
 
 
 def make_copilot_call_model_input_filter(token_budget: int) -> Callable[[CallModelData[Any]], ModelInputData]:
@@ -245,8 +221,7 @@ def _is_unsent_reasoning(item: TResponseInputItem) -> bool:
 
 
 def _copilot_call_model_input_filter(data: CallModelData[Any], *, token_budget: int) -> ModelInputData:
-    # Compacted up front so the sharp-copy budget check below sees the input the budget filter will.
-    items = _compact_tool_items([item for item in data.model_data.input if not _is_unsent_reasoning(item)])
+    items = [item for item in data.model_data.input if not _is_unsent_reasoning(item)]
     ctx = _run_context(data)
     # A fallback to a non-vision model replays session history that may already hold attached or captured images.
     if not (isinstance(ctx, AgentContext) and ctx.supports_vision):
@@ -278,16 +253,24 @@ def _copilot_call_model_input_filter(data: CallModelData[Any], *, token_budget: 
                 capture_id=entry.capture_id,
                 input_fingerprint=fingerprint,
             )
-    if screenshot_msg is not None:
+    instructions = data.model_data.instructions
+    if screenshot_msg is None:
+        budgeted = _filter_to_budget(items, instructions, token_budget=token_budget)
+    else:
+        budgeted = _filter_to_budget([*items, screenshot_msg], instructions, token_budget=token_budget)
+        summarized = TOOL_WINDOW_SUMMARIZED.get()
         sharp_msg = pending_screenshot_message(ctx, sharp=True)
-        # The sharp copy may cost older screenshots and attached images, which budget pruning drops first anyway,
-        # but nothing else.
-        if (
-            sharp_msg is not None
-            and estimate_tokens(_drop_attached_images(_drop_older_screenshots([*items, sharp_msg]))) <= token_budget
-        ):
-            screenshot_msg = sharp_msg
-        else:
+        if sharp_msg is not None:
+            sharp_budgeted = _filter_to_budget([*items, sharp_msg], instructions, token_budget=token_budget)
+            # The sharp copy may cost older screenshots and attached images, which budget pruning drops first anyway,
+            # but nothing else.
+            if estimate_tokens(sharp_budgeted.input) <= token_budget and _items_besides_frames(
+                sharp_budgeted.input
+            ) == _items_besides_frames(budgeted.input):
+                budgeted, screenshot_msg = sharp_budgeted, sharp_msg
+            else:
+                TOOL_WINDOW_SUMMARIZED.set(summarized)
+        if screenshot_msg is not sharp_msg:
             LOG.info("copilot_sharp_frame_over_budget")
         LOG.info(
             "Injecting screenshot user message",
@@ -297,9 +280,7 @@ def _copilot_call_model_input_filter(data: CallModelData[Any], *, token_budget: 
             capture_id=entry.capture_id if entry else None,
             capture_event_id=entry.capture_event_id if entry else None,
         )
-        items.append(screenshot_msg)
 
-    budgeted = _filter_to_budget(items, data.model_data.instructions, token_budget=token_budget)
     # Last thing before the request leaves: every budget rung above reorders nothing, but
     # history assembly upstream can seat a result after a later assistant turn, which the
     # provider rejects outright. Repair here so no path can emit an invalid pairing.
@@ -307,7 +288,7 @@ def _copilot_call_model_input_filter(data: CallModelData[Any], *, token_budget: 
         input=pair_tool_calls_with_outputs(list(budgeted.input), on_repair=_log_tool_pair_repair),
         instructions=budgeted.instructions,
     )
-    _maybe_dump_model_input(data, model_data)
+    _maybe_dump_model_input(data, model_data, token_budget=token_budget)
     return model_data
 
 
@@ -336,7 +317,7 @@ def _captured_authoring_capability(ctx: AgentContext | None) -> dict[str, bool] 
     }
 
 
-def _maybe_dump_model_input(data: CallModelData[Any], model_data: ModelInputData) -> None:
+def _maybe_dump_model_input(data: CallModelData[Any], model_data: ModelInputData, *, token_budget: int) -> None:
     """Record the exact model input so a prompt or tool-schema change can be replayed offline.
 
     Written here rather than at the Runner call because this is the only point that sees what the
@@ -371,6 +352,7 @@ def _maybe_dump_model_input(data: CallModelData[Any], model_data: ModelInputData
             "instructions": model_data.instructions,
             "input": [_jsonable(item) for item in model_data.input],
             "requested_output_paths": requested_output_paths,
+            "token_budget": token_budget,
         }
         parameters = getattr(ctx, "codeblock_redaction_parameters", {})
         if parameters:
@@ -392,30 +374,22 @@ def _maybe_dump_model_input(data: CallModelData[Any], model_data: ModelInputData
 
 
 def _filter_to_budget(items: list[Any], instructions: str | None, *, token_budget: int) -> ModelInputData:
-    """Token-budget enforcement applied just before each model call.
-
-    Graduated pruning:
-    1. Compact older tool outputs + function-call arguments using the
-       KEEP_RECENT_TOOL_OUTPUTS rule (mirrors ``enforcement._prune_input_list``).
-    2. If still over budget: drop all screenshots except the most recent, then attached images,
-       then replace the latest unread outputs that do not fit with a notice that the call ran.
-    3. If still over budget: truncate every tool output except loaded skill bodies — first to 2000 chars,
-       then to 300 only if the softer pass was not enough. Every layer keeps loaded skill bodies whole.
-    4. If still over budget: aggressive prune as last resort, keeping the most recent screenshot unless
-       it predates every step the prune keeps.
-    """
+    """Under budget, send every tool output whole up to the per-output cap.
+    Over budget, summarize all but the newest outputs and arguments, then drop older screenshots and images, defer
+    unread outputs, truncate, and prune; loaded skills and user answers stay whole throughout."""
+    TOOL_WINDOW_SUMMARIZED.set(False)
     if not items:
         return ModelInputData(input=items, instructions=instructions)
 
-    est = estimate_tokens(items)
+    capped = _cap_tool_outputs(items)
+    est = estimate_tokens(capped)
     LOG.info("Token estimate before filtering", tokens=est)
+    if est <= token_budget:
+        LOG.info("Within budget, outputs whole", tokens=est)
+        return ModelInputData(input=capped, instructions=instructions)
 
-    # Re-run compaction here even though ``copilot_session_input_callback``
-    # already compacted on session merge. The KEEP_RECENT_TOOL_OUTPUTS window
-    # shifts whenever new items get appended — an output that was "recent" on
-    # the previous turn may now be old enough to summarize. Cheap to re-run
-    # (pure function over the item list), idempotent on already-compact items.
-    items = _compact_tool_items(items)
+    TOOL_WINDOW_SUMMARIZED.set(True)
+    items = _summarize_older_tool_items(items)
 
     est = estimate_tokens(items)
     if est <= token_budget:
@@ -484,14 +458,14 @@ def _filter_to_budget(items: list[Any], instructions: str | None, *, token_budge
         and get_agent_message_field(item, "type") == "function_call"
     }
     frame = next((item for item in reversed(items[1:]) if _screenshot_with_image(item)), None)
-    reinserted_skill_items = {id(item) for item in aggressive_prune_skill_pairs(items)}
+    reinserted_whole_items = {id(item) for item in aggressive_prune_whole_pairs(items)}
     pruned = aggressive_prune(items)
     # The prune drops every screenshot and appends a re-take note, or keeps an earlier note instead of adding one.
     # A frame newer than the oldest kept step goes back in its input position without any note older than it; an
     # older frame stays dropped because the steps taken after it were cut.
     position = {id(item): index for index, item in enumerate(items)}
     oldest_kept = next(
-        (position[id(item)] for item in pruned[1:] if id(item) in position and id(item) not in reinserted_skill_items),
+        (position[id(item)] for item in pruned[1:] if id(item) in position and id(item) not in reinserted_whole_items),
         None,
     )
     if frame is not None and (oldest_kept is None or position[id(frame)] > oldest_kept):

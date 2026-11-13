@@ -89,6 +89,7 @@ ACCOUNT_GROUP_SUBMIT_TOOL_NAME = "run_workflow_for_accounts"
 ACCOUNT_GROUP_STATUS_TOOL_NAME = "get_account_group_status"
 ACCOUNT_GROUP_CANCEL_TOOL_NAME = "cancel_account_group"
 SINGLE_RUN_TOOL_NAME = "run_saved_workflow"
+ASK_USER_TOOL_NAME = "ask_user"
 
 REPEAT_RISK_OUTCOMES = (
     WorkflowRunGroupItemOutcome.completed,
