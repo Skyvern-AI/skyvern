@@ -209,6 +209,12 @@ class CopilotInFlightTurn(BaseModel):
     latest_draft_at: datetime | None = None
 
 
+class CopilotAcceptedTestedRun(BaseModel):
+    workflow_id: str
+    modified_at: datetime
+    workflow_run_id: str | None = None
+
+
 class WorkflowCopilotChat(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -226,6 +232,9 @@ class WorkflowCopilotChat(BaseModel):
         default_factory=dict, description="In-flight turns keyed by turn id"
     )
     work_plan: list[str] = Field(default_factory=list, description="Latest work plan the copilot model wrote")
+    accepted_tested_run: CopilotAcceptedTestedRun | None = Field(
+        None, description="The run that tested the draft this chat last accepted, keyed by the saved version"
+    )
 
     @field_validator("accepted_turn_ids", mode="before")
     @classmethod

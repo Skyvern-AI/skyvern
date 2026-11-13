@@ -2546,6 +2546,24 @@ class WorkflowRunsRepository(BaseRepository):
                 .limit(1)
             )
 
+    @db_operation("get_latest_finished_run_for_workflow_version")
+    async def get_latest_finished_run_for_workflow_version(
+        self, organization_id: str, workflow_permanent_id: str, workflow_id: str, created_at_start: datetime
+    ) -> WorkflowRun | None:
+        async with self.Session() as session:
+            run = await session.scalar(
+                select(WorkflowRunModel)
+                .where(WorkflowRunModel.organization_id == organization_id)
+                .where(WorkflowRunModel.workflow_permanent_id == workflow_permanent_id)
+                .where(WorkflowRunModel.workflow_id == workflow_id)
+                .where(WorkflowRunModel.parent_workflow_run_id.is_(None))
+                .where(WorkflowRunModel.status.in_([status.value for status in WorkflowRunStatus if status.is_final()]))
+                .where(WorkflowRunModel.created_at >= created_at_start)
+                .order_by(WorkflowRunModel.created_at.desc())
+                .limit(1)
+            )
+            return convert_to_workflow_run(run) if run is not None else None
+
     @db_operation("get_last_queued_workflow_run")
     async def get_last_queued_workflow_run(
         self,

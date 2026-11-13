@@ -116,6 +116,31 @@ class AccountGroupRow(BaseModel):
     parameter_key: str | None = Field(default=None, exclude_if=lambda key: key is None)
 
 
+class RunCostFacts(BaseModel):
+    runs_to_start: int | None = Field(default=None, exclude_if=lambda count: count is None)
+    based_on_run_id: str | None = Field(default=None, exclude_if=lambda run_id: run_id is None)
+    based_on_credits: int | None = Field(default=None, exclude_if=lambda credits: credits is None)
+    blocks_completed: int | None = Field(default=None, exclude_if=lambda count: count is None)
+    blocks_total: int | None = Field(default=None, exclude_if=lambda count: count is None)
+    estimate_from_one_run: int | None = Field(default=None, exclude_if=lambda credits: credits is None)
+    balance_credits: int | None = Field(default=None, exclude_if=lambda credits: credits is None)
+    credits_note: str | None = Field(default=None, exclude_if=lambda note: note is None)
+    stop_rule: str | None = Field(default=None, exclude_if=lambda rule: rule is None)
+
+    def for_runs(self, count: int) -> RunCostFacts:
+        if self.runs_to_start is None:
+            return self
+        estimate = (
+            count * self.based_on_credits
+            if self.estimate_from_one_run is not None and self.based_on_credits is not None
+            else None
+        )
+        return self.model_copy(update={"runs_to_start": count, "estimate_from_one_run": estimate})
+
+    def not_started(self) -> RunCostFacts:
+        return self.model_copy(update={"runs_to_start": None, "estimate_from_one_run": None})
+
+
 class AccountGroupReview(BaseModel):
     workflow_permanent_id: str
     workflow_id: str
@@ -135,6 +160,9 @@ class AccountGroupReview(BaseModel):
     proposal_revision: int | None = Field(default=None, exclude_if=lambda revision: revision is None)
     draft_tested: bool = Field(default=False, exclude_if=lambda tested: not tested)
     tested_workflow_run_id: str | None = Field(default=None, exclude_if=lambda run_id: run_id is None)
+    cost: RunCostFacts | None = Field(default=None, exclude_if=lambda cost: cost is None)
+    # On the card only: the tool results copy `cost`, never these values.
+    based_on_inputs: dict[str, JsonValue] | None = Field(default=None, exclude_if=lambda inputs: inputs is None)
     saved_workflow_id: str | None = Field(default=None, exclude_if=lambda workflow_id: workflow_id is None)
     saved_version: int | None = Field(default=None, exclude_if=lambda version: version is None)
     run_started: bool | None = Field(default=None, exclude_if=lambda started: started is None)

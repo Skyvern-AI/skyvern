@@ -2304,6 +2304,7 @@ class WorkflowCopilotChatModel(Base):
     auto_accept = Column(Boolean, nullable=True, default=False)
     pending_turns = Column(JSON, nullable=True)
     work_plan = Column(JSON, nullable=True)
+    accepted_tested_run = Column(JSON, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(

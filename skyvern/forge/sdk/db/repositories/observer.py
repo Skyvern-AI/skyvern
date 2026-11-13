@@ -958,6 +958,20 @@ class ObserverRepository(BaseRepository):
             )
             return {run_id for run_id in rows if run_id is not None}
 
+    @db_operation("get_completed_workflow_run_block_labels")
+    async def get_completed_workflow_run_block_labels(self, workflow_run_id: str, organization_id: str) -> set[str]:
+        async with self.Session() as session:
+            rows = await session.scalars(
+                select(WorkflowRunBlockModel.label)
+                .distinct()
+                .where(
+                    WorkflowRunBlockModel.workflow_run_id == workflow_run_id,
+                    WorkflowRunBlockModel.organization_id == organization_id,
+                    WorkflowRunBlockModel.status == BlockStatus.completed.value,
+                )
+            )
+            return {label for label in rows if label is not None}
+
     @db_operation("get_workflow_run_blocks")
     async def get_workflow_run_blocks(
         self,
