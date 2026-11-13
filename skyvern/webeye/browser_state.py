@@ -174,7 +174,12 @@ class BrowserState(Protocol):
 
     async def new_page(self) -> Page: ...
 
-    async def reload_page(self, degradation: bool = False, page: Page | None = None) -> None: ...
+    async def reload_page(
+        self,
+        degradation: bool = False,
+        page: Page | None = None,
+        still_wanted: Callable[[Page], Awaitable[bool]] | None = None,
+    ) -> bool: ...
 
     async def wait_for_main_frame_navigation(self, page: Page, deadline: float) -> None:
         """Wait, until at most the monotonic ``deadline``, for ``page``'s in-flight main-frame navigation to settle."""

@@ -232,7 +232,7 @@ async def test_agent_navigation_rejects_hostname_resolving_to_internal_address(
     monkeypatch.setattr(
         agent_module.app,
         "AGENT_FUNCTION",
-        SimpleNamespace(validate_step_execution=AsyncMock()),
+        SimpleNamespace(validate_step_execution=AsyncMock(), release_page_reload_owner=AsyncMock()),
     )
 
     with agent_module.skyvern_context.scoped(agent_module.skyvern_context.SkyvernContext()):

@@ -14483,6 +14483,7 @@ def build_browser_tools(
     unseen_text: UnseenPageText | None = None,
     download_failures: DownloadFailureWatch | None = None,
     download_wait: Callable[[], Awaitable[None]] | None = None,
+    recover_page: Callable[[Any], Awaitable[bool | None]] | None = None,
 ) -> list[ToolSpec]:
     """Raw-browser tools that resolve their page from `page_provider` on every call.
 
@@ -23425,6 +23426,16 @@ def build_browser_tools(
                 )
         else:
             _reload_confirm_pending[0] = None
+        if same_page and recover_page is not None:
+            recovered = await recover_page(_current_page())
+            if recovered is not None:
+                return (
+                    ToolResult.ok("page reloaded", {"same_url_reload": True, "page_state_changed": True})
+                    if recovered
+                    else ToolResult.error(
+                        "page recovery withheld: submission or page identity changed", error_class="navigation_failed"
+                    )
+                )
         # Commit first, then wait for readiness on THAT document, under budgets that sum to today's
         # single-attempt ceiling. A page whose bundle is starved still commits in under a second, so
         # one wait_until="load" attempt spends the whole ceiling and reports nothing about the page;

@@ -29,11 +29,13 @@ from skyvern.webeye.actions.actions import (
     CompleteAction,
     DownloadFileAction,
     ExtractAction,
+    ReloadPageAction,
     TerminateAction,
     WaitAction,
 )
 from skyvern.webeye.actions.models import DetailedAgentStepOutput
 from skyvern.webeye.actions.responses import ActionFailure, ActionResult, ActionSuccess
+from skyvern.webeye.real_browser_state import RealBrowserState
 from skyvern.webeye.scraper import scraper
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
 from tests.unit._task_block_fakes import output_parameter
@@ -406,6 +408,74 @@ async def test_refresh_working_page_signal_reloads_and_skips_batch(monkeypatch: 
     assert output.actions_and_results is not None
     assert output.actions_and_results[0][0].action_type == ActionType.RELOAD_PAGE
     assert rig.context.refresh_working_page is False
+
+
+@pytest.mark.asyncio
+async def test_a_private_submission_request_does_not_reload_a_normal_action(monkeypatch: pytest.MonkeyPatch) -> None:
+    rig = make_agent_step_rig(monkeypatch)
+    rig.context.page_reload_request = object()
+    step, output = await rig.run()
+    assert step.status == StepStatus.completed
+    rig.browser_state.reload_page.assert_not_awaited()
+    assert rig.action_handler.await_count == 1
+    assert output.actions_and_results[0][0].action_type == ActionType.CLICK
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("private_reload", ["withheld", "carried_out", "failed"])
+async def test_a_private_reload_leaves_a_refresh_another_producer_raised_meanwhile(
+    monkeypatch: pytest.MonkeyPatch, private_reload: str
+) -> None:
+    rig = make_agent_step_rig(monkeypatch, parsed_actions=[ReloadPageAction(reasoning="reset")])
+    persisted = app.DATABASE.workflow_params.create_action
+    persisted.return_value.action_id = "act_recovery"
+    started = datetime.now(UTC).replace(tzinfo=None)
+    page = MagicMock()
+    page.url = "https://example.com/form"
+    page.reload = AsyncMock(side_effect=RuntimeError("refused") if private_reload == "failed" else None)
+
+    async def still_wanted(selected):
+        return selected is page and private_reload != "withheld"
+
+    request = MagicMock(pin=lambda: page, still_wanted=still_wanted)
+    # The real reload, with its own wait for the browser to record the page, on a browser state over this page.
+    real_state = RealBrowserState(pw=MagicMock(), browser_context=MagicMock())
+    recorded = real_state._wait_for_browser_to_record_page
+
+    async def another_producer_raises_while_recording(waited_on: Any) -> None:
+        rig.context.refresh_working_page = True
+        await recorded(waited_on)
+
+    monkeypatch.setattr(real_state, "_wait_for_browser_to_record_page", another_producer_raises_while_recording)
+    monkeypatch.setattr(real_state, "_wait_for_settle", AsyncMock())
+    rig.browser_state.reload_page = real_state.reload_page
+    rig.browser_state.must_get_working_page = AsyncMock(return_value=page)
+
+    async def settle_page_reload_signal(*, task: Task) -> bool:
+        rig.context.page_reload_request = request
+        return True
+
+    monkeypatch.setattr("skyvern.forge.agent.app.AGENT_FUNCTION.settle_page_reload_signal", settle_page_reload_signal)
+
+    if private_reload == "failed":
+        step, _ = await rig.run()
+        assert step.status == StepStatus.failed
+        # Kept for a retry that validates it afresh.
+        assert rig.context.page_reload_request is request
+    else:
+        _, output = await rig.run()
+        assert output.actions_and_results is not None
+        assert output.actions_and_results[0][0].action_type == ActionType.RELOAD_PAGE
+        assert output.actions_and_results[0][1][0].success is (private_reload == "carried_out")
+        rig.action_handler.assert_not_awaited()
+    action = persisted.await_args.kwargs["action"]
+    assert action.action_id == "act_recovery" and action.status == (
+        "completed" if private_reload == "carried_out" else "failed"
+    )
+    assert started <= action.started_at <= action.finished_at <= datetime.now(UTC).replace(tzinfo=None)
+    assert page.reload.await_count == (0 if private_reload == "withheld" else 1)
+    # The other producer's refresh is its own, left for the next action to carry out.
+    assert rig.context.refresh_working_page is True
 
 
 @pytest.mark.asyncio

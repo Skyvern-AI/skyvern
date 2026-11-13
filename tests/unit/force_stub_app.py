@@ -104,6 +104,8 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.AGENT_FUNCTION.execute_code_block_override = AsyncMock(return_value=None)
     base_agent_function = AgentFunction()
     fake_app_module.AGENT_FUNCTION.note_page_action = base_agent_function.note_page_action
+    fake_app_module.AGENT_FUNCTION.page_submission_evidence = base_agent_function.page_submission_evidence
+    fake_app_module.AGENT_FUNCTION.settle_page_reload_signal = base_agent_function.settle_page_reload_signal
     fake_app_module.AGENT_FUNCTION.enforce_platform_aws_secret_ownership = (
         base_agent_function.enforce_platform_aws_secret_ownership
     )

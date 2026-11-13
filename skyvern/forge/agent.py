@@ -2341,6 +2341,42 @@ def _holding_replay_candidates(
     return holding
 
 
+async def _recover_page(browser_state: BrowserState, task: Task, page: Any) -> bool | None:
+    context = skyvern_context.current()
+    if context is not None and (request := context.page_reload_request) is not None and request.pin() is not page:
+        context.page_reload_request = None
+    if context is None or context.page_reload_request is None:
+        prepared = await app.AGENT_FUNCTION.settle_page_reload_signal(task=task)
+        if prepared is not True:
+            return prepared
+    request = context.page_reload_request if context is not None else None
+    if context is None or request is None or request.pin() is not page:
+        return False
+    context.page_reload_request = None
+    try:
+        preflight_action(ReloadPageAction(task_id=task.task_id), page, site="internal_refresh")
+        return await browser_state.reload_page(page=page, still_wanted=request.still_wanted)
+    except Exception:
+        context.page_reload_request = request
+        raise
+
+
+async def _recover_page_action(
+    browser_state: BrowserState, task: Task, page: Any, action: ReloadPageAction
+) -> bool | None:
+    recovered: bool | None = False
+    action.started_at = naive_utc_now()
+    try:
+        recovered = await _recover_page(browser_state, task, page)
+        return recovered
+    finally:
+        if recovered is not None:
+            with contained_effect("persist page recovery action"):
+                action.finished_at = naive_utc_now()
+                action.status = ActionStatus.completed if recovered else ActionStatus.failed
+                action.action_id = (await app.DATABASE.workflow_params.create_action(action=action)).action_id
+
+
 class ForgeAgent:
     def __init__(self) -> None:
         self.async_operation_pool = AsyncOperationPool()
@@ -4292,6 +4328,11 @@ class ForgeAgent:
                 download_settle=download_settle,
                 native_download_attempt=native_download_attempt,
                 completion_gate=_completion_gate,
+                settle_reload_signal=lambda accept: app.AGENT_FUNCTION.settle_page_reload_signal(
+                    task=task, raise_signal=False, accept=accept
+                ),
+                submission_evidence=lambda: app.AGENT_FUNCTION.page_submission_evidence(task=task),
+                recover_page=lambda page: _recover_page(browser_state, task, page),
                 staged_downloads=staged_downloads,
                 deadline_seconds=loop_deadline_seconds,
                 verification_blocker=verification_state.block_finish,
@@ -4892,6 +4933,7 @@ class ForgeAgent:
                     workflow_run_id=workflow_run.workflow_run_id,
                 )
                 # The parent run tears the browser down without this task's cleanup, so stop its pooled operations here.
+                await app.AGENT_FUNCTION.release_page_reload_owner(task=task)
                 await self.async_operation_pool.cancel_task(task.task_id)
                 step = await self.update_step(
                     step,
@@ -4911,6 +4953,7 @@ class ForgeAgent:
                     "Workflow run is timed out, stopping execution inside task",
                     workflow_run_id=workflow_run.workflow_run_id,
                 )
+                await app.AGENT_FUNCTION.release_page_reload_owner(task=task)
                 await self.async_operation_pool.cancel_task(task.task_id)
                 step = await self.update_step(
                     step,
@@ -5011,6 +5054,10 @@ class ForgeAgent:
                 browser_session_id,
                 pre_resolved_browser_state=pre_resolved_browser_state,
             )
+            # Before the engine split, so both engines' reload signals belong to this task's page. Unbound, no
+            # page-level request can ask for a reload, so a failure here costs only that.
+            with contained_effect("page reload owner bind", task_id=task.task_id):
+                await app.AGENT_FUNCTION.bind_page_reload_owner(task=task, browser_state=browser_state)
 
             # mark step as completed and mark task as completed
             if (
@@ -5226,6 +5273,7 @@ class ForgeAgent:
                 # The poll already settled this stop; a failed read or write (or a row already final) must not
                 # reach the catch-all, which would fail the task and run cleanup the parent run owns.
                 if canceled_by_workflow_run:
+                    await app.AGENT_FUNCTION.release_page_reload_owner(task=task)
                     await self.async_operation_pool.cancel_task(task.task_id)
                     try:
                         task = await self.update_task(task, status=terminal_status)
@@ -5488,6 +5536,7 @@ class ForgeAgent:
         # TODO (kerem): Let's add other exceptions that we know about here as custom exceptions as well
         except CancelledError:
             context.clear_multi_field_totp_state(task.task_id)
+            await app.AGENT_FUNCTION.release_page_reload_owner(task=task)
             # A cancelled step never reaches clean_up_task, where its pooled operations are otherwise stopped.
             with contained_effect("pooled async operation cancellation", task_id=task.task_id):
                 await self.async_operation_pool.cancel_task(task.task_id)
@@ -5803,6 +5852,8 @@ class ForgeAgent:
             # It recovers the download half only, so its kwargs are pinned to that scope rather than
             # inherited from the handler that skipped this cleanup.
             try:
+                if cleanup_skipped_by_handler:
+                    await app.AGENT_FUNCTION.release_page_reload_owner(task=task)
                 if cleanup_skipped_by_handler and not context.cleanup_downloads_recorded(task.task_id):
                     with contained_effect("skipped task cleanup recovery", task_id=task.task_id):
                         LOG.warning(
@@ -6691,6 +6742,16 @@ class ForgeAgent:
             try:
                 if otp_refusal is not None:
                     results = [otp_refusal]
+                elif (
+                    isinstance(action, ReloadPageAction)
+                    and (recovered := await _recover_page_action(browser_state, task, current_page, action)) is not None
+                ):
+                    results = [
+                        ActionSuccess()
+                        if recovered
+                        else ActionFailure(RuntimeError("page recovery withheld: submission or page identity changed"))
+                    ]
+                    results[0].skip_remaining_actions = True
                 else:
                     results = await ActionHandler.handle_action(
                         scraped_page=dispatch_page,
@@ -7971,6 +8032,9 @@ class ForgeAgent:
         _ctx = skyvern_context.current()
         lean_enabled = bool(_ctx and _ctx.enable_lean_element_tree)
         llm_screenshots_enabled = bool(_ctx and _ctx.llm_screenshots_enabled_for_prompt(retry_index=step.retry_index))
+        submission_evidence = await app.AGENT_FUNCTION.page_submission_evidence(task=task)
+        if submission_evidence:
+            actions_and_results_str += "\n" + submission_evidence
         verification_prompt = load_prompt_with_elements(
             element_tree_builder=scraped_page_refreshed,
             prompt_engine=prompt_engine,
@@ -9470,6 +9534,8 @@ class ForgeAgent:
             properties={"task_url": task.url, "organization_id": task.organization_id},
         )
         extra_action_guidance = await app.AGENT_FUNCTION.get_extra_extract_action_guidance(task)
+        if submission_evidence := await app.AGENT_FUNCTION.page_submission_evidence(task=task):
+            extra_action_guidance = f"{extra_action_guidance or ''}\n{submission_evidence}"
 
         # SKY-9983: render per-step-changing sections (action history, dialogs, tabs) after the
         # element tree so provider prefix caches can hit the tree across steps on the same page.
@@ -10136,6 +10202,9 @@ class ForgeAgent:
         download_completion_files: list[str] | None = None,
     ) -> Task:
         cleanup_context = skyvern_context.current()
+        # The task is over: a page-level handler finishing later must not raise a reload for the next task.
+        with contained_effect("page reload owner release", task_id=task.task_id):
+            await app.AGENT_FUNCTION.release_page_reload_owner(task=task)
         try:
             return await self._clean_up_task(
                 task,
@@ -11828,6 +11897,7 @@ class ForgeAgent:
                 is_last=True,
             )
             extracted_information = await self.get_extracted_information_for_task(task)
+            await app.AGENT_FUNCTION.settle_page_reload_signal(task=task, raise_signal=False, accept=True)
             await self.update_task(
                 task,
                 status=TaskStatus.completed,
@@ -12634,6 +12704,7 @@ class ForgeAgent:
             )
             last_step = await self.update_step(step, is_last=True)
             extracted_information = await self.get_extracted_information_for_task(task)
+            await app.AGENT_FUNCTION.settle_page_reload_signal(task=task, raise_signal=False, accept=True)
             if task_completes_on_download:
                 # Cleanup is the last chance to validate a native download before completion.
                 task.extracted_information = extracted_information

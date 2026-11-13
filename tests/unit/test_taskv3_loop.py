@@ -12203,27 +12203,53 @@ def _finish_that_also_signals_refresh() -> ToolSpec:
 
 
 @pytest.mark.asyncio
-async def test_refresh_signal_never_voids_a_terminal_finish() -> None:
+@pytest.mark.parametrize("status", ["completed", "failed", "terminated"])
+async def test_refresh_signal_never_voids_a_terminal_finish(status: str) -> None:
     reload_calls: list[None] = []
 
     async def reload_page() -> None:
         reload_calls.append(None)
 
     tools = [_finish_that_also_signals_refresh()]
-    script: list[list[tuple[str, dict[str, Any]]]] = [[("finish", {"status": "completed", "reason": "done"})]]
+    script: list[list[tuple[str, dict[str, Any]]]] = [[("finish", {"status": status, "reason": "done"})]]
 
-    ctx = SkyvernContext(task_id="tsk_refresh_terminal")
+    ctx = SkyvernContext(task_id="tsk_refresh_terminal", page_reload_request=object())
+    seal = AsyncMock(return_value=False)
     skyvern_context.set(ctx)
     try:
-        outcome, caller = await _run(script, tools, reload_page=reload_page)
+        outcome, caller = await _run(script, tools, reload_page=reload_page, settle_reload_signal=seal)
     finally:
         skyvern_context.reset()
 
-    assert outcome.status == "completed"
+    assert outcome.status == status
+    assert seal.await_args_list == ([((True,), {})] if status == "completed" else [])
     assert reload_calls == []
     assert ctx.refresh_working_page is False
     contents = [str(m.get("content", "")) for m in caller.message_history]
     assert not any("refresh" in c.lower() or "skipped" in c.lower() for c in contents)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_shared_flag", [False, True], ids=["private_only", "shared_flag_too"])
+async def test_private_requests_do_not_spend_the_shared_refresh_budget(with_shared_flag: bool) -> None:
+    reload_page = AsyncMock()
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    request = object()
+    ctx = SkyvernContext(task_id="tsk_withheld_reload", refresh_working_page=with_shared_flag)
+    ctx.page_reload_request = request
+    skyvern_context.set(ctx)
+    try:
+        outcome, _ = await _run(
+            [[("click", {"selector": "#next"})], [("finish", {"status": "completed", "reason": "done"})]],
+            [_recording_tool("click", clicks, billable=True), make_finish_tool()],
+            reload_page=reload_page,
+            max_refresh_cycles=1 if with_shared_flag else 0,
+        )
+    finally:
+        skyvern_context.reset()
+    assert outcome.status == "completed"
+    assert reload_page.await_count == int(with_shared_flag) and len(clicks) == int(not with_shared_flag)
+    assert ctx.page_reload_request is request and ctx.refresh_working_page is False
 
 
 @pytest.mark.asyncio

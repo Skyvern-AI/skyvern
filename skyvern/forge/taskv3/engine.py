@@ -21,6 +21,7 @@ in-process adapter over ``do_observe``/``do_execute`` for shared hardening + act
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import dataclasses
 import functools
@@ -321,6 +322,9 @@ async def run_task_v3_agent_loop(
     page_probe: Callable[[], Awaitable[str | None]] | None = None,
     document_identity: Callable[[], Awaitable[str | None]] | None = None,
     reload_page: Callable[[], Awaitable[None]] | None = None,
+    settle_reload_signal: Callable[[bool], Awaitable[bool | None]] | None = None,
+    submission_evidence: Callable[[], Awaitable[str | None]] | None = None,
+    recover_page: Callable[[Any], Awaitable[bool | None]] | None = None,
     restore_page_url: Callable[[Any, str], Awaitable[None]] | None = None,
     download_attempts: Callable[[], int | None] | None = None,
     block_type: str | None = None,
@@ -445,6 +449,13 @@ async def run_task_v3_agent_loop(
             staged_downloads=staged_downloads,
         )
     )
+
+    async def _recover(page: Any) -> bool | None:
+        if recover_page is None:
+            return None
+        async with asyncio.timeout(_deadline_remaining()):
+            return await recover_page(page)
+
     unseen_text = None if page_free else UnseenPageText()
     failure_watch = (
         None
@@ -467,8 +478,31 @@ async def run_task_v3_agent_loop(
             unseen_text=unseen_text,
             download_failures=failure_watch,
             download_wait=download_wait,
+            recover_page=_recover if recover_page is not None else None,
         )
     )
+    last_submission_evidence: str | None = None
+
+    async def _submission_news() -> str:
+        nonlocal last_submission_evidence
+        if page_free or submission_evidence is None:
+            return ""
+        try:
+            async with asyncio.timeout(_deadline_remaining()):
+                evidence = await submission_evidence()
+        except TimeoutError:
+            return ""
+        news = evidence if evidence != last_submission_evidence else ""
+        last_submission_evidence = evidence
+        return news or ""
+
+    if unseen_text is not None and unseen_text.unreported is not None and submission_evidence is not None:
+        page_news = unseen_text.unreported
+
+        async def _unreported() -> str:
+            return "\n".join(filter(None, (await page_news(), await _submission_news())))
+
+        unseen_text.unreported = _unreported
 
     # Withheld whenever offered: code driving the page bypasses the realm ledger the native action tools
     # write, so in-frame fills and submits would be invisible to the data-loss guard and the completion gate.
@@ -829,6 +863,8 @@ async def run_task_v3_agent_loop(
             page_fingerprint=None if page_free else page_fingerprint,
             action_effect_fingerprint=None if page_free else action_effect_fingerprint,
             reload_page=None if page_free else reload_page,
+            settle_reload_signal=None if page_free else settle_reload_signal,
+            submission_evidence=_submission_news,
             final_turn_token_reserve=MAX_TOKENS_PER_ACTION_STEP,
             backstops_for_cap=taskv3_runaway_backstops,
             semantic_commit_stats=semantic_commit_stats,
@@ -849,8 +885,9 @@ async def run_task_v3_agent_loop(
         # The context outlives this run; a signal raised as the loop was cancelled must not fire
         # on the next block's first action.
         _exit_ctx = skyvern_context.current()
-        if _exit_ctx is not None and _exit_ctx.refresh_working_page:
+        if _exit_ctx is not None:
             _exit_ctx.refresh_working_page = False
+            _exit_ctx.page_reload_request = None
         # Backstop for the handoff the ticket rides on: the loop can end without a further tool call
         # (budget, cancellation, a raise), leaving the page blank for the next url-less block. In the
         # `finally` because a raising block can still be followed by another one

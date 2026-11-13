@@ -4322,6 +4322,8 @@ async def run_agent_tool_loop(
     login_identifier_tokens: Callable[[], Collection[str]] | None = None,
     page_probe: Callable[[], Awaitable[str | None]] | None = None,
     reload_page: Callable[[], Awaitable[None]] | None = None,
+    settle_reload_signal: Callable[[bool], Awaitable[bool | None]] | None = None,
+    submission_evidence: Callable[[], Awaitable[str | None]] | None = None,
     max_refresh_cycles: int = 3,
     page_fingerprint: Callable[[], Awaitable[str | None]] | None = None,
     # One model call's worth of token headroom, reserved so the granted final turn (below) is
@@ -5075,6 +5077,9 @@ async def run_agent_tool_loop(
                 # Read by the finish tool's hold gates: a hold's retry turn no longer exists.
                 activity.final_turn_active = True
         st.turns += 1
+        if submission_evidence is not None:
+            if notice := await _sample_probe(submission_evidence, deadline_at=deadline_at):
+                st.messages.append({"role": "user", "content": notice})
         if turn_notice is not None:
             try:
                 notice = turn_notice(st.turns)
@@ -5962,6 +5967,13 @@ async def run_agent_tool_loop(
                             result = held
                         else:
                             result = await spec.handler(args)
+                            if (
+                                spec.terminal
+                                and result.status == "ok"
+                                and settle_reload_signal is not None
+                                and (result.data or {}).get("status", "completed") == "completed"
+                            ):
+                                await settle_reload_signal(True)
                 except ToolRefusal as refusal:
                     result = refusal.as_result()
                 except Exception as exc:
