@@ -199,6 +199,14 @@ def running_in_packaged_deployment() -> bool:
     return any(os.path.exists(path) for path in _PACKAGED_DEPLOYMENT_MARKER_FILES)
 
 
+def developer_checkout_opted_into_inline_copilot_code() -> bool:
+    # ENV alone cannot carry this: self-hosted Docker and Kubernetes are documented with
+    # ENV=local, so a packaged deployment would look identical to a laptop.
+    if settings.is_cloud_environment() or running_in_packaged_deployment():
+        return False
+    return settings.COPILOT_ALLOW_INLINE_CODE_EXECUTION
+
+
 USELESS_SHAPE_ATTRIBUTE = [SKYVERN_ID_ATTR, "id", "aria-describedby"]
 SVG_SHAPE_CONVERTION_ATTEMPTS = 3
 CSS_SHAPE_CONVERTION_ATTEMPTS = 1
@@ -2078,12 +2086,8 @@ class AgentFunction:
 
     def allow_copilot_inline_code_execution(self) -> bool:
         """Whether a copilot block test run may execute in the API process when sandbox dispatch is
-        unavailable. Developer checkouts only."""
-        # ENV alone cannot carry this: self-hosted Docker and Kubernetes are documented with
-        # ENV=local, so a packaged deployment would look identical to a laptop.
-        if settings.is_cloud_environment() or running_in_packaged_deployment():
-            return False
-        return settings.COPILOT_ALLOW_INLINE_CODE_EXECUTION
+        unavailable. Open source has no sandbox and already runs every workflow in the API process."""
+        return True
 
     async def is_workflow_tagging_enabled(self, organization_id: str) -> bool:
         """OSS always-on; cloud overrides to gate per-org for staged rollout."""

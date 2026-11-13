@@ -319,9 +319,9 @@ class Settings(BaseSettings):
     WORKFLOW_COPILOT_EVAL_LLM_OVERRIDES_ORGANIZATION_IDS: list[str] = []
     WORKFLOW_COPILOT_EVAL_COST_ENABLED: bool = False
     WORKFLOW_COPILOT_EVAL_COST_ORGANIZATION_IDS: list[str] = []
-    # Local-development escape hatch: run a copilot block test run in the API process when sandbox
-    # dispatch is unavailable, instead of failing closed. Grants nothing on its own -- see
-    # AgentFunction.allow_copilot_inline_code_execution for the conditions it is ANDed with.
+    # Cloud-image local-development escape hatch: run a copilot block test run in the API process when
+    # sandbox dispatch is unavailable, instead of failing closed. Grants nothing on its own -- see
+    # developer_checkout_opted_into_inline_copilot_code for the conditions it is ANDed with.
     COPILOT_ALLOW_INLINE_CODE_EXECUTION: bool = False
     RUN_HEARTBEAT_TIMEOUT_MINUTES: int = 30
     PORT: int = 8000
