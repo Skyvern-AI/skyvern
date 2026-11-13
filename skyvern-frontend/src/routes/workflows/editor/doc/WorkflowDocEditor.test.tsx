@@ -25,6 +25,7 @@ import { MemoryRouter } from "react-router-dom";
 
 import { ProxyLocation } from "@/api/types";
 import { useCopilotProposalStore } from "@/store/CopilotProposalStore";
+import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 
 import {
@@ -56,6 +57,19 @@ import {
   noteDemonstrationStartFailed,
   useRecordingLauncherStore,
 } from "@/store/useRecordingLauncherStore";
+
+const toastSpy = vi.hoisted(() => vi.fn());
+vi.mock("@/components/ui/use-toast", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("@/components/ui/use-toast")>();
+  return {
+    ...actual,
+    toast: (...args: Parameters<typeof actual.toast>) => {
+      toastSpy(...args);
+      return actual.toast(...args);
+    },
+  };
+});
 
 vi.mock("./useDocLatestRunCompleted", () => ({
   useDocLatestRunCompleted: () => false,
@@ -144,7 +158,10 @@ function renderDoc(
 }
 
 // A Doc whose edits change what it renders: rerender() shows the graph the last edit left.
-function renderLiveDoc(blocks: WorkflowBlock[]) {
+function renderLiveDoc(
+  blocks: WorkflowBlock[],
+  workflowId: string | null = null,
+) {
   let current = getElements(blocks, settings(), true) as DocGraph;
   const client = new QueryClient();
   const edits: DocGraphEdits = {
@@ -157,19 +174,21 @@ function renderLiveDoc(blocks: WorkflowBlock[]) {
     addStep: () => null,
     duplicate: () => {},
   };
-  const view = () => (
+  const view = (readOnly: boolean) => (
     <QueryClientProvider client={client}>
       <MemoryRouter>
         <ReactFlowProvider>
-          <WorkflowDocEditor {...current} edits={edits} />
+          <WorkflowScopeContext.Provider value={{ workflowId, readOnly }}>
+            <WorkflowDocEditor {...current} edits={edits} />
+          </WorkflowScopeContext.Provider>
         </ReactFlowProvider>
       </MemoryRouter>
     </QueryClientProvider>
   );
-  const rendered = render(view());
+  const rendered = render(view(false));
   return {
     graph: () => current,
-    rerender: () => rendered.rerender(view()),
+    rerender: (readOnly = false) => rendered.rerender(view(readOnly)),
   };
 }
 
@@ -3340,5 +3359,613 @@ describe("a long step text", () => {
     fireEvent.click(screen.getByRole("option"));
     expect(folded("other_long")).toBe(false);
     expect(folded("long_step")).toBe(true);
+  });
+});
+
+describe("naming a step from its title", () => {
+  beforeEach(() => {
+    useWorkflowParametersStore.setState({ parameters: [] });
+    useWorkflowYamlEditorStore.setState(
+      useWorkflowYamlEditorStore.getInitialState(),
+    );
+    useCopilotProposalStore.getState().setProposal(null);
+    useRecordingLauncherStore.setState({ demonstration: null });
+    useCopilotActionStore.setState({
+      generatingBlockLabel: null,
+      queuedBuilds: [],
+    });
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      },
+    );
+    Element.prototype.scrollIntoView = vi.fn();
+  });
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+  const prompt = (label: string, next: string | null, text: string) =>
+    block("text_prompt", label, next, { prompt: text, parameters: [] });
+
+  test("an unnamed step's placeholder takes a name that becomes its label, shown as saved, and later references follow it", () => {
+    const doc = renderLiveDoc([
+      prompt("block_1", "summary", "Write a short note"),
+      prompt("summary", null, "Summarize {{ block_1_output }}"),
+    ]);
+    fireEvent.click(screen.getByRole("button", { name: "Name this step" }));
+    const input = screen.getByRole("textbox", { name: "Step name" });
+    fireEvent.change(input, { target: { value: "Login (HR)" } });
+    expect(screen.getByText("Saves as Login_HR")).toBeTruthy();
+    fireEvent.keyDown(input, { key: "Enter" });
+    const nodes = doc.graph().nodes;
+    expect(nodes.map((node) => node.data.label)).toContain("Login_HR");
+    const summary = nodes.find((node) => node.data.label === "summary")!;
+    expect(JSON.stringify(summary.data)).toContain("{{ Login_HR_output }}");
+    doc.rerender();
+    expect(
+      screen.getByRole("button", { name: "Login HR", description: "Rename" }),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Name this step" })).toBeNull();
+  });
+
+  test("a name another step has shows an error and changes nothing", () => {
+    const doc = renderLiveDoc([
+      prompt("first", "second", "Write A"),
+      prompt("second", null, "Write B"),
+    ]);
+    const before = doc.graph();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Second", description: "Rename" }),
+    );
+    const input = screen.getByRole("textbox", { name: "Step name" });
+    fireEvent.change(input, { target: { value: "first" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(screen.getByRole("alert").textContent).toBe(
+      "Another step already uses this name.",
+    );
+    expect(doc.graph()).toBe(before);
+  });
+
+  test("Escape puts the title back, and an empty name leaves the label as it was", () => {
+    const doc = renderLiveDoc([prompt("first", null, "Write A")]);
+    const before = doc.graph();
+    fireEvent.click(
+      screen.getByRole("button", { name: "First", description: "Rename" }),
+    );
+    fireEvent.change(screen.getByRole("textbox", { name: "Step name" }), {
+      target: { value: "Something else" },
+    });
+    fireEvent.keyDown(screen.getByRole("textbox", { name: "Step name" }), {
+      key: "Escape",
+    });
+    expect(screen.queryByRole("textbox", { name: "Step name" })).toBeNull();
+    fireEvent.click(
+      screen.getByRole("button", { name: "First", description: "Rename" }),
+    );
+    fireEvent.change(screen.getByRole("textbox", { name: "Step name" }), {
+      target: { value: "  " },
+    });
+    fireEvent.keyDown(screen.getByRole("textbox", { name: "Step name" }), {
+      key: "Enter",
+    });
+    expect(doc.graph()).toBe(before);
+    expect(screen.queryByRole("textbox", { name: "Step name" })).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  test("the rename is one structural edit of the graph, never a field update", () => {
+    const edits = {
+      apply: vi.fn(),
+      update: vi.fn(),
+      addStep: vi.fn(),
+      duplicate: vi.fn(),
+    };
+    renderDoc([prompt("first", null, "Write A")], edits);
+    fireEvent.click(
+      screen.getByRole("button", { name: "First", description: "Rename" }),
+    );
+    const input = screen.getByRole("textbox", { name: "Step name" });
+    fireEvent.change(input, { target: { value: "Write the note" } });
+    fireEvent.blur(input);
+    expect(edits.apply).toHaveBeenCalledTimes(1);
+    expect(edits.update).not.toHaveBeenCalled();
+    const [graph] = edits.apply.mock.calls[0]!;
+    expect(
+      graph.nodes.some(
+        (node: { data: { label: string } }) =>
+          node.data.label === "Write_the_note",
+      ),
+    ).toBe(true);
+  });
+
+  test("a read-only Doc shows a step's title but never the placeholder or a rename button", () => {
+    renderDoc([
+      prompt("block_1", "second", "Write A"),
+      prompt("second", null, "B"),
+    ]);
+    expect(screen.queryByText("Name this step")).toBeNull();
+    expect(document.querySelector("[data-doc-step-name]")).toBeNull();
+    expect(screen.getByRole("heading", { name: "Second" })).toBeTruthy();
+    expect(screen.getAllByRole("heading").map((h) => h.textContent)).toEqual([
+      "Second",
+    ]);
+  });
+
+  const typeName = (name: string) => {
+    const input = screen.getByRole("textbox", { name: "Step name" });
+    fireEvent.change(input, { target: { value: name } });
+    return input;
+  };
+
+  test("a name that starts with a digit saves with a step_ prefix, the field shows it, and the title reads it back", () => {
+    const doc = renderLiveDoc([prompt("block_1", null, "Write A")]);
+    fireEvent.click(screen.getByRole("button", { name: "Name this step" }));
+    const input = typeName("2FA login");
+    expect(screen.getByText("Saves as step_2FA_login")).toBeTruthy();
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(doc.graph().nodes.map((node) => node.data.label)).toContain(
+      "step_2FA_login",
+    );
+    doc.rerender();
+    // The caption reads the saved label, prefix included.
+    expect(
+      screen.getByRole("button", {
+        name: "Step 2FA login",
+        description: "Rename",
+      }),
+    ).toBeTruthy();
+  });
+
+  test.each(["block", "block_1", "text_prompt", "text_prompt_2"])(
+    "%s reads as a default name, so the field rejects it and nothing changes",
+    (name) => {
+      const doc = renderLiveDoc([prompt("first", null, "Write A")]);
+      const before = doc.graph();
+      fireEvent.click(
+        screen.getByRole("button", { name: "First", description: "Rename" }),
+      );
+      fireEvent.keyDown(typeName(name), { key: "Enter" });
+      expect(screen.getByRole("alert").textContent).toBe(
+        "Add a word: this name reads as a default one",
+      );
+      expect(doc.graph()).toBe(before);
+    },
+  );
+
+  test.each(["日本語", "مرحبا", "!!!"])(
+    "%s has no letter or digit a label can keep: Enter keeps the field open with an error, a blur puts the title back",
+    (name) => {
+      const doc = renderLiveDoc([prompt("first", null, "Write A")]);
+      const before = doc.graph();
+      fireEvent.click(
+        screen.getByRole("button", { name: "First", description: "Rename" }),
+      );
+      const input = typeName(name);
+      fireEvent.keyDown(input, { key: "Enter" });
+      expect(screen.getByRole("alert").textContent).toBe(
+        "Use letters or numbers",
+      );
+      expect(
+        (screen.getByRole("textbox", { name: "Step name" }) as HTMLInputElement)
+          .value,
+      ).toBe(name);
+      fireEvent.blur(input);
+      expect(screen.queryByRole("textbox", { name: "Step name" })).toBeNull();
+      expect(screen.queryByRole("alert")).toBeNull();
+      expect(doc.graph()).toBe(before);
+    },
+  );
+
+  test("a blur with a rejected name puts the title back instead of keeping the error", () => {
+    const doc = renderLiveDoc([
+      prompt("first", "second", "Write A"),
+      prompt("second", null, "Write B"),
+    ]);
+    const before = doc.graph();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Second", description: "Rename" }),
+    );
+    let input = typeName("first");
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(screen.getByRole("alert")).toBeTruthy();
+    fireEvent.blur(input);
+    expect(screen.queryByRole("textbox", { name: "Step name" })).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Second", description: "Rename" }),
+    );
+    input = typeName("block");
+    fireEvent.blur(input);
+    expect(screen.queryByRole("textbox", { name: "Step name" })).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(doc.graph()).toBe(before);
+  });
+
+  test("Enter and Escape return focus to the step's title, and the blur after Escape saves nothing", () => {
+    const doc = renderLiveDoc([prompt("first", null, "Write A")]);
+    const before = doc.graph();
+    fireEvent.click(
+      screen.getByRole("button", { name: "First", description: "Rename" }),
+    );
+    const input = typeName("Other name");
+    fireEvent.keyDown(input, { key: "Escape" });
+    fireEvent.blur(input);
+    expect(doc.graph()).toBe(before);
+    expect(document.activeElement).toBe(
+      screen.getByRole("button", { name: "First", description: "Rename" }),
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "First", description: "Rename" }),
+    );
+    fireEvent.keyDown(typeName("Write the note"), { key: "Enter" });
+    doc.rerender();
+    const title = screen.getByRole("button", {
+      name: "Write the note",
+      description: "Rename",
+    });
+    expect(title.hasAttribute("data-doc-step-name")).toBe(true);
+    expect(document.activeElement).toBe(title);
+  });
+
+  test("an unnamed editable Conditional is named from its title", () => {
+    const doc = renderLiveDoc([
+      conditional("block_1", null, [
+        { id: "yes", next: "first", when: "the page has a form" },
+        { id: "else", next: null },
+      ]),
+      prompt("first", null, "Write A"),
+    ]);
+    fireEvent.click(screen.getByRole("button", { name: "Name this step" }));
+    fireEvent.keyDown(typeName("Check the page"), { key: "Enter" });
+    expect(doc.graph().nodes.map((node) => node.data.label)).toContain(
+      "Check_the_page",
+    );
+  });
+
+  test("an editable step two branches share, which has no place to move, still offers Name this step", () => {
+    renderLiveDoc([
+      conditional("route", "after", [
+        { id: "yes", next: "first", when: "the page has a form" },
+        { id: "no", next: "second", when: "the page is empty" },
+        { id: "else", next: null },
+      ]),
+      prompt("first", "block_2", "Write A"),
+      prompt("second", "block_2", "Write B"),
+      prompt("block_2", "after", "Write C"),
+      prompt("after", null, "Write D"),
+    ]);
+    expect(screen.getByText(/reached from/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Name this step" })).toBeTruthy();
+  });
+
+  // The step's title control, found by what it shows rather than by its accessible name.
+  const titleOf = (caption: string) =>
+    Array.from(
+      document.querySelectorAll<HTMLButtonElement>("[data-doc-step-name]"),
+    ).find((button) => button.textContent === caption)!;
+  const field = () =>
+    screen.queryByRole("textbox", {
+      name: "Step name",
+    }) as HTMLInputElement | null;
+  const proposalOf = (label: string) => {
+    const proposed = {
+      workflow_id: "w_1",
+      workflow_permanent_id: "wpid_1",
+      title: "Synthetic",
+      description: null,
+      workflow_definition: {
+        version: 2,
+        blocks: [block("text_prompt", label, null, { prompt: "Hi" })],
+        parameters: [],
+      },
+    } as unknown as WorkflowApiResponse;
+    return {
+      proposed,
+      baseline: proposed,
+      review: null,
+      actionable: true,
+      acceptable: true,
+      decide: async () => true,
+    };
+  };
+  const locks: Array<
+    [string, (doc: ReturnType<typeof renderLiveDoc>, on: boolean) => void]
+  > = [
+    [
+      "a save transaction",
+      (_doc, on) =>
+        act(() =>
+          useWorkflowYamlEditorStore.setState({ commitInProgress: on }),
+        ),
+    ],
+    [
+      "a Copilot proposal",
+      (_doc, on) =>
+        act(() =>
+          useCopilotProposalStore
+            .getState()
+            .setProposal(on ? proposalOf("proposed_step") : null),
+        ),
+    ],
+    [
+      "a demonstration",
+      (_doc, on) =>
+        act(() =>
+          useRecordingLauncherStore.setState({
+            demonstration: on
+              ? {
+                  phase: "recording",
+                  actionCount: 0,
+                  interrupted: false,
+                  insertion: null,
+                }
+              : null,
+          }),
+        ),
+    ],
+    ["a read-only scope", (doc, on) => doc.rerender(on)],
+  ];
+
+  test.each(locks)(
+    "a name being typed survives %s: nothing is saved while the Doc is locked, and the draft is back after",
+    (name, lock) => {
+      const doc = renderLiveDoc([prompt("first", null, "Write A")], "wpid_1");
+      const before = doc.graph();
+      fireEvent.click(titleOf("First"));
+      fireEvent.change(field()!, { target: { value: "Write the note" } });
+      lock(doc, true);
+      // A proposal shows Copilot's steps instead; every other lock leaves the field on screen, read-only, with the caret.
+      if (name !== "a Copilot proposal") {
+        expect(field()?.readOnly).toBe(true);
+        expect(document.activeElement).toBe(field());
+        fireEvent.keyDown(field()!, { key: "Enter" });
+        fireEvent.blur(field()!);
+      }
+      expect(doc.graph()).toBe(before);
+      lock(doc, false);
+      expect(field()?.value).toBe("Write the note");
+      fireEvent.keyDown(field()!, { key: "Enter" });
+      expect(doc.graph().nodes.map((node) => node.data.label)).toContain(
+        "Write_the_note",
+      );
+    },
+  );
+
+  test("a field reopened after Escape saves on a click away again", () => {
+    const doc = renderLiveDoc([prompt("first", null, "Write A")]);
+    fireEvent.click(titleOf("First"));
+    fireEvent.keyDown(typeName("Other name"), { key: "Escape" });
+    fireEvent.click(titleOf("First"));
+    fireEvent.blur(typeName("Write the note"));
+    expect(doc.graph().nodes.map((node) => node.data.label)).toContain(
+      "Write_the_note",
+    );
+  });
+
+  test("a Code step's title is locked while its Goal builds, as its Code line is", () => {
+    const doc = renderLiveDoc([code("build_it", null)]);
+    const before = doc.graph();
+    fireEvent.click(titleOf("Build it"));
+    fireEvent.change(field()!, { target: { value: "Write the note" } });
+    act(() =>
+      useCopilotActionStore.setState({ generatingBlockLabel: "build_it" }),
+    );
+    fireEvent.blur(field()!);
+    expect(doc.graph()).toBe(before);
+    expect(field()?.value).toBe("Write the note");
+    fireEvent.keyDown(field()!, { key: "Escape" });
+    expect(document.querySelector("[data-doc-step-name]")).toBeNull();
+    expect(screen.getByRole("heading", { name: "Build it" })).toBeTruthy();
+  });
+
+  test("a Conditional that can't be edited here shows its title without a field", () => {
+    const { nodes, edges } = getElements(
+      [
+        conditional("Check_page", null, [
+          { id: "yes", next: "inside", when: "the page has a form" },
+          { id: "else", next: null },
+        ]),
+        prompt("inside", null, "Write C"),
+      ],
+      settings(),
+      true,
+    );
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter>
+          <ReactFlowProvider>
+            <WorkflowDocEditor
+              nodes={nodes.map((node) =>
+                node.data.label === "Check_page"
+                  ? ({
+                      ...node,
+                      data: { ...node.data, editable: false },
+                    } as typeof node)
+                  : node,
+              )}
+              edges={edges}
+              edits={{
+                apply: vi.fn(),
+                update: vi.fn(),
+                addStep: vi.fn(),
+                duplicate: vi.fn(),
+              }}
+            />
+          </ReactFlowProvider>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(screen.getByRole("heading", { name: "Check page" })).toBeTruthy();
+    expect(titleOf("Check page")).toBeUndefined();
+    expect(titleOf("Inside")).toBeTruthy();
+  });
+
+  test("a step whose title hides a version suffix can be renamed to that title", () => {
+    const doc = renderLiveDoc([prompt("Review_v2", null, "Write A")]);
+    fireEvent.click(titleOf("Review"));
+    // Typing over the title passes through other text; a change to the same value would not reach the field.
+    typeName("");
+    fireEvent.keyDown(typeName("Review"), { key: "Enter" });
+    expect(doc.graph().nodes.map((node) => node.data.label)).toContain(
+      "Review",
+    );
+  });
+
+  test.each(
+    ["Review_v2", "_private", "foo__bar"].flatMap((label) =>
+      (["Enter", "a click away"] as const).map((exit) => [label, exit]),
+    ),
+  )(
+    "opening the title of %s and leaving it with %s, with nothing typed, changes nothing",
+    (label, exit) => {
+      const doc = renderLiveDoc([
+        prompt(label, "second", "Write A"),
+        prompt("second", null, `Use {{ ${label}_output }}`),
+      ]);
+      const before = doc.graph();
+      toastSpy.mockClear();
+      fireEvent.click(
+        document.querySelector<HTMLButtonElement>("[data-doc-step-name]")!,
+      );
+      expect(field()).toBeTruthy();
+      if (exit === "Enter") fireEvent.keyDown(field()!, { key: "Enter" });
+      else fireEvent.blur(field()!);
+      expect(doc.graph()).toBe(before);
+      expect(field()).toBeNull();
+      expect(toastSpy).not.toHaveBeenCalled();
+    },
+  );
+
+  test("opening a title and leaving it as it reads changes nothing, even when the label's case differs", () => {
+    const doc = renderLiveDoc([
+      prompt("first", "second", "Write A"),
+      prompt("second", null, "Use {{ first_output }}"),
+    ]);
+    const before = doc.graph();
+    fireEvent.click(titleOf("First"));
+    fireEvent.blur(field()!);
+    expect(doc.graph()).toBe(before);
+  });
+
+  test("a name ending in v and a number is refused, since the title drops it", () => {
+    const doc = renderLiveDoc([prompt("first", null, "Write A")]);
+    const before = doc.graph();
+    fireEvent.click(titleOf("First"));
+    fireEvent.keyDown(typeName("Review v2"), { key: "Enter" });
+    expect(screen.getByRole("alert").textContent).toBe(
+      "Add a word after the v and number: the title drops it",
+    );
+    expect(doc.graph()).toBe(before);
+  });
+
+  test("a name that differs from another step's only in case reads the same, so it is refused", () => {
+    const doc = renderLiveDoc([
+      prompt("Write_note", "second", "Write A"),
+      prompt("second", null, "Write B"),
+    ]);
+    const before = doc.graph();
+    fireEvent.click(titleOf("Second"));
+    fireEvent.keyDown(typeName("write note"), { key: "Enter" });
+    expect(screen.getByRole("alert").textContent).toBe(
+      "Another step already uses this name.",
+    );
+    expect(doc.graph()).toBe(before);
+  });
+
+  test.each(["Yes", "no", "ON", "Off"])(
+    "%s is refused: the saved YAML would read it as true or false",
+    (name) => {
+      const doc = renderLiveDoc([prompt("first", null, "Write A")]);
+      const before = doc.graph();
+      fireEvent.click(titleOf("First"));
+      fireEvent.keyDown(typeName(name), { key: "Enter" });
+      expect(screen.getByRole("alert").textContent).toBe(
+        "Add a word: Yes, No, On and Off save as true or false",
+      );
+      expect(doc.graph()).toBe(before);
+    },
+  );
+
+  test("a click away from a refused name puts the title back and says why in a notice", () => {
+    renderLiveDoc([
+      prompt("first", "second", "Write A"),
+      prompt("second", null, "Write B"),
+    ]);
+    toastSpy.mockClear();
+    fireEvent.click(titleOf("Second"));
+    fireEvent.blur(typeName("first"));
+    expect(field()).toBeNull();
+    expect(toastSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: "Name not saved",
+        description: "Another step already uses this name.",
+      }),
+    );
+  });
+
+  test("a rename from the title shows no Renamed notice: the title shows the new name", () => {
+    renderLiveDoc([prompt("first", null, "Write A")]);
+    toastSpy.mockClear();
+    fireEvent.click(titleOf("First"));
+    fireEvent.keyDown(typeName("Write the note"), { key: "Enter" });
+    expect(toastSpy).not.toHaveBeenCalled();
+  });
+
+  test("Enter and Escape that confirm or cancel an input-method candidate leave the field open", () => {
+    const doc = renderLiveDoc([prompt("first", null, "Write A")]);
+    const before = doc.graph();
+    fireEvent.click(titleOf("First"));
+    const input = typeName("Login ろぐいん");
+    fireEvent.keyDown(input, { key: "Enter", isComposing: true });
+    fireEvent.keyDown(input, { key: "Escape", keyCode: 229 });
+    expect(field()?.value).toBe("Login ろぐいん");
+    expect(doc.graph()).toBe(before);
+  });
+
+  test("the title's accessible name is the title itself, with Rename as its description", () => {
+    renderLiveDoc([prompt("first", null, "Write A")]);
+    const title = screen.getByRole("button", {
+      name: "First",
+      description: "Rename",
+    });
+    expect(title.hasAttribute("data-doc-step-name")).toBe(true);
+    expect(screen.getByRole("heading", { name: "First" })).toBeTruthy();
+  });
+
+  test("a step in a read-only part of an editable Doc has no title field", () => {
+    const { nodes, edges } = getElements(
+      [
+        prompt("first", "Stray_note", "Write A"),
+        prompt("Stray_note", null, "B"),
+      ],
+      settings(),
+      true,
+    );
+    const stray = nodes.find((node) => node.data.label === "Stray_note")!;
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter>
+          <ReactFlowProvider>
+            <WorkflowDocEditor
+              nodes={nodes}
+              edges={edges.filter((edge) => edge.target !== stray.id)}
+              edits={{
+                apply: vi.fn(),
+                update: vi.fn(),
+                addStep: vi.fn(),
+                duplicate: vi.fn(),
+              }}
+            />
+          </ReactFlowProvider>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(screen.getByText(/can't be placed/)).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "Stray note" })).toBeTruthy();
+    expect(titleOf("Stray note")).toBeUndefined();
   });
 });

@@ -65,6 +65,41 @@ describe("doc edit api", () => {
     );
   });
 
+  test("a rename from the title rewrites references like any rename but shows no toast", () => {
+    const graph = getElements(
+      [code("read", "use"), code("use", null, { code: "{{ read_output }}" })],
+      settings(),
+      true,
+    ) as DocGraph;
+    const read = graph.nodes.find((node) => node.data.label === "read")!;
+    const notification = vi
+      .spyOn(toastModule, "toast")
+      .mockReturnValue({ id: "test", dismiss: vi.fn(), update: vi.fn() });
+    let applied = graph;
+    const api = createDocEditApi({
+      ...graph,
+      edits: {
+        apply: (next) => {
+          applied = next;
+        },
+        update: () => {},
+        addStep: () => null,
+        duplicate: () => {},
+      },
+      finallyId: null,
+      workflowId: "wpid_test",
+      selectBranch: () => {},
+      selectedBranch: () => undefined,
+      inputKeys: [],
+      credentialKeys: new Set(),
+    });
+
+    expect(api.rename(read.id, "fetch", { fromTitle: true })).toBeNull();
+    const use = applied.nodes.find((node) => node.data.label === "use")!;
+    expect(JSON.stringify(use.data)).toContain("{{ fetch_output }}");
+    expect(notification).not.toHaveBeenCalled();
+  });
+
   test("notes offer parameters but not block outputs, while prompts keep earlier outputs", () => {
     const graph = getElements(
       [code("read", "after"), code("after", null)],

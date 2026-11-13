@@ -20,7 +20,6 @@ import type { DocBranch, DocItem } from "./buildDocTree";
 import { WorkflowDocActionsContext } from "./WorkflowDocActionsContext";
 import { docStepTitle } from "./docStepRegistry";
 import {
-  DocStepCaption,
   DocStepControls,
   DocStepNumber,
   DocTag,
@@ -28,6 +27,7 @@ import {
 } from "./DocStep";
 import { runStepByKey, type LineSplit } from "./docKeys";
 import type { DocScopeRef } from "./docGraphEdits";
+import { DocStepName } from "./DocStepName";
 import { DocText } from "./DocText";
 import { DocDeleteConfirm, DocEditableLine } from "./DocEditing";
 import { docBranchSelection, selectedStepIds } from "./docBranchSelection";
@@ -240,7 +240,7 @@ export function DocConditional({
             showRunControl={showRunControl}
           />
         </div>
-        <DocStepCaption node={node} />
+        <DocStepName node={node} editable={editable} />
       </div>
       {open && (
         <>

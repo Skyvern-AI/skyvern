@@ -16,7 +16,6 @@ import {
   SKIP_KEYS_FOR_JINJA_CHECK,
   transformStringFieldsInObject,
 } from "../jinjaReferences";
-import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { goalChangeIsPending } from "../workflowEditorUtils";
 import type { CodeBlockNodeData } from "../nodes/CodeBlockNode/types";
 import {
@@ -86,6 +85,8 @@ import {
 } from "./DocProposalView";
 import { DocOneActionHint } from "./DocOneActionHint";
 import { DocStepMeta } from "./DocStepMeta";
+import { DocStepName } from "./DocStepName";
+import { useDocGoalBuild } from "./useDocGoalBuild";
 import { useDocStepMetaRows } from "./useDocStepMetaRows";
 import {
   docShortcut,
@@ -530,15 +531,6 @@ export function DocStepNumber({ number }: { number?: string }) {
   ) : null;
 }
 
-export function DocStepCaption({ node }: { node: WorkflowBlockNode }) {
-  const caption = docStepCaption(node);
-  return caption ? (
-    <h3 className="mt-0.5 break-words text-lg font-semibold leading-snug text-foreground">
-      {caption}
-    </h3>
-  ) : null;
-}
-
 export function DocStepHeader({
   node,
   editable,
@@ -596,7 +588,7 @@ export function DocStepHeader({
           settings={false}
         />
       </div>
-      <DocStepCaption node={node} />
+      <DocStepName node={node} editable={editable} />
     </div>
   );
 }
@@ -633,15 +625,7 @@ export function DocStepBody({
   const actions = useContext(WorkflowDocActionsContext);
   const data = node.data as Record<string, unknown>;
   // A build in flight carries the Goal it started with, so the Code line is read-only until it ends, as in Visual.
-  const goalBuild = useCopilotActionStore((state) =>
-    state.generatingBlockLabel === node.data.label
-      ? "building"
-      : state.queuedBuilds.some(
-            (queued) => queued.blockLabel === node.data.label,
-          )
-        ? "queued"
-        : null,
-  );
+  const goalBuild = useDocGoalBuild(node.data.label);
   const editable = editableProp && !(node.type === "codeBlock" && goalBuild);
   const goalNotApplied =
     node.type === "codeBlock" &&

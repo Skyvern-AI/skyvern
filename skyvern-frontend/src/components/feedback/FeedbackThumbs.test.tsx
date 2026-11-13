@@ -48,7 +48,7 @@ describe("FeedbackThumbs", () => {
         "It skipped the second page",
       ),
     );
-    expect(screen.getByText("Thanks, that helps.")).toBeTruthy();
+    expect(await screen.findByText("Thanks, that helps.")).toBeTruthy();
     expect(screen.queryByLabelText("Feedback reason")).toBeNull();
 
     act(() => {
@@ -80,7 +80,7 @@ describe("FeedbackThumbs", () => {
 
     fireEvent.click(screen.getByText("Send"));
     await waitFor(() => expect(onRate).toHaveBeenLastCalledWith("down", ""));
-    expect(screen.getByText("Thanks, noted.")).toBeTruthy();
+    expect(await screen.findByText("Thanks, noted.")).toBeTruthy();
     expect(control.getAttribute("data-subtle")).toBeNull();
 
     act(() => {

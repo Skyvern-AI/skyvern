@@ -22,6 +22,7 @@ import {
 import type { DocItem } from "./buildDocTree";
 import {
   docMainIsSetting,
+  docStepCaption,
   docStepIsNoteOnly,
   getDocProseFields,
   labelStem,
@@ -768,7 +769,12 @@ export function createDocEditApi({
       }
       edits.apply(end.kind === "ok" ? end.graph : { nodes: next, edges });
     },
-    rename: (id: string, label: string): string | null => {
+    // The title field shows the new name itself, so no toast; fromTitle refuses a label another step's title reads as.
+    rename: (
+      id: string,
+      label: string,
+      { fromTitle = false }: { fromTitle?: boolean } = {},
+    ): string | null => {
       const node = nodes.find((n) => n.id === id);
       if (!node || !isWorkflowBlockNode(node) || node.data.label === label)
         return null;
@@ -777,6 +783,19 @@ export function createDocEditApi({
         .parameters.map((parameter) => parameter.key);
       const problem = checkLabel(nodes, id, label, parameterKeys);
       if (problem) return problem;
+      const title = fromTitle
+        ? docStepCaption({ ...node, data: { ...node.data, label } })
+        : null;
+      if (
+        title !== null &&
+        nodes.some(
+          (n) =>
+            n.id !== id &&
+            isWorkflowBlockNode(n) &&
+            docStepCaption(n) === title,
+        )
+      )
+        return "Another step already uses this name.";
       const result = renameStep(nodes, id, label);
       const rewritten = result.rewritten;
       const renamed =
@@ -794,12 +813,13 @@ export function createDocEditApi({
         .getState()
         .renameBlock(workflowId, node.data.label, label);
       edits.apply({ nodes: renamed, edges });
-      toast({
-        title: `Renamed ${node.data.label} to ${label}`,
-        ...(rewritten > 0 && {
-          description: `${rewritten} reference${rewritten === 1 ? "" : "s"} updated`,
-        }),
-      });
+      if (!fromTitle)
+        toast({
+          title: `Renamed ${node.data.label} to ${label}`,
+          ...(rewritten > 0 && {
+            description: `${rewritten} reference${rewritten === 1 ? "" : "s"} updated`,
+          }),
+        });
       return null;
     },
     addBranch: (conditionalId: string) => {
