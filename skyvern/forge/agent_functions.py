@@ -125,6 +125,7 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
     from skyvern.forge.sdk.db.models import FolderModel
     from skyvern.forge.sdk.integrations.catalog import AccountsById, IntegrationEntry
+    from skyvern.forge.sdk.integrations.connected_accounts import OrgConnection
     from skyvern.forge.sdk.schemas.totp_codes import OTPType
     from skyvern.forge.sdk.schemas.workflow_copilot import CopilotTurnControl
     from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
@@ -1072,6 +1073,9 @@ OnePasswordTelemetryErrorClass = Literal["invalid_token", "rate_limited", "timeo
 class AgentFunction:
     async def nango_gmail_catalog_available(self, organization_id: str) -> bool:
         return False
+
+    async def own_connected_gmail_connections(self, organization_id: str, user_id: str) -> list[OrgConnection]:
+        return []
 
     async def prepare_gmail_hop_tokens(self, *, workflow_run: WorkflowRun, workflow: Workflow) -> None:
         return None

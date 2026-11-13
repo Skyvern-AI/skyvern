@@ -25,11 +25,11 @@ from skyvern.schemas.workflows import (
 
 LOG = structlog.get_logger()
 
-ConnectionProvider = Literal["google", "microsoft"]
+ConnectionProvider = Literal["google", "microsoft", "nango"]
 
-# ponytail: Nango connections are not among the org connections resolved here, so their fields stay outside the
-# approval check; add a Nango reader to org_connections to bring them under it (SKY-19944).
-_UNRESOLVED_CONNECTION_SOURCES = frozenset({"nango"})
+# ponytail: org_connections lists only Connected Gmail among Nango accounts, so other blocks' Nango fields stay
+# outside the approval check; add a block type here once its owned Nango rows join org_connections.
+_LISTED_NANGO_BLOCK_TYPES = frozenset({BlockType.SEND_EMAIL, BlockType.EMAIL_INBOX})
 
 
 @dataclass(frozen=True)
@@ -47,7 +47,8 @@ def _marked_fields(model: type[BaseModel]) -> tuple[_MarkedField, ...]:
             continue
         condition = extra.get(CONNECTED_ACCOUNT_CONDITION_MARK)
         condition = dict(condition) if isinstance(condition, dict) else {}
-        if condition.get("credential_source") in _UNRESOLVED_CONNECTION_SOURCES:
+        block_type = model.model_fields["block_type"].default
+        if condition.get("credential_source") == "nango" and block_type not in _LISTED_NANGO_BLOCK_TYPES:
             continue
         defaults = {key: model.model_fields[key].default for key in condition if key in model.model_fields}
         marked.append(
@@ -115,6 +116,11 @@ class OrgConnection:
     def active(self) -> bool:
         return self.state == STATE_ACTIVE
 
+    @property
+    def agent_step_usable(self) -> bool:
+        # A Nango hop token is minted only for a saved block, so the agent step never offers a Nango account (ADR 0033).
+        return self.provider != "nango"
+
     def choice(self) -> ConnectedAccountChoice:
         return ConnectedAccountChoice(
             connection_id=self.id, name=self.name, state=self.state, email_address=self.email_address
@@ -144,29 +150,39 @@ def _connection(
     )
 
 
+async def _no_connections() -> list[OrgConnection]:
+    return []
+
+
 class IncompleteConnectionRead(Exception):
     """A provider's rows could not be read. `connections` holds the providers that did load; only an id lookup may
     use them, because a name that looks unique among them can still match a row in the provider that failed."""
 
-    def __init__(self, connections: list[OrgConnection]) -> None:
+    def __init__(self, connections: list[OrgConnection], failed: frozenset[str]) -> None:
         super().__init__("a connected-account provider could not be read")
         self.connections = connections
+        self.failed = failed
 
 
 async def org_connections(organization_id: str, user_id: str | None = None) -> list[OrgConnection]:
-    """Every OAuth connection `user_id` may see in the org, as one flat list."""
+    """Every connection `user_id` may see in the org, as one flat list. Nango connections are the user's own."""
     # Not integrations_for_org: it files accounts under catalog entries by scope, and this list must not.
-    results: list[Sequence[GoogleOAuthCredentialBase | MicrosoftOAuthCredentialBase] | BaseException] = list(
+    own_nango: Awaitable[list[OrgConnection]] = (
+        app.AGENT_FUNCTION.own_connected_gmail_connections(organization_id, user_id) if user_id else _no_connections()
+    )
+    reads: list[Sequence[Any] | BaseException] = list(
         await asyncio.gather(
             google_oauth_service.get_visible_credentials_for_org(organization_id),
             microsoft_oauth_service.get_credentials_for_org(organization_id, user_id=user_id),
+            own_nango,
             return_exceptions=True,
         )
     )
-    providers: tuple[ConnectionProvider, ...] = ("google", "microsoft")
+    providers: tuple[ConnectionProvider, ...] = ("google", "microsoft", "nango")
     connections: list[OrgConnection] = []
     failure: BaseException | None = None
-    for provider, rows in zip(providers, results):
+    failed: set[str] = set()
+    for provider, rows in zip(providers, reads):
         if isinstance(rows, BaseException):
             if not isinstance(rows, Exception):
                 raise rows
@@ -177,10 +193,14 @@ async def org_connections(organization_id: str, user_id: str | None = None) -> l
                 exc_info=rows,
             )
             failure = rows
+            failed.add(provider)
             continue
-        connections.extend(_connection(row, provider) for row in rows if row.organization_id == organization_id)
+        if provider == "nango":
+            connections.extend(rows)
+        else:
+            connections.extend(_connection(row, provider) for row in rows if row.organization_id == organization_id)
     if failure is not None:
-        raise IncompleteConnectionRead(connections) from failure
+        raise IncompleteConnectionRead(connections, frozenset(failed)) from failure
     return connections
 
 
@@ -216,6 +236,17 @@ async def run_connection_ids(organization_id: str, workflow_run_id: str) -> set[
     except (TypeError, ValueError):
         return set()
     return {i for i in ids if isinstance(i, str)} if isinstance(ids, list) else set()
+
+
+async def agent_step_org_connections(organization_id: str, user_id: str | None) -> list[OrgConnection]:
+    """The connections an agent step may be offered. A Nango-only read failure hides nothing it could use."""
+    try:
+        connections = await org_connections(organization_id, user_id)
+    except IncompleteConnectionRead as incomplete:
+        if not incomplete.failed <= {"nango"}:
+            raise
+        connections = incomplete.connections
+    return [connection for connection in connections if connection.agent_step_usable]
 
 
 async def org_connections_by_id(organization_id: str, user_id: str | None = None) -> list[OrgConnection]:
@@ -268,8 +299,7 @@ async def _nango_access(organization_id: str, account_id: str, required_scopes: 
     return UseHop()
 
 
-# ponytail: Nango accounts are not among org_connections yet, so the lookup never reaches "nango" until a Nango
-# reader joins it. Its token never leaves the hop, so no block can call a provider API with it directly.
+# A Nango account's token never leaves the hop, so no block can call a provider API with it directly.
 ACCOUNT_BACKENDS: dict[str, AccountBackend] = {
     "google": AccountBackend(_google_access, frozenset({"google"})),
     "microsoft": AccountBackend(_microsoft_access, frozenset({"microsoft"})),

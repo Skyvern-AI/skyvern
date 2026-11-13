@@ -382,6 +382,8 @@ from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.browser_session_kind import BrowserSessionKind
 from skyvern.schemas.browser_settings import requested_timezone_id
 from skyvern.schemas.emails import (
+    CONNECTED_ACCOUNT_COPILOT_TEST_RUN_REASON,
+    CONNECTED_ACCOUNT_IN_CREDENTIAL_ID_REASON,
     CONNECTED_ACCOUNT_OWNER_UNCONFIRMED_REASON,
     CONNECTED_ACCOUNT_RESAVE_REASON,
     EmailBodyFormat,
@@ -389,6 +391,7 @@ from skyvern.schemas.emails import (
     GmailHopRefusal,
     GmailSendErrorCode,
     GmailSendOutcome,
+    is_connected_gmail_id,
 )
 from skyvern.schemas.runs import RunEngine, read_browser_type
 from skyvern.schemas.self_heal import HealClassification, HealSkipReason, HealStatus, OutputObligation
@@ -14562,6 +14565,10 @@ class SendEmailBlock(Block):
                 raise _GmailSendRefused(
                     GmailSendErrorCode.CONFIGURATION, f"{CONNECTED_ACCOUNT_OWNER_UNCONFIRMED_REASON} Nothing was sent."
                 )
+            if refusal == GmailHopRefusal.copilot_test_run:
+                raise _GmailSendRefused(
+                    GmailSendErrorCode.CONFIGURATION, f"{CONNECTED_ACCOUNT_COPILOT_TEST_RUN_REASON} Nothing was sent."
+                )
             if refusal == GmailHopRefusal.run_not_supported or (
                 refusal is None and await _is_unsupported_connected_account_run(workflow_run_id, organization_id)
             ):
@@ -14676,6 +14683,11 @@ class SendEmailBlock(Block):
                     or not authorization.access_token
                     or not authorization.from_address
                 ):
+                    if is_connected_gmail_id(credential_id):
+                        raise _GmailSendRefused(
+                            GmailSendErrorCode.CONFIGURATION,
+                            f"{CONNECTED_ACCOUNT_IN_CREDENTIAL_ID_REASON} Nothing was sent.",
+                        )
                     raise _GmailSendRefused(
                         _GMAIL_AUTHORIZATION_ERROR_CODES.get(authorization.status, GmailSendErrorCode.INTERNAL_ERROR)
                     )
