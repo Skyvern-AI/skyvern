@@ -453,6 +453,31 @@ async def test_records_goto_click_fill_with_types_and_order() -> None:
     assert recorded[2].element_id == "#go"
 
 
+@pytest.mark.asyncio
+async def test_recovery_rows_built_from_recorded_calls_carry_no_call_argument() -> None:
+    value = "ARGVALUE9"
+    page = RecordingPage(FakePage())
+    await page.goto(f"https://example.com/p?token={value}#{value}")
+    await page.locator("#a").select_option(value)
+    await page.locator("#b").press(value)
+    await page.click("#c")
+    await page.fill("#d", value)
+    await page.evaluate(f"document.title = '{value}'")
+    await page.locator("#e").fill(value)
+
+    shapes = [block_module._call_shape(action) for action in page.recorded_actions()]
+
+    assert shapes == [
+        "page.goto https://example.com/p",
+        "locator.select_option #a",
+        "locator.press #b (key withheld)",
+        "page.click #c",
+        "page.fill #d",
+        "page.evaluate",
+        "locator.fill #e",
+    ]
+
+
 def test_recording_page_keeps_raw_page_behind_private_seam() -> None:
     # The safety validator only refuses underscore-prefixed access, so the raw Playwright page must be
     # reachable ONLY through a private seam -- never a public attribute a snippet could read to bypass the
