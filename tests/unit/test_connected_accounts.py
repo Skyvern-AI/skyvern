@@ -62,7 +62,7 @@ async def test_an_unpinned_caller_resolves_only_a_known_account_id() -> None:
 @pytest.mark.parametrize(
     ("failure", "reference", "token"),
     [
-        (IncompleteConnectionRead([_ACCOUNTS[2]]), "acct_fake", "fake:acct_fake"),
+        (IncompleteConnectionRead([_ACCOUNTS[2]], frozenset({"google"})), "acct_fake", "fake:acct_fake"),
         (RuntimeError("account list unavailable"), "goac_1", "google:goac_1"),
     ],
 )

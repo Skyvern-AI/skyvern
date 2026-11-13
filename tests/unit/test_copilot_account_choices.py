@@ -30,6 +30,7 @@ from skyvern.forge.sdk.copilot.context import (
 )
 from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
 from skyvern.forge.sdk.copilot.output_utils import sanitize_tool_result_for_llm
+from skyvern.forge.sdk.copilot.tools import credentials as credentials_module
 from skyvern.forge.sdk.copilot.tools import mcp_hooks
 from skyvern.forge.sdk.copilot.tools.credentials import (
     UNAPPROVED_CONNECTION_REASON_CODE,
@@ -49,7 +50,12 @@ from skyvern.forge.sdk.copilot.turn_outcome import (
     selected_connected_account_id,
 )
 from skyvern.forge.sdk.copilot.workflow_credential_utils import workflow_connection_refs
-from skyvern.forge.sdk.integrations.connected_accounts import ConnectionProvider, OrgConnection
+from skyvern.forge.sdk.integrations.connected_accounts import (
+    ConnectionProvider,
+    IncompleteConnectionRead,
+    OrgConnection,
+    org_connections,
+)
 from skyvern.forge.sdk.routes import workflow_copilot as workflow_copilot_route
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import (
     ConnectedAccountChoice,
@@ -64,6 +70,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatSender,
 )
 from skyvern.forge.sdk.services import google_oauth_service, microsoft_oauth_service
+from skyvern.forge.sdk.workflow.models.agent_step_tools import ACCOUNT_TOOL_NAMES
 from skyvern.forge.sdk.workflow.models.block import WorkflowTriggerBlock
 from skyvern.utils.yaml_loader import safe_load_no_dates
 from tests.unit.copilot_test_helpers import make_copilot_ctx
@@ -634,6 +641,106 @@ async def test_editor_bound_account_keeps_run_authority_from_resolution_through_
     assert EDITOR_BOUND_ACCOUNT_ID in _approved_run_credential_ids(next_turn)
     assert _credential_run_approval_error(dispatched_ids, next_turn) is None
     assert _blocker(dispatched_ids, next_turn) is None
+
+
+CONNECTED_GMAIL_ID = "nc_connected_gmail"
+CONNECTED_GMAIL_YAML = (
+    "workflow_definition:\n"
+    "  blocks:\n"
+    "    - label: send\n"
+    "      block_type: send_email\n"
+    "      transport: gmail\n"
+    "      credential_source: nango\n"
+    f"      connection_id: {CONNECTED_GMAIL_ID}\n"
+    "      recipients: [ops@example.com]\n"
+    "      subject: Report\n"
+    "      body: Done\n"
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("owner", "picked", "approved"),
+    [("user-1", False, True), ("user-2", False, False), ("user-1", True, True)],
+    ids=["own_saved_binding", "another_users_saved_binding", "own_card_pick"],
+)
+async def test_connected_gmail_gets_run_authority_only_for_its_owner_and_never_reaches_the_agent_step(
+    monkeypatch: pytest.MonkeyPatch, owner: str, picked: bool, approved: bool
+) -> None:
+    monkeypatch.setattr(google_oauth_service, "get_visible_credentials_for_org", AsyncMock(return_value=[]))
+    for module in (request_policy_module, credentials_module):
+        monkeypatch.setattr(module, "request_user_id", lambda organization_id: "user-1")
+
+    async def own_connected_gmail(organization_id: str, user_id: str) -> list[OrgConnection]:
+        return (
+            [OrgConnection(CONNECTED_GMAIL_ID, "nango", "Connected Gmail", None, "active", ())]
+            if user_id == owner
+            else []
+        )
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "own_connected_gmail_connections", own_connected_gmail)
+
+    policy = await request_policy_module._build_request_policy_bootstrap(
+        user_message="run it",
+        workflow_yaml=EMPTY_WORKFLOW_YAML if picked else CONNECTED_GMAIL_YAML,
+        chat_history=[],
+        global_llm_context="",
+        organization_id="org-1",
+        persisted_workflow_yaml=None if picked else CONNECTED_GMAIL_YAML,
+        selected_connected_account_id=CONNECTED_GMAIL_ID if picked else None,
+    )
+    refs = _connection_refs(_parsed_workflow_definition(CONNECTED_GMAIL_YAML), ["send"])
+
+    assert refs == [CONNECTED_GMAIL_ID]
+    assert (policy.run_approved_connection_ids == [CONNECTED_GMAIL_ID]) is approved
+    if picked:
+        # The model is told what it picked, so it binds the account to the Gmail block's connection_id.
+        facts = json.loads(
+            connected_account_choice_context(
+                None,
+                explicit_selected_connection_id=policy.selected_connected_account_id,
+                explicit_selected_connection_scopes=policy.selected_connected_account_scopes,
+                explicit_selected_connection_provider=policy.selected_connected_account_provider,
+            )
+        )["selected_connection"]
+        assert facts["provider"] == "nango" and facts["scopes_granted"] is None
+        # The right binding for the pick dispatches; a wrong slot is left for the test run to report (rule 3).
+        ctx = make_copilot_ctx(request_policy=policy)
+        send = safe_load_no_dates(CONNECTED_GMAIL_YAML)["workflow_definition"]["blocks"][0]
+        right = await run_credential_gate(ctx, {"parameters": [], "blocks": [send]}, labels=None, run_parameters=None)
+        assert right.error is None and right.blocker is None
+        # A leftover native id on a Connected Gmail send is never read, so it cannot hold the run.
+        stale = {**send, "credential_id": "goac_stale"}
+        left = await run_credential_gate(ctx, {"parameters": [], "blocks": [stale]}, labels=None, run_parameters=None)
+        assert left.error is None and left.blocker is None
+    assert (_blocker(refs, policy) is None) is approved
+    agent_step_ids, _ = await credentials_module._agent_step_connection_ids(
+        "org-1", {}, set(ACCOUNT_TOOL_NAMES), selected_labels=None, run_parameters=None
+    )
+    assert CONNECTED_GMAIL_ID not in agent_step_ids
+
+
+@pytest.mark.asyncio
+async def test_a_failed_connected_gmail_read_leaves_native_accounts_usable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        google_oauth_service,
+        "get_visible_credentials_for_org",
+        AsyncMock(return_value=[_google(EDITOR_BOUND_ACCOUNT_ID, "Google Sheets")]),
+    )
+    monkeypatch.setattr(credentials_module, "request_user_id", lambda organization_id: "user-1")
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION, "own_connected_gmail_connections", AsyncMock(side_effect=RuntimeError("nango down"))
+    )
+
+    # The agent step cannot use a Nango account, so a failed Nango read must not refuse its native accounts.
+    agent_step_ids, _ = await credentials_module._agent_step_connection_ids(
+        "org-1", {}, set(ACCOUNT_TOOL_NAMES), selected_labels=None, run_parameters=None
+    )
+
+    assert agent_step_ids == [EDITOR_BOUND_ACCOUNT_ID]
+    # Name resolution still learns the read was incomplete, since a hidden Connected Gmail row could share a name.
+    with pytest.raises(IncompleteConnectionRead):
+        await org_connections("org-1", "user-1")
 
 
 @pytest.mark.asyncio
@@ -2505,7 +2612,9 @@ async def test_a_copilot_test_run_records_the_accounts_this_turn_admitted(monkey
 
 
 @pytest.mark.asyncio
-async def test_a_nango_gmail_send_is_not_held_to_the_native_account_check(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_an_unapproved_nango_gmail_send_is_held_but_a_saved_powerbi_query_is_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     send = {
         "label": "send",
         "block_type": "send_email",
@@ -2517,9 +2626,20 @@ async def test_a_nango_gmail_send_is_not_held_to_the_native_account_check(monkey
         "body": "Done",
     }
 
-    result = await _gate(monkeypatch, {"parameters": [], "blocks": [send]})
+    powerbi = {
+        "label": "query",
+        "block_type": "powerbi_query",
+        "connection_id": "nango-powerbi-1",
+        "dataset_id": "dataset-1",
+        "query": 'EVALUATE ROW("x", 1)',
+    }
 
-    assert result.blocker is None and result.error is None
+    held = await _gate(monkeypatch, {"parameters": [], "blocks": [send]})
+    # Power BI's Nango accounts are not listed among the user's connections yet, so its field stays outside the check.
+    passed = await _gate(monkeypatch, {"parameters": [], "blocks": [powerbi]})
+
+    assert held.blocker is not None
+    assert passed.blocker is None and passed.error is None
 
 
 @pytest.mark.asyncio
