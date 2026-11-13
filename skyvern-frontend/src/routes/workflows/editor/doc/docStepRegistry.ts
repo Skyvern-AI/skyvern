@@ -256,11 +256,18 @@ const requiredSettings: Record<string, Array<[string, string]>> = {
   sendEmail: [["recipients", "Recipients"]],
 };
 
-export function getDocMissingSettings(node: Node): string[] {
+export function getDocMissingSettings(
+  node: Node,
+  skip: (key: string) => boolean = () => false,
+): string[] {
   return (requiredSettings[node.type ?? ""] ?? []).flatMap(([key, label]) =>
-    settingIsSet(node, key) ? [] : [label],
+    settingIsSet(node, key) || skip(key) ? [] : [label],
   );
 }
+
+/** The data keys a step of this type cannot run without. */
+export const docRequiredSettingKeys = (node: Node): string[] =>
+  (requiredSettings[node.type ?? ""] ?? []).map(([key]) => key);
 
 // A Wait needs a whole number of seconds of at least 1; "" or "0" would save as a wait that does nothing or is refused.
 function settingIsSet(node: Node, key: string): boolean {

@@ -1974,9 +1974,9 @@ describe("a step that was just added", () => {
 
     fireEvent.pointerDown(document.body);
 
-    expect(screen.getAllByText(docDetailsText.noCredential(true))).toHaveLength(
-      1,
-    );
+    expect(
+      screen.getAllByText(docDetailsText.noCredential(true, false)),
+    ).toHaveLength(1);
     expect(document.querySelector("[data-doc-problems]")?.textContent).toBe(
       "1 problem",
     );
@@ -1986,7 +1986,9 @@ describe("a step that was just added", () => {
   test("a read-only Doc's credential line does not send the user to the side panel, and its Jump leaves Details closed", async () => {
     useWorkflowYamlEditorStore.setState({ commitInProgress: true });
     renderDoc([block("login", "sign_in", null, { url: "" })]);
-    expect(screen.getByText(docDetailsText.noCredential(false))).toBeTruthy();
+    expect(
+      screen.getByText(docDetailsText.noCredential(false, false)),
+    ).toBeTruthy();
     expect(screen.queryByText(/side panel to choose/)).toBeNull();
     fireEvent.click(
       document.querySelector<HTMLElement>("[data-doc-problems]")!,
@@ -2002,6 +2004,204 @@ describe("a step that was just added", () => {
         .getByRole("button", { name: /^Details for/ })
         .getAttribute("aria-expanded"),
     ).toBe("false");
+  });
+
+  test("an editable login's credential and page are on its summary line, not in Details, and its Jump leaves Details closed", async () => {
+    const edits = {
+      apply: vi.fn(),
+      update: vi.fn(),
+      addStep: vi.fn(),
+      duplicate: vi.fn(),
+    };
+    renderDoc([block("login", "sign_in", null, { url: "" })], edits);
+    expect(
+      screen.getByRole("button", { name: "Add Credential to Sign in" }),
+    ).toBeTruthy();
+    expect(
+      screen.getByText(docDetailsText.noCredential(true, true)),
+    ).toBeTruthy();
+    fireEvent.click(
+      document.querySelector<HTMLElement>("[data-doc-problems]")!,
+    );
+    fireEvent.click(
+      within(await screen.findByRole("dialog")).getByText(
+        /no saved credential/,
+      ),
+    );
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    const toggle = screen.getByRole("button", { name: /^Details for/ });
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    fireEvent.click(toggle);
+    const details = document.getElementById(
+      toggle.getAttribute("aria-controls")!,
+    )!;
+    expect(within(details).queryByText("Credential")).toBeNull();
+    expect(within(details).queryByText("URL")).toBeNull();
+    expect(within(details).getByText("2FA")).toBeTruthy();
+  });
+
+  test("a login in a section the Doc shows read-only gets no chip, its fix line names no control, and its Jump leaves Details closed", async () => {
+    const edits = {
+      apply: vi.fn(),
+      update: vi.fn(),
+      addStep: vi.fn(),
+      duplicate: vi.fn(),
+    };
+    // Two branches with one id are a shape the Doc can't show, so the conditional and its steps are read-only.
+    renderDoc(
+      [
+        conditional("route", null, [
+          { id: "same", next: "sign_in", when: "found" },
+          { id: "same", next: null },
+        ]),
+        block("login", "sign_in", null, { url: "" }),
+      ],
+      edits,
+    );
+    fireEvent.pointerDown(document.body);
+    expect(
+      screen.queryByRole("button", { name: "Add Credential to Sign in" }),
+    ).toBeNull();
+    expect(document.querySelector("[data-doc-meta-add]")).toBeNull();
+    expect(
+      screen.getByText(docDetailsText.noCredential(false, false)),
+    ).toBeTruthy();
+    expect(
+      screen.queryByText(/Open this step's settings|Click Credential/),
+    ).toBeNull();
+    fireEvent.click(
+      document.querySelector<HTMLElement>("[data-doc-problems]")!,
+    );
+    fireEvent.click(
+      within(await screen.findByRole("dialog")).getByText(
+        /no saved credential/,
+      ),
+    );
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(
+      screen
+        .getByRole("button", { name: "Details for Sign in" })
+        .getAttribute("aria-expanded"),
+    ).toBe("false");
+  });
+
+  test.each([
+    [true, "editable"],
+    [false, "not editable"],
+  ])(
+    "a step that is %s: the line shows the host, and only a step whose settings cannot open lists the full URL in Details",
+    (canEdit) => {
+      const url = "https://example.com/list/page?sort=new";
+      renderDoc(
+        [
+          block("navigation", "the_step", null, {
+            url,
+            navigation_goal: "Read the list",
+          }),
+        ],
+        canEdit
+          ? {
+              apply: vi.fn(),
+              update: vi.fn(),
+              addStep: vi.fn(),
+              duplicate: vi.fn(),
+            }
+          : undefined,
+      );
+      const line = document.querySelector<HTMLElement>("[data-doc-meta]")!;
+      expect(line.textContent).toContain("example.com");
+      expect(line.textContent).not.toContain("/list");
+      const toggle = screen.getByRole("button", {
+        name: "Details for The step",
+      });
+      if (toggle.getAttribute("aria-expanded") !== "true")
+        fireEvent.click(toggle);
+      const details = within(
+        document.getElementById(toggle.getAttribute("aria-controls")!)!,
+      );
+      if (canEdit) expect(details.queryByText(url)).toBeNull();
+      else expect(details.getByText(url)).toBeTruthy();
+    },
+  );
+
+  test("only the first page-opening step without a URL asks for one", () => {
+    renderDoc(
+      [
+        block("navigation", "first_page", "next_page", {
+          url: "",
+          navigation_goal: "Open the list",
+        }),
+        block("navigation", "next_page", null, {
+          url: "",
+          navigation_goal: "Open the next item",
+        }),
+      ],
+      { apply: vi.fn(), update: vi.fn(), addStep: vi.fn(), duplicate: vi.fn() },
+    );
+    expect(
+      screen.getByRole("button", { name: "Add Page URL to First page" }),
+    ).toBeTruthy();
+    expect(
+      screen.queryByRole("button", { name: "Add Page URL to Next page" }),
+    ).toBeNull();
+  });
+
+  test.each([
+    [
+      "send_email",
+      "Recipients",
+      { recipients: [], subject: "", body: "", file_attachments: [] },
+    ],
+    ["workflow_trigger", "Agent", { workflow_permanent_id: "" }],
+  ])(
+    "an editable %s step asks for its %s with a dashed chip marked required, not also a required pill",
+    (blockType, label, extra) => {
+      renderDoc([block(blockType, "the_step", null, extra)], {
+        apply: vi.fn(),
+        update: vi.fn(),
+        addStep: vi.fn(),
+        duplicate: vi.fn(),
+      });
+      const chip = screen.getByRole("button", {
+        name: `Add ${label} to The step (required)`,
+      });
+      expect(chip.querySelector("[data-doc-meta-required]")).toBeTruthy();
+      expect(document.querySelector("[data-doc-missing]")).toBeNull();
+    },
+  );
+
+  test("re-rendering with the same graph and a new edits object writes nothing new to the run check", () => {
+    const { nodes, edges } = getElements(
+      [block("login", "sign_in", null, { url: "" })],
+      settings(),
+      true,
+    );
+    const view = () => (
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <ReactFlowProvider>
+            <WorkflowDocEditor
+              nodes={nodes}
+              edges={edges}
+              edits={{
+                apply: vi.fn(),
+                update: vi.fn(),
+                addStep: vi.fn(),
+                duplicate: vi.fn(),
+              }}
+            />
+          </ReactFlowProvider>
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+    const client = new QueryClient();
+    const rendered = render(view());
+    let writes = 0;
+    const stop = useDocRunCheckStore.subscribe(() => writes++);
+    for (let i = 0; i < 20; i++) rendered.rerender(view());
+    stop();
+    expect(useDocRunCheckStore.getState().critical.length).toBeGreaterThan(0);
+    expect(writes).toBe(0);
   });
 
   test.each([

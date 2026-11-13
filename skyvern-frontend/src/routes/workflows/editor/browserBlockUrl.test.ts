@@ -16,7 +16,11 @@ import {
 } from "./nodes/NavigationNode/types";
 import { fileDownloadNodeDefaultData } from "./nodes/FileDownloadNode/types";
 import { urlNodeDefaultData } from "./nodes/URLNode/types";
-import { isMissingRequiredStartUrl } from "./workflowEditorUtils";
+import { waitNodeDefaultData } from "./nodes/WaitNode/types";
+import {
+  isMissingRequiredStartUrl,
+  startUrlRequiredIds,
+} from "./workflowEditorUtils";
 
 const start = {
   id: "start",
@@ -172,6 +176,131 @@ describe("isMissingRequiredStartUrl across block types and branches", () => {
     ).toBe(false);
   });
 });
+
+test("startUrlRequiredIds holds exactly the ids isMissingRequiredStartUrl flags", () => {
+  const loop = (id: string, parentId?: string) =>
+    ({
+      id,
+      type: "loop",
+      position: { x: 0, y: 0 },
+      parentId,
+      data: { ...loopNodeDefaultData, label: id },
+    }) as AppNode;
+  const sftp = {
+    id: "sftp",
+    type: "fileDownload",
+    position: { x: 0, y: 0 },
+    data: {
+      ...fileDownloadNodeDefaultData,
+      label: "sftp",
+      sftpSourcePath: "/reports/report.csv",
+    },
+  } as AppNode;
+  const graphs: Array<[AppNode[], Edge[]]> = [
+    [
+      // A page opened two steps back still counts.
+      [
+        start,
+        navigation("opened", { url: "https://example.com" }),
+        sftp,
+        navigation("later"),
+      ],
+      [edge("start", "opened"), edge("opened", "sftp"), edge("sftp", "later")],
+    ],
+    [
+      [
+        start,
+        sftp,
+        navigation("v2", { engine: RunEngine.SkyvernV2 }),
+        navigation("a"),
+        navigation("b"),
+      ],
+      [
+        edge("start", "sftp"),
+        edge("sftp", "v2"),
+        edge("v2", "a"),
+        edge("a", "b"),
+      ],
+    ],
+    [
+      // A loop whose first child opens the page, then a step after the loop.
+      [
+        start,
+        loop("outer"),
+        navigation("in1", {}, "outer"),
+        navigation("in2", {}, "outer"),
+        navigation("after"),
+      ],
+      [edge("start", "outer"), edge("in1", "in2"), edge("outer", "after")],
+    ],
+    [
+      // A loop nested in a loop, both before any page is open.
+      [
+        start,
+        loop("l1"),
+        loop("l2", "l1"),
+        navigation("deep", {}, "l2"),
+        navigation("next"),
+      ],
+      [edge("start", "l1"), edge("l1", "next")],
+    ],
+  ];
+  for (const [nodes, edges] of graphs)
+    expect([...startUrlRequiredIds(nodes, edges)].sort()).toEqual(
+      nodes
+        .filter((node) => isMissingRequiredStartUrl(nodes, edges, node.id))
+        .map((node) => node.id)
+        .sort(),
+    );
+});
+
+// Counts the reads of each edge's ends, so a pass that walks the edges once per step fails on any machine.
+function countedEdges(ids: string[]): { edges: Edge[]; reads: () => number } {
+  let reads = 0;
+  const edges = ["start", ...ids].slice(0, -1).map((source, i) => {
+    const target = ids[i]!;
+    return {
+      id: `${source}-${target}`,
+      get source() {
+        reads += 1;
+        return source;
+      },
+      get target() {
+        reads += 1;
+        return target;
+      },
+    } as Edge;
+  });
+  return { edges, reads: () => reads };
+}
+
+test.each([
+  ["2,000 page-opening steps", 2000, 2000],
+  // A walk that recurses once per step would overflow the stack here.
+  ["20,000 steps that open no page, then one that does", 20000, 1],
+])(
+  "startUrlRequiredIds reads each edge a fixed number of times on a chain of %s",
+  (_case, length, browserSteps) => {
+    const ids = Array.from({ length }, (_, i) => `n${i}`);
+    const firstBrowser = length - browserSteps;
+    const nodes = [
+      start,
+      ...ids.map((id, i) =>
+        i >= firstBrowser
+          ? navigation(id)
+          : ({
+              id,
+              type: "wait",
+              position: { x: 0, y: 0 },
+              data: { ...waitNodeDefaultData, label: id },
+            } as AppNode),
+      ),
+    ];
+    const { edges, reads } = countedEdges(ids);
+    expect([...startUrlRequiredIds(nodes, edges)]).toEqual([ids[firstBrowser]]);
+    expect(reads()).toBeLessThanOrEqual(4 * edges.length);
+  },
+);
 
 describe("getBrowserBlockUrlError", () => {
   test.each([

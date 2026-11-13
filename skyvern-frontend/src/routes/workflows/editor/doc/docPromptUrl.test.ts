@@ -3,7 +3,12 @@ import type { WorkflowBlock } from "../../types/workflowTypes";
 import { isWorkflowBlockNode, type AppNode } from "../nodes";
 import { getElements } from "../workflowEditorUtils";
 import type { DocGraph } from "./docGraphEdits";
-import { docPromptUrlOffer, docShortUrl } from "./docPromptUrl";
+import {
+  docPromptUrlOffer,
+  docShortUrl,
+  docUrlHost,
+  docUrlWithoutUserinfo,
+} from "./docPromptUrl";
 import { block, settings } from "./docTestBlocks";
 
 const step = (type: string, data: Record<string, unknown>) =>
@@ -303,4 +308,51 @@ test("docShortUrl keeps the scheme and host and shortens the path", () => {
   );
   expect(short.startsWith("https://example.com/a/very/")).toBe(true);
   expect(short.endsWith("…")).toBe(true);
+});
+
+test("docUrlHost keeps only the host, and a reference whole", () => {
+  expect(docUrlHost("https://www.example.com/login?next=/home")).toBe(
+    "www.example.com",
+  );
+  expect(docUrlHost("example.com/login")).toBe("example.com");
+  expect(docUrlHost("https://user:pw@example.com/")).toBe("example.com");
+  expect(docUrlWithoutUserinfo("https://user:pw@example.com/a?b=1")).toBe(
+    "https://example.com/a?b=1",
+  );
+  expect(docUrlWithoutUserinfo("https://example.com/a@b")).toBe(
+    "https://example.com/a@b",
+  );
+  expect(docUrlWithoutUserinfo("https://user:pw@{{ host }}/login")).toBe(
+    "https://{{ host }}/login",
+  );
+  expect(docUrlHost("https://user:pw@{{ host }}/login")).toBe(
+    "https://{{ host }}/login",
+  );
+  expect(docUrlWithoutUserinfo("user:pw@{{ host }}")).toBe("{{ host }}");
+  // Userinfo with a literal next to a reference, or after a protocol-relative `//`, is dropped too.
+  for (const [url, stripped, host] of [
+    [
+      "https://{{ username }}:literal-password@example.com/path",
+      "https://example.com/path",
+      "example.com",
+    ],
+    ["https://{{ user }}:hunter2@host/p", "https://host/p", "host"],
+    ["//user:pw@host/p", "//host/p", "host"],
+    ["{{ user }}:{{ pw }}@host/x", "host/x", "host"],
+  ]) {
+    expect(docUrlWithoutUserinfo(url!)).toBe(stripped);
+    expect(docUrlHost(url!)).toBe(host);
+  }
+  // A reference by itself may hold the whole URL, so it is kept.
+  expect(docUrlWithoutUserinfo("{{ a }}@{{ b }}/p")).toBe("{{ a }}@{{ b }}/p");
+  for (const kept of [
+    "{{ base }}/x?email=a@b.com",
+    "https://{{ host }}/p@q",
+    "{{ url }}",
+  ])
+    expect(docUrlWithoutUserinfo(kept)).toBe(kept);
+  expect(docUrlHost("{{ start_url }}")).toBe("{{ start_url }}");
+  expect(docUrlHost("https://{{ host }}/login")).toBe(
+    "https://{{ host }}/login",
+  );
 });

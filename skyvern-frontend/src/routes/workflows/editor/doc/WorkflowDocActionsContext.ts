@@ -29,6 +29,10 @@ export const WorkflowDocActionsContext = createContext<{
   previousNoteReader: (nodeId: string) => string | undefined;
   // The URL in the step's prompt, offered for its empty URL field.
   promptUrlOffer: (node: AppNode) => DocPromptUrlOffer | null;
+  // The step is the first to open a page and has no URL yet, so a run would fail without one.
+  opensFirstPage: (id: string) => boolean;
+  // The step's lines can be edited where the Doc shows it, so its unset key settings are dashed chips.
+  stepLinesEditable: (id: string) => boolean;
   // Each placed step's number, from docStepNumbers over the whole tree.
   stepNumbers: ReadonlyMap<string, string>;
   selectBranch: (conditionalId: string, branchId: string) => void;
@@ -71,6 +75,8 @@ export const WorkflowDocActionsContext = createContext<{
   selectedBranch: () => undefined,
   previousNoteReader: () => undefined,
   promptUrlOffer: () => null,
+  opensFirstPage: () => false,
+  stepLinesEditable: () => false,
   stepNumbers: new Map(),
   selectBranch: () => {},
   loopOpen: () => true,

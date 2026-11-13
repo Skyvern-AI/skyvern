@@ -21,7 +21,8 @@ import {
 import { humanizeKey, reviewFieldValue } from "../panels/workflowReviewDiff";
 import { createNode, getWorkflowBlocks } from "../workflowEditorUtils";
 import { docDetailsText } from "./docDetailsText";
-import { DOC_FIELD_MAP } from "./docFieldMap";
+import type { DocItem } from "./buildDocTree";
+import { DOC_FIELD_MAP, type DocFieldMeta } from "./docFieldMap";
 import { getDocFilledProseFields, getDocProseFields } from "./docStepRegistry";
 import { taskv2NodeDefaultData } from "../nodes/Taskv2Node/types";
 
@@ -47,6 +48,8 @@ export type DocSettingRow = {
   unset?: boolean;
   // A key setting whose saved value differs from a new step's.
   changed?: boolean;
+  meta?: DocFieldMeta;
+  addLabel?: string;
 };
 
 // Saved keys a step shows outside Details (its title, list, branches, wait, notes) or that only the editor writes.
@@ -85,16 +88,84 @@ export const yamlKey = (key: string) =>
 const MAX_VALUE = 200;
 
 /** The saved keys of the lines a step shows with Details closed, as the step renders them when no line is being edited. */
-export function docStepLineKeys(node: AppNode, editable: boolean): string[] {
+export function docStepLineKeys(
+  node: AppNode,
+  editable: boolean,
+  metaKeys: readonly string[] = [],
+): string[] {
   const fields = getDocProseFields(node);
-  if (!fields.length) return ["description"];
+  if (!fields.length) return ["description", ...metaKeys];
   const filled = getDocFilledProseFields(node);
   // While editing, the first field is the step's text even when empty; read-only, the first filled one is.
   const main = editable ? fields[0]! : (filled[0] ?? fields[0]!);
   const mainEmpty = !filled.some((f) => f.key === main.key);
-  return [main.key, ...(mainEmpty ? filled.map((f) => f.key) : [])].map(
-    yamlKey,
+  return [
+    ...[main.key, ...(mainEmpty ? filled.map((f) => f.key) : [])].map(yamlKey),
+    ...metaKeys,
+  ];
+}
+
+/** A step's key settings split into its summary line (each set one and, where it gets a dashed chip, an unset one; at
+ * most two) and Details. An unset first-page field on a step that inherits the open page is in neither, unless a
+ * proposal changed it. */
+export function docSettingRowsSplit(
+  rows: readonly DocSettingRow[],
+  editable: boolean,
+  opensFirstPage: boolean,
+  proposed: (key: string) => boolean = () => false,
+): { line: DocSettingRow[]; details: DocSettingRow[] } {
+  const shown = rows.filter(
+    ({ key, meta, unset }) =>
+      !(unset && meta?.emptyChip === "firstPage" && !opensFirstPage) ||
+      proposed(key),
   );
+  const line = shown
+    .filter(
+      ({ meta, unset }) =>
+        meta &&
+        (!unset ||
+          (editable &&
+            (meta.emptyChip === "always" || meta.emptyChip === "firstPage"))),
+    )
+    .slice(0, 2);
+  return { line, details: shown.filter((row) => !line.includes(row)) };
+}
+
+// No `proposed` here: its callers read it for fix lines, and the editor has none while a proposal is shown.
+export function docMetaLineKeys(
+  node: AppNode,
+  loginCredentialKeys: ReadonlySet<string>,
+  editable: boolean,
+  opensFirstPage: boolean,
+): string[] {
+  return docSettingRowsSplit(
+    docKeySettings(node, loginCredentialKeys),
+    editable,
+    opensFirstPage,
+  ).line.map((row) => row.key);
+}
+
+/** The ids of the steps whose lines can be edited where the Doc shows them, as DocScope decides it for each step. */
+export function docEditableStepIds(
+  items: readonly DocItem[],
+  byId: ReadonlyMap<string, AppNode>,
+  editable: boolean,
+): Set<string> {
+  const ids = new Set<string>();
+  const visit = (list: readonly DocItem[], readOnly: boolean) => {
+    for (const item of list) {
+      if (item.kind === "note" || item.kind === "unplaced") continue;
+      const node = byId.get(item.nodeId);
+      const inner = readOnly || Boolean(item.readOnlyReason);
+      if (!inner && node && isWorkflowBlockNode(node) && node.data.editable)
+        ids.add(item.nodeId);
+      if (item.kind === "loop") visit(item.children, inner);
+      if (item.kind === "conditional")
+        for (const branch of item.branches) visit(branch.children, inner);
+    }
+  };
+  if (editable) visit(items, false);
+  return ids;
 }
 
 /** Whether a saved key shows on the step with Details closed: its lines, title, list, branches, wait or notes. */
@@ -267,6 +338,8 @@ export function docKeySettings(
         label: spec.label,
         value: value === null ? spec.empty : shortValue(value),
         unset: value === null,
+        meta: spec.meta,
+        addLabel: spec.addLabel,
         changed:
           value !== null &&
           (changedKeys?.some((key) => spec.keys.includes(key)) ?? true),

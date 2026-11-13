@@ -182,14 +182,22 @@ export function docStepProblems(
   );
 }
 
+// A step's own editability, as the Doc shows it: a step in a read-only section has no settings to open.
+type StepEditable = boolean | ((id: string) => boolean);
+
+const editableAt = (editable: StepEditable, id: string) =>
+  typeof editable === "function" ? editable(id) : editable;
+
 export function docStepFixes(
   nodes: AppNode[],
-  editable = true,
+  editable: StepEditable = true,
+  metaKeys?: (node: AppNode) => readonly string[],
 ): Map<string, DocStepFix[]> {
   const problems = new Map<string, DocStepFix[]>();
   for (const node of nodes) {
     if (!isWorkflowBlockNode(node)) continue;
     const data = node.data as Record<string, unknown>;
+    const stepEditable = editableAt(editable, node.id);
     const found: DocStepFix[] = [];
     const listFix = (message: string) =>
       found.push({ message, field: "loop_variable_reference" });
@@ -227,9 +235,12 @@ export function docStepFixes(
       })
     )
       found.push({
-        message: docDetailsText.noCredential(editable),
+        message: docDetailsText.noCredential(
+          stepEditable,
+          Boolean(metaKeys?.(node).includes("parameter_keys")),
+        ),
         // A read-only Doc's Details has no way to choose a credential, so it is not opened for this.
-        field: editable ? "parameter_keys" : null,
+        field: stepEditable ? "parameter_keys" : null,
       });
     if (found.length) problems.set(node.id, found);
   }
@@ -282,8 +293,11 @@ export function docProblemEntries({
   fixes,
   problems,
   editable,
+  metaKeys,
 }: {
   nodes: AppNode[];
+  // The key settings a step shows on its summary line, which a fix finds there and not in Details.
+  metaKeys?: (node: AppNode) => readonly string[];
   items: DocItem[];
   fixes: ReadonlyMap<string, DocStepFix[]>;
   problems: ReadonlyArray<{
@@ -293,7 +307,7 @@ export function docProblemEntries({
     message: string;
     severity?: "error" | "warning";
   }>;
-  editable: boolean;
+  editable: StepEditable;
 }): DocProblemEntry[] {
   const idsByLabel = new Map(nodes.map((node) => [node.data.label, node.id]));
   const byId = new Map(nodes.map((node) => [node.id, node]));
@@ -302,7 +316,15 @@ export function docProblemEntries({
     const node = nodeId === null ? undefined : byId.get(nodeId);
     return (
       Boolean(node && field) &&
-      !docStepShowsKey(node!, field!, docStepLineKeys(node!, editable))
+      !docStepShowsKey(
+        node!,
+        field!,
+        docStepLineKeys(
+          node!,
+          editableAt(editable, node!.id),
+          metaKeys?.(node!),
+        ),
+      )
     );
   };
   // A check that couldn't reach the server leaves problems from an older draft: shown, but Run does not ask about them.
