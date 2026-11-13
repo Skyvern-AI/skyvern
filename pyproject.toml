@@ -61,6 +61,8 @@ local = [
     "tiktoken>=0.13.0",
     "anthropic>=0.122.0,<0.123",
     "google-cloud-aiplatform>=1.164.0,<2",
+    "grpcio>=1.83.0",
+    "grpcio-status>=1.83.0",
     "google-auth>=2.56.3,<3",
     "google-auth-oauthlib>=1.4.0,<2",
     "onepassword-sdk==0.4.1",
@@ -138,6 +140,8 @@ server = [
     "tiktoken>=0.13.0",
     "anthropic>=0.122.0,<0.123",
     "google-cloud-aiplatform>=1.164.0,<2",
+    "grpcio>=1.83.0",
+    "grpcio-status>=1.83.0",
     "google-auth>=2.56.3,<3",
     "google-auth-oauthlib>=1.4.0,<2",
     "onepassword-sdk==0.4.1",
@@ -284,6 +288,12 @@ constraint-dependencies = [
     "cryptography>=48.0.1",
     "flask>=3.1.3",
     "fsspec>=2026.6.0",
+    # google-api-core warns at import below grpcio 1.83.0 (no Post-Quantum
+    # Cryptography), and Google Cloud packages enforce the floor in April 2027.
+    # Raised here, not by bumping grpcio-tools: grpcio-tools >= 1.83 needs
+    # protobuf >= 7, which google-cloud-aiplatform caps below.
+    "grpcio>=1.83.0",
+    "grpcio-status>=1.83.0",
     "idna>=3.15",
     "joserfc>=1.6.8",
     "jupyter-server>=2.21.0",

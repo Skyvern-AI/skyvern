@@ -9,6 +9,7 @@ from skyvern.exceptions import (
     ActionDeadlineExceeded,
     MissingBrowserStatePage,
     MissingElement,
+    MissingElementDict,
     ScrapingFailed,
     ScreenshotPageHasNoDrawnArea,
     ScreenshotTargetClosed,
@@ -420,7 +421,7 @@ async def _run_sdk_action(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="The browser had no page left to act on before the action could complete.",
             )
-        except MissingElement as e:
+        except (MissingElement, MissingElementDict) as e:
             await app.DATABASE.tasks.update_task(
                 task_id=task.task_id,
                 organization_id=organization_id,
@@ -435,7 +436,12 @@ async def _run_sdk_action(
             )
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                detail="The element the action targeted was not found on the page. An earlier action may have removed it.",
+                detail=(
+                    "The chosen element is not in the page's current snapshot. "
+                    "Retry the action or describe the target more specifically."
+                    if isinstance(e, MissingElementDict)
+                    else "The element the action targeted was not found on the page. An earlier action may have removed it."
+                ),
             )
         except ActionDeadlineExceeded as e:
             await app.DATABASE.tasks.update_task(

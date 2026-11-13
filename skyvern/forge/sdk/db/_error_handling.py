@@ -45,6 +45,22 @@ def register_passthrough_exception(exc_type: type[Exception]) -> None:
         _PASSTHROUGH_EXCEPTIONS = (*_PASSTHROUGH_EXCEPTIONS, exc_type)
 
 
+def _masked_cancellation(exc: BaseException, cancellations_before: int) -> asyncio.CancelledError | None:
+    # SQLAlchemy's psycopg pre-ping restores autocommit in a `finally`, replacing a mid-ping cancellation with
+    # "can't change 'autocommit' now"; return the original, since anyio scopes only absorb their own CancelledError.
+    task = asyncio.current_task()
+    if task is None or task.cancelling() <= cancellations_before:
+        return None
+    seen: set[int] = set()
+    ctx = exc.__context__
+    while ctx is not None and id(ctx) not in seen:
+        if isinstance(ctx, asyncio.CancelledError):
+            return ctx
+        seen.add(id(ctx))
+        ctx = ctx.__context__
+    return None
+
+
 def db_operation(
     operation_name: str,
     log_errors: bool = True,
@@ -90,11 +106,20 @@ def db_operation(
 
         @functools.wraps(fn)
         async def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:  # type: ignore[return]
+            task = asyncio.current_task()
+            cancellations_before = task.cancelling() if task is not None else 0
+            if cancellations_before:
+                # A caught cancellation leaves its count behind; deliver any pending request before treating it as stale.
+                await asyncio.sleep(0)
             try:
                 try:
                     return await fn(*args, **kwargs)  # type: ignore[misc]
-                except StatementError as exc:
-                    exc.hide_parameters = True
+                except SQLAlchemyError as exc:
+                    if isinstance(exc, StatementError):
+                        exc.hide_parameters = True
+                    cancellation = _masked_cancellation(exc, cancellations_before)
+                    if cancellation is not None:
+                        raise cancellation from exc
                     raise
             except _PASSTHROUGH_EXCEPTIONS:
                 if log_errors:
