@@ -341,6 +341,20 @@ def reset_copilot_driver_ledgers() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def reset_copilot_tool_window_summarized() -> Iterator[None]:
+    # A sync test that runs the model input filter sets this in the main thread's context, which every later test and
+    # its event loop inherit.
+    def _clear() -> None:
+        enforcement = sys.modules.get("skyvern.forge.sdk.copilot.enforcement")
+        if enforcement is not None:
+            enforcement.TOOL_WINDOW_SUMMARIZED.set(False)
+
+    _clear()
+    yield
+    _clear()
+
+
+@pytest.fixture(autouse=True)
 def restore_interpreter_traceback_hooks() -> Iterator[None]:
     """setup_logger() replaces the three interpreter hooks process-wide.
 

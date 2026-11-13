@@ -31,7 +31,9 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _TOOL_OUTPUT_SUMMARIZE_THRESHOLD,
     KEEP_RECENT_TOOL_OUTPUTS,
     NUDGE_SENTINEL,
+    SCREENSHOT_PLACEHOLDER,
     TOTAL_TIMEOUT_SECONDS,
+    _cap_tool_outputs,
     _mark_copilot_total_timeout,
     _prune_input_list,
     _recover_from_context_overflow,
@@ -49,6 +51,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
 )
 from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion
+from skyvern.forge.sdk.copilot.session_factory import _summarize_older_tool_items
 from skyvern.forge.sdk.copilot.tools import (
     _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
     _analyze_run_blocks,
@@ -875,17 +878,25 @@ async def test_context_overflow_session_rewrite_stores_pair_valid_history(
     session.clear_session.assert_awaited_once()
 
 
-def test_recent_outputs_preserved_full() -> None:
-    # Build KEEP_RECENT_TOOL_OUTPUTS + 1 items so exactly one is "old".
-    items = []
-    short = '{"ok":true,"data":{"overall_status":"completed"}}'
-    for i in range(KEEP_RECENT_TOOL_OUTPUTS + 1):
-        items.append(_fco(f"c{i}", short))
+def test_the_no_session_prune_keeps_every_tool_payload_and_only_the_newest_screenshot() -> None:
+    items: list[dict[str, Any]] = [{"role": "user", "content": "goal"}]
+    for index in range(KEEP_RECENT_TOOL_OUTPUTS + 3):
+        page = {"ok": True, "value": f"Plan {index}: $49 per seat. " * 40, "executed_source_reference": f"src_{index}"}
+        items += [
+            {"type": "function_call", "call_id": f"c{index}", "name": "run_browser_code", "arguments": "x" * 600},
+            _fco(f"c{index}", json.dumps(page)),
+            _reasoning(),
+            {"role": "user", "content": f"[copilot:screenshot] frame {index}"},
+        ]
+    items.append(_fco("c_big", "y" * (_RECENT_TOOL_OUTPUT_CHAR_CAP + 1)))
 
     pruned = _prune_input_list(items)
-    # Each recent item is unchanged (they're all short and JSON).
-    for i in range(1, KEEP_RECENT_TOOL_OUTPUTS + 1):
-        assert pruned[i]["output"] == short
+
+    screenshots = [i for i, item in enumerate(items) if is_screenshot_message(item)]
+    assert [item for i, item in enumerate(pruned) if i not in screenshots[:-1]] == [
+        item for i, item in enumerate(items) if i not in screenshots[:-1]
+    ]
+    assert [pruned[i]["content"] for i in screenshots[:-1]] == [SCREENSHOT_PLACEHOLDER] * (len(screenshots) - 1)
 
 
 def test_recent_code_sized_output_survives_untruncated() -> None:
@@ -895,7 +906,7 @@ def test_recent_code_sized_output_survives_untruncated() -> None:
     assert 2000 < len(code_sized) < _RECENT_TOOL_OUTPUT_CHAR_CAP
     items = [_fco("c0", code_sized)]
 
-    pruned = _prune_input_list(items)
+    pruned = _cap_tool_outputs(items)
     assert pruned[0]["output"] == code_sized
 
 
@@ -906,7 +917,7 @@ def test_old_code_output_synopsis_names_elided_code_size() -> None:
         _fco(f"c{i}", '{"ok":true}') for i in range(KEEP_RECENT_TOOL_OUTPUTS)
     ]
 
-    pruned = _prune_input_list(items)
+    pruned = _summarize_older_tool_items(items)
     synopsis = json.loads(pruned[0]["output"])
     assert synopsis["code_chars_elided"] == len(code)
 
@@ -914,8 +925,8 @@ def test_old_code_output_synopsis_names_elided_code_size() -> None:
 def _prune_twice(old_output: str) -> tuple[dict[str, Any], dict[str, Any]]:
     """Session continuation re-compacts already-summarized outputs; both passes must agree."""
     filler = [_fco(f"c{i}", '{"ok":true}') for i in range(KEEP_RECENT_TOOL_OUTPUTS)]
-    first = _prune_input_list([_fco("c_old", old_output), _reasoning()] + filler)
-    second = _prune_input_list(first)
+    first = _summarize_older_tool_items([_fco("c_old", old_output), _reasoning()] + filler)
+    second = _summarize_older_tool_items(first)
     return json.loads(first[0]["output"]), json.loads(second[0]["output"])
 
 
@@ -993,7 +1004,7 @@ def test_an_evicted_build_test_packet_keeps_its_challenge_facts_and_levers() -> 
         _fco(f"c{i}", '{"ok":true}') for i in range(KEEP_RECENT_TOOL_OUTPUTS)
     ]
 
-    pruned = _prune_input_list(items)
+    pruned = _summarize_older_tool_items(items)
 
     synopsis = json.loads(pruned[0]["output"])
     packet = synopsis.get("build_test_packet", synopsis.get("data", {}).get("build_test_packet"))
@@ -1140,7 +1151,7 @@ def test_an_evicted_frame_only_packet_gains_no_solver_facts_on_the_way_through()
         _fco(f"c{i}", '{"ok":true}') for i in range(KEEP_RECENT_TOOL_OUTPUTS)
     ]
 
-    pruned = _prune_input_list(items)
+    pruned = _summarize_older_tool_items(items)
 
     synopsis = json.loads(pruned[0]["output"])
     packet = synopsis.get("build_test_packet", synopsis.get("data", {}).get("build_test_packet"))
@@ -1172,7 +1183,7 @@ def test_an_evicted_page_evidence_summary_keeps_the_author_time_levers() -> None
         _fco(f"c{i}", '{"ok":true}') for i in range(KEEP_RECENT_TOOL_OUTPUTS)
     ]
 
-    pruned = _prune_input_list(items)
+    pruned = _summarize_older_tool_items(items)
 
     assert pruned[0]["output"] != old_output, "the summarizer must have run"
     summary = json.loads(pruned[0]["output"])
@@ -1224,7 +1235,7 @@ def test_an_evicted_browser_result_keeps_a_bounded_page_state(
         _fco(f"c{i}", '{"ok":true}') for i in range(KEEP_RECENT_TOOL_OUTPUTS)
     ]
 
-    pruned = _prune_input_list(items)
+    pruned = _summarize_older_tool_items(items)
 
     assert pruned[0]["output"] != old_output, "the summarizer must have run"
     assert json.loads(pruned[0]["output"])["page_state"] == expected
@@ -1255,7 +1266,7 @@ def test_page_facts_alone_do_not_push_a_short_result_into_compaction() -> None:
         _fco(f"c{i}", '{"ok":true}') for i in range(KEEP_RECENT_TOOL_OUTPUTS)
     ]
 
-    pruned = _prune_input_list(items)
+    pruned = _summarize_older_tool_items(items)
 
     assert json.loads(pruned[0]["output"])["outcome"] == "solved"
 
@@ -1294,7 +1305,7 @@ def test_old_large_output_is_summarized() -> None:
     for i in range(KEEP_RECENT_TOOL_OUTPUTS):
         items.append(_fco(f"c_new_{i}", '{"ok":true,"data":{"overall_status":"completed"}}'))
 
-    pruned = _prune_input_list(items)
+    pruned = _summarize_older_tool_items(items)
     summarized = pruned[0]["output"]
     # The summary must be drastically shorter than the original.
     assert len(summarized) < 1000
@@ -1322,19 +1333,12 @@ def test_summarize_short_output_is_unchanged() -> None:
 
 
 def test_recent_large_output_is_head_truncated_not_summarized() -> None:
-    import structlog.testing
-
-    # Over-cap JSON in the most-recent slot should be head-truncated,
-    # NOT replaced with a summary.
     large = '{"ok":true,"data":{"value":"' + ("y" * (_RECENT_TOOL_OUTPUT_CHAR_CAP + 1000)) + '"}}'
-    items = [_fco("c_recent", large)]
-    with structlog.testing.capture_logs() as logs:
-        pruned = _prune_input_list(items)
+    pruned = _summarize_older_tool_items([_fco("c_recent", large)])
     out = pruned[0]["output"]
     assert out.startswith('{"ok":true,')
     assert out.endswith("\n... [truncated]")
     assert len(out) <= _RECENT_TOOL_OUTPUT_CHAR_CAP + 20
-    assert any(entry["event"] == "copilot_recent_tool_output_truncated" for entry in logs)
 
 
 def _run_results_call(call_id: str) -> dict[str, str]:
@@ -1361,7 +1365,7 @@ def test_a_parallel_batch_the_model_has_not_read_is_never_summarized(trailing: l
     assert len(outputs) > KEEP_RECENT_TOOL_OUTPUTS
     assert all(len(output) > _TOOL_OUTPUT_SUMMARIZE_THRESHOLD for output in outputs)
 
-    pruned = _prune_input_list(items)
+    pruned = _summarize_older_tool_items(items)
 
     assert [item["output"] for item in pruned if item.get("type") == "function_call_output"] == outputs
 
@@ -1375,7 +1379,7 @@ def test_a_parallel_batch_the_model_has_not_read_is_never_summarized(trailing: l
     ],
 )
 def test_outputs_the_model_has_read_go_back_through_the_recent_window(items: list[dict[str, Any]]) -> None:
-    pruned = _prune_input_list([{"role": "user", "content": "goal"}, *items])
+    pruned = _summarize_older_tool_items([{"role": "user", "content": "goal"}, *items])
 
     outputs = [item["output"] for item in pruned if item.get("type") == "function_call_output"]
     assert ["_summarized" in output for output in outputs] == [True, True, False, False, False]
@@ -1398,7 +1402,7 @@ def test_an_unread_output_over_the_cap_is_still_head_cut_and_logged_with_its_too
     items = [_reasoning(), _run_results_call("c_big"), _fco("c_big", large)]
 
     with capture_logs() as logs:
-        pruned = _prune_input_list(items)
+        pruned = _cap_tool_outputs(items)
 
     assert pruned[2]["output"].endswith("\n... [truncated]")
     event = next(entry for entry in logs if entry["event"] == "copilot_recent_tool_output_truncated")
@@ -1809,26 +1813,6 @@ def test_aggressive_prune_keeps_a_loaded_skill_whole_and_paired(filler_after: in
     assert len(_call_ids(pruned, "function_call")) == len(set(_call_ids(pruned, "function_call")))
     validity = [log for log in logs if log["event"] == "copilot_aggressive_prune_pair_validity"]
     assert validity[0]["retained_skill_pairs"] == (0 if filler_after == 2 else 1)
-
-
-def test_prune_input_list_keeps_an_old_skill_output_whole_and_summarizes_reads() -> None:
-    skill = load_skill_items("call_skill", "example-portal-login", "x" * 6_000)
-    read_output = json.dumps(
-        {"ok": True, "data": {"name": "example-portal-login", "path": "a.md", "text": "y" * 6_000}}
-    )
-    history = [
-        {"role": "user", "content": "goal"},
-        *skill,
-        {"type": "function_call", "call_id": "call_read", "name": "read_skill_resource", "arguments": "{}"},
-        _fco("call_read", read_output),
-        *_filler_pairs(0, KEEP_RECENT_TOOL_OUTPUTS),
-        _reasoning(),
-    ]
-
-    pruned = _prune_input_list(history)
-
-    assert pruned[3]["output"] == skill[2]["output"]
-    assert pruned[5]["output"] != read_output
 
 
 def test_aggressive_prune_keeps_the_shared_reasoning_of_a_parallel_skill_call() -> None:
