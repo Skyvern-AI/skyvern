@@ -33,6 +33,7 @@ from PIL import Image
 from playwright.async_api import Page, Route, async_playwright
 
 from skyvern.forge import app as forge_app
+from skyvern.forge.sdk.agents.skills import AvailableSkill, SkillOwner, SkillPackage, SkillSession
 from skyvern.forge.sdk.api.llm import api_handler_factory
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot import agent as copilot_agent
@@ -89,6 +90,7 @@ from skyvern.forge.sdk.copilot.tools import reply_ends_turn, reply_tool
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
 from skyvern.forge.sdk.copilot.tools.credentials import _resolve_exact_credential
+from skyvern.forge.sdk.copilot.tools.skills import load_skill
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml as process_workflow_yaml
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -1538,6 +1540,31 @@ def sent_image_px(message: Any) -> list[tuple[int, int]]:
         Image.open(io.BytesIO(base64.b64decode(part["image_url"].partition(";base64,")[2]))).size
         for part in (content if isinstance(content, list) else [])
         if part.get("type") == "input_image"
+    ]
+
+
+def skill_md(name: str, body: str = "Body\n", description: str = "Log in to the example.com portal.") -> str:
+    return f"---\nname: {name}\ndescription: {description}\n---\n{body}"
+
+
+def available_skill(
+    name: str, owner: SkillOwner, body: str, description: str = "Log in to the example.com portal.", **files: str
+) -> AvailableSkill:
+    package = SkillPackage.from_files({"SKILL.md": skill_md(name, body, description), **files})
+    return AvailableSkill(package=package, owner=owner, version=package.version)
+
+
+def load_skill_items(call_id: str, name: str, body: str) -> list[dict[str, Any]]:
+    """A reasoning item, a load_skill call and its real body-carrying output."""
+    session = SkillSession([available_skill(name, "organization", body)], agent="copilot")
+    return [
+        {"type": "reasoning", "summary": [{"type": "summary_text", "text": "Load the skill."}]},
+        {"type": "function_call", "call_id": call_id, "name": "load_skill", "arguments": json.dumps({"name": name})},
+        {
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": json.dumps(load_skill(session, name), ensure_ascii=False),
+        },
     ]
 
 

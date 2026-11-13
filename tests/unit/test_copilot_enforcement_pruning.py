@@ -18,6 +18,7 @@ import pytest
 from structlog.testing import capture_logs
 
 from skyvern.config import Settings, settings
+from skyvern.forge.sdk.agents.skills import MAX_SKILL_RESULT_CHARS
 from skyvern.forge.sdk.copilot import enforcement as enforcement_module
 from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 from skyvern.forge.sdk.copilot.config import (
@@ -58,7 +59,7 @@ from skyvern.forge.sdk.copilot.tools._shared import TOTAL_TIMEOUT_SECONDS as sha
 from skyvern.forge.sdk.copilot.tools.workflow_update import _PERSISTENCE_MESSAGES
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from tests.unit._mcp_browser_fakes import page_crash_entry
-from tests.unit.copilot_test_helpers import make_copilot_ctx
+from tests.unit.copilot_test_helpers import load_skill_items, make_copilot_ctx
 
 
 class _Ctx:
@@ -1780,3 +1781,74 @@ def test_repeated_compaction_preserves_page_evidence_for_fallback() -> None:
     once = _summarize_tool_output(payload)
     assert "page_evidence" in json.loads(once)
     assert _summarize_tool_output(once) == once
+
+
+def _filler_pairs(start: int, count: int) -> list[dict[str, Any]]:
+    return [
+        item for index in range(start, start + count) for item in (_fc(f"call_{index}"), _fco(f"call_{index}", "x"))
+    ]
+
+
+@pytest.mark.parametrize(
+    ("filler_after", "split_at_boundary"),
+    [(10, False), (3, True), (2, False)],
+    ids=["pair_before_tail", "output_alone_in_tail", "whole_pair_in_tail"],
+)
+def test_aggressive_prune_keeps_a_loaded_skill_whole_and_paired(filler_after: int, split_at_boundary: bool) -> None:
+    skill = load_skill_items("call_skill", "example-portal-login", "Tick 'Remember this device'.\n" * 400)
+    history = [{"role": "user", "content": "goal"}, *_filler_pairs(100, 3), *skill, *_filler_pairs(0, filler_after)]
+    tail_starts_at_output = history.index(skill[2]) == len(history) - 7
+    assert tail_starts_at_output is split_at_boundary
+
+    with capture_logs() as logs:
+        pruned = aggressive_prune(history)
+
+    assert [item for item in pruned if item is skill[2]] == [skill[2]]
+    assert pruned.index(skill[0]) + 1 == pruned.index(skill[1]) == pruned.index(skill[2]) - 1
+    assert _orphaned_tool_result_ids(pruned) == []
+    assert len(_call_ids(pruned, "function_call")) == len(set(_call_ids(pruned, "function_call")))
+    validity = [log for log in logs if log["event"] == "copilot_aggressive_prune_pair_validity"]
+    assert validity[0]["retained_skill_pairs"] == (0 if filler_after == 2 else 1)
+
+
+def test_prune_input_list_keeps_an_old_skill_output_whole_and_summarizes_reads() -> None:
+    skill = load_skill_items("call_skill", "example-portal-login", "x" * 6_000)
+    read_output = json.dumps(
+        {"ok": True, "data": {"name": "example-portal-login", "path": "a.md", "text": "y" * 6_000}}
+    )
+    history = [
+        {"role": "user", "content": "goal"},
+        *skill,
+        {"type": "function_call", "call_id": "call_read", "name": "read_skill_resource", "arguments": "{}"},
+        _fco("call_read", read_output),
+        *_filler_pairs(0, KEEP_RECENT_TOOL_OUTPUTS),
+        _reasoning(),
+    ]
+
+    pruned = _prune_input_list(history)
+
+    assert pruned[3]["output"] == skill[2]["output"]
+    assert pruned[5]["output"] != read_output
+
+
+def test_aggressive_prune_keeps_the_shared_reasoning_of_a_parallel_skill_call() -> None:
+    reasoning, skill_call, skill_output = load_skill_items("call_skill", "example-portal-login", "Tick it.\n" * 400)
+    history = [
+        {"role": "user", "content": "goal"},
+        *_filler_pairs(100, 3),
+        reasoning,
+        _fc("call_parallel"),
+        skill_call,
+        _fco("call_parallel", "x"),
+        skill_output,
+        *_filler_pairs(0, 10),
+    ]
+
+    pruned = aggressive_prune(history)
+
+    assert pruned.index(reasoning) + 1 == pruned.index(skill_call) == pruned.index(skill_output) - 1
+    assert _orphaned_tool_result_ids(pruned) == []
+
+
+def test_one_whole_skill_result_fits_under_the_recent_output_cap() -> None:
+    assert MAX_SKILL_RESULT_CHARS < _RECENT_TOOL_OUTPUT_CHAR_CAP
