@@ -1038,6 +1038,9 @@ class WorkflowCopilotBlockProgressUpdate(BaseModel):
         description="Dispatched run id for this block; lets the FE fetch recorded actions live during execution. "
         "Optional for backward compatibility with clients that only read the run id from run_outcome.",
     )
+    parent_workflow_run_block_id: str | None = Field(
+        None, description="Run-block id of the block that ran this one (an agent step, loop or code-block fallback)"
+    )
     block_label: str = Field(..., description="Workflow block label (e.g. 'enter_name')")
     block_type: str = Field(..., description="Workflow block type (e.g. 'navigation', 'extraction')")
     status: str = Field(

@@ -135,6 +135,7 @@ vi.mock("../hooks/useWorkflowRunQuery", () => ({
   useWorkflowRunQuery: ({ workflowRunId }: { workflowRunId?: string }) => ({
     data: workflowRunId ? focusedRun.current : undefined,
   }),
+  useWorkflowRunByIdQuery: () => ({ data: undefined, isError: false }),
 }));
 
 vi.mock(
@@ -265,6 +266,211 @@ const runStartedFrame = (overrides: Partial<Record<string, unknown>> = {}) => ({
   ...overrides,
 });
 
+const agentStepCall = (index: number, status: string, goal: string) => ({
+  index,
+  tool: "page_extract",
+  status,
+  started_at: `2026-06-10T00:00:0${index + 1}Z`,
+  finished_at: status === "running" ? null : `2026-06-10T00:00:0${index + 2}Z`,
+  arguments: JSON.stringify({ prompt: goal }),
+});
+
+const agentStepTimeline = (
+  steps: Array<{ id: string; label: string; status: string; calls: unknown[] }>,
+) => ({
+  data: steps.map((step) => ({
+    type: "block",
+    block: {
+      workflow_run_block_id: step.id,
+      block_type: "agent_step",
+      label: step.label,
+      status: step.status,
+      actions: [],
+      tool_calls: step.calls,
+    },
+    children: [],
+    thought: null,
+    created_at: "2026-06-10T00:00:00Z",
+    modified_at: "2026-06-10T00:00:00Z",
+  })),
+});
+
+const agentStepFrame = (id: string, label: string, status: string) =>
+  blockProgressFrame({
+    workflow_run_id: "wr_1",
+    workflow_run_block_id: id,
+    block_label: label,
+    block_type: "agent_step",
+    status,
+  });
+
+function seedReloadedAgentStepTurn() {
+  const activity = (kind: "tool_call" | "tool_result", second: number) => ({
+    kind,
+    text: "Testing workflow",
+    iteration: 0,
+    toolName: "run_blocks_and_collect_debug",
+    displayLabel: "Testing workflow",
+    id: `${kind === "tool_call" ? "tc" : "tr"}-call_test_end_to_end_turn-1`,
+    timestamp: `2026-06-10T00:00:${second}Z`,
+    activityStartedAt: "2026-06-10T00:00:00Z",
+    activityBucket: { kind: "design" },
+    ...(kind === "tool_result" ? { success: true, workflowRunId: "wr_1" } : {}),
+  });
+  const savedBlock = (
+    id: string,
+    label: string,
+    blockType: string,
+    extra: Record<string, unknown> = {},
+  ) => ({
+    label,
+    workflowRunBlockId: id,
+    workflowRunId: "wr_1",
+    blockType,
+    state: "completed",
+    lastSeenIteration: 0,
+    activity: [],
+    startedAt: "2026-06-10T00:00:01Z",
+    endedAt: "2026-06-10T00:00:20Z",
+    ...extra,
+  });
+  historyResponse.data = {
+    workflow_copilot_chat_id: "chat_1",
+    chat_history: [
+      {
+        sender: "user",
+        content: "test it",
+        created_at: "2026-06-10T00:00:00Z",
+      },
+      {
+        sender: "ai",
+        content: "Tested the workflow.",
+        created_at: "2026-06-10T00:00:30Z",
+        narrative_payload: {
+          turnId: "turn-1",
+          turnIndex: 0,
+          designStarted: true,
+          designEnded: true,
+          draft: null,
+          terminal: "response",
+          terminalMessage: "Tested the workflow.",
+          narrativeSummary: "Tested the workflow.",
+          designActivity: [
+            activity("tool_call", 0),
+            activity("tool_result", 25),
+          ],
+          blocks: [
+            savedBlock("wrb_step", "research", "agent_step"),
+            savedBlock("wrb_child", "research_task_1", "task_v2", {
+              parentWorkflowRunBlockId: "wrb_step",
+            }),
+          ],
+        },
+      },
+    ],
+    proposed_workflow: null,
+    auto_accept: false,
+  };
+}
+
+// The step finished one call; its child recorded an action the reloaded child card must not gain.
+function reloadedAgentStepTimeline() {
+  const timeline = agentStepTimeline([
+    {
+      id: "wrb_step",
+      label: "research",
+      status: "completed",
+      calls: [agentStepCall(0, "completed", "Step call goal")],
+    },
+  ]);
+  timeline.data[0]!.children = [
+    {
+      type: "block",
+      block: {
+        workflow_run_block_id: "wrb_child",
+        block_type: "task_v2",
+        label: "research_task_1",
+        status: "completed",
+        actions: [
+          {
+            action_id: "child_a1",
+            action_type: "wobble_gizmo",
+            status: "completed",
+            task_id: null,
+            step_id: null,
+            step_order: null,
+            action_order: 0,
+            confidence_float: null,
+            description: null,
+            reasoning: "Child action reasoning",
+            intention: null,
+            response: null,
+            created_by: null,
+            text: null,
+            output: { duration_ms: 120 },
+          },
+        ],
+      },
+      children: [],
+      thought: null,
+      created_at: "2026-06-10T00:00:00Z",
+      modified_at: "2026-06-10T00:00:00Z",
+    },
+  ] as never[];
+  return timeline;
+}
+
+async function openReloadedStepCard() {
+  await waitFor(() =>
+    expect(screen.getByText("Tested the workflow.")).toBeTruthy(),
+  );
+  const fold = screen.queryByRole("button", { name: /^Worked through/ });
+  if (fold !== null && fold.getAttribute("aria-expanded") !== "true") {
+    fireEvent.click(fold);
+  }
+  document
+    .querySelectorAll<HTMLElement>('[data-activity-line="true"]')
+    .forEach((line) => {
+      if (line.getAttribute("aria-expanded") === "false") {
+        fireEvent.click(line);
+      }
+    });
+  const step = screen.getAllByTestId("copilot-test-card")[0]!;
+  fireEvent.click(within(step).getAllByRole("button")[0]!);
+}
+
+async function startDesignTurn() {
+  await renderChat();
+  await submit("build a workflow");
+  streamCalls[0]!.onMessage({
+    type: "turn_start",
+    turn_id: "turn-1",
+    turn_index: 0,
+    mode: "build",
+    timestamp: "2026-06-10T00:00:00Z",
+  });
+  streamCalls[0]!.onMessage({
+    type: "design_start",
+    timestamp: "2026-06-10T00:00:00Z",
+  });
+}
+
+async function endTurnWithRunLive() {
+  streamCalls[0]!.onMessage({
+    type: "response",
+    workflow_copilot_chat_id: "chat_1",
+    message: "Ran out of time.",
+    response_time: "2026-06-10T00:00:06Z",
+    proposal_disposition: "no_proposal",
+    turn_id: "turn-1",
+    narrative_payload: null,
+  });
+  await act(async () => streamCalls[0]!.resolve());
+  await waitFor(() =>
+    expect(screen.getAllByText("Ran out of time.").length).toBeGreaterThan(0),
+  );
+}
+
 beforeEach(() => {
   switchStudioRun.mockClear();
   navigate.mockClear();
@@ -357,6 +563,42 @@ describe("WorkflowCopilotChat — recorded-action live poll wiring", () => {
       streamCalls[0]!.onMessage(runOutcomeFrame({ verdict: "demonstrated" }));
       await waitFor(() => expect(timelineGet).toHaveBeenCalledTimes(2));
       expect(clearIntervalSpy).toHaveBeenCalledWith(intervalId);
+    } finally {
+      setIntervalSpy.mockRestore();
+      clearIntervalSpy.mockRestore();
+    }
+  });
+
+  it("stops its own poll when the turn ends with the run still live", async () => {
+    const clearIntervalSpy = vi.spyOn(window, "clearInterval");
+    const setIntervalSpy = vi.spyOn(window, "setInterval");
+    try {
+      await renderChat();
+      await submit("build a workflow");
+
+      streamCalls[0]!.onMessage(
+        blockProgressFrame({ workflow_run_id: "wr_1" }),
+      );
+      await waitFor(() => expect(timelineGet).toHaveBeenCalledTimes(1));
+      const idx = setIntervalSpy.mock.calls.findIndex((c) => c[1] === 2500);
+      const intervalId = setIntervalSpy.mock.results[idx]!.value;
+      expect(clearIntervalSpy).not.toHaveBeenCalledWith(intervalId);
+
+      streamCalls[0]!.onMessage({
+        type: "response",
+        workflow_copilot_chat_id: "chat_1",
+        message: "Ran out of time.",
+        response_time: "2026-06-10T00:00:06Z",
+        proposal_disposition: "no_proposal",
+        turn_id: "turn-1",
+        narrative_payload: null,
+      });
+      await act(async () => streamCalls[0]!.resolve());
+
+      await waitFor(() =>
+        expect(clearIntervalSpy).toHaveBeenCalledWith(intervalId),
+      );
+      expect(timelineGet).toHaveBeenCalledTimes(1);
     } finally {
       setIntervalSpy.mockRestore();
       clearIntervalSpy.mockRestore();
@@ -640,6 +882,375 @@ describe("WorkflowCopilotChat — recorded-action live poll wiring", () => {
     fireEvent.click(within(statusRegion).getByText("Block 1"));
 
     await waitFor(() => expect(screen.getByText("Wobble Gizmo")).toBeTruthy());
+  });
+
+  it("drops an older timeline response that resolves after a newer one, so the step keeps its nested child", async () => {
+    const pending: Array<(value: { data: unknown[] }) => void> = [];
+    timelineGet.mockImplementation(
+      () => new Promise((resolve) => pending.push(resolve)),
+    );
+    const timeline = (childId: string | null) => ({
+      data: [
+        {
+          type: "block",
+          block: {
+            workflow_run_block_id: "wrb_step",
+            block_type: "agent_step",
+            label: "research",
+            status: "running",
+            actions: [],
+            tool_calls: [
+              {
+                index: 0,
+                tool: "browser_task",
+                status: "running",
+                started_at: "2026-06-10T00:00:01Z",
+                finished_at: null,
+                arguments: '{"navigation_goal": "Click Start"}',
+                block_type: "task_v2",
+                label: "research_task_1",
+                child_workflow_run_block_id: childId,
+              },
+            ],
+          },
+          children: [],
+          thought: null,
+          created_at: "2026-06-10T00:00:00Z",
+          modified_at: "2026-06-10T00:00:00Z",
+        },
+      ],
+    });
+    const setIntervalSpy = vi.spyOn(window, "setInterval");
+    try {
+      await renderChat();
+      await submit("build a workflow");
+      streamCalls[0]!.onMessage({
+        type: "turn_start",
+        turn_id: "turn-1",
+        turn_index: 0,
+        mode: "build",
+        timestamp: "2026-06-10T00:00:00Z",
+      });
+      streamCalls[0]!.onMessage({
+        type: "design_start",
+        timestamp: "2026-06-10T00:00:00Z",
+      });
+      streamCalls[0]!.onMessage({
+        type: "block_progress",
+        workflow_run_id: "wr_1",
+        workflow_run_block_id: "wrb_step",
+        block_label: "research",
+        block_type: "agent_step",
+        status: "running",
+        iteration: 0,
+        timestamp: "2026-06-10T00:00:00Z",
+      });
+      streamCalls[0]!.onMessage({
+        type: "block_progress",
+        workflow_run_id: "wr_1",
+        workflow_run_block_id: "wrb_child",
+        block_label: "research_task_1",
+        block_type: "task_v2",
+        status: "running",
+        iteration: 0,
+        timestamp: "2026-06-10T00:00:02Z",
+      });
+      await waitFor(() => expect(timelineGet).toHaveBeenCalledTimes(1));
+      const tick = setIntervalSpy.mock.calls.find((c) => c[1] === 2500)![0] as (
+        ...args: unknown[]
+      ) => void;
+      tick();
+      await waitFor(() => expect(timelineGet).toHaveBeenCalledTimes(2));
+
+      await act(async () => pending[1]!(timeline("wrb_child")));
+      await act(async () => pending[0]!(timeline(null)));
+
+      await waitFor(() =>
+        expect(
+          screen.getAllByTestId("copilot-test-card")[0]!.textContent,
+        ).toContain("Click Start"),
+      );
+      const cards = screen.getAllByTestId("copilot-test-card");
+      expect(cards).toHaveLength(2);
+      expect(
+        cards[1]!.parentElement!.closest('[data-testid="copilot-test-card"]'),
+      ).toBe(cards[0]);
+    } finally {
+      setIntervalSpy.mockRestore();
+    }
+  });
+
+  it("nests a reloaded turn's child from its saved parent id and reads the calls with one timeline GET", async () => {
+    seedReloadedAgentStepTurn();
+    timelineGet.mockResolvedValue(reloadedAgentStepTimeline());
+    await renderChat();
+    await openReloadedStepCard();
+
+    const cards = screen.getAllByTestId("copilot-test-card");
+    expect(
+      cards[1]!.parentElement!.closest('[data-testid="copilot-test-card"]'),
+    ).toBe(cards[0]);
+    await waitFor(() => expect(timelineGet).toHaveBeenCalledTimes(1));
+    expect(timelineGet.mock.calls[0]![0]).toBe(
+      "/workflows/wpid_1/runs/wr_1/timeline",
+    );
+    await waitFor(() =>
+      expect(screen.getByText("Step call goal")).toBeTruthy(),
+    );
+    const child = screen.getAllByTestId("copilot-test-card")[1]!;
+    // A child with action rows folds when finished; open it so its rows would be in the DOM.
+    const childHeader = within(child).getAllByRole("button")[0]!;
+    if (childHeader.getAttribute("aria-expanded") === "false") {
+      fireEvent.click(childHeader);
+    }
+    expect(within(child).queryByText("Child action reasoning")).toBeNull();
+  });
+
+  it("re-reads the calls when the same chat re-hydrates after a read showed the step finished", async () => {
+    seedReloadedAgentStepTurn();
+    timelineGet.mockResolvedValue(reloadedAgentStepTimeline());
+    const view = await renderChat();
+    await openReloadedStepCard();
+    await waitFor(() =>
+      expect(screen.getByText("Step call goal")).toBeTruthy(),
+    );
+    const readsFor = (wpid: string) =>
+      timelineGet.mock.calls.filter(
+        ([url]) => url === `/workflows/${wpid}/runs/wr_1/timeline`,
+      ).length;
+    expect(readsFor("wpid_1")).toBe(1);
+
+    routeParams.current = {
+      ...routeParams.current,
+      workflowPermanentId: "wpid_2",
+    };
+    view.rerender(chatUi());
+    await waitFor(() =>
+      expect(screen.getByText("Tested the workflow.")).toBeTruthy(),
+    );
+    routeParams.current = {
+      ...routeParams.current,
+      workflowPermanentId: "wpid_1",
+    };
+    view.rerender(chatUi());
+    await waitFor(() =>
+      expect(screen.getByText("Tested the workflow.")).toBeTruthy(),
+    );
+    await openReloadedStepCard();
+
+    await waitFor(() => expect(readsFor("wpid_1")).toBe(2));
+    await waitFor(() =>
+      expect(screen.getByText("Step call goal")).toBeTruthy(),
+    );
+  });
+  it("re-reads a step the turn stopped watching when its row reopens after the run ends", async () => {
+    const call = (index: number, tool: string, status: string) => ({
+      index,
+      tool,
+      status,
+      started_at: `2026-06-10T00:00:0${index + 1}Z`,
+      finished_at:
+        status === "running" ? null : `2026-06-10T00:00:0${index + 2}Z`,
+      arguments: JSON.stringify({ prompt: `Call ${index} goal` }),
+    });
+    const timeline = (status: string, calls: unknown[]) => ({
+      data: [
+        {
+          type: "block",
+          block: {
+            workflow_run_block_id: "wrb_step",
+            block_type: "agent_step",
+            label: "research",
+            status,
+            actions: [],
+            tool_calls: calls,
+          },
+          children: [],
+          thought: null,
+          created_at: "2026-06-10T00:00:00Z",
+          modified_at: "2026-06-10T00:00:00Z",
+        },
+      ],
+    });
+    timelineGet.mockResolvedValue(
+      timeline("running", [
+        call(0, "page_goto", "completed"),
+        call(1, "page_extract", "running"),
+      ]),
+    );
+
+    await renderChat();
+    await submit("build a workflow");
+    streamCalls[0]!.onMessage({
+      type: "turn_start",
+      turn_id: "turn-1",
+      turn_index: 0,
+      mode: "build",
+      timestamp: "2026-06-10T00:00:00Z",
+    });
+    streamCalls[0]!.onMessage({
+      type: "design_start",
+      timestamp: "2026-06-10T00:00:00Z",
+    });
+    streamCalls[0]!.onMessage(
+      blockProgressFrame({
+        workflow_run_id: "wr_1",
+        workflow_run_block_id: "wrb_step",
+        block_label: "research",
+        block_type: "agent_step",
+      }),
+    );
+    await waitFor(() => expect(screen.getByText("Call 1 goal")).toBeTruthy());
+    streamCalls[0]!.onMessage(runOutcomeFrame({ verdict: "not_evaluated" }));
+    await waitFor(() => expect(timelineGet).toHaveBeenCalledTimes(2));
+    await act(async () => {});
+    streamCalls[0]!.onMessage({
+      type: "response",
+      workflow_copilot_chat_id: "chat_1",
+      message: "Ran out of time.",
+      response_time: "2026-06-10T00:00:06Z",
+      proposal_disposition: "no_proposal",
+      turn_id: "turn-1",
+      narrative_payload: null,
+    });
+    await act(async () => streamCalls[0]!.resolve());
+    await waitFor(() =>
+      expect(screen.getAllByText("Ran out of time.").length).toBeGreaterThan(0),
+    );
+    expect(timelineGet).toHaveBeenCalledTimes(2);
+
+    timelineGet.mockResolvedValue(
+      timeline("completed", [
+        call(0, "page_goto", "completed"),
+        call(1, "page_extract", "completed"),
+        call(2, "finish", "completed"),
+      ]),
+    );
+    const step = screen.getAllByTestId("copilot-test-card")[0]!;
+    fireEvent.click(within(step).getAllByRole("button")[0]!);
+
+    await waitFor(() => expect(screen.getByText("Call 2 goal")).toBeTruthy());
+    expect(timelineGet).toHaveBeenCalledTimes(3);
+
+    fireEvent.click(within(step).getAllByRole("button")[0]!);
+    fireEvent.click(within(step).getAllByRole("button")[0]!);
+    await act(async () => {});
+    expect(timelineGet).toHaveBeenCalledTimes(3);
+  });
+
+  it("re-reads a later step whose card opens after the turn, even when an earlier read showed every step finished", async () => {
+    const stepA = {
+      id: "wrb_a",
+      label: "step_a",
+      status: "completed",
+      calls: [agentStepCall(0, "completed", "Goal A0")],
+    };
+    timelineGet.mockResolvedValue(agentStepTimeline([stepA]));
+    const setIntervalSpy = vi.spyOn(window, "setInterval");
+    try {
+      await startDesignTurn();
+      streamCalls[0]!.onMessage(agentStepFrame("wrb_a", "step_a", "running"));
+      await waitFor(() => expect(timelineGet).toHaveBeenCalledTimes(1));
+      await act(async () => {});
+
+      timelineGet.mockResolvedValue(
+        agentStepTimeline([
+          stepA,
+          {
+            id: "wrb_b",
+            label: "step_b",
+            status: "running",
+            calls: [agentStepCall(0, "running", "Goal B0")],
+          },
+        ]),
+      );
+      streamCalls[0]!.onMessage(agentStepFrame("wrb_a", "step_a", "completed"));
+      streamCalls[0]!.onMessage(agentStepFrame("wrb_b", "step_b", "running"));
+      const tick = setIntervalSpy.mock.calls.find((c) => c[1] === 2500)![0] as (
+        ...args: unknown[]
+      ) => void;
+      tick();
+      await waitFor(() => expect(screen.getByText("Goal B0")).toBeTruthy());
+      await endTurnWithRunLive();
+      expect(timelineGet).toHaveBeenCalledTimes(2);
+
+      timelineGet.mockResolvedValue(
+        agentStepTimeline([
+          stepA,
+          {
+            id: "wrb_b",
+            label: "step_b",
+            status: "completed",
+            calls: [
+              agentStepCall(0, "completed", "Goal B0"),
+              agentStepCall(1, "completed", "Goal B1"),
+            ],
+          },
+        ]),
+      );
+      const fold = screen.queryByRole("button", { name: /^Worked through/ });
+      if (fold !== null) fireEvent.click(fold);
+      fireEvent.click(screen.getByTitle("Highlight step_b on canvas"));
+
+      await waitFor(() => expect(screen.getByText("Goal B1")).toBeTruthy());
+      expect(timelineGet).toHaveBeenCalledTimes(3);
+    } finally {
+      setIntervalSpy.mockRestore();
+    }
+  });
+
+  it("re-reads an open step card when its activity row reopens after the run ends", async () => {
+    const step = (status: string, calls: unknown[]) =>
+      agentStepTimeline([{ id: "wrb_step", label: "research", status, calls }]);
+    timelineGet.mockResolvedValue(
+      step("running", [
+        agentStepCall(0, "completed", "Call 0 goal"),
+        agentStepCall(1, "running", "Call 1 goal"),
+      ]),
+    );
+    await startDesignTurn();
+    streamCalls[0]!.onMessage({
+      type: "tool_call",
+      tool_name: "run_blocks_and_collect_debug",
+      display_label: "Testing workflow",
+      tool_input: {},
+      iteration: 0,
+      tool_call_id: "call_test",
+      timestamp: "2026-06-10T00:00:00Z",
+    });
+    streamCalls[0]!.onMessage(
+      agentStepFrame("wrb_step", "research", "running"),
+    );
+    await waitFor(() => expect(screen.getByText("Call 1 goal")).toBeTruthy());
+    await endTurnWithRunLive();
+
+    const fold = screen.queryByRole("button", { name: /^Worked through/ });
+    if (fold !== null) fireEvent.click(fold);
+    const row = document.querySelector<HTMLElement>(
+      '[data-tool-call-id="call_test"] > [data-activity-line="true"]',
+    )!;
+    if (row.getAttribute("aria-expanded") === "false") fireEvent.click(row);
+    const header = () => screen.getByTitle("Highlight research on canvas");
+    if (header().getAttribute("aria-expanded") === "false") {
+      fireEvent.click(header());
+    }
+    await waitFor(() => expect(screen.getByText("Call 1 goal")).toBeTruthy());
+    await act(async () => {});
+    const readsBeforeReopen = timelineGet.mock.calls.length;
+    fireEvent.click(row);
+    expect(screen.queryByText("Call 1 goal")).toBeNull();
+
+    timelineGet.mockResolvedValue(
+      step("completed", [
+        agentStepCall(0, "completed", "Call 0 goal"),
+        agentStepCall(1, "completed", "Call 1 goal"),
+        agentStepCall(2, "completed", "Call 2 goal"),
+      ]),
+    );
+    fireEvent.click(row);
+
+    await waitFor(() => expect(screen.getByText("Call 2 goal")).toBeTruthy());
+    expect(timelineGet).toHaveBeenCalledTimes(readsBeforeReopen + 1);
   });
 });
 

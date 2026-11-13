@@ -820,6 +820,8 @@ export interface WorkflowCopilotBlockProgressUpdate {
   // (surfaced mid-execution). Absent against older backends, which only carry
   // the run id on run_outcome; the chat falls back to that.
   workflow_run_id?: string | null;
+  // Absent against older backends; the chat then nests by the step's call ids only.
+  parent_workflow_run_block_id?: string | null;
   block_label: string;
   block_type: string;
   status: string;

@@ -31,6 +31,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotBlockProgressUpdate,
     WorkflowCopilotStreamMessageType,
 )
+from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.context import NarrativeActivityEntry, NarrativeScreenshot, NarrativeWorkPlan
@@ -281,6 +282,7 @@ class BlockProgressEvent:
     block_label: str
     block_type: str
     status: str
+    parent_block_id: str | None = None
 
 
 _TERMINAL_BLOCK_STATUSES = frozenset({"completed", "failed", "canceled", "terminated", "timed_out", "skipped"})
@@ -288,22 +290,21 @@ _TERMINAL_BLOCK_STATUSES = frozenset({"completed", "failed", "canceled", "termin
 
 def record_block_transitions(
     state: NarratorState,
-    snapshot: list[tuple[str, str, str, str]],
+    snapshot: list[tuple[str, str, str, str, str | None]],
     seen_state: dict[str, str],
     iteration: int,
 ) -> list[BlockProgressEvent]:
     events: list[BlockProgressEvent] = []
-    for block_id, label, block_type, status in snapshot:
+    for block_id, label, block_type, status, parent_block_id in snapshot:
         if not block_id or seen_state.get(block_id) == status:
             continue
         seen_state[block_id] = status
         if status == "running" or status in _TERMINAL_BLOCK_STATUSES:
-            events.append(BlockProgressEvent(block_id, label, block_type, status))
+            events.append(BlockProgressEvent(block_id, label, block_type, status, parent_block_id))
     return events
 
 
-# Returns objects exposing workflow_run_block_id and status; helper reads only those two fields.
-FetchBlockStatusesCallable = Callable[[], Awaitable[list[Any]]]
+FetchBlockStatusesCallable = Callable[[], Awaitable[list[WorkflowRunBlock]]]
 
 
 class NarratorPollTickResult(NamedTuple):
@@ -345,28 +346,19 @@ async def narrator_poll_tick(
             blocks = None
 
         if blocks is not None:
-            snapshot: list[tuple[str, str, str, str]] = []
+            snapshot: list[tuple[str, str, str, str, str | None]] = []
             for block in blocks:
-                block_id = getattr(block, "workflow_run_block_id", None)
-                if not block_id:
+                if not block.workflow_run_block_id or not block.status:
                     continue
-                raw_status = getattr(block, "status", None)
-                if raw_status is None:
-                    continue
-                status = raw_status.value if hasattr(raw_status, "value") else str(raw_status)
-                if not status:
-                    continue
-                block_label = getattr(block, "label", None) or ""
-                raw_block_type = getattr(block, "block_type", None)
-                if raw_block_type is None:
-                    block_type = ""
-                elif hasattr(raw_block_type, "value"):
-                    block_type = raw_block_type.value
-                elif hasattr(raw_block_type, "name"):
-                    block_type = raw_block_type.name
-                else:
-                    block_type = str(raw_block_type)
-                snapshot.append((block_id, block_label, block_type, status))
+                snapshot.append(
+                    (
+                        block.workflow_run_block_id,
+                        block.label or "",
+                        block.block_type.value,
+                        block.status,
+                        block.parent_workflow_run_block_id,
+                    )
+                )
             # Repository returns DESC by created_at; reverse for chronological order.
             snapshot.reverse()
             new_events = record_block_transitions(state, snapshot, seen_block_states, state.current_iteration)
@@ -383,6 +375,7 @@ async def narrator_poll_tick(
                         narrative_block_attempts,
                         workflow_run_block_id=event.block_id,
                         workflow_run_id=workflow_run_id,
+                        parent_workflow_run_block_id=event.parent_block_id,
                         label=event.block_label,
                         block_type=event.block_type,
                         status=event.status,
@@ -402,6 +395,7 @@ async def narrator_poll_tick(
                             type=WorkflowCopilotStreamMessageType.BLOCK_PROGRESS,
                             workflow_run_block_id=event.block_id,
                             workflow_run_id=workflow_run_id,
+                            parent_workflow_run_block_id=event.parent_block_id,
                             block_label=event.block_label,
                             block_type=event.block_type,
                             status=event.status,

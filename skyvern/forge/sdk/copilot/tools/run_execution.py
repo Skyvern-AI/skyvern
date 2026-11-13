@@ -678,6 +678,7 @@ def _reconcile_narrative_block_attempts(ctx: CopilotContext, blocks: list[Workfl
             ctx.narrative_block_attempts,
             workflow_run_block_id=block.workflow_run_block_id,
             workflow_run_id=block.workflow_run_id,
+            parent_workflow_run_block_id=block.parent_workflow_run_block_id,
             label=block.label,
             block_type=block.block_type.value,
             status=block.status,
