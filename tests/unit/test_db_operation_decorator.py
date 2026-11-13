@@ -1,7 +1,9 @@
 """Tests for the @db_operation decorator."""
 
+import asyncio
 from unittest.mock import ANY, patch
 
+import anyio
 import pytest
 from sqlalchemy.exc import OperationalError, ProgrammingError, SQLAlchemyError
 
@@ -312,3 +314,71 @@ async def test_db_operation_schedule_limit_exceeded_is_passthrough() -> None:
             await db.create_schedule()
         mock_log.warning.assert_called_once_with("BusinessLogicError", operation="create_schedule", exc_info=True)
         mock_log.exception.assert_not_called()
+
+
+class _CancelledPingDB:
+    # Mirrors SQLAlchemy's psycopg do_ping: the cancelled SELECT 1 leaves the connection ACTIVE, and the
+    # autocommit restore in its `finally` raises ProgrammingError over the CancelledError.
+    @db_operation("get_tasks")
+    async def get_tasks(self) -> None:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            raise ProgrammingError(
+                "SELECT 1", None, Exception("can't change 'autocommit' now: connection in transaction status ACTIVE")
+            )
+
+
+@pytest.mark.asyncio
+async def test_db_error_masking_a_cancellation_propagates_as_the_cancellation() -> None:
+    """A client disconnect cancels a streaming body through an anyio scope; it must not surface as a DB error."""
+    db = _CancelledPingDB()
+    with patch("skyvern.forge.sdk.db._error_handling.LOG") as mock_log:
+        with anyio.CancelScope() as scope:
+            asyncio.get_running_loop().call_soon(scope.cancel)
+            await db.get_tasks()
+        assert scope.cancelled_caught
+        mock_log.exception.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_stale_request_cancellation_does_not_mask_a_later_database_error() -> None:
+    task = asyncio.current_task()
+    assert task is not None
+    task.cancel()
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.sleep(0)
+        child = asyncio.create_task(asyncio.sleep(0))
+        child.cancel()
+        error = ProgrammingError("SELECT 1", None, Exception("database cleanup failed"))
+
+        @db_operation("child_cancel")
+        async def operation() -> None:
+            try:
+                await child
+            finally:
+                raise error
+
+        with patch("skyvern.forge.sdk.db._error_handling.LOG") as mock_log:
+            with pytest.raises(ProgrammingError) as caught:
+                await operation()
+            assert caught.value is error
+            assert error.hide_parameters
+            mock_log.exception.assert_called_once_with("SQLAlchemyError", operation="child_cancel")
+    finally:
+        task.uncancel()
+
+
+@pytest.mark.asyncio
+async def test_request_cancelled_before_database_call_still_propagates_cancellation() -> None:
+    task = asyncio.current_task()
+    assert task is not None
+    with patch("skyvern.forge.sdk.db._error_handling.LOG") as mock_log:
+        task.cancel()
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await _CancelledPingDB().get_tasks()
+            mock_log.exception.assert_not_called()
+        finally:
+            task.uncancel()

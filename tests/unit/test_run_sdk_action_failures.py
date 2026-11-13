@@ -17,6 +17,7 @@ from skyvern.exceptions import (
     FailedToTakeScreenshot,
     MissingBrowserStatePage,
     MissingElement,
+    MissingElementDict,
     ScrapingFailed,
     ScreenshotPageHasNoDrawnArea,
     ScreenshotTargetClosed,
@@ -340,9 +341,10 @@ async def test_handler_returns_400_when_action_raises_scraping_failed(
             "no drawn area to capture",
         ),
         (MissingElement(selector="//div[1]", element_id="CATO"), "not found on the page"),
+        (MissingElementDict("DAAX"), "not in the page's current snapshot"),
         (ActionDeadlineExceeded("The browser did not answer within 5000 ms"), "before the action's deadline"),
     ],
-    ids=["closed-target", "zero-width-screenshot", "missing-element", "action-deadline"],
+    ids=["closed-target", "zero-width-screenshot", "missing-element", "element-id-not-in-scrape", "action-deadline"],
 )
 async def test_page_and_action_failures_answer_422(
     mock_request: Any, mock_organization: Any, mock_app: Any, error: Exception, expected_detail_fragment: str
