@@ -2393,6 +2393,7 @@ async def test_execute_step_v3_standalone_flushes_llm_artifacts(cancelled: bool)
         ):
             mock_app.DATABASE.tasks.get_task = AsyncMock(return_value=None)
             mock_app.DATABASE.tasks.update_task = AsyncMock(return_value=task)
+            mock_app.AGENT_FUNCTION.release_page_reload_owner = AsyncMock()
             mock_app.AGENT_FUNCTION.validate_step_execution = AsyncMock()
             mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
             mock_app.EXPERIMENTATION_PROVIDER.resolve_feature_flag_strict = AsyncMock(return_value=False)
