@@ -694,6 +694,9 @@ Skyvern doesn't call Bitwarden directly. It talks to a Bitwarden CLI server (`bw
 | `BITWARDEN_SERVER` | `http://localhost` | CLI server address, without the port |
 | `BITWARDEN_SERVER_PORT` | `8002` | CLI server port |
 | `BITWARDEN_TIMEOUT_SECONDS` / `BITWARDEN_MAX_RETRIES` | `60` / `3` | Per-operation timeout and retries |
+| `BITWARDEN_LOGIN_TIMEOUT_SECONDS` | `180` | Timeout for the login that opens a CLI session, and for the unlock after an API-key login. A login downloads and decrypts the whole vault, so it gets a longer budget than a read. A value below `BITWARDEN_TIMEOUT_SECONDS` is raised to it. |
+
+`BITWARDEN_TIMEOUT_SECONDS`, `BITWARDEN_MAX_RETRIES` and `BITWARDEN_LOGIN_TIMEOUT_SECONDS` don't apply to requests to the CLI server, which use fixed timeouts. They apply when Skyvern runs the `bw` CLI itself, for example to read a Bitwarden item named in a workflow parameter.
 
 **Self-hosted Vaultwarden.** The open-source `docker-compose.yml` ships two commented-out services: `vaultwarden` (the server, on `127.0.0.1:11002`) and `bitwarden-cli` (built from `bitwarden-cli-server/`). To use them:
 
