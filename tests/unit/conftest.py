@@ -1334,8 +1334,10 @@ class GroupEnv:
     limiter: RecordingRateLimiter
 
 
-def run_group_definition(*blocks: BlockTypeVar) -> dict[str, Any]:
-    return WorkflowDefinition(parameters=[], blocks=list(blocks)).model_dump(mode="json")
+def run_group_definition(*blocks: BlockTypeVar, finally_block_label: str | None = None) -> dict[str, Any]:
+    return WorkflowDefinition(parameters=[], blocks=list(blocks), finally_block_label=finally_block_label).model_dump(
+        mode="json"
+    )
 
 
 def run_group_task_block() -> TaskBlock:
@@ -1391,6 +1393,10 @@ async def run_group_env(monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEng
     monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "is_feature_enabled_cached", AsyncMock(return_value=False))
     monkeypatch.setattr(app.AGENT_FUNCTION, "is_block_scoped_workflow_run", AsyncMock(return_value=False))
     monkeypatch.setattr(app.AGENT_FUNCTION, "workflow_run_group_limits", AgentFunction().workflow_run_group_limits)
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION, "get_organization_usage_quota", AgentFunction().get_organization_usage_quota
+    )
+    monkeypatch.setattr(app.AGENT_FUNCTION, "copilot_run_stop_rule", AgentFunction().copilot_run_stop_rule)
     monkeypatch.setattr(AsyncExecutorFactory, "get_executor", lambda: executor)
     monkeypatch.setattr(group_service, "_spawn", spawned.append)
     monkeypatch.setattr(service, "_schedule_workflow_run_terminal_hooks", lambda **_: None)
