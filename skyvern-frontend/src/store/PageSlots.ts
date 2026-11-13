@@ -48,6 +48,19 @@ export type BrokerCredentialSelectorProps = BrokerCredentialSelectorBase &
       }>
   );
 
+// The Integrations page's Connected Gmail flow, for a surface that starts a new Gmail connection.
+export type ConnectedGmailFlow = Readonly<{
+  // "default": no visible native Gmail credential, so a new Gmail connection starts Connected Gmail.
+  status: "loading" | "default" | "unavailable";
+  canConnect: boolean;
+  busy: boolean;
+  // A message to show for a failed attempt; a cancelled sign-in has none.
+  failure: string | null;
+  // Active connections, named as the Integrations page names them.
+  connections: ReadonlyArray<Readonly<{ connection_id: string; name: string }>>;
+  start: () => void;
+}>;
+
 export type PermissionCapability = Readonly<{
   capability: string;
   allowed: boolean;
@@ -87,6 +100,9 @@ export type PageSlots = {
     }>
   >;
   brokerCredentialSelector?: React.ComponentType<BrokerCredentialSelectorProps>;
+  connectedGmailFlow?: React.ComponentType<
+    Readonly<{ children: (flow: ConnectedGmailFlow) => React.ReactNode }>
+  >;
   workflowFindingsScope?: React.ComponentType<
     Readonly<{
       workflowPermanentIds: readonly string[];

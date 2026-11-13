@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { usePostHog } from "posthog-js/react";
 
 import type {
   GoogleOAuthCredential,
@@ -21,7 +22,12 @@ import {
   storeGoogleOAuthIntegrationIdForState,
 } from "@/routes/integrations/googleOAuth";
 import { markGoogleOAuthPopup } from "@/routes/integrations/googleOAuthPopup";
-import { useHasCapability } from "@/store/PageSlots";
+import { useCurrentOrgId } from "@/hooks/useCurrentOrgId";
+import {
+  type ConnectedGmailFlow,
+  useHasCapability,
+  usePageSlots,
+} from "@/store/PageSlots";
 
 import {
   connectionCardKey,
@@ -66,17 +72,44 @@ function googleScopeProfile(
   return GOOGLE_SCOPE_PROFILES.find((profile) => profile === value);
 }
 
-export function ConnectionCard({
-  card,
-  selectedConnectionId = null,
-  disabled = false,
-  onSelect,
-}: {
+type ConnectionCardProps = {
   card: ConnectionCardData;
   selectedConnectionId?: string | null;
   disabled?: boolean;
   onSelect?: (connectionId: string) => void;
-}) {
+};
+
+export function ConnectionCard(props: ConnectionCardProps) {
+  const { connectedGmailFlow: GmailFlow } = usePageSlots();
+  // A reconnect keeps its native credential; only a new Gmail connection follows the Connected Gmail default.
+  if (
+    !GmailFlow ||
+    props.card.integrationId !== "gmail" ||
+    props.card.reconnectConnectionId
+  ) {
+    return <ConnectionCardBody {...props} />;
+  }
+  return (
+    <GmailFlow>
+      {(flow) => <ConnectionCardBody {...props} connectedGmail={flow} />}
+    </GmailFlow>
+  );
+}
+
+function ConnectionCardBody({
+  card,
+  selectedConnectionId = null,
+  disabled = false,
+  onSelect,
+  connectedGmail,
+}: ConnectionCardProps & { connectedGmail?: ConnectedGmailFlow }) {
+  // An existing Connected Gmail account stays a choice even when a native credential makes it no longer the default.
+  const gmailFlow =
+    connectedGmail?.status === "default" ? connectedGmail : undefined;
+  const gmailFlowLoading = connectedGmail?.status === "loading";
+  // A Connected Gmail sign-in can run after a 409 switch even when native is the card's default, so its progress shows either way.
+  const postHog = usePostHog();
+  const orgId = useCurrentOrgId();
   const isGoogle = card.provider === "google";
   const accountKind = isGoogle ? "Google" : card.integrationName;
   const google = useGoogleOAuthCredentials({
@@ -89,7 +122,14 @@ export function ConnectionCard({
   });
   const canGoogleAuthorize = useHasCapability("google_oauth.authorize");
   const canMicrosoftAuthorize = useHasCapability("microsoft_oauth.authorize");
-  const canAuthorize = isGoogle ? canGoogleAuthorize : canMicrosoftAuthorize;
+  // While the flow decides, the button stays a disabled Connect rather than guessing at an admin note.
+  const canAuthorize = gmailFlowLoading
+    ? true
+    : gmailFlow
+      ? gmailFlow.canConnect
+      : isGoogle
+        ? canGoogleAuthorize
+        : canMicrosoftAuthorize;
   const [isStarting, setIsStarting] = useState(false);
   const [confirmSetAccount, setConfirmSetAccount] = useState(false);
   const [attempt, setAttempt] = useState<AttemptState>("idle");
@@ -98,10 +138,17 @@ export function ConnectionCard({
   const refetchGoogle = google.refetchCredentials;
   const reconnectConnectionId = card.reconnectConnectionId;
   const [initialIds, setInitialIds] = useState<Set<string> | null>(null);
-  const credentialsLoading = isGoogle ? google.isLoading : microsoft.isLoading;
-  const loadedIds = (isGoogle ? google.credentials : microsoft.credentials).map(
-    (credential) => credential.id,
-  );
+  // Connected Gmail accounts join the baseline, so one that already existed never reads as just connected.
+  const credentialsLoading =
+    (isGoogle ? google.isLoading : microsoft.isLoading) || gmailFlowLoading;
+  const loadedIds = [
+    ...(isGoogle ? google.credentials : microsoft.credentials).map(
+      (credential) => credential.id,
+    ),
+    ...(connectedGmail?.connections ?? []).map(
+      (connection) => connection.connection_id,
+    ),
+  ];
   const loadedIdsKey = loadedIds.join(" ");
 
   useEffect(() => {
@@ -136,7 +183,7 @@ export function ConnectionCard({
     };
   }, [attempt, refetchGoogle, reconnectConnectionId]);
 
-  const choices: ConnectedAccountChoice[] = isGoogle
+  const nativeChoices: ConnectedAccountChoice[] = isGoogle
     ? google.credentials
         .filter(
           (credential) =>
@@ -161,6 +208,38 @@ export function ConnectionCard({
           state: "active",
           email_address: credential.email_address ?? null,
         }));
+  const choices: ConnectedAccountChoice[] = [
+    ...nativeChoices,
+    ...(connectedGmail?.connections ?? []).map((connection) => ({
+      connection_id: connection.connection_id,
+      name: connection.name,
+      state: "active" as const,
+      email_address: null,
+    })),
+  ];
+
+  // The same connect events the Integrations page sends; the card has no naming step, so a start is also the submit.
+  const captureConnectStarted = () => {
+    postHog?.capture("integrations.connect_clicked", {
+      integration_id: card.integrationId,
+      integration_name: card.integrationName,
+      surface: "copilot",
+    });
+    postHog?.capture(`integrations.${card.provider}.connect.started`, {
+      org_id: orgId,
+      surface: "copilot",
+    });
+    postHog?.capture("integrations.connect_submitted", {
+      integration_id: card.integrationId,
+      surface: "copilot",
+    });
+  };
+
+  const startConnectedGmail = () => {
+    if (!gmailFlow) return;
+    captureConnectStarted();
+    gmailFlow.start();
+  };
 
   const reconnectCredential = google.credentials.find(
     (credential) => credential.id === card.reconnectConnectionId,
@@ -171,6 +250,7 @@ export function ConnectionCard({
       setConfirmSetAccount(true);
       return;
     }
+    captureConnectStarted();
     snapshotRef.current = google.credentials;
     // One named window per card, so starting a sibling card's consent cannot take over this card's popup.
     const authTab = window.open(
@@ -208,6 +288,12 @@ export function ConnectionCard({
       setAttempt("open");
     } catch (startError) {
       authTab.close();
+      // The server found Connected Gmail is the way for this org after this card fell back to native (409).
+      if (responseStatus(startError) === 409 && connectedGmail?.canConnect) {
+        setAttempt("idle");
+        connectedGmail.start();
+        return;
+      }
       setAttempt(
         responseStatus(startError) === 403 ? "forbidden" : "start_failed",
       );
@@ -225,11 +311,20 @@ export function ConnectionCard({
       choices.find(
         (choice) =>
           initialIds !== null && !initialIds.has(choice.connection_id),
-      ));
+      ) ??
+      // A user's one Connected Gmail account is already the way to use Gmail, so the card settles on it.
+      (gmailFlow && !gmailFlow.canConnect
+        ? choices.find((choice) =>
+            gmailFlow.connections.some(
+              (connection) => connection.connection_id === choice.connection_id,
+            ),
+          )
+        : undefined));
   const failure =
-    attempt === "not_completed"
+    gmailFlow?.failure ||
+    (attempt === "not_completed"
       ? `The connection was not completed. If your ${isGoogle ? "Google Workspace" : "Microsoft 365"} administrator blocks this app, ask them to allow it, then try again.`
-      : ATTEMPT_FAILURES[attempt];
+      : ATTEMPT_FAILURES[attempt]);
   const actionLabel = card.reconnectConnectionId ? "Reconnect" : "Connect";
 
   if (connected) {
@@ -287,6 +382,8 @@ export function ConnectionCard({
             className="mt-3 rounded bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground disabled:opacity-60"
             disabled={
               isStarting ||
+              Boolean(connectedGmail?.busy) ||
+              gmailFlowLoading ||
               !canAuthorize ||
               (Boolean(card.reconnectConnectionId) && google.isLoading)
             }
@@ -295,13 +392,15 @@ export function ConnectionCard({
                 ? undefined
                 : "Organization admin access is required."
             }
-            onClick={() => void startGoogle()}
+            onClick={() =>
+              gmailFlow ? startConnectedGmail() : void startGoogle()
+            }
           >
             {isStarting
               ? "Opening…"
               : !canAuthorize
                 ? "Admin required"
-                : attempt === "open"
+                : attempt === "open" || connectedGmail?.busy
                   ? "Waiting for sign-in…"
                   : failure
                     ? `${actionLabel} again`
