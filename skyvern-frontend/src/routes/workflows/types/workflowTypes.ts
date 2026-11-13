@@ -316,12 +316,23 @@ export const WorkflowEditorParameterTypes = {
 export type WorkflowEditorParameterType =
   (typeof WorkflowEditorParameterTypes)[keyof typeof WorkflowEditorParameterTypes];
 
+// An uploaded image on a block. `placement` names the line it shows under: the above note, the trailing note or the
+// block's own text.
+export type WorkflowBlockImage = {
+  file_id: string;
+  caption: string | null;
+  placement: "above" | "trailing" | "block";
+};
+
 // Text shown in the Doc view. `notes` sits above a block and `trailing_notes` after the last block of a sequence;
-// both are read by the agent at run time. `description` is for people only.
+// both are read by the agent at run time. `description` and `doc_images` are for people only. The Doc carries
+// `prompt_images` through unchanged.
 export type WorkflowBlockDocFields = {
   notes?: string | null;
   trailing_notes?: string | null;
   description?: string | null;
+  doc_images?: WorkflowBlockImage[] | null;
+  prompt_images?: WorkflowBlockImage[] | null;
 };
 
 export type WorkflowBlockBase = WorkflowBlockDocFields & {

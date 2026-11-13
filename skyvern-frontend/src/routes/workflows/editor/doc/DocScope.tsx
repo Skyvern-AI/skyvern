@@ -41,7 +41,14 @@ import {
   DocProposalStepMark,
 } from "./DocProposalView";
 import { DocEditableLine, DocInsertPopover } from "./DocEditing";
-import { NOTE_MAX_LENGTH, type DocScopeRef } from "./docGraphEdits";
+import {
+  docImagesOf,
+  NOTE_MAX_LENGTH,
+  type DocScopeRef,
+} from "./docGraphEdits";
+import { DocImagePicker, DocImages } from "./DocImages";
+import { docImageDropProps, useDocImageFiles } from "./useDocImageFiles";
+import type { WorkflowBlockImage } from "../../types/workflowTypes";
 import { TOP_SCOPE, type DocPlace } from "./docEditApi";
 import { DocDemonstrationLine } from "./DocDemonstrationLine";
 import { demonstrationLineIndex } from "./docDemonstration";
@@ -642,7 +649,7 @@ export function DocAddStep({
   );
 }
 
-function DocNote({
+function DocNoteLine({
   ownerNodeId,
   placement,
   text,
@@ -651,6 +658,7 @@ function DocNote({
   place,
   nestsInto,
   into,
+  onFiles,
 }: {
   ownerNodeId: string;
   placement: "above" | "trailing";
@@ -662,6 +670,8 @@ function DocNote({
   nestsInto?: "loop" | "branch";
   // Set when Tab put this line in an empty loop or branch: the picked step goes in there, holding the line's text.
   into?: DocScopeRef;
+  // Files pasted into the line, for its screenshots.
+  onFiles?: (files: File[]) => void;
 }) {
   const actions = useContext(WorkflowDocActionsContext);
   const [inserting, setInserting] = useState(false);
@@ -729,6 +739,7 @@ function DocNote({
         className="text-base leading-[1.55] text-muted-foreground"
       >
         <DocEditableLine
+          onFiles={onFiles}
           value={text}
           editable={editable && Boolean(actions.edit)}
           multiline
@@ -839,6 +850,41 @@ function DocNote({
         />
       </div>
     </DocInsertPopover>
+  );
+}
+
+/** A note line with its screenshots: paste, drop or the picker add one under the line. */
+function DocNote({
+  images = [],
+  ...line
+}: Omit<Parameters<typeof DocNoteLine>[0], "onFiles"> & {
+  images?: WorkflowBlockImage[];
+}) {
+  const actions = useContext(WorkflowDocActionsContext);
+  const { ownerNodeId, placement } = line;
+  const imageFiles = useDocImageFiles({ ownerNodeId, placement });
+  const addFiles = line.editable && actions.edit ? imageFiles.addFiles : null;
+  return (
+    <div className="group/note" {...docImageDropProps(addFiles)}>
+      <div className="flex items-start gap-1">
+        <div className="min-w-0 flex-1">
+          <DocNoteLine {...line} onFiles={addFiles ?? undefined} />
+        </div>
+        {addFiles && (
+          <DocImagePicker
+            slot={{ ownerNodeId, placement }}
+            onFiles={addFiles}
+            className="mt-0.5 opacity-0 focus-visible:opacity-100 group-focus-within/note:opacity-100 group-hover/note:opacity-100 [@media(hover:none)]:opacity-100"
+          />
+        )}
+      </div>
+      <DocImages
+        slot={{ ownerNodeId, placement }}
+        images={images}
+        editable={line.editable && Boolean(actions.edit)}
+        onRetry={imageFiles.retry}
+      />
+    </div>
   );
 }
 
@@ -956,6 +1002,10 @@ export function DocScope({
     Boolean(pending.into);
   const pendingInto =
     pending?.into && sameScope(pending.into, scope) ? pending : null;
+  const noteImages = (owner: string, placement: "above" | "trailing") =>
+    docImagesOf(byId.get(owner)).filter(
+      (image) => image.placement === placement,
+    );
   // The loop or If that Tab would put a line in: the one it trails, or the step just above it.
   const nestsInto = (owner: string, placement: "above" | "trailing") => {
     const container =
@@ -1127,6 +1177,7 @@ export function DocScope({
           ownerNodeId={pendingInto.ownerNodeId}
           placement={pendingInto.placement}
           text={noteTextOfNode(byId, pendingInto)}
+          images={noteImages(pendingInto.ownerNodeId, pendingInto.placement)}
           editable={editable}
           into={scope}
         />
@@ -1160,6 +1211,7 @@ export function DocScope({
               ownerNodeId={item.ownerNodeId}
               placement={item.placement}
               text={item.text}
+              images={noteImages(item.ownerNodeId, item.placement)}
               title={noteReaders(item, byId, actions.previousNoteReader)}
               nestsInto={nestsInto(item.ownerNodeId, item.placement)}
               editable={editable && !previousReason(items, index + 1)}

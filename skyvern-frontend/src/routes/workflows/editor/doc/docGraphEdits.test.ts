@@ -18,6 +18,7 @@ import {
   checkLabel,
   findOutputUsers,
   hasSettingsBeyondText,
+  isBlankStep,
   moveBlock,
   newStepLabel,
   referencesAt,
@@ -931,6 +932,61 @@ describe("back to plain text", () => {
       graph.nodes.find((n) => n.id === idOf(graph, label))!;
     expect(hasSettingsBeyondText(node("configured"))).toBe(true);
     expect(hasSettingsBeyondText(node("plain"))).toBe(false);
+  });
+
+  test("a step holding only screenshots can become plain text, and its screenshots go under the note", () => {
+    const shot = (file_id: string, placement: string) => ({
+      file_id,
+      caption: null,
+      placement,
+    });
+    const graph = graphOf([
+      code("shots", "next", {
+        doc_images: [shot("a", "above"), shot("b", "block")],
+      }),
+      code("next", null, {
+        prompt: "Send the report",
+        doc_images: [shot("c", "above")],
+      }),
+    ]);
+    const shots = graph.nodes.find((n) => n.id === idOf(graph, "shots"))!;
+    expect(hasSettingsBeyondText(shots)).toBe(false);
+    expect(isBlankStep(shots)).toBe(false);
+
+    const result = toNote(graph, shots.id)!;
+    expect(result.note).toEqual({
+      ownerNodeId: idOf(graph, "next"),
+      placement: "above",
+    });
+    const next = result.graph.nodes.find((n) => n.id === idOf(graph, "next"))!;
+    expect((next.data as { docImages: unknown }).docImages).toEqual([
+      shot("a", "above"),
+      shot("b", "above"),
+      shot("c", "above"),
+    ]);
+  });
+
+  test("images the agent reads are a setting plain text can't keep; screenshots for people are not", () => {
+    const shot = { file_id: "file_a", caption: null, placement: "block" };
+    const graph = graphOf([
+      code("people", "agent", { doc_images: [shot] }),
+      code("agent", null, { prompt_images: [shot] }),
+    ]);
+    const node = (label: string) =>
+      graph.nodes.find((n) => n.id === idOf(graph, label))!;
+    expect(hasSettingsBeyondText(node("people"))).toBe(false);
+    expect(hasSettingsBeyondText(node("agent"))).toBe(true);
+  });
+
+  test("a duplicated step merged back into a note lists each screenshot once", () => {
+    const shot = { file_id: "file_a", caption: null, placement: "above" };
+    const graph = graphOf([
+      code("copy", "next", { doc_images: [shot] }),
+      code("next", null, { prompt: "Send it", doc_images: [shot] }),
+    ]);
+    const result = toNote(graph, idOf(graph, "copy"))!;
+    const next = result.graph.nodes.find((n) => n.id === idOf(graph, "next"))!;
+    expect((next.data as { docImages: unknown }).docImages).toEqual([shot]);
   });
 
   test("a switch turned off from its on-by-default setting counts as a setting", () => {

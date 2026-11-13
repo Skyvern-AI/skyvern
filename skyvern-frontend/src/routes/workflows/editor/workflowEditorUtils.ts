@@ -237,6 +237,7 @@ import {
   transformStringFieldsInObject,
   type AffectedBlock,
 } from "./jinjaReferences";
+import { resolveDocImages } from "./doc/docImageHandles";
 import {
   findFinallyBlockNodeId,
   isBlockFinallyGated,
@@ -254,29 +255,41 @@ export function inferBranchCriteriaTypeFromExpression(
   return BranchCriteriaTypes.Prompt;
 }
 
+type DocFieldsData = Pick<
+  NodeBaseData,
+  "notes" | "trailingNotes" | "description" | "docImages" | "promptImages"
+>;
+
 // Loaded only when set, so a block without them (or with the server's null default)
 // saves exactly as it would without these fields.
-function docFieldsFromBlock(
-  block: WorkflowBlockDocFields,
-): Pick<NodeBaseData, "notes" | "trailingNotes" | "description"> {
+function docFieldsFromBlock(block: WorkflowBlockDocFields): DocFieldsData {
   return {
     ...(block.notes != null && { notes: block.notes }),
     ...(block.trailing_notes != null && {
       trailingNotes: block.trailing_notes,
     }),
     ...(block.description != null && { description: block.description }),
+    ...(block.doc_images != null && { docImages: block.doc_images }),
+    ...(block.prompt_images != null && { promptImages: block.prompt_images }),
   };
 }
 
-function docFieldsFromNodeData(
-  data: Pick<NodeBaseData, "notes" | "trailingNotes" | "description">,
-): WorkflowBlockDocFields {
+function docFieldsFromNodeData(data: DocFieldsData): WorkflowBlockDocFields {
+  // Screenshots still uploading leave the save; a step holding only those saves as if it held none.
+  const docImages = data.docImages?.length
+    ? resolveDocImages(data.docImages)
+    : data.docImages;
   return {
     ...(data.notes != null && { notes: data.notes }),
     ...(data.trailingNotes != null && {
       trailing_notes: data.trailingNotes,
     }),
     ...(data.description != null && { description: data.description }),
+    ...(docImages != null &&
+      (docImages.length > 0 || !data.docImages?.length) && {
+        doc_images: docImages,
+      }),
+    ...(data.promptImages != null && { prompt_images: data.promptImages }),
   };
 }
 

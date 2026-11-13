@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
 import * as toastModule from "@/components/ui/use-toast";
+import { useWorkflowHistoryAccessStore } from "@/store/WorkflowHistoryAccessStore";
 
 import { isWorkflowBlockNode, type AppNode } from "../nodes";
 import {
@@ -16,6 +17,7 @@ import { block, code, conditional, forLoop, settings } from "./docTestBlocks";
 import { docStepProblems, loopSchemaStepId } from "./docProblems";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { useDocUnfinishedStore } from "./docUnfinished";
+import { newDocImageHandle } from "./docImageHandles";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 
 afterEach(() => vi.restoreAllMocks());
@@ -1018,6 +1020,326 @@ describe("building from scratch in the doc", () => {
     const turned = latest().nodes.find((n) => n.id === step.id)!;
     expect(turned.type).toBe("extraction");
     expect(turned.data.label).toBe("extraction_1");
+  });
+
+  const shot = (file_id: string, placement: string) => ({
+    file_id,
+    caption: null,
+    placement,
+  });
+  const imagesOf = (graph: DocGraph, label: string) =>
+    (byLabel(graph, label).data as Record<string, unknown>).docImages ?? null;
+
+  test("turning a step into another type keeps its screenshots, and the save still sends them", () => {
+    const graph = getElements(
+      [
+        code("first", null, {
+          prompt: "Read the plan",
+          notes: "See the picture",
+          doc_images: [shot("file_a", "above"), shot("file_b", "block")],
+          prompt_images: [shot("file_p", "block")],
+        }),
+      ],
+      settings(),
+      true,
+    ) as DocGraph;
+    const step = byLabel(graph, "first");
+    const { api, latest } = editing(graph);
+    api.turnInto(step.id, "extraction");
+    const turned = latest().nodes.find((n) => n.id === step.id)!;
+    expect(turned.type).toBe("extraction");
+    expect(turned.data).toMatchObject({
+      docImages: [shot("file_a", "above"), shot("file_b", "block")],
+      promptImages: [shot("file_p", "block")],
+    });
+    const saved = getWorkflowBlocks(latest().nodes, latest().edges)[0]!;
+    expect(saved).toMatchObject({
+      doc_images: [shot("file_a", "above"), shot("file_b", "block")],
+      prompt_images: [shot("file_p", "block")],
+    });
+  });
+
+  test("Tab and Shift+Tab move a note's screenshots with its text", () => {
+    const graph = getElements(
+      [
+        forLoop("books", "after", [
+          code("inner", null, { doc_images: [shot("file_i", "block")] }),
+        ]),
+        code("after", null, {
+          notes: "Skip sold out books",
+          doc_images: [shot("file_a", "above"), shot("file_s", "block")],
+        }),
+      ],
+      settings(),
+      true,
+    ) as DocGraph;
+    const after = byLabel(graph, "after");
+    const inner = byLabel(graph, "inner");
+    const { api, latest } = editing(graph);
+    api.nestNote({ ownerNodeId: after.id, placement: "above" }, false);
+    expect(imagesOf(latest(), "inner")).toEqual([
+      shot("file_i", "block"),
+      shot("file_a", "trailing"),
+    ]);
+    expect(imagesOf(latest(), "after")).toEqual([shot("file_s", "block")]);
+
+    const back = editing(latest());
+    back.api.nestNote({ ownerNodeId: inner.id, placement: "trailing" }, true);
+    expect(imagesOf(back.latest(), "books")).toEqual([
+      shot("file_a", "trailing"),
+    ]);
+    expect(imagesOf(back.latest(), "inner")).toEqual([shot("file_i", "block")]);
+  });
+
+  test("Tab moves a note that holds only a screenshot", () => {
+    const graph = getElements(
+      [
+        forLoop("books", "after", [code("inner", null)]),
+        code("after", null, { doc_images: [shot("file_a", "above")] }),
+      ],
+      settings(),
+      true,
+    ) as DocGraph;
+    const after = byLabel(graph, "after");
+    const inner = byLabel(graph, "inner");
+    const { api, latest } = editing(graph);
+    expect(
+      api.nestNote({ ownerNodeId: after.id, placement: "above" }, false),
+    ).toEqual({ ownerNodeId: inner.id, placement: "trailing" });
+    expect(imagesOf(latest(), "inner")).toEqual([shot("file_a", "trailing")]);
+    expect(imagesOf(latest(), "after")).toBeNull();
+  });
+
+  test("Tab won't move screenshots past the step's limit, and moves nothing then", () => {
+    const ten = Array.from({ length: 10 }, (_, i) =>
+      shot(`file_${i}`, "block"),
+    );
+    const graph = getElements(
+      [
+        forLoop("books", "after", [code("inner", null, { doc_images: ten })]),
+        code("after", null, {
+          notes: "Skip sold out books",
+          doc_images: [shot("file_a", "above")],
+        }),
+      ],
+      settings(),
+      true,
+    ) as DocGraph;
+    const after = byLabel(graph, "after");
+    const notification = vi
+      .spyOn(toastModule, "toast")
+      .mockReturnValue({ id: "test", dismiss: vi.fn(), update: vi.fn() });
+    const { api, latest } = editing(graph);
+    expect(
+      api.nestNote({ ownerNodeId: after.id, placement: "above" }, false),
+    ).toBeNull();
+    expect(latest()).toBe(graph);
+    expect(notification).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: expect.stringContaining("up to 10 screenshots"),
+      }),
+    );
+  });
+
+  test("the step picked under an empty loop takes the note's screenshots, uploads included, under its text", () => {
+    const uploading = newDocImageHandle();
+    const graph = getElements(
+      [forLoop("books", null, [])],
+      settings(),
+      true,
+    ) as DocGraph;
+    const books = byLabel(graph, "books");
+    const { api, latest } = editingAdding({
+      ...graph,
+      nodes: graph.nodes.map((n) =>
+        n.id === books.id
+          ? ({
+              ...n,
+              data: {
+                ...n.data,
+                trailingNotes: "Open each book page",
+                docImages: [
+                  shot("file_a", "trailing"),
+                  shot(uploading, "trailing"),
+                ],
+              },
+            } as AppNode)
+          : n,
+      ),
+    });
+    const id = api.adoptNote(
+      { ownerNodeId: books.id, placement: "trailing" },
+      { parentId: books.id, conditionalBranchId: null },
+      "extraction",
+    );
+    const step = latest().nodes.find((n) => n.id === id)!;
+    expect((step.data as Record<string, unknown>).docImages).toEqual([
+      shot("file_a", "block"),
+      shot(uploading, "block"),
+    ]);
+    expect(imagesOf(latest(), "books")).toBeNull();
+  });
+
+  test("a note holding only an uploading screenshot gives it to the step picked under an empty loop", () => {
+    const uploading = newDocImageHandle();
+    const graph = getElements(
+      [forLoop("books", null, [])],
+      settings(),
+      true,
+    ) as DocGraph;
+    const books = byLabel(graph, "books");
+    const { api, latest } = editingAdding({
+      ...graph,
+      nodes: graph.nodes.map((n) =>
+        n.id === books.id
+          ? ({
+              ...n,
+              data: { ...n.data, docImages: [shot(uploading, "trailing")] },
+            } as AppNode)
+          : n,
+      ),
+    });
+    const id = api.adoptNote(
+      { ownerNodeId: books.id, placement: "trailing" },
+      { parentId: books.id, conditionalBranchId: null },
+      "extraction",
+    );
+    const step = latest().nodes.find((n) => n.id === id)!;
+    expect((step.data as Record<string, unknown>).docImages).toEqual([
+      shot(uploading, "block"),
+    ]);
+  });
+
+  test("a step that holds only screenshots, or only one still uploading, is not empty, so / won't replace it", () => {
+    const graph = getElements(
+      [
+        code("shots", null, { doc_images: [shot("file_a", "block")] }),
+        code("uploading", null, {
+          doc_images: [shot(newDocImageHandle(), "block")],
+        }),
+      ],
+      settings(),
+      true,
+    ) as DocGraph;
+    const { api } = editing(graph);
+    expect(api.isEmptyStep(byLabel(graph, "shots").id)).toBe(false);
+    expect(api.isEmptyStep(byLabel(graph, "uploading").id)).toBe(false);
+  });
+
+  test("a paste reserves all its screenshots in one undo step, and the reservations count toward the cap", async () => {
+    const eight = Array.from({ length: 8 }, (_, i) =>
+      shot(`file_${i}`, "block"),
+    );
+    const graph = getElements(
+      [code("shots", null, { doc_images: eight })],
+      settings(),
+      true,
+    ) as DocGraph;
+    const id = byLabel(graph, "shots").id;
+    const reserved = () => ({
+      file_id: newDocImageHandle(),
+      caption: null,
+      placement: "above" as const,
+    });
+    const captured = vi.fn();
+    useWorkflowHistoryAccessStore.setState({ captureImmediately: captured });
+    const { api, latest } = editing(graph);
+    const two = [reserved(), reserved()];
+    expect(await api.addImages(id, two)).toBe("added");
+    expect(captured).toHaveBeenCalledTimes(1);
+    expect(imagesOf(latest(), "shots")).toEqual([...eight, ...two]);
+
+    const full = editing(latest());
+    expect(full.api.imageCount(id)).toBe(10);
+    expect(await full.api.addImages(id, [reserved()])).toBe("full");
+    expect(full.latest()).toBe(latest());
+    useWorkflowHistoryAccessStore.getState().reset();
+  });
+
+  test("two adds read from the same render both pass its count; the second is refused by the latest graph", async () => {
+    const eight = Array.from({ length: 8 }, (_, i) =>
+      shot(`file_${i}`, "block"),
+    );
+    const graph = getElements(
+      [code("shots", null, { doc_images: eight })],
+      settings(),
+      true,
+    ) as DocGraph;
+    const id = byLabel(graph, "shots").id;
+    const reserved = () => ({
+      file_id: newDocImageHandle(),
+      caption: null,
+      placement: "above" as const,
+    });
+    const { api, latest } = editing(graph);
+    const first = api.addImages(id, [reserved(), reserved()]);
+    const second = api.addImages(id, [reserved()]);
+    expect(await first).toBe("added");
+    expect(await second).toBe("full");
+    expect(imagesOf(latest(), "shots")).toHaveLength(10);
+    useWorkflowHistoryAccessStore.getState().reset();
+  });
+
+  test("Tab onto a step at nine screenshots and one upload is refused by the cap", () => {
+    const nine = Array.from({ length: 9 }, (_, i) =>
+      shot(`file_${i}`, "block"),
+    );
+    const graph = getElements(
+      [
+        forLoop("books", "after", [
+          code("inner", null, {
+            doc_images: [...nine, shot(newDocImageHandle(), "trailing")],
+          }),
+        ]),
+        code("after", null, {
+          notes: "Skip sold out books",
+          doc_images: [shot("file_a", "above")],
+        }),
+      ],
+      settings(),
+      true,
+    ) as DocGraph;
+    vi.spyOn(toastModule, "toast").mockReturnValue({
+      id: "test",
+      dismiss: vi.fn(),
+      update: vi.fn(),
+    });
+    const { api, latest } = editing(graph);
+    expect(
+      api.nestNote(
+        { ownerNodeId: byLabel(graph, "after").id, placement: "above" },
+        false,
+      ),
+    ).toBeNull();
+    expect(latest()).toBe(graph);
+  });
+
+  test("plain text won't push the step it joins past 10 screenshots, and 10 exactly is fine", () => {
+    const many = (prefix: string, n: number) =>
+      Array.from({ length: n }, (_, i) => shot(`${prefix}_${i}`, "above"));
+    const graphWith = (moving: number) =>
+      getElements(
+        [
+          code("shots", "next", { doc_images: many("m", moving) }),
+          code("next", null, {
+            prompt: "Send it",
+            doc_images: many("n", 5),
+          }),
+        ],
+        settings(),
+        true,
+      ) as DocGraph;
+    vi.spyOn(toastModule, "toast").mockReturnValue({
+      id: "test",
+      dismiss: vi.fn(),
+      update: vi.fn(),
+    });
+    const over = editing(graphWith(6));
+    expect(over.api.toPlainText(byLabel(graphWith(6), "shots").id)).toBeNull();
+    const fits = graphWith(5);
+    const exact = editing(fits);
+    expect(exact.api.toPlainText(byLabel(fits, "shots").id)).not.toBeNull();
+    expect(imagesOf(exact.latest(), "next")).toHaveLength(10);
   });
 
   test("turning a step that something refers to keeps its name", () => {

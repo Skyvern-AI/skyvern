@@ -1,7 +1,10 @@
 import type { Edge } from "@xyflow/react";
 import { nanoid } from "nanoid";
 import type { BranchContext } from "@/store/WorkflowPanelStore";
-import type { BranchCondition } from "../../types/workflowTypes";
+import type {
+  BranchCondition,
+  WorkflowBlockImage,
+} from "../../types/workflowTypes";
 import {
   containsJinjaReference,
   objectContainsJinjaReference,
@@ -829,13 +832,15 @@ const KEPT_ON_TURN_INTO = [
   "notes",
   "trailingNotes",
   "description",
+  "docImages",
+  "promptImages",
   "conditionalNodeId",
   "conditionalBranchId",
   "conditionalLabel",
   "conditionalMergeLabel",
 ] as const;
 
-/** Changes a step's type in place, keeping its name, notes and place in a branch. */
+/** Changes a step's type in place, keeping its name, notes, screenshots and place in a branch. */
 export function turnInto(
   graph: DocGraph,
   id: string,
@@ -967,6 +972,8 @@ export function hasSettingsBeyondText(node: AppNode): boolean {
     "notes",
     "trailingNotes",
     "description",
+    // Screenshots move with the text into the note; prompt images are read by the agent and stay a setting.
+    "docImages",
     "review",
     "showCode",
   ]);
@@ -993,16 +1000,73 @@ export function isBlankStep(node: AppNode): boolean {
     "description",
     "notes",
     "trailingNotes",
+    "docImages",
   ].every((key) => blank(data[key]) || String(data[key]).trim() === "");
 }
 
 // The backend's BLOCK_NOTE_MAX_LENGTH: a longer note fails the save.
 export const NOTE_MAX_LENGTH = 2000;
+// The backend's BLOCK_DOC_IMAGES_MAX, counted over the whole step.
+export const DOC_IMAGES_MAX = 10;
+
+export function docImagesOf(node: AppNode | undefined): WorkflowBlockImage[] {
+  const images = (node?.data as { docImages?: unknown } | undefined)?.docImages;
+  return Array.isArray(images) ? (images as WorkflowBlockImage[]) : [];
+}
+
+/** Changes one step's screenshots; none left is stored as null, as a blank note is. */
+export function withDocImages(
+  nodes: AppNode[],
+  id: string,
+  change: (images: WorkflowBlockImage[]) => WorkflowBlockImage[],
+): AppNode[] {
+  return nodes.map((n) => {
+    if (n.id !== id) return n;
+    const next = change(docImagesOf(n));
+    return {
+      ...n,
+      data: { ...n.data, docImages: next.length ? next : null },
+    } as AppNode;
+  });
+}
 
 export type DocNoteRef = {
   ownerNodeId: string;
   placement: "above" | "trailing";
 };
+
+export const DOC_IMAGES_CAP_MESSAGE = `A step holds up to ${DOC_IMAGES_MAX} screenshots. Remove one to add another.`;
+
+// One entry per file: a step duplicated and then merged back into a note would otherwise list a file twice.
+const uniqueImages = (images: WorkflowBlockImage[]) =>
+  images.filter(
+    (image, at) => images.findIndex((i) => i.file_id === image.file_id) === at,
+  );
+
+/**
+ * Moves the screenshots under one line to another line, as the line's text moves. Null when the receiving step
+ * would hold more than DOC_IMAGES_MAX.
+ */
+export function moveDocImages(
+  nodes: AppNode[],
+  from: { ownerNodeId: string; placement: WorkflowBlockImage["placement"] },
+  to: { ownerNodeId: string; placement: WorkflowBlockImage["placement"] },
+  toFront: boolean,
+): AppNode[] | null {
+  const moving = docImagesOf(nodes.find((n) => n.id === from.ownerNodeId))
+    .filter((image) => image.placement === from.placement)
+    .map((image) => ({ ...image, placement: to.placement }));
+  if (!moving.length) return nodes;
+  const without = withDocImages(nodes, from.ownerNodeId, (images) =>
+    images.filter((image) => image.placement !== from.placement),
+  );
+  const held = docImagesOf(without.find((n) => n.id === to.ownerNodeId));
+  const merged = uniqueImages(
+    toFront ? [...moving, ...held] : [...held, ...moving],
+  );
+  if (merged.length > DOC_IMAGES_MAX) return null;
+  return withDocImages(without, to.ownerNodeId, () => merged);
+}
 
 /**
  * Turns a step back into plain text: its text joins the note above the next step, or the trailing note of the
@@ -1034,6 +1098,7 @@ export function toNote(
     ...[...proseKeys, "description"].map((k) => data[k]),
     data.trailingNotes,
   );
+  const images = docImagesOf(node);
   const removed = removeBlock(graph, id, finallyId);
   if (!removed) return null;
   const next = ids[at + 1];
@@ -1044,17 +1109,34 @@ export function toNote(
       ? { ownerNodeId: previous, placement: "trailing" }
       : null;
   // An empty step leaves an empty note where it stood, for the caret to land in.
-  if (!text) return { graph: removed, note };
+  if (!text && !images.length) return { graph: removed, note };
   if (!note) return null;
   const key = note.placement === "above" ? "notes" : "trailingNotes";
+  // The step's screenshots go under the note that takes its text, in the order the step showed them.
+  const moved = images.map((image) => ({
+    ...image,
+    placement: note.placement,
+  }));
   const nodes = removed.nodes.map((n) => {
     if (n.id !== note.ownerNodeId) return n;
     const current = (n.data as Record<string, unknown>)[key];
-    const value =
-      note.placement === "above"
+    const value = !text
+      ? current
+      : note.placement === "above"
         ? joinLines(text, current)
         : joinLines(current, text);
-    return { ...n, data: { ...n.data, [key]: value } } as AppNode;
+    const held = docImagesOf(n);
+    const docImages = moved.length
+      ? uniqueImages(
+          note.placement === "above"
+            ? [...moved, ...held]
+            : [...held, ...moved],
+        )
+      : (n.data as Record<string, unknown>).docImages;
+    return {
+      ...n,
+      data: { ...n.data, [key]: value, docImages },
+    } as AppNode;
   });
   return { graph: { nodes, edges: removed.edges }, note };
 }

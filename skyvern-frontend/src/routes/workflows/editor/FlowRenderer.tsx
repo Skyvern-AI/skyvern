@@ -1,6 +1,7 @@
 import { useWorkflowDocEditorFlag } from "@/hooks/useWorkflowDocEditorFlag";
 import { useWorkflowPresentationStore } from "@/store/WorkflowPresentationStore";
 import { WorkflowDocEditor } from "./doc/WorkflowDocEditor";
+import { useDocImageUploadScope } from "./doc/docImageUploads";
 import { useWorkflowHistoryAccessStore } from "@/store/WorkflowHistoryAccessStore";
 import {
   useWorkflowHasChangesStore,
@@ -548,6 +549,10 @@ function FlowRenderer({
       (node) => node.type === "start" && !node.parentId && node.data.editable,
     ) &&
     !yamlActive;
+  useDocImageUploadScope(
+    workflow.workflow_permanent_id,
+    embedded && !readOnly && docEnabled,
+  );
   const editorFinallyBlockLabel = useWorkflowSettingsStore(
     (state) => state.finallyBlockLabel,
   );

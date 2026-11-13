@@ -4,6 +4,8 @@ import { nanoid } from "nanoid";
 import { toast } from "@/components/ui/use-toast";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
+import { useWorkflowHistoryAccessStore } from "@/store/WorkflowHistoryAccessStore";
+import type { WorkflowBlockImage } from "../../types/workflowTypes";
 import { useLocateBlockStore } from "../runValidation/useLocateBlockStore";
 import { stripJinjaReferences } from "./docTextUtils";
 import { useNodeCollapseStore } from "../collapse/useNodeCollapseStore";
@@ -40,6 +42,10 @@ import {
   newStepLabel,
   branchMembers,
   contextInputsFedBy,
+  docImagesOf,
+  DOC_IMAGES_CAP_MESSAGE,
+  moveDocImages,
+  DOC_IMAGES_MAX,
   findOutputUsers,
   hasSettingsBeyondText,
   isBlankStep,
@@ -52,6 +58,7 @@ import {
   scopeOfNode,
   toNote,
   setStepField,
+  withDocImages,
   turnInto,
   type DocGraph,
   type DocNoteRef,
@@ -235,6 +242,7 @@ export function createDocEditApi({
     toFront: boolean,
   ): DocNoteRef | null => {
     const moving = noteText(from.ownerNodeId, from.placement).trim();
+    let next = nodes;
     if (moving) {
       const existing = noteText(to.ownerNodeId, to.placement).trim();
       const joined = [toFront ? moving : existing, toFront ? existing : moving]
@@ -246,15 +254,15 @@ export function createDocEditApi({
         );
         return null;
       }
-      let next = setStepField(
-        nodes,
-        from.ownerNodeId,
-        noteKey(from.placement),
-        "",
-      );
+      next = setStepField(next, from.ownerNodeId, noteKey(from.placement), "");
       next = setStepField(next, to.ownerNodeId, noteKey(to.placement), joined);
-      edits.apply({ nodes: next, edges });
     }
+    const withImages = moveDocImages(next, from, to, toFront);
+    if (!withImages) {
+      refuse(DOC_IMAGES_CAP_MESSAGE);
+      return null;
+    }
+    if (withImages !== nodes) edits.apply({ nodes: withImages, edges });
     return to;
   };
   const insertStep = (
@@ -353,6 +361,43 @@ export function createDocEditApi({
           n.id === id ? withLineSetting(n, key, previous) : n,
         );
       }),
+    imageCount: (id: string) =>
+      docImagesOf(nodes.find((n) => n.id === id)).length,
+    // Screenshots are reserved under their line when pasted, all in one undo step. A reservation counts toward the
+    // cap like a saved screenshot; two adds before a render both pass this render's `nodes`, so the step and the cap
+    // are checked again on the latest graph and the outcome settles when that update runs.
+    addImages: (
+      id: string,
+      images: WorkflowBlockImage[],
+    ): Promise<"added" | "missing" | "full"> => {
+      const node = nodes.find((n) => n.id === id);
+      if (!node) return Promise.resolve("missing");
+      if (docImagesOf(node).length + images.length > DOC_IMAGES_MAX)
+        return Promise.resolve("full");
+      return new Promise((settle) => {
+        useWorkflowHistoryAccessStore.getState().captureImmediately();
+        edits.update((current) => {
+          const latest = current.find((n) => n.id === id);
+          const outcome = !latest
+            ? "missing"
+            : docImagesOf(latest).length + images.length > DOC_IMAGES_MAX
+              ? "full"
+              : "added";
+          settle(outcome);
+          return outcome === "added"
+            ? withDocImages(current, id, (held) => [...held, ...images])
+            : current;
+        });
+      });
+    },
+    removeImage: (id: string, fileId: string) => {
+      useWorkflowHistoryAccessStore.getState().captureImmediately();
+      edits.update((current) =>
+        withDocImages(current, id, (images) =>
+          images.filter((image) => image.file_id !== fileId),
+        ),
+      );
+    },
     // The If line is the branch's condition. Its check follows what was typed, as the save reads it.
     setCondition: (conditionalId: string, branchId: string, value: string) =>
       edits.update((current) =>
@@ -441,7 +486,10 @@ export function createDocEditApi({
       // A loop or If takes its list or condition from its own fields, and a step with no instruction field (Wait,
       // Print Page, ...) keeps its description as a note the agent never reads. The note stays where it is for both,
       // so the workflow's runtime context does not change.
-      if (stepId && text)
+      const holdsImages = docImagesOf(
+        nodes.find((n) => n.id === note.ownerNodeId),
+      ).some((image) => image.placement === note.placement);
+      if (stepId && (text || holdsImages))
         edits.update((current) => {
           const added = current.find((n) => n.id === stepId);
           if (
@@ -454,9 +502,18 @@ export function createDocEditApi({
           const key =
             (!docMainIsSetting(added) && getDocProseFields(added)[0]?.key) ||
             "description";
+          // A new step holds nothing yet, so the note's screenshots always fit under its text.
+          const withImages =
+            moveDocImages(
+              current,
+              note,
+              { ownerNodeId: stepId, placement: "block" },
+              false,
+            ) ?? current;
+          if (!text) return withImages;
           return setStepField(
             setStepField(
-              current,
+              withImages,
               note.ownerNodeId,
               noteKey(note.placement),
               "",
@@ -671,15 +728,17 @@ export function createDocEditApi({
       )
         return false;
       const data = node.data as Record<string, unknown>;
-      return [
-        ...getDocProseFields(node).map((f) => f.key),
-        "description",
-        "notes",
-        "trailingNotes",
-      ].every((key) => {
-        const value = data[key];
-        return typeof value !== "string" || !value.trim();
-      });
+      return (
+        [
+          ...getDocProseFields(node).map((f) => f.key),
+          "description",
+          "notes",
+          "trailingNotes",
+        ].every((key) => {
+          const value = data[key];
+          return typeof value !== "string" || !value.trim();
+        }) && !docImagesOf(node).length
+      );
     },
     // Only a step whose whole content is text can become text without losing anything.
     canBePlainText: (id: string) => {
@@ -718,6 +777,12 @@ export function createDocEditApi({
         if (typeof text === "string" && text.length > NOTE_MAX_LENGTH) {
           refuse(
             `The note would be over ${NOTE_MAX_LENGTH.toLocaleString("en-US")} characters. Shorten the step's text first.`,
+          );
+          return null;
+        }
+        if (docImagesOf(owner).length > DOC_IMAGES_MAX) {
+          refuse(
+            `The step it joins would hold over ${DOC_IMAGES_MAX} screenshots. Remove some first.`,
           );
           return null;
         }
