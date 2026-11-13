@@ -3,6 +3,7 @@ from __future__ import annotations
 import abc
 import ast
 import asyncio
+import base64
 import builtins
 import codecs
 import contextlib
@@ -62,7 +63,7 @@ from typing import (
     Union,
     cast,
 )
-from urllib.parse import quote, urljoin, urlparse, urlsplit, urlunsplit
+from urllib.parse import quote, unquote, unquote_plus, urljoin, urlparse, urlsplit, urlunsplit
 
 import aiofiles
 import aiohttp
@@ -341,7 +342,10 @@ from skyvern.forge.sdk.workflow.models.code_block_recorder import (
     page_shows_sign_in_form,
     user_code_line_from_exception,
 )
-from skyvern.forge.sdk.workflow.models.code_block_recording import CodeBlockActionRecording
+from skyvern.forge.sdk.workflow.models.code_block_recording import (
+    CodeBlockActionRecording,
+    redact_recorded_action_payload,
+)
 from skyvern.forge.sdk.workflow.models.credential_release import (
     CodeBlockCredentialReleaseError,
     CredentialReleaseGuard,
@@ -372,7 +376,7 @@ from skyvern.forge.sdk.workflow.secret_encryption import (
     is_encrypted_secret,
     is_full_template_reference,
 )
-from skyvern.forge.taskv3.goal_composition import CodeProgressRecord, CodeTypedValue
+from skyvern.forge.taskv3.goal_composition import CodeExecutedCall, CodeProgressRecord, CodeTypedValue
 from skyvern.forge.taskv3.handoff_redaction import pin_caller_authored_block_urls
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.browser_session_kind import BrowserSessionKind
@@ -437,7 +441,7 @@ from skyvern.utils.url_validators import (
 )
 from skyvern.webeye import dialog_handler
 from skyvern.webeye.actions.action_types import ActionType
-from skyvern.webeye.actions.actions import Action, ActionStatus
+from skyvern.webeye.actions.actions import Action, ActionStatus, KeypressAction
 from skyvern.webeye.browser_artifacts import DownloadBinding
 from skyvern.webeye.browser_driver_errors import is_driver_error
 from skyvern.webeye.browser_engine import is_any_engine_error
@@ -5865,6 +5869,61 @@ _CODE_BLOCK_SESSION_DOWNLOAD_WAIT_SECONDS = 60
 _CODE_BLOCK_SESSION_DOWNLOAD_SETTLE_ATTEMPTS = 6
 _CODE_BLOCK_SESSION_DOWNLOAD_SETTLE_INTERVAL_SECONDS = 0.5
 _AUTHORING_RUN_LINEAGE_MAX_DEPTH = 10
+_EXECUTED_CALL_DESCRIPTION_MAX_CHARS = 160
+_WITHHELD_CALL_DESCRIPTION = "(description withheld)"
+_WITHHELD_KEY = "(key withheld)"
+_NON_TYPING_KEYS = frozenset(
+    {
+        "Enter",
+        "Tab",
+        "Escape",
+        "Backspace",
+        "Delete",
+        "Home",
+        "End",
+        "PageUp",
+        "PageDown",
+        "ArrowUp",
+        "ArrowDown",
+        "ArrowLeft",
+        "ArrowRight",
+        "Shift",
+        "Control",
+        "Alt",
+        "Meta",
+        "ControlOrMeta",
+        *(f"F{number}" for number in range(1, 13)),
+    }
+)
+
+
+def _withhold_typed_keys(action: Action, description: str) -> str:
+    """A press that can type a character is a credential spelled out one call at a time, so only listed keys stay."""
+    if not isinstance(action, KeypressAction):
+        return description
+    for key in action.keys:
+        if any(part not in _NON_TYPING_KEYS for part in key.split("+")):
+            return (
+                description.removesuffix(key) + _WITHHELD_KEY
+                if description.endswith(key)
+                else _WITHHELD_CALL_DESCRIPTION
+            )
+    return description
+
+
+def _base64_alignments(secret: str) -> set[str]:
+    """The base64 runs a secret produces inside a longer encoded string, whichever byte offset it starts at.
+    Unfloored like the plain screen, so a short secret fails closed."""
+    raw = secret.encode()
+    runs: set[str] = set()
+    for offset, leading_mixed_chars in ((0, 0), (1, 2), (2, 3)):
+        encoded = base64.b64encode(b"\0" * offset + raw).decode()
+        # The last character mixes in padding bits, so only the characters before it are the same inside a longer string.
+        run = encoded.rstrip("=")[:-1] if encoded.endswith("=") else encoded
+        run = run[leading_mixed_chars:]
+        if run:
+            runs.update((run, run.replace("+", "-").replace("/", "_")))
+    return runs
 
 
 async def _code_block_solve_captcha_builtin(
@@ -8553,6 +8612,17 @@ async def wrapper({default_args}):
     def _compose_heal_goal(self, *, workflow_run_context: WorkflowRunContext) -> str:
         return workflow_run_context.mask_secrets_in_data(self.prompt or "")
 
+    def _secret_screen_forms(self, workflow_run_context: WorkflowRunContext) -> set[str]:
+        """Every form a registered secret or placeholder id can take in text. Unfloored, so a short secret such as a
+        PIN fails closed; the JSON-escaped forms catch a secret inside a value that is itself a JSON string."""
+        encoded = {
+            variant
+            for secret in (*self._registered_secret_values(workflow_run_context), *workflow_run_context.secrets)
+            for variant in (*expand_secret_encodings(secret), repr(secret)[1:-1])
+            if variant
+        }
+        return encoded | {json.dumps(variant, ensure_ascii=False)[1:-1] for variant in encoded}
+
     def _secret_free_typed_values(
         self, *, workflow_run_context: WorkflowRunContext, authored_code: str | None
     ) -> tuple[CodeTypedValue, ...]:
@@ -8560,30 +8630,89 @@ async def wrapper({default_args}):
         # differs from the executed code means its line numbers would not match the failing line.
         if authored_code is None or len(authored_code.splitlines()) != len((self.code or "").splitlines()):
             return ()
+        secrets = self._secret_screen_forms(workflow_run_context)
         typed_values: list[CodeTypedValue] = []
         for line, target, value in code_typed_values(authored_code):
-            if self._contains_registered_secret(value, workflow_run_context) or self._contains_registered_secret(
-                target, workflow_run_context
-            ):
+            if any(secret in value or secret in target for secret in secrets):
                 continue
             typed_values.append(CodeTypedValue(line=line, target=target, value=value))
         return tuple(typed_values)
 
+    def _secret_free_executed_calls(
+        self,
+        *,
+        workflow_run_context: WorkflowRunContext,
+        recorded_actions: Iterable[Action],
+        redaction_parameters: dict[str, Any],
+    ) -> tuple[CodeExecutedCall, ...]:
+        secrets = self._secret_screen_forms(workflow_run_context)
+        for secret in self._registered_secret_values(workflow_run_context):
+            secrets |= _base64_alignments(secret)
+        calls: list[CodeExecutedCall] = []
+        for action in recorded_actions:
+            raw = action.description or ""
+            decoded_forms = (raw, unquote(raw), unquote_plus(raw))
+            # The recorder cuts a call's argument before anything masks it, so a secret split at the cut survives
+            # masking as a prefix at the end of the description.
+            if any(secret in text for text in decoded_forms for secret in secrets) or any(
+                raw.endswith(secret[:length])
+                for secret in secrets
+                for length in range(MIN_SECRET_LENGTH, min(len(secret), len(raw) + 1))
+            ):
+                description: object = _WITHHELD_CALL_DESCRIPTION
+            else:
+                redacted = redact_recorded_action_payload(
+                    action.model_dump(mode="json", warnings=False), workflow_run_context, redaction_parameters
+                )
+                description = redacted.get("description")
+            if not isinstance(description, str) or not description:
+                description = _WITHHELD_CALL_DESCRIPTION
+            description = _withhold_typed_keys(action, description)
+            line = action.output.get("code_line") if isinstance(action.output, dict) else None
+            calls.append(
+                CodeExecutedCall(
+                    line=line if type(line) is int else None,
+                    description=description[:_EXECUTED_CALL_DESCRIPTION_MAX_CHARS],
+                    failed=action.status != ActionStatus.completed,
+                )
+            )
+        return tuple(calls)
+
     def _code_progress_record(
-        self, *, workflow_run_context: WorkflowRunContext, failing_line: int | None, authored_code: str | None
+        self,
+        *,
+        workflow_run_context: WorkflowRunContext,
+        failing_line: int | None,
+        authored_code: str | None,
+        recorded_actions: Iterable[Action],
+        redaction_parameters: dict[str, Any],
     ) -> CodeProgressRecord | None:
+        executed_calls = self._secret_free_executed_calls(
+            workflow_run_context=workflow_run_context,
+            recorded_actions=recorded_actions,
+            redaction_parameters=redaction_parameters,
+        )
         if failing_line is None:
-            return None
+            if not executed_calls:
+                return None
+            return CodeProgressRecord(
+                before=(), failed_step=None, failed_line=None, after=(), executed_calls=executed_calls
+            )
         typed_values = self._secret_free_typed_values(
             workflow_run_context=workflow_run_context, authored_code=authored_code
         )
         index = self._matched_step_index_for_failing_line(failing_line)
         steps = self.steps or []
         if index is None or not steps[index].description:
-            if not typed_values:
+            if not typed_values and not executed_calls:
                 return None
             return CodeProgressRecord(
-                before=(), failed_step=None, failed_line=failing_line, after=(), typed_values=typed_values
+                before=(),
+                failed_step=None,
+                failed_line=failing_line,
+                after=(),
+                typed_values=typed_values,
+                executed_calls=executed_calls,
             )
 
         def masked(chunk: list[CodeBlockStep]) -> tuple[str, ...]:
@@ -8597,6 +8726,7 @@ async def wrapper({default_args}):
             failed_line=failing_line,
             after=masked(steps[index + 1 :]),
             typed_values=typed_values,
+            executed_calls=executed_calls,
         )
 
     async def _record_unregistered_download_intent(
@@ -8770,16 +8900,7 @@ async def wrapper({default_args}):
             include_workflow_run_summary="workflow_run_summary" in roots,
             include_credential_entries=False,
         )
-        # Unfloored, so a short secret such as a PIN drops a root that merely contains it (fail closed). Each
-        # encoding is also JSON-escaped, which catches a secret inside an upstream value that is itself a JSON string.
-        encoded_secrets = {
-            variant
-            for secret in (*self._registered_secret_values(workflow_run_context), *workflow_run_context.secrets)
-            for variant in (*expand_secret_encodings(secret), repr(secret)[1:-1])
-        }
-        escaped_secrets = encoded_secrets | {
-            json.dumps(variant, ensure_ascii=False)[1:-1] for variant in encoded_secrets
-        }
+        escaped_secrets = self._secret_screen_forms(workflow_run_context)
         values: dict[str, Any] = {}
         budget = self._REFERENCED_FALLBACK_TOTAL_MAX_CHARS
         over_budget: list[str] = []
@@ -9079,6 +9200,8 @@ async def wrapper({default_args}):
                         workflow_run_context=workflow_run_context,
                         failing_line=failing_line,
                         authored_code=authored_code,
+                        recorded_actions=recording_page.recorded_actions(),
+                        redaction_parameters=resolved_redaction_parameters,
                     ),
                 )
             finally:

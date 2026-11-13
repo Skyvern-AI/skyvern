@@ -7,6 +7,7 @@ selector heals even when no step covers the failing line (the common case).
 from __future__ import annotations
 
 import asyncio
+import base64
 import html
 import json
 import urllib.parse
@@ -70,6 +71,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.forge.taskv3.goal_composition import (
+    EXECUTED_CALLS_HEADER,
     CodeProgressRecord,
     GoalDirectives,
     compose_goal,
@@ -80,7 +82,7 @@ from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.self_heal import HealClassification, HealSkipReason, HealStatus
 from skyvern.services import otp_service
 from skyvern.webeye.actions.action_types import ActionType
-from skyvern.webeye.actions.actions import Action
+from skyvern.webeye.actions.actions import Action, ActionStatus, KeypressAction
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from skyvern.webeye.browser_runtime_events import BrowserRuntimeLogContext
 from skyvern.webeye.navigation import clear_task_nav_error_code, record_task_nav_error_code
@@ -3940,13 +3942,204 @@ def test_outline_is_source_order_and_never_claims_what_ran(failing_line: int, ex
     )
 
     record = block._code_progress_record(
-        workflow_run_context=_make_context(), failing_line=failing_line, authored_code=code
+        workflow_run_context=_make_context(),
+        failing_line=failing_line,
+        authored_code=code,
+        recorded_actions=[],
+        redaction_parameters={},
     )
 
     assert record == expected
     section = compose_goal(DEFAULT_PROMPT, GoalDirectives(code_progress=record)).removeprefix(DEFAULT_PROMPT).lower()
     for claim in ("completed", "not run", " ran", "already", "done"):
         assert claim not in section
+
+
+def _recorded_call(order: int, line: int | None, description: str, status: ActionStatus) -> Action:
+    return Action(
+        action_type=ActionType.CLICK,
+        status=status,
+        action_order=order,
+        description=description,
+        output={"code_line": line},
+        response="Timeout 5000ms exceeded" if status == ActionStatus.failed else None,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failing_line", [9, None])
+async def test_executed_calls_reach_the_recovery_without_secrets_or_parameter_values(
+    monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None], failing_line: int | None
+) -> None:
+    ai_fallback_flag("o_test")
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "redact_codeblock_parameter_values",
+        lambda value, parameters, **_: (
+            json.loads(json.dumps(value).replace("Grace Param", "[redacted]")) if parameters else value
+        ),
+    )
+    state = _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block(steps=[CodeBlockStep(description="read the panel", line_start=9, line_end=9)])
+    exc = RuntimeError("rotted selector")
+    recording_page = _recording_page(exc)
+    url_secret = "p@ss/w0rd!X"
+    recording_page.recorded_actions = MagicMock(
+        return_value=[
+            _recorded_call(0, None, "locator.click #size-m", ActionStatus.completed),
+            _recorded_call(1, 4, f"locator.fill #password {SECRET_VALUE}", ActionStatus.completed),
+            _recorded_call(2, 5, f"locator.click #promo {'x' * 180}{SECRET_VALUE[:8]}", ActionStatus.completed),
+            _recorded_call(3, 6, "locator.click #contact Grace Param", ActionStatus.completed),
+            _recorded_call(
+                4, 7, f"page.goto https://u:{urllib.parse.quote(url_secret, safe='')}@h", ActionStatus.completed
+            ),
+            _recorded_call(4, 7, "locator.click #add", ActionStatus.completed),
+            _recorded_call(5, 8, "locator.click #open-panel", ActionStatus.failed),
+        ]
+    )
+    redaction_parameters = {"contact_name": "Grace Param"}
+    workflow_run_context = _make_context(with_secret=True)
+    workflow_run_context.secrets["k_url_secret"] = url_secret
+
+    with skyvern_context.scoped(SkyvernContext(organization_id="o_test", workflow_run_id="wr_test")):
+        await block._attempt_self_heal(
+            exception=exc,
+            failing_line=failing_line,
+            recording_page=recording_page,
+            workflow_run_context=workflow_run_context,
+            workflow_run_id="wr_test",
+            workflow_run_block_id="wrb_test",
+            organization_id="o_test",
+            browser_session_id=None,
+            browser_state=_browser_state(),
+            page=MagicMock(),
+            redaction_parameters=redaction_parameters,
+            authored_code=None,
+            code_failure_reason=None,
+        )
+
+    record = state["execute_step_kwargs"]["recovery_code_progress"]
+    goal = compose_goal(DEFAULT_PROMPT, GoalDirectives(code_progress=record))
+    assert goal.split("\n\n")[1].split("\n") == [
+        EXECUTED_CALLS_HEADER,
+        '- "locator.click #size-m" returned',
+        '- Line 4: "(description withheld)" returned',
+        '- Line 5: "(description withheld)" returned',
+        '- Line 6: "locator.click #contact [redacted]" returned',
+        '- Line 7: "(description withheld)" returned',
+        '- Line 7: "locator.click #add" returned',
+        '- Line 8: "locator.click #open-panel" raised an error',
+    ]
+    assert (record.failed_line, "Code outline" in goal) == (failing_line, failing_line is not None)
+    for leaked in (SECRET_VALUE, SECRET_VALUE[:8], "Grace Param", "*****", "w0rd"):
+        assert leaked not in goal
+
+
+@pytest.mark.parametrize(
+    "encode",
+    [
+        lambda secret: urllib.parse.quote(secret),
+        lambda secret: base64.b64encode(f"bob:{secret}".encode()).decode(),
+        lambda secret: base64.b64encode(f"al:{secret}".encode()).decode(),
+        lambda secret: base64.b64encode(f"alic:{secret}".encode()).decode(),
+        lambda secret: base64.urlsafe_b64encode(f"bob:{secret}".encode()).decode(),
+        lambda secret: base64.urlsafe_b64encode(f"carol:{secret}".encode()).decode(),
+    ],
+)
+def test_a_secret_in_a_common_encoding_is_withheld_but_its_call_stays_listed(
+    encode: Callable[[str], str],
+) -> None:
+    secret = "pa?s>w~rd!"
+    context = _make_context(with_secret=True)
+    context.secrets["k_pw"] = secret
+    block = _make_code_block(code='await page.goto("https://example.com")\n')
+    recorded = [_recorded_call(0, 1, f"page.goto https://h/login?x={encode(secret)}", ActionStatus.completed)]
+
+    record = block._code_progress_record(
+        workflow_run_context=context,
+        failing_line=None,
+        authored_code=None,
+        recorded_actions=recorded,
+        redaction_parameters={},
+    )
+
+    assert record is not None
+    assert [(call.line, call.failed) for call in record.executed_calls] == [(1, False)]
+    assert encode(secret) not in compose_goal(DEFAULT_PROMPT, GoalDirectives(code_progress=record))
+
+
+def test_a_credential_typed_one_key_per_call_is_not_spelled_out_but_named_keys_stay() -> None:
+    block = _make_code_block(code='await page.keyboard.press("1")\n')
+    keys = [
+        (None, "1"),
+        (None, "Digit2"),
+        (None, "KeyA"),
+        (None, "Shift+A"),
+        ("#pin", "+"),
+        (None, "Enter"),
+        ("#pin", "ArrowDown"),
+        (None, "Control+Enter"),
+        (None, "F5"),
+    ]
+    recorded = [
+        KeypressAction(
+            status=ActionStatus.completed,
+            action_order=order,
+            description=" ".join(filter(None, ["locator.press" if target else "keyboard.press", target, key])),
+            keys=[key],
+            output={"code_line": order + 1},
+        )
+        for order, (target, key) in enumerate(keys)
+    ]
+
+    record = block._code_progress_record(
+        workflow_run_context=_make_context(),
+        failing_line=None,
+        authored_code=None,
+        recorded_actions=recorded,
+        redaction_parameters={},
+    )
+
+    assert record is not None
+    assert [call.description for call in record.executed_calls] == [
+        "keyboard.press (key withheld)",
+        "keyboard.press (key withheld)",
+        "keyboard.press (key withheld)",
+        "keyboard.press (key withheld)",
+        "locator.press #pin (key withheld)",
+        "keyboard.press Enter",
+        "locator.press #pin ArrowDown",
+        "keyboard.press Control+Enter",
+        "keyboard.press F5",
+    ]
+    assert [call.line for call in record.executed_calls] == list(range(1, 10))
+
+
+@pytest.mark.parametrize("secret", ["4242", "123", "25"])
+def test_a_short_secret_never_hides_that_a_call_ran(secret: str) -> None:
+    context = _make_context(with_secret=True)
+    context.secrets["k_card"] = secret
+    block = _make_code_block(code='await page.get_by_role("button", name="Add").click()\n')
+    compound = base64.b64encode(f"bob:{secret}".encode()).decode()
+    recorded = [
+        _recorded_call(0, 1, f"locator.click Add item {secret}", ActionStatus.completed),
+        _recorded_call(1, 2, f"page.goto https://h/#auth={compound}", ActionStatus.completed),
+        _recorded_call(2, 3, "locator.click Open bag", ActionStatus.failed),
+    ]
+
+    record = block._code_progress_record(
+        workflow_run_context=context,
+        failing_line=None,
+        authored_code=None,
+        recorded_actions=recorded,
+        redaction_parameters={},
+    )
+
+    assert record is not None
+    assert [(call.line, call.failed) for call in record.executed_calls] == [(1, False), (2, False), (3, True)]
+    assert [call.description for call in record.executed_calls[:2]] == ["(description withheld)"] * 2
+    assert compound not in compose_goal(DEFAULT_PROMPT, GoalDirectives(code_progress=record))
 
 
 @pytest.mark.asyncio
