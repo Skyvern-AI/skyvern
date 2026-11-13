@@ -346,7 +346,7 @@ The **Skyvern Agent** extension lets a local MCP server drive tabs in your every
 3. Run `skyvern browser extension-pair` and approve the pairing in the browser, then again in the **Skyvern Agent** tab that opens.
 4. Drag the tabs you want to share into the **Skyvern Controlled** tab group, or use **Add to Skyvern Controlled** in the extension popup.
 
-Skyvern only sees tabs in that group. Drag a tab out to revoke access at once. In broker mode, a new browser session opens its own tab in that group. To start the session in a tab you shared, create it with `use_shared_tab=true`. Shared tabs show "Skyvern is controlling this tab". The extension can't evaluate JavaScript, handle downloads or file pickers, or work in incognito windows. Check the setup with `skyvern browser extension-status`. MCP client setup is on [MCP and coding agents](/developers/getting-started/mcp).
+Skyvern only sees tabs in that group. Drag a tab out to revoke access at once. In broker mode (the default on macOS and Linux), a new session opens its own tab in that group. To use a free tab you shared instead, ask your agent to pass `use_shared_tab=true` to `skyvern_browser_session_create` when creating the session. If none is free, a new tab opens; legacy relay mode ignores this option. Shared tabs show "Skyvern is controlling this tab". The extension can't evaluate JavaScript, handle downloads or file pickers, or work in incognito windows. Check the setup with `skyvern browser extension-status`. MCP client setup is on [MCP and coding agents](/developers/getting-started/mcp).
 
 The extension connects to `ws://127.0.0.1:19777/extension/v1` on your machine. What listens there depends on the platform:
 
