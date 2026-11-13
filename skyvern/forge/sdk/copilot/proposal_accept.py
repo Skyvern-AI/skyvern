@@ -328,6 +328,11 @@ async def accept_copilot_proposal(
                     workflow_id=accepted.workflow_id,
                     version=accepted.version,
                     modified_at=accepted.modified_at,
+                    tested_workflow_run_id=(
+                        metadata.workflow_run_id
+                        if original_disposition in ("review_tested", "auto_applicable")
+                        else None
+                    ),
                 )
         except Exception:
             LOG.warning(

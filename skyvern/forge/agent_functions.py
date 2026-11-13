@@ -2016,6 +2016,11 @@ class AgentFunction:
         del organization_id
         return CopilotOrganizationUsage(credits_note="This deployment does not track billing.")
 
+    async def copilot_run_stop_rule(self, *, organization_id: str) -> str | None:
+        """The billing check that stops this organization's runs, in one sentence; None when it cannot be stated."""
+        del organization_id
+        return None
+
     def copilot_trigger_sources(self) -> list[CopilotTriggerSource]:
         return []
 

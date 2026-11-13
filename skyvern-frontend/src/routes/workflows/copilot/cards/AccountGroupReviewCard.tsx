@@ -1,4 +1,4 @@
-import { useId, useState } from "react";
+import { useId, useState, type ReactNode } from "react";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { cn } from "@/util/utils";
@@ -6,6 +6,7 @@ import type {
   AccountGroupCancelReview,
   AccountGroupOutcome,
   AccountGroupReview,
+  RunCostFacts,
 } from "../workflowCopilotTypes";
 import type { TurnNarrativeState } from "../narrativeState";
 import { AttentionTray } from "./AttentionTray";
@@ -106,6 +107,114 @@ function InputList({ inputs }: { inputs: Record<string, unknown> }) {
   ) : null;
 }
 
+function credits(count: number): string {
+  return count === 1 ? "1 credit" : `${count.toLocaleString()} credits`;
+}
+
+export function RunCostFactList({
+  cost,
+  basedOnInputs,
+  runs,
+  receipt = false,
+  testedRunId,
+  testedRunLinkedAbove = false,
+  className,
+}: {
+  cost?: RunCostFacts | null;
+  basedOnInputs?: Record<string, unknown> | null;
+  runs?: number;
+  receipt?: boolean;
+  testedRunId?: string | null;
+  testedRunLinkedAbove?: boolean;
+  className?: string;
+}) {
+  const headingId = useId();
+  if (!cost) return null;
+  // The server leaves out every number when the account's credits are not tracked.
+  const count =
+    cost.runs_to_start == null || runs === 0
+      ? null
+      : (runs ?? cost.runs_to_start);
+  const isTestedRun =
+    cost.based_on_run_id != null && cost.based_on_run_id === testedRunId;
+  const basedOnText = isTestedRun ? "the test run" : "the latest run";
+  const facts: [string, ReactNode][] = [];
+  if (count != null) {
+    facts.push([receipt ? "Runs approved" : "Runs to start", String(count)]);
+  }
+  if (cost.based_on_run_id) {
+    facts.push([
+      "Based on",
+      isTestedRun && testedRunLinkedAbove ? (
+        basedOnText
+      ) : (
+        <a
+          className="underline-offset-2 hover:underline"
+          href={`/runs/${cost.based_on_run_id}`}
+          target="_blank"
+          rel="noreferrer"
+        >
+          {basedOnText}
+          <span className="sr-only"> (opens in new tab)</span>
+        </a>
+      ),
+    ]);
+  }
+  if (cost.based_on_run_id && cost.based_on_credits != null) {
+    facts.push(["That run used", credits(cost.based_on_credits)]);
+  }
+  if (
+    cost.based_on_run_id &&
+    cost.blocks_completed != null &&
+    cost.blocks_total != null
+  ) {
+    facts.push([
+      "Blocks it completed",
+      `${cost.blocks_completed} of ${cost.blocks_total}`,
+    ]);
+  }
+  if (cost.based_on_run_id && basedOnInputs) {
+    facts.push(["Its inputs", <InputList inputs={basedOnInputs} />]);
+  }
+  if (
+    cost.estimate_from_one_run != null &&
+    cost.based_on_credits != null &&
+    count != null
+  ) {
+    facts.push([
+      receipt ? "Estimate at review" : "Estimate",
+      `${credits(count * cost.based_on_credits)} (estimate from one run)`,
+    ]);
+  }
+  if (cost.balance_credits != null) {
+    facts.push([
+      receipt ? "Balance at review" : "Balance",
+      credits(cost.balance_credits),
+    ]);
+  }
+  if (cost.credits_note) facts.push(["Credits", cost.credits_note]);
+  if (cost.stop_rule) facts.push(["What stops spending", cost.stop_rule]);
+  return facts.length > 0 ? (
+    <div
+      role="group"
+      aria-labelledby={headingId}
+      className={cn("flex flex-col gap-1", className)}
+    >
+      <p id={headingId} className="text-muted-foreground">
+        Cost
+      </p>
+      <dl className="grid grid-cols-[auto,1fr] gap-x-2 gap-y-0.5">
+        {facts.map(([label, value]) => (
+          <div key={label} className="contents">
+            <dt className="text-muted-foreground">{label}</dt>
+            <dd className="break-words">{value}</dd>
+          </div>
+        ))}
+      </dl>
+    </div>
+  ) : null;
+}
+
 function SingleRunReviewCard({
   review,
   disabled,
@@ -203,6 +312,12 @@ function SingleRunReviewCard({
             </dl>
           </div>
         ) : null}
+        <RunCostFactList
+          cost={review.cost}
+          basedOnInputs={review.based_on_inputs}
+          testedRunId={review.tested_workflow_run_id}
+          testedRunLinkedAbove={savesDraft}
+        />
         <p className="text-muted-foreground">
           {savesDraft
             ? "Approving saves the draft as a new version, as Accept does, then runs it the same way pressing Run does, with the logins it's set up to use."
@@ -318,6 +433,11 @@ function GroupReviewCard({
             );
           })}
         </ul>
+        <RunCostFactList
+          cost={review.cost}
+          basedOnInputs={review.based_on_inputs}
+          runs={approved.length}
+        />
       </div>
       <ReviewActions
         disabled={disabled}

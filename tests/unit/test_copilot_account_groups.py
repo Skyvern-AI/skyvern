@@ -20,13 +20,14 @@ from sqlalchemy import delete, func, select, update
 from skyvern.config import settings
 from skyvern.exceptions import SkyvernHTTPException, WorkflowPinnedByRunGroup
 from skyvern.forge import app
+from skyvern.forge.agent_functions import CopilotOrganizationUsage
 from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot.ask_user import AccountGroupReview, QuestionInteraction
 from skyvern.forge.sdk.copilot.browser_ablation import resolve_copilot_tool_surface
 from skyvern.forge.sdk.copilot.canonical_ownership import workflow_content_fingerprint
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
-from skyvern.forge.sdk.copilot.secret_scrub import register_secret_scrub_value
+from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER, register_secret_scrub_value
 from skyvern.forge.sdk.copilot.tools import account_groups, copilot_native_tools
 from skyvern.forge.sdk.copilot.tools import credentials as credentials_module
 from skyvern.forge.sdk.copilot.tools import mcp_hooks, workflow_update
@@ -90,6 +91,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     COPILOT_TEST_WORKFLOW_CREATOR,
     Workflow,
     WorkflowDefinition,
+    WorkflowRun,
     WorkflowRunStatus,
 )
 from skyvern.schemas.workflow_run_groups import (
@@ -104,6 +106,7 @@ from tests.unit.conftest import (
     RUN_GROUP_ORG,
     RUN_GROUP_WPID,
     GroupEnv,
+    make_block_output_parameter,
     run_group_definition,
     run_group_task_block,
 )
@@ -200,12 +203,16 @@ async def _seed_run(
     blocks: tuple[tuple[str, str, str | None], ...] = (("login", "completed", None),),
     status: WorkflowRunStatus = WorkflowRunStatus.completed,
     group: bool = True,
-) -> None:
+    credits: tuple[int, int] = (0, 0),
+    note: str | None = None,
+) -> str:
     workflow = await env.database.workflows.get_workflow(workflow_id)
     parameters = await app.WORKFLOW_SERVICE.get_workflow_parameters(workflow_id=workflow_id)
     login = next(parameter for parameter in parameters if parameter.key == "login")
+    note_parameter = next(parameter for parameter in parameters if parameter.key == "note")
     workflow_run_id = f"wr_{uuid4().hex}"
-    block_ids = {label: f"wrb_{uuid4().hex}" for label, _, _ in blocks}
+    row_ids = [f"wrb_{uuid4().hex}" for _ in blocks]
+    block_ids = {label: row_id for (label, _, _), row_id in zip(blocks, row_ids)}
     async with env.database.Session() as session:
         if group:
             group_id = f"wrg_{uuid4().hex}"
@@ -238,6 +245,8 @@ async def _seed_run(
                 workflow_permanent_id=RUN_GROUP_WPID,
                 organization_id=RUN_GROUP_ORG,
                 status=status.value,
+                credits_used=credits[0],
+                cached_credits_used=credits[1],
             )
         )
         session.add(
@@ -247,9 +256,17 @@ async def _seed_run(
                 value=credential_id,
             )
         )
+        if note is not None:
+            session.add(
+                WorkflowRunParameterModel(
+                    workflow_run_id=workflow_run_id,
+                    workflow_parameter_id=note_parameter.workflow_parameter_id,
+                    value=note,
+                )
+            )
         session.add_all(
             WorkflowRunBlockModel(
-                workflow_run_block_id=block_ids[label],
+                workflow_run_block_id=row_id,
                 parent_workflow_run_block_id=block_ids[parent] if parent else None,
                 workflow_run_id=workflow_run_id,
                 organization_id=RUN_GROUP_ORG,
@@ -257,9 +274,10 @@ async def _seed_run(
                 status=block_status,
                 label=label,
             )
-            for label, block_status, parent in blocks
+            for (label, block_status, parent), row_id in zip(blocks, row_ids)
         )
         await session.commit()
+    return workflow_run_id
 
 
 @contextmanager
@@ -2069,3 +2087,288 @@ async def test_group_schedule_and_run_refusals_state_the_same_fact_about_an_unsa
     for error in (run.error, group.error, schedule["error"]):
         assert error.endswith(mcp_hooks.PENDING_PROPOSAL_FACT)
         assert "auto-accept" not in error
+
+
+STOP_RULE = "Each run checks this account's credits before it starts, and its steps check again while it runs."
+
+
+def _metered(monkeypatch: pytest.MonkeyPatch) -> None:
+    usage = CopilotOrganizationUsage(plan_tier="pro", remaining_credits=500)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "get_organization_usage_quota", AsyncMock(return_value=usage))
+    monkeypatch.setattr(app.AGENT_FUNCTION, "copilot_run_stop_rule", AsyncMock(return_value=STOP_RULE))
+
+
+async def _save_blocks_with_finally(chat: Chat) -> None:
+    confirm, wrapup = (
+        TaskBlock(label=label, url="https://example.com", output_parameter=make_block_output_parameter(label))
+        for label in ("confirm", "wrapup")
+    )
+    definition = run_group_definition(run_group_task_block(), confirm, wrapup, finally_block_label="wrapup")
+    async with chat.env.database.Session() as session:
+        await session.execute(
+            update(WorkflowModel).where(WorkflowModel.workflow_id == "wf_1").values(workflow_definition=definition)
+        )
+        await session.commit()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("blocks", "completed"),
+    [
+        ((("login", "completed", None), ("confirm", "completed", None), ("wrapup", "failed", None)), 2),
+        ((("login", "completed", None),), 1),
+        ((("login", "completed", None), ("login", "completed", None)), 1),
+    ],
+    ids=["whole_workflow", "partial", "retried_block"],
+)
+async def test_the_run_card_and_its_result_report_the_cost_of_the_versions_latest_completed_run(
+    chat: Chat,
+    monkeypatch: pytest.MonkeyPatch,
+    blocks: tuple[tuple[str, str, str | None], ...],
+    completed: int,
+) -> None:
+    _metered(monkeypatch)
+    register_secret_scrub_value(chat.ctx, SECRET)
+    await _save_blocks_with_finally(chat)
+    run_id = await _seed_run(chat.env, blocks=blocks, group=False, credits=(30, 12), note=f"ref {SECRET}")
+
+    task = _start_single_run(chat, {"note": "May", "login": "cred_3"})
+    card = await _card(chat)
+    review = card["account_group_review"]
+    cost = review["cost"]
+
+    assert cost == {
+        "runs_to_start": 1,
+        "based_on_run_id": run_id,
+        "based_on_credits": 42,
+        "blocks_completed": completed,
+        "blocks_total": 2,
+        "balance_credits": 500,
+        "stop_rule": STOP_RULE,
+    } | ({"estimate_from_one_run": 42} if completed == 2 else {})
+    assert review["based_on_inputs"] == {
+        "login": REDACTED_SECRET_PLACEHOLDER,
+        "note": f"ref {REDACTED_SECRET_PLACEHOLDER}",
+    }
+    assert "cred_1" not in to_json(review).decode() and SECRET not in to_json(review).decode()
+    assert await _decide(chat, card, {"approved": True, "credential_ids": ["cred_3"]}) == 200
+    result = await asyncio.wait_for(task, 5)
+    assert isinstance(result, SingleRunSubmission) and result.dispatched
+    assert result.cost is not None and result.cost.model_dump(mode="json") == cost
+    assert "based_on_inputs" not in result.model_dump_json() and "ref " not in result.model_dump_json()
+    assert (await _restored_review(chat))["account_group_review"]["cost"] == cost
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("quota", ["note", "unreadable"])
+async def test_an_account_whose_credits_are_not_tracked_sees_no_credit_numbers(
+    chat: Chat, monkeypatch: pytest.MonkeyPatch, quota: str
+) -> None:
+    run_id = await _seed_run(chat.env, group=False, credits=(30, 12))
+    note = "Custom enterprise billing, so credit counters do not apply."
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "get_organization_usage_quota",
+        AsyncMock(return_value=CopilotOrganizationUsage(remaining_credits=0, credits_note=note))
+        if quota == "note"
+        else AsyncMock(side_effect=RuntimeError("billing read failed")),
+    )
+
+    task = _start(chat, ["cred_2", "cred_3"])
+    card = await _card(chat)
+    cost = card["account_group_review"]["cost"]
+
+    assert cost == {
+        "based_on_run_id": run_id,
+        "credits_note": note if quota == "note" else account_groups._QUOTA_UNREADABLE_NOTE,
+    }
+    assert card["account_group_review"]["based_on_inputs"] == {"login": REDACTED_SECRET_PLACEHOLDER}
+    assert await _decide(chat, card, {"approved": True, "credential_ids": ["cred_2"]}) == 200
+    result = await asyncio.wait_for(task, 5)
+    assert isinstance(result, AccountGroupSubmission) and result.cost is not None
+    assert result.cost.model_dump(mode="json") == cost
+    assert "based_on_inputs" not in result.model_dump_json()
+
+
+@pytest.mark.asyncio
+async def test_a_draft_card_reports_its_tested_run_with_no_estimate_when_that_run_failed(
+    chat: Chat, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _metered(monkeypatch)
+    run_id = await _seed_run(chat.env, group=False, status=WorkflowRunStatus.failed, credits=(5, 0))
+    await _stage_draft(chat, tested_run_id=run_id)
+    chat.ctx.proposal_owner_turn_id, chat.ctx.proposal_revision = "turn_draft", 1
+
+    task = _start_single_run(chat, {"login": "cred_1"})
+    card = await _card(chat)
+    cost = card["account_group_review"]["cost"]
+
+    assert cost == {
+        "runs_to_start": 1,
+        "based_on_run_id": run_id,
+        "based_on_credits": 5,
+        "blocks_completed": 1,
+        "blocks_total": 1,
+        "balance_credits": 500,
+        "stop_rule": STOP_RULE,
+    }
+    assert await _decide(chat, card, {"approved": False}) == 200
+    result = await asyncio.wait_for(task, 5)
+    assert isinstance(result, SingleRunSubmission) and result.cost is not None
+    assert result.cost.model_dump(mode="json") == {
+        key: value for key, value in cost.items() if key not in ("runs_to_start", "estimate_from_one_run")
+    }
+
+
+@pytest.mark.asyncio
+async def test_the_group_card_carries_the_single_run_facts_and_its_result_counts_the_approved_runs(
+    chat: Chat, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _metered(monkeypatch)
+    await _seed_run(chat.env, group=False, credits=(30, 12))
+    single = _start_single_run(chat, {"login": "cred_1"})
+    single_card = await _card(chat)
+    assert await _decide(chat, single_card, {"approved": False}) == 200
+    await asyncio.wait_for(single, 5)
+
+    group = _start(chat, ["cred_1", "cred_2", "cred_3"])
+    group_card = await _card(chat)
+    group_cost = group_card["account_group_review"]["cost"]
+
+    assert group_cost == single_card["account_group_review"]["cost"] | {
+        "runs_to_start": 3,
+        "estimate_from_one_run": 126,
+    }
+    assert await _decide(chat, group_card, {"approved": True, "credential_ids": ["cred_2"]}) == 200
+    result = await asyncio.wait_for(group, 5)
+    assert isinstance(result, AccountGroupSubmission) and result.cost is not None
+    assert (result.cost.runs_to_start, result.cost.estimate_from_one_run) == (1, 42)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["untested_draft", "saved_version_never_completed_since_its_last_write"])
+async def test_a_card_with_no_qualifying_run_shows_no_run_blocks_or_estimate(
+    chat: Chat, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    _metered(monkeypatch)
+    await _seed_run(chat.env, group=False, credits=(30, 12))
+    if case == "untested_draft":
+        await _stage_draft(chat, tested=False, tested_run_id=None)
+        chat.ctx.proposal_owner_turn_id, chat.ctx.proposal_revision = "turn_draft", 1
+    else:
+        async with chat.env.database.Session() as session:
+            await session.execute(
+                update(WorkflowRunModel)
+                .where(WorkflowRunModel.workflow_permanent_id == RUN_GROUP_WPID)
+                .values(created_at=datetime(2000, 1, 1))
+            )
+            await session.commit()
+
+    task = _start_single_run(chat, {"login": "cred_1"})
+    card = await _card(chat)
+
+    assert card["account_group_review"]["cost"] == {
+        "runs_to_start": 1,
+        "balance_credits": 500,
+        "stop_rule": STOP_RULE,
+    }
+    assert "based_on_inputs" not in card["account_group_review"]
+    assert await _decide(chat, card, {"approved": False}) == 200
+    await asyncio.wait_for(task, 5)
+
+
+@pytest.mark.asyncio
+async def test_a_copilot_test_run_of_the_saved_version_is_cited_as_its_based_on_run(
+    chat: Chat, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _metered(monkeypatch)
+    run_id = await _seed_run(chat.env, group=False, credits=(30, 12))
+    async with chat.env.database.Session() as session:
+        await session.execute(
+            update(WorkflowRunModel)
+            .where(WorkflowRunModel.workflow_run_id == run_id)
+            .values(copilot_session_id=chat.ctx.workflow_copilot_chat_id)
+        )
+        await session.commit()
+
+    task = _start_single_run(chat, {"login": "cred_1"})
+    card = await _card(chat)
+
+    cost = card["account_group_review"]["cost"]
+    assert cost["based_on_run_id"] == run_id
+    assert cost["blocks_completed"] == cost["blocks_total"]
+    assert cost["estimate_from_one_run"] == 42
+    assert await _decide(chat, card, {"approved": False}) == 200
+    await asyncio.wait_for(task, 5)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["tested", "edited_after_accept", "untested", "newer_real_run", "receipt_unreadable"])
+async def test_after_accept_the_saved_version_cards_cite_the_run_that_tested_the_accepted_draft(
+    chat: Chat, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    _metered(monkeypatch)
+    tested_id = await _seed_run(chat.env, group=False, credits=(7, 0))
+    await _stage_draft(chat, tested=case != "untested", tested_run_id=tested_id)
+    await _accept(chat)
+    saved = await chat.env.database.workflows.get_workflow_by_permanent_id(RUN_GROUP_WPID, RUN_GROUP_ORG)
+    assert saved is not None and saved.version == 2
+    receipt = (await _chat_row(chat)).accepted_tested_run
+    assert receipt is not None
+    assert (receipt.workflow_id, receipt.modified_at) == (saved.workflow_id, saved.modified_at)
+    assert receipt.workflow_run_id == (None if case == "untested" else tested_id)
+    expected: str | None = tested_id if case == "tested" else None
+    if case == "edited_after_accept":
+        await _edit_in_place(chat, version=2)
+    elif case in ("newer_real_run", "receipt_unreadable"):
+        expected = await _seed_run(chat.env, workflow_id=saved.workflow_id, group=False, credits=(30, 12))
+    if case == "receipt_unreadable":
+        get_run = chat.env.database.workflow_runs.get_workflow_run
+
+        async def unreadable_receipt_run(workflow_run_id: str, *args: Any, **kwargs: Any) -> WorkflowRun | None:
+            if workflow_run_id == tested_id:
+                raise RuntimeError("down")
+            return await get_run(workflow_run_id, *args, **kwargs)
+
+        monkeypatch.setattr(chat.env.database.workflow_runs, "get_workflow_run", unreadable_receipt_run)
+
+    single = _start_single_run(chat, {"login": "cred_1"})
+    single_card = await _card(chat)
+    assert await _decide(chat, single_card, {"approved": False}) == 200
+    await asyncio.wait_for(single, 5)
+    group = _start(chat, ["cred_1", "cred_2"])
+    group_card = await _card(chat)
+    assert await _decide(chat, group_card, {"approved": False}) == 200
+    await asyncio.wait_for(group, 5)
+
+    for card in (single_card, group_card):
+        assert card["account_group_review"]["cost"].get("based_on_run_id") == expected
+
+
+@pytest.mark.asyncio
+async def test_an_older_accept_does_not_replace_the_tested_run_receipt_of_a_newer_one(chat: Chat) -> None:
+    repo = chat.env.database.workflow_params
+    chat_id = chat.ctx.workflow_copilot_chat_id
+    assert chat_id is not None
+    newer = datetime(2026, 1, 2)
+
+    async def accept(modified_at: datetime, run_id: str | None) -> None:
+        await repo.record_copilot_draft_acceptance(
+            RUN_GROUP_ORG,
+            chat_id,
+            owner_turn_id="turn_draft",
+            revision=1,
+            workflow_id="wf_1",
+            version=1,
+            modified_at=modified_at,
+            tested_workflow_run_id=run_id,
+        )
+
+    await accept(newer, "wr_newer")
+    await accept(datetime(2026, 1, 1), "wr_older")
+    receipt = (await _chat_row(chat)).accepted_tested_run
+    assert receipt is not None and (receipt.modified_at, receipt.workflow_run_id) == (newer, "wr_newer")
+
+    await accept(newer, None)
+    receipt = (await _chat_row(chat)).accepted_tested_run
+    assert receipt is not None and (receipt.modified_at, receipt.workflow_run_id) == (newer, None)

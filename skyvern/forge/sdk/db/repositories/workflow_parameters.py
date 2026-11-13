@@ -81,6 +81,7 @@ from skyvern.forge.sdk.schemas.task_generations import TaskGeneration
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     COPILOT_PROPOSAL_METADATA_KEY,
     MAX_STEER_MESSAGES_PER_TURN,
+    CopilotAcceptedTestedRun,
     CopilotAttachedFile,
     CopilotCandidateDisposition,
     CopilotPendingTurn,
@@ -1560,9 +1561,20 @@ class WorkflowParametersRepository(BaseRepository):
         workflow_id: str,
         version: int,
         modified_at: datetime,
+        tested_workflow_run_id: str | None,
     ) -> None:
         async with self.Session() as session:
             chat = await self._locked_question_chat(session, organization_id, chat_id)
+            stored = (
+                CopilotAcceptedTestedRun.model_validate(chat.accepted_tested_run)
+                if chat.accepted_tested_run is not None
+                else None
+            )
+            # A slower Accept of an older version must not replace the receipt of a newer one.
+            if stored is None or stored.modified_at <= modified_at:
+                chat.accepted_tested_run = CopilotAcceptedTestedRun(
+                    workflow_id=workflow_id, modified_at=modified_at, workflow_run_id=tested_workflow_run_id
+                ).model_dump(mode="json")
             for raw in list((chat.pending_turns or {}).values()):
                 entry = CopilotPendingTurn.model_validate(raw)
                 stamped = False

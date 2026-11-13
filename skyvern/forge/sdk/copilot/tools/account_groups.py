@@ -4,10 +4,10 @@ import asyncio
 import hmac
 import json
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Awaitable, Iterable
 from datetime import UTC, datetime
 from hashlib import sha256
-from typing import Literal
+from typing import Literal, TypeVar
 from uuid import uuid4
 
 import structlog
@@ -26,6 +26,7 @@ from skyvern.forge.sdk.copilot.ask_user import (
     AccountGroupRow,
     AccountGroupRunRow,
     QuestionInteraction,
+    RunCostFacts,
     wait_for_interaction,
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
@@ -33,7 +34,12 @@ from skyvern.forge.sdk.copilot.cost_telemetry import exclude_workflow_block_cost
 from skyvern.forge.sdk.copilot.credential_resolution import load_credentials
 from skyvern.forge.sdk.copilot.proposal_accept import accept_copilot_proposal
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
-from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure, scrub_secrets_from_text
+from skyvern.forge.sdk.copilot.secret_scrub import (
+    REDACTED_SECRET_PLACEHOLDER,
+    scrub_secrets_from_structure,
+    scrub_secrets_from_text,
+)
+from skyvern.forge.sdk.copilot.tools._shared import _executable_workflow_block_labels
 from skyvern.forge.sdk.copilot.tools.credentials import (
     _credential_run_approval_error,
     _extract_credential_ids_from_tool_value,
@@ -41,7 +47,7 @@ from skyvern.forge.sdk.copilot.tools.credentials import (
     run_credential_gate,
 )
 from skyvern.forge.sdk.copilot.tools.mcp_hooks import PENDING_PROPOSAL_FACT, _chat_has_pending_proposal
-from skyvern.forge.sdk.copilot.tools.run_execution import _declared_execution_snapshot
+from skyvern.forge.sdk.copilot.tools.run_execution import _declared_execution_snapshot, _run_credits_used
 from skyvern.forge.sdk.copilot.tools.workflow_update import adopt_stored_workflow_candidate
 from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     block_credential_ids,
@@ -72,9 +78,21 @@ from skyvern.forge.sdk.services.request_principal import (
     trigger_owner_id,
 )
 from skyvern.forge.sdk.workflow.block_notes import strip_inert_block_fields
-from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter, WorkflowParameter, WorkflowParameterType
+from skyvern.forge.sdk.workflow.models.parameter import (
+    CredentialParameter,
+    WorkflowParameter,
+    WorkflowParameterType,
+    is_sensitive_workflow_parameter,
+)
 from skyvern.forge.sdk.workflow.models.tags import CallerType
-from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRequestBody
+from skyvern.forge.sdk.workflow.models.workflow import (
+    Workflow,
+    WorkflowDefinition,
+    WorkflowRequestBody,
+    WorkflowRun,
+    WorkflowRunParameter,
+    WorkflowRunStatus,
+)
 from skyvern.schemas.run_enums import RunType
 from skyvern.schemas.workflow_run_groups import (
     WorkflowRunGroupCreateRequest,
@@ -88,6 +106,8 @@ from skyvern.services import workflow_run_group_service, workflow_service
 from skyvern.services.organization_log_scope import organization_log_scope
 
 LOG = structlog.get_logger()
+
+_T = TypeVar("_T")
 
 ACCOUNT_GROUP_MAX_ITEMS = 25
 
@@ -185,6 +205,8 @@ _SINGLE_RUN_UNCONFIRMED = (
     "Starting the run raised an error after its run id was created, so the run may or may not exist."
 )
 
+_QUOTA_UNREADABLE_NOTE = "The account's credits could not be read just now, so no credit numbers are shown."
+
 _STATUS_NOTE = (
     "Runs execute one after another. Pending and in-progress rows have no result yet; "
     "use get_account_group_status for outcomes."
@@ -211,6 +233,7 @@ class AccountGroupSubmission(BaseModel):
     credential_parameter_used_by: list[str] = Field(default_factory=list)
     rows: list[AccountGroupRunRow] = Field(default_factory=list)
     repeated_after_prior_effect: list[AccountGroupRow] = Field(default_factory=list)
+    cost: RunCostFacts | None = Field(default=None, exclude_if=lambda cost: cost is None)
     note: str
 
 
@@ -222,6 +245,7 @@ class SingleRunSubmission(BaseModel):
     saved_version: int | None = None
     error: str | None = None
     note: str | None = None
+    cost: RunCostFacts | None = Field(default=None, exclude_if=lambda cost: cost is None)
 
 
 class AccountGroupState(BaseModel):
@@ -487,6 +511,113 @@ async def _check_draft_connected_accounts(
     )
 
 
+async def _fact(name: str, read: Awaitable[_T]) -> _T | None:
+    try:
+        return await read
+    except Exception:
+        LOG.warning("A run card cost fact could not be read", fact=name, exc_info=True)
+        return None
+
+
+async def _accepted_tested_run(ctx: CopilotContext, saved: Workflow) -> WorkflowRun | None:
+    if ctx.workflow_copilot_chat_id is None:
+        return None
+    chat = await app.DATABASE.workflow_params.get_workflow_copilot_chat_by_id(
+        organization_id=ctx.organization_id, workflow_copilot_chat_id=ctx.workflow_copilot_chat_id
+    )
+    receipt = chat.accepted_tested_run if chat is not None else None
+    if (
+        receipt is None
+        or receipt.workflow_run_id is None
+        or (receipt.workflow_id, receipt.modified_at) != (saved.workflow_id, saved.modified_at)
+    ):
+        return None
+    return await app.DATABASE.workflow_runs.get_workflow_run(
+        receipt.workflow_run_id, organization_id=ctx.organization_id
+    )
+
+
+async def _based_on_run(ctx: CopilotContext, run_id: str | None, saved: Workflow | None) -> WorkflowRun | None:
+    if run_id is not None:
+        return await _fact(
+            "based_on_run", app.DATABASE.workflow_runs.get_workflow_run(run_id, organization_id=ctx.organization_id)
+        )
+    if saved is None:
+        return None
+    tested, completed = await asyncio.gather(
+        _fact("accepted_tested_run", _accepted_tested_run(ctx, saved)),
+        _fact(
+            "based_on_run",
+            app.DATABASE.workflow_runs.get_latest_finished_run_for_workflow_version(
+                ctx.organization_id, saved.workflow_permanent_id, saved.workflow_id, saved.modified_at
+            ),
+        ),
+    )
+    return max((run for run in (tested, completed) if run is not None), key=lambda run: run.created_at, default=None)
+
+
+def _shown_run_inputs(
+    ctx: CopilotContext, run_parameters: list[tuple[WorkflowParameter, WorkflowRunParameter]]
+) -> dict[str, JsonValue]:
+    inputs: dict[str, JsonValue] = {
+        parameter.key: REDACTED_SECRET_PLACEHOLDER if is_sensitive_workflow_parameter(parameter) else value.value
+        for parameter, value in run_parameters
+    }
+    return scrub_secrets_from_structure(ctx, inputs)
+
+
+async def _run_cost_facts(
+    ctx: CopilotContext,
+    *,
+    definition: WorkflowDefinition,
+    based_on_run_id: str | None,
+    saved: Workflow | None,
+    runs_to_start: int,
+) -> tuple[RunCostFacts, dict[str, JsonValue] | None]:
+    usage, stop_rule, run = await asyncio.gather(
+        _fact("usage", app.AGENT_FUNCTION.get_organization_usage_quota(organization_id=ctx.organization_id)),
+        _fact("stop_rule", app.AGENT_FUNCTION.copilot_run_stop_rule(organization_id=ctx.organization_id)),
+        _based_on_run(ctx, based_on_run_id, saved),
+    )
+    labels = _executable_workflow_block_labels(definition)
+    based_on_inputs: dict[str, JsonValue] | None = None
+    blocks_completed: int | None = None
+    if run is not None:
+        completed, run_parameters = await asyncio.gather(
+            _fact(
+                "run_blocks",
+                app.DATABASE.observer.get_completed_workflow_run_block_labels(run.workflow_run_id, ctx.organization_id),
+            ),
+            _fact("run_inputs", app.DATABASE.workflow_runs.get_workflow_run_parameters(run.workflow_run_id)),
+        )
+        if run_parameters is not None:
+            based_on_inputs = _shown_run_inputs(ctx, run_parameters)
+        if completed is not None:
+            blocks_completed = len(completed.intersection(labels))
+    based_on_run_id = run.workflow_run_id if run is not None else None
+    note = _QUOTA_UNREADABLE_NOTE if usage is None else usage.credits_note
+    if usage is None or note is not None:
+        return RunCostFacts(based_on_run_id=based_on_run_id, credits_note=note, stop_rule=stop_rule), based_on_inputs
+    credits = _run_credits_used(run)
+    whole_run = (
+        run is not None
+        and run.status == WorkflowRunStatus.completed
+        and len(labels) > 0
+        and blocks_completed == len(labels)
+    )
+    cost = RunCostFacts(
+        runs_to_start=runs_to_start,
+        based_on_run_id=based_on_run_id,
+        based_on_credits=credits,
+        blocks_completed=blocks_completed,
+        blocks_total=len(labels) if run is not None else None,
+        estimate_from_one_run=runs_to_start * credits if whole_run and credits is not None else None,
+        balance_credits=usage.remaining_credits,
+        stop_rule=stop_rule,
+    )
+    return cost, based_on_inputs
+
+
 async def build_review(
     ctx: CopilotContext,
     *,
@@ -527,6 +658,24 @@ async def build_review(
     except SkyvernHTTPException as e:
         raise AccountGroupRefused(str(e)) from e
     last_groups, prior_outcomes = await _latest_outcomes(ctx, workflow, credential_ids)
+    rows = [
+        AccountGroupRow(
+            credential_id=credential_id,
+            label=_label(credentials[credential_id]),
+            identity=_identity_digest(credentials[credential_id]),
+            prior_outcome=prior_outcomes.get(credential_id),
+            last_group_id=last_groups.get(credential_id),
+            preselected=prior_outcomes.get(credential_id) not in REPEAT_RISK_OUTCOMES,
+        )
+        for credential_id in credential_ids
+    ]
+    cost, based_on_inputs = await _run_cost_facts(
+        ctx,
+        definition=workflow.workflow_definition,
+        based_on_run_id=None,
+        saved=workflow,
+        runs_to_start=sum(row.preselected for row in rows),
+    )
     return AccountGroupReview(
         workflow_permanent_id=workflow.workflow_permanent_id,
         workflow_id=workflow.workflow_id,
@@ -539,17 +688,9 @@ async def build_review(
         common_inputs=common_inputs,
         clean_group_run_id=await _clean_group_run_id(ctx, workflow, credential_parameter, credential_ids),
         credential_parameter_used_by=_blocks_using_parameter(workflow, credential_parameter_key),
-        rows=[
-            AccountGroupRow(
-                credential_id=credential_id,
-                label=_label(credentials[credential_id]),
-                identity=_identity_digest(credentials[credential_id]),
-                prior_outcome=prior_outcomes.get(credential_id),
-                last_group_id=last_groups.get(credential_id),
-                preselected=prior_outcomes.get(credential_id) not in REPEAT_RISK_OUTCOMES,
-            )
-            for credential_id in credential_ids
-        ],
+        rows=rows,
+        cost=cost,
+        based_on_inputs=based_on_inputs,
     )
 
 
@@ -617,7 +758,12 @@ async def submit_approved(
     decision = interaction.account_group_decision
     chat_id = ctx.workflow_copilot_chat_id
     if review is None or decision is None or not decision.approved or chat_id is None:
-        return AccountGroupSubmission(approved=False, dispatched=False, note="Nothing was dispatched.")
+        return AccountGroupSubmission(
+            approved=False,
+            dispatched=False,
+            cost=review.cost.not_started() if review is not None and review.cost is not None else None,
+            note="Nothing was dispatched.",
+        )
     approved_ids = decision.credential_ids
     # Held until the group exists, so a sibling tool call cannot publish a proposal after the recheck.
     async with ctx.proposal_mutation_lock:
@@ -665,6 +811,7 @@ async def submit_approved(
         credential_parameter_used_by=review.credential_parameter_used_by,
         rows=_rows(group, labels),
         repeated_after_prior_effect=review.repeated_after_prior_effect(approved_ids),
+        cost=review.cost.for_runs(len(approved_ids)) if review.cost is not None else None,
         note=_STATUS_NOTE,
     )
 
@@ -881,6 +1028,14 @@ async def build_single_run_review(
         raise AccountGroupRefused(str(e)) from e
     # Same source as the pending proposal's Tested badge: the stored disposition, which may carry no run id.
     draft_tested = metadata is not None and metadata.disposition in ("review_tested", "auto_applicable")
+    tested_workflow_run_id = metadata.workflow_run_id if metadata is not None and draft_tested else None
+    cost, based_on_inputs = await _run_cost_facts(
+        ctx,
+        definition=workflow.workflow_definition,
+        based_on_run_id=tested_workflow_run_id,
+        saved=saved if metadata is None else None,
+        runs_to_start=1,
+    )
     return AccountGroupReview(
         workflow_permanent_id=saved.workflow_permanent_id,
         workflow_id=saved.workflow_id,
@@ -897,7 +1052,9 @@ async def build_single_run_review(
         proposal_owner_turn_id=metadata.owner_turn_id if metadata is not None else None,
         proposal_revision=metadata.revision if metadata is not None else None,
         draft_tested=draft_tested,
-        tested_workflow_run_id=metadata.workflow_run_id if metadata is not None and draft_tested else None,
+        tested_workflow_run_id=tested_workflow_run_id,
+        cost=cost,
+        based_on_inputs=based_on_inputs,
         rows=[
             AccountGroupRow(
                 credential_id=credential_id,
@@ -1297,6 +1454,7 @@ async def _save_and_start_run(
             dispatched=False,
             saved_version=saved.version,
             error=f"{saved_note} The run was not started: {failure}",
+            cost=review.cost.not_started() if review.cost is not None else None,
         )
     return SingleRunSubmission(
         ok=started is True,
@@ -1306,6 +1464,7 @@ async def _save_and_start_run(
         saved_version=saved.version,
         error=None if started else f"{saved_note} {_SINGLE_RUN_UNCONFIRMED}",
         note=f"{saved_note} {_SINGLE_RUN_NOTE}" if started else None,
+        cost=review.cost,
     )
 
 
@@ -1327,7 +1486,12 @@ async def submit_single_run(
     decision = interaction.account_group_decision
     chat_id = ctx.workflow_copilot_chat_id
     if review is None or decision is None or not decision.approved or chat_id is None:
-        return SingleRunSubmission(approved=False, dispatched=False, note="Nothing was started.")
+        return SingleRunSubmission(
+            approved=False,
+            dispatched=False,
+            note="Nothing was started.",
+            cost=review.cost.not_started() if review is not None and review.cost is not None else None,
+        )
     workflow_run_id = generate_workflow_run_id()
     # Shielded so cancelling the tool call cannot cut dispatch, or the lock it holds, short; the set keeps the
     # task alive after a cancel, since the event loop holds only a weak reference.
@@ -1355,6 +1519,7 @@ async def submit_single_run(
         workflow_run_id=workflow_run_id,
         error=None if dispatched else _SINGLE_RUN_UNCONFIRMED,
         note=_SINGLE_RUN_NOTE if dispatched else None,
+        cost=review.cost,
     )
 
 
