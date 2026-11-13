@@ -33,7 +33,7 @@ from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal, NamedTuple, TypeVar
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal, NamedTuple, TypedDict, TypeVar
 from urllib.parse import unquote, urlparse
 
 import structlog
@@ -884,6 +884,15 @@ def _short_surface_verdict(
     return CommitStatus.OK if len(hits) == 1 and pre is not None else CommitStatus.UNVERIFIED
 
 
+class _ObservedRow(TypedDict):
+    caption: str
+    role: str
+    list: str
+    host: str
+    # The row's list hangs directly under the live list's stamped parent.
+    beside_offers: bool
+
+
 class _TypeaheadPick(NamedTuple):
     """What one type-and-pick attempt at a typeahead established.
 
@@ -911,7 +920,7 @@ class _TypeaheadPick(NamedTuple):
     shared_surface: str | None = None
     # A removable row with the picked label that the field's container gained while the field's value did not
     # change, and whose ownership the field cannot prove: shown to the model, never a commit.
-    observed_row: dict[str, str] | None = None
+    observed_row: _ObservedRow | None = None
     # The call's final result when pressing Enter to search settled it before any row was picked.
     verdict: ToolResult | None = None
     # How the picked row names the value, and why no row was picked.
@@ -958,7 +967,9 @@ def _rows_nested_in(n: int, rows: list[dict[str, Any]]) -> list[str]:
     return nested
 
 
-def _log_committed_pick(row: str, value: str, verdict: CommitStatus, path: str, tier: Tier | None = None) -> None:
+def _log_committed_pick(
+    row: str, value: str, verdict: CommitStatus, path: str, tier: Tier | None = None, observed_row: bool = False
+) -> None:
     # Whether the clicked row IS the requested value, or the value plus one parenthesized decoration, so an
     # inexact pick can be counted apart from an exact one; `tier` is the matcher's decision, None where no tier
     # decided the row. No form values and no selector.
@@ -970,6 +981,7 @@ def _log_committed_pick(row: str, value: str, verdict: CommitStatus, path: str, 
         committed_matches_row=_exact_tier_key(row) == _exact_tier_key(value),
         row_names_value=_label_names_value(row, value),
         tier=tier.value if tier is not None else None,
+        observed_row=observed_row,
     )
 
 
@@ -4710,7 +4722,7 @@ _OWN_FIELD_SCOPES_FN_JS = r"""
   // via its host, instead of stopping blind at the boundary.
   const scopeUp = (s) => {
     if (!s) return null;
-    if (s.host) {
+    if (s.nodeType === 11) {
       const h = s.host;
       if (h.parentElement) return h.parentElement;
       return h.parentNode && h.parentNode.host ? h.parentNode : null;
@@ -4798,9 +4810,6 @@ _FIELD_OWN_STATE_FN_JS = r"""
   // merely names an option ("Choose Canada", a quick pick) is an offer, not a commit.
   const CHIP_SEL = 'button,[role="button"],[class*="chip" i],[class*="pill" i],[class*="token" i],[class*="multi-value" i],[class*="multiValue" i]';
   const REMOVAL_RE = /\b(?:remove|dismiss|delete|clear|deselect|unselect)\b|^[x\u00d7\u2715\u2716\u2a2f]$/;
-  // The chip's branch under the scope it shares with the field holds no caption of its own: a sibling
-  // group's chips sit under that group's caption ("Countries lived in"), which a field-less group cannot
-  // otherwise be told apart by.
   // A component may draw its tags as options, each nesting its own remove control; an offered row nests no control.
   const nestsControl = (c) => flatQueryAll(c, 'button,[role="button"]').length > 0;
   const tagRow = (c) => c.matches('[role="option"]') && nestsControl(c);
@@ -4813,10 +4822,18 @@ _FIELD_OWN_STATE_FN_JS = r"""
     }
     return n.shadowRoot ? Array.from(n.shadowRoot.childNodes) : Array.from(n.childNodes);
   };
-  const captionFree = (scope, c) => {
+  // The first text the chip's drawn branch under the scope draws besides chips: another group's caption or the
+  // field's own ("Selected:"), which the page does not tell apart. '' is no caption; null is a climb that never
+  // reached the scope, so nothing is proven.
+  const drawnUp = (n) => (n.nodeType === 1 && n.assignedSlot) || scopeUp(n);
+  const branchCaption = (scope, c) => {
     let branch = c;
-    while (branch && scopeUp(branch) !== scope) branch = scopeUp(branch);
-    if (!branch || branch === c) return true;
+    // Termination guard.
+    for (let hops = 0; branch && drawnUp(branch) !== scope && scopeUp(branch) !== scope; hops++) {
+      branch = hops < 64 ? drawnUp(branch) : null;
+    }
+    if (!branch) return null;
+    if (branch === c) return '';
     const runs = [];
     const walk = (n, depth) => {
       if (depth > 6 || runs.length) return;
@@ -4829,7 +4846,7 @@ _FIELD_OWN_STATE_FN_JS = r"""
       }
     };
     walk(branch, 0);
-    return runs.length === 0;
+    return runs.length ? String(runs[0].nodeValue).replace(/\s+/g, ' ').trim().slice(0, 200) : '';
   };
   const idRefs = (el, attr) => {
     const root = el.getRootNode();
@@ -4868,23 +4885,42 @@ _FIELD_OWN_STATE_FN_JS = r"""
     walk(scope, 0);
     return !text;
   };
+  // Only the stamped live-list node proves a tag row is offered: a role or a page-authored label identifies no node. The
+  // before-act read stamps the live list's parent, so a row in a new list under it is reported with that relation.
+  const ROW_LIST_SEL = '[role="listbox"],[role="list"],ul,ol';
+  const listParent = (l) => (l.parentNode && l.parentNode.nodeType === 11 ? l.parentNode.host : l.parentNode);
+  const markLiveParents = (el) => {
+    pQSA('[data-tv3-liveparent]').forEach((e) => e.removeAttribute('data-tv3-liveparent'));
+    for (const scope of ownFieldScopes(el)) {
+      for (const o of flatQueryAll(scope, OFFER_TAGS)) {
+        // The live list itself, never a list that encloses it: a menu of plain divs has none.
+        const l = o.matches(ROW_LIST_SEL) ? o : composedClosest(o, ROW_LIST_SEL);
+        const box = o.closest('[data-tv3-sugglist],[data-tv3-menu]');
+        const parent = l && (!box || box.contains(l)) ? listParent(l) : null;
+        if (parent && parent.nodeType === 1) parent.setAttribute('data-tv3-liveparent', '1');
+      }
+    }
+  };
   // A tag row is a chip while it sits in the field's own container outside the live list and the field's declared list.
   const tagOption = (el, c) => tagRow(c) && !c.closest(OFFER_TAGS) && !declaredTargets(el).some((t) => pContains(t, c));
   // A chip in a root the field is not inside belongs to another component as far as the page shows.
   const inFieldRoots = (el, c) => {
-    for (let r = el.getRootNode(); r; r = r.host ? r.host.getRootNode() : null) if (r === c.getRootNode()) return true;
+    // Termination guard.
+    for (let r = el.getRootNode(), hops = 0; r && hops < 32; r = r.nodeType === 11 ? r.host.getRootNode() : null, hops++) {
+      if (r === c.getRootNode()) return true;
+    }
     return false;
   };
   // The scopes are read over the flat tree. A chip is the field's own only when it is not a tag row (a list of recent
   // picks draws the same shape), sits in one of the field's roots, and with `strict` (the pre-act no-op) passes
-  // chipProvablyOwned; the rest are rows the field's container shows, never a commit.
+  // chipProvablyOwned; the rest are rows the field's container shows, never a commit. A chip under a caption in its
+  // branch, or whose branch never reached the scope, is never owned; it keeps the caption of the nearest scope that read it.
   const chipReads = (el, strict) => {
     const found = [];
-    // A chip refused for its caption in a nearer scope stays refused where that caption is out of reach.
-    const captioned = new Set();
+    const seen = new Set();
     for (const scope of ownFieldScopes(el)) {
       for (const c of flatQueryAll(scope, CHIP_SEL + ',[role="option"]')) {
-        if (found.some((f) => f.node === c) || captioned.has(c) || !visible(c)) continue;
+        if (seen.has(c) || !visible(c)) continue;
         if (!tagOption(el, c) && (excludedFor(el, c) || offered(c)
           || c.matches('[aria-selected],[aria-pressed],[aria-checked],[aria-expanded],[type="submit" i]'))) continue;
         const runs = textRuns(c, el);
@@ -4893,22 +4929,31 @@ _FIELD_OWN_STATE_FN_JS = r"""
         let removable = runs.slice(1).some((t) => REMOVAL_RE.test(t)) || (!!aria && aria !== runs[0] && REMOVAL_RE.test(aria));
         try { removable = removable || nestsControl(c); } catch (e) { /* keep */ }
         if (!removable) continue;
-        if (!captionFree(scope, c)) { captioned.add(c); continue; }
-        const owned = !tagRow(c) && inFieldRoots(el, c) && (!strict || chipProvablyOwned(el, c));
-        found.push({ node: c, label: runs.filter((t) => !REMOVAL_RE.test(t)).join(' '), owned });
+        const label = runs.filter((t) => !REMOVAL_RE.test(t)).join(' ');
+        seen.add(c);
+        const caption = branchCaption(scope, c);
+        const owned = caption === '' && !tagRow(c) && inFieldRoots(el, c) && (!strict || chipProvablyOwned(el, c));
+        found.push({ node: c, label, owned, caption: caption || '' });
       }
     }
-    return found.filter((f) => !found.some((o) => o !== f && f.node.contains(o.node)));
+    // A captioned row inside a chip (its remove button reads the chip's text as a caption) never displaces the chip.
+    return found.filter((f) => !found.some((o) => o !== f && !o.caption && f.node.contains(o.node)));
   };
   const ownChipLabels = (el, strict) => chipReads(el, strict).filter((f) => f.owned).map((f) => f.label);
-  const observedRows = (el, want) => chipReads(el, false).filter((f) => !f.owned && f.label === want).map((f) => {
-    const list = composedClosest(f.node.parentNode || f.node, '[role="listbox"],[role="list"],ul,ol');
-    const host = (list || f.node).getRootNode().host;
+  // A row the before-act read stamped was already there; any other node with the label is new.
+  const observedRows = (el, want) => chipReads(el, false).filter((f) => !f.owned && f.label === want
+    && !f.node.hasAttribute('data-tv3-prerow')).map((f) => {
+    const list = composedClosest(f.node.parentNode || f.node, ROW_LIST_SEL);
+    const root = (list || f.node).getRootNode();
+    const host = root.nodeType === 11 ? root.host : null;
+    const parent = list ? listParent(list) : null;
     return {
-      text: f.label,
+      caption: f.caption,
       role: f.node.getAttribute('role') || f.node.localName,
       list: list ? ownNrm(list.getAttribute('aria-label')) : '',
       host: host ? host.localName : '',
+      beside_offers: !!parent && parent.nodeType === 1 && parent.hasAttribute('data-tv3-liveparent')
+        && !list.querySelector(OFFER_TAGS) && !list.closest(OFFER_TAGS),
     };
   });
   const anchorHolds = (el, want, anyState) => {
@@ -4976,8 +5021,10 @@ _SEMANTIC_COMMIT_STATE_JS = (
   }
   if (arg.baseline === true) {
     if (!el || !want) return null;
-    // 'row': an exact-label row the field cannot prove its own was already there, so a later one is not new.
-    return fieldOwnSources(el, want, true).concat(observedRows(el, want).length ? ['row'] : []);
+    markLiveParents(el);
+    pQSA('[data-tv3-prerow]').forEach((e) => e.removeAttribute('data-tv3-prerow'));
+    for (const f of chipReads(el, false)) if (!f.owned && f.label === want) f.node.setAttribute('data-tv3-prerow', '1');
+    return fieldOwnSources(el, want, true);
   }
   if (!el || !want) return { committed: false };
   if (el.tagName === 'SELECT') return { committed: false };
@@ -18172,8 +18219,8 @@ def build_browser_tools(
             return None
         return [str(c) for c in chips if isinstance(c, str)] if isinstance(chips, list) else None
 
-    async def _observed_row(page: Any, selector: str, label: str, pre_held: list[str] | None) -> dict[str, str] | None:
-        if pre_held is None or "row" in pre_held:
+    async def _observed_row(page: Any, selector: str, label: str, pre_held: list[str] | None) -> _ObservedRow | None:
+        if pre_held is None:
             return None
         try:
             rows = await page.evaluate(_OWN_CHIPS_JS, {**(await _probe_arg(page, selector)), "observe": label})
@@ -18181,7 +18228,14 @@ def build_browser_tools(
             return None
         if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
             return None
-        return {k: str(rows[0].get(k) or "") for k in ("text", "role", "list", "host")}
+        r = rows[0]
+        return _ObservedRow(
+            caption=str(r.get("caption") or ""),
+            role=str(r.get("role") or ""),
+            list=str(r.get("list") or ""),
+            host=str(r.get("host") or ""),
+            beside_offers=r.get("beside_offers") is True,
+        )
 
     async def _holds_own_chips(page: Any, selector: str) -> bool:
         return bool(await _own_chip_labels(page, selector))
@@ -21563,7 +21617,9 @@ def build_browser_tools(
                     error_class="click_failed",
                 )
             verdict, matches = await _typeahead_commit_verdict(page, selector, pick.committed, pick.readable)
-            _log_committed_pick(pick.suggestion, text, verdict, "type", pick.tier)
+            _log_committed_pick(
+                pick.suggestion, text, verdict, "type", pick.tier, bool(pick.observed_row and not pick.committed)
+            )
             if verdict is CommitStatus.OK:
                 if pick.declared:
                     closed = await _close_lingering_typeahead_list(
@@ -21580,7 +21636,9 @@ def build_browser_tools(
                     _model_text(text, 60),
                 )
             if not pick.committed and pick.observed_row:
-                return _observed_row_result(f"typed into {selector} and picked {suggestion!r}", pick.observed_row)
+                return _observed_row_result(
+                    f"typed into {selector} and picked {suggestion!r}", pick.observed_row, suggestion
+                )
             if not pick.committed and pick.shared_surface:
                 # The widget renders only a short form of the label ("+1"), and either another row visible
                 # at the click showed it too or the field was unreadable before the click.
@@ -22646,15 +22704,16 @@ def build_browser_tools(
                 _choice_tiers(typeahead=False),
             )
         )
-        _log_committed_pick(matched, value, verdict, "open_pick", tier)
+        row = None if committed else await _observed_row(page, selector, matched, pre_held)
+        _log_committed_pick(matched, value, verdict, "open_pick", tier, row is not None)
         if verdict is CommitStatus.OK:
             return with_tier_note(
                 ToolResult.ok(f"selected {matched!r} for {selector} (committed value: {committed!r})"),
                 tier,
                 _model_text(value, 60),
             )
-        if not committed and (row := await _observed_row(page, selector, matched, pre_held)):
-            return _observed_row_result(f"selected {matched!r} for {selector}", row)
+        if row:
+            return _observed_row_result(f"selected {_model_text(matched, 60)!r} for {selector}", row, matched)
         if verdict is CommitStatus.UNVERIFIED and matches != 1:
             return unconfirmed_ok(
                 f"selected {matched!r} for {selector}, but it re-resolved to {matches} elements so the "
@@ -22674,16 +22733,23 @@ def build_browser_tools(
             f"clicked {matched!r} but {selector} did not commit a value", error_class="did_not_commit"
         )
 
-    def _observed_row_result(did: str, row: dict[str, str]) -> ToolResult:
-        where = f"the list {row['list']!r}" if row["list"] else "the field's container"
+    def _observed_row_result(did: str, row: _ObservedRow, label: str) -> ToolResult:
+        # Every page string is capped; the label is the picked row's own, in its original case.
+        where = f"the list {_model_text(row['list'], 60)!r}" if row["list"] else "the field's container"
         if row["host"]:
-            where += f" inside <{row['host']}>"
-        text = _model_text(row["text"], 60)
+            where += f" inside <{_model_text(row['host'], 40)}>"
+        if row["caption"]:
+            where += f" under the caption {_model_text(row['caption'], 60)!r}"
+        if row["beside_offers"]:
+            where += "; the row's list hangs under the offering list's parent"
+        text = _model_text(label, 60)
         return unconfirmed_ok(
-            f"{did}; the field's value did not change, and a removable {row['role']} row {text!r} appeared in "
+            f"{did}; the field's value did not change, and a removable {_model_text(row['role'], 30)!r} row {text!r} "
+            f"appeared in "
             f"{where}. The tool cannot tell whether that row is this field's selected tag or a row of another list "
             f"(recent picks, another field), so the pick is NOT confirmed. Compare the row with the field and the "
-            f"goal before acting: picking {text!r} again may remove it."
+            f"goal before acting: picking {text!r} again may remove it.",
+            {"observed_row": True},
         )
 
     def _already_held_result(selector: str, value: str) -> ToolResult:
@@ -22768,7 +22834,7 @@ def build_browser_tools(
             declared: bool,
             surface_vouched_pre_click: bool = False,
             shared_surface: str | None = None,
-            observed_row: dict[str, str] | None = None,
+            observed_row: _ObservedRow | None = None,
             clicked: bool,
             tier: Tier | None = None,
         ) -> ToolResult:
@@ -22779,7 +22845,7 @@ def build_browser_tools(
                     error_class="click_failed",
                 )
             verdict, matches = await _typeahead_commit_verdict(page, selector, committed, readable)
-            _log_committed_pick(opt_txt, value, verdict, "typeahead", tier)
+            _log_committed_pick(opt_txt, value, verdict, "typeahead", tier, bool(observed_row and not committed))
             opt_txt = _model_text(opt_txt, 60)
             if verdict is CommitStatus.OK:
                 if declared:
@@ -22790,7 +22856,7 @@ def build_browser_tools(
                         return closed
                 return ToolResult.ok(f"selected {opt_txt!r} for {selector} (committed value: {committed!r})")
             if not committed and observed_row:
-                return _observed_row_result(f"selected suggestion {opt_txt!r} for {selector}", observed_row)
+                return _observed_row_result(f"selected suggestion {opt_txt!r} for {selector}", observed_row, opt_txt)
             if not committed and shared_surface:
                 # The widget renders only a short form of the label ("+1"), and either another row visible
                 # at the click showed it too or the field was unreadable before the click.

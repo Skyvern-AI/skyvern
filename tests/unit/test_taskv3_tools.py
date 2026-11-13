@@ -50279,16 +50279,11 @@ async def test_select_combobox_commits_shadow_form_dropdowns_and_reports_the_mul
 
 
 def _reports_observed_row(r: ToolResult, label: str) -> bool:
-    return (
-        r.status == "ok"
-        and r.ok_class == "unverified"
-        and f"'{label.lower()}'" in r.content.lower()
-        and "cannot tell" in r.content
-    )
+    return r.ok_class == "unverified" and (r.data or {}).get("observed_row") is True and f"row '{label}'" in r.content
 
 
 # A field's picks shown as tag rows, generated over where the field and its tag list live (light DOM, one shadow root,
-# nested roots), how a row carries its text (direct or slotted, beside a remove button) and what the pick did. A
+# nested roots, slotted into a component), how a row carries its text (direct or slotted, beside a remove button) and what the pick did. A
 # page-level tag list, a captioned list of recent picks (plain, or a component with a slotted caption) and two other
 # fields hold every label too. A tag row is never a commit: the one this field's own list gained with the pick is
 # reported as an observed row, and a row that was already there, another field's row, another label and a pick that did
@@ -50322,9 +50317,35 @@ const chipNode = (label, kind, loose) => {
   return d;
 };
 const fields = [];
-const paint = (f) => {
-  f.tags.textContent = '';
-  for (const v of f.chips) f.tags.appendChild(chipNode(v, f.cfg.chip, f.cfg.loose));
+// render 'append' keeps the list node and its chip nodes; a pick with 'rerender' draws a new list node (place 'box': the
+// whole box with innerHTML). place 'created': the list is drawn only once it holds a chip.
+const paint = (f, picked) => {
+  const cfg = f.cfg;
+  if (cfg.place === 'created' && !f.tags.isConnected) {
+    if (!f.chips.length) { window.__chips[f.i] = []; return; }
+    f.tagsParent.appendChild(f.tags);
+  }
+  if (picked && cfg.render === 'rerender') {
+    let fresh;
+    if (cfg.place === 'box') {
+      for (const k of [...f.tags.children]) if (k.hasAttribute('data-c')) k.remove();
+      f.box.innerHTML = f.box.innerHTML;
+      fresh = f.box.querySelector('[data-taglist]');
+    } else {
+      fresh = f.tags.cloneNode(false);
+      for (const k of [...f.tags.childNodes]) if (!(k.nodeType === 1 && k.hasAttribute('data-c'))) fresh.appendChild(k);
+      f.tags.replaceWith(fresh);
+    }
+    f.tags = fresh;
+  }
+  const drawn = [...f.tags.children].filter((k) => k.hasAttribute('data-c'));
+  for (const k of drawn) if (!f.chips.includes(k.getAttribute('data-c'))) k.remove();
+  for (const v of f.chips) {
+    if (drawn.some((k) => k.getAttribute('data-c') === v && k.isConnected)) continue;
+    const c = chipNode(v, cfg.chip, cfg.loose);
+    c.setAttribute('data-c', v);
+    f.tags.appendChild(c);
+  }
   window.__chips[f.i] = f.chips.slice();
 };
 const shadowHost = (tag, parent) => {
@@ -50337,7 +50358,14 @@ CR.forEach((cfg, i) => {
   const card = document.createElement('div');
   card.style.margin = '8px 0';
   document.getElementById('crf').appendChild(card);
-  const root = cfg.dom === 'light' ? card : shadowHost('cr-wrap', card);
+  // 'slotted': the field and its tag list are light children of a host whose root is only a <slot>.
+  let root = card;
+  if (cfg.dom === 'slotted') {
+    root = document.createElement('cr-slot');
+    root.style.display = 'block';
+    card.appendChild(root);
+    root.attachShadow({mode: 'open'}).innerHTML = '<slot></slot>';
+  } else if (cfg.dom !== 'light') root = shadowHost('cr-wrap', card);
   const cap = document.createElement('div');
   cap.textContent = 'Instruments ' + i;
   root.appendChild(cap);
@@ -50357,8 +50385,20 @@ CR.forEach((cfg, i) => {
   const tagsRoot = cfg.dom === 'nested' ? shadowHost('cr-tags', root) : root;
   const tags = document.createElement('div');
   tags.setAttribute('role', 'listbox');
-  tags.setAttribute('aria-label', 'Selected values');
-  tagsRoot.appendChild(tags);
+  tags.setAttribute('data-taglist', '');
+  // Only the original sibling list carries a label; the other places share the live list's role and no label.
+  if (cfg.place === 'sibling' && cfg.render === 'append') tags.setAttribute('aria-label', 'Selected values');
+  let box = null;
+  if (cfg.place === 'enclosing') {
+    // The tag list holds the field and its live list.
+    wrap.replaceWith(tags);
+    tags.appendChild(wrap);
+  } else if (cfg.place === 'box') {
+    box = document.createElement('div');
+    tagsRoot.appendChild(box);
+    if (tagsRoot === inputRoot) box.appendChild(wrap);
+    box.appendChild(tags);
+  } else if (cfg.place !== 'created') tagsRoot.appendChild(tags);
   // A captioned list of recent picks beside the field's own tags is not its selection.
   const recents = document.createElement('div');
   recents.setAttribute('role', 'listbox');
@@ -50388,7 +50428,7 @@ CR.forEach((cfg, i) => {
     sibTags.setAttribute('role', 'listbox');
     sib.appendChild(sibTags);
   }
-  const f = {i, cfg, tags, chips: cfg.pre ? [cfg.pick] : []};
+  const f = {i, cfg, tags, box, tagsParent: tagsRoot, chips: cfg.pre ? [cfg.pick] : []};
   fields.push(f);
   paint(f);
   const close = () => {
@@ -50396,12 +50436,12 @@ CR.forEach((cfg, i) => {
     if (m) m.remove();
     input.setAttribute('aria-expanded', 'false');
   };
-  const add = (g, v) => { if (!g.chips.includes(v)) { g.chips.push(v); paint(g); } };
+  const add = (g, v) => { if (!g.chips.includes(v)) { g.chips.push(v); paint(g, true); } };
   const pick = (v) => {
     const sink = fields[fields.length - 1];
     const otherComponent = fields[fields.length - 2];
     if (cfg.effect === 'add') add(f, v);
-    else if (cfg.effect === 'toggle') { f.chips = f.chips.includes(v) ? f.chips.filter((x) => x !== v) : f.chips.concat([v]); paint(f); }
+    else if (cfg.effect === 'toggle') { f.chips = f.chips.includes(v) ? f.chips.filter((x) => x !== v) : f.chips.concat([v]); paint(f, true); }
     else if (cfg.effect === 'other-field') add(sink, v);
     else if (cfg.effect === 'other-component') add(otherComponent, v);
     else if (cfg.effect === 'other-unlabelled-component') sibTags.appendChild(chipNode(v, cfg.chip, cfg.loose));
@@ -50456,12 +50496,25 @@ _CR_OUTCOMES = (
 
 
 def _cr_configs() -> list[dict[str, Any]]:
-    # Every outcome once, the place and the row shape rotating, and the gaining pick in all nine of them.
-    shapes = list(itertools.product(("light", "shadow", "nested"), ("direct", "remove", "slotted")))
-    picks = [(shapes[k % 9], outcome) for k, outcome in enumerate(_CR_OUTCOMES)]
+    # Every outcome once, the place and the row shape rotating, and the gaining pick in every shape.
+    shapes = list(itertools.product(("light", "shadow", "nested", "slotted"), ("direct", "remove", "slotted")))
+    picks = [(shapes[k % len(shapes)], outcome) for k, outcome in enumerate(_CR_OUTCOMES)]
     picks += [(shape, ("add", False)) for shape in shapes if shape != shapes[0]]
+    # The slotted placement produced the earlier false commits, so every outcome runs over it too.
+    picks += [(("slotted", ("direct", "remove", "slotted")[k % 3]), outcome) for k, outcome in enumerate(_CR_OUTCOMES)]
+    layouts = [("append", "sibling")] * len(picks)
+    # Where the tag list sits beside the live list, and whether the pick appends to it or draws a new list node: every
+    # outcome over every place, the render alternating, and the gaining pick over all eight.
+    places = ("sibling", "enclosing", "created", "box")
+    for k, outcome in enumerate(_CR_OUTCOMES):
+        for j, place in enumerate(places):
+            picks.append((shapes[(k * 4 + j) % len(shapes)], outcome))
+            layouts.append((("append", "rerender")[(k + j) % 2], place))
+    for j, layout in enumerate(itertools.product(("append", "rerender"), places)):
+        picks.append((shapes[(j * 5) % len(shapes)], ("add", False)))
+        layouts.append(layout)
     configs: list[dict[str, Any]] = []
-    for (dom, chip), (effect, pre) in picks:
+    for ((dom, chip), (effect, pre)), (render, place) in zip(picks, layouts, strict=True):
         # Main reads a slotted chip in a captioned recents list as a commit too; that limit predates the chip read.
         if effect == "recents" and chip == "slotted":
             chip = "direct"
@@ -50473,11 +50526,14 @@ def _cr_configs() -> list[dict[str, Any]]:
                 "pre": pre,
                 "pick": "Glass harp",
                 "loose": len(configs) % 2 == 1,
+                "render": render,
+                "place": place,
             }
         )
     # Two sinks: another component whose label is drawn inside its own root, and a light field.
-    configs.append({"dom": "shadow", "chip": "direct", "effect": "none", "pre": False, "pick": "", "loose": False})
-    configs.append({"dom": "light", "chip": "direct", "effect": "none", "pre": False, "pick": "", "loose": False})
+    sink = {"effect": "none", "pre": False, "pick": "", "loose": False, "render": "append", "place": "sibling"}
+    configs.append({"dom": "shadow", "chip": "direct", **sink})
+    configs.append({"dom": "light", "chip": "direct", **sink})
     return configs
 
 
@@ -50495,28 +50551,32 @@ async def test_select_combobox_reports_a_tag_row_only_its_own_field_gained_and_n
             r = await select({"selector": f"#cr{i}", "value": cfg["pick"]})
             after = await page.evaluate("(i) => window.__chips[i].slice()", i)
             gained = cfg["pick"] in after and cfg["pick"] not in before
-            # Main's own verifier reads a light-DOM label slotted into a row outside a nested root as the commit.
-            mains = cfg["chip"] == "slotted" and cfg["dom"] != "nested"
+            # A row landing under a recents caption is an observed row: the caption is evidence, never a refusal.
+            recents = cfg["effect"].startswith("recents")
+            # Main's own verifier reads a light-DOM label slotted into the field's own row outside a nested root as the commit.
+            mains = cfg["chip"] == "slotted" and cfg["dom"] != "nested" and not recents
             right = (
                 (
                     r.status == "ok" and "committed value" in r.content
                     if mains
                     else _reports_observed_row(r, cfg["pick"])
                 )
-                if gained
+                if gained or recents
                 else r.error_class == "did_not_commit"
             )
+            # The recents row names its caption: the climb reached the scope through the slot it is drawn in.
+            right = right and (not recents or "'Recently used:'" in r.content)
+            # The relation is stated only for the field's own tag list drawn beside the live list in one parent.
+            beside = gained and cfg["dom"] != "nested" and cfg["place"] != "enclosing"
+            if not mains and (gained or recents):
+                right = right and ("hangs under the offering list's parent" in r.content) == beside
             if not right:
                 wrong.append((i, cfg, before, after, r.status, r.error_class, r.content[:200]))
     assert not wrong, wrong
 
 
-# Chips whose ownership the field cannot prove. A component beside the field draws the picked label as a removable chip
-# in its own root (a pill, a tag row, under a host aria-label): the field still picks, and the pill its own list gains
-# is the commit. A pill the field's own list already holds is left as is. A host carrying role=combobox with the real
-# input in its root is one field, so the pill beside it is still read. A label assigned to a slot the pill hides is not
-# drawn, so the pill reads as no chip. An owned pill commits only when it is new and carries the exact label. Two
-# light-DOM fields sharing a vocabulary behave as on main: each reads only its own pills.
+# Chips whose ownership the field cannot prove (another component's chip, a pill under a hidden slot) never block or
+# fake the pick; an owned pill commits only when new and exact, and light-DOM fields behave as on main.
 _UNPROVABLE_CHIPS_HTML = """<!doctype html><html><body style="font:14px sans-serif">
 <div id="cards"></div>
 <script>
@@ -50639,6 +50699,291 @@ async def test_select_combobox_picks_past_a_chip_it_cannot_prove_is_the_fields_o
     assert results[8].error_class == "did_not_commit" and pills[8] == ["Glass harp"], results[8].content
     assert results[9].status == "ok" and "already selected" in results[9].content and pair[0] == ["Glass harp"]
     assert results[10].status == "ok" and "committed value" in results[10].content and pair[1] == ["Glass harp"]
+
+
+# Tags drawn inside the offering list show no new row. A tag row in any other list node is an observed row, the offering
+# list rebuilt by a dead click, a list the pick created or re-rendered and a list enclosing the offering list included,
+# saying when it hangs beside the offering list. A same-label row already on the page is neither new nor proof.
+# The page's `document.host` is a form.
+# A pill under a caption, slotted either way, is an observed row naming the caption with its page strings capped.
+_CHIP_FOLLOWUP_HTML = """<!doctype html><html><body style="font:14px sans-serif">
+<form name="host"></form>
+<div id="cards"></div>
+<script>
+const css = 'display:inline-block;border:1px solid #888;padding:1px 6px;margin:2px';
+const VALUES = ['Copper bell', 'Glass harp', 'Reed pipe'];
+const combo = (host, input, onPick, rowHtml, values = VALUES, menu = {}) => {
+  const aria = !input.hasAttribute('data-bare');
+  const close = () => { const m = host.querySelector('.menu'); if (m) m.remove(); if (aria) input.setAttribute('aria-expanded', 'false'); };
+  let open;
+  const fill = (m, all) => {
+    m.innerHTML = values.filter((v) => all || v.toLowerCase().includes((input.value || '').toLowerCase())).map(rowHtml).join('');
+    for (const o of m.querySelectorAll('[role=option]')) {
+      o.addEventListener('mousedown', (e) => e.preventDefault());
+      o.addEventListener('click', () => onPick(o.firstChild.nodeValue, close, open));
+    }
+  };
+  open = (all) => {
+    close();
+    const m = document.createElement(menu.tag || 'div');
+    m.className = 'menu';
+    if (menu.role !== '') m.setAttribute('role', menu.role || 'listbox');
+    if (menu.label) m.setAttribute('aria-label', menu.label);
+    m.style.cssText = 'border:1px solid #888;width:300px;background:#fff';
+    fill(m, all === true);
+    input.after(m);
+    if (aria) input.setAttribute('aria-expanded', 'true');
+  };
+  if (aria) input.setAttribute('aria-expanded', 'false');
+  input.addEventListener('click', open);
+  input.addEventListener('input', open);
+};
+const plainRow = (v) => '<div role="option">' + v + '</div>';
+const cards = document.getElementById('cards');
+const card = () => { const c = document.createElement('div'); c.style.margin = '8px 0'; cards.appendChild(c); return c; };
+// 0: every row nests an icon button, and a click only clears the query and rebuilds the whole list.
+let c = card();
+c.innerHTML = '<label for="g0">Instruments 0</label> <input id="g0" data-bare style="width:300px">';
+const c0input = c.querySelector('input');
+combo(c, c0input, (v, close, open) => {
+  c0input.value = '';
+  open(true);
+},
+  (v) => '<div role="option" aria-selected="false" style="padding:4px">' + v + '<button type="button" aria-label="About" style="width:12px;height:12px"></button></div>');
+// 1: the field's own component slots a captioned list of recent picks; the pick lands only there.
+c = card();
+const host = document.createElement('x-multi');
+host.style.display = 'block';
+c.appendChild(host);
+host.innerHTML = '<div>Recently used: <span class="recent"></span></div>';
+const root = host.attachShadow({mode: 'open'});
+root.innerHTML = '<input id="g1" role="combobox" aria-autocomplete="list" aria-label="Instruments 1" style="width:300px">'
+  + '<div class="own"></div><slot></slot>';
+combo(root, root.querySelector('input'), (v, close) => {
+  host.querySelector('.recent').insertAdjacentHTML('beforeend', '<span class="chip" style="' + css + '">' + v
+    + '<button type="button">x</button></span>');
+  close();
+}, plainRow);
+// 2: the pick lands as a tag row in a list whose page strings are long.
+c = card();
+const long = 'Selected '.repeat(600);
+c.innerHTML = '<label for="g2">Instruments 2</label> <input id="g2" role="combobox" aria-autocomplete="list" style="width:300px">'
+  + '<div role="list" class="tags" aria-label="' + long + '">Picked: </div>';
+const c2 = c;
+combo(c, c.querySelector('input'), (v, close) => {
+  c2.querySelector('.tags').insertAdjacentHTML('beforeend', '<span class="chip" role="' + long + '" style="' + css + '">' + v
+    + '<button type="button">x</button></span>');
+  close();
+}, plainRow);
+// 3: the field's own component slots its selected chips after a caption; the pick lands there.
+const own = document.createElement('x-multi');
+own.style.display = 'block';
+card().appendChild(own);
+own.innerHTML = '<div>Selected: <span class="picked"></span></div>';
+const ownRoot = own.attachShadow({mode: 'open'});
+ownRoot.innerHTML = '<input id="g3" role="combobox" aria-autocomplete="list" aria-label="Instruments 3" style="width:300px">'
+  + '<slot></slot>';
+combo(ownRoot, ownRoot.querySelector('input'), (v, close) => {
+  own.querySelector('.picked').insertAdjacentHTML('beforeend', '<span class="chip" style="' + css + '">' + v
+    + '<button type="button" aria-label="Remove">x</button></span>');
+  close();
+}, plainRow);
+// 4: a light field slotted into a component beside a captioned list of recent picks; the pick lands only there.
+const wrap = document.createElement('x-wrap');
+wrap.style.display = 'block';
+card().appendChild(wrap);
+wrap.attachShadow({mode: 'open'}).innerHTML = '<slot></slot>';
+wrap.innerHTML = '<input id="g4" role="combobox" aria-autocomplete="list" aria-label="Instruments 4" style="width:300px">'
+  + '<div>Recently used: <span class="recent"></span></div>';
+combo(wrap, wrap.querySelector('input'), (v, close) => {
+  wrap.querySelector('.recent').insertAdjacentHTML('beforeend', '<span class="chip" style="' + css + '">' + v
+    + '<button type="button">x</button></span>');
+  close();
+}, plainRow);
+// 5, 6: offered rows that nest a control (5) or not (6); the pick adds a tag row to a sibling list 'Selected'.
+const aboutRow = (v) => '<div role="option" style="padding:4px">' + v
+  + '<button type="button" aria-label="About" style="width:12px;height:12px"></button></div>';
+for (const [n, rowHtml] of [[5, aboutRow], [6, plainRow]]) {
+  const k = card();
+  k.innerHTML = '<label for="g' + n + '">Instruments ' + n + '</label> <input id="g' + n
+    + '" role="combobox" aria-autocomplete="list" style="width:300px"><div role="listbox" aria-label="Selected"></div>';
+  combo(k, k.querySelector('input'), (v, close) => {
+    k.querySelector('[aria-label=Selected]').insertAdjacentHTML('beforeend', '<div role="option" style="' + css + '">' + v
+      + '<button type="button">x</button></div>');
+    close();
+  }, rowHtml);
+}
+// 7: a recents pill nested past the caption climb's bound; 8: a recents <form> holding a control named host;
+// 9: one root draws the field's own 'Selected:' area beside a captioned recents list; 11: the recents pill is a link.
+const pillIn = (k, sel, v, tag) => k.querySelector(sel).insertAdjacentHTML('beforeend', '<' + tag + ' class="chip" href="/x" style="'
+  + css + '">' + v + '<button type="button">x</button></' + tag + '>');
+for (const [n, inner, sel, tag] of [
+  [7, '<div>Recently used: <div class="deep">' + '<div>'.repeat(70) + '<span class="recent"></span>' + '</div>'.repeat(70) + '</div></div>', '.recent', 'span'],
+  [8, '<form>Recently used: <input type="hidden" name="host"><span class="recent"></span></form>', '.recent', 'span'],
+  [11, '<div>Recently used: <span class="recent"></span></div>', '.recent', 'a'],
+]) {
+  const k = card();
+  k.innerHTML = '<label for="g' + n + '">Instruments ' + n + '</label> <input id="g' + n
+    + '" role="combobox" aria-autocomplete="list" style="width:300px">' + inner;
+  combo(k, k.querySelector('input'), (v, close) => { pillIn(k, sel, v, tag); close(); }, plainRow);
+}
+const one = document.createElement('x-one');
+one.style.display = 'block';
+card().appendChild(one);
+const oneRoot = one.attachShadow({mode: 'open'});
+oneRoot.innerHTML = '<input id="g9" role="combobox" aria-autocomplete="list" aria-label="Instruments 9" style="width:300px">'
+  + '<div>Selected: <span class="own"></span></div><div>Recently used: <span class="recent"></span></div>';
+combo(oneRoot, oneRoot.querySelector('input'), (v, close) => { pillIn(oneRoot, '.own', v, 'span'); close(); }, plainRow);
+// 10: a click-to-open list whose option label is long (a menu row stays under 200 characters); the pick lands under a recents caption.
+const k10 = card();
+k10.innerHTML = '<span>Instruments 10</span> <button id="g10" type="button" role="combobox" aria-haspopup="listbox"'
+  + ' aria-label="Instruments 10">Choose</button><div>Recently used: <span class="recent"></span></div>';
+combo(k10, k10.querySelector('button'), (v, close) => { pillIn(k10, '.recent', v, 'span'); close(); }, plainRow,
+  ['Glass harp ' + 'with a bow '.repeat(16), 'Reed pipe']);
+// 12: the pick creates the tag list 'Selected' outside the box that holds the field and its live list.
+const k12 = card();
+k12.innerHTML = '<div class="box"><label for="g12">Instruments 12</label> <input id="g12" role="combobox"'
+  + ' aria-autocomplete="list" style="width:300px"></div>';
+combo(k12.querySelector('.box'), k12.querySelector('input'), (v, close) => {
+  let sel = k12.querySelector('[aria-label=Selected]');
+  if (!sel) {
+    sel = document.createElement('div');
+    sel.setAttribute('role', 'listbox');
+    sel.setAttribute('aria-label', 'Selected');
+    k12.appendChild(sel);
+  }
+  sel.insertAdjacentHTML('beforeend', '<div role="option" style="' + css + '">' + v + '<button type="button">x</button></div>');
+  close();
+}, plainRow);
+// 13: the widget draws its tags inside the list that offers them, which stays open.
+const k13 = card();
+k13.innerHTML = '<label for="g13">Instruments 13</label> <input id="g13" role="combobox" aria-autocomplete="list" style="width:300px">';
+combo(k13, k13.querySelector('input'), (v) => {
+  k13.querySelector('.menu').insertAdjacentHTML('afterbegin', '<div role="option" style="' + css + '">' + v
+    + '<button type="button">x</button></div>');
+}, plainRow);
+// 14, 15: the pick creates a selected <ul> beside the offering <ul> under one wrapper, both with no role or label (14)
+// or both with the same role and label (15).
+for (const [n, role, label] of [[14, '', ''], [15, 'listbox', 'Instruments']]) {
+  const k = card();
+  k.innerHTML = '<div class="wrap"><label for="g' + n + '">Instruments ' + n + '</label> <input id="g' + n
+    + '" role="combobox" aria-autocomplete="list" style="width:300px"></div>';
+  const wrap = k.querySelector('.wrap');
+  combo(wrap, wrap.querySelector('input'), (v, close) => {
+    let sel = wrap.querySelector('ul.sel');
+    if (!sel) {
+      sel = document.createElement('ul');
+      sel.className = 'sel';
+      if (role) sel.setAttribute('role', role);
+      if (label) sel.setAttribute('aria-label', label);
+      wrap.appendChild(sel);
+    }
+    sel.insertAdjacentHTML('beforeend', '<li role="option" style="' + css + '">' + v + '<button type="button">x</button></li>');
+    close();
+  }, (v) => '<li role="option">' + v + '</li>', VALUES, {tag: 'ul', role, label});
+}
+// 16: the tags sit in an existing <ul> that also holds the input and the live list; the pick only appends an <li>.
+const k16 = card();
+k16.innerHTML = '<ul class="tags"><li><label for="g16">Instruments 16</label> <input id="g16" role="combobox"'
+  + ' aria-autocomplete="list" style="width:300px"></li></ul>';
+combo(k16.querySelector('li'), k16.querySelector('input'), (v, close) => {
+  k16.querySelector('.tags').insertAdjacentHTML('beforeend', '<li role="option" style="' + css + '">' + v
+    + '<button type="button">x</button></li>');
+  close();
+}, plainRow);
+// 17, 18, 19: an unlabelled tag listbox beside the live listbox that the pick re-renders as a new node (17), the same
+// named by aria-labelledby (18), and a pick that re-renders the whole widget box with innerHTML (19).
+for (const n of [17, 18, 19]) {
+  const k = card();
+  const named = n === 18 ? ' aria-labelledby="t18"' : '';
+  const boxHtml = (tags) => '<span id="t' + n + '">Instruments ' + n + '</span> <input id="g' + n + '" role="combobox"'
+    + ' aria-autocomplete="list" aria-label="Instruments ' + n + '" style="width:300px"><div role="listbox" class="tags"'
+    + named + '>' + tags + '</div>';
+  const box = document.createElement('div');
+  k.appendChild(box);
+  box.innerHTML = boxHtml('');
+  const tag = (v) => '<div role="option" style="' + css + '">' + v + '<button type="button">x</button></div>';
+  combo(box, box.querySelector('input'), (v, close) => {
+    close();
+    if (n === 19) { box.innerHTML = boxHtml(tag(v)); return; }
+    const fresh = document.createElement('div');
+    fresh.setAttribute('role', 'listbox');
+    fresh.className = 'tags';
+    if (named) fresh.setAttribute('aria-labelledby', 't18');
+    fresh.innerHTML = box.querySelector('.tags').innerHTML + tag(v);
+    box.querySelector('.tags').replaceWith(fresh);
+  }, plainRow);
+}
+// 20, 21: a same-label pill under "Recently used:" is already there; the pick appends a tag to a <ul> (20) or does
+// nothing (21).
+for (const n of [20, 21]) {
+  const k = card();
+  k.innerHTML = '<label for="g' + n + '">Instruments ' + n + '</label> <input id="g' + n + '" role="combobox"'
+    + ' aria-autocomplete="list" style="width:300px"><ul class="sel"></ul><div>Recently used: <span class="chip" style="'
+    + css + '">Glass harp<button type="button">x</button></span></div>';
+  combo(k, k.querySelector('input'), (v, close) => {
+    if (n === 20) k.querySelector('.sel').insertAdjacentHTML('beforeend', '<li role="option" style="' + css + '">' + v
+      + '<button type="button">x</button></li>');
+    close();
+  }, plainRow);
+}
+</script></body></html>"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_reports_a_rebuilt_list_row_and_a_captioned_pill_as_observed_rows() -> None:
+    async def _serve(route: Any) -> None:
+        await route.fulfill(status=200, content_type="text/html", body=_CHIP_FOLLOWUP_HTML)
+
+    long_label = "Glass harp " + "with a bow " * 16
+    async with _content_page("") as page:
+        # A served URL: a link's `.host` is then a non-empty string.
+        await page.route("**/*", _serve)
+        await page.goto("http://chips.test/")
+        select = _tool(build_browser_tools(_fixed_page_provider(page)), "select_combobox").handler
+        values = ["Glass harp", "Glass harp", "Glass harp", "Reed pipe", "Copper bell", "Glass harp", "Glass harp"]
+        values += [
+            "Reed pipe",
+            "Reed pipe",
+            "Copper bell",
+            long_label.strip(),
+            "Copper bell",
+            "Glass harp",
+            "Reed pipe",
+            "Copper bell",
+            "Reed pipe",
+        ]
+        values += ["Reed pipe", "Copper bell", "Copper bell", "Reed pipe", "Glass harp", "Glass harp"]
+        results = {i: await select({"selector": f"#g{i}", "value": values[i]}) for i in range(13)}
+        # Older unbounded walks climb `.host` from the document and loop on this form (SKY-20076).
+        await page.evaluate("() => document.querySelector('form[name=host]').remove()")
+        # Card 13 leaves its offering list open, so it runs last.
+        for i in [*range(14, len(values)), 13]:
+            results[i] = await select({"selector": f"#g{i}", "value": values[i]})
+    # Tags drawn inside the offering list add no row. A new list node under the offering list's parent is no offer,
+    # whatever its role and label: the rebuilt list (0) and the lists the pick created (14, 15) are observed rows.
+    assert results[13].error_class == "did_not_commit", results[13].content
+    beside = "the row's list hangs under the offering list's parent"
+    for i in (0, 5, 6, 14, 15, 17, 18, 19):
+        assert _reports_observed_row(results[i], values[i]) and beside in results[i].content, results[i].content
+    # The tag list that encloses the offering list (16) is no sibling of it, and the list outside the box (12) neither.
+    for i in (12, 16):
+        assert _reports_observed_row(results[i], values[i]) and beside not in results[i].content, results[i].content
+    # A same-label row already on the page proves nothing about a new one.
+    assert _reports_observed_row(results[20], values[20]) and "Recently used" not in results[20].content, results[20]
+    # Card 21 (a dead click beside that row) reads as a commit, as on main: SKY-20358, a twin row only.
+    captions = {1: "Recently used:", 2: "Picked:", 3: "Selected:", 4: "Recently used:", 8: "Recently used:"}
+    captions |= {9: "Selected:", 11: "Recently used:"}
+    for i, caption in captions.items():
+        assert _reports_observed_row(results[i], values[i]) and f"'{caption}'" in results[i].content, results[i].content
+    for i in (5, 6, 12):
+        assert _reports_observed_row(results[i], values[i]) and "the list 'selected'" in results[i].content, results[i]
+    # Past the climb's bound the pill's branch is unproven: an observed row, with no caption read.
+    assert _reports_observed_row(results[7], values[7]) and "caption" not in results[7].content, results[7].content
+    long_row = results[10]
+    assert (long_row.data or {}).get("observed_row") is True and long_label.strip() not in long_row.content, long_row
+    assert all(len(r.content) < 1200 for r in results.values()), [len(r.content) for r in results.values()]
 
 
 # A menu row that holds its own list: the list's rows declare no role, so each belongs to the inner list, not to the

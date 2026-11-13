@@ -1,8 +1,8 @@
 """Empty-page recovery: close a dead blank working page and fall back to a survivor.
 
 Covers the scraper blank predicate, the scrape-ladder blank-evidence preservation, the
-handle_completed_step ActionBlock/max-step guards for a recovery-only step, the download-popup
-claim read, and the cached-script tab-close skip.
+handle_completed_step ActionBlock/max-step guards (for a recovery-only step, and for a step whose
+action did not succeed), the download-popup claim read, and the cached-script tab-close skip.
 """
 
 from __future__ import annotations
@@ -15,15 +15,17 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from skyvern.exceptions import FailedToReloadPage, ScrapingFailedBlankPage
-from skyvern.forge.agent import EMPTY_PAGE_RECOVERY_MAX_ATTEMPTS, ForgeAgent
+from skyvern.exceptions import FailedToReloadPage, MissingElement, ScrapingFailedBlankPage
+from skyvern.forge.agent import EMPTY_PAGE_RECOVERY_MAX_ATTEMPTS, ForgeAgent, _action_block_action_succeeded
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import StepStatus
+from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.models.block import ActionBlock
 from skyvern.schemas.steps import AgentStepOutput
-from skyvern.webeye.actions.actions import ClosePageAction
-from skyvern.webeye.actions.responses import ActionSuccess
+from skyvern.utils.prompt_engine import MaxStepsReasonResponse
+from skyvern.webeye.actions.actions import ActionStatus, ClickAction, ClosePageAction
+from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionResult, ActionSuccess
 from skyvern.webeye.scraper.scraper import (
     page_has_meaningful_child_frame,
     page_is_dead_blank,
@@ -190,17 +192,31 @@ def _recovery_step(now: datetime, task, *, order: int):
     return make_step(now, task, step_id="step-recovery", status=StepStatus.completed, order=order, output=output)
 
 
-async def _run_handle_completed_step(monkeypatch: pytest.MonkeyPatch, *, mark_recovery: bool):
+def _click_step(now: datetime, task, *, order: int, results: list[ActionResult]):
+    output = AgentStepOutput(actions_and_results=[(ClickAction(element_id="node-1"), results)])
+    return make_step(now, task, step_id="step-click", status=StepStatus.completed, order=order, output=output)
+
+
+async def _run_handle_completed_step(
+    monkeypatch: pytest.MonkeyPatch, *, mark_recovery: bool, action_results: list[ActionResult] | None = None
+):
     agent = ForgeAgent()
     now = datetime.now(UTC)
     organization = make_organization(now)
     # max_steps_per_run=1 is the ActionBlock default; step.order+1 would trip the max-steps failure.
     task = make_task(now, organization, navigation_goal="do it", workflow_run_id="wr-block", max_steps_per_run=1)
-    step = _recovery_step(now, task, order=0)
+    step = (
+        _recovery_step(now, task, order=0)
+        if action_results is None
+        else _click_step(now, task, order=0, results=action_results)
+    )
 
     agent._check_workflow_run_step_budget = AsyncMock(return_value=None)
     agent.update_step = AsyncMock(side_effect=lambda s, *a, **k: s)
     agent.update_task = AsyncMock(side_effect=lambda t, *a, **k: t)
+    agent.summary_failure_reason_for_max_steps = AsyncMock(
+        return_value=MaxStepsReasonResponse(page_info="", reasoning="the element was not on the page")
+    )
     next_step_sentinel = MagicMock(name="next_step")
     monkeypatch.setattr(
         "skyvern.forge.agent.app.DATABASE.tasks.create_step",
@@ -212,14 +228,18 @@ async def _run_handle_completed_step(monkeypatch: pytest.MonkeyPatch, *, mark_re
         context.empty_page_recovery_step_id = step.step_id
     skyvern_context.set(context)
     try:
-        return next_step_sentinel, await agent.handle_completed_step(
-            organization=organization,
-            task=task,
-            step=step,
-            page=MagicMock(),
-            task_block=ActionBlock.model_construct(label="b", max_steps_per_run=1),
-            browser_state=MagicMock(),
-            scraped_page=None,
+        return (
+            agent,
+            next_step_sentinel,
+            await agent.handle_completed_step(
+                organization=organization,
+                task=task,
+                step=step,
+                page=MagicMock(),
+                task_block=ActionBlock.model_construct(label="b", max_steps_per_run=1),
+                browser_state=MagicMock(),
+                scraped_page=None,
+            ),
         )
     finally:
         skyvern_context.reset()
@@ -297,7 +317,7 @@ async def test_non_recovery_navigation_step_still_uses_parallel_verification(mon
 async def test_recovery_step_does_not_complete_or_maxstep_fail_action_block(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    next_step_sentinel, (task_result, last_step, created_next) = await _run_handle_completed_step(
+    _agent, next_step_sentinel, (task_result, last_step, created_next) = await _run_handle_completed_step(
         monkeypatch, mark_recovery=True
     )
     # The block is neither completed (True) nor max-step-failed (False, last_step); a next step runs
@@ -311,9 +331,70 @@ async def test_recovery_step_does_not_complete_or_maxstep_fail_action_block(
 async def test_non_recovery_success_still_completes_action_block(monkeypatch: pytest.MonkeyPatch) -> None:
     # Control: without the recovery marker, the same successful step completes the ActionBlock via the
     # pre-existing single-step hack. Proves the guard is what discriminates, not the setup.
-    _next, (task_result, _last_step, created_next) = await _run_handle_completed_step(monkeypatch, mark_recovery=False)
+    _agent, _next, (task_result, _last_step, created_next) = await _run_handle_completed_step(
+        monkeypatch, mark_recovery=False
+    )
     assert task_result is True
     assert created_next is None
+
+
+# ---- a tolerated action failure does not complete an ActionBlock (SKY-20159) ------------------
+
+
+@pytest.mark.asyncio
+async def test_tolerated_action_failure_does_not_complete_action_block(monkeypatch: pytest.MonkeyPatch) -> None:
+    # An element id that is not on the page fails with stop_execution_on_failure=False, which leaves
+    # the step completed. The block's only action never happened, so the block must not report
+    # success: on its single-step budget it max-step-fails instead.
+    agent, _next, (task_result, last_step, created_next) = await _run_handle_completed_step(
+        monkeypatch,
+        mark_recovery=False,
+        action_results=[ActionFailure(MissingElement(element_id="node-1"), stop_execution_on_failure=False)],
+    )
+    assert task_result is False
+    assert last_step is not None
+    assert created_next is None
+    assert agent.update_task.await_args.kwargs["status"] == TaskStatus.failed
+
+
+@pytest.mark.asyncio
+async def test_successful_action_completes_action_block(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Control for the case above: the same block with a succeeding click still completes.
+    agent, _next, (task_result, _last_step, created_next) = await _run_handle_completed_step(
+        monkeypatch, mark_recovery=False, action_results=[ActionSuccess()]
+    )
+    assert task_result is True
+    assert created_next is None
+    assert agent.update_task.await_args.kwargs["status"] == TaskStatus.completed
+
+
+@pytest.mark.parametrize(
+    ("second_status", "second_result", "expected"),
+    [
+        (ActionStatus.skipped, ActionAbort(), False),
+        (ActionStatus.completed, ActionAbort(desired_state_reached=True), True),
+        (ActionStatus.completed, ActionAbort(setup_performed=True), True),
+        (ActionStatus.failed, ActionFailure(Exception("failed")), False),
+    ],
+)
+def test_action_block_requires_each_recorded_action_to_succeed(second_status, second_result, expected) -> None:
+    now = datetime.now(UTC)
+    task = make_task(now, make_organization(now))
+    output = AgentStepOutput(
+        actions_and_results=[
+            (ClickAction(element_id="node-1", status=ActionStatus.completed), [ActionSuccess()]),
+            (ClickAction(element_id="node-2", status=second_status), [second_result]),
+        ]
+    )
+    step = make_step(
+        now,
+        task,
+        step_id="step-click",
+        status=StepStatus.completed,
+        order=0,
+        output=AgentStepOutput.model_validate(output.model_dump()),
+    )
+    assert _action_block_action_succeeded(step) is expected
 
 
 # ---- download-popup claim read ---------------------------------------------------------------
