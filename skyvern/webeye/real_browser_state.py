@@ -2152,12 +2152,22 @@ class RealBrowserState(BrowserState):
             if session is not None:
                 _schedule_detach(session)
 
-    async def reload_page(self, degradation: bool = False, page: Page | None = None) -> None:
+    async def reload_page(
+        self,
+        degradation: bool = False,
+        page: Page | None = None,
+        still_wanted: Callable[[Page], Awaitable[bool]] | None = None,
+    ) -> bool:
+        """Reload the page; False, without reloading, when `still_wanted` says the reload no longer stands."""
         # A caller that pins its own page passes it, since the working-page accessor would reload
         # (and repoint to) the newest tab instead.
         if page is None:
             page = await self.__assert_page()
         await self._wait_for_browser_to_record_page(page)
+        # Awaited last, so nothing between its answer and the reload below can change it.
+        if still_wanted is not None and not await still_wanted(page):
+            LOG.info("Reload withheld: the request for it no longer stands", url=page.url)
+            return False
         url = page.url
 
         if not degradation:
@@ -2173,7 +2183,7 @@ class RealBrowserState(BrowserState):
                 self._record_reload_timeout(e)
                 LOG.exception("Error while reload url", error=repr(e))
                 raise FailedToReloadPage(url=url, error_message=repr(e))
-            return
+            return True
 
         strategies: list[str] = ["load", "domcontentloaded", "commit"]
         for i, strategy in enumerate(strategies):
@@ -2190,7 +2200,7 @@ class RealBrowserState(BrowserState):
                 skyvern_context.record_browser_success()
                 await self._wait_for_settle()
                 await self._wait_for_challenge_solver(page=page)
-                return
+                return True
             except Exception as e:
                 self._record_reload_timeout(e)
                 # A reload that failed after the owning run lost its browser is final; degrading would send another.
@@ -2205,6 +2215,8 @@ class RealBrowserState(BrowserState):
                     continue
                 LOG.warning("Error while reload url after degradation", error=repr(e), exc_info=True)
                 raise FailedToReloadPage(url=url, error_message=repr(e))
+        # Unreachable: every strategy above returns or raises.
+        raise FailedToReloadPage(url=url, error_message="no reload strategy left")
 
     async def scrape_website(
         self,

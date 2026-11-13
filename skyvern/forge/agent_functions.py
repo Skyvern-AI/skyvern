@@ -2535,6 +2535,23 @@ class AgentFunction:
         if step.status == StepStatus.completed:
             await self._maybe_close_magic_link_page(task)
 
+    async def bind_page_reload_owner(self, *, task: Task, browser_state: BrowserState) -> None:
+        """Bind `task` to its browser, so a page-level handler finishing later raises the reload signal only for
+        the task and page document that sent its request."""
+        return None
+
+    async def settle_page_reload_signal(
+        self, *, task: Task, raise_signal: bool = True, accept: bool = False
+    ) -> bool | None:
+        """None means ordinary recovery; False withholds a private request; True prepares its checked executor."""
+        return None
+
+    async def page_submission_evidence(self, *, task: Task) -> str | None:
+        return None
+
+    async def release_page_reload_owner(self, *, task: Task) -> None:
+        return None
+
     async def gate_step_completion(
         self,
         *,
