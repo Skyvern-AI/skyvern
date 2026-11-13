@@ -42,7 +42,7 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
     _stash_recorded_run_outcome,
 )
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotStreamMessageType
-from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.schemas.workflow_runs import AgentStepToolCall, WorkflowRunBlock
 from skyvern.services import workflow_service as workflow_service_module
 from tests.unit.copilot_test_helpers import (
     FakeCopilotStream,
@@ -472,6 +472,52 @@ def test_attempt_archive_keeps_only_the_most_recent_attempts() -> None:
     assert len(archive) == MAX_NARRATIVE_BLOCK_ATTEMPTS
     assert "wrb_iter_0" not in archive
     assert next(iter(archive)) == "wrb_iter_1"
+
+
+def test_saved_turn_nests_a_child_by_parent_id_without_saving_the_steps_calls() -> None:
+    ctx = _ctx()
+    step = WorkflowRunBlock(
+        workflow_run_block_id="wrb_step",
+        workflow_run_id="wr_full",
+        organization_id="org",
+        block_type="agent_step",
+        label="research",
+        status="completed",
+        created_at=_TS,
+        modified_at=_TS,
+        tool_calls=[
+            AgentStepToolCall(
+                index=0,
+                tool="browser_task",
+                status="completed",
+                started_at=_TS,
+                finished_at=_TS,
+                arguments='{"navigation_goal": "open the private dashboard"}',
+                child_workflow_run_block_id="wrb_child",
+            )
+        ],
+    )
+    child = WorkflowRunBlock(
+        workflow_run_block_id="wrb_child",
+        parent_workflow_run_block_id="wrb_step",
+        workflow_run_id="wr_full",
+        organization_id="org",
+        block_type="task_v2",
+        label="research_task_1",
+        status="completed",
+        created_at=_TS,
+        modified_at=_TS,
+    )
+
+    _reconcile_narrative_block_attempts(ctx, [step, child])
+    payload = _build_narrative_payload(ctx, terminal="response", terminal_message="done", narrative_summary=None)
+
+    blocks = {block["workflowRunBlockId"]: block for block in payload["blocks"]}
+    assert blocks["wrb_child"].get("parentWorkflowRunBlockId") == "wrb_step"
+    assert "parentWorkflowRunBlockId" not in blocks["wrb_step"]
+    saved = json.dumps(payload)
+    for leaked in ("tool_calls", "toolCalls", "arguments", "agentStepCalls", "private dashboard"):
+        assert leaked not in saved
 
 
 def test_run_row_reconciliation_puts_both_ends_of_elapsed_on_the_database_clock() -> None:

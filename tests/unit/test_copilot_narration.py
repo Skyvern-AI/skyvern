@@ -16,6 +16,7 @@ from skyvern.forge.sdk.copilot.narration import (
     tool_activity_display_label,
 )
 from skyvern.forge.sdk.copilot.tools import run_execution
+from skyvern.schemas.workflows import BlockType
 from tests.unit.copilot_test_helpers import FakeCopilotStream, handback_ctx, terminal_extraction_block
 
 
@@ -29,7 +30,15 @@ async def test_pending_block_progress_and_archive_without_narrator() -> None:
     status = "running"
 
     async def fetch():
-        return [SimpleNamespace(workflow_run_block_id="wrb_1", label="booking", block_type="code", status=status)]
+        return [
+            SimpleNamespace(
+                workflow_run_block_id="wrb_1",
+                label="booking",
+                block_type=BlockType.CODE,
+                status=status,
+                parent_workflow_run_block_id="wrb_step",
+            )
+        ]
 
     for index, current in enumerate(("running", "completed")):
         status = current
@@ -46,7 +55,9 @@ async def test_pending_block_progress_and_archive_without_narrator() -> None:
         )
         assert stream.sent[index].status == current
         assert stream.sent[index].iteration == 7
+        assert stream.sent[index].parent_workflow_run_block_id == "wrb_step"
     assert archive["wrb_1"]["rawStatus"] == "completed"
+    assert archive["wrb_1"]["parentWorkflowRunBlockId"] == "wrb_step"
     assert archive["wrb_1"]["startedAt"] is not None
     assert archive["wrb_1"]["endedAt"] is not None
     assert state.running_block_id is None
