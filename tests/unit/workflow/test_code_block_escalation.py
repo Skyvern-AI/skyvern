@@ -82,7 +82,15 @@ from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.self_heal import HealClassification, HealSkipReason, HealStatus
 from skyvern.services import otp_service
 from skyvern.webeye.actions.action_types import ActionType
-from skyvern.webeye.actions.actions import Action, ActionStatus, KeypressAction
+from skyvern.webeye.actions.actions import (
+    Action,
+    ActionStatus,
+    ClickAction,
+    GotoUrlAction,
+    KeypressAction,
+    SelectOption,
+    SelectOptionAction,
+)
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from skyvern.webeye.browser_runtime_events import BrowserRuntimeLogContext
 from skyvern.webeye.navigation import clear_task_nav_error_code, record_task_nav_error_code
@@ -3955,14 +3963,41 @@ def test_outline_is_source_order_and_never_claims_what_ran(failing_line: int, ex
         assert claim not in section
 
 
-def _recorded_call(order: int, line: int | None, description: str, status: ActionStatus) -> Action:
-    return Action(
-        action_type=ActionType.CLICK,
-        status=status,
-        action_order=order,
-        description=description,
-        output={"code_line": line},
-        response="Timeout 5000ms exceeded" if status == ActionStatus.failed else None,
+def _recorded_call(
+    order: int, line: int | None, description: str, status: ActionStatus, argument: str | None = None
+) -> Action:
+    """A row as the recorder writes it: typed fields hold the target or URL, and an argument is appended to the
+    description."""
+    method, _, target = description.partition(" ")
+    fields = {
+        "status": status,
+        "action_order": order,
+        "description": f"{description} {argument}" if argument else description,
+        "output": {"code_line": line},
+        "response": "Timeout 5000ms exceeded" if status == ActionStatus.failed else None,
+    }
+    if method == "page.goto":
+        return GotoUrlAction(url=target, **fields)
+    return ClickAction(element_id=target, **fields)
+
+
+def _progress_descriptions(
+    recorded: list[Action], *, secrets: dict[str, str] | None = None, parameters: dict[str, str] | None = None
+) -> tuple[list[str], str]:
+    context = _make_context(with_secret=True)
+    context.secrets.update(secrets or {})
+    block = _make_code_block(code='await page.goto("https://example.com")\n')
+    record = block._code_progress_record(
+        workflow_run_context=context,
+        failing_line=None,
+        authored_code=None,
+        recorded_actions=recorded,
+        redaction_parameters=parameters or {},
+    )
+    assert record is not None
+    return (
+        [call.description for call in record.executed_calls],
+        compose_goal(DEFAULT_PROMPT, GoalDirectives(code_progress=record)),
     )
 
 
@@ -3985,17 +4020,20 @@ async def test_executed_calls_reach_the_recovery_without_secrets_or_parameter_va
     exc = RuntimeError("rotted selector")
     recording_page = _recording_page(exc)
     url_secret = "p@ss/w0rd!X"
+    quoted = urllib.parse.quote(url_secret, safe="")
     recording_page.recorded_actions = MagicMock(
         return_value=[
             _recorded_call(0, None, "locator.click #size-m", ActionStatus.completed),
-            _recorded_call(1, 4, f"locator.fill #password {SECRET_VALUE}", ActionStatus.completed),
-            _recorded_call(2, 5, f"locator.click #promo {'x' * 180}{SECRET_VALUE[:8]}", ActionStatus.completed),
-            _recorded_call(3, 6, "locator.click #contact Grace Param", ActionStatus.completed),
+            _recorded_call(1, 4, "locator.fill #password", ActionStatus.completed, argument=SECRET_VALUE),
             _recorded_call(
-                4, 7, f"page.goto https://u:{urllib.parse.quote(url_secret, safe='')}@h", ActionStatus.completed
+                2, 5, "locator.click #promo", ActionStatus.completed, argument=f"{'x' * 180}{SECRET_VALUE[:8]}"
             ),
-            _recorded_call(4, 7, "locator.click #add", ActionStatus.completed),
-            _recorded_call(5, 8, "locator.click #open-panel", ActionStatus.failed),
+            _recorded_call(3, 6, "locator.click [name='Grace Param']", ActionStatus.completed),
+            _recorded_call(4, 7, f"page.goto https://u:{quoted}@h/login?k={quoted}#f", ActionStatus.completed),
+            _recorded_call(5, 7, "page.goto https://h/login?page=2#top", ActionStatus.completed),
+            _recorded_call(6, 7, f"page.goto https://h/{quoted}", ActionStatus.completed),
+            _recorded_call(7, 7, "locator.click #add", ActionStatus.completed),
+            _recorded_call(8, 8, "locator.click #open-panel", ActionStatus.failed),
         ]
     )
     redaction_parameters = {"contact_name": "Grace Param"}
@@ -4024,49 +4062,159 @@ async def test_executed_calls_reach_the_recovery_without_secrets_or_parameter_va
     assert goal.split("\n\n")[1].split("\n") == [
         EXECUTED_CALLS_HEADER,
         '- "locator.click #size-m" returned',
-        '- Line 4: "(description withheld)" returned',
-        '- Line 5: "(description withheld)" returned',
-        '- Line 6: "locator.click #contact [redacted]" returned',
+        '- Line 4: "locator.fill #password" returned',
+        '- Line 5: "locator.click #promo" returned',
+        "- Line 6: \"locator.click [name='[redacted]']\" returned",
+        '- Line 7: "(description withheld)" returned',
+        '- Line 7: "page.goto https://h/login" returned',
         '- Line 7: "(description withheld)" returned',
         '- Line 7: "locator.click #add" returned',
         '- Line 8: "locator.click #open-panel" raised an error',
     ]
     assert (record.failed_line, "Code outline" in goal) == (failing_line, failing_line is not None)
-    for leaked in (SECRET_VALUE, SECRET_VALUE[:8], "Grace Param", "*****", "w0rd"):
+    for leaked in (SECRET_VALUE, SECRET_VALUE[:8], "Grace Param", "*****", "w0rd", url_secret, quoted):
         assert leaked not in goal
+
+
+def _b64(text: str) -> str:
+    return base64.b64encode(text.encode()).decode()
+
+
+_BOB7 = _b64("bob:7")
+_USER7 = _b64("user:7")
+_JSON7 = _b64('{\n  "a": "7"\n}').rstrip("=")
+_NBSP7 = _b64("user:\u00a07")
+
+
+@pytest.mark.parametrize(
+    ("url", "leaked"),
+    [
+        ("https://u:7@h/p?x=1", "u:7@"),
+        ("https://h/p?token=7", "token=7"),
+        (f"https://h/p#auth={_BOB7}", _BOB7),
+        (f"https://h/p?k=sk-{_USER7}", _USER7),
+        (f"https://h/p?q={'p' * 150}&t={_USER7}", _USER7),
+        (f"https://h/p?j={_JSON7}/foo", _JSON7),
+        (f"https://h/p?v={_NBSP7}", _NBSP7),
+    ],
+)
+def test_a_urls_query_fragment_and_userinfo_never_reach_the_goal(url: str, leaked: str) -> None:
+    descriptions, goal = _progress_descriptions(
+        [_recorded_call(0, 1, f"page.goto {url}", ActionStatus.completed)], secrets={"k_month": "7"}
+    )
+
+    assert descriptions == ["page.goto https://h/p"]
+    assert leaked not in goal
+
+
+def test_a_registered_link_is_screened_whole_before_its_query_is_dropped() -> None:
+    link = "https://example.com/login/SyntheticAuthToken93?next=/dashboard"
+    recorded = [
+        _recorded_call(0, 1, f"page.goto {link}", ActionStatus.completed),
+        _recorded_call(1, 2, "page.goto https://example.com/login/other?next=/dashboard", ActionStatus.completed),
+    ]
+
+    descriptions, goal = _progress_descriptions(recorded, secrets={"k_link": link})
+
+    assert descriptions == ["(description withheld)", "page.goto https://example.com/login/other"]
+    assert "SyntheticAuthToken93" not in goal
+
+
+def test_other_call_arguments_never_reach_the_goal() -> None:
+    recorded = [
+        SelectOptionAction(
+            element_id="#size",
+            option=SelectOption(value="CARD-1234"),
+            description="locator.select_option #size CARD-1234",
+            action_order=0,
+            output={"code_line": 1},
+        ),
+        Action(
+            action_type=ActionType.EXECUTE_JS,
+            description="page.evaluate localStorage.setItem('t', 'abc')",
+            action_order=1,
+            output={"code_line": 2},
+        ),
+        _recorded_call(2, 3, "locator.click #pay", ActionStatus.completed, argument="4111111111111111"),
+        Action(
+            action_type=ActionType.EXTRACT,
+            description="Extract the order total",
+            action_order=3,
+            output={"code_line": 4},
+        ),
+        Action(action_type=ActionType.CLICK, description="locator.click #untyped", action_order=4),
+    ]
+
+    descriptions, goal = _progress_descriptions(recorded)
+
+    assert descriptions == [
+        "locator.select_option #size",
+        "page.evaluate",
+        "locator.click #pay",
+        "extract",
+        "locator.click",
+    ]
+    for leaked in ("CARD-1234", "localStorage", "4111111111111111", "order total"):
+        assert leaked not in goal
+
+
+@pytest.mark.parametrize("url", ["about:blank", "data:text/html,abc", "https://h:99999/p", "/relative/path"])
+def test_a_url_without_a_usable_host_shows_only_the_method(url: str) -> None:
+    descriptions, _ = _progress_descriptions([_recorded_call(0, 1, f"page.goto {url}", ActionStatus.completed)])
+
+    assert descriptions == ["page.goto"]
 
 
 @pytest.mark.parametrize(
     "encode",
     [
         lambda secret: urllib.parse.quote(secret),
-        lambda secret: base64.b64encode(f"bob:{secret}".encode()).decode(),
-        lambda secret: base64.b64encode(f"al:{secret}".encode()).decode(),
-        lambda secret: base64.b64encode(f"alic:{secret}".encode()).decode(),
+        lambda secret: _b64(f"bob:{secret}"),
+        lambda secret: _b64(f"al:{secret}"),
+        lambda secret: _b64(f"alic:{secret}"),
         lambda secret: base64.urlsafe_b64encode(f"bob:{secret}".encode()).decode(),
         lambda secret: base64.urlsafe_b64encode(f"carol:{secret}".encode()).decode(),
     ],
 )
-def test_a_secret_in_a_common_encoding_is_withheld_but_its_call_stays_listed(
-    encode: Callable[[str], str],
+@pytest.mark.parametrize("carrier", ['locator.click [href="/a/{}"]', "page.goto https://h/a/{}"])
+def test_a_secret_in_a_selector_or_url_path_is_withheld_but_its_call_stays_listed(
+    carrier: str, encode: Callable[[str], str]
 ) -> None:
-    secret = "pa?s>w~rd!"
-    context = _make_context(with_secret=True)
-    context.secrets["k_pw"] = secret
-    block = _make_code_block(code='await page.goto("https://example.com")\n')
-    recorded = [_recorded_call(0, 1, f"page.goto https://h/login?x={encode(secret)}", ActionStatus.completed)]
+    secret = "p@s/w~rd!"
+    encoded = encode(secret)
+    recorded = [_recorded_call(0, 1, carrier.format(encoded), ActionStatus.completed)]
 
-    record = block._code_progress_record(
-        workflow_run_context=context,
-        failing_line=None,
-        authored_code=None,
-        recorded_actions=recorded,
-        redaction_parameters={},
-    )
+    descriptions, goal = _progress_descriptions(recorded, secrets={"k_pw": secret})
 
-    assert record is not None
-    assert [(call.line, call.failed) for call in record.executed_calls] == [(1, False)]
-    assert encode(secret) not in compose_goal(DEFAULT_PROMPT, GoalDirectives(code_progress=record))
+    assert descriptions == ["(description withheld)"]
+    assert encoded not in goal
+
+
+@pytest.mark.parametrize("secret", ["4242", "123", "25"])
+def test_a_short_secret_never_hides_that_a_call_ran(secret: str) -> None:
+    compound = _b64(f"bob:{secret}")
+    recorded = [
+        _recorded_call(0, 1, f"locator.click Add item {secret}", ActionStatus.completed),
+        _recorded_call(1, 2, f"page.goto https://h/#auth={compound}", ActionStatus.completed),
+        _recorded_call(2, 3, "locator.click Open bag", ActionStatus.failed),
+    ]
+
+    descriptions, goal = _progress_descriptions(recorded, secrets={"k_card": secret})
+
+    assert descriptions == ["(description withheld)", "page.goto https://h/", "locator.click Open bag"]
+    assert compound not in goal
+
+
+def test_a_one_character_secret_does_not_withhold_unrelated_calls() -> None:
+    recorded = [
+        _recorded_call(0, 1, "locator.click Next", ActionStatus.completed),
+        _recorded_call(1, 2, "locator.click ProductDescriptionToggle", ActionStatus.completed),
+        _recorded_call(2, 3, "locator.click Open bag", ActionStatus.failed),
+    ]
+
+    descriptions, _ = _progress_descriptions(recorded, secrets={"k_month": "5"})
+
+    assert descriptions == ["locator.click Next", "locator.click ProductDescriptionToggle", "locator.click Open bag"]
 
 
 def test_a_credential_typed_one_key_per_call_is_not_spelled_out_but_named_keys_stay() -> None:
@@ -4114,32 +4262,6 @@ def test_a_credential_typed_one_key_per_call_is_not_spelled_out_but_named_keys_s
         "keyboard.press F5",
     ]
     assert [call.line for call in record.executed_calls] == list(range(1, 10))
-
-
-@pytest.mark.parametrize("secret", ["4242", "123", "25"])
-def test_a_short_secret_never_hides_that_a_call_ran(secret: str) -> None:
-    context = _make_context(with_secret=True)
-    context.secrets["k_card"] = secret
-    block = _make_code_block(code='await page.get_by_role("button", name="Add").click()\n')
-    compound = base64.b64encode(f"bob:{secret}".encode()).decode()
-    recorded = [
-        _recorded_call(0, 1, f"locator.click Add item {secret}", ActionStatus.completed),
-        _recorded_call(1, 2, f"page.goto https://h/#auth={compound}", ActionStatus.completed),
-        _recorded_call(2, 3, "locator.click Open bag", ActionStatus.failed),
-    ]
-
-    record = block._code_progress_record(
-        workflow_run_context=context,
-        failing_line=None,
-        authored_code=None,
-        recorded_actions=recorded,
-        redaction_parameters={},
-    )
-
-    assert record is not None
-    assert [(call.line, call.failed) for call in record.executed_calls] == [(1, False), (2, False), (3, True)]
-    assert [call.description for call in record.executed_calls[:2]] == ["(description withheld)"] * 2
-    assert compound not in compose_goal(DEFAULT_PROMPT, GoalDirectives(code_progress=record))
 
 
 @pytest.mark.asyncio
