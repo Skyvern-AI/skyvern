@@ -753,7 +753,8 @@ _PAGE_FINGERPRINT_PROBE_JS = (
     # detector reads that as progress and the action-effect check as an effect. Page-authored data-tv3 values stay
     # significant, as in loop.py's canonicalization. OTP bookkeeping attributes are ignored for the same reason.
     " const scrub = (s) => s.replace(/ data-(?:tv3-(?:act|catcher|cellgrid|close|codebox|collateral|cover|dateseg"
-    '|filter-base|focus|look|menu|menu-scroller|pick|popup-filter|pre|sugg|sugglist)|skyvern-otp-[^\\s=]+)="[^"]*"'
+    "|filter-base|focus|liveparent|look|menu|menu-scroller|pick|popup-filter|pre|prerow|sugg|sugglist)"
+    '|skyvern-otp-[^\\s=]+)="[^"]*"'
     "| data-tv3=\"t\\d+(?:-\\d+)?\"/gi, '');"
     # Each sample scores every element's own text, capped at 2: +1 when rewritten, -1 when unchanged, 0 when it grew.
     # From 2 until back at 0 it is a ticker, and the settle check (maskTicks) ignores a ticker's change only to a
@@ -1879,6 +1880,22 @@ def _redacted_user_defined_errors(task: Task, errors: list[UserDefinedError]) ->
         ).model_dump()
         for error in errors
     ]
+
+
+def _action_block_action_succeeded(step: Step) -> bool:
+    """Whether the step executed actions and each actually succeeded.
+
+    A tolerated ``ActionFailure`` (``stop_execution_on_failure=False``, e.g. an element id the model
+    picked that is not on the page) still persists the step as completed, so the step's status alone
+    cannot tell a performed action from a skipped one.
+    """
+    actions_and_results = step.output.actions_and_results if step.output else None
+    if not actions_and_results:
+        return False
+    return all(
+        results and results[-1].success and action.status != ActionStatus.skipped
+        for action, results in actions_and_results
+    )
 
 
 def _is_transient_page_read_refusal(exc: BaseException) -> bool:
@@ -12813,20 +12830,30 @@ class ForgeAgent:
             or settings.MAX_STEPS_PER_RUN
         )
 
-        # HACK: action block only have one step to execute without complete action, so we consider the task is completed as long as the step is completed
+        # HACK: action block only have one step to execute without complete action, so we consider the task is
+        # completed as long as the step is completed AND all recorded actions actually succeeded. Without the second
+        # half, a tolerated action failure (which leaves the step completed) reports the block as successful and the
+        # workflow continues as if the click or input happened.
         if isinstance(task_block, ActionBlock) and step.is_success() and not recovery_only:
-            LOG.info(
-                "Step completed for the action block, marking task as completed",
+            if _action_block_action_succeeded(step):
+                LOG.info(
+                    "Step completed for the action block, marking task as completed",
+                    step_order=step.order,
+                    step_retry=step.retry_index,
+                    **llm_response_log_metadata(step.output.model_dump() if step.output is not None else None),
+                )
+                last_step = await self.update_step(step, is_last=True)
+                await self.update_task(
+                    task,
+                    status=TaskStatus.completed,
+                )
+                return True, last_step, None
+            LOG.warning(
+                "Step completed for the action block but its actions did not all succeed, not completing the block",
                 step_order=step.order,
                 step_retry=step.retry_index,
                 **llm_response_log_metadata(step.output.model_dump() if step.output is not None else None),
             )
-            last_step = await self.update_step(step, is_last=True)
-            await self.update_task(
-                task,
-                status=TaskStatus.completed,
-            )
-            return True, last_step, None
 
         workflow_run_budget = await self._check_workflow_run_step_budget(organization, task)
         if workflow_run_budget is not None and workflow_run_budget[0] >= workflow_run_budget[1]:
