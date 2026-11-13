@@ -1457,9 +1457,7 @@ describe("WorkflowDocEditor navigation", () => {
     });
     const openPanel = () => {
       fireEvent.click(toggle);
-      fireEvent.click(
-        screen.getByRole("button", { name: "More details in the side panel" }),
-      );
+      fireEvent.click(screen.getByRole("button", { name: "All settings" }));
       expect(
         screen.getByRole("complementary", { name: "Document panel" }),
       ).toBeTruthy();
@@ -1620,7 +1618,8 @@ describe("WorkflowDocEditor navigation", () => {
     const options = within(
       document.getElementById(toggle.getAttribute("aria-controls")!)!,
     );
-    expect(options.getByText("Custom settings")).toBeTruthy();
+    // Both changed fields are key settings, so there is no Custom settings section.
+    expect(options.queryByText("Custom settings")).toBeNull();
     expect(options.getByText("Max steps").nextElementSibling?.textContent).toBe(
       "12",
     );
@@ -1630,9 +1629,7 @@ describe("WorkflowDocEditor navigation", () => {
     // Settings at their default appear only in the side panel.
     expect(options.queryByText("Continue on failure")).toBeNull();
 
-    fireEvent.click(
-      options.getByRole("button", { name: "More details in the side panel" }),
-    );
+    fireEvent.click(options.getByRole("button", { name: "All settings" }));
     expect(toggle.getAttribute("aria-expanded")).toBe("false");
     const selected = within(screen.getByLabelText("Selected step"));
     expect(selected.getByText("Find prices")).toBeTruthy();
@@ -1687,7 +1684,7 @@ describe("WorkflowDocEditor navigation", () => {
     // A read-only Doc's side panel cannot show the settings, so Details does not point there.
     expect(
       readOnlyBox.queryByRole("button", {
-        name: "More details in the side panel",
+        name: "All settings",
       }),
     ).toBeNull();
   });
@@ -2202,6 +2199,51 @@ describe("a step that was just added", () => {
     stop();
     expect(useDocRunCheckStore.getState().critical.length).toBeGreaterThan(0);
     expect(writes).toBe(0);
+  });
+
+  test("a login's unset 2FA and error codes offer add buttons that open the settings; set ones show the value; read-only offers none", () => {
+    const edits = {
+      apply: vi.fn(),
+      update: vi.fn(),
+      addStep: vi.fn(),
+      duplicate: vi.fn(),
+    };
+    const openDetails = () => {
+      const toggle = screen.getByRole("button", { name: /^Details for/ });
+      fireEvent.click(toggle);
+      return within(
+        document.getElementById(toggle.getAttribute("aria-controls")!)!,
+      );
+    };
+    renderDoc([block("login", "sign_in", null, { url: "" })], edits);
+    let details = openDetails();
+    expect(details.getByText("2FA").nextElementSibling?.textContent).toBe(
+      "Not set" + "Add 2FA",
+    );
+    fireEvent.click(details.getByRole("button", { name: "Add error code" }));
+    expect(
+      screen.getByRole("complementary", { name: "Document panel" }),
+    ).toBeTruthy();
+    cleanup();
+    renderDoc(
+      [
+        block("login", "sign_in", null, {
+          url: "",
+          totp_identifier: "codes@example.com",
+        }),
+      ],
+      edits,
+    );
+    details = openDetails();
+    expect(details.getByText("2FA").nextElementSibling?.textContent).toBe(
+      "codes@example.com",
+    );
+    expect(details.queryByRole("button", { name: "Add 2FA" })).toBeNull();
+    cleanup();
+    renderDoc([block("login", "sign_in", null, { url: "" })]);
+    details = openDetails();
+    expect(details.queryByRole("button", { name: /^Add / })).toBeNull();
+    expect(details.queryByRole("button", { name: "All settings" })).toBeNull();
   });
 
   test.each([
@@ -3034,6 +3076,29 @@ describe("the Add note button", () => {
       screen.getByRole("textbox", { name: "Note" }),
     );
     expect(notesOf(doc).read_page).toEqual(["Look closely", ""]);
+  });
+
+  test("Escape on the empty note it opened returns focus to + Note", () => {
+    renderLiveDoc(steps());
+    fireEvent.click(addNote("Open site"));
+    const note = screen.getByRole("textbox", { name: "Note" });
+    expect(document.activeElement).toBe(note);
+    fireEvent.keyDown(note, { key: "Escape" });
+    expect(document.activeElement).toBe(addNote("Open site"));
+  });
+
+  test("Enter at the end of a step that keeps a note under it goes to that note, as + Note does", () => {
+    const doc = renderLiveDoc([
+      block("wait", "open_site", "read_page", {
+        wait_sec: 5,
+        trailing_notes: "Wait for the banner",
+      }),
+      steps()[1]!,
+    ]);
+    fireEvent.focus(firstLine());
+    fireEvent.keyDown(firstLine(), { key: "Enter" });
+    expect(screen.getAllByRole("textbox", { name: "Note" })).toHaveLength(1);
+    expect(notesOf(doc).read_page).toEqual(["", ""]);
   });
 
   test("is not offered on a loop or a read-only Doc", () => {

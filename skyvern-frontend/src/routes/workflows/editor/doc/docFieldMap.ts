@@ -33,7 +33,8 @@ export type DocFieldSpec = {
   // A value the editor holds but does not save, shown ahead of the saved keys.
   editorValue?: (data: Record<string, unknown>) => unknown;
   meta?: DocFieldMeta;
-  // What follows "Add" on the button an editable Doc offers for the field while it is unset, when the label is too terse.
+  // What follows "Add" on the button an editable Doc offers for the field while it is unset (a dashed chip on the
+  // summary line, a button on its Details row); it opens the step's settings.
   addLabel?: string;
 };
 
@@ -82,6 +83,11 @@ const L = {
   agent: "Agent",
 } as const;
 
+const errorCodes = () => ({
+  ...field("error_code_mapping", L.errorCodes),
+  addLabel: "error code",
+});
+
 const pageUrl = (
   emptyChip: DocFieldMeta["emptyChip"] = "firstPage",
   addLabel = "Page URL",
@@ -99,13 +105,10 @@ export const DOC_FIELD_MAP: Partial<
   navigation: [
     field("engine", L.engine, "Default"),
     field("max_steps_per_run", L.maxSteps, "Default"),
-    field("error_code_mapping", L.errorCodes),
+    errorCodes(),
     pageUrl(),
   ],
-  code: [
-    field("error_code_mapping", L.errorCodes),
-    field("continue_on_failure", L.continueOnFailure, "No"),
-  ],
+  code: [errorCodes(), field("continue_on_failure", L.continueOnFailure, "No")],
   extraction: [
     pageUrl(),
     field("engine", L.engine, "Default"),
@@ -118,15 +121,18 @@ export const DOC_FIELD_MAP: Partial<
       { ...field("parameter_keys", L.credential), credentialsOnly: true },
       { icon: "credential", emptyChip: "always" },
     ),
-    field(["totp_identifier", "totp_verification_url"], L.twoFactor),
-    field("error_code_mapping", L.errorCodes),
+    {
+      ...field(["totp_identifier", "totp_verification_url"], L.twoFactor),
+      addLabel: "2FA",
+    },
+    errorCodes(),
     pageUrl("always", "Login page URL"),
   ],
   action: [
     pageUrl(),
     field("engine", L.engine, "Default"),
     field("max_retries", L.maxRetries, "0"),
-    field("error_code_mapping", L.errorCodes),
+    errorCodes(),
     field("continue_on_failure", L.continueOnFailure, "No"),
   ],
   file_download: [
@@ -135,7 +141,7 @@ export const DOC_FIELD_MAP: Partial<
       emptyChip: "never",
     }),
     pageUrl(),
-    field("error_code_mapping", L.errorCodes),
+    errorCodes(),
     field("engine", L.engine, "Default"),
     {
       ...field("download_timeout", L.downloadTimeout, "Default"),
@@ -179,7 +185,7 @@ export const DOC_FIELD_MAP: Partial<
     field("continue_on_failure", L.continueOnFailure, "No"),
   ],
   validation: [
-    field("error_code_mapping", L.errorCodes),
+    errorCodes(),
     field("engine", L.engine, "Default"),
     field("next_loop_on_failure", L.nextLoopOnFailure, "No"),
   ],
