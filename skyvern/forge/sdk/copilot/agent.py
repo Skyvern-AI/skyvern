@@ -250,6 +250,7 @@ from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     REPAIR_INSTRUCTION_MAX_CHARS,
     RUNTIME_FAILURE_REASON_MAX_CHARS,
 )
+from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result, run_result_screenshot_provenance
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_structured_prompt
 from skyvern.forge.sdk.copilot.secret_scrub import (
     registered_scrub_values,
@@ -2622,6 +2623,11 @@ async def _run_end_to_end_test_turn(
             result["data"][BUILD_TEST_PACKET_KEY] = project_direct_test_handoff_packet_for_llm(packet).model_dump(
                 mode="json", exclude_none=True
             )
+    enqueue_screenshot_from_result(
+        ctx,
+        result,
+        provenance=run_result_screenshot_provenance(result, source_tool="run_blocks_and_collect_debug"),
+    )
     sanitized = scrub_secrets_from_structure(
         ctx,
         sanitize_tool_result_for_llm("run_blocks_and_collect_debug", result),
@@ -5472,7 +5478,9 @@ async def _run_copilot_turn_impl(
     # success can still be the one the user is complaining about.
     prior_run_packet = None
     if associated_run_id and (ctx.proposal_workflow_run_id == associated_run_id or repair_origin_binding.finished):
-        prior_run_packet = await hydrate_prior_run_packet(ctx, workflow_run_id=associated_run_id)
+        prior_run_packet = await hydrate_prior_run_packet(
+            ctx, workflow_run_id=associated_run_id, queue_failure_frame=True
+        )
         if prior_run_packet is None and ctx.proposal_workflow_run_id == associated_run_id:
             prior_run_packet = {
                 "run": {
