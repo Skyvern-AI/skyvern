@@ -4911,6 +4911,12 @@ function getAvailableOutputParameterKeys(
 // well as a Drive URL, and lowercases the host before comparing it. A templated URL can
 // still resolve to a Drive link at run time, so treat it as a maybe.
 const bareDriveFileId = /^[A-Za-z0-9_-]+$/;
+// Publish-to-web Doc links (/document/d/e/<public-id>) are not Drive file ids.
+const driveFilePathByHost: Record<string, RegExp> = {
+  "drive.google.com": /^\/file\/(?:u\/\d+\/)?d\/[A-Za-z0-9_-]+(?:\/|$)/,
+  "docs.google.com":
+    /^\/document\/(?:u\/\d+\/)?d\/(?!e(?:\/|$))[A-Za-z0-9_-]+(?:\/|$)/,
+};
 
 function urlMayBeGoogleDrive(url: string): boolean {
   const candidate = url.trim();
@@ -4922,8 +4928,7 @@ function urlMayBeGoogleDrive(url: string): boolean {
     const parsed = new URL(candidate);
     return (
       parsed.protocol === "https:" &&
-      parsed.hostname === "drive.google.com" &&
-      parsed.pathname.startsWith("/file/d/")
+      (driveFilePathByHost[parsed.hostname]?.test(parsed.pathname) ?? false)
     );
   } catch {
     return false;
