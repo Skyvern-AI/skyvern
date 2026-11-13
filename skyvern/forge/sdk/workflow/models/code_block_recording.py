@@ -91,6 +91,16 @@ def _withhold_values(payload: dict[str, Any]) -> dict[str, Any]:
     return {field: withhold(value) for field, value in payload.items()}
 
 
+def redact_recorded_action_payload(
+    payload: dict[str, Any], workflow_run_context: WorkflowRunContext, redaction_parameters: dict[str, Any]
+) -> dict[str, Any]:
+    masked = workflow_run_context.mask_secrets_in_data([payload])[0]
+    masked = app.AGENT_FUNCTION.redact_codeblock_parameter_values(masked, redaction_parameters)
+    # A matching bool/number becomes a string placeholder, which typed Action fields reject.
+    # Null it recursively so subclass defaults cannot silently restore user-controlled values.
+    return _null_redacted_scalars(payload, masked) if isinstance(masked, dict) else _withhold_values(payload)
+
+
 def _page_closed(page: Page) -> bool | None:
     # Separates "page was already gone" from "page was alive but hung" — a screenshot TimeoutError
     # alone cannot tell them apart. Must not raise: the caller is an except handler whose remaining
@@ -318,11 +328,7 @@ class CodeBlockActionRecording:
             return
         try:
             payload = action.model_dump(mode="json", warnings=False)
-            masked = self._workflow_run_context.mask_secrets_in_data([payload])[0]
-            masked = app.AGENT_FUNCTION.redact_codeblock_parameter_values(masked, self._redaction_parameters)
-            # A matching bool/number becomes a string placeholder, which typed Action fields reject.
-            # Null it recursively so subclass defaults cannot silently restore user-controlled values.
-            masked = _null_redacted_scalars(payload, masked) if isinstance(masked, dict) else _withhold_values(payload)
+            masked = redact_recorded_action_payload(payload, self._workflow_run_context, self._redaction_parameters)
             response = masked.get("response")
             if isinstance(response, str):
                 masked["response"] = response[:RECORDED_FAILURE_RESPONSE_MAX_CHARS]
