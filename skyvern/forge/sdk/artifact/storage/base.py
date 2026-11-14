@@ -399,6 +399,9 @@ class StreamingArtifactStorage(ABC):
 
 
 class BaseStorage(ABC):
+    # False when a URL from presign_managed_file keeps working for as long as the file exists.
+    presigned_urls_expire = True
+
     @abstractmethod
     def build_uri(self, *, organization_id: str, artifact_id: str, step: Step, artifact_type: ArtifactType) -> str:
         pass
@@ -679,6 +682,24 @@ class BaseStorage(ABC):
 
     async def managed_file_size(self, uri: str, organization_id: str) -> int | None:
         """Size in bytes of a managed file read from metadata alone, or None when the backend cannot tell."""
+        return None
+
+    async def read_managed_file_head(self, uri: str, organization_id: str, length: int) -> bytes | None:
+        """The first ``length`` bytes of a managed file from a ranged read. None when this backend has none."""
+        self.assert_managed_file_access(uri, organization_id)
+        return None
+
+    async def presign_managed_file(
+        self,
+        uri: str,
+        organization_id: str,
+        *,
+        expiry_seconds: int,
+        inline_content_type: str,
+    ) -> str | None:
+        """A browser URL that serves a managed file inline as ``inline_content_type``. None when this
+        backend cannot mint one."""
+        self.assert_managed_file_access(uri, organization_id)
         return None
 
     @abstractmethod

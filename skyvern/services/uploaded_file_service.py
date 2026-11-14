@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import struct
 import zipfile
 from datetime import datetime, timedelta, timezone
 
@@ -21,7 +22,7 @@ from fastapi import HTTPException, UploadFile
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.db.id import generate_uploaded_file_id
-from skyvern.forge.sdk.schemas.files import UploadedFile
+from skyvern.forge.sdk.schemas.files import UploadedFile, UploadedFileSignedUrl
 
 LOG = structlog.get_logger()
 
@@ -811,8 +812,8 @@ BLOCK_IMAGE_MAX_BYTES = 4 * 1024 * 1024
 
 
 def is_block_image_upload(uploaded_file: UploadedFile) -> bool:
-    # The row records no content type, so the extension decides; the upload routes accept a renamed BMP, TIFF or ICO
-    # under a .png name, and the signed-URL route, which sniffs the stored bytes, is the real gate.
+    # The row records no content type, so the extension decides: any bytes can sit under an image name, which is
+    # why the signed-URL route sniffs the stored bytes before it serves them.
     media_types = IMAGE_UPLOAD_TYPES.get(upload_extension(uploaded_file.filename), ())
     return bool(media_types) and media_types[0] in BLOCK_IMAGE_MEDIA_TYPES
 
@@ -820,11 +821,141 @@ def is_block_image_upload(uploaded_file: UploadedFile) -> bool:
 def is_past_retention(uploaded_file: UploadedFile) -> bool:
     # The purge runs hourly, so an expired row can still name live bytes. The retention the caller
     # was promised governs the dereference, not when the sweep happens to run.
-    expires_at = uploaded_file.expires_at
-    if expires_at is None:
+    if uploaded_file.expires_at is None:
         return False
-    expiry = expires_at if expires_at.tzinfo else expires_at.replace(tzinfo=timezone.utc)
-    return expiry <= datetime.now(timezone.utc)
+    return _as_utc(uploaded_file.expires_at) <= datetime.now(timezone.utc)
+
+
+def _as_utc(moment: datetime) -> datetime:
+    return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
+
+
+FILE_URL_EXPIRY_SECONDS = 60 * 60
+# A 56-byte WebP can declare 268 megapixels, which costs a viewer's tab gigabytes to decode.
+BLOCK_IMAGE_MAX_PIXELS = 80_000_000
+# A JPEG's SOF or a GIF's first frame can sit behind metadata past this; the route then reads the whole file.
+_IMAGE_HEAD_BYTES = 64 * 1024
+_JPEG_SOF_MARKERS = frozenset({0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF})
+# As in libjpeg: no length follows these markers.
+_JPEG_BARE_MARKERS = frozenset({0x00, 0x01, *range(0xD0, 0xD8)})
+_JPEG_FILL = re.compile(rb"\xff+")
+# A real header takes tens of steps; a crafted 4 MiB one takes millions, each on the event loop.
+_IMAGE_HEADER_MAX_STEPS = 4096
+
+
+def _jpeg_pixels(head: bytes) -> int | None:
+    offset, pixels = 2, None
+    for _ in range(_IMAGE_HEADER_MAX_STEPS):
+        fill = _JPEG_FILL.match(head, offset)
+        if fill is None or fill.end() + 2 >= len(head):
+            return None
+        marker, offset = head[fill.end()], fill.end() + 1
+        if marker == 0xDA:
+            return pixels
+        if marker in _JPEG_BARE_MARKERS:
+            continue
+        if marker in _JPEG_SOF_MARKERS:
+            if pixels is not None or offset + 7 > len(head):
+                return None
+            height, width = struct.unpack(">HH", head[offset + 3 : offset + 7])
+            pixels = width * height
+        offset += int.from_bytes(head[offset : offset + 2], "big")
+    return None
+
+
+def _gif_pixels(head: bytes) -> int | None:
+    # Chromium and Pillow size a GIF to its first frame's extent, which can lie far outside the logical screen.
+    width, height, flags = struct.unpack("<HHB", head[6:11])
+    offset, in_extension = 13 + (3 << ((flags & 7) + 1) if flags & 0x80 else 0), False
+    for _ in range(_IMAGE_HEADER_MAX_STEPS):
+        if offset >= len(head) or not (in_extension or head[offset] == 0x21):
+            break
+        if in_extension:
+            in_extension, offset = head[offset] > 0, offset + 1 + head[offset]
+        else:
+            in_extension, offset = True, offset + 2
+    else:
+        return None
+    if offset + 9 > len(head) or head[offset] != 0x2C:
+        return None
+    left, top, frame_width, frame_height = struct.unpack("<HHHH", head[offset + 1 : offset + 9])
+    return max(width, left + frame_width) * max(height, top + frame_height)
+
+
+def declared_pixels(head: bytes) -> int | None:
+    """Width times height as the image header declares it, read without decoding; None when it cannot be read."""
+    chunk = head[12:16]
+    if head.startswith(b"\x89PNG\r\n\x1a\n") and chunk == b"IHDR" and len(head) >= 24:
+        width, height = struct.unpack(">II", head[16:24])
+    elif head[:6] in (b"GIF87a", b"GIF89a") and len(head) >= 13:
+        return _gif_pixels(head) or None
+    elif head[:4] == b"RIFF" and head[8:12] == b"WEBP" and len(head) >= 30:
+        if chunk == b"VP8X":
+            width, height = 1 + int.from_bytes(head[24:27], "little"), 1 + int.from_bytes(head[27:30], "little")
+        elif chunk == b"VP8L" and head[20] == 0x2F:
+            bits = int.from_bytes(head[21:25], "little")
+            width, height = (bits & 0x3FFF) + 1, (bits >> 14 & 0x3FFF) + 1
+        elif chunk == b"VP8 " and head[23:26] == b"\x9d\x01\x2a":
+            width, height = (value & 0x3FFF for value in struct.unpack("<HH", head[26:30]))
+        else:
+            return None
+    elif head[:2] == b"\xff\xd8":
+        return _jpeg_pixels(head) or None
+    else:
+        return None
+    return width * height or None
+
+
+async def mint_file_url(*, file_id: str, organization_id: str) -> UploadedFileSignedUrl | None:
+    """A short-lived inline URL for a live raster-image upload of ``organization_id``; None for anything else.
+    A run-bound upload is deleted with its run and is never a workflow's own file."""
+    uploaded_file = await app.DATABASE.uploaded_files.get_uploaded_file(
+        file_id=file_id, organization_id=organization_id
+    )
+    if (
+        uploaded_file is None
+        or uploaded_file.organization_id != organization_id
+        or uploaded_file.run_id is not None
+        or (uploaded_file.size_bytes is not None and uploaded_file.size_bytes > BLOCK_IMAGE_MAX_BYTES)
+        or is_past_retention(uploaded_file)
+    ):
+        return None
+    head = await app.STORAGE.read_managed_file_head(uploaded_file.storage_uri, organization_id, _IMAGE_HEAD_BYTES)
+    if not head:
+        return None
+    if uploaded_file.size_bytes is None:
+        stored_size = await app.STORAGE.managed_file_size(uploaded_file.storage_uri, organization_id)
+        if stored_size is None or stored_size > BLOCK_IMAGE_MAX_BYTES:
+            return None
+    sniffed = filetype.guess(head)
+    if sniffed is None or sniffed.mime not in BLOCK_IMAGE_MEDIA_TYPES:
+        return None
+    pixels = declared_pixels(head)
+    if pixels is None and len(head) == _IMAGE_HEAD_BYTES:
+        whole = await app.STORAGE.read_managed_file_head(
+            uploaded_file.storage_uri, organization_id, BLOCK_IMAGE_MAX_BYTES
+        )
+        pixels = declared_pixels(whole or b"")
+    if pixels is None or pixels > BLOCK_IMAGE_MAX_PIXELS:
+        return None
+    now = datetime.now(timezone.utc)
+    lifetime = FILE_URL_EXPIRY_SECONDS
+    if uploaded_file.expires_at is not None:
+        lifetime = max(1, min(lifetime, int((_as_utc(uploaded_file.expires_at) - now).total_seconds())))
+    signed_url = await app.STORAGE.presign_managed_file(
+        uploaded_file.storage_uri,
+        organization_id,
+        expiry_seconds=lifetime,
+        inline_content_type=sniffed.mime,
+    )
+    if signed_url is None:
+        return None
+    return UploadedFileSignedUrl(
+        file_id=file_id,
+        signed_url=signed_url,
+        expires_at=int(now.timestamp()) + lifetime if app.STORAGE.presigned_urls_expire else None,
+        content_type=sniffed.mime,
+    )
 
 
 async def purge_expired_files(*, limit: int = 500) -> dict[str, int]:

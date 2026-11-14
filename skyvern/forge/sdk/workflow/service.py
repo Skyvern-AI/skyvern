@@ -2408,7 +2408,7 @@ async def _delete_backend_schedule(backend_schedule_id: str, slots: asyncio.Sema
             await app.AGENT_FUNCTION.delete_workflow_schedule(backend_schedule_id)
 
 
-def _block_image_ids(blocks: list[BLOCK_YAML_TYPES] | list[BlockTypeVar]) -> list[tuple[str, str]]:
+def block_image_ids(blocks: list[BLOCK_YAML_TYPES] | list[BlockTypeVar]) -> list[tuple[str, str]]:
     return [
         (block.label, image.file_id)
         for block in get_all_blocks(blocks)
@@ -13063,7 +13063,7 @@ class WorkflowService:
             )
             if validate_code_block_templates:
                 self._validate_code_block_templates(workflow_definition)
-            if validate_block_image_files and _block_image_ids(workflow_definition.blocks):
+            if validate_block_image_files and block_image_ids(workflow_definition.blocks):
                 image_organization_id = organization_id
                 if image_organization_id is None:
                     owner = await app.DATABASE.workflows.get_workflow(workflow_id=workflow_id)
@@ -19009,8 +19009,8 @@ class WorkflowService:
         organization_id: str,
     ) -> None:
         """Every image a save adds must be a live upload of the saving organization; saved ones were checked."""
-        saved = {file_id for _, file_id in _block_image_ids(previous_blocks)}
-        added = [(label, file_id) for label, file_id in _block_image_ids(blocks) if file_id not in saved]
+        saved = {file_id for _, file_id in block_image_ids(previous_blocks)}
+        added = [(label, file_id) for label, file_id in block_image_ids(blocks) if file_id not in saved]
         live = await uploaded_file_service.live_uploaded_files(
             file_ids=[file_id for _, file_id in added], organization_id=organization_id
         )
