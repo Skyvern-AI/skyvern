@@ -28,7 +28,7 @@ import sys
 import time
 import weakref
 from collections import Counter, defaultdict, deque
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
@@ -1709,20 +1709,34 @@ _A11Y_REMOVED_JS = r"""(el) => {
   return String(hidden || '').toLowerCase() === 'true' ? 'aria-hidden' : '';
 }"""
 
-# The roles this engine treats as controls. observe enumerates exactly these (its `q` selector is
-# this list expanded) and reports them on each record, so it is the single answer to "is this a
-# control?" rather than each probe keeping its own.
-_WIDGET_ROLES_JS = (
-    "['button','checkbox','radio','combobox','option','menuitem',"
-    "'menuitemcheckbox','menuitemradio','listbox','switch','spinbutton','tab']"
+# The roles this engine treats as controls: observe's and look's selectors and the frame census are built from
+# these tuples, so they are the single answer to "is this a control?" rather than each probe keeping its own.
+_BASE_ROLES = tuple(
+    "button checkbox radio combobox option menuitem menuitemcheckbox menuitemradio listbox switch spinbutton tab".split()
 )
+# Listed after the base roles: an element only these match rides outside observe's element budget under its own cap,
+# and look marks it only after every other control.
+_ADDED_ROLES = ("link",)
+_WIDGET_ROLES = _BASE_ROLES + _ADDED_ROLES
+_WIDGET_ROLES_JS = "[" + ",".join(f"'{r}'" for r in _WIDGET_ROLES) + "]"
+
+
+def _control_selector(roles: Iterable[str]) -> str:
+    return "input,textarea,select,button,a[href]," + "".join(f"[role={r}]," for r in roles) + "[contenteditable=true]"
+
+
+_CONTROL_SEL = _control_selector(_WIDGET_ROLES)
+# The set look marks first, observe's element budget counts, and the pointer scan and the shadow caption rule judge by.
+_BASE_CONTROL_SEL = _control_selector(_BASE_ROLES)
 
 # The subset of those that can be a ROW in an opened menu. Derived rather than restated so the two
 # cannot drift. Excluded: combobox/listbox/spinbutton, which are the control or its container and
-# never one of its rows; and tab, because a probe that called a tab strip a menu of options would
-# invite a wrong move.
+# never one of its rows; tab, because a probe that called a tab strip a menu of options would
+# invite a wrong move; and link, which was never a row role.
 _MENU_ROW_ROLES_JS = (
-    "new Set(" + _WIDGET_ROLES_JS + ".filter((r) => ['combobox','listbox','spinbutton','tab'].indexOf(r) === -1))"
+    "new Set("
+    + _WIDGET_ROLES_JS
+    + ".filter((r) => ['combobox','listbox','spinbutton','tab','link'].indexOf(r) === -1))"
 )
 
 # Counts the VISIBLE menu-row descendants of a node, using the SAME row definition _FIND_MENU_JS
@@ -1863,8 +1877,8 @@ _OFF_CANVAS_JS = r"""(el, r) => {
   return true;
 }"""
 
-# Emits `root`'s semantic matches merged in document order with its "pointer roots" (named, role-less
-# elements styled cursor:pointer, the only trace a delegated click listener leaves; v1 lists them via
+# Emits `root`'s semantic matches merged in document order with its "pointer roots" (named elements `q` does not
+# match, styled cursor:pointer, the only trace a delegated click listener leaves; v1 lists them via
 # isHoverPointerElement, domUtils.js), recording each root and its name in `state.roots`. An element is
 # not a root when the reading already covers it: it is or is inside a control `listable` keeps, or its
 # pointer parent is itself a root or covered. One that holds such a control is a holder: at most one
@@ -2986,7 +3000,8 @@ _WITH_POINTER_ROOTS_JS = (
   let p = head;
   for (const el of semantic) {
     for (; p && (follows.call(p.el, el) & 4); p = p.next) emit(p.el);
-    emit(el);
+    // A [role=link] the scan made a root is emitted once, as that root.
+    if (!(p && p.el === el)) emit(el);
   }
   for (; p; p = p.next) emit(p.el);
 }"""
@@ -5619,7 +5634,6 @@ _LOOK_ENUM_JS = (
   const _roots = """
     + _SHADOW_ROOTS_JS
     + r""";
-  const q = 'input,textarea,select,button,a[href],[role=button],[role=checkbox],[role=radio],[role=combobox],[role=option],[role=menuitem],[role=menuitemcheckbox],[role=menuitemradio],[role=listbox],[role=switch],[role=spinbutton],[role=tab],[contenteditable=true]';
   const _shownText = """
     + _SHOWN_TEXT_JS
     + r""";
@@ -5634,7 +5648,12 @@ _LOOK_ENUM_JS = (
   let truncated = false;
   let showsTotal = 0;
   let showsOmitted = 0;
-  for (const root of _roots(document)) {
+  // Every other control takes the marks first; an element only an added role matches fills what is left.
+  marking: for (const q of ['"""
+    + _BASE_CONTROL_SEL
+    + "', '"
+    + ",".join(f"[role={r}]" for r in _ADDED_ROLES)
+    + r"""']) for (const root of _roots(document)) {
     let els;
     try { els = root.querySelectorAll(q); } catch (e) { continue; }
     for (const el of els) {
@@ -5691,7 +5710,7 @@ _LOOK_ENUM_JS = (
     + r"""; } else if (shows) showsOmitted++;
       out.push(rec);
     }
-    if (truncated) break;
+    if (truncated) break marking;
   }
   return { vw, vh, truncated, showsOmitted, elements: out };
 })()"""
@@ -7359,9 +7378,8 @@ _TYPE_TARGET_PROBE_JS = (
     const allControls = [];
     // observe() never mints data-tv3 inside a component, so a marker-shaped selector below can only
     // ever come from the light DOM -- a shadow-piercing find here does not risk minting a fresh one.
-    // The role list mirrors observe()'s own _WIDGET_ROLES answer to "is this a control?" (minus the
-    // form-field roles observe treats as fillable, not actionable), so a consent switch or a
-    // role=menuitem Close action is not omitted just because it isn't a <button>.
+    // The role list is observe()'s base roles (_BASE_ROLES; its added role=link is not in it), so a
+    // consent switch or a role=menuitem Close action is not omitted just because it isn't a <button>.
     const controlSel = 'button,a[href],input[type="button"],input[type="submit"],input[type="image"],'
       + 'input[type="reset"],[role="button"],'
       + '[role="checkbox"],[role="radio"],[role="combobox"],[role="option"],[role="menuitem"],'
@@ -10912,10 +10930,11 @@ async (__tv3TextArgs) => {
     + r""";
   // [role=textbox] is deliberately absent: on a div without contenteditable it names a control that
   // cannot be filled, and the ones that can are already matched by [contenteditable=true].
-  const _WIDGET_ROLES = """
-    + _WIDGET_ROLES_JS
-    + r""";
-  const q = 'input,textarea,select,button,a[href],[role=button],[role=checkbox],[role=radio],[role=combobox],[role=option],[role=menuitem],[role=menuitemcheckbox],[role=menuitemradio],[role=listbox],[role=switch],[role=spinbutton],[role=tab],[contenteditable=true]';
+  const _WIDGET_ROLES = __OBSERVE_WIDGET_ROLES__;
+  // The pointer scan and the shadow caption rule judge an added role as before it was listed, so a pointer-cursor
+  // role=link stays a pointer root (named by its graphic, an icon) and never hides another control's name.
+  const _qBase = '__OBSERVE_BASE_SEL__';
+  const q = '__OBSERVE_CONTROL_SEL__';
   // Set wherever we learn that some region of the page cannot be read. Declared here because the
   // walk below is one of those places and it runs before the marker gather.
   let sawUnreadableRoot = false;
@@ -11078,6 +11097,10 @@ async (__tv3TextArgs) => {
   // selector that names them). Telemetry only.
   let pointerDropped = 0;
   let semanticListed = 0;
+  // An element only an added role matches rides outside the budget under the pointer roots' cap, so it never costs
+  // the page a control.
+  let addedListed = 0;
+  let addedCapped = 0;
   // Roots whose host chain reaches a <form>. `closest` stops at the root it starts in, so a block
   // inside a component cannot see the form its host sits in; this is that answer, carried down.
   const inFormRoots = new Set();
@@ -11092,7 +11115,7 @@ async (__tv3TextArgs) => {
       // to a SECOND overridable entry point for the same outcome.
       // Pointer roots are merged at their document position, not appended: a page past the element
       // budget would otherwise never reach a header trigger that sits above its listing.
-      _withPointerRoots(root, q, root.querySelectorAll(q), _pointerState, (el) => { els.push({ el, host }); }, _screenListable);
+      _withPointerRoots(root, _qBase, root.querySelectorAll(q), _pointerState, (el) => { els.push({ el, host }); }, _screenListable);
       for (const el of root.querySelectorAll('*')) {
        // Same clobbering hazard as the element loop below, and this walk runs before it: a form's
        // named getter can turn any read here into a foreign object, so one element pays for itself.
@@ -11177,6 +11200,9 @@ async (__tv3TextArgs) => {
       const tag = String(el.tagName || '').toLowerCase();
       if (tag === 'button' || tag === 'a' || tag === 'summary') return true;
       if (tag === 'input' && /^(?:submit|button|reset|image)$/.test(String(el.type || ''))) return true;
+      // `_attr` is not defined in this script, so the role test below always throws into the catch; this line is what
+      // lets a role=link count as a command.
+      if (Element.prototype.getAttribute.call(el, 'role') === 'link') return true;
       const role = String(_attr(el, 'role') || '').trim().toLowerCase();
       return /^(?:button|link|tab|menuitem|menuitemcheckbox|menuitemradio)$/.test(role);
     } catch (e) { return false; }
@@ -11752,7 +11778,7 @@ async (__tv3TextArgs) => {
     try { root = Node.prototype.getRootNode.call(el); } catch (e) { return ''; }
     if (!root || root.nodeType !== 11) return '';
     let peers;
-    try { peers = root.querySelectorAll(q); } catch (e) { return ''; }
+    try { peers = root.querySelectorAll(el.getAttribute('role') === 'link' && !_pointerState.roots.has(el) ? q : _qBase); } catch (e) { return ''; }
     if (peers.length !== 1 || peers[0] !== el) return '';
     // Only a host whose light DOM is bare text is a caption; a card slotting headings and a body
     // beside its one icon button would otherwise hand that button the whole card as its name.
@@ -11984,12 +12010,12 @@ async (__tv3TextArgs) => {
   // Icon controls get only the budget every semantic candidate leaves over, so listing one never cuts a control.
   // Screening every candidate is paid only when the raw count and the icons together could fill the budget.
   let controlCount = 0;
-  for (const e of els) if (!_pointerState.roots.has(e.el)) controlCount++;
+  for (const e of els) if (!_pointerState.roots.has(e.el) && _matches.call(e.el, _qBase)) controlCount++;
   if (_pointerState.iconCount > 0 && controlCount + _pointerState.iconCount > 250) {
     controlCount = 0;
     let hiddenCounted = 0;
     for (const e of els) {
-      if (_pointerState.roots.has(e.el)) continue;
+      if (_pointerState.roots.has(e.el) || !_matches.call(e.el, _qBase)) continue;
       let screened = null;
       try { screened = _screen(e.el, false); } catch (err) { screened = null; }
       if (!screened || screened.why !== null) continue;
@@ -12019,6 +12045,7 @@ async (__tv3TextArgs) => {
     pointerRoot = _pointerState.roots.has(el) && !iconRoot;
     const extraRoot = pointerRoot && _pointerState.extra.has(el);
     if (pointerRoot && !_pointerState.held.has(el) && !extraRoot) pointerReserved--;
+    const addedRole = !pointerRoot && !iconRoot && !_matches.call(el, _qBase);
     const screened = _screen(el, pointerRoot);
     const { r, gr, gateEl, ownGated } = screened;
     if (screened.why === 'offCanvas') { hiddenDropped++; hiddenDroppedOffCanvas++; continue; }
@@ -12091,6 +12118,7 @@ async (__tv3TextArgs) => {
     // Main never listed these anchors, so one past its budget is not a cut the cap note reports.
     if (extraRoot && extraListed >= _POINTER_ROOT_CAP) continue;
     if (!extraRoot && pointerRoot && pointerListed + (_pointerState.held.has(el) ? pointerReserved : 0) >= _POINTER_ROOT_CAP) { pointerCapped++; continue; }
+    if (addedRole && addedListed >= _POINTER_ROOT_CAP) { addedCapped++; continue; }
     let selector = naturalSelector(el);
     let bind = '';
     if (!selector) {
@@ -12142,6 +12170,7 @@ async (__tv3TextArgs) => {
     const rec = { i, tag: el.tagName.toLowerCase(), type: (_typed && el.type) || null, selector, label: label.slice(0, _RETAIN_WIDTH) };
     if (bind) rec.bind = bind;
     if (pointerRoot) rec.pointerRoot = true;
+    if (addedRole) rec.addedRole = true;
     if (iconRoot) rec.icon = true;
     if (pointerRoot && _pointerState.held.has(el)) rec.pointerHeld = true;
     if (extraRoot) rec.pointerExtra = true;
@@ -12290,12 +12319,13 @@ async (__tv3TextArgs) => {
     if (extraRoot) extraListed++;
     else if (pointerRoot) pointerListed++;
     if (iconRoot) iconsListed++;
+    if (addedRole) addedListed++;
     elOfRec.set(rec, el);
     stampOfRec.set(rec, { fp: fingerprint(el), anchor: lastAnchor && lastAnchor.sel === selector ? lastAnchor : null });
     i++;
     // Pointer roots ride outside the budget (they have their own cap), so listing one never costs
     // the page a semantic control.
-    if (!pointerRoot && !iconRoot && ++semanticListed > 250) {
+    if (!pointerRoot && !iconRoot && !addedRole && ++semanticListed > 250) {
       // Count what the budget actually cost, not what is left in the array: a zero-size match would
       // have been skipped anyway, and counting it overstates the loss on any page carrying a hidden
       // dialog. Shadow matches are tallied separately because they are appended last and are
@@ -12311,6 +12341,7 @@ async (__tv3TextArgs) => {
             else pointerCapped++;
             continue;
           }
+          if (!_matches.call(els[k].el, _qBase)) { addedCapped++; continue; }
           truncated++;
           if (els[k].host) truncatedInComponents++;
           if (_inOpenModal(els[k].el)) modalTruncated++;
@@ -12778,7 +12809,9 @@ async (__tv3TextArgs) => {
   // Covers at least the scanner's own `q` set, since an undercount reads as "decorative" and
   // argues against the fix this justifies. Hidden and disabled controls are excluded: a CSRF
   // input is not actionable.
-  const INTERACTIVE_SEL = ':is(a[href],button,input:not([type="hidden" i]),select,textarea,[role=button],[role=option],[role=combobox],[role=checkbox],[role=radio],[role=tab],[role=menuitem],[role=menuitemcheckbox],[role=menuitemradio],[role=listbox],[role=switch],[role=spinbutton],[contenteditable=""],[contenteditable="true"]):not(:disabled):not([aria-disabled="true" i])';
+  const INTERACTIVE_SEL = ':is(a[href],button,input:not([type="hidden" i]),select,textarea,"""
+    + "".join(f"[role={r}]," for r in _WIDGET_ROLES)
+    + r"""[contenteditable=""],[contenteditable="true"]):not(:disabled):not([aria-disabled="true" i])';
   try {
     const sig = /"""
     + CHALLENGE_VENDOR_SIGNATURE
@@ -12941,7 +12974,7 @@ async (__tv3TextArgs) => {
   } catch (e) { /* a count the page broke is not worth the reading */ }
   let readyState = '';
   try { readyState = String(_getter(Document.prototype, 'readyState').call(document)); } catch (e) { readyState = ''; }
-  const payload = _ownStringify({ textDelta: textDelta, refsFresh: refsFresh, unnamedNotIcon: _pointerState.notIcon, flutter: __OBSERVE_FLUTTER__, url: location.href, title: document.title, text: texts, textFull: texts.map((t) => { const f = fullText.get(t); return f && f !== t ? f : null; }), textTruncated: textFull, textDropped: textDropped, iframes: iframeInfo, frameCensus: frameCensus, dropped: dropped, truncated: truncated, iconsTruncated: iconsTruncated + _pointerState.iconOverflow, truncatedInComponents: truncatedInComponents, pointerCapped: pointerCapped, pointerTruncated: pointerTruncated, pointerDropped: pointerDropped, pointerListed: pointerListed, pointerScanStopped: _pointerState.scanStopped ? 1 : 0, pointerScanFailed: _pointerState.scanFailed ? 1 : 0, unreadableRoot: sawUnreadableRoot, undiscoveredRoots: undiscoveredRoots, rootCount: allRoots.length - 1, hiddenListed: hiddenListed, hiddenDropped: hiddenDropped, hiddenDroppedOffCanvas: hiddenDroppedOffCanvas, hiddenDroppedVisibility: hiddenDroppedVisibility, hiddenDroppedZeroRect: hiddenDroppedZeroRect, hiddenDroppedOffViewport: hiddenDroppedOffViewport, offViewportUnreachableUnnamed: offViewportUnreachableUnnamed, offViewportUnnamedHostExempt: offViewportUnnamedHostExempt, phantomDropped: phantomDropped, markersMinted: markersWritten, markersReused: markersReused, pageMutated: mutated, modalOpen: modalOpen, modalListed: modalListed, modalTruncated: modalTruncated, readyState: readyState, elements: out });
+  const payload = _ownStringify({ textDelta: textDelta, refsFresh: refsFresh, unnamedNotIcon: _pointerState.notIcon, flutter: __OBSERVE_FLUTTER__, url: location.href, title: document.title, text: texts, textFull: texts.map((t) => { const f = fullText.get(t); return f && f !== t ? f : null; }), textTruncated: textFull, textDropped: textDropped, iframes: iframeInfo, frameCensus: frameCensus, dropped: dropped, truncated: truncated, iconsTruncated: iconsTruncated + _pointerState.iconOverflow, truncatedInComponents: truncatedInComponents, addedCapped: addedCapped, pointerCapped: pointerCapped, pointerTruncated: pointerTruncated, pointerDropped: pointerDropped, pointerListed: pointerListed, pointerScanStopped: _pointerState.scanStopped ? 1 : 0, pointerScanFailed: _pointerState.scanFailed ? 1 : 0, unreadableRoot: sawUnreadableRoot, undiscoveredRoots: undiscoveredRoots, rootCount: allRoots.length - 1, hiddenListed: hiddenListed, hiddenDropped: hiddenDropped, hiddenDroppedOffCanvas: hiddenDroppedOffCanvas, hiddenDroppedVisibility: hiddenDroppedVisibility, hiddenDroppedZeroRect: hiddenDroppedZeroRect, hiddenDroppedOffViewport: hiddenDroppedOffViewport, offViewportUnreachableUnnamed: offViewportUnreachableUnnamed, offViewportUnnamedHostExempt: offViewportUnnamedHostExempt, phantomDropped: phantomDropped, markersMinted: markersWritten, markersReused: markersReused, pageMutated: mutated, modalOpen: modalOpen, modalListed: modalListed, modalTruncated: modalTruncated, readyState: readyState, elements: out });
   return __OBSERVE_RETURN__;
 }
 """
@@ -12953,8 +12986,12 @@ def _observe_js_returning(expression: str, retain_width: int) -> str:
     # cannot be targeted by a page that poisoned Object.prototype before this script ran, because the
     # name did not exist then. Same principle as the act token.
     key = f'"__tv3el_{secrets.token_hex(8)}"'
+    roles = _BASE_ROLES + _ADDED_ROLES
     return (
         _OBSERVE_JS_TEMPLATE.replace("__OBSERVE_RETAIN_WIDTH__", str(int(retain_width)), 1)
+        .replace("__OBSERVE_WIDGET_ROLES__", json.dumps(roles), 1)
+        .replace("__OBSERVE_BASE_SEL__", _control_selector(_BASE_ROLES), 1)
+        .replace("__OBSERVE_CONTROL_SEL__", _control_selector(roles), 1)
         .replace("__OBSERVE_RETURN__", expression, 1)
         .replace("__OBSERVE_EL_KEY__", key)
         .replace("__OBSERVE_TEXT_DELTA__", _OBSERVE_TEXT_DELTA_JS, 1)
@@ -14298,6 +14335,7 @@ _OBSERVE_SUMMED_KEYS = (
     "truncatedInComponents",
     "pointerCapped",
     "pointerTruncated",
+    "addedCapped",
     "pointerDropped",
     "pointerListed",
     "pointerScanStopped",
@@ -14337,6 +14375,10 @@ OBSERVE_MERGED_TEXT_MAX = 12
 OBSERVE_MERGED_ELEMENT_MAX = 250
 
 
+def _counts_against_element_budget(e: Mapping[str, Any]) -> bool:
+    return not (e.get("pointerRoot") or e.get("icon") or e.get("addedRole"))
+
+
 def _iframe_reach_clause(observation: _Observation) -> str:
     """What the tools can do with this page's frames, as of this reading.
 
@@ -14361,7 +14403,8 @@ def _merge_realm(into: dict[str, Any], other: dict[str, Any]) -> list[int]:
     incoming = other.get("elements") or []
     # Pointer roots ride outside the element budget here as in each realm, under their own cap applied
     # page-wide, so neither limit ever costs the other kind a place.
-    room = max(0, OBSERVE_MERGED_ELEMENT_MAX - sum(1 for e in elements if not (e.get("pointerRoot") or e.get("icon"))))
+    room = max(0, OBSERVE_MERGED_ELEMENT_MAX - sum(map(_counts_against_element_budget, elements)))
+    link_room = max(0, OBSERVE_POINTER_ROOT_CAP - sum(1 for e in elements if e.get("addedRole")))
     pointer_room = max(
         0,
         OBSERVE_POINTER_ROOT_CAP
@@ -14369,10 +14412,16 @@ def _merge_realm(into: dict[str, Any], other: dict[str, Any]) -> list[int]:
     )
     kept: list[int] = []
     pointer_over_cap = 0
+    link_over_cap = 0
     over_page_cap = 0
     for i, e in enumerate(incoming):
         if e.get("pointerHeld") or e.get("pointerExtra") or e.get("icon"):
             pass  # Ranked page-wide by _rank_held_pointer_roots_last once every realm is merged.
+        elif e.get("addedRole"):
+            if link_room == 0:
+                link_over_cap += 1
+                continue
+            link_room -= 1
         elif e.get("pointerRoot"):
             if pointer_room == 0:
                 pointer_over_cap += 1
@@ -14405,6 +14454,7 @@ def _merge_realm(into: dict[str, Any], other: dict[str, Any]) -> list[int]:
         into[key] = int(into.get(key) or 0) + int(other.get(key) or 0)
     into["textDropped"] = int(into.get("textDropped") or 0) + dropped_by_cap
     into["pointerCapped"] = int(into.get("pointerCapped") or 0) + pointer_over_cap
+    into["addedCapped"] = int(into.get("addedCapped") or 0) + link_over_cap
     into["pointerListed"] = int(into.get("pointerListed") or 0) - pointer_over_cap
     for key in _OBSERVE_ANY_KEYS:
         into[key] = bool(into.get(key)) or bool(other.get(key))
@@ -14421,7 +14471,7 @@ def _rank_held_pointer_roots_last(data: dict[str, Any]) -> list[int]:
         1 for e in elements if e.get("pointerRoot") and not (e.get("pointerHeld") or e.get("pointerExtra"))
     )
     extra_room = OBSERVE_POINTER_ROOT_CAP
-    icon_room = OBSERVE_MERGED_ELEMENT_MAX - sum(1 for e in elements if not (e.get("pointerRoot") or e.get("icon")))
+    icon_room = OBSERVE_MERGED_ELEMENT_MAX - sum(map(_counts_against_element_budget, elements))
     kept: list[int] = []
     held_over = 0
     icons_over = 0
@@ -15304,12 +15354,20 @@ def build_browser_tools(
                 note += f", {in_components} of them inside components"
             note += "; get_html shows them, and click, type and select_option take a selector"
             lines.append(note)
+        if link_capped := int(data.get("addedCapped") or 0):
+            lines.append(
+                f"note: {link_capped} more [role=link] element(s) are not listed: they exceeded the cap of "
+                f"{OBSERVE_POINTER_ROOT_CAP} such elements or came after the element budget; get_html shows them, "
+                "and click, type and select_option take a selector"
+            )
         pointer_capped = int(data.get("pointerCapped") or 0)
         pointer_truncated = int(data.get("pointerTruncated") or 0)
         pointer_scan_stopped = bool(data.get("pointerScanStopped"))
         if pointer_capped or pointer_truncated or pointer_scan_stopped:
-            # Role-less pointer-styled elements are listed under their own cap, outside the element
-            # budget; what either limit starved is stated like every other cap here.
+            # Pointer-styled elements no other selector lists, and pointer-cursor role=link ones, are listed under
+            # their own cap, outside the element budget; what either limit starved is stated like every other cap here.
+            # Only an added role can sit on a pointer root, and it is named only when a listed one carries it.
+            roles = ", or with role=link," if any(e.get("pointerRoot") and e.get("role") for e in elements) else ""
             why = []
             if pointer_capped:
                 why.append(f"{pointer_capped} exceeded the cap of {OBSERVE_POINTER_ROOT_CAP} such elements")
@@ -15320,7 +15378,8 @@ def build_browser_tools(
             unlisted = pointer_capped + pointer_truncated
             count = f"{unlisted}{'+' if pointer_scan_stopped else ''} " if unlisted else ""
             lines.append(
-                f"note: {count}more pointer-styled element(s) without a control role are not listed: {'; '.join(why)}"
+                f"note: {count}more pointer-styled element(s) without a control role{roles} are not listed: "
+                f"{'; '.join(why)}"
             )
 
         bodies: list[str] = []
@@ -15339,19 +15398,21 @@ def build_browser_tools(
 
         shows_left = SHOWN_TEXT_TOTAL_CAP
         shows_omitted = 0
+        shows_parts: dict[int, str] = {}
+        # Charged at its printed width, escapes included; once one is left off, every later one is too, so the note's
+        # count is a tail. Added-role records come last, so they never cost another control its shows=.
+        for idx in sorted(range(len(elements)), key=lambda i: bool(elements[i].get("addedRole"))):
+            if elements[idx].get("shows"):
+                shows_part = f" shows={_field(elements[idx]['shows'], OBSERVE_DISPLAY_WIDTHS['label'])}"
+                if not shows_omitted and len(shows_part) <= shows_left:
+                    shows_left -= len(shows_part)
+                    shows_parts[idx] = shows_part
+                else:
+                    shows_omitted += 1
         to_left = LINK_DESTINATION_TOTAL_CAP
         to_omitted = 0
         for _render_idx, e in enumerate(elements):
-            extra = ""
-            if e.get("shows"):
-                # Charged at its printed width, escapes included; once one is left off, every later one
-                # is too, so the note's count is a tail and not a scatter.
-                shows_part = f" shows={_field(e['shows'], OBSERVE_DISPLAY_WIDTHS['label'])}"
-                if not shows_omitted and len(shows_part) <= shows_left:
-                    shows_left -= len(shows_part)
-                    extra += shows_part
-                else:
-                    shows_omitted += 1
+            extra = shows_parts.get(_render_idx, "")
             if e.get("to") and _link_destination_adds(str(e["to"]), str(e.get("label", ""))):
                 to_part = f" to={_field(e['to'], LINK_DESTINATION_MAX)}"
                 # As with shows=, once one is left off every later one is too, so the note's count is a tail.
@@ -15550,7 +15611,9 @@ def build_browser_tools(
             # report being truncated: a truncated digest is a SUCCESS. `elements_listed` is the
             # denominator the cap-hit rate needs, so it rides every observe, truncating or not.
             # Semantic controls only, so the rate keeps its denominator; pointer roots are counted apart.
-            "elements_listed": sum(1 for e in elements if not (e.get("pointerRoot") or e.get("icon"))),
+            "elements_listed": sum(map(_counts_against_element_budget, elements)),
+            "links_listed": sum(1 for e in elements if e.get("addedRole")),
+            "link_capped": int(data.get("addedCapped") or 0),
             "icons_listed": sum(1 for e in elements if e.get("icon")),
             # Icons the budget left over cut, apart from `elements_truncated`, whose denominator leaves icons out.
             "icons_truncated": int(data.get("iconsTruncated") or 0),
@@ -15581,7 +15644,7 @@ def build_browser_tools(
             # The main document's load state when `elements_listed` is 0: 1 loading, 2 interactive, 3 complete,
             # 4 unreadable, else 0. An int because the record keeps only ints.
             "ready_state_when_empty": 0
-            if any(not (e.get("pointerRoot") or e.get("icon")) for e in elements)
+            if any(map(_counts_against_element_budget, elements))
             else _READY_STATE_CODES.get(str(data.get("readyState") or ""), 4),
         }
         # Mask the whole rendered payload, not just url=: a signed payload ref can surface as page
