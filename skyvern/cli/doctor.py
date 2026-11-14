@@ -314,17 +314,11 @@ def _check_mcp_config() -> CheckResult:
 def _check_database() -> CheckResult:
     from dotenv import load_dotenv
 
+    from skyvern.config import _default_database_string
     from skyvern.utils.env_paths import resolve_backend_env_path
 
     load_dotenv(resolve_backend_env_path(), override=False)
-    db_string = os.environ.get("DATABASE_STRING", "")
-    if not db_string:
-        return CheckResult(
-            name="Database",
-            status="warn",
-            detail="DATABASE_STRING not set",
-            hint="Run `skyvern init` or set DATABASE_STRING in .env",
-        )
+    db_string = os.environ.get("DATABASE_STRING") or _default_database_string()
 
     if db_string.startswith("sqlite"):
         db_path = db_string.split("///")[-1] if "///" in db_string else ""
@@ -333,9 +327,9 @@ def _check_database() -> CheckResult:
         if db_path:
             return CheckResult(
                 name="Database",
-                status="error",
+                status="warn",
                 detail=f"SQLite file not found: {db_path}",
-                hint="Run `alembic upgrade head` to initialize the database",
+                hint="Run `skyvern run server` or `skyvern init` to create it",
             )
         return CheckResult(name="Database", status="ok", detail="SQLite (in-memory or relative)")
 

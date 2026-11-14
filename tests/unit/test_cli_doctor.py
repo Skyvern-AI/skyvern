@@ -172,3 +172,19 @@ async def test_stream_doctor_stops_when_browser_session_has_expired(monkeypatch:
 
     with pytest.raises(RuntimeError, match="stream ended before a frame arrived: session_expired"):
         await doctor._wait_for_stream_frame("ws://example.test", timeout_seconds=1, api_key="key")
+
+
+def test_database_check_uses_default_sqlite_database_when_unset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("DATABASE_STRING", raising=False)
+    default_database = tmp_path / ".skyvern" / "data.db"
+    default_database.parent.mkdir()
+    default_database.touch()
+
+    result = doctor._check_database()
+
+    assert result.status == "ok"
+    assert str(default_database) in result.detail
