@@ -298,7 +298,14 @@ if (run.status === "completed") {
 
 Each mapped error looks like `{"error_code": "login_failed", "reasoning": "...", "confidence_float": 0.95}`. In an agent, set `error_code_mapping` on a block instead. A Validation block with `complete_criterion`, `terminate_criterion`, and `error_code_mapping` works like an assertion: it stops the agent with your code as soon as the page shows the wrong state. See [blocks](/reference/blocks).
 
-Skyvern also adds its own codes to `errors`: `REACH_MAX_STEPS`, `REACH_MAX_RETRIES`, `OTP_ERROR`, `OTP_TIMEOUT`, `OTP_EXPIRED`, and `MISSING_TOTP_SOURCE`.
+Skyvern also adds its own codes to `errors`. They need no mapping:
+
+- `REACH_MAX_STEPS` and `REACH_MAX_RETRIES`: the run used up its steps, or a step used up its retries.
+- `OTP_ERROR`, `OTP_TIMEOUT` and `MISSING_TOTP_SOURCE`: Skyvern couldn't get the one-time code, the code didn't arrive in time, or no code source is set up.
+- `OTP_OUTCOME_UNCONFIRMED`: Skyvern entered the one-time code, but the site didn't confirm it before the page load timed out. Skyvern doesn't enter the same code twice.
+- `ANTI_BOT_ERROR`, on Skyvern Cloud only: the failed attempt hit a bot-protection block or a challenge that wasn't solved. When Skyvern can name the service, it also adds `RECAPTCHA_ERROR`, `HCAPTCHA_ERROR`, `CLOUDFLARE_TURNSTILE_ERROR` or `CLOUDFLARE_ERROR`. Not every blocked run gets one.
+- `browser_connection_lost`, in an agent run: the run lost its browser connection, so it failed at that block.
+- A code that starts with `net::ERR_`, in an agent run: the block couldn't load a page. It is the browser's own error code, except `net::ERR_SKYVERN_UNRESOLVABLE_HOST`, which Skyvern adds when the site's domain has no DNS record.
 
 An error from a failed block also names it: `workflow_run_block_id`, `block_label`, `block_type`, `loop_index` (null outside a loop), and `final_url`. A failed code block adds `exception_class`, `exception_message`, `failing_line`, and `source_line`, any of which can be null.
 
