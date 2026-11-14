@@ -31714,7 +31714,7 @@ def _cc_widget_script(
         "  });\n"
         "  scroller.addEventListener('scroll', function () {\n"
         "    if (SHAPE) shapeScrolled();\n"
-        "    render();\n"
+        "    if (SHAPE && SHAPE.render_delay_ms) setTimeout(render, SHAPE.render_delay_ms); else render();\n"
         "    if (LAZY.length && !lazyDone && scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 1) {\n"
         "      lazyDone = true;\n"
         "      setTimeout(function () {\n"
@@ -31798,6 +31798,7 @@ def _cc_walk_shape_script(shape: dict[str, Any] | None, row_h: float) -> str:
         "          style += ';transform:translateY(' + SHAPE.jitter + 'px)';\n"
         "        }\n"
         "        if (SHAPE.enter_ms) style += ';animation:tv3-enter ' + SHAPE.enter_ms + 'ms ease-out';\n"
+        "        if (SHAPE.enter_delay_ms) style += ';animation-delay:' + SHAPE.enter_delay_ms + 'ms;animation-fill-mode:backwards';\n"
         "        html += '<li style=\"position:absolute;top:0;left:8px;width:calc(100% - 16px);height:' + h +\n"
         "          'px;transform:translateY(' + TOPS[i] + 'px)\"><div role=\"option\" aria-selected=\"' +\n"
         "          (i === currentIndex ? 'true' : 'false') + '\" id=\"item-' + i + '\" aria-label=\"' + c[0] + '\"' +\n"
@@ -31918,15 +31919,89 @@ async def test_select_combobox_commits_a_unique_prefix_in_a_walked_list_with_a_r
 
 @_skip_no_browser
 @pytest.mark.asyncio
-async def test_select_combobox_refuses_an_exact_hit_whose_twin_the_walk_saw_at_the_list_end() -> None:
-    # The walk covers the whole list and meets a second "Canada" as the last row, after taking the first.
+@pytest.mark.parametrize("motion", ["steady", "stepped_open", "scripted_restore", "restore_reveals_twin"])
+async def test_select_combobox_refuses_an_exact_hit_whose_twin_the_walk_saw_at_the_list_end(motion: str) -> None:
+    # Walked twins, a delayed stepped opening window, and a script-only positioning read must name both rivals.
     countries = [*_CC_COUNTRIES, ("Canada", "+1")]
-    async with _content_page(_cc_widget_html(countries, _CC_CURRENT_INDEX)) as page:
+    current = _CC_CURRENT_INDEX
+    if motion != "steady":
+        countries = [(f"Option {i:02d}", f"+{200 + i}") for i in range(40)]
+        first, last = (31, 39) if motion == "stepped_open" else (14, 35)
+        countries[first], countries[last] = ("Canada", "+1"), ("Canada", "+2")
+        current = 30
+    if motion == "restore_reveals_twin":
+        countries[35] = ("Option 35", "+235")
+    markup = _cc_widget_html(
+        countries,
+        current,
+        setsize=motion == "restore_reveals_twin",
+        setsize_extra=1 if motion == "restore_reveals_twin" else 0,
+        search_box=motion == "restore_reveals_twin",
+    )
+    if motion == "stepped_open":
+        markup = markup.replace(
+            "if (SHAPE && SHAPE.render_delay_ms) setTimeout(render, SHAPE.render_delay_ms); else render();",
+            "if (scroller.scrollTop === 28 * ROW_H) "
+            "setTimeout(() => { window.__delayedRender = true; render(); }, 60); else render();",
+        )
+    if motion == "restore_reveals_twin":
+        markup = markup.replace(
+            "spacer.innerHTML = html;",
+            """spacer.innerHTML = html;
+            if (spacer.querySelector('#item-35')) {
+              window.__reachedEnd = true;
+            } else if (window.__reachedEnd && !window.__restoreTwin) {
+              window.__restoreTwin = true;
+              COUNTRIES[35] = ['Canada', '+2'];
+              scroller.scrollTop = 35 * ROW_H;
+              render();
+            }""",
+        )
+    if motion == "scripted_restore":
+        markup = markup.replace(
+            "spacer.innerHTML = html;",
+            """spacer.innerHTML = html;
+            if (spacer.querySelector('#item-35')) {
+              window.__seenLateTwin = true;
+            } else if (window.__seenLateTwin) {
+              window.__scriptRestore = true;
+              const rows = Array.from(spacer.querySelectorAll('[role=option]'));
+              const started = performance.now();
+              function move(now) {
+                const dy = 40 * Math.max(0, 1 - Math.max(0, now - started - 80) / 200);
+                rows.forEach((row) => { row.style.transform = `translateY(${dy}px)`; });
+                if (dy) requestAnimationFrame(move);
+              }
+              move(started);
+            }""",
+        )
+    async with _content_page(markup) as page:
+        if motion == "stepped_open":
+            await page.add_style_tag(
+                content="@keyframes enter-row { from { transform: translateY(-40px); } } "
+                "#cc-spacer [role=option] { animation: enter-row 300ms steps(1, end); }"
+            )
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "Canada"})
+        if motion == "stepped_open":
+            assert await page.evaluate("() => window.__delayedRender === true"), r.content
+        if motion == "restore_reveals_twin":
+            assert await page.evaluate("() => window.__restoreTwin === true"), r.content
+            assert await page.eval_on_selector("#cc-search", "el => el.value") == "", r.content
+        if motion == "scripted_restore":
+            assert await page.evaluate(
+                "() => window.__scriptRestore === true && document.getAnimations().length === 0"
+            ), (
+                r.content,
+                await page.evaluate(
+                    "() => [window.__seenLateTwin, window.__scriptRestore, document.getAnimations().length]"
+                ),
+            )
         assert r.status == "error", r.content
         assert "ambiguous" in r.content, r.content
         assert await page.eval_on_selector("#phone", "el => el.value") == "", r.content
+        count = re.search(r"(\d+) options share", r.content)
+        assert count is not None and int(count.group(1)) == 2, r.content
 
 
 @_skip_no_browser
@@ -32028,10 +32103,10 @@ _WALK_FAMILIES: dict[str, dict[str, Any]] = {
     "mixed_heights_tall": {"heights": "tall"},
     "mixed_heights_short": {"heights": "short"},
     "inner_offsets": {"offsets": True},
-    "sticky_fillers": {"sticky": True},
+    "sticky_fillers": {"sticky": True, "render_delay_ms": 80},
     "prepend_mid_walk": {"prepend_at": 3},
-    "ancestor_scale": {"scale": 1.25},
-    "enter_animation": {"enter_ms": 250},
+    "ancestor_scale": {"scale": 1.25, "render_delay_ms": 80},
+    "enter_animation": {"enter_ms": 250, "enter_delay_ms": 120},
     "extent_grows_after_end": {"grow": True},
     "double_counted_setsize": {"overscan": 2, "jitter": 4, "jitter_label": "Canada", "setsize": True},
 }
@@ -32126,6 +32201,23 @@ def test_list_coverage_a_declared_size_never_proves_rows_the_geometry_leaves_unr
     long_list = {"scrollTop": 0, "scrollHeight": 6400, "padTop": 0, "padBottom": 0, "dpr": 1, "fillers": []}
     assert _list_coverage([_list_window(window, long_list)]) == "incomplete"
     assert _list_coverage([_list_window(window, long_list | {"scrollHeight": 400})]) == "complete"
+
+    state = {"scrollTop": 1392, "clientHeight": 280, "scrollHeight": 2320, "fillers": []}
+    rows = [
+        {"n": i - 23, "text": f"Option {i}", "box": [i * 58, (i + 1) * 58], "after": f"Option {i - 1}"}
+        for i in range(24, 29)
+    ]
+    previous = _list_window(rows, state)
+    stale = _list_window(rows, state | {"scrollTop": 1624})
+    assert not taskv3_tools._visited_band_tiles(stale, previous)
+    fresh = _list_window(
+        [
+            {"n": i - 27, "text": f"Option {i}", "box": [i * 58, (i + 1) * 58], "after": f"Option {i - 1}"}
+            for i in range(28, 33)
+        ],
+        state | {"scrollTop": 1624},
+    )
+    assert taskv3_tools._visited_band_tiles(fresh, previous)
 
 
 def test_list_coverage_refuses_a_group_short_of_its_own_declared_size() -> None:
@@ -32276,6 +32368,147 @@ async def test_select_combobox_walk_commits_only_a_list_it_read_whole(
     assert got == commits and (commits or phone == ""), (
         f"want {'commit' if commits else 'refuse'}, {r.status} phone={phone!r}: {r.content[:140]}"
     )
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "deferred",
+        "custom_property",
+        "mixed_custom_property",
+        "unregistered_custom_property",
+        "sparse_unregistered_custom_property",
+        "inner_wrapper",
+        "beyond_cap_no_fill",
+        "restore_steps",
+        "restore_steps_open",
+    ],
+)
+async def test_select_combobox_waits_for_settled_scroll_rows(scenario: str) -> None:
+    rows = [(f"Option {i:02d}", f"+{200 + i}") for i in range(40)]
+    rows[31 if scenario == "restore_steps_open" else 14] = ("Canada", "+1")
+    style = ""
+    if scenario == "deferred":
+        html = _cc_widget_html(rows, 30, row_h=35.5, walk_shape={"scale": 1.25, "render_delay_ms": 80})
+    elif scenario in ("inner_wrapper", "beyond_cap_no_fill", "restore_steps", "restore_steps_open"):
+        html = _cc_widget_html(rows, 30)
+        if scenario == "inner_wrapper":
+            # Enter from above so label motion cannot grow the list's scrollable extent.
+            style = (
+                "@keyframes enter-wrapper { from { transform: translateY(-40px); } } "
+                "#cc-spacer [role=option] > div { animation: enter-wrapper 250ms ease-out 120ms backwards; }"
+            )
+            html = html.replace(
+                "spacer.innerHTML = html;",
+                "spacer.innerHTML = html; "
+                "if (scroller.clientHeight) (window.__wrapperExtents ||= []).push(scroller.scrollHeight);",
+            )
+        else:
+            timing = "300ms ease-out 200ms" if scenario == "beyond_cap_no_fill" else "300ms steps(1, end)"
+            style = (
+                "@keyframes enter-row { from { transform: translateY(40px); } } "
+                "#cc-spacer [role=option] { animation: enter-row " + timing + "; }"
+            )
+    else:
+        html = _cc_widget_html(rows, 30, pad_px=8, walk_shape={"enter_ms": 250, "enter_delay_ms": 120})
+        if "unregistered" not in scenario:
+            style = "@property --row-y { syntax: '<length>'; initial-value: 0px; inherits: false; } "
+        opacity = "opacity: .4;" if scenario == "mixed_custom_property" else ""
+        style += (
+            "@keyframes tv3-enter { from { --row-y: 40px; " + opacity + "} to { --row-y: 0px; } } "
+            "#cc-spacer [role=option] { translate: 0 var(--row-y, 0px); }"
+        )
+        if scenario == "sparse_unregistered_custom_property":
+            style += "#cc-spacer [role=option]:not(#item-22) { animation: none !important; }"
+    async with _content_page(html) as page:
+        if style:
+            await page.add_style_tag(content=style)
+        tools = build_browser_tools(_fixed_page_provider(page))
+        result = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "Canada"})
+        if scenario == "inner_wrapper":
+            extents = await page.evaluate("window.__wrapperExtents")
+            assert extents and set(extents) == {len(rows) * 58}, extents
+        assert result.status == "ok", result.content
+        assert await page.eval_on_selector("#phone", "el => el.value") == "+1", result.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("animation_css", "row_count"),
+    [
+        (
+            "@keyframes fade { from { opacity: .4; } to { opacity: 1; } } "
+            "#cc-spacer [role=option] { animation: fade 250ms; }",
+            240,
+        ),
+        (
+            "@keyframes decorate { from { filter: blur(2px); clip-path: inset(0 0 0 10px); "
+            "box-shadow: 0 0 6px #888; text-shadow: 0 0 6px #888; background-position: 20px 10px; } } "
+            "#cc-spacer [role=option] { background-image: linear-gradient(#fff, #eee); "
+            "animation: decorate 1s 1000 alternate; } "
+            "@keyframes pulse { to { opacity: .9; } } #cc-scroll { animation: pulse 1s 1000 alternate; } "
+            "@keyframes color { to { background-color: #eee; } } body { animation: color 1s 1000 alternate; } "
+            "@keyframes graphic { to { fill: blue; transform: rotate(360deg); } } "
+            "#cc-spacer svg { animation: graphic 1s 1000 linear; }",
+            240,
+        ),
+        (
+            "@keyframes pulse { to { opacity: .9; } } #cc-scroll { animation: pulse 1s infinite alternate; }",
+            240,
+        ),
+        (
+            "@keyframes spin { to { transform: rotate(360deg); } } .cc-indicator { animation: spin 1s 1000 linear; }",
+            240,
+        ),
+        (
+            "@keyframes delayed { from { opacity: .4; } } "
+            "#cc-spacer [role=option] { animation: delayed 250ms ease-out 500ms; } "
+            "body { animation: delayed 250ms ease-out 2s; } "
+            "#cc-spacer .flag { opacity: 1; transition: opacity 250ms 500ms; } "
+            "@starting-style { #cc-spacer .flag { opacity: .6; } }",
+            240,
+        ),
+        (
+            "@keyframes stagger { from { opacity: .4; } } "
+            "#cc-spacer [role=option] { animation: stagger 250ms; } "
+            "#cc-spacer li:nth-child(2) [role=option] { animation-delay: 100ms; } "
+            "#cc-spacer li:nth-child(3) [role=option] { animation-delay: 200ms; } "
+            "#cc-spacer li:nth-child(4) [role=option] { animation-delay: 300ms; }",
+            360,
+        ),
+    ],
+    ids=["row_fade", "mixed_effects", "infinite_list_fade", "sibling_spinner", "long_delay", "staggered_delay"],
+)
+async def test_select_combobox_walks_stable_rows_during_decorative_animation(
+    animation_css: str, row_count: int
+) -> None:
+    rows = [(f"Option {i:03d}", f"+{200 + i}") for i in range(row_count)]
+    rows[14] = ("Canada", "+1")
+    html = _cc_widget_html(rows, 0, visible_h=220)
+    assert html.count("<title>") == 1 and html.count('<ul id="cc-spacer"') == 1
+    html = html.replace("<title>", '<rect width="16" height="12"/><title>')
+    html = html.replace(
+        '<ul id="cc-spacer"',
+        '<div aria-hidden="true" style="position:absolute;top:0;left:244px;width:16px;height:16px;'
+        'overflow:hidden;pointer-events:none"><span class="cc-indicator" '
+        'style="display:block;width:12px;height:12px;background:#888"></span></div><ul id="cc-spacer"',
+    )
+    async with _content_page(html) as page:
+        if "transition:" in animation_css:
+            await page.evaluate(
+                "() => { window.__transitions = 0; "
+                "document.addEventListener('transitionrun', () => window.__transitions++, true); }"
+            )
+        await page.add_style_tag(content=animation_css)
+        tools = build_browser_tools(_fixed_page_provider(page))
+        result = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "Canada"})
+        if "transition:" in animation_css:
+            assert await page.evaluate("window.__transitions") > 0
+        assert result.status == "ok", result.content
+        assert await page.eval_on_selector("#phone", "el => el.value") == "+1", result.content
 
 
 def _remounting_list_html(*, target: int, scroll_top: int, sticky_header: bool, fade_mask: bool) -> str:
