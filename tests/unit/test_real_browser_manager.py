@@ -4935,3 +4935,81 @@ async def test_deferred_close_leaves_the_session_lease_with_the_execution_that_a
     assert manager._persistent_session_leases[workflow_run_id].browser_state is browser
     b_exit.set()
     await adopter
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner", ["task", "workflow", "task_v2"])
+async def test_actual_acquisition_binds_before_first_navigation_and_keeps_same_owner_generation(
+    monkeypatch: pytest.MonkeyPatch, owner: str
+) -> None:
+    """Exercise manager acquisition and the real get_or_create_page; only browser IO is substituted."""
+    manager = RealBrowserManager()
+    sent: list[str | None] = []
+    monkeypatch.setattr(
+        real_browser_state_module.app.AGENT_FUNCTION,
+        "set_browser_run_http_cache",
+        lambda context, generation, **kwargs: sent.append(generation),
+    )
+    monkeypatch.setattr(real_browser_state_module.app.AGENT_FUNCTION, "on_browser_run_released", lambda _: None)
+    context = MagicMock()
+    page = MagicMock(url="about:blank")
+    context.new_page = AsyncMock(return_value=page)
+    state = RealBrowserState(pw=MagicMock(), browser_context=context)
+    working = None
+
+    async def get_page():
+        return working
+
+    async def set_page(page, index):
+        nonlocal working
+        working = page
+
+    observed = []
+
+    async def navigate(**kwargs):
+        observed.append((state._run_http_cache_bound, sent[-1], state.runtime_event_context))
+
+    monkeypatch.setattr(state, "get_working_page", get_page)
+    monkeypatch.setattr(state, "set_working_page", set_page)
+    monkeypatch.setattr(state, "_close_all_other_pages", AsyncMock())
+    monkeypatch.setattr(state, "navigate_to_url", navigate)
+    monkeypatch.setattr(state, "_arm_display_recorder", lambda: None)
+    monkeypatch.setattr(state, "_note_working_page_ready", lambda page: None)
+    monkeypatch.setattr(manager, "_create_browser_state", AsyncMock(return_value=state))
+    monkeypatch.setattr(manager, "_start_frame_publisher", AsyncMock())
+    monkeypatch.setattr(real_browser_manager, "_record_run_timezone_receipt", AsyncMock())
+    monkeypatch.setattr(real_browser_manager, "_retain_run_dialog_answers", lambda *args, **kwargs: None)
+    workflow = make_workflow_run("wr_cache_owner")
+    workflow.browser_address = None
+    task = MagicMock(
+        task_id="tsk_cache_owner", workflow_run_id=None, browser_address=None, url="https://fixture.invalid/"
+    )
+    task.requested_by = None
+    with patch_browser_manager_app() as mock_app:
+        configure_browser_context_acquired_hook(mock_app)
+        if owner == "task":
+            await manager.get_or_create_for_task(task)
+            await manager.get_or_create_for_task(task)
+        else:
+            await manager.get_or_create_for_workflow_run(
+                workflow, url="https://fixture.invalid/", navigate=owner != "task_v2"
+            )
+            acquired_generation = sent[-1]
+            await manager.get_or_create_for_workflow_run(workflow)
+            assert sent[-1] == acquired_generation
+            if owner == "task_v2":
+                assert observed == []
+                await state.navigate_to_url(page=page, url="https://fixture.invalid/")
+        assert len(observed) == 1
+        assert observed[0][0] is True and observed[0][1] == sent[-1]
+        assert len(sent) == 2  # initial attachment, then authoritative owner; reacquisition is idempotent
+        assert (observed[0][2].task_id if owner == "task" else observed[0][2].workflow_run_id) == (
+            task.task_id if owner == "task" else workflow.workflow_run_id
+        )
+        state.mark_run_released()
+        assert sent[-1] is None
+        if owner == "task":
+            await manager.get_or_create_for_task(task)
+        else:
+            await manager.get_or_create_for_workflow_run(workflow)
+        assert sent[-1] not in (None, observed[0][1])
