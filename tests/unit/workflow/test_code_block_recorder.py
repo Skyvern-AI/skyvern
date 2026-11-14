@@ -28,13 +28,13 @@ from skyvern.core.script_generations.skyvern_page import SkyvernPage
 from skyvern.exceptions import NO_ADDRESS_RECORD_NAV_ERROR_CODE, FailedToNavigateToUrl
 from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent
-from skyvern.forge.sdk.copilot.code_block_steps import _METHOD_ACTION_TYPES
 from skyvern.forge.sdk.credential_site_policy import LoginSite
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.models import ActionModel
 from skyvern.forge.sdk.db.utils import hydrate_action
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
+from skyvern.forge.sdk.workflow.code_block_steps import _METHOD_ACTION_TYPES
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models import block as block_module
 from skyvern.forge.sdk.workflow.models.block import CodeBlock, Credential

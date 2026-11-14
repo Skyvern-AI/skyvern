@@ -17,7 +17,7 @@ from skyvern.cli.mcp_tools import browser as mcp_browser
 from skyvern.cli.mcp_tools import session as mcp_session
 from skyvern.cli.mcp_tools import trajectory as mcp_trajectory
 from skyvern.cli.mcp_tools.code_block import skyvern_code_block_synthesize
-from skyvern.forge.sdk.copilot.typed_value_policy import typed_text_looks_secret
+from skyvern.utils.typed_value_policy import typed_text_looks_secret
 
 _HASH_A = "principal-a"
 _HASH_B = "principal-b"

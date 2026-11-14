@@ -7,7 +7,8 @@ from typing import Any
 import pytest
 import yaml
 
-from skyvern.forge.sdk.copilot.code_block_steps import (
+from skyvern.forge.sdk.copilot.code_block_synthesis import synthesize_code_block
+from skyvern.forge.sdk.workflow.code_block_steps import (
     analyze_code_actions,
     bind_referenced_parameters_in_yaml,
     carry_user_owned_goals_in_yaml,
@@ -18,7 +19,6 @@ from skyvern.forge.sdk.copilot.code_block_steps import (
     derive_code_block_steps_in_yaml,
     user_owned_goal_carry_disclosure,
 )
-from skyvern.forge.sdk.copilot.code_block_synthesis import synthesize_code_block
 from skyvern.webeye.actions.action_types import ActionType
 
 pytestmark = pytest.mark.usefixtures("no_saved_workflow")

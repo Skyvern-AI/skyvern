@@ -31,7 +31,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     CompletionCriterion,
     RequestPolicy,
 )
-from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER, register_secret_scrub_value
+from skyvern.forge.sdk.copilot.secret_scrub import register_secret_scrub_value
 from skyvern.forge.sdk.copilot.tools import workflow_update as workflow_update_module
 from skyvern.forge.sdk.copilot.tools.guardrails import _authority_tool_error
 from skyvern.forge.sdk.copilot.tools.workflow_update import (
@@ -57,6 +57,7 @@ from skyvern.forge.sdk.copilot.workflow_yaml import (
 )
 from skyvern.forge.sdk.db.exceptions import CopilotProposalConflictError
 from skyvern.forge.sdk.workflow.secret_encryption import WORKFLOW_SECRET_MASK
+from skyvern.utils.secret_scrub import REDACTED_SECRET_PLACEHOLDER
 from skyvern.utils.yaml_loader import dump_workflow_yaml, safe_load_no_dates
 from tests.unit._copilot_workflow_fakes import fake_workflow
 

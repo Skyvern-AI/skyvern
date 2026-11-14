@@ -28,8 +28,6 @@ from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.output_utils import sanitize_tool_result_for_llm
 from skyvern.forge.sdk.copilot.runtime import browser_session_lock
 from skyvern.forge.sdk.copilot.secret_scrub import (
-    REDACTED_SECRET_PLACEHOLDER,
-    clear_session_scrub_values,
     register_secret_scrub_value,
     register_secret_scrub_values_from_structure,
 )
@@ -49,6 +47,7 @@ from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.schemas.workflows import BlockType
+from skyvern.utils.secret_scrub import REDACTED_SECRET_PLACEHOLDER, clear_session_scrub_values
 from tests.unit.copilot_test_helpers import make_copilot_ctx, skip_no_browser
 
 STAR_BUTTON = 'button.pill:has-text("Star")'

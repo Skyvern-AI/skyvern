@@ -29,21 +29,17 @@ from skyvern.exceptions import BROWSER_CONNECTION_LOST_ERROR_CODE, NO_ADDRESS_RE
 from skyvern.forge import app
 from skyvern.forge.agent_functions import CodeBlockEngineFailure, CodeBlockEngineResult
 from skyvern.forge.sdk.api.llm.schema_validator import validate_and_fill_extraction_result, validate_schema
-from skyvern.forge.sdk.copilot.code_block_steps import derive_code_block_steps
 from skyvern.forge.sdk.copilot.nav_attribution import (
     block_nav_error_codes,
     proxy_owns_nav_codes,
     target_owns_nav_codes,
-)
-from skyvern.forge.sdk.copilot.reached_download_target import (
-    GENERATED_FILE_ARTIFACT_IDS_KEY,
-    REGISTERED_DOWNLOAD_OUTPUT_KEYS,
 )
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.repositories.workflow_runs import WorkflowRunsRepository
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
+from skyvern.forge.sdk.workflow.code_block_steps import derive_code_block_steps
 from skyvern.forge.sdk.workflow.context_manager import (
     RANDOM_SECRET_ID_PREFIX,
     WorkflowContextManager,
@@ -69,6 +65,10 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameterType,
 )
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
+from skyvern.forge.sdk.workflow.reached_download_target import (
+    GENERATED_FILE_ARTIFACT_IDS_KEY,
+    REGISTERED_DOWNLOAD_OUTPUT_KEYS,
+)
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.forge.taskv3.goal_composition import (
     EXECUTED_CALLS_HEADER,

@@ -49,7 +49,6 @@ from skyvern.forge.sdk.copilot.output_utils import (
     OUTPUT_VALUE_MAX_CHARS,
     REGISTERED_OUTPUTS_NOTICE_PREFIX,
 )
-from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion
 from skyvern.forge.sdk.copilot.session_factory import _summarize_older_tool_items
 from skyvern.forge.sdk.copilot.tools import (
@@ -61,6 +60,7 @@ from skyvern.forge.sdk.copilot.tools import (
 from skyvern.forge.sdk.copilot.tools._shared import TOTAL_TIMEOUT_SECONDS as shared_total_timeout_seconds
 from skyvern.forge.sdk.copilot.tools.workflow_update import _PERSISTENCE_MESSAGES
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
+from skyvern.forge.sdk.workflow.reached_download_target import ReachedDownloadTarget
 from tests.unit._mcp_browser_fakes import page_crash_entry
 from tests.unit.copilot_test_helpers import load_skill_items, make_copilot_ctx
 

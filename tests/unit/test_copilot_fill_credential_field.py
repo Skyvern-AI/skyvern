@@ -49,8 +49,6 @@ from skyvern.forge.sdk.copilot.request_policy import (
 )
 from skyvern.forge.sdk.copilot.runtime import AgentContext, browser_session_recovery
 from skyvern.forge.sdk.copilot.secret_scrub import (
-    REDACTED_SECRET_PLACEHOLDER,
-    clear_session_scrub_values,
     register_secret_scrub_value,
     register_secret_scrub_values_from_structure,
     scrub_secrets_from_structure,
@@ -74,6 +72,7 @@ from skyvern.forge.sdk.services.bitwarden import BitwardenLoginSecret
 from skyvern.forge.sdk.services.credential.credential_vault_service import VaultLogin, VaultLoginListing
 from skyvern.forge.sdk.workflow.models.credential_release import login_release_sites
 from skyvern.library.skyvern_browser_page import SkyvernBrowserPage
+from skyvern.utils.secret_scrub import REDACTED_SECRET_PLACEHOLDER, clear_session_scrub_values
 from skyvern.webeye.browser_retirement import BrowserOperationRejected, BrowserRetirementReason
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.persistent_sessions_manager import BrowserOperation, BrowserRetirement

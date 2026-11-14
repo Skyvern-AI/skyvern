@@ -12,8 +12,8 @@ from typing import Any
 
 import pytest
 
-from skyvern.forge.sdk.copilot.block_goal_wrapping import compose_mini_goal, unwrap_goal_fields
 from skyvern.forge.sdk.prompting import PromptEngine
+from skyvern.forge.sdk.workflow.block_goal_wrapping import compose_mini_goal, unwrap_goal_fields
 
 MAIN_GOAL = "Open the example site, find the pricing page, and report the plan names"
 MINI_GOAL = "Click the link that leads to the pricing page"
