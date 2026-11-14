@@ -231,7 +231,6 @@ async function renderStudioChat(
       <StudioShellContext.Provider
         value={{
           copilotPortalEl: null,
-          panelPortalEl: null,
           setEditorStreamSlot: () => {},
           setBrowserStreamSlot: () => {},
           setRunStreamSlot: () => {},

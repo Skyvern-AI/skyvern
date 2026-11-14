@@ -39,7 +39,6 @@ export type WorkflowStartNodeData = {
   workflowSystemPrompt: string | null;
   errorCodeMapping: Record<string, string> | null;
   label: "__start_block__";
-  showCode: boolean;
   review?: StartReviewAnnotation;
 };
 
@@ -47,7 +46,6 @@ export type OtherStartNodeData = {
   withWorkflowSettings: false;
   editable: boolean;
   label: "__start_block__";
-  showCode: boolean;
   parentNodeType?: "loop" | "conditional";
 };
 

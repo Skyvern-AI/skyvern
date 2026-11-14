@@ -277,7 +277,7 @@ export const debuggableWorkflowBlockTypes: Set<WorkflowBlockType> = new Set(
   Object.values(WorkflowBlockTypes),
 );
 
-export const scriptableWorkflowBlockTypes: Set<WorkflowBlockType> = new Set([
+const taskVariantWorkflowBlockTypes: Set<WorkflowBlockType> = new Set([
   "action",
   "extraction",
   "file_download",
@@ -292,7 +292,7 @@ export const scriptableWorkflowBlockTypes: Set<WorkflowBlockType> = new Set([
 export function isTaskVariantBlock(item: {
   block_type: WorkflowBlockType;
 }): boolean {
-  return scriptableWorkflowBlockTypes.has(item.block_type);
+  return taskVariantWorkflowBlockTypes.has(item.block_type);
 }
 
 export function isNestedLoopWorkflowBlock(

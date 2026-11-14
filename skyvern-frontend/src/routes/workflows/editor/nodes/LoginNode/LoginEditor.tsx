@@ -37,7 +37,6 @@ import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow"
 import { type AppNode } from "..";
 import { parameterIsSkyvernCredential } from "../../types";
 import { BlockExecutionOptions } from "../components/BlockExecutionOptions";
-import { DisableCache } from "../DisableCache";
 import { IgnoreWorkflowSystemPrompt } from "../IgnoreWorkflowSystemPrompt";
 import { LoginBlockCredentialSelector } from "./LoginBlockCredentialSelector";
 import { useSelectedCredentialTotpIdentifier } from "../../hooks/useSelectedCredentialTotpIdentifier";
@@ -464,13 +463,6 @@ function LoginEditorBody({
                 }
                 onIncludeActionHistoryInVerificationChange={(checked) =>
                   update({ includeActionHistoryInVerification: checked })
-                }
-              />
-              <DisableCache
-                disableCache={data.disableCache}
-                editable={editable}
-                onDisableCacheChange={(disableCache) =>
-                  update({ disableCache })
                 }
               />
               <IgnoreWorkflowSystemPrompt

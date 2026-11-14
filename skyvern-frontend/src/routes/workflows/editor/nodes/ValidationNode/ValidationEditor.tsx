@@ -20,7 +20,6 @@ import { AI_IMPROVE_CONFIGS } from "../../constants";
 import { helpTooltips } from "../../helpContent";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { type AppNode } from "..";
-import { DisableCache } from "../DisableCache";
 import { BlockExecutionOptions } from "../components/BlockExecutionOptions";
 import { type ValidationNode, type ValidationNodeData } from "./types";
 import { errorMappingExampleValue } from "../types";
@@ -60,7 +59,6 @@ function ValidationEditorBody({
     model,
     continueOnFailure,
     nextLoopOnFailure,
-    disableCache,
     engine,
   } = data;
   const availableEngines = [
@@ -199,11 +197,6 @@ function ValidationEditorBody({
                 onNextLoopOnFailureChange={(checked) =>
                   update({ nextLoopOnFailure: checked })
                 }
-              />
-              <DisableCache
-                disableCache={disableCache}
-                editable={editable}
-                onDisableCacheChange={(next) => update({ disableCache: next })}
               />
             </div>
           </AccordionContent>

@@ -40,7 +40,6 @@ const startNodeData: WorkflowStartNodeData = {
   errorCodeMapping: null,
   retryPolicy: null,
   label: "__start_block__",
-  showCode: false,
 };
 
 let nodeData = startNodeData;
@@ -169,7 +168,7 @@ import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
 import { WorkflowSettingsEditor } from "./WorkflowSettingsEditor";
 
-const GROUP_IDS = ["model", "runs", "safety", "browser", "runwith", "webhook"];
+const GROUP_IDS = ["model", "runs", "safety", "browser", "webhook"];
 
 function renderSettings(
   overrides: Partial<WorkflowStartNodeData> = {},
@@ -489,7 +488,7 @@ test("changing a retry status preserves the custom error-code draft", () => {
 });
 
 describe("WorkflowSettingsEditor groups", () => {
-  test("six groups start folded and summarise defaults", () => {
+  test("five groups start folded and summarise defaults", () => {
     renderSettings({ runWith: "code" }, { open: false });
 
     const groups = GROUP_IDS.map((id) =>
@@ -500,18 +499,15 @@ describe("WorkflowSettingsEditor groups", () => {
         g.querySelector("button")?.getAttribute("aria-expanded"),
       ),
     ).toEqual(GROUP_IDS.map(() => "false"));
-    expect(screen.getByText("Code")).toBeDefined();
     expect(screen.getByText("No webhook")).toBeDefined();
   });
 
-  test("Run With = agent hides AI fallback and code key; code shows them", () => {
-    renderSettings({ runWith: "agent" });
+  test("a workflow stored in code mode shows no run-with, AI fallback or code key setting", () => {
+    renderSettings({ runWith: "code" });
+    expect(screen.queryByTestId("settings-group-runwith")).toBeNull();
+    expect(screen.queryByText("Run With")).toBeNull();
     expect(screen.queryByText("AI Fallback (cached scripts)")).toBeNull();
     expect(screen.queryByText("Code Key (optional)")).toBeNull();
-    cleanup();
-    renderSettings({ runWith: "code" });
-    expect(screen.getByText("AI Fallback (cached scripts)")).toBeDefined();
-    expect(screen.getByText("Code Key (optional)")).toBeDefined();
   });
 });
 

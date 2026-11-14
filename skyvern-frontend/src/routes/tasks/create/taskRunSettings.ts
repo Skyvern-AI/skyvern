@@ -6,7 +6,6 @@ export type TaskRunSettings = {
   totpIdentifier: string;
   webhookCallbackUrl: string | null;
   dataSchema: string | null;
-  generateScript: boolean;
   publishWorkflow: boolean;
   extraHttpHeaders: string | null;
   maxScreenshotScrolls: string | null;
@@ -20,7 +19,6 @@ export const DEFAULT_TASK_RUN_SETTINGS: TaskRunSettings = {
   totpIdentifier: "",
   webhookCallbackUrl: null,
   dataSchema: null,
-  generateScript: false,
   publishWorkflow: false,
   extraHttpHeaders: null,
   maxScreenshotScrolls: null,

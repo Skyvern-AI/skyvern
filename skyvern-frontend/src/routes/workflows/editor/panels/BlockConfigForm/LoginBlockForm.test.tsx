@@ -139,15 +139,6 @@ vi.mock("../../nodes/components/BlockExecutionOptions", () => ({
   ),
 }));
 
-vi.mock("../../nodes/DisableCache", () => ({
-  DisableCache: (props: { disableCache: boolean }) => (
-    <div
-      data-testid="disable-cache"
-      data-disabled={String(props.disableCache)}
-    />
-  ),
-}));
-
 vi.mock("../../ErrorCodeMappingEditor", () => ({
   ErrorCodeMappingEditor: (props: { value: string }) => (
     <div data-testid="error-code-mapping-editor" data-value={props.value} />
@@ -415,7 +406,6 @@ describe("LoginBlockForm (SKY-9374)", () => {
     expect(screen.getByTestId("model-selector")).toBeDefined();
     expect(screen.getByTestId("engine-selector")).toBeDefined();
     expect(screen.getByTestId("block-execution-options")).toBeDefined();
-    expect(screen.getByTestId("disable-cache")).toBeDefined();
     expect(screen.getByPlaceholderText("Default: 10")).toBeDefined();
     // Error-mapping editor only appears when the mapping is non-null —
     // default fixture is "null" so the editor stays hidden even after

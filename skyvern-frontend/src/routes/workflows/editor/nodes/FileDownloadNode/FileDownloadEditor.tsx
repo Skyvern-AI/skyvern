@@ -33,7 +33,6 @@ import { AI_IMPROVE_CONFIGS } from "../../constants";
 import { helpTooltips, placeholders } from "../../helpContent";
 import { useHasInteractedThisSession } from "../../panels/useHasInteractedThisSession";
 import { type AppNode } from "..";
-import { DisableCache } from "../DisableCache";
 import { IgnoreWorkflowSystemPrompt } from "../IgnoreWorkflowSystemPrompt";
 import { BlockExecutionOptions } from "../components/BlockExecutionOptions";
 import { SftpPrivateKeyField } from "../components/SftpPrivateKeyField";
@@ -110,7 +109,6 @@ function FileDownloadEditorBody({
     errorCodeMapping,
     continueOnFailure,
     nextLoopOnFailure,
-    disableCache,
     downloadSuffix,
     totpIdentifier,
     totpVerificationUrl,
@@ -763,11 +761,6 @@ function FileDownloadEditorBody({
                 onNextLoopOnFailureChange={(checked) =>
                   update({ nextLoopOnFailure: checked })
                 }
-              />
-              <DisableCache
-                disableCache={disableCache}
-                editable={editable}
-                onDisableCacheChange={(next) => update({ disableCache: next })}
               />
               <IgnoreWorkflowSystemPrompt
                 ignoreWorkflowSystemPrompt={

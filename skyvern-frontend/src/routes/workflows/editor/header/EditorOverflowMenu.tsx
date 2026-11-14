@@ -44,7 +44,6 @@ import { cn } from "@/util/utils";
 
 import { SaveFailedError, useSaveWorkflow } from "../hooks/useSaveWorkflow";
 import { useToggleHistoryPanel } from "../hooks/useToggleHistoryPanel";
-import { CodeSubmenu } from "./CodeSubmenu";
 
 export function EditorOverflowMenu({
   triggerClassName = "size-10 min-w-[2.5rem]",
@@ -167,7 +166,6 @@ export function EditorOverflowMenu({
             View schema
           </DropdownMenuItem>
         )}
-        <CodeSubmenu />
         {/* Restoring a version would replace the canvas a Copilot proposal is staged on. */}
         {!workflowRunIsRunningOrQueued && !proposalPending && (
           <DropdownMenuItem

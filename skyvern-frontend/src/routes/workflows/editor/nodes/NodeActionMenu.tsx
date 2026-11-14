@@ -20,13 +20,10 @@ type Props = {
   duplicateDisabledReason?: string | null;
   isDeletable?: boolean;
   isDuplicable?: boolean;
-  isScriptable?: boolean;
   isCanvasLocked?: boolean;
-  showScriptText?: string;
   onDelete?: () => void;
   onDemonstrate?: () => void;
   onDuplicate?: () => void;
-  onShowScript?: () => void;
 };
 
 function NodeActionMenu({
@@ -34,13 +31,10 @@ function NodeActionMenu({
   duplicateDisabledReason = null,
   isDeletable = true,
   isDuplicable = true,
-  isScriptable = false,
   isCanvasLocked = false,
-  showScriptText,
   onDelete,
   onDemonstrate,
   onDuplicate,
-  onShowScript,
 }: Props) {
   const deleteGated = isCanvasLocked;
   const deleteGateReason = isCanvasLocked
@@ -51,7 +45,7 @@ function NodeActionMenu({
     ? "Unlock canvas to duplicate blocks"
     : duplicateDisabledReason;
 
-  if (!isDeletable && !isDuplicable && !isScriptable) {
+  if (!isDeletable && !isDuplicable) {
     return null;
   }
 
@@ -155,15 +149,6 @@ function NodeActionMenu({
               Demonstrate this block
             </DropdownMenuItem>
           ))}
-        {isScriptable && onShowScript && (
-          <DropdownMenuItem
-            onSelect={() => {
-              onShowScript();
-            }}
-          >
-            {showScriptText ?? "Show Code"}
-          </DropdownMenuItem>
-        )}
       </DropdownMenuContent>
     </DropdownMenu>
   );

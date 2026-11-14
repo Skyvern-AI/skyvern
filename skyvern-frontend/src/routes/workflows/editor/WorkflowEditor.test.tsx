@@ -243,12 +243,6 @@ vi.mock("../hooks/useWorkflowRunWithWorkflowQuery", () => ({
 vi.mock("../hooks/useWorkflowRunsQuery", () => ({
   useWorkflowRunsQuery: () => runsQueryMock(),
 }));
-vi.mock("../hooks/useBlockScriptsQuery", () => ({
-  useBlockScriptsQuery: () => ({ data: undefined }),
-}));
-vi.mock("../hooks/useCacheKeyValuesQuery", () => ({
-  useCacheKeyValuesQuery: () => ({ data: undefined, isLoading: false }),
-}));
 vi.mock("../hooks/useDebugSessionQuery", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../hooks/useDebugSessionQuery")>()),
   useDebugSessionQuery: () => debugQueryMock(),
@@ -2995,7 +2989,6 @@ describe("save failures stop navigation and block runs", () => {
                           requestDeleteNodeCallback: vi.fn(),
                           duplicateNodeCallback: vi.fn(),
                           transmuteNodeCallback: vi.fn(),
-                          toggleScriptForNodeCallback: vi.fn(),
                         }}
                       >
                         <NodeHeader
@@ -3157,7 +3150,6 @@ describe("save failures stop navigation and block runs", () => {
                         requestDeleteNodeCallback: vi.fn(),
                         duplicateNodeCallback: vi.fn(),
                         transmuteNodeCallback: vi.fn(),
-                        toggleScriptForNodeCallback: vi.fn(),
                       }}
                     >
                       <NodeHeader

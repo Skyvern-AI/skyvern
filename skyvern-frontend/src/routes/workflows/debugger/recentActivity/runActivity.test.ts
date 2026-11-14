@@ -6,7 +6,6 @@ import {
   buildBlockTypeByLabel,
   getRunActivityKey,
   getRunDurationLabel,
-  getRunModeLabel,
   getRunStatusKind,
   getRunStatusLabel,
 } from "./runActivity";
@@ -80,15 +79,6 @@ describe("getRunDurationLabel", () => {
         }),
       ),
     ).toBeNull();
-  });
-});
-
-describe("getRunModeLabel", () => {
-  it("distinguishes explicit run modes from missing or unknown values", () => {
-    expect(getRunModeLabel(makeRun({ run_with: "code" }))).toBe("Code");
-    expect(getRunModeLabel(makeRun({ run_with: "agent" }))).toBe("Agent");
-    expect(getRunModeLabel(makeRun({ run_with: null }))).toBe("Unknown");
-    expect(getRunModeLabel(makeRun({ run_with: "legacy" }))).toBe("Unknown");
   });
 });
 

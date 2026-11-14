@@ -65,7 +65,6 @@ const L = {
   errorCodes: "Error codes",
   url: "URL",
   terminateIf: "Terminate if",
-  cache: "Cache disabled",
   continueOnFailure: "Continue on failure",
   nextLoopOnFailure: "Next loop on failure",
   completeIfEmpty: "Complete if empty",
@@ -114,7 +113,6 @@ export const DOC_FIELD_MAP: Partial<
     field("engine", L.engine, "Default"),
     field("max_steps_per_run", L.maxSteps, "Default"),
     field("max_retries", L.maxRetries, "0"),
-    field("disable_cache", L.cache, "No"),
   ],
   login: [
     onLine(

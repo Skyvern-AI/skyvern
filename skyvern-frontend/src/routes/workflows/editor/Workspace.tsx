@@ -36,7 +36,6 @@ import {
   useMemo,
   useRef,
   useState,
-  MutableRefObject,
   type ReactNode,
 } from "react";
 import { nanoid } from "nanoid";
@@ -45,7 +44,6 @@ import {
   ChevronRightIcon,
   ChevronLeftIcon,
   GlobeIcon,
-  PlayIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
 import {
@@ -76,7 +74,6 @@ import {
 } from "../hooks/useDebugSessionQuery";
 import { useIsGlobalWorkflow } from "../hooks/useIsGlobalWorkflow";
 import { resolveWorkspaceBrowserSessionBindings } from "./browserSessionBindings";
-import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
 import { BrowserSessionStream } from "@/routes/browserSessions/BrowserSessionStream";
 import { useStreamTransport } from "@/hooks/useRuntimeConfig";
 import {
@@ -84,20 +81,16 @@ import {
   StreamStatusPanel,
 } from "@/routes/streaming/StreamDiagnostics";
 import { type BrowserSession as BrowserSessionData } from "@/routes/workflows/types/browserSessionTypes";
-import { useCacheKeyValuesQuery } from "../hooks/useCacheKeyValuesQuery";
 import {
   DEBUG_SESSION_EXPIRY_STATUS_REFETCH_MS,
   DEBUG_SESSION_EXPIRY_WARNING_THRESHOLD_MS,
   formatBrowserSessionRemainingTime,
   getBrowserSessionRemainingMs,
 } from "../hooks/debugSessionLease";
-import { useBlockScriptStore } from "@/store/BlockScriptStore";
 import { useBlockSidebarWidthStore } from "@/store/BlockSidebarWidthStore";
-import { useCacheKeyValueStore } from "@/store/CacheKeyValueStore";
 import { useWorkflowSettingsStore } from "@/store/WorkflowSettingsStore";
 import { useStudioPaneDefaults } from "../studio/StudioPaneDefaultsContext";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
-import { useShowAllCodeStore } from "@/store/ShowAllCodeStore";
 import { useSidebarSaveStateStore } from "@/store/SidebarSaveStateStore";
 import { useWorkflowHistoryAccessStore } from "@/store/WorkflowHistoryAccessStore";
 import { useBrowserLoadingFlag } from "../hooks/useBrowserLoadingFlag";
@@ -118,7 +111,6 @@ import {
   DialogFooter,
   DialogHeader,
   DialogTitle,
-  DialogTrigger,
 } from "@/components/ui/dialog";
 import { toast } from "@/components/ui/use-toast";
 import { PaneErrorBoundary } from "@/components/PaneErrorBoundary";
@@ -126,11 +118,7 @@ import { useLogging } from "@/hooks/useLogging";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { AffectedBlocksNotice } from "./AffectedBlocksNotice";
 import { BrowserStream } from "@/components/BrowserStream";
-import {
-  runIsLogicallyFinal,
-  runIsExecuting,
-} from "@/routes/workflows/workflowRun/runRetryState";
-import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
+import { runIsExecuting } from "@/routes/workflows/workflowRun/runRetryState";
 import { DebuggerRun } from "@/routes/workflows/debugger/DebuggerRun";
 import { DebuggerRunMinimal } from "@/routes/workflows/debugger/DebuggerRunMinimal";
 import { RecentActivityRunSelector } from "@/routes/workflows/debugger/recentActivity/RecentActivityRunSelector";
@@ -157,18 +145,11 @@ import {
   applyYamlCommitMetadata,
   useWorkflowTitleStore,
 } from "@/store/WorkflowTitleStore";
-import {
-  getCode,
-  getOrderedBlockLabels,
-  shouldPollForGeneratedCode,
-} from "@/routes/workflows/utils";
-import { CopyButton } from "@/components/CopyButton";
 import { isMacPlatform } from "@/util/platform";
 import { parseHeaderJson } from "@/util/secretHeaders";
 import { getJsonParseErrorDetail } from "@/util/jsonParseError";
 import { cn } from "@/util/utils";
 import { FlowRenderer, type FlowRendererProps } from "./FlowRenderer";
-import { useCacheKeyValueUrlSync } from "./hooks/useCacheKeyValueUrlSync";
 import {
   getInitialSelectedBlockId,
   useSelectedBlockUrlSync,
@@ -189,7 +170,6 @@ import {
   isConditionalNode,
 } from "./nodes/ConditionalNode/types";
 import { WorkflowParametersPanel } from "./panels/WorkflowParametersPanel";
-import { WorkflowCacheKeyValuesPanel } from "./panels/WorkflowCacheKeyValuesPanel";
 import { WorkflowComparisonPanel } from "./panels/WorkflowComparisonPanel";
 import {
   getElements,
@@ -237,7 +217,7 @@ import { WorkflowDefinition, WorkflowSettings } from "../types/workflowTypes";
 import { useAgentsPathMatch } from "../useAgentsPathMatch";
 import { shouldKeepExistingEdgeForInsertion } from "./workflowInsertion";
 
-import { constructCacheKeyValue, getInitialParameters } from "./utils";
+import { getInitialParameters } from "./utils";
 import {
   WorkflowCopilotChat,
   type WorkflowUpdateOptions,
@@ -255,7 +235,6 @@ import {
   shouldAutoOpenEditor,
 } from "./editorAutoOpen";
 import { useStudioShellContext } from "../studio/StudioShellContext";
-import { StudioShellPanelPortal } from "../studio/StudioShellPanelPortal";
 import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
 import type { CopilotAttachedFile } from "@/routes/workflows/copilot/workflowCopilotTypes";
 import {
@@ -373,77 +352,6 @@ export type AddNodeProps = {
   // A step that leaves the graph in the same pass that adds this one.
   replacing?: string;
 };
-
-interface Dom {
-  splitLeft: MutableRefObject<HTMLInputElement | null>;
-}
-
-function bash(text: string, alternateText?: string) {
-  return (
-    <div className="flex items-center justify-start gap-1">
-      <CopyButton className="min-w-[2.25rem]" value={alternateText ?? text} />
-      <code className="text-xs text-neutral-600 dark:text-neutral-300">
-        {text}
-      </code>
-    </div>
-  );
-}
-
-function CopyAndExplainCode({
-  code,
-  showCopy = true,
-}: {
-  code: string;
-  showCopy?: boolean;
-}) {
-  const [isOpen, setIsOpen] = useState(false);
-  const numCodeLines = code.split("\n").length;
-
-  return (
-    <div className="flex items-center justify-end">
-      <Dialog open={isOpen} onOpenChange={setIsOpen}>
-        <DialogTrigger asChild>
-          <Button variant="tertiary" size="sm">
-            <div className="flex items-center justify-center gap-2">
-              <div>Run Locally</div>
-              <PlayIcon />
-            </div>
-          </Button>
-        </DialogTrigger>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Run This Code</DialogTitle>
-            <DialogDescription>
-              Set up skyvern in your environment and run the code on your own.
-            </DialogDescription>
-          </DialogHeader>
-          <div>
-            <div>1. Install skyvern: {bash("pip install skyvern")}</div>
-            <div>2. Set up skyvern: {bash("skyvern quickstart")}</div>
-            <div>
-              3. Copy-paste the code and save it in a file, for example{" "}
-              <code>main.py</code>{" "}
-              {bash(`copy code [${numCodeLines} line(s)]`, code)}
-            </div>
-            <div>
-              4. Run the code:{" "}
-              {bash(
-                'skyvern run code --params \'{"param1": "val1", "param2": "val2"}\' main.py',
-              )}
-            </div>
-          </div>
-
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setIsOpen(false)}>
-              Ok
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-      {showCopy ? <CopyButton value={code} /> : null}
-    </div>
-  );
-}
 
 // eslint-disable-next-line react-refresh/only-export-components -- Exercise the production apply callback without mounting the entire workspace.
 export function useWorkspaceCopilotUpdate({
@@ -613,21 +521,13 @@ function Workspace({
       openStudioPane("copilot", { state: location.state });
     }
   });
-  const cacheKeyValueParam = searchParams.get("cache-key-value");
   const headlessTurnDrainEnabled = ["1", "true"].includes(
     (searchParams.get("copilotHeadlessTurnDrain") ?? "").toLowerCase(),
   );
   const [timelineMode, setTimelineMode] = useState("wide");
-  const [page, setPage] = useState(1);
   const [nudge, setNudge] = useState(false);
   const { workflowPanelState, setWorkflowPanelState, closeWorkflowPanel } =
     useWorkflowPanelStore();
-  const showAllCode = useShowAllCodeStore((s) => s.showAllCode);
-  const setShowAllCode = useShowAllCodeStore((s) => s.setShowAllCode);
-  const cacheKeyValue = useCacheKeyValueStore((s) => s.cacheKeyValue);
-  const setExplicitCacheKeyValue = useCacheKeyValueStore((s) => s.setExplicit);
-  const cacheKeyValueFilter = useCacheKeyValueStore((s) => s.filter);
-  const setCacheKeyValueFilter = useCacheKeyValueStore((s) => s.setFilter);
   const headerCollapsed = useWorkflowHeaderCollapseStore((s) => s.collapsed);
   const editorMode = useWorkflowEditorMode();
   const selectedBlockId = useWorkflowPanelStore((s) => s.selectedBlockId);
@@ -823,7 +723,6 @@ function Workspace({
 
   const { data: workflowRun } = useWorkflowRunQuery();
   const studioRunId = useStudioRunId();
-  const isFinalized = workflowRun ? runIsLogicallyFinal(workflowRun) : false;
 
   const [openCycleBrowserDialogue, setOpenCycleBrowserDialogue] =
     useState(false);
@@ -880,11 +779,9 @@ function Workspace({
   const yamlEntryHadChangesRef = useRef(false);
   const [shouldFetchDebugSession, setShouldFetchDebugSession] = useState(false);
   const [isCopilotTurnActive, setIsCopilotTurnActive] = useState(false);
-  const blockScriptStore = useBlockScriptStore();
   const finallyBlockLabel = useWorkflowSettingsStore(
     (state) => state.finallyBlockLabel,
   );
-  const cacheKey = workflow?.cache_key ?? "";
 
   // Block delete confirmation dialog state
   const [deleteBlockDialogState, setDeleteBlockDialogState] = useState<{
@@ -941,14 +838,6 @@ function Workspace({
     },
     [affectedBlocksForBlockDelete],
   );
-
-  const [leftSideLayoutMode, setLeftSideLayoutMode] = useState<
-    "single" | "side-by-side"
-  >("single");
-
-  const dom: Dom = {
-    splitLeft: useRef<HTMLInputElement>(null),
-  };
 
   // Track all used labels globally (including those in saved branch states)
   // Initialize with labels from initial nodes
@@ -1018,42 +907,6 @@ function Workspace({
       document.removeEventListener("keydown", handleKeyDown);
     };
   }, [undoWorkflowEdit, redoWorkflowEdit, isMac]);
-
-  const { data: blockScriptsPublished } = useBlockScriptsQuery({
-    cacheKey,
-    cacheKeyValue,
-    workflowPermanentId,
-    status: "published",
-  });
-
-  const publishedLabelCount = Object.keys(
-    blockScriptsPublished?.blocks ?? {},
-  ).length;
-  const hasPublishedScript =
-    publishedLabelCount > 0 || Boolean(blockScriptsPublished?.main_script);
-
-  const isGeneratingCode =
-    Boolean(workflowRun) &&
-    shouldPollForGeneratedCode(workflow, isFinalized, hasPublishedScript);
-
-  const { data: blockScriptsPending } = useBlockScriptsQuery({
-    cacheKey,
-    cacheKeyValue,
-    enabled: isGeneratingCode,
-    workflowPermanentId,
-    pollIntervalMs: isGeneratingCode ? 3000 : undefined,
-    status: "pending",
-    workflowRunId: workflowRun?.workflow_run_id,
-  });
-
-  const { data: cacheKeyValues, isLoading: cacheKeyValuesLoading } =
-    useCacheKeyValuesQuery({
-      cacheKey,
-      debounceMs: 100,
-      filter: cacheKeyValueFilter || undefined,
-      page,
-      workflowPermanentId,
-    });
 
   const { isRateLimited, recordAttempt, resetOnSuccess } =
     useBrowserSessionRateLimit(workflowPermanentId);
@@ -1174,7 +1027,6 @@ function Workspace({
             data: {
               ...node.data,
               ...hydrated.data,
-              showCode: node.data.showCode,
             },
           };
         }),
@@ -1345,8 +1197,8 @@ function Workspace({
   // `useMountEffect`, but the Workspace instance can be reused across
   // workflows when the parent route doesn't key by workflowPermanentId
   // (e.g. /agents/A/build → /agents/B/build); in that case the
-  // mount-only initializer would skip and selectedBlockId / showAllCode /
-  // sidebar save timestamps would leak from A into B. Keying this on
+  // mount-only initializer would skip and selectedBlockId / sidebar save
+  // timestamps would leak from A into B. Keying this on
   // `workflowPermanentId` fires the reset on every workflow change,
   // including a same-instance route swap.
   //
@@ -1354,12 +1206,7 @@ function Workspace({
   // refetches (e.g. `useWorkflowSave` invalidates `['workflow', id]` after a
   // sidebar save) produce a new `workflow` object reference; if we included
   // `workflow` here the reset would fire mid-session and wipe the user's
-  // current block selection, sidebar save state, and cache-key filter.
-  // Tracks which wpid the cache-key store was last initialized against, so a
-  // same-wpid refetch (object-identity change on `workflow`) doesn't clobber
-  // the user's current filter, while an A→B nav still re-initializes once B's
-  // payload resolves.
-  const cacheKeyInitWpidRef = useRef<string | null>(null);
+  // current block selection and sidebar save state.
   useEffect(() => {
     // empty), unless the URL asks for a specific block; fires only on workflow
     // change, so tab-switch selection persists.
@@ -1369,13 +1216,11 @@ function Workspace({
       searchParams,
     });
     useWorkflowPanelStore.getState().setSelectedBlockId(initialSelectedBlockId);
-    useShowAllCodeStore.getState().reset();
     useSidebarSaveStateStore.getState().reset();
     // Drop A's unsaved-changes baseline on an A→B same-instance route swap;
     // a carried snapshot would diff B's graph against A's and surface phantom
     // "edited" lines. clearSnapshot resets contentDirty + userHasEdited too.
     useWorkflowSnapshotStore.getState().clearSnapshot();
-    cacheKeyInitWpidRef.current = null;
     setReadyBrowserSessionId(null);
     if (workflowPermanentId) {
       queryClient.removeQueries({
@@ -1389,28 +1234,6 @@ function Workspace({
     // would re-fire this reset on every workflow refetch.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workflowPermanentId, queryClient]);
-
-  useEffect(() => {
-    // Gate on workflow payload matching the route wpid: `useWorkflowQuery`
-    // can serve placeholderData from the prior workflow on an A→B nav, and
-    // initializing with that stale payload would lock in A's cache-key for
-    // B. Wait until B's payload resolves, then init once per wpid.
-    if (!workflowPermanentId) return;
-    if (workflow.workflow_permanent_id !== workflowPermanentId) return;
-    if (cacheKeyInitWpidRef.current === workflowPermanentId) return;
-    cacheKeyInitWpidRef.current = workflowPermanentId;
-    useCacheKeyValueStore
-      .getState()
-      .initialize(
-        cacheKey === ""
-          ? ""
-          : cacheKeyValueParam
-            ? cacheKeyValueParam
-            : constructCacheKeyValue({ codeKey: cacheKey, workflow }),
-        !!cacheKeyValueParam,
-      );
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [workflowPermanentId, workflow.workflow_permanent_id]);
 
   // Prune persisted collapse labels every time the workflow id or
   // definition changes. Same Workspace-instance-reuse failure mode as the
@@ -1453,14 +1276,11 @@ function Workspace({
   }, [workflowPermanentId]);
 
   useWorkspaceMountInitialization({
-    cacheKey,
     closeWorkflowPanel,
-    queryClient,
     workflowChangesStore,
     workflowPermanentId,
   });
 
-  useCacheKeyValueUrlSync(cacheKeyInitWpidRef.current === workflowPermanentId);
   useSelectedBlockUrlSync({
     enabled: embedded,
     nodes,
@@ -1487,7 +1307,6 @@ function Workspace({
   useEffect(() => {
     if (workflowPanelState.data?.showComparison) {
       clearComparisonViewAndShowFreshIfActive(false);
-      setShowAllCode(false);
     }
     // We intentionally omit workflowPanelState.data?.showComparison from deps
     // to avoid clearing comparison immediately when it's set
@@ -1495,7 +1314,7 @@ function Workspace({
   }, [showBrowser, clearComparisonViewAndShowFreshIfActive]);
 
   useEffect(() => {
-    // Header-anchored panels (cacheKeyValues, parameters, schedules, history)
+    // Header-anchored panels (parameters, schedules, history)
     // sit at top-[8.5rem] and slide off with the header; nodeLibrary lives in
     // the right sidebar and stays put, so don't auto-dismiss it on collapse.
     if (
@@ -1528,7 +1347,6 @@ function Workspace({
   });
 
   // Add window resize listener to trigger NoVNC canvas resize
-  // invalidate block scripts (so we always fetch latest on mount)
   useEffect(() => {
     const handleResize = () => {
       setWindowResizeTrigger((prev) => prev + 1);
@@ -1536,30 +1354,8 @@ function Workspace({
 
     window.addEventListener("resize", handleResize);
 
-    queryClient.invalidateQueries({
-      queryKey: ["block-scripts"],
-    });
-
     return () => window.removeEventListener("resize", handleResize);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  useEffect(() => {
-    if (isFinalized) {
-      queryClient.invalidateQueries({
-        queryKey: ["block-scripts"],
-      });
-
-      queryClient.invalidateQueries({
-        queryKey: ["cache-key-values"],
-      });
-    }
-  }, [isFinalized, queryClient, workflowRun]);
-
-  useEffect(() => {
-    blockScriptStore.setScripts(blockScriptsPublished?.blocks ?? {});
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [blockScriptsPublished]);
 
   const afterCycleBrowser = () => {
     setOpenCycleBrowserDialogue(false);
@@ -1602,34 +1398,6 @@ function Workspace({
       });
 
       afterCycleBrowser();
-    },
-  });
-
-  const deleteCacheKeyValue = useMutation({
-    mutationFn: async ({
-      workflowPermanentId,
-      cacheKeyValue,
-    }: {
-      workflowPermanentId: string;
-      cacheKeyValue: string;
-    }) => {
-      const client = await getClient(credentialGetter, "sans-api-v1");
-      const encodedCacheKeyValue = encodeURIComponent(cacheKeyValue);
-      return client.delete(
-        `/scripts/${workflowPermanentId}/value?cache-key-value=${encodedCacheKeyValue}`,
-      );
-    },
-    onSuccess: () => {
-      queryClient.invalidateQueries({
-        queryKey: ["cache-key-values", workflowPermanentId, cacheKey],
-      });
-    },
-    onError: (error: AxiosError) => {
-      toast({
-        variant: "destructive",
-        title: "Failed to delete code key value",
-        description: error.message,
-      });
     },
   });
 
@@ -1701,32 +1469,6 @@ function Workspace({
       resetOnSuccess();
     }
   }, [debugSession?.browser_session_id, resetOnSuccess]);
-
-  useEffect(() => {
-    const splitLeft = dom.splitLeft.current;
-
-    if (!splitLeft) {
-      return;
-    }
-
-    const parent = splitLeft.parentElement;
-
-    if (!parent) {
-      return;
-    }
-
-    const observer = new ResizeObserver(() => {
-      setLeftSideLayoutMode(
-        parent.offsetWidth < 1100 ? "single" : "side-by-side",
-      );
-    });
-
-    observer.observe(parent);
-
-    return () => {
-      observer.disconnect();
-    };
-  }, [dom.splitLeft]);
 
   const doLayout = useCallback(
     (nodes: Array<AppNode>, edges: Array<Edge>) => {
@@ -1984,7 +1726,6 @@ function Workspace({
             withWorkflowSettings: false,
             editable: true,
             label: "__start_block__",
-            showCode: false,
           },
           id,
         ),
@@ -2004,7 +1745,6 @@ function Workspace({
             withWorkflowSettings: false,
             editable: true,
             label: "__start_block__",
-            showCode: false,
             parentNodeType: "conditional",
           },
           id,
@@ -2077,15 +1817,6 @@ function Workspace({
     if (select) useWorkflowPanelStore.getState().setSelectedBlockId(id);
     return id;
   }
-
-  const orderedBlockLabels = getOrderedBlockLabels(workflow);
-  const code = getCode(orderedBlockLabels, blockScriptsPublished?.blocks).join(
-    "",
-  );
-  const codePending = getCode(
-    orderedBlockLabels,
-    blockScriptsPending?.blocks,
-  ).join("");
 
   const handleCompareVersions = (
     version1: WorkflowVersion,
@@ -2853,29 +2584,6 @@ function Workspace({
                 opacity: !embedded && headerCollapsed ? 0 : 1,
               }}
             >
-              {!embedded && workflowPanelState.content === "cacheKeyValues" && (
-                <WorkflowCacheKeyValuesPanel
-                  cacheKeyValues={cacheKeyValues}
-                  pending={cacheKeyValuesLoading}
-                  scriptKey={workflow.cache_key ?? "default"}
-                  filter={cacheKeyValueFilter ?? undefined}
-                  onFilterChange={setCacheKeyValueFilter}
-                  onDelete={(cacheKeyValue) => {
-                    deleteCacheKeyValue.mutate({
-                      workflowPermanentId: workflowPermanentId!,
-                      cacheKeyValue,
-                    });
-                  }}
-                  onPaginate={(page) => {
-                    setPage(page);
-                  }}
-                  onSelect={(cacheKeyValue) => {
-                    setExplicitCacheKeyValue(cacheKeyValue);
-                    setCacheKeyValueFilter("");
-                    closeWorkflowPanel();
-                  }}
-                />
-              )}
               {workflowPanelState.content === "parameters" && (
                 <div className="z-30">
                   <WorkflowParametersPanel />
@@ -2996,30 +2704,6 @@ function Workspace({
                     }}
                   >
                     {!embedded &&
-                      workflowPanelState.content === "cacheKeyValues" && (
-                        <WorkflowCacheKeyValuesPanel
-                          cacheKeyValues={cacheKeyValues}
-                          pending={cacheKeyValuesLoading}
-                          scriptKey={workflow.cache_key ?? "default"}
-                          filter={cacheKeyValueFilter ?? undefined}
-                          onFilterChange={setCacheKeyValueFilter}
-                          onDelete={(cacheKeyValue) => {
-                            deleteCacheKeyValue.mutate({
-                              workflowPermanentId: workflowPermanentId!,
-                              cacheKeyValue,
-                            });
-                          }}
-                          onPaginate={(page) => {
-                            setPage(page);
-                          }}
-                          onSelect={(cacheKeyValue) => {
-                            setExplicitCacheKeyValue(cacheKeyValue);
-                            setCacheKeyValueFilter("");
-                            closeWorkflowPanel();
-                          }}
-                        />
-                      )}
-                    {!embedded &&
                       workflowPanelState.content === "parameters" && (
                         <div className="z-30">
                           <WorkflowParametersPanel />
@@ -3069,29 +2753,6 @@ function Workspace({
                 opacity: headerCollapsed ? 0 : 1,
               }}
             >
-              {!embedded && workflowPanelState.content === "cacheKeyValues" && (
-                <WorkflowCacheKeyValuesPanel
-                  cacheKeyValues={cacheKeyValues}
-                  pending={cacheKeyValuesLoading}
-                  scriptKey={workflow.cache_key ?? "default"}
-                  filter={cacheKeyValueFilter ?? undefined}
-                  onFilterChange={setCacheKeyValueFilter}
-                  onDelete={(cacheKeyValue) => {
-                    deleteCacheKeyValue.mutate({
-                      workflowPermanentId: workflowPermanentId!,
-                      cacheKeyValue,
-                    });
-                  }}
-                  onPaginate={(page) => {
-                    setPage(page);
-                  }}
-                  onSelect={(cacheKeyValue) => {
-                    setExplicitCacheKeyValue(cacheKeyValue);
-                    setCacheKeyValueFilter("");
-                    closeWorkflowPanel();
-                  }}
-                />
-              )}
               {workflowPanelState.content === "parameters" && (
                 <WorkflowParametersPanel />
               )}
@@ -3111,7 +2772,7 @@ function Workspace({
           </>
         )}
 
-      {/* code, infinite canvas, browser, timeline, and node library sub panel when in debug mode */}
+      {/* infinite canvas, browser, timeline, and node library sub panel when in debug mode */}
       {showBrowser && !workflowPanelState.data?.showComparison && (
         <div className="relative flex h-full w-full overflow-hidden overflow-x-hidden">
           <Splitter
@@ -3121,51 +2782,11 @@ function Workspace({
             split={{ left: workflowWidth }}
             onResize={() => setContainerResizeTrigger((prev) => prev + 1)}
           >
-            {/* code + canvas; recording overlays the panel without unmounting FlowRenderer */}
+            {/* canvas; recording overlays the panel without unmounting FlowRenderer */}
             <div className="relative h-full w-full">
-              <div
-                className={cn(
-                  "skyvern-split-left flex h-full w-[200%] translate-x-[-50%] transition-none duration-300",
-                  {
-                    "w-[100%] translate-x-0":
-                      leftSideLayoutMode === "side-by-side",
-                  },
-                  {
-                    "translate-x-0": showAllCode,
-                  },
-                )}
-                ref={dom.splitLeft}
-              >
-                {/* code */}
-                <div
-                  className={cn("h-full w-[50%]", {
-                    "w-[0%]":
-                      leftSideLayoutMode === "side-by-side" && !showAllCode,
-                  })}
-                >
-                  <div className="relative mt-[8.5rem] w-full p-6 pr-5 pt-0">
-                    <div className="absolute right-[2rem] top-[0.75rem] z-20">
-                      <CopyAndExplainCode code={code} />
-                    </div>
-                    <CodeEditor
-                      className={cn("w-full overflow-y-scroll", {
-                        "animate-pulse": isGeneratingCode,
-                      })}
-                      language="python"
-                      value={isGeneratingCode ? codePending : code}
-                      lineWrap={false}
-                      readOnly
-                      fontSize={10}
-                    />
-                  </div>
-                </div>
+              <div className="flex h-full w-full">
                 {/* infinite canvas */}
-                <div
-                  className={cn("relative h-full w-[50%]", {
-                    "w-[100%]":
-                      leftSideLayoutMode === "side-by-side" && !showAllCode,
-                  })}
-                >
+                <div className="relative h-full w-full">
                   <FlowRenderer
                     showZoomControls={false}
                     nodes={nodes}
@@ -3676,41 +3297,6 @@ function Workspace({
         <AffectedBlocksNotice affectedBlocks={affectedBlocksForDelete} />
       </ConfirmDialog>
 
-      {/* Studio: the cache key/value panel escapes the Editor pane via the
-          shell-level portal, so the Overview pane's Code view can open it (and
-          close it) even with the Editor pane hidden. */}
-      {embedded ? (
-        <StudioShellPanelPortal
-          open={
-            workflowPanelState.active &&
-            workflowPanelState.content === "cacheKeyValues"
-          }
-          onDismiss={closeWorkflowPanel}
-        >
-          <WorkflowCacheKeyValuesPanel
-            cacheKeyValues={cacheKeyValues}
-            pending={cacheKeyValuesLoading}
-            scriptKey={workflow.cache_key ?? "default"}
-            filter={cacheKeyValueFilter ?? undefined}
-            onFilterChange={setCacheKeyValueFilter}
-            onClose={closeWorkflowPanel}
-            onDelete={(cacheKeyValue) => {
-              deleteCacheKeyValue.mutate({
-                workflowPermanentId: workflowPermanentId!,
-                cacheKeyValue,
-              });
-            }}
-            onPaginate={(page) => {
-              setPage(page);
-            }}
-            onSelect={(cacheKeyValue) => {
-              setExplicitCacheKeyValue(cacheKeyValue);
-              setCacheKeyValueFilter("");
-              closeWorkflowPanel();
-            }}
-          />
-        </StudioShellPanelPortal>
-      ) : null}
       {/* Studio: Code mode swaps the Editor pane's content (sibling panes stay
           usable); legacy keeps the original full-screen modal overlay. */}
       {yamlEditorActive
@@ -3726,4 +3312,4 @@ function Workspace({
   );
 }
 
-export { CopyAndExplainCode, Workspace };
+export { Workspace };

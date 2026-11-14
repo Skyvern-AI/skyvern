@@ -36,14 +36,6 @@ vi.mock("./WorkflowSettingsEditor", () => ({
   WorkflowSettingsEditor: () => <div data-testid="workflow-settings-editor" />,
 }));
 
-vi.mock("@/routes/workflows/hooks/useToggleScriptForNodeCallback", () => ({
-  useToggleScriptForNodeCallback: () => vi.fn(),
-}));
-
-vi.mock("@/routes/workflows/components/BlockCodeEditor", () => ({
-  BlockCodeEditor: () => null,
-}));
-
 const startNodeData: WorkflowStartNodeData = {
   withWorkflowSettings: true,
   webhookCallbackUrl: "",
@@ -75,7 +67,6 @@ const startNodeData: WorkflowStartNodeData = {
   errorCodeMapping: null,
   retryPolicy: null,
   label: "__start_block__",
-  showCode: false,
 };
 
 type StartNodeComponentProps = {
@@ -165,20 +156,6 @@ describe("StartNode inputs summary", () => {
       active: true,
       content: "parameters",
     });
-  });
-
-  test("the flipped code view takes the Inputs controls out of reach", () => {
-    // Flippable only turns the front face away, so without inert a keyboard
-    // user could tab to the invisible Add and open the panel over the script.
-    // Exactly one face is inert either way, so the visible one never is.
-    const flipped = renderStartNode({ showCode: true });
-    expect(screen.getByText("Add").closest("[inert]")).not.toBeNull();
-    expect(flipped.container.querySelectorAll("[inert]")).toHaveLength(1);
-
-    cleanup();
-    const front = renderStartNode();
-    expect(screen.getByText("Add").closest("[inert]")).toBeNull();
-    expect(front.container.querySelectorAll("[inert]")).toHaveLength(1);
   });
 
   test("a long input name is cut in the sentence but kept for assistive tech", () => {
