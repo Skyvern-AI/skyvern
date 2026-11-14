@@ -12,6 +12,7 @@ from oauthlib.oauth2 import InvalidGrantError, OAuth2Error
 
 from skyvern.forge import app
 from skyvern.forge.agent_functions import record_request_audit_event
+from skyvern.forge.sdk.integrations.catalog import has_native_gmail_credential
 from skyvern.forge.sdk.schemas.google_oauth import (
     CreateGoogleOAuthAuthorizeRequest,
     CreateGoogleOAuthCallbackRequest,
@@ -25,13 +26,22 @@ from skyvern.forge.sdk.schemas.google_oauth import (
     UpdateGoogleOAuthCredentialRequest,
 )
 from skyvern.forge.sdk.schemas.organizations import Organization
-from skyvern.forge.sdk.services import google_gmail_service, google_oauth_service, org_auth_service
+from skyvern.forge.sdk.services import (
+    google_gmail_service,
+    google_oauth_service,
+    oauth_redirect_uri,
+    org_auth_service,
+)
 from skyvern.forge.sdk.services.google_oauth_service import InvalidAppOriginError
 from skyvern.forge.sdk.services.route_authorization import require_request_actions
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.utils.email_validation import normalize_email_address
 
 LOG = structlog.get_logger()
+REDIRECT_URIS_REQUIRED_MESSAGE = (
+    "Enter the exact redirect URIs registered for this Google OAuth client, for example "
+    "https://app.example.com/integrations/google/callback. Host-only redirect entries are no longer accepted."
+)
 
 google_oauth_router = APIRouter()
 
@@ -128,6 +138,34 @@ def _require_scopes_from_token(token_data: dict) -> list[str]:
     return parts
 
 
+CONNECTED_GMAIL_DEFAULT_MESSAGE = "New Gmail connections use Connected Gmail. Connect Gmail from the Integrations page."
+_GMAIL_SCOPE_PROFILES = frozenset(
+    {
+        google_oauth_service.GOOGLE_OAUTH_SCOPE_PROFILE_GMAIL,
+        google_oauth_service.GOOGLE_OAUTH_SCOPE_PROFILE_GMAIL_SEND,
+        google_oauth_service.GOOGLE_OAUTH_SCOPE_PROFILE_GMAIL_READ_SEND,
+    }
+)
+
+
+async def _connected_gmail_replaces_new_native_gmail(
+    request: CreateGoogleOAuthAuthorizeRequest, organization_id: str, user_id: str | None
+) -> bool:
+    # Connected Gmail is per user, so a caller with no user keeps the native path as its only way to add Gmail.
+    if request.credential_id is not None or request.scope_profile not in _GMAIL_SCOPE_PROFILES or user_id is None:
+        return False
+    try:
+        if not await app.AGENT_FUNCTION.nango_gmail_catalog_available(organization_id):
+            return False
+    except Exception:  # noqa: BLE001 - an unknown availability keeps the native path open.
+        return False
+    try:
+        credentials = await google_oauth_service.get_visible_credentials_for_org(organization_id)
+    except Exception:  # noqa: BLE001 - as on the page, an unreadable native list keeps the native path open.
+        return False
+    return not has_native_gmail_credential(credentials)
+
+
 @google_oauth_router.post("/oauth/authorize")
 async def google_oauth_authorize(
     request: CreateGoogleOAuthAuthorizeRequest,
@@ -136,6 +174,8 @@ async def google_oauth_authorize(
     _request_authorization: None = Depends(require_request_actions(frozenset({"google_oauth.authorize"}))),
 ) -> GoogleOAuthAuthorizeResponse:
     """Kick off the Google OAuth 2.0 authorization flow."""
+    if await _connected_gmail_replaces_new_native_gmail(request, current_org.organization_id, current_user_id):
+        raise HTTPException(status_code=409, detail=CONNECTED_GMAIL_DEFAULT_MESSAGE)
     try:
         start = await google_oauth_service.start_authorization(
             organization_id=current_org.organization_id,
@@ -378,6 +418,12 @@ async def update_google_oauth_client_config(
 ) -> GoogleOAuthClientConfigResponse:
     """Store an organization-level Google OAuth client configuration."""
     _require_organization_client_config_enabled()
+    if not request.redirect_uris:
+        raise HTTPException(status_code=400, detail=REDIRECT_URIS_REQUIRED_MESSAGE)
+    for redirect_uri in request.redirect_uris:
+        rejection = oauth_redirect_uri.registration_rejection(redirect_uri)
+        if rejection:
+            raise HTTPException(status_code=422, detail=f"Invalid redirect URI {redirect_uri}: {rejection}")
     try:
         resolved = await google_oauth_service.resolve_client_config(current_org.organization_id)
     except google_oauth_service.OrganizationClientConfigUnavailableError:
@@ -397,7 +443,7 @@ async def update_google_oauth_client_config(
     config = GoogleOAuthClientConfig(
         client_id=request.client_id,
         client_secret=client_secret,
-        redirect_hosts=request.redirect_hosts,
+        redirect_uris=request.redirect_uris,
         app_origins=request.app_origins,
     )
     try:

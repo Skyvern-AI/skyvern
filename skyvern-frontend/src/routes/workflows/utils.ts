@@ -4,7 +4,6 @@ import { ProxyLocation } from "@/api/types";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import type { Parameter, WorkflowParameter } from "./types/workflowTypes";
-import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 
 type Location = ReturnType<typeof useLocation>;
 
@@ -308,32 +307,6 @@ export const getInitialValues = (
   );
 };
 
-export const getOrderedBlockLabels = (workflow?: WorkflowApiResponse) => {
-  if (!workflow) {
-    return [];
-  }
-
-  const blockLabels = workflow.workflow_definition.blocks.map(
-    (block) => block.label,
-  );
-
-  return blockLabels;
-};
-
-export const shouldPollForGeneratedCode = (
-  workflow: WorkflowApiResponse | undefined,
-  isFinalized: boolean | null,
-  hasPublishedCode: boolean,
-) =>
-  !isFinalized &&
-  !hasPublishedCode &&
-  Boolean(
-    workflow?.workflow_definition.blocks.some(
-      (block) =>
-        block.label !== workflow.workflow_definition.finally_block_label,
-    ),
-  );
-
 /**
  * Returns run parameter entries ordered by the workflow definition's parameter array,
  * each paired with its matched workflow-parameter definition (undefined when absent).
@@ -374,30 +347,3 @@ export function getOrderedRunParameters(
 
   return ordered;
 }
-
-export const getCode = (
-  orderedBlockLabels: string[],
-  blockScripts?: {
-    [blockName: string]: string;
-  },
-): string[] => {
-  const blockCode: string[] = [];
-  const startBlockCode = blockScripts?.__start_block__;
-
-  if (startBlockCode) {
-    blockCode.push(startBlockCode);
-  }
-
-  for (const blockLabel of orderedBlockLabels) {
-    const code = blockScripts?.[blockLabel];
-
-    if (!code) {
-      continue;
-    }
-
-    blockCode.push(`${code}
-`);
-  }
-
-  return blockCode;
-};

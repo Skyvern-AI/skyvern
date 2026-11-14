@@ -23,7 +23,14 @@ from skyvern.forge.sdk.workflow.models.block import (
     sanitize_filename,
 )
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE
-from skyvern.schemas.emails import GmailHopRefusal
+from skyvern.schemas.emails import (
+    CONNECTED_ACCOUNT_COPILOT_TEST_RUN_REASON,
+    CONNECTED_ACCOUNT_IN_CREDENTIAL_ID_REASON,
+    CONNECTED_ACCOUNT_OWNER_UNCONFIRMED_REASON,
+    CONNECTED_ACCOUNT_RESAVE_REASON,
+    GmailHopRefusal,
+    is_connected_gmail_id,
+)
 from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType
 from skyvern.services import email
 from skyvern.services.email.gmail import _message_from_gmail
@@ -393,15 +400,28 @@ class EmailInboxBlock(Block):
                         status=404, code="integration_unavailable", message="Gmail integration unavailable"
                     )
                 assert folder_used is not None
-                if (
-                    not workflow_run_context.get_gmail_hop_token(self.label)
-                    and workflow_run_context.get_gmail_hop_refusal(self.label) == GmailHopRefusal.reconnect
-                ):
-                    raise email.GmailAPIError(
-                        status=403,
-                        code="reconnect_required",
-                        message="reconnect it on the Integrations page, then select it again in this block",
-                    )
+                if not workflow_run_context.get_gmail_hop_token(self.label):
+                    refusal = workflow_run_context.get_gmail_hop_refusal(self.label)
+                    if refusal == GmailHopRefusal.reconnect:
+                        raise email.GmailAPIError(
+                            status=403,
+                            code="reconnect_required",
+                            message="reconnect it on the Integrations page, then select it again in this block",
+                        )
+                    if refusal == GmailHopRefusal.resave_required:
+                        raise email.GmailAPIError(
+                            status=403, code="resave_required", message=CONNECTED_ACCOUNT_RESAVE_REASON
+                        )
+                    if refusal == GmailHopRefusal.owner_unconfirmed:
+                        raise email.GmailAPIError(
+                            status=403, code="owner_unconfirmed", message=CONNECTED_ACCOUNT_OWNER_UNCONFIRMED_REASON
+                        )
+                    if refusal == GmailHopRefusal.copilot_test_run:
+                        raise email.GmailAPIError(
+                            status=403,
+                            code="copilot_test_run_unsupported",
+                            message=CONNECTED_ACCOUNT_COPILOT_TEST_RUN_REASON,
+                        )
                 data = await app.AGENT_FUNCTION.execute_gmail_inbox_for_run(
                     organization_id=effective_org_id,
                     workflow_run_id=workflow_run_id,
@@ -439,6 +459,12 @@ class EmailInboxBlock(Block):
                         required_scopes=["Mail.Read"],
                     )
                     reconnect_label = "Outlook"
+                if not access_token and self.email_client == "gmail" and is_connected_gmail_id(self.credential_id):
+                    return await self._failure(
+                        failure_reason=CONNECTED_ACCOUNT_IN_CREDENTIAL_ID_REASON,
+                        workflow_run_block_id=workflow_run_block_id,
+                        organization_id=organization_id,
+                    )
                 if not access_token:
                     return await self._failure(
                         failure_reason=f"Reconnect the {reconnect_label} account: no valid access token",
@@ -573,6 +599,8 @@ class EmailInboxBlock(Block):
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, error_data)
         if exc.code == "reconnect_required":
             failure_reason = f"Reconnect the {provider} account: {exc.message}"
+        elif exc.code in {"resave_required", "owner_unconfirmed"}:
+            failure_reason = exc.message
         else:
             failure_reason = f"{provider} email fetch failed (HTTP {exc.status}): {exc.message}"
         return await self._failure(

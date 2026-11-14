@@ -1,10 +1,11 @@
 import ipaddress
+import re
 import socket
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from http import HTTPStatus
 from typing import Annotated, Any
-from urllib.parse import parse_qsl, quote, urljoin, urlparse, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlparse, urlsplit, urlunsplit
 
 import httpx
 from pydantic import AfterValidator, AnyHttpUrl, HttpUrl, ValidationError, ValidationInfo
@@ -54,7 +55,11 @@ def strip_query_params(url: str) -> str:
 
 
 def redact_url_query(url: str) -> str:
-    """Remove the query string while preserving the other URL components."""
+    """Remove the query string while preserving the other URL components.
+
+    A URL the stdlib refuses to split (an unterminated IPv6 literal, say) is dropped whole: the
+    query is the part that must not be written down, so failing to locate it cannot mean logging it.
+    """
     try:
         parsed = urlsplit(url)
     except ValueError:
@@ -545,3 +550,43 @@ def encode_url(url: str) -> str:
     parts[2] = quote(parts[2], safe="/%")
     parts[3] = quote(parts[3], safe="=&/%")
     return urlunsplit(parts)
+
+
+_SENSITIVE_URL_QUERY_RE = re.compile(
+    r"(?:password|passwd|token|secret|api[_-]?key|credential|auth|session|cookie)", re.I
+)
+
+
+def scrub_url_for_code_literal(url: str) -> str:
+    try:
+        parts = urlsplit(url)
+        hostname = parts.hostname
+        port = parts.port
+    except ValueError:
+        return url
+    if not parts.scheme or not parts.netloc or hostname is None:
+        return url
+
+    netloc = hostname
+    if ":" in netloc and not netloc.startswith("["):
+        netloc = f"[{netloc}]"
+    if port is not None:
+        netloc = f"{netloc}:{port}"
+
+    query = urlencode(
+        [
+            (key, "__redacted__" if _SENSITIVE_URL_QUERY_RE.search(key) else value)
+            for key, value in parse_qsl(parts.query, keep_blank_values=True)
+        ],
+        doseq=True,
+    )
+    fragment = parts.fragment
+    fragment_pairs = parse_qsl(fragment, keep_blank_values=True) if "=" in fragment or "&" in fragment else []
+    if fragment_pairs:
+        fragment = urlencode(
+            [(key, "__redacted__" if _SENSITIVE_URL_QUERY_RE.search(key) else value) for key, value in fragment_pairs],
+            doseq=True,
+        )
+    elif fragment and _SENSITIVE_URL_QUERY_RE.search(fragment):
+        fragment = "__redacted__"
+    return urlunsplit((parts.scheme, netloc, parts.path, query, fragment))

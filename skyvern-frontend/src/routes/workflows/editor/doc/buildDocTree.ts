@@ -2,6 +2,7 @@ import type { Edge, Node } from "@xyflow/react";
 import {
   BranchCriteriaTypes,
   type BranchCondition,
+  type WorkflowBlockImage,
 } from "../../types/workflowTypes";
 import {
   edgeBelongsToScope,
@@ -302,31 +303,28 @@ export function buildDocTree(
     );
   }
 
+  // A note line with screenshots under it stays on screen when its text is empty, so the screenshots do too.
   function withNotes(node: Node, item: DocItem): DocItem[] {
-    const above = text(node.data.notes);
-    const trailing = text(node.data.trailingNotes);
+    const images = Array.isArray(node.data.docImages)
+      ? (node.data.docImages as WorkflowBlockImage[])
+      : [];
+    const note = (placement: "above" | "trailing", value: unknown) => {
+      const noteText = text(value);
+      return noteText || images.some((i) => i.placement === placement)
+        ? [
+            {
+              kind: "note",
+              ownerNodeId: node.id,
+              placement,
+              text: noteText ?? "",
+            } as const,
+          ]
+        : [];
+    };
     return [
-      ...(above
-        ? [
-            {
-              kind: "note",
-              ownerNodeId: node.id,
-              placement: "above",
-              text: above,
-            } as const,
-          ]
-        : []),
+      ...note("above", node.data.notes),
       item,
-      ...(trailing
-        ? [
-            {
-              kind: "note",
-              ownerNodeId: node.id,
-              placement: "trailing",
-              text: trailing,
-            } as const,
-          ]
-        : []),
+      ...note("trailing", node.data.trailingNotes),
     ];
   }
 

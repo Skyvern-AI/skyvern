@@ -18,6 +18,7 @@ from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.custom_llm_registry import is_custom_llm_key
 
 EVAL_LLM_OVERRIDES_HEADER = "x-copilot-eval-llm-overrides"
+EMBER_EVAL_LLM_OVERRIDES_HEADER = "x-ember-eval-llm-overrides"
 EVAL_LLM_PROMPT_TYPES = frozenset({"workflow-copilot", "workflow-copilot-fast", "workflow-copilot-raw-secret-safety"})
 MAX_EVAL_LLM_OVERRIDES_BYTES = 2048
 _CONFIG_KEY = re.compile(r"[A-Za-z0-9_.:/-]{1,160}")

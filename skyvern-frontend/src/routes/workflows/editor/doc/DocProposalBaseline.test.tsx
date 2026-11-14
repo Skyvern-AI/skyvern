@@ -4,7 +4,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { parse as parseYaml } from "yaml";
 import * as axiosClient from "@/api/AxiosClient";
-import { useCopilotProposalStore } from "@/store/CopilotProposalStore";
+import { useEmberProposalStore } from "@/store/EmberProposalStore";
 import {
   useWorkflowHasChangesStore,
   type WorkflowSaveData,
@@ -57,7 +57,7 @@ beforeEach(() => {
 });
 afterEach(() => {
   cleanup();
-  useCopilotProposalStore.getState().setProposal(null);
+  useEmberProposalStore.getState().setProposal(null);
   vi.restoreAllMocks();
 });
 
@@ -78,7 +78,7 @@ async function renderProposal(block = step()) {
         settings: { proxyLocation: "RESIDENTIAL", runWith: "agent" },
       }) as unknown as WorkflowSaveData,
   });
-  useCopilotProposalStore.getState().setProposal({
+  useEmberProposalStore.getState().setProposal({
     proposed,
     baseline: null,
     review: null,
@@ -158,7 +158,7 @@ it("gates only Doc Accept while conversion is pending", async () => {
     (screen.getByRole("button", { name: "Reject" }) as HTMLButtonElement)
       .disabled,
   ).toBe(false);
-  expect(useCopilotProposalStore.getState().proposal?.acceptable).toBe(true);
+  expect(useEmberProposalStore.getState().proposal?.acceptable).toBe(true);
   await act(async () =>
     resolve({
       data: { workflow_definition: workflow(step()).workflow_definition },
@@ -185,8 +185,8 @@ it("shows a conversion error without blocking the chat settlement path", async (
     (screen.getByRole("button", { name: "Reject" }) as HTMLButtonElement)
       .disabled,
   ).toBe(false);
-  expect(useCopilotProposalStore.getState().proposal?.acceptable).toBe(true);
-  await useCopilotProposalStore.getState().proposal!.decide("approve");
+  expect(useEmberProposalStore.getState().proposal?.acceptable).toBe(true);
+  await useEmberProposalStore.getState().proposal!.decide("approve");
   expect(decide).toHaveBeenCalledWith("approve");
 });
 
@@ -207,9 +207,9 @@ it("keeps the converted baseline when the chat republishes the same proposal wit
   await renderProposal();
   expect(post).toHaveBeenCalledOnce();
 
-  const current = useCopilotProposalStore.getState().proposal!;
+  const current = useEmberProposalStore.getState().proposal!;
   await act(async () => {
-    useCopilotProposalStore
+    useEmberProposalStore
       .getState()
       .setProposal({ ...current, actionable: false, acceptable: false });
   });

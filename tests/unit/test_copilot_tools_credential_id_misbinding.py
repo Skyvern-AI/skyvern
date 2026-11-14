@@ -13,10 +13,9 @@ from skyvern.forge.sdk.copilot.tools import (
     _update_workflow,
 )
 from skyvern.forge.sdk.copilot.tools.credentials import (
-    _google_connection_reference_ids,
     bitwarden_binding_change_error,
 )
-from skyvern.forge.sdk.copilot.workflow_credential_utils import bitwarden_secret_bindings
+from skyvern.forge.sdk.copilot.workflow_credential_utils import bitwarden_secret_bindings, workflow_connection_refs
 from tests.unit.conftest import ORG_VAULT_ITEM_ID
 
 
@@ -692,7 +691,7 @@ async def test_update_workflow_refuses_a_new_bitwarden_parameter() -> None:
     assert result["error"] == bitwarden_binding_change_error(_LITERAL_BINDING, ctx.request_policy)
 
 
-def test_a_bitwarden_login_parameter_does_not_back_a_google_sheets_connection_slot() -> None:
+def test_a_bitwarden_login_parameter_does_not_back_a_connected_account_slot() -> None:
     definition = {
         "parameters": [
             {
@@ -704,4 +703,4 @@ def test_a_bitwarden_login_parameter_does_not_back_a_google_sheets_connection_sl
         "blocks": [{"block_type": "google_sheets_read", "label": "read_sheet", "credential_id": "{{ portal_login }}"}],
     }
 
-    assert _google_connection_reference_ids(definition, None) == ["{{ portal_login }}"]
+    assert workflow_connection_refs({"workflow_definition": definition}) == ["{{ portal_login }}"]

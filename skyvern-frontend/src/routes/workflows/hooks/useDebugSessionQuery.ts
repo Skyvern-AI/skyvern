@@ -3,12 +3,29 @@ import { isForbiddenError } from "@/api/forbidden";
 import { isPaymentRequiredError } from "@/api/paymentRequired";
 import { DebugSessionApiResponse } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { useQuery } from "@tanstack/react-query";
+import { QueryClient, useQuery } from "@tanstack/react-query";
 import { waitForBrowserSessionPrewarm } from "@/routes/tasks/create/useBrowserSessionPrewarm";
 
 const DEBUG_SESSION_KEEP_ALIVE_INTERVAL_MS = 5 * 60 * 1000;
 const DEBUG_SESSION_ERROR_REFETCH_INTERVAL_MS = 30 * 1000;
 const DEBUG_SESSION_MAX_RETRIES = 3;
+
+// The GET is the source of truth, so a caller without the new session still refetches it.
+export function adoptDebugSession(
+  queryClient: QueryClient,
+  workflowPermanentId: string | undefined,
+  debugSession?: DebugSessionApiResponse,
+) {
+  if (debugSession) {
+    queryClient.setQueryData(
+      ["debugSession", workflowPermanentId],
+      debugSession,
+    );
+  }
+  void queryClient.invalidateQueries({
+    queryKey: ["debugSession", workflowPermanentId],
+  });
+}
 
 type DebugSessionRefetchState = {
   status: "pending" | "error" | "success";

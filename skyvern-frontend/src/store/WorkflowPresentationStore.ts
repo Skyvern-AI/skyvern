@@ -11,23 +11,27 @@ type WorkflowPresentationStore = {
   setDocMounted: (mounted: boolean) => void;
   syncScope: (workflowPermanentId: string | null, enabled: boolean) => void;
   setPresentation: (presentation: WorkflowPresentation) => void;
+  // True when it switched the Doc to Visual.
+  showVisualUnremembered: () => boolean;
+  restoreView: () => void;
 };
 
 const storageKey = (workflowPermanentId: string) =>
   `skyvern.workflowPresentation.${workflowPermanentId}`;
 
+// With nothing stored (or storage unreadable) an agent opens in the Doc.
 function readStored(workflowPermanentId: string | null): WorkflowPresentation {
   if (!workflowPermanentId) return "visual";
   try {
-    return localStorage.getItem(storageKey(workflowPermanentId)) === "doc"
-      ? "doc"
-      : "visual";
+    return localStorage.getItem(storageKey(workflowPermanentId)) === "visual"
+      ? "visual"
+      : "doc";
   } catch {
-    return "visual";
+    return "doc";
   }
 }
 
-// An agent born from a demonstration opens in the Doc the first time; any later choice replaces this.
+// An agent born from a demonstration is pinned to the Doc; any later choice replaces this.
 export function openNewAgentInDoc(workflowPermanentId: string) {
   writeStored(workflowPermanentId, "doc");
 }
@@ -63,7 +67,7 @@ export const useWorkflowPresentationStore = create<WorkflowPresentationStore>(
       set({
         workflowPermanentId,
         enabled,
-        // Only an agent whose Doc is available reopens in the Doc; with the flag off it is always Visual.
+        // With the Doc unavailable (flag off, region, kill switch) every agent is Visual.
         presentation: enabled ? readStored(workflowPermanentId) : "visual",
         generation: state.generation + 1,
       });
@@ -73,6 +77,19 @@ export const useWorkflowPresentationStore = create<WorkflowPresentationStore>(
       const next = presentation === "doc" && !enabled ? "visual" : presentation;
       set({ presentation: next });
       if (enabled) writeStored(workflowPermanentId, next);
+    },
+    // Only a person's click on a view is remembered; this switch lasts until restoreView.
+    showVisualUnremembered: () => {
+      const switched = get().presentation === "doc";
+      if (switched) set({ presentation: "visual" });
+      return switched;
+    },
+    // The person's remembered view, or the default, again.
+    restoreView: () => {
+      const { enabled, workflowPermanentId } = get();
+      set({
+        presentation: enabled ? readStored(workflowPermanentId) : "visual",
+      });
     },
   }),
 );

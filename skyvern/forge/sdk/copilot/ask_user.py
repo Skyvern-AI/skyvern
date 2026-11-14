@@ -11,12 +11,12 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
 
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.human_input_wait import pause_human_input
-from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_text
 from skyvern.forge.sdk.schemas.credentials import CredentialType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.workflow_run_groups import WorkflowRunGroupItemOutcome
 from skyvern.utils.contained_effects import contained_effect
+from skyvern.utils.raw_secret_redaction import redact_raw_secrets_for_prompt
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.context import CopilotContext
@@ -89,6 +89,7 @@ ACCOUNT_GROUP_SUBMIT_TOOL_NAME = "run_workflow_for_accounts"
 ACCOUNT_GROUP_STATUS_TOOL_NAME = "get_account_group_status"
 ACCOUNT_GROUP_CANCEL_TOOL_NAME = "cancel_account_group"
 SINGLE_RUN_TOOL_NAME = "run_saved_workflow"
+ASK_USER_TOOL_NAME = "ask_user"
 
 REPEAT_RISK_OUTCOMES = (
     WorkflowRunGroupItemOutcome.completed,
@@ -115,6 +116,31 @@ class AccountGroupRow(BaseModel):
     parameter_key: str | None = Field(default=None, exclude_if=lambda key: key is None)
 
 
+class RunCostFacts(BaseModel):
+    runs_to_start: int | None = Field(default=None, exclude_if=lambda count: count is None)
+    based_on_run_id: str | None = Field(default=None, exclude_if=lambda run_id: run_id is None)
+    based_on_credits: int | None = Field(default=None, exclude_if=lambda credits: credits is None)
+    blocks_completed: int | None = Field(default=None, exclude_if=lambda count: count is None)
+    blocks_total: int | None = Field(default=None, exclude_if=lambda count: count is None)
+    estimate_from_one_run: int | None = Field(default=None, exclude_if=lambda credits: credits is None)
+    balance_credits: int | None = Field(default=None, exclude_if=lambda credits: credits is None)
+    credits_note: str | None = Field(default=None, exclude_if=lambda note: note is None)
+    stop_rule: str | None = Field(default=None, exclude_if=lambda rule: rule is None)
+
+    def for_runs(self, count: int) -> RunCostFacts:
+        if self.runs_to_start is None:
+            return self
+        estimate = (
+            count * self.based_on_credits
+            if self.estimate_from_one_run is not None and self.based_on_credits is not None
+            else None
+        )
+        return self.model_copy(update={"runs_to_start": count, "estimate_from_one_run": estimate})
+
+    def not_started(self) -> RunCostFacts:
+        return self.model_copy(update={"runs_to_start": None, "estimate_from_one_run": None})
+
+
 class AccountGroupReview(BaseModel):
     workflow_permanent_id: str
     workflow_id: str
@@ -128,6 +154,22 @@ class AccountGroupReview(BaseModel):
     single_run: bool = Field(default=False, exclude_if=lambda single_run: not single_run)
     credential_inputs: dict[str, str] = Field(default_factory=dict, exclude_if=lambda inputs: not inputs)
     workflow_run_id: str | None = Field(default=None, exclude_if=lambda run_id: run_id is None)
+    # A single run that first saves the chat's unsaved draft, bound to the proposal token the user reviewed.
+    saves_draft: bool = Field(default=False, exclude_if=lambda saves_draft: not saves_draft)
+    proposal_owner_turn_id: str | None = Field(default=None, exclude_if=lambda turn_id: turn_id is None)
+    proposal_revision: int | None = Field(default=None, exclude_if=lambda revision: revision is None)
+    draft_tested: bool = Field(default=False, exclude_if=lambda tested: not tested)
+    tested_workflow_run_id: str | None = Field(default=None, exclude_if=lambda run_id: run_id is None)
+    cost: RunCostFacts | None = Field(default=None, exclude_if=lambda cost: cost is None)
+    # On the card only: the tool results copy `cost`, never these values.
+    based_on_inputs: dict[str, JsonValue] | None = Field(default=None, exclude_if=lambda inputs: inputs is None)
+    saved_workflow_id: str | None = Field(default=None, exclude_if=lambda workflow_id: workflow_id is None)
+    saved_version: int | None = Field(default=None, exclude_if=lambda version: version is None)
+    run_started: bool | None = Field(default=None, exclude_if=lambda started: started is None)
+    # The version an Accept of this card's exact proposal token saved while the card waited.
+    accepted_workflow_id: str | None = Field(default=None, exclude_if=lambda workflow_id: workflow_id is None)
+    accepted_version: int | None = Field(default=None, exclude_if=lambda version: version is None)
+    accepted_modified_at: datetime | None = Field(default=None, exclude_if=lambda modified_at: modified_at is None)
     clean_group_run_id: str | None = None
     credential_parameter_used_by: list[str] = Field(default_factory=list)
     rows: list[AccountGroupRow]
@@ -266,16 +308,20 @@ class QuestionInteraction(BaseModel):
         if self.account_group_review is not None and self.account_group_review.single_run:
             decision = self.account_group_decision
             approved = decision is not None and decision.approved
-            run_id = self.account_group_review.workflow_run_id
-            return {
+            review = self.account_group_review
+            run_id = review.workflow_run_id
+            result: dict[str, Any] = {
                 "ok": True,
                 "interaction_id": self.interaction_id,
                 "tool_call_id": self.tool_call_id,
                 "approved": approved,
                 # The link is written before the run is created, so a linked run may not exist.
-                "dispatched": None if run_id is not None else False,
+                "dispatched": True if review.run_started else None if run_id is not None else False,
                 "workflow_run_id": run_id,
             }
+            if review.saved_version is not None:
+                result["saved_version"] = review.saved_version
+            return result
         if self.account_group_review is not None:
             decision = self.account_group_decision
             approved_ids = decision.credential_ids if decision is not None and decision.approved else []
@@ -563,6 +609,7 @@ async def wait_for_interaction(ctx: CopilotContext, interaction: QuestionInterac
                     "type": "question_required",
                     "turn_id": ctx.turn_id,
                     "workflow_copilot_chat_id": chat_id,
+                    "ember_chat_id": chat_id,
                     "interactions": [interaction.model_dump(mode="json")],
                     "cancel_token": ctx.copilot_cancel_token,
                 }

@@ -897,6 +897,7 @@ class WorkflowRunGroupModel(Base):
     status = Column(String, nullable=False, default="active")
     created_by = Column(String, nullable=True)
     requested_by = Column(String, nullable=True)
+    max_concurrency = Column(Integer, nullable=True, server_default="1")
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,
@@ -2303,6 +2304,7 @@ class WorkflowCopilotChatModel(Base):
     auto_accept = Column(Boolean, nullable=True, default=False)
     pending_turns = Column(JSON, nullable=True)
     work_plan = Column(JSON, nullable=True)
+    accepted_tested_run = Column(JSON, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(

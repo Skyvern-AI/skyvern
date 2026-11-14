@@ -1,4 +1,4 @@
-import type { CopilotProposalMetadata } from "../copilot/workflowCopilotTypes";
+import type { EmberProposalMetadata } from "../ember/emberTypes";
 import type {
   WorkflowApiResponse,
   WorkflowSettings,
@@ -7,7 +7,7 @@ import type {
 import type { Edge } from "@xyflow/react";
 import type { AppNode } from "./nodes";
 import type { ParametersState } from "./types";
-import type { CopilotReviewStatus } from "./panels/WorkflowComparisonPanel";
+import type { EmberReviewStatus } from "./panels/WorkflowComparisonPanel";
 import type { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import type { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import type { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
@@ -38,10 +38,10 @@ export type RestoreResult =
   | "refused-locked"
   | "refused-stale-workflow";
 
-export function bindCopilotReviewClose(
+export function bindEmberReviewClose(
   reject: () => Promise<boolean>,
-  close: (status: CopilotReviewStatus) => void | Promise<void>,
-): (status: CopilotReviewStatus) => Promise<void> {
+  close: (status: EmberReviewStatus) => void | Promise<void>,
+): (status: EmberReviewStatus) => Promise<void> {
   return async (status) => {
     if (status === "reject" && !(await reject())) return;
     await close(status);
@@ -116,12 +116,12 @@ export function restoreEditorState(
   deps.scheduleLayout();
   return "restored";
 }
-export type CopilotAcceptSnapshot = {
+export type EmberAcceptSnapshot = {
   workflowPermanentId: string;
   chatId: string;
   acceptChatId: string;
   acceptAttempt: Pick<
-    CopilotProposalMetadata,
+    EmberProposalMetadata,
     "owner_turn_id" | "revision" | "disposition"
   > | null;
   baseline?: WorkflowApiResponse;

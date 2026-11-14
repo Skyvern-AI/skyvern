@@ -33,6 +33,7 @@ from PIL import Image
 from playwright.async_api import Page, Route, async_playwright
 
 from skyvern.forge import app as forge_app
+from skyvern.forge.sdk.agents.skills import AvailableSkill, SkillOwner, SkillPackage, SkillSession
 from skyvern.forge.sdk.api.llm import api_handler_factory
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot import agent as copilot_agent
@@ -79,7 +80,6 @@ from skyvern.forge.sdk.copilot.screenshot_utils import (
     ScreenshotProvenance,
     resize_screenshot_b64,
 )
-from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER
 from skyvern.forge.sdk.copilot.session_factory import (
     copilot_call_model_input_filter,
     copilot_session_input_callback,
@@ -89,6 +89,7 @@ from skyvern.forge.sdk.copilot.tools import reply_ends_turn, reply_tool
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
 from skyvern.forge.sdk.copilot.tools.credentials import _resolve_exact_credential
+from skyvern.forge.sdk.copilot.tools.skills import load_skill
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml as process_workflow_yaml
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -121,6 +122,7 @@ from skyvern.schemas.runs import ProxyLocation
 from skyvern.schemas.self_heal import HealEpisode
 from skyvern.schemas.workflows import BlockStatus, BlockType
 from skyvern.services import workflow_service as workflow_service_module
+from skyvern.utils.secret_scrub import REDACTED_SECRET_PLACEHOLDER
 from skyvern.webeye import real_browser_manager
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import ActionStatus
@@ -1541,6 +1543,31 @@ def sent_image_px(message: Any) -> list[tuple[int, int]]:
     ]
 
 
+def skill_md(name: str, body: str = "Body\n", description: str = "Log in to the example.com portal.") -> str:
+    return f"---\nname: {name}\ndescription: {description}\n---\n{body}"
+
+
+def available_skill(
+    name: str, owner: SkillOwner, body: str, description: str = "Log in to the example.com portal.", **files: str
+) -> AvailableSkill:
+    package = SkillPackage.from_files({"SKILL.md": skill_md(name, body, description), **files})
+    return AvailableSkill(package=package, owner=owner, version=package.version)
+
+
+def load_skill_items(call_id: str, name: str, body: str) -> list[dict[str, Any]]:
+    """A reasoning item, a load_skill call and its real body-carrying output."""
+    session = SkillSession([available_skill(name, "organization", body)], agent="copilot")
+    return [
+        {"type": "reasoning", "summary": [{"type": "summary_text", "text": "Load the skill."}]},
+        {"type": "function_call", "call_id": call_id, "name": "load_skill", "arguments": json.dumps({"name": name})},
+        {
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": json.dumps(load_skill(session, name), ensure_ascii=False),
+        },
+    ]
+
+
 def make_model_input_data(items: list[Any], *, instructions: str | None = None, context: Any = None) -> Any:
     """Build a fake CallModelData payload with a model_data.input list.
 
@@ -1661,7 +1688,9 @@ async def run_turn_to_exit(
         )
         monkeypatch.setattr(copilot_agent, "seed_repair_origin_run", AsyncMock(return_value=origin))
 
-        async def hydrate_and_exit(ctx: CopilotContext, *, workflow_run_id: str | None) -> None:
+        async def hydrate_and_exit(
+            ctx: CopilotContext, *, workflow_run_id: str | None, queue_failure_frame: bool = False
+        ) -> None:
             await copilot_runtime.resolve_browser_state_for_context(ctx, session_id=session_id)
             await _exit(ctx)
 

@@ -53,7 +53,6 @@ from skyvern.forge.taskv3.goal_check import (
 )
 from skyvern.forge.taskv3.handoff_redaction import MAX_HANDOFF_URL_CHARS, normalized_url, sanitize_published_url
 from skyvern.forge.taskv3.intercepted_submission import InterceptedSubmission, SubmissionOutcome
-from skyvern.forge.taskv3.llm_call_params import fallback_error_class, rejects_carried_reasoning
 from skyvern.forge.taskv3.target_label import describe_target
 from skyvern.schemas.steps import StepToolCall
 from skyvern.schemas.workflows import ERROR_CODE_MAPPING_MAX_ENTRIES, ERROR_CODE_MAPPING_MAX_UTF8_BYTES
@@ -435,7 +434,8 @@ _TYPE_REACH: ContextVar[dict[str, bool] | None] = ContextVar("taskv3_type_reach"
 # A click that raised after the page received it (a slow submit whose navigation had not committed).
 _CLICK_DISPATCHED: ContextVar[bool] = ContextVar("taskv3_click_dispatched", default=False)
 # How a token click went: locator, handle (the resolver's element, after the locator never resolved),
-# handle_failed (that fallback raised), or stale (the node was gone or no longer held the token).
+# handle_failed (that fallback raised), stale (the node was gone or no longer held the token), or navigated (the
+# press replaced the document before the driver's wait ended; it overwrites handle_failed on the handle fallback).
 _CLICK_PATH: ContextVar[str | None] = ContextVar("taskv3_click_path", default=None)
 # Which field shape a field-entry read-back judged (field_commit), so an unconfirmed entry is countable per variant.
 _ENTRY_RECORD: ContextVar[dict[str, Any] | None] = ContextVar("taskv3_entry_record", default=None)
@@ -919,8 +919,6 @@ class LoopOutcome:
     converted_from: NonCompletedStatus | None = None
     converted_from_reason: str = ""
     unlisted_reask: dict[str, Any] | None = None
-    carried_reasoning_turns: int = 0
-    carry_reasoning_stripped: bool = False
     # The finish tool's completion gate approved this verdict, so the caller must not consult it again.
     gate_passed: bool = False
     # The model's own user-defined error code on a failed/terminated finish, re-validated against the mapping.
@@ -968,13 +966,6 @@ def _extract_reasoning_summary(response: Any) -> str | None:
     if message is None:
         return None
     return _get(message, "reasoning_content")
-
-
-def _extract_reasoning_items(response: Any) -> list[dict[str, Any]]:
-    message = _extract_message(response)
-    if message is None:
-        return []
-    return [item for item in _get(message, "reasoning_items") or [] if isinstance(item, dict)]
 
 
 def _extract_tool_calls(response: Any) -> list[tuple[str, str, dict[str, Any]]]:
@@ -2636,6 +2627,8 @@ OBSERVE_SUMMARY_FIELDS = frozenset(
         "frame_scan_failed",
         "frame_unreadable_regions",
         "elements_listed",
+        "links_listed",
+        "link_capped",
         "pointer_roots_listed",
         "pointer_extras_listed",
         "pointer_capped",
@@ -4247,8 +4240,6 @@ class LoopState:
     block_reserve_verdict: GoalVerdict | None = None
     target_action_rounds_granted: int = 0
     open_turn: _OpenTurn | None = None
-    carried_reasoning_turns: int = 0
-    carry_reasoning_stripped: bool = False
 
 
 async def run_agent_tool_loop(
@@ -4273,9 +4264,6 @@ async def run_agent_tool_loop(
     # Awaited after each successful model call, before the turn touches the page.
     on_model_returned: Callable[[], Awaitable[None]] | None = None,
     on_pre_action: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
-    # Keep each response's reasoning items on its assistant message; litellm's Responses bridge sends them back right
-    # before that message's calls. Only for a route whose main group can read the reasoning it returns.
-    carry_reasoning: bool = False,
     # Called with every look's images as the tool returns them, superseded ones included.
     on_look_screenshots: Callable[[list[bytes]], None] | None = None,
     # Called before each page-touching tool call is dispatched.
@@ -4322,6 +4310,8 @@ async def run_agent_tool_loop(
     login_identifier_tokens: Callable[[], Collection[str]] | None = None,
     page_probe: Callable[[], Awaitable[str | None]] | None = None,
     reload_page: Callable[[], Awaitable[None]] | None = None,
+    settle_reload_signal: Callable[[bool], Awaitable[bool | None]] | None = None,
+    submission_evidence: Callable[[], Awaitable[str | None]] | None = None,
     max_refresh_cycles: int = 3,
     page_fingerprint: Callable[[], Awaitable[str | None]] | None = None,
     # One model call's worth of token headroom, reserved so the granted final turn (below) is
@@ -4800,37 +4790,16 @@ async def run_agent_tool_loop(
         active_call_kwargs["caller_owns_exhaustion_receipt"] = True
 
     def _degrade_call_params(exc: BaseException) -> bool:
-        """Drop one optional call param (the carried reasoning, then the reasoning-summary dict, then the Claude cache
-        markers for the rest of this loop) and report whether the turn is worth re-issuing.
+        """Drop one optional call param (the reasoning-summary dict, then the Claude cache markers for the rest
+        of the run) and report whether the turn is worth re-issuing.
 
         Called only when the turn is otherwise about to end the run, so the cost is one extra call
-        on a run that was already failing. A refusal is excluded because dropping a parameter provably cannot fix
-        it, and so is a context-window overflow unless carried reasoning is part of the input. Dropping
-        reasoning_effort reverts to the config's own value, so a provider that rejects the dict form cannot end the
-        run on turn 1.
+        on a run that was already failing. A context-window overflow or a refusal is excluded because
+        dropping a parameter provably cannot fix it. Dropping reasoning_effort reverts to the config's own
+        value, so a provider that rejects the dict form cannot end the run on turn 1.
         """
-        nonlocal anthropic_cache_markers, carry_reasoning
-        if isinstance(exc, LLMContentFilteredError):
-            return False
-        # Before the overflow exclusion: the carried items count as input, so dropping them can fix an overflow.
-        if carry_reasoning and any("reasoning_items" in message for message in st.messages):
-            carry_reasoning = False
-            st.carry_reasoning_stripped = True
-            for message in st.messages:
-                message.pop("reasoning_items", None)
-            llm_caller.message_history = list(st.messages)
-            cause = exc.__cause__ or exc
-            LOG.warning(
-                "taskv3 loop retrying without optional call param",
-                dropped="reasoning_items",
-                carry_reasoning_stripped_on_error=type(cause).__name__,
-                status_code=getattr(cause, "status_code", None),
-                fallback_error=fallback_error_class(cause),
-                turn=st.turns,
-                exc_info=True,
-            )
-            return True
-        if isinstance(exc, SkyvernContextWindowExceededError):
+        nonlocal anthropic_cache_markers
+        if isinstance(exc, (SkyvernContextWindowExceededError, LLMContentFilteredError)):
             return False
         for param in ("reasoning_effort", "cache_control_injection_points"):
             if active_call_kwargs.pop(param, None) is not None:
@@ -5075,6 +5044,9 @@ async def run_agent_tool_loop(
                 # Read by the finish tool's hold gates: a hold's retry turn no longer exists.
                 activity.final_turn_active = True
         st.turns += 1
+        if submission_evidence is not None:
+            if notice := await _sample_probe(submission_evidence, deadline_at=deadline_at):
+                st.messages.append({"role": "user", "content": notice})
         if turn_notice is not None:
             try:
                 notice = turn_notice(st.turns)
@@ -5150,16 +5122,6 @@ async def run_agent_tool_loop(
                 break
             except retryable_call_exceptions as exc:
                 call_attempt += 1
-                # A leg that cannot read the carried items rejects them every time; waiting out the transient budget
-                # only re-sends the doomed call.
-                if (
-                    carry_reasoning
-                    and any("reasoning_items" in message for message in st.messages)
-                    and rejects_carried_reasoning(exc.__cause__ or exc)
-                    and _degrade_call_params(exc)
-                ):
-                    call_attempt = max_call_retries
-                    continue
                 if call_attempt > max_call_retries:
                     # A provider rejecting the parameter surfaces here, not in the generic handler
                     # below: litellm's 400s subclass openai.APIError, which the LLM layer maps to
@@ -5231,16 +5193,6 @@ async def run_agent_tool_loop(
                 {"id": tool_call_id, "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}
                 for tool_call_id, name, args in tool_calls
             ]
-        # Only reasoning the main group is known to have returned: its legs could not read what a fallback leg returned.
-        main_group = getattr(llm_caller.llm_config, "main_model_group", None)
-        served_group = getattr(llm_caller, "last_served_model_group", None)
-        if (
-            carry_reasoning
-            and (main_group is None or served_group == main_group)
-            and (reasoning_items := _extract_reasoning_items(response))
-        ):
-            assistant_message["reasoning_items"] = reasoning_items
-            st.carried_reasoning_turns += 1
         st.messages.append(assistant_message)
 
         if not tool_calls:
@@ -5962,6 +5914,13 @@ async def run_agent_tool_loop(
                             result = held
                         else:
                             result = await spec.handler(args)
+                            if (
+                                spec.terminal
+                                and result.status == "ok"
+                                and settle_reload_signal is not None
+                                and (result.data or {}).get("status", "completed") == "completed"
+                            ):
+                                await settle_reload_signal(True)
                 except ToolRefusal as refusal:
                     result = refusal.as_result()
                 except Exception as exc:
@@ -6913,8 +6872,6 @@ async def run_agent_tool_loop(
     )
 
     st.outcome.turns = st.turns
-    st.outcome.carried_reasoning_turns = st.carried_reasoning_turns
-    st.outcome.carry_reasoning_stripped = st.carry_reasoning_stripped
     st.outcome.no_tool_call_turns = st.no_tool_call_turns
     st.outcome.tool_calls = st.total_tool_calls
     st.outcome.tool_seconds = st.tool_seconds

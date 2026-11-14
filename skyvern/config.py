@@ -290,6 +290,9 @@ class Settings(BaseSettings):
     # Experimental Workflow Copilot code-first authoring mode.
     # Off = standard block authoring. On = prefer code blocks for browser work.
     WORKFLOW_COPILOT_CODE_BLOCK_MODE: bool = False
+    # Offer a Copilot test run's agent steps only the accounts the chat approved. Turn on for every worker fleet
+    # before any API (and off in the reverse order): a worker that is off offers every account when a record is lost.
+    COPILOT_NARROW_AGENT_STEP_ACCOUNTS: bool = False
     WORKFLOW_COPILOT_QA_TOKEN_BUDGET: int | None = Field(default=None, gt=0)
     # Process-global override of the per-turn copilot deadline, read once at import;
     # changing it needs a hard restart. QA/debug only -- unset keeps the 900s default.
@@ -316,9 +319,9 @@ class Settings(BaseSettings):
     WORKFLOW_COPILOT_EVAL_LLM_OVERRIDES_ORGANIZATION_IDS: list[str] = []
     WORKFLOW_COPILOT_EVAL_COST_ENABLED: bool = False
     WORKFLOW_COPILOT_EVAL_COST_ORGANIZATION_IDS: list[str] = []
-    # Local-development escape hatch: run a copilot block test run in the API process when sandbox
-    # dispatch is unavailable, instead of failing closed. Grants nothing on its own -- see
-    # AgentFunction.allow_copilot_inline_code_execution for the conditions it is ANDed with.
+    # Cloud-image local-development escape hatch: run a copilot block test run in the API process when
+    # sandbox dispatch is unavailable, instead of failing closed. Grants nothing on its own -- see
+    # developer_checkout_opted_into_inline_copilot_code for the conditions it is ANDed with.
     COPILOT_ALLOW_INLINE_CODE_EXECUTION: bool = False
     RUN_HEARTBEAT_TIMEOUT_MINUTES: int = 30
     PORT: int = 8000
@@ -381,6 +384,9 @@ class Settings(BaseSettings):
     # S3/AWS settings
     AWS_REGION: str = "us-east-1"
     MAX_UPLOAD_FILE_SIZE: int = 30 * 1024 * 1024  # 30 MB
+    # Extensions added to the /v1/upload_file allowlist. Set it as a JSON list, e.g. '["gz","epub"]';
+    # a bare comma list fails at startup. The executable and markup denylist still applies.
+    UPLOAD_EXTRA_ALLOWED_EXTENSIONS: list[str] = []
     MAX_HTTP_DOWNLOAD_FILE_SIZE: int = 500 * 1024 * 1024  # 500 MB
     # Most memory a pdfplumber child may add (RLIMIT_AS on Linux, an RSS watchdog everywhere); rendering a 300 dpi A0
     # or A1 scan for OCR can need more than 512 MiB. A pod with less free memory than this, after a 256 MiB margin and
@@ -988,13 +994,13 @@ class Settings(BaseSettings):
     # Google OAuth settings (used by the Google Sheets connector)
     GOOGLE_OAUTH_CLIENT_ID: str | None = None
     GOOGLE_OAUTH_CLIENT_SECRET: str | None = None
-    # Hostnames allowed as the OAuth ``redirect_uri`` sent to Google. Defense-in-depth
-    # alongside Google's own redirect_uri allowlist (which is the real enforcement
-    # gate — it validates the full URI against its registered list). This setting is
-    # intentionally host-only: any path or port on an approved host passes. Empty
-    # list means no redirect_uri may be supplied at all (the route layer rejects
-    # with 400) when CLIENT_ID is set.
-    GOOGLE_OAUTH_REDIRECT_HOSTS: list[str] = Field(default_factory=list)
+    # Full redirect URIs accepted as the OAuth ``redirect_uri`` sent to Google, e.g.
+    # ``https://app.example.com/integrations/google/callback``. A request must equal an
+    # entry character for character (https unless loopback; no query or fragment).
+    # Mirror the list registered on the Google client. Empty list means no
+    # redirect_uri may be supplied at all (the route layer rejects with 400) when
+    # CLIENT_ID is set.
+    GOOGLE_OAUTH_REDIRECT_URIS: list[str] = Field(default_factory=list)
     # Origins allowed as the bounce-back destination after OAuth callback.
     # Never sent to Google. Two entry shapes — port handling differs:
     #   - Exact-match: ``https://host:port`` matches that exact origin (port included).
@@ -1012,7 +1018,8 @@ class Settings(BaseSettings):
     MICROSOFT_OAUTH_CLIENT_ID: str | None = None
     MICROSOFT_OAUTH_CLIENT_SECRET: str | None = None
     MICROSOFT_OAUTH_TENANT: str = "common"
-    MICROSOFT_OAUTH_REDIRECT_HOSTS: list[str] = Field(default_factory=list)
+    # Same contract as GOOGLE_OAUTH_REDIRECT_URIS.
+    MICROSOFT_OAUTH_REDIRECT_URIS: list[str] = Field(default_factory=list)
     MICROSOFT_OAUTH_APP_ORIGINS: list[str] = Field(default_factory=list)
 
     # Google Sheets API runtime tuning

@@ -89,7 +89,6 @@ from skyvern.forge.sdk.copilot.runtime import (
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotProvenance, enqueue_screenshot
 from skyvern.forge.sdk.copilot.secret_scrub import (
-    clear_session_scrub_values,
     register_secret_scrub_value,
     register_secret_scrub_values_from_structure,
 )
@@ -97,6 +96,9 @@ from skyvern.forge.sdk.copilot.tools import (
     NATIVE_TOOLS,
     _with_action_reason,
     _with_page_state,
+)
+from skyvern.forge.sdk.copilot.tools import credentials as credentials_module
+from skyvern.forge.sdk.copilot.tools import (
     mcp_hooks,
     run_execution,
 )
@@ -114,6 +116,7 @@ from skyvern.forge.sdk.copilot.tools.mcp_hooks import (
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.services.request_principal import AuthKind, RequestPrincipal
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.utils.secret_scrub import clear_session_scrub_values
 from skyvern.webeye.browser_state import PageCrashRecord
 from skyvern.webeye.persistent_sessions_manager import (
     BrowserOperation,
@@ -3475,15 +3478,20 @@ async def test_schedule_parameters_need_the_same_credential_approval_as_a_run(
     asks_for_account: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(mcp_hooks, "_server_verified_google_account_choices", AsyncMock(return_value=None))
+    monkeypatch.setattr(credentials_module, "connected_account_choices", AsyncMock(return_value=None))
     ctx = make_copilot_ctx(
         workflow_permanent_id="wpid_chat",
         request_policy=RequestPolicy(
             persisted_workflow_credential_ids=["cred_saved"],
-            run_approved_google_connection_ids=["goac_chosen"],
+            run_approved_connection_ids=["goac_chosen"],
         ),
     )
-    server = _schedule_server(monkeypatch, ctx, {"ok": True, "data": {"schedule": {"workflow_schedule_id": "wfs_1"}}})
+    server = _schedule_server(
+        monkeypatch,
+        ctx,
+        {"ok": True, "data": {"schedule": {"workflow_schedule_id": "wfs_1"}}},
+        definition=_sheets_definition("{{ login }}") if asks_for_account else None,
+    )
     args = {"workflow_schedule_id": "wfs_1", "cron_expression": "0 9 * * *", "timezone": "America/Los_Angeles"}
 
     refused = await server.call_tool(tool_name, {**args, "parameters": {"login": unapproved_id}})
@@ -3500,7 +3508,7 @@ async def test_schedule_parameters_need_the_same_credential_approval_as_a_run(
 
 def _sheets_definition(credential_id: str) -> dict[str, Any]:
     return {
-        "parameters": [],
+        "parameters": [{"key": "login", "parameter_type": "workflow"}],
         "blocks": [{"label": "write", "block_type": "google_sheets_write", "credential_id": credential_id}],
     }
 
@@ -3509,11 +3517,11 @@ def _sheets_definition(credential_id: str) -> dict[str, Any]:
 @pytest.mark.parametrize(
     "tool_name", ["create_workflow_schedule", "update_workflow_schedule", "enable_workflow_schedule"]
 )
-async def test_schedule_needs_approval_for_google_references_in_the_saved_workflow(
+async def test_schedule_needs_approval_for_account_references_in_the_saved_workflow(
     tool_name: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(mcp_hooks, "_server_verified_google_account_choices", AsyncMock(return_value=None))
+    monkeypatch.setattr(credentials_module, "connected_account_choices", AsyncMock(return_value=None))
     ctx = make_copilot_ctx(workflow_permanent_id="wpid_chat", request_policy=RequestPolicy())
     args = {"workflow_schedule_id": "wfs_1", "cron_expression": "0 9 * * *", "timezone": "America/Los_Angeles"}
     payload = {"ok": True, "data": {"schedule": {"workflow_schedule_id": "wfs_1"}}}
@@ -4196,9 +4204,26 @@ async def test_closed_value_parameters_carry_the_enforced_values_as_a_schema_enu
 _NOTE_FIELDS = {"notes", "trailing_notes", "description"}
 
 
+_IMAGE_FIELDS = ("doc_images", "prompt_images")
+
+
 def _saved_workflow_with_notes() -> dict[str, Any]:
-    child = {"label": "open", "block_type": "navigation", "notes": "use the left menu", "description": "people only"}
-    loop = {"label": "each", "block_type": "for_loop", "loop_blocks": [child], "trailing_notes": "stop at ten"}
+    image = [{"file_id": "file_901", "caption": None, "placement": "block"}]
+    child = {
+        "label": "open",
+        "block_type": "navigation",
+        "notes": "use the left menu",
+        "description": "people only",
+        "doc_images": image,
+        "prompt_images": image,
+    }
+    loop = {
+        "label": "each",
+        "block_type": "for_loop",
+        "loop_blocks": [child],
+        "trailing_notes": "stop at ten",
+        "doc_images": image,
+    }
     return {
         "ok": True,
         "data": {"description": "workflow summary", "workflow_definition": {"parameters": [], "blocks": [loop]}},
@@ -4217,6 +4242,7 @@ async def test_copilot_reads_notes_only_with_the_doc_editor(doc_editor_enabled: 
         asked = await call("get_workflow_knowledge", {"topics": ["notes_between_blocks", "for_loop_block"]})
         asked_only_notes = await call("get_workflow_knowledge", {"topics": ["notes_between_blocks"]})
         loop_schema = (await call("get_block_schema", {"block_type": "for_loop"}))["data"]["schema"]
+        task_schema = (await call("get_block_schema", {"block_type": "task"}))["data"]["schema"]
     saved = await _build_skyvern_mcp_overlays(ALL_BLOCK_FAMILIES, notes_visible=doc_editor_enabled)[
         "get_org_workflow"
     ].post_hook(_saved_workflow_with_notes(), {}, make_copilot_ctx(doc_editor_enabled=doc_editor_enabled))
@@ -4227,6 +4253,9 @@ async def test_copilot_reads_notes_only_with_the_doc_editor(doc_editor_enabled: 
         if {"label", "block_type"} <= set(definition.get("properties", {}))
     ]
     saved_loop = saved["data"]["workflow_definition"]["blocks"][0]
+    for schema in (loop_schema, task_schema):
+        assert not any(name in json.dumps(schema) for name in (*_IMAGE_FIELDS, "BlockImage", "file_id"))
+    assert "file_901" not in json.dumps(saved)
     if doc_editor_enabled:
         assert "notes_between_blocks" in catalog and "notes_between_blocks" in asked["data"]["sections"]
         assert set(asked_only_notes["data"]["sections"]) == {"notes_between_blocks"}
@@ -4254,8 +4283,12 @@ async def test_the_task_unavailable_topic_never_reaches_the_model(capability: Au
             "get_workflow_knowledge", {"topics": [_TASK_UNAVAILABLE_KNOWLEDGE_TOPIC, "for_loop_block"]}
         )
         alone = await call("get_workflow_knowledge", {"topics": [_TASK_UNAVAILABLE_KNOWLEDGE_TOPIC.upper()]})
+        retired_id = await call(
+            "get_workflow_knowledge", {"topics": ["task_block_task_not_available_in_workflow_copilot"]}
+        )
 
-    assert _TASK_UNAVAILABLE_KNOWLEDGE_TOPIC not in json.dumps(tools["get_workflow_knowledge"].inputSchema)
+    assert retired_id == catalog
+    assert "task_block_task_not_available" not in json.dumps(tools["get_workflow_knowledge"].inputSchema)
     topics = catalog["data"]["topics"]
     assert _TASK_UNAVAILABLE_KNOWLEDGE_TOPIC not in topics
     assert "for_loop_block" in topics

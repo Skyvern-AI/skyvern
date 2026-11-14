@@ -17,14 +17,15 @@ import {
   beforeEach,
   describe,
   expect,
+  onTestFinished,
   test,
   vi,
 } from "vitest";
 
 import { ProxyLocation, Status } from "@/api/types";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { useCopilotActionStore } from "@/store/useCopilotActionStore";
-import { useCopilotProposalStore } from "@/store/CopilotProposalStore";
+import { useEmberActionStore } from "@/store/useEmberActionStore";
+import { useEmberProposalStore } from "@/store/EmberProposalStore";
 import {
   clearDeferredEdits,
   deferredEdits,
@@ -58,8 +59,16 @@ vi.mock("../editor/hooks/useSaveWorkflow", () => ({
   useSaveWorkflow: () => saveWorkflowSpy,
 }));
 vi.mock("@/api/AxiosClient", () => ({ getClient: getClientMock }));
-vi.mock("../editor/doc/DocRunButton", () => ({
-  DocRunButton: () => <div data-testid="doc-run" />,
+const docScreen = vi.hoisted(() => ({
+  onScreen: false,
+  panes: ["editor"] as string[],
+}));
+vi.mock("../editor/doc/useDocOnScreen", () => ({
+  useDocOnScreen: () => docScreen.onScreen,
+}));
+vi.mock("./useStudioPanes", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./useStudioPanes")>()),
+  useStudioPanes: () => ({ panes: docScreen.panes }),
 }));
 vi.mock("@/hooks/useCredentialGetter", () => ({
   useCredentialGetter: () => vi.fn(),
@@ -83,14 +92,12 @@ import { useAutoGenerateWorkflowTitle } from "../hooks/useAutoGenerateWorkflowTi
 import { taskNodeDefaultData } from "../editor/nodes/TaskNode/types";
 
 import { useRunValidationStore } from "../editor/runValidation/useRunValidationStore";
-import { useDocRunStore } from "../editor/doc/docRunStore";
-import { useWorkflowPresentationStore } from "@/store/WorkflowPresentationStore";
 import {
-  RunStopButton,
-  SaveButton,
-  TitleSection,
-  TopBarRunControl,
-} from "./StudioTopBar";
+  DOC_RUN_AGENT_EVENT,
+  DOC_SHOW_PROBLEMS_EVENT,
+} from "../editor/doc/docKeys";
+import { publishDocCriticalProblems } from "../editor/doc/docRunCheckStore";
+import { RunStopButton, SaveButton, TitleSection } from "./StudioTopBar";
 
 // jsdom lacks ResizeObserver, which Radix's tooltip popper constructs once a
 // tooltip opens. Install it for this suite only and restore afterward.
@@ -166,6 +173,11 @@ function mockRun(status: Status, overrides: Record<string, unknown> = {}) {
       ...overrides,
     },
   });
+}
+
+// RunStopButton reads this store, so touching it re-renders with the run mock's new value.
+function rerenderRun() {
+  act(() => useRunValidationStore.setState({ blockingBlocks: [] }));
 }
 
 function locationState() {
@@ -403,7 +415,7 @@ function renderSaveButton() {
 // list. Each case here has `contentDirty` stale-false to exercise that gap.
 describe("SaveButton confirmation gating", () => {
   afterEach(() => {
-    useCopilotProposalStore.setState({ proposal: null });
+    useEmberProposalStore.setState({ proposal: null });
     useWorkflowSnapshotStore.getState().clearSnapshot();
     useWorkflowHasChangesStore.setState({
       getSaveData: () => null,
@@ -415,7 +427,7 @@ describe("SaveButton confirmation gating", () => {
       draft: "",
       entrySnapshot: "",
       authoringInProgress: false,
-      copilotAcceptance: null,
+      emberAcceptance: null,
     });
   });
 
@@ -425,7 +437,7 @@ describe("SaveButton confirmation gating", () => {
       reason: "Finish the current authoring action before saving",
     },
     {
-      lock: { copilotAcceptance: Symbol("acceptance") },
+      lock: { emberAcceptance: Symbol("acceptance") },
       reason: "Wait for the Copilot change to finish",
     },
   ])(
@@ -449,15 +461,15 @@ describe("SaveButton confirmation gating", () => {
       act(() =>
         useWorkflowYamlEditorStore.setState({
           authoringInProgress: false,
-          copilotAcceptance: null,
+          emberAcceptance: null,
         }),
       );
       expect(save.matches(":disabled")).toBe(false);
     },
   );
 
-  test("disables Save while the Doc has a pending Copilot proposal", () => {
-    useCopilotProposalStore.setState({ proposal: {} as never });
+  test("disables Save while the Doc has a pending Ember proposal", () => {
+    useEmberProposalStore.setState({ proposal: {} as never });
 
     renderSaveButton();
     const save = screen.getByRole("button", {
@@ -469,7 +481,7 @@ describe("SaveButton confirmation gating", () => {
     fireEvent.click(save);
     expect(saveWorkflowSpy).not.toHaveBeenCalled();
 
-    act(() => useCopilotProposalStore.setState({ proposal: null }));
+    act(() => useEmberProposalStore.setState({ proposal: null }));
     expect(save.matches(":disabled")).toBe(false);
   });
 
@@ -643,7 +655,7 @@ describe("SaveButton with a new Goal that isn't applied yet", () => {
       getSaveData: () => null,
       saveIsPending: false,
     });
-    useCopilotActionStore.setState({
+    useEmberActionStore.setState({
       pendingGoalChanges: [],
       pendingBuild: null,
       generatingBlockLabel: null,
@@ -652,8 +664,8 @@ describe("SaveButton with a new Goal that isn't applied yet", () => {
     });
   });
 
-  test("asks instead of saving, and Apply asks the copilot to follow the new Goal", () => {
-    useCopilotActionStore.setState({
+  test("asks instead of saving, and Apply asks the Ember to follow the new Goal", () => {
+    useEmberActionStore.setState({
       pendingGoalChanges: [{ label: "a", goal: "New", previousGoal: "Old" }],
     });
 
@@ -665,7 +677,7 @@ describe("SaveButton with a new Goal that isn't applied yet", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Apply new Goal" }));
 
-    expect(useCopilotActionStore.getState().pendingBuild).toEqual({
+    expect(useEmberActionStore.getState().pendingBuild).toEqual({
       blockLabel: "a",
       prompt: "New",
       applyingGoalChange: true,
@@ -679,9 +691,9 @@ describe("SaveButton with a new Goal that isn't applied yet", () => {
     useWorkflowHasChangesStore.setState({ getSaveData: () => edited });
     const undoGoalChange = vi.fn(() => {
       useWorkflowHasChangesStore.setState({ getSaveData: afterUndo });
-      useCopilotActionStore.getState().setPendingGoalChanges([]);
+      useEmberActionStore.getState().setPendingGoalChanges([]);
     });
-    useCopilotActionStore.setState({
+    useEmberActionStore.setState({
       pendingGoalChanges: [{ label: "a", goal: "New", previousGoal: "Old" }],
       undoGoalChange,
     });
@@ -698,7 +710,7 @@ describe("SaveButton with a new Goal that isn't applied yet", () => {
   });
 
   test("offers no undo when the old Goal is unknown", () => {
-    useCopilotActionStore.setState({
+    useEmberActionStore.setState({
       pendingGoalChanges: [{ label: "a", goal: "New", previousGoal: null }],
     });
 
@@ -717,7 +729,7 @@ describe("TitleSection title link + edit affordance", () => {
     clearDeferredEdits();
     useWorkflowYamlEditorStore.setState({
       commitInProgress: false,
-      copilotAcceptance: null,
+      emberAcceptance: null,
     });
     useWorkflowTitleStore.setState({ title: "My Workflow" });
     useWorkflowHasChangesStore.setState({ hasChanges: false });
@@ -772,7 +784,7 @@ describe("TitleSection title link + edit affordance", () => {
     renderTitleSection();
     const link = screen.getByRole("link", { name: "My Workflow" });
     expect(link.getAttribute("href")).toBe("/agents/wpid_abc/runs");
-    // jsdom can't evaluate :hover; pin the color cue (mirrors WorkflowScriptsPage's runs link).
+    // jsdom can't evaluate :hover; pin the color cue.
     expect(link.className).toContain("hover:text-blue-700");
     expect(link.className).toContain("dark:hover:text-blue-400");
     // Radix mounts the tooltip content on focus (visible + a11y copies), so
@@ -799,8 +811,8 @@ describe("TitleSection title link + edit affordance", () => {
   });
 
   test.each([
-    { commitInProgress: true, copilotAcceptance: null },
-    { commitInProgress: false, copilotAcceptance: Symbol("acceptance") },
+    { commitInProgress: true, emberAcceptance: null },
+    { commitInProgress: false, emberAcceptance: Symbol("acceptance") },
   ])("preserves a rename entered before the editor locks: %s", (lock) => {
     renderTitleSection();
     fireEvent.click(
@@ -820,7 +832,7 @@ describe("TitleSection title link + edit affordance", () => {
     act(() =>
       useWorkflowYamlEditorStore.setState({
         commitInProgress: false,
-        copilotAcceptance: null,
+        emberAcceptance: null,
       }),
     );
     expect(useWorkflowTitleStore.getState().title).toBe("Renamed during save");
@@ -839,7 +851,7 @@ describe("TitleSection title link + edit affordance", () => {
       });
       act(() =>
         useWorkflowYamlEditorStore.setState({
-          copilotAcceptance: Symbol("queued-send"),
+          emberAcceptance: Symbol("queued-send"),
         }),
       );
       view.unmount();
@@ -857,7 +869,7 @@ describe("TitleSection title link + edit affordance", () => {
         expect(useWorkflowTitleStore.getState().title).toBe(storeTitle);
         expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(false);
         act(() =>
-          useWorkflowYamlEditorStore.setState({ copilotAcceptance: null }),
+          useWorkflowYamlEditorStore.setState({ emberAcceptance: null }),
         );
         const applies = storeTitle === "My Workflow";
         expect(useWorkflowTitleStore.getState().title).toBe(
@@ -1052,71 +1064,325 @@ describe("RunStopButton on an agent with no blocks", () => {
   });
 });
 
-describe("RunStopButton while the Doc lists problems", () => {
+describe("RunStopButton from the Doc", () => {
   afterEach(() => {
-    useRunValidationStore.setState({
-      docProblemCount: 0,
-      docShowProblems: null,
-    });
+    useRunValidationStore.setState({ blockingBlocks: [] });
   });
 
-  test("Run stays enabled; a click says what to fix, jumps to it and starts nothing", () => {
+  test("Shift+Enter on a Doc line opens the run form, as Run does, and does nothing while Run is blocked", () => {
     workflowRunQueryMock.mockReturnValue({ data: undefined });
-    const showProblems = vi.fn();
     useRunValidationStore.setState({
-      docProblemCount: 2,
-      docShowProblems: showProblems,
+      blockingBlocks: [
+        { id: "n1", label: "Log in", ancestorIds: [], path: [] },
+      ],
     });
     renderAt("/workflows/wpid_1/studio");
+    act(() => {
+      window.dispatchEvent(new Event(DOC_RUN_AGENT_EVENT));
+    });
+    expect(screen.queryByTestId("location")).toBeNull();
 
-    const runButton = screen.getByRole("button", { name: "Run" });
-    expect(runButton.hasAttribute("disabled")).toBe(false);
-    fireEvent.click(runButton);
+    act(() => {
+      useRunValidationStore.setState({ blockingBlocks: [] });
+    });
+    act(() => {
+      window.dispatchEvent(new Event(DOC_RUN_AGENT_EVENT));
+    });
+    expect(screen.getByTestId("location").textContent).toBe(
+      "/agents/wpid_1/run",
+    );
+  });
+  test("Shift+Enter during a block run asks the same 'Start a full run?' question as the visible Run", () => {
+    renderAt("/workflows/wpid_1/studio?wr=wr_1&bl=Block%201");
+    act(() => {
+      window.dispatchEvent(new Event(DOC_RUN_AGENT_EVENT));
+    });
+    expect(screen.queryByText("Start a full run?")).not.toBeNull();
+    expect(screen.queryByTestId("location")).toBeNull();
 
-    expect(showProblems).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole("button", { name: "Start full run" }));
+    expect(screen.getByTestId("location").textContent).toBe(
+      "/agents/wpid_1/run",
+    );
+  });
+
+  test("a block run that ends with the full-run question open does not reopen it with the next block run", () => {
+    renderAt("/workflows/wpid_1/studio?wr=wr_1&bl=Block%201");
+    act(() => {
+      window.dispatchEvent(new Event(DOC_RUN_AGENT_EVENT));
+    });
+    expect(screen.queryByText("Start a full run?")).not.toBeNull();
+    mockRun(Status.Completed);
+    rerenderRun();
+    mockRun(Status.Running);
+    rerenderRun();
+    expect(screen.queryByText("Start a full run?")).toBeNull();
+  });
+
+  test("Shift+Enter during a full run starts nothing", () => {
+    renderAt("/workflows/wpid_1/studio?wr=wr_1");
+    act(() => {
+      window.dispatchEvent(new Event(DOC_RUN_AGENT_EVENT));
+    });
+    expect(screen.queryByText("Start a full run?")).toBeNull();
     expect(screen.queryByTestId("location")).toBeNull();
   });
 });
 
-describe("TopBarRunControl with the Doc as the editor", () => {
+describe("RunStopButton with critical Doc problems", () => {
+  const critical = [
+    {
+      key: "n1:fix:0",
+      step: "Go to URL · Open the site",
+      message: "This step has no URL. Type it on the line, or use @.",
+    },
+  ];
   beforeEach(() => {
-    useWorkflowPresentationStore.setState({
-      enabled: true,
-      presentation: "doc",
-    });
-    useDocRunStore.setState({ mounted: true });
+    workflowRunQueryMock.mockReturnValue({ data: undefined });
+    docScreen.onScreen = true;
+    publishDocCriticalProblems(critical);
   });
   afterEach(() => {
-    useWorkflowPresentationStore.setState({
-      enabled: false,
-      presentation: "visual",
-    });
-    useDocRunStore.setState({ mounted: false });
+    docScreen.onScreen = false;
+    docScreen.panes = ["editor"];
+    publishDocCriticalProblems([]);
   });
 
-  test("the Doc owns Run only while its pane is open and no block run is going", () => {
-    mockRun(Status.Completed);
-    renderAt("/workflows/wpid_1/studio?panes=editor", <TopBarRunControl />);
-    expect(screen.queryByTestId("doc-run")).not.toBeNull();
-    cleanup();
+  test("Escape returns focus to Run, and Fix problems hands the list where focus was", async () => {
+    const shown = vi.fn();
+    window.addEventListener(DOC_SHOW_PROBLEMS_EVENT, shown);
+    try {
+      renderAt("/workflows/wpid_1/studio");
+      const run = screen.getByRole("button", { name: /Run/ });
+      act(() => run.focus());
+      fireEvent.click(run);
+      fireEvent.keyDown(document.activeElement ?? document.body, {
+        key: "Escape",
+      });
+      expect(screen.queryByText("Run with 1 problem?")).toBeNull();
+      await waitFor(() => expect(document.activeElement).toBe(run));
 
-    // Watching a run with the editor pane closed: the hidden Doc must not take the shared control.
-    renderAt(
-      "/workflows/wpid_1/studio?wr=wr_1&panes=overview",
-      <TopBarRunControl />,
+      fireEvent.click(run);
+      fireEvent.click(screen.getByRole("button", { name: "Fix problems" }));
+      expect(
+        (shown.mock.calls[0]![0] as CustomEvent).detail.returnPoint.element,
+      ).toBe(run);
+    } finally {
+      window.removeEventListener(DOC_SHOW_PROBLEMS_EVENT, shown);
+    }
+  });
+
+  const docLine = (label: string) => {
+    const el = document.createElement("div");
+    el.setAttribute("data-doc-line", "");
+    el.setAttribute("role", "textbox");
+    el.setAttribute("aria-label", label);
+    el.tabIndex = 0;
+    return el;
+  };
+  // Run pressed from the line at `pressedAt` (inside step n1 unless `topLevel`); the Doc remounts it as
+  // `remountedLabel` while the question is open.
+  const askFromLine = ({
+    labels,
+    pressedAt,
+    topLevel = false,
+  }: {
+    labels: string[];
+    pressedAt: number;
+    topLevel?: boolean;
+  }) => {
+    renderAt("/workflows/wpid_1/studio");
+    const step = document.createElement("div");
+    if (!topLevel) step.setAttribute("data-doc-node-id", "n1");
+    const lines = labels.map(docLine);
+    step.append(...lines);
+    document.body.append(step);
+    onTestFinished(() => step.remove());
+    act(() => lines[pressedAt]!.focus());
+    act(() => {
+      window.dispatchEvent(new Event(DOC_RUN_AGENT_EVENT));
+    });
+    expect(screen.queryByText("Run with 1 problem?")).not.toBeNull();
+    return lines;
+  };
+  const remountAndEscape = (line: HTMLElement, remountedLabel: string) => {
+    const remounted = docLine(remountedLabel);
+    line.replaceWith(remounted);
+    fireEvent.keyDown(document.activeElement ?? document.body, {
+      key: "Escape",
+    });
+    return remounted;
+  };
+
+  test("Escape returns focus to the remounted line Run was pressed from, not the step's first line", async () => {
+    const lines = askFromLine({
+      labels: ["navigation navigationGoal", "navigation url"],
+      pressedAt: 1,
+    });
+    const remounted = remountAndEscape(lines[1]!, "navigation url");
+    await waitFor(() => expect(document.activeElement).toBe(remounted));
+  });
+
+  test("Escape returns to the second of two Notes in a loop when it remounts, not the first", async () => {
+    const lines = askFromLine({ labels: ["Note", "Note"], pressedAt: 1 });
+    const remounted = remountAndEscape(lines[1]!, "Note");
+    await waitFor(() => expect(document.activeElement).toBe(remounted));
+    expect(document.activeElement).not.toBe(lines[0]);
+  });
+
+  test("Escape falls back to the step's first line when the line Run was pressed from is gone", async () => {
+    const lines = askFromLine({
+      labels: ["navigation navigationGoal", "navigation url"],
+      pressedAt: 1,
+    });
+    remountAndEscape(lines[1]!, "navigation title");
+    await waitFor(() => expect(document.activeElement).toBe(lines[0]));
+  });
+
+  test("Escape from a top-level Note that remounted lands on Run, not on the page", async () => {
+    const lines = askFromLine({
+      labels: ["Note"],
+      pressedAt: 0,
+      topLevel: true,
+    });
+    remountAndEscape(lines[0]!, "Note");
+    const run = screen.getByRole("button", { name: /Run/ });
+    await waitFor(() => expect(document.activeElement).toBe(run));
+  });
+
+  test("Fix problems hands the list the pressed line's step, label and index", () => {
+    const shown = vi.fn();
+    window.addEventListener(DOC_SHOW_PROBLEMS_EVENT, shown);
+    onTestFinished(() =>
+      window.removeEventListener(DOC_SHOW_PROBLEMS_EVENT, shown),
     );
-    expect(screen.queryByTestId("doc-run")).toBeNull();
-    expect(screen.queryByRole("button", { name: /Re-run|Run/ })).not.toBeNull();
-    cleanup();
+    const lines = askFromLine({ labels: ["Note", "Note"], pressedAt: 1 });
+    fireEvent.click(screen.getByRole("button", { name: "Fix problems" }));
+    expect((shown.mock.calls[0]![0] as CustomEvent).detail.returnPoint).toEqual(
+      { element: lines[1], stepId: "n1", lineLabel: "Note", lineIndex: 1 },
+    );
+  });
 
-    // A live block run keeps Stop with a full run beside it.
+  test("asked from the 'Start a full run?' question, Escape returns focus to Run", async () => {
     mockRun(Status.Running);
-    renderAt(
-      "/workflows/wpid_1/studio?panes=editor&wr=wr_1&bl=Block%201",
-      <TopBarRunControl />,
+    renderAt("/workflows/wpid_1/studio?wr=wr_1&bl=Block%201");
+    const run = screen.getByRole("button", { name: /Run/ });
+    fireEvent.click(run);
+    const start = screen.getByRole("button", { name: "Start full run" });
+    act(() => start.focus());
+    fireEvent.click(start);
+    expect(screen.queryByText("Run with 1 problem?")).not.toBeNull();
+    fireEvent.keyDown(document.activeElement ?? document.body, {
+      key: "Escape",
+    });
+    await waitFor(() => expect(document.activeElement).toBe(run));
+
+    // Fix problems hands the Doc's list the same place to return to, not the closed question's button.
+    const shown = vi.fn();
+    window.addEventListener(DOC_SHOW_PROBLEMS_EVENT, shown);
+    onTestFinished(() =>
+      window.removeEventListener(DOC_SHOW_PROBLEMS_EVENT, shown),
     );
-    expect(screen.queryByTestId("doc-run")).toBeNull();
-    expect(screen.queryByRole("button", { name: /Stop/ })).not.toBeNull();
-    expect(screen.queryByRole("button", { name: /Run/ })).not.toBeNull();
+    fireEvent.click(run);
+    fireEvent.click(screen.getByRole("button", { name: "Start full run" }));
+    fireEvent.click(screen.getByRole("button", { name: "Fix problems" }));
+    expect(
+      (shown.mock.calls[0]![0] as CustomEvent).detail.returnPoint.element,
+    ).toBe(run);
+  });
+
+  test("the question shows the problems at the click, even if the check changes while it is open", () => {
+    renderAt("/workflows/wpid_1/studio");
+    fireEvent.click(screen.getByRole("button", { name: /Run/ }));
+    act(() => publishDocCriticalProblems([]));
+    expect(screen.queryByText("Run with 1 problem?")).not.toBeNull();
+    expect(
+      screen.queryByText(
+        "This step has no URL. Type it on the line, or use @.",
+      ),
+    ).not.toBeNull();
+  });
+
+  test("a question left open when a run starts does not come back after it", () => {
+    renderAt("/workflows/wpid_1/studio?wr=wr_1");
+    fireEvent.click(screen.getByRole("button", { name: /Run/ }));
+    expect(screen.queryByText("Run with 1 problem?")).not.toBeNull();
+    mockRun(Status.Running);
+    rerenderRun();
+    mockRun(Status.Completed);
+    rerenderRun();
+    expect(screen.queryByText("Run with 1 problem?")).toBeNull();
+  });
+
+  test("with the Editor pane closed, Run does not ask", () => {
+    docScreen.panes = ["run"];
+    renderAt("/workflows/wpid_1/studio");
+    fireEvent.click(screen.getByRole("button", { name: /Run/ }));
+    expect(screen.queryByText(/Run with/)).toBeNull();
+    expect(screen.getByTestId("location").textContent).toBe(
+      "/agents/wpid_1/run",
+    );
+  });
+
+  test("Run asks first and starts nothing; Run anyway opens the run form", () => {
+    renderAt("/workflows/wpid_1/studio");
+    fireEvent.click(screen.getByRole("button", { name: /Run/ }));
+    expect(screen.queryByText("Run with 1 problem?")).not.toBeNull();
+    expect(
+      screen.queryByText(
+        "This step has no URL. Type it on the line, or use @.",
+      ),
+    ).not.toBeNull();
+    expect(screen.queryByTestId("location")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Run anyway" }));
+    expect(screen.getByTestId("location").textContent).toBe(
+      "/agents/wpid_1/run",
+    );
+  });
+
+  test("Fix problems opens the Doc's problems list and starts nothing", () => {
+    const shown = vi.fn();
+    window.addEventListener(DOC_SHOW_PROBLEMS_EVENT, shown);
+    try {
+      renderAt("/workflows/wpid_1/studio");
+      fireEvent.click(screen.getByRole("button", { name: /Run/ }));
+      fireEvent.click(screen.getByRole("button", { name: "Fix problems" }));
+      expect(shown).toHaveBeenCalled();
+      expect(screen.queryByText("Run with 1 problem?")).toBeNull();
+      expect(screen.queryByTestId("location")).toBeNull();
+    } finally {
+      window.removeEventListener(DOC_SHOW_PROBLEMS_EVENT, shown);
+    }
+  });
+
+  test("Shift+Enter asks the same question", () => {
+    renderAt("/workflows/wpid_1/studio");
+    act(() => {
+      window.dispatchEvent(new Event(DOC_RUN_AGENT_EVENT));
+    });
+    expect(screen.queryByText("Run with 1 problem?")).not.toBeNull();
+    expect(screen.queryByTestId("location")).toBeNull();
+  });
+
+  test("with no critical problem, or with the Doc off screen, Run starts at once", () => {
+    publishDocCriticalProblems([]);
+    renderAt("/workflows/wpid_1/studio");
+    fireEvent.click(screen.getByRole("button", { name: /Run/ }));
+    expect(screen.queryByText(/Run with/)).toBeNull();
+    expect(screen.getByTestId("location").textContent).toBe(
+      "/agents/wpid_1/run",
+    );
+    cleanup();
+
+    // The Visual editor never asks, even while a hidden Doc holds problems.
+    publishDocCriticalProblems(critical);
+    docScreen.onScreen = false;
+    renderAt("/workflows/wpid_1/studio");
+    fireEvent.click(screen.getByRole("button", { name: /Run/ }));
+    expect(screen.queryByText(/Run with/)).toBeNull();
+    expect(screen.getByTestId("location").textContent).toBe(
+      "/agents/wpid_1/run",
+    );
   });
 });

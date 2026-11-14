@@ -320,7 +320,18 @@ describe("yamlCommitInputs", () => {
     });
   });
 
-  test("rejects Copilot-managed completion contracts in full documents", () => {
+  test.each(["copilot_authored", "ember_authored"])(
+    "accepts the server-managed %s key in a full document",
+    (key) => {
+      const draft = stringify({
+        [key]: true,
+        workflow_definition: { parameters: [], blocks: [] },
+      });
+      expect(() => yamlCommitInputs(parse(draft), draft)).not.toThrow();
+    },
+  );
+
+  test("rejects Ember-managed completion contracts in full documents", () => {
     const draft = stringify({
       workflow_definition: {
         parameters: [],

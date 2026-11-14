@@ -38,7 +38,7 @@ The right side of the top bar holds the agent's controls:
 
 | Control | What it does |
 |---|---|
-| Save (disk icon) | Saves your hand edits. A dot on the icon means unsaved changes. |
+| Save (disk icon) | Saves your hand edits. A dot on the icon means unsaved changes. It is disabled, and its tooltip says why, while Copilot is working on a request or applying changes and while YAML edits are being applied. When Copilot pauses saving so you don't overwrite a newer change (for example, the agent changed after Copilot proposed its changes), Save stays clickable and opens **Save is paused**, which explains why and offers **Reload and discard my edits**. |
 | **Schedule** (calendar icon) | Lists this agent's schedules and adds new ones. See [Runs and schedules](/cloud/runs#schedule-an-agent). |
 | **Triggers** (lightning icon) | Starts this agent from a signed HTTP request. See [Event triggers](/developers/event-triggers). |
 | **More actions** (⋯) | **Code**, **Version history**, **Save as Template**, **Take a tour** |
@@ -74,6 +74,19 @@ Other things you can do in the Copilot pane:
 If a run fails, the Run pane offers **Fix with Copilot**, which sends the failure to Copilot to diagnose and propose a fix.
 
 <img src="/images/cloud/cloud-copilot-proposal.png" alt="Copilot reply with the extracted posts and a Proposed changes card marked Tested, with Accept, its Always accept option, Review and Reject" />
+
+### Demonstrate a task
+
+When a site is easier to show than to describe, do the steps yourself and let Copilot build the blocks from them. Start with **Demonstrate task** in the **+** menu of the message box or in the Editor's add menu. The browser has to be ready first. When you tell Copilot you would rather show it, its reply carries a **Show Copilot how in the browser** card with **Start demonstration**.
+
+While you drive the browser, the message box reads **Demonstrating** with the number of actions recorded so far, and each action becomes a step: clicks, typing, dropdown choices, key presses, navigation, and dragging one element onto another. A freehand stroke on a canvas or on a slider the page builds itself, and a drag inside an embedded page, read **Drag not recorded** instead. A browser's built-in slider or color picker reads **Step not recorded**.
+
+Two requests come to the chat instead of the browser:
+
+- **A sign-in.** When you focus a password or one-time-code field, Skyvern asks you to fill it from a saved login or type it yourself. The step records the field and not the value, as **Fill password (value not recorded)** or **Fill one-time code (value not recorded)**. Skip the field without typing and no step is recorded for it.
+- **A file.** When the page opens a file picker, the chat asks you to choose a file for that field, with **Choose file** and **Skip**. The file you choose is attached in the page, and Copilot makes it the default for the agent's file input.
+
+While you record, the send button reads **Done, build the workflow**. Click it and Copilot builds the agent from what you did. **Discard** throws the demonstration away.
 
 ## Edit blocks by hand
 
@@ -213,7 +226,7 @@ The **⋯** menu on a row holds:
 | **Duplicate Agent** | Creates a copy of the agent |
 | **Save as template** / **Remove from template** | Adds or removes the agent from your organization's templates |
 | **Export** | Downloads the agent as **YAML** or **JSON** |
-| **Delete** | Deletes the agent after you confirm |
+| **Delete** | Deletes the agent, and its [schedules](/cloud/runs#manage-schedules), after you confirm |
 
 **Import** uploads one or more agents from `.yaml`, `.yml`, `.json` or `.zip` files. A `.pdf` procedure (SOP) is turned into a new agent.
 

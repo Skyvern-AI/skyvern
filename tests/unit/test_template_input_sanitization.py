@@ -8,8 +8,8 @@ import pytest
 from jinja2 import Environment
 
 from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.copilot.block_goal_wrapping import compose_mini_goal, unwrap_goal_fields
 from skyvern.forge.sdk.prompting import _untrusted_filter
+from skyvern.forge.sdk.workflow.block_goal_wrapping import compose_mini_goal, unwrap_goal_fields
 from skyvern.utils.prompt_engine import load_prompt_with_elements_tracked
 from skyvern.utils.strings import escape_code_fences
 

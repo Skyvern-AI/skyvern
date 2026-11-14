@@ -1,3 +1,4 @@
+import type { CreatedTrigger } from "@/routes/workflows/ember/narrativeState";
 import type { WorkflowReliability } from "@/routes/workflows/types/reliabilityTypes";
 import { createContext, useContext } from "react";
 import type { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
@@ -10,6 +11,14 @@ export type WorkflowAnalyticsPanelProps = {
 export type WorkflowTriggersPanelProps = Readonly<{
   workflowPermanentId: string;
   onClose: () => void;
+  // Opens this trigger's detail with its on switch highlighted.
+  focusTriggerId?: string;
+  // Changes on every request to focus, so asking again for the same trigger reopens it.
+  focusRequest?: number;
+}>;
+export type TriggerCreatedCardSlotProps = Readonly<{
+  trigger: CreatedTrigger;
+  onOpen?: () => void;
 }>;
 export type WorkflowRunMilestoneCardProps = Readonly<{
   workflowRunId: string;
@@ -39,6 +48,19 @@ export type BrokerCredentialSelectorProps = BrokerCredentialSelectorBase &
       }>
   );
 
+// The Integrations page's Connected Gmail flow, for a surface that starts a new Gmail connection.
+export type ConnectedGmailFlow = Readonly<{
+  // "default": no visible native Gmail credential, so a new Gmail connection starts Connected Gmail.
+  status: "loading" | "default" | "unavailable";
+  canConnect: boolean;
+  busy: boolean;
+  // A message to show for a failed attempt; a cancelled sign-in has none.
+  failure: string | null;
+  // Active connections, named as the Integrations page names them.
+  connections: ReadonlyArray<Readonly<{ connection_id: string; name: string }>>;
+  start: () => void;
+}>;
+
 export type PermissionCapability = Readonly<{
   capability: string;
   allowed: boolean;
@@ -52,6 +74,8 @@ export type PermissionsResponse = Readonly<{
   org_role: string | null;
   role: "admin" | "member" | "billing_admin" | null;
   capabilities: ReadonlyArray<PermissionCapability>;
+  // When the organization enforces app roles, effective_role overrides the Clerk role above.
+  rbac?: Readonly<{ enforce: boolean; effective_role: string | null }>;
 }>;
 
 export type PermissionsState =
@@ -76,6 +100,9 @@ export type PageSlots = {
     }>
   >;
   brokerCredentialSelector?: React.ComponentType<BrokerCredentialSelectorProps>;
+  connectedGmailFlow?: React.ComponentType<
+    Readonly<{ children: (flow: ConnectedGmailFlow) => React.ReactNode }>
+  >;
   workflowFindingsScope?: React.ComponentType<
     Readonly<{
       workflowPermanentIds: readonly string[];
@@ -95,6 +122,8 @@ export type PageSlots = {
   >;
   workflowAnalyticsPanel?: React.ComponentType<WorkflowAnalyticsPanelProps>;
   workflowTriggersPanel?: React.ComponentType<WorkflowTriggersPanelProps>;
+  // The Ember trigger card with the trigger's live state and a Turn on switch.
+  triggerCreatedCard?: React.ComponentType<TriggerCreatedCardSlotProps>;
   workflowRunsFilterControls?: React.ComponentType;
   workflowRunMilestoneCard?: React.ComponentType<WorkflowRunMilestoneCardProps>;
   firstRunWaitCard?: React.ComponentType<FirstRunWaitCardProps>;

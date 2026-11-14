@@ -29,13 +29,15 @@ from agents import (
 from agents.items import TResponseOutputItem
 from agents.models.interface import Model
 from agents.tool_context import ToolContext
+from jsonschema import Draft202012Validator
 from litellm.types.utils import ModelResponse as LitellmResponse
 from openai.types.responses import ResponseFunctionToolCall
-from pydantic import JsonValue, ValidationError
+from pydantic import Field, JsonValue, ValidationError
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 from structlog.testing import capture_logs
 
+from skyvern.config import settings
 from skyvern.core.script_generations import real_skyvern_page_ai
 from skyvern.core.script_generations.real_skyvern_page_ai import _render_template_with_label
 from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
@@ -45,11 +47,17 @@ from skyvern.forge.sdk.api.llm.copilot_model_usage import CopilotModelUsageEvent
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.artifact.storage.local import LocalStorage
+from skyvern.forge.sdk.cache.local import LocalCache
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.agent_db import AgentDB
-from skyvern.forge.sdk.db.models import WorkflowRunBlockModel, WorkflowRunModel
+from skyvern.forge.sdk.db.models import GoogleOAuthCredentialModel, WorkflowRunBlockModel, WorkflowRunModel
 from skyvern.forge.sdk.experimentation.providers import NoOpExperimentationProvider
+from skyvern.forge.sdk.integrations.connected_accounts import (
+    OrgConnection,
+    _run_accounts_key,
+    record_run_connection_ids,
+)
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
@@ -85,8 +93,10 @@ from skyvern.schemas.workflows import (
     BranchConditionYAML,
     BranchCriteriaYAML,
     ConditionalBlockYAML,
+    GoogleSheetsReadBlockYAML,
     SendEmailBlockYAML,
     WorkflowDefinitionYAML,
+    _connected_account_field,
 )
 from skyvern.services import script_service
 from skyvern.utils.secret_redaction import REDACTED_SECRET_PLACEHOLDER
@@ -563,6 +573,82 @@ async def test_a_stored_step_listing_pdf_parser_is_offered_file_url_parser(
     assert "pdf_parser" not in json.dumps(offered)
 
 
+SHEET_URL = "https://docs.google.com/spreadsheets/d/sheet_id/edit"
+
+
+def _sheets_write(values: JsonValue, call_id: str = "sheet") -> list[TResponseOutputItem]:
+    arguments = {
+        "spreadsheet_url": SHEET_URL,
+        "sheet_name": "Sheet1",
+        "range": "A1",
+        "credential_id": "goc_active",
+        "write_mode": "update",
+        "values": values,
+    }
+    return [scripted_call("run_block", {"block_type": "google_sheets_write", "arguments": arguments}, call_id=call_id)]
+
+
+@pytest.fixture
+def sheets_writes(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+    monkeypatch.setattr(app.AGENT_FUNCTION, "get_google_sheets_credentials", AsyncMock(return_value="token"))
+    write = AsyncMock(return_value={"updatedRange": "Sheet1!A1", "updatedRows": 1})
+    monkeypatch.setattr(app.AGENT_FUNCTION, "google_sheets_values_update", write)
+    return write
+
+
+def _offered_run_block(model: _ScriptedModel) -> FunctionTool:
+    return next(tool for tool in model.tools[0] if isinstance(tool, FunctionTool) and tool.name == "run_block")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tools", [["google_sheets_write"], ["google_sheets_write", "text_prompt"]])
+async def test_run_block_offers_each_listed_blocks_argument_schema_before_the_first_call(
+    monkeypatch: pytest.MonkeyPatch, database: AgentDB, sheets_writes: AsyncMock, tools: list[str]
+) -> None:
+    monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
+    await _google_accounts(database)
+    (sheet_call,) = (json.loads(call.arguments)["arguments"] for call in _sheets_write(json.dumps([["12.5%"]])))
+    calls = {
+        "google_sheets_write": (sheet_call, {**sheet_call, "values": [["12.5%"]]}),
+        "text_prompt": ({"prompt": "Hi"}, {"prompt": ["Hi"]}),
+    }
+    invalid = [
+        [scripted_call("run_block", {"block_type": name, "arguments": calls[name][1]}, call_id=name)] for name in tools
+    ]
+    model = _ScriptedModel([*invalid, _sheets_write(json.dumps([["12.5%"]]), call_id="write"), VALID_FINISH])
+
+    await _run_agent_block(monkeypatch, LUNA_MEDIUM, model, tools=tools)
+
+    write = json.loads(tool_outputs_for(model.inputs[-1][1], "write")[0])
+    assert write["status"] == "completed"
+    assert write["output"]["updated_range"] == "Sheet1!A1"
+    sheets_writes.assert_awaited_once()
+    assert sheets_writes.await_args is not None
+    assert sheets_writes.await_args.kwargs["values"] == [["12.5%"]]
+    offer = _offered_run_block(model).params_json_schema
+    listed = offer["properties"]["block_type"]["enum"]
+    arguments = offer["properties"]["arguments"]
+    branches = [arguments] if len(listed) == 1 else arguments["anyOf"]
+    for name, branch in zip(listed, branches, strict=True):
+        report = json.loads(tool_outputs_for(model.inputs[-1][1], name)[0])
+        assert report["status"] == "invalid_arguments", name
+        recovery = report["argument_schema"]
+        recovery_defs = recovery.pop("$defs", {})
+        assert branch == recovery, name
+        assert recovery_defs.items() <= offer.get("$defs", {}).items(), name
+        recovery["$defs"] = recovery_defs
+        good, bad = calls[name]
+        for schema in ({**branch, "$defs": offer.get("$defs", {})}, recovery):
+            assert Draft202012Validator(schema).is_valid(good), name
+            assert not Draft202012Validator(schema).is_valid(bad), name
+    assert set(re.findall(r'"#/\$defs/(\w+)"', json.dumps(offer))) <= set(offer.get("$defs", {}))
+    assert branches[listed.index("google_sheets_write")]["properties"]["values"]["type"] == "string"
+    validator = Draft202012Validator(offer)
+    written = {"block_type": "google_sheets_write", "arguments": sheet_call}
+    assert validator.is_valid(written)
+    assert not validator.is_valid({**written, "arguments": calls["google_sheets_write"][1]})
+
+
 def test_a_saved_list_naming_pdf_parser_reads_as_file_url_parser() -> None:
     block = AgentStepBlockYAML(label="agent", prompt="Find the answer.", tools=["pdf_parser", "file_url_parser"])
 
@@ -883,12 +969,23 @@ async def test_the_agent_block_sends_its_pinned_effort_on_a_bare_gpt_5_name(monk
 
 
 def test_every_block_tool_schema_defines_exactly_the_definitions_it_references() -> None:
-    state = cast(agent_step_loop._RunState, SimpleNamespace(credential_keys=["login_credential"]))
-    for tool in agent_step_tools.AGENT_BLOCK_TOOLS.values():
-        if isinstance(tool, agent_step_tools.BlockTool):
-            schema = agent_step_loop._arguments_schema(tool, state)
-            references = set(re.findall(r'"#/\$defs/(\w+)"', json.dumps(schema)))
-            assert references == set(schema.get("$defs", {})), tool.yaml_class.__name__
+    state = cast(
+        agent_step_loop._RunState, SimpleNamespace(credential_keys=["login_credential"], connected_accounts=[])
+    )
+    schemas = [
+        (tool.yaml_class.__name__, agent_step_loop._arguments_schema(tool, state))
+        for tool in agent_step_tools.AGENT_BLOCK_TOOLS.values()
+        if isinstance(tool, agent_step_tools.BlockTool)
+    ]
+    schemas.append(("run_block", agent_step_loop._run_block_schema(state, list(agent_step_tools.RUN_BLOCK_TYPES))))
+    for name, schema in schemas:
+        references = set(re.findall(r'"#/\$defs/(\w+)"', json.dumps(schema)))
+        assert references == set(schema.get("$defs", {})), name
+    # run_block hoists every listed block's $defs into one root, so a shared name must mean the same thing.
+    shared: dict[str, Any] = {}
+    for _, tool in agent_step_tools.RUN_BLOCK_TYPES.values():
+        for key, definition in agent_step_loop._arguments_schema(tool, state).get("$defs", {}).items():
+            assert shared.setdefault(key, definition) == definition, key
 
 
 def test_every_block_type_is_an_agent_tool_or_says_why_not() -> None:
@@ -899,6 +996,274 @@ def test_every_block_type_is_an_agent_tool_or_says_why_not() -> None:
             continue
         assert tool.yaml_class.model_fields["block_type"].default == block_type
         assert set(tool.fields) - {"credential", "files"} <= set(tool.yaml_class.model_fields)
+
+
+def test_each_block_tool_offers_exactly_the_account_fields_its_schema_marks() -> None:
+    offered = {
+        block_type.value: tool.arguments[len(tool.fields) :]
+        for block_type, tool in agent_step_tools.AGENT_BLOCK_TOOLS.items()
+        if isinstance(tool, agent_step_tools.BlockTool) and len(tool.arguments) > len(tool.fields)
+    }
+
+    assert offered == {
+        "file_upload": ("google_credential_id",),
+        "send_email": ("credential_id",),
+        "google_sheets_read": ("credential_id",),
+        "google_sheets_write": ("credential_id",),
+        "email_inbox": ("credential_id",),
+    }
+
+
+SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets.readonly"
+
+
+async def _google_accounts(database: AgentDB) -> None:
+    async with database.Session() as session:
+        for account_id, organization_id, state in [
+            ("goc_active", ORG, "active"),
+            ("goc_errored", ORG, "error"),
+            ("goc_foreign", "o_other", "active"),
+        ]:
+            session.add(
+                GoogleOAuthCredentialModel(
+                    id=account_id,
+                    organization_id=organization_id,
+                    credential_name=account_id,
+                    email_address=f"{account_id}@example.com",
+                    state=state,
+                    scopes_granted=[SHEETS_SCOPE],
+                )
+            )
+        await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_a_copilot_run_offers_and_accepts_only_the_account_the_chat_approved(
+    monkeypatch: pytest.MonkeyPatch, database: AgentDB
+) -> None:
+    async with database.Session() as session:
+        for account_id in ("goc_a", "goc_b", "goc_c"):
+            session.add(
+                GoogleOAuthCredentialModel(
+                    id=account_id,
+                    organization_id=ORG,
+                    credential_name=account_id,
+                    email_address=f"{account_id}@example.com",
+                    state="active",
+                    scopes_granted=[SHEETS_SCOPE],
+                )
+            )
+        await session.execute(
+            update(WorkflowRunModel).where(WorkflowRunModel.workflow_run_id == RUN).values(created_by="copilot")
+        )
+        await session.commit()
+    monkeypatch.setattr(app, "CACHE", LocalCache())
+    # With no record, narrowing off keeps every account (an older API required them all); on offers none.
+    assert {account.id for account in await agent_step_loop._connected_accounts(ORG, RUN)} == {
+        "goc_a",
+        "goc_b",
+        "goc_c",
+    }
+    monkeypatch.setattr(settings, "COPILOT_NARROW_AGENT_STEP_ACCOUNTS", True)
+    assert await agent_step_loop._connected_accounts(ORG, RUN) == []
+    await record_run_connection_ids(ORG, RUN, ["goc_a"])
+    monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
+    sheet = {"spreadsheet_url": "https://docs.google.com/spreadsheets/d/x"}
+    model = _ScriptedModel(
+        [
+            [
+                scripted_call(
+                    "run_block",
+                    {"block_type": "google_sheets_read", "arguments": {**sheet, "credential_id": account}},
+                    call_id=account,
+                )
+            ]
+            for account in ("goc_b", "goc_a")
+        ]
+        + [[scripted_call("finish", {"answer": "done"}, call_id="f")]]
+    )
+
+    await _run_agent_block(monkeypatch, LUNA_MEDIUM, model, tools=["google_sheets_read"])
+
+    (run_block,) = (tool for tool in model.tools[0] if isinstance(tool, FunctionTool) and tool.name == "run_block")
+    assert run_block.params_json_schema["$defs"][agent_step_loop._ACCOUNT_DEF]["enum"] == ["goc_a"]
+    async with database.Session() as session:
+        session.add(
+            WorkflowRunModel(
+                workflow_run_id="wr_child",
+                workflow_id="w_1",
+                workflow_permanent_id=WPID,
+                organization_id=ORG,
+                status="running",
+                parent_workflow_run_id=RUN,
+            )
+        )
+        await session.commit()
+    assert [account.id for account in await agent_step_loop._connected_accounts(ORG, "wr_child")] == ["goc_a"]
+    (refused,) = tool_outputs_for(model.inputs[1][1], "goc_b")
+    (accepted,) = tool_outputs_for(model.inputs[2][1], "goc_a")
+    assert "invalid_arguments" in refused and "goc_b@" not in refused
+    assert "invalid_arguments" not in accepted
+
+
+@pytest.mark.asyncio
+async def test_a_copilot_runs_record_holds_whatever_the_workers_setting_and_a_broken_chain_offers_none(
+    monkeypatch: pytest.MonkeyPatch, database: AgentDB
+) -> None:
+    async with database.Session() as session:
+        for account_id in ("goc_a", "goc_b"):
+            session.add(
+                GoogleOAuthCredentialModel(
+                    id=account_id,
+                    organization_id=ORG,
+                    credential_name=account_id,
+                    email_address=f"{account_id}@example.com",
+                    state="active",
+                    scopes_granted=[SHEETS_SCOPE],
+                )
+            )
+        await session.execute(
+            update(WorkflowRunModel).where(WorkflowRunModel.workflow_run_id == RUN).values(created_by="copilot")
+        )
+        # wr_hop_1 is RUN's child, and each wr_hop_n the child of wr_hop_{n-1}; wr_dangling's parent is gone.
+        for hop in range(1, agent_step_loop._MAX_PARENT_RUN_HOPS + 2):
+            session.add(
+                WorkflowRunModel(
+                    workflow_run_id=f"wr_hop_{hop}",
+                    workflow_id="w_1",
+                    workflow_permanent_id=WPID,
+                    organization_id=ORG,
+                    status="running",
+                    parent_workflow_run_id=RUN if hop == 1 else f"wr_hop_{hop - 1}",
+                )
+            )
+        session.add(
+            WorkflowRunModel(
+                workflow_run_id="wr_dangling",
+                workflow_id="w_1",
+                workflow_permanent_id=WPID,
+                organization_id=ORG,
+                status="running",
+                parent_workflow_run_id="wr_deleted",
+            )
+        )
+        await session.commit()
+    cache = LocalCache()
+    monkeypatch.setattr(app, "CACHE", cache)
+    await record_run_connection_ids(ORG, RUN, ["goc_a"])
+
+    async def offered(run_id: str) -> list[str]:
+        return sorted(account.id for account in await agent_step_loop._connected_accounts(ORG, run_id))
+
+    # Narrowing off on this worker: a record is still enforced, and an unreadable one offers none.
+    assert await offered(RUN) == ["goc_a"]
+    assert await offered(f"wr_hop_{agent_step_loop._MAX_PARENT_RUN_HOPS}") == ["goc_a"]
+    await cache.set(_run_accounts_key(ORG, RUN), "not json")
+    assert await offered(RUN) == []
+    monkeypatch.setattr(cache, "get", AsyncMock(side_effect=RuntimeError("cache down")))
+    assert await offered(RUN) == []
+    assert await offered("wr_dangling") == ["goc_a", "goc_b"]
+
+    monkeypatch.setattr(settings, "COPILOT_NARROW_AGENT_STEP_ACCOUNTS", True)
+    assert await offered("wr_dangling") == []
+    assert await offered(f"wr_hop_{agent_step_loop._MAX_PARENT_RUN_HOPS + 1}") == []
+
+
+@pytest.mark.asyncio
+async def test_a_run_creators_connected_gmail_account_is_never_offered_to_the_agent_step(
+    monkeypatch: pytest.MonkeyPatch, database: AgentDB
+) -> None:
+    async with database.Session() as session:
+        session.add(
+            GoogleOAuthCredentialModel(
+                id="goc_a",
+                organization_id=ORG,
+                credential_name="goc_a",
+                email_address="goc_a@example.com",
+                state="active",
+                scopes_granted=[SHEETS_SCOPE],
+            )
+        )
+        await session.execute(
+            update(WorkflowRunModel).where(WorkflowRunModel.workflow_run_id == RUN).values(created_by="user-1")
+        )
+        await session.commit()
+
+    async def own_connected_gmail(organization_id: str, user_id: str) -> list[OrgConnection]:
+        return (
+            [OrgConnection("ngc_owned", "nango", "Connected Gmail", None, "active", ())] if user_id == "user-1" else []
+        )
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "own_connected_gmail_connections", own_connected_gmail)
+
+    # A Nango hop token exists only for a saved block, so the agent step cannot use the account (ADR 0033).
+    assert [account.id for account in await agent_step_loop._connected_accounts(ORG, RUN)] == ["goc_a"]
+
+
+class _SheetsWithBackupAccount(GoogleSheetsReadBlockYAML):
+    backup_credential_id: str | None = Field(default=None, json_schema_extra=_connected_account_field())
+
+
+@pytest.mark.asyncio
+async def test_a_newly_marked_block_field_becomes_a_choice_of_the_runs_active_accounts(database: AgentDB) -> None:
+    tool = agent_step_tools.BlockTool(_SheetsWithBackupAccount, ("spreadsheet_url", "range"))
+    state = _bare_state()
+    unconnected = agent_step_loop._dedicated_tool(BlockType.GOOGLE_SHEETS_READ, tool, state).params_json_schema
+    account = unconnected["$defs"][agent_step_loop._ACCOUNT_DEF]
+    assert "enum" not in account and "no connected account is available" in account["description"]
+
+    await _google_accounts(database)
+    state.connected_accounts = await agent_step_loop._connected_accounts(ORG, RUN)
+
+    schema = agent_step_loop._dedicated_tool(BlockType.GOOGLE_SHEETS_READ, tool, state).params_json_schema
+
+    account = schema["$defs"][agent_step_loop._ACCOUNT_DEF]
+    for name in ("credential_id", "backup_credential_id"):
+        assert schema["properties"][name]["$ref"] == f"#/$defs/{agent_step_loop._ACCOUNT_DEF}"
+    assert account["enum"] == ["goc_active"]
+    (choice,) = json.loads(account["description"].partition("accounts: ")[2])
+    assert (choice["connection_id"], choice["provider"], choice["scopes_granted"]) == (
+        "goc_active",
+        "google",
+        [SHEETS_SCOPE],
+    )
+    assert "backup_credential_id" not in schema["required"]
+    sheet = {"spreadsheet_url": "https://docs.google.com/spreadsheets/d/x", "credential_id": "goc_active"}
+    assert agent_step_loop._yaml_arguments(tool, sheet, state)["credential_id"] == "goc_active"
+
+
+@pytest.mark.asyncio
+async def test_an_account_outside_the_runs_active_accounts_is_refused_with_the_valid_choices(
+    monkeypatch: pytest.MonkeyPatch, database: AgentDB
+) -> None:
+    await _google_accounts(database)
+    monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
+    sheet = {"spreadsheet_url": "https://docs.google.com/spreadsheets/d/x"}
+    model = _ScriptedModel(
+        [
+            [
+                scripted_call(
+                    "run_block",
+                    {"block_type": "google_sheets_read", "arguments": {**sheet, "credential_id": account}},
+                    call_id=account,
+                )
+            ]
+            for account in ("goc_foreign", "goc_errored")
+        ]
+        + [[scripted_call("finish", {"answer": "done"}, call_id="f")]]
+    )
+
+    await _run_agent_block(monkeypatch, LUNA_MEDIUM, model, tools=["google_sheets_read"])
+
+    (run_block,) = (tool for tool in model.tools[0] if isinstance(tool, FunctionTool) and tool.name == "run_block")
+    offered = run_block.params_json_schema["$defs"][agent_step_loop._ACCOUNT_DEF]["enum"]
+    assert offered == ["goc_active"]
+    for turn, account in enumerate(("goc_foreign", "goc_errored"), start=1):
+        (output,) = tool_outputs_for(model.inputs[turn][1], account)
+        assert "invalid_arguments" in output
+        assert "goc_active" in output and "goc_errored@" not in output and "goc_foreign@" not in output
+    rows = await database.observer.get_workflow_run_blocks(workflow_run_id=RUN, organization_id=ORG)
+    assert [row.block_type for row in rows] == [BlockType.AGENT_STEP]
 
 
 CHILD_OUTPUT = "agent_text_prompt_1_output"

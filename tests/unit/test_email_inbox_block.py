@@ -152,6 +152,20 @@ async def test_execute_reads_gmail_messages(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 @pytest.mark.asyncio
+async def test_a_connected_gmail_id_in_credential_id_names_the_field_that_can_use_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(app.AGENT_FUNCTION, "get_google_workspace_credentials", AsyncMock(return_value=None))
+
+    misplaced = await _execute_block_for_test(_make_block(folder="INBOX", credential_id="ngc_abc"))
+    unknown = await _execute_block_for_test(_make_block(folder="INBOX", credential_id="goac_gone"))
+
+    assert "credential_source to nango" in (misplaced.failure_reason or "")
+    assert "connection_id" in (misplaced.failure_reason or "")
+    assert "Reconnect the Gmail account" in (unknown.failure_reason or "")
+
+
+@pytest.mark.asyncio
 async def test_execute_reads_outlook_messages(monkeypatch: pytest.MonkeyPatch) -> None:
     list_messages = AsyncMock(return_value=_messages())
     monkeypatch.setattr(app.AGENT_FUNCTION, "get_microsoft_credentials", AsyncMock(return_value="AT"), raising=False)

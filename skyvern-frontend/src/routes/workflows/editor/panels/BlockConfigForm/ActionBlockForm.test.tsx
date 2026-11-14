@@ -103,9 +103,6 @@ vi.mock("../../nodes/TaskNode/ParametersMultiSelect", () => ({
 vi.mock("../../nodes/components/BlockExecutionOptions", () => ({
   BlockExecutionOptions: () => <div data-testid="block-execution-options" />,
 }));
-vi.mock("../../nodes/DisableCache", () => ({
-  DisableCache: () => <div data-testid="disable-cache" />,
-}));
 vi.mock("../../hooks/useSelectedCredentialTotpIdentifier", () => ({
   useSelectedCredentialTotpIdentifier: () => null,
 }));
@@ -185,7 +182,7 @@ describe("ActionBlockForm (SKY-9373)", () => {
     // Mirrors the inline ActionNode JSX: URL, action instruction (textarea
     // with the navigation-goal placeholder), informational tip box,
     // model/engine selectors, parameters multi-select, error-code mapping
-    // toggle, execution options, disable-cache, file-name input, and 2FA
+    // toggle, execution options, file-name input, and 2FA
     // identifier + verification-url textareas. If a field disappears here
     // it disappears from the sidebar UI. The Advanced Settings accordion
     // is collapsed by default — assert the trigger plus the
@@ -209,7 +206,6 @@ describe("ActionBlockForm (SKY-9373)", () => {
     expect(screen.getByTestId("engine-selector")).toBeDefined();
     expect(screen.getByTestId("parameters-multi-select")).toBeDefined();
     expect(screen.getByTestId("block-execution-options")).toBeDefined();
-    expect(screen.getByTestId("disable-cache")).toBeDefined();
   });
 
   test("dispatches updateNodeData when the URL field changes", () => {

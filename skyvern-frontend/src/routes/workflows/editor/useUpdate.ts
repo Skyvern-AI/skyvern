@@ -37,7 +37,7 @@ export function useUpdate<T extends Record<string, unknown>>({
       if (!editable || readOnlyScope || refuseMutationDuringYamlCommit())
         return false;
       if (options?.source !== "workflow")
-        useWorkflowTitleStore.getState().recordCopilotGraphEdit();
+        useWorkflowTitleStore.getState().recordEmberGraphEdit();
       // Only a pick in the engine dropdown marks skyvern-1.0 as a pin; a load carries the stored marker.
       updateNodeData(
         id,

@@ -118,10 +118,6 @@ from skyvern.forge.sdk.artifact.storage.unique_pdfs import (
 from skyvern.forge.sdk.browser_action_policy import BrowserActionPolicy
 from skyvern.forge.sdk.cache import extraction_cache
 from skyvern.forge.sdk.cache.factory import CacheFactory
-from skyvern.forge.sdk.copilot.reached_download_target import (
-    REGISTERED_DOWNLOAD_OUTPUT_KEYS,
-    generated_file_artifact_ids,
-)
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -330,6 +326,10 @@ from skyvern.forge.sdk.workflow.private_settings import (
     resolve_totp_identifier,
     resolve_totp_verification_url,
     resolve_webhook_callback_url,
+)
+from skyvern.forge.sdk.workflow.reached_download_target import (
+    REGISTERED_DOWNLOAD_OUTPUT_KEYS,
+    generated_file_artifact_ids,
 )
 from skyvern.forge.sdk.workflow.response_value_caps import (
     capped_loop_values,
@@ -2408,6 +2408,14 @@ async def _delete_backend_schedule(backend_schedule_id: str, slots: asyncio.Sema
             await app.AGENT_FUNCTION.delete_workflow_schedule(backend_schedule_id)
 
 
+def block_image_ids(blocks: list[BLOCK_YAML_TYPES] | list[BlockTypeVar]) -> list[tuple[str, str]]:
+    return [
+        (block.label, image.file_id)
+        for block in get_all_blocks(blocks)
+        for image in [*(block.doc_images or []), *(block.prompt_images or [])]
+    ]
+
+
 class WorkflowService:
     def __init__(self) -> None:
         # Per-instance so a fire-and-forget task created under one event loop cannot leak into
@@ -4122,8 +4130,14 @@ class WorkflowService:
         organization: Organization,
         request_data: dict[str, Any] | None,
         credential_use_principal: RequestPrincipal | None = None,
+        *,
+        workflow_parameters: list[WorkflowParameter] | None = None,
     ) -> None:
-        all_workflow_parameters = await self.get_workflow_parameters(workflow_id=workflow.workflow_id)
+        all_workflow_parameters = (
+            workflow_parameters
+            if workflow_parameters is not None
+            else await self.get_workflow_parameters(workflow_id=workflow.workflow_id)
+        )
         schedule_parameters = [
             cast(WorkflowParameter, workflow_parameter)
             for workflow_parameter in all_workflow_parameters
@@ -12113,7 +12127,7 @@ class WorkflowService:
                         default_next_map[block.label] = blocks[idx + 1].label
 
         # connect conditional branch terminals to the conditional's merge-point successor.
-        resolve_conditional_merge_edges(all_blocks, label_to_block, default_next_map)
+        skipped_merge_link = resolve_conditional_merge_edges(all_blocks, label_to_block, default_next_map)
 
         adjacency: dict[str, set[str]] = {label: set() for label in label_to_block}
         incoming: dict[str, int] = {label: 0 for label in label_to_block}
@@ -12133,6 +12147,12 @@ class WorkflowService:
             if isinstance(block, ConditionalBlock):
                 for branch in block.ordered_branches:
                     _add_edge(label, branch.next_block_label)
+                # A skipped merge link can hide a loop closed by the run falling back to the conditional's own next, which
+                # it does on an empty branch or a continued failure. Without a skipped link the edge is left out.
+                if skipped_merge_link and (
+                    block.continue_on_failure or any(not branch.next_block_label for branch in block.ordered_branches)
+                ):
+                    _add_edge(label, default_next_map.get(label))
             else:
                 _add_edge(label, default_next_map.get(label))
 
@@ -13004,6 +13024,7 @@ class WorkflowService:
         preserve_completion_contract: bool = True,
         created_via: str | None = None,
         validate_code_block_templates: bool = True,
+        validate_block_image_files: bool = True,
         preserve_redacted_credential_references_from: Workflow | None = None,
         preserved_credential_references: set[tuple[str, str, str]] | None = None,
         prior_definition: WorkflowDefinition | None = None,
@@ -13042,6 +13063,17 @@ class WorkflowService:
             )
             if validate_code_block_templates:
                 self._validate_code_block_templates(workflow_definition)
+            if validate_block_image_files and block_image_ids(workflow_definition.blocks):
+                image_organization_id = organization_id
+                if image_organization_id is None:
+                    owner = await app.DATABASE.workflows.get_workflow(workflow_id=workflow_id)
+                    if owner is None:
+                        raise InvalidWorkflowDefinition("Block images need the workflow's organization.")
+                    image_organization_id = owner.organization_id
+                replaced = await self._replaced_definition(workflow_id, image_organization_id, prior_definition)
+                await self._validate_block_image_files(
+                    workflow_definition.blocks, replaced.blocks if replaced is not None else [], image_organization_id
+                )
             self._validate_block_engines(workflow_definition)
             if preserved_credential_references is None:
                 preserved_credential_references = await self._preserve_redacted_credential_references(
@@ -18918,6 +18950,8 @@ class WorkflowService:
             except WorkflowNotFound:
                 pass
 
+            # A retry returns the version the first call made even if its images have since expired.
+            await self._validate_block_image_files(request.workflow_definition.blocks, [], organization_id)
             created_workflow = await self._create_initial_workflow_from_request(
                 organization_id=organization_id,
                 request=request,
@@ -18967,6 +19001,32 @@ class WorkflowService:
             organization_id=organization_id,
         )
         return latest.version, settings_base
+
+    @staticmethod
+    async def _validate_block_image_files(
+        blocks: list[BLOCK_YAML_TYPES] | list[BlockTypeVar],
+        previous_blocks: list[BlockTypeVar],
+        organization_id: str,
+    ) -> None:
+        """Every image a save adds must be a live upload of the saving organization; saved ones were checked."""
+        saved = {file_id for _, file_id in block_image_ids(previous_blocks)}
+        added = [(label, file_id) for label, file_id in block_image_ids(blocks) if file_id not in saved]
+        live = await uploaded_file_service.live_uploaded_files(
+            file_ids=[file_id for _, file_id in added], organization_id=organization_id
+        )
+        for label, file_id in added:
+            uploaded_file = live.get(file_id)
+            if uploaded_file is None:
+                raise InvalidWorkflowDefinition(
+                    f"Block {label} references image {file_id}, which is not a file uploaded by this organization."
+                )
+            if not uploaded_file_service.is_block_image_upload(uploaded_file):
+                raise InvalidWorkflowDefinition(f"Block {label}: file {file_id} is not a png, jpeg, gif or webp image.")
+            if (
+                uploaded_file.size_bytes is not None
+                and uploaded_file.size_bytes > uploaded_file_service.BLOCK_IMAGE_MAX_BYTES
+            ):
+                raise InvalidWorkflowDefinition(f"Block {label}: image {file_id} is larger than 4 MiB.")
 
     @overload
     async def create_workflow_from_request(
@@ -19098,6 +19158,11 @@ class WorkflowService:
                     organization_id=organization_id,
                     kept_note_labels=list(kept_note_labels),
                 )
+        await self._validate_block_image_files(
+            request.workflow_definition.blocks,
+            existing_latest_workflow.workflow_definition.blocks if existing_latest_workflow else [],
+            organization_id,
+        )
         await self._validate_and_normalize_credential_rotation_parameters(
             request.workflow_definition.parameters,
             organization,
@@ -19172,6 +19237,8 @@ class WorkflowService:
                     created_via=created_via,
                     notify_workflow_saved=False,
                     validate_code_block_templates=validate_code_block_templates,
+                    # create_workflow_from_request checked the images above; another caller must not skip the check.
+                    validate_block_image_files=False,
                     preserved_credential_references=preserved_credential_references,
                     prior_definition=(
                         existing_latest_workflow.workflow_definition if existing_latest_workflow else None

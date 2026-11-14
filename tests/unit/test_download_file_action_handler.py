@@ -45,6 +45,7 @@ from skyvern.webeye.actions.handler import (
     _BLOCKED_INLINE_PDF_RECOVERY_TIMEOUT_SECONDS,
     _INLINE_IFRAME_SRC_JS,
     DOWNLOAD_NOT_TRIGGERED_FOLLOWUP_MESSAGE,
+    DOWNLOAD_TIMEOUT_FAILURE_MESSAGE,
     ActionHandler,
     ScopedXhrDownloadCapture,
     _browser_dispatch_committed,
@@ -2041,19 +2042,23 @@ async def test_handle_action_timeout_bounds_browser_download_handler_drain(
             ),
             patch("skyvern.webeye.actions.handler.app", mock_app),
         ):
-            with pytest.raises(TimeoutError):
-                await asyncio.wait_for(
-                    ActionHandler.handle_action(
-                        scraped_page=scraped_page,
-                        task=task,
-                        step=step,
-                        page=page,
-                        action=action,
-                    ),
-                    timeout=CI_TEST_RUNAWAY_TIMEOUT_SECONDS,
-                )
+            results = await asyncio.wait_for(
+                ActionHandler.handle_action(
+                    scraped_page=scraped_page,
+                    task=task,
+                    step=step,
+                    page=page,
+                    action=action,
+                ),
+                timeout=CI_TEST_RUNAWAY_TIMEOUT_SECONDS,
+            )
 
         assert time.monotonic() - started_at < CI_TEST_RUNAWAY_TIMEOUT_SECONDS
+        # The budget's TimeoutError stays inside the download path: the action reports a typed download
+        # failure instead of escaping to the step runner's unexpected-exception catch-all.
+        assert results[-1].success is False
+        assert results[-1].exception_message == DOWNLOAD_TIMEOUT_FAILURE_MESSAGE
+        assert results[-1].download_triggered is True
         await _assert_background_tasks_drained(interceptor._browser_download_tasks)
 
 
@@ -2574,18 +2579,6 @@ async def test_handle_action_download_completion_budget_bounds_hanging_settle(
                 settle_was_cancelled.set()
                 raise
 
-        async def handle_action_until_the_budget_raises() -> None:
-            # The budget's TimeoutError is the expected outcome and is caught here. The runaway guard's
-            # TimeoutError is the same class, so it must be raised outside this catch to read as red.
-            with pytest.raises(TimeoutError):
-                await ActionHandler.handle_action(
-                    scraped_page=scraped_page,
-                    task=task,
-                    step=step,
-                    page=page,
-                    action=action,
-                )
-
         mock_app = MagicMock()
         mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
         mock_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
@@ -2603,10 +2596,23 @@ async def test_handle_action_download_completion_budget_bounds_hanging_settle(
             ),
             patch("skyvern.webeye.actions.handler.app", mock_app),
         ):
-            await asyncio.wait_for(handle_action_until_the_budget_raises(), timeout=CI_TEST_RUNAWAY_TIMEOUT_SECONDS)
+            results = await asyncio.wait_for(
+                ActionHandler.handle_action(
+                    scraped_page=scraped_page,
+                    task=task,
+                    step=step,
+                    page=page,
+                    action=action,
+                ),
+                timeout=CI_TEST_RUNAWAY_TIMEOUT_SECONDS,
+            )
 
     # The budget cancelled the hung settle mid-flight rather than the settle being skipped or abandoned.
     assert settle_was_cancelled.is_set()
+    # And the exhausted budget reads as a typed download failure, not a raised TimeoutError.
+    assert results[-1].success is False
+    assert results[-1].exception_message == DOWNLOAD_TIMEOUT_FAILURE_MESSAGE
+    assert results[-1].download_triggered is True
 
 
 def test_remove_download_listener_uses_playwright_remove_listener_when_off_unavailable() -> None:

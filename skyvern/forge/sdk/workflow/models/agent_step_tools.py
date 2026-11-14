@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pydantic import BaseModel
 
 from skyvern.cli.mcp_tools.blocks import BLOCK_SUMMARIES
+from skyvern.forge.sdk.integrations.connected_accounts import settable_connected_account_fields
 from skyvern.schemas.agent_step_tool_names import (
     AGENT_STEP_TOOL_NAMES,
     ALWAYS_OFFERED_TOOLS,
@@ -55,6 +56,11 @@ class BlockTool:
     tool_name: str | None = None
     description: str | None = None
     nested_agent: bool = False
+
+    @property
+    def arguments(self) -> tuple[str, ...]:
+        """fields, plus every field the block's schema marks as a connected account that the caller can reach."""
+        return (*self.fields, *settable_connected_account_fields(self.yaml_class, self.fields))
 
 
 _CONTROL_FLOW = "Control flow: the step's own loop already repeats and decides."
@@ -104,7 +110,6 @@ AGENT_BLOCK_TOOLS: dict[BlockType, BlockTool | str] = {
             "azure_storage_account_name",
             "azure_storage_account_key",
             "azure_blob_container_name",
-            "google_credential_id",
             "google_drive_folder_id",
             "sftp_host",
             "sftp_port",
@@ -129,7 +134,6 @@ AGENT_BLOCK_TOOLS: dict[BlockType, BlockTool | str] = {
             "body_format",
             "file_attachments",
             "transport",
-            "credential_id",
             "cc",
             "bcc",
         ),
@@ -173,7 +177,7 @@ AGENT_BLOCK_TOOLS: dict[BlockType, BlockTool | str] = {
         PrintPageBlockYAML, ("include_timestamp", "custom_filename", "format", "landscape", "print_background")
     ),
     BlockType.GOOGLE_SHEETS_READ: BlockTool(
-        GoogleSheetsReadBlockYAML, ("spreadsheet_url", "sheet_name", "range", "credential_id", "has_header_row")
+        GoogleSheetsReadBlockYAML, ("spreadsheet_url", "sheet_name", "range", "has_header_row")
     ),
     BlockType.GOOGLE_SHEETS_WRITE: BlockTool(
         GoogleSheetsWriteBlockYAML,
@@ -181,7 +185,6 @@ AGENT_BLOCK_TOOLS: dict[BlockType, BlockTool | str] = {
             "spreadsheet_url",
             "sheet_name",
             "range",
-            "credential_id",
             "write_mode",
             "values",
             "column_mapping",
@@ -194,7 +197,6 @@ AGENT_BLOCK_TOOLS: dict[BlockType, BlockTool | str] = {
         EmailInboxBlockYAML,
         (
             "email_client",
-            "credential_id",
             "folder",
             "prompt",
             "sender",
@@ -230,6 +232,17 @@ RUN_BLOCK_TYPES: dict[str, tuple[BlockType, BlockTool]] = {
     for block_type, tool in AGENT_BLOCK_TOOLS.items()
     if isinstance(tool, BlockTool) and tool.tool_name is None
 }
+# The step is offered every active account of the run's owner for these tools' marked fields.
+ACCOUNT_TOOL_NAMES: frozenset[str] = frozenset(
+    name
+    for name, (_, tool) in {**DEDICATED_BLOCK_TOOLS, **RUN_BLOCK_TYPES}.items()
+    if len(tool.arguments) > len(tool.fields)
+)
+ACTING_ACCOUNT_TOOL_NAMES: frozenset[str] = frozenset(
+    name
+    for name, (_, tool) in {**DEDICATED_BLOCK_TOOLS, **RUN_BLOCK_TYPES}.items()
+    if settable_connected_account_fields(tool.yaml_class, tool.fields, acting_only=True)
+)
 RUN_TOOL_DESCRIPTIONS: dict[str, str] = {
     "read_run_data": "Read what this run already has. Without name: the names of its workflow parameters, its "
     "earlier blocks with their status, and its downloaded files. With name: that parameter's value, that block's "
@@ -265,7 +278,7 @@ def run_block_description(block_types: Iterable[str]) -> str:
         "Run one workflow block in this run and return its status, output and error. arguments holds "
         "that block's fields; bad arguments return the block's argument schema. Block types:\n"
         + "\n".join(
-            f"- {name}({', '.join(tool.fields)}): {block_description(block_type, tool).rstrip('.')}"
+            f"- {name}({', '.join(tool.arguments)}): {block_description(block_type, tool).rstrip('.')}"
             for name in block_types
             for block_type, tool in [RUN_BLOCK_TYPES[name]]
         )

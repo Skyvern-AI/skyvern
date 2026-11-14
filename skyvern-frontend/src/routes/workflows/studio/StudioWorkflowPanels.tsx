@@ -46,6 +46,8 @@ export function StudioWorkflowPanels() {
             <WorkflowTriggersPanel
               workflowPermanentId={workflowPermanentId ?? ""}
               onClose={close}
+              focusTriggerId={state.data?.focusTriggerId}
+              focusRequest={state.data?.focusRequest}
             />
           ) : null}
         </div>

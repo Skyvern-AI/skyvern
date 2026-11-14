@@ -46,7 +46,7 @@ from sqlalchemy.pool import StaticPool
 
 import skyvern._cli_bootstrap as cli_bootstrap
 from skyvern.config import settings
-from skyvern.forge import app
+from skyvern.forge import app, log_redaction
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api import files
@@ -83,6 +83,7 @@ from skyvern.forge.sdk.workflow.models.block import BlockTypeVar, TaskBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.service import WorkflowService
+from skyvern.schemas.proxy_pinning import render_proxy_observability_value
 from skyvern.services import workflow_run_group_service as group_service
 from skyvern.webeye.browser_engine import SKYCDP_ENGINE_NAME, BrowserEngineMetadata, BrowserEngineSelection
 from skyvern.webeye.utils import page as page_module
@@ -270,6 +271,12 @@ def setup_forge_stub_app():
     yield
 
 
+@pytest.fixture(autouse=True)
+def _isolate_proxy_observability_renderer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cloud app bootstrap registers its renderer globally; unit tests start with the OSS renderer."""
+    monkeypatch.setattr(log_redaction, "_proxy_observability_renderer", render_proxy_observability_value)
+
+
 def cancel_leftover_tasks(loop: asyncio.AbstractEventLoop) -> None:
     # A task left suspended in a SQLAlchemy session on a closed loop is later finalized by a garbage collection
     # inside another test's session, which fails that test with GeneratorExit and stops all later collections.
@@ -334,6 +341,20 @@ def reset_copilot_driver_ledgers() -> Iterator[None]:
             runtime._DRIVER_RELEASES_IN_FLIGHT.clear()
             runtime._DRIVER_RELEASE_EPOCHS.clear()
             runtime._SCRUB_VALUES_CLEARED_ON_RELEASE.clear()
+
+    _clear()
+    yield
+    _clear()
+
+
+@pytest.fixture(autouse=True)
+def reset_copilot_tool_window_summarized() -> Iterator[None]:
+    # A sync test that runs the model input filter sets this in the main thread's context, which every later test and
+    # its event loop inherit.
+    def _clear() -> None:
+        enforcement = sys.modules.get("skyvern.forge.sdk.copilot.enforcement")
+        if enforcement is not None:
+            enforcement.TOOL_WINDOW_SUMMARIZED.set(False)
 
     _clear()
     yield
@@ -520,11 +541,14 @@ def gpt56_litellm_models() -> Iterator[None]:
 # DDL, and each test still gets its own isolated database.
 
 
+_REGISTERED_ENCRYPTION_SECRET_KEY = "registered-encryption-test-key"
+
+
 @pytest.fixture
 def registered_encryption() -> Iterator[None]:
-    """The real AES-CBC and AES-GCM encryptors, registered as a deployment with ENABLE_ENCRYPTION would."""
+    """The real AES-GCM encryptor and legacy AES-CBC reader, registered as a deployment with ENABLE_ENCRYPTION would."""
     with patch.dict(encryptor._methods, clear=True):
-        register_aes_encryptor(secret_key="registered-encryption-test-key")
+        register_aes_encryptor(secret_key=_REGISTERED_ENCRYPTION_SECRET_KEY)
         yield
 
 
@@ -1317,8 +1341,10 @@ class GroupEnv:
     limiter: RecordingRateLimiter
 
 
-def run_group_definition(*blocks: BlockTypeVar) -> dict[str, Any]:
-    return WorkflowDefinition(parameters=[], blocks=list(blocks)).model_dump(mode="json")
+def run_group_definition(*blocks: BlockTypeVar, finally_block_label: str | None = None) -> dict[str, Any]:
+    return WorkflowDefinition(parameters=[], blocks=list(blocks), finally_block_label=finally_block_label).model_dump(
+        mode="json"
+    )
 
 
 def run_group_task_block() -> TaskBlock:
@@ -1373,6 +1399,11 @@ async def run_group_env(monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEng
     monkeypatch.setattr(app, "WORKFLOW_SERVICE", service)
     monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "is_feature_enabled_cached", AsyncMock(return_value=False))
     monkeypatch.setattr(app.AGENT_FUNCTION, "is_block_scoped_workflow_run", AsyncMock(return_value=False))
+    monkeypatch.setattr(app.AGENT_FUNCTION, "workflow_run_group_limits", AgentFunction().workflow_run_group_limits)
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION, "get_organization_usage_quota", AgentFunction().get_organization_usage_quota
+    )
+    monkeypatch.setattr(app.AGENT_FUNCTION, "copilot_run_stop_rule", AgentFunction().copilot_run_stop_rule)
     monkeypatch.setattr(AsyncExecutorFactory, "get_executor", lambda: executor)
     monkeypatch.setattr(group_service, "_spawn", spawned.append)
     monkeypatch.setattr(service, "_schedule_workflow_run_terminal_hooks", lambda **_: None)

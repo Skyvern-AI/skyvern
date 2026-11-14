@@ -24,6 +24,7 @@ import { rewireBlockDropInScope } from "./sortable/rewire";
 import { duplicateBlockBelow } from "./workflowDuplicate";
 import { TOP_LEVEL_SCOPE } from "./sortable/scope";
 import {
+  findNextBlockLabel,
   getElements,
   getUpdatedNodesAfterLabelUpdateForParameterKeys,
   getWorkflowBlocks,
@@ -663,6 +664,23 @@ describe("conditional without a merge label", () => {
     );
   });
 
+  test("a branch block's explicit next to its conditional's merge survives load -> save", () => {
+    const blocks = (): Array<WorkflowBlock> => [
+      conditional("check", "draft", [
+        { id: "c1", next: "report" },
+        { id: "c2", next: "draft" },
+        { id: "c3", next: "recheck", isDefault: true },
+      ]),
+      conditional("recheck", "report", [
+        { id: "r1", next: "draft" },
+        { id: "r2", next: "report", isDefault: true },
+      ]),
+      code("draft", "report"),
+      code("report", null),
+    ];
+    expect(savedRoutingSorted(blocks())).toEqual(inputRoutingSorted(blocks()));
+  });
+
   test("converging branches inside a loop keep their targets", () => {
     const blocks = [forLoop("loop", skipFirst())];
     const { nodes, edges } = getElements(blocks, DEFAULT_SETTINGS, true);
@@ -878,6 +896,215 @@ describe("conditional without a merge label", () => {
         expect(saved.map((block) => block.label)).toEqual(order);
       }
     }
+  });
+
+  test("a branch's last block that the merge point already reaches saves with no merge link", () => {
+    const blocks: Array<WorkflowBlock> = [
+      conditional("check", "draft", [
+        { id: "b1", next: "draft" },
+        { id: "b2", next: "report", isDefault: true },
+      ]),
+      code("draft", "review"),
+      code("review", "report"),
+      code("report", null),
+    ];
+    const { nodes, edges } = getElements(blocks, DEFAULT_SETTINGS, true);
+    const saved = getWorkflowBlocks(nodes, edges) as Array<WorkflowBlock>;
+
+    expect(savedRoutingSorted(blocks)).toEqual(inputRoutingSorted(blocks));
+    expect(savedRoutingSorted(saved)).toEqual(inputRoutingSorted(blocks));
+    expect(() => validateWorkflowBlocks(saved)).not.toThrow();
+  });
+
+  test("the shared merge walk saves the same next labels as a fresh walk per block", () => {
+    const blocks: Array<WorkflowBlock> = [
+      conditional("inner", "draft", [
+        { id: "i1", next: "finish" },
+        { id: "i2", next: null },
+        { id: "i3", next: "notify", isDefault: true },
+      ]),
+      code("finish", null),
+      code("notify", "finish"),
+      code("draft", null),
+      conditional("route", "notify", [
+        { id: "r1", next: "draft" },
+        { id: "r2", next: "inner", isDefault: true },
+      ]),
+    ];
+    const { nodes, edges } = getElements(blocks, DEFAULT_SETTINGS, true);
+    const saved = getWorkflowBlocks(nodes, edges);
+
+    for (const block of saved.filter((b) => b.block_type !== "conditional")) {
+      const node = getNodeByLabel(nodes, block.label);
+      expect(block.next_block_label ?? null).toBe(
+        findNextBlockLabel(node.id, nodes, edges),
+      );
+    }
+  });
+
+  test("a branch's last block that the merge point reaches through another conditional's branch saves with no merge link", () => {
+    const blocks: Array<WorkflowBlock> = [
+      conditional("gate", null, [
+        { id: "g1", next: "review" },
+        { id: "g2", next: "skip", isDefault: true },
+      ]),
+      conditional("check", "draft", [
+        { id: "b1", next: "draft" },
+        { id: "b2", next: "report", isDefault: true },
+      ]),
+      code("draft", "gate"),
+      code("review", "report"),
+      code("skip", null),
+      code("report", null),
+    ];
+    const { nodes, edges } = getElements(blocks, DEFAULT_SETTINGS, true);
+    const saved = getWorkflowBlocks(nodes, edges);
+
+    expect(savedRoutingSorted(blocks)).toEqual(inputRoutingSorted(blocks));
+    expect(() =>
+      validateWorkflowBlocks(saved as Array<WorkflowBlock>),
+    ).not.toThrow();
+  });
+
+  test("a branch's last block that the merge point reaches through a nested conditional's inherited merge saves with no merge link", () => {
+    const blocks: Array<WorkflowBlock> = [
+      conditional("route", "inner", [
+        { id: "r1", next: "group" },
+        { id: "r2", next: "side", isDefault: true },
+      ]),
+      conditional("group", "finish", [
+        { id: "g1", next: "inner" },
+        { id: "g2", next: "other", isDefault: true },
+      ]),
+      conditional("inner", "finish", [
+        { id: "i1", next: "left" },
+        { id: "i2", next: "right", isDefault: true },
+      ]),
+      code("side", "inner"),
+      code("other", "finish"),
+      code("left", "finish"),
+      code("right", "finish"),
+      code("finish", null),
+    ];
+    const { nodes, edges } = getElements(blocks, DEFAULT_SETTINGS, true);
+    const saved = getWorkflowBlocks(nodes, edges);
+
+    expect(savedRoutingSorted(blocks)).toEqual(inputRoutingSorted(blocks));
+    expect(() =>
+      validateWorkflowBlocks(saved as Array<WorkflowBlock>),
+    ).not.toThrow();
+  });
+
+  test("a branch's last block that its own merge point reaches saves the enclosing conditional's merge", () => {
+    const blocks: Array<WorkflowBlock> = [
+      conditional("c1", "m1", [
+        { id: "a1", next: "c2" },
+        { id: "a2", next: "side", isDefault: true },
+      ]),
+      conditional("c2", "m2", [
+        { id: "b1", next: "t" },
+        { id: "b2", next: "x", isDefault: true },
+      ]),
+      code("t", null),
+      code("x", null),
+      code("m2", "t"),
+      code("side", null),
+      code("m1", null),
+    ];
+    const { nodes, edges } = getElements(blocks, DEFAULT_SETTINGS, true);
+    const saved = getWorkflowBlocks(nodes, edges) as Array<WorkflowBlock>;
+
+    expect(
+      Object.fromEntries(
+        saved
+          .filter((b) => b.block_type !== "conditional")
+          .map((b) => [b.label, b.next_block_label ?? null]),
+      ),
+    ).toEqual({ t: "m1", x: "m2", m2: "t", side: "m1", m1: null });
+    expect(() => validateWorkflowBlocks(saved)).not.toThrow();
+  });
+
+  function permutations<T>(items: Array<T>): Array<Array<T>> {
+    if (items.length <= 1) {
+      return [items];
+    }
+    return items.flatMap((item, index) =>
+      permutations([...items.slice(0, index), ...items.slice(index + 1)]).map(
+        (rest) => [item, ...rest],
+      ),
+    );
+  }
+
+  test.each([
+    [
+      "the other branch's last block",
+      (): Array<WorkflowBlock> => [
+        conditional("D", "T", [
+          { id: "d1", next: "R" },
+          { id: "d2", next: "C", isDefault: true },
+        ]),
+        code("R", null),
+        conditional("C", "S", [
+          { id: "c1", next: "T" },
+          { id: "c2", next: "S", isDefault: true },
+        ]),
+        code("T", null),
+        code("S", "R"),
+      ],
+    ],
+    [
+      "a nested conditional's branch",
+      (): Array<WorkflowBlock> => [
+        conditional("C", "S", [
+          { id: "c1", next: "T" },
+          { id: "c2", next: "D", isDefault: true },
+        ]),
+        code("T", null),
+        conditional("D", "T", [
+          { id: "d1", next: "R" },
+          { id: "d2", next: "X", isDefault: true },
+        ]),
+        code("R", null),
+        code("X", "S"),
+        code("S", "R"),
+      ],
+    ],
+  ])(
+    "two last blocks whose merges reach each other through %s save with no merge link in every block order",
+    (_shape, makeBlocks) => {
+      for (const blocks of permutations(makeBlocks())) {
+        const { nodes, edges } = getElements(blocks, DEFAULT_SETTINGS, true);
+        const saved = getWorkflowBlocks(nodes, edges);
+
+        expect(savedRoutingSorted(blocks)).toEqual(inputRoutingSorted(blocks));
+        expect(() =>
+          validateWorkflowBlocks(saved as Array<WorkflowBlock>),
+        ).not.toThrow();
+      }
+    },
+  );
+
+  test("a long chain of conditionals whose merge is also a branch target saves loop-free", () => {
+    const count = 30;
+    const blocks: Array<WorkflowBlock> = [];
+    for (let i = 0; i < count; i++) {
+      const merge = i + 1 < count ? `gate_${i + 1}` : "done";
+      blocks.push(
+        conditional(`gate_${i}`, merge, [
+          { id: `g${i}_a`, next: `step_${i}` },
+          { id: `g${i}_b`, next: merge, isDefault: true },
+        ]),
+        code(`step_${i}`, null),
+      );
+    }
+    blocks.push(code("done", null));
+    const { nodes, edges } = getElements(blocks, DEFAULT_SETTINGS, true);
+    const saved = getWorkflowBlocks(nodes, edges) as Array<WorkflowBlock>;
+
+    expect(saved.find((b) => b.label === "step_0")?.next_block_label).toBe(
+      "gate_1",
+    );
+    expect(() => validateWorkflowBlocks(saved)).not.toThrow();
   });
 
   test("a branch that owns no blocks keeps its target when only some branches converge", () => {

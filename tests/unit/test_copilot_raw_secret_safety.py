@@ -19,7 +19,6 @@ from skyvern.forge.sdk.copilot.agent import (
     _store_request_policy_on_context,
 )
 from skyvern.forge.sdk.copilot.agent_context import ScoutedInteraction
-from skyvern.forge.sdk.copilot.code_block_synthesis import CREDENTIAL_FILL_TOOL_NAME
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import (
     ApprovedCredential,
@@ -47,8 +46,10 @@ from skyvern.forge.sdk.copilot.tools.credential_fill import (
     _within_grant,
 )
 from skyvern.forge.sdk.copilot.tools.guardrails import _authority_tool_error
+from skyvern.forge.sdk.integrations.connected_accounts import IncompleteConnectionRead, OrgConnection
 from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotStreamMessageType
+from skyvern.forge.sdk.workflow.code_block_steps import CREDENTIAL_FILL_TOOL_NAME
 from tests.unit.copilot_test_helpers import make_copilot_ctx, redact_mid_turn, resolve_exact_credential_data
 from tests.unit.scoped_asyncio import ScopedAsyncio
 from tests.unit.scoped_time import ScopedTime
@@ -578,12 +579,18 @@ async def test_credential_id_citation_is_exonerated() -> None:
 
 
 @pytest.mark.asyncio
-async def test_org_visible_google_connection_id_citation_is_exonerated() -> None:
-    connection_id = "goac_530111222333444555"
-    with patch(
-        "skyvern.forge.sdk.copilot.request_policy.google_oauth_service.get_visible_credentials_for_org",
-        new=AsyncMock(return_value=[SimpleNamespace(id=connection_id)]),
-    ):
+@pytest.mark.parametrize("connection_id", ["goac_530111222333444555", "moac_530111222333444555"])
+@pytest.mark.parametrize("other_provider_failed", [False, True], ids=["complete", "other_provider_failed"])
+async def test_org_visible_connection_id_citation_is_exonerated(
+    connection_id: str, other_provider_failed: bool
+) -> None:
+    rows = [OrgConnection(connection_id, "google", "Account", None, "active", ())]
+    lookup = (
+        AsyncMock(side_effect=IncompleteConnectionRead(rows, frozenset({"microsoft"})))
+        if other_provider_failed
+        else AsyncMock(return_value=rows)
+    )
+    with patch("skyvern.forge.sdk.integrations.connected_accounts.org_connections", new=lookup):
         policy, _ = await _build(
             connection_id,
             {"version": "1", "state": "detected", "citations": [connection_id]},

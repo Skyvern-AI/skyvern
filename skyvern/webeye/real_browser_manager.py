@@ -328,6 +328,22 @@ def _retain_run_dialog_answers(
     )
 
 
+def _bind_browser_run(
+    browser_state: BrowserState,
+    workflow_run_id: str | None,
+    *,
+    task_id: str | None = None,
+    browser_session_id: str | None = None,
+    acquire: bool = True,
+) -> None:
+    if acquire:
+        browser_state.bind_runtime_event_context(
+            BrowserRuntimeLogContext.for_run(
+                workflow_run_id=workflow_run_id, task_id=task_id, browser_session_id=browser_session_id
+            )
+        )
+
+
 async def _on_browser_state_acquired(
     browser_state: BrowserState,
     workflow_run_id: str | None,
@@ -347,13 +363,7 @@ async def _on_browser_state_acquired(
         # The run still bound to this browser owns any loss latched up to here; rebinding would hide it.
         raise_if_browser_connection_lost(browser_state, workflow_run_id=workflow_run_id)
     if acquire:
-        browser_state.bind_runtime_event_context(
-            BrowserRuntimeLogContext.for_run(
-                workflow_run_id=workflow_run_id,
-                task_id=task_id,
-                browser_session_id=browser_session_id,
-            )
-        )
+        _bind_browser_run(browser_state, workflow_run_id, task_id=task_id, browser_session_id=browser_session_id)
         browser_state.record_browser_acquisition("reuse")
     return browser_state
 
@@ -1533,6 +1543,9 @@ class RealBrowserManager(BrowserManager):
             if browser_state is not None:
                 page = await browser_state.get_working_page()
                 if page:
+                    _bind_browser_run(
+                        browser_state, task.workflow_run_id, task_id=task.task_id, browser_session_id=browser_session_id
+                    )
                     await browser_state.navigate_to_url(page=page, url=task.url)
                 else:
                     LOG.warning("Browser state has no page", workflow_run_id=task.workflow_run_id)
@@ -1590,6 +1603,9 @@ class RealBrowserManager(BrowserManager):
                 task.workflow_run_id, browser_state, exclusive=created_exclusive_browser
             )
         self._alias_task(task.task_id, task.workflow_run_id, browser_state)
+        _bind_browser_run(
+            browser_state, task.workflow_run_id, task_id=task.task_id, browser_session_id=browser_session_id
+        )
 
         # The URL here is only used when creating a new page, and not when using an existing page.
         # This will make sure browser_state.page is not None.
@@ -1854,6 +1870,9 @@ class RealBrowserManager(BrowserManager):
                 page = await browser_state.get_working_page()
                 if page:
                     if url and navigate:
+                        _bind_browser_run(
+                            browser_state, workflow_run_id, browser_session_id=browser_session_id, acquire=acquire
+                        )
                         if before_navigation is not None:
                             before_navigation(browser_state)
                         try:
@@ -1922,6 +1941,12 @@ class RealBrowserManager(BrowserManager):
                                 await _rebind_pbs_download_dir(browser_state, download_run_id, browser_session_id)
                             page = await browser_state.get_working_page()
                             if page is not None:
+                                _bind_browser_run(
+                                    browser_state,
+                                    workflow_run_id,
+                                    browser_session_id=browser_session_id,
+                                    acquire=acquire,
+                                )
                                 if before_navigation is not None:
                                     before_navigation(browser_state)
                                 await browser_state.navigate_to_url(page=page, url=url)
@@ -2018,6 +2043,7 @@ class RealBrowserManager(BrowserManager):
 
         # The URL here is only used when creating a new page, and not when using an existing page.
         # This will make sure browser_state.page is not None.
+        _bind_browser_run(browser_state, workflow_run_id, browser_session_id=browser_session_id, acquire=acquire)
         # When navigate is False, the URL has already been used for proxy selection in
         # _create_browser_state above; we skip navigation so the caller (e.g. a generated
         # script) performs the first goto itself, avoiding a redundant page load.

@@ -1,5 +1,5 @@
 import type { Edge } from "@xyflow/react";
-import type { ReviewProjection } from "../../copilot/narrativeState";
+import type { ReviewProjection } from "../../ember/narrativeState";
 import type { WorkflowBlock } from "../../types/workflowTypes";
 import type { AppNode } from "../nodes";
 import {
@@ -34,6 +34,7 @@ export type DocProposal = {
   edges: Edge[];
   // The same version diff used by the workflow comparison panel.
   marks: Map<string, DocProposalStepMark>;
+  changedKeys?: Map<string, string[]>;
   removed: DocRemovedStep[];
   // What Accept would save, so the Doc's description and Inputs show the proposal, not the live editor.
   description: string | null;
@@ -236,10 +237,16 @@ export function buildDocProposal({
   collect(baselineBlocks as BlockLike[], baseline);
 
   const marks = new Map<string, DocProposalStepMark>();
+  const changedKeys = new Map<string, string[]>();
   for (const [label, block] of diff.after) {
     if (block.status === "new" || block.status === "changed") {
       marks.set(label, block.status === "new" ? "added" : "changed");
     }
+    if (block.status === "changed")
+      changedKeys.set(
+        label,
+        block.changes.map((change) => change.key),
+      );
   }
 
   const removed: DocRemovedStep[] = [];
@@ -261,7 +268,7 @@ export function buildDocProposal({
     removed,
     topologyOf(baselineBlocks as BlockLike[]),
   );
-  // Copilot conversion can regenerate branch IDs, so render removals against the proposed IDs.
+  // Ember conversion can regenerate branch IDs, so render removals against the proposed IDs.
   const matchedBranchRemovals = removed.map((step) => {
     const anchor = step.anchor;
     if (anchor?.side !== "branch") return step;
@@ -277,7 +284,7 @@ export function buildDocProposal({
     const stillThere = (
       afterConditional.branch_conditions as BlockLike[] | undefined
     )?.some((branch) => branch?.id === anchor.branchId);
-    // A branch Copilot dropped has nowhere to render, so its steps sit after the conditional.
+    // A branch Ember dropped has nowhere to render, so its steps sit after the conditional.
     return stillThere
       ? step
       : { ...step, anchor: { label: anchor.label, side: "after" as const } };
@@ -303,6 +310,7 @@ export function buildDocProposal({
     nodes,
     edges,
     marks,
+    changedKeys,
     removed: matchedBranchRemovals,
     description,
     descriptionChange: descriptionDiff

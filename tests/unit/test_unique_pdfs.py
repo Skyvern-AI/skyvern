@@ -23,7 +23,7 @@ from datetime import UTC, datetime, timedelta
 from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import quote
@@ -1554,15 +1554,18 @@ async def test_timeline_stops_and_settles_gcs_blob_listing_work_at_the_response_
     _install_gcs_fallback(monkeypatch, sdk)
 
     # The 0.5 s response deadline falls inside the slow call, never at a boundary between calls.
-    begun = time.monotonic()
     blocks = await asyncio.wait_for(timeline.get(), timeout=10)
     answered = time.monotonic()
     # Long enough for any GCS work the response left running to show itself.
     await asyncio.sleep(1.5)
 
     assert _listed(blocks["wrb_1"]) == ["a_1", "a_2"], "the block keeps its stored entries"
-    assert any(call["kind"] == slow for call in sdk.calls)
-    assert all(call["start"] < begun + 0.7 for call in sdk.calls), "a GCS request started after the deadline"
+    kinds = [call["kind"] for call in sdk.calls]
+    assert slow in kinds
+    # Each fake call runs its full delay or until its timeout ends at the deadline, so any call past those that fit
+    # the budget began after it.
+    fit = kinds.index(slow) + math.ceil(unique_pdfs.GET_DOWNLOADED_FILES_TIMEOUT / delay)
+    assert len(kinds) <= fit, "a GCS request started after the deadline"
     outlived = [call["kind"] for call in sdk.calls if call["end"] is None or call["end"] > answered]
     assert not outlived, f"GCS {outlived} work ran on after the response"
 
@@ -1588,14 +1591,36 @@ _SIGNER = "signer@synthetic.iam.gserviceaccount.com"
 _SIGNED_URI = "gs://uploads/downloads/o_1/wr_1/invoice.pdf"
 
 
+class _VirtualClock:
+    """Stands in for ``time`` in ``real_gcp`` and the synthetic transports, and moves only while a fake request runs.
+
+    No time passes between ``real_gcp`` computing a request's remaining budget and the request reaching a transport."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
 class _AuthTransport:
     """Synthetic stand-in for google-auth's HTTP transport, with no network behind it.
 
     It answers the Compute metadata and IAM signBlob endpoints, honours each request's timeout like the real transport,
-    and records which transport sent every request, with its timeout, start and end."""
+    and records which transport sent every request, with its timeout, start and end on ``clock``."""
 
-    def __init__(self, delays: dict[str, float] | None = None, statuses: dict[str, list[int]] | None = None) -> None:
-        self.delays, self.statuses = delays or {}, statuses or {}
+    def __init__(
+        self,
+        delays: dict[str, float] | None = None,
+        statuses: dict[str, list[int]] | None = None,
+        clock: ModuleType | _VirtualClock = time,
+    ) -> None:
+        self.delays, self.clock = delays or {}, clock
+        # Copied, since answering pops each status and a repeated parametrized case would otherwise see none.
+        self.statuses = {kind: list(codes) for kind, codes in (statuses or {}).items()}
         self.calls: list[dict[str, Any]] = []
 
     def built_by(self, origin: str) -> type:
@@ -1625,14 +1650,14 @@ class _AuthTransport:
             "kind": kind,
             "url": url,
             "timeout": timeout,
-            "start": time.monotonic(),
+            "start": self.clock.monotonic(),
             "end": None,
         }
         self.calls.append(call)
         delay = self.delays.get(kind, 0.0)
         limit = delay if timeout is None else min(delay, timeout[1] if isinstance(timeout, tuple) else timeout)
-        time.sleep(limit)
-        call["end"] = time.monotonic()
+        self.clock.sleep(limit)
+        call["end"] = self.clock.monotonic()
         if limit < delay:
             raise google_auth_exceptions.TransportError("synthetic request timed out")
         status = (self.statuses.get(kind) or [200]).pop(0)
@@ -1652,6 +1677,17 @@ class _AuthTransport:
             return SimpleNamespace(status=status, headers=headers, data=text)
         headers = {"metadata-flavor": "Google", "content-type": "application/json"}
         return SimpleNamespace(status=status, headers=headers, data=json.dumps(body).encode())
+
+
+def _on_virtual_clock(
+    monkeypatch: pytest.MonkeyPatch, delays: dict[str, float], statuses: dict[str, list[int]]
+) -> tuple[_AuthTransport, _VirtualClock]:
+    """A transport on the virtual clock ``real_gcp`` reads, where each request takes 10 ms unless ``delays`` says
+    longer, so a timeout computed from a stale budget runs past the deadline."""
+    clock = _VirtualClock()
+    monkeypatch.setattr(real_gcp, "time", clock)
+    request_time = dict.fromkeys(("metadata", "token", "signblob", "list"), 0.01)
+    return _AuthTransport(request_time | delays, statuses, clock), clock
 
 
 def _signing_client(monkeypatch: pytest.MonkeyPatch, transport: _AuthTransport) -> real_gcp.RealAsyncGcsStorageClient:
@@ -1677,27 +1713,27 @@ def _signing_client(monkeypatch: pytest.MonkeyPatch, transport: _AuthTransport) 
 async def test_gcs_signing_under_a_deadline_sends_discovery_refresh_and_signblob_within_its_budget(
     monkeypatch: pytest.MonkeyPatch, delays: dict[str, float], statuses: dict[str, list[int]], budget: float
 ) -> None:
-    transport = _AuthTransport(delays, statuses)
+    transport, clock = _on_virtual_clock(monkeypatch, delays, statuses)
     client = _signing_client(monkeypatch, transport)
-    begun = time.monotonic()
+    begun = clock.now
 
     signing = asyncio.ensure_future(
         client.create_signed_urls([_SIGNED_URI], deadline=asyncio.get_running_loop().time() + budget)
     )
     await asyncio.wait({signing}, timeout=20)
-    ended = time.monotonic()
+    ended = clock.now
 
     assert transport.calls and {call["origin"] for call in transport.calls} == {"real_gcp"}, (
         "a request bypassed the budget"
     )
     for call in transport.calls:
         timeout = call["timeout"][1] if isinstance(call["timeout"], tuple) else call["timeout"]
-        assert timeout is not None and call["start"] + timeout <= begun + budget + 0.05, call
+        assert timeout is not None and call["start"] + timeout <= begun + budget, call
         assert call["end"] is not None and call["end"] <= ended, call
     kinds = [call["kind"] for call in transport.calls]
     assert kinds.count("token") <= 1 and kinds.count("signblob") <= 1, "a request was retried"
     if delays or statuses:
-        assert isinstance(signing.exception(), TimeoutError) and ended - begun < min(budget, 1.0) + 0.5
+        assert isinstance(signing.exception(), TimeoutError) and ended == transport.calls[-1]["end"]
     else:
         assert "X-Goog-Signature=" + b"synthetic-signature".hex() in signing.result()[0]
 
@@ -1723,7 +1759,7 @@ def _cold_client(
             "kind": "list",
             "url": request.url,
             "timeout": timeout,
-            "start": time.monotonic(),
+            "start": transport.clock.monotonic(),
         }
         transport.calls.append(call | {"authorization": request.headers.get("Authorization")})
         response = requests.Response()
@@ -1731,7 +1767,8 @@ def _cold_client(
         response.headers["content-type"] = "application/json"
         response._content = json.dumps({"items": [{"name": "downloads/o_1/wr_1/invoice.pdf"}]}).encode()
         response.request, response.url = request, request.url
-        transport.calls[-1]["end"] = time.monotonic()
+        transport.clock.sleep(transport.delays.get("list", 0.0))
+        transport.calls[-1]["end"] = transport.clock.monotonic()
         return response
 
     monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", send)
@@ -1751,29 +1788,29 @@ def _cold_client(
 async def test_cold_gcs_listing_under_a_deadline_builds_its_client_within_the_budget(
     monkeypatch: pytest.MonkeyPatch, delays: dict[str, float], statuses: dict[str, list[int]], budget: float
 ) -> None:
-    transport = _AuthTransport(delays, statuses)
+    transport, clock = _on_virtual_clock(monkeypatch, delays, statuses)
     client = _cold_client(monkeypatch, transport)
-    begun = time.monotonic()
+    begun = clock.now
 
     listing = asyncio.ensure_future(
         client.list_files("gs://uploads/downloads/o_1/wr_1", deadline=asyncio.get_running_loop().time() + budget)
     )
     await asyncio.wait({listing}, timeout=20)
-    ended = time.monotonic()
+    ended = clock.now
     # Long enough for any background request the listing left behind to show itself.
     await asyncio.sleep(0.3)
 
     assert {call["origin"] for call in transport.calls} <= {"real_gcp", "data_plane"}, "a request bypassed the budget"
     for call in transport.calls:
         timeout = call["timeout"][1] if isinstance(call["timeout"], tuple) else call["timeout"]
-        assert timeout is not None and call["start"] + timeout <= begun + max(budget, 0) + 0.05, call
+        assert timeout is not None and call["start"] + timeout <= begun + max(budget, 0), call
         assert call["end"] is not None and call["end"] <= ended, call
     assert [call["kind"] for call in transport.calls].count("token") <= 1, "a request was retried"
     assert client._client is None, "the shared client kept a client built for one deadline"
     if budget <= 0:
         assert isinstance(listing.exception(), TimeoutError) and not transport.calls
     elif delays or statuses:
-        assert isinstance(listing.exception(), TimeoutError) and ended - begun < min(budget, 1.0) + 0.5
+        assert isinstance(listing.exception(), TimeoutError) and ended == transport.calls[-1]["end"]
         assert not any(call["origin"] == "data_plane" for call in transport.calls)
     else:
         assert listing.result() == ["downloads/o_1/wr_1/invoice.pdf"]

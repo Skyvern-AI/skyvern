@@ -10,7 +10,7 @@ import time
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import asdict
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any
 
 import structlog
 from agents import FunctionTool, function_tool
@@ -22,6 +22,8 @@ from openai.types.responses import ResponseFunctionToolCall
 from pydantic import Field, JsonValue
 
 from skyvern.forge import app as app
+from skyvern.forge.agent_functions import CopilotTriggerSource
+from skyvern.forge.sdk.agents.skills import LOAD_SKILL_TOOL_NAME, READ_SKILL_RESOURCE_TOOL_NAME, SKILL_TOOL_NAMES
 from skyvern.forge.sdk.copilot.ask_user import (
     ACCOUNT_GROUP_CANCEL_TOOL_NAME,
     ACCOUNT_GROUP_STATUS_TOOL_NAME,
@@ -84,10 +86,10 @@ from skyvern.forge.sdk.copilot.runtime import (
     resolve_browser_state_for_context,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import (
-    ScreenshotActionRelation,
-    ScreenshotProvenance,
     capturing_tool_call,
     enqueue_screenshot_from_result,
+    run_result_screenshot_provenance,
+    stored_run_frame_provenance,
 )
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.tools.account_groups import (
@@ -114,6 +116,7 @@ from skyvern.forge.sdk.copilot.tools.credential_deletion import (
 from skyvern.forge.sdk.copilot.tools.event_triggers import (
     create_webhook_trigger_tool,
     list_workflow_triggers_tool,
+    render_trigger_sources,
     test_trigger_mapping_tool,
 )
 from skyvern.forge.sdk.copilot.tools.locator_inspection import TOOL_DESCRIPTION as LOCATOR_INSPECTION_TOOL_DESCRIPTION
@@ -264,7 +267,7 @@ from .guardrails import _parameter_binding_invariant_error as _parameter_binding
 from .integrations import (
     _list_integrations,
     _read_google_sheet,
-    _request_google_connection,
+    _request_connection,
 )
 from .mcp_hooks import _build_skyvern_mcp_overlays as _build_skyvern_mcp_overlays
 from .mcp_hooks import _click_post_hook as _click_post_hook
@@ -343,6 +346,7 @@ from .scouting import _register_scout_interaction_observation as _register_scout
 from .scouting import _resolve_scout_role_name as _resolve_scout_role_name
 from .scouting import _role_name_from_selector as _role_name_from_selector
 from .scouting import read_page_state_on_page as read_page_state_on_page
+from .skills import LOAD_SKILL_DESCRIPTION, READ_SKILL_RESOURCE_DESCRIPTION, load_skill, read_skill_resource
 from .web_search import _search_web_impl as _search_web_impl
 from .workflow_update import BlockObservationRef as BlockObservationRef
 from .workflow_update import CodeArtifactMetadata as CodeArtifactMetadata
@@ -1291,10 +1295,9 @@ async def list_integrations_tool(ctx: RunContextWrapper) -> str:
     lists are disjoint, so check this one before concluding the user has no Google
     or Microsoft access.
     Prefer a purpose-built native integration block over automating that connected
-    service through its browser UI. For Google Sheets, author a `google_sheets_read`
-    or `google_sheets_write` block and pass an active compatible connection's
-    `connection_id` as its `credential_id`. Not paginated; one call returns every
-    entry and connection.
+    service through its browser UI, and pass an active compatible connection's
+    `connection_id` in the block's account field. Not paginated; one call returns
+    every entry and connection.
 
     Match on `scopes_granted`, not on `provider` alone: connections are granted per
     product, so a Sheets connection cannot read Gmail and binding it to a mail block
@@ -1304,13 +1307,17 @@ async def list_integrations_tool(ctx: RunContextWrapper) -> str:
 
     When the current request identifies one active, scope-compatible row, bind its
     exact `connection_id` as the native block's `credential_id` and continue.
+    A `provider` `nango` row is a Connected Gmail account: it reports no scopes, and
+    its `connection_id` goes in the Gmail block's `connection_id` with
+    `credential_source: nango`, never in `credential_id`.
     Never require an opaque ID already present in this tool result to be repeated.
     If the requested account remains ambiguous or no compatible active row exists,
     use a grounded ordinary-language clarification instead.
 
-    A `credential_id` may instead be the connection `name` or `email_address`
+    An account field may instead hold the connection `name` or `email_address`
     exactly as the user wrote it in this turn. The server resolves it when the
-    workflow is saved, and the save result says what happened to that slot.
+    workflow is saved, and `connection_resolution` in the save result says what
+    happened to that slot.
     """
     copilot_ctx = ctx.context
     arguments: dict[str, Any] = {}
@@ -1326,7 +1333,7 @@ async def list_integrations_tool(ctx: RunContextWrapper) -> str:
     return json.dumps(sanitized)
 
 
-GOOGLE_SETUP_TOOL_NAME = "request_google_connection"
+CONNECTION_CARD_TOOL_NAME = "request_connection"
 DEMONSTRATION_OFFER_TOOL_NAME = "offer_demonstration"
 
 
@@ -1344,35 +1351,32 @@ async def offer_demonstration_tool(ctx: RunContextWrapper) -> str:
     return json.dumps(result)
 
 
-@function_tool(failure_error_function=copilot_tool_failure, name_override=GOOGLE_SETUP_TOOL_NAME)
-async def request_google_connection_tool(
+@function_tool(failure_error_function=copilot_tool_failure, name_override=CONNECTION_CARD_TOOL_NAME)
+async def request_connection_tool(
     ctx: RunContextWrapper,
-    scope_profile: Literal["gmail", "google_sheets"],
+    integration_id: str,
     connection_id: str | None = None,
 ) -> str:
-    """Show the user a card in this chat for connecting a Google account under one existing scope
-    profile: `gmail` reads mail (gmail.readonly, no sending) and `google_sheets` reads and writes
-    spreadsheets. The two are separate grants and separate connections, so a workflow that needs
-    both needs one card per profile.
+    """Show the user a card in this chat for connecting an account to one `list_integrations` entry,
+    named by its `id`. The card asks for that entry's `required_scopes`.
 
-    The card appears with your reply. The user clicks Connect, finishes Google consent in a popup,
-    and then picks the account on the card; that pick reaches you on the next turn as
-    CONNECTED ACCOUNT CHOICE FACTS. This call does not start consent, does not wait for it and does
-    not change the workflow, so nothing is connected when it returns (`status` is `offered`).
+    The card appears with your reply. The user connects through the provider's consent and then picks
+    the account on the card; that pick reaches you on the next turn as CONNECTED ACCOUNT CHOICE FACTS
+    and is approved for runs. This call does not start consent, does not wait for it and does not
+    change the workflow, so nothing is connected when it returns (`status` is `offered`). An entry
+    that is not `live` gets no card (`status` is `not_offered`).
 
-    `compatible_connections` lists the active connections that already hold this profile's scope;
-    the card offers them for selection without new consent. With `connection_id`, a connection that
-    was granted for this same profile but is not active gets a reconnect card that keeps its ID
-    (`reconnect_connection_id`); any other ID is not used and comes back as `ignored_connection_id`.
+    With `connection_id`, the card reauthorizes that connection in place when `reconnect_in_place`
+    is true: its id stays the same. Otherwise the user connects a new account, which gets a new id.
     """
     copilot_ctx = ctx.context
-    arguments: dict[str, Any] = {"scope_profile": scope_profile, "connection_id": connection_id}
-    authority_error = _authority_tool_error(copilot_ctx, GOOGLE_SETUP_TOOL_NAME)
+    arguments: dict[str, Any] = {"integration_id": integration_id, "connection_id": connection_id}
+    authority_error = _authority_tool_error(copilot_ctx, CONNECTION_CARD_TOOL_NAME)
     if authority_error:
         result: dict[str, Any] = {"ok": False, "error": authority_error}
     else:
-        result = await _request_google_connection(scope_profile, connection_id, copilot_ctx)
-    record_tool_step_result_for_ctx(copilot_ctx, GOOGLE_SETUP_TOOL_NAME, arguments, result)
+        result = await _request_connection(integration_id, connection_id, copilot_ctx)
+    record_tool_step_result_for_ctx(copilot_ctx, CONNECTION_CARD_TOOL_NAME, arguments, result)
     return json.dumps(result)
 
 
@@ -1543,7 +1547,7 @@ async def run_blocks_tool(
             enqueue_screenshot_from_result(
                 copilot_ctx,
                 result,
-                provenance=_run_result_screenshot_provenance(result, source_tool="run_blocks_and_collect_debug"),
+                provenance=run_result_screenshot_provenance(result, source_tool="run_blocks_and_collect_debug"),
             )
 
     sanitized = _stamp_turn_budget_on_result(
@@ -1586,7 +1590,7 @@ async def test_workflow_from_blank_browser_tool(
     enqueue_screenshot_from_result(
         copilot_ctx,
         result,
-        provenance=_run_result_screenshot_provenance(result, source_tool="test_workflow_from_blank_browser"),
+        provenance=run_result_screenshot_provenance(result, source_tool="test_workflow_from_blank_browser"),
     )
     sanitized = sanitize_tool_result_for_llm("test_workflow_from_blank_browser", result)
     return json.dumps(_stamp_turn_budget_on_result(copilot_ctx, sanitized))
@@ -1659,9 +1663,18 @@ async def get_run_results_tool(
                 {"ok": False, "error": f"row_keys holds {len(row_keys)} keys; pass at most {RUN_RESULTS_MAX_ROW_KEYS}."}
             )
     first_page = block_cursor is None and row_keys is None
+    # Stamped before the read so a frame queued while it awaits counts as newer and is kept.
+    started = time.monotonic()
     result = await _get_run_results(params, copilot_ctx, read_live_page=first_page, skip_page_evidence=not first_page)
     record_tool_step_result_for_ctx(copilot_ctx, "get_run_results", params, result)
     if result.get("ok") is not False:
+        if first_page:
+            enqueue_screenshot_from_result(
+                copilot_ctx,
+                result,
+                provenance=stored_run_frame_provenance(result),
+                captured_at=started,
+            )
         # Exact-match scrubbing has to see whole strings, before any preview cuts or re-serializes them.
         result = scrub_secrets_from_structure(copilot_ctx, result)
         run_rows = await _chronological_run_block_rows(result["data"]["workflow_run_id"], copilot_ctx.organization_id)
@@ -1916,38 +1929,12 @@ async def _run_updated_workflow_blocks(
             enqueue_screenshot_from_result(
                 copilot_ctx,
                 run_result,
-                provenance=_run_result_screenshot_provenance(run_result, source_tool=tool_name),
+                provenance=run_result_screenshot_provenance(run_result, source_tool=tool_name),
             )
     sanitized = _stamp_turn_budget_on_result(
         copilot_ctx, sanitize_tool_result_for_llm("run_blocks_and_collect_debug", run_result)
     )
     return json.dumps(sanitized)
-
-
-def _run_result_screenshot_provenance(result: dict[str, Any], *, source_tool: str) -> ScreenshotProvenance:
-    """Bind a run-result frame to the facts carried by the run payload.
-
-    Run execution returns its identity fields under ``data``. Some older call
-    sites and error paths still expose them at the top level, so retain that as
-    a factual fallback rather than stamping the frame as unidentified.
-    """
-    data = result.get("data")
-    facts = data if isinstance(data, dict) else {}
-
-    def _string_fact(key: str) -> str | None:
-        value = facts.get(key)
-        if not isinstance(value, str) or not value:
-            value = result.get(key)
-        return value if isinstance(value, str) and value else None
-
-    return ScreenshotProvenance(
-        source_tool=source_tool,
-        captured_url=_string_fact("current_url"),
-        observation_step=None,
-        browser_session_id=_string_fact("browser_session_id"),
-        workflow_run_id=_string_fact("workflow_run_id"),
-        action_relation=ScreenshotActionRelation.WORKFLOW_RUN_RESULT,
-    )
 
 
 @function_tool(
@@ -2060,9 +2047,10 @@ async def start_fresh_browser_tool(ctx: RunContextWrapper) -> str:
 
     The new session has no cookies, storage, sign-ins or challenge history, so a site that challenged
     or blocked the old browser may not challenge it. Everything in the old browser is lost, including
-    open tabs and the current page. When the studio browser pane streams the old browser, it stays
-    open and the pane keeps showing it while your browser tools act in the new one. If the new
-    browser cannot start, the old one stays in use.
+    open tabs and the current page. When the old browser is the studio browser, the new one replaces it
+    there and the old one closes, unless a person has Take control, a demonstration is recording in it,
+    a run occupies it, or that cannot be checked; then the old one stays the studio browser and the
+    pane keeps showing it. If the new browser cannot start, the old one stays in use.
     """
     authority_error = _authority_tool_error(ctx.context, FRESH_BROWSER_TOOL_NAME)
     if authority_error:
@@ -2150,6 +2138,34 @@ async def read_chat_history_tool(
         turn_id=ctx.context.turn_id,
     )
     record_tool_step_result_for_ctx(ctx.context, CHAT_HISTORY_TOOL_NAME, {"cursor": cursor, "limit": limit}, result)
+    return json.dumps(result, ensure_ascii=False)
+
+
+@function_tool(
+    failure_error_function=copilot_tool_failure,
+    name_override=LOAD_SKILL_TOOL_NAME,
+    description_override=LOAD_SKILL_DESCRIPTION,
+)
+async def load_skill_tool(ctx: RunContextWrapper, name: str) -> str:
+    authority_error = _authority_tool_error(ctx.context, LOAD_SKILL_TOOL_NAME)
+    if authority_error:
+        return _diagnosis_repair_tool_error(ctx.context, LOAD_SKILL_TOOL_NAME, authority_error)
+    result = load_skill(ctx.context.skill_session, name)
+    record_tool_step_result_for_ctx(ctx.context, LOAD_SKILL_TOOL_NAME, {"name": name}, result)
+    return json.dumps(result, ensure_ascii=False)
+
+
+@function_tool(
+    failure_error_function=copilot_tool_failure,
+    name_override=READ_SKILL_RESOURCE_TOOL_NAME,
+    description_override=READ_SKILL_RESOURCE_DESCRIPTION,
+)
+async def read_skill_resource_tool(ctx: RunContextWrapper, name: str, path: str) -> str:
+    authority_error = _authority_tool_error(ctx.context, READ_SKILL_RESOURCE_TOOL_NAME)
+    if authority_error:
+        return _diagnosis_repair_tool_error(ctx.context, READ_SKILL_RESOURCE_TOOL_NAME, authority_error)
+    result = read_skill_resource(ctx.context.skill_session, name, path)
+    record_tool_step_result_for_ctx(ctx.context, READ_SKILL_RESOURCE_TOOL_NAME, {"name": name, "path": path}, result)
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -2464,7 +2480,7 @@ NATIVE_TOOLS = [
     delete_block_tool,
     list_credentials_tool,
     list_integrations_tool,
-    request_google_connection_tool,
+    request_connection_tool,
     offer_demonstration_tool,
     read_google_sheet_tool,
     get_organization_usage_quota_tool,
@@ -2488,6 +2504,8 @@ NATIVE_TOOLS = [
     upload_attached_file_tool,
     read_attached_pdf_tool,
     read_chat_history_tool,
+    load_skill_tool,
+    read_skill_resource_tool,
     run_workflow_for_accounts_tool,
     run_saved_workflow_tool,
     get_account_group_status_tool,
@@ -2657,11 +2675,14 @@ def copilot_native_tools(
     supports_account_group_card: bool = False,
     supports_single_run_card: bool = False,
     supports_credential_delete_card: bool = False,
-    supports_google_setup_card: bool = False,
+    supports_connection_card: bool = False,
     supports_demonstration_offer: bool = False,
     browser_pattern_accepting_calls: tuple[str, ...] = (),
+    trigger_sources: list[CopilotTriggerSource] | None = None,
+    skills_available: bool = False,
 ) -> list[FunctionTool]:
     capability = _normalized_authoring_capability(authoring_capability)
+    trigger_sources_text = render_trigger_sources(trigger_sources or [])
     both_families = capability.code_blocks and capability.agent_blocks
     appended = SCHEMA_FIRST_GUIDANCE if not both_families else f"{AUTHORING_FAMILY_GUIDANCE}\n\n{SCHEMA_FIRST_GUIDANCE}"
     tools: list[FunctionTool] = []
@@ -2670,8 +2691,9 @@ def copilot_native_tools(
             (tool.name == "ask_user" and not supports_question_tool)
             or (tool.name == BROWSER_CODE_TOOL_NAME and not browser_code_available)
             or (tool.name in ACCOUNT_GROUP_TOOL_NAMES and not supports_account_group_card)
-            or (tool.name == GOOGLE_SETUP_TOOL_NAME and not supports_google_setup_card)
+            or (tool.name == CONNECTION_CARD_TOOL_NAME and not supports_connection_card)
             or (tool.name == DEMONSTRATION_OFFER_TOOL_NAME and not supports_demonstration_offer)
+            or (tool.name in SKILL_TOOL_NAMES and not skills_available)
             or (tool.name == ACCOUNT_GROUP_SUBMIT_TOOL_NAME and not account_group_submit_enabled())
             or (tool.name == SINGLE_RUN_TOOL_NAME and not (supports_single_run_card and single_run_submit_enabled()))
             or (
@@ -2691,6 +2713,8 @@ def copilot_native_tools(
             tool = _with_executed_source_param(tool, browser_code_available=browser_code_available)
         if tool.name in _BUILD_TEST_TOOL_NAMES:
             tool = dataclasses.replace(tool, description=f"{tool.description}\n\n{BUILD_TEST_BROWSER_START}")
+        if tool.name == create_webhook_trigger_tool.name and trigger_sources_text:
+            tool = dataclasses.replace(tool, description=f"{tool.description}\n\n{trigger_sources_text}")
         if tool.name == list_integrations_tool.name and run_tools_available:
             tool = dataclasses.replace(tool, description=f"{tool.description}\n\n{_LIST_INTEGRATIONS_RUN_GUIDANCE}")
         if tool.name in AUTHORING_GUIDANCE_TOOL_NAMES:

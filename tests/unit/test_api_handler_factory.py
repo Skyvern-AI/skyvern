@@ -39,13 +39,13 @@ from skyvern.forge.sdk.api.llm.exceptions import (
 from skyvern.forge.sdk.api.llm.models import LLMConfig
 from skyvern.forge.sdk.api.llm.utils import uses_only_anthropic_models
 from skyvern.forge.sdk.artifact.models import ArtifactType
-from skyvern.forge.sdk.copilot import secret_scrub
-from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.prompting import PromptEngine
 from skyvern.forge.sdk.schemas.custom_llms import CustomLLMConfig, CustomLLMProvider
 from skyvern.schemas.llm import LLMRouterConfig, LLMRouterModelConfig
+from skyvern.utils import secret_scrub
+from skyvern.utils.secret_scrub import REDACTED_SECRET_PLACEHOLDER
 from tests.unit.forge_log_capture import capture_runtime_logs
 from tests.unit.helpers import DummyLogger, FakeLLMResponse, fallback_receipts, router_test_context
 

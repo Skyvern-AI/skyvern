@@ -617,7 +617,7 @@ def classify_from_failure_reason(
 
 # Bump when the taxonomy or the category->component mapping below changes, so a frozen
 # coverage baseline stays reproducible per classifier_version.
-CLASSIFIER_VERSION = 11
+CLASSIFIER_VERSION = 12
 FAILURE_ATTRIBUTION_SCHEMA_VERSION = 1
 
 # Bounded sentinels — neither is an infra component id.
@@ -629,6 +629,9 @@ _MIN_ATTRIBUTION_CONFIDENCE = 0.7
 
 # Shared with typed run emitters; dynamic/user-defined categories remain excluded.
 _FAILURE_CATEGORY_LITERALS = frozenset(category.value for category in FailureCategory)
+# Labels only the model failure classifier writes (a real business reason in the target system or the run's inputs).
+# They stay out of FailureCategory, whose membership decides how model-written task categories are read (ADR 0028).
+MODEL_ONLY_FAILURE_CATEGORIES = frozenset({"BUSINESS_OUTCOME"})
 
 
 def partition_failure_categories(value: Any) -> tuple[list[dict], list[str]]:
@@ -683,6 +686,8 @@ SITE_THROTTLE_REASON_CODE = "site_throttle"
 EXTERNAL_SERVICE_THROTTLE_REASON_CODE = "external_service_throttle"
 SIGN_IN_FORM_VISIBLE_REASON_CODE = "sign_in_form_visible"
 SAVED_PROFILE_SIGNED_OUT_REASON_CODE = "saved_profile_signed_out"
+# Marks a primary entry written by the model-based failure classifier, so a reader can tell it from a rule's.
+FAILURE_CLASSIFIER_V2_REASON_CODE = "failure_classifier_v2"
 # The user-defined errors a task v2 root's own failure summary matched, carried for the run's errors[] output.
 TASK_V2_ROOT_USER_ERRORS_REASON_CODE = "task_v2_root_user_errors"
 _MAX_ROOT_USER_ERRORS = 10
@@ -703,6 +708,9 @@ OUTPUT_ONLY_LABEL_REASON_CODES = frozenset(
         SAVED_PROFILE_SIGNED_OUT_REASON_CODE,
         TASK_V2_ROOT_USER_ERRORS_REASON_CODE,
         FINAL_HAR_USER_MATCH_REASON_CODE,
+        # The model classifier's label is for the run page and API; runtime readers keep following the rule
+        # classifier's entries (ADR 0028).
+        FAILURE_CLASSIFIER_V2_REASON_CODE,
     }
 )
 
@@ -766,12 +774,16 @@ def with_root_user_errors(categories: list[dict] | None, user_errors: list[dict[
 
 
 def has_classifier_primary(categories: object) -> bool:
-    """Whether ``categories[0]`` is a classifier entry; an output-only label there is not a primary to follow."""
+    """Whether ``categories[0]`` is a classifier entry; an output-only label there is not a primary to follow, except
+    the model classifier's, which is the run's primary label."""
     return (
         isinstance(categories, list)
         and bool(categories)
         and isinstance(categories[0], dict)
-        and not is_output_only_entry(categories[0])
+        and (
+            not is_output_only_entry(categories[0])
+            or categories[0].get("reason_code") == FAILURE_CLASSIFIER_V2_REASON_CODE
+        )
     )
 
 
@@ -911,6 +923,7 @@ _REASON_CODE_LITERALS = frozenset(
         SIGN_IN_FORM_VISIBLE_REASON_CODE,
         SAVED_PROFILE_SIGNED_OUT_REASON_CODE,
         HAR_ANTI_BOT_DIAGNOSTIC_REASON_CODE,
+        FAILURE_CLASSIFIER_V2_REASON_CODE,
     }
 )
 
@@ -935,6 +948,7 @@ _NON_INFRA_CATEGORIES = {
     "LLM_REASONING_ERROR",
     "WRONG_PAGE_STATE",
     "BROWSER_SESSION_EXPIRED",
+    "BUSINESS_OUTCOME",
 }
 
 
@@ -969,7 +983,12 @@ def _bounded_category(primary: dict) -> str | None:
     membership lookup, so this cannot raise ``TypeError`` and terminal derivation never fails.
     """
     category = primary.get("category")
-    return category if isinstance(category, str) and category in _FAILURE_CATEGORY_LITERALS else None
+    return (
+        category
+        if isinstance(category, str)
+        and (category in _FAILURE_CATEGORY_LITERALS or category in MODEL_ONLY_FAILURE_CATEGORIES)
+        else None
+    )
 
 
 def _bounded_reason_code(primary: dict) -> str | None:

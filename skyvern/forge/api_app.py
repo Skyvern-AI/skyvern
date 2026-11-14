@@ -22,8 +22,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
-from sqlalchemy import inspect, text
-from sqlalchemy.engine import Connection
 from sqlalchemy.exc import DataError, OperationalError
 from starlette.datastructures import MutableHeaders, QueryParams
 from starlette.requests import ClientDisconnect, HTTPConnection, Request
@@ -42,9 +40,8 @@ from skyvern.forge.sdk.copilot.tracing_setup import ensure_tracing_initialized
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import assert_signing_key_usable
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
-from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.exceptions import DatabaseConnectionUnavailableError, NotFoundError, is_connection_failure
-from skyvern.forge.sdk.db.models import Base
+from skyvern.forge.sdk.db.sqlite_schema import ensure_sqlite_schema
 from skyvern.forge.sdk.executor.background_task_executor import BackgroundTaskExecutor
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.executor.run_liveness import start_run_lease_tasks, stop_run_lease_tasks
@@ -55,6 +52,7 @@ from skyvern.forge.sdk.routes.microsoft_oauth import microsoft_oauth_router
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router, legacy_v2_router
 from skyvern.forge.sdk.routes.sms_inbound import sms_inbound_router
 from skyvern.forge.sdk.routes.twilio_integration import twilio_integration_router
+from skyvern.forge.sdk.services import oauth_redirect_uri
 from skyvern.forge.sdk.services.local_org_auth_token_service import (
     ensure_local_api_key,
     ensure_local_org,
@@ -382,41 +380,6 @@ def register_agent_route_aliases(fastapi_app: FastAPI) -> None:
         route.include_in_schema = False
 
 
-# Columns that migrations added to tables an older local SQLite database already has. create_all only
-# creates missing tables, so an upgraded install needs each of these added here.
-_SQLITE_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
-    ("organizations", "slug", "VARCHAR"),
-    ("tasks", "attempt_number", "INTEGER"),
-    ("workflow_run_blocks", "attempt_number", "INTEGER"),
-    ("workflow_run_blocks", "capped_output", "JSON"),
-    ("workflow_run_blocks", "tool_calls", "JSON"),
-    ("google_oauth_credentials", "google_subject", "VARCHAR"),
-    ("tasks", "task_queue", "VARCHAR"),
-)
-
-
-def upgrade_sqlite_schema(connection: Connection) -> None:
-    """Add the columns and indexes that create_all leaves out of an existing local SQLite database."""
-    inspector = inspect(connection)
-    tables = set(inspector.get_table_names())
-    for table, column, column_type in _SQLITE_ADDED_COLUMNS:
-        if table in tables and column not in {existing["name"] for existing in inspector.get_columns(table)}:
-            connection.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}"))
-    if "organizations" in tables:
-        connection.execute(
-            text(
-                "CREATE UNIQUE INDEX IF NOT EXISTS uq_organizations_slug ON organizations (slug) WHERE slug IS NOT NULL"
-            )
-        )
-
-
-async def ensure_sqlite_schema(db: AgentDB) -> None:
-    """Create missing tables and add missing columns to a local SQLite database."""
-    async with db.engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-        await conn.run_sync(upgrade_sqlite_schema)
-
-
 async def _bootstrap_sqlite() -> None:
     """Auto-bootstrap SQLite on first server start.
 
@@ -427,7 +390,7 @@ async def _bootstrap_sqlite() -> None:
     _ensure_sqlite_dir(settings.DATABASE_STRING)
 
     db = forge_app.DATABASE
-    await ensure_sqlite_schema(db)
+    await ensure_sqlite_schema(db.engine)
 
     # Preserve an existing API key if it's a real value (not the skeleton default).
     # settings.SKYVERN_API_KEY already incorporates env vars and .env via pydantic-settings.
@@ -476,6 +439,7 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
     """Lifespan context manager for FastAPI app startup and shutdown."""
 
     LOG.info("Server started")
+    oauth_redirect_uri.warn_removed_redirect_host_settings()
 
     # Initialize tracing eagerly so OTel spans (`@traced(...)`) ship from the
     # first request. Without this, the tracer provider is configured lazily on

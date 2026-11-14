@@ -2,7 +2,10 @@ import { createElement } from "react";
 import { renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { FeatureFlagContext } from "./useFeatureFlag";
-import { useWorkflowDocEditorFlag } from "./useWorkflowDocEditorFlag";
+import {
+  useWorkflowDocEditorFlag,
+  useWorkflowDocImagesFlag,
+} from "./useWorkflowDocEditorFlag";
 
 function shown(
   setting: string | undefined,
@@ -40,5 +43,23 @@ describe("useWorkflowDocEditorFlag", () => {
   it("shows it when the setting is on (the default) and the server enables the flag", () => {
     expect(shown(undefined, true)).toBe(true);
     expect(shown("true", true)).toBe(true);
+  });
+});
+
+describe("useWorkflowDocImagesFlag", () => {
+  const images = (serverFlag: boolean | undefined) =>
+    renderHook(() => useWorkflowDocImagesFlag(), {
+      wrapper: ({ children }) =>
+        createElement(FeatureFlagContext.Provider, {
+          value: (name: string) =>
+            name === "WORKFLOW_DOC_IMAGES" ? serverFlag : undefined,
+          children,
+        }),
+    }).result.current;
+
+  it("adds screenshots only when the server enables the flag", () => {
+    expect(images(true)).toBe(true);
+    expect(images(false)).toBe(false);
+    expect(images(undefined)).toBe(false);
   });
 });

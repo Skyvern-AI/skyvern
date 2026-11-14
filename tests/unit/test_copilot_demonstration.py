@@ -43,7 +43,6 @@ from skyvern.forge.sdk.copilot.demonstration_replay import replay_demonstration
 from skyvern.forge.sdk.copilot.demonstration_tap import TapEvent
 from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
-from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.secret_scrub import register_secret_scrub_value
 from skyvern.forge.sdk.copilot.tools import _build_skyvern_mcp_overlays, get_skyvern_mcp_alias_map
 from skyvern.forge.sdk.copilot.tools import mcp_hooks as mcp_hooks_module
@@ -51,6 +50,7 @@ from skyvern.forge.sdk.routes import workflow_copilot as copilot_routes
 from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType, CredentialVaultType
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotDemonstrationControlRequest
 from skyvern.services import uploaded_file_service
+from skyvern.utils.raw_secret_redaction import redact_raw_secrets_for_prompt
 from tests.unit.copilot_test_helpers import make_copilot_ctx, stamping_browser_manager, stop_activity_renewer
 from tests.unit.scoped_asyncio import ScopedAsyncio
 

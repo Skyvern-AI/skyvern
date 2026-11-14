@@ -105,7 +105,6 @@ from skyvern.forge.taskv3.loop import (
 from skyvern.forge.taskv3.run_arms import (
     ANSWER_AUDIT_LOG_ONLY_FLAG,
     APPLICATION_CONTEXT_FLAG,
-    CARRY_REASONING_FLAG,
     DATE_SEGMENT_AIM_FLAG,
     LLM_ROUTE_FLAG,
     LOGIN_PACE_FLAG,
@@ -474,12 +473,7 @@ async def test_execute_task_v3_buckets_the_date_segment_aim_arm_per_run(monkeypa
     )
 
     assert loop_mock.date_segment_aim_enabled_during_loop is True
-    for flag in (
-        DATE_SEGMENT_AIM_FLAG,
-        APPLICATION_CONTEXT_FLAG,
-        ANSWER_AUDIT_LOG_ONLY_FLAG,
-        CARRY_REASONING_FLAG,
-    ):
+    for flag in (DATE_SEGMENT_AIM_FLAG, APPLICATION_CONTEXT_FLAG, ANSWER_AUDIT_LOG_ONLY_FLAG):
         assert loop_mock.context.run_arms[flag] == (task.workflow_run_id, "treatment")
         provider.assert_any_await(flag, task.workflow_run_id, properties={"organization_id": task.organization_id})
 
@@ -2393,6 +2387,7 @@ async def test_execute_step_v3_standalone_flushes_llm_artifacts(cancelled: bool)
         ):
             mock_app.DATABASE.tasks.get_task = AsyncMock(return_value=None)
             mock_app.DATABASE.tasks.update_task = AsyncMock(return_value=task)
+            mock_app.AGENT_FUNCTION.release_page_reload_owner = AsyncMock()
             mock_app.AGENT_FUNCTION.validate_step_execution = AsyncMock()
             mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
             mock_app.EXPERIMENTATION_PROVIDER.resolve_feature_flag_strict = AsyncMock(return_value=False)

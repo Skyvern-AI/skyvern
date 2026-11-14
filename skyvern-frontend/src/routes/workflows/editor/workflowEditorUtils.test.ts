@@ -24,6 +24,10 @@ import {
   workflowEffectiveDefaultEngine,
 } from "./workflowEditorUtils";
 import { removeJinjaReferenceFromNodes } from "./jinjaReferences";
+import {
+  newDocImageHandle,
+  resolveDocImageHandle,
+} from "./doc/docImageHandles";
 import { collectKnownErrorCodes } from "./nodes/StartNode/retryPolicyUtils";
 import { terminateNodeDefaultData } from "./nodes/TerminateNode/types";
 
@@ -818,12 +822,49 @@ describe("removeKeyFromNodesParameterKeys", () => {
 });
 
 describe("block note metadata round trip", () => {
+  test("no upload handle leaves a save: a finished one is sent as its file, the rest are left out", () => {
+    const done = newDocImageHandle();
+    const uploading = newDocImageHandle();
+    resolveDocImageHandle(done, "file_done");
+    const shots = (...ids: string[]) =>
+      ids.map((file_id) => ({ file_id, caption: null, placement: "above" }));
+    const { nodes, edges } = getElements(
+      [
+        {
+          ...minimalTaskBlock(),
+          label: "mixed",
+          doc_images: shots("file_saved", uploading, done),
+        },
+        {
+          ...minimalTaskBlock(),
+          label: "uploading",
+          doc_images: shots(uploading),
+        },
+        { ...minimalTaskBlock(), label: "empty", doc_images: [] },
+      ] as WorkflowBlock[],
+      SETTINGS,
+      false,
+    );
+    const saved = getWorkflowBlocks(nodes, edges);
+    const of = (label: string) => saved.find((b) => b.label === label)!;
+    expect(of("mixed").doc_images).toEqual(shots("file_saved", "file_done"));
+    expect(of("uploading")).not.toHaveProperty("doc_images");
+    expect(of("empty").doc_images).toEqual([]);
+    expect(JSON.stringify(saved)).not.toContain("pending_");
+  });
+
   test("preserves notes and omits unset fields through graph serialization", () => {
     const noted = {
       ...minimalTaskBlock(),
       notes: "Read the saved plan first.",
       trailing_notes: "Stop after confirming the result.",
       description: "Only for the workflow author.",
+      doc_images: [
+        { file_id: "file_shot", caption: "Login page", placement: "above" },
+      ],
+      prompt_images: [
+        { file_id: "file_ref", caption: null, placement: "block" },
+      ],
     } as WorkflowBlock;
     const oldVersion = {
       ...minimalTaskBlock(),
@@ -836,12 +877,24 @@ describe("block note metadata round trip", () => {
       notes: "Read the saved plan first.",
       trailing_notes: "Stop after confirming the result.",
       description: "Only for the workflow author.",
+      doc_images: [
+        { file_id: "file_shot", caption: "Login page", placement: "above" },
+      ],
+      prompt_images: [
+        { file_id: "file_ref", caption: null, placement: "block" },
+      ],
     });
     const savedOldVersion = saved.find(
       (block) => block.label === "old_version",
     );
     expect(savedOldVersion).toBeDefined();
-    for (const key of ["notes", "trailing_notes", "description"] as const) {
+    for (const key of [
+      "notes",
+      "trailing_notes",
+      "description",
+      "doc_images",
+      "prompt_images",
+    ] as const) {
       expect(savedOldVersion).not.toHaveProperty(key);
     }
   });

@@ -15,6 +15,9 @@ MIN_NUMERIC_SECRET_LENGTH = 6
 # Shorter variants only match on token boundaries, so they cannot redact inside an unrelated word.
 MIN_UNANCHORED_SECRET_LENGTH = 8
 
+# Names whose value is scrubbed out of a stored artifact, irreversibly. Distinct from the `***`
+# mask in utils/secret_headers.py, which is a reversible API round-trip placeholder for every
+# header a customer authored, so the two cannot be merged.
 SENSITIVE_HEADER_NAMES: frozenset[str] = frozenset(
     {"authorization", "proxy-authorization", "cookie", "set-cookie", "x-api-key"}
 )

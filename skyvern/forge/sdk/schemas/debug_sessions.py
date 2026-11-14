@@ -1,7 +1,7 @@
 import typing as t
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from skyvern.schemas.runs import ProxyLocationInput
 
@@ -28,6 +28,7 @@ class DebugSession(BaseModel):
     browser_session_id: str
     vnc_streaming_supported: bool | None = None
     workflow_permanent_id: str | None = None
+    user_id: str | None = Field(default=None, exclude=True)
     # Mirrors the visible PBS's saved profile so the UI can warn before a debug
     # run with a credential profile diverges from the user's stream.
     pbs_browser_profile_id: str | None = None

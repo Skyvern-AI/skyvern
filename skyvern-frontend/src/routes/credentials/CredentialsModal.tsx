@@ -268,9 +268,9 @@ type Props = {
   editingCredential?: CredentialApiResponse;
   /** Override the modal type (used in edit mode to set the correct form) */
   overrideType?: CredentialModalType;
-  // Copilot-only: seed the login URL so a quick-added credential carries a
+  // Ember-only: seed the login URL so a quick-added credential carries a
   // tested_url and matches later hostname-keyed asks. Create mode only; leaving
-  // it undefined (every non-copilot caller) keeps the field empty as before.
+  // it undefined (every non-Ember caller) keeps the field empty as before.
   defaultTestUrl?: string;
   defaultTotpType?: PasswordCredential["totp_type"];
   heading?: string;
@@ -1315,7 +1315,7 @@ function CredentialsModal({
     isEditMode &&
     extraSiteUrls.join("\n") !==
       (editingCredential?.extra_site_urls ?? []).join("\n");
-  // The sites this copy was loaded with: a save that changes them is refused if Copilot moved them meanwhile.
+  // The sites this copy was loaded with: a save that changes them is refused if Ember moved them meanwhile.
   const expectedSiteUrls = [
     ...new Set(
       [

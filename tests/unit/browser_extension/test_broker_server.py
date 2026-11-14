@@ -10,7 +10,7 @@ from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -2042,6 +2042,198 @@ async def test_already_detached_shared_cleanup_frees_tab_for_next_client() -> No
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("args", [{}, {"adopt_shared": False}, {"adopt_shared": True}])
+async def test_default_lease_adopts_only_when_requested(args: dict) -> None:
+    server = BrowserExtensionBrokerServer(19777, base_dir=_test_broker_base_dir())
+    relay = FakeRelay("extension-secret", 19777, server._handle_extension_event, server._handle_disconnect)
+    original_request = relay.request
+
+    async def request(
+        op: str,
+        args: dict,
+        timeout: float | None = 30.0,
+        *,
+        retain_until_terminal: bool = False,
+        on_registered: Callable[[], None] | None = None,
+        on_terminal: Callable[[], None] | None = None,
+    ) -> dict:
+        if op != "tabs.create":
+            return await original_request(
+                op,
+                args,
+                timeout,
+                retain_until_terminal=retain_until_terminal,
+                on_registered=on_registered,
+                on_terminal=on_terminal,
+            )
+        relay.requests.append((op, dict(args)))
+        if on_registered is not None:
+            on_registered()
+        tab = {"tabId": 99, "url": "about:blank", "title": ""}
+        relay.scoped_tabs = [*relay.scoped_tabs, tab]
+        await server._handle_extension_event("scope.tabAdded", {**tab, "origin": "created"})
+        if on_terminal is not None:
+            on_terminal()
+        return tab
+
+    relay.request = request  # type: ignore[method-assign]
+    server._relay = relay
+    client = BrokerClient(19777, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
+    server_task = await _connect_over_socketpair(server, client)
+    relay.scoped_tabs = [{"tabId": 12}, {"tabId": 7}]
+    try:
+        result = await client._control_request("lease.acquire_default", args, 2.0)
+        if args.get("adopt_shared"):
+            assert result["tab"]["tabId"] == 7
+            assert server._leases[7].origin == "shared"
+            assert not any(op == "tabs.create" for op, _args in relay.requests)
+        else:
+            assert result["tab"]["tabId"] == 99
+            assert server._leases[99].origin == "created"
+            assert 7 not in server._leases
+            assert ("tabs.create", {"url": "about:blank"}) in relay.requests
+        assert 12 not in server._leases
+    finally:
+        await client.stop()
+        await asyncio.wait_for(server_task, 1.0)
+        await server.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "args",
+    [
+        {"extra": True},
+        {"adopt_shared": True, "extra": False},
+        {"adopt_shared": None},
+        {"adopt_shared": 1},
+        {"adopt_shared": "true"},
+    ],
+)
+async def test_default_lease_rejects_invalid_arguments(args: dict) -> None:
+    server = BrowserExtensionBrokerServer(19777, base_dir=_test_broker_base_dir())
+    relay = FakeRelay("extension-secret", 19777, server._handle_extension_event, server._handle_disconnect)
+    server._relay = relay
+    client = BrokerClient(19777, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
+    server_task = await _connect_over_socketpair(server, client)
+    try:
+        with pytest.raises(BrowserExtensionBrokerError) as exc:
+            await client._control_request("lease.acquire_default", args, 2.0)
+        assert exc.value.code == "INVALID_REQUEST"
+        assert not server._leases
+    finally:
+        await client.stop()
+        await asyncio.wait_for(server_task, 1.0)
+        await server.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scope_order", "reply"),
+    [
+        ("before", {"kept": True}),
+        ("after", {"kept": True}),
+        ("successor", {"kept": True}),
+        ("successor", {}),
+        ("during_request", {"kept": True}),
+    ],
+)
+async def test_kept_close_drain_frees_once_and_preserves_successor(
+    monkeypatch: pytest.MonkeyPatch,
+    scope_order: str,
+    reply: dict,
+) -> None:
+    server = BrowserExtensionBrokerServer(19777, base_dir=_test_broker_base_dir())
+    relay = FakeRelay("extension-secret", 19777, server._handle_extension_event, server._handle_disconnect)
+    original_request = relay.request
+    request_started = asyncio.Event()
+    finish_request = asyncio.Event()
+
+    async def request(
+        op: str,
+        args: dict,
+        timeout: float = 30.0,
+        *,
+        retain_until_terminal: bool = False,
+        on_registered: Callable[[], None] | None = None,
+        on_terminal: Callable[[], None] | None = None,
+    ) -> dict:
+        if op != "tabs.remove":
+            return await original_request(
+                op,
+                args,
+                timeout,
+                retain_until_terminal=retain_until_terminal,
+                on_registered=on_registered,
+                on_terminal=on_terminal,
+            )
+        if scope_order == "during_request":
+            relay.requests.append((op, dict(args)))
+            if on_registered is not None:
+                on_registered()
+                request_started.set()
+                try:
+                    await finish_request.wait()
+                finally:
+                    if on_terminal is not None:
+                        on_terminal()
+            return reply
+        if scope_order != "after":
+            relay.scoped_tabs = []
+            await server._handle_extension_event("scope.tabRemoved", {"tabId": 7, "reason": "unshared"})
+            if scope_order == "successor":
+                relay.scoped_tabs = [{"tabId": 7}]
+                await server._grant_lease(7, "successor", origin="shared")
+        return reply
+
+    relay.request = request  # type: ignore[method-assign]
+    server._relay = relay
+    client = BrokerClient(19777, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
+    server_task = await _connect_over_socketpair(server, client)
+    relay.scoped_tabs = [{"tabId": 7}]
+    free_lease = AsyncMock(wraps=server._free_lease)
+    monkeypatch.setattr(server, "_free_lease", free_lease)
+    pending_request: asyncio.Task[dict] | None = None
+    try:
+        assert client._client_id is not None
+        await server._grant_lease(7, client._client_id, origin="created")
+        if scope_order == "during_request":
+            pending_request = asyncio.create_task(client.request("tabs.remove", {"tabId": 7}, timeout=2.0))
+            await asyncio.wait_for(request_started.wait(), 1.0)
+        await client.release_tab(7)
+        if scope_order == "during_request":
+            assert server._leases[7].draining
+            assert server._tab_request_counts == {7: 1}
+            relay.scoped_tabs = []
+            await server._handle_extension_event("scope.tabRemoved", {"tabId": 7, "reason": "unshared"})
+            free_lease.assert_not_awaited()
+            finish_request.set()
+            assert pending_request is not None
+            assert await asyncio.wait_for(pending_request, 1.0) == {"kept": True}
+        await _eventually(lambda: not server._cleanup_tasks)
+        if scope_order == "during_request":
+            assert relay.requests == [("tabs.remove", {"tabId": 7})]
+        if scope_order == "after":
+            assert server._leases[7].draining
+            free_lease.assert_not_awaited()
+            relay.scoped_tabs = []
+            await server._handle_extension_event("scope.tabRemoved", {"tabId": 7, "reason": "unshared"})
+        if scope_order == "successor":
+            assert server._leases[7].client_id == "successor"
+            assert not server._leases[7].draining
+        else:
+            assert 7 not in server._leases
+        free_lease.assert_awaited_once_with(7)
+    finally:
+        finish_request.set()
+        if pending_request is not None:
+            await asyncio.gather(pending_request, return_exceptions=True)
+        await client.stop()
+        await asyncio.wait_for(server_task, 1.0)
+        await server.stop()
+
+
+@pytest.mark.asyncio
 async def test_successful_shared_detach_waits_for_scope_removal() -> None:
     server = BrowserExtensionBrokerServer(19777, base_dir=_test_broker_base_dir())
     relay = FakeRelay("extension-secret", 19777, server._handle_extension_event, server._handle_disconnect)
@@ -2256,6 +2448,7 @@ async def test_timed_out_tab_create_stays_fenced_without_blocking_popup_routing(
             "scope.tabAdded",
             {"tabId": 93, "url": "https://shared.example.test", "title": "Shared", "origin": "shared"},
         )
+        second.shared_tab_start = True
         shared_lease = await second.ensure_root_lease()
         assert shared_lease is not None and shared_lease["tabId"] == 93
         assert 93 not in server._pending_tab_events

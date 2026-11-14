@@ -1,10 +1,14 @@
 import { ArtifactApiResponse, TaskApiResponse } from "@/api/types";
 import { artifactApiBaseUrl } from "@/util/env";
 
+// The whole URI, encoded once: the artifact server decodes a managed URI and falls back to a legacy raw path.
+export const localArtifactImageURL = (fileUri: string) =>
+  `${artifactApiBaseUrl}/artifact/image?path=${encodeURIComponent(fileUri)}`;
+
 export function getImageURL(artifact: ArtifactApiResponse): string {
   const url = artifact.signed_url ?? artifact.uri;
   if (url.startsWith("file://")) {
-    return `${artifactApiBaseUrl}/artifact/image?path=${encodeURIComponent(url.slice(7))}`;
+    return localArtifactImageURL(url);
   }
   return url;
 }

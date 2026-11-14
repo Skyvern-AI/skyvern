@@ -13,7 +13,6 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { ProxyLocation, Status } from "@/api/types";
 import { useWorkflowPresentationStore } from "@/store/WorkflowPresentationStore";
-import { useDocRunStore } from "../editor/doc/docRunStore";
 import { RunTab } from "./RunTab";
 
 const { runsQueryMock, workflowRunQueryMock } = vi.hoisted(() => ({
@@ -168,7 +167,7 @@ describe("RunTab milestone rerun", () => {
 });
 
 describe("RunTab Fix navigation", () => {
-  test("writes the Copilot message and selected block in one navigation", () => {
+  test("writes the Ember message and selected block in one navigation", () => {
     mockWorkflowRun();
     const router = createMemoryRouter(
       [
@@ -193,8 +192,8 @@ describe("RunTab Fix navigation", () => {
 
       expect(writes).toHaveLength(1);
       expect(writes[0]?.search).toBe("?wr=run_1&selected-block=checkout");
-      const action = (writes[0]?.state as { copilotAction?: unknown })
-        ?.copilotAction as Record<string, unknown> | undefined;
+      const action = (writes[0]?.state as { emberAction?: unknown })
+        ?.emberAction as Record<string, unknown> | undefined;
       expect(action?.kind).toBe("diagnose_run");
       expect(action?.workflowRunId).toBe("run_1");
       expect(typeof action?.nonce).toBe("string");
@@ -303,8 +302,8 @@ describe("RunTab selection mirroring behind the Doc", () => {
     useWorkflowPresentationStore.setState({
       enabled: false,
       presentation: "visual",
+      docMounted: false,
     });
-    useDocRunStore.setState({ mounted: false });
   });
   const mirror = () =>
     screen.getByTestId("runview").getAttribute("data-mirror-selection");
@@ -313,8 +312,8 @@ describe("RunTab selection mirroring behind the Doc", () => {
     useWorkflowPresentationStore.setState({
       enabled: true,
       presentation: "doc",
+      docMounted: true,
     });
-    useDocRunStore.setState({ mounted: true });
     renderAt("/workflows/wpid_abc/studio?panes=copilot,editor");
     expect(mirror()).toBe("no");
   });
@@ -323,13 +322,15 @@ describe("RunTab selection mirroring behind the Doc", () => {
     useWorkflowPresentationStore.setState({
       enabled: true,
       presentation: "doc",
+      docMounted: true,
     });
-    useDocRunStore.setState({ mounted: true });
     renderAt("/workflows/wpid_abc/studio?panes=overview,editor");
     expect(mirror()).toBe("yes");
     cleanup();
-    useWorkflowPresentationStore.setState({ presentation: "visual" });
-    useDocRunStore.setState({ mounted: false });
+    useWorkflowPresentationStore.setState({
+      presentation: "visual",
+      docMounted: false,
+    });
     renderAt("/workflows/wpid_abc/studio?panes=copilot,editor");
     expect(mirror()).toBe("yes");
   });

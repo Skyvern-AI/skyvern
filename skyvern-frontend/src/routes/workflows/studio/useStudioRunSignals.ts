@@ -4,7 +4,6 @@ import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWork
 import { useWorkflowRunsQuery } from "../hooks/useWorkflowRunsQuery";
 import { finalizedRunStatus } from "./runProjections";
 import { useStudioRunId } from "./useStudioRunId";
-import { isStepRun } from "../editor/doc/docRunStore";
 
 /**
  * The run facts the shell keys UI off: Run-tab gating, the toggle status dot
@@ -25,8 +24,7 @@ export function useStudioRunSignals() {
   const { data: urlRun } = useWorkflowRunWithWorkflowQuery({
     workflowRunId: runId,
   });
-  // The Doc states a step run's outcome on the step's own line; no toast on top.
-  useRunCompletionToast(runId && !isStepRun(runId) ? urlRun : undefined);
+  useRunCompletionToast(runId ? urlRun : undefined);
   const knownHasRuns = runs === undefined ? undefined : runs.length > 0;
   return {
     hasRun: Boolean(urlRunId) || knownHasRuns === true,

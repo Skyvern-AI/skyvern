@@ -396,8 +396,9 @@ async def test_eval_override_contexts_are_isolated_and_reset_after_cancellation(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("override_mapping", [{}, {"workflow-copilot": "EVAL_ACTOR"}])
+@pytest.mark.parametrize("override_header", [b"x-ember-eval-llm-overrides", b"x-copilot-eval-llm-overrides"])
 async def test_eval_override_scope_covers_detached_stream_and_terminal_receipt(
-    override_mapping: dict[str, str], eval_llm_registry: None, monkeypatch: pytest.MonkeyPatch
+    override_mapping: dict[str, str], override_header: bytes, eval_llm_registry: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     captured: dict[str, Any] = {}
     started, release = asyncio.Event(), asyncio.Event()
@@ -419,9 +420,7 @@ async def test_eval_override_scope_covers_detached_stream_and_terminal_receipt(
 
     monkeypatch.setattr(workflow_copilot_route.FastAPIEventSourceStream, "create", detached_stream)
     monkeypatch.setattr(workflow_copilot_route, "_get_or_create_workflow_copilot_chat", stop_before_writes)
-    request = Request(
-        {"type": "http", "headers": [(b"x-copilot-eval-llm-overrides", json.dumps(override_mapping).encode())]}
-    )
+    request = Request({"type": "http", "headers": [(override_header, json.dumps(override_mapping).encode())]})
     chat_request = WorkflowCopilotChatRequest(
         workflow_permanent_id="wpid_eval", workflow_id="wf_eval", message="Hello", workflow_yaml=""
     )
@@ -535,11 +534,13 @@ async def test_followup_safety_cost_receipts_require_evaluation_org(
 
     http_response = await _answer_followup(surface, organization_id, screen, monkeypatch)
     if organization_id == "org_eval":
-        receipt = json.loads(http_response.headers["X-Copilot-Eval-LLM-Cost"])
+        assert http_response.headers["X-Ember-Eval-LLM-Cost"] == http_response.headers["X-Copilot-Eval-LLM-Cost"]
+        receipt = json.loads(http_response.headers["X-Ember-Eval-LLM-Cost"])
         assert len(receipt["receipt_id"]) == 32
         assert receipt["llm_cost"]["known_cost_usd"] == 0.12
         assert receipt["llm_cost"]["observed_call_count"] == 1
     else:
+        assert "X-Ember-Eval-LLM-Cost" not in http_response.headers
         assert "X-Copilot-Eval-LLM-Cost" not in http_response.headers
     assert current_copilot_cost() is None
 

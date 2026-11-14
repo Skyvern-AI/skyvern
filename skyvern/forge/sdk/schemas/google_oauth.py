@@ -10,7 +10,7 @@ GOOGLE_GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
 class GoogleOAuthClientConfig(BaseModel):
     client_id: str = Field(..., min_length=1)
     client_secret: str = Field(..., min_length=1)
-    redirect_hosts: list[str] = Field(default_factory=list)
+    redirect_uris: list[str] = Field(default_factory=list)
     app_origins: list[str] = Field(default_factory=list)
 
     @field_validator("client_id", "client_secret")
@@ -21,7 +21,7 @@ class GoogleOAuthClientConfig(BaseModel):
             raise ValueError("value must not be blank")
         return stripped
 
-    @field_validator("redirect_hosts", "app_origins")
+    @field_validator("redirect_uris", "app_origins")
     @classmethod
     def _strip_list_values(cls, values: list[str]) -> list[str]:
         return [item.strip() for item in values if item and item.strip()]
@@ -29,7 +29,7 @@ class GoogleOAuthClientConfig(BaseModel):
 
 class GoogleOAuthClientConfigSafe(BaseModel):
     client_id: str | None = None
-    redirect_hosts: list[str] = Field(default_factory=list)
+    redirect_uris: list[str] = Field(default_factory=list)
     app_origins: list[str] = Field(default_factory=list)
     client_secret_configured: bool = False
     configured: bool = False
@@ -47,7 +47,7 @@ class UpdateGoogleOAuthClientConfigRequest(BaseModel):
         default=None,
         description="Google OAuth client secret. Omit or leave blank to preserve the current organization-level secret.",
     )
-    redirect_hosts: list[str] = Field(default_factory=list)
+    redirect_uris: list[str] = Field(default_factory=list)
     app_origins: list[str] = Field(default_factory=list)
 
     @field_validator("client_id")
@@ -66,7 +66,7 @@ class UpdateGoogleOAuthClientConfigRequest(BaseModel):
         stripped = value.strip()
         return stripped or None
 
-    @field_validator("redirect_hosts", "app_origins")
+    @field_validator("redirect_uris", "app_origins")
     @classmethod
     def _strip_update_list_values(cls, values: list[str]) -> list[str]:
         return [item.strip() for item in values if item and item.strip()]

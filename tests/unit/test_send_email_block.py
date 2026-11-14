@@ -1809,6 +1809,15 @@ async def test_gmail_send_refusals_make_no_token_or_provider_call(
 
 
 @pytest.mark.asyncio
+async def test_a_connected_gmail_id_in_credential_id_names_the_field_that_can_send(gmail_env: GmailEnv) -> None:
+    result = await _run_gmail(_gmail_block(credential_id="ngc_abc"))
+
+    assert _outcome(result) == ("failed", "configuration", False)
+    assert "credential_source to nango" in (result.failure_reason or "")
+    assert gmail_env.requests == []
+
+
+@pytest.mark.asyncio
 async def test_gmail_send_template_refusal_names_its_cause(gmail_env: GmailEnv) -> None:
     result = await _run_gmail(_gmail_block(subject="Weekly report {{ missing_block.output.total }}"))
 

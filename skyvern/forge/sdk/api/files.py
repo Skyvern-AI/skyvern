@@ -52,7 +52,7 @@ from skyvern.forge.sdk.core.http_request_authorization import (
     RedirectHopAuthorizer,
     authorize_request_hop_once,
 )
-from skyvern.forge.sdk.db.id import UPLOADED_FILE_PREFIX
+from skyvern.forge.sdk.db.id import is_uploaded_file_id
 from skyvern.services import uploaded_file_service
 from skyvern.utils.url_validators import (
     MAX_SAFE_REDIRECTS,
@@ -65,8 +65,6 @@ if TYPE_CHECKING:
 
 LOG = structlog.get_logger()
 
-# Ids are generated from a 64-bit int, so a real one never exceeds 20 digits.
-_UPLOADED_FILE_ID_PATTERN = re.compile(rf"^{UPLOADED_FILE_PREFIX}_[0-9]{{1,20}}$")
 _ORIGINAL_FILENAME_MARKER = "__skyvern_original_filename__"
 _ORIGINAL_FILENAME_TEMPLATE_RE = re.compile(r"\{\{\s*original_filename\s*\}\}")
 _LOCAL_DOWNLOAD_ROOTS: set[str] = {os.path.realpath(os.path.join(settings.ARTIFACT_STORAGE_PATH, "downloads"))}
@@ -82,15 +80,6 @@ def local_file_requires_organization(file_url: str) -> bool:
         return False
     path = parse_uri_to_path(file_url) if scheme == "file" else file_url
     return not Path(path).resolve().is_relative_to((Path(REPO_ROOT_DIR) / "downloads").resolve())
-
-
-def is_uploaded_file_id(value: str) -> bool:
-    """Whether a value names a file uploaded through ``POST /v1/upload_file``.
-
-    Distinguishable from a URL by construction: an id carries no scheme, and ``file_`` is not
-    a parsable URL scheme, so this can never shadow a ``file://`` path.
-    """
-    return bool(_UPLOADED_FILE_ID_PATTERN.match(value.strip()))
 
 
 async def resolve_uploaded_file_id(file_id: str, organization_id: str | None) -> str:

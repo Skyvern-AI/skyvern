@@ -40,6 +40,7 @@ from pydantic import JsonValue, TypeAdapter, ValidationError
 from skyvern.exceptions import NO_ADDRESS_RECORD_NAV_ERROR_MARKER
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.agents.skills import LOAD_SKILL_TOOL_NAME, SkillSession
 from skyvern.forge.sdk.copilot.agent_naming import schedule_agent_naming
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
@@ -80,11 +81,6 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     redacted_terminal_text,
 )
 from skyvern.forge.sdk.copilot.cache_envelope import CacheableSystemInstructions
-from skyvern.forge.sdk.copilot.code_block_steps import (
-    bind_referenced_parameters_in_yaml,
-    carry_user_owned_goals_in_yaml,
-    derive_code_block_steps_in_yaml,
-)
 from skyvern.forge.sdk.copilot.completion_criteria_store import (
     StoredCriteriaSnapshot,
     apply_requested_output_producer_floor,
@@ -95,6 +91,7 @@ from skyvern.forge.sdk.copilot.config import (
     DEFAULT_MAX_TURNS,
     CopilotConfig,
 )
+from skyvern.forge.sdk.copilot.connected_accounts import request_user_id
 from skyvern.forge.sdk.copilot.context import (
     COPILOT_RESPONSE_TYPES,
     EDIT_BLOCK_TOOL_NAME,
@@ -156,7 +153,6 @@ from skyvern.forge.sdk.copilot.entrypoint import (
     resolve_turn_entrypoint_url,
 )
 from skyvern.forge.sdk.copilot.failure_tracking import block_shape_hashes_by_label
-from skyvern.forge.sdk.copilot.google_connection_notice import google_setup_notice, unselected_google_setup_offers
 from skyvern.forge.sdk.copilot.hooks import FinalReplyRunHooks
 from skyvern.forge.sdk.copilot.interruption import INTERRUPTED_TERMINAL_SUPERSEDED_HEADLINE, StoppedTurnFacts
 from skyvern.forge.sdk.copilot.llm_errors import CopilotEmptyCompletionError
@@ -249,7 +245,7 @@ from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     REPAIR_INSTRUCTION_MAX_CHARS,
     RUNTIME_FAILURE_REASON_MAX_CHARS,
 )
-from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_structured_prompt
+from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result, run_result_screenshot_provenance
 from skyvern.forge.sdk.copilot.secret_scrub import (
     registered_scrub_values,
     scrub_secrets_from_structure,
@@ -268,8 +264,9 @@ from skyvern.forge.sdk.copilot.tools._shared import _copilot_seconds_remaining
 from skyvern.forge.sdk.copilot.tools.blockers import _goal_value_paths_for_code_block
 from skyvern.forge.sdk.copilot.tools.browser_code import close_browser_code_session
 from skyvern.forge.sdk.copilot.tools.credentials import (
-    _server_verified_google_account_choices,
+    UNAPPROVED_CONNECTION_REASON_CODE,
     bitwarden_binding_change_error,
+    connected_account_choices,
     import_bound_vault_logins,
 )
 from skyvern.forge.sdk.copilot.tools.run_execution import (
@@ -286,6 +283,7 @@ from skyvern.forge.sdk.copilot.tools.scouting import (
     hydrate_prior_carried_trajectory,
     read_page_state_on_page,
 )
+from skyvern.forge.sdk.copilot.tools.skills import render_skills_catalog
 from skyvern.forge.sdk.copilot.tools.workflow_update import (
     CANONICAL_WORKFLOW_UNAVAILABLE_ERROR,
     CopilotCanonicalWorkflowUnavailableError,
@@ -341,15 +339,14 @@ from skyvern.forge.sdk.copilot.workflow_yaml import (
     runner_code_block_associations,
     stored_block_code,
     stored_workflow_yaml,
-    workflow_to_copilot_yaml,
 )
 from skyvern.forge.sdk.db.datetime_utils import to_naive_utc
 from skyvern.forge.sdk.db.exceptions import CopilotProposalConflictError
+from skyvern.forge.sdk.integrations.connected_accounts import org_connections_by_id
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import (
     ConnectedAccountChoice,
     ConnectedAccountChoiceReference,
     DeliveredOutputFile,
-    GoogleSetupOffer,
     ResponseKind,
     TurnOutcome,
 )
@@ -362,8 +359,8 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
     chat_history_role,
 )
-from skyvern.forge.sdk.services import google_oauth_service
 from skyvern.forge.sdk.trace import apply_context_attrs, record_span_exception, traced_span
+from skyvern.forge.sdk.workflow.authoring_yaml import workflow_to_authoring_yaml
 from skyvern.forge.sdk.workflow.block_notes import (
     NOTE_FIELDS,
     block_field_texts,
@@ -372,8 +369,14 @@ from skyvern.forge.sdk.workflow.block_notes import (
     labels_with_different_notes,
     stored_notes_for_labels,
 )
+from skyvern.forge.sdk.workflow.code_block_steps import (
+    bind_referenced_parameters_in_yaml,
+    carry_user_owned_goals_in_yaml,
+    derive_code_block_steps_in_yaml,
+)
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
+from skyvern.utils.raw_secret_redaction import redact_raw_secrets_for_structured_prompt
 from skyvern.utils.strings import escape_code_fences
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
@@ -466,6 +469,7 @@ class RequestPolicyGuardrailInputs:
     browser_session_id: str | None = None
     persisted_workflow_yaml: str | None = None
     selected_connected_account_id: str | None = None
+    selected_connected_account_from_pending_proposal: bool = False
     stored_completion_criteria: StoredCriteriaSnapshot | None = None
     # Unlike chat_history_messages, this is not truncated to the prompt window: a site is grounded
     # by the user having written it, which does not expire when the message leaves that window.
@@ -1033,7 +1037,7 @@ def _transcript_anchor_for_turn(packet: TurnContextPacket | None, chat_history_l
 
 def _workflow_yaml_for_prompt(ctx: CopilotContext, workflow_yaml: str | None) -> str:
     safe_yaml = redact_raw_secrets_for_prompt(workflow_yaml or "")
-    return safe_yaml if copilot_sees_notes(ctx) else drop_submitted_note_fields(safe_yaml)
+    return drop_submitted_note_fields(safe_yaml, keep_notes=copilot_sees_notes(ctx))
 
 
 def _store_turn_context_packet_on_context(
@@ -1670,6 +1674,24 @@ def _reusable_origin_inputs_text(workflow_run_id: str | None, keys: list[str]) -
     )
 
 
+async def _copilot_skill_session(ctx: CopilotContext) -> SkillSession:
+    skills = (
+        []
+        if ctx.turn_origin == TurnOrigin.code_block_ai_fallback
+        else await app.AGENT_FUNCTION.agent_skills(
+            organization_id=ctx.organization_id,
+            workflow_permanent_id=ctx.workflow_permanent_id,
+            agent="copilot",
+        )
+    )
+    return SkillSession(
+        skills,
+        agent="copilot",
+        organization_id=ctx.organization_id,
+        workflow_copilot_chat_id=ctx.workflow_copilot_chat_id,
+    )
+
+
 def _build_user_context(
     workflow_yaml: str,
     chat_history_text: str,
@@ -1681,6 +1703,7 @@ def _build_user_context(
     user_goal_summary: str = "",
     attached_files_summary: str = "",
     scope_check: str = "",
+    skills_catalog: str = "",
 ) -> str:
     """Render untrusted context into the user message with code fencing.
 
@@ -1706,6 +1729,7 @@ def _build_user_context(
         attached_files_summary=escape_code_fences(redact_raw_secrets_for_prompt(attached_files_summary or "")),
         video_attachment_formats="/".join(VIDEO_ATTACHMENT_FORMAT_NAMES.values()),
         scope_check=scope_check,
+        skills_catalog=escape_code_fences(skills_catalog),
     )
 
 
@@ -1941,7 +1965,7 @@ def _review_projection_for(
         saved_workflow_canvas(ctx) or _EMPTY_REVIEW_BASELINE_YAML,
         proposal_yaml,
         ctx.executed_block_fingerprints,
-        workflow_to_copilot_yaml(candidate) if isinstance(candidate, Workflow) else None,
+        workflow_to_authoring_yaml(candidate) if isinstance(candidate, Workflow) else None,
     )
     if review is None:
         return None
@@ -2102,6 +2126,7 @@ def _make_agent_result(
     """
     final_context = global_llm_context
     if ctx is not None:
+        kwargs.setdefault("run_card_saved_workflow", ctx.run_card_saved_workflow)
         final_context = finalize_observation_context(ctx, global_llm_context)
         final_context = record_approved_credentials_in_global_llm_context(ctx, final_context)
     if ctx is not None and turn_outcome is not None:
@@ -2112,15 +2137,6 @@ def _make_agent_result(
         output_files = _turn_output_files(ctx)
         if output_files:
             turn_outcome = turn_outcome.model_copy(update={"output_files": output_files})
-        if ctx.google_setup_notices:
-            turn_outcome = turn_outcome.model_copy(
-                update={
-                    "google_setup_offers": [
-                        GoogleSetupOffer(scope_profile=notice.scopeProfile, connection_id=notice.connectionId)
-                        for notice in ctx.google_setup_notices
-                    ]
-                }
-            )
     if ctx is not None and _is_saved_workflow(ctx, kwargs.get("updated_workflow")):
         LOG.warning(
             "copilot dropped saved workflow offered as a proposal",
@@ -2259,12 +2275,12 @@ def _make_agent_result(
                 payload_updates["credentialPause"] = pause_payload
             if len(ctx.credential_pause_receipts) > 1:
                 payload_updates["credentialPauses"] = list(ctx.credential_pause_receipts)
-        if ctx is not None and "googleConnectionNotices" not in narrative_payload:
-            notice_payloads = ctx.google_connection_notice_payloads()
-            if notice_payloads:
-                payload_updates["googleConnectionNotices"] = notice_payloads
+        if ctx is not None and ctx.connection_cards and "connectionCards" not in narrative_payload:
+            payload_updates["connectionCards"] = list(ctx.connection_cards)
         if ctx is not None and ctx.demonstration_offered and "demonstrationOffer" not in narrative_payload:
             payload_updates["demonstrationOffer"] = True
+        if ctx is not None and ctx.created_triggers and "createdTriggers" not in narrative_payload:
+            payload_updates["createdTriggers"] = list(ctx.created_triggers)
         if (
             ctx is not None
             and "canonicalWorkflowUnavailable" not in narrative_payload
@@ -2386,6 +2402,8 @@ def _build_narrative_payload(
         }
         if workflow_run_id := attempt["workflowRunId"]:
             block_entry["workflowRunId"] = workflow_run_id
+        if "parentWorkflowRunBlockId" in attempt:
+            block_entry["parentWorkflowRunBlockId"] = attempt["parentWorkflowRunBlockId"]
         if "outcome" in attempt:
             block_entry["outcome"] = attempt["outcome"]
         if "outcomeRole" in attempt:
@@ -2434,11 +2452,12 @@ def _build_narrative_payload(
             "drainFingerprint": budget_state.drain_fingerprint,
             "leftRunIds": list(budget_state.leavable_run_ids) if budget_state.hard_backstop_reached else [],
         }
-    notice_payloads = ctx.google_connection_notice_payloads()
-    if notice_payloads:
-        payload["googleConnectionNotices"] = notice_payloads
+    if ctx.connection_cards:
+        payload["connectionCards"] = list(ctx.connection_cards)
     if ctx.demonstration_offered:
         payload["demonstrationOffer"] = True
+    if ctx.created_triggers:
+        payload["createdTriggers"] = list(ctx.created_triggers)
     if ctx.canonical_workflow_unavailable is not None:
         payload["canonicalWorkflowUnavailable"] = ctx.canonical_workflow_unavailable
     if ctx.demonstration_items:
@@ -2606,6 +2625,11 @@ async def _run_end_to_end_test_turn(
             result["data"][BUILD_TEST_PACKET_KEY] = project_direct_test_handoff_packet_for_llm(packet).model_dump(
                 mode="json", exclude_none=True
             )
+    enqueue_screenshot_from_result(
+        ctx,
+        result,
+        provenance=run_result_screenshot_provenance(result, source_tool="run_blocks_and_collect_debug"),
+    )
     sanitized = scrub_secrets_from_structure(
         ctx,
         sanitize_tool_result_for_llm("run_blocks_and_collect_debug", result),
@@ -3077,7 +3101,7 @@ def _finalize_result_with_blocker_override(
         terminal_reason=cancel_terminal_reason,
     )
     if (
-        local_signal.internal_reason_code == "unapproved_google_connection_reference"
+        local_signal.internal_reason_code == UNAPPROVED_CONNECTION_REASON_CODE
         and ctx.connected_account_recovery_choices
     ):
         turn_outcome = turn_outcome.model_copy(
@@ -3762,7 +3786,7 @@ async def _verified_connected_account_choices(
     if not references:
         return None
     try:
-        visible = await google_oauth_service.get_visible_credentials_for_org(organization_id)
+        visible = await org_connections_by_id(organization_id, request_user_id(organization_id))
     except Exception:
         LOG.warning(
             "copilot_connected_account_choice_lookup_failed",
@@ -3771,48 +3795,16 @@ async def _verified_connected_account_choices(
         )
         return None
 
-    visible_by_id = {credential.id: credential for credential in visible}
+    visible_by_id = {connection.id: connection for connection in visible}
     seen: set[str] = set()
     choices: list[ConnectedAccountChoice] = []
     for reference in references:
-        credential = visible_by_id.get(reference.connection_id)
-        if credential is None or credential.id in seen:
+        connection = visible_by_id.get(reference.connection_id)
+        if connection is None or connection.id in seen:
             continue
-        seen.add(credential.id)
-        choices.append(
-            ConnectedAccountChoice(
-                connection_id=credential.id,
-                name=credential.credential_name,
-                state=credential.state,
-                email_address=credential.email_address,
-            )
-        )
+        seen.add(connection.id)
+        choices.append(connection.choice())
     return choices or None
-
-
-async def _reshow_unselected_google_setup(
-    ctx: CopilotContext, prior_turn_outcome: TurnOutcome | None, request_policy: RequestPolicy
-) -> list[str]:
-    """A pick on one setup card leaves its sibling cards in history, where they are inert, so offer them again."""
-    if request_policy.picked_connected_account_id is None or prior_turn_outcome is None:
-        return []
-    pending = unselected_google_setup_offers(
-        prior_turn_outcome.google_setup_offers or [], request_policy.picked_connected_account_scopes
-    )
-    if not pending:
-        return []
-    try:
-        visible = await google_oauth_service.get_visible_credentials_for_org(ctx.organization_id)
-    except Exception:
-        LOG.warning("copilot_google_setup_reshow_lookup_failed", organization_id=ctx.organization_id, exc_info=True)
-        return []
-    ctx.google_setup_notices = [
-        google_setup_notice(
-            scope_profile=offer.scope_profile, connection_id=offer.connection_id, visible_credentials=visible
-        )
-        for offer in pending
-    ]
-    return [offer.scope_profile for offer in pending]
 
 
 async def _server_verified_connected_account_recovery_choices(
@@ -3820,20 +3812,11 @@ async def _server_verified_connected_account_recovery_choices(
     *,
     organization_id: str,
 ) -> list[ConnectedAccountChoice] | None:
-    """Return display-only rows when a staged Google binding lacks run authority.
-
-    The pending condition comes from structured workflow slots captured at turn
-    start, never from user prose. The repository lookup supplies both org
-    ownership and canonical display state; these rows do not mutate authority.
-    """
-    approved = set(request_policy.run_approved_google_connection_ids)
-    has_unapproved_staged_google = any(
-        credential_id.startswith("goac_") and credential_id not in approved
-        for credential_id in request_policy.existing_workflow_credential_ids
-    )
-    if not has_unapproved_staged_google:
+    """Display-only rows when a connected-account field staged at turn start lacks run authority.
+    The lookup supplies org ownership and display state; these rows do not grant authority."""
+    if set(request_policy.existing_workflow_connection_ids) <= set(request_policy.run_approved_connection_ids):
         return None
-    return await _server_verified_google_account_choices(organization_id)
+    return await connected_account_choices(organization_id)
 
 
 async def _translate_to_agent_result(
@@ -4000,9 +3983,8 @@ async def _translate_to_agent_result(
             workflow_yaml = goal_carry.workflow_yaml
             for goal_note in _user_owned_goal_notes(goal_carry.kept, goal_carry.dropped):
                 user_response = f"{user_response}\n\n(Note: {goal_note})"
-            if not copilot_sees_notes(ctx):
-                # Without the Doc editor the user cannot see notes, so the saved ones stay untouched.
-                workflow_yaml = drop_submitted_note_fields(workflow_yaml)
+            # Copilot never writes images, and writes notes only with the Doc editor; saved values are carried.
+            workflow_yaml = drop_submitted_note_fields(workflow_yaml, keep_notes=copilot_sees_notes(ctx))
             workflow_yaml, kept_note_labels, dropped_note_labels = carry_block_notes_from_versions(
                 workflow_yaml, ctx.last_workflow_yaml or ctx.workflow_yaml, ctx.persisted_workflow_yaml
             )
@@ -4226,7 +4208,7 @@ async def _translate_to_agent_result(
         # Once the references survive the org-scoped server lookup, product
         # copy owns the choice interaction. Do not let model prose invite an
         # account-name reply or mix password credentials into this OAuth path.
-        final_user_response = _connected_google_account_choice_reply()
+        final_user_response = _connected_account_choice_reply()
     attempted_kind = _concrete_narrative_response_kind(
         response_type=resp_type,
         has_workflow_attempt=ctx.has_genuine_workflow_attempt(),
@@ -4843,6 +4825,9 @@ def _build_copilot_input_guardrails(
                 prior_user_messages=policy_inputs.prior_user_messages,
                 persisted_workflow_yaml=policy_inputs.persisted_workflow_yaml,
                 selected_connected_account_id=policy_inputs.selected_connected_account_id,
+                selected_connected_account_from_pending_proposal=(
+                    policy_inputs.selected_connected_account_from_pending_proposal
+                ),
             )
             if isinstance(ctx, CopilotContext):
                 _store_request_policy_on_context(
@@ -4950,9 +4935,9 @@ def _output_policy_reason_codes_from_guardrail_exception(exc: BaseException) -> 
     return reason_codes or list(_output_policy_verdict_from_guardrail_exception(exc).reason_codes)
 
 
-def _connected_google_account_choice_reply() -> str:
+def _connected_account_choice_reply() -> str:
     return (
-        "Choose one of the connected Google accounts below so I can continue. "
+        "Choose one of the connected accounts below so I can continue. "
         "Reconnect any unavailable account on the Integrations page first."
     )
 
@@ -5494,7 +5479,9 @@ async def _run_copilot_turn_impl(
     # success can still be the one the user is complaining about.
     prior_run_packet = None
     if associated_run_id and (ctx.proposal_workflow_run_id == associated_run_id or repair_origin_binding.finished):
-        prior_run_packet = await hydrate_prior_run_packet(ctx, workflow_run_id=associated_run_id)
+        prior_run_packet = await hydrate_prior_run_packet(
+            ctx, workflow_run_id=associated_run_id, queue_failure_frame=True
+        )
         if prior_run_packet is None and ctx.proposal_workflow_run_id == associated_run_id:
             prior_run_packet = {
                 "run": {
@@ -5547,6 +5534,7 @@ async def _run_copilot_turn_impl(
         persisted_workflow_yaml=persisted_workflow_yaml,
         selected_connected_account_id=chat_request.selected_connected_account_id
         or selected_connected_account_id(prior_turn_outcome, chat_request.message),
+        selected_connected_account_from_pending_proposal=chat_request.selected_connected_account_from_pending_proposal,
         stored_completion_criteria=stored_completion_criteria,
     )
     request_policy_guardrails = _build_copilot_input_guardrails(
@@ -5828,22 +5816,25 @@ async def _run_copilot_turn_impl(
         organization_id=organization_id,
         workflow_permanent_id=chat_request.workflow_permanent_id,
     )
+    ctx.skill_session = await _copilot_skill_session(ctx)
     surface = resolve_copilot_tool_surface(
         mode=eval_mode,
         native_tools=copilot_native_tools(
             supports_question_tool=chat_request.supports_question_tool,
             supports_account_group_card=chat_request.supports_account_group_card,
+            supports_connection_card=chat_request.supports_connection_card,
             supports_single_run_card=chat_request.supports_single_run_card,
-            supports_google_setup_card=chat_request.supports_google_setup_card,
             supports_demonstration_offer=chat_request.supports_demonstration_offer,
             supports_credential_delete_card=chat_request.supports_credential_delete_card,
             browser_code_available=browser_code_mode != CopilotBrowserCodeMode.OFF
             and copilot_config.authoring_capability.code_blocks,
             browser_pattern_accepting_calls=app.AGENT_FUNCTION.copilot_browser_pattern_accepting_calls(),
+            trigger_sources=app.AGENT_FUNCTION.copilot_trigger_sources(),
             authoring_capability=copilot_config.authoring_capability,
             run_tools_available=surface_runs_blocks(
                 mode=eval_mode, browser_tools_available=copilot_config.browser_tools_available
             ),
+            skills_available=bool(ctx.skill_session.catalog_lines()),
         ),
         alias_map=alias_map,
         overlays=overlays,
@@ -5892,15 +5883,10 @@ async def _run_copilot_turn_impl(
     scoped_global_llm_context = safe_global_llm_context
     prior_choice_context = connected_account_choice_context(
         prior_turn_outcome,
-        explicit_selected_connection_id=request_policy.picked_connected_account_id,
-        explicit_selected_connection_scopes=request_policy.picked_connected_account_scopes,
+        explicit_selected_connection_id=request_policy.selected_connected_account_id,
+        explicit_selected_connection_scopes=request_policy.selected_connected_account_scopes,
+        explicit_selected_connection_provider=request_policy.selected_connected_account_provider,
         from_pending_proposal=chat_request.selected_connected_account_from_pending_proposal,
-        reshown_setup_profiles=(
-            await _reshow_unselected_google_setup(ctx, prior_turn_outcome, request_policy)
-            if chat_request.supports_google_setup_card
-            and not chat_request.selected_connected_account_from_pending_proposal
-            else []
-        ),
     )
     if prior_choice_context:
         scoped_global_llm_context = (
@@ -5951,6 +5937,9 @@ async def _run_copilot_turn_impl(
         user_goal_summary=user_goal_summary,
         attached_files_summary=attached_files_summary,
         scope_check=copilot_config.scope_check,
+        skills_catalog=(
+            render_skills_catalog(ctx.skill_session) if LOAD_SKILL_TOOL_NAME in surface.ordered_native_names else ""
+        ),
     )
     initial_input: str | list[dict[str, Any]] = user_message
     if video_attachment_message is not None or image_attachment_message is not None or direct_test_handoff is not None:

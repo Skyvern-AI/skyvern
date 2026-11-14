@@ -3,6 +3,7 @@ from __future__ import annotations
 import abc
 import ast
 import asyncio
+import base64
 import builtins
 import codecs
 import contextlib
@@ -62,7 +63,7 @@ from typing import (
     Union,
     cast,
 )
-from urllib.parse import quote, urljoin, urlparse, urlsplit, urlunsplit
+from urllib.parse import quote, unquote, unquote_plus, urljoin, urlparse, urlsplit, urlunsplit
 
 import aiofiles
 import aiohttp
@@ -198,19 +199,6 @@ from skyvern.forge.sdk.api.llm.utils import (
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at, is_file_from_retry_attempt
 from skyvern.forge.sdk.artifact.storage.unique_pdfs import run_stoppable_comparison, unique_pdf_paths
-from skyvern.forge.sdk.copilot.code_block_security import (
-    INERT_SLOT_NAME,
-    SlottedReference,
-    is_inert_slot,
-    slot_template,
-)
-from skyvern.forge.sdk.copilot.code_block_steps import analyze_code_actions, code_typed_values
-from skyvern.forge.sdk.copilot.reached_download_target import (
-    REGISTERED_DOWNLOAD_OUTPUT_KEYS,
-    block_output_has_registered_download,
-    code_is_download_intent,
-    without_generated_file_stamp,
-)
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
@@ -236,6 +224,7 @@ from skyvern.forge.sdk.experimentation.workflow_block_engine import (
     workflow_block_engine_override,
 )
 from skyvern.forge.sdk.forge_log import exception_log_fields
+from skyvern.forge.sdk.integrations.connected_accounts import resolve_account_token
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Status
@@ -283,6 +272,13 @@ from skyvern.forge.sdk.workflow.code_block_safety import (
     module_shims,
     safe_builtins,
 )
+from skyvern.forge.sdk.workflow.code_block_security import (
+    INERT_SLOT_NAME,
+    SlottedReference,
+    is_inert_slot,
+    slot_template,
+)
+from skyvern.forge.sdk.workflow.code_block_steps import analyze_code_actions, code_typed_values
 from skyvern.forge.sdk.workflow.constants import OUTPUT_PARAMETER_MAX_VALUE_BYTES
 from skyvern.forge.sdk.workflow.context_manager import (
     NON_SECRET_CREDENTIAL_FIELDS,
@@ -340,7 +336,10 @@ from skyvern.forge.sdk.workflow.models.code_block_recorder import (
     page_shows_sign_in_form,
     user_code_line_from_exception,
 )
-from skyvern.forge.sdk.workflow.models.code_block_recording import CodeBlockActionRecording
+from skyvern.forge.sdk.workflow.models.code_block_recording import (
+    CodeBlockActionRecording,
+    redact_recorded_action_payload,
+)
 from skyvern.forge.sdk.workflow.models.credential_release import (
     CodeBlockCredentialReleaseError,
     CredentialReleaseGuard,
@@ -364,6 +363,12 @@ from skyvern.forge.sdk.workflow.page_derived_templates import (
     loop_source_is_page_derived,
     render_page_derived,
 )
+from skyvern.forge.sdk.workflow.reached_download_target import (
+    REGISTERED_DOWNLOAD_OUTPUT_KEYS,
+    block_output_has_registered_download,
+    code_is_download_intent,
+    without_generated_file_stamp,
+)
 from skyvern.forge.sdk.workflow.secret_encryption import (
     SENSITIVE_DESTINATION_FIELDS,
     SENSITIVE_SEND_EMAIL_FIELDS,
@@ -371,27 +376,34 @@ from skyvern.forge.sdk.workflow.secret_encryption import (
     is_encrypted_secret,
     is_full_template_reference,
 )
-from skyvern.forge.taskv3.goal_composition import CodeProgressRecord, CodeTypedValue
+from skyvern.forge.taskv3.goal_composition import CodeExecutedCall, CodeProgressRecord, CodeTypedValue
 from skyvern.forge.taskv3.handoff_redaction import pin_caller_authored_block_urls
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.browser_session_kind import BrowserSessionKind
 from skyvern.schemas.browser_settings import requested_timezone_id
 from skyvern.schemas.emails import (
+    CONNECTED_ACCOUNT_COPILOT_TEST_RUN_REASON,
+    CONNECTED_ACCOUNT_IN_CREDENTIAL_ID_REASON,
+    CONNECTED_ACCOUNT_OWNER_UNCONFIRMED_REASON,
+    CONNECTED_ACCOUNT_RESAVE_REASON,
     EmailBodyFormat,
     EmailTransport,
     GmailHopRefusal,
     GmailSendErrorCode,
     GmailSendOutcome,
+    is_connected_gmail_id,
 )
 from skyvern.schemas.runs import RunEngine, read_browser_type
 from skyvern.schemas.self_heal import HealClassification, HealSkipReason, HealStatus, OutputObligation
 from skyvern.schemas.workflows import (
+    BLOCK_IMAGE_FIELDS,
     ERROR_CODE_MAPPING_MAX_ENTRIES,
     ERROR_CODE_MAPPING_MAX_UTF8_BYTES,
     ERROR_CODE_MAX_LENGTH,
     ERROR_CODE_REASONING_MAX_LENGTH,
     FORCE_OCR_DESCRIPTION,
     AIFallbackMode,
+    BlockImage,
     BlockResult,
     BlockStatus,
     BlockType,
@@ -434,7 +446,7 @@ from skyvern.utils.url_validators import (
 )
 from skyvern.webeye import dialog_handler
 from skyvern.webeye.actions.action_types import ActionType
-from skyvern.webeye.actions.actions import Action, ActionStatus
+from skyvern.webeye.actions.actions import Action, ActionStatus, GotoUrlAction, KeypressAction, WebAction
 from skyvern.webeye.browser_artifacts import DownloadBinding
 from skyvern.webeye.browser_driver_errors import is_driver_error
 from skyvern.webeye.browser_engine import is_any_engine_error
@@ -1281,6 +1293,18 @@ class Block(BaseModel, abc.ABC):
         json_schema_extra={"x-internal": True},
         description="What this block does, for people. Never read by the agent.",
     )
+    doc_images: list[BlockImage] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        json_schema_extra={"x-internal": True},
+        description="Uploaded images shown with this block, for people. Never sent to the agent.",
+    )
+    prompt_images: list[BlockImage] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        json_schema_extra={"x-internal": True},
+        description="Uploaded images reserved for this block's prompt; no block reads them yet.",
+    )
     block_type: BlockType
     output_parameter: OutputParameter
     continue_on_failure: bool = False
@@ -1329,7 +1353,7 @@ class Block(BaseModel, abc.ABC):
     def _preserve_explicit_note_clears(self, handler: SerializerFunctionWrapHandler):  # type: ignore[no-untyped-def]
         data = handler(self)
         if isinstance(data, dict):
-            for field in ("notes", "trailing_notes", "description"):
+            for field in ("notes", "trailing_notes", "description", *BLOCK_IMAGE_FIELDS):
                 if field in self.model_fields_set and getattr(self, field) is None:
                     data[field] = None
         return data
@@ -5862,6 +5886,84 @@ _CODE_BLOCK_SESSION_DOWNLOAD_WAIT_SECONDS = 60
 _CODE_BLOCK_SESSION_DOWNLOAD_SETTLE_ATTEMPTS = 6
 _CODE_BLOCK_SESSION_DOWNLOAD_SETTLE_INTERVAL_SECONDS = 0.5
 _AUTHORING_RUN_LINEAGE_MAX_DEPTH = 10
+_EXECUTED_CALL_DESCRIPTION_MAX_CHARS = 160
+_WITHHELD_CALL_DESCRIPTION = "(description withheld)"
+_WITHHELD_KEY = "(key withheld)"
+_NON_TYPING_KEYS = frozenset(
+    {
+        "Enter",
+        "Tab",
+        "Escape",
+        "Backspace",
+        "Delete",
+        "Home",
+        "End",
+        "PageUp",
+        "PageDown",
+        "ArrowUp",
+        "ArrowDown",
+        "ArrowLeft",
+        "ArrowRight",
+        "Shift",
+        "Control",
+        "Alt",
+        "Meta",
+        "ControlOrMeta",
+        *(f"F{number}" for number in range(1, 13)),
+    }
+)
+
+
+def _withhold_typed_keys(action: Action, description: str) -> str:
+    """A press that can type a character is a credential spelled out one call at a time, so only listed keys stay."""
+    if not isinstance(action, KeypressAction):
+        return description
+    for key in action.keys:
+        if any(part not in _NON_TYPING_KEYS for part in key.split("+")):
+            return (
+                description.removesuffix(key) + _WITHHELD_KEY
+                if description.endswith(key)
+                else _WITHHELD_CALL_DESCRIPTION
+            )
+    return description
+
+
+_CALL_METHOD = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+")
+
+
+def _call_shape(action: Action) -> str:
+    """A call as the recovery sees it: the method, the target selector, and a URL's scheme, host and path.
+    The argument is never read: the recorder appends it to the description, and credentials arrive encoded in it."""
+    description = action.description or ""
+    head = description.split(" ", 1)[0]
+    method = head if _CALL_METHOD.fullmatch(head) else action.action_type.value
+    if isinstance(action, GotoUrlAction):
+        try:
+            url = urlsplit(action.url)
+            port = f":{url.port}" if url.port else ""
+        except ValueError:
+            return method
+        return f"{method} {url.scheme}://{url.hostname}{port}{url.path}" if url.scheme and url.hostname else method
+    if isinstance(action, KeypressAction):
+        return _withhold_typed_keys(action, description)
+    if isinstance(action, WebAction) and action.element_id:
+        return f"{method} {action.element_id}"
+    return method
+
+
+def _base64_alignments(secret: str) -> set[str]:
+    """The base64 runs a secret produces inside a longer encoded string, whichever byte offset it starts at.
+    A one-character run is skipped because it matches most selectors, so a one-byte secret is not found this way."""
+    raw = secret.encode()
+    runs: set[str] = set()
+    for offset, leading_mixed_chars in ((0, 0), (1, 2), (2, 3)):
+        encoded = base64.b64encode(b"\0" * offset + raw).decode()
+        # The last character mixes in padding bits, so only the characters before it repeat inside a longer string.
+        run = encoded.rstrip("=")[:-1] if encoded.endswith("=") else encoded
+        run = run[leading_mixed_chars:]
+        if len(run) >= 2:
+            runs.update((run, run.replace("+", "-").replace("/", "_")))
+    return runs
 
 
 async def _code_block_solve_captcha_builtin(
@@ -8550,6 +8652,17 @@ async def wrapper({default_args}):
     def _compose_heal_goal(self, *, workflow_run_context: WorkflowRunContext) -> str:
         return workflow_run_context.mask_secrets_in_data(self.prompt or "")
 
+    def _secret_screen_forms(self, workflow_run_context: WorkflowRunContext) -> set[str]:
+        """Every form a registered secret or placeholder id can take in text. Unfloored, so a short secret such as a
+        PIN fails closed; the JSON-escaped forms catch a secret inside a value that is itself a JSON string."""
+        encoded = {
+            variant
+            for secret in (*self._registered_secret_values(workflow_run_context), *workflow_run_context.secrets)
+            for variant in (*expand_secret_encodings(secret), repr(secret)[1:-1])
+            if variant
+        }
+        return encoded | {json.dumps(variant, ensure_ascii=False)[1:-1] for variant in encoded}
+
     def _secret_free_typed_values(
         self, *, workflow_run_context: WorkflowRunContext, authored_code: str | None
     ) -> tuple[CodeTypedValue, ...]:
@@ -8557,30 +8670,89 @@ async def wrapper({default_args}):
         # differs from the executed code means its line numbers would not match the failing line.
         if authored_code is None or len(authored_code.splitlines()) != len((self.code or "").splitlines()):
             return ()
+        secrets = self._secret_screen_forms(workflow_run_context)
         typed_values: list[CodeTypedValue] = []
         for line, target, value in code_typed_values(authored_code):
-            if self._contains_registered_secret(value, workflow_run_context) or self._contains_registered_secret(
-                target, workflow_run_context
-            ):
+            if any(secret in value or secret in target for secret in secrets):
                 continue
             typed_values.append(CodeTypedValue(line=line, target=target, value=value))
         return tuple(typed_values)
 
+    def _secret_free_executed_calls(
+        self,
+        *,
+        workflow_run_context: WorkflowRunContext,
+        recorded_actions: Iterable[Action],
+        redaction_parameters: dict[str, Any],
+    ) -> tuple[CodeExecutedCall, ...]:
+        secrets = self._secret_screen_forms(workflow_run_context)
+        link_secrets = {secret for secret in secrets if len(secret) >= MIN_SECRET_LENGTH}
+        for secret in self._registered_secret_values(workflow_run_context):
+            secrets |= _base64_alignments(secret)
+        calls: list[CodeExecutedCall] = []
+        for action in recorded_actions:
+            shape = _call_shape(action)
+            # The shape drops a URL's query and fragment, so a registered link whose token sits in the path is whole
+            # only in the original URL.
+            original = (
+                (action.url, unquote(action.url), unquote_plus(action.url)) if isinstance(action, GotoUrlAction) else ()
+            )
+            if any(
+                secret in form for form in (shape, unquote(shape), unquote_plus(shape)) for secret in secrets
+            ) or any(secret in form for form in original for secret in link_secrets):
+                description: object = _WITHHELD_CALL_DESCRIPTION
+            else:
+                redacted = redact_recorded_action_payload(
+                    {"description": shape}, workflow_run_context, redaction_parameters
+                )
+                description = redacted.get("description")
+            if not isinstance(description, str) or not description:
+                description = _WITHHELD_CALL_DESCRIPTION
+            line = action.output.get("code_line") if isinstance(action.output, dict) else None
+            calls.append(
+                CodeExecutedCall(
+                    line=line if type(line) is int else None,
+                    description=description[:_EXECUTED_CALL_DESCRIPTION_MAX_CHARS],
+                    failed=action.status != ActionStatus.completed,
+                )
+            )
+        return tuple(calls)
+
     def _code_progress_record(
-        self, *, workflow_run_context: WorkflowRunContext, failing_line: int | None, authored_code: str | None
+        self,
+        *,
+        workflow_run_context: WorkflowRunContext,
+        failing_line: int | None,
+        authored_code: str | None,
+        recorded_actions: Iterable[Action],
+        redaction_parameters: dict[str, Any],
     ) -> CodeProgressRecord | None:
+        executed_calls = self._secret_free_executed_calls(
+            workflow_run_context=workflow_run_context,
+            recorded_actions=recorded_actions,
+            redaction_parameters=redaction_parameters,
+        )
         if failing_line is None:
-            return None
+            if not executed_calls:
+                return None
+            return CodeProgressRecord(
+                before=(), failed_step=None, failed_line=None, after=(), executed_calls=executed_calls
+            )
         typed_values = self._secret_free_typed_values(
             workflow_run_context=workflow_run_context, authored_code=authored_code
         )
         index = self._matched_step_index_for_failing_line(failing_line)
         steps = self.steps or []
         if index is None or not steps[index].description:
-            if not typed_values:
+            if not typed_values and not executed_calls:
                 return None
             return CodeProgressRecord(
-                before=(), failed_step=None, failed_line=failing_line, after=(), typed_values=typed_values
+                before=(),
+                failed_step=None,
+                failed_line=failing_line,
+                after=(),
+                typed_values=typed_values,
+                executed_calls=executed_calls,
             )
 
         def masked(chunk: list[CodeBlockStep]) -> tuple[str, ...]:
@@ -8594,6 +8766,7 @@ async def wrapper({default_args}):
             failed_line=failing_line,
             after=masked(steps[index + 1 :]),
             typed_values=typed_values,
+            executed_calls=executed_calls,
         )
 
     async def _record_unregistered_download_intent(
@@ -8767,16 +8940,7 @@ async def wrapper({default_args}):
             include_workflow_run_summary="workflow_run_summary" in roots,
             include_credential_entries=False,
         )
-        # Unfloored, so a short secret such as a PIN drops a root that merely contains it (fail closed). Each
-        # encoding is also JSON-escaped, which catches a secret inside an upstream value that is itself a JSON string.
-        encoded_secrets = {
-            variant
-            for secret in (*self._registered_secret_values(workflow_run_context), *workflow_run_context.secrets)
-            for variant in (*expand_secret_encodings(secret), repr(secret)[1:-1])
-        }
-        escaped_secrets = encoded_secrets | {
-            json.dumps(variant, ensure_ascii=False)[1:-1] for variant in encoded_secrets
-        }
+        escaped_secrets = self._secret_screen_forms(workflow_run_context)
         values: dict[str, Any] = {}
         budget = self._REFERENCED_FALLBACK_TOTAL_MAX_CHARS
         over_budget: list[str] = []
@@ -9076,6 +9240,8 @@ async def wrapper({default_args}):
                         workflow_run_context=workflow_run_context,
                         failing_line=failing_line,
                         authored_code=authored_code,
+                        recorded_actions=recording_page.recorded_actions(),
+                        redaction_parameters=resolved_redaction_parameters,
                     ),
                 )
             finally:
@@ -12998,14 +13164,12 @@ class FileDestinationBlock(Block):
                 raise ValueError("Google credential id is required")
 
             if google_access_token is None:
-                google_credentials = await app.AGENT_FUNCTION.get_google_workspace_credentials(
-                    organization_id=org_id,
-                    credential_id=google_credential_id,
-                    required_scopes=list(google_oauth_service.GOOGLE_DRIVE_SCOPES),
+                drive_access = await resolve_account_token(
+                    org_id, google_credential_id, list(google_oauth_service.GOOGLE_DRIVE_SCOPES), api="google"
                 )
-                if not google_credentials or not google_credentials.token:
+                if not drive_access:
                     raise ValueError("Google Drive credential is not connected or is missing required scopes")
-                google_access_token = google_credentials.token
+                google_access_token = drive_access
 
             folder_id = google_drive_service.extract_folder_id(self.google_drive_folder_id)
             for file_path in files_to_upload:
@@ -13800,25 +13964,35 @@ GMAIL_SEND_FAILURE_MESSAGES: dict[GmailSendErrorCode, str] = {
     GmailSendErrorCode.INTERNAL_ERROR: "The email could not be prepared. Nothing was sent.",
 }
 
-# The only triggers a person starts directly; a connected account's capability is never prepared for the rest.
-_PERSON_TRIGGER_TYPES = frozenset(
-    {None, WorkflowRunTriggerType.manual, WorkflowRunTriggerType.mcp, WorkflowRunTriggerType.api}
+# The trigger kinds a connected account's capability may be prepared for; never for the rest. A child run carries
+# its chain root's kind, so admitting a kind admits that kind's children too.
+_CONNECTED_ACCOUNT_TRIGGER_TYPES = frozenset(
+    {
+        None,
+        WorkflowRunTriggerType.manual,
+        WorkflowRunTriggerType.mcp,
+        WorkflowRunTriggerType.api,
+        WorkflowRunTriggerType.scheduled,
+        WorkflowRunTriggerType.event,
+    }
 )
 
 
-async def _is_unattended_run(workflow_run_id: str, organization_id: str) -> bool:
-    """Whether the run is a child or was triggered without a person; an unreadable run reads as neither."""
+async def _is_unsupported_connected_account_run(workflow_run_id: str, organization_id: str) -> bool:
+    """Whether this run's trigger kind can never hold the capability; an unreadable run reads as neither."""
     try:
         run = await app.DATABASE.workflow_runs.get_workflow_run(workflow_run_id, organization_id=organization_id)
     except Exception:  # noqa: BLE001 - only the wording of a refusal depends on this.
         return False
-    return run is not None and (run.parent_workflow_run_id is not None or run.trigger_type not in _PERSON_TRIGGER_TYPES)
+    return run is not None and run.trigger_type not in _CONNECTED_ACCOUNT_TRIGGER_TYPES
 
 
 _CONNECTED_ACCOUNT_RECONNECT_MESSAGE = (
     "The selected Gmail account must be reconnected on the Integrations page and then selected again in this block "
     "before it can send email. Nothing was sent."
 )
+
+_CONNECTED_ACCOUNT_RESAVE_MESSAGE = f"{CONNECTED_ACCOUNT_RESAVE_REASON} Nothing was sent."
 
 _GMAIL_AUTHORIZATION_ERROR_CODES: dict[google_oauth_service.GmailSendAuthorizationStatus, GmailSendErrorCode] = {
     google_oauth_service.GmailSendAuthorizationStatus.CONFIGURATION: GmailSendErrorCode.CONFIGURATION,
@@ -14422,14 +14596,23 @@ class SendEmailBlock(Block):
             refusal = workflow_run_context.get_gmail_hop_refusal(self.label)
             if refusal == GmailHopRefusal.reconnect:
                 raise _GmailSendRefused(GmailSendErrorCode.RECONNECT, _CONNECTED_ACCOUNT_RECONNECT_MESSAGE)
+            if refusal == GmailHopRefusal.resave_required:
+                raise _GmailSendRefused(GmailSendErrorCode.CONFIGURATION, _CONNECTED_ACCOUNT_RESAVE_MESSAGE)
+            if refusal == GmailHopRefusal.owner_unconfirmed:
+                raise _GmailSendRefused(
+                    GmailSendErrorCode.CONFIGURATION, f"{CONNECTED_ACCOUNT_OWNER_UNCONFIRMED_REASON} Nothing was sent."
+                )
+            if refusal == GmailHopRefusal.copilot_test_run:
+                raise _GmailSendRefused(
+                    GmailSendErrorCode.CONFIGURATION, f"{CONNECTED_ACCOUNT_COPILOT_TEST_RUN_REASON} Nothing was sent."
+                )
             if refusal == GmailHopRefusal.run_not_supported or (
-                refusal is None and await _is_unattended_run(workflow_run_id, organization_id)
+                refusal is None and await _is_unsupported_connected_account_run(workflow_run_id, organization_id)
             ):
                 raise _GmailSendRefused(
                     GmailSendErrorCode.CONFIGURATION,
-                    "This Gmail account can send only in runs a person starts. Scheduled, webhook, event, API-key "
-                    "and child workflow runs are not supported; use a natively connected Google account for those. "
-                    "Nothing was sent.",
+                    "This Gmail account cannot send in a run started with an API key, or in a webhook, job recipe or "
+                    "directory submission run; use a natively connected Google account for those. Nothing was sent.",
                 )
             raise _GmailSendRefused(GmailSendErrorCode.CONFIGURATION)
         to = self._resolve_recipient_entries(self.recipients, workflow_run_context)
@@ -14537,6 +14720,11 @@ class SendEmailBlock(Block):
                     or not authorization.access_token
                     or not authorization.from_address
                 ):
+                    if is_connected_gmail_id(credential_id):
+                        raise _GmailSendRefused(
+                            GmailSendErrorCode.CONFIGURATION,
+                            f"{CONNECTED_ACCOUNT_IN_CREDENTIAL_ID_REASON} Nothing was sent.",
+                        )
                     raise _GmailSendRefused(
                         _GMAIL_AUTHORIZATION_ERROR_CODES.get(authorization.status, GmailSendErrorCode.INTERNAL_ERROR)
                     )
@@ -17414,17 +17602,15 @@ class FileDownloadBlock(BaseTaskBlock, FileDestinationBlock):
         if not google_credential_id:
             raise ValueError("Google credential id is required")
 
-        google_credentials = await app.AGENT_FUNCTION.get_google_workspace_credentials(
-            organization_id=org_id,
-            credential_id=google_credential_id,
-            required_scopes=list(google_oauth_service.GOOGLE_DRIVE_SCOPES),
+        drive_access = await resolve_account_token(
+            org_id, google_credential_id, list(google_oauth_service.GOOGLE_DRIVE_SCOPES), api="google"
         )
-        if not google_credentials or not google_credentials.token:
+        if not drive_access:
             raise ValueError("Google Drive credential is not connected or is missing required scopes")
 
         try:
             file_path = await google_drive_service.download_file(
-                access_token=google_credentials.token,
+                access_token=drive_access,
                 file_id=file_id,
                 resource_key=file_reference.resource_key,
                 output_dir=download_files_path,
@@ -17451,7 +17637,7 @@ class FileDownloadBlock(BaseTaskBlock, FileDestinationBlock):
         return (
             file_path,
             matching_files[:1] if matching_files is not None else None,
-            google_credentials.token,
+            drive_access,
         )
 
     async def _download_authenticated_sftp_source(
@@ -21731,6 +21917,40 @@ def _copy_workflow_block(block: Any, updates: dict[str, Any]) -> Any:
     return {**block, **updates} if isinstance(block, Mapping) else block.model_copy(update=updates)
 
 
+def _conditional_branches(block: BlockTypeVar | Mapping[str, Any]) -> Sequence[BranchCondition | Mapping[str, Any]]:
+    branches = _workflow_block_field(block, "ordered_branches")
+    if branches is None:
+        branches = _workflow_block_field(block, "branch_conditions") or []
+    return branches
+
+
+def reachable_block_labels(
+    start_labels: Iterable[str | None],
+    label_to_block: Mapping[str, BlockTypeVar | Mapping[str, Any]],
+    default_next_map: Mapping[str, str | None],
+    *,
+    follow_conditional_next: bool = True,
+    seen: set[str] | None = None,
+) -> set[str]:
+    """A conditional counts as reaching every branch target, since it has not chosen one yet. With
+    follow_conditional_next=False it skips a conditional's own next label, as the block graph check does. Labels
+    already in `seen` are not walked again, and new ones are added to it."""
+    seen = set() if seen is None else seen
+    pending = list(start_labels)
+    while pending:
+        label = pending.pop()
+        if label is None or label in seen or label not in label_to_block:
+            continue
+        seen.add(label)
+        block = label_to_block[label]
+        if _workflow_block_field(block, "block_type") == BlockType.CONDITIONAL:
+            pending.extend(_workflow_block_field(branch, "next_block_label") for branch in _conditional_branches(block))
+            if not follow_conditional_next:
+                continue
+        pending.append(default_next_map.get(label))
+    return seen
+
+
 def strip_finally_block_references(blocks: Sequence[Any], finally_block_label: str) -> list[Any]:
     """Remove the finally block and nullify edges that point to it before building the run graph."""
     result: list[Any] = []
@@ -21753,30 +21973,29 @@ def strip_finally_block_references(blocks: Sequence[Any], finally_block_label: s
     return result
 
 
-def resolve_conditional_merge_edges(
-    blocks: Sequence[Any],
-    label_to_block: dict[str, Any],
-    default_next_map: dict[str, str | None],
-) -> None:
-    """Point each conditional branch chain's terminal block at the conditional's successor (merge point).
+# ponytail: the skip path walks reach about once per conditional, so a looping graph bigger than this keeps main's links
+# and its loop error. Share reach between walks if a real workflow needs more.
+_SKIP_PATH_WORK_LIMIT = 1_000_000
 
-    SKY-8571: iterates to convergence so an outer conditional patched on one pass can let an inner
-    conditional's branch terminals be patched on the next. Mutates default_next_map in place.
-    """
+
+def _link_branch_tails(
+    conditionals: Sequence[BlockTypeVar | Mapping[str, Any]],
+    label_to_block: Mapping[str, BlockTypeVar | Mapping[str, Any]],
+    default_next_map: dict[str, str | None],
+    skip_reached: bool,
+) -> set[str]:
+    skipped: set[str] = set()
+    # Links are only ever added, so each successor's reach only grows: extend it as links land instead of re-walking.
+    reach: dict[str, set[str]] = {}
     changed = True
     while changed:
         changed = False
-        for block in blocks:
-            if _workflow_block_field(block, "block_type") != BlockType.CONDITIONAL:
-                continue
+        for block in conditionals:
             label = _workflow_block_field(block, "label")
             successor = default_next_map.get(label)
             if not successor:
                 continue
-            branches = _workflow_block_field(block, "ordered_branches")
-            if branches is None:
-                branches = _workflow_block_field(block, "branch_conditions") or []
-            for branch in branches:
+            for branch in _conditional_branches(block):
                 target = _workflow_block_field(branch, "next_block_label")
                 if not target or target == successor:
                     continue
@@ -21788,10 +22007,115 @@ def resolve_conditional_merge_edges(
                     visited.add(cur)
                     nxt = default_next_map.get(cur)
                     if nxt is None:
+                        if skip_reached:
+                            if successor not in reach:
+                                reach[successor] = reachable_block_labels(
+                                    {successor}, label_to_block, default_next_map, follow_conditional_next=False
+                                )
+                            if cur in reach[successor]:
+                                skipped.add(label)
+                                break
                         default_next_map[cur] = successor
                         changed = True
+                        if skip_reached and _workflow_block_field(label_to_block[cur], "block_type") != (
+                            BlockType.CONDITIONAL
+                        ):
+                            for reached in reach.values():
+                                if cur in reached:
+                                    reachable_block_labels(
+                                        {successor},
+                                        label_to_block,
+                                        default_next_map,
+                                        follow_conditional_next=False,
+                                        seen=reached,
+                                    )
                         break
                     cur = nxt
+    return skipped
+
+
+def _has_loop(
+    label_to_block: Mapping[str, BlockTypeVar | Mapping[str, Any]], default_next_map: Mapping[str, str | None]
+) -> bool:
+    successors = {
+        label: [
+            target
+            for target in (
+                (_workflow_block_field(branch, "next_block_label") for branch in _conditional_branches(block))
+                if _workflow_block_field(block, "block_type") == BlockType.CONDITIONAL
+                else [default_next_map.get(label)]
+            )
+            if target in label_to_block
+        ]
+        for label, block in label_to_block.items()
+    }
+    state: dict[str, int] = {}
+    for root in successors:
+        if root in state:
+            continue
+        state[root] = 1
+        stack = [(root, iter(successors[root]))]
+        while stack:
+            label, pending = stack[-1]
+            target = next(pending, None)
+            if target is None:
+                state[label] = 2
+                stack.pop()
+            elif state.get(target) == 1:
+                return True
+            elif target not in state:
+                state[target] = 1
+                stack.append((target, iter(successors[target])))
+    return False
+
+
+def resolve_conditional_merge_edges(
+    blocks: Sequence[BlockTypeVar | Mapping[str, Any]],
+    label_to_block: Mapping[str, BlockTypeVar | Mapping[str, Any]],
+    default_next_map: dict[str, str | None],
+) -> bool:
+    """Point each conditional branch chain's terminal block at the conditional's successor, in place, repeating until
+    nothing changes. A terminal the successor already reaches stays unlinked; returns whether any link was skipped."""
+    conditionals = [block for block in blocks if _workflow_block_field(block, "block_type") == BlockType.CONDITIONAL]
+    resolved = dict(default_next_map)
+    _link_branch_tails(conditionals, label_to_block, resolved, skip_reached=False)
+    # Links are skipped only when resolving every link leaves a loop, so a graph the graph check accepts keeps them all.
+    edges = len(label_to_block) + sum(len(_conditional_branches(block)) for block in conditionals)
+    if not _has_loop(label_to_block, resolved) or len(conditionals) * edges > _SKIP_PATH_WORK_LIMIT:
+        default_next_map.update(resolved)
+        return False
+    resolved = dict(default_next_map)
+    skipped = _link_branch_tails(conditionals, label_to_block, resolved, skip_reached=True)
+    if skipped:
+        # Re-resolve conditionals nested in or enclosing one whose merge link was skipped, by descending reach then
+        # label, so the result does not depend on block order. Conditionals sharing or crossing a branch tail resolve
+        # in block order.
+        reach = {
+            _workflow_block_field(block, "label"): reachable_block_labels(
+                (_workflow_block_field(branch, "next_block_label") for branch in _conditional_branches(block)),
+                label_to_block,
+                default_next_map,
+                follow_conditional_next=False,
+            )
+            for block in conditionals
+        }
+        involved = skipped.union(*(reach[label] for label in skipped))
+        involved |= {label for label, reached in reach.items() if reached & skipped}
+        slots = [i for i, block in enumerate(conditionals) if _workflow_block_field(block, "label") in involved]
+        reordered = list(conditionals)
+        by_reach = sorted(
+            (conditionals[i] for i in slots),
+            key=lambda block: (
+                -len(reach[_workflow_block_field(block, "label")]),
+                _workflow_block_field(block, "label"),
+            ),
+        )
+        for slot, block in zip(slots, by_reach):
+            reordered[slot] = block
+        resolved = dict(default_next_map)
+        _link_branch_tails(reordered, label_to_block, resolved, skip_reached=True)
+    default_next_map.update(resolved)
+    return bool(skipped)
 
 
 def labels_only_on_untaken_branches(
@@ -21800,22 +22124,7 @@ def labels_only_on_untaken_branches(
     label_to_block: dict[str, BlockTypeVar],
     default_next_map: dict[str, str | None],
 ) -> set[str]:
-    """A nested conditional counts as reaching every branch target, since it has not chosen one yet."""
-
-    def reachable(start_labels: set[str | None]) -> set[str]:
-        seen: set[str] = set()
-        pending = list(start_labels)
-        while pending:
-            label = pending.pop()
-            if label is None or label in seen or label not in label_to_block:
-                continue
-            seen.add(label)
-            block = label_to_block[label]
-            if isinstance(block, ConditionalBlock):
-                pending.extend(branch.next_block_label for branch in block.ordered_branches)
-            pending.append(default_next_map.get(label))
-        return seen
-
     own_next = default_next_map.get(conditional.label)
     targets = {branch.next_block_label or own_next for branch in conditional.ordered_branches}
-    return reachable(targets - {taken_label}) - reachable({taken_label})
+    untaken_reach = reachable_block_labels(targets - {taken_label}, label_to_block, default_next_map)
+    return untaken_reach - reachable_block_labels({taken_label}, label_to_block, default_next_map)

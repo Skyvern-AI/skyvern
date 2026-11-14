@@ -84,10 +84,7 @@ from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     post_run_inspection_cleanly_matches,
     record_pending_runtime_authoring_repair_context,
 )
-from skyvern.forge.sdk.copilot.secret_scrub import (
-    clear_session_scrub_values,
-    register_secret_scrub_values_from_structure,
-)
+from skyvern.forge.sdk.copilot.secret_scrub import register_secret_scrub_values_from_structure
 from skyvern.forge.sdk.copilot.tools import composition_capture as composition_capture_module
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools.composition_capture import store_post_run_page_evidence
@@ -100,6 +97,7 @@ from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.schemas.proxy_location import ProxyLocation
 from skyvern.schemas.workflows import BlockType
+from skyvern.utils.secret_scrub import clear_session_scrub_values
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, ActionStatus
 from skyvern.webeye.utils.captcha_solver import ChallengeOutcome, ChallengeStatus

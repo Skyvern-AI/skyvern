@@ -15,6 +15,7 @@ from fastapi import HTTPException
 from skyvern.forge.sdk.db.repositories.microsoft_oauth import ActiveCredentialCiphertext, PendingConsentContext
 from skyvern.forge.sdk.encrypt import Encryptor
 from skyvern.forge.sdk.encrypt.aes import AES
+from skyvern.forge.sdk.encrypt.aes_gcm import AESGCMEncryptor
 from skyvern.forge.sdk.routes import microsoft_oauth as microsoft_oauth_routes
 from skyvern.forge.sdk.schemas.microsoft_oauth import (
     CreateMicrosoftOAuthAuthorizeRequest,
@@ -22,6 +23,9 @@ from skyvern.forge.sdk.schemas.microsoft_oauth import (
     MicrosoftOAuthCredentialBase,
 )
 from skyvern.forge.sdk.services import microsoft_oauth_service
+
+# "rt-legacy" as the retired CBC writer stored it under legacy-test-key / legacy-salt / legacy-iv.
+LEGACY_CBC_REFRESH_TOKEN = "vAV6Q7iRBxtfQM2THvF6pQ=="
 
 
 def _install_microsoft_transport(
@@ -47,7 +51,12 @@ def test_build_authorize_url_includes_required_params(monkeypatch: pytest.Monkey
     monkeypatch.setattr(microsoft_oauth_service.settings, "MICROSOFT_OAUTH_CLIENT_ID", "cid", raising=False)
     monkeypatch.setattr(microsoft_oauth_service.settings, "MICROSOFT_OAUTH_CLIENT_SECRET", "secret", raising=False)
     monkeypatch.setattr(microsoft_oauth_service.settings, "MICROSOFT_OAUTH_TENANT", "common", raising=False)
-    monkeypatch.setattr(microsoft_oauth_service.settings, "MICROSOFT_OAUTH_REDIRECT_HOSTS", ["app"], raising=False)
+    monkeypatch.setattr(
+        microsoft_oauth_service.settings,
+        "MICROSOFT_OAUTH_REDIRECT_URIS",
+        ["https://app/settings/microsoft/callback", "https://app/cb"],
+        raising=False,
+    )
 
     url, code_verifier = microsoft_oauth_service.build_authorize_url(
         redirect_uri="https://app/settings/microsoft/callback",
@@ -75,7 +84,12 @@ def test_build_authorize_url_includes_required_params(monkeypatch: pytest.Monkey
 def test_pkce_challenge_derivation(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(microsoft_oauth_service.settings, "MICROSOFT_OAUTH_CLIENT_ID", "cid", raising=False)
     monkeypatch.setattr(microsoft_oauth_service.settings, "MICROSOFT_OAUTH_CLIENT_SECRET", "secret", raising=False)
-    monkeypatch.setattr(microsoft_oauth_service.settings, "MICROSOFT_OAUTH_REDIRECT_HOSTS", ["app"], raising=False)
+    monkeypatch.setattr(
+        microsoft_oauth_service.settings,
+        "MICROSOFT_OAUTH_REDIRECT_URIS",
+        ["https://app/settings/microsoft/callback", "https://app/cb"],
+        raising=False,
+    )
 
     verifier = "fixed-verifier"
     url, returned_verifier = microsoft_oauth_service.build_authorize_url(
@@ -493,30 +507,86 @@ def test_email_from_id_token_requires_email_shaped_preferred_username(
     assert microsoft_oauth_service.email_from_id_token(token) == expected
 
 
-def test_validate_redirect_uri_allowlist(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_validate_redirect_uri_requires_exact_registered_uri(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         microsoft_oauth_service.settings,
-        "MICROSOFT_OAUTH_REDIRECT_HOSTS",
-        ["app.skyvern.com"],
+        "MICROSOFT_OAUTH_REDIRECT_URIS",
+        ["https://app.skyvern.com/integrations/microsoft/callback"],
         raising=False,
     )
 
-    microsoft_oauth_service._validate_redirect_uri("https://app.skyvern.com/microsoft/callback")
+    microsoft_oauth_service._validate_redirect_uri("https://app.skyvern.com/integrations/microsoft/callback")
+
+    for redirect_uri in (
+        "https://evil.example.com/integrations/microsoft/callback",
+        "https://app.skyvern.com/other/callback",
+        "https://app.skyvern.com/integrations/microsoft/callback?next=x",
+        "https://app.skyvern.com/integrations/microsoft/callback#frag",
+        "https://app.skyvern.com:8443/integrations/microsoft/callback",
+        "https://app.skyvern.com@evil.example.com/integrations/microsoft/callback",
+        "https://app.skyvern.com/integrations/microsoft/../microsoft/callback",
+        "https://app.skyvern.com/integrations/microsoft/%2e%2e/microsoft/callback",
+        "http://app.skyvern.com/integrations/microsoft/callback",
+    ):
+        with pytest.raises(microsoft_oauth_service.InvalidRedirectURIError):
+            microsoft_oauth_service._validate_redirect_uri(redirect_uri)
+
+
+def test_validate_redirect_uri_rejects_http_on_registered_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        microsoft_oauth_service.settings,
+        "MICROSOFT_OAUTH_REDIRECT_URIS",
+        [
+            "https://app.skyvern.com/integrations/microsoft/callback",
+            "http://app.skyvern.com/integrations/microsoft/callback",
+        ],
+        raising=False,
+    )
+    with pytest.raises(microsoft_oauth_service.InvalidRedirectURIError, match="https"):
+        microsoft_oauth_service._validate_redirect_uri("http://app.skyvern.com/integrations/microsoft/callback")
+
+
+def test_validate_redirect_uri_loopback_requires_registered_port(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        microsoft_oauth_service.settings,
+        "MICROSOFT_OAUTH_REDIRECT_URIS",
+        ["http://localhost:5173/integrations/microsoft/callback"],
+        raising=False,
+    )
+    microsoft_oauth_service._validate_redirect_uri("http://localhost:5173/integrations/microsoft/callback")
+    for redirect_uri in (
+        "http://localhost:8080/integrations/microsoft/callback",
+        "http://localhost:8080/other",
+        "http://127.0.0.1:5173/integrations/microsoft/callback",
+        "https://localhost:5173/integrations/microsoft/callback",
+    ):
+        with pytest.raises(microsoft_oauth_service.InvalidRedirectURIError):
+            microsoft_oauth_service._validate_redirect_uri(redirect_uri)
+
+
+@pytest.mark.asyncio
+async def test_start_authorization_rejects_unregistered_redirect_uri_before_storing_consent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(microsoft_oauth_service.settings, "ENABLE_ENCRYPTION", True, raising=False)
+    monkeypatch.setattr(microsoft_oauth_service.settings, "MICROSOFT_OAUTH_CLIENT_ID", "cid", raising=False)
+    monkeypatch.setattr(microsoft_oauth_service.settings, "MICROSOFT_OAUTH_CLIENT_SECRET", "secret", raising=False)
+    monkeypatch.setattr(
+        microsoft_oauth_service.settings,
+        "MICROSOFT_OAUTH_REDIRECT_URIS",
+        ["https://app.skyvern.com/integrations/microsoft/callback"],
+        raising=False,
+    )
+    repo = SimpleNamespace(insert_pending_credential=AsyncMock(), begin_reauthorization=AsyncMock())
+    monkeypatch.setattr(microsoft_oauth_service.app, "DATABASE", SimpleNamespace(microsoft_oauth=repo), raising=False)
 
     with pytest.raises(microsoft_oauth_service.InvalidRedirectURIError):
-        microsoft_oauth_service._validate_redirect_uri("https://evil.example.com/callback")
-
-
-def test_validate_redirect_uri_rejects_http_for_non_loopback(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        microsoft_oauth_service.settings,
-        "MICROSOFT_OAUTH_REDIRECT_HOSTS",
-        ["app.skyvern.com"],
-        raising=False,
-    )
-
-    with pytest.raises(microsoft_oauth_service.InvalidRedirectURIError, match="https"):
-        microsoft_oauth_service._validate_redirect_uri("http://app.skyvern.com/callback")
+        await microsoft_oauth_service.start_authorization(
+            organization_id="org_1",
+            redirect_uri="https://evil.example.com/integrations/microsoft/callback",
+        )
+    repo.insert_pending_credential.assert_not_awaited()
+    repo.begin_reauthorization.assert_not_awaited()
 
 
 def test_validate_app_origin_allowlist(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -997,9 +1067,12 @@ async def test_rotated_token_survives_backfill_reencrypting_the_row_mid_refresh(
     monkeypatch.setattr(microsoft_oauth_service.settings, "ENABLE_ENCRYPTION", True, raising=False)
     monkeypatch.setattr(microsoft_oauth_service.settings, "ENCRYPTOR_AES_SECRET_KEY", "gcm-test-key", raising=False)
     monkeypatch.setattr(microsoft_oauth_service.settings, "ENCRYPTOR_AES_SALT", "gcm-test-salt", raising=False)
-    encrypt_method = microsoft_oauth_service.EncryptMethod
+    deployment_encryptor = Encryptor()
+    deployment_encryptor.add_encrypt_method(AES(secret_key="legacy-test-key", salt="legacy-salt", iv="legacy-iv"))
+    deployment_encryptor.add_encrypt_method(AESGCMEncryptor(secret_key="legacy-test-key", salt="legacy-salt"))
+    monkeypatch.setattr(microsoft_oauth_service, "encryptor", deployment_encryptor)
     row = {
-        "ciphertext": await microsoft_oauth_service.encryptor.encrypt("rt-legacy", encrypt_method.AES),
+        "ciphertext": LEGACY_CBC_REFRESH_TOKEN,
         "method": "aes",
     }
 
@@ -1017,7 +1090,7 @@ async def test_rotated_token_survives_backfill_reencrypting_the_row_mid_refresh(
     async def refresh_access_token(*_: Any, **__: Any) -> dict[str, str]:
         # The GCM backfill rewrites the row after the refresh read it but before the refresh writes.
         row.update(
-            ciphertext=await microsoft_oauth_service.encryptor.encrypt("rt-legacy", encrypt_method.AES_GCM),
+            ciphertext=await deployment_encryptor.encrypt("rt-legacy", microsoft_oauth_service.EncryptMethod.AES_GCM),
             method="aes_gcm",
         )
         return {"access_token": "at-fresh", "refresh_token": "rt-rotated"}
@@ -1053,7 +1126,7 @@ async def test_legacy_cbc_credential_refreshes_and_is_rewritten_as_gcm(
     legacy_aes = AES(secret_key="legacy-test-key", salt="legacy-salt", iv="legacy-iv")
     legacy_encryptor = Encryptor()
     legacy_encryptor.add_encrypt_method(legacy_aes)
-    ciphertext = await legacy_encryptor.encrypt("rt-legacy", microsoft_oauth_service.EncryptMethod.AES)
+    ciphertext = LEGACY_CBC_REFRESH_TOKEN
     update_active_refresh_token = AsyncMock()
     repository = SimpleNamespace(
         load_active_ciphertext=AsyncMock(
@@ -1154,7 +1227,7 @@ async def test_legacy_cbc_credential_remains_readable_without_refresh(monkeypatc
     legacy_aes = AES(secret_key="legacy-test-key", salt="legacy-salt", iv="legacy-iv")
     legacy_encryptor = Encryptor()
     legacy_encryptor.add_encrypt_method(legacy_aes)
-    ciphertext = await legacy_encryptor.encrypt("rt-legacy", microsoft_oauth_service.EncryptMethod.AES)
+    ciphertext = LEGACY_CBC_REFRESH_TOKEN
     repository = SimpleNamespace(
         load_active_ciphertext=AsyncMock(
             return_value=ActiveCredentialCiphertext(
@@ -1179,7 +1252,7 @@ async def test_refresh_fails_closed_without_gcm_key_and_leaves_legacy_row_untouc
     legacy_aes = AES(secret_key="legacy-test-key", salt="legacy-salt", iv="legacy-iv")
     legacy_encryptor = Encryptor()
     legacy_encryptor.add_encrypt_method(legacy_aes)
-    old_ciphertext = await legacy_encryptor.encrypt("rt-legacy", microsoft_oauth_service.EncryptMethod.AES)
+    old_ciphertext = LEGACY_CBC_REFRESH_TOKEN
     update_active_refresh_token = AsyncMock()
     repository = SimpleNamespace(
         load_active_ciphertext=AsyncMock(
@@ -1917,7 +1990,12 @@ async def test_microsoft_oauth_callback_rejects_state_redeemed_by_another_caller
     monkeypatch.setattr(microsoft_oauth_service.settings, "ENABLE_ENCRYPTION", True, raising=False)
     monkeypatch.setattr(microsoft_oauth_service.settings, "MICROSOFT_OAUTH_CLIENT_ID", "cid", raising=False)
     monkeypatch.setattr(microsoft_oauth_service.settings, "MICROSOFT_OAUTH_CLIENT_SECRET", "csecret", raising=False)
-    monkeypatch.setattr(microsoft_oauth_service.settings, "MICROSOFT_OAUTH_REDIRECT_HOSTS", ["app"], raising=False)
+    monkeypatch.setattr(
+        microsoft_oauth_service.settings,
+        "MICROSOFT_OAUTH_REDIRECT_URIS",
+        ["https://app/settings/microsoft/callback", "https://app/cb"],
+        raising=False,
+    )
     monkeypatch.setattr(
         microsoft_oauth_service.app,
         "DATABASE",

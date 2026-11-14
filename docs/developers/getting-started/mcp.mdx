@@ -35,7 +35,7 @@ Most clients connect with browser sign-in (OAuth) and need no API key or install
 
 ## Fastest setup: the MCP page in the app
 
-In the app, go to **Integrations → MCP** ([app.skyvern.com/integrations/mcp](https://app.skyvern.com/integrations/mcp)). Pick your client and follow the steps. The page marks the recommended method for each client, and API-key snippets come pre-filled with your key.
+In the app, go to **Integrations → MCP** ([app.skyvern.com/integrations/mcp](https://app.skyvern.com/integrations/mcp)). Pick your client and follow the steps. The page marks the recommended method for each client, and API-key snippets come pre-filled with your key, unless your organization enables [role-based access control](/cloud/account#roles) and withholds **API keys: View** from your role. You then read **An organization admin manages API keys. Use an OAuth method for this client, or ask an admin for a key.**
 
 <img src="/images/cloud/cloud-integrations-mcp.png" alt="Connect Skyvern with MCP with Claude Code selected and the Browser sign-in steps" />
 
@@ -44,6 +44,8 @@ The sections below show the same setups.
 ## Sign in with your browser (OAuth)
 
 Use this for Claude Code, Cursor, Codex CLI, Grok Build, ChatGPT and Claude custom connectors. There is no API key in the config. The client opens your browser, you sign in to Skyvern, and the client stores the token.
+
+When a Member signs in, the token the client stores is a key bound to that Member, not the organization API key. It acts as that Member and can't read or rotate the organization's key.
 
 <Tabs>
 <Tab title="Claude Code">
@@ -223,7 +225,7 @@ export SKYVERN_API_KEY="YOUR_SKYVERN_API_KEY"
 skyvern setup hermes
 ```
 
-This writes `~/.hermes/config.yaml` and every profile under `~/.hermes/profiles/`. To do it by hand:
+This writes `~/.hermes/config.yaml` and each profile under `~/.hermes/profiles/` that already has a `config.yaml`. To do it by hand:
 
 ```yaml
 mcp_servers:
@@ -281,7 +283,7 @@ pip install "skyvern[local]"
 skyvern setup
 ```
 
-To configure one client, name it: `skyvern setup claude-code`, `skyvern setup claude` (Claude Desktop), `cursor`, `windsurf`, `hermes`, `openclaw`, `opencode` or `mcporter`. Add `--dry-run` to preview the change.
+To configure one client, name it: `skyvern setup claude-code`, `skyvern setup claude` (Claude Desktop), `cursor`, `windsurf`, `hermes`, `openclaw` or `opencode`. Add `--dry-run` to preview the change. `skyvern setup mcporter` writes nothing, because MCPorter discovers MCP servers from other tools' configs. It lists which of your Claude Desktop, Claude Code, Cursor, Windsurf and OpenCode configs have a Skyvern entry.
 
 To change the API key or server in configs you already have, run `skyvern mcp switch`. It shows which apps have a Skyvern entry, lets you pick which to update, and writes a backup first. Restart your client afterwards.
 

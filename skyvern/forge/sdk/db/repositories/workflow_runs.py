@@ -1909,6 +1909,33 @@ class WorkflowRunsRepository(BaseRepository):
             await session.refresh(refreshed)
             return convert_to_workflow_run(refreshed)
 
+    @db_operation("merge_failure_classification")
+    async def merge_failure_classification(
+        self,
+        workflow_run_id: str,
+        status: WorkflowRunStatus,
+        finished_at: datetime | None,
+        merge: Callable[[list[dict[str, Any]] | None], list[dict[str, Any]] | None],
+    ) -> bool:
+        """Rewrite a finished run's category from the stored one under a row lock and re-derive its attribution.
+        Nothing is written when ``merge`` returns None, or when the run was reset or finished again since status and
+        finished_at were read."""
+        async with self.Session() as session:
+            row = (
+                await session.scalars(
+                    select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id).with_for_update()
+                )
+            ).one_or_none()
+            if row is None or row.status != status.value or to_naive_utc(row.finished_at) != to_naive_utc(finished_at):
+                return False
+            merged = merge(row.failure_category)
+            if merged is None:
+                return False
+            row.failure_category = merged
+            row.failure_attribution = derive_failure_attribution(merged)
+            await session.commit()
+            return True
+
     @db_operation("bulk_update_workflow_runs")
     async def bulk_update_workflow_runs(
         self,
@@ -2518,6 +2545,24 @@ class WorkflowRunsRepository(BaseRepository):
                 .where(WorkflowRunModel.status.in_(["created", "queued", "running"]))
                 .limit(1)
             )
+
+    @db_operation("get_latest_finished_run_for_workflow_version")
+    async def get_latest_finished_run_for_workflow_version(
+        self, organization_id: str, workflow_permanent_id: str, workflow_id: str, created_at_start: datetime
+    ) -> WorkflowRun | None:
+        async with self.Session() as session:
+            run = await session.scalar(
+                select(WorkflowRunModel)
+                .where(WorkflowRunModel.organization_id == organization_id)
+                .where(WorkflowRunModel.workflow_permanent_id == workflow_permanent_id)
+                .where(WorkflowRunModel.workflow_id == workflow_id)
+                .where(WorkflowRunModel.parent_workflow_run_id.is_(None))
+                .where(WorkflowRunModel.status.in_([status.value for status in WorkflowRunStatus if status.is_final()]))
+                .where(WorkflowRunModel.created_at >= created_at_start)
+                .order_by(WorkflowRunModel.created_at.desc())
+                .limit(1)
+            )
+            return convert_to_workflow_run(run) if run is not None else None
 
     @db_operation("get_last_queued_workflow_run")
     async def get_last_queued_workflow_run(

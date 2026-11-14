@@ -4,12 +4,9 @@ import { type StudioPaneId } from "./panes";
 
 type StudioShellContextValue = {
   organizationId?: string | null;
-  // Left-column target Workspace portals the docked Copilot into; null when
+  // Left-column target Workspace portals the docked Ember into; null when
   // collapsed or when Workspace isn't embedded in the studio shell.
-  copilotPortalEl: HTMLElement | null;
-  // Stage-level overlay target for Workspace-wired panels that must outlive a
-  // hidden Editor pane (e.g. the code-cache key/value panel).
-  panelPortalEl: HTMLElement | null;
+  emberPortalEl: HTMLElement | null;
   // Tabs register their stream container so the shell can re-parent the single
   // persistent stream node into the active surface without remounting it.
   setEditorStreamSlot: (el: HTMLElement | null) => void;
@@ -25,12 +22,13 @@ type StudioShellContextValue = {
   showPane?: (id: StudioPaneId) => void;
   // Whether an open pane is folded into a strip to make room for the Doc.
   isPaneFolded?: (id: StudioPaneId) => boolean;
+  // Whether a pane is on screen now: open, not folded, not hidden at phone width or behind an expanded pane.
+  isPaneOnScreen?: (id: StudioPaneId) => boolean;
 };
 
 export const StudioShellContext = createContext<StudioShellContextValue>({
   organizationId: null,
-  copilotPortalEl: null,
-  panelPortalEl: null,
+  emberPortalEl: null,
   setEditorStreamSlot: () => {},
   setBrowserStreamSlot: () => {},
   setRunStreamSlot: () => {},
@@ -51,7 +49,7 @@ export function useStudioPaneCompact(): boolean {
 
 // The source agent's deleted_at when the studio shows a run whose workflow was
 // deleted (the shell runs from the run's embedded snapshot). Workflow-mutating
-// chrome keys off this to degrade: Copilot/Editor panes blocked, top-bar
+// chrome keys off this to degrade: Ember/Editor panes blocked, top-bar
 // actions replaced by the legacy "Agent deleted on …" tag.
 export const StudioWorkflowDeletedContext = createContext<string | null>(null);
 

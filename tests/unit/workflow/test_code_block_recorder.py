@@ -28,13 +28,13 @@ from skyvern.core.script_generations.skyvern_page import SkyvernPage
 from skyvern.exceptions import NO_ADDRESS_RECORD_NAV_ERROR_CODE, FailedToNavigateToUrl
 from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent
-from skyvern.forge.sdk.copilot.code_block_steps import _METHOD_ACTION_TYPES
 from skyvern.forge.sdk.credential_site_policy import LoginSite
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.models import ActionModel
 from skyvern.forge.sdk.db.utils import hydrate_action
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
+from skyvern.forge.sdk.workflow.code_block_steps import _METHOD_ACTION_TYPES
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models import block as block_module
 from skyvern.forge.sdk.workflow.models.block import CodeBlock, Credential
@@ -451,6 +451,31 @@ async def test_records_goto_click_fill_with_types_and_order() -> None:
     assert recorded[1].text == ""
     assert isinstance(recorded[2], ClickAction)
     assert recorded[2].element_id == "#go"
+
+
+@pytest.mark.asyncio
+async def test_recovery_rows_built_from_recorded_calls_carry_no_call_argument() -> None:
+    value = "ARGVALUE9"
+    page = RecordingPage(FakePage())
+    await page.goto(f"https://example.com/p?token={value}#{value}")
+    await page.locator("#a").select_option(value)
+    await page.locator("#b").press(value)
+    await page.click("#c")
+    await page.fill("#d", value)
+    await page.evaluate(f"document.title = '{value}'")
+    await page.locator("#e").fill(value)
+
+    shapes = [block_module._call_shape(action) for action in page.recorded_actions()]
+
+    assert shapes == [
+        "page.goto https://example.com/p",
+        "locator.select_option #a",
+        "locator.press #b (key withheld)",
+        "page.click #c",
+        "page.fill #d",
+        "page.evaluate",
+        "locator.fill #e",
+    ]
 
 
 def test_recording_page_keeps_raw_page_behind_private_seam() -> None:

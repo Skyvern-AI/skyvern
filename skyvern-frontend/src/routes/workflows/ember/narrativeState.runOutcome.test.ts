@@ -1,0 +1,1113 @@
+import { describe, expect, it } from "vitest";
+
+import bundles from "./narrativeState.turnFacts.fixture.json";
+import { getReviewGateVerdict } from "./cards/ReviewGateCard";
+import {
+  EMPTY_NARRATIVE,
+  TurnNarrativeState,
+  applyNarrativeEvent,
+  hydrateNarrativeFromPayload,
+  hydrateHistoryNarrative,
+  isBlockOk,
+  isDeadlineHalt,
+  notConfirmedOutcome,
+  ranCleanOnCurrentSource,
+  terminalNarrativeText,
+} from "./narrativeState";
+
+import {
+  EmberBlockProgressUpdate,
+  EmberRunOutcomeUpdate,
+  EmberStreamErrorUpdate,
+  EmberStreamResponseUpdate,
+  EmberTurnStartUpdate,
+} from "./emberTypes";
+
+describe("budget expiry narrative", () => {
+  it("hydrates typed status from the terminal payload", () => {
+    const turn = hydrateNarrativeFromPayload({
+      turnId: "turn-1",
+      terminal: "error",
+      budgetExpiry: {
+        budgetExpired: true,
+        source: "deadline",
+        reportProduced: false,
+        stagedDraftId: "wf_draft",
+        drainFingerprint: "drain-1",
+      },
+    });
+    expect(turn?.budgetExpiry).toEqual({
+      budgetExpired: true,
+      source: "deadline",
+      reportProduced: false,
+      stagedDraftId: "wf_draft",
+      drainFingerprint: "drain-1",
+      leftRunIds: [],
+    });
+  });
+
+  it("grafts persisted expiry facts when the narrative predates them", () => {
+    const turn = hydrateHistoryNarrative(
+      { turnId: "turn-1", terminal: "error" },
+      {
+        budget_expired: true,
+        budget_expiry_source: "max_turns",
+        budget_expiry_report_produced: false,
+        budget_expiry_staged_draft_id: "wf_draft",
+        drain_fingerprint: "drain-2",
+      },
+    );
+    expect(turn?.budgetExpiry?.source).toBe("max_turns");
+    expect(turn?.budgetExpiry?.drainFingerprint).toBe("drain-2");
+  });
+});
+
+describe("a deadline exit persisted with an empty reply", () => {
+  // Shape of a persisted assistant row whose turn hit its deadline before any
+  // report: empty content, terminal "error" payload, typed outcome beside it.
+  const persistedDeadlineRow = (stagedDraftId: string | null) =>
+    hydrateHistoryNarrative(
+      { turnId: "turn-1", terminal: "error", terminalMessage: "" },
+      {
+        budget_expired: true,
+        budget_expiry_source: "deadline",
+        budget_expiry_report_produced: false,
+        budget_expiry_staged_draft_id: stagedDraftId,
+        response_kind: "clarify",
+      },
+    );
+
+  it("renders the time-limit notice from the typed outcome, not the empty reply", () => {
+    const turn = persistedDeadlineRow(null);
+    expect(turn?.terminal).toBe("error");
+    expect(turn?.budgetExpiry?.reportProduced).toBe(false);
+    expect(isDeadlineHalt(turn!)).toBe(true);
+    expect(terminalNarrativeText(turn!)).toBe(
+      "This turn reached its time limit without producing a report.",
+    );
+  });
+
+  it("names the staged draft the outcome records", () => {
+    const turn = persistedDeadlineRow("w_draft");
+    expect(terminalNarrativeText(turn!)).toBe(
+      "This turn reached its time limit without producing a report. A draft was staged during this session.",
+    );
+  });
+});
+
+const turnStart = (): EmberTurnStartUpdate => ({
+  type: "turn_start",
+  turn_id: "turn-1",
+  turn_index: 0,
+  timestamp: "2026-06-10T00:00:00Z",
+});
+
+const blockProgress = (
+  overrides: Partial<EmberBlockProgressUpdate> &
+    Pick<EmberBlockProgressUpdate, "block_label" | "status">,
+): EmberBlockProgressUpdate => ({
+  type: "block_progress",
+  workflow_run_block_id: `wrb_${overrides.block_label}`,
+  block_type: "code",
+  iteration: 0,
+  timestamp: "2026-06-10T00:00:04Z",
+  ...overrides,
+});
+
+const runOutcome = (
+  overrides: Partial<EmberRunOutcomeUpdate> &
+    Pick<EmberRunOutcomeUpdate, "verdict">,
+): EmberRunOutcomeUpdate => ({
+  type: "run_outcome",
+  workflow_run_id: "wr_1",
+  workflow_run_block_ids: ["wrb_open_search", "wrb_search_person"],
+  block_labels: ["open_search", "search_person"],
+  reason_code: null,
+  display_reason: null,
+  iteration: 0,
+  timestamp: "2026-06-10T00:01:00Z",
+  ...overrides,
+});
+
+const response = (): EmberStreamResponseUpdate => ({
+  type: "response",
+  workflow_copilot_chat_id: "chat-1",
+  message: "Done.",
+  response_time: "2026-06-10T00:02:00Z",
+  proposal_disposition: "auto_applicable",
+});
+
+const errorUpdate = (): EmberStreamErrorUpdate => ({
+  type: "error",
+  error: "Something broke.",
+});
+
+function reduce(events: Parameters<typeof applyNarrativeEvent>[1][]) {
+  return events.reduce(
+    (state: TurnNarrativeState, event) => applyNarrativeEvent(state, event),
+    EMPTY_NARRATIVE,
+  );
+}
+
+const bothBlocksRan = [
+  turnStart(),
+  blockProgress({ block_label: "open_search", status: "running" }),
+  blockProgress({ block_label: "open_search", status: "completed" }),
+  blockProgress({ block_label: "search_person", status: "running" }),
+  blockProgress({ block_label: "search_person", status: "completed" }),
+];
+
+describe("applyNarrativeEvent — run_outcome", () => {
+  it("negative verdict withholds the success affordance from completed rows", () => {
+    const s = reduce([
+      ...bothBlocksRan,
+      runOutcome({ verdict: "evaluating" }),
+      runOutcome({
+        verdict: "not_demonstrated",
+        reason_code: "blocker_reported",
+        display_reason: "The search stayed gated by a verification challenge.",
+      }),
+    ]);
+    expect(s.blocks).toHaveLength(2);
+    for (const b of s.blocks) {
+      expect(b.state).toBe("completed");
+      expect(b.outcome).toBe("not_demonstrated");
+      expect(b.outcomeReason).toBe(
+        "The search stayed gated by a verification challenge.",
+      );
+      expect(b.outcomeRole).toBe("recorded");
+      expect(isBlockOk(b)).toBe(false);
+    }
+    expect(s.lastRunOutcome?.role).toBe("recorded");
+    expect(notConfirmedOutcome(s)?.verdict).toBe("not_demonstrated");
+  });
+
+  it("interim verdict stays non-green but suppresses live not-confirmed alarms", () => {
+    const s = reduce([
+      ...bothBlocksRan,
+      runOutcome({
+        verdict: "not_demonstrated",
+        role: "interim_build_test",
+        reason_code: "no_meaningful_output",
+        display_reason: "The workflow still needs its extraction block.",
+      }),
+    ]);
+
+    for (const b of s.blocks) {
+      expect(b.outcomeRole).toBe("interim_build_test");
+      expect(isBlockOk(b)).toBe(false);
+    }
+    expect(s.lastRunOutcome?.role).toBe("interim_build_test");
+    expect(notConfirmedOutcome(s)).toBeNull();
+  });
+
+  it("shows a started run's skipped rows before its first block while it runs", () => {
+    const skipped = [{ label: "load_records", kind: "reused" as const }];
+    const s = reduce([
+      turnStart(),
+      blockProgress({
+        block_label: "earlier_run",
+        status: "failed",
+        workflow_run_id: "wr_0",
+      }),
+      {
+        type: "run_started",
+        workflow_run_id: "wr_1",
+        skipped_prefix: skipped,
+        timestamp: "2026-06-10T00:00:03Z",
+      },
+      blockProgress({
+        block_label: "open_search",
+        status: "running",
+        workflow_run_id: "wr_1",
+      }),
+      blockProgress({
+        block_label: "search_person",
+        status: "running",
+        workflow_run_id: "wr_1",
+      }),
+    ]);
+    expect(s.blocks.map((b) => b.skippedBefore)).toEqual([
+      undefined,
+      skipped,
+      undefined,
+    ]);
+    expect(s.pendingSkippedPrefix).toEqual({});
+  });
+
+  it("evaluating hold withholds the success affordance until the final frame", () => {
+    const s = reduce([...bothBlocksRan, runOutcome({ verdict: "evaluating" })]);
+    for (const b of s.blocks) {
+      expect(b.outcome).toBe("evaluating");
+      expect(isBlockOk(b)).toBe(false);
+    }
+  });
+
+  it("response-terminal sweep cannot resurrect success on a negative-verdict row", () => {
+    const s = reduce([
+      turnStart(),
+      blockProgress({ block_label: "open_search", status: "running" }),
+      blockProgress({ block_label: "open_search", status: "completed" }),
+      // search_person never gets its terminal block_progress.
+      blockProgress({ block_label: "search_person", status: "running" }),
+      runOutcome({ verdict: "evaluating" }),
+      runOutcome({
+        verdict: "not_demonstrated",
+        reason_code: "blocker_reported",
+      }),
+      response(),
+    ]);
+    const swept = s.blocks.find((b) => b.label === "search_person")!;
+    expect(swept.state).toBe("completed");
+    expect(swept.outcome).toBe("not_demonstrated");
+    expect(isBlockOk(swept)).toBe(false);
+    expect(s.blocks.some((b) => isBlockOk(b))).toBe(false);
+  });
+
+  it("a row stuck in evaluating at terminal never satisfies isBlockOk", () => {
+    const s = reduce([
+      ...bothBlocksRan,
+      runOutcome({ verdict: "evaluating" }),
+      response(),
+    ]);
+    for (const b of s.blocks) {
+      expect(b.state).toBe("completed");
+      expect(b.outcome).toBe("evaluating");
+      expect(isBlockOk(b)).toBe(false);
+    }
+  });
+
+  it("error-terminal sweep changes lifecycle state only, never the verdict", () => {
+    const s = reduce([
+      turnStart(),
+      blockProgress({ block_label: "search_person", status: "running" }),
+      runOutcome({
+        verdict: "not_demonstrated",
+        workflow_run_block_ids: ["wrb_search_person"],
+        block_labels: ["search_person"],
+      }),
+      errorUpdate(),
+    ]);
+    const b = s.blocks[0]!;
+    expect(b.state).toBe("failed");
+    expect(b.outcome).toBe("not_demonstrated");
+    expect(isBlockOk(b)).toBe(false);
+  });
+
+  it("a late block_progress upsert cannot wipe a recorded verdict", () => {
+    const s = reduce([
+      ...bothBlocksRan,
+      runOutcome({ verdict: "evaluating" }),
+      runOutcome({
+        verdict: "not_demonstrated",
+        reason_code: "blocker_reported",
+        display_reason: "The search stayed gated by a verification challenge.",
+      }),
+      blockProgress({
+        block_label: "search_person",
+        status: "completed",
+        timestamp: "2026-06-10T00:01:30Z",
+      }),
+    ]);
+    const late = s.blocks.find((b) => b.label === "search_person")!;
+    expect(late.state).toBe("completed");
+    expect(late.outcome).toBe("not_demonstrated");
+    expect(late.outcomeReason).toBe(
+      "The search stayed gated by a verification challenge.",
+    );
+    expect(isBlockOk(late)).toBe(false);
+  });
+
+  it("applies by run-block id only; other rows keep their own verdict", () => {
+    const s = reduce([
+      ...bothBlocksRan,
+      runOutcome({
+        verdict: "not_demonstrated",
+        workflow_run_block_ids: ["wrb_search_person"],
+        block_labels: ["search_person"],
+      }),
+      runOutcome({
+        verdict: "demonstrated",
+        workflow_run_id: "wr_2",
+        workflow_run_block_ids: ["wrb_open_search"],
+        block_labels: ["open_search"],
+      }),
+    ]);
+    const open = s.blocks.find((b) => b.label === "open_search")!;
+    const search = s.blocks.find((b) => b.label === "search_person")!;
+    expect(open.outcome).toBe("demonstrated");
+    expect(isBlockOk(open)).toBe(true);
+    expect(search.outcome).toBe("not_demonstrated");
+    expect(isBlockOk(search)).toBe(false);
+  });
+
+  it("demonstrated and not_evaluated verdicts keep the success affordance", () => {
+    for (const verdict of ["demonstrated", "not_evaluated"] as const) {
+      const s = reduce([
+        ...bothBlocksRan,
+        runOutcome({ verdict: "evaluating" }),
+        runOutcome({ verdict }),
+        response(),
+      ]);
+      for (const b of s.blocks) {
+        expect(b.outcome).toBe(verdict);
+        expect(isBlockOk(b)).toBe(true);
+      }
+    }
+  });
+
+  it("without run_outcome frames (old backend) rendering state is unchanged", () => {
+    const s = reduce([...bothBlocksRan, response()]);
+    for (const b of s.blocks) {
+      expect(b.outcome).toBeUndefined();
+      expect(b.outcomeReason).toBeUndefined();
+      expect(isBlockOk(b)).toBe(true);
+    }
+  });
+});
+
+describe("hydrateNarrativeFromPayload — outcome", () => {
+  const payloadBlock = (overrides: Record<string, unknown>) => ({
+    label: "search_person",
+    blockType: "code",
+    state: "completed",
+    lastSeenIteration: 0,
+    activity: [],
+    startedAt: "2026-06-10T00:00:04Z",
+    endedAt: "2026-06-10T00:01:00Z",
+    ...overrides,
+  });
+
+  const payload = (blocks: Record<string, unknown>[]) => ({
+    turnId: "turn-1",
+    turnIndex: 0,
+    terminal: "response",
+    terminalMessage: "Done.",
+    startedAt: "2026-06-10T00:00:00Z",
+    endedAt: "2026-06-10T00:02:00Z",
+    blocks,
+  });
+
+  it("round-trips outcome/outcomeReason/outcomeRole so reload renders like the live stream", () => {
+    const live = reduce([
+      turnStart(),
+      blockProgress({ block_label: "search_person", status: "running" }),
+      blockProgress({ block_label: "search_person", status: "completed" }),
+      runOutcome({
+        verdict: "not_demonstrated",
+        role: "interim_build_test",
+        workflow_run_block_ids: ["wrb_search_person"],
+        block_labels: ["search_person"],
+        reason_code: "blocker_reported",
+        display_reason: "The search stayed gated by a verification challenge.",
+      }),
+      response(),
+    ]);
+    const liveRow = live.blocks[0]!;
+
+    const hydrated = hydrateNarrativeFromPayload(
+      payload([
+        payloadBlock({
+          outcome: "not_demonstrated",
+          outcomeReason: "The search stayed gated by a verification challenge.",
+          outcomeRole: "interim_build_test",
+        }),
+      ]),
+    )!;
+    const hydratedRow = hydrated.blocks[0]!;
+
+    expect(hydratedRow.state).toBe(liveRow.state);
+    expect(hydratedRow.outcome).toBe(liveRow.outcome);
+    expect(hydratedRow.outcomeReason).toBe(liveRow.outcomeReason);
+    expect(hydratedRow.outcomeRole).toBe(liveRow.outcomeRole);
+    expect(isBlockOk(hydratedRow)).toBe(false);
+    expect(isBlockOk(liveRow)).toBe(false);
+  });
+
+  it("round-trips a recorded outcome role across reload", () => {
+    const hydrated = hydrateNarrativeFromPayload(
+      payload([
+        payloadBlock({
+          outcome: "not_evaluated",
+          outcomeRole: "recorded",
+        }),
+      ]),
+    )!;
+
+    expect(hydrated.blocks[0]?.outcomeRole).toBe("recorded");
+  });
+
+  it("hydrates rows without outcome keys exactly as before", () => {
+    const hydrated = hydrateNarrativeFromPayload(payload([payloadBlock({})]))!;
+    const row = hydrated.blocks[0]!;
+    expect(row.outcome).toBeUndefined();
+    expect(row.outcomeReason).toBeUndefined();
+    expect(row.outcomeRole).toBeUndefined();
+    expect(isBlockOk(row)).toBe(true);
+  });
+
+  it("ignores unknown outcome values", () => {
+    const hydrated = hydrateNarrativeFromPayload(
+      payload([payloadBlock({ outcome: "maybe", outcomeReason: 7 })]),
+    )!;
+    const row = hydrated.blocks[0]!;
+    expect(row.outcome).toBeUndefined();
+    expect(row.outcomeReason).toBeUndefined();
+    expect(row.outcomeRole).toBeUndefined();
+    expect(isBlockOk(row)).toBe(true);
+  });
+
+  it("normalizes absent and unknown persisted roles to adjudicated", () => {
+    const hydrated = hydrateNarrativeFromPayload(
+      payload([
+        payloadBlock({ outcome: "not_demonstrated" }),
+        payloadBlock({
+          label: "search_person_2",
+          outcome: "not_demonstrated",
+          outcomeRole: "future_role",
+        }),
+      ]),
+    )!;
+
+    expect(hydrated.blocks.map((block) => block.outcomeRole)).toEqual([
+      "adjudicated",
+      "adjudicated",
+    ]);
+    expect(notConfirmedOutcome(hydrated)?.verdict).toBe("not_demonstrated");
+  });
+
+  it("hydrate sweep promotes a stuck-running row without inventing a verdict", () => {
+    const hydrated = hydrateNarrativeFromPayload(
+      payload([
+        payloadBlock({
+          state: "running",
+          outcome: "not_demonstrated",
+          endedAt: null,
+        }),
+      ]),
+    )!;
+    const row = hydrated.blocks[0]!;
+    expect(row.state).toBe("completed");
+    expect(row.outcome).toBe("not_demonstrated");
+    expect(isBlockOk(row)).toBe(false);
+  });
+
+  it("ignores a saved terminal envelope and reports run facts from their own records", () => {
+    const withStaleEnvelope = hydrateNarrativeFromPayload({
+      ...payload([]),
+      terminalEnvelope: {
+        next_state: "completed",
+        verified: true,
+        workflow_applied: true,
+        run_verdict: "demonstrated",
+        rendered_from_envelope: true,
+      },
+    })!;
+    const withoutEnvelope = hydrateNarrativeFromPayload(payload([]))!;
+
+    expect(withStaleEnvelope).toEqual(withoutEnvelope);
+    expect(notConfirmedOutcome(withStaleEnvelope)).toBeNull();
+  });
+});
+
+describe("run_started supersedes an earlier run's verdict", () => {
+  const runStarted = (
+    workflowRunId: string,
+    skippedPrefix: { label: string; kind: "reused" }[] = [],
+  ) => ({
+    type: "run_started" as const,
+    workflow_run_id: workflowRunId,
+    skipped_prefix: skippedPrefix,
+    timestamp: "2026-06-10T00:01:30Z",
+  });
+
+  it("clears an ownerless not-confirmed verdict when a new run starts", () => {
+    const refused = [
+      turnStart(),
+      runOutcome({
+        workflow_run_id: "",
+        workflow_run_block_ids: [],
+        block_labels: [],
+        verdict: "not_demonstrated",
+        reason_code: "blocker_reported",
+        display_reason: "Credential approval blocked this run.",
+      }),
+    ];
+    expect(notConfirmedOutcome(reduce(refused))).not.toBeNull();
+
+    const s = reduce([
+      ...refused,
+      runStarted("wr_2"),
+      blockProgress({
+        block_label: "login",
+        status: "running",
+        workflow_run_id: "wr_2",
+      }),
+    ]);
+    expect(notConfirmedOutcome(s)).toBeNull();
+  });
+
+  it("does not fall back to the earlier run's block verdict while the new run runs", () => {
+    const skipped = [{ label: "open_search", kind: "reused" as const }];
+    const s = reduce([
+      ...bothBlocksRan,
+      runOutcome({
+        verdict: "not_demonstrated",
+        reason_code: "blocker_reported",
+        display_reason: "The search stayed gated by a verification challenge.",
+      }),
+      runStarted("wr_2", skipped),
+    ]);
+    expect(notConfirmedOutcome(s)).toBeNull();
+    expect(s.blocks.map((b) => b.outcome)).toEqual([
+      "not_demonstrated",
+      "not_demonstrated",
+    ]);
+    expect(s.pendingSkippedPrefix).toEqual({ wr_2: skipped });
+  });
+
+  it("keeps the verdict when run_started repeats for the same run", () => {
+    const s = reduce([
+      ...bothBlocksRan,
+      runOutcome({
+        verdict: "not_demonstrated",
+        display_reason: "The search stayed gated by a verification challenge.",
+      }),
+      runStarted("wr_1"),
+    ]);
+    expect(notConfirmedOutcome(s)?.workflowRunId).toBe("wr_1");
+  });
+});
+
+describe("notConfirmedOutcome — recorded run facts", () => {
+  const base = {
+    ...EMPTY_NARRATIVE,
+    lastRunOutcome: null,
+    blocks: [],
+  };
+
+  it("reports the recorded not-confirmed outcome with its own reason", () => {
+    const outcome = notConfirmedOutcome({
+      ...base,
+      lastRunOutcome: {
+        verdict: "not_demonstrated",
+        displayReason: "Cart never showed the item.",
+      },
+    });
+    expect(outcome).toEqual({
+      verdict: "not_demonstrated",
+      displayReason: "Cart never showed the item.",
+    });
+  });
+
+  it("a reloaded turn shows the run's recorded failure even when no block carries a reason", () => {
+    // The original incident's shape: the failure was recorded, the deadline fired before the
+    // block's evidence finished, and the assistant shipped no reply. lastRunOutcome is live-only,
+    // so on reload the card has only turnFacts to read.
+    const outcome = notConfirmedOutcome({
+      ...base,
+      lastRunOutcome: null,
+      turnFacts: {
+        factsAvailable: true,
+        authoredBlockCount: 1,
+        matchingSourceBlockCount: 1,
+        evaluationState: "not_demonstrated",
+        runId: "wr_1",
+        runCompleted: false,
+        terminalCause: "browser_operation_failed",
+        blocksRunThisTurn: 1,
+        recordedFailure: "Browser operation timed out on line 18.",
+        ranCleanOnCurrentSource: false,
+      },
+      blocks: [
+        {
+          workflowRunBlockId: "wrb_1",
+          label: "checkout",
+          blockType: "code",
+          outcome: "not_demonstrated",
+          state: "failed",
+          lastSeenIteration: 0,
+          activity: [],
+          startedAt: null,
+          endedAt: null,
+        },
+      ],
+    });
+    expect(outcome).toEqual({
+      verdict: "not_demonstrated",
+      displayReason: "Browser operation timed out on line 18.",
+      workflowRunId: "wr_1",
+    });
+  });
+
+  it("a reloaded turn whose anchored run never recorded does not borrow an earlier run's block verdict", () => {
+    const outcome = notConfirmedOutcome({
+      ...base,
+      lastRunOutcome: null,
+      turnFacts: {
+        factsAvailable: true,
+        authoredBlockCount: 1,
+        matchingSourceBlockCount: 1,
+        evaluationState: null,
+        runId: "wr_2",
+        runCompleted: null,
+        terminalCause: null,
+        blocksRunThisTurn: null,
+        recordedFailure: null,
+        ranCleanOnCurrentSource: false,
+      },
+      blocks: [
+        {
+          workflowRunBlockId: "wrb_1",
+          workflowRunId: "wr_1",
+          label: "checkout",
+          blockType: "code",
+          outcome: "not_demonstrated",
+          outcomeReason: "The earlier run never reached the dashboard.",
+          state: "completed",
+          lastSeenIteration: 0,
+          activity: [],
+          startedAt: null,
+          endedAt: null,
+        },
+      ],
+    });
+    expect(outcome).toBeNull();
+  });
+
+  it("a recorded demonstrated outcome suppresses the block-derived not-confirmed", () => {
+    const outcome = notConfirmedOutcome({
+      ...base,
+      lastRunOutcome: { verdict: "demonstrated", displayReason: null },
+      blocks: [
+        {
+          workflowRunBlockId: "wrb_1",
+          label: "checkout",
+          blockType: "code",
+          outcome: "not_demonstrated",
+          outcomeReason: "stale",
+          state: "completed",
+          lastSeenIteration: 0,
+          activity: [],
+          startedAt: null,
+          endedAt: null,
+        },
+      ],
+    });
+    expect(outcome).toBeNull();
+  });
+
+  it("an interim run start is not a resolved outcome and does not suppress the block-derived one", () => {
+    const outcome = notConfirmedOutcome({
+      ...base,
+      lastRunOutcome: null,
+      turnFacts: null,
+      blocks: [
+        {
+          workflowRunBlockId: "wrb_1",
+          label: "checkout",
+          blockType: "code",
+          outcome: "not_demonstrated",
+          outcomeReason: "The earlier run never reached the dashboard.",
+          state: "completed",
+          lastSeenIteration: 0,
+          activity: [],
+          startedAt: null,
+          endedAt: null,
+        },
+      ],
+    });
+    expect(outcome).not.toBeNull();
+  });
+});
+
+// A recorded terminal-surface packet: one authored block, one clean run against
+// the staged source.
+const CLEAN_RECORDED_TURN = "surface-20260820T082523349904";
+
+describe("canonical turn facts — pill and prose over one bundle", () => {
+  const surfaces = (leg: keyof typeof bundles) => {
+    const turn = hydrateNarrativeFromPayload(
+      bundles[leg] as unknown as Record<string, unknown>,
+    );
+    if (!turn) throw new Error(`fixture ${leg} did not hydrate`);
+    return {
+      turn,
+      pill: getReviewGateVerdict(turn, null),
+      prose: turn.terminalMessage ?? "",
+    };
+  };
+
+  it("states coverage and evaluation as independent facts when one of three blocks ran", () => {
+    const { turn, pill, prose } = surfaces("partial-coverage");
+
+    expect(turn.turnFacts?.authoredBlockCount).toBe(3);
+    expect(turn.turnFacts?.matchingSourceBlockCount).toBe(1);
+    expect(turn.turnFacts?.evaluationState).toBe("not_evaluated");
+    expect(pill).toBe("untested");
+    expect(prose).not.toContain("tested draft");
+  });
+
+  it("reports a deadline halt without a failure row or a tested pill", () => {
+    const { turn, pill, prose } = surfaces("deadline-after-one-clean-run");
+
+    expect(turn.turnFacts?.terminalCause).toBe("deadline_expired");
+    expect(turn.blocks.some((block) => block.state === "failed")).toBe(false);
+    expect(isDeadlineHalt(turn)).toBe(true);
+    expect(pill).toBe("untested");
+    expect(prose).toContain("1 block ran this turn");
+    expect(prose).toContain("outcome was not evaluated");
+    expect(prose).toContain("reached its time limit");
+  });
+
+  it("marks an edited block as run against different source, never as failed", () => {
+    const { turn, pill } = surfaces("different-source-edit-one-of-two");
+
+    expect(
+      turn.review?.blocks.map((block) => [block.label, block.coverage]),
+    ).toEqual([
+      ["extract_github_star_count", "different_source"],
+      ["append_star_count_to_sheet", "never_run"],
+      ["append_star_count_to_sales_marketing", "never_run"],
+    ]);
+    expect(turn.blocks.some((block) => block.state === "failed")).toBe(false);
+    expect(pill).toBe("untested");
+  });
+
+  it("names clean lifecycle plus full current-source coverage on the satisfaction path", () => {
+    const { turn, pill, prose } = surfaces("satisfaction");
+
+    expect(turn.turnFacts?.authoredBlockCount).toBe(3);
+    expect(turn.turnFacts?.matchingSourceBlockCount).toBe(3);
+    expect(turn.turnFacts?.runCompleted).toBe(true);
+    expect(ranCleanOnCurrentSource(turn.turnFacts)).toBe(true);
+    expect(pill).toBe("tested");
+    expect(prose).not.toMatch(/verified|demonstrated/i);
+  });
+
+  it("states its counts without a completion claim when no run is anchored to the turn", () => {
+    const { turn } = surfaces(CLEAN_RECORDED_TURN);
+
+    expect(turn.blocks.map((block) => block.state)).toEqual(["completed"]);
+    expect(turn.turnFacts?.runCompleted).toBeNull();
+    expect(turn.turnFacts?.authoredBlockCount).toBe(1);
+    expect(turn.turnFacts?.matchingSourceBlockCount).toBe(1);
+  });
+
+  it("withholds the tested pill when the recorded run did not complete", () => {
+    const recorded = bundles[CLEAN_RECORDED_TURN] as unknown as {
+      turnFacts: Record<string, unknown>;
+    };
+    const turn = hydrateNarrativeFromPayload({
+      ...(bundles[CLEAN_RECORDED_TURN] as unknown as Record<string, unknown>),
+      turnFacts: {
+        ...recorded.turnFacts,
+        runCompleted: false,
+        ranCleanOnCurrentSource: false,
+      },
+    });
+    if (!turn) throw new Error("fixture did not hydrate");
+
+    expect(turn.turnFacts?.runCompleted).toBe(false);
+    expect(ranCleanOnCurrentSource(turn.turnFacts)).toBe(false);
+    expect(getReviewGateVerdict(turn, null)).toBe("untested");
+  });
+
+  it("makes no completion claim when a stop left the run start unresolved", () => {
+    const recorded = bundles[CLEAN_RECORDED_TURN] as unknown as {
+      turnFacts: Record<string, unknown>;
+    };
+    const turn = hydrateNarrativeFromPayload({
+      ...(bundles[CLEAN_RECORDED_TURN] as unknown as Record<string, unknown>),
+      turnFacts: {
+        ...recorded.turnFacts,
+        runId: "wr_1",
+        runCompleted: null,
+        blocksRunThisTurn: null,
+        evaluationState: null,
+        ranCleanOnCurrentSource: false,
+      },
+    });
+    if (!turn) throw new Error("fixture did not hydrate");
+
+    expect(turn.turnFacts?.runCompleted).toBeNull();
+    expect(turn.turnFacts?.authoredBlockCount).toBe(1);
+    expect(turn.turnFacts?.matchingSourceBlockCount).toBe(1);
+    expect(ranCleanOnCurrentSource(turn.turnFacts)).toBe(false);
+    expect(getReviewGateVerdict(turn, null)).toBe("untested");
+  });
+
+  it("says a renamed block is untested under this name across review and pill", () => {
+    const { turn, pill } = surfaces("renamed-block");
+
+    expect(
+      turn.review?.blocks.map((block) => [block.label, block.coverage]),
+    ).toEqual([
+      ["extract_github_star_count_v2", "unknown"],
+      ["append_star_count_to_sheet", "current_source"],
+      ["append_star_count_to_sales_marketing", "current_source"],
+      ["extract_github_star_count", undefined],
+    ]);
+    expect(turn.turnFacts?.matchingSourceBlockCount).toBe(2);
+    expect(pill).toBe("untested");
+  });
+
+  it.each([
+    [false, "unfinished", "unfinished"],
+    [false, "running", "stopped"],
+    [true, "running", "stopped"],
+  ])(
+    "keeps a block saved at the deadline (cancelled: %s, saved as %s) as %s, not failed",
+    (cancelled, savedState, expected) => {
+      const turn = hydrateNarrativeFromPayload({
+        ...(bundles["deadline-after-one-clean-run"] as unknown as Record<
+          string,
+          unknown
+        >),
+        cancelled,
+        budgetExpiry: {
+          budgetExpired: true,
+          source: "deadline",
+          reportProduced: true,
+          stagedDraftId: null,
+          drainFingerprint: null,
+          leftRunIds: ["wr_left"],
+        },
+        blocks: [
+          {
+            workflowRunBlockId: "wrb_1",
+            label: "append_star_count_to_sheet",
+            blockType: "code",
+            state: savedState,
+            lastSeenIteration: 0,
+            activity: [],
+          },
+        ],
+      });
+      if (!turn) throw new Error("fixture did not hydrate");
+
+      expect(turn.blocks.map((block) => block.state)).toEqual([expected]);
+      expect(isDeadlineHalt(turn)).toBe(true);
+    },
+  );
+
+  it("keeps a failed block a failure even when the deadline expired", () => {
+    const turn = hydrateNarrativeFromPayload({
+      ...(bundles["deadline-after-one-clean-run"] as unknown as Record<
+        string,
+        unknown
+      >),
+      blocks: [
+        {
+          workflowRunBlockId: "wrb_1",
+          label: "append_star_count_to_sheet",
+          blockType: "code",
+          state: "failed",
+          lastSeenIteration: 0,
+          activity: [],
+        },
+      ],
+    });
+    if (!turn) throw new Error("fixture did not hydrate");
+
+    expect(turn.turnFacts?.terminalCause).toBe("deadline_expired");
+    expect(isDeadlineHalt(turn)).toBe(false);
+  });
+
+  it("makes no tested claim for a turn that published no facts or coverage", () => {
+    const legacy = bundles[CLEAN_RECORDED_TURN] as unknown as Record<
+      string,
+      unknown
+    >;
+    const review = legacy.review as { blocks: Array<Record<string, unknown>> };
+    const turn = hydrateNarrativeFromPayload({
+      ...legacy,
+      turnFacts: undefined,
+      review: {
+        ...review,
+        blocks: review.blocks.map((block) => {
+          const withoutCoverage = { ...block };
+          delete withoutCoverage.coverage;
+          return withoutCoverage;
+        }),
+      },
+    });
+    if (!turn) throw new Error("fixture did not hydrate");
+
+    expect(turn.turnFacts).toBeNull();
+    expect(turn.review?.blocks[0]?.coverage).toBeUndefined();
+    expect(getReviewGateVerdict(turn, null)).toBe("untested");
+  });
+
+  it("keeps the review when the backend sends a coverage value it does not know", () => {
+    const known = bundles[CLEAN_RECORDED_TURN] as unknown as Record<
+      string,
+      unknown
+    >;
+    const review = known.review as { blocks: Array<Record<string, unknown>> };
+    const turn = hydrateNarrativeFromPayload({
+      ...known,
+      review: {
+        ...review,
+        blocks: review.blocks.map((block) => ({
+          ...block,
+          coverage: "some_future_value",
+        })),
+      },
+    });
+    if (!turn) throw new Error("fixture did not hydrate");
+
+    expect(turn.review?.blocks).toHaveLength(1);
+    expect(turn.review?.blocks[0]?.coverage).toBeUndefined();
+  });
+
+  it("refuses a tested pill for a pre-fix payload that carries no fact bundle", () => {
+    const turn = hydrateNarrativeFromPayload(
+      bundles["facts-absent"] as unknown as Record<string, unknown>,
+    );
+    if (!turn) throw new Error("fixture did not hydrate");
+
+    expect(turn.turnFacts).toBeNull();
+    expect(turn.proposalDisposition).toBe("review_tested");
+    expect(getReviewGateVerdict(turn, null)).toBe("untested");
+  });
+
+  it("keeps facts and pill telling one story when the envelope is missing", () => {
+    const full = bundles["full-coverage"] as unknown as Record<string, unknown>;
+    const facts = full.turnFacts as Record<string, unknown>;
+    const turn = hydrateNarrativeFromPayload({
+      ...full,
+      turnFacts: {
+        ...facts,
+        evaluationState: null,
+        runId: null,
+        runCompleted: null,
+        terminalCause: null,
+        blocksRunThisTurn: null,
+      },
+    });
+    if (!turn) throw new Error("fixture did not hydrate");
+
+    expect(turn.turnFacts?.factsAvailable).toBe(true);
+    expect(turn.turnFacts?.authoredBlockCount).toBe(facts.authoredBlockCount);
+    expect(turn.turnFacts?.matchingSourceBlockCount).toBe(
+      facts.matchingSourceBlockCount,
+    );
+    expect(turn.turnFacts?.runCompleted).toBeNull();
+    expect(ranCleanOnCurrentSource(turn.turnFacts)).toBe(true);
+    expect(getReviewGateVerdict(turn, null)).toBe("tested");
+  });
+
+  it("stays non-committal when the turn published no facts", () => {
+    const turn = hydrateNarrativeFromPayload({
+      ...(bundles["full-coverage"] as unknown as Record<string, unknown>),
+      review: undefined,
+      proposalDisposition: "auto_applicable",
+      turnFacts: {
+        factsAvailable: false,
+        evaluationState: null,
+        runId: null,
+        terminalCause: null,
+        blocksRunThisTurn: null,
+      },
+    });
+    if (!turn) throw new Error("fixture did not hydrate");
+
+    expect(ranCleanOnCurrentSource(turn.turnFacts)).toBe(false);
+    expect(getReviewGateVerdict(turn, null)).toBe("untested");
+  });
+});
+
+describe("hydrateNarrativeFromPayload -- a superseded build test", () => {
+  it("reports the recorded verdict back after a reload, from the persisted turn facts", () => {
+    const hydrated = hydrateNarrativeFromPayload({
+      turnId: "turn-1",
+      turnIndex: 0,
+      terminal: "response",
+      blocks: [],
+      turnFacts: {
+        factsAvailable: true,
+        evaluationState: "not_demonstrated",
+        runId: "wr_superseded",
+        runCompleted: false,
+        terminalCause: "occupied",
+        blocksRunThisTurn: null,
+        ranCleanOnCurrentSource: false,
+      },
+    });
+
+    expect(hydrated).toBeDefined();
+    expect(hydrated!.turnFacts?.runId).toBe("wr_superseded");
+    expect(notConfirmedOutcome(hydrated!)?.verdict).toBe("not_demonstrated");
+  });
+
+  it("surfaces the recorded block reason behind the persisted verdict, and null when no block carries one", () => {
+    const facts = {
+      factsAvailable: true,
+      evaluationState: "not_demonstrated",
+      runId: "wr_superseded",
+      runCompleted: false,
+      terminalCause: "occupied",
+      blocksRunThisTurn: null,
+      ranCleanOnCurrentSource: false,
+    };
+    const withBlock = hydrateNarrativeFromPayload({
+      turnId: "turn-1",
+      turnIndex: 0,
+      terminal: "response",
+      blocks: [
+        {
+          label: "checkout",
+          blockType: "code",
+          state: "completed",
+          lastSeenIteration: 0,
+          activity: [],
+          startedAt: null,
+          endedAt: null,
+          outcome: "not_demonstrated",
+          outcomeReason: "Cart never showed the item.",
+        },
+      ],
+      turnFacts: facts,
+    });
+    expect(notConfirmedOutcome(withBlock!)).toEqual({
+      verdict: "not_demonstrated",
+      displayReason: "Cart never showed the item.",
+      workflowRunId: "wr_superseded",
+    });
+
+    const withoutBlocks = hydrateNarrativeFromPayload({
+      turnId: "turn-2",
+      turnIndex: 0,
+      terminal: "response",
+      blocks: [],
+      turnFacts: facts,
+    });
+    expect(notConfirmedOutcome(withoutBlocks!)).toEqual({
+      verdict: "not_demonstrated",
+      displayReason: null,
+      workflowRunId: "wr_superseded",
+    });
+  });
+
+  it("a run start with no result behind it reports an unknown block count, never zero", () => {
+    const hydrated = hydrateNarrativeFromPayload({
+      turnId: "turn-1",
+      turnIndex: 0,
+      terminal: "response",
+      blocks: [],
+      turnFacts: {
+        factsAvailable: true,
+        evaluationState: null,
+        runId: "wr_started",
+        runCompleted: null,
+        terminalCause: null,
+        blocksRunThisTurn: null,
+        ranCleanOnCurrentSource: false,
+      },
+    });
+
+    expect(hydrated!.turnFacts?.blocksRunThisTurn).toBeNull();
+    expect(notConfirmedOutcome(hydrated!)).toBeNull();
+  });
+});

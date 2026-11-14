@@ -5,7 +5,6 @@ import structlog
 
 from skyvern.config import settings
 from skyvern.constants import DEFAULT_LOGIN_PROMPT
-from skyvern.forge.sdk.copilot.code_block_steps import derive_code_block_steps
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.id import (
     generate_aws_secret_parameter_id,
@@ -18,6 +17,7 @@ from skyvern.forge.sdk.db.id import (
     generate_output_parameter_id,
     generate_workflow_parameter_id,
 )
+from skyvern.forge.sdk.workflow.code_block_steps import derive_code_block_steps
 from skyvern.forge.sdk.workflow.exceptions import (
     ContextParameterSourceNotDefined,
     InvalidWaitBlockTime,
@@ -95,6 +95,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
 )
 from skyvern.schemas.emails import EmailTransport
 from skyvern.schemas.workflows import (
+    BLOCK_IMAGE_FIELDS,
     BLOCK_YAML_TYPES,
     BlockType,
     ForLoopBlockYAML,
@@ -434,7 +435,7 @@ def _build_block_kwargs(
         "model": block_yaml.model,
         "ignore_workflow_system_prompt": block_yaml.ignore_workflow_system_prompt,
     }
-    for field in ("notes", "trailing_notes", "description"):
+    for field in ("notes", "trailing_notes", "description", *BLOCK_IMAGE_FIELDS):
         if field in block_yaml.model_fields_set:
             kwargs[field] = getattr(block_yaml, field)
     return kwargs

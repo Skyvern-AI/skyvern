@@ -1,13 +1,10 @@
 import {
   BarChartIcon,
-  LightningBoltIcon,
-  CodeIcon,
   MixerHorizontalIcon,
   Pencil2Icon,
   PlayIcon,
 } from "@radix-ui/react-icons";
 
-import { Tip } from "@/components/Tip";
 import { WorkflowRunStatusApiResponse } from "@/api/types";
 import { StatusBadge } from "@/components/StatusBadge";
 import { WorkflowRunAttemptChip } from "@/components/WorkflowRunAttemptChip";
@@ -344,12 +341,6 @@ function WorkflowPage() {
             {workflowNotFound ? null : (
               <>
                 <Button asChild variant="secondary">
-                  <Link to={`/agents/${workflowPermanentId}/scripts`}>
-                    <CodeIcon className="mr-2 size-4" />
-                    Scripts
-                  </Link>
-                </Button>
-                <Button asChild variant="secondary">
                   <Link
                     to={workflowEditorPath(workflowPermanentId, studioEnabled)}
                     data-testid="workflow-open-editor-link"
@@ -495,17 +486,7 @@ function WorkflowPage() {
                     </TableMessageRow>
                   ) : (
                     workflowRuns?.map((workflowRun) => {
-                      const workflowRunId =
-                        workflowRun.script_run === true ? (
-                          <div className="flex items-center gap-2">
-                            <Tip content="Ran with code">
-                              <LightningBoltIcon className="text-[gold]" />
-                            </Tip>
-                            <span>{workflowRun.workflow_run_id ?? ""}</span>
-                          </div>
-                        ) : (
-                          (workflowRun.workflow_run_id ?? "")
-                        );
+                      const workflowRunId = workflowRun.workflow_run_id ?? "";
 
                       const isExpanded = expandedRows.has(
                         workflowRun.workflow_run_id,

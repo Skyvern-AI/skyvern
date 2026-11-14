@@ -199,7 +199,7 @@ vi.mock("@/components/icons/MessageIcon", () => ({ MessageIcon: () => null }));
 vi.mock("@/components/icons/TrophyIcon", () => ({ TrophyIcon: () => null }));
 
 function renderPromptBox(
-  enableCopilotHandoff = false,
+  enableEmberHandoff = false,
   ref?: Ref<PromptBoxHandle>,
   minimal = false,
   siblingBusy = false,
@@ -217,7 +217,7 @@ function renderPromptBox(
       <QueryClientProvider client={queryClient}>
         <PromptBox
           ref={ref}
-          enableCopilotHandoff={enableCopilotHandoff}
+          enableEmberHandoff={enableEmberHandoff}
           minimal={minimal}
           siblingBusy={siblingBusy}
         />
@@ -294,10 +294,10 @@ describe("PromptBox", () => {
     ["Copilot handoff", true, true, null],
   ])(
     "prewarms once on first input in the %s Home prompt",
-    async (_label, enableCopilotHandoff, minimal, expectedProxyLocation) => {
+    async (_label, enableEmberHandoff, minimal, expectedProxyLocation) => {
       prewarmFlagState.enabled = true;
       mockPost.mockResolvedValue({ data: {} });
-      renderPromptBox(enableCopilotHandoff, undefined, minimal);
+      renderPromptBox(enableEmberHandoff, undefined, minimal);
 
       const textarea = document.getElementById(
         "discover-prompt-input",
@@ -583,7 +583,7 @@ describe("PromptBox", () => {
     );
   });
 
-  test("hides run settings on the legacy home when the Copilot handoff is on", () => {
+  test("hides run settings on the legacy home when the Ember handoff is on", () => {
     renderPromptBox(true);
     expect(screen.queryByLabelText(/^Advanced settings/)).toBeNull();
     cleanup();
@@ -921,7 +921,7 @@ describe("PromptBox", () => {
     fireEvent.click(submit);
 
     await waitFor(() => expect(mockNavigate).toHaveBeenCalled());
-    expect(mockNavigate.mock.calls[0]![1].state.copilotAttachedFiles).toEqual([
+    expect(mockNavigate.mock.calls[0]![1].state.emberAttachedFiles).toEqual([
       expect.objectContaining({
         file_id: "file_resume",
         filename: "sample-resume.pdf",
@@ -1075,7 +1075,7 @@ describe("PromptBox", () => {
     expect(mockNavigate).toHaveBeenCalledWith(
       "/agents/wpid_studio/studio?via=discover",
       {
-        state: { copilotMessage: "Build this in studio" },
+        state: { emberMessage: "Build this in studio" },
       },
     );
     expect(

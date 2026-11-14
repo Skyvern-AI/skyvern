@@ -17,6 +17,7 @@ import structlog
 from sqlalchemy.exc import SQLAlchemyError, StatementError
 
 from skyvern.forge.sdk.db.exceptions import NotFoundError
+from skyvern.forge.sdk.db.statement_timeout import is_statement_timeout
 
 LOG = structlog.get_logger()
 
@@ -44,10 +45,27 @@ def register_passthrough_exception(exc_type: type[Exception]) -> None:
         _PASSTHROUGH_EXCEPTIONS = (*_PASSTHROUGH_EXCEPTIONS, exc_type)
 
 
+def _masked_cancellation(exc: BaseException, cancellations_before: int) -> asyncio.CancelledError | None:
+    # SQLAlchemy's psycopg pre-ping restores autocommit in a `finally`, replacing a mid-ping cancellation with
+    # "can't change 'autocommit' now"; return the original, since anyio scopes only absorb their own CancelledError.
+    task = asyncio.current_task()
+    if task is None or task.cancelling() <= cancellations_before:
+        return None
+    seen: set[int] = set()
+    ctx = exc.__context__
+    while ctx is not None and id(ctx) not in seen:
+        if isinstance(ctx, asyncio.CancelledError):
+            return ctx
+        seen.add(id(ctx))
+        ctx = ctx.__context__
+    return None
+
+
 def db_operation(
     operation_name: str,
     log_errors: bool = True,
     expected_errors: tuple[type[Exception], ...] = (),
+    warn_on_statement_timeout: bool = False,
 ) -> Callable[[Callable[P, R]], Callable[P, R]]:
     """Decorator that wraps an async function with standardized DB error handling.
 
@@ -68,6 +86,12 @@ def db_operation(
             the wrapper from asserting an error level the caller contradicts.
             Empty by default, so every operation is loud unless it opts in — keep
             a declared set no wider than the caller's own ``except``.
+        warn_on_statement_timeout: Log a statement-timeout cancellation at WARNING
+            instead of ERROR, for an operation whose every caller handles the
+            cancellation and reports it itself. ``expected_errors`` cannot express
+            this, since the declarable type is wider than the cancellation. Mirrors
+            ``log_statement_timeouts`` on ``@read_retry()``. The event name stays
+            ``SQLAlchemyError`` so message-keyed monitors still count the line.
 
     Usage:
         @db_operation("get_task")
@@ -82,11 +106,20 @@ def db_operation(
 
         @functools.wraps(fn)
         async def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:  # type: ignore[return]
+            task = asyncio.current_task()
+            cancellations_before = task.cancelling() if task is not None else 0
+            if cancellations_before:
+                # A caught cancellation leaves its count behind; deliver any pending request before treating it as stale.
+                await asyncio.sleep(0)
             try:
                 try:
                     return await fn(*args, **kwargs)  # type: ignore[misc]
-                except StatementError as exc:
-                    exc.hide_parameters = True
+                except SQLAlchemyError as exc:
+                    if isinstance(exc, StatementError):
+                        exc.hide_parameters = True
+                    cancellation = _masked_cancellation(exc, cancellations_before)
+                    if cancellation is not None:
+                        raise cancellation from exc
                     raise
             except _PASSTHROUGH_EXCEPTIONS:
                 if log_errors:
@@ -102,9 +135,12 @@ def db_operation(
                         error_type=type(exc).__name__,
                     )
                 raise
-            except SQLAlchemyError:
+            except SQLAlchemyError as exc:
                 if log_errors:
-                    LOG.exception("SQLAlchemyError", operation=operation_name)
+                    if warn_on_statement_timeout and is_statement_timeout(exc):
+                        LOG.warning("SQLAlchemyError", operation=operation_name, exc_info=True)
+                    else:
+                        LOG.exception("SQLAlchemyError", operation=operation_name)
                 raise
             except Exception:
                 if log_errors:

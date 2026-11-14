@@ -1,3 +1,5 @@
+from collections.abc import Iterator
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -8,9 +10,16 @@ from structlog.testing import capture_logs
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot.active_run_session import ActiveRunSessionAssociation
 from skyvern.forge.sdk.routes import debug_sessions as debug_sessions_mod
+from skyvern.forge.sdk.services import debug_session_browser as debug_session_browser_mod
 from skyvern.schemas.browser_session_kind import BrowserSessionKind
 from skyvern.schemas.runs import ProxyLocation
 from skyvern.webeye.persistent_session_errors import BrowserSessionCreditAdmissionRefusal
+
+
+@contextmanager
+def _patched_app(app_mock: MagicMock) -> Iterator[None]:
+    with patch.object(debug_sessions_mod, "app", app_mock), patch.object(debug_session_browser_mod, "app", app_mock):
+        yield
 
 
 @pytest.mark.asyncio
@@ -28,7 +37,7 @@ async def test_prewarm_debug_session_dispatches_an_unattached_live_browser() -> 
     app_mock.AGENT_FUNCTION.validate_enterprise_feature_access = AsyncMock()
     app_mock.PERSISTENT_SESSIONS_MANAGER.create_session = AsyncMock(return_value=browser_session)
 
-    with patch.object(debug_sessions_mod, "app", app_mock):
+    with _patched_app(app_mock):
         result = await debug_sessions_mod.prewarm_debug_session(
             request=SimpleNamespace(proxy_location=None),
             current_org=SimpleNamespace(organization_id="org_123"),
@@ -74,7 +83,7 @@ async def test_prewarm_debug_session_reuses_the_live_user_binding() -> None:
         return_value=browser_session
     )
 
-    with patch.object(debug_sessions_mod, "app", app_mock):
+    with _patched_app(app_mock):
         result = await debug_sessions_mod.prewarm_debug_session(
             request=SimpleNamespace(proxy_location=None),
             current_org=SimpleNamespace(organization_id="org_123"),
@@ -90,7 +99,7 @@ async def test_prewarm_debug_session_is_a_noop_when_the_rollout_is_disabled() ->
     app_mock = MagicMock()
     app_mock.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
 
-    with patch.object(debug_sessions_mod, "app", app_mock):
+    with _patched_app(app_mock):
         result = await debug_sessions_mod.prewarm_debug_session(
             request=SimpleNamespace(proxy_location=None),
             current_org=SimpleNamespace(organization_id="org_123"),
@@ -114,7 +123,7 @@ async def test_prewarm_debug_session_treats_a_concurrent_binding_as_success() ->
         side_effect=IntegrityError("INSERT", {}, Exception("duplicate live binding"))
     )
 
-    with patch.object(debug_sessions_mod, "app", app_mock):
+    with _patched_app(app_mock):
         result = await debug_sessions_mod.prewarm_debug_session(
             request=SimpleNamespace(proxy_location=None),
             current_org=SimpleNamespace(organization_id="org_123"),
@@ -134,7 +143,7 @@ async def test_prewarm_debug_session_treats_an_unresolved_binding_race_as_a_noop
         side_effect=IntegrityError("INSERT", {}, Exception("duplicate live binding"))
     )
 
-    with patch.object(debug_sessions_mod, "app", app_mock):
+    with _patched_app(app_mock):
         result = await debug_sessions_mod.prewarm_debug_session(
             request=SimpleNamespace(proxy_location=None),
             current_org=SimpleNamespace(organization_id="org_123"),
@@ -152,7 +161,7 @@ async def test_prewarm_debug_session_treats_creation_failure_as_a_noop() -> None
     app_mock.DATABASE.browser_sessions.get_live_bound_persistent_browser_session = AsyncMock(return_value=None)
     app_mock.PERSISTENT_SESSIONS_MANAGER.create_session = AsyncMock(side_effect=RuntimeError("infra unavailable"))
 
-    with patch.object(debug_sessions_mod, "app", app_mock):
+    with _patched_app(app_mock):
         result = await debug_sessions_mod.prewarm_debug_session(
             request=SimpleNamespace(proxy_location=None),
             current_org=SimpleNamespace(organization_id="org_123"),
@@ -173,7 +182,7 @@ async def test_prewarm_debug_session_closes_an_unpublished_session_and_returns_a
     app_mock.DATABASE.browser_sessions.mark_prewarm_dispatched = AsyncMock(side_effect=RuntimeError("db unavailable"))
     app_mock.PERSISTENT_SESSIONS_MANAGER.close_session = AsyncMock()
 
-    with patch.object(debug_sessions_mod, "app", app_mock):
+    with _patched_app(app_mock):
         result = await debug_sessions_mod.prewarm_debug_session(
             request=SimpleNamespace(proxy_location=None),
             current_org=SimpleNamespace(organization_id="org_123"),
@@ -194,7 +203,7 @@ async def test_prewarm_debug_session_closes_a_session_when_dispatch_loses_its_bi
     app_mock.DATABASE.browser_sessions.mark_prewarm_dispatched = AsyncMock(return_value=False)
     app_mock.PERSISTENT_SESSIONS_MANAGER.close_session = AsyncMock()
 
-    with patch.object(debug_sessions_mod, "app", app_mock):
+    with _patched_app(app_mock):
         result = await debug_sessions_mod.prewarm_debug_session(
             request=SimpleNamespace(proxy_location=None),
             current_org=SimpleNamespace(organization_id="org_123"),
@@ -242,7 +251,7 @@ async def test_get_debug_session_claims_a_compatible_prewarm(already_started: bo
     app_mock.PERSISTENT_SESSIONS_MANAGER.renew_or_close_session = AsyncMock(return_value=browser_session)
     app_mock.PERSISTENT_SESSIONS_MANAGER.seconds_until_fixed_deadline = AsyncMock(return_value=None)
 
-    with patch.object(debug_sessions_mod, "app", app_mock), capture_logs() as logs:
+    with _patched_app(app_mock), capture_logs() as logs:
         result = await debug_sessions_mod.get_or_create_debug_session_by_user_and_workflow_permanent_id(
             "wpid_test",
             current_org=SimpleNamespace(organization_id="org_123"),
@@ -294,7 +303,7 @@ async def test_claim_prewarm_reuses_debug_session_created_by_concurrent_request(
         return_value=SimpleNamespace(proxy_location=None)
     )
 
-    with patch.object(debug_sessions_mod, "app", app_mock):
+    with _patched_app(app_mock):
         result = await debug_sessions_mod._claim_compatible_prewarm(
             workflow_permanent_id="wpid_test",
             organization_id="org_123",
@@ -326,7 +335,7 @@ async def test_claim_prewarm_closes_the_browser_when_debug_session_creation_fail
     )
     app_mock.PERSISTENT_SESSIONS_MANAGER.close_session = AsyncMock()
 
-    with patch.object(debug_sessions_mod, "app", app_mock), pytest.raises(RuntimeError, match="db unavailable"):
+    with _patched_app(app_mock), pytest.raises(RuntimeError, match="db unavailable"):
         await debug_sessions_mod._claim_compatible_prewarm(
             workflow_permanent_id="wpid_test",
             organization_id="org_123",
@@ -355,7 +364,7 @@ async def test_claim_prewarm_rejects_a_started_session_that_cannot_be_renewed() 
         side_effect=debug_sessions_mod.BrowserSessionNotRenewable("Session has expired", "pbs_expiring")
     )
 
-    with patch.object(debug_sessions_mod, "app", app_mock):
+    with _patched_app(app_mock):
         result = await debug_sessions_mod._claim_compatible_prewarm(
             workflow_permanent_id="wpid_test",
             organization_id="org_123",
@@ -380,7 +389,7 @@ async def test_claim_prewarm_does_not_adopt_a_session_before_dispatch_finishes()
         return_value=browser_session
     )
 
-    with patch.object(debug_sessions_mod, "app", app_mock):
+    with _patched_app(app_mock):
         result = await debug_sessions_mod._claim_compatible_prewarm(
             workflow_permanent_id="wpid_test",
             organization_id="org_123",
@@ -411,7 +420,7 @@ async def test_claim_prewarm_retires_an_incompatible_proxy() -> None:
     app_mock.DATABASE.browser_sessions.clear_prewarm_binding = AsyncMock(return_value=True)
     app_mock.PERSISTENT_SESSIONS_MANAGER.close_session = AsyncMock()
 
-    with patch.object(debug_sessions_mod, "app", app_mock):
+    with _patched_app(app_mock):
         result = await debug_sessions_mod._claim_compatible_prewarm(
             workflow_permanent_id="wpid_test",
             organization_id="org_123",
@@ -443,7 +452,7 @@ async def test_claim_prewarm_retires_a_fixed_deadline_without_a_fresh_debug_wind
     app_mock.DATABASE.browser_sessions.clear_prewarm_binding = AsyncMock(return_value=True)
     app_mock.PERSISTENT_SESSIONS_MANAGER.close_session = AsyncMock()
 
-    with patch.object(debug_sessions_mod, "app", app_mock):
+    with _patched_app(app_mock):
         result = await debug_sessions_mod._claim_compatible_prewarm(
             workflow_permanent_id="wpid_test",
             organization_id="org_123",
@@ -462,7 +471,7 @@ async def test_get_debug_session_falls_back_when_prewarm_claim_fails() -> None:
     app_mock.DATABASE.debug.get_debug_session = AsyncMock(return_value=None)
 
     with (
-        patch.object(debug_sessions_mod, "app", app_mock),
+        _patched_app(app_mock),
         patch.object(
             debug_sessions_mod,
             "_claim_compatible_prewarm",
@@ -525,7 +534,7 @@ async def test_new_debug_session_uses_workflow_proxy_default_for_created_browser
     app_mock.AGENT_FUNCTION.validate_enterprise_feature_access = AsyncMock()
 
     with (
-        patch.object(debug_sessions_mod, "app", app_mock),
+        _patched_app(app_mock),
         patch.object(debug_sessions_mod.settings, "ENV", "local"),
     ):
         result = await debug_sessions_mod.new_debug_session(
@@ -547,6 +556,7 @@ async def test_new_debug_session_uses_workflow_proxy_default_for_created_browser
         needs_live_view=True,
         created_by="user_123",
         session_kind=BrowserSessionKind.editor,
+        created_for_workflow_permanent_id="wpid_test",
     )
     app_mock.DATABASE.debug.create_debug_session.assert_awaited_once_with(
         browser_session_id="pbs_new",
@@ -582,7 +592,7 @@ async def test_new_debug_session_records_no_vnc_when_the_infrastructure_cannot_s
     app_mock.AGENT_FUNCTION.supports_live_view = AsyncMock(return_value=False)
 
     with (
-        patch.object(debug_sessions_mod, "app", app_mock),
+        _patched_app(app_mock),
         patch.object(debug_sessions_mod.settings, "ENV", "local"),
     ):
         await debug_sessions_mod.new_debug_session(
@@ -616,7 +626,7 @@ async def test_new_debug_session_logs_a_credit_refusal_below_error_and_a_real_fa
     app_mock.PERSISTENT_SESSIONS_MANAGER.create_session = AsyncMock(side_effect=create_error)
 
     with (
-        patch.object(debug_sessions_mod, "app", app_mock),
+        _patched_app(app_mock),
         patch.object(debug_sessions_mod.settings, "ENV", "local"),
         capture_logs() as logs,
         pytest.raises(type(create_error)) as raised,
@@ -646,7 +656,7 @@ async def test_hydrate_pbs_browser_profile_id_sets_field_when_session_exists() -
         return_value=SimpleNamespace(browser_profile_id="bp_42"),
     )
 
-    with patch.object(debug_sessions_mod, "app", app_mock):
+    with _patched_app(app_mock):
         result = await debug_sessions_mod._hydrate_pbs_browser_profile_id(
             debug_session,
             organization_id="org_x",
@@ -668,7 +678,7 @@ async def test_hydrate_pbs_browser_profile_id_leaves_field_when_session_missing(
         return_value=None,
     )
 
-    with patch.object(debug_sessions_mod, "app", app_mock):
+    with _patched_app(app_mock):
         result = await debug_sessions_mod._hydrate_pbs_browser_profile_id(
             debug_session,
             organization_id="org_x",
@@ -695,7 +705,7 @@ async def test_hydrate_pbs_browser_profile_id_swallows_lookup_errors() -> None:
         side_effect=RuntimeError("transient DB blip"),
     )
 
-    with patch.object(debug_sessions_mod, "app", app_mock):
+    with _patched_app(app_mock):
         result = await debug_sessions_mod._hydrate_pbs_browser_profile_id(
             debug_session,
             organization_id="org_x",
@@ -735,7 +745,7 @@ async def test_new_debug_session_response_carries_pbs_browser_profile_id() -> No
     app_mock.AGENT_FUNCTION.supports_live_view = AsyncMock(return_value=True)
 
     with (
-        patch.object(debug_sessions_mod, "app", app_mock),
+        _patched_app(app_mock),
         patch.object(debug_sessions_mod.settings, "ENV", "local"),
     ):
         result = await debug_sessions_mod.new_debug_session(
@@ -786,7 +796,7 @@ def _viewer_state_app(*, run_status: str = "running") -> MagicMock:
 async def test_viewer_state_returns_matching_nonterminal_run_without_renewal() -> None:
     app_mock = _viewer_state_app()
     with (
-        patch.object(debug_sessions_mod, "app", app_mock),
+        _patched_app(app_mock),
         patch.object(
             debug_sessions_mod,
             "get_active_run_session",
@@ -828,7 +838,7 @@ async def test_viewer_state_rejects_mismatched_or_terminal_state(
     association = _active_association().model_copy(update=association_update)
 
     with (
-        patch.object(debug_sessions_mod, "app", app_mock),
+        _patched_app(app_mock),
         patch.object(
             debug_sessions_mod,
             "get_active_run_session",
@@ -854,7 +864,7 @@ async def test_viewer_state_returns_null_for_missing_or_unreadable_association()
             else AsyncMock(return_value=association_result)
         )
         with (
-            patch.object(debug_sessions_mod, "app", app_mock),
+            _patched_app(app_mock),
             patch.object(debug_sessions_mod, "get_active_run_session", lookup),
         ):
             result = await debug_sessions_mod.get_debug_session_viewer_state(
@@ -887,7 +897,7 @@ async def test_compatibility_returns_compatible_when_no_debug_session() -> None:
     app_mock = MagicMock()
     app_mock.DATABASE.debug.get_debug_session = AsyncMock(return_value=None)
 
-    with patch.object(debug_sessions_mod, "app", app_mock):
+    with _patched_app(app_mock):
         result = await debug_sessions_mod.get_login_block_compatibility(
             workflow_permanent_id="wpid_test",
             block_label="login_1",
@@ -910,7 +920,7 @@ async def test_compatibility_returns_compatible_when_block_is_not_login() -> Non
         return_value=_wf(blocks=[non_login_block]),
     )
 
-    with patch.object(debug_sessions_mod, "app", app_mock):
+    with _patched_app(app_mock):
         result = await debug_sessions_mod.get_login_block_compatibility(
             workflow_permanent_id="wpid_test",
             block_label="login_1",
@@ -935,7 +945,7 @@ async def test_compatibility_compatible_when_credential_has_no_profile() -> None
         return_value=None,
     )
 
-    with patch.object(debug_sessions_mod, "app", app_mock):
+    with _patched_app(app_mock):
         with patch.object(debug_sessions_mod, "LoginBlock", SimpleNamespace):
             result = await debug_sessions_mod.get_login_block_compatibility(
                 workflow_permanent_id="wpid_test",
@@ -965,7 +975,7 @@ async def test_compatibility_reports_pbs_no_profile_when_pbs_unprofiled() -> Non
         return_value=SimpleNamespace(browser_profile_id=None),
     )
 
-    with patch.object(debug_sessions_mod, "app", app_mock):
+    with _patched_app(app_mock):
         with patch.object(debug_sessions_mod, "LoginBlock", SimpleNamespace):
             result = await debug_sessions_mod.get_login_block_compatibility(
                 workflow_permanent_id="wpid_test",
@@ -994,7 +1004,7 @@ async def test_compatibility_reports_pbs_different_profile_when_profiles_differ(
         return_value=SimpleNamespace(browser_profile_id="bp_other"),
     )
 
-    with patch.object(debug_sessions_mod, "app", app_mock):
+    with _patched_app(app_mock):
         with patch.object(debug_sessions_mod, "LoginBlock", SimpleNamespace):
             result = await debug_sessions_mod.get_login_block_compatibility(
                 workflow_permanent_id="wpid_test",
@@ -1023,7 +1033,7 @@ async def test_compatibility_reports_compatible_when_profiles_match() -> None:
         return_value=SimpleNamespace(browser_profile_id="bp_same"),
     )
 
-    with patch.object(debug_sessions_mod, "app", app_mock):
+    with _patched_app(app_mock):
         with patch.object(debug_sessions_mod, "LoginBlock", SimpleNamespace):
             result = await debug_sessions_mod.get_login_block_compatibility(
                 workflow_permanent_id="wpid_test",
@@ -1046,7 +1056,7 @@ async def test_compatibility_returns_compatible_when_block_label_not_found() -> 
         return_value=_wf(blocks=[other_block]),
     )
 
-    with patch.object(debug_sessions_mod, "app", app_mock):
+    with _patched_app(app_mock):
         result = await debug_sessions_mod.get_login_block_compatibility(
             workflow_permanent_id="wpid_test",
             block_label="login_missing",

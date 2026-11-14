@@ -6,7 +6,7 @@ import {
 } from "../../types/workflowTypes";
 import { blockTypeFromNode } from "../nodes/blockTypeFromNode";
 import { workflowBlockTitle } from "../nodes/types";
-import { humanizeBlockLabel } from "../../copilot/blockLabel";
+import { humanizeBlockLabel } from "../../ember/blockLabel";
 import { stripJinjaReferences } from "./docTextUtils";
 import { nodeLibraryItems } from "../panels/nodeLibraryItems";
 
@@ -254,19 +254,28 @@ const requiredSettings: Record<string, Array<[string, string]>> = {
   workflowTrigger: [["workflowPermanentId", "Agent"]],
   wait: [["waitInSeconds", "Seconds"]],
   sendEmail: [["recipients", "Recipients"]],
+  agentStep: [["tools", "Tools"]],
 };
 
-export function getDocMissingSettings(node: Node): string[] {
+export function getDocMissingSettings(
+  node: Node,
+  skip: (key: string) => boolean = () => false,
+): string[] {
   return (requiredSettings[node.type ?? ""] ?? []).flatMap(([key, label]) =>
-    settingIsSet(node, key) ? [] : [label],
+    settingIsSet(node, key) || skip(key) ? [] : [label],
   );
 }
+
+/** The data keys a step of this type cannot run without. */
+export const docRequiredSettingKeys = (node: Node): string[] =>
+  (requiredSettings[node.type ?? ""] ?? []).map(([key]) => key);
 
 // A Wait needs a whole number of seconds of at least 1; "" or "0" would save as a wait that does nothing or is refused.
 function settingIsSet(node: Node, key: string): boolean {
   if (node.type === "wait")
     return /^\d+$/.test(text(node, key)) && Number(text(node, key)) >= 1;
-  return Boolean(text(node, key));
+  const value = node.data[key];
+  return Array.isArray(value) ? value.length > 0 : Boolean(text(node, key));
 }
 
 const text = (node: Node, key: string) =>
@@ -369,32 +378,6 @@ export function getDocSettingSummary(node: Node): string | null {
   return SUMMARY_IS_SETTING.has(node.type ?? "")
     ? getDocStepSummary(node)
     : null;
-}
-
-export type DocKeyField = { key: string; label: string; value: string };
-
-const keyFields: Record<string, Array<[string, string]>> = {
-  http_request: [["method", "Method"]],
-  sendEmail: [
-    ["recipients", "Recipients"],
-    ["subject", "Subject"],
-  ],
-  fileParser: [["fileType", "Type"]],
-  workflowTrigger: [["workflowTitle", "Agent"]],
-  googleSheetsRead: [["range", "Range"]],
-  googleSheetsWrite: [["range", "Range"]],
-};
-
-export function getDocKeyFields(node: Node): DocKeyField[] {
-  return (keyFields[node.type ?? ""] ?? []).flatMap(([key, label]) => {
-    const value = node.data[key];
-    const shown = Array.isArray(value)
-      ? value.filter((v) => typeof v === "string" && v).join(", ")
-      : typeof value === "string" || typeof value === "number"
-        ? String(value).trim()
-        : "";
-    return shown ? [{ key, label, value: shown }] : [];
-  });
 }
 
 /** One line naming a step, for the outline and Jump buttons. */

@@ -12,7 +12,9 @@ import structlog
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
 from pydantic import (
+    AfterValidator,
     BaseModel,
+    ConfigDict,
     Field,
     SerializerFunctionWrapHandler,
     StrictInt,
@@ -29,6 +31,7 @@ from pydantic_core import to_jsonable_python
 from skyvern.config import settings
 from skyvern.constants import ERROR_CODE_REASONING_MAX_LENGTH, MAX_PDF_OCR_PAGES
 from skyvern.forge.sdk.api.llm.custom_llm_registry import is_custom_llm_key
+from skyvern.forge.sdk.db.id import is_uploaded_file_id
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.browser_profile_key import validate_browser_profile_key
 from skyvern.forge.sdk.workflow.models.parameter import (
@@ -88,6 +91,23 @@ def sanitize_parameter_key(value: str) -> str:
 
 def _has_jinja_syntax(value: str) -> bool:
     return "{{" in value or "{%" in value
+
+
+# Marks a block field whose value is the id of a connected account. The condition names the sibling field values
+# under which the block reads it; with none, the field is always read.
+CONNECTED_ACCOUNT_SCHEMA_MARK = "x-skyvern-connected-account"
+CONNECTED_ACCOUNT_CONDITION_MARK = "x-skyvern-connected-account-when"
+# Marks a connected-account field the block uses to act on the outside world (send, upload), not only to read.
+CONNECTED_ACCOUNT_ACTS_MARK = "x-skyvern-connected-account-acts"
+
+
+def _connected_account_field(*, acts: bool = False, **condition: str) -> dict[str, Any]:
+    extra: dict[str, Any] = {CONNECTED_ACCOUNT_SCHEMA_MARK: True}
+    if condition:
+        extra[CONNECTED_ACCOUNT_CONDITION_MARK] = condition
+    if acts:
+        extra[CONNECTED_ACCOUNT_ACTS_MARK] = True
+    return extra
 
 
 @functools.lru_cache(maxsize=1)
@@ -845,6 +865,26 @@ class OutputParameterYAML(ParameterYAML):
 
 
 BLOCK_NOTE_MAX_LENGTH = 2000
+BLOCK_IMAGE_CAPTION_MAX_LENGTH = 200
+BLOCK_DOC_IMAGES_MAX = 10
+BLOCK_PROMPT_IMAGES_MAX = 3
+
+
+def _uploaded_file_id(value: str) -> str:
+    if not is_uploaded_file_id(value):
+        raise ValueError(f"{value!r} is not an uploaded file id")
+    return value.strip()
+
+
+class BlockImage(BaseModel):
+    model_config = ConfigDict(json_schema_extra={"x-internal": True})
+
+    file_id: Annotated[str, AfterValidator(_uploaded_file_id)]
+    caption: str | None = Field(default=None, max_length=BLOCK_IMAGE_CAPTION_MAX_LENGTH)
+    placement: Literal["above", "trailing", "block"] = "block"
+
+
+BLOCK_IMAGE_FIELDS = ("doc_images", "prompt_images")
 
 
 class BlockYAML(BaseModel, abc.ABC):
@@ -878,6 +918,23 @@ class BlockYAML(BaseModel, abc.ABC):
         "changing it never clears cached scripts. Omitting it on an update keeps the saved description; send null "
         "or an empty string to delete it.",
     )
+    doc_images: list[BlockImage] | None = Field(
+        default=None,
+        max_length=BLOCK_DOC_IMAGES_MAX,
+        exclude_if=lambda value: value is None,
+        json_schema_extra={"x-internal": True},
+        description="Uploaded images shown with this block, for people reading the workflow. The agent never sees "
+        "them, and changing them never clears cached scripts. Omit to keep the saved images; send null or [] to "
+        "delete them.",
+    )
+    prompt_images: list[BlockImage] | None = Field(
+        default=None,
+        max_length=BLOCK_PROMPT_IMAGES_MAX,
+        exclude_if=lambda value: value is None,
+        json_schema_extra={"x-internal": True},
+        description="Uploaded images reserved for this block's prompt; no block reads them yet. Omit to keep the "
+        "saved images; send null or [] to delete them.",
+    )
     next_block_label: str | None = Field(
         default=None,
         description="Optional pointer to the label of the next block. "
@@ -897,7 +954,7 @@ class BlockYAML(BaseModel, abc.ABC):
     def _preserve_explicit_note_clears(self, handler: SerializerFunctionWrapHandler):  # type: ignore[no-untyped-def]
         data = handler(self)
         if isinstance(data, dict):
-            for field in ("notes", "trailing_notes", "description"):
+            for field in ("notes", "trailing_notes", "description", *BLOCK_IMAGE_FIELDS):
                 if field in self.model_fields_set and getattr(self, field) is None:
                     data[field] = None
         return data
@@ -1283,7 +1340,10 @@ class FileUploadBlockYAML(BlockYAML):
     azure_storage_account_key: str | None = None
     azure_blob_container_name: str | None = None
     azure_folder_path: str | None = None
-    google_credential_id: str | None = Field(default=None, json_schema_extra={"x-skyvern-connected-account": True})
+    google_credential_id: str | None = Field(
+        default=None,
+        json_schema_extra=_connected_account_field(acts=True, storage_type=FileStorageType.GOOGLE_DRIVE.value),
+    )
     google_drive_folder_id: str | None = None
     sftp_host: str | None = None
     sftp_port: int | None = None
@@ -1334,13 +1394,17 @@ class SendEmailBlockYAML(BlockYAML):
     credential_id: str | None = Field(
         default=None,
         description="ID of a connected Google account that has send permission. Used only with transport 'gmail'.",
-        json_schema_extra={"x-skyvern-connected-account": True},
+        json_schema_extra=_connected_account_field(
+            acts=True, transport=EmailTransport.GMAIL.value, credential_source="native"
+        ),
     )
     credential_source: Literal["native", "nango"] = Field(
         default="native",
         description="'nango' sends from the connected account named by connection_id instead of credential_id.",
     )
-    connection_id: str | None = Field(default=None, json_schema_extra={"x-skyvern-connected-account": True})
+    connection_id: str | None = Field(
+        default=None, json_schema_extra=_connected_account_field(acts=True, credential_source="nango")
+    )
     reply_to_message_id: str | None = Field(
         default=None,
         description="Gmail message ID to reply to in its original thread; requires send and read permissions.",
@@ -1634,7 +1698,10 @@ class FileDownloadBlockYAML(BlockYAML):
     azure_storage_account_name: str | None = None
     azure_storage_account_key: str | None = None
     azure_blob_container_name: str | None = None
-    google_credential_id: str | None = Field(default=None, json_schema_extra={"x-skyvern-connected-account": True})
+    google_credential_id: str | None = Field(
+        default=None,
+        json_schema_extra=_connected_account_field(acts=True, download_target=FileDownloadTarget.GOOGLE_DRIVE.value),
+    )
     google_drive_folder_id: str | None = None
     sftp_host: str | None = None
     sftp_port: int | None = None
@@ -1847,7 +1914,7 @@ class GoogleSheetsReadBlockYAML(BlockYAML):
     spreadsheet_url: str
     sheet_name: str | None = None
     range: str | None = None
-    credential_id: str | None = Field(default=None, json_schema_extra={"x-skyvern-connected-account": True})
+    credential_id: str | None = Field(default=None, json_schema_extra=_connected_account_field())
     has_header_row: bool = True
     parameter_keys: list[str] | None = None
 
@@ -1856,8 +1923,12 @@ class EmailInboxBlockYAML(BlockYAML):
     block_type: Literal[BlockType.EMAIL_INBOX] = BlockType.EMAIL_INBOX  # type: ignore
     email_client: Literal["gmail", "outlook"]
     credential_source: Literal["native", "nango"] = "native"
-    connection_id: str | None = Field(default=None, json_schema_extra={"x-skyvern-connected-account": True})
-    credential_id: str | None = Field(default=None, json_schema_extra={"x-skyvern-connected-account": True})
+    connection_id: str | None = Field(
+        default=None, json_schema_extra=_connected_account_field(credential_source="nango")
+    )
+    credential_id: str | None = Field(
+        default=None, json_schema_extra=_connected_account_field(credential_source="native")
+    )
     message_id: str | None = None
     folder: str | None = None
     prompt: str | None = None
@@ -1877,7 +1948,7 @@ class GoogleSheetsWriteBlockYAML(BlockYAML):
     spreadsheet_url: str
     sheet_name: str | None = None
     range: str | None = None
-    credential_id: str | None = Field(default=None, json_schema_extra={"x-skyvern-connected-account": True})
+    credential_id: str | None = Field(default=None, json_schema_extra=_connected_account_field(acts=True))
     write_mode: Literal["append", "update"] = "append"
     values: str = ""
     column_mapping: dict[str, str] | None = None
@@ -1892,7 +1963,7 @@ class PowerBIQueryBlockYAML(BlockYAML):
     connection_id: str = Field(
         min_length=1,
         description="Power BI connection ID for this user.",
-        json_schema_extra={"x-skyvern-connected-account": True},
+        json_schema_extra=_connected_account_field(credential_source="nango"),
     )
     credential_source: Literal["nango"] = "nango"
     dataset_id: str = Field(min_length=1)

@@ -318,5 +318,337 @@
       "inside_b": "Inside.\n\nInside done.",
       "after": "After."
     }
+  },
+  {
+    "name": "merge-is-own-branch-target",
+    "definition": {
+      "blocks": [
+        {
+          "label": "check",
+          "block_type": "conditional",
+          "next_block_label": "draft",
+          "branch_conditions": [
+            {
+              "next_block_label": "draft"
+            },
+            {
+              "next_block_label": "report"
+            }
+          ],
+          "notes": "Check."
+        },
+        {
+          "label": "draft",
+          "block_type": "navigation",
+          "next_block_label": "review",
+          "notes": "Draft."
+        },
+        {
+          "label": "review",
+          "block_type": "navigation",
+          "next_block_label": "report",
+          "notes": "Review."
+        },
+        {
+          "label": "report",
+          "block_type": "navigation",
+          "next_block_label": null,
+          "notes": "Report."
+        }
+      ]
+    },
+    "expected": {
+      "check": "Check.\n\nDraft.",
+      "draft": "Draft.\n\nReview.",
+      "review": "Review.\n\nReport.",
+      "report": "Report."
+    }
+  },
+  {
+    "name": "inner-conditional-listed-first",
+    "definition": {
+      "blocks": [
+        {
+          "label": "inner",
+          "block_type": "conditional",
+          "next_block_label": "store",
+          "branch_conditions": [
+            {
+              "next_block_label": "wrap_up"
+            },
+            {
+              "next_block_label": "detail"
+            }
+          ],
+          "notes": "Inner."
+        },
+        {
+          "label": "route",
+          "block_type": "conditional",
+          "next_block_label": "wrap_up",
+          "branch_conditions": [
+            {
+              "next_block_label": "inner"
+            },
+            {
+              "next_block_label": "side"
+            }
+          ],
+          "notes": "Route."
+        },
+        {
+          "label": "side",
+          "block_type": "navigation",
+          "next_block_label": null,
+          "notes": "Side."
+        },
+        {
+          "label": "detail",
+          "block_type": "navigation",
+          "next_block_label": null,
+          "notes": "Detail."
+        },
+        {
+          "label": "store",
+          "block_type": "navigation",
+          "next_block_label": null,
+          "notes": "Store."
+        },
+        {
+          "label": "wrap_up",
+          "block_type": "navigation",
+          "next_block_label": "notify",
+          "notes": "Wrap_up."
+        },
+        {
+          "label": "notify",
+          "block_type": "navigation",
+          "next_block_label": null,
+          "notes": "Notify."
+        }
+      ]
+    },
+    "expected": {
+      "route": "Route.\n\nWrap_up.",
+      "wrap_up": "Wrap_up.\n\nNotify.",
+      "notify": "Notify.",
+      "inner": "Inner.\n\nStore.",
+      "store": "Store.\n\nWrap_up.",
+      "side": "Side.\n\nWrap_up.",
+      "detail": "Detail.\n\nStore."
+    }
+  },
+  {
+    "name": "outer-merge-conditional-listed-first",
+    "definition": {
+      "blocks": [
+        {
+          "label": "wrap_up",
+          "block_type": "conditional",
+          "next_block_label": "notify",
+          "branch_conditions": [
+            {
+              "next_block_label": "notify"
+            }
+          ],
+          "notes": "Wrap_up."
+        },
+        {
+          "label": "route",
+          "block_type": "conditional",
+          "next_block_label": "wrap_up",
+          "branch_conditions": [
+            {
+              "next_block_label": "inner"
+            },
+            {
+              "next_block_label": "side"
+            }
+          ],
+          "notes": "Route."
+        },
+        {
+          "label": "inner",
+          "block_type": "conditional",
+          "next_block_label": "store",
+          "branch_conditions": [
+            {
+              "next_block_label": "wrap_up"
+            },
+            {
+              "next_block_label": "detail"
+            }
+          ],
+          "notes": "Inner."
+        },
+        {
+          "label": "side",
+          "block_type": "navigation",
+          "next_block_label": null,
+          "notes": "Side."
+        },
+        {
+          "label": "detail",
+          "block_type": "navigation",
+          "next_block_label": null,
+          "notes": "Detail."
+        },
+        {
+          "label": "store",
+          "block_type": "navigation",
+          "next_block_label": null,
+          "notes": "Store."
+        },
+        {
+          "label": "notify",
+          "block_type": "navigation",
+          "next_block_label": null,
+          "notes": "Notify."
+        }
+      ]
+    },
+    "expected": {
+      "route": "Route.\n\nWrap_up.",
+      "wrap_up": "Wrap_up.\n\nNotify.",
+      "notify": "Notify.",
+      "inner": "Inner.\n\nStore.",
+      "store": "Store.\n\nWrap_up.",
+      "side": "Side.\n\nWrap_up.",
+      "detail": "Detail.\n\nStore."
+    }
+  },
+  {
+    "name": "loop-body-empty-branch-ends-iteration",
+    "definition": {
+      "blocks": [
+        {
+          "label": "loop",
+          "block_type": "for_loop",
+          "next_block_label": null,
+          "loop_blocks": [
+            {
+              "label": "route",
+              "block_type": "conditional",
+              "next_block_label": "submit",
+              "branch_conditions": [
+                {
+                  "next_block_label": "prepare"
+                },
+                {
+                  "next_block_label": "submit"
+                }
+              ],
+              "notes": "Route."
+            },
+            {
+              "label": "prepare",
+              "block_type": "navigation",
+              "next_block_label": null,
+              "notes": "Prepare."
+            },
+            {
+              "label": "submit",
+              "block_type": "navigation",
+              "next_block_label": "settle",
+              "notes": "Submit."
+            },
+            {
+              "label": "settle",
+              "block_type": "conditional",
+              "next_block_label": "prepare",
+              "branch_conditions": [
+                {
+                  "next_block_label": null
+                },
+                {
+                  "next_block_label": null
+                }
+              ],
+              "notes": "Settle."
+            }
+          ],
+          "notes": "Loop."
+        }
+      ]
+    },
+    "expected": {
+      "loop": "Loop.",
+      "route": "Route.\n\nSubmit.",
+      "submit": "Submit.\n\nSettle.",
+      "settle": "Settle.\n\nPrepare.",
+      "prepare": "Prepare.\n\nSubmit."
+    }
+  },
+  {
+    "name": "conditional-tail-keeps-merge-link",
+    "definition": {
+      "blocks": [
+        {
+          "label": "route",
+          "block_type": "conditional",
+          "next_block_label": "merge_check",
+          "branch_conditions": [
+            {
+              "next_block_label": "prepare"
+            },
+            {
+              "next_block_label": "side"
+            }
+          ],
+          "notes": "Route."
+        },
+        {
+          "label": "prepare",
+          "block_type": "navigation",
+          "next_block_label": "settle_check",
+          "notes": "Prepare."
+        },
+        {
+          "label": "settle_check",
+          "block_type": "conditional",
+          "next_block_label": null,
+          "branch_conditions": [
+            {
+              "next_block_label": null
+            }
+          ],
+          "notes": "Settle_check."
+        },
+        {
+          "label": "side",
+          "block_type": "navigation",
+          "next_block_label": null,
+          "notes": "Side."
+        },
+        {
+          "label": "merge_check",
+          "block_type": "conditional",
+          "next_block_label": null,
+          "branch_conditions": [
+            {
+              "next_block_label": "settle_check"
+            },
+            {
+              "next_block_label": "wrap"
+            }
+          ],
+          "notes": "Merge_check."
+        },
+        {
+          "label": "wrap",
+          "block_type": "navigation",
+          "next_block_label": null,
+          "notes": "Wrap."
+        }
+      ]
+    },
+    "expected": {
+      "route": "Route.\n\nMerge_check.",
+      "merge_check": "Merge_check.",
+      "prepare": "Prepare.\n\nSettle_check.",
+      "settle_check": "Settle_check.\n\nMerge_check.",
+      "side": "Side.\n\nMerge_check.",
+      "wrap": "Wrap."
+    }
   }
 ]

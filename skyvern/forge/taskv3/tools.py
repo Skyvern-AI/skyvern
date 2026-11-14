@@ -28,12 +28,12 @@ import sys
 import time
 import weakref
 from collections import Counter, defaultdict, deque
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal, NamedTuple, TypeVar
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal, NamedTuple, TypedDict, TypeVar
 from urllib.parse import unquote, urlparse
 
 import structlog
@@ -160,6 +160,7 @@ from skyvern.webeye.utils.challenge_signature import (
     CHALLENGE_VENDOR_SIGNATURE,
     rendered_challenge_vendor_reading,
 )
+from skyvern.webeye.utils.dom import is_post_dispatch_click_timeout
 from skyvern.webeye.utils.flutter_semantics import (
     FLUTTER_STATE_JS,
     FLUTTER_TEXT_FIELD_JS,
@@ -884,6 +885,15 @@ def _short_surface_verdict(
     return CommitStatus.OK if len(hits) == 1 and pre is not None else CommitStatus.UNVERIFIED
 
 
+class _ObservedRow(TypedDict):
+    caption: str
+    role: str
+    list: str
+    host: str
+    # The row's list hangs directly under the live list's stamped parent.
+    beside_offers: bool
+
+
 class _TypeaheadPick(NamedTuple):
     """What one type-and-pick attempt at a typeahead established.
 
@@ -911,7 +921,7 @@ class _TypeaheadPick(NamedTuple):
     shared_surface: str | None = None
     # A removable row with the picked label that the field's container gained while the field's value did not
     # change, and whose ownership the field cannot prove: shown to the model, never a commit.
-    observed_row: dict[str, str] | None = None
+    observed_row: _ObservedRow | None = None
     # The call's final result when pressing Enter to search settled it before any row was picked.
     verdict: ToolResult | None = None
     # How the picked row names the value, and why no row was picked.
@@ -958,7 +968,9 @@ def _rows_nested_in(n: int, rows: list[dict[str, Any]]) -> list[str]:
     return nested
 
 
-def _log_committed_pick(row: str, value: str, verdict: CommitStatus, path: str, tier: Tier | None = None) -> None:
+def _log_committed_pick(
+    row: str, value: str, verdict: CommitStatus, path: str, tier: Tier | None = None, observed_row: bool = False
+) -> None:
     # Whether the clicked row IS the requested value, or the value plus one parenthesized decoration, so an
     # inexact pick can be counted apart from an exact one; `tier` is the matcher's decision, None where no tier
     # decided the row. No form values and no selector.
@@ -970,6 +982,7 @@ def _log_committed_pick(row: str, value: str, verdict: CommitStatus, path: str, 
         committed_matches_row=_exact_tier_key(row) == _exact_tier_key(value),
         row_names_value=_label_names_value(row, value),
         tier=tier.value if tier is not None else None,
+        observed_row=observed_row,
     )
 
 
@@ -1008,6 +1021,7 @@ class _ListWindow:
     eps: float
     walk_pass: int = 0
     chain: bool = True
+    viewport_bottom: float = 0.0
 
 
 def _finite(v: Any) -> float | None:
@@ -1049,17 +1063,19 @@ def _list_window(raw: Any, state: Any, *, walk_pass: int = 0, chain: bool = True
     if not isinstance(state, dict):
         return _ListWindow(rows, 0.0, 0.0, None, (), 1.0, walk_pass, chain)
     height = float(state.get("scrollHeight") or 0)
+    top = float(state.get("scrollTop") or 0)
     fillers = tuple(span for f in state.get("fillers") or [] if (span := _span(f)) is not None)
     dpr = _finite(state.get("dpr"))
     return _ListWindow(
         rows=rows,
-        scroll_top=float(state.get("scrollTop") or 0),
+        scroll_top=top,
         scroll_height=height,
         content=(float(state.get("padTop") or 0), height - float(state.get("padBottom") or 0)),
         fillers=fillers,
         eps=1 / dpr if dpr is not None and dpr > 0 else 1.0,
         walk_pass=walk_pass,
         chain=chain,
+        viewport_bottom=top + float(state.get("clientHeight") or 0),
     )
 
 
@@ -1171,6 +1187,22 @@ def _rows_tile(chain: Sequence[_ListWindow]) -> bool:
     return all(slot < limit for slot in [_slot(start, boxes[0][0]), _slot(bottom, end), *interior])
 
 
+def _visited_band_tiles(window: _ListWindow, previous: _ListWindow | None) -> bool:
+    if window.content is None:
+        return False
+    band = [previous, window] if previous is not None else [window]
+    start = (
+        min((r.box[0] for r in previous.rows if r.text and r.box is not None), default=None)
+        if previous is not None
+        else window.content[0]
+    )
+    bottom = max((r.box[1] for w in band for r in w.rows if r.text and r.box is not None), default=None)
+    if start is None or bottom is None:
+        return False
+    bottom = max(bottom, min(window.viewport_bottom, window.content[1]))
+    return _rows_tile([*band[:-1], dataclasses.replace(window, content=(start, bottom))])
+
+
 @dataclasses.dataclass(frozen=True)
 class _ListLog:
     """Every window a walk read, in order. Appending returns a new log, so no read is ever overwritten."""
@@ -1212,7 +1244,9 @@ def _log_rows(windows: Sequence[_ListWindow]) -> list[_ListRow]:
 def _first_scroll_top(windows: Sequence[_ListWindow], text: str) -> float | None:
     last = max((w.walk_pass for w in windows), default=0)
     holding = [w for w in windows if any(r.text == text for r in w.rows)]
-    return next((w.scroll_top for w in holding if w.walk_pass == last), holding[0].scroll_top if holding else None)
+    latest = [w for w in holding if w.walk_pass == last]
+    preferred = [w for w in latest if w.chain] or latest or holding
+    return preferred[0].scroll_top if preferred else None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1696,20 +1730,34 @@ _A11Y_REMOVED_JS = r"""(el) => {
   return String(hidden || '').toLowerCase() === 'true' ? 'aria-hidden' : '';
 }"""
 
-# The roles this engine treats as controls. observe enumerates exactly these (its `q` selector is
-# this list expanded) and reports them on each record, so it is the single answer to "is this a
-# control?" rather than each probe keeping its own.
-_WIDGET_ROLES_JS = (
-    "['button','checkbox','radio','combobox','option','menuitem',"
-    "'menuitemcheckbox','menuitemradio','listbox','switch','spinbutton','tab']"
+# The roles this engine treats as controls: observe's and look's selectors and the frame census are built from
+# these tuples, so they are the single answer to "is this a control?" rather than each probe keeping its own.
+_BASE_ROLES = tuple(
+    "button checkbox radio combobox option menuitem menuitemcheckbox menuitemradio listbox switch spinbutton tab".split()
 )
+# Listed after the base roles: an element only these match rides outside observe's element budget under its own cap,
+# and look marks it only after every other control.
+_ADDED_ROLES = ("link",)
+_WIDGET_ROLES = _BASE_ROLES + _ADDED_ROLES
+_WIDGET_ROLES_JS = "[" + ",".join(f"'{r}'" for r in _WIDGET_ROLES) + "]"
+
+
+def _control_selector(roles: Iterable[str]) -> str:
+    return "input,textarea,select,button,a[href]," + "".join(f"[role={r}]," for r in roles) + "[contenteditable=true]"
+
+
+_CONTROL_SEL = _control_selector(_WIDGET_ROLES)
+# The set look marks first, observe's element budget counts, and the pointer scan and the shadow caption rule judge by.
+_BASE_CONTROL_SEL = _control_selector(_BASE_ROLES)
 
 # The subset of those that can be a ROW in an opened menu. Derived rather than restated so the two
 # cannot drift. Excluded: combobox/listbox/spinbutton, which are the control or its container and
-# never one of its rows; and tab, because a probe that called a tab strip a menu of options would
-# invite a wrong move.
+# never one of its rows; tab, because a probe that called a tab strip a menu of options would
+# invite a wrong move; and link, which was never a row role.
 _MENU_ROW_ROLES_JS = (
-    "new Set(" + _WIDGET_ROLES_JS + ".filter((r) => ['combobox','listbox','spinbutton','tab'].indexOf(r) === -1))"
+    "new Set("
+    + _WIDGET_ROLES_JS
+    + ".filter((r) => ['combobox','listbox','spinbutton','tab','link'].indexOf(r) === -1))"
 )
 
 # Counts the VISIBLE menu-row descendants of a node, using the SAME row definition _FIND_MENU_JS
@@ -1850,8 +1898,8 @@ _OFF_CANVAS_JS = r"""(el, r) => {
   return true;
 }"""
 
-# Emits `root`'s semantic matches merged in document order with its "pointer roots" (named, role-less
-# elements styled cursor:pointer, the only trace a delegated click listener leaves; v1 lists them via
+# Emits `root`'s semantic matches merged in document order with its "pointer roots" (named elements `q` does not
+# match, styled cursor:pointer, the only trace a delegated click listener leaves; v1 lists them via
 # isHoverPointerElement, domUtils.js), recording each root and its name in `state.roots`. An element is
 # not a root when the reading already covers it: it is or is inside a control `listable` keeps, or its
 # pointer parent is itself a root or covered. One that holds such a control is a holder: at most one
@@ -2973,7 +3021,8 @@ _WITH_POINTER_ROOTS_JS = (
   let p = head;
   for (const el of semantic) {
     for (; p && (follows.call(p.el, el) & 4); p = p.next) emit(p.el);
-    emit(el);
+    // A [role=link] the scan made a root is emitted once, as that root.
+    if (!(p && p.el === el)) emit(el);
   }
   for (; p; p = p.next) emit(p.el);
 }"""
@@ -4710,7 +4759,7 @@ _OWN_FIELD_SCOPES_FN_JS = r"""
   // via its host, instead of stopping blind at the boundary.
   const scopeUp = (s) => {
     if (!s) return null;
-    if (s.host) {
+    if (s.nodeType === 11) {
       const h = s.host;
       if (h.parentElement) return h.parentElement;
       return h.parentNode && h.parentNode.host ? h.parentNode : null;
@@ -4798,9 +4847,6 @@ _FIELD_OWN_STATE_FN_JS = r"""
   // merely names an option ("Choose Canada", a quick pick) is an offer, not a commit.
   const CHIP_SEL = 'button,[role="button"],[class*="chip" i],[class*="pill" i],[class*="token" i],[class*="multi-value" i],[class*="multiValue" i]';
   const REMOVAL_RE = /\b(?:remove|dismiss|delete|clear|deselect|unselect)\b|^[x\u00d7\u2715\u2716\u2a2f]$/;
-  // The chip's branch under the scope it shares with the field holds no caption of its own: a sibling
-  // group's chips sit under that group's caption ("Countries lived in"), which a field-less group cannot
-  // otherwise be told apart by.
   // A component may draw its tags as options, each nesting its own remove control; an offered row nests no control.
   const nestsControl = (c) => flatQueryAll(c, 'button,[role="button"]').length > 0;
   const tagRow = (c) => c.matches('[role="option"]') && nestsControl(c);
@@ -4813,10 +4859,18 @@ _FIELD_OWN_STATE_FN_JS = r"""
     }
     return n.shadowRoot ? Array.from(n.shadowRoot.childNodes) : Array.from(n.childNodes);
   };
-  const captionFree = (scope, c) => {
+  // The first text the chip's drawn branch under the scope draws besides chips: another group's caption or the
+  // field's own ("Selected:"), which the page does not tell apart. '' is no caption; null is a climb that never
+  // reached the scope, so nothing is proven.
+  const drawnUp = (n) => (n.nodeType === 1 && n.assignedSlot) || scopeUp(n);
+  const branchCaption = (scope, c) => {
     let branch = c;
-    while (branch && scopeUp(branch) !== scope) branch = scopeUp(branch);
-    if (!branch || branch === c) return true;
+    // Termination guard.
+    for (let hops = 0; branch && drawnUp(branch) !== scope && scopeUp(branch) !== scope; hops++) {
+      branch = hops < 64 ? drawnUp(branch) : null;
+    }
+    if (!branch) return null;
+    if (branch === c) return '';
     const runs = [];
     const walk = (n, depth) => {
       if (depth > 6 || runs.length) return;
@@ -4829,7 +4883,7 @@ _FIELD_OWN_STATE_FN_JS = r"""
       }
     };
     walk(branch, 0);
-    return runs.length === 0;
+    return runs.length ? String(runs[0].nodeValue).replace(/\s+/g, ' ').trim().slice(0, 200) : '';
   };
   const idRefs = (el, attr) => {
     const root = el.getRootNode();
@@ -4868,23 +4922,42 @@ _FIELD_OWN_STATE_FN_JS = r"""
     walk(scope, 0);
     return !text;
   };
+  // Only the stamped live-list node proves a tag row is offered: a role or a page-authored label identifies no node. The
+  // before-act read stamps the live list's parent, so a row in a new list under it is reported with that relation.
+  const ROW_LIST_SEL = '[role="listbox"],[role="list"],ul,ol';
+  const listParent = (l) => (l.parentNode && l.parentNode.nodeType === 11 ? l.parentNode.host : l.parentNode);
+  const markLiveParents = (el) => {
+    pQSA('[data-tv3-liveparent]').forEach((e) => e.removeAttribute('data-tv3-liveparent'));
+    for (const scope of ownFieldScopes(el)) {
+      for (const o of flatQueryAll(scope, OFFER_TAGS)) {
+        // The live list itself, never a list that encloses it: a menu of plain divs has none.
+        const l = o.matches(ROW_LIST_SEL) ? o : composedClosest(o, ROW_LIST_SEL);
+        const box = o.closest('[data-tv3-sugglist],[data-tv3-menu]');
+        const parent = l && (!box || box.contains(l)) ? listParent(l) : null;
+        if (parent && parent.nodeType === 1) parent.setAttribute('data-tv3-liveparent', '1');
+      }
+    }
+  };
   // A tag row is a chip while it sits in the field's own container outside the live list and the field's declared list.
   const tagOption = (el, c) => tagRow(c) && !c.closest(OFFER_TAGS) && !declaredTargets(el).some((t) => pContains(t, c));
   // A chip in a root the field is not inside belongs to another component as far as the page shows.
   const inFieldRoots = (el, c) => {
-    for (let r = el.getRootNode(); r; r = r.host ? r.host.getRootNode() : null) if (r === c.getRootNode()) return true;
+    // Termination guard.
+    for (let r = el.getRootNode(), hops = 0; r && hops < 32; r = r.nodeType === 11 ? r.host.getRootNode() : null, hops++) {
+      if (r === c.getRootNode()) return true;
+    }
     return false;
   };
   // The scopes are read over the flat tree. A chip is the field's own only when it is not a tag row (a list of recent
   // picks draws the same shape), sits in one of the field's roots, and with `strict` (the pre-act no-op) passes
-  // chipProvablyOwned; the rest are rows the field's container shows, never a commit.
+  // chipProvablyOwned; the rest are rows the field's container shows, never a commit. A chip under a caption in its
+  // branch, or whose branch never reached the scope, is never owned; it keeps the caption of the nearest scope that read it.
   const chipReads = (el, strict) => {
     const found = [];
-    // A chip refused for its caption in a nearer scope stays refused where that caption is out of reach.
-    const captioned = new Set();
+    const seen = new Set();
     for (const scope of ownFieldScopes(el)) {
       for (const c of flatQueryAll(scope, CHIP_SEL + ',[role="option"]')) {
-        if (found.some((f) => f.node === c) || captioned.has(c) || !visible(c)) continue;
+        if (seen.has(c) || !visible(c)) continue;
         if (!tagOption(el, c) && (excludedFor(el, c) || offered(c)
           || c.matches('[aria-selected],[aria-pressed],[aria-checked],[aria-expanded],[type="submit" i]'))) continue;
         const runs = textRuns(c, el);
@@ -4893,22 +4966,31 @@ _FIELD_OWN_STATE_FN_JS = r"""
         let removable = runs.slice(1).some((t) => REMOVAL_RE.test(t)) || (!!aria && aria !== runs[0] && REMOVAL_RE.test(aria));
         try { removable = removable || nestsControl(c); } catch (e) { /* keep */ }
         if (!removable) continue;
-        if (!captionFree(scope, c)) { captioned.add(c); continue; }
-        const owned = !tagRow(c) && inFieldRoots(el, c) && (!strict || chipProvablyOwned(el, c));
-        found.push({ node: c, label: runs.filter((t) => !REMOVAL_RE.test(t)).join(' '), owned });
+        const label = runs.filter((t) => !REMOVAL_RE.test(t)).join(' ');
+        seen.add(c);
+        const caption = branchCaption(scope, c);
+        const owned = caption === '' && !tagRow(c) && inFieldRoots(el, c) && (!strict || chipProvablyOwned(el, c));
+        found.push({ node: c, label, owned, caption: caption || '' });
       }
     }
-    return found.filter((f) => !found.some((o) => o !== f && f.node.contains(o.node)));
+    // A captioned row inside a chip (its remove button reads the chip's text as a caption) never displaces the chip.
+    return found.filter((f) => !found.some((o) => o !== f && !o.caption && f.node.contains(o.node)));
   };
   const ownChipLabels = (el, strict) => chipReads(el, strict).filter((f) => f.owned).map((f) => f.label);
-  const observedRows = (el, want) => chipReads(el, false).filter((f) => !f.owned && f.label === want).map((f) => {
-    const list = composedClosest(f.node.parentNode || f.node, '[role="listbox"],[role="list"],ul,ol');
-    const host = (list || f.node).getRootNode().host;
+  // A row the before-act read stamped was already there; any other node with the label is new.
+  const observedRows = (el, want) => chipReads(el, false).filter((f) => !f.owned && f.label === want
+    && !f.node.hasAttribute('data-tv3-prerow')).map((f) => {
+    const list = composedClosest(f.node.parentNode || f.node, ROW_LIST_SEL);
+    const root = (list || f.node).getRootNode();
+    const host = root.nodeType === 11 ? root.host : null;
+    const parent = list ? listParent(list) : null;
     return {
-      text: f.label,
+      caption: f.caption,
       role: f.node.getAttribute('role') || f.node.localName,
       list: list ? ownNrm(list.getAttribute('aria-label')) : '',
       host: host ? host.localName : '',
+      beside_offers: !!parent && parent.nodeType === 1 && parent.hasAttribute('data-tv3-liveparent')
+        && !list.querySelector(OFFER_TAGS) && !list.closest(OFFER_TAGS),
     };
   });
   const anchorHolds = (el, want, anyState) => {
@@ -4976,8 +5058,10 @@ _SEMANTIC_COMMIT_STATE_JS = (
   }
   if (arg.baseline === true) {
     if (!el || !want) return null;
-    // 'row': an exact-label row the field cannot prove its own was already there, so a later one is not new.
-    return fieldOwnSources(el, want, true).concat(observedRows(el, want).length ? ['row'] : []);
+    markLiveParents(el);
+    pQSA('[data-tv3-prerow]').forEach((e) => e.removeAttribute('data-tv3-prerow'));
+    for (const f of chipReads(el, false)) if (!f.owned && f.label === want) f.node.setAttribute('data-tv3-prerow', '1');
+    return fieldOwnSources(el, want, true);
   }
   if (!el || !want) return { committed: false };
   if (el.tagName === 'SELECT') return { committed: false };
@@ -5571,7 +5655,6 @@ _LOOK_ENUM_JS = (
   const _roots = """
     + _SHADOW_ROOTS_JS
     + r""";
-  const q = 'input,textarea,select,button,a[href],[role=button],[role=checkbox],[role=radio],[role=combobox],[role=option],[role=menuitem],[role=menuitemcheckbox],[role=menuitemradio],[role=listbox],[role=switch],[role=spinbutton],[role=tab],[contenteditable=true]';
   const _shownText = """
     + _SHOWN_TEXT_JS
     + r""";
@@ -5586,7 +5669,12 @@ _LOOK_ENUM_JS = (
   let truncated = false;
   let showsTotal = 0;
   let showsOmitted = 0;
-  for (const root of _roots(document)) {
+  // Every other control takes the marks first; an element only an added role matches fills what is left.
+  marking: for (const q of ['"""
+    + _BASE_CONTROL_SEL
+    + "', '"
+    + ",".join(f"[role={r}]" for r in _ADDED_ROLES)
+    + r"""']) for (const root of _roots(document)) {
     let els;
     try { els = root.querySelectorAll(q); } catch (e) { continue; }
     for (const el of els) {
@@ -5643,7 +5731,7 @@ _LOOK_ENUM_JS = (
     + r"""; } else if (shows) showsOmitted++;
       out.push(rec);
     }
-    if (truncated) break;
+    if (truncated) break marking;
   }
   return { vw, vh, truncated, showsOmitted, elements: out };
 })()"""
@@ -7311,9 +7399,8 @@ _TYPE_TARGET_PROBE_JS = (
     const allControls = [];
     // observe() never mints data-tv3 inside a component, so a marker-shaped selector below can only
     // ever come from the light DOM -- a shadow-piercing find here does not risk minting a fresh one.
-    // The role list mirrors observe()'s own _WIDGET_ROLES answer to "is this a control?" (minus the
-    // form-field roles observe treats as fillable, not actionable), so a consent switch or a
-    // role=menuitem Close action is not omitted just because it isn't a <button>.
+    // The role list is observe()'s base roles (_BASE_ROLES; its added role=link is not in it), so a
+    // consent switch or a role=menuitem Close action is not omitted just because it isn't a <button>.
     const controlSel = 'button,a[href],input[type="button"],input[type="submit"],input[type="image"],'
       + 'input[type="reset"],[role="button"],'
       + '[role="checkbox"],[role="radio"],[role="combobox"],[role="option"],[role="menuitem"],'
@@ -7913,6 +8000,30 @@ _ENTRY_VARIANT_TYPES = frozenset(
 _FIELD_VALUE_IS_SECRET_JS = (
     "(el) => {" + OTP_INPUT_PRIVACY_JS + "return el.type === 'password' || isOtpInputValueSecret(el);}"
 )
+
+# A jQuery UI datepicker attached to the field declares the format and names it reads, and its own parser says whether
+# the field's value is a date in that format. Null for a field without one.
+_DATEPICKER_READING_JS = r"""(el) => {
+  const $ = el.ownerDocument.defaultView.jQuery;
+  if (!$ || !$.datepicker || !el.classList.contains('hasDatepicker')) return null;
+  let format, settings;
+  try {
+    const option = (name) => $(el).datepicker('option', name);
+    format = option('dateFormat');
+    // The parser and formatter fall back to the page-wide defaults for any setting not passed, so a picker with its
+    // own month or day names would be read in another language.
+    settings = {};
+    for (const name of ['shortYearCutoff', 'dayNamesShort', 'dayNames', 'monthNamesShort', 'monthNames']) {
+      settings[name] = option(name);
+    }
+  } catch (e) { return null; }
+  if (typeof format !== 'string' || !format) return null;
+  let reads;
+  try { reads = $.datepicker.parseDate(format, el.value, settings) !== null; } catch (e) { reads = false; }
+  let example = null;
+  try { example = $.datepicker.formatDate(format, new Date(2026, 0, 31), settings); } catch (e) {}
+  return {format: format, reads: reads, example: example};
+}"""
 
 
 # The element focus actually went to -- followed into shadow roots -- when it takes typed text and sits at
@@ -8763,6 +8874,7 @@ _CLICK_SAME_DOC_PLANT_JS = """() => {
 }"""
 _CLICK_SAME_DOC_CHECK_JS = "() => window.__tv3_click_same === 1"
 _CLICK_SEEN_CHECK_JS = "() => window.__tv3_click_seen === 1"
+_NAVIGATION_WAIT_LOG_LINE = "- waiting for scheduled navigations to finish"
 
 
 async def _note_click_dispatch(page: Any, *, marker_armed: bool) -> None:
@@ -8774,6 +8886,16 @@ async def _note_click_dispatch(page: Any, *, marker_armed: bool) -> None:
         seen = True
     if seen:
         record_click_dispatched()
+
+
+async def _document_replaced(realm: input_dispatch.Realm) -> bool:
+    # A read made while the new document commits raises (its context is destroyed), so one more read follows it.
+    for _ in range(2):
+        try:
+            return not await realm.evaluate(_CLICK_SAME_DOC_CHECK_JS)
+        except Exception:
+            continue
+    return False
 
 
 async def _act_token(handle: Any) -> str | None:
@@ -9622,16 +9744,16 @@ _LIST_POLL_HARD_S = 8.0
 _MENU_WINDOW_FINGERPRINT_JS = (
     r"""() => {"""
     + _PIERCED_QUERY_JS
+    + _LIST_BOX_JS
     + r"""
   const sc = pQS('[data-tv3-menu-scroller]');
   if (!sc) return null;
   // querySelector cannot see a row inside a component's shadow root, and a fingerprint that never
   // changes makes every window pay the full settle instead of reading as soon as it re-rendered.
-  const scTop = sc.getBoundingClientRect().top;
   let best = null;
   for (const row of pQSA('[role="option"],[role="menuitem"],[role="menuitemradio"],[role="treeitem"],li')) {
-    if (row === sc || !pContains(sc, row)) continue;
-    const pos = Math.round(row.getBoundingClientRect().top - scTop + sc.scrollTop);
+    if (row === sc || !pContains(sc, row) || pinned(row, sc)) continue;
+    const pos = Math.round(contentBox(row, sc)[0]);
     if (!best || pos < best.pos) best = { row, pos };
   }
   if (!best) return '';
@@ -9657,13 +9779,13 @@ _MENU_SCROLLER_STEP_JS = (
     .map((s) => contentBox(s, el))
     .filter((b) => b[1] > b[0]);
   const cs = getComputedStyle(el);
-  // A CSS animation or transition running on the scroller, inside it or above it moves the boxes a read takes.
   let moving = true;
   try {
-    moving = document.getAnimations().some((a) => {
+    const animations = document.getAnimations().filter((a) => {
       const t = a.playState === 'running' && a.effect ? a.effect.target : null;
       return !!t && (pContains(el, t) || pContains(t, el));
     });
+    moving = animations.length > 0;
   } catch (e) { moving = true; }
   return {
     moving,
@@ -10829,10 +10951,11 @@ async (__tv3TextArgs) => {
     + r""";
   // [role=textbox] is deliberately absent: on a div without contenteditable it names a control that
   // cannot be filled, and the ones that can are already matched by [contenteditable=true].
-  const _WIDGET_ROLES = """
-    + _WIDGET_ROLES_JS
-    + r""";
-  const q = 'input,textarea,select,button,a[href],[role=button],[role=checkbox],[role=radio],[role=combobox],[role=option],[role=menuitem],[role=menuitemcheckbox],[role=menuitemradio],[role=listbox],[role=switch],[role=spinbutton],[role=tab],[contenteditable=true]';
+  const _WIDGET_ROLES = __OBSERVE_WIDGET_ROLES__;
+  // The pointer scan and the shadow caption rule judge an added role as before it was listed, so a pointer-cursor
+  // role=link stays a pointer root (named by its graphic, an icon) and never hides another control's name.
+  const _qBase = '__OBSERVE_BASE_SEL__';
+  const q = '__OBSERVE_CONTROL_SEL__';
   // Set wherever we learn that some region of the page cannot be read. Declared here because the
   // walk below is one of those places and it runs before the marker gather.
   let sawUnreadableRoot = false;
@@ -10995,6 +11118,10 @@ async (__tv3TextArgs) => {
   // selector that names them). Telemetry only.
   let pointerDropped = 0;
   let semanticListed = 0;
+  // An element only an added role matches rides outside the budget under the pointer roots' cap, so it never costs
+  // the page a control.
+  let addedListed = 0;
+  let addedCapped = 0;
   // Roots whose host chain reaches a <form>. `closest` stops at the root it starts in, so a block
   // inside a component cannot see the form its host sits in; this is that answer, carried down.
   const inFormRoots = new Set();
@@ -11009,7 +11136,7 @@ async (__tv3TextArgs) => {
       // to a SECOND overridable entry point for the same outcome.
       // Pointer roots are merged at their document position, not appended: a page past the element
       // budget would otherwise never reach a header trigger that sits above its listing.
-      _withPointerRoots(root, q, root.querySelectorAll(q), _pointerState, (el) => { els.push({ el, host }); }, _screenListable);
+      _withPointerRoots(root, _qBase, root.querySelectorAll(q), _pointerState, (el) => { els.push({ el, host }); }, _screenListable);
       for (const el of root.querySelectorAll('*')) {
        // Same clobbering hazard as the element loop below, and this walk runs before it: a form's
        // named getter can turn any read here into a foreign object, so one element pays for itself.
@@ -11094,6 +11221,9 @@ async (__tv3TextArgs) => {
       const tag = String(el.tagName || '').toLowerCase();
       if (tag === 'button' || tag === 'a' || tag === 'summary') return true;
       if (tag === 'input' && /^(?:submit|button|reset|image)$/.test(String(el.type || ''))) return true;
+      // `_attr` is not defined in this script, so the role test below always throws into the catch; this line is what
+      // lets a role=link count as a command.
+      if (Element.prototype.getAttribute.call(el, 'role') === 'link') return true;
       const role = String(_attr(el, 'role') || '').trim().toLowerCase();
       return /^(?:button|link|tab|menuitem|menuitemcheckbox|menuitemradio)$/.test(role);
     } catch (e) { return false; }
@@ -11669,7 +11799,7 @@ async (__tv3TextArgs) => {
     try { root = Node.prototype.getRootNode.call(el); } catch (e) { return ''; }
     if (!root || root.nodeType !== 11) return '';
     let peers;
-    try { peers = root.querySelectorAll(q); } catch (e) { return ''; }
+    try { peers = root.querySelectorAll(el.getAttribute('role') === 'link' && !_pointerState.roots.has(el) ? q : _qBase); } catch (e) { return ''; }
     if (peers.length !== 1 || peers[0] !== el) return '';
     // Only a host whose light DOM is bare text is a caption; a card slotting headings and a body
     // beside its one icon button would otherwise hand that button the whole card as its name.
@@ -11901,12 +12031,12 @@ async (__tv3TextArgs) => {
   // Icon controls get only the budget every semantic candidate leaves over, so listing one never cuts a control.
   // Screening every candidate is paid only when the raw count and the icons together could fill the budget.
   let controlCount = 0;
-  for (const e of els) if (!_pointerState.roots.has(e.el)) controlCount++;
+  for (const e of els) if (!_pointerState.roots.has(e.el) && _matches.call(e.el, _qBase)) controlCount++;
   if (_pointerState.iconCount > 0 && controlCount + _pointerState.iconCount > 250) {
     controlCount = 0;
     let hiddenCounted = 0;
     for (const e of els) {
-      if (_pointerState.roots.has(e.el)) continue;
+      if (_pointerState.roots.has(e.el) || !_matches.call(e.el, _qBase)) continue;
       let screened = null;
       try { screened = _screen(e.el, false); } catch (err) { screened = null; }
       if (!screened || screened.why !== null) continue;
@@ -11936,6 +12066,7 @@ async (__tv3TextArgs) => {
     pointerRoot = _pointerState.roots.has(el) && !iconRoot;
     const extraRoot = pointerRoot && _pointerState.extra.has(el);
     if (pointerRoot && !_pointerState.held.has(el) && !extraRoot) pointerReserved--;
+    const addedRole = !pointerRoot && !iconRoot && !_matches.call(el, _qBase);
     const screened = _screen(el, pointerRoot);
     const { r, gr, gateEl, ownGated } = screened;
     if (screened.why === 'offCanvas') { hiddenDropped++; hiddenDroppedOffCanvas++; continue; }
@@ -12008,6 +12139,7 @@ async (__tv3TextArgs) => {
     // Main never listed these anchors, so one past its budget is not a cut the cap note reports.
     if (extraRoot && extraListed >= _POINTER_ROOT_CAP) continue;
     if (!extraRoot && pointerRoot && pointerListed + (_pointerState.held.has(el) ? pointerReserved : 0) >= _POINTER_ROOT_CAP) { pointerCapped++; continue; }
+    if (addedRole && addedListed >= _POINTER_ROOT_CAP) { addedCapped++; continue; }
     let selector = naturalSelector(el);
     let bind = '';
     if (!selector) {
@@ -12059,6 +12191,7 @@ async (__tv3TextArgs) => {
     const rec = { i, tag: el.tagName.toLowerCase(), type: (_typed && el.type) || null, selector, label: label.slice(0, _RETAIN_WIDTH) };
     if (bind) rec.bind = bind;
     if (pointerRoot) rec.pointerRoot = true;
+    if (addedRole) rec.addedRole = true;
     if (iconRoot) rec.icon = true;
     if (pointerRoot && _pointerState.held.has(el)) rec.pointerHeld = true;
     if (extraRoot) rec.pointerExtra = true;
@@ -12207,12 +12340,13 @@ async (__tv3TextArgs) => {
     if (extraRoot) extraListed++;
     else if (pointerRoot) pointerListed++;
     if (iconRoot) iconsListed++;
+    if (addedRole) addedListed++;
     elOfRec.set(rec, el);
     stampOfRec.set(rec, { fp: fingerprint(el), anchor: lastAnchor && lastAnchor.sel === selector ? lastAnchor : null });
     i++;
     // Pointer roots ride outside the budget (they have their own cap), so listing one never costs
     // the page a semantic control.
-    if (!pointerRoot && !iconRoot && ++semanticListed > 250) {
+    if (!pointerRoot && !iconRoot && !addedRole && ++semanticListed > 250) {
       // Count what the budget actually cost, not what is left in the array: a zero-size match would
       // have been skipped anyway, and counting it overstates the loss on any page carrying a hidden
       // dialog. Shadow matches are tallied separately because they are appended last and are
@@ -12228,6 +12362,7 @@ async (__tv3TextArgs) => {
             else pointerCapped++;
             continue;
           }
+          if (!_matches.call(els[k].el, _qBase)) { addedCapped++; continue; }
           truncated++;
           if (els[k].host) truncatedInComponents++;
           if (_inOpenModal(els[k].el)) modalTruncated++;
@@ -12695,7 +12830,9 @@ async (__tv3TextArgs) => {
   // Covers at least the scanner's own `q` set, since an undercount reads as "decorative" and
   // argues against the fix this justifies. Hidden and disabled controls are excluded: a CSRF
   // input is not actionable.
-  const INTERACTIVE_SEL = ':is(a[href],button,input:not([type="hidden" i]),select,textarea,[role=button],[role=option],[role=combobox],[role=checkbox],[role=radio],[role=tab],[role=menuitem],[role=menuitemcheckbox],[role=menuitemradio],[role=listbox],[role=switch],[role=spinbutton],[contenteditable=""],[contenteditable="true"]):not(:disabled):not([aria-disabled="true" i])';
+  const INTERACTIVE_SEL = ':is(a[href],button,input:not([type="hidden" i]),select,textarea,"""
+    + "".join(f"[role={r}]," for r in _WIDGET_ROLES)
+    + r"""[contenteditable=""],[contenteditable="true"]):not(:disabled):not([aria-disabled="true" i])';
   try {
     const sig = /"""
     + CHALLENGE_VENDOR_SIGNATURE
@@ -12858,7 +12995,7 @@ async (__tv3TextArgs) => {
   } catch (e) { /* a count the page broke is not worth the reading */ }
   let readyState = '';
   try { readyState = String(_getter(Document.prototype, 'readyState').call(document)); } catch (e) { readyState = ''; }
-  const payload = _ownStringify({ textDelta: textDelta, refsFresh: refsFresh, unnamedNotIcon: _pointerState.notIcon, flutter: __OBSERVE_FLUTTER__, url: location.href, title: document.title, text: texts, textFull: texts.map((t) => { const f = fullText.get(t); return f && f !== t ? f : null; }), textTruncated: textFull, textDropped: textDropped, iframes: iframeInfo, frameCensus: frameCensus, dropped: dropped, truncated: truncated, iconsTruncated: iconsTruncated + _pointerState.iconOverflow, truncatedInComponents: truncatedInComponents, pointerCapped: pointerCapped, pointerTruncated: pointerTruncated, pointerDropped: pointerDropped, pointerListed: pointerListed, pointerScanStopped: _pointerState.scanStopped ? 1 : 0, pointerScanFailed: _pointerState.scanFailed ? 1 : 0, unreadableRoot: sawUnreadableRoot, undiscoveredRoots: undiscoveredRoots, rootCount: allRoots.length - 1, hiddenListed: hiddenListed, hiddenDropped: hiddenDropped, hiddenDroppedOffCanvas: hiddenDroppedOffCanvas, hiddenDroppedVisibility: hiddenDroppedVisibility, hiddenDroppedZeroRect: hiddenDroppedZeroRect, hiddenDroppedOffViewport: hiddenDroppedOffViewport, offViewportUnreachableUnnamed: offViewportUnreachableUnnamed, offViewportUnnamedHostExempt: offViewportUnnamedHostExempt, phantomDropped: phantomDropped, markersMinted: markersWritten, markersReused: markersReused, pageMutated: mutated, modalOpen: modalOpen, modalListed: modalListed, modalTruncated: modalTruncated, readyState: readyState, elements: out });
+  const payload = _ownStringify({ textDelta: textDelta, refsFresh: refsFresh, unnamedNotIcon: _pointerState.notIcon, flutter: __OBSERVE_FLUTTER__, url: location.href, title: document.title, text: texts, textFull: texts.map((t) => { const f = fullText.get(t); return f && f !== t ? f : null; }), textTruncated: textFull, textDropped: textDropped, iframes: iframeInfo, frameCensus: frameCensus, dropped: dropped, truncated: truncated, iconsTruncated: iconsTruncated + _pointerState.iconOverflow, truncatedInComponents: truncatedInComponents, addedCapped: addedCapped, pointerCapped: pointerCapped, pointerTruncated: pointerTruncated, pointerDropped: pointerDropped, pointerListed: pointerListed, pointerScanStopped: _pointerState.scanStopped ? 1 : 0, pointerScanFailed: _pointerState.scanFailed ? 1 : 0, unreadableRoot: sawUnreadableRoot, undiscoveredRoots: undiscoveredRoots, rootCount: allRoots.length - 1, hiddenListed: hiddenListed, hiddenDropped: hiddenDropped, hiddenDroppedOffCanvas: hiddenDroppedOffCanvas, hiddenDroppedVisibility: hiddenDroppedVisibility, hiddenDroppedZeroRect: hiddenDroppedZeroRect, hiddenDroppedOffViewport: hiddenDroppedOffViewport, offViewportUnreachableUnnamed: offViewportUnreachableUnnamed, offViewportUnnamedHostExempt: offViewportUnnamedHostExempt, phantomDropped: phantomDropped, markersMinted: markersWritten, markersReused: markersReused, pageMutated: mutated, modalOpen: modalOpen, modalListed: modalListed, modalTruncated: modalTruncated, readyState: readyState, elements: out });
   return __OBSERVE_RETURN__;
 }
 """
@@ -12870,8 +13007,12 @@ def _observe_js_returning(expression: str, retain_width: int) -> str:
     # cannot be targeted by a page that poisoned Object.prototype before this script ran, because the
     # name did not exist then. Same principle as the act token.
     key = f'"__tv3el_{secrets.token_hex(8)}"'
+    roles = _BASE_ROLES + _ADDED_ROLES
     return (
         _OBSERVE_JS_TEMPLATE.replace("__OBSERVE_RETAIN_WIDTH__", str(int(retain_width)), 1)
+        .replace("__OBSERVE_WIDGET_ROLES__", json.dumps(roles), 1)
+        .replace("__OBSERVE_BASE_SEL__", _control_selector(_BASE_ROLES), 1)
+        .replace("__OBSERVE_CONTROL_SEL__", _control_selector(roles), 1)
         .replace("__OBSERVE_RETURN__", expression, 1)
         .replace("__OBSERVE_EL_KEY__", key)
         .replace("__OBSERVE_TEXT_DELTA__", _OBSERVE_TEXT_DELTA_JS, 1)
@@ -14215,6 +14356,7 @@ _OBSERVE_SUMMED_KEYS = (
     "truncatedInComponents",
     "pointerCapped",
     "pointerTruncated",
+    "addedCapped",
     "pointerDropped",
     "pointerListed",
     "pointerScanStopped",
@@ -14254,6 +14396,10 @@ OBSERVE_MERGED_TEXT_MAX = 12
 OBSERVE_MERGED_ELEMENT_MAX = 250
 
 
+def _counts_against_element_budget(e: Mapping[str, Any]) -> bool:
+    return not (e.get("pointerRoot") or e.get("icon") or e.get("addedRole"))
+
+
 def _iframe_reach_clause(observation: _Observation) -> str:
     """What the tools can do with this page's frames, as of this reading.
 
@@ -14278,7 +14424,8 @@ def _merge_realm(into: dict[str, Any], other: dict[str, Any]) -> list[int]:
     incoming = other.get("elements") or []
     # Pointer roots ride outside the element budget here as in each realm, under their own cap applied
     # page-wide, so neither limit ever costs the other kind a place.
-    room = max(0, OBSERVE_MERGED_ELEMENT_MAX - sum(1 for e in elements if not (e.get("pointerRoot") or e.get("icon"))))
+    room = max(0, OBSERVE_MERGED_ELEMENT_MAX - sum(map(_counts_against_element_budget, elements)))
+    link_room = max(0, OBSERVE_POINTER_ROOT_CAP - sum(1 for e in elements if e.get("addedRole")))
     pointer_room = max(
         0,
         OBSERVE_POINTER_ROOT_CAP
@@ -14286,10 +14433,16 @@ def _merge_realm(into: dict[str, Any], other: dict[str, Any]) -> list[int]:
     )
     kept: list[int] = []
     pointer_over_cap = 0
+    link_over_cap = 0
     over_page_cap = 0
     for i, e in enumerate(incoming):
         if e.get("pointerHeld") or e.get("pointerExtra") or e.get("icon"):
             pass  # Ranked page-wide by _rank_held_pointer_roots_last once every realm is merged.
+        elif e.get("addedRole"):
+            if link_room == 0:
+                link_over_cap += 1
+                continue
+            link_room -= 1
         elif e.get("pointerRoot"):
             if pointer_room == 0:
                 pointer_over_cap += 1
@@ -14322,6 +14475,7 @@ def _merge_realm(into: dict[str, Any], other: dict[str, Any]) -> list[int]:
         into[key] = int(into.get(key) or 0) + int(other.get(key) or 0)
     into["textDropped"] = int(into.get("textDropped") or 0) + dropped_by_cap
     into["pointerCapped"] = int(into.get("pointerCapped") or 0) + pointer_over_cap
+    into["addedCapped"] = int(into.get("addedCapped") or 0) + link_over_cap
     into["pointerListed"] = int(into.get("pointerListed") or 0) - pointer_over_cap
     for key in _OBSERVE_ANY_KEYS:
         into[key] = bool(into.get(key)) or bool(other.get(key))
@@ -14338,7 +14492,7 @@ def _rank_held_pointer_roots_last(data: dict[str, Any]) -> list[int]:
         1 for e in elements if e.get("pointerRoot") and not (e.get("pointerHeld") or e.get("pointerExtra"))
     )
     extra_room = OBSERVE_POINTER_ROOT_CAP
-    icon_room = OBSERVE_MERGED_ELEMENT_MAX - sum(1 for e in elements if not (e.get("pointerRoot") or e.get("icon")))
+    icon_room = OBSERVE_MERGED_ELEMENT_MAX - sum(map(_counts_against_element_budget, elements))
     kept: list[int] = []
     held_over = 0
     icons_over = 0
@@ -14459,6 +14613,7 @@ def build_browser_tools(
     unseen_text: UnseenPageText | None = None,
     download_failures: DownloadFailureWatch | None = None,
     download_wait: Callable[[], Awaitable[None]] | None = None,
+    recover_page: Callable[[Any], Awaitable[bool | None]] | None = None,
 ) -> list[ToolSpec]:
     """Raw-browser tools that resolve their page from `page_provider` on every call.
 
@@ -15220,12 +15375,20 @@ def build_browser_tools(
                 note += f", {in_components} of them inside components"
             note += "; get_html shows them, and click, type and select_option take a selector"
             lines.append(note)
+        if link_capped := int(data.get("addedCapped") or 0):
+            lines.append(
+                f"note: {link_capped} more [role=link] element(s) are not listed: they exceeded the cap of "
+                f"{OBSERVE_POINTER_ROOT_CAP} such elements or came after the element budget; get_html shows them, "
+                "and click, type and select_option take a selector"
+            )
         pointer_capped = int(data.get("pointerCapped") or 0)
         pointer_truncated = int(data.get("pointerTruncated") or 0)
         pointer_scan_stopped = bool(data.get("pointerScanStopped"))
         if pointer_capped or pointer_truncated or pointer_scan_stopped:
-            # Role-less pointer-styled elements are listed under their own cap, outside the element
-            # budget; what either limit starved is stated like every other cap here.
+            # Pointer-styled elements no other selector lists, and pointer-cursor role=link ones, are listed under
+            # their own cap, outside the element budget; what either limit starved is stated like every other cap here.
+            # Only an added role can sit on a pointer root, and it is named only when a listed one carries it.
+            roles = ", or with role=link," if any(e.get("pointerRoot") and e.get("role") for e in elements) else ""
             why = []
             if pointer_capped:
                 why.append(f"{pointer_capped} exceeded the cap of {OBSERVE_POINTER_ROOT_CAP} such elements")
@@ -15236,7 +15399,8 @@ def build_browser_tools(
             unlisted = pointer_capped + pointer_truncated
             count = f"{unlisted}{'+' if pointer_scan_stopped else ''} " if unlisted else ""
             lines.append(
-                f"note: {count}more pointer-styled element(s) without a control role are not listed: {'; '.join(why)}"
+                f"note: {count}more pointer-styled element(s) without a control role{roles} are not listed: "
+                f"{'; '.join(why)}"
             )
 
         bodies: list[str] = []
@@ -15255,19 +15419,21 @@ def build_browser_tools(
 
         shows_left = SHOWN_TEXT_TOTAL_CAP
         shows_omitted = 0
+        shows_parts: dict[int, str] = {}
+        # Charged at its printed width, escapes included; once one is left off, every later one is too, so the note's
+        # count is a tail. Added-role records come last, so they never cost another control its shows=.
+        for idx in sorted(range(len(elements)), key=lambda i: bool(elements[i].get("addedRole"))):
+            if elements[idx].get("shows"):
+                shows_part = f" shows={_field(elements[idx]['shows'], OBSERVE_DISPLAY_WIDTHS['label'])}"
+                if not shows_omitted and len(shows_part) <= shows_left:
+                    shows_left -= len(shows_part)
+                    shows_parts[idx] = shows_part
+                else:
+                    shows_omitted += 1
         to_left = LINK_DESTINATION_TOTAL_CAP
         to_omitted = 0
         for _render_idx, e in enumerate(elements):
-            extra = ""
-            if e.get("shows"):
-                # Charged at its printed width, escapes included; once one is left off, every later one
-                # is too, so the note's count is a tail and not a scatter.
-                shows_part = f" shows={_field(e['shows'], OBSERVE_DISPLAY_WIDTHS['label'])}"
-                if not shows_omitted and len(shows_part) <= shows_left:
-                    shows_left -= len(shows_part)
-                    extra += shows_part
-                else:
-                    shows_omitted += 1
+            extra = shows_parts.get(_render_idx, "")
             if e.get("to") and _link_destination_adds(str(e["to"]), str(e.get("label", ""))):
                 to_part = f" to={_field(e['to'], LINK_DESTINATION_MAX)}"
                 # As with shows=, once one is left off every later one is too, so the note's count is a tail.
@@ -15466,7 +15632,9 @@ def build_browser_tools(
             # report being truncated: a truncated digest is a SUCCESS. `elements_listed` is the
             # denominator the cap-hit rate needs, so it rides every observe, truncating or not.
             # Semantic controls only, so the rate keeps its denominator; pointer roots are counted apart.
-            "elements_listed": sum(1 for e in elements if not (e.get("pointerRoot") or e.get("icon"))),
+            "elements_listed": sum(map(_counts_against_element_budget, elements)),
+            "links_listed": sum(1 for e in elements if e.get("addedRole")),
+            "link_capped": int(data.get("addedCapped") or 0),
             "icons_listed": sum(1 for e in elements if e.get("icon")),
             # Icons the budget left over cut, apart from `elements_truncated`, whose denominator leaves icons out.
             "icons_truncated": int(data.get("iconsTruncated") or 0),
@@ -15497,7 +15665,7 @@ def build_browser_tools(
             # The main document's load state when `elements_listed` is 0: 1 loading, 2 interactive, 3 complete,
             # 4 unreadable, else 0. An int because the record keeps only ints.
             "ready_state_when_empty": 0
-            if any(not (e.get("pointerRoot") or e.get("icon")) for e in elements)
+            if any(map(_counts_against_element_budget, elements))
             else _READY_STATE_CODES.get(str(data.get("readyState") or ""), 4),
         }
         # Mask the whole rendered payload, not just url=: a signed payload ref can surface as page
@@ -17368,6 +17536,7 @@ def build_browser_tools(
             except Exception:
                 checked_before = None
 
+        document_replaced = False
         if skinned and label_click:
             if _acted_realm:
                 # The coordinates come from a getBoundingClientRect inside the element's own realm, so
@@ -17411,10 +17580,25 @@ def build_browser_tools(
                 marker_armed = False
             click_path = "locator"
             try:
-                # With label_over_control the probe already answered: the only thing "over" this control is
-                # its own label (slotted, or a sibling for=id), which the driver's containment check would
-                # wait 15s to reject.
-                click_path = await _click_marker(page, selector, force=bool(label_over_control))
+                try:
+                    # With label_over_control the probe already answered: the only thing "over" this control is
+                    # its own label (slotted, or a sibling for=id), which the driver's containment check would
+                    # wait 15s to reject.
+                    click_path = await _click_marker(page, selector, force=bool(label_over_control))
+                except Exception as wait_exc:
+                    # A press whose navigation (a slow form POST) outlasts the driver's wait landed if the document
+                    # was replaced, as v1's click chain reports it. The call log quotes page text, so only the
+                    # driver's own line counts, split on "\n" alone: page text can carry other line breaks.
+                    waited = _NAVIGATION_WAIT_LOG_LINE in (line.strip() for line in str(wait_exc).split("\n"))
+                    if not (
+                        marker_armed
+                        and waited
+                        and is_post_dispatch_click_timeout(wait_exc)
+                        and await _document_replaced(page)
+                    ):
+                        raise
+                    click_path = "navigated"
+                    document_replaced = True
             except Exception as e:
                 await _note_click_dispatch(page, marker_armed=marker_armed)
                 gone = False
@@ -17503,6 +17687,8 @@ def build_browser_tools(
                     error_class="stale_selector",
                 )
             base = f"clicked {selector} — now at {await _url(page)}"
+            if document_replaced:
+                base += f" — {_navigated_phrase()}"
 
         # url_after vs url_before is the real page-transition signal the shadow net-progress ledger
         # reads (loop.py _ProgressLedger). Surfaced, not newly computed: _url is the page.url property,
@@ -17522,6 +17708,9 @@ def build_browser_tools(
             "url_before": page_url_before,
             CLICK_DISPATCHED_DATA_KEY: True,
         }
+        if document_replaced:
+            # A form posting back to its own URL replaces the document without moving the URL.
+            transition_data["page_state_changed"] = True
         if page_url_before and page_url_after and page_url_after != page_url_before:
             # Click-driven transitions feed the same visited-URL ring navigate reads, so a later
             # navigate back to a click-reached page is classified as a revisit, not fresh territory.
@@ -17540,7 +17729,7 @@ def build_browser_tools(
             and bool(skin_probe.get("radio"))
             and checked_before is True
         )
-        if (skinned or verify_toggle or toggle) and not already_checked_radio:
+        if (skinned or verify_toggle or toggle) and not already_checked_radio and not document_replaced:
             try:
                 checked_after = await _probe_evaluate(
                     page, _CHECKBOX_CHECKED_JS, selector, await _probe_arg(page, selector)
@@ -18147,8 +18336,8 @@ def build_browser_tools(
             return None
         return [str(c) for c in chips if isinstance(c, str)] if isinstance(chips, list) else None
 
-    async def _observed_row(page: Any, selector: str, label: str, pre_held: list[str] | None) -> dict[str, str] | None:
-        if pre_held is None or "row" in pre_held:
+    async def _observed_row(page: Any, selector: str, label: str, pre_held: list[str] | None) -> _ObservedRow | None:
+        if pre_held is None:
             return None
         try:
             rows = await page.evaluate(_OWN_CHIPS_JS, {**(await _probe_arg(page, selector)), "observe": label})
@@ -18156,7 +18345,14 @@ def build_browser_tools(
             return None
         if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
             return None
-        return {k: str(rows[0].get(k) or "") for k in ("text", "role", "list", "host")}
+        r = rows[0]
+        return _ObservedRow(
+            caption=str(r.get("caption") or ""),
+            role=str(r.get("role") or ""),
+            list=str(r.get("list") or ""),
+            host=str(r.get("host") or ""),
+            beside_offers=r.get("beside_offers") is True,
+        )
 
     async def _holds_own_chips(page: Any, selector: str) -> bool:
         return bool(await _own_chip_labels(page, selector))
@@ -21334,7 +21530,24 @@ def build_browser_tools(
             held = await _read_field_value(page, selector)
             match = compare_text(text, held, before, exact=exact)
         shown = _masked_echo(held) if held is not None and not exact else None
-        return entry_outcome(selector, match, shown=shown)
+        result = entry_outcome(selector, match, shown=shown)
+        if held and not exact and match in (EntryMatch.REFORMATTED, EntryMatch.DIFFERENT):
+            # A datepicker's keystroke filter can drop what its format does not use ("11/05/2026" -> "11052026"). Its
+            # parser's verdict is evidence for the model, not a guard: held_as stays ok, so a queued submit or Enter runs.
+            try:
+                reading = await page.locator(selector).first.evaluate(_DATEPICKER_READING_JS, timeout=2000)
+            except Exception:
+                reading = None
+            if reading and not reading.get("reads"):
+                example = reading.get("example")
+                written_as = f" (31 January 2026 is written {example!r})" if example else ""
+                result = dataclasses.replace(
+                    result,
+                    content=f"{result.content} The field is a date picker that reads dates as "
+                    f"{reading.get('format')!r}{written_as}, and its own parser cannot read {_masked_echo(held)!r} "
+                    "as a date.",
+                )
+        return result
 
     async def _value_changed_by_page_error(
         page: Any, selector: str, typed: str, held: str, *, echo: bool
@@ -21521,7 +21734,9 @@ def build_browser_tools(
                     error_class="click_failed",
                 )
             verdict, matches = await _typeahead_commit_verdict(page, selector, pick.committed, pick.readable)
-            _log_committed_pick(pick.suggestion, text, verdict, "type", pick.tier)
+            _log_committed_pick(
+                pick.suggestion, text, verdict, "type", pick.tier, bool(pick.observed_row and not pick.committed)
+            )
             if verdict is CommitStatus.OK:
                 if pick.declared:
                     closed = await _close_lingering_typeahead_list(
@@ -21538,7 +21753,9 @@ def build_browser_tools(
                     _model_text(text, 60),
                 )
             if not pick.committed and pick.observed_row:
-                return _observed_row_result(f"typed into {selector} and picked {suggestion!r}", pick.observed_row)
+                return _observed_row_result(
+                    f"typed into {selector} and picked {suggestion!r}", pick.observed_row, suggestion
+                )
             if not pick.committed and pick.shared_surface:
                 # The widget renders only a short form of the label ("+1"), and either another row visible
                 # at the click showed it too or the field was unreadable before the click.
@@ -21834,11 +22051,8 @@ def build_browser_tools(
                         fp = None
                     if (isinstance(fp, str) and fp != last_fingerprint) or time.monotonic() >= settle_until:
                         break
-                last_fingerprint = fp if isinstance(fp, str) else last_fingerprint
                 # Re-read the scroller AFTER the settle: a page appended during the wait must show in the extent
-                # this scan reports. A read taken while an animation runs on the list, or at a scroll offset other
-                # than the one asked for (short of the list end), may catch rows mid-move, so that window is taken
-                # on two equal reads in a row; a still read is taken as it is.
+                # this scan reports. Animated reads must agree within the existing wait cap.
                 texts_raw: Any = None
                 prior: Any = None
                 steady_until = time.monotonic() + 0.4
@@ -21854,14 +22068,31 @@ def build_browser_tools(
                         texts_raw = await page.evaluate(_MENU_OPTION_TEXTS_JS, {"attr": "menu"})
                     except Exception:
                         texts_raw = None
-                    if (
-                        (prior is None and not _unsteady(state, top))
-                        or (state, texts_raw) == prior
-                        or time.monotonic() >= steady_until
-                    ):
+                    stable = (state, texts_raw) == prior
+                    if stable and state.get("moving") is not False:
+                        candidate = _list_window(texts_raw, state, walk_pass=walk_pass, chain=chain)
+                        previous = next(
+                            (
+                                w
+                                for w in reversed(log.windows)
+                                if w.chain
+                                and w.walk_pass == walk_pass
+                                and (chain or abs(w.scroll_top - candidate.scroll_top) <= max(w.eps, candidate.eps))
+                            ),
+                            None,
+                        )
+                        if chain or previous is not None:
+                            stable = _visited_band_tiles(candidate, previous)
+                    if (prior is None and not _unsteady(state, top)) or stable or time.monotonic() >= steady_until:
                         break
                     prior = (state, texts_raw)
                     await asyncio.sleep(0.02)
+                # Compare the next scroll with the accepted phase, not an earlier animation frame.
+                try:
+                    fp = await page.evaluate(_MENU_WINDOW_FINGERPRINT_JS)
+                except Exception:
+                    fp = None
+                last_fingerprint = fp if isinstance(fp, str) else last_fingerprint
                 window = _list_window(texts_raw, state, walk_pass=walk_pass, chain=chain)
                 log = log.appended(window)
                 return state, [dict(r.read) for r in window.rows if r.text]
@@ -22000,7 +22231,6 @@ def build_browser_tools(
                 definitive: bool,
                 idx: int | None = None,
                 hit: str | None = None,
-                unproven_row: dict[str, Any] | None = None,
             ) -> _WalkResult:
                 twins = _twin_keys()
                 flagged = tuple(
@@ -22014,7 +22244,6 @@ def build_browser_tools(
                     complete=complete,
                     twins=want in twins,
                     twin_rows=_rows_per_key(log.windows)[want] if want in twins else 0,
-                    unproven=unproven_row,
                     seen=tuple(o for o in flagged if not o.get("nav")),
                 )
 
@@ -22037,20 +22266,27 @@ def build_browser_tools(
                         return _result(current, definitive=reached_end, idx=n, hit=text)
                 if verdict != "commit":
                     unproven = unproven or (text if verdict == "incomplete" else None)
-            # Leave the list where the open-click rendered it so the model's next look() matches the
-            # window it already reasoned about, or at the row the refusal will name. `data-tv3-menu` numbers from
-            # earlier windows are not identities, so a full scan reports the option TEXTS it saw and a cut-short
-            # one reports only the rows live in the restored window.
-            restore = _first_scroll_top(log.windows, unproven) if unproven else None
-            _, current = await _scan(start_top if restore is None else restore, chain=False)
-            n_unproven = _row_n(current, unproven) if unproven else None
             # A walk that reached the end but left gaps is reported as cut short: its rows are not the
             # whole list, so the definitive no-match/ambiguity verdicts do not apply.
             definitive = reached_end and (_is_ambiguous(hit_text) if hit_text is not None else coverage != "incomplete")
-            return _result(
-                current,
-                definitive=definitive,
-                unproven_row=None
+            # Keep observed twins fixed during positioning; otherwise retain new rivals before filtering.
+            refusal = _result(current, definitive=definitive) if want in _twin_keys() else None
+            # Restore a row the verdict names, otherwise the open-click window. Earlier menu numbers are not
+            # identities, so a cut-short scan reports only rows live in the restored window.
+            restore_text = unproven or hit_text
+            restore = _first_scroll_top(log.windows, restore_text) if restore_text else None
+            _, current = await _scan(start_top if restore is None else restore, chain=False)
+            n_unproven = _row_n(current, unproven) if unproven else None
+            if refusal is None:
+                refusal = _result(
+                    current,
+                    definitive=reached_end
+                    and (_is_ambiguous(hit_text) if hit_text is not None else coverage != "incomplete"),
+                )
+            return dataclasses.replace(
+                refusal,
+                rows=refusal.rows if refusal.definitive else tuple(current),
+                unproven=None
                 if n_unproven is None
                 else {
                     "n": n_unproven,
@@ -22604,15 +22840,16 @@ def build_browser_tools(
                 _choice_tiers(typeahead=False),
             )
         )
-        _log_committed_pick(matched, value, verdict, "open_pick", tier)
+        row = None if committed else await _observed_row(page, selector, matched, pre_held)
+        _log_committed_pick(matched, value, verdict, "open_pick", tier, row is not None)
         if verdict is CommitStatus.OK:
             return with_tier_note(
                 ToolResult.ok(f"selected {matched!r} for {selector} (committed value: {committed!r})"),
                 tier,
                 _model_text(value, 60),
             )
-        if not committed and (row := await _observed_row(page, selector, matched, pre_held)):
-            return _observed_row_result(f"selected {matched!r} for {selector}", row)
+        if row:
+            return _observed_row_result(f"selected {_model_text(matched, 60)!r} for {selector}", row, matched)
         if verdict is CommitStatus.UNVERIFIED and matches != 1:
             return unconfirmed_ok(
                 f"selected {matched!r} for {selector}, but it re-resolved to {matches} elements so the "
@@ -22632,16 +22869,23 @@ def build_browser_tools(
             f"clicked {matched!r} but {selector} did not commit a value", error_class="did_not_commit"
         )
 
-    def _observed_row_result(did: str, row: dict[str, str]) -> ToolResult:
-        where = f"the list {row['list']!r}" if row["list"] else "the field's container"
+    def _observed_row_result(did: str, row: _ObservedRow, label: str) -> ToolResult:
+        # Every page string is capped; the label is the picked row's own, in its original case.
+        where = f"the list {_model_text(row['list'], 60)!r}" if row["list"] else "the field's container"
         if row["host"]:
-            where += f" inside <{row['host']}>"
-        text = _model_text(row["text"], 60)
+            where += f" inside <{_model_text(row['host'], 40)}>"
+        if row["caption"]:
+            where += f" under the caption {_model_text(row['caption'], 60)!r}"
+        if row["beside_offers"]:
+            where += "; the row's list hangs under the offering list's parent"
+        text = _model_text(label, 60)
         return unconfirmed_ok(
-            f"{did}; the field's value did not change, and a removable {row['role']} row {text!r} appeared in "
+            f"{did}; the field's value did not change, and a removable {_model_text(row['role'], 30)!r} row {text!r} "
+            f"appeared in "
             f"{where}. The tool cannot tell whether that row is this field's selected tag or a row of another list "
             f"(recent picks, another field), so the pick is NOT confirmed. Compare the row with the field and the "
-            f"goal before acting: picking {text!r} again may remove it."
+            f"goal before acting: picking {text!r} again may remove it.",
+            {"observed_row": True},
         )
 
     def _already_held_result(selector: str, value: str) -> ToolResult:
@@ -22726,7 +22970,7 @@ def build_browser_tools(
             declared: bool,
             surface_vouched_pre_click: bool = False,
             shared_surface: str | None = None,
-            observed_row: dict[str, str] | None = None,
+            observed_row: _ObservedRow | None = None,
             clicked: bool,
             tier: Tier | None = None,
         ) -> ToolResult:
@@ -22737,7 +22981,7 @@ def build_browser_tools(
                     error_class="click_failed",
                 )
             verdict, matches = await _typeahead_commit_verdict(page, selector, committed, readable)
-            _log_committed_pick(opt_txt, value, verdict, "typeahead", tier)
+            _log_committed_pick(opt_txt, value, verdict, "typeahead", tier, bool(observed_row and not committed))
             opt_txt = _model_text(opt_txt, 60)
             if verdict is CommitStatus.OK:
                 if declared:
@@ -22748,7 +22992,7 @@ def build_browser_tools(
                         return closed
                 return ToolResult.ok(f"selected {opt_txt!r} for {selector} (committed value: {committed!r})")
             if not committed and observed_row:
-                return _observed_row_result(f"selected suggestion {opt_txt!r} for {selector}", observed_row)
+                return _observed_row_result(f"selected suggestion {opt_txt!r} for {selector}", observed_row, opt_txt)
             if not committed and shared_surface:
                 # The widget renders only a short form of the label ("+1"), and either another row visible
                 # at the click showed it too or the field was unreadable before the click.
@@ -23384,6 +23628,16 @@ def build_browser_tools(
                 )
         else:
             _reload_confirm_pending[0] = None
+        if same_page and recover_page is not None:
+            recovered = await recover_page(_current_page())
+            if recovered is not None:
+                return (
+                    ToolResult.ok("page reloaded", {"same_url_reload": True, "page_state_changed": True})
+                    if recovered
+                    else ToolResult.error(
+                        "page recovery withheld: submission or page identity changed", error_class="navigation_failed"
+                    )
+                )
         # Commit first, then wait for readiness on THAT document, under budgets that sum to today's
         # single-attempt ceiling. A page whose bundle is starved still commits in under a second, so
         # one wait_until="load" attempt spends the whole ceiling and reports nothing about the page;

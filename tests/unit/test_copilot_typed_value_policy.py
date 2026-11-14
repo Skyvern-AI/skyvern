@@ -7,8 +7,8 @@ import pytest
 from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction, CodeBlockExecutionLimits
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
-from skyvern.forge.sdk.copilot.reached_download_target import DownloadClaimHelperContract
 from skyvern.forge.sdk.copilot.tools.mcp_hooks import _get_block_schema_post_hook, _type_text_pre_hook
+from skyvern.forge.sdk.workflow.reached_download_target import DownloadClaimHelperContract
 
 
 @pytest.mark.asyncio

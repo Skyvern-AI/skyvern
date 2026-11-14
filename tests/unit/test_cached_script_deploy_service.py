@@ -1,3 +1,4 @@
+import asyncio
 import base64
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -205,8 +206,12 @@ def _stub_app(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         restored_workflow_scripts=[],
         soft_deleted_script_revisions=[],
         artifacts=[],
+        stored_artifacts=[],
+        existing_script_file=None,
+        existing_artifact=None,
         fail_dispatch_update=False,
         fail_create_artifact=False,
+        fail_store_artifact=False,
     )
 
     class Workflows:
@@ -252,6 +257,9 @@ def _stub_app(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         async def create_script_file(self, **kwargs: object) -> SimpleNamespace:
             state.created_files.append(kwargs)
             return SimpleNamespace(file_id=f"sf_{len(state.created_files)}")
+
+        async def get_script_file_by_path(self, **_: object) -> SimpleNamespace | None:
+            return state.existing_script_file
 
         async def get_latest_script_version(self, **_: object) -> SimpleNamespace:
             return SimpleNamespace(script_id="s_existing", script_revision_id="sr_existing", version=1, run_id=None)
@@ -300,6 +308,10 @@ def _stub_app(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         async def soft_delete_script_by_revision(self, **kwargs: object) -> None:
             state.soft_deleted_script_revisions.append(kwargs["script_revision_id"])
 
+    class Artifacts:
+        async def get_artifact_by_id(self, artifact_id: str, organization_id: str) -> SimpleNamespace | None:
+            return state.existing_artifact
+
     class ArtifactManager:
         async def create_script_file_artifact(self, **kwargs: object) -> str:
             if state.fail_create_artifact:
@@ -307,15 +319,28 @@ def _stub_app(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
             state.artifacts.append(kwargs)
             return f"artifact_{len(state.artifacts)}"
 
+    class Storage:
+        async def store_artifact(self, artifact: SimpleNamespace, data: bytes) -> None:
+            # Yield once so an unawaited upload stays in flight for the rest of the caller's turn.
+            await asyncio.sleep(0)
+            if state.fail_store_artifact:
+                raise RuntimeError("storage write failed")
+            state.stored_artifacts.append((artifact, data))
+
     monkeypatch.setattr(
         cached_script_deploy_service.app,
         "DATABASE",
-        SimpleNamespace(workflows=Workflows(), scripts=Scripts()),
+        SimpleNamespace(workflows=Workflows(), scripts=Scripts(), artifacts=Artifacts()),
     )
     monkeypatch.setattr(
         cached_script_deploy_service.app,
         "ARTIFACT_MANAGER",
         ArtifactManager(),
+    )
+    monkeypatch.setattr(
+        cached_script_deploy_service.app,
+        "STORAGE",
+        Storage(),
     )
     monkeypatch.setattr(
         cached_script_deploy_service.app,
@@ -1167,6 +1192,41 @@ async def test_build_file_tree_validates_when_decoded_bytes_are_omitted(_stub_ap
 
     assert exc.value.status_code == 400
     _assert_no_persistence_writes(_stub_app)
+
+
+async def _save_pending_file(source: str) -> dict[str, script_service.FileNode]:
+    return await script_service.build_file_tree(
+        files=[_script_file("main.py", source)],
+        organization_id="org_test",
+        script_id="s_test",
+        script_version=1,
+        script_revision_id="sr_test",
+        pending=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_pending_save_stores_new_bytes_before_returning_the_tree(_stub_app: SimpleNamespace) -> None:
+    # A run started right after the save reads storage, so the overwrite cannot still be in flight.
+    _stub_app.existing_script_file = SimpleNamespace(file_id="sf_1", artifact_id="artifact_1")
+    _stub_app.existing_artifact = SimpleNamespace(artifact_id="artifact_1")
+    source = "value = 1\n"
+
+    file_tree = await _save_pending_file(source)
+
+    assert _stub_app.stored_artifacts == [(_stub_app.existing_artifact, source.encode("utf-8"))]
+    assert file_tree["main.py"].size == len(source)
+    assert _stub_app.artifacts == []
+
+
+@pytest.mark.asyncio
+async def test_pending_save_raises_when_the_storage_overwrite_fails(_stub_app: SimpleNamespace) -> None:
+    _stub_app.existing_script_file = SimpleNamespace(file_id="sf_1", artifact_id="artifact_1")
+    _stub_app.existing_artifact = SimpleNamespace(artifact_id="artifact_1")
+    _stub_app.fail_store_artifact = True
+
+    with pytest.raises(RuntimeError):
+        await _save_pending_file("value = 1\n")
 
 
 @pytest.mark.asyncio

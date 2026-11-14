@@ -34,6 +34,7 @@ from skyvern.exceptions import (
 from skyvern.forge import app
 from skyvern.forge.async_operations import AsyncOperation
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.agents.skills import AvailableSkill
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
 from skyvern.forge.sdk.api.azure import AzureClientFactory
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
@@ -94,6 +95,7 @@ from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, BlockTypeVar,
 from skyvern.forge.sdk.workflow.retry_policy import WORKFLOW_WEBHOOK_HTTP_TIMEOUT_SECONDS
 from skyvern.schemas.emails import GmailSendErrorCode, GmailSendOutcome
 from skyvern.schemas.run_enums import RunEngine, RunType
+from skyvern.schemas.workflow_run_groups import DEFAULT_RUN_GROUP_LIMITS, RunGroupLimits
 from skyvern.schemas.workflows import BlockResult, CodeBlockFailureKind, FileStorageType, FileUploadDestination
 from skyvern.services.email.gmail import GmailSendResult
 from skyvern.services.email.gmail_client import GmailAPIError
@@ -123,6 +125,7 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
     from skyvern.forge.sdk.db.models import FolderModel
     from skyvern.forge.sdk.integrations.catalog import AccountsById, IntegrationEntry
+    from skyvern.forge.sdk.integrations.connected_accounts import OrgConnection
     from skyvern.forge.sdk.schemas.totp_codes import OTPType
     from skyvern.forge.sdk.schemas.workflow_copilot import CopilotTurnControl
     from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
@@ -194,6 +197,14 @@ def running_in_packaged_deployment() -> bool:
     if any(os.environ.get(marker) for marker in _PACKAGED_DEPLOYMENT_ENV_MARKERS):
         return True
     return any(os.path.exists(path) for path in _PACKAGED_DEPLOYMENT_MARKER_FILES)
+
+
+def developer_checkout_opted_into_inline_copilot_code() -> bool:
+    # ENV alone cannot carry this: self-hosted Docker and Kubernetes are documented with
+    # ENV=local, so a packaged deployment would look identical to a laptop.
+    if settings.is_cloud_environment() or running_in_packaged_deployment():
+        return False
+    return settings.COPILOT_ALLOW_INLINE_CODE_EXECUTION
 
 
 USELESS_SHAPE_ATTRIBUTE = [SKYVERN_ID_ATTR, "id", "aria-describedby"]
@@ -299,8 +310,28 @@ class CopilotTriggerSummary:
     workflow_permanent_id: str
     source_kind: str
     mapping: dict[str, str]
+    settings: dict[str, JsonValue]
     enabled: bool
     created_at: str
+    note: str | None = None
+    # Whether its source starts runs by itself once on (a poller), so switching it on is the only step left.
+    fires_on_its_own: bool = False
+    # The connected account the source reads through, when it has one, so the card can name it.
+    account_id: str | None = None
+    # The source's settings as {"label", "value"} rows in plain words, for the user-facing trigger card.
+    filters: list[dict[str, str]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class CopilotTriggerSource:
+    source_kind: str
+    description: str
+    # Adapter-managed sources are set up outside Copilot; `set_up_in` names where.
+    creatable_in_copilot: bool
+    settings_schema: dict[str, JsonValue]
+    example_event: dict[str, JsonValue]
+    fires_on_its_own: bool
+    set_up_in: str | None = None
 
 
 TriggerMappingReasonCode = Literal[
@@ -319,6 +350,7 @@ class CopilotTriggerResult:
     triggers: list[CopilotTriggerSummary] = field(default_factory=list)
     resolved_parameters: dict[str, JsonValue] | None = None
     reason_code: TriggerMappingReasonCode | None = None
+    after_create: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1018,6 +1050,12 @@ async def _convert_css_shape_to_string(
 
 
 @dataclass(frozen=True)
+class ProxyProviderRefusal:
+    status: int
+    reason: str
+
+
+@dataclass(frozen=True)
 class RecordingVideoSizeResolution:
     """Outcome of resolving the recording resolution for a run.
 
@@ -1044,7 +1082,14 @@ class AgentFunction:
     async def nango_gmail_catalog_available(self, organization_id: str) -> bool:
         return False
 
+    async def own_connected_gmail_connections(self, organization_id: str, user_id: str) -> list[OrgConnection]:
+        return []
+
     async def prepare_gmail_hop_tokens(self, *, workflow_run: WorkflowRun, workflow: Workflow) -> None:
+        return None
+
+    async def request_gmail_hop_tokens(self, *, organization_id: str, workflow_run_id: str, workflow: Workflow) -> None:
+        """Ask whichever process may mint to issue this run's capabilities; a run can start where it cannot mint."""
         return None
 
     async def execute_gmail_inbox_for_run(
@@ -1097,6 +1142,10 @@ class AgentFunction:
 
     async def nango_powerbi_catalog_available(self, organization_id: str) -> bool:
         return False
+
+    async def hidden_integration_ids(self, organization_id: str) -> frozenset[str]:
+        """Catalog entries this organization must not see at all, not even as coming soon."""
+        return frozenset()
 
     async def powerbi_plan_allows(self, organization_id: str) -> bool | None:
         """None when the plan could not be read."""
@@ -1482,6 +1531,10 @@ class AgentFunction:
     async def task_v3_error_code_on_finish(self, *, organization_id: str) -> bool:
         return settings.TASK_V3_ERROR_CODE_ON_FINISH
 
+    # Read once when a run group is submitted; the group stores its bound, so a later change never reaches it.
+    async def workflow_run_group_limits(self, *, organization_id: str) -> RunGroupLimits:
+        return DEFAULT_RUN_GROUP_LIMITS
+
     # Whether a v3 run holds its first terminated verdict once for what prevents the task. Read once per run.
     async def task_v3_justify_hold_enabled(self, *, task_id: str | None, organization_id: str | None) -> bool:
         return not settings.DISABLE_TASK_V3_JUSTIFY_HOLD
@@ -1580,6 +1633,13 @@ class AgentFunction:
     async def proxy_unreachable_target_status(self, *, host: str, since: float) -> int | None:
         """The upstream status the run's proxy provider refused a CONNECT to ``host`` with at or after ``since``
         (``time.monotonic()``), when that status says the host did not accept the provider's connection."""
+        return None
+
+    async def proxy_provider_refusal(
+        self, *, browser_session_id: str, host: str, since_wall: float
+    ) -> ProxyProviderRefusal | None:
+        """The refusal, with the reason it stated, the proxy provider gave this browser's connection to ``host`` at
+        or after ``since_wall`` (``time.time()``)."""
         return None
 
     async def capture_workflow_run_created(
@@ -1940,6 +2000,11 @@ class AgentFunction:
     def copilot_browser_pattern_accepting_calls(self) -> tuple[str, ...]:
         return ()
 
+    async def agent_skills(
+        self, *, organization_id: str, workflow_permanent_id: str | None, agent: str
+    ) -> list[AvailableSkill]:
+        return []
+
     async def open_copilot_browser_code_session(
         self,
         *,
@@ -1963,8 +2028,23 @@ class AgentFunction:
         del organization_id
         return CopilotOrganizationUsage(credits_note="This deployment does not track billing.")
 
-    async def create_copilot_webhook_trigger(
-        self, *, organization_id: str, workflow_permanent_id: str, mapping: dict[str, str]
+    async def copilot_run_stop_rule(self, *, organization_id: str) -> str | None:
+        """The billing check that stops this organization's runs, in one sentence; None when it cannot be stated."""
+        del organization_id
+        return None
+
+    def copilot_trigger_sources(self) -> list[CopilotTriggerSource]:
+        return []
+
+    async def create_copilot_trigger(
+        self,
+        *,
+        organization_id: str,
+        workflow_permanent_id: str,
+        source_kind: str,
+        settings: dict[str, JsonValue],
+        mapping: dict[str, str],
+        enabled: bool,
     ) -> CopilotTriggerResult:
         return CopilotTriggerResult(error=COPILOT_TRIGGERS_UNAVAILABLE)
 
@@ -1973,8 +2053,9 @@ class AgentFunction:
         *,
         organization_id: str,
         workflow_permanent_id: str,
+        source_kind: str,
         mapping: dict[str, str],
-        payload: dict[str, JsonValue],
+        payload: dict[str, JsonValue] | None,
     ) -> CopilotTriggerResult:
         return CopilotTriggerResult(error=COPILOT_TRIGGERS_UNAVAILABLE)
 
@@ -2005,12 +2086,8 @@ class AgentFunction:
 
     def allow_copilot_inline_code_execution(self) -> bool:
         """Whether a copilot block test run may execute in the API process when sandbox dispatch is
-        unavailable. Developer checkouts only."""
-        # ENV alone cannot carry this: self-hosted Docker and Kubernetes are documented with
-        # ENV=local, so a packaged deployment would look identical to a laptop.
-        if settings.is_cloud_environment() or running_in_packaged_deployment():
-            return False
-        return settings.COPILOT_ALLOW_INLINE_CODE_EXECUTION
+        unavailable. Open source has no sandbox and already runs every workflow in the API process."""
+        return True
 
     async def is_workflow_tagging_enabled(self, organization_id: str) -> bool:
         """OSS always-on; cloud overrides to gate per-org for staged rollout."""
@@ -2258,6 +2335,11 @@ class AgentFunction:
     def on_browser_run_released(self, browser_context: BrowserContext | BrowserArtifacts | None) -> None:
         """A run released a browser that no other run shares. OSS no-op."""
 
+    def set_browser_run_http_cache(
+        self, browser_context: BrowserContext, generation: str | None, *, fresh_run: bool = False
+    ) -> None:
+        """Start a fresh run-scoped static response store on this context, or turn it off with None. OSS no-op."""
+
     def on_browser_context_retired(self, browser_context: BrowserContext) -> None:
         """A replacement took over from this context, which no run uses again; it may never emit close. OSS no-op."""
 
@@ -2467,6 +2549,23 @@ class AgentFunction:
     async def post_step_execution(self, task: Task, step: Step) -> None:
         if step.status == StepStatus.completed:
             await self._maybe_close_magic_link_page(task)
+
+    async def bind_page_reload_owner(self, *, task: Task, browser_state: BrowserState) -> None:
+        """Bind `task` to its browser, so a page-level handler finishing later raises the reload signal only for
+        the task and page document that sent its request."""
+        return None
+
+    async def settle_page_reload_signal(
+        self, *, task: Task, raise_signal: bool = True, accept: bool = False
+    ) -> bool | None:
+        """None means ordinary recovery; False withholds a private request; True prepares its checked executor."""
+        return None
+
+    async def page_submission_evidence(self, *, task: Task) -> str | None:
+        return None
+
+    async def release_page_reload_owner(self, *, task: Task) -> None:
+        return None
 
     async def gate_step_completion(
         self,
