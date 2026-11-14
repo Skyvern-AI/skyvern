@@ -754,12 +754,8 @@ async def cdp_input_stream(
     websocket: WebSocket,
     workflow_run_id: str,
     client_id: str | None = None,
-    apikey: str | None = None,
-    token: str | None = None,
 ) -> None:
     organization_id = await auth(
-        apikey=apikey,
-        token=token,
         websocket=websocket,
         folder_action="workflow_run.execute",
         folder_resource={"workflow_run_id": workflow_run_id},
@@ -944,12 +940,8 @@ async def cdp_input_browser_session_stream(
     websocket: WebSocket,
     browser_session_id: str,
     client_id: str | None = None,
-    apikey: str | None = None,
-    token: str | None = None,
 ) -> None:
     organization_id = await auth(
-        apikey=apikey,
-        token=token,
         websocket=websocket,
         folder_action="workflow_run.execute",
         folder_resource={"browser_session_id": browser_session_id},

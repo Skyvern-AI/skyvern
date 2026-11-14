@@ -1661,17 +1661,19 @@ def _api_v1_url(api_root: str, path: str) -> str:
     return f"{api_root}/v1{path}"
 
 
-def _ws_v1_url(api_root: str, path: str, query: dict[str, str]) -> str:
+def _ws_v1_url(api_root: str, path: str, query: dict[str, str] | None = None) -> str:
     parsed = urllib.parse.urlsplit(api_root)
     scheme = "wss" if parsed.scheme == "https" else "ws"
-    query_string = urllib.parse.urlencode(query)
+    query_string = urllib.parse.urlencode(query or {})
     return urllib.parse.urlunsplit((scheme, parsed.netloc, f"{parsed.path.rstrip('/')}/v1{path}", query_string, ""))
 
 
-async def _wait_for_stream_frame(ws_url: str, timeout_seconds: int) -> str:
+async def _wait_for_stream_frame(ws_url: str, timeout_seconds: int, api_key: str) -> str:
     import websockets
+    from websockets.typing import Subprotocol
 
-    async with websockets.connect(ws_url, open_timeout=min(timeout_seconds, 10)) as websocket:
+    protocols = [Subprotocol("skyvern.v1"), Subprotocol(f"apikey.{api_key}")]
+    async with websockets.connect(ws_url, subprotocols=protocols, open_timeout=min(timeout_seconds, 10)) as websocket:
         deadline = asyncio.get_running_loop().time() + timeout_seconds
         last_status = "connected"
         while True:
@@ -1693,10 +1695,12 @@ async def _wait_for_stream_frame(ws_url: str, timeout_seconds: int) -> str:
                 raise RuntimeError(f"stream ended before a frame arrived: {last_status}")
 
 
-async def _wait_for_cdp_input_ready(ws_url: str, timeout_seconds: int) -> None:
+async def _wait_for_cdp_input_ready(ws_url: str, timeout_seconds: int, api_key: str) -> None:
     import websockets
+    from websockets.typing import Subprotocol
 
-    async with websockets.connect(ws_url, open_timeout=min(timeout_seconds, 10)) as websocket:
+    protocols = [Subprotocol("skyvern.v1"), Subprotocol(f"apikey.{api_key}")]
+    async with websockets.connect(ws_url, subprotocols=protocols, open_timeout=min(timeout_seconds, 10)) as websocket:
         raw = await asyncio.wait_for(websocket.recv(), timeout=timeout_seconds)
         if not isinstance(raw, str):
             raise RuntimeError("CDP input channel returned a non-text message")
@@ -1764,18 +1768,16 @@ async def _streaming_smoke_test_async(
                     raise TimeoutError(f"browser session did not start; last status={last_status}")
                 await asyncio.sleep(1)
 
-            auth_query = {"apikey": api_key}
             frame_format = await _wait_for_stream_frame(
-                _ws_v1_url(api_root, f"/stream/browser_sessions/{session_id}", auth_query),
+                _ws_v1_url(api_root, f"/stream/browser_sessions/{session_id}"),
                 timeout_seconds=timeout_seconds,
+                api_key=api_key,
             )
-            input_query = {
-                "apikey": api_key,
-                "client_id": f"doctor-smoke-{secrets.token_hex(4)}",
-            }
+            input_query = {"client_id": f"doctor-smoke-{secrets.token_hex(4)}"}
             await _wait_for_cdp_input_ready(
                 _ws_v1_url(api_root, f"/stream/cdp_input/browser_session/{session_id}", input_query),
                 timeout_seconds=timeout_seconds,
+                api_key=api_key,
             )
             return CheckResult(
                 name="Streaming Smoke Test",
