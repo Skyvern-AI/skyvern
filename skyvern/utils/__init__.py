@@ -35,10 +35,6 @@ def setup_windows_event_loop_policy() -> None:
 
 
 def migrate_db() -> None:
-    migrations_path = REPO_ROOT_DIR / "alembic"
-    if not migrations_path.is_dir():
-        raise RuntimeError(_MISSING_MIGRATIONS_MESSAGE)
-
     # Keep these imports lazy: skyvern.config imports skyvern.utils.env_paths
     # while this module is initializing, and analytics also depends on config.
     import skyvern.config as skyvern_config
@@ -46,6 +42,7 @@ def migrate_db() -> None:
     from alembic.config import Config
     from skyvern.analytics import capture_setup_error, capture_setup_event
     from skyvern.config import Settings, _ensure_sqlite_dir
+    from skyvern.forge.sdk.db.sqlite_schema import ensure_sqlite_schema_at
     from skyvern.forge.sdk.settings_manager import SettingsManager
 
     # Reload settings so env vars set by setup_postgresql() are picked up.
@@ -54,14 +51,25 @@ def migrate_db() -> None:
     SettingsManager.set_settings(refreshed)
     _ensure_sqlite_dir(refreshed.DATABASE_STRING)
 
+    is_sqlite = refreshed.is_sqlite()
+    migrations_path = REPO_ROOT_DIR / "alembic"
+    if not is_sqlite and not migrations_path.is_dir():
+        raise RuntimeError(_MISSING_MIGRATIONS_MESSAGE)
+
     capture_setup_event("migration-start")
     try:
-        alembic_cfg = Config()
-        alembic_cfg.set_main_option("script_location", str(migrations_path))
-        command.upgrade(alembic_cfg, "head")
+        if is_sqlite:
+            # The Alembic history is Postgres-only; SQLite builds its schema from the models, as server boot does.
+            asyncio.run(ensure_sqlite_schema_at(refreshed.DATABASE_STRING))
+        else:
+            alembic_cfg = Config()
+            alembic_cfg.set_main_option("script_location", str(migrations_path))
+            command.upgrade(alembic_cfg, "head")
         capture_setup_event("migration-complete", success=True)
     except Exception as e:
-        capture_setup_error("migration-fail", e, error_type="alembic_migration_error")
+        capture_setup_error(
+            "migration-fail", e, error_type="sqlite_schema_error" if is_sqlite else "alembic_migration_error"
+        )
         raise
 
 
