@@ -10,6 +10,7 @@ from urllib.parse import parse_qs, urlparse
 
 import azure.core.exceptions as azure_exceptions
 import pytest
+from structlog.testing import capture_logs
 
 import skyvern.forge.sdk.artifact.storage.azure as azure_module
 import skyvern.forge.sdk.artifact.storage.base as base_module
@@ -253,6 +254,12 @@ class TestAzureStorageBrowserSessionFiles:
 
         with pytest.raises(PermissionError, match="No permission to access storage URI"):
             await azure_storage.download_managed_file(uri, TEST_ORGANIZATION_ID)
+        with pytest.raises(PermissionError, match="No permission to access storage URI"):
+            await azure_storage.read_managed_file_head(uri, TEST_ORGANIZATION_ID, 64)
+        with pytest.raises(PermissionError, match="No permission to access storage URI"):
+            await azure_storage.presign_managed_file(
+                uri, TEST_ORGANIZATION_ID, expiry_seconds=60, inline_content_type="image/png"
+            )
 
     async def test_storage_type_property(self, azure_storage: AzureStorageForTests) -> None:
         """Test storage_type returns 'azure'."""
@@ -614,3 +621,46 @@ async def test_azure_downloads_list_each_pdf_content_once_only_from_etag_pinned_
     claimed = [pdf, pdf, make_pdf("Statement 2002")]
 
     assert await unique_stored_pdf_ids(monkeypatch, storage, "azure://c/o_1", claimed) == expected
+
+
+@pytest.mark.asyncio
+async def test_managed_file_head_reads_only_the_requested_bytes(monkeypatch: pytest.MonkeyPatch) -> None:
+    data = b"\x89PNG" + b"\x00" * 100_000
+    served: list[int] = []
+
+    async def download_blob(offset: int = 0, length: int | None = None) -> SimpleNamespace:
+        chunk = data[offset : None if length is None else offset + length]
+        served.append(len(chunk))
+
+        async def readall() -> bytes:
+            return chunk
+
+        return SimpleNamespace(readall=readall)
+
+    blobs = SimpleNamespace(
+        get_container_client=lambda _c: SimpleNamespace(
+            get_blob_client=lambda _p: SimpleNamespace(download_blob=download_blob)
+        )
+    )
+    storage = AzureStorageForTests(container=TEST_CONTAINER)
+    storage.async_client = RealAsyncAzureStorageClient(
+        account_name="acct", account_key=base64.b64encode(b"k" * 32).decode()
+    )
+    monkeypatch.setattr(storage.async_client, "_get_blob_service_client", lambda: blobs)
+    uri = f"azure://{settings.AZURE_STORAGE_CONTAINER_UPLOADS}/{settings.ENV}/{TEST_ORGANIZATION_ID}/shot.png"
+
+    head = await storage.read_managed_file_head(uri, TEST_ORGANIZATION_ID, 64)
+
+    assert head == data[:64]
+    assert served == [64]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_managed_file_head_read_logs_one_warning(azure_storage: AzureStorageForTests) -> None:
+    azure_storage.async_client.download_file.return_value = None
+    uri = f"azure://{settings.AZURE_STORAGE_CONTAINER_UPLOADS}/{settings.ENV}/{TEST_ORGANIZATION_ID}/shot.png"
+
+    with capture_logs() as logs:
+        assert await azure_storage.read_managed_file_head(uri, TEST_ORGANIZATION_ID, 64) is None
+
+    assert [(log["log_level"], log["uri"]) for log in logs] == [("warning", uri)]

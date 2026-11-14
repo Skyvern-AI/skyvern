@@ -257,6 +257,12 @@ class TestGcsStorageBrowserSessionFiles:
         uri = f"gs://{settings.GCS_BUCKET_UPLOADS}/{settings.ENV}/o_other/file.pdf"
         with pytest.raises(PermissionError, match="No permission to access storage URI"):
             await gcs_storage.download_managed_file(uri, TEST_ORGANIZATION_ID)
+        with pytest.raises(PermissionError, match="No permission to access storage URI"):
+            await gcs_storage.read_managed_file_head(uri, TEST_ORGANIZATION_ID, 64)
+        with pytest.raises(PermissionError, match="No permission to access storage URI"):
+            await gcs_storage.presign_managed_file(
+                uri, TEST_ORGANIZATION_ID, expiry_seconds=60, inline_content_type="image/png"
+            )
 
     async def test_storage_type_property(self, gcs_storage: GcsStorageForTests) -> None:
         assert gcs_storage.storage_type == "gcs"
@@ -710,3 +716,24 @@ async def test_cancelling_a_gcs_comparison_waits_for_its_storage_thread_to_finis
     with pytest.raises(asyncio.CancelledError):
         await read
     assert finished.is_set()
+
+
+@pytest.mark.asyncio
+async def test_managed_file_head_reads_only_the_requested_bytes() -> None:
+    data = b"\x89PNG" + b"\x00" * 100_000
+    served: list[int] = []
+
+    def download_as_bytes(start: int | None = None, end: int | None = None) -> bytes:
+        chunk = data[start or 0 : None if end is None else end + 1]
+        served.append(len(chunk))
+        return chunk
+
+    storage = GcsStorageForTests(bucket="b")
+    storage.async_client = client = RealAsyncGcsStorageClient(project_id="test")
+    client._get_blob = lambda _uri: SimpleNamespace(download_as_bytes=download_as_bytes)  # type: ignore[method-assign]
+    uri = f"gs://{settings.GCS_BUCKET_UPLOADS}/{settings.ENV}/{TEST_ORGANIZATION_ID}/shot.png"
+
+    head = await storage.read_managed_file_head(uri, TEST_ORGANIZATION_ID, 64)
+
+    assert head == data[:64]
+    assert served == [64]

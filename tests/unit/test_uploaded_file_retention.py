@@ -11,22 +11,29 @@ from __future__ import annotations
 
 import io
 import os
+import re
+import struct
 import zipfile
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from typing import Any, Callable
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException, UploadFile
 from fastapi.testclient import TestClient
+from PIL import Image
 from starlette.datastructures import Headers
 from structlog.testing import capture_logs
 
 from skyvern.config import settings
+from skyvern.exceptions import WorkflowNotFound
 from skyvern.forge.sdk.api import files as files_api
+from skyvern.forge.sdk.artifact.storage.local import LocalStorage
 from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
 from skyvern.forge.sdk.schemas.files import UploadedFile
 from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.workflow.models.block import BlockType
 from skyvern.schemas.runs import RunEngine
 from skyvern.services import uploaded_file_service
 from tests.unit._uploaded_files_fake import FakeUploadedFilesRepository, uploaded_file_uri
@@ -39,6 +46,8 @@ ATTACKER_ORG_ID = "o_attacker"
 class FakeStorage:
     """Enforces the same org-prefix rule the real storage backends do."""
 
+    presigned_urls_expire = True
+
     def __init__(self) -> None:
         self.deleted: list[str] = []
         self.fail_with: Exception | None = None
@@ -46,6 +55,7 @@ class FakeStorage:
         # anything, as S3, GCS, Azure and local storage all do for an absent key.
         self.absent: set[str] = set()
         self.objects: dict[str, bytes] = {}
+        self.sizes: dict[str, int | None] = {}
         self.downloads: list[str] = []
 
     @staticmethod
@@ -57,6 +67,22 @@ class FakeStorage:
         self.downloads.append(uri)
         self._assert_org_prefix(uri, organization_id)
         return self.objects.get(uri)
+
+    async def managed_file_size(self, uri: str, organization_id: str) -> int | None:
+        self._assert_org_prefix(uri, organization_id)
+        if uri in self.sizes:
+            return self.sizes[uri]
+        return len(self.objects[uri]) if uri in self.objects else None
+
+    async def read_managed_file_head(self, uri: str, organization_id: str, length: int) -> bytes | None:
+        content = await self.download_managed_file(uri, organization_id)
+        return None if content is None else content[:length]
+
+    async def presign_managed_file(
+        self, uri: str, organization_id: str, *, expiry_seconds: int, inline_content_type: str
+    ) -> str:
+        self._assert_org_prefix(uri, organization_id)
+        return f"https://signed.test/{uri.rsplit('/', 1)[-1]}?inline={inline_content_type}&ttl={expiry_seconds}"
 
     async def delete_legacy_file(self, *, organization_id: str, uri: str) -> None:
         self._assert_org_prefix(uri, organization_id)
@@ -116,6 +142,500 @@ async def test_a_file_past_its_expiry_no_longer_dereferences(
     assert await uploaded_file_service.resolve_file_reference(
         file_id=live, organization_id=VICTIM_ORG_ID
     ) == uploaded_file_uri(VICTIM_ORG_ID, "live.csv")
+
+
+def _png(width: int, height: int) -> bytes:
+    return (
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+        + struct.pack(">II", width, height)
+        + b"\x08\x02\x00\x00\x00"
+        + b"\x00" * 64
+    )
+
+
+def _webp(chunk: bytes, payload: bytes) -> bytes:
+    body = chunk + len(payload).to_bytes(4, "little") + payload
+    return b"RIFF" + (len(body) + 4).to_bytes(4, "little") + b"WEBP" + body + b"\x00" * 64
+
+
+def _webp_vp8x(width: int, height: int) -> bytes:
+    return _webp(b"VP8X", b"\x00" * 4 + (width - 1).to_bytes(3, "little") + (height - 1).to_bytes(3, "little"))
+
+
+def _webp_vp8l(width: int, height: int) -> bytes:
+    return _webp(b"VP8L", b"\x2f" + ((width - 1) | (height - 1) << 14).to_bytes(4, "little"))
+
+
+def _webp_vp8(width: int, height: int) -> bytes:
+    return _webp(b"VP8 ", b"\x00" * 3 + b"\x9d\x01\x2a" + struct.pack("<HH", width, height))
+
+
+def _gif(width: int, height: int) -> bytes:
+    frame = b"\x2c" + struct.pack("<HHHH", 0, 0, width, height) + b"\x00"
+    return b"GIF89a" + struct.pack("<HH", width, height) + b"\x00" * 3 + frame + b"\x00" * 64
+
+
+def _pillow(image_format: str, size: tuple[int, int] = (1200, 800), **save: Any) -> bytes:
+    out = io.BytesIO()
+    Image.new("RGB", size, (40, 90, 160)).save(out, image_format, **save)
+    return out.getvalue()
+
+
+# A 1x1 screen whose first frame sits at (20000, 20000): Chromium and Pillow size it 20001x20001.
+_GIF_FRAME_OFF_SCREEN = bytes.fromhex("47494638396101000100800000000000ffffff2c204e204e010001000002024401003b")
+
+
+def _jpeg_decoy(after_soi: bytes) -> bytes:
+    # Bytes a decoder skips without a length (a fill byte, RST0), then a comment that hides a 1x1 SOF where a walker
+    # that reads a length after them lands; the real SOF declares 10000x9000.
+    real = bytearray(_pillow("JPEG", (64, 64)))
+    sof = real.index(b"\xff\xc0")
+    real[sof + 5 : sof + 9] = struct.pack(">HH", 9000, 10000)
+    app0_end = 4 + int.from_bytes(real[4:6], "big")
+    head = bytes(real[:2]) + after_soi + bytes(real[2:app0_end])
+    lands = 4 + int.from_bytes(head[4:6], "big") - len(head) - 4
+    payload = b"\x00" * lands + b"\xff\xc0\x00\x0b\x08\x00\x01\x00\x01\x01\x01" + b"\x00" * 32
+    return head + b"\xff\xfe" + (len(payload) + 2).to_bytes(2, "big") + payload + bytes(real[app0_end:])
+
+
+def _sof(width: int, height: int) -> bytes:
+    return b"\xff\xc2\x00\x11\x08" + struct.pack(">HH", height, width) + b"\x03" + b"\x00" * 9
+
+
+_JPEG_SOS = b"\xff\xda\x00\x08\x01\x01\x00\x00\x3f\x00"
+
+
+def _jpeg(width: int, height: int, app_segment_bytes: tuple[int, ...] = ()) -> bytes:
+    app = b"".join(b"\xff\xe1" + (size + 2).to_bytes(2, "big") + b"\x00" * size for size in app_segment_bytes)
+    jfif = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
+    return jfif + app + _sof(width, height) + _JPEG_SOS + b"\x00" * 64
+
+
+def _gif_after_extension(sub_blocks: bytes, width: int = 64, height: int = 64) -> bytes:
+    frame = b"\x2c" + struct.pack("<HHHH", 0, 0, width, height) + b"\x00"
+    return b"GIF89a" + struct.pack("<HH", width, height) + b"\x00" * 3 + b"\x21\xfe" + sub_blocks + frame
+
+
+def _filled(prefix: bytes, unit: bytes) -> bytes:
+    count = (uploaded_file_service.BLOCK_IMAGE_MAX_BYTES - len(prefix)) // len(unit)
+    return prefix + unit * count
+
+
+# Shapes that walk the whole 4 MiB one marker or one sub-block at a time unless the walk is bounded.
+_PAST_THE_STEP_CAP = 4097
+# A sub-block whose size byte reads as an image descriptor of a 1x1 frame.
+_DESCRIPTOR_SUB_BLOCK = b"\x2c" + struct.pack("<HHHH", 0, 0, 1, 1) + b"\x00" * 36
+CRAFTED_4_MIB_HEADERS = {
+    "jpeg-fill-bytes": _filled(b"\xff\xd8", b"\xff"),
+    "jpeg-ff01-pairs": _filled(b"\xff\xd8", b"\xff\x01"),
+    "jpeg-empty-app-segments": _filled(b"\xff\xd8", b"\xff\xe1\x00\x02"),
+    "gif-one-byte-comment-sub-blocks": _filled(b"GIF89a\x01\x00\x01\x00\x00\x00\x00\x21\xfe", b"\x01\x00"),
+}
+
+
+_SCREENSHOT_PNG = _png(1920, 1080)
+_RASTER_HEADS = {
+    "image/png": _SCREENSHOT_PNG,
+    "image/jpeg": _jpeg(1920, 1080),
+    "image/gif": _gif(640, 480),
+    "image/webp": _webp_vp8(1920, 1080),
+}
+
+
+class TestFileSignedUrlEndpoint:
+    def _request(
+        self,
+        client: TestClient,
+        file_id: str,
+        caller_org_id: str,
+        workflow_org_id: str,
+        named: list[str],
+        folder_denied: bool = False,
+        version: int | None = None,
+        named_by_version: dict[int, list[str]] | None = None,
+        named_elsewhere: tuple[str, ...] = (),
+    ) -> Any:
+        async def get_workflow(workflow_permanent_id: str, organization_id: str, version: int | None) -> Any:
+            if organization_id != workflow_org_id:
+                raise WorkflowNotFound(workflow_permanent_id=workflow_permanent_id)
+            names = named if version is None else (named_by_version or {}).get(version, named)
+            images = [SimpleNamespace(file_id=file_id) for file_id in names]
+            inner = SimpleNamespace(
+                label="inner",
+                block_type=BlockType.NAVIGATION,
+                notes=" ".join(named_elsewhere),
+                doc_images=images[::2],
+                prompt_images=images[1::2],
+            )
+            loop = SimpleNamespace(
+                label="loop", block_type=BlockType.FOR_LOOP, doc_images=None, prompt_images=None, loop_blocks=[inner]
+            )
+            dumped = {"blocks": [{"notes": inner.notes, "doc_images": [{"file_id": i.file_id} for i in images]}]}
+            return SimpleNamespace(
+                organization_id=workflow_org_id,
+                workflow_definition=SimpleNamespace(blocks=[loop], model_dump=lambda mode: dumped),
+            )
+
+        route_app = MagicMock()
+        route_app.WORKFLOW_SERVICE.get_workflow_by_permanent_id = AsyncMock(side_effect=get_workflow)
+        route_app.AGENT_FUNCTION.enforce_folder_access = AsyncMock(
+            side_effect=HTTPException(status_code=403, detail="Folder access denied") if folder_denied else None
+        )
+        self.folder_check = route_app.AGENT_FUNCTION.enforce_folder_access
+        with (
+            patch("skyvern.forge.sdk.routes.agent_protocol.app", route_app),
+            patch(
+                "skyvern.forge.sdk.services.org_auth_service.get_current_org_cached",
+                new=AsyncMock(return_value=_make_org(caller_org_id)),
+            ),
+        ):
+            return client.get(
+                f"/v1/files/{file_id}/signed-url",
+                params={"workflow_permanent_id": "wpid_doc", **({} if version is None else {"version": version})},
+                headers={"x-api-key": "key"},
+            )
+
+    def _seed(self, repo: FakeUploadedFilesRepository, storage: FakeStorage, org: str, body: bytes, **seed: Any) -> str:
+        file_id = repo.seed(org, **seed)
+        storage.objects[repo.rows[file_id].storage_uri] = body
+        return file_id
+
+    @pytest.mark.parametrize(
+        ("media_type", "head"),
+        [
+            *_RASTER_HEADS.items(),
+            ("image/webp", _webp_vp8x(1920, 1080)),
+            ("image/webp", _webp_vp8l(1920, 1080)),
+            ("image/jpeg", _jpeg(1920, 1080, app_segment_bytes=(30_000, 30_000))),
+            ("image/png", _pillow("PNG")),
+            ("image/jpeg", _pillow("JPEG")),
+            ("image/jpeg", _pillow("JPEG", progressive=True)),
+            ("image/jpeg", _pillow("JPEG", icc_profile=b"\x00" * 70_000)),
+            ("image/gif", _pillow("GIF")),
+            ("image/webp", _pillow("WEBP")),
+            ("image/webp", _pillow("WEBP", lossless=True)),
+            ("image/gif", _gif_after_extension(b"\x03abc\x01d\x00")),
+            ("image/jpeg", _jpeg(1920, 1080).replace(b"\xff\xc2", b"\xff\xff\xd0\xff\xff\xff\xc2")),
+        ],
+        ids=[
+            *_RASTER_HEADS,
+            "webp-vp8x",
+            "webp-vp8l",
+            "jpeg-app-segments",
+            "pillow-png",
+            "pillow-jpeg",
+            "pillow-jpeg-progressive",
+            "pillow-jpeg-sof-past-64-kib",
+            "pillow-gif",
+            "pillow-webp-lossy",
+            "pillow-webp-lossless",
+            "gif-after-a-comment",
+            "jpeg-fill-bytes-and-rst0-before-sof",
+        ],
+    )
+    def test_a_named_image_of_the_workflows_organization_gets_an_inline_one_hour_url(
+        self,
+        service_app: object,
+        repo: FakeUploadedFilesRepository,
+        storage: FakeStorage,
+        monkeypatch: Any,
+        media_type: str,
+        head: bytes,
+    ) -> None:
+        file_id = self._seed(repo, storage, VICTIM_ORG_ID, head, size_bytes=len(head))
+
+        resp = self._request(_client(monkeypatch), file_id, VICTIM_ORG_ID, VICTIM_ORG_ID, [file_id])
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["content_type"] == media_type
+        assert body["signed_url"].endswith(f"?inline={media_type}&ttl=3600")
+        assert abs(body["expires_at"] - (datetime.now(timezone.utc).timestamp() + 3600)) < 60
+
+    @pytest.mark.asyncio
+    async def test_a_local_file_url_reports_no_expiry_because_it_never_expires(
+        self, service_app: Any, repo: FakeUploadedFilesRepository, tmp_path: Any
+    ) -> None:
+        image = tmp_path / settings.ENV / VICTIM_ORG_ID / "uploads" / "shot.png"
+        image.parent.mkdir(parents=True)
+        image.write_bytes(_SCREENSHOT_PNG)
+        file_id = repo.seed(VICTIM_ORG_ID, expires_at=datetime.now(timezone.utc) + timedelta(seconds=60))
+        repo.rows[file_id].storage_uri = f"file://{image}"
+        service_app.STORAGE = LocalStorage(artifact_path=str(tmp_path))
+
+        signed = await uploaded_file_service.mint_file_url(file_id=file_id, organization_id=VICTIM_ORG_ID)
+
+        assert signed is not None
+        assert signed.signed_url == f"file://{image}"
+        assert signed.expires_at is None
+
+    def test_another_organization_never_gets_a_url(
+        self, service_app: object, repo: FakeUploadedFilesRepository, storage: FakeStorage, monkeypatch: Any
+    ) -> None:
+        client = _client(monkeypatch)
+        victim_file = self._seed(repo, storage, VICTIM_ORG_ID, _SCREENSHOT_PNG)
+
+        # The attacker names the victim's file in its own workflow, or asks through the victim's workflow.
+        own_workflow = self._request(client, victim_file, ATTACKER_ORG_ID, ATTACKER_ORG_ID, [victim_file])
+        victim_workflow = self._request(client, victim_file, ATTACKER_ORG_ID, VICTIM_ORG_ID, [victim_file])
+        repo.rows.clear()
+        never_existed = self._request(client, victim_file, ATTACKER_ORG_ID, ATTACKER_ORG_ID, [victim_file])
+
+        assert own_workflow.status_code == victim_workflow.status_code == never_existed.status_code == 404
+        assert own_workflow.json() == victim_workflow.json() == never_existed.json()
+        assert storage.downloads == []
+
+    def test_version_selects_the_definition_that_must_name_the_file(
+        self, service_app: object, repo: FakeUploadedFilesRepository, storage: FakeStorage, monkeypatch: Any
+    ) -> None:
+        client = _client(monkeypatch)
+        file_id = self._seed(repo, storage, VICTIM_ORG_ID, _SCREENSHOT_PNG)
+        only_in_v1 = {1: [file_id]}
+
+        v1 = self._request(client, file_id, VICTIM_ORG_ID, VICTIM_ORG_ID, [], version=1, named_by_version=only_in_v1)
+        latest = self._request(client, file_id, VICTIM_ORG_ID, VICTIM_ORG_ID, [], named_by_version=only_in_v1)
+
+        assert v1.status_code == 200
+        assert latest.status_code == 404
+
+    @pytest.mark.parametrize("version", [0, 2**31])
+    def test_a_version_outside_the_int4_range_is_rejected_like_the_other_versioned_workflow_routes(
+        self,
+        service_app: object,
+        repo: FakeUploadedFilesRepository,
+        storage: FakeStorage,
+        monkeypatch: Any,
+        version: int,
+    ) -> None:
+        file_id = self._seed(repo, storage, VICTIM_ORG_ID, _SCREENSHOT_PNG)
+
+        resp = self._request(_client(monkeypatch), file_id, VICTIM_ORG_ID, VICTIM_ORG_ID, [file_id], version=version)
+
+        assert resp.status_code == 422
+
+    @pytest.mark.boundary
+    def test_the_client_image_limits_match_the_servers(self) -> None:
+        with open("skyvern-frontend/src/routes/workflows/editor/doc/docImageUploads.ts") as source_file:
+            source = source_file.read()
+        max_bytes = re.search(r"export const DOC_IMAGE_MAX_BYTES = ([\d *]+);", source)
+        max_pixels = re.search(r"export const DOC_IMAGE_MAX_PIXELS = ([\d_]+);", source)
+        types = re.search(r"export const DOC_IMAGE_TYPES = \[([^\]]*)\]", source)
+        assert max_bytes and max_pixels and types, "a doc image limit was renamed; update this guard"
+
+        product = 1
+        for factor in max_bytes.group(1).split("*"):
+            product *= int(factor)
+        assert product == uploaded_file_service.BLOCK_IMAGE_MAX_BYTES
+        assert int(max_pixels.group(1).replace("_", "")) == uploaded_file_service.BLOCK_IMAGE_MAX_PIXELS
+        assert set(re.findall(r'"([^"]+)"', types.group(1))) == uploaded_file_service.BLOCK_IMAGE_MEDIA_TYPES
+
+    def test_a_file_the_workflow_does_not_name_is_a_404(
+        self, service_app: object, repo: FakeUploadedFilesRepository, storage: FakeStorage, monkeypatch: Any
+    ) -> None:
+        file_id = self._seed(repo, storage, VICTIM_ORG_ID, _SCREENSHOT_PNG)
+        longer = f"{file_id}0"
+
+        resp = self._request(_client(monkeypatch), file_id, VICTIM_ORG_ID, VICTIM_ORG_ID, [longer])
+
+        assert resp.status_code == 404
+
+    def test_a_reader_gets_no_url_for_an_upload_the_version_names_only_outside_its_image_fields(
+        self, service_app: object, repo: FakeUploadedFilesRepository, storage: FakeStorage, monkeypatch: Any
+    ) -> None:
+        client = _client(monkeypatch)
+        doc_image, prompt_image, elsewhere = (
+            self._seed(repo, storage, VICTIM_ORG_ID, _SCREENSHOT_PNG) for _ in range(3)
+        )
+        named = [doc_image, prompt_image]
+
+        outside = self._request(client, elsewhere, VICTIM_ORG_ID, VICTIM_ORG_ID, named, named_elsewhere=(elsewhere,))
+        served = [self._request(client, file_id, VICTIM_ORG_ID, VICTIM_ORG_ID, named) for file_id in named]
+
+        assert outside.status_code == 404
+        assert [resp.status_code for resp in served] == [200, 200]
+
+    def test_a_folder_the_caller_cannot_read_is_refused(
+        self, service_app: object, repo: FakeUploadedFilesRepository, storage: FakeStorage, monkeypatch: Any
+    ) -> None:
+        file_id = self._seed(repo, storage, VICTIM_ORG_ID, _SCREENSHOT_PNG)
+
+        resp = self._request(_client(monkeypatch), file_id, VICTIM_ORG_ID, VICTIM_ORG_ID, [file_id], folder_denied=True)
+
+        assert resp.status_code == 403
+        assert self.folder_check.await_args.args[1:] == ("workflow.read", {"workflow_permanent_id": "wpid_doc"})
+        assert storage.downloads == []
+
+    def test_a_deleted_expired_or_vanished_file_is_no_longer_available(
+        self, service_app: object, repo: FakeUploadedFilesRepository, storage: FakeStorage, monkeypatch: Any
+    ) -> None:
+        client = _client(monkeypatch)
+        expired = self._seed(
+            repo, storage, VICTIM_ORG_ID, _SCREENSHOT_PNG, expires_at=datetime.now(timezone.utc) - timedelta(minutes=1)
+        )
+        vanished = repo.seed(VICTIM_ORG_ID, filename="vanished.png")
+        deleted = self._seed(repo, storage, VICTIM_ORG_ID, _SCREENSHOT_PNG, filename="deleted.png")
+        repo.rows[deleted].deleted_at = datetime.now(timezone.utc)
+
+        for file_id in (expired, vanished, deleted):
+            resp = self._request(client, file_id, VICTIM_ORG_ID, VICTIM_ORG_ID, [file_id])
+            assert resp.status_code == 404
+            assert resp.json() == {"detail": "File is no longer available"}
+
+    @pytest.mark.parametrize(
+        ("filename", "body"),
+        [
+            ("notes.pdf", b"%PDF-1.7 body"),
+            ("table.csv", b"name,amount\nalpha,1\n"),
+            ("pic.svg", b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'),
+            ("page.html", b"<!doctype html><html><script>alert(1)</script></html>"),
+            ("clip.mp4", b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom" + b"\x00" * 64),
+        ],
+    )
+    def test_a_named_file_that_is_not_a_raster_image_answers_like_a_missing_file(
+        self,
+        service_app: object,
+        repo: FakeUploadedFilesRepository,
+        storage: FakeStorage,
+        monkeypatch: Any,
+        filename: str,
+        body: bytes,
+    ) -> None:
+        client = _client(monkeypatch)
+        file_id = self._seed(repo, storage, VICTIM_ORG_ID, body, filename=filename)
+        missing = "file_missing"
+
+        resp = self._request(client, file_id, VICTIM_ORG_ID, VICTIM_ORG_ID, [file_id])
+        missing_resp = self._request(client, missing, VICTIM_ORG_ID, VICTIM_ORG_ID, [missing])
+
+        assert resp.status_code == missing_resp.status_code == 404
+        assert resp.json() == missing_resp.json() == {"detail": "File is no longer available"}
+
+    def test_an_image_is_served_up_to_the_4_mib_cap_and_not_past_it(
+        self, service_app: object, repo: FakeUploadedFilesRepository, storage: FakeStorage, monkeypatch: Any
+    ) -> None:
+        client = _client(monkeypatch)
+        at_cap = self._seed(repo, storage, VICTIM_ORG_ID, _SCREENSHOT_PNG, filename="at.png", size_bytes=4194304)
+        over_cap = self._seed(repo, storage, VICTIM_ORG_ID, _SCREENSHOT_PNG, filename="over.png", size_bytes=4194305)
+
+        served = self._request(client, at_cap, VICTIM_ORG_ID, VICTIM_ORG_ID, [at_cap])
+        refused = self._request(client, over_cap, VICTIM_ORG_ID, VICTIM_ORG_ID, [over_cap])
+
+        assert served.status_code == 200
+        assert refused.status_code == 404
+        assert refused.json() == {"detail": "File is no longer available"}
+
+    @pytest.mark.parametrize(("stored_size", "status"), [(4194304, 200), (4194305, 404), (None, 404)])
+    def test_a_row_with_no_recorded_size_is_held_to_the_cap_by_the_stored_size(
+        self,
+        service_app: object,
+        repo: FakeUploadedFilesRepository,
+        storage: FakeStorage,
+        monkeypatch: Any,
+        stored_size: int | None,
+        status: int,
+    ) -> None:
+        file_id = self._seed(repo, storage, VICTIM_ORG_ID, _SCREENSHOT_PNG)
+        storage.sizes[repo.rows[file_id].storage_uri] = stored_size
+
+        resp = self._request(_client(monkeypatch), file_id, VICTIM_ORG_ID, VICTIM_ORG_ID, [file_id])
+
+        assert resp.status_code == status
+
+    @pytest.mark.parametrize(
+        "head",
+        [
+            _png(10_000, 8_001),
+            _webp_vp8x(16_384, 16_384),
+            _webp_vp8x(10_000, 8_001),
+            _webp_vp8l(10_000, 8_001),
+            _webp_vp8(10_000, 8_001),
+            _gif(10_000, 8_001),
+            _jpeg(10_000, 8_001, app_segment_bytes=(30_000, 30_000)),
+            _png(0, 1080),
+            b"\xff\xd8\xff\xe1\xff\xff" + b"\x00" * 70_000,
+            _GIF_FRAME_OFF_SCREEN,
+            b"GIF89a\x01\x00\x01\x00\x00\x00\x00\x3b" + b"\x00" * 64,
+            _jpeg_decoy(b"\xff"),
+            _jpeg_decoy(b"\xff\xd0"),
+            _jpeg(1, 1).replace(_JPEG_SOS, _sof(10_000, 9_000) + _JPEG_SOS),
+            _jpeg(10_000, 9_000).replace(_JPEG_SOS, _sof(1, 1) + _JPEG_SOS),
+            _jpeg(64, 64).replace(b"\xff\xc2", b"\xff\x01" * _PAST_THE_STEP_CAP + b"\xff\xc2"),
+            _gif_after_extension(_DESCRIPTOR_SUB_BLOCK * _PAST_THE_STEP_CAP + b"\x00"),
+            *CRAFTED_4_MIB_HEADERS.values(),
+        ],
+        ids=[
+            "png",
+            "webp-268-megapixels",
+            "webp-vp8x",
+            "webp-vp8l",
+            "webp-vp8",
+            "gif",
+            "jpeg-late-sof",
+            "png-zero",
+            "jpeg-no-sof",
+            "gif-first-frame-off-screen",
+            "gif-no-frame",
+            "jpeg-fill-byte-decoy",
+            "jpeg-rst0-decoy",
+            "jpeg-second-sof-larger",
+            "jpeg-second-sof-smaller",
+            "jpeg-bare-markers-past-the-step-cap",
+            "gif-sub-blocks-past-the-step-cap",
+            *CRAFTED_4_MIB_HEADERS,
+        ],
+    )
+    def test_an_image_declaring_more_than_80_megapixels_or_no_size_answers_like_a_missing_file(
+        self,
+        service_app: object,
+        repo: FakeUploadedFilesRepository,
+        storage: FakeStorage,
+        monkeypatch: Any,
+        head: bytes,
+    ) -> None:
+        file_id = self._seed(repo, storage, VICTIM_ORG_ID, head, size_bytes=len(head))
+
+        resp = self._request(_client(monkeypatch), file_id, VICTIM_ORG_ID, VICTIM_ORG_ID, [file_id])
+
+        assert resp.status_code == 404
+        assert resp.json() == {"detail": "File is no longer available"}
+
+    @pytest.mark.parametrize("header", [_png, _webp_vp8x, _webp_vp8l, _webp_vp8, _gif, _jpeg])
+    def test_an_image_at_80_megapixels_is_served(
+        self,
+        service_app: object,
+        repo: FakeUploadedFilesRepository,
+        storage: FakeStorage,
+        monkeypatch: Any,
+        header: Callable[[int, int], bytes],
+    ) -> None:
+        file_id = self._seed(repo, storage, VICTIM_ORG_ID, header(10_000, 8_000), size_bytes=1024)
+
+        resp = self._request(_client(monkeypatch), file_id, VICTIM_ORG_ID, VICTIM_ORG_ID, [file_id])
+
+        assert resp.status_code == 200
+
+    def test_a_run_bound_upload_named_by_the_workflow_is_no_longer_available(
+        self, service_app: object, repo: FakeUploadedFilesRepository, storage: FakeStorage, monkeypatch: Any
+    ) -> None:
+        file_id = self._seed(repo, storage, VICTIM_ORG_ID, _SCREENSHOT_PNG, run_id="wr_1")
+        presign = AsyncMock(wraps=storage.presign_managed_file)
+
+        with patch.object(storage, "presign_managed_file", presign):
+            resp = self._request(_client(monkeypatch), file_id, VICTIM_ORG_ID, VICTIM_ORG_ID, [file_id])
+
+        assert resp.status_code == 404
+        assert resp.json() == {"detail": "File is no longer available"}
+        presign.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_row_of_another_organization_is_refused_even_if_the_lookup_returns_it(
+        self, service_app: object, repo: FakeUploadedFilesRepository, storage: FakeStorage
+    ) -> None:
+        file_id = self._seed(repo, storage, VICTIM_ORG_ID, _SCREENSHOT_PNG)
+        unscoped = AsyncMock(return_value=repo.rows[file_id])
+        with patch.object(repo, "get_uploaded_file", unscoped):
+            assert await uploaded_file_service.mint_file_url(file_id=file_id, organization_id=ATTACKER_ORG_ID) is None
+        assert storage.downloads == []
 
 
 class TestDeleteEndpoint:
