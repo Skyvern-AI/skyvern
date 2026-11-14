@@ -2,7 +2,7 @@ import { PlusIcon } from "@radix-ui/react-icons";
 import { Handle, NodeProps, Position, useEdges, useNodes } from "@xyflow/react";
 import { useRef, useState } from "react";
 
-import { useCopilotActionStore } from "@/store/useCopilotActionStore";
+import { useEmberActionStore } from "@/store/useEmberActionStore";
 import {
   BranchContext,
   useWorkflowPanelStore,
@@ -37,9 +37,7 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
   const startDemonstration = useRecordingLauncherStore(
     (state) => state.startDemonstration,
   );
-  const stageAttachment = useCopilotActionStore(
-    (state) => state.stageAttachment,
-  );
+  const stageAttachment = useEmberActionStore((state) => state.stageAttachment);
   const workflowSettingsStore = useWorkflowSettingsStore();
   const setWorkflowPanelState = useWorkflowPanelStore(
     (state) => state.setWorkflowPanelState,

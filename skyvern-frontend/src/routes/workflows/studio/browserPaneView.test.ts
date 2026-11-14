@@ -14,7 +14,7 @@ const base = {
   inspectingRun: true,
   blockRunInDebugSession: false,
   systemFocused: false,
-  copilotBrowserFocused: false,
+  emberBrowserFocused: false,
   runInDebugSession: false,
   running: false,
   hasRecording: false,
@@ -231,7 +231,7 @@ describe("resolveBrowserPaneView", () => {
     ).toBe("screenshots");
   });
 
-  it("shows Copilot's own browser live over the failed run it focused", () => {
+  it("shows Ember's own browser live over the failed run it focused", () => {
     const failedRun = {
       ...base,
       systemFocused: true,
@@ -240,30 +240,30 @@ describe("resolveBrowserPaneView", () => {
     };
     expect(resolveBrowserPaneView(failedRun)).toBe("screenshots");
     expect(
-      resolveBrowserPaneView({ ...failedRun, copilotBrowserFocused: true }),
+      resolveBrowserPaneView({ ...failedRun, emberBrowserFocused: true }),
     ).toBe("live");
   });
 
-  it("lets pills, scrubbing and the recorder outrank Copilot's browser", () => {
-    const copilotBrowser = {
+  it("lets pills, scrubbing and the recorder outrank Ember's browser", () => {
+    const emberBrowser = {
       ...base,
       systemFocused: true,
-      copilotBrowserFocused: true,
+      emberBrowserFocused: true,
     };
     expect(
-      resolveBrowserPaneView({ ...copilotBrowser, intent: "recording" }),
+      resolveBrowserPaneView({ ...emberBrowser, intent: "recording" }),
     ).toBe("recording");
     expect(
-      resolveBrowserPaneView({ ...copilotBrowser, intent: "screenshots" }),
+      resolveBrowserPaneView({ ...emberBrowser, intent: "screenshots" }),
     ).toBe("screenshots");
-    expect(resolveBrowserPaneView({ ...copilotBrowser, scrubbing: true })).toBe(
+    expect(resolveBrowserPaneView({ ...emberBrowser, scrubbing: true })).toBe(
       "screenshots",
     );
     expect(
       resolveLiveSurface({
         ...liveBase,
         recording: true,
-        copilotBrowserSurface: "run",
+        emberBrowserSurface: "run",
         hasRunId: true,
       }),
     ).toBe("debug");
@@ -348,7 +348,7 @@ describe("resolveBrowserPaneView", () => {
 
 const liveBase = {
   recording: false,
-  copilotBrowserSurface: null,
+  emberBrowserSurface: null,
   running: false,
   runInDebugSession: false,
   hasRunId: false,
@@ -378,11 +378,11 @@ describe("resolveLiveSurface", () => {
     ).toBe("debug");
   });
 
-  it("shows the browser Copilot's latest call named, over the run's own default", () => {
+  it("shows the browser Ember's latest call named, over the run's own default", () => {
     expect(
       resolveLiveSurface({
         ...liveBase,
-        copilotBrowserSurface: "debug",
+        emberBrowserSurface: "debug",
         running: true,
         hasRunId: true,
       }),
@@ -390,7 +390,7 @@ describe("resolveLiveSurface", () => {
     expect(
       resolveLiveSurface({
         ...liveBase,
-        copilotBrowserSurface: "run",
+        emberBrowserSurface: "run",
         hasRunId: true,
       }),
     ).toBe("run");

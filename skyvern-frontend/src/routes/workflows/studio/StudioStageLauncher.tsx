@@ -22,7 +22,7 @@ import { useStudioWorkflowDeletedAt } from "./StudioShellContext";
 
 /**
  * Zero-panes stage: every pane stays one labeled click away instead of the
- * stage dead-ending. Copilot/Editor/Browser open their pane; the "Past Runs"
+ * stage dead-ending. Ember/Editor/Browser open their pane; the "Past Runs"
  * tile opens the run selector (picking a run opens the run pane), mirroring the
  * rail tab.
  */

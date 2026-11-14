@@ -1,6 +1,6 @@
 import { stringify as convertToYAML } from "yaml";
 import type { AxiosInstance } from "axios";
-import type { WorkflowYAMLConversionResponse } from "../copilot/workflowCopilotTypes";
+import type { WorkflowYAMLConversionResponse } from "../ember/emberTypes";
 
 import type { WorkflowSaveData } from "@/store/WorkflowHasChangesStore";
 import { parseHeaderJson } from "@/util/secretHeaders";
@@ -239,6 +239,7 @@ const managedKeys = new Set([
   "created_by",
   "edited_by",
   "copilot_authored",
+  "ember_authored",
   "is_template",
   "enable_self_healing",
 ]);

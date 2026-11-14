@@ -7,14 +7,14 @@ import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import {
-  beginCopilotAcceptance,
+  beginEmberAcceptance,
   beginSaveTransaction,
-  finishCopilotAcceptance,
+  finishEmberAcceptance,
   finishSaveTransaction,
   isLockedByOther,
   registerEditorOwner,
   useWorkflowYamlEditorStore,
-  withCopilotAcceptance,
+  withEmberAcceptance,
 } from "@/store/WorkflowYamlEditorStore";
 import { useWorkflowSnapshotStore } from "@/store/WorkflowSnapshotStore";
 import { getWorkflowSettings } from "./workflowEditorUtils";
@@ -323,17 +323,17 @@ test("refuses stale workflows and other owners without partial writes", () => {
   expect(restoreEditorState(snapshot, stale)).toBe("refused-stale-workflow");
   expect(stale.setNodes).not.toHaveBeenCalled();
   expect(stale.restoreOwnership).not.toHaveBeenCalled();
-  const token = beginCopilotAcceptance()!;
+  const token = beginEmberAcceptance()!;
   const target = deps();
   expect(restoreEditorState(snapshot, target)).toBe("refused-locked");
   expect(target.setNodes).not.toHaveBeenCalled();
   expect(target.restoreOwnership).not.toHaveBeenCalled();
   expect(
-    withCopilotAcceptance(token, () =>
+    withEmberAcceptance(token, () =>
       expect(restoreEditorState(snapshot, target)).toBe("restored"),
     ),
   ).toBe(true);
-  finishCopilotAcceptance(token);
+  finishEmberAcceptance(token);
 });
 
 test("a title generation response cannot overwrite a restored placeholder", async () => {
@@ -415,9 +415,9 @@ test.each(["save", "copilot"] as const)(
         expect(beginSaveTransaction(owner)).toBe(true);
         release = () => finishSaveTransaction(owner);
       } else {
-        const token = beginCopilotAcceptance()!;
+        const token = beginEmberAcceptance()!;
         expect(token).not.toBeNull();
-        release = () => finishCopilotAcceptance(token);
+        release = () => finishEmberAcceptance(token);
       }
     });
     await act(async () => {

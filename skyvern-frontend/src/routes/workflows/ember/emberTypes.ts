@@ -1,0 +1,907 @@
+import {
+  WorkflowApiResponse,
+  WorkflowDefinition,
+} from "@/routes/workflows/types/workflowTypes";
+
+// The API sends both chat-id keys while the rename window is open; an older API sends only the old key.
+export function emberChatIdOf<
+  T extends {
+    ember_chat_id?: string | null;
+    workflow_copilot_chat_id?: string | null;
+  },
+>(wire: T): T["workflow_copilot_chat_id"] {
+  return (wire.ember_chat_id ??
+    wire.workflow_copilot_chat_id) as T["workflow_copilot_chat_id"];
+}
+
+export function emberChatMessageIdOf<
+  T extends {
+    ember_chat_message_id?: string | null;
+    workflow_copilot_chat_message_id?: string | null;
+  },
+>(wire: T): T["workflow_copilot_chat_message_id"] {
+  return (wire.ember_chat_message_id ??
+    wire.workflow_copilot_chat_message_id) as T["workflow_copilot_chat_message_id"];
+}
+
+export type EmberChatSender = "user" | "ai" | "product";
+export type EmberProductAction = {
+  kind: "diagnose_run";
+  workflowRunId: string;
+  nonce: string;
+};
+
+export interface EmberDemonstrationInsertion {
+  after_label: string | null;
+  before_label: string | null;
+  replace_label?: string | null;
+}
+export type ProposalDisposition =
+  | "no_proposal"
+  | "auto_applicable"
+  | "review_untested"
+  | "review_tested";
+export type EmberResponseType = "REPLY" | "ASK_QUESTION" | "REPLACE_WORKFLOW";
+
+export interface QuestionChoice {
+  choice_id: string;
+  text: string;
+  recommended?: boolean;
+  detail_prompt?: string | null;
+}
+
+export interface QuestionPart {
+  part_id: string;
+  prompt: string;
+  choices: QuestionChoice[];
+}
+
+export interface QuestionAnswer {
+  part_id: string;
+  choice_id?: string | null;
+  text?: string | null;
+}
+
+export type AccountGroupOutcome =
+  | "pending"
+  | "in_progress"
+  | "completed"
+  | "failed"
+  | "unknown"
+  | "canceled";
+
+export interface AccountGroupRow {
+  credential_id: string;
+  label: string;
+  prior_outcome: AccountGroupOutcome | null;
+  preselected: boolean;
+  parameter_key?: string;
+}
+
+export interface AccountGroupReview {
+  workflow_permanent_id: string;
+  workflow_id: string;
+  version: number;
+  workflow_title: string;
+  credential_parameter_key: string;
+  action_summary: string;
+  common_inputs: Record<string, unknown>;
+  clean_group_run_id?: string | null;
+  credential_parameter_used_by?: string[];
+  rows: AccountGroupRow[];
+  workflow_run_group_id: string | null;
+  single_run?: boolean;
+  workflow_run_id?: string | null;
+  saves_draft?: boolean;
+  proposal_owner_turn_id?: string | null;
+  proposal_revision?: number | null;
+  draft_tested?: boolean;
+  tested_workflow_run_id?: string | null;
+  cost?: RunCostFacts | null;
+  based_on_inputs?: Record<string, unknown> | null;
+  saved_workflow_id?: string | null;
+  saved_version?: number | null;
+  run_started?: boolean | null;
+  decision?: AccountGroupDecision | null;
+}
+
+export interface RunCostFacts {
+  runs_to_start?: number;
+  based_on_run_id?: string;
+  based_on_credits?: number;
+  blocks_completed?: number;
+  blocks_total?: number;
+  estimate_from_one_run?: number;
+  balance_credits?: number;
+  credits_note?: string;
+  stop_rule?: string;
+}
+
+export interface AccountGroupRunRow {
+  credential_id: string;
+  label: string;
+  workflow_run_id: string;
+  outcome: AccountGroupOutcome;
+}
+
+export interface AccountGroupCancelReview {
+  workflow_run_group_id: string;
+  unfinished_rows: AccountGroupRunRow[];
+  decision?: AccountGroupDecision | null;
+}
+
+export interface AccountGroupDecision {
+  approved: boolean;
+  credential_ids: string[];
+}
+
+export type CredentialDeleteOutcomeKind = "deleted" | "not_found" | "failed";
+
+export interface CredentialDeleteRow {
+  credential_id: string;
+  name: string;
+  credential_type: "password" | "credit_card" | "secret";
+}
+
+export interface CredentialDeleteReview {
+  rows: CredentialDeleteRow[];
+  total_credential_count: number;
+  claimed_at?: string | null;
+  approved_credential_ids?: string[] | null;
+  outcomes?: { credential_id: string; outcome: CredentialDeleteOutcomeKind }[];
+}
+
+export interface QuestionResponse {
+  answers?: QuestionAnswer[];
+  text?: string | null;
+  skipped?: boolean;
+  account_group_decision?: AccountGroupDecision;
+}
+
+export interface QuestionInteraction {
+  interaction_id: string;
+  turn_id: string;
+  tool_call_id: string;
+  parts: QuestionPart[];
+  status: "pending" | "resolved" | "cancelled" | "interrupted";
+  response: QuestionResponse | null;
+  created_at: string;
+  resolved_at: string | null;
+  account_group_review?: AccountGroupReview;
+  account_group_cancel?: AccountGroupCancelReview;
+  credential_delete_review?: CredentialDeleteReview;
+}
+
+export interface EmberQuestionRequired {
+  type: "question_required";
+  turn_id: string;
+  workflow_copilot_chat_id: string;
+  ember_chat_id?: string;
+  interactions: QuestionInteraction[];
+  cancel_token: string | null;
+}
+
+export interface EmberQuestionResolved {
+  type: "question_resolved";
+  interaction: QuestionInteraction;
+  continued: boolean;
+}
+
+export interface ConnectedAccountChoice {
+  connection_id: string;
+  name: string;
+  state: string;
+  email_address?: string | null;
+}
+
+export interface DeliveredOutputFile {
+  artifact_id: string;
+  filename: string;
+}
+
+export interface BudgetExpiryOutcome {
+  budget_expired?: boolean;
+  budget_expiry_source?: "deadline" | "max_turns" | null;
+  budget_expiry_report_produced?: boolean | null;
+  budget_expiry_staged_draft_id?: string | null;
+  drain_fingerprint?: string | null;
+}
+
+export interface EmberAttachedFile {
+  file_id: string;
+  filename: string;
+  size_bytes?: number | null;
+  // Resolved fresh by the server on every read; false once the file expires or is deleted.
+  available: boolean;
+}
+
+export interface EmberChat {
+  workflow_copilot_chat_id: string;
+  ember_chat_id?: string;
+  organization_id: string;
+  workflow_permanent_id: string;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface EmberChatMessage {
+  workflow_copilot_chat_message_id: string;
+  ember_chat_message_id?: string;
+  workflow_copilot_chat_id: string;
+  ember_chat_id?: string;
+  sender: EmberChatSender;
+  content: string;
+  audio_artifact_id?: string | null;
+  attached_files?: EmberAttachedFile[];
+  global_llm_context: string | null;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface EmberChatRequest {
+  selected_connected_account_id?: string | null;
+  workflow_permanent_id: string;
+  workflow_id: string;
+  workflow_copilot_chat_id?: string | null;
+  workflow_run_id?: string | null;
+  browser_session_id?: string | null;
+  message: string;
+  audio_artifact_id?: string | null;
+  attached_file_ids?: string[];
+  workflow_yaml: string;
+  mode?: "build" | null;
+  code_block?: boolean | null;
+  /** Internal capability: send only when the document editor is active. */
+  doc_editor_enabled?: boolean;
+  cancel_token?: string;
+  idempotency_key?: string | null;
+  target_block_label?: string | null;
+  // Ambient fact: the block selected on the studio canvas when the message was
+  // sent — context for "this block" references, never a directive.
+  selected_block_label?: string | null;
+  keep_pending_proposal?: boolean;
+  product_action?: "test_end_to_end" | "diagnose_run" | "demonstrate" | null;
+  demonstration_id?: string | null;
+  // Opt-in: only clients that can render the credential_required frame set
+  // this, so the backend never pauses a turn a client would silently drop.
+  supports_credential_pause?: boolean;
+  supports_credential_generation?: boolean;
+  credential_recovery_token?: string;
+  supports_credential_pause_recovery?: boolean;
+  supports_question_tool?: boolean;
+  supports_account_group_card?: boolean;
+  supports_single_run_card?: boolean;
+  supports_credential_delete_card?: boolean;
+  supports_connection_card?: boolean;
+  supports_demonstration_offer?: boolean;
+}
+
+export type EmberCancelSource = "escape_key" | "stop_button" | "api";
+
+export interface EmberCancelRequest {
+  cancel_token: string;
+  source: EmberCancelSource;
+}
+
+export interface EmberSteerRequest {
+  workflow_copilot_chat_id: string;
+  cancel_token: string;
+  steer_id: string;
+  message: string;
+}
+
+// A message sent into a running turn, as the server screened and stored it.
+export interface EmberSteerMessage {
+  steer_id: string;
+  text: string;
+  created_at: string;
+  delivered_at: string | null;
+}
+
+export interface EmberSteerDeliveredUpdate {
+  type: "steer_delivered";
+  turn_id: string;
+  steer_messages: EmberSteerMessage[];
+}
+
+// A browser frame captured for the agent, stored as a chat-owned artifact.
+export interface EmberScreenshotUpdate {
+  type: "screenshot";
+  artifact_id: string;
+  captured_at: string;
+  tool_call_id?: string | null;
+}
+
+export type EmberMessageFeedbackRating = "up" | "down";
+
+export interface EmberMessageFeedback {
+  rating: EmberMessageFeedbackRating;
+  reason?: string | null;
+  rated_at: string;
+}
+
+export interface EmberMessageFeedbackRequest {
+  workflow_copilot_chat_id: string;
+  workflow_copilot_chat_message_id?: string | null;
+  turn_id?: string | null;
+  rating: EmberMessageFeedbackRating | null;
+  reason?: string | null;
+}
+
+export interface EmberMessageFeedbackResponse {
+  workflow_copilot_chat_message_id: string;
+  ember_chat_message_id?: string;
+  feedback: EmberMessageFeedback | null;
+}
+
+export interface EmberChatHistoryMessage {
+  // Persisted row id; absent on rows synthesized in-process or from an older backend.
+  workflow_copilot_chat_message_id?: string | null;
+  ember_chat_message_id?: string | null;
+  sender: EmberChatSender;
+  content: string;
+  turn_id?: string | null;
+  feedback?: EmberMessageFeedback | null;
+  audio_artifact_id?: string | null;
+  attached_files?: EmberAttachedFile[];
+  created_at: string;
+  modified_at?: string;
+  // Typed turn outcome persisted on assistant rows; optional so the FE
+  // tolerates an older backend that does not serve it.
+  turn_outcome?:
+    | (BudgetExpiryOutcome & {
+        response_kind?: string | null;
+        connected_account_choices?: ConnectedAccountChoice[] | null;
+        output_files?: DeliveredOutputFile[] | null;
+        // Server-minted id of the turn that wrote this row; the same id the
+        // turn_start frame carries, so a client can correlate a row to its own send.
+        copilot_turn_id?: string | null;
+        terminal_reason?: string | null;
+        // Set on every interrupted row the server serves, since no late reply replaces
+        // a stored row. Absent only from a backend that still replaced rows.
+        interrupted_row_final?: boolean;
+      })
+    | null;
+  narrative_payload?: Record<string, unknown> | null;
+}
+
+export interface EmberInFlightTurn {
+  turn_id: string;
+  cancel_token?: string | null;
+  latest_draft?: WorkflowApiResponse | null;
+  latest_draft_at?: string | null;
+}
+
+export interface EmberChatHistoryResponse {
+  pending_credential_requests?: EmberCredentialRequiredUpdate[];
+  question_interactions?: QuestionInteraction[];
+  pending_question_cancel_token?: string | null;
+  workflow_copilot_chat_id: string | null;
+  ember_chat_id?: string | null;
+  request_turn_id?: string | null;
+  in_flight_turn?: EmberInFlightTurn | null;
+  chat_history: EmberChatHistoryMessage[];
+  accepted_turn_ids?: string[];
+  proposed_workflow?: WorkflowApiResponse | null;
+  proposed_workflow_metadata?: EmberProposalMetadata | null;
+  // Seconds the server's accepting claim has left; null when no live claim holds the
+  // proposal. A duration, so a skewed client clock still agrees with the server.
+  proposed_claim_expires_in_seconds?: number | null;
+  proposed_workflow_run?: EmberProposalRunFacts | null;
+  auto_accept?: boolean | null;
+  work_plan?: string[];
+}
+
+export interface EmberProposalMetadata {
+  owner_turn_id: string;
+  revision: number;
+  canonical_fingerprint: string;
+  disposition: ProposalDisposition | "accepting";
+  workflow_run_id?: string | null;
+}
+
+export interface EmberProposalRunFacts {
+  workflow_run_id: string;
+  status?: string | null;
+  available: boolean;
+  failure_reason?: string | null;
+  outputs: Array<{
+    output_parameter_id: string;
+    value: unknown;
+  }>;
+}
+
+export interface EmberChatSummary {
+  workflow_copilot_chat_id: string;
+  ember_chat_id?: string;
+  workflow_permanent_id: string;
+  // Returned by the API; not rendered since the list is already scoped to one workflow.
+  workflow_title?: string | null;
+  title: string;
+  created_at: string;
+  modified_at: string;
+  // Absent on responses from a backend that predates the marker.
+  awaiting_user_input?: boolean;
+}
+
+export interface EmberClearProposedWorkflowRequest {
+  workflow_copilot_chat_id: string;
+  auto_accept: boolean;
+  owner_turn_id?: string | null;
+  revision?: number | null;
+}
+
+export interface EmberApplyProposedWorkflowRequest {
+  workflow_copilot_chat_id: string;
+  auto_accept: boolean;
+  owner_turn_id?: string | null;
+  revision?: number | null;
+}
+
+export interface EmberAudioUploadResponse {
+  workflow_copilot_chat_id: string;
+  ember_chat_id?: string;
+  audio_artifact_id: string;
+}
+
+export type EmberStreamMessageType =
+  | "processing_update"
+  | "response"
+  | "error"
+  | "tool_call"
+  | "tool_result"
+  | "condensing"
+  | "narration"
+  | "block_progress"
+  | "run_started"
+  | "run_outcome"
+  | "turn_start"
+  | "design_start"
+  | "design_end"
+  | "workflow_draft"
+  | "codegen_progress"
+  | "title_update"
+  | "credential_required"
+  | "question_required"
+  | "steer_delivered"
+  | "screenshot";
+
+export interface EmberProcessingUpdate {
+  type: "processing_update";
+  status: string;
+  timestamp: string;
+}
+
+export interface EmberStreamResponseUpdate {
+  type: "response";
+  workflow_copilot_chat_id: string;
+  ember_chat_id?: string;
+  message: string;
+  updated_workflow?: WorkflowApiResponse | null;
+  response_time: string;
+  response_type?: EmberResponseType;
+  proposal_disposition: ProposalDisposition;
+  workflow_applied?: boolean;
+  proposed_workflow_metadata?: EmberProposalMetadata | null;
+  proposed_workflow_run?: EmberProposalRunFacts | null;
+  // Cancel forces explicit review.
+  cancelled?: boolean;
+  // Optional so the FE tolerates an older backend that does not emit the
+  // turn-narrative envelope.
+  turn_id?: string | null;
+  narrative_summary?: string | null;
+  narrative_payload?: Record<string, unknown> | null;
+  // An empty list means the model cleared its plan; null/absent means this frame
+  // carries no snapshot and the rendered plan stands.
+  work_plan?: string[] | null;
+}
+
+export interface EmberStreamErrorUpdate {
+  type: "error";
+  error: string;
+  turn_id?: string | null;
+  narrative_summary?: string | null;
+}
+
+export interface EmberTurnStartUpdate {
+  type: "turn_start";
+  turn_id: string;
+  turn_index: number;
+  timestamp: string;
+  // Block count of the canonical workflow at turn entry. Drives the FE's
+  // edit-vs-build chip; the snap-back source is captured client-side at
+  // submit time so unsaved local canvas edits survive.
+  prior_block_count?: number | null;
+  workflow_copilot_chat_id?: string | null;
+  ember_chat_id?: string | null;
+}
+
+export interface EmberDesignStartUpdate {
+  type: "design_start";
+  timestamp: string;
+}
+
+export interface EmberDesignEndUpdate {
+  type: "design_end";
+  timestamp: string;
+}
+
+// Summary-only payload — the full workflow definition is delivered via the
+// terminal response's updated_workflow or via the chat's proposed_workflow
+// field, not here.
+export interface EmberWorkflowDraftUpdate {
+  type: "workflow_draft";
+  block_count: number;
+  block_labels: string[];
+  summary: string | null;
+  timestamp: string;
+  workflow?: WorkflowApiResponse | null;
+  // A write and its test share one tool call, so the tool_result arrives only after the run.
+  // These carry the patch at write time and name the call whose row it belongs to.
+  code_diffs?: unknown;
+  tool_call_id?: string | null;
+}
+
+// Throttled progress while the model streams an authoring tool call's arguments.
+// Live-only and never persisted: a reload has no access to these, and the
+// workflow_draft / tool_call frames that follow supersede them.
+export interface EmberCodegenProgressUpdate {
+  type: "codegen_progress";
+  tool_name: string;
+  // Cumulative and ordered: every frame carries the full list seen so far.
+  blocks_drafted: string[];
+  chars_streamed: number;
+  iteration: number;
+  // New for every model response; the authoring calls within one response
+  // share it. Absent from servers that predate it.
+  generation_id?: string | null;
+  timestamp: string;
+}
+
+// Emitted once the backend has persisted a derived agent name, before any block
+// exists. Clients must not treat it as authoritative over a user-chosen title.
+export interface EmberTitleUpdate {
+  type: "title_update";
+  turn_id: string;
+  workflow_permanent_id: string;
+  title: string;
+  timestamp: string;
+}
+
+export type CredentialBinding =
+  | "saved_workflow"
+  | "matched_by_saved_url"
+  | "not_bound";
+
+// Mid-build pause frame: the turn stays open (SSE alive) while the client
+// surfaces a credential card. reason stays a raw string here — CredentialCard
+// tolerates unknown reason tokens, so a newer backend can't break the wiring.
+export interface EmberCredentialRequiredUpdate {
+  type: "credential_required";
+  turn_id: string;
+  workflow_copilot_chat_id: string;
+  ember_chat_id?: string;
+  resume_token: string;
+  reason: string;
+  message: string;
+  login_page_urls: string[];
+  credential_refs: string[];
+  named_credential_id?: string | null;
+  timeout_seconds: number;
+  expires_at: string;
+  // The tool call whose activity row was newest when the pause was raised, so
+  // the card renders there. Absent against a backend that predates it.
+  anchor_tool_call_id?: string | null;
+  // The live browser the user may sign in to themselves; absent when the card does not offer it.
+  sign_in_browser_session_id?: string | null;
+  signing_in?: boolean;
+  // Set on update cards only: how the credential they name is bound.
+  credential_binding?: CredentialBinding | null;
+  // Present on a card that offers Generate and save; never carries a password.
+  registration?: {
+    username: string;
+    credential_name: string;
+    attempted?: boolean;
+    outcome?: "rejected" | "unknown" | "created_not_connected" | null;
+  } | null;
+  // The site question asked about a picked login, so a reloaded card asks it again.
+  site_question?: CredentialSiteQuestion | null;
+  timestamp: string;
+}
+
+export type CredentialSiteAnswer = "add" | "no";
+
+export interface CredentialSiteQuestion {
+  credential_id: string;
+  name: string;
+  // The origin this card signs in on.
+  site: string;
+  // Origins the login is saved for.
+  saved_sites: string[];
+  // The sites come from a connected vault, so only that vault can add one.
+  vault_sourced: boolean;
+}
+
+export interface EmberDemonstrationStartedUpdate {
+  type: "demonstration_started";
+  demonstration_id: string;
+  browser_session_id: string;
+  action_count: number;
+  resumed: boolean;
+  can_fill_credentials: boolean;
+}
+
+export interface EmberDemonstrationActionUpdate {
+  type: "demonstration_action";
+  seq: number;
+  label: string;
+  tool_name:
+    | "click"
+    | "type_text"
+    | "select_option"
+    | "press_key"
+    | "drag"
+    | "navigate_browser"
+    | "upload_attached_file"
+    | "fill_credential_field"
+    | "note"
+    | "skyvern_tab_switch";
+  // Present only on an upload the recorder attached; a skipped file request has none.
+  file_id?: string;
+  filename?: string;
+}
+
+export interface EmberDemonstrationSensitiveFieldUpdate {
+  type: "demonstration_sensitive_field";
+  field: "password" | "totp" | "other";
+  selector: string;
+  url: string;
+}
+
+export interface EmberDemonstrationFileRequestedUpdate {
+  type: "demonstration_file_requested";
+  label: string;
+}
+
+export interface EmberDemonstrationNoticeUpdate {
+  type: "demonstration_notice";
+  message: string;
+  level: "info" | "error";
+}
+
+export interface EmberDemonstrationStoppedUpdate {
+  type: "demonstration_stopped";
+  demonstration_id?: string;
+  reason:
+    | "stopped"
+    | "cancelled"
+    | "disconnected"
+    | "browser_gone"
+    | "time_limit"
+    | "event_limit"
+    | "consumed";
+  action_count: number;
+}
+
+export interface EmberDemonstrationControlRequest {
+  demonstration_id: string;
+  action:
+    | "navigate"
+    | "fill_credential"
+    | "upload_file"
+    | "note"
+    | "stop"
+    | "cancel";
+  url?: string | null;
+  text?: string | null;
+  selector?: string | null;
+  credential_id?: string | null;
+  field?: "password" | "totp" | null;
+  stop_reason?: "browser_gone" | null;
+}
+
+export interface EmberDemonstrationControlResult {
+  seq: number;
+  action_count?: number | null;
+  file_id?: string | null;
+}
+
+export type EmberDemonstrationUpdate =
+  | EmberDemonstrationStartedUpdate
+  | EmberDemonstrationActionUpdate
+  | EmberDemonstrationSensitiveFieldUpdate
+  | EmberDemonstrationFileRequestedUpdate
+  | EmberDemonstrationNoticeUpdate
+  | EmberDemonstrationStoppedUpdate;
+
+export interface EmberActiveDemonstration {
+  demonstration_id: string;
+  status: "recording" | "stopping" | "stopped";
+  action_count: number;
+  action_labels: string[];
+  can_fill_credentials: boolean;
+  can_resume: boolean;
+  insertion?: EmberDemonstrationInsertion | null;
+}
+
+export interface EmberCredentialResponseResult {
+  result:
+    | "accepted"
+    | "signed_in"
+    | "no_sign_in_found"
+    | "save_failed"
+    | "site_question"
+    | "site_changed_not_connected"
+    | "site_change_unknown";
+  site_question?: CredentialSiteQuestion | null;
+  expires_at?: string | null;
+  host?: string | null;
+  browser_profile_id?: string | null;
+}
+
+export interface EmberCredentialGenerateResult {
+  result: "connected" | "rejected" | "unknown" | "created_not_connected";
+  credential_id?: string | null;
+  name?: string | null;
+  username?: string | null;
+  // The reopened card's new deadline after "rejected" or "unknown".
+  expires_at?: string | null;
+}
+
+export interface EmberCredentialPauseResolvedUpdate {
+  type: "credential_pause_resolved";
+  turn_id: string;
+  workflow_copilot_chat_id: string;
+  ember_chat_id?: string;
+  resume_token: string;
+  outcome: "connected" | "skipped" | "not_admitted" | "signed_in";
+  credential_id: string | null;
+  name: string | null;
+  browser_profile_id?: string | null;
+  site_answer?: CredentialSiteAnswer | null;
+  site_a?: string | null;
+  saved_sites?: string[] | null;
+  site_b?: string | null;
+  timestamp: string;
+}
+
+export type ActivityBucket =
+  | { kind: "design" }
+  | { kind: "block"; workflow_run_block_id: string };
+
+export interface EmberToolCallUpdate {
+  reason?: string | null;
+  activity_bucket?: ActivityBucket | null;
+  type: "tool_call";
+  tool_name: string;
+  display_label?: string | null;
+  tool_input: Record<string, unknown>;
+  iteration: number;
+  tool_call_id: string;
+  timestamp?: string | null;
+  // The browser this call resolved to when it was emitted; null for calls that
+  // act in no page. Not persisted, so a reloaded chat never sees it.
+  browser_session_id?: string | null;
+}
+
+// One changed code block's line delta. `patch` is absent when the server dropped
+// it for size; the counts are always the full change and never the patch's.
+export interface CodeWriteDiff {
+  label: string;
+  added: number;
+  removed: number;
+  patch?: string;
+  patchDropped?: boolean;
+}
+
+export interface EmberToolResultUpdate {
+  activity_started_at?: string | null;
+  reason?: string | null;
+  activity_bucket?: ActivityBucket | null;
+  type: "tool_result";
+  tool_name: string;
+  display_label?: string | null;
+  success: boolean;
+  summary: string;
+  iteration: number;
+  tool_call_id: string;
+  code_diffs?: CodeWriteDiff[] | null;
+  // The plan a successful set_work_plan stored. Absent on every other tool.
+  work_plan?: string[] | null;
+  // A successful run_browser_code call's operations as display phrases.
+  browser_steps?: string[] | null;
+  detail?: string | null;
+  workflow_run_id?: string | null;
+  // Keys and sources only; values are read from the run itself.
+  test_inputs?: EmberTestInput[] | null;
+  debug_session_id?: string | null;
+  timestamp?: string | null;
+}
+
+export type EmberTestInputSource =
+  | "copilot"
+  | "page"
+  | "earlier_run"
+  | "default"
+  | "placeholder";
+
+export interface EmberTestInput {
+  key: string;
+  source: EmberTestInputSource;
+  sourceRunId?: string;
+}
+
+export interface EmberCondensingUpdate {
+  type: "condensing";
+  status: "started" | "completed";
+}
+
+export interface EmberNarrationUpdate {
+  type: "narration";
+  narration: string;
+  // The narrator's intent and outcome for the step. The log reads only
+  // active_label, to group browse retries under one intent.
+  active_label?: string | null;
+  outcome_label?: string | null;
+  iteration: number;
+  timestamp: string;
+}
+
+export interface EmberBlockProgressUpdate {
+  type: "block_progress";
+  workflow_run_block_id: string;
+  // Present once the backend stamps the dispatched run id onto progress frames
+  // (surfaced mid-execution). Absent against older backends, which only carry
+  // the run id on run_outcome; the chat falls back to that.
+  workflow_run_id?: string | null;
+  // Absent against older backends; the chat then nests by the step's call ids only.
+  parent_workflow_run_block_id?: string | null;
+  block_label: string;
+  block_type: string;
+  status: string;
+  iteration: number;
+  timestamp: string;
+}
+
+export interface EmberRunStartedUpdate {
+  type: "run_started";
+  workflow_run_id: string;
+  skipped_prefix?: SkippedPrefixBlock[];
+  timestamp: string;
+}
+
+export type EmberRunOutcomeVerdict =
+  | "evaluating"
+  | "demonstrated"
+  | "not_demonstrated"
+  | "not_evaluated";
+
+export type RunOutcomeRole = "recorded" | "adjudicated" | "interim_build_test";
+
+export interface SkippedPrefixBlock {
+  label: string;
+  kind: "reused" | "not_run";
+  sourceWorkflowRunId?: string;
+}
+
+export interface EmberRunOutcomeUpdate {
+  type: "run_outcome";
+  workflow_run_id: string;
+  workflow_run_block_ids: string[];
+  block_labels: string[];
+  verdict: EmberRunOutcomeVerdict;
+  role?: RunOutcomeRole;
+  reason_code?: string | null;
+  display_reason?: string | null;
+  iteration: number;
+  timestamp: string;
+}
+
+export interface WorkflowYAMLConversionRequest {
+  workflow_definition_yaml: string;
+  workflow_id: string;
+}
+
+export interface WorkflowYAMLConversionResponse {
+  workflow_definition: WorkflowDefinition;
+}

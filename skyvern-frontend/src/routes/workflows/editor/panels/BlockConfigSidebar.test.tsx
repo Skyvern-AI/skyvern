@@ -15,8 +15,8 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { clearDeferredEdits } from "@/hooks/useDeferredLockedEdit";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import {
-  beginCopilotAcceptance,
-  finishCopilotAcceptance,
+  beginEmberAcceptance,
+  finishEmberAcceptance,
   useWorkflowYamlEditorStore,
 } from "@/store/WorkflowYamlEditorStore";
 import { useSidebarSaveStateStore } from "@/store/SidebarSaveStateStore";
@@ -486,13 +486,13 @@ describe("BlockConfigSidebar block title editing (SKY-10255)", () => {
     });
     let token: symbol;
     act(() => {
-      token = beginCopilotAcceptance()!;
+      token = beginEmberAcceptance()!;
     });
     expect(screen.queryByRole("textbox")).toBeNull();
     expect(xyflow.nodes[0]?.data.label).toBe("Alpha");
     expect(xyflow.setNodes).not.toHaveBeenCalled();
 
-    act(() => finishCopilotAcceptance(token));
+    act(() => finishEmberAcceptance(token));
 
     expect(xyflow.nodes[0]?.data.label).toBe("renamed_block");
     expect(xyflow.setNodes).toHaveBeenCalledTimes(1);

@@ -15,7 +15,7 @@ import { WorkflowDocActionsContext } from "./WorkflowDocActionsContext";
 
 const PLACEHOLDER = "Name this step";
 const DEFAULT_NAME = "Add a word: this name reads as a default one";
-// What was typed, by node id, so an entry marks the field as touched. A Copilot proposal replaces the live steps, so a
+// What was typed, by node id, so an entry marks the field as touched. An Ember proposal replaces the live steps, so a
 // draft outlives its field here; node ids are generated per load, so none carries to another workflow.
 const drafts = new Map<string, string>();
 const title =

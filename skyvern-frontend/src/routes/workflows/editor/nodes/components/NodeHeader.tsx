@@ -1355,7 +1355,7 @@ function NodeHeader({
               editable={editable}
               onChange={(value) => {
                 // The label handler queues edits while the graph is locked.
-                useWorkflowTitleStore.getState().recordCopilotGraphEdit();
+                useWorkflowTitleStore.getState().recordEmberGraphEdit();
                 setLabel(value);
               }}
               titleClassName={cn("text-base", {

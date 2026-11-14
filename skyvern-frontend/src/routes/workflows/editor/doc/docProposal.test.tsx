@@ -24,15 +24,15 @@ import { MemoryRouter } from "react-router-dom";
 import { parse as parseYaml } from "yaml";
 import { ProxyLocation } from "@/api/types";
 import * as axiosClientModule from "@/api/AxiosClient";
-import { useCopilotProposalStore } from "@/store/CopilotProposalStore";
+import { useEmberProposalStore } from "@/store/EmberProposalStore";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 
 import {
   EMPTY_NARRATIVE,
   type ReviewProjection,
-} from "../../copilot/narrativeState";
-import { ReviewGateCard } from "../../copilot/cards/ReviewGateCard";
+} from "../../ember/narrativeState";
+import { ReviewGateCard } from "../../ember/cards/ReviewGateCard";
 import type {
   WorkflowApiResponse,
   WorkflowBlock,
@@ -159,7 +159,7 @@ async function renderDoc(
   tested = false,
 ) {
   const decide = vi.fn(async () => true);
-  useCopilotProposalStore.getState().setProposal({
+  useEmberProposalStore.getState().setProposal({
     proposed: workflow(proposed),
     baseline: workflow(saved),
     review,
@@ -197,7 +197,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
-  useCopilotProposalStore.getState().setProposal(null);
+  useEmberProposalStore.getState().setProposal(null);
   vi.restoreAllMocks();
 });
 
@@ -207,7 +207,7 @@ async function renderProposal(
   after: WorkflowBlock,
   lead: WorkflowBlock[] = [],
 ) {
-  useCopilotProposalStore.getState().setProposal({
+  useEmberProposalStore.getState().setProposal({
     proposed: workflow([...lead, after]),
     baseline: workflow([...lead, before]),
     review: {
@@ -233,8 +233,8 @@ async function renderProposal(
   );
 }
 
-describe("Copilot proposal in the Doc view", () => {
-  test("the banner says Tested when Copilot ran the proposal and Untested when it did not", async () => {
+describe("Ember proposal in the Doc view", () => {
+  test("the banner says Tested when Ember ran the proposal and Untested when it did not", async () => {
     await renderDoc(true, true, true);
     const banner = screen.getByRole("region", { name: "Copilot proposal" });
     expect(banner.textContent).toContain("Tested");
@@ -274,7 +274,7 @@ describe("Copilot proposal in the Doc view", () => {
       description: "The workflow gathers and verifies the requested data.",
       webhook_callback_url: "old-webhook-token",
     });
-    useCopilotProposalStore.getState().setProposal({
+    useEmberProposalStore.getState().setProposal({
       proposed: proposedWorkflow,
       baseline: baselineWorkflow,
       review,
@@ -341,7 +341,7 @@ describe("Copilot proposal in the Doc view", () => {
         },
       ],
     };
-    useCopilotProposalStore.getState().setProposal({
+    useEmberProposalStore.getState().setProposal({
       proposed: workflow(proposed),
       baseline: workflow(saved),
       review: evidenceReview,
@@ -424,7 +424,7 @@ describe("Copilot proposal in the Doc view", () => {
       },
     ] as WorkflowApiResponse["workflow_definition"]["parameters"];
     const comparison = diffWorkflowVersions(baseline, proposedWorkflow);
-    useCopilotProposalStore.getState().setProposal({
+    useEmberProposalStore.getState().setProposal({
       proposed: proposedWorkflow,
       baseline,
       review,
@@ -471,7 +471,7 @@ describe("Copilot proposal in the Doc view", () => {
       task("open_page", null, { navigation_goal: "Open the proposed page." }),
     ];
     useWorkflowHasChangesStore.setState({ getSaveData: () => null });
-    useCopilotProposalStore.getState().setProposal({
+    useEmberProposalStore.getState().setProposal({
       proposed: workflow(proposedBlocks),
       baseline: null,
       review,
@@ -529,7 +529,7 @@ describe("Copilot proposal in the Doc view", () => {
       task("right", "after"),
       task("after", null),
     ];
-    useCopilotProposalStore.getState().setProposal({
+    useEmberProposalStore.getState().setProposal({
       proposed: workflow(proposedBlocks),
       baseline: workflow(baselineBlocks),
       review: {
@@ -567,7 +567,7 @@ describe("Copilot proposal in the Doc view", () => {
       }) as unknown as WorkflowBlock;
     const baselineBlocks = [loop([task("only", null)])];
     const proposedBlocks = [loop([])];
-    useCopilotProposalStore.getState().setProposal({
+    useEmberProposalStore.getState().setProposal({
       proposed: workflow(proposedBlocks),
       baseline: workflow(baselineBlocks),
       review: {
@@ -600,7 +600,7 @@ describe("Copilot proposal in the Doc view", () => {
         next_block_label: null,
       }) as unknown as WorkflowBlock;
     const baselineBlocks = [loop(null)];
-    useCopilotProposalStore.getState().setProposal({
+    useEmberProposalStore.getState().setProposal({
       proposed: workflow([loop("For each of the search results")]),
       baseline: workflow(baselineBlocks),
       review: {
@@ -691,7 +691,7 @@ describe("Copilot proposal in the Doc view", () => {
       task("open_page", "read_total"),
       task("read_total", null, { notes: "Totals sit at the bottom." }),
     ];
-    useCopilotProposalStore.getState().setProposal({
+    useEmberProposalStore.getState().setProposal({
       proposed: workflow([
         task("open_page", "read_total", {
           complete_criterion: "The results show",
@@ -896,7 +896,7 @@ describe("Copilot proposal in the Doc view", () => {
     async (blockType, extra) => {
       const open = (next: string | null) =>
         task("open_page", next, { url: "https://example.com" });
-      useCopilotProposalStore.getState().setProposal({
+      useEmberProposalStore.getState().setProposal({
         proposed: workflow([
           open("the_step"),
           block(blockType, "the_step", null, { ...extra, url: "" }),
@@ -953,7 +953,7 @@ describe("Copilot proposal in the Doc view", () => {
         "Not set",
       );
       cleanup();
-      useCopilotProposalStore.getState().setProposal(null);
+      useEmberProposalStore.getState().setProposal(null);
       const live = getElements([...lead, step("")], settings, true);
       await renderInStudio(
         <WorkflowDocEditor nodes={live.nodes} edges={live.edges} />,
@@ -994,7 +994,7 @@ describe("Copilot proposal in the Doc view", () => {
     ],
   ])("a step the proposal adds %s", async (_case, extra, open) => {
     const before = [task("open_page", null)];
-    useCopilotProposalStore.getState().setProposal({
+    useEmberProposalStore.getState().setProposal({
       proposed: workflow([
         task("open_page", "check_page"),
         task("check_page", null, extra),
@@ -1132,7 +1132,7 @@ describe("Copilot proposal in the Doc view", () => {
         (change) =>
           `${change.label}: ${change.before ?? "Not set"} → ${change.after ?? "Not set"}`,
       );
-    useCopilotProposalStore.getState().setProposal({
+    useEmberProposalStore.getState().setProposal({
       proposed: proposedWorkflow,
       baseline,
       review,
@@ -1226,7 +1226,7 @@ describe("Copilot proposal in the Doc view", () => {
 
   test("shows the editable doc again once the proposal clears", async () => {
     await renderDoc();
-    act(() => useCopilotProposalStore.getState().setProposal(null));
+    act(() => useEmberProposalStore.getState().setProposal(null));
 
     expect(screen.queryByRole("region", { name: "Copilot proposal" })).toBe(
       null,
@@ -1235,7 +1235,7 @@ describe("Copilot proposal in the Doc view", () => {
   });
 });
 
-describe("Copilot proposal marks", () => {
+describe("Ember proposal marks", () => {
   const reviewProjection = (label: string) => ({
     blocks: [{ label, blockType: "navigation", change: "changed" as const }],
     duplicateWrites: [],
@@ -1468,7 +1468,7 @@ describe("Copilot proposal marks", () => {
     ]);
   });
 
-  test("steps of a branch Copilot dropped sit after the conditional", () => {
+  test("steps of a branch Ember dropped sit after the conditional", () => {
     const check = (branches: unknown[]) => ({
       label: "check",
       block_type: "conditional",
@@ -1588,7 +1588,7 @@ test("a proposal's input chips do not open the live Inputs panel", async () => {
       default_value: null,
     },
   ] as unknown as WorkflowApiResponse["workflow_definition"]["parameters"];
-  useCopilotProposalStore.getState().setProposal({
+  useEmberProposalStore.getState().setProposal({
     proposed: withInput,
     baseline: workflow(saved),
     review,
@@ -1609,7 +1609,7 @@ test("a proposal's input chips do not open the live Inputs panel", async () => {
   );
 });
 
-describe("a long text in a Copilot proposal", () => {
+describe("a long text in an Ember proposal", () => {
   const FIVE = (last: string) =>
     `Open the report.\nCheck every row.\nNote each difference.\nSum the totals.\n${last}`;
   beforeEach(() => {
@@ -1631,7 +1631,7 @@ describe("a long text in a Copilot proposal", () => {
   ];
   const propose = (blocks: WorkflowBlock[], base = live) =>
     act(() =>
-      useCopilotProposalStore.getState().setProposal({
+      useEmberProposalStore.getState().setProposal({
         proposed: workflow(blocks),
         baseline: workflow(base),
         review: null,
@@ -1667,7 +1667,7 @@ describe("a long text in a Copilot proposal", () => {
     expect(folded("CHANGED_LINE")).toBe(false);
     expect(folded("Wait.")).toBe(true);
 
-    act(() => useCopilotProposalStore.getState().setProposal(null));
+    act(() => useEmberProposalStore.getState().setProposal(null));
     expect(control("Long step")).not.toBeNull();
     expect(folded("Stop.")).toBe(true);
   });

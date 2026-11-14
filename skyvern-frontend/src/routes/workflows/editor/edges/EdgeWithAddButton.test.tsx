@@ -12,7 +12,7 @@ import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { useCopilotActionStore } from "@/store/useCopilotActionStore";
+import { useEmberActionStore } from "@/store/useEmberActionStore";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import {
   createYamlCommitOwner,
@@ -122,13 +122,13 @@ describe("EdgeWithAddButton", () => {
 
   afterEach(() => {
     cleanup();
-    useCopilotActionStore.setState({ stageAttachment: null });
+    useEmberActionStore.setState({ stageAttachment: null });
     useWorkflowYamlEditorStore.setState(
       useWorkflowYamlEditorStore.getInitialState(),
     );
   });
 
-  it("stages a picked PDF in Copilot with a draft naming the block after it", () => {
+  it("stages a picked PDF in Ember with a draft naming the block after it", () => {
     useNodesMock.mockReturnValue([
       { id: "source", type: "start", data: {} },
       { id: "target", type: "task", data: { label: "download" } },
@@ -139,7 +139,7 @@ describe("EdgeWithAddButton", () => {
     expect(uploadItem().disabled).toBe(true);
 
     const stage = vi.fn();
-    act(() => useCopilotActionStore.setState({ stageAttachment: stage }));
+    act(() => useEmberActionStore.setState({ stageAttachment: stage }));
     expect(uploadItem().disabled).toBe(false);
     const file = new File(["pdf"], "steps.pdf", { type: "application/pdf" });
     fireEvent.change(

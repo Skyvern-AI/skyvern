@@ -166,8 +166,8 @@ function WorkflowYamlEditor({ workflowId, variant = "fullscreen" }: Props) {
   const error = useWorkflowYamlEditorStore((s) => s.error);
   const stale = useWorkflowYamlEditorStore((s) => s.stale);
   const enterYamlMode = useWorkflowYamlEditorStore((s) => s.enterYamlMode);
-  const copilotActive = useWorkflowYamlEditorStore(
-    (s) => s.copilotAcceptance !== null,
+  const emberActive = useWorkflowYamlEditorStore(
+    (s) => s.emberAcceptance !== null,
   );
   const committing = useWorkflowYamlEditorStore(
     (s) => s.committing || s.commitInProgress,
@@ -276,7 +276,7 @@ function WorkflowYamlEditor({ workflowId, variant = "fullscreen" }: Props) {
               variant="outline"
               size="sm"
               className="ml-3"
-              disabled={committing || copilotActive || !enterYamlMode}
+              disabled={committing || emberActive || !enterYamlMode}
               onClick={() => enterYamlMode?.()}
             >
               Reopen YAML and discard draft

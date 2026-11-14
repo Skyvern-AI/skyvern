@@ -6,7 +6,7 @@ import {
 } from "../../types/workflowTypes";
 import { blockTypeFromNode } from "../nodes/blockTypeFromNode";
 import { workflowBlockTitle } from "../nodes/types";
-import { humanizeBlockLabel } from "../../copilot/blockLabel";
+import { humanizeBlockLabel } from "../../ember/blockLabel";
 import { stripJinjaReferences } from "./docTextUtils";
 import { nodeLibraryItems } from "../panels/nodeLibraryItems";
 

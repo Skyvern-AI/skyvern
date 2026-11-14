@@ -60,20 +60,20 @@ import {
   type WorkflowReviewDiff,
 } from "./workflowReviewDiff";
 
-type ComparisonMode = "history" | "copilot";
+type ComparisonMode = "history" | "ember";
 
-export type CopilotReviewStatus = "approve" | "reject" | "close";
+export type EmberReviewStatus = "approve" | "reject" | "close";
 
 type Props = {
   version1: WorkflowVersion;
   version2: WorkflowVersion;
   onSelectState?: (version: WorkflowVersion) => void;
   mode?: ComparisonMode;
-  onCopilotReviewClose?: (status: CopilotReviewStatus) => void | Promise<void>;
-  // Copilot mode: why Accept and Reject are held, e.g. while an Accept's outcome is unresolved.
+  onEmberReviewClose?: (status: EmberReviewStatus) => void | Promise<void>;
+  // Ember mode: why Accept and Reject are held, e.g. while an Accept's outcome is unresolved.
   lockReason?: string | null;
   // History mode: exits comparison without applying a version (the studio's
-  // "Keep current version"). Copilot mode keeps its own close flow.
+  // "Keep current version"). Ember mode keeps its own close flow.
   onExit?: () => void;
 };
 
@@ -309,7 +309,7 @@ function ReviewSummary({
 
 const START_TARGET = "__start_block__";
 
-function CopilotReview({
+function EmberReview({
   diff,
   version,
   isSettling,
@@ -322,7 +322,7 @@ function CopilotReview({
   isSettling: boolean;
   lockReason: string | null;
   canClose: boolean;
-  onSettle: (status: CopilotReviewStatus) => void;
+  onSettle: (status: EmberReviewStatus) => void;
 }) {
   const reactFlow = useReactFlow<AppNode>();
   const hideUnchangedId = useId();
@@ -709,7 +709,7 @@ function WorkflowComparisonPanel({
   version2,
   onSelectState,
   mode = "history",
-  onCopilotReviewClose,
+  onEmberReviewClose,
   lockReason = null,
   onExit,
 }: Props) {
@@ -722,34 +722,34 @@ function WorkflowComparisonPanel({
   // settles would race a concurrent apply/clear against the same revision.
   const settlingRef = useRef(false);
   const [isSettling, setIsSettling] = useState(false);
-  const settleCopilotReview = useCallback(
-    async (status: CopilotReviewStatus) => {
-      if (!onCopilotReviewClose || settlingRef.current) return;
+  const settleEmberReview = useCallback(
+    async (status: EmberReviewStatus) => {
+      if (!onEmberReviewClose || settlingRef.current) return;
       settlingRef.current = true;
       setIsSettling(true);
       try {
-        await onCopilotReviewClose(status);
+        await onEmberReviewClose(status);
       } finally {
         settlingRef.current = false;
         setIsSettling(false);
       }
     },
-    [onCopilotReviewClose],
+    [onEmberReviewClose],
   );
 
-  // ESC key handler for copilot mode - close without rejecting
+  // ESC key handler for Ember mode - close without rejecting
   useEffect(() => {
-    if (mode !== "copilot" || !onCopilotReviewClose) return;
+    if (mode !== "ember" || !onEmberReviewClose) return;
 
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
-        void settleCopilotReview("close");
+        void settleEmberReview("close");
       }
     };
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [mode, onCopilotReviewClose, settleCopilotReview]);
+  }, [mode, onEmberReviewClose, settleEmberReview]);
 
   // ESC in history mode mirrors "Keep current version" when an exit is wired.
   useEffect(() => {
@@ -765,16 +765,16 @@ function WorkflowComparisonPanel({
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [mode, onExit]);
 
-  if (mode === "copilot") {
+  if (mode === "ember") {
     return (
       <ReactFlowProvider>
-        <CopilotReview
+        <EmberReview
           diff={diff}
           version={version2}
           isSettling={isSettling}
           lockReason={lockReason}
-          canClose={Boolean(onCopilotReviewClose)}
-          onSettle={(status) => void settleCopilotReview(status)}
+          canClose={Boolean(onEmberReviewClose)}
+          onSettle={(status) => void settleEmberReview(status)}
         />
       </ReactFlowProvider>
     );

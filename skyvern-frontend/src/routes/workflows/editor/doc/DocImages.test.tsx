@@ -105,7 +105,7 @@ afterEach(() => {
   useWorkflowYamlEditorStore.setState({
     active: false,
     stale: false,
-    copilotAcceptance: null,
+    emberAcceptance: null,
   });
   useWorkflowSnapshotStore.getState().clearSnapshot();
   imagesFlag.on = true;
@@ -878,7 +878,7 @@ describe("Doc screenshots", () => {
       staysUnsaved(doc, studio, "file_yaml_key");
     });
 
-    test("an upload that ends during a Copilot acceptance gives no toast and marks unsaved once it ends", async () => {
+    test("an upload that ends during an Ember acceptance gives no toast and marks unsaved once it ends", async () => {
       const finish = pendingUpload();
       const doc = renderImageDoc({});
       const studio = studioBaseline();
@@ -888,7 +888,7 @@ describe("Doc screenshots", () => {
       saved();
       act(() =>
         useWorkflowYamlEditorStore.setState({
-          copilotAcceptance: Symbol("copilot"),
+          emberAcceptance: Symbol("copilot"),
         }),
       );
       await finish("file_copilot");
@@ -897,9 +897,7 @@ describe("Doc screenshots", () => {
           title: "Wait for the Copilot change to finish",
         }),
       );
-      act(() =>
-        useWorkflowYamlEditorStore.setState({ copilotAcceptance: null }),
-      );
+      act(() => useWorkflowYamlEditorStore.setState({ emberAcceptance: null }));
       await waitFor(() =>
         expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true),
       );

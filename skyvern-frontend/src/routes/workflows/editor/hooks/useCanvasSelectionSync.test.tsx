@@ -14,7 +14,7 @@ import { beforeAll, beforeEach, expect, test, vi } from "vitest";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 
 import {
-  beginCopilotAcceptance,
+  beginEmberAcceptance,
   beginSaveTransaction,
   beginYamlCommit,
   createYamlCommitOwner,
@@ -168,7 +168,7 @@ test.each(["unlocked", "copilot", "yaml", "save"])(
       expect(storeApi?.getState().nodeLookup.has("block-alpha")).toBe(true),
     );
     act(() => {
-      if (lock === "copilot") beginCopilotAcceptance();
+      if (lock === "copilot") beginEmberAcceptance();
       if (lock === "yaml")
         beginYamlCommit(createYamlCommitOwner("wpid_fixture"));
       if (lock === "save") {

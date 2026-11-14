@@ -198,7 +198,7 @@ describe("useSelectedBlockUrlSync", () => {
   });
 
   test("keeps the machine-origin marker on the block it names, drops it on the next", async () => {
-    // The copilot's build-follow sets ?sbs= before focusing, so the marker has
+    // The Ember's build-follow sets ?sbs= before focusing, so the marker has
     // to ride through the mirror write it was set for — and die the moment the
     // user picks something else, or their pick never reaches the run pin.
     const { result } = renderHook(() => useTestHarness(), {

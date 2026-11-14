@@ -5,7 +5,7 @@ import {
 } from "../templateGuidance";
 import { removeBlock } from "./doc/docGraphEdits";
 import {
-  bindCopilotReviewClose,
+  bindEmberReviewClose,
   captureEditorState,
   restoreEditorState,
   type EditorStateSnapshot,
@@ -63,7 +63,7 @@ import { isPaymentRequiredError } from "@/api/paymentRequired";
 import { DebugSessionApiResponse } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { isEditableTarget } from "./editableTarget";
-import { useCopilotProposalStore } from "@/store/CopilotProposalStore";
+import { useEmberProposalStore } from "@/store/EmberProposalStore";
 import { useMountEffect } from "@/hooks/useMountEffect";
 import { useBrowserSessionRateLimit } from "../hooks/useBrowserSessionRateLimit";
 import { useActiveRunSessionQuery } from "../hooks/useActiveRunSessionQuery";
@@ -90,7 +90,7 @@ import {
 import { useBlockSidebarWidthStore } from "@/store/BlockSidebarWidthStore";
 import { useWorkflowSettingsStore } from "@/store/WorkflowSettingsStore";
 import { useStudioPaneDefaults } from "../studio/StudioPaneDefaultsContext";
-import { useCopilotActionStore } from "@/store/useCopilotActionStore";
+import { useEmberActionStore } from "@/store/useEmberActionStore";
 import { useSidebarSaveStateStore } from "@/store/SidebarSaveStateStore";
 import { useWorkflowHistoryAccessStore } from "@/store/WorkflowHistoryAccessStore";
 import { useBrowserLoadingFlag } from "../hooks/useBrowserLoadingFlag";
@@ -218,25 +218,22 @@ import { useAgentsPathMatch } from "../useAgentsPathMatch";
 import { shouldKeepExistingEdgeForInsertion } from "./workflowInsertion";
 
 import { getInitialParameters } from "./utils";
-import {
-  WorkflowCopilotChat,
-  type WorkflowUpdateOptions,
-} from "../copilot/WorkflowCopilotChat";
+import { EmberChat, type WorkflowUpdateOptions } from "../ember/EmberChat";
 import { useStudioRunId } from "../studio/useStudioRunId";
 import { SYSTEM_RUN_FOCUS_PARAM } from "../studio/panes";
-import { copilotRunId } from "./copilotRunId";
+import { emberRunId } from "./emberRunId";
 import {
-  shouldOpenCopilotPaneForHandoff,
-  useDiscoverCopilotPromptRecovery,
+  shouldOpenEmberPaneForHandoff,
+  useDiscoverEmberPromptRecovery,
   withoutDiscoverViaParam,
-} from "../discoverCopilotHandoff";
+} from "../discoverEmberHandoff";
 import {
   initialEditorAutoOpenState,
   shouldAutoOpenEditor,
 } from "./editorAutoOpen";
 import { useStudioShellContext } from "../studio/StudioShellContext";
 import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
-import type { CopilotAttachedFile } from "@/routes/workflows/copilot/workflowCopilotTypes";
+import type { EmberAttachedFile } from "@/routes/workflows/ember/emberTypes";
 import {
   demonstrationInsertionFromNodes,
   resolveAppendInsertionPoint,
@@ -247,13 +244,13 @@ import {
 import { DemonstrateFromBlockStatus } from "./DemonstrateFromBlockStatus";
 import { paneWidthsKey } from "../studio/paneLayout";
 import { useStudioPanes } from "../studio/useStudioPanes";
-import { WorkflowCopilotButton } from "../copilot/WorkflowCopilotButton";
-import { resolveCopilotLiveBrowserReady } from "../copilot/browserReadiness";
+import { EmberButton } from "../ember/EmberButton";
+import { resolveEmberLiveBrowserReady } from "../ember/browserReadiness";
 
 import type {
-  CopilotProductAction,
+  EmberProductAction,
   WorkflowYAMLConversionResponse,
-} from "../copilot/workflowCopilotTypes";
+} from "../ember/emberTypes";
 import {
   WorkflowYamlEditor,
   WorkflowSaveConflictNotice,
@@ -270,21 +267,21 @@ import {
 } from "./workflowVersionFromSaveData";
 import "./workspace-styles.css";
 
-function readCopilotAttachedFiles(
+function readEmberAttachedFiles(
   value: unknown,
-): Array<CopilotAttachedFile> | undefined {
+): Array<EmberAttachedFile> | undefined {
   if (!Array.isArray(value)) return undefined;
   const files = value.filter(
-    (item): item is CopilotAttachedFile =>
+    (item): item is EmberAttachedFile =>
       typeof item === "object" &&
       item !== null &&
-      typeof (item as CopilotAttachedFile).file_id === "string" &&
-      typeof (item as CopilotAttachedFile).filename === "string",
+      typeof (item as EmberAttachedFile).file_id === "string" &&
+      typeof (item as EmberAttachedFile).filename === "string",
   );
   return files.length > 0 ? files : undefined;
 }
 
-function readCopilotProductAction(value: unknown): CopilotProductAction | null {
+function readEmberProductAction(value: unknown): EmberProductAction | null {
   if (!value || typeof value !== "object") {
     return null;
   }
@@ -354,7 +351,7 @@ export type AddNodeProps = {
 };
 
 // eslint-disable-next-line react-refresh/only-export-components -- Exercise the production apply callback without mounting the entire workspace.
-export function useWorkspaceCopilotUpdate({
+export function useWorkspaceEmberUpdate({
   applyWorkflowUpdate,
   embedded = false,
   initialBlockCount = 0,
@@ -373,7 +370,7 @@ export function useWorkspaceCopilotUpdate({
   const editorAutoOpenStateRef = useRef(
     initialEditorAutoOpenState(initialBlockCount),
   );
-  // A run the user opened owns the stage; Copilot's own run focus does not.
+  // A run the user opened owns the stage; Ember's own run focus does not.
   const [searchParams] = useSearchParams();
   const studioRunId = useStudioRunId();
   const inspectingUserRunRef = useRef(false);
@@ -381,7 +378,7 @@ export function useWorkspaceCopilotUpdate({
     Boolean(studioRunId) && !searchParams.has(SYSTEM_RUN_FOCUS_PARAM);
   return (workflowData: WorkflowVersion, options?: WorkflowUpdateOptions) => {
     try {
-      // All Copilot-driven applies are user edits (mid-turn draft, accept,
+      // All Ember-driven applies are user edits (mid-turn draft, accept,
       // snap-back); only version-restore/load call applyWorkflowUpdate
       // without this and stay a clean baseline.
       if (
@@ -402,7 +399,7 @@ export function useWorkspaceCopilotUpdate({
       if (fire && !inspectingUserRunRef.current) reopenEditor();
     } catch (error) {
       console.error("Failed to parse and apply agent", error, workflowData);
-      logging.error("Copilot agent apply failed", {
+      logging.error("Ember agent apply failed", {
         workflow_permanent_id: workflowData.workflow_permanent_id,
         error,
       });
@@ -438,41 +435,41 @@ function Workspace({
   const logging = useLogging();
   const { blockLabel } = useParams();
   const workflowPermanentId = useWorkflowPermanentId();
-  const { copilotPortalEl: studioCopilotPortalEl } = useStudioShellContext();
+  const { emberPortalEl: studioEmberPortalEl } = useStudioShellContext();
   const { panes: studioPanes, openPane: openStudioPane } = useStudioPanes();
   const { paneWidths: studioPaneWidths, entryId: studioEntryId } =
     useStudioPaneDefaults();
-  const studioCopilotOpen = studioPanes.includes("copilot");
+  const studioEmberOpen = studioPanes.includes("copilot");
   const location = useLocation();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const locationState = location.state as {
-    copilotMessage?: unknown;
-    copilotAttachedFiles?: unknown;
-    copilotAction?: unknown;
+    emberMessage?: unknown;
+    emberAttachedFiles?: unknown;
+    emberAction?: unknown;
   } | null;
-  const routeInitialCopilotAttachments = useMemo(
-    () => readCopilotAttachedFiles(locationState?.copilotAttachedFiles),
-    [locationState?.copilotAttachedFiles],
+  const routeInitialEmberAttachments = useMemo(
+    () => readEmberAttachedFiles(locationState?.emberAttachedFiles),
+    [locationState?.emberAttachedFiles],
   );
-  const routeInitialCopilotMessage =
-    typeof locationState?.copilotMessage === "string"
-      ? locationState.copilotMessage
+  const routeInitialEmberMessage =
+    typeof locationState?.emberMessage === "string"
+      ? locationState.emberMessage
       : null;
   // Identity has to survive re-renders: this gates a timer that re-arms whenever it changes.
-  const copilotActionState = locationState?.copilotAction;
-  const initialCopilotAction = useMemo(
-    () => readCopilotProductAction(copilotActionState),
-    [copilotActionState],
+  const emberActionState = locationState?.emberAction;
+  const initialEmberAction = useMemo(
+    () => readEmberProductAction(emberActionState),
+    [emberActionState],
   );
-  const { storedInitialCopilotMessage, clearStoredInitialCopilotMessage } =
-    useDiscoverCopilotPromptRecovery({
+  const { storedInitialEmberMessage, clearStoredInitialEmberMessage } =
+    useDiscoverEmberPromptRecovery({
       shouldRead: searchParams.get("via") === "discover",
       workflowPermanentId,
     });
-  const initialCopilotMessage = useMemo(
-    () => routeInitialCopilotMessage ?? storedInitialCopilotMessage,
-    [routeInitialCopilotMessage, storedInitialCopilotMessage],
+  const initialEmberMessage = useMemo(
+    () => routeInitialEmberMessage ?? storedInitialEmberMessage,
+    [routeInitialEmberMessage, storedInitialEmberMessage],
   );
   const templateGuidance = useMemo(
     () =>
@@ -487,42 +484,46 @@ function Workspace({
       state: location.state,
     });
   }, [location.pathname, location.search, location.state, navigate]);
-  const handleInitialCopilotMessageConsumed = useCallback(() => {
-    if (!initialCopilotMessage && !initialCopilotAction) return;
-    clearStoredInitialCopilotMessage();
+  const handleInitialEmberMessageConsumed = useCallback(() => {
+    if (!initialEmberMessage && !initialEmberAction) return;
+    clearStoredInitialEmberMessage();
     navigate(location.pathname + withoutDiscoverViaParam(location.search), {
       replace: true,
       state: null,
     });
   }, [
-    initialCopilotMessage,
-    initialCopilotAction,
-    clearStoredInitialCopilotMessage,
+    initialEmberMessage,
+    initialEmberAction,
+    clearStoredInitialEmberMessage,
     location.pathname,
     location.search,
     navigate,
   ]);
   // A handoff (Discover or the onboarding CTA) lands with the prompt seeded but
-  // only the default editor+browser panes open; open the Copilot pane once on
+  // only the default editor+browser panes open; open the Ember pane once on
   // mount so the handed-off prompt is visible (the non-embedded editor opens
-  // Copilot via isCopilotOpen's initializer below instead). Thread the handoff
+  // Ember via isEmberOpen's initializer below instead). Thread the handoff
   // route state through the pane-open navigation: the CTA seeds the prompt via
   // location.state alone (Discover also has a sessionStorage fallback), so a
-  // state-wiping open would drop it before the Copilot consumes it.
+  // state-wiping open would drop it before the Ember consumes it.
   useMountEffect(() => {
     if (
-      shouldOpenCopilotPaneForHandoff({
+      shouldOpenEmberPaneForHandoff({
         embedded,
-        hasInitialCopilotMessage:
-          Boolean(initialCopilotMessage) || Boolean(templateGuidance),
-        copilotPaneOpen: studioCopilotOpen,
+        hasInitialEmberMessage:
+          Boolean(initialEmberMessage) || Boolean(templateGuidance),
+        emberPaneOpen: studioEmberOpen,
       })
     ) {
       openStudioPane("copilot", { state: location.state });
     }
   });
   const headlessTurnDrainEnabled = ["1", "true"].includes(
-    (searchParams.get("copilotHeadlessTurnDrain") ?? "").toLowerCase(),
+    (
+      searchParams.get("emberHeadlessTurnDrain") ??
+      searchParams.get("copilotHeadlessTurnDrain") ??
+      ""
+    ).toLowerCase(),
   );
   const [timelineMode, setTimelineMode] = useState("wide");
   const [nudge, setNudge] = useState(false);
@@ -576,11 +577,11 @@ function Workspace({
     registerEditorOwner(owner);
     useWorkflowTitleStore
       .getState()
-      .startCopilotMetadata(owner.workflowPermanentId);
+      .startEmberMetadata(owner.workflowPermanentId);
     return () => {
       unregisterEditorOwner(owner);
       const titleStore = useWorkflowTitleStore.getState();
-      titleStore.clearCopilotMetadata(owner.workflowPermanentId);
+      titleStore.clearEmberMetadata(owner.workflowPermanentId);
       titleStore.resetTitleSession(owner.workflowPermanentId);
       titleStore.resetDescriptionSession(owner.workflowPermanentId);
       useWorkflowParametersStore
@@ -726,31 +727,29 @@ function Workspace({
 
   const [openCycleBrowserDialogue, setOpenCycleBrowserDialogue] =
     useState(false);
-  const [isCopilotOpen, setIsCopilotOpen] = useState(
-    () => !!initialCopilotMessage || !initialNodes.some(isWorkflowBlockNode),
+  const [isEmberOpen, setIsEmberOpen] = useState(
+    () => !!initialEmberMessage || !initialNodes.some(isWorkflowBlockNode),
   );
-  // Open the copilot panel when a code block requests a goal-driven (re)build,
+  // Open the Ember panel when a code block requests a goal-driven (re)build,
   // so the user can watch the scout and the generated block apply.
-  const copilotPendingBuild = useCopilotActionStore(
-    (state) => state.pendingBuild,
-  );
+  const emberPendingBuild = useEmberActionStore((state) => state.pendingBuild);
   useEffect(() => {
-    if (copilotPendingBuild) {
-      setIsCopilotOpen(true);
+    if (emberPendingBuild) {
+      setIsEmberOpen(true);
     }
-  }, [copilotPendingBuild]);
+  }, [emberPendingBuild]);
   useEffect(() => {
-    if (initialCopilotAction) {
-      setIsCopilotOpen(true);
+    if (initialEmberAction) {
+      setIsEmberOpen(true);
     }
-  }, [initialCopilotAction]);
-  // Opening an already-open studio pane still restores a maximized pane, which would otherwise hide Copilot.
-  const openCopilot = useCallback(() => {
-    if (!embedded) setIsCopilotOpen(true);
+  }, [initialEmberAction]);
+  // Opening an already-open studio pane still restores a maximized pane, which would otherwise hide Ember.
+  const openEmber = useCallback(() => {
+    if (!embedded) setIsEmberOpen(true);
     else openStudioPane("copilot", { state: location.state });
   }, [embedded, openStudioPane, location.state]);
-  const [copilotMessageCount, setCopilotMessageCount] = useState(0);
-  const copilotButtonRef = useRef<HTMLButtonElement>(null);
+  const [emberMessageCount, setEmberMessageCount] = useState(0);
+  const emberButtonRef = useRef<HTMLButtonElement>(null);
   const [readyBrowserSessionId, setReadyBrowserSessionId] = useState<
     string | null
   >(null);
@@ -778,7 +777,7 @@ function Workspace({
   // restores the pre-YAML dirty state instead of leaving it stuck true.
   const yamlEntryHadChangesRef = useRef(false);
   const [shouldFetchDebugSession, setShouldFetchDebugSession] = useState(false);
-  const [isCopilotTurnActive, setIsCopilotTurnActive] = useState(false);
+  const [isEmberTurnActive, setIsEmberTurnActive] = useState(false);
   const finallyBlockLabel = useWorkflowSettingsStore(
     (state) => state.finallyBlockLabel,
   );
@@ -962,7 +961,7 @@ function Workspace({
     workflowPermanentId,
     enabled:
       shouldFetchDebugSession && Boolean(workflowPermanentId) && !isRateLimited,
-    isTurnActive: isCopilotTurnActive,
+    isTurnActive: isEmberTurnActive,
   });
 
   const activeDebugSession = debugSession ?? null;
@@ -1060,14 +1059,14 @@ function Workspace({
     (!activeDebugSession || activeDebugSession.vnc_streaming_supported);
   const showCdpBrowserPanel =
     isCdpStreamingMode && shouldFetchDebugSession && !isRateLimited;
-  // Embedded: the shell owns the stream, so bind the copilot once the backend
+  // Embedded: the shell owns the stream, so bind the Ember once the backend
   // session exists — else it gets a null id and the backend spins a separate browser.
-  const copilotRequiresLiveBrowser =
+  const emberRequiresLiveBrowser =
     (showBrowser || embedded) && shouldFetchDebugSession && !isRateLimited;
   // readyBrowserSessionId is keyed to the browser session id rather than a
   // bare boolean: when activeDebugSession's id changes, stale ready state
   // from the previous session cannot leak into the next render.
-  const copilotLiveBrowserReady = resolveCopilotLiveBrowserReady({
+  const emberLiveBrowserReady = resolveEmberLiveBrowserReady({
     displayReady: Boolean(
       readyBrowserSessionId && readyBrowserSessionId === debugBrowserSessionId,
     ),
@@ -1490,7 +1489,7 @@ function Workspace({
   }, [getEdges, getNodes]);
   const authoringActionAvailability =
     resolveWorkspaceAuthoringActionAvailability({
-      browserReady: copilotLiveBrowserReady,
+      browserReady: emberLiveBrowserReady,
       isGlobalWorkflow,
       isWorkflowDeleted: Boolean(workflow.deleted_at),
       hasActiveRun: Boolean(viewerState?.active_run_session_id),
@@ -1503,7 +1502,7 @@ function Workspace({
   const authoringBlocked = useWorkflowYamlEditorStore(
     (state) =>
       state.commitInProgress ||
-      state.copilotAcceptance !== null ||
+      state.emberAcceptance !== null ||
       state.authoringInProgress,
   );
   const startRecordingAtEnd = useCallback(() => {
@@ -1549,20 +1548,20 @@ function Workspace({
     authoringBlocked,
     startRecordingAtEnd,
   ]);
-  // `/discover`'s "Upload an SOP" lands here with ?sop=1; stage the SOP file in Copilot once its
+  // `/discover`'s "Upload an SOP" lands here with ?sop=1; stage the SOP file in Ember once its
   // composer can take a file.
   const sopHandoffRequested = searchParams.get("sop") === "1";
   const sopHandoffHandledRef = useRef(false);
   // A boolean, not the function: the chat re-registers the stager whenever its callbacks change,
   // and subscribing to the identity would re-render this component into a loop.
-  const copilotCanStageAttachment = useCopilotActionStore(
+  const emberCanStageAttachment = useEmberActionStore(
     (state) => state.stageAttachment !== null,
   );
   useEffect(() => {
     if (
       !sopHandoffRequested ||
       sopHandoffHandledRef.current ||
-      !copilotCanStageAttachment
+      !emberCanStageAttachment
     ) {
       return;
     }
@@ -1579,7 +1578,7 @@ function Workspace({
           description:
             "The SOP file did not reach the editor. Use Upload an SOP in the Copilot panel to try again.",
         });
-      // After staging: opening the Copilot pane navigates with the current URL, which would
+      // After staging: opening the Ember pane navigates with the current URL, which would
       // put the marker back if it ran after this rewrite.
       setRecordSearchParams(
         (current) => {
@@ -1593,7 +1592,7 @@ function Workspace({
     return () => window.clearTimeout(timer);
   }, [
     sopHandoffRequested,
-    copilotCanStageAttachment,
+    emberCanStageAttachment,
     setRecordSearchParams,
     workflow.workflow_permanent_id,
   ]);
@@ -1911,7 +1910,7 @@ function Workspace({
       const titleStore = useWorkflowTitleStore.getState();
       if (typeof workflowData.title === "string") {
         if (options?.midTurnDraft) {
-          titleStore.setTitleFromCopilotIfDefault(workflowData.title);
+          titleStore.setTitleFromEmberIfDefault(workflowData.title);
         } else {
           titleStore.syncTitleFromWorkflow(workflowData.title, options);
         }
@@ -1947,7 +1946,7 @@ function Workspace({
     } else {
       workflowChangesStore.setHasChanges(true, options);
       if (options?.userDriven) {
-        // A Copilot build has no canvas gesture but is user-driven; mark it so
+        // An Ember build has no canvas gesture but is user-driven; mark it so
         // the dot/summary surface it instead of the baseline absorbing it.
         useWorkflowSnapshotStore.getState().markUserEdit();
       }
@@ -1955,7 +1954,7 @@ function Workspace({
     return true;
   };
 
-  const handleCopilotWorkflowUpdate = useWorkspaceCopilotUpdate({
+  const handleEmberWorkflowUpdate = useWorkspaceEmberUpdate({
     applyWorkflowUpdate,
     embedded,
     initialBlockCount: workflow.workflow_definition.blocks.length,
@@ -2053,7 +2052,7 @@ function Workspace({
     return () => store.registerEnterYamlMode(null);
   }, [embedded, isGlobalWorkflow]);
 
-  // Commit-on-switch: reparse the edited YAML into the graph via the Copilot's
+  // Commit-on-switch: reparse the edited YAML into the graph via the Ember's
   // non-persisting convert endpoint. Returns false on invalid YAML (stays open).
   const commitYaml = async (
     persist: boolean = false,
@@ -2266,7 +2265,7 @@ function Workspace({
             JSON.stringify(value) !== JSON.stringify(baselineSettings[key]),
         )
       )
-        useWorkflowTitleStore.getState().recordCopilotGraphEdit();
+        useWorkflowTitleStore.getState().recordEmberGraphEdit();
       yamlStore.close();
       return true;
     } catch (error) {
@@ -2314,8 +2313,8 @@ function Workspace({
 
   const handleSelectState = (selectedVersion: WorkflowVersion) => {
     if (refuseMutationDuringYamlCommit()) return;
-    // A restore would replace the canvas a pending Copilot proposal is staged on.
-    if (useCopilotProposalStore.getState().proposal) {
+    // A restore would replace the canvas a pending Ember proposal is staged on.
+    if (useEmberProposalStore.getState().proposal) {
       toast({
         title: "Resolve the Copilot proposal before restoring a version.",
         variant: "destructive",
@@ -2350,10 +2349,10 @@ function Workspace({
     );
     setEdges(elements.edges);
     const titleStore = useWorkflowTitleStore.getState();
-    titleStore.clearCopilotMetadata(selectedVersion.workflow_permanent_id);
-    titleStore.trackCopilotMetadata(
+    titleStore.clearEmberMetadata(selectedVersion.workflow_permanent_id);
+    titleStore.trackEmberMetadata(
       selectedVersion.workflow_permanent_id,
-      titleStore.copilotMetadataEdits[selectedVersion.workflow_permanent_id]
+      titleStore.emberMetadataEdits[selectedVersion.workflow_permanent_id]
         ?.proposal,
     );
     titleStore.setTitle(selectedVersion.title, { source: "workflow" });
@@ -2513,9 +2512,7 @@ function Workspace({
                 version2={workflowPanelState.data.version2}
                 onSelectState={handleSelectState}
                 mode={workflowPanelState.data.mode}
-                onCopilotReviewClose={
-                  workflowPanelState.data.onCopilotReviewClose
-                }
+                onEmberReviewClose={workflowPanelState.data.onEmberReviewClose}
                 lockReason={workflowChangesStore.saveBlockedReason}
                 onExit={embedded ? exitVersionHistory : undefined}
               />
@@ -2552,9 +2549,7 @@ function Workspace({
               version2={workflowPanelState.data.version2}
               onSelectState={handleSelectState}
               mode={workflowPanelState.data.mode}
-              onCopilotReviewClose={
-                workflowPanelState.data.onCopilotReviewClose
-              }
+              onEmberReviewClose={workflowPanelState.data.onEmberReviewClose}
               lockReason={workflowChangesStore.saveBlockedReason}
               onExit={embedded ? exitVersionHistory : undefined}
             />
@@ -2892,10 +2887,10 @@ function Workspace({
                       )}
                     </div>
                     <footer className="flex h-[2rem] w-full items-center justify-start gap-4 text-muted-foreground">
-                      <WorkflowCopilotButton
-                        ref={copilotButtonRef}
-                        messageCount={copilotMessageCount}
-                        onClick={() => setIsCopilotOpen((prev) => !prev)}
+                      <EmberButton
+                        ref={emberButtonRef}
+                        messageCount={emberMessageCount}
+                        onClick={() => setIsEmberOpen((prev) => !prev)}
                       />
                       <div className="flex items-center gap-2 text-muted-foreground">
                         <GlobeIcon /> Live Browser
@@ -2964,10 +2959,10 @@ function Workspace({
                       )}
                     </div>
                     <footer className="flex h-[2rem] w-full items-center justify-start gap-4 text-muted-foreground">
-                      <WorkflowCopilotButton
-                        ref={copilotButtonRef}
-                        messageCount={copilotMessageCount}
-                        onClick={() => setIsCopilotOpen((prev) => !prev)}
+                      <EmberButton
+                        ref={emberButtonRef}
+                        messageCount={emberMessageCount}
+                        onClick={() => setIsEmberOpen((prev) => !prev)}
                       />
                       <div className="flex items-center gap-2 text-muted-foreground">
                         <GlobeIcon /> Live Browser
@@ -3112,7 +3107,7 @@ function Workspace({
       <DemonstrateFromBlockStatus />
       {withStudioPaneBoundary(
         "copilot",
-        <WorkflowCopilotChat
+        <EmberChat
           templateGuidance={templateGuidance}
           onTemplateGuidanceShown={handleTemplateGuidanceShown}
           organizationId={workflow.organization_id}
@@ -3124,25 +3119,25 @@ function Workspace({
               .getState()
               .recordPersistedSave(workflowPermanentId)
           }
-          isOpen={embedded ? studioCopilotOpen : showBrowser && isCopilotOpen}
+          isOpen={embedded ? studioEmberOpen : showBrowser && isEmberOpen}
           docked={embedded}
           chromeless={embedded}
-          portalTarget={embedded ? studioCopilotPortalEl : undefined}
-          onClose={() => setIsCopilotOpen(false)}
-          onMessageCountChange={setCopilotMessageCount}
-          buttonRef={copilotButtonRef}
+          portalTarget={embedded ? studioEmberPortalEl : undefined}
+          onClose={() => setIsEmberOpen(false)}
+          onMessageCountChange={setEmberMessageCount}
+          buttonRef={emberButtonRef}
           liveBrowserSessionId={
-            copilotLiveBrowserReady ? debugBrowserSessionId : null
+            emberLiveBrowserReady ? debugBrowserSessionId : null
           }
-          onTurnActivityChange={setIsCopilotTurnActive}
-          workflowRunId={copilotRunId({ embedded, studioRunId })}
-          requiresLiveBrowser={copilotRequiresLiveBrowser}
-          isLiveBrowserReady={copilotLiveBrowserReady}
-          initialMessage={initialCopilotMessage ?? undefined}
-          initialAttachments={routeInitialCopilotAttachments}
-          initialAction={initialCopilotAction ?? undefined}
-          onInitialMessageConsumed={handleInitialCopilotMessageConsumed}
-          onRequestOpen={openCopilot}
+          onTurnActivityChange={setIsEmberTurnActive}
+          workflowRunId={emberRunId({ embedded, studioRunId })}
+          requiresLiveBrowser={emberRequiresLiveBrowser}
+          isLiveBrowserReady={emberLiveBrowserReady}
+          initialMessage={initialEmberMessage ?? undefined}
+          initialAttachments={routeInitialEmberAttachments}
+          initialAction={initialEmberAction ?? undefined}
+          onInitialMessageConsumed={handleInitialEmberMessageConsumed}
+          onRequestOpen={openEmber}
           onRecordTask={startRecordingAtEnd}
           canRecordTask={authoringActionAvailability.canRecordTask}
           runOwnsBrowser={Boolean(viewerState?.active_run_session_id)}
@@ -3216,7 +3211,7 @@ function Workspace({
               // exactly as the chat's own buttons do. A refused decision keeps the
               // panel open; an Accept failure renders on the chat's review gate,
               // so the panel closes to reveal it.
-              const handleCopilotReviewClose = bindCopilotReviewClose(
+              const handleEmberReviewClose = bindEmberReviewClose(
                 () => settle("reject"),
                 async (status) => {
                   if (status === "approve" && !(await settle("approve"))) {
@@ -3231,13 +3226,13 @@ function Workspace({
                       version2: undefined,
                     },
                   });
-                  setIsCopilotOpen(true);
+                  setIsEmberOpen(true);
                 },
               );
 
               // Hide chat and show comparison. The comparison renders on the
               // editor canvas, so surface the Editor pane when docked in the studio.
-              setIsCopilotOpen(false);
+              setIsEmberOpen(false);
               if (embedded) {
                 openStudioPane("editor");
               }
@@ -3248,8 +3243,8 @@ function Workspace({
                   version1: currentVersion,
                   version2: pendingWorkflow,
                   showComparison: true,
-                  mode: "copilot",
-                  onCopilotReviewClose: handleCopilotReviewClose,
+                  mode: "ember",
+                  onEmberReviewClose: handleEmberReviewClose,
                 },
               });
             } catch (error) {
@@ -3262,9 +3257,9 @@ function Workspace({
               });
             }
           }}
-          onWorkflowUpdate={handleCopilotWorkflowUpdate}
+          onWorkflowUpdate={handleEmberWorkflowUpdate}
         />,
-        studioCopilotPortalEl,
+        studioEmberPortalEl,
       )}
       <ConfirmDialog
         open={deleteBlockDialogState.open}

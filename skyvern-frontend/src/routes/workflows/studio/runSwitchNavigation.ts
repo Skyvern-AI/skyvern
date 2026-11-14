@@ -5,8 +5,8 @@ import { useRunViewStore } from "@/store/RunViewStore";
 
 import { liveSearch } from "./liveSearch";
 import {
-  copilotBrowserFocusSessionId,
-  COPILOT_RUN_FOCUS,
+  emberBrowserFocusSessionId,
+  EMBER_RUN_FOCUS,
   fitPanesToWidth,
   panesFitWidth,
   searchWithRunReference,
@@ -18,7 +18,7 @@ import {
 import { useStudioRunId } from "./useStudioRunId";
 import { useStudioPaneDefaults } from "./StudioPaneDefaultsContext";
 
-// Which panes a Copilot run keeps on a narrow stage, first to last.
+// Which panes an Ember run keeps on a narrow stage, first to last.
 const NARROW_RUN_PANE_RANK: Record<StudioPaneId, number> = {
   browser: 0,
   copilot: 1,
@@ -37,17 +37,17 @@ export function searchWithRunSwitched(
   options?: { systemFocus?: boolean },
 ): string {
   const params = new URLSearchParams(search);
-  // The marker says the copilot INTRODUCED this run reference, so the layout
-  // class is whatever it would have been without the copilot. Marking a run
+  // The marker says the Ember INTRODUCED this run reference, so the layout
+  // class is whatever it would have been without the Ember. Marking a run
   // the user already opened would flip them out of the run class they chose —
   // the same remap this marker exists to prevent.
-  const copilotOwnsFocus =
+  const emberOwnsFocus =
     params.get(SYSTEM_RUN_FOCUS_PARAM) !== null ||
     (params.get("wr") === null && params.get("active") === null);
   params.set("wr", runId);
   if (!options?.systemFocus) params.delete("panes");
-  if (options?.systemFocus && copilotOwnsFocus) {
-    params.set(SYSTEM_RUN_FOCUS_PARAM, COPILOT_RUN_FOCUS);
+  if (options?.systemFocus && emberOwnsFocus) {
+    params.set(SYSTEM_RUN_FOCUS_PARAM, EMBER_RUN_FOCUS);
   } else {
     // A user switching runs takes over the focus; the layout reclassifies.
     params.delete(SYSTEM_RUN_FOCUS_PARAM);
@@ -63,7 +63,7 @@ export function searchWithRunSwitched(
 
 // The latest call that names a browser wins the pin; useBrowserPaneView shows it only while it is one the
 // studio can stream. A run the user opened (no marker) is never pinned.
-export function searchWithCopilotBrowserFocus(
+export function searchWithEmberBrowserFocus(
   search: string,
   callBrowserSessionId: string | null | undefined,
 ): string {
@@ -79,10 +79,10 @@ export function searchWithCopilotBrowserFocus(
   return toReadableSearch(params);
 }
 
-export function searchWithCopilotBrowserReleased(search: string): string {
+export function searchWithEmberBrowserReleased(search: string): string {
   const params = new URLSearchParams(search);
-  if (!copilotBrowserFocusSessionId(params)) return search;
-  params.set(SYSTEM_RUN_FOCUS_PARAM, COPILOT_RUN_FOCUS);
+  if (!emberBrowserFocusSessionId(params)) return search;
+  params.set(SYSTEM_RUN_FOCUS_PARAM, EMBER_RUN_FOCUS);
   return toReadableSearch(params);
 }
 
@@ -111,7 +111,7 @@ export function searchWithoutRun(search: string): string {
  * user's behalf rather than at their request, so Back never re-focuses it.
  * `systemFocus` keeps the layout in whatever class it already had,
  * so following the run never remaps the user's pane arrangement; it only adds
- * the Browser pane, so a Copilot test run started from Edit is visible.
+ * the Browser pane, so an Ember test run started from Edit is visible.
  */
 export function useSwitchStudioRun(options?: {
   replace?: boolean;
@@ -146,7 +146,7 @@ export function useSwitchStudioRun(options?: {
           if (stageWidth <= 0 || panesFitWidth(opened, stageWidth)) {
             return opened;
           }
-          // Narrow stage: keep Browser, then Copilot, then whatever else fits,
+          // Narrow stage: keep Browser, then Ember, then whatever else fits,
           // with Editor dropped first (the sign-in rule); keep on-screen order.
           const priority = [...opened].sort(
             (a, b) => NARROW_RUN_PANE_RANK[a] - NARROW_RUN_PANE_RANK[b],

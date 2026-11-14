@@ -63,7 +63,7 @@ type UseWorkflowHistoryResult = {
    * being coalesced into the reorder snapshot.
    */
   captureImmediately: () => void;
-  // A Copilot draft that lands while an internal update is open would otherwise be absorbed into its drift.
+  // An Ember draft that lands while an internal update is open would otherwise be absorbed into its drift.
   captureNextAsUserEdit: () => void;
   canUndo: boolean;
   canRedo: boolean;

@@ -3,7 +3,7 @@ import { createBranchCondition } from "../nodes/ConditionalNode/types";
 import { nanoid } from "nanoid";
 import { toast } from "@/components/ui/use-toast";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
-import { useCopilotActionStore } from "@/store/useCopilotActionStore";
+import { useEmberActionStore } from "@/store/useEmberActionStore";
 import { useWorkflowHistoryAccessStore } from "@/store/WorkflowHistoryAccessStore";
 import type { WorkflowBlockImage } from "../../types/workflowTypes";
 import { useLocateBlockStore } from "../runValidation/useLocateBlockStore";
@@ -16,7 +16,7 @@ import {
 } from "../nodes";
 import type { AddNodeProps } from "../Workspace";
 import { demonstrationInsertionFromNodes } from "../workspaceAuthoringActions";
-import type { WorkflowCopilotDemonstrationInsertion } from "../../copilot/workflowCopilotTypes";
+import type { EmberDemonstrationInsertion } from "../../ember/emberTypes";
 import {
   getUpdatedParametersAfterLabelUpdateForSourceParameterKey,
   inferBranchCriteriaTypeFromExpression,
@@ -303,7 +303,7 @@ export function createDocEditApi({
   const demonstrationInsertion = (
     place: DocPlace,
     replacing?: string,
-  ): WorkflowCopilotDemonstrationInsertion | null => {
+  ): EmberDemonstrationInsertion | null => {
     if (place.scope.parentId || place.scope.conditionalBranchId) return null;
     // The empty step being replaced is not a neighbour: the recording goes where it stood.
     const without =
@@ -347,7 +347,7 @@ export function createDocEditApi({
         // A build in flight carries the Goal it started with, so a later edit would be lost to it (the Visual editor disables the field).
         if (key === "prompt" && typeof before?.label === "string") {
           const { generatingBlockLabel, queuedBuilds } =
-            useCopilotActionStore.getState();
+            useEmberActionStore.getState();
           if (
             current.find((n) => n.id === id)?.type === "codeBlock" &&
             (generatingBlockLabel === before.label ||

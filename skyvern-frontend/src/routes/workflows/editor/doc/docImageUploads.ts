@@ -7,7 +7,7 @@ import {
   selectEditorMutationLocked,
   useWorkflowYamlEditorStore,
 } from "@/store/WorkflowYamlEditorStore";
-import { ATTACHMENT_SIZE_LIMIT_BYTES } from "../../copilot/attachmentLimits";
+import { ATTACHMENT_SIZE_LIMIT_BYTES } from "../../ember/attachmentLimits";
 import type { WorkflowBlockImage } from "../../types/workflowTypes";
 
 export const DOC_IMAGE_TYPES = [
@@ -65,7 +65,7 @@ export const useDocImageUploadStore = create<DocImageUploadStore>((set) => ({
     set((state) => ({ uploads: state.uploads.filter((u) => u.id !== id) })),
 }));
 
-// A save, a YAML commit or a Copilot acceptance sets the unsaved mark itself (the last two refuse one meanwhile, with a
+// A save, a YAML commit or an Ember acceptance sets the unsaved mark itself (the last two refuse one meanwhile, with a
 // toast), and a change while the YAML view is open marks the YAML stale.
 const saveOrYamlBusy = () => {
   const yaml = useWorkflowYamlEditorStore.getState();

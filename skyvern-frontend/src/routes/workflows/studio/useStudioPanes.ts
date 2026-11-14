@@ -6,6 +6,8 @@ import {
   type NavigateOptions,
 } from "react-router-dom";
 
+import { EMBER_EVENTS } from "@/routes/workflows/ember/emberEvents";
+
 import { liveLocationState, liveSearch } from "./liveSearch";
 import {
   panesWithoutDeletedBlocked,
@@ -76,7 +78,7 @@ export function useStudioPanes() {
           !current.includes("copilot") &&
           next.includes("copilot")
         ) {
-          posthog.capture("copilot.pane.opened", {
+          posthog.capture(EMBER_EVENTS.paneOpened, {
             org_id: organizationId,
             workflow_permanent_id: workflowPermanentId,
           });
