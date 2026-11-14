@@ -13,7 +13,9 @@ jobs:
         with:
           persist-credentials: false
       - name: Install Fern
-        run: npm install -g fern-api
+        # fern-api 5.215.0 and later refuse to run the CLI version pinned in fern/fern.config.json (0.94.3).
+        # Unpin once that version is upgraded.
+        run: npm install -g fern-api@5.214.0
       - name: Publish Docs
         env:
           FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
