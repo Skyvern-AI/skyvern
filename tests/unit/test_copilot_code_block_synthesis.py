@@ -26,21 +26,11 @@ from skyvern.forge.sdk.copilot.code_block_preflight import (
     author_time_code_block_diagnostics,
     preflight_code_block,
 )
-from skyvern.forge.sdk.copilot.code_block_security import (
-    CodeBlockSecurityInput,
-    author_time_code_security_errors,
-    runtime_code_security_errors,
-)
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
-    _DOWNLOAD_VAR_BASE,
-    _ENTRY_RESUME_AFTER_AUTH_VAR,
-    _ENTRY_REUSED_VAR,
-    _ENTRY_TARGET_VAR,
     _INDENT,
     _MAX_STEPS,
     _READONLY_DEFERRED_VAR,
     _REQUIRED_STATE_TIMEOUT_MS,
-    CREDENTIAL_FILL_TOOL_NAME,
     INPUT_TEMPLATED_PROVENANCE_SOURCE,
     LOCATOR_WITNESS_PARAM_SOURCE,
     SynthesisDiagnostics,
@@ -63,13 +53,25 @@ from skyvern.forge.sdk.copilot.output_extraction_plan import (
     RequestedOutputExtractionPlan,
     RevealAnchor,
 )
-from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
 from skyvern.forge.sdk.copilot.tools.scouting import _fill_carry_to_interaction
 from skyvern.forge.sdk.copilot.tools.workflow_update import (
     _code_block_safety_errors,
 )
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml
+from skyvern.forge.sdk.workflow.code_block_security import (
+    CodeBlockSecurityInput,
+    author_time_code_security_errors,
+    runtime_code_security_errors,
+)
+from skyvern.forge.sdk.workflow.code_block_steps import (
+    CREDENTIAL_FILL_TOOL_NAME,
+    DOWNLOAD_VAR_BASE,
+    ENTRY_RESUME_AFTER_AUTH_VAR,
+    ENTRY_REUSED_VAR,
+    ENTRY_TARGET_VAR,
+)
 from skyvern.forge.sdk.workflow.models.block import CodeBlock, CodeBlockStep
+from skyvern.forge.sdk.workflow.reached_download_target import ReachedDownloadTarget
 from tests.unit.copilot_test_helpers import carried_interaction
 
 
@@ -2771,7 +2773,7 @@ class TestDownloadRungSynthesis:
                     selector="#field",
                     source_url="https://example.com/",
                     typed_value="x",
-                    accessible_name=_DOWNLOAD_VAR_BASE,
+                    accessible_name=DOWNLOAD_VAR_BASE,
                 ),
                 _nav_click(),
             ],
@@ -2779,8 +2781,8 @@ class TestDownloadRungSynthesis:
         )
         assert result is not None
         param_keys = [p["key"] for p in result.parameters]
-        assert _DOWNLOAD_VAR_BASE not in param_keys
-        assert f"{_DOWNLOAD_VAR_BASE}_field" in param_keys
+        assert DOWNLOAD_VAR_BASE not in param_keys
+        assert f"{DOWNLOAD_VAR_BASE}_field" in param_keys
         assert "await click_and_claim_download(page, " in result.code
 
     def test_emitted_download_snippet_is_safe_and_parses(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3015,7 +3017,7 @@ class TestReadonlyControlStateSynthesis:
         result = synthesize_code_block(trajectory, reached_download_target=_download_target())
         assert result is not None
         lines = result.code.splitlines()
-        guard = next(ln for ln in lines if ln.strip() == f"if not {_ENTRY_REUSED_VAR}:")
+        guard = next(ln for ln in lines if ln.strip() == f"if not {ENTRY_REUSED_VAR}:")
         guard_indent = len(guard) - len(guard.lstrip())
         read_idx = next(i for i, ln in enumerate(lines) if f"{_READONLY_DEFERRED_VAR} = await" in ln)
         deferred_try = max(i for i in range(read_idx) if lines[i].strip() == "try:")
@@ -3106,9 +3108,7 @@ class TestReadonlyControlStateSynthesis:
         pre_read = next(i for i, ln in enumerate(lines) if "#account-id" in ln and ".input_value()" in ln)
         post_read = next(i for i, ln in enumerate(lines) if "#post-field" in ln and ".input_value()" in ln)
         guard = next(
-            i
-            for i, ln in enumerate(lines)
-            if ln == f"{_INDENT}if not {_ENTRY_RESUME_AFTER_AUTH_VAR}:" and i > post_read
+            i for i, ln in enumerate(lines) if ln == f"{_INDENT}if not {ENTRY_RESUME_AFTER_AUTH_VAR}:" and i > post_read
         )
         assert post_read < guard < pre_read
         guard_indent = len(lines[guard]) - len(lines[guard].lstrip())
@@ -3140,18 +3140,18 @@ class TestReadonlyControlStateSynthesis:
             ]
         )
         assert resume is not None
-        pre_resume = _guarded_deferred_snippet(resume.code, _ENTRY_RESUME_AFTER_AUTH_VAR)
+        pre_resume = _guarded_deferred_snippet(resume.code, ENTRY_RESUME_AFTER_AUTH_VAR)
         post_resume = _deferred_conditional_snippet(resume.code)
 
         exec(
             pre_resume,
-            {_ENTRY_RESUME_AFTER_AUTH_VAR: True, _READONLY_DEFERRED_VAR: "2026-06-22", "start_date": "06/22/2026"},
+            {ENTRY_RESUME_AFTER_AUTH_VAR: True, _READONLY_DEFERRED_VAR: "2026-06-22", "start_date": "06/22/2026"},
         )
         assert capsys.readouterr().out == ""
         with pytest.raises(AssertionError):
-            exec(pre_resume, {_ENTRY_RESUME_AFTER_AUTH_VAR: False, _READONLY_DEFERRED_VAR: ""})
+            exec(pre_resume, {ENTRY_RESUME_AFTER_AUTH_VAR: False, _READONLY_DEFERRED_VAR: ""})
         with pytest.raises(AssertionError):
-            exec(post_resume, {_ENTRY_RESUME_AFTER_AUTH_VAR: True, _READONLY_DEFERRED_VAR: ""})
+            exec(post_resume, {ENTRY_RESUME_AFTER_AUTH_VAR: True, _READONLY_DEFERRED_VAR: ""})
 
         reuse = synthesize_code_block(
             [
@@ -3167,11 +3167,11 @@ class TestReadonlyControlStateSynthesis:
             reached_download_target=_download_target(),
         )
         assert reuse is not None
-        reuse_gated = _guarded_deferred_snippet(reuse.code, _ENTRY_REUSED_VAR)
-        exec(reuse_gated, {_ENTRY_REUSED_VAR: True, _READONLY_DEFERRED_VAR: "2026-06-22", "start_date": "06/22/2026"})
+        reuse_gated = _guarded_deferred_snippet(reuse.code, ENTRY_REUSED_VAR)
+        exec(reuse_gated, {ENTRY_REUSED_VAR: True, _READONLY_DEFERRED_VAR: "2026-06-22", "start_date": "06/22/2026"})
         assert capsys.readouterr().out == ""
         with pytest.raises(AssertionError):
-            exec(reuse_gated, {_ENTRY_REUSED_VAR: False, _READONLY_DEFERRED_VAR: ""})
+            exec(reuse_gated, {ENTRY_REUSED_VAR: False, _READONLY_DEFERRED_VAR: ""})
 
 
 class TestReadonlyControlStateCarry:
@@ -3797,9 +3797,9 @@ class TestLoginEntryReadinessSynthesis:
         )
         result = synthesize_code_block(traj, strict_selectors=True)
         assert result is not None
-        assert f"if await {_ENTRY_TARGET_VAR}.count() == 1:" not in result.code
+        assert f"if await {ENTRY_TARGET_VAR}.count() == 1:" not in result.code
         assert (
-            f'await {_ENTRY_TARGET_VAR}.wait_for(state="visible", timeout={_REQUIRED_STATE_TIMEOUT_MS})' in result.code
+            f'await {ENTRY_TARGET_VAR}.wait_for(state="visible", timeout={_REQUIRED_STATE_TIMEOUT_MS})' in result.code
         )
         assert f'{_INDENT}await page.locator("#username").fill(portal.username)' in result.code
         assert f'{_INDENT}await page.locator("#password").fill(portal.password)' in result.code
@@ -3811,7 +3811,7 @@ class TestLoginEntryReadinessSynthesis:
         )
         result = synthesize_code_block(traj, strict_selectors=True)
         assert result is not None
-        assert f"if await {_ENTRY_TARGET_VAR}.count() == 1:" not in result.code
+        assert f"if await {ENTRY_TARGET_VAR}.count() == 1:" not in result.code
         assert f'{_INDENT}await page.locator("#password").press("Enter")' in result.code
 
     def test_present_state_runs_full_login(self) -> None:

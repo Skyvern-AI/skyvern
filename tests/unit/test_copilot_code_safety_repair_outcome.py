@@ -12,10 +12,10 @@ from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, redact_raw_secrets_for_prompt
-from skyvern.forge.sdk.copilot.secret_scrub import scrub_all_registered_from_text
 from skyvern.forge.sdk.copilot.tools import workflow_update as workflow_update_module
 from skyvern.forge.sdk.copilot.tools.workflow_update import _update_workflow
 from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
+from skyvern.utils.secret_scrub import scrub_all_registered_from_text
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
 pytestmark = pytest.mark.usefixtures("no_saved_workflow")

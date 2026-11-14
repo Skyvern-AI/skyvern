@@ -11,7 +11,7 @@ from jinja2 import TemplateSyntaxError, nodes
 from jinja2.sandbox import SandboxedEnvironment
 from pydantic import BaseModel, ValidationError
 
-from skyvern.forge.sdk.copilot.workflow_yaml import workflow_to_copilot_yaml
+from skyvern.forge.sdk.workflow.authoring_yaml import workflow_to_authoring_yaml
 from skyvern.forge.sdk.workflow.models._jinja import mask_jinja_in_python_comments
 from skyvern.forge.sdk.workflow.models.block import BlockSubclasses
 from skyvern.forge.sdk.workflow.models.parameter import RESERVED_PARAMETER_KEYS, is_sensitive_workflow_parameter
@@ -719,5 +719,5 @@ def validate_workflow_definition(raw: dict[str, Any]) -> WorkflowValidationResul
 def validate_stored_workflow(workflow: Workflow) -> WorkflowValidationResult:
     """Validate a stored workflow in the same YAML shape the editor and Copilot author."""
     ensure_workflow_validation_limits(workflow)
-    authored = yaml.safe_load(workflow_to_copilot_yaml(workflow))
+    authored = yaml.safe_load(workflow_to_authoring_yaml(workflow))
     return validate_workflow_definition(authored if isinstance(authored, dict) else {})

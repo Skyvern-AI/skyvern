@@ -27,7 +27,7 @@ from skyvern.forge.sdk.copilot.browser_ablation import resolve_copilot_tool_surf
 from skyvern.forge.sdk.copilot.canonical_ownership import workflow_content_fingerprint
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
-from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER, register_secret_scrub_value
+from skyvern.forge.sdk.copilot.secret_scrub import register_secret_scrub_value
 from skyvern.forge.sdk.copilot.tools import account_groups, copilot_native_tools
 from skyvern.forge.sdk.copilot.tools import credentials as credentials_module
 from skyvern.forge.sdk.copilot.tools import mcp_hooks, workflow_update
@@ -46,7 +46,6 @@ from skyvern.forge.sdk.copilot.tools.workflow_update import (
     proposal_workflow_fingerprint,
     proposal_workflow_fingerprint_matches,
 )
-from skyvern.forge.sdk.copilot.workflow_yaml import workflow_to_copilot_yaml
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
@@ -78,6 +77,7 @@ from skyvern.forge.sdk.services.request_principal import (
     RequestPrincipal,
     scoped_api_key_id_from_actor,
 )
+from skyvern.forge.sdk.workflow.authoring_yaml import workflow_to_authoring_yaml
 from skyvern.forge.sdk.workflow.models.block import TaskBlock
 from skyvern.forge.sdk.workflow.models.google_sheets_blocks import GoogleSheetsReadBlock
 from skyvern.forge.sdk.workflow.models.parameter import (
@@ -102,6 +102,7 @@ from skyvern.schemas.workflow_run_groups import (
     WorkflowRunGroupStatus,
 )
 from skyvern.services import workflow_run_group_service as group_service
+from skyvern.utils.secret_scrub import REDACTED_SECRET_PLACEHOLDER
 from tests.unit.conftest import (
     RUN_GROUP_ORG,
     RUN_GROUP_WPID,
@@ -1289,7 +1290,7 @@ async def _stage_draft(
     published = await repo.publish_workflow_copilot_candidate(
         RUN_GROUP_ORG,
         chat_id,
-        proposal={**draft.model_dump(mode="json"), "_copilot_yaml": workflow_to_copilot_yaml(draft)},
+        proposal={**draft.model_dump(mode="json"), "_copilot_yaml": workflow_to_authoring_yaml(draft)},
         owner_turn_id="turn_draft",
         canonical_fingerprint=proposal_workflow_fingerprint(saved),
         canonical_title=saved.title,

@@ -81,11 +81,6 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     redacted_terminal_text,
 )
 from skyvern.forge.sdk.copilot.cache_envelope import CacheableSystemInstructions
-from skyvern.forge.sdk.copilot.code_block_steps import (
-    bind_referenced_parameters_in_yaml,
-    carry_user_owned_goals_in_yaml,
-    derive_code_block_steps_in_yaml,
-)
 from skyvern.forge.sdk.copilot.completion_criteria_store import (
     StoredCriteriaSnapshot,
     apply_requested_output_producer_floor,
@@ -251,7 +246,6 @@ from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     RUNTIME_FAILURE_REASON_MAX_CHARS,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result, run_result_screenshot_provenance
-from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_structured_prompt
 from skyvern.forge.sdk.copilot.secret_scrub import (
     registered_scrub_values,
     scrub_secrets_from_structure,
@@ -345,7 +339,6 @@ from skyvern.forge.sdk.copilot.workflow_yaml import (
     runner_code_block_associations,
     stored_block_code,
     stored_workflow_yaml,
-    workflow_to_copilot_yaml,
 )
 from skyvern.forge.sdk.db.datetime_utils import to_naive_utc
 from skyvern.forge.sdk.db.exceptions import CopilotProposalConflictError
@@ -367,6 +360,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     chat_history_role,
 )
 from skyvern.forge.sdk.trace import apply_context_attrs, record_span_exception, traced_span
+from skyvern.forge.sdk.workflow.authoring_yaml import workflow_to_authoring_yaml
 from skyvern.forge.sdk.workflow.block_notes import (
     NOTE_FIELDS,
     block_field_texts,
@@ -375,8 +369,14 @@ from skyvern.forge.sdk.workflow.block_notes import (
     labels_with_different_notes,
     stored_notes_for_labels,
 )
+from skyvern.forge.sdk.workflow.code_block_steps import (
+    bind_referenced_parameters_in_yaml,
+    carry_user_owned_goals_in_yaml,
+    derive_code_block_steps_in_yaml,
+)
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
+from skyvern.utils.raw_secret_redaction import redact_raw_secrets_for_structured_prompt
 from skyvern.utils.strings import escape_code_fences
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
@@ -1965,7 +1965,7 @@ def _review_projection_for(
         saved_workflow_canvas(ctx) or _EMPTY_REVIEW_BASELINE_YAML,
         proposal_yaml,
         ctx.executed_block_fingerprints,
-        workflow_to_copilot_yaml(candidate) if isinstance(candidate, Workflow) else None,
+        workflow_to_authoring_yaml(candidate) if isinstance(candidate, Workflow) else None,
     )
     if review is None:
         return None

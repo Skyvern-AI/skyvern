@@ -42,7 +42,6 @@ from skyvern.forge.sdk.copilot.budget_expiry import (
     serialize_budget_expiry_observation,
 )
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
-    CREDENTIAL_FILL_TOOL_NAME,
     credential_scout_gap,
     credential_submit_boundary_index,
     first_matched_post_fill_submit_index,
@@ -151,6 +150,7 @@ from skyvern.forge.sdk.copilot.unrecoverable_tool_error import (
 from skyvern.forge.sdk.copilot.unrecoverable_tool_error import (
     _maybe_raise_unrecoverable_tool_error as _maybe_raise_unrecoverable_tool_error,
 )
+from skyvern.forge.sdk.workflow.code_block_steps import CREDENTIAL_FILL_TOOL_NAME
 from skyvern.schemas.proxy_location import ProxyLocationInput
 from skyvern.utils.token_counter import count_tokens
 

@@ -7,7 +7,7 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from skyvern.config import settings
-from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
+from skyvern.utils.raw_secret_redaction import redact_raw_secrets_for_prompt
 
 _LOCATION_FINGERPRINT_DOMAIN = b"skyvern.copilot.page_location.v1"
 _LOCATION_FALLBACK_SECRET = secrets.token_bytes(32)

@@ -14,11 +14,11 @@ from skyvern.forge.sdk.copilot.code_block_preflight import (
     preflight_code_block,
     scanner_advisory_diagnostics,
 )
-from skyvern.forge.sdk.copilot.code_block_security import (
+from skyvern.forge.sdk.copilot.code_block_synthesis import synthesize_code_block
+from skyvern.forge.sdk.workflow.code_block_security import (
     CodeBlockSecurityError,
     author_time_code_security_errors,
 )
-from skyvern.forge.sdk.copilot.code_block_synthesis import synthesize_code_block
 
 from ._common import ErrorCode, make_error, make_result
 from .trajectory import skyvern_trajectory_get
@@ -59,7 +59,7 @@ async def skyvern_code_block_lint(
     ] = None,
     label: Annotated[str, Field(description="Block label, used in security-error messages")] = "code_block",
 ) -> dict[str, Any]:
-    """Lint a Workflow Copilot `code` block with the copilot's own deterministic gates.
+    """Lint a workflow `code` block with the same deterministic gates the authoring agent uses.
 
     Runs CodeBlock.is_safe_code(), the security denylist
     (page.request/page.context), static preflight, and author-time AST diagnostics.
@@ -95,7 +95,7 @@ async def skyvern_code_block_lint(
             if ok
             else make_error(
                 ErrorCode.INVALID_INPUT,
-                "Code block failed copilot lint gates",
+                "Code block failed lint gates",
                 "Fix the listed security or preflight issues before persisting the block",
             )
         ),
@@ -219,7 +219,7 @@ async def skyvern_code_block_synthesize(
 
     data = {
         "prompt": "",
-        # The synthesizer emits wrapper-indented code for the copilot stitch path; this tool's
+        # The synthesizer emits wrapper-indented code for the authoring agent's stitch path; this tool's
         # contract is a standalone block, so dedent before returning.
         "code": textwrap.dedent(synthesized.code),
         "parameters": synthesized.parameters,

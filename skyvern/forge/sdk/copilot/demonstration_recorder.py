@@ -40,12 +40,12 @@ from skyvern.forge.sdk.copilot.runtime import (
     start_browser_driver_release,
     wait_for_driver_releases,
 )
-from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.tools.credential_fill import fill_credential_field
 from skyvern.forge.sdk.core.event_source_stream import EventSourceStream
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotDemonstrationControlRequest
 from skyvern.services import uploaded_file_service
+from skyvern.utils.raw_secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.utils.url_validators import validate_fetch_url
 
 LOG = structlog.get_logger()

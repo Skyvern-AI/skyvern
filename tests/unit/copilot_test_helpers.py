@@ -80,7 +80,6 @@ from skyvern.forge.sdk.copilot.screenshot_utils import (
     ScreenshotProvenance,
     resize_screenshot_b64,
 )
-from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER
 from skyvern.forge.sdk.copilot.session_factory import (
     copilot_call_model_input_filter,
     copilot_session_input_callback,
@@ -123,6 +122,7 @@ from skyvern.schemas.runs import ProxyLocation
 from skyvern.schemas.self_heal import HealEpisode
 from skyvern.schemas.workflows import BlockStatus, BlockType
 from skyvern.services import workflow_service as workflow_service_module
+from skyvern.utils.secret_scrub import REDACTED_SECRET_PLACEHOLDER
 from skyvern.webeye import real_browser_manager
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import ActionStatus

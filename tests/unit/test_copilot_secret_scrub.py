@@ -16,7 +16,7 @@ from urllib.parse import quote
 import pytest
 
 from skyvern.forge import app
-from skyvern.forge.sdk.copilot import mcp_adapter, runtime, secret_scrub
+from skyvern.forge.sdk.copilot import mcp_adapter, runtime
 from skyvern.forge.sdk.copilot.agent import _MCP_RESULT_SECURITY_BOUNDARY
 from skyvern.forge.sdk.copilot.mcp_adapter import PageStateReader, SchemaOverlay, SkyvernOverlayMCPServer
 from skyvern.forge.sdk.copilot.output_utils import (
@@ -25,16 +25,19 @@ from skyvern.forge.sdk.copilot.output_utils import (
 )
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.secret_scrub import (
-    MIN_PERSISTED_REDACTION_LENGTH,
-    REDACTED_SECRET_PLACEHOLDER,
-    all_registered_secret_values,
-    clear_session_scrub_values,
     register_secret_scrub_value,
     registered_scrub_values,
     scrub_secrets_from_structure,
     scrub_secrets_from_text,
 )
 from skyvern.forge.sdk.copilot.workflow_yaml import redact_credentials_in_workflow_yaml
+from skyvern.utils import secret_scrub
+from skyvern.utils.secret_scrub import (
+    MIN_PERSISTED_REDACTION_LENGTH,
+    REDACTED_SECRET_PLACEHOLDER,
+    all_registered_secret_values,
+    clear_session_scrub_values,
+)
 from skyvern.utils.yaml_loader import dump_workflow_yaml, safe_load_no_dates
 from tests.unit.copilot_test_helpers import make_model_input_data
 
@@ -492,7 +495,7 @@ class TestPersistenceSeam:
             "json_literal": json.dumps(password),
         }
 
-        scrubbed = json.dumps(secret_scrub.scrub_secrets_from_structure(ctx, page))
+        scrubbed = json.dumps(scrub_secrets_from_structure(ctx, page))
 
         for form in (username, quote(username, safe=""), password, html.escape(password), json.dumps(password)[1:-1]):
             assert form not in scrubbed

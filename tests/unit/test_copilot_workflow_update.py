@@ -20,7 +20,6 @@ from skyvern.forge.sdk.copilot import agent as copilot_agent
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot import workflow_yaml as workflow_yaml_module
 from skyvern.forge.sdk.copilot.agent import _build_narrative_payload
-from skyvern.forge.sdk.copilot.code_block_steps import UserOwnedGoalCarry, user_owned_goal_carry_disclosure
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.output_utils import BUILD_TEST_PACKET_KEY, sanitize_tool_result_for_llm
@@ -38,6 +37,8 @@ from skyvern.forge.sdk.copilot.tools.workflow_update import (
 )
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml, apply_block_edit, tool_call_submitted_yaml
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
+from skyvern.forge.sdk.workflow.authoring_yaml import workflow_to_authoring_yaml
+from skyvern.forge.sdk.workflow.code_block_steps import UserOwnedGoalCarry, user_owned_goal_carry_disclosure
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
 from skyvern.schemas.runs import ProxyLocation
 from skyvern.schemas.workflows import WorkflowCreateYAMLRequest, WorkflowStatus
@@ -62,7 +63,7 @@ async def test_a_copilot_round_trip_leaves_an_unset_block_engine_unset(monkeypat
     document = {"title": "t", "workflow_definition": {"version": 2, "parameters": [], "blocks": blocks}}
     stored = await _process_workflow_yaml("w", "wp", "o", yaml.safe_dump(document))
 
-    copilot_yaml = workflow_yaml_module.workflow_to_copilot_yaml(stored)
+    copilot_yaml = workflow_to_authoring_yaml(stored)
     applied = await _process_workflow_yaml("w", "wp", "o", copilot_yaml, settings_fallback_workflow=stored)
 
     assert all("engine" not in block for block in yaml.safe_load(copilot_yaml)["workflow_definition"]["blocks"])
@@ -180,7 +181,7 @@ async def test_workflow_yaml_settings_presence_contract(
         expected = replacement
     assert getattr(updated, field_name) == expected
     if field_name == "browser_type":
-        assert yaml.safe_load(workflow_yaml_module.workflow_to_copilot_yaml(updated)).get(field_name) == expected
+        assert yaml.safe_load(workflow_to_authoring_yaml(updated)).get(field_name) == expected
 
 
 @pytest.mark.asyncio

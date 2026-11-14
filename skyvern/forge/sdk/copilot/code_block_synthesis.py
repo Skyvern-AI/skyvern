@@ -21,7 +21,7 @@ from collections.abc import Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import urlsplit
 
 import structlog
 
@@ -35,11 +35,26 @@ from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
 )
 from skyvern.forge.sdk.copilot.credential_fill_fields import CREDENTIAL_FILL_FIELDS
 from skyvern.forge.sdk.copilot.output_extraction_plan import output_path_segments
-from skyvern.forge.sdk.copilot.reached_download_target import (
+from skyvern.forge.sdk.workflow.code_block_steps import (
+    CREDENTIAL_FILL_TOOL_NAME,
+    DOWNLOAD_FILENAME_VAR_BASE,
+    ENTRY_OPENER_VAR,
+    ENTRY_RESUME_AFTER_AUTH_VAR,
+    ENTRY_RESUME_TARGET_VAR,
+    ENTRY_REUSED_VAR,
+    ENTRY_TARGET_VAR,
+    ISO_DATE_HELPER_VAR,
+    MONTH_HELPER_VAR,
+    PERIOD_DATE_PATTERN_HELPER_VAR,
+    RECORDING_REQUIRED_ACTION_TYPES,
+    RESERVED_PARAM_NAMES,
+)
+from skyvern.forge.sdk.workflow.reached_download_target import (
     DOWNLOAD_CLAIM_HELPER_NAME,
     ReachedDownloadTarget,
     can_deliver_registered_download,
 )
+from skyvern.utils.url_validators import scrub_url_for_code_literal
 
 LOG = structlog.get_logger()
 
@@ -48,51 +63,25 @@ _INDENT = "    "
 # A dashboard renders the tile before the figure it will hold, so a designated read waits for the
 # value rather than reporting the empty frame it lands in first.
 _DOMCONTENTLOADED = "domcontentloaded"
-_ENTRY_TARGET_VAR = "_scout_entry_target"
 _DOWNLOAD_TARGET_VAR = "_scout_download_target"
 _SAME_MONTH_HELPER_VAR = "_scout_same_month_iso"
-_ENTRY_REUSED_VAR = "_scout_entry_reused_current_page"
-_ENTRY_RESUME_AFTER_AUTH_VAR = "_scout_entry_resume_after_auth"
-_ENTRY_RESUME_TARGET_VAR = "_scout_entry_resume_target"
-_ENTRY_OPENER_VAR = "_scout_entry_opener"
 _OPTIONAL_DISMISSAL_VAR = "_scout_optional_dismissal"
 _READONLY_DEFERRED_VAR = "_scout_readonly_actual"
-_MONTH_HELPER_VAR = "_scout_month_to_iso"
-_ISO_DATE_HELPER_VAR = "_scout_iso_date_to_year_month"
-_PERIOD_DATE_PATTERN_HELPER_VAR = "_scout_period_date_pattern"
 _INTERNAL_SCOUT_VARS = (
-    _ENTRY_TARGET_VAR,
+    ENTRY_TARGET_VAR,
     _DOWNLOAD_TARGET_VAR,
-    _ENTRY_REUSED_VAR,
-    _ENTRY_RESUME_AFTER_AUTH_VAR,
-    _ENTRY_RESUME_TARGET_VAR,
-    _ENTRY_OPENER_VAR,
+    ENTRY_REUSED_VAR,
+    ENTRY_RESUME_AFTER_AUTH_VAR,
+    ENTRY_RESUME_TARGET_VAR,
+    ENTRY_OPENER_VAR,
     _OPTIONAL_DISMISSAL_VAR,
     _READONLY_DEFERRED_VAR,
-    _MONTH_HELPER_VAR,
+    MONTH_HELPER_VAR,
     _SAME_MONTH_HELPER_VAR,
-    _ISO_DATE_HELPER_VAR,
-    _PERIOD_DATE_PATTERN_HELPER_VAR,
+    ISO_DATE_HELPER_VAR,
+    PERIOD_DATE_PATTERN_HELPER_VAR,
 )
 
-# Base name for the download var bound by `async with page.expect_download() as <name>:`.
-_DOWNLOAD_VAR_BASE = "dl_info"
-_DOWNLOAD_FILENAME_VAR_BASE = "downloaded_file_name"
-_DOWNLOAD_PATH_VAR_BASE = "_downloaded_file_path"
-_DOWNLOAD_OUTPUT_VAR_BASE = "downloaded_files"
-
-CREDENTIAL_FILL_TOOL_NAME = "fill_credential_field"
-# Recorded actions a workflow silently loses if dropped; a recording emits a repair step for them instead.
-# Dropped hovers are tolerated: they are usually incidental to a located click.
-_RECORDING_REQUIRED_ACTION_TYPES = {
-    "click": "click",
-    "drag": "drag",
-    "set_dialog_policy": "input_text",
-    "type_text": "input_text",
-    CREDENTIAL_FILL_TOOL_NAME: "input_text",
-    "select_option": "select_option",
-    "upload_file": "upload_file",
-}
 
 _CREDENTIAL_FIELDS = CREDENTIAL_FILL_FIELDS
 
@@ -331,71 +320,6 @@ _STRUCTURAL_DISMISSAL_SELECTOR_PATTERN = re.compile(
 # genuinely absent state pays the full budget. Distinct from the deliberate 1s speculative probes.
 _REQUIRED_STATE_TIMEOUT_MS = 120_000
 
-# Names the code-block executor reserves in its exec() namespace (block.py build_safe_vars
-# plus the injected `page`). A parameter key colliding with one of these is shadowed by the
-# builtin at bind time (block.py's late safe globals let a persisted parameter keep its value,
-# but a new block must not rely on that), so the synthesized fill would stringify the builtin.
-# "username"/"password"/"totp"/"totp_identifier" are reserved too: CodeBlock.execute also
-# injects a bound credential's fields under those bare names, so a plain parameter named
-# `password` would resolve to the credential's secret value instead of the user input.
-_RESERVED_PARAM_NAMES = frozenset(
-    {
-        "page",
-        "username",
-        "password",
-        "totp",
-        "totp_identifier",
-        "otp",
-        "solve_captcha",
-        "search_web",
-        "read_document_text",
-        "open_page",
-        "clear_browser_data",
-        "attach_authorized_file",
-        "set_dialog_policy",
-        DOWNLOAD_CLAIM_HELPER_NAME,
-        "print",
-        "len",
-        "range",
-        "str",
-        "int",
-        "float",
-        "dict",
-        "list",
-        "tuple",
-        "set",
-        "bool",
-        "isinstance",
-        "enumerate",
-        "any",
-        "all",
-        "max",
-        "min",
-        "sum",
-        "round",
-        "abs",
-        "sorted",
-        "sleep",
-        "asyncio",
-        "re",
-        "json",
-        "html",
-        "Exception",
-        _ENTRY_TARGET_VAR,
-        _ENTRY_REUSED_VAR,
-        _ENTRY_RESUME_AFTER_AUTH_VAR,
-        _ENTRY_RESUME_TARGET_VAR,
-        _ENTRY_OPENER_VAR,
-        _MONTH_HELPER_VAR,
-        _ISO_DATE_HELPER_VAR,
-        _PERIOD_DATE_PATTERN_HELPER_VAR,
-        _DOWNLOAD_VAR_BASE,
-        f"{_DOWNLOAD_VAR_BASE}_file",
-        _DOWNLOAD_FILENAME_VAR_BASE,
-        _DOWNLOAD_PATH_VAR_BASE,
-        _DOWNLOAD_OUTPUT_VAR_BASE,
-    }
-)
 
 # role=<role>[name="<name>"] optionally followed by `>> nth=<n>` or other engines.
 _ROLE_NAME_RE = re.compile(r'^role=([a-zA-Z]+)(?:\[name="((?:[^"\\]|\\.)*)"\])?(.*)$')
@@ -462,7 +386,7 @@ def grounded_parameter_key_is_safe(parameter_key: str) -> bool:
         and normalized_key.isidentifier()
         and not keyword.iskeyword(normalized_key)
         and not normalized_key.startswith("__")
-        and normalized_key not in _RESERVED_PARAM_NAMES
+        and normalized_key not in RESERVED_PARAM_NAMES
     )
 
 
@@ -574,44 +498,6 @@ _EXTRA_LINE_SEPARATORS = ("\u2028", "\u2029")
 _CONTROL_CODEPOINTS = frozenset(
     chr(cp) for cp in (*range(0x00, 0x20), 0x7F, *range(0x80, 0xA0)) if chr(cp) not in ("\n", "\r")
 )
-_SENSITIVE_URL_QUERY_RE = re.compile(
-    r"(?:password|passwd|token|secret|api[_-]?key|credential|auth|session|cookie)", re.I
-)
-
-
-def _scrub_url_for_code_literal(url: str) -> str:
-    try:
-        parts = urlsplit(url)
-        hostname = parts.hostname
-        port = parts.port
-    except ValueError:
-        return url
-    if not parts.scheme or not parts.netloc or hostname is None:
-        return url
-
-    netloc = hostname
-    if ":" in netloc and not netloc.startswith("["):
-        netloc = f"[{netloc}]"
-    if port is not None:
-        netloc = f"{netloc}:{port}"
-
-    query = urlencode(
-        [
-            (key, "__redacted__" if _SENSITIVE_URL_QUERY_RE.search(key) else value)
-            for key, value in parse_qsl(parts.query, keep_blank_values=True)
-        ],
-        doseq=True,
-    )
-    fragment = parts.fragment
-    fragment_pairs = parse_qsl(fragment, keep_blank_values=True) if "=" in fragment or "&" in fragment else []
-    if fragment_pairs:
-        fragment = urlencode(
-            [(key, "__redacted__" if _SENSITIVE_URL_QUERY_RE.search(key) else value) for key, value in fragment_pairs],
-            doseq=True,
-        )
-    elif fragment and _SENSITIVE_URL_QUERY_RE.search(fragment):
-        fragment = "__redacted__"
-    return urlunsplit((parts.scheme, netloc, parts.path, query, fragment))
 
 
 def _py_str(value: str) -> str:
@@ -671,7 +557,7 @@ def _slug(value: str) -> str:
 
 def _safe_param_base(value: str) -> str:
     base = _slug(value)
-    if keyword.iskeyword(base) or base in _RESERVED_PARAM_NAMES:
+    if keyword.iskeyword(base) or base in RESERVED_PARAM_NAMES:
         return f"{base}_field"
     return base
 
@@ -693,7 +579,7 @@ def _get_by_role_expr_strict(role: str, name: str) -> str:
 LOCATOR_WITNESS_PARAM_SOURCE = "locator_witness"
 INPUT_TEMPLATED_PROVENANCE_SOURCE = "input_templated"
 SAME_MONTH_FILE_MATCH_PROVENANCE_SOURCE = "same_month_file_match"
-_SCOUT_MONTH_HELPER_NAME = _MONTH_HELPER_VAR
+_SCOUT_MONTH_HELPER_NAME = MONTH_HELPER_VAR
 _WITNESS_MIN_VALUE_LEN = 3
 _WITNESS_SAFE_CHARSET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]*$")
 _WITNESS_KEY_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -741,7 +627,7 @@ def _witness_key_is_safe(key: str) -> bool:
         return False
     if key.startswith("_scout"):
         return False
-    return key not in _RESERVED_PARAM_NAMES
+    return key not in RESERVED_PARAM_NAMES
 
 
 def _month_name_to_iso(value: str) -> str | None:
@@ -1045,7 +931,7 @@ def _witness_transform_expression(key: str, transform: str) -> str | None:
     if transform == "month_name_to_iso":
         return f"{_SCOUT_MONTH_HELPER_NAME}({key})"
     if transform == "iso_date_to_year_month":
-        return f"{_ISO_DATE_HELPER_VAR}({key})"
+        return f"{ISO_DATE_HELPER_VAR}({key})"
     return None
 
 
@@ -1111,7 +997,7 @@ def build_input_templated_locator(
         transformed = _witness_transform_expression(key, str(hole.get("transform") or "identity"))
         if transformed is None:
             return None
-        return f"page.locator({_py_str(selector)}).filter(has_text={_PERIOD_DATE_PATTERN_HELPER_VAR}({transformed}))"
+        return f"page.locator({_py_str(selector)}).filter(has_text={PERIOD_DATE_PATTERN_HELPER_VAR}({transformed}))"
     return None
 
 
@@ -1339,7 +1225,7 @@ def _scout_month_helper_lines() -> list[str]:
 
 def _scout_iso_date_helper_lines() -> list[str]:
     return [
-        f"{_INDENT}def {_ISO_DATE_HELPER_VAR}(_value):",
+        f"{_INDENT}def {ISO_DATE_HELPER_VAR}(_value):",
         f"{_INDENT * 2}_parts = str(_value).split('-')",
         f"{_INDENT * 2}if not (len(_parts) == 3 and len(_parts[0]) == 4 and len(_parts[1]) == 2 "
         f"and len(_parts[2]) == 2 and all(_part.isdigit() for _part in _parts)):",
@@ -1357,7 +1243,7 @@ def _scout_period_helper_lines() -> list[str]:
     month_names = "(" + ", ".join(f'"{name.title()}"' for name in _WITNESS_MONTH_TO_ISO) + ")"
     day_patterns = repr(_PERIOD_DAY_PATTERN_BY_MAX)
     return [
-        f"{_INDENT}def {_PERIOD_DATE_PATTERN_HELPER_VAR}(_period):",
+        f"{_INDENT}def {PERIOD_DATE_PATTERN_HELPER_VAR}(_period):",
         f"{_INDENT * 2}_parts = str(_period).split('-')",
         f"{_INDENT * 2}if not (len(_parts) == 2 and len(_parts[0]) == 4 and _parts[0].isdigit() "
         f"and len(_parts[1]) == 2 and _parts[1].isdigit() and int(_parts[0]) >= 1 "
@@ -1917,14 +1803,13 @@ def synthesize_goto_code_block(url: str) -> SynthesizedCodeBlock | None:
     if not url:
         return None
     line = (
-        f"{_INDENT}await page.goto("
-        f"{_py_str(_scrub_url_for_code_literal(url))}, wait_until={_py_str(_DOMCONTENTLOADED)})"
+        f"{_INDENT}await page.goto({_py_str(scrub_url_for_code_literal(url))}, wait_until={_py_str(_DOMCONTENTLOADED)})"
     )
     return SynthesizedCodeBlock(
         code=line + "\n",
         steps=[
             {
-                "description": f"Open {_scrub_url_for_code_literal(url)}",
+                "description": f"Open {scrub_url_for_code_literal(url)}",
                 "action_type": "goto_url",
                 "line_start": 1,
                 "line_end": 1,
@@ -2283,54 +2168,54 @@ def synthesize_code_block(
         line_start = len(lines) + 1
         if entry_target:
             if entry_replay_condition_active:
-                lines.append(f"{_INDENT}{_ENTRY_REUSED_VAR} = False")
+                lines.append(f"{_INDENT}{ENTRY_REUSED_VAR} = False")
             if entry_post_auth_resume_index:
-                lines.append(f"{_INDENT}{_ENTRY_RESUME_AFTER_AUTH_VAR} = False")
-            lines.append(f"{_INDENT}{_ENTRY_TARGET_VAR} = {entry_target}")
+                lines.append(f"{_INDENT}{ENTRY_RESUME_AFTER_AUTH_VAR} = False")
+            lines.append(f"{_INDENT}{ENTRY_TARGET_VAR} = {entry_target}")
             lines.append(f"{_INDENT}try:")
-            lines.append(f'{_INDENT * 2}await {_ENTRY_TARGET_VAR}.wait_for(state="visible", timeout=1000)')
+            lines.append(f'{_INDENT * 2}await {ENTRY_TARGET_VAR}.wait_for(state="visible", timeout=1000)')
             if entry_replay_condition_active:
-                lines.append(f"{_INDENT * 2}{_ENTRY_REUSED_VAR} = True")
+                lines.append(f"{_INDENT * 2}{ENTRY_REUSED_VAR} = True")
             lines.append(f"{_INDENT}except Exception:")
             lines.append(
                 f"{_INDENT * 2}await page.goto("
-                f"{_py_str(_scrub_url_for_code_literal(entry_url))}, wait_until={_py_str(_DOMCONTENTLOADED)})"
+                f"{_py_str(scrub_url_for_code_literal(entry_url))}, wait_until={_py_str(_DOMCONTENTLOADED)})"
             )
             post_goto_indent = 2
             if entry_replay_condition_active:
                 lines.append(f"{_INDENT * 2}try:")
-                lines.append(f'{_INDENT * 3}await {_ENTRY_TARGET_VAR}.wait_for(state="visible", timeout=1000)')
-                lines.append(f"{_INDENT * 3}{_ENTRY_REUSED_VAR} = True")
+                lines.append(f'{_INDENT * 3}await {ENTRY_TARGET_VAR}.wait_for(state="visible", timeout=1000)')
+                lines.append(f"{_INDENT * 3}{ENTRY_REUSED_VAR} = True")
                 lines.append(f"{_INDENT * 2}except Exception:")
                 post_goto_indent = 3
             if fallback_entry_target and fallback_entry_target != entry_target:
-                lines.append(f"{_INDENT * post_goto_indent}{_ENTRY_TARGET_VAR} = {fallback_entry_target}")
+                lines.append(f"{_INDENT * post_goto_indent}{ENTRY_TARGET_VAR} = {fallback_entry_target}")
             if entry_recovery_clicks or entry_post_auth_resume_index:
                 lines.append(f"{_INDENT * post_goto_indent}try:")
                 lines.append(
-                    f"{_INDENT * (post_goto_indent + 1)}await {_ENTRY_TARGET_VAR}.wait_for("
+                    f"{_INDENT * (post_goto_indent + 1)}await {ENTRY_TARGET_VAR}.wait_for("
                     f'state="visible", timeout=1000)'
                 )
                 lines.append(f"{_INDENT * post_goto_indent}except Exception:")
                 if entry_post_auth_resume_index:
                     lines.append(
-                        f"{_INDENT * (post_goto_indent + 1)}{_ENTRY_RESUME_TARGET_VAR} = {post_auth_resume_target}"
+                        f"{_INDENT * (post_goto_indent + 1)}{ENTRY_RESUME_TARGET_VAR} = {post_auth_resume_target}"
                     )
                     lines.append(f"{_INDENT * (post_goto_indent + 1)}try:")
                     lines.append(
-                        f"{_INDENT * (post_goto_indent + 2)}await {_ENTRY_RESUME_TARGET_VAR}.wait_for("
+                        f"{_INDENT * (post_goto_indent + 2)}await {ENTRY_RESUME_TARGET_VAR}.wait_for("
                         f'state="visible", timeout=1000)'
                     )
-                    lines.append(f"{_INDENT * (post_goto_indent + 2)}{_ENTRY_RESUME_AFTER_AUTH_VAR} = True")
+                    lines.append(f"{_INDENT * (post_goto_indent + 2)}{ENTRY_RESUME_AFTER_AUTH_VAR} = True")
                     lines.append(f"{_INDENT * (post_goto_indent + 1)}except Exception:")
                     recovery_indent = post_goto_indent + 2
                 else:
                     recovery_indent = post_goto_indent + 1
                 for recovery_index, recovery_locator in entry_recovery_clicks:
                     recovery_line_start = len(lines) + 1
-                    lines.append(f"{_INDENT * recovery_indent}{_ENTRY_OPENER_VAR} = {recovery_locator}")
-                    lines.append(f"{_INDENT * recovery_indent}if await {_ENTRY_OPENER_VAR}.count() == 1:")
-                    lines.append(f"{_INDENT * (recovery_indent + 1)}await {_ENTRY_OPENER_VAR}.click()")
+                    lines.append(f"{_INDENT * recovery_indent}{ENTRY_OPENER_VAR} = {recovery_locator}")
+                    lines.append(f"{_INDENT * recovery_indent}if await {ENTRY_OPENER_VAR}.count() == 1:")
+                    lines.append(f"{_INDENT * (recovery_indent + 1)}await {ENTRY_OPENER_VAR}.click()")
                     lines.append(
                         f"{_INDENT * (recovery_indent + 1)}await page.wait_for_load_state({_py_str(_DOMCONTENTLOADED)})"
                     )
@@ -2343,26 +2228,26 @@ def synthesize_code_block(
                         lane="entry_recovery",
                     )
                 lines.append(
-                    f'{_INDENT * recovery_indent}await {_ENTRY_TARGET_VAR}.wait_for(state="visible", timeout={_REQUIRED_STATE_TIMEOUT_MS})'
+                    f'{_INDENT * recovery_indent}await {ENTRY_TARGET_VAR}.wait_for(state="visible", timeout={_REQUIRED_STATE_TIMEOUT_MS})'
                 )
             else:
                 lines.append(
-                    f'{_INDENT * post_goto_indent}await {_ENTRY_TARGET_VAR}.wait_for(state="visible", timeout={_REQUIRED_STATE_TIMEOUT_MS})'
+                    f'{_INDENT * post_goto_indent}await {ENTRY_TARGET_VAR}.wait_for(state="visible", timeout={_REQUIRED_STATE_TIMEOUT_MS})'
                 )
         else:
             lines.append(
                 f"{_INDENT}await page.goto("
-                f"{_py_str(_scrub_url_for_code_literal(entry_url))}, wait_until={_py_str(_DOMCONTENTLOADED)})"
+                f"{_py_str(scrub_url_for_code_literal(entry_url))}, wait_until={_py_str(_DOMCONTENTLOADED)})"
             )
         if entry_replay_condition_active:
-            lines.append(f"{_INDENT}if not {_ENTRY_REUSED_VAR}:")
+            lines.append(f"{_INDENT}if not {ENTRY_REUSED_VAR}:")
             if entry_post_auth_resume_index:
-                lines.append(f"{_INDENT * 2}if not {_ENTRY_RESUME_AFTER_AUTH_VAR}:")
+                lines.append(f"{_INDENT * 2}if not {ENTRY_RESUME_AFTER_AUTH_VAR}:")
                 lines.append(f"{_INDENT * 3}pass")
         elif entry_post_auth_resume_index:
-            lines.append(f"{_INDENT}if not {_ENTRY_RESUME_AFTER_AUTH_VAR}:")
+            lines.append(f"{_INDENT}if not {ENTRY_RESUME_AFTER_AUTH_VAR}:")
             lines.append(f"{_INDENT * 2}pass")
-        append_step(f"Open {_scrub_url_for_code_literal(entry_url)}", "goto_url", line_start)
+        append_step(f"Open {scrub_url_for_code_literal(entry_url)}", "goto_url", line_start)
 
     emitted = 0
     terminal_action_index = _last_action_interaction_index(trajectory)
@@ -2428,7 +2313,7 @@ def synthesize_code_block(
         for dropped in diagnostics.dropped_interactions[repaired_drop_count:]:
             dropped_index = dropped.get("trajectory_index")
             dropped_tool = str(dropped.get("tool_name") or "")
-            action_type = _RECORDING_REQUIRED_ACTION_TYPES.get(dropped_tool)
+            action_type = RECORDING_REQUIRED_ACTION_TYPES.get(dropped_tool)
             if action_type is None or not isinstance(dropped_index, int) or dropped_index < 0:
                 continue
             line_start = len(lines) + 1
@@ -2844,7 +2729,7 @@ def synthesize_code_block(
     if deferred_readonly_assertions:
         deferred_base = _INDENT
         if entry_replay_condition_active:
-            lines.append(f"{_INDENT}if not {_ENTRY_REUSED_VAR}:")
+            lines.append(f"{_INDENT}if not {ENTRY_REUSED_VAR}:")
             deferred_base = _INDENT * 2
 
         def emit_deferred_readonly_assertion(indent: str, locator_expr: str, param_ref: str, target: str) -> None:
@@ -2888,7 +2773,7 @@ def synthesize_code_block(
             if entry_post_auth_resume_index and entry[0] < entry_post_auth_resume_index
         ]
         if pre_resume_deferred:
-            lines.append(f"{deferred_base}if not {_ENTRY_RESUME_AFTER_AUTH_VAR}:")
+            lines.append(f"{deferred_base}if not {ENTRY_RESUME_AFTER_AUTH_VAR}:")
             for deferred_index, deferred_locator, deferred_param_key, deferred_target in pre_resume_deferred:
                 deferred_line_start = len(lines) + 1
                 emit_deferred_readonly_assertion(
@@ -2928,7 +2813,7 @@ def synthesize_code_block(
         # affordance. The helper clicks once and confirms the fired
         # download; the bytes land wherever this run's download binding already sends them, and the
         # execution layer registers them from there.
-        download_filename = _unique_key(_DOWNLOAD_FILENAME_VAR_BASE, used_download_vars)
+        download_filename = _unique_key(DOWNLOAD_FILENAME_VAR_BASE, used_download_vars)
         claim_selector = file_match_selector or _py_str(reached_download_target.selector)
         lines.append(f"{_INDENT}{download_filename} = await {DOWNLOAD_CLAIM_HELPER_NAME}(page, {claim_selector})")
         # Read bindings emit their own return below, and an extraction suffix appends one after this

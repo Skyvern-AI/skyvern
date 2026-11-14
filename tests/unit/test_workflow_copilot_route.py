@@ -92,7 +92,7 @@ from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_modul
 from skyvern.forge.sdk.copilot.tools import workflow_update
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.turn_outcome import build_minimal_turn_outcome
-from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml, dump_workflow_yaml, workflow_to_copilot_yaml
+from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml, dump_workflow_yaml
 from skyvern.forge.sdk.db.agent_db import AgentDB, _build_engine
 from skyvern.forge.sdk.db.base_alchemy_db import BaseAlchemyDB
 from skyvern.forge.sdk.db.exceptions import CopilotProposalConflictError, DatabaseConnectionUnavailableError
@@ -150,6 +150,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     copilot_proposal_metadata,
 )
 from skyvern.forge.sdk.services.request_principal import AuthKind, RequestPrincipal
+from skyvern.forge.sdk.workflow.authoring_yaml import workflow_to_authoring_yaml
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
@@ -4159,7 +4160,7 @@ async def test_route_error_recovery_keeps_the_committed_workflow_and_other_turns
         user_response="done",
         updated_workflow=committed,
         global_llm_context=None,
-        workflow_yaml=workflow_copilot_route.workflow_to_copilot_yaml(committed),
+        workflow_yaml=workflow_copilot_route.workflow_to_authoring_yaml(committed),
         proposal_disposition="auto_applicable",
         has_staged_proposal=True,
         staged_workflow=committed,
@@ -4305,7 +4306,7 @@ async def test_auto_accept_receipt_reports_whether_this_turn_moved_the_saved_wor
         user_response="done",
         updated_workflow=committed,
         global_llm_context=None,
-        workflow_yaml=workflow_copilot_route.workflow_to_copilot_yaml(committed),
+        workflow_yaml=workflow_copilot_route.workflow_to_authoring_yaml(committed),
         proposal_disposition="auto_applicable",
         has_staged_proposal=True,
         staged_workflow=committed,
@@ -5585,7 +5586,7 @@ async def test_a_pending_proposal_restores_over_the_canvas_of_a_blank_saved_work
     agent_mock = AsyncMock(return_value=agent_result)
     monkeypatch.setattr(workflow_copilot_route, "run_copilot_agent", agent_mock)
     request = _make_chat_request(mode="build")
-    request.workflow_yaml = workflow_copilot_route.workflow_to_copilot_yaml(original_workflow)
+    request.workflow_yaml = workflow_copilot_route.workflow_to_authoring_yaml(original_workflow)
 
     await workflow_copilot_chat_post(api_key_request, request, organization)
     await captured["handler"](copilot_stream)
@@ -5787,7 +5788,7 @@ async def test_pending_proposal_private_settings_follow_canvas_selection(
         agent.await_args.kwargs["chat_request"].workflow_yaml,
         agent.await_args.kwargs["prior_copilot_workflow_yaml"],
         agent.await_args.kwargs["persisted_workflow_yaml"],
-        workflow_copilot_route.workflow_to_copilot_yaml(Workflow.model_validate(pending_turn.pre_turn_workflow)),
+        workflow_copilot_route.workflow_to_authoring_yaml(Workflow.model_validate(pending_turn.pre_turn_workflow)),
     ):
         assert "proxy_location" not in yaml.safe_load(model_yaml)
         assert "synthetic-proxy" not in model_yaml
@@ -10529,7 +10530,7 @@ async def test_a_copilot_turn_never_saves_a_block_image_the_model_wrote(
         workflow_id=saved.workflow_id,
         workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
         message="Make the lookup step clearer",
-        workflow_yaml=workflow_to_copilot_yaml(saved),
+        workflow_yaml=workflow_to_authoring_yaml(saved),
         doc_editor_enabled=doc_editor_enabled,
     )
 

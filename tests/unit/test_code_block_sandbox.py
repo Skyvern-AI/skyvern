@@ -32,11 +32,10 @@ from playwright.async_api import Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from structlog.testing import capture_logs
 
-import skyvern.forge.sdk.copilot.code_block_security as code_block_security
+import skyvern.forge.sdk.workflow.code_block_security as code_block_security
 import skyvern.forge.sdk.workflow.document_text as document_text
 import skyvern.forge.sdk.workflow.models.block as block_module
 from skyvern.config import settings
-from skyvern.forge.sdk.copilot.code_block_security import rendering_introduced_security_errors
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.workflow.code_block_authorized_files import (
     MaterializedAuthorizedFile,
@@ -48,6 +47,7 @@ from skyvern.forge.sdk.workflow.code_block_safety import (
     is_safe_script_code,
     safe_builtins,
 )
+from skyvern.forge.sdk.workflow.code_block_security import rendering_introduced_security_errors
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.document_text import ClaimedDocuments
 from skyvern.forge.sdk.workflow.exceptions import (

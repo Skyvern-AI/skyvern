@@ -12,9 +12,9 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler_factory import get_org_aware_secondary_llm_api_handler
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
-from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.streaming_adapter import emit_title_update
 from skyvern.forge.sdk.copilot.workflow_yaml import workflow_yaml_title
+from skyvern.utils.raw_secret_redaction import redact_raw_secrets_for_prompt
 
 LOG = structlog.get_logger()
 

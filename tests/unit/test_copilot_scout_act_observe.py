@@ -59,11 +59,7 @@ from skyvern.forge.sdk.copilot.page_identity import safe_page_origin
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
 from skyvern.forge.sdk.copilot.result_evidence import scout_observation_bound_paths
 from skyvern.forge.sdk.copilot.runtime import AgentContext, bound_call_browser_session
-from skyvern.forge.sdk.copilot.secret_scrub import (
-    clear_session_scrub_values,
-    register_secret_scrub_value,
-    registered_scrub_values,
-)
+from skyvern.forge.sdk.copilot.secret_scrub import register_secret_scrub_value, registered_scrub_values
 from skyvern.forge.sdk.copilot.tools import _click_post_hook
 from skyvern.forge.sdk.copilot.tools import mcp_hooks as mcp_hooks_module
 from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
@@ -81,6 +77,7 @@ from skyvern.forge.sdk.copilot.tools.scouting import (
     _safe_page_evidence_url,
     _scout_act_observe_page_evidence,
 )
+from skyvern.utils.secret_scrub import clear_session_scrub_values
 from skyvern.webeye.browser_state import BrowserState
 from tests.unit.copilot_test_helpers import carried_interaction, make_copilot_ctx
 from tests.unit.scoped_asyncio import ScopedAsyncio

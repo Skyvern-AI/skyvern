@@ -60,7 +60,6 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     CREDENTIAL_ORIGIN_RECOVERY_PENDING_REASON_CODE,
     CopilotToolBlockerSignal,
 )
-from skyvern.forge.sdk.copilot.code_block_synthesis import CREDENTIAL_FILL_TOOL_NAME
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
 from skyvern.forge.sdk.copilot.context import (
     AgentResult,
@@ -150,6 +149,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotCredentialResponseResult,
     WorkflowCopilotStreamMessageType,
 )
+from skyvern.forge.sdk.workflow.code_block_steps import CREDENTIAL_FILL_TOOL_NAME
 from skyvern.forge.sdk.workflow.models.credential_release import saved_site_urls
 from tests.unit.conftest import make_copilot_context
 from tests.unit.copilot_test_helpers import make_missing_credential_ask_contract, wire_credential_vault

@@ -32,12 +32,12 @@ from typing import Any, Awaitable, Callable
 
 import structlog
 
-from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory, LLMCaller
-from skyvern.forge.sdk.copilot.loop_detection import (
+from skyvern.forge.sdk.agents.loop_detection import (
     detect_failed_tool_step_loop,
     detect_tool_loop,
     record_tool_step_result,
 )
+from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory, LLMCaller
 from skyvern.services.script_reviewer_v3.budget import Budget, InvocationHandle
 from skyvern.services.script_reviewer_v3.decision import Decision
 from skyvern.services.script_reviewer_v3.redaction import redact_sensitive_value
@@ -227,7 +227,7 @@ async def run_agent_loop(
     if not isinstance(sensitive_value, str):
         sensitive_value = None
 
-    # Anti-oscillation trackers, ported from Copilot's loop_detection module.
+    # Anti-oscillation trackers from the shared loop_detection module.
     # ``consecutive_tool_tracker`` catches A-A-A streaks (same skill 3 times
     # in a row). ``failed_step_tracker`` catches repeated failures of the
     # same (skill, args) pair — even when other skills run in between.

@@ -26,7 +26,6 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
     clear_tool_blocker_signals_for_reason_codes,
 )
-from skyvern.forge.sdk.copilot.code_block_synthesis import CREDENTIAL_FILL_TOOL_NAME
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.context import CopilotContext, advertises
 from skyvern.forge.sdk.copilot.credential_fill_fields import CREDENTIAL_FILL_FIELD_NAMES, CREDENTIAL_FILL_FIELDS
@@ -75,11 +74,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     ensure_browser_session,
     mcp_browser_context,
 )
-from skyvern.forge.sdk.copilot.secret_scrub import (
-    REDACTED_SECRET_PLACEHOLDER,
-    register_secret_scrub_value,
-    scrub_secrets_from_text,
-)
+from skyvern.forge.sdk.copilot.secret_scrub import register_secret_scrub_value, scrub_secrets_from_text
 from skyvern.forge.sdk.copilot.vault_logins import VAULT_LOGIN_REF_PREFIX, load_vault_logins
 from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     workflow_credential_origins,
@@ -96,7 +91,9 @@ from skyvern.forge.sdk.schemas.credentials import (
 from skyvern.forge.sdk.schemas.workflow_copilot import CredentialRegistration, WorkflowCopilotCredentialRegistration
 from skyvern.forge.sdk.services.credentials import generate_totp_code, normalize_totp_config
 from skyvern.forge.sdk.services.request_principal import get_request_principal
+from skyvern.forge.sdk.workflow.code_block_steps import CREDENTIAL_FILL_TOOL_NAME
 from skyvern.forge.sdk.workflow.models.credential_release import saved_site_urls
+from skyvern.utils.secret_scrub import REDACTED_SECRET_PLACEHOLDER
 from skyvern.webeye.utils.dom import is_post_dispatch_click_timeout
 
 from ._shared import _emit_tool_blocker_signal

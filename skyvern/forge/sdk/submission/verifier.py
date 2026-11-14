@@ -9,7 +9,6 @@ from datetime import UTC, datetime, timedelta
 from pathlib import PurePosixPath
 from urllib.parse import urlsplit
 
-from skyvern.forge.sdk.copilot.completion_output_grounding import _boundary_delimited_present
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.submission.models import (
     BrowserPath,
@@ -26,6 +25,7 @@ from skyvern.forge.sdk.submission.models import (
     TierBEvidence,
     UrlTransitionEvidence,
 )
+from skyvern.utils.strings import boundary_delimited_present
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, ClickAction
 from skyvern.webeye.actions.responses import ActionResult
@@ -112,7 +112,7 @@ def _submit_shaped(element_data: Mapping[str, object]) -> bool:
 
     text_values = [element_data.get("text"), attributes.get("value"), attributes.get("aria-label")]
     return any(
-        _boundary_delimited_present(verb, value.strip().lower())
+        boundary_delimited_present(verb, value.strip().lower())
         for value in text_values
         if isinstance(value, str)
         for verb in _SUBMIT_VERBS
@@ -379,7 +379,7 @@ def evaluate_tier_b(
         normalized_pre = pre_page_text.casefold()
         normalized_post = post_page_text.casefold()
         for phrase in _CONFIRMATION_PHRASES:
-            if _boundary_delimited_present(phrase, normalized_post) and not _boundary_delimited_present(
+            if boundary_delimited_present(phrase, normalized_post) and not boundary_delimited_present(
                 phrase, normalized_pre
             ):
                 matched_value = _confirmation_value(phrase, normalized_post)

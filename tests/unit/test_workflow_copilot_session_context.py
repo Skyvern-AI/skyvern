@@ -10,12 +10,12 @@ from unittest.mock import MagicMock
 import pytest
 
 from skyvern.forge.sdk.api.llm.api_handler_factory import _enrich_llm_span
-from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.forge_log import redact_registered_log_payload
 from skyvern.forge.sdk.routes.workflow_copilot import _bind_copilot_session_id
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChat
+from skyvern.utils.secret_scrub import REDACTED_SECRET_PLACEHOLDER
 
 
 class TestBindCopilotSessionId:

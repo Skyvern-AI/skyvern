@@ -8,7 +8,6 @@ from fastapi import BackgroundTasks, Depends, HTTPException, Query, Request, sta
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.log_redaction import redact_bearer_tokens_in_text
-from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.feedback import (
@@ -23,6 +22,7 @@ from skyvern.forge.sdk.schemas.feedback import (
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.services.request_principal import get_request_principal
+from skyvern.utils.raw_secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.utils.secret_redaction import redact_secrets_from_text
 
 LOG = structlog.get_logger()

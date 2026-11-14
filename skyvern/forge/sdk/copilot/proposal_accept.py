@@ -22,7 +22,6 @@ from skyvern.forge.sdk.copilot.workflow_yaml import (
     dump_workflow_yaml,
     inherited_header_settings,
     merge_private_workflow_settings,
-    strip_private_workflow_settings,
 )
 from skyvern.forge.sdk.db.enums import WorkflowBuildSource
 from skyvern.forge.sdk.db.exceptions import CopilotProposalConflictError
@@ -36,6 +35,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
 from skyvern.forge.sdk.services.request_principal import get_request_principal
 from skyvern.forge.sdk.workflow.exceptions import WorkflowVersionConflict
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
+from skyvern.forge.sdk.workflow.private_settings import strip_private_workflow_settings
 from skyvern.schemas.workflows import WorkflowCreateYAMLRequest
 from skyvern.utils.yaml_loader import safe_load_no_dates
 

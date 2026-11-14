@@ -10,7 +10,7 @@ from typing import Literal
 import structlog
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
+from skyvern.utils.raw_secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.utils.strings import escape_code_fences
 
 LOG = structlog.get_logger()

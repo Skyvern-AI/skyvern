@@ -4,7 +4,7 @@ from unittest.mock import MagicMock
 import pytest
 from pydantic import ValidationError
 
-from skyvern.forge.sdk.copilot.code_block_steps import derive_code_block_steps
+from skyvern.forge.sdk.workflow.code_block_steps import derive_code_block_steps
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import CodeBlock, CodeBlockStep, ErrorCode
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter

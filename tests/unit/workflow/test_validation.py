@@ -738,7 +738,7 @@ def test_stored_workflow_limits_run_before_yaml_conversion(monkeypatch: pytest.M
     workflow = Workflow.model_construct(workflow_definition=WorkflowDefinition.model_construct(blocks=blocks))
     monkeypatch.setattr(
         workflow_validation,
-        "workflow_to_copilot_yaml",
+        "workflow_to_authoring_yaml",
         lambda _: pytest.fail("over-nested stored workflow reached YAML conversion"),
     )
 

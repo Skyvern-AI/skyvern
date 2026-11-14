@@ -156,15 +156,12 @@ from skyvern.forge.sdk.copilot.workflow_credential_utils import workflow_connect
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml as _copilot_process_workflow_yaml
 from skyvern.forge.sdk.copilot.workflow_yaml import _repair_next_block_label_chain as _repair_next_block_label_chain
 from skyvern.forge.sdk.copilot.workflow_yaml import (
-    _runs_in_list_order,
     dump_workflow_yaml,
     inherited_header_settings,
     merge_private_workflow_settings,
     private_workflow_settings_from_yaml,
-    strip_private_workflow_settings,
     submitted_private_workflow_settings,
     with_workflow_yaml_title,
-    workflow_to_copilot_yaml,
 )
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.event_source_stream import EventSourceStream, FastAPIEventSourceStream
@@ -258,9 +255,11 @@ from skyvern.forge.sdk.services.credential.credential_creation_service import (
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
 from skyvern.forge.sdk.services.request_principal import enforce_principal_role, get_request_principal, human_user_id
 from skyvern.forge.sdk.services.route_authorization import require_request_actions
+from skyvern.forge.sdk.workflow.authoring_yaml import runs_in_list_order, workflow_to_authoring_yaml
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException
 from skyvern.forge.sdk.workflow.models.credential_release import normalize_extra_site_urls
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
+from skyvern.forge.sdk.workflow.private_settings import strip_private_workflow_settings
 from skyvern.forge.sdk.workflow.secret_encryption import (
     mask_workflow_for_api,
     preserve_workflow_definition_secrets,
@@ -2518,7 +2517,7 @@ def _run_grant_workflow_yaml(workflow: Workflow | None) -> str | None:
     definition = workflow.workflow_definition
     if definition is None or not definition.blocks:
         return None
-    return workflow_to_copilot_yaml(workflow)
+    return workflow_to_authoring_yaml(workflow)
 
 
 def _ensure_copilot_workflow_yaml(
@@ -2552,7 +2551,7 @@ def _ensure_copilot_workflow_yaml(
         and workflow_definition.blocks
     ):
         if persisted_workflow_yaml is None:
-            persisted_workflow_yaml = workflow_to_copilot_yaml(original_workflow)
+            persisted_workflow_yaml = workflow_to_authoring_yaml(original_workflow)
         if persisted_workflow_yaml:
             LOG.warning(
                 "Copilot agent chat request had no workflow blocks; using persisted workflow YAML",
@@ -5903,7 +5902,7 @@ async def workflow_copilot_convert_yaml_to_blocks(
         parsed_yaml = safe_load_no_dates(request.workflow_definition_yaml)
         workflow_definition_yaml = WorkflowDefinitionYAML.model_validate(parsed_yaml)
 
-        _repair_next_block_label_chain(workflow_definition_yaml.blocks, list_ordered=_runs_in_list_order(parsed_yaml))
+        _repair_next_block_label_chain(workflow_definition_yaml.blocks, list_ordered=runs_in_list_order(parsed_yaml))
 
         workflow_definition = convert_workflow_definition(
             workflow_definition_yaml=workflow_definition_yaml,

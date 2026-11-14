@@ -1,4 +1,4 @@
-"""Tests for the copilot v2 block-goal wrap helper (SKY-9174, Part B).
+"""Tests for the block-goal wrap helper (SKY-9174, Part B).
 
 Covers wrapping of ``navigation_goal``, ``complete_criterion``, and
 ``terminate_criterion`` via ``MINI_GOAL_TEMPLATE``.
@@ -13,8 +13,8 @@ import pytest
 import yaml
 
 from skyvern.constants import MINI_GOAL_TEMPLATE
-from skyvern.forge.sdk.copilot.block_goal_wrapping import wrap_block_goals, wrap_workflow_block_goals
 from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
+from skyvern.forge.sdk.workflow.block_goal_wrapping import wrap_block_goals, wrap_workflow_block_goals
 
 pytestmark = pytest.mark.usefixtures("no_saved_workflow")
 

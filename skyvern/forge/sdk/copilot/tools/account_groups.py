@@ -33,12 +33,7 @@ from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.cost_telemetry import exclude_workflow_block_cost
 from skyvern.forge.sdk.copilot.credential_resolution import load_credentials
 from skyvern.forge.sdk.copilot.proposal_accept import accept_copilot_proposal
-from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
-from skyvern.forge.sdk.copilot.secret_scrub import (
-    REDACTED_SECRET_PLACEHOLDER,
-    scrub_secrets_from_structure,
-    scrub_secrets_from_text,
-)
+from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure, scrub_secrets_from_text
 from skyvern.forge.sdk.copilot.tools._shared import _executable_workflow_block_labels
 from skyvern.forge.sdk.copilot.tools.credentials import (
     _credential_run_approval_error,
@@ -57,7 +52,6 @@ from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     workflow_blocks,
     workflow_connection_refs,
 )
-from skyvern.forge.sdk.copilot.workflow_yaml import workflow_to_copilot_yaml
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
 from skyvern.forge.sdk.core.run_submission_gate import run_submission_slot
@@ -77,6 +71,7 @@ from skyvern.forge.sdk.services.request_principal import (
     get_request_principal,
     trigger_owner_id,
 )
+from skyvern.forge.sdk.workflow.authoring_yaml import workflow_to_authoring_yaml
 from skyvern.forge.sdk.workflow.block_notes import strip_inert_block_fields
 from skyvern.forge.sdk.workflow.models.parameter import (
     CredentialParameter,
@@ -104,6 +99,8 @@ from skyvern.schemas.workflow_run_groups import (
 from skyvern.schemas.workflows import BlockStatus
 from skyvern.services import workflow_run_group_service, workflow_service
 from skyvern.services.organization_log_scope import organization_log_scope
+from skyvern.utils.raw_secret_redaction import redact_raw_secrets_for_prompt
+from skyvern.utils.secret_scrub import REDACTED_SECRET_PLACEHOLDER
 
 LOG = structlog.get_logger()
 
@@ -423,7 +420,7 @@ async def _clean_group_run_id(
 
 
 def _blocks_using_parameter(workflow: Workflow, key: str) -> list[str]:
-    parsed = parse_workflow_yaml(workflow_to_copilot_yaml(workflow))
+    parsed = parse_workflow_yaml(workflow_to_authoring_yaml(workflow))
     return [
         str(block.get("label"))
         for block in workflow_blocks(parsed if isinstance(parsed, dict) else {})
@@ -1292,7 +1289,7 @@ def _point_ctx_at_saved(ctx: CopilotContext, saved: Workflow) -> None:
     ctx.last_good_workflow = None
     ctx.last_good_workflow_yaml = None
     ctx.workflow_id = saved.workflow_id
-    ctx.workflow_yaml = workflow_to_copilot_yaml(saved)
+    ctx.workflow_yaml = workflow_to_authoring_yaml(saved)
     ctx.authored_private_workflow_settings = {}
     ctx.private_workflow_settings = {}
 

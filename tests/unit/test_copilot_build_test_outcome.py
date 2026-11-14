@@ -101,7 +101,7 @@ from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     build_test_page_state_from_evidence,
     inject_runtime_authoring_repair_context,
 )
-from skyvern.forge.sdk.copilot.secret_scrub import clear_session_scrub_values, register_secret_scrub_value
+from skyvern.forge.sdk.copilot.secret_scrub import register_secret_scrub_value
 from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools import workflow_update as workflow_update_module
 from skyvern.forge.sdk.copilot.tools.composition_capture import store_post_run_page_evidence
@@ -130,7 +130,7 @@ from skyvern.forge.sdk.copilot.tools.workflow_update import (
     publish_workflow_candidate,
     restore_pending_workflow_proposal,
 )
-from skyvern.forge.sdk.copilot.workflow_yaml import runner_code_block_associations, workflow_to_copilot_yaml
+from skyvern.forge.sdk.copilot.workflow_yaml import runner_code_block_associations
 from skyvern.forge.sdk.db.base_alchemy_db import BaseAlchemyDB
 from skyvern.forge.sdk.db.exceptions import CopilotProposalConflictError
 from skyvern.forge.sdk.db.repositories.workflow_parameters import WorkflowParametersRepository
@@ -143,6 +143,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     copilot_proposal_metadata,
 )
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.workflow.authoring_yaml import workflow_to_authoring_yaml
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import FailedToFormatJinjaStyleParameter
 from skyvern.forge.sdk.workflow.models.block import CodeBlock, ForLoopBlock, render_failure_reason
@@ -163,6 +164,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
 from skyvern.schemas.self_heal import HealEpisode, HealSkipReason, HealStatus
 from skyvern.schemas.workflows import BlockType
 from skyvern.services import workflow_service as workflow_service_module
+from skyvern.utils.secret_scrub import clear_session_scrub_values
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import ActionStatus
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
@@ -6311,7 +6313,7 @@ async def test_stale_proposal_token_conflict_recovers_so_the_next_call_succeeds(
         review = _review_projection_for(ctx, ctx.staged_workflow_yaml)
         assert review is not None and [block["neverTested"] for block in review["blocks"]] == [True]
     else:
-        assert ctx.workflow_yaml == workflow_to_copilot_yaml(accepted)
+        assert ctx.workflow_yaml == workflow_to_authoring_yaml(accepted)
 
     await _next_model_response(ctx)
     second = await test_or_edit()

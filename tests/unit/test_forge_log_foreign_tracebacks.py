@@ -15,9 +15,9 @@ import structlog
 
 import skyvern.forge.sdk.forge_log as forge_log
 from skyvern.config import settings
-from skyvern.forge.sdk.copilot import secret_scrub
-from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER
 from skyvern.forge.sdk.forge_log import setup_logger
+from skyvern.utils import secret_scrub
+from skyvern.utils.secret_scrub import REDACTED_SECRET_PLACEHOLDER
 
 _REGISTERED_CREDENTIAL = "fake-registered-pa55w0rd-9f3c1a"
 _MAX_EMITTED_JSON_BYTES = 64 * 1024
@@ -452,7 +452,7 @@ def _stop_every_import(monkeypatch: pytest.MonkeyPatch) -> None:
     ModuleNotFoundError from the same statement. Both are ImportError, and one reversible key beats
     clearing `sys.meta_path`, which would break every other test sharing the process.
     """
-    monkeypatch.setitem(sys.modules, "skyvern.forge.sdk.copilot.secret_scrub", None)
+    monkeypatch.setitem(sys.modules, "skyvern.utils.secret_scrub", None)
 
 
 def test_exit_time_foreign_record_stays_legible_and_scrubbed(
