@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 from datetime import datetime
 from enum import StrEnum
 from typing import Literal
@@ -36,12 +35,6 @@ class ScriptFile(BaseModel):
     artifact_id: str | None = None
     created_at: datetime
     modified_at: datetime
-
-    async def get_content(self) -> str:
-        # get the content from the artifact
-        if self.encoding == FileEncoding.BASE64:
-            return base64.b64decode(self.content).decode("utf-8")
-        return self.content
 
 
 class ScriptFileCreate(BaseModel):
