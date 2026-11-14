@@ -10,10 +10,10 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING, Any
 
-from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure, scrub_secrets_from_text
 from skyvern.forge.sdk.workflow.context_manager import RANDOM_SECRET_ID_PREFIX
 from skyvern.schemas.self_heal import HealEpisode, HealEpisodeDetail
+from skyvern.utils.raw_secret_redaction import redact_raw_secrets_for_prompt
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.runtime import AgentContext

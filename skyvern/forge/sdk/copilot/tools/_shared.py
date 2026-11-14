@@ -62,7 +62,6 @@ from skyvern.forge.sdk.copilot.runtime import (
     mcp_browser_context,
     resolve_browser_state_for_context,
 )
-from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.task_output_envelope import (
     _TASK_ENVELOPE_BLOCK_TYPES,
     _TASK_OUTPUT_PAYLOAD_FIELDS,
@@ -73,6 +72,7 @@ from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerification
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.proxy_location import ProxyLocationInput
 from skyvern.schemas.workflows import BlockType
+from skyvern.utils.raw_secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.utils.url_validators import canonical_navigation_host
 from skyvern.utils.yaml_loader import safe_load_no_dates
 from skyvern.webeye.browser_errors import BrowserAutomationError

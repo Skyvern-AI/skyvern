@@ -12,7 +12,7 @@ from typing import Any, TypeGuard
 
 from skyvern.forge.sdk.copilot.composition_evidence_size import size_compaction_omits
 from skyvern.forge.sdk.copilot.page_identity import safe_page_origin
-from skyvern.forge.sdk.copilot.secret_redaction import (
+from skyvern.utils.raw_secret_redaction import (
     SECRET_KEYWORD_LABEL_PATTERN,
     is_account_row_email,
     redact_raw_secrets_for_prompt,

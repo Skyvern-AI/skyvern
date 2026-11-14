@@ -139,7 +139,6 @@ from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_a
 from skyvern.forge.sdk.artifact.storage.unique_pdfs import starts_like_pdf
 from skyvern.forge.sdk.browser_action_preflight import preflight_action, preflight_derived_action
 from skyvern.forge.sdk.cache import extraction_cache, extraction_shadow
-from skyvern.forge.sdk.copilot.block_goal_wrapping import unwrap_goal_fields
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.core.http_request_authorization import RedirectHopAuthorizer, deny_unenrolled_redirect_hop
@@ -170,6 +169,7 @@ from skyvern.forge.sdk.services.credentials import (
 )
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced, traced_span
+from skyvern.forge.sdk.workflow.block_goal_wrapping import unwrap_goal_fields
 from skyvern.services import service_utils
 from skyvern.services.action_service import get_action_history
 from skyvern.services.run_cancellation import RunCancellation, read_run_cancellation

@@ -152,7 +152,6 @@ from skyvern.forge.sdk.browser_action_preflight import (
     stamp_parsed_actions,
 )
 from skyvern.forge.sdk.cache import extraction_cache, extraction_shadow
-from skyvern.forge.sdk.copilot.block_goal_wrapping import unwrap_goal_fields
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
@@ -212,6 +211,7 @@ from skyvern.forge.sdk.services.credentials import parse_totp_config
 from skyvern.forge.sdk.services.request_principal import RequestPrincipal, task_requester_id
 from skyvern.forge.sdk.submission import shadow as submission_shadow
 from skyvern.forge.sdk.trace import VerificationTrigger, apply_context_attrs, traced, traced_span
+from skyvern.forge.sdk.workflow.block_goal_wrapping import unwrap_goal_fields
 from skyvern.forge.sdk.workflow.context_manager import NON_SECRET_CREDENTIAL_FIELDS, WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import (
     ActionBlock,

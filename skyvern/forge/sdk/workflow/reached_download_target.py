@@ -1,4 +1,4 @@
-"""Typed reached-download-target signal for the copilot compose surface, matched on the captured
+"""Typed reached-download-target signal for code-block composition, matched on the captured
 selector and trajectory recency (never URL identity — a browser download does not change the SPA URL)."""
 
 from __future__ import annotations

@@ -46,9 +46,9 @@ def record_span_exception(span: Any, exc: BaseException, *, set_error_status: bo
     logging processors in front of them, so ``str(exc)`` and the traceback reach the collector
     verbatim.
     """
-    # Lazy: this module is imported far earlier in boot than the copilot package.
-    from skyvern.forge.sdk.copilot.secret_scrub import scrub_all_registered_from_text  # noqa: PLC0415
+    # Lazy: keeps secret_scrub and its skyvern_context import out of this module's import time.
     from skyvern.forge.sdk.forge_log import current_codeblock_log_redactor  # noqa: PLC0415
+    from skyvern.utils.secret_scrub import scrub_all_registered_from_text  # noqa: PLC0415
 
     try:
         exc_type = type(exc)

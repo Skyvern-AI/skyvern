@@ -50,7 +50,6 @@ from skyvern.forge.sdk.copilot.config import (
     TOTAL_TIMEOUT_SECONDS,
 )
 from skyvern.forge.sdk.copilot.human_input_wait import turn_clock_seconds
-from skyvern.forge.sdk.copilot.secret_scrub import clear_session_scrub_values
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_origin import (
     HealAdoptionFailed,
@@ -70,6 +69,7 @@ from skyvern.library.skyvern_browser import SkyvernBrowser
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.browser_session_kind import COPILOT_PRESTART_RUNNABLE_TYPE, BrowserSessionKind
 from skyvern.schemas.proxy_location import ProxyLocation, ProxyLocationInput
+from skyvern.utils.secret_scrub import clear_session_scrub_values
 from skyvern.webeye.browser_engine import is_any_engine_error
 from skyvern.webeye.browser_errors import (
     BrowserCdpAcquisitionError,

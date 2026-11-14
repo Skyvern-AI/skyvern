@@ -8,7 +8,7 @@ import unicodedata
 from collections.abc import Collection
 from typing import Any
 
-from skyvern.forge.sdk.copilot.secret_redaction import raw_secret_spans_for_prompt
+from skyvern.utils.raw_secret_redaction import raw_secret_spans_for_prompt
 from skyvern.utils.secret_redaction import expand_secret_encodings
 
 # Transport bound on a captured element name, applied page-side by the probe and re-applied here.

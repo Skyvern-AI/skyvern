@@ -52,7 +52,6 @@ from skyvern.forge.sdk.copilot.mcp_adapter import (
     scrub_model_facing_tool_result,
 )
 from skyvern.forge.sdk.copilot.nav_attribution import proxy_owns_nav_codes
-from skyvern.forge.sdk.copilot.reached_download_target import DownloadClaimHelperContract
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     CopilotBrowserGenerationRetired,
@@ -65,6 +64,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     mcp_browser_context,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import capturing_tool_call_id, withdraw_frame_captured_before
+from skyvern.forge.sdk.workflow.reached_download_target import DownloadClaimHelperContract
 from skyvern.utils.contained_effects import contained_effect
 from skyvern.webeye.browser_errors import BrowserAutomationError
 from skyvern.webeye.navigation import driver_nav_error_code

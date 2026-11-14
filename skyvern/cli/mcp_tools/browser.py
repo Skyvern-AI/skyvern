@@ -93,10 +93,10 @@ from skyvern.exceptions import (
     StaleFrameSelectionError,
 )
 from skyvern.forge.sdk.api.files import resolve_run_download_id
-from skyvern.forge.sdk.copilot.typed_value_policy import typed_text_looks_secret
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.schemas.action_log import ActionLogOutcome, project_action_event
 from skyvern.schemas.run_blocks import CredentialType
+from skyvern.utils.typed_value_policy import typed_text_looks_secret
 from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.actions.handler_utils import strategy_aware_input
 from skyvern.webeye.actions.key_names import normalize_key_chord

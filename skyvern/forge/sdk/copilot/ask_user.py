@@ -11,12 +11,12 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
 
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.human_input_wait import pause_human_input
-from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_text
 from skyvern.forge.sdk.schemas.credentials import CredentialType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.workflow_run_groups import WorkflowRunGroupItemOutcome
 from skyvern.utils.contained_effects import contained_effect
+from skyvern.utils.raw_secret_redaction import redact_raw_secrets_for_prompt
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.context import CopilotContext

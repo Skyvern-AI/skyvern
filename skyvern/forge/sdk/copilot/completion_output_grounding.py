@@ -25,6 +25,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     schema_output_path_aliases_from_criteria,
 )
 from skyvern.forge.sdk.copilot.task_output_envelope import _TASK_ENVELOPE_BLOCK_TYPES, _TASK_OUTPUT_PAYLOAD_FIELDS
+from skyvern.utils.strings import boundary_delimited_present
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
 LOG = structlog.get_logger()
@@ -544,23 +545,6 @@ def _iter_prose_scalars(value: Any) -> list[str]:
             collected.extend(_iter_prose_scalars(item))
         return collected
     return []
-
-
-def _boundary_delimited_present(needle: str, haystack: str) -> bool:
-    if not needle or not haystack:
-        return False
-    length = len(needle)
-    start = 0
-    while True:
-        idx = haystack.find(needle, start)
-        if idx == -1:
-            return False
-        before_ok = idx == 0 or not haystack[idx - 1].isalnum()
-        after_index = idx + length
-        after_ok = after_index == len(haystack) or not haystack[after_index].isalnum()
-        if before_ok and after_ok:
-            return True
-        start = idx + 1
 
 
 def _evidence_source_for_ref(
@@ -1353,7 +1337,7 @@ def _standalone_number_present(value_text: str, text: str) -> bool:
 
 
 def _value_present_in_text(value_text: str, text: str) -> bool:
-    return _boundary_delimited_present(value_text, text)
+    return boundary_delimited_present(value_text, text)
 
 
 def _normalize_output_path(path: str | None) -> str:

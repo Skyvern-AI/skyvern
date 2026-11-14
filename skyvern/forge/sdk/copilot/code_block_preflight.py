@@ -19,8 +19,8 @@ from jinja2 import StrictUndefined, TemplateSyntaxError, UndefinedError
 from jinja2.exceptions import SecurityError
 from jinja2.sandbox import SandboxedEnvironment
 
-from skyvern.forge.sdk.copilot.code_block_security import CodeBlockSecurityError, author_time_code_security_errors
 from skyvern.forge.sdk.copilot.code_block_synthesis import is_root_locator_selector
+from skyvern.forge.sdk.workflow.code_block_security import CodeBlockSecurityError, author_time_code_security_errors
 from skyvern.forge.sdk.workflow.models._jinja import _json_finalize, _json_type_filter
 from skyvern.utils.strings import join_phrases
 from skyvern.utils.templating import get_missing_variables

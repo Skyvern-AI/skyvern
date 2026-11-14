@@ -5,8 +5,8 @@ import asyncio
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler_factory import get_org_aware_secondary_llm_api_handler
-from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.tools.workflow_update import CodeArtifactMetadata
+from skyvern.utils.raw_secret_redaction import redact_raw_secrets_for_prompt
 
 _GOAL_PROMPT_NAME = "workflow-copilot-goal-from-code"
 _GOAL_TIMEOUT_SECONDS = 30.0

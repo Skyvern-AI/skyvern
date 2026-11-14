@@ -11,12 +11,12 @@ from skyvern.forge.sdk.copilot.request_policy import (
     RequestPolicy,
     contains_email_password_pair,
 )
-from skyvern.forge.sdk.copilot.secret_redaction import (
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import OutputPolicyReason
+from skyvern.utils.raw_secret_redaction import (
     RAW_SECRET_PATTERNS,
     SECRET_KEYWORD_ASSIGNMENT_PATTERN,
     SECRET_KEYWORD_LABEL_PATTERN,
 )
-from skyvern.forge.sdk.schemas.copilot_turn_outcome import OutputPolicyReason
 
 WORKFLOW_PRESENT_SENTINEL = object()
 _PLACEHOLDER_MARKERS = ("{{", "{%", "[REDACTED_SECRET]")
