@@ -141,7 +141,7 @@ export default {
           },
           to: { height: "0", opacity: "0" },
         },
-        "copilot-sparkle-breathe": {
+        "ember-sparkle-breathe": {
           "0%, 100%": { transform: "scale(0.8) rotate(0deg)", opacity: "0.6" },
           "50%": { transform: "scale(1) rotate(90deg)", opacity: "1" },
         },
@@ -157,11 +157,11 @@ export default {
           from: { boxShadow: "0 0 0 0 rgb(56 189 248 / 0.65)" },
           to: { boxShadow: "0 0 0 10px rgb(56 189 248 / 0)" },
         },
-        "copilot-row-flash-success": {
+        "ember-row-flash-success": {
           "0%, 30%": { backgroundColor: "rgba(16, 185, 129, 0.22)" },
           "100%": { backgroundColor: "transparent" },
         },
-        "copilot-row-flash-error": {
+        "ember-row-flash-error": {
           "0%, 30%": { backgroundColor: "rgba(244, 63, 94, 0.22)" },
           "100%": { backgroundColor: "transparent" },
         },
@@ -177,14 +177,14 @@ export default {
           "collapsible-down-fade 0.22s cubic-bezier(0.22, 1, 0.36, 1)",
         "collapsible-up-fade":
           "collapsible-up-fade 0.22s cubic-bezier(0.22, 1, 0.36, 1)",
-        "copilot-sparkle-breathe":
-          "copilot-sparkle-breathe 2.8s ease-in-out infinite",
+        "ember-sparkle-breathe":
+          "ember-sparkle-breathe 2.8s ease-in-out infinite",
         glow: "glow 2.5s ease-in-out infinite",
         "run-blocking-locate": "glow 0.85s ease-in-out 3",
         "analytics-pulse": "analytics-pulse-ring 0.6s ease-out 1",
         "switch-focus-pulse": "switch-focus-pulse 1.2s ease-out 3",
-        "copilot-row-flash-success": "copilot-row-flash-success 0.6s ease-out",
-        "copilot-row-flash-error": "copilot-row-flash-error 0.6s ease-out",
+        "ember-row-flash-success": "ember-row-flash-success 0.6s ease-out",
+        "ember-row-flash-error": "ember-row-flash-error 0.6s ease-out",
       },
     },
   },

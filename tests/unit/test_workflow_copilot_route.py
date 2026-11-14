@@ -8759,10 +8759,10 @@ async def test_a_request_without_an_eval_entrypoint_url_reaches_the_agent_path_u
 
 @pytest.mark.boundary
 def test_the_client_recovery_budget_still_outlasts_the_server_abandon_threshold() -> None:
-    """The client's poll budget is a literal in WorkflowCopilotChat.tsx, while the threshold it has to
+    """The client's poll budget is a literal in EmberChat.tsx, while the threshold it has to
     outlast is derived from two env-configurable settings. Raising either without raising the literal
     would silently strand every recovered turn, so the drift fails here instead."""
-    source = Path("skyvern-frontend/src/routes/workflows/copilot/WorkflowCopilotChat.tsx").read_text()
+    source = Path("skyvern-frontend/src/routes/workflows/ember/EmberChat.tsx").read_text()
     match = re.search(r"const RECOVERY_POLL_BUDGET_MS = ([\d_]+);", source)
     assert match, "RECOVERY_POLL_BUDGET_MS not found; update this guard if the constant was renamed"
 

@@ -7,6 +7,7 @@ import {
   STUDIO_STAGE_PADDING_PX,
   STUDIO_PANE_MIN_WIDTH,
   WORKFLOW_AUTHORING_PANES,
+  emberBrowserFocusSessionId,
   fitPanesToWidth,
   isAuthoringLayout,
   panesCollapsedForDoc,
@@ -70,6 +71,11 @@ describe("parsePanesParam", () => {
     ]);
   });
 
+  test("accepts ember for the Ember pane before it is the canonical id", () => {
+    expect(parsePanesParam("ember,editor")).toEqual(["copilot", "editor"]);
+    expect(parsePanesParam("ember,copilot")).toEqual(["copilot"]);
+  });
+
   test("tolerates whitespace around entries", () => {
     expect(parsePanesParam(" copilot , browser ")).toEqual([
       "copilot",
@@ -107,7 +113,7 @@ describe("panesFromDeepLink", () => {
     ).toEqual([...DEFAULT_STUDIO_PANES]);
   });
 
-  test("no deep link (Edit) opens only Copilot and Editor", () => {
+  test("no deep link (Edit) opens only Ember and Editor", () => {
     expect(
       panesFromDeepLink({ runId: null, active: null, blockLabel: null }),
     ).toEqual(["copilot", "editor"]);
@@ -232,8 +238,8 @@ describe("panesCollapsedForDoc", () => {
     expect(panesCollapsedForDoc(["copilot", "browser"], 300)).toEqual([]);
   });
 
-  test("the Browser gives way first, then Run, then Copilot; never the Editor", () => {
-    // copilot 260 + doc 360 + run 260 + 2 gaps + padding = 928; a strip adds 48.
+  test("the Browser gives way first, then Run, then Ember; never the Editor", () => {
+    // Ember 260 + doc 360 + run 260 + 2 gaps + padding = 928; a strip adds 48.
     expect(panesCollapsedForDoc(four, 1100)).toEqual(["browser"]);
     expect(panesCollapsedForDoc(four, 976)).toEqual(["browser"]);
     expect(panesCollapsedForDoc(four, 975)).toEqual(["browser", "overview"]);
@@ -253,7 +259,7 @@ describe("fitPanesToWidth", () => {
   });
 
   test("keeps the longest leading prefix that fits", () => {
-    // copilot(260) + editor(220) + padding(24) + gap(12) = 516 fits in 600;
+    // Ember(260) + editor(220) + padding(24) + gap(12) = 516 fits in 600;
     // adding browser(260) + gap(12) = 788 does not.
     expect(
       fitPanesToWidth(["copilot", "editor", "browser", "overview"], 600),
@@ -398,7 +404,7 @@ describe("panesWithoutDeletedBlocked", () => {
     ]);
   });
 
-  test("blocks exactly the copilot and editor panes", () => {
+  test("blocks exactly the Ember and editor panes", () => {
     expect(WORKFLOW_AUTHORING_PANES).toEqual(["copilot", "editor"]);
   });
 });
@@ -411,13 +417,24 @@ describe("isAuthoringLayout", () => {
     expect(isAuthoringLayout([])).toBe(false);
   });
 
-  test("any open editor or copilot pane makes the layout authoring", () => {
+  test("any open editor or Ember pane makes the layout authoring", () => {
     expect(isAuthoringLayout(DEFAULT_STUDIO_PANES)).toBe(true);
     expect(isAuthoringLayout(["browser", "overview", "copilot"])).toBe(true);
   });
 });
 
 describe("system run focus (?wrs=)", () => {
+  test("reads both Ember markers as Ember's focus, never as a browser session id", () => {
+    for (const marker of ["copilot", "ember"]) {
+      expect(
+        emberBrowserFocusSessionId(new URLSearchParams(`wrs=${marker}`)),
+      ).toBeNull();
+    }
+    expect(emberBrowserFocusSessionId(new URLSearchParams("wrs=pbs_1"))).toBe(
+      "pbs_1",
+    );
+  });
+
   test("does not remap deep-link panes to the run layout", () => {
     expect(
       resolveOpenPanes("?wr=wr_1&wrs=copilot", ["editor", "browser"]),
@@ -438,7 +455,7 @@ describe("searchWithRunReference", () => {
   });
 
   test("drops a stale marker so a path run keeps its run class", () => {
-    // The marker belongs to a copilot focus that is gone; leaving it would pin
+    // The marker belongs to an Ember focus that is gone; leaving it would pin
     // a run the user opened to the edit layout.
     expect(searchWithRunReference("?wrs=copilot", "wr_123")).toBe("?wr=wr_123");
     expect(

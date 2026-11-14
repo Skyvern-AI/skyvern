@@ -1,7 +1,7 @@
 import {
-  COPILOT_ATTENTION_LABEL,
-  useCopilotHeaderStore,
-} from "@/store/useCopilotHeaderStore";
+  EMBER_ATTENTION_LABEL,
+  useEmberHeaderStore,
+} from "@/store/useEmberHeaderStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 import { cn } from "@/util/utils";
 
@@ -20,7 +20,7 @@ export function StudioNarrowPaneSwitch({
   onShow: (id: StudioPaneId) => void;
 }) {
   const browserActivity = useStudioBrowserStore((s) => s.hasUnseenActivity);
-  const copilotAttention = useCopilotHeaderStore((s) => s.attention);
+  const emberAttention = useEmberHeaderStore((s) => s.attention);
   return (
     <nav
       aria-label="Pane switch"
@@ -32,7 +32,7 @@ export function StudioNarrowPaneSwitch({
         const active = id === shown;
         // Only another pane's news needs a dot; the shown pane says it itself.
         const activity = id === "browser" && browserActivity && !active;
-        const awaiting = id === "copilot" && !active ? copilotAttention : null;
+        const awaiting = id === "copilot" && !active ? emberAttention : null;
         return (
           <button
             key={id}
@@ -42,7 +42,7 @@ export function StudioNarrowPaneSwitch({
               activity
                 ? "Browser, new activity"
                 : awaiting
-                  ? `Copilot, ${COPILOT_ATTENTION_LABEL[awaiting]}`
+                  ? `Copilot, ${EMBER_ATTENTION_LABEL[awaiting]}`
                   : undefined
             }
             onClick={() => onShow(id)}
@@ -64,7 +64,7 @@ export function StudioNarrowPaneSwitch({
               ) : awaiting ? (
                 <StudioPaneAttentionDot
                   tone="waiting"
-                  title={`Copilot, ${COPILOT_ATTENTION_LABEL[awaiting]}`}
+                  title={`Copilot, ${EMBER_ATTENTION_LABEL[awaiting]}`}
                 />
               ) : null}
             </span>

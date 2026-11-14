@@ -14,7 +14,7 @@ import { getClient } from "@/api/AxiosClient";
 
 import { flushBufferedEditorEdits } from "@/hooks/useDeferredLockedEdit";
 
-import { useCopilotActionStore } from "@/store/useCopilotActionStore";
+import { useEmberActionStore } from "@/store/useEmberActionStore";
 
 import type { AppNode } from "./nodes";
 import {
@@ -61,7 +61,7 @@ test("publishes a pending Goal change and undoes it in the canvas", () => {
     </ReactFlowProvider>,
   );
 
-  expect(useCopilotActionStore.getState().pendingGoalChanges).toEqual([
+  expect(useEmberActionStore.getState().pendingGoalChanges).toEqual([
     {
       label: "find_provider",
       goal: "Return every provider's phone number",
@@ -70,10 +70,10 @@ test("publishes a pending Goal change and undoes it in the canvas", () => {
   ]);
 
   act(() => {
-    useCopilotActionStore.getState().undoGoalChange("find_provider");
+    useEmberActionStore.getState().undoGoalChange("find_provider");
   });
 
-  expect(useCopilotActionStore.getState().pendingGoalChanges).toEqual([]);
+  expect(useEmberActionStore.getState().pendingGoalChanges).toEqual([]);
 });
 
 test("undo and save saves after the canvas has dropped the new Goal", () => {
@@ -81,7 +81,7 @@ test("undo and save saves after the canvas has dropped the new Goal", () => {
   const onOpenChange = vi.fn();
   let changesAtSave: number | undefined;
   const save = vi.fn(() => {
-    changesAtSave = useCopilotActionStore.getState().pendingGoalChanges.length;
+    changesAtSave = useEmberActionStore.getState().pendingGoalChanges.length;
     // The real save forces buffered edits through with flushSync before it writes.
     flushBufferedEditorEdits();
   });
@@ -159,12 +159,12 @@ describe("a Goal update offered after a hand code edit", () => {
 
   async function requestSuggestion() {
     await act(async () => {
-      useCopilotActionStore.getState().updateGoal("read_total");
+      useEmberActionStore.getState().updateGoal("read_total");
     });
   }
 
   beforeEach(() => {
-    useCopilotActionStore.setState(useCopilotActionStore.getInitialState());
+    useEmberActionStore.setState(useEmberActionStore.getInitialState());
     post.mockReset();
     post.mockResolvedValue({ data: { goal: suggested } });
   });
@@ -173,13 +173,13 @@ describe("a Goal update offered after a hand code edit", () => {
     renderBlock();
 
     act(() => {
-      useCopilotActionStore.getState().keepGoal("read_total");
+      useEmberActionStore.getState().keepGoal("read_total");
     });
 
     expect(liveData().prompt).toBe(editedGoal);
     expect(liveData().userOwnedGoal).toBe(true);
     expect(liveData().codeEditedByHand).toBe(false);
-    expect(useCopilotActionStore.getState().codeEditedBlocks).toEqual([]);
+    expect(useEmberActionStore.getState().codeEditedBlocks).toEqual([]);
   });
 
   test.each([
@@ -192,7 +192,7 @@ describe("a Goal update offered after a hand code edit", () => {
   ])(
     "Keep my code on a Goal typed after a hand edit %s",
     (_, state, refused) => {
-      useCopilotActionStore.setState(state);
+      useEmberActionStore.setState(state);
       renderBlock({
         goalNeedsRegeneration: true,
         goalBeforeEdit: {
@@ -203,14 +203,14 @@ describe("a Goal update offered after a hand code edit", () => {
       });
 
       act(() => {
-        useCopilotActionStore.getState().keepCode("read_total");
+        useEmberActionStore.getState().keepCode("read_total");
       });
 
       expect(liveData().prompt).toBe(editedGoal);
       expect(liveData().userOwnedGoal).toBe(true);
       expect(liveData().goalNeedsRegeneration).toBe(refused);
       expect(liveData().codeEditedByHand).toBe(refused);
-      expect(useCopilotActionStore.getState().pendingGoalChanges.length).toBe(
+      expect(useEmberActionStore.getState().pendingGoalChanges.length).toBe(
         refused ? 1 : 0,
       );
     },
@@ -219,7 +219,7 @@ describe("a Goal update offered after a hand code edit", () => {
   test("Update Goal sends the code without the data schema, and Accept makes the suggestion the person's Goal", async () => {
     renderBlock({ dataSchema: '{"type": "object"}' });
 
-    expect(useCopilotActionStore.getState().codeEditedBlocks).toEqual([
+    expect(useEmberActionStore.getState().codeEditedBlocks).toEqual([
       { label: "read_total", goal: editedGoal, suggestedGoal: null },
     ]);
     await requestSuggestion();
@@ -232,12 +232,12 @@ describe("a Goal update offered after a hand code edit", () => {
       parameter_keys: [],
     });
     expect(liveData().prompt).toBe(editedGoal);
-    expect(useCopilotActionStore.getState().codeEditedBlocks).toEqual([
+    expect(useEmberActionStore.getState().codeEditedBlocks).toEqual([
       { label: "read_total", goal: editedGoal, suggestedGoal: suggested },
     ]);
 
     act(() => {
-      useCopilotActionStore.getState().acceptGoal("read_total");
+      useEmberActionStore.getState().acceptGoal("read_total");
     });
 
     expect(liveData()).toMatchObject({
@@ -246,7 +246,7 @@ describe("a Goal update offered after a hand code edit", () => {
       goalNeedsRegeneration: false,
       codeEditedByHand: false,
     });
-    expect(useCopilotActionStore.getState().pendingGoalChanges).toEqual([]);
+    expect(useEmberActionStore.getState().pendingGoalChanges).toEqual([]);
   });
 
   test("a suggestion requested before the person edited the Goal cannot be accepted", async () => {
@@ -255,12 +255,12 @@ describe("a Goal update offered after a hand code edit", () => {
     renderBlock();
 
     act(() => {
-      useCopilotActionStore.getState().updateGoal("read_total");
+      useEmberActionStore.getState().updateGoal("read_total");
     });
     act(() => editGoal("Read the order total and currency"));
     await act(async () => resolve({ data: { goal: suggested } }));
     act(() => {
-      useCopilotActionStore.getState().acceptGoal("read_total");
+      useEmberActionStore.getState().acceptGoal("read_total");
     });
 
     expect(liveData().prompt).toBe("Read the order total and currency");
@@ -272,15 +272,15 @@ describe("a Goal update offered after a hand code edit", () => {
     renderBlock();
 
     act(() => {
-      useCopilotActionStore.getState().updateGoal("read_total");
+      useEmberActionStore.getState().updateGoal("read_total");
     });
     act(() => {
-      useCopilotActionStore.getState().keepGoal("read_total");
+      useEmberActionStore.getState().keepGoal("read_total");
     });
     await act(async () => resolve({ data: { goal: suggested } }));
 
-    expect(useCopilotActionStore.getState().goalSuggestions).toEqual({});
-    expect(useCopilotActionStore.getState().suggestingGoalLabels).toEqual([]);
+    expect(useEmberActionStore.getState().goalSuggestions).toEqual({});
+    expect(useEmberActionStore.getState().suggestingGoalLabels).toEqual([]);
   });
 
   test.each([
@@ -299,7 +299,7 @@ describe("a Goal update offered after a hand code edit", () => {
   ])(
     "Update Goal, Accept and Keep Goal change nothing while the block is %s",
     async (_, state, data, readOnly) => {
-      useCopilotActionStore.setState({
+      useEmberActionStore.setState({
         ...state,
         goalSuggestions: {
           read_total: {
@@ -313,8 +313,8 @@ describe("a Goal update offered after a hand code edit", () => {
 
       await requestSuggestion();
       act(() => {
-        useCopilotActionStore.getState().acceptGoal("read_total");
-        useCopilotActionStore.getState().keepGoal("read_total");
+        useEmberActionStore.getState().acceptGoal("read_total");
+        useEmberActionStore.getState().keepGoal("read_total");
       });
 
       expect(post).not.toHaveBeenCalled();

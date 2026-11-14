@@ -2,7 +2,7 @@ import { useEffect, useRef } from "react";
 import { create } from "zustand";
 
 type ManualSignInStore = {
-  // The live browser the user is signing in to from a Copilot credential card, if any.
+  // The live browser the user is signing in to from an Ember credential card, if any.
   browserSessionId: string | null;
   setBrowserSessionId: (browserSessionId: string | null) => void;
 };

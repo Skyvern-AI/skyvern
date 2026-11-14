@@ -98,7 +98,7 @@ describe("resolveEditorSelectionPin", () => {
     expect(resolveEditorSelectionPin({ ...base, blockRun: true })).toBeNull();
   });
 
-  test("never pins a selection the copilot's build-follow wrote", () => {
+  test("never pins a selection the Ember's build-follow wrote", () => {
     // Follow calls focusBlock, which mirrors into ?selected-block=. Pinning
     // that would walk the Run and Browser panes through an old finalized run
     // for the length of the build.

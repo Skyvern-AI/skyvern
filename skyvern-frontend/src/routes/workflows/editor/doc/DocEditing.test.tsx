@@ -11,7 +11,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { useContext, useState } from "react";
 
 import { toast } from "@/components/ui/use-toast";
-import { useCopilotActionStore } from "@/store/useCopilotActionStore";
+import { useEmberActionStore } from "@/store/useEmberActionStore";
 import { AxiosError } from "axios";
 
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
@@ -57,7 +57,7 @@ afterEach(() => {
   cleanup();
   save.mockClear();
   catalogState.data = undefined;
-  useCopilotActionStore.setState({ pendingGoalChanges: [] });
+  useEmberActionStore.setState({ pendingGoalChanges: [] });
   useWorkflowHistoryAccessStore.getState().reset();
   useWorkflowSnapshotStore.getState().clearSnapshot();
   useWorkflowHasChangesStore.setState({ hasChanges: false });
@@ -77,7 +77,7 @@ describe("Doc edit bar row", () => {
 describe("Doc Save", () => {
   test("asks about a new Goal that isn't applied before saving", () => {
     useWorkflowHasChangesStore.setState({ hasChanges: true });
-    useCopilotActionStore.setState({
+    useEmberActionStore.setState({
       pendingGoalChanges: [
         { label: "read_total", goal: "Read the total", previousGoal: "Old" },
       ],

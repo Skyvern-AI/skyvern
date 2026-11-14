@@ -235,7 +235,7 @@ describe("describeCodeBlockFailure", () => {
     ).toBe("A browser operation failed");
   });
 
-  test("every fix or either guidance points to Fix with Copilot, never to editing code", () => {
+  test("every fix or either guidance points to Fix with Ember, never to editing code", () => {
     const failures = [
       ...[
         "user_code_error",

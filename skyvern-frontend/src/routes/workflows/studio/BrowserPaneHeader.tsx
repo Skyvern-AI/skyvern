@@ -118,7 +118,7 @@ export function BrowserPaneViewPills() {
     visuals,
     inspectingRun,
     liveSurface,
-    copilotBrowserFocused,
+    emberBrowserFocused,
     debugBrowserSessionId,
     runId,
     recordingAvailable,
@@ -213,7 +213,7 @@ export function BrowserPaneViewPills() {
   // the run's own status. Once that run is over this view is the debug browser
   // — a surface the run left behind — so it has to say so.
   const finishedRun = visuals.finalized;
-  // Only Copilot's pin puts a finished run's own browser on the Live view.
+  // Only Ember's pin puts a finished run's own browser on the Live view.
   const liveLabel =
     liveSurface === "run"
       ? finishedRun
@@ -221,7 +221,7 @@ export function BrowserPaneViewPills() {
         : "Live"
       : finishedRun
         ? "Debug browser"
-        : copilotBrowserFocused
+        : emberBrowserFocused
           ? "Copilot browser"
           : "Live";
   const showsDebugBrowserAfterRun = finishedRun && liveSurface === "debug";

@@ -214,7 +214,7 @@ describe("useRunVisuals loop-iteration threading", () => {
             inspectingRun: true,
             blockRunInDebugSession: false,
             systemFocused: false,
-            copilotBrowserFocused: false,
+            emberBrowserFocused: false,
             runInDebugSession: false,
             running: visuals.running,
             hasRecording: visuals.recordingUrls.length > 0,

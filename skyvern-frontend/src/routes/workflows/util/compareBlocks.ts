@@ -2,7 +2,7 @@ import { stableStringify } from "@/util/stableStringify";
 import { WorkflowBlock } from "../types/workflowTypes";
 
 // Backend-generated fields that diverge across workflow versions even when the
-// user-visible block content is unchanged. Copilot's rehydrated proposal
+// user-visible block content is unchanged. Ember's rehydrated proposal
 // regenerates IDs and timestamps for every parameter, and convert_workflow_definition
 // rebuilds BranchCondition with a fresh UUID `id`, so leaving any of these in
 // the equality input would flip every block to "modified". The bare `id` here

@@ -18,11 +18,13 @@ import { studioPanelId } from "./constants";
 import { liveSearch } from "./liveSearch";
 
 const SURFACE = "studio" as const;
+// Sent to PostHog as the tour's step_name, so tour funnels stay continuous.
+export const EMBER_TOUR_STEP_NAME = "copilot";
 const AUTO_START_DELAY_MS = 1500;
 
 const TOUR_STEPS: { name: string; step: DriveStep }[] = [
   {
-    name: "copilot",
+    name: EMBER_TOUR_STEP_NAME,
     step: {
       element: `#${studioPanelId("copilot")}`,
       popover: {
@@ -68,7 +70,7 @@ function isShown(selector: string): boolean {
   return el !== null && el.checkVisibility?.() !== false;
 }
 
-// Entry is read once on mount: Copilot strips ?via=discover and autoplay clears
+// Entry is read once on mount: Ember strips ?via=discover and autoplay clears
 // itself once consumed. Shared run/block links never start the tour; a Home
 // prompt waits for its run's browser to go live; a directly created agent starts now.
 function useStudioOnboardingTour(

@@ -19,7 +19,7 @@ import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import {
   primaryButton,
   secondaryButton,
-} from "@/routes/workflows/copilot/PendingGoalChangesCard";
+} from "@/routes/workflows/ember/PendingGoalChangesCard";
 import { jinjaHighlight } from "@/routes/workflows/components/jinjaHighlight";
 import { lineHighlight } from "@/routes/workflows/components/lineHighlight";
 import { analyzeCodeBlockErrorCodes } from "@/routes/workflows/editor/codeBlockErrorCodeDiagnostics";
@@ -43,8 +43,8 @@ import {
 import { getCodeStepPlainText } from "@/routes/workflows/workflowBlockUtils";
 import {
   goalActionIsLocked,
-  useCopilotActionStore,
-} from "@/store/useCopilotActionStore";
+  useEmberActionStore,
+} from "@/store/useEmberActionStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import {
   selectEditorMutationLocked,
@@ -131,12 +131,12 @@ function CodeBlockEditorBody({
     ];
   }, [activeStep?.line_start, activeStep?.line_end]);
 
-  const requestBuild = useCopilotActionStore((state) => state.requestBuild);
-  const requestCancel = useCopilotActionStore((state) => state.requestCancel);
-  const stopBlockedReason = useCopilotActionStore(
+  const requestBuild = useEmberActionStore((state) => state.requestBuild);
+  const requestCancel = useEmberActionStore((state) => state.requestCancel);
+  const stopBlockedReason = useEmberActionStore(
     (state) => state.stopBlockedReason,
   );
-  const generatingBlockLabel = useCopilotActionStore(
+  const generatingBlockLabel = useEmberActionStore(
     (state) => state.generatingBlockLabel,
   );
   const isGenerating =
@@ -148,7 +148,7 @@ function CodeBlockEditorBody({
     !scopeReadOnly &&
     !mutationLocked;
   const hasCode = stripPythonComments(data.code ?? "").trim().length > 0;
-  const isQueued = useCopilotActionStore((state) =>
+  const isQueued = useEmberActionStore((state) =>
     state.queuedBuilds.some((queued) => queued.blockLabel === data.label),
   );
   const goalChangePending = goalChangeIsPending(data);
@@ -156,16 +156,16 @@ function CodeBlockEditorBody({
   const undoPatch = goalChangeUndoPatch(data);
   const keepCodePatch = keepCodeWithGoalPatch(data);
   const codeEditedNotice = codeEditedNoticeIsShown(data);
-  const suggestedGoal = useCopilotActionStore((state) =>
+  const suggestedGoal = useEmberActionStore((state) =>
     freshGoalSuggestion(data, state.goalSuggestions[data.label]),
   );
-  const suggestingGoal = useCopilotActionStore((state) =>
+  const suggestingGoal = useEmberActionStore((state) =>
     state.suggestingGoalLabels.includes(data.label),
   );
-  const updateGoal = useCopilotActionStore((state) => state.updateGoal);
-  const keepGoal = useCopilotActionStore((state) => state.keepGoal);
-  const acceptGoal = useCopilotActionStore((state) => state.acceptGoal);
-  const canActOnCodeEdit = useCopilotActionStore(
+  const updateGoal = useEmberActionStore((state) => state.updateGoal);
+  const keepGoal = useEmberActionStore((state) => state.keepGoal);
+  const acceptGoal = useEmberActionStore((state) => state.acceptGoal);
+  const canActOnCodeEdit = useEmberActionStore(
     (state) =>
       !goalActionIsLocked(state, data.label, {
         readOnly: !editable || scopeReadOnly,

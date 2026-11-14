@@ -48,7 +48,7 @@ import { EditorOverflowMenu } from "./header/EditorOverflowMenu";
 import { InputsCountBadge } from "./WorkflowInputs";
 import { SaveFailedError, useSaveWorkflow } from "./hooks/useSaveWorkflow";
 import { PendingGoalChangesDialog } from "./PendingGoalChangesDialog";
-import { useCopilotActionStore } from "@/store/useCopilotActionStore";
+import { useEmberActionStore } from "@/store/useEmberActionStore";
 import { getRunBlockingTooltipText } from "./runValidation/runBlockingCopy";
 import { useRunValidationStore } from "./runValidation/useRunValidationStore";
 import { useWorkflowHeaderCollapseStore } from "./useWorkflowHeaderCollapseStore";
@@ -95,7 +95,7 @@ function SaveButton() {
   const saveLockReason = useWorkflowYamlEditorStore(selectSaveLockReason);
   const isGlobalWorkflow = useIsGlobalWorkflow();
   const onSave = useSaveWorkflow();
-  const pendingGoalChangeCount = useCopilotActionStore(
+  const pendingGoalChangeCount = useEmberActionStore(
     (state) => state.pendingGoalChanges.length,
   );
   const [goalDialogOpen, setGoalDialogOpen] = useState(false);

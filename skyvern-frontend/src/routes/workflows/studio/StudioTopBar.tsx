@@ -75,8 +75,8 @@ import {
 } from "../editor/workflowChangesSummary";
 import { useSaveWorkflow } from "../editor/hooks/useSaveWorkflow";
 import { PendingGoalChangesDialog } from "../editor/PendingGoalChangesDialog";
-import { useCopilotActionStore } from "@/store/useCopilotActionStore";
-import { useCopilotProposalStore } from "@/store/CopilotProposalStore";
+import { useEmberActionStore } from "@/store/useEmberActionStore";
+import { useEmberProposalStore } from "@/store/EmberProposalStore";
 import { useToggleHistoryPanel } from "../editor/hooks/useToggleHistoryPanel";
 import { getRunBlockingTooltipText } from "../editor/runValidation/runBlockingCopy";
 import { useRunValidationStore } from "../editor/runValidation/useRunValidationStore";
@@ -166,19 +166,19 @@ export function SaveButton() {
   const contentDirty = useWorkflowSnapshotStore((s) => s.contentDirty);
   const snapshot = useWorkflowSnapshotStore((s) => s.snapshot);
   const saveLockReason = useWorkflowYamlEditorStore(selectSaveLockReason);
-  const proposalPending = useCopilotProposalStore((s) => s.proposal !== null);
+  const proposalPending = useEmberProposalStore((s) => s.proposal !== null);
   const saveUnavailable = saveLockReason !== null || proposalPending;
   const saveUnavailableReason = proposalPending
     ? "Resolve the Copilot proposal before saving."
     : saveLockReason;
   const onSave = useSaveWorkflow();
   const [confirmOpen, setConfirmOpen] = useState(false);
-  const pendingGoalChangeCount = useCopilotActionStore(
+  const pendingGoalChangeCount = useEmberActionStore(
     (state) => state.pendingGoalChanges.length,
   );
   const [goalDialogOpen, setGoalDialogOpen] = useState(false);
   const saveOrConfirm = () => {
-    if (useCopilotProposalStore.getState().proposal) return;
+    if (useEmberProposalStore.getState().proposal) return;
     // Recompute dirtiness synchronously from the same source as the
     // summary (incl. the YAML draft). contentDirty is debounced and
     // canvas-only, so gating the confirmation on it would skip it for a
@@ -295,7 +295,7 @@ export function SaveButton() {
               <Button
                 disabled={saving || saveUnavailable}
                 onClick={() => {
-                  if (useCopilotProposalStore.getState().proposal) return;
+                  if (useEmberProposalStore.getState().proposal) return;
                   // Close only on success; a failed save (already toasted by
                   // onSave's onError) keeps the list open for retry, so swallow
                   // the rejection rather than leaving it unhandled.

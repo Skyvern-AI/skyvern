@@ -8,7 +8,7 @@ import { type AppNode, isWorkflowBlockNode } from "../nodes";
 
 export const SELECTED_BLOCK_SEARCH_PARAM = "selected-block";
 
-// Marks the current ?selected-block= as a machine-origin focus — the copilot
+// Marks the current ?selected-block= as a machine-origin focus — the Ember
 // following its own build — rather than a block the user picked. Same role as
 // SYSTEM_RUN_FOCUS_PARAM for ?wr=: consumers that act on the selection must not
 // treat a follow as a choice. Valued with the label it applies to, so the

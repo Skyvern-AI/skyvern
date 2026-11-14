@@ -913,7 +913,7 @@ export function RunView({
   const failureDetail = failureReason.detail;
   const failureTips = matchFailureTips(workflowRun.failure_reason ?? null);
   // Editing code cannot reach a sandbox that was never available, so a fault the
-  // block did not cause offers a retry alone rather than a copilot session that
+  // block did not cause offers a retry alone rather than an Ember session that
   // would rewrite working code.
   const showFix = codeFailure === null || codeFailure.recovery !== "retry";
   const hasFixAction = Boolean(onFix && showFix);

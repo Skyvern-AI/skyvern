@@ -105,7 +105,7 @@ import type {
   CodeEditedBlock,
   GoalSuggestion,
   PendingGoalChange,
-} from "@/store/useCopilotActionStore";
+} from "@/store/useEmberActionStore";
 import { dataExportNodeDefaultData } from "./nodes/DataExportNode/types";
 import { downloadNodeDefaultData } from "./nodes/DownloadNode/types";
 import {
@@ -6703,18 +6703,18 @@ function workflowGraphContent(items: AppNode[], connections: Edge[]) {
   }
 }
 
-// Marker class for the copilot's gold-ring block-highlight flash. Kept off
+// Marker class for the Ember's gold-ring block-highlight flash. Kept off
 // React Flow's `.selected` so a normal editor node click (which sets
 // `selected` to open the sidebar) doesn't trigger the flash. Must match the
 // selector in reactFlowOverrideStyles.css.
-const COPILOT_BLOCK_HIGHLIGHT_CLASS = "sk-copilot-block-highlight";
-const COPILOT_BLOCK_HIGHLIGHT_MS = 1500;
+const EMBER_BLOCK_HIGHLIGHT_CLASS = "sk-ember-block-highlight";
+const EMBER_BLOCK_HIGHLIGHT_MS = 1500;
 
 function setBlockHighlightClass(node: AppNode, on: boolean): AppNode {
   const tokens = (node.className ?? "")
     .split(/\s+/)
-    .filter((token) => token && token !== COPILOT_BLOCK_HIGHLIGHT_CLASS);
-  if (on) tokens.push(COPILOT_BLOCK_HIGHLIGHT_CLASS);
+    .filter((token) => token && token !== EMBER_BLOCK_HIGHLIGHT_CLASS);
+  if (on) tokens.push(EMBER_BLOCK_HIGHLIGHT_CLASS);
   const next = tokens.join(" ") || undefined;
   if ((node.className ?? undefined) === next) return node;
   return { ...node, className: next };
@@ -6759,7 +6759,7 @@ export function useWorkflowGraphState(
       const workflowId =
         useWorkflowYamlEditorStore.getState().editorOwner?.workflowPermanentId;
       const trackedProposal = workflowId
-        ? useWorkflowTitleStore.getState().copilotMetadataEdits[workflowId]
+        ? useWorkflowTitleStore.getState().emberMetadataEdits[workflowId]
         : undefined;
       if (
         fromUser &&
@@ -6768,7 +6768,7 @@ export function useWorkflowGraphState(
         JSON.stringify(getWorkflowBlocks(previous, currentEdges.current)) !==
           JSON.stringify(getWorkflowBlocks(next, currentEdges.current))
       )
-        useWorkflowTitleStore.getState().recordCopilotGraphEdit();
+        useWorkflowTitleStore.getState().recordEmberGraphEdit();
       updateNodes(next);
     },
     [updateNodes],
@@ -6788,7 +6788,7 @@ export function useWorkflowGraphState(
       const workflowId =
         useWorkflowYamlEditorStore.getState().editorOwner?.workflowPermanentId;
       const trackedProposal = workflowId
-        ? useWorkflowTitleStore.getState().copilotMetadataEdits[workflowId]
+        ? useWorkflowTitleStore.getState().emberMetadataEdits[workflowId]
         : undefined;
       if (
         fromUser &&
@@ -6797,7 +6797,7 @@ export function useWorkflowGraphState(
         JSON.stringify(getWorkflowBlocks(currentNodes.current, previous)) !==
           JSON.stringify(getWorkflowBlocks(currentNodes.current, next))
       )
-        useWorkflowTitleStore.getState().recordCopilotGraphEdit();
+        useWorkflowTitleStore.getState().recordEmberGraphEdit();
       updateEdges(next);
     },
     [updateEdges],
@@ -6829,7 +6829,7 @@ export function useWorkflowGraphState(
     [setEdges, updateEdges],
   );
   // A highlight is presentation, not an edit, so it bypasses the edit lock a
-  // running Copilot turn holds.
+  // running Ember turn holds.
   const highlightBlock = useCallback(
     (blockLabel: string) => {
       const matches = (node: AppNode) =>
@@ -6845,7 +6845,7 @@ export function useWorkflowGraphState(
             matches(node) ? setBlockHighlightClass(node, false) : node,
           ),
         );
-      }, COPILOT_BLOCK_HIGHLIGHT_MS);
+      }, EMBER_BLOCK_HIGHLIGHT_MS);
     },
     [updateNodes],
   );

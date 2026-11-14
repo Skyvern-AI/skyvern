@@ -21,8 +21,8 @@ import { WorkflowScopeContext } from "@/routes/workflows/editor/WorkflowScopeCon
 import type { GoogleOAuthCredential } from "@/api/types";
 import {
   beginSaveTransaction,
-  beginCopilotAcceptance,
-  finishCopilotAcceptance,
+  beginEmberAcceptance,
+  finishEmberAcceptance,
   createYamlCommitOwner,
   finishSaveTransaction,
   useWorkflowYamlEditorStore,
@@ -148,9 +148,9 @@ describe("GoogleOAuthCredentialSelector", () => {
           expect(beginSaveTransaction(owner)).toBe(true);
           releaseLock = () => finishSaveTransaction(owner);
         } else {
-          const token = beginCopilotAcceptance();
+          const token = beginEmberAcceptance();
           expect(token).not.toBeNull();
-          releaseLock = () => finishCopilotAcceptance(token!);
+          releaseLock = () => finishEmberAcceptance(token!);
         }
       });
       const deferKey = JSON.stringify([

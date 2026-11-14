@@ -27,9 +27,9 @@ import {
 } from "@/components/ui/tooltip";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import {
-  COPILOT_ATTENTION_LABEL,
-  useCopilotHeaderStore,
-} from "@/store/useCopilotHeaderStore";
+  EMBER_ATTENTION_LABEL,
+  useEmberHeaderStore,
+} from "@/store/useEmberHeaderStore";
 import { useManualSignInStore } from "@/store/useManualSignInStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 import { cn } from "@/util/utils";
@@ -38,7 +38,7 @@ import { deriveDropIndicator } from "../editor/sortable/dropIndicator";
 import { WorkflowRunVerificationCodeForm } from "../workflowRun/WorkflowRunVerificationCodeForm";
 
 import { BrowserPaneActions, BrowserPaneViewPills } from "./BrowserPaneHeader";
-import { CopilotActiveDot, CopilotPaneControls } from "./CopilotPaneHeader";
+import { EmberActiveDot, EmberPaneControls } from "./EmberPaneHeader";
 import {
   EditorPaneBlockSearch,
   EditorPaneModeToggle,
@@ -151,7 +151,7 @@ export function StudioPane({
   headerExtras?: ReactNode;
   // Rendered right-aligned, before the close button.
   headerActions?: ReactNode;
-  // Presence-badge overlay on the pane icon (e.g. the Copilot active dot).
+  // Presence-badge overlay on the pane icon (e.g. the Ember active dot).
   iconBadge?: ReactNode;
   chromeless?: boolean;
   children: ReactNode;
@@ -450,13 +450,13 @@ function CollapsedPaneStrip({
   const { icon: Icon } = STUDIO_PANE_META[id];
   const label = paneAccessibleName(id);
   const browserActivity = useStudioBrowserStore((s) => s.hasUnseenActivity);
-  const copilotAttention = useCopilotHeaderStore((s) => s.attention);
+  const emberAttention = useEmberHeaderStore((s) => s.attention);
   const activity = id === "browser" && browserActivity;
-  const awaiting = id === "copilot" ? copilotAttention : null;
+  const awaiting = id === "copilot" ? emberAttention : null;
   const news = activity
     ? ", new activity"
     : awaiting
-      ? `, ${COPILOT_ATTENTION_LABEL[awaiting]}`
+      ? `, ${EMBER_ATTENTION_LABEL[awaiting]}`
       : "";
   return (
     <Tooltip>
@@ -484,7 +484,7 @@ function CollapsedPaneStrip({
             ) : awaiting ? (
               <StudioPaneAttentionDot
                 tone="waiting"
-                title={`Copilot, ${COPILOT_ATTENTION_LABEL[awaiting]}`}
+                title={`Copilot, ${EMBER_ATTENTION_LABEL[awaiting]}`}
               />
             ) : null}
           </span>
@@ -702,9 +702,9 @@ function StudioPaneDivider({
 }
 
 /**
- * Panes shell: the top bar's pane toggles (Copilot, Editor, Browser, Overview)
+ * Panes shell: the top bar's pane toggles (Ember, Editor, Browser, Overview)
  * each toggle a pane; open panes share the stage side by side in click order
- * (?panes=). The Copilot chat is portaled into its pane from Workspace.
+ * (?panes=). The Ember chat is portaled into its pane from Workspace.
  */
 export function StudioShell(props: StudioWorkspaceProps) {
   const [searchParams] = useSearchParams();
@@ -742,7 +742,7 @@ export function StudioShell(props: StudioWorkspaceProps) {
 
 /**
  * Pane body while the source agent is deleted: the pane's normal content would
- * operate on the missing workflow (Copilot chats, editor saves, debug
+ * operate on the missing workflow (Ember chats, editor saves, debug
  * browsers), so it never mounts — runs stay viewable from the run panes.
  */
 function WorkflowDeletedPaneNotice() {
@@ -842,9 +842,7 @@ function StudioStage(props: StudioWorkspaceProps) {
     fromBounds: PaneBounds;
   } | null>(null);
   const previousPanesRef = useRef(panes);
-  const [copilotPortalEl, setCopilotPortalEl] = useState<HTMLElement | null>(
-    null,
-  );
+  const [emberPortalEl, setEmberPortalEl] = useState<HTMLElement | null>(null);
 
   // The live browser stream is mounted once into this detached host and
   // re-parented into the owning pane, so it never remounts on pane changes.
@@ -1055,7 +1053,7 @@ function StudioStage(props: StudioWorkspaceProps) {
   const shellContextValue = useMemo(
     () => ({
       organizationId: props.workflow.organization_id,
-      copilotPortalEl,
+      emberPortalEl,
       setEditorStreamSlot,
       setBrowserStreamSlot,
       setRunStreamSlot,
@@ -1065,7 +1063,7 @@ function StudioStage(props: StudioWorkspaceProps) {
       isPaneOnScreen,
     }),
     [
-      copilotPortalEl,
+      emberPortalEl,
       props.workflow.organization_id,
       restoreExpandedPane,
       showPane,
@@ -1187,8 +1185,8 @@ function StudioStage(props: StudioWorkspaceProps) {
             >
               <StudioPane
                 {...paneProps("copilot")}
-                headerActions={<CopilotPaneControls />}
-                iconBadge={<CopilotActiveDot />}
+                headerActions={<EmberPaneControls />}
+                iconBadge={<EmberActiveDot />}
               >
                 {workflowDeleted ? (
                   <WorkflowDeletedPaneNotice />
@@ -1196,7 +1194,7 @@ function StudioStage(props: StudioWorkspaceProps) {
                   <div className="relative h-full w-full">
                     {/* The chat stays mounted throughout recording. Its transcript
                         owns the live recording chapter and its independent scroll. */}
-                    <div ref={setCopilotPortalEl} className="h-full w-full" />
+                    <div ref={setEmberPortalEl} className="h-full w-full" />
                   </div>
                 )}
               </StudioPane>

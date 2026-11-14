@@ -1384,7 +1384,7 @@ describe("CredentialsModal browser-memory profile section (flag on)", () => {
 });
 
 describe("CredentialsModal copilot-context tested_url default", () => {
-  function renderCopilotPasswordModal(opts: {
+  function renderEmberPasswordModal(opts: {
     defaultTestUrl?: string;
     onCredentialCreated?: (id: string, name?: string) => void;
   }) {
@@ -1440,7 +1440,7 @@ describe("CredentialsModal copilot-context tested_url default", () => {
     });
     patchMock.mockResolvedValue({ data: {} });
     const onCredentialCreated = vi.fn();
-    renderCopilotPasswordModal({
+    renderEmberPasswordModal({
       defaultTestUrl: "https://news.ycombinator.com/login",
       onCredentialCreated,
     });
@@ -1465,7 +1465,7 @@ describe("CredentialsModal copilot-context tested_url default", () => {
       data: { credential_id: "cred-z", name: "credentials" },
     });
     const onCredentialCreated = vi.fn();
-    renderCopilotPasswordModal({ onCredentialCreated });
+    renderEmberPasswordModal({ onCredentialCreated });
     await fillUsername();
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() =>
@@ -1487,7 +1487,7 @@ describe("CredentialsModal copilot-context tested_url default", () => {
       data: { credential_id: "cred-e", name: "credentials" },
     });
     const onCredentialCreated = vi.fn();
-    renderCopilotPasswordModal({ onCredentialCreated });
+    renderEmberPasswordModal({ onCredentialCreated });
     await fillUsernameAndPassword();
     fireEvent.keyDown(
       document.querySelector('input[type="password"]') as HTMLInputElement,
@@ -1503,7 +1503,7 @@ describe("CredentialsModal copilot-context tested_url default", () => {
       data: { credential_id: "cred-y", name: "credentials" },
     });
     const onCredentialCreated = vi.fn();
-    renderCopilotPasswordModal({ onCredentialCreated });
+    renderEmberPasswordModal({ onCredentialCreated });
     await fillUsernameAndPassword();
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() =>

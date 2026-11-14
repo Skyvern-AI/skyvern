@@ -130,7 +130,7 @@ function useAutoGenerateWorkflowTitle(
   );
 
   useEffect(() => {
-    // Read-only renderers (compare canvas, copilot preview) share the
+    // Read-only renderers (compare canvas, Ember preview) share the
     // WorkflowTitleStore with the live editor; generating here would mutate
     // the live title and persist it on the next user save.
     if (readOnly) {

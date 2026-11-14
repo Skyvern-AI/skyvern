@@ -54,7 +54,7 @@ import type {
   WorkflowRunBlock,
   WorkflowRunTimelineItem,
 } from "../../types/workflowRunTypes";
-import { WorkflowCopilotChat } from "../../copilot/WorkflowCopilotChat";
+import { EmberChat } from "../../ember/EmberChat";
 import { describeCodeBlockFailure } from "../../workflowRun/codeBlockFailure";
 import { StudioPaneCompactContext } from "../StudioShellContext";
 import { RunPaneActions, RunPaneViewToggles } from "./RunPaneHeader";
@@ -369,7 +369,7 @@ function SelectBlockOnCanvas({ label }: { label: string }) {
   );
 }
 
-function ReleaseCopilotRunFocus() {
+function ReleaseEmberRunFocus() {
   const [params, setParams] = useSearchParams();
   return (
     <button
@@ -1112,13 +1112,13 @@ describe("RunView cold-open selection", () => {
     expect(useRunViewStore.getState().pinnedFrameId).toBe("act_1");
   });
 
-  test("a terminal Copilot-focused run stays unselected through release", () => {
+  test("a terminal Ember-focused run stays unselected through release", () => {
     seedTerminalRunWithActions();
     const view = renderRunView(
       {},
       "/?wr=wr_1&wrs=copilot",
       false,
-      <ReleaseCopilotRunFocus />,
+      <ReleaseEmberRunFocus />,
     );
 
     expect(useRunViewStore.getState().pinnedFrameId).toBeNull();
@@ -1296,7 +1296,7 @@ describe("RunView live-watch terminal transition", () => {
     expect(useStudioBrowserStore.getState().view).toBe("auto");
   });
 
-  test("a Copilot-focused watched run stays unselected when it finishes", () => {
+  test("an Ember-focused watched run stays unselected when it finishes", () => {
     seedWatchedRun(Status.Running);
     const view = renderRunView({}, "/?wr=wr_1&wrs=copilot");
 
@@ -1309,7 +1309,7 @@ describe("RunView live-watch terminal transition", () => {
     );
   });
 
-  test("an explicit timeline pin still wins during Copilot focus", () => {
+  test("an explicit timeline pin still wins during Ember focus", () => {
     seedWatchedRun(Status.Running);
     const view = renderRunView({}, "/?wr=wr_1&wrs=copilot");
 
@@ -1751,7 +1751,7 @@ describe("RunView failure presentation", () => {
     expect(useRunViewStore.getState().pinnedFrameId).toBe("wrb_code");
   });
 
-  test("a failed Copilot-focused run does not auto-pin its failing block", () => {
+  test("a failed Ember-focused run does not auto-pin its failing block", () => {
     seedFailedCodeRun();
     const { getByTestId } = renderRunView({}, "/?wr=wr_1&wrs=copilot");
 
@@ -1759,7 +1759,7 @@ describe("RunView failure presentation", () => {
     expect(getByTestId("location-search").textContent).not.toContain("active=");
   });
 
-  test("a Copilot-focused latest failed run does not auto-pin its failing block", () => {
+  test("an Ember-focused latest failed run does not auto-pin its failing block", () => {
     seedFailedCodeRun();
     const { getByTestId } = renderRunView({}, "/?wrs=copilot");
 
@@ -1928,7 +1928,7 @@ describe("RunView failure presentation", () => {
     expect(line.getByRole("button", { name: "Retry" })).not.toBeNull();
   });
 
-  test("a sandbox fault offers a retry instead of a copilot fix", () => {
+  test("a sandbox fault offers a retry instead of an Ember fix", () => {
     seedFailedCodeRun(
       "Secure CodeBlock runner is unavailable. Please retry.",
       "runner_unavailable",
@@ -1947,7 +1947,7 @@ describe("RunView failure presentation", () => {
     expect(onRetry).toHaveBeenCalledTimes(1);
   });
 
-  test("an input reassembly memory limit offers a retry instead of a copilot fix", () => {
+  test("an input reassembly memory limit offers a retry instead of an Ember fix", () => {
     seedFailedCodeRun(
       "CodeBlock inputs exhausted the sandbox memory limit before the block started.",
       "parameter_reassembly_memory_limit_exceeded",
@@ -1959,7 +1959,7 @@ describe("RunView failure presentation", () => {
     expect(line.getByRole("button", { name: "Retry" })).not.toBeNull();
   });
 
-  test("a code memory limit still offers a copilot fix", () => {
+  test("a code memory limit still offers an Ember fix", () => {
     seedFailedCodeRun(
       "CodeBlock exceeded the configured memory limit.",
       "memory_limit_exceeded",
@@ -2502,7 +2502,7 @@ describe("RunView output signals", () => {
     expect(scope.queryByText("Downloaded files")).toBeNull();
   });
 
-  test("does not substitute persisted Copilot prose for a genuinely omitted output", async () => {
+  test("does not substitute persisted Ember prose for a genuinely omitted output", async () => {
     const corroboratingProse =
       "Copilot found 22.9k stars, matching the value visible in the source.";
     getSpy.mockImplementation((path: string) => {
@@ -2525,15 +2525,15 @@ describe("RunView output signals", () => {
       return Promise.resolve({ data: [] });
     });
     seedCompletedRun(sealedSavedRunReplayOverrides());
-    const copilotPortal = document.createElement("div");
-    document.body.appendChild(copilotPortal);
+    const emberPortal = document.createElement("div");
+    document.body.appendChild(emberPortal);
 
     const { container } = renderRunView(
       {},
       "/",
       false,
       <WorkflowPermanentIdContext.Provider value="wpid_1">
-        <WorkflowCopilotChat docked portalTarget={copilotPortal} />
+        <EmberChat docked portalTarget={emberPortal} />
       </WorkflowPermanentIdContext.Provider>,
     );
     const runView = within(container);
@@ -2547,7 +2547,7 @@ describe("RunView output signals", () => {
     expect(runView.queryByText(corroboratingProse)).toBeNull();
     expect(runView.queryByText("22.9k")).toBeNull();
 
-    copilotPortal.remove();
+    emberPortal.remove();
   });
 });
 

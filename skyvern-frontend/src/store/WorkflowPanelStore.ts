@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { WorkflowVersion } from "@/routes/workflows/hooks/useWorkflowVersionsQuery";
-import { CopilotReviewStatus } from "@/routes/workflows/editor/panels/WorkflowComparisonPanel";
+import { EmberReviewStatus } from "@/routes/workflows/editor/panels/WorkflowComparisonPanel";
 
 export type BranchContext = {
   conditionalNodeId: string;
@@ -32,10 +32,8 @@ type WorkflowPanelState = {
     // For triggers panel
     focusTriggerId?: string;
     focusRequest?: number;
-    mode?: "history" | "copilot";
-    onCopilotReviewClose?: (
-      status: CopilotReviewStatus,
-    ) => void | Promise<void>;
+    mode?: "history" | "ember";
+    onEmberReviewClose?: (status: EmberReviewStatus) => void | Promise<void>;
   };
 };
 

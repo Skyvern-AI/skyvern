@@ -20,7 +20,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { Status } from "@/api/types";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { WorkflowPermanentIdContext } from "@/routes/workflows/WorkflowPermanentIdContext";
-import { useCopilotHeaderStore } from "@/store/useCopilotHeaderStore";
+import { useEmberHeaderStore } from "@/store/useEmberHeaderStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 
 import { useStudioRunSignals } from "./useStudioRunSignals";
@@ -230,14 +230,14 @@ describe("StudioPaneToggles structure", () => {
 });
 
 describe("StudioPaneToggles pane toggling", () => {
-  test("opening Copilot updates runtime state without creating a panes param", () => {
+  test("opening Ember updates runtime state without creating a panes param", () => {
     renderAt("/workflows/wpid_abc/studio?wr=wr_1");
     fireEvent.click(tab(/^Copilot/));
     expect(urlPanes()).toBeNull();
     expect(tab(/^Copilot/).getAttribute("aria-expanded")).toBe("true");
   });
 
-  test("closing Copilot keeps the committed panes URL unchanged", () => {
+  test("closing Ember keeps the committed panes URL unchanged", () => {
     renderAt("/workflows/wpid_abc/studio?panes=editor,copilot,browser");
     fireEvent.click(tab(/^Copilot/));
     expect(urlPanes()).toBe("editor,copilot,browser");
@@ -252,7 +252,7 @@ describe("StudioPaneToggles pane toggling", () => {
     expect(urlPanes()).toBe("editor");
   });
 
-  test("Copilot toggling preserves unrelated params without adding panes", () => {
+  test("Ember toggling preserves unrelated params without adding panes", () => {
     runsQueryMock.mockReturnValue({ data: [{ status: Status.Completed }] });
     renderAt("/workflows/wpid_abc/studio?wr=run_1&bl=block_1");
     fireEvent.click(tab(/^Copilot/));
@@ -376,7 +376,7 @@ describe("StudioPaneToggles run selector", () => {
         <StudioPaneDefaultsProvider hasBlocks={true}>
           <StudioShellContext.Provider
             value={{
-              copilotPortalEl: null,
+              emberPortalEl: null,
               setEditorStreamSlot: () => {},
               setBrowserStreamSlot: () => {},
               setRunStreamSlot: () => {},
@@ -408,7 +408,7 @@ describe("StudioPaneToggles run selector", () => {
         <StudioPaneDefaultsProvider hasBlocks={true}>
           <StudioShellContext.Provider
             value={{
-              copilotPortalEl: null,
+              emberPortalEl: null,
               setEditorStreamSlot: () => {},
               setBrowserStreamSlot: () => {},
               setRunStreamSlot: () => {},
@@ -438,7 +438,7 @@ describe("StudioPaneToggles run selector", () => {
         <StudioPaneDefaultsProvider hasBlocks={true}>
           <StudioShellContext.Provider
             value={{
-              copilotPortalEl: null,
+              emberPortalEl: null,
               setEditorStreamSlot: () => {},
               setBrowserStreamSlot: () => {},
               setRunStreamSlot: () => {},
@@ -523,7 +523,7 @@ describe("StudioPaneToggles run selector", () => {
         <StudioPaneDefaultsProvider hasBlocks={true}>
           <StudioShellContext.Provider
             value={{
-              copilotPortalEl: null,
+              emberPortalEl: null,
               setEditorStreamSlot: () => {},
               setBrowserStreamSlot: () => {},
               setRunStreamSlot: () => {},
@@ -552,7 +552,7 @@ describe("StudioPaneToggles run selector", () => {
       ]),
     );
     renderInBrowser("/workflows/wpid_abc/studio?panes=copilot&wr=wr_other", {
-      copilotMessage: "Fix run A",
+      emberMessage: "Fix run A",
     });
 
     fireEvent.click(tab("Past Runs"));
@@ -681,13 +681,13 @@ describe("StudioPaneToggles browser activity", () => {
   });
 });
 
-describe("StudioPaneToggles Copilot question", () => {
-  afterEach(() => useCopilotHeaderStore.getState().setAttention(null));
+describe("StudioPaneToggles Ember question", () => {
+  afterEach(() => useEmberHeaderStore.getState().setAttention(null));
 
   test.each(["copilot", "browser"])(
-    "flags the Copilot tab while a question waits (panes=%s)",
+    "flags the Ember tab while a question waits (panes=%s)",
     (panes) => {
-      useCopilotHeaderStore.getState().setAttention("question");
+      useEmberHeaderStore.getState().setAttention("question");
       renderAt(`/workflows/wpid_abc/studio?panes=${panes}`);
       expect(
         screen.getByRole("button", {
@@ -698,7 +698,7 @@ describe("StudioPaneToggles Copilot question", () => {
   );
 
   test("names a sign-in request instead of a question", () => {
-    useCopilotHeaderStore.getState().setAttention("credential");
+    useEmberHeaderStore.getState().setAttention("credential");
     renderAt("/workflows/wpid_abc/studio?panes=browser");
     expect(
       screen.getByRole("button", { name: "Copilot, needs to sign in" }),
@@ -706,9 +706,9 @@ describe("StudioPaneToggles Copilot question", () => {
   });
 
   test("drops the flag once the question is answered", () => {
-    useCopilotHeaderStore.getState().setAttention("question");
+    useEmberHeaderStore.getState().setAttention("question");
     renderAt("/workflows/wpid_abc/studio?panes=copilot");
-    act(() => useCopilotHeaderStore.getState().setAttention(null));
+    act(() => useEmberHeaderStore.getState().setAttention(null));
     expect(
       screen.queryByRole("button", {
         name: "Copilot, waiting for your answer",

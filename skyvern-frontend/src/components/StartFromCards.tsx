@@ -29,7 +29,7 @@ type StartFromCardsProps = {
   recordTask: RecordTaskAction;
   className?: string;
   labelClassName?: string;
-  /** Column rule for the host: the Copilot pane uses a container query, Home a breakpoint. */
+  /** Column rule for the host: the Ember pane uses a container query, Home a breakpoint. */
   gridClassName?: string;
 };
 

@@ -31,7 +31,7 @@ afterEach(() => {
   clearDeferredEdits();
   useWorkflowYamlEditorStore.setState({
     commitInProgress: false,
-    copilotAcceptance: null,
+    emberAcceptance: null,
   });
   vi.restoreAllMocks();
   vi.useRealTimers();
@@ -142,7 +142,7 @@ describe.each(["save", "copilot"] as const)(
           useWorkflowYamlEditorStore.setState(
             lock === "save"
               ? { commitInProgress: true }
-              : { copilotAcceptance: Symbol("turn") },
+              : { emberAcceptance: Symbol("turn") },
           ),
         );
         expect(screen.getByTestId("block-textarea-actions")).toBe(actions);
@@ -166,7 +166,7 @@ describe.each(["save", "copilot"] as const)(
         act(() =>
           useWorkflowYamlEditorStore.setState({
             commitInProgress: false,
-            copilotAcceptance: null,
+            emberAcceptance: null,
           }),
         );
         expect(trigger.disabled).toBe(false);
@@ -197,7 +197,7 @@ describe.each([undefined, "node-draft:prompt"])(
       act(() => result.current.onChange("buffered"));
       act(() =>
         useWorkflowYamlEditorStore.setState({
-          copilotAcceptance: Symbol("turn"),
+          emberAcceptance: Symbol("turn"),
         }),
       );
       rerender({ value: "draft" });
@@ -206,9 +206,7 @@ describe.each([undefined, "node-draft:prompt"])(
 
       rerender({ value: "original" });
       expect(onChange).not.toHaveBeenCalled();
-      act(() =>
-        useWorkflowYamlEditorStore.setState({ copilotAcceptance: null }),
-      );
+      act(() => useWorkflowYamlEditorStore.setState({ emberAcceptance: null }));
 
       expect(result.current.value).toBe("buffered");
       expect(onChange).toHaveBeenCalledExactlyOnceWith("buffered");
@@ -226,15 +224,13 @@ describe.each([undefined, "node-draft:prompt"])(
       act(() => result.current.onChange("buffered"));
       act(() =>
         useWorkflowYamlEditorStore.setState({
-          copilotAcceptance: Symbol("turn"),
+          emberAcceptance: Symbol("turn"),
         }),
       );
       rerender({ value: "draft" });
       act(() => vi.advanceTimersByTime(300));
       expect(onChange).not.toHaveBeenCalled();
-      act(() =>
-        useWorkflowYamlEditorStore.setState({ copilotAcceptance: null }),
-      );
+      act(() => useWorkflowYamlEditorStore.setState({ emberAcceptance: null }));
 
       expect(result.current.value).toBe("draft");
       act(() => vi.advanceTimersByTime(300));

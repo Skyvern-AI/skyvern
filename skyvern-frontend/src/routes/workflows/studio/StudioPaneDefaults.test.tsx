@@ -15,8 +15,8 @@ import { useMountEffect } from "@/hooks/useMountEffect";
 import { useStudioFirstRunStore } from "@/store/StudioFirstRunStore";
 import { useManualSignInStore } from "@/store/useManualSignInStore";
 
-import { shouldOpenCopilotPaneForHandoff } from "../discoverCopilotHandoff";
-import { useWorkspaceCopilotUpdate } from "../editor/Workspace";
+import { shouldOpenEmberPaneForHandoff } from "../discoverEmberHandoff";
+import { useWorkspaceEmberUpdate } from "../editor/Workspace";
 import type { WorkflowVersion } from "../hooks/useWorkflowVersionsQuery";
 import { StudioPaneDefaultsProvider } from "./StudioPaneDefaults";
 import { useStudioPaneDefaults } from "./StudioPaneDefaultsContext";
@@ -134,7 +134,7 @@ beforeEach(() => {
 
 describe("cold-entry default panes (the four contexts)", () => {
   test.each(["?via=blank", "?via=discover", "?record=1"])(
-    "a new agent created with %s starts on Copilot + Browser",
+    "a new agent created with %s starts on Ember + Browser",
     (search) => {
       renderStudio({
         path: `/workflows/wpid_1/studio${search}`,
@@ -144,7 +144,7 @@ describe("cold-entry default panes (the four contexts)", () => {
     },
   );
 
-  test("a new agent created from a template keeps Copilot + Browser + Editor", () => {
+  test("a new agent created from a template keeps Ember + Browser + Editor", () => {
     renderStudio({ path: "/workflows/wpid_1/studio?via=template" });
     expect(panesText()).toBe("copilot,browser,editor");
   });
@@ -158,7 +158,7 @@ describe("cold-entry default panes (the four contexts)", () => {
     expect(addressText()).toBe("/workflows/wpid_1/studio?cache-key-value=x");
   });
 
-  test("keeps ?via=discover for the Copilot handoff that strips it later", () => {
+  test("keeps ?via=discover for the Ember handoff that strips it later", () => {
     renderStudio({
       path: "/workflows/wpid_1/studio?via=discover",
       hasBlocks: false,
@@ -166,12 +166,12 @@ describe("cold-entry default panes (the four contexts)", () => {
     expect(addressText()).toBe("/workflows/wpid_1/studio?via=discover");
   });
 
-  test("Edit on an existing empty agent opens Copilot + Editor", () => {
+  test("Edit on an existing empty agent opens Ember + Editor", () => {
     renderStudio({ hasBlocks: false });
     expect(panesText()).toBe("copilot,editor");
   });
 
-  test("a built agent starts on Copilot + Editor", () => {
+  test("a built agent starts on Ember + Editor", () => {
     renderStudio({ hasBlocks: true });
     expect(panesText()).toBe("copilot,editor");
   });
@@ -223,28 +223,28 @@ describe("cold-entry default panes (the four contexts)", () => {
 });
 
 // Mirrors Workspace's mount-effect wiring for the handoff into the studio shell:
-// open the Copilot pane once when a seeded prompt lands. `threadState` verifies
+// open the Ember pane once when a seeded prompt lands. `threadState` verifies
 // that the pane hook retains an existing handoff when a caller omits state.
 function HandoffProbe({
   embedded = true,
-  hasInitialCopilotMessage = true,
+  hasInitialEmberMessage = true,
   threadState = true,
 }: {
   embedded?: boolean;
-  hasInitialCopilotMessage?: boolean;
+  hasInitialEmberMessage?: boolean;
   threadState?: boolean;
 }) {
   const location = useLocation();
   const { panes, openPane } = useStudioPanes();
-  const copilotPaneOpen = panes.includes("copilot");
-  const copilotMessage = (location.state as { copilotMessage?: string } | null)
-    ?.copilotMessage;
+  const emberPaneOpen = panes.includes("copilot");
+  const emberMessage = (location.state as { emberMessage?: string } | null)
+    ?.emberMessage;
   useMountEffect(() => {
     if (
-      shouldOpenCopilotPaneForHandoff({
+      shouldOpenEmberPaneForHandoff({
         embedded,
-        hasInitialCopilotMessage,
-        copilotPaneOpen,
+        hasInitialEmberMessage,
+        emberPaneOpen,
       })
     ) {
       openPane("copilot", threadState ? { state: location.state } : undefined);
@@ -253,7 +253,7 @@ function HandoffProbe({
   return (
     <div>
       <output data-testid="panes">{panes.join(",")}</output>
-      <output data-testid="copilot-message">{copilotMessage ?? ""}</output>
+      <output data-testid="copilot-message">{emberMessage ?? ""}</output>
     </div>
   );
 }
@@ -261,7 +261,7 @@ function HandoffProbe({
 function renderHandoff(
   props: {
     embedded?: boolean;
-    hasInitialCopilotMessage?: boolean;
+    hasInitialEmberMessage?: boolean;
     threadState?: boolean;
   } = {},
   entry: string | { pathname: string; search?: string; state?: unknown } = {
@@ -282,14 +282,14 @@ function messageText(): string {
   return screen.getByTestId("copilot-message").textContent ?? "";
 }
 
-describe("Discover → Studio handoff opens the Copilot pane", () => {
-  test("a seeded handoff retains the default Copilot and Browser", () => {
+describe("Discover → Studio handoff opens the Ember pane", () => {
+  test("a seeded handoff retains the default Ember and Browser", () => {
     renderHandoff();
     expect(panesText()).toBe("copilot,browser");
   });
 
   test("no handoff prompt leaves the default panes untouched", () => {
-    renderHandoff({ hasInitialCopilotMessage: false });
+    renderHandoff({ hasInitialEmberMessage: false });
     expect(panesText()).toBe("copilot,browser");
   });
 
@@ -310,7 +310,7 @@ describe("Discover → Studio handoff opens the Copilot pane", () => {
       {
         pathname: "/workflows/wpid_1/studio",
         search: "?panes=browser",
-        state: { copilotMessage: "Fill out the contact form" },
+        state: { emberMessage: "Fill out the contact form" },
       },
     );
     expect(panesText()).toBe("browser,copilot");
@@ -323,7 +323,7 @@ describe("Discover → Studio handoff opens the Copilot pane", () => {
       {
         pathname: "/workflows/wpid_1/studio",
         search: "?panes=browser",
-        state: { copilotMessage: "Fill out the contact form" },
+        state: { emberMessage: "Fill out the contact form" },
       },
     );
     expect(panesText()).toBe("browser,copilot");
@@ -356,7 +356,7 @@ describe("narrow-viewport clamp of shared links", () => {
     expect(panesText()).toBe("copilot,editor,overview");
   });
 
-  test("live panes include Copilot from the clamped shared selection", () => {
+  test("live panes include Ember from the clamped shared selection", () => {
     renderStudio({
       path: "/workflows/wpid_1/studio?panes=copilot,editor,browser",
       stageWidth: 600,
@@ -365,7 +365,7 @@ describe("narrow-viewport clamp of shared links", () => {
     expect(livePanesText()).toBe("copilot,editor");
   });
 
-  test("clamps a deleted workflow without restoring blocked Copilot", () => {
+  test("clamps a deleted workflow without restoring blocked Ember", () => {
     renderStudio({
       path: "/workflows/wpid_1/studio?wr=wr_1",
       stageWidth: 500,
@@ -375,7 +375,7 @@ describe("narrow-viewport clamp of shared links", () => {
     expect(livePanesText()).toBe("overview");
   });
 
-  test("a Copilot-only close does not reveal a clamp-hidden run pane", () => {
+  test("an Ember-only close does not reveal a clamp-hidden run pane", () => {
     const address = "/workflows/wpid_1/studio?panes=copilot,overview#proof";
     renderStudio({ path: address, stageWidth: 300 });
     expect(panesText()).toBe("copilot");
@@ -389,7 +389,7 @@ describe("narrow-viewport clamp of shared links", () => {
     expect(addressText()).toBe(address);
   });
 
-  test("a Copilot-only reorder does not reveal a clamp-hidden run pane", () => {
+  test("an Ember-only reorder does not reveal a clamp-hidden run pane", () => {
     const address =
       "/workflows/wpid_1/studio?panes=copilot,editor,overview#proof";
     renderStudio({ path: address, stageWidth: 600 });
@@ -401,7 +401,7 @@ describe("narrow-viewport clamp of shared links", () => {
     expect(addressText()).toBe(address);
   });
 
-  test("an exact override removes clamp-hidden non-Copilot panes", () => {
+  test("an exact override removes clamp-hidden non-Ember panes", () => {
     const address =
       "/workflows/wpid_1/studio?panes=copilot,editor,overview#proof";
     renderStudio({ path: address, stageWidth: 600 });
@@ -448,7 +448,7 @@ describe("narrow-viewport nudge", () => {
   });
 });
 
-// Mirrors the Copilot credential card: the sign-in starts, and a pane showing a
+// Mirrors the Ember credential card: the sign-in starts, and a pane showing a
 // past run is sent back to the live browser by dropping ?wr=.
 function SignInProbe() {
   const navigate = useNavigate();
@@ -470,7 +470,7 @@ function SignInProbe() {
   );
 }
 
-describe("Copilot manual sign-in", () => {
+describe("Ember manual sign-in", () => {
   test("opens the Browser pane on the Edit layout", () => {
     renderStudio();
     expect(panesText()).toBe("copilot,editor");
@@ -506,7 +506,7 @@ describe("Copilot manual sign-in", () => {
     expect(panesText().split(",")).toContain("browser");
   });
 
-  // Copilot + Editor + Browser needs 868px at min widths; the clamp keeps a
+  // Ember + Editor + Browser needs 868px at min widths; the clamp keeps a
   // leading prefix, so Browser must not sit last.
   test("keeps the Browser pane through a narrow-stage re-resolve", () => {
     render(
@@ -546,8 +546,8 @@ describe("Copilot manual sign-in", () => {
   });
 });
 
-// Mirrors the Copilot chat focusing the test run its turn just started.
-function CopilotRunProbe() {
+// Mirrors the Ember chat focusing the test run its turn just started.
+function EmberRunProbe() {
   const switchRun = useSwitchStudioRun({ replace: true, systemFocus: true });
   const userSwitchRun = useSwitchStudioRun();
   const { reopenEditor } = useStudioPaneDefaults();
@@ -560,9 +560,9 @@ function CopilotRunProbe() {
   );
 }
 
-// The Workspace's Copilot update entry, on an agent that opened with no blocks.
-function CopilotDraftProbe() {
-  const onWorkflowUpdate = useWorkspaceCopilotUpdate({
+// The Workspace's Ember update entry, on an agent that opened with no blocks.
+function EmberDraftProbe() {
+  const onWorkflowUpdate = useWorkspaceEmberUpdate({
     applyWorkflowUpdate: () => true,
     embedded: true,
     initialBlockCount: 0,
@@ -590,12 +590,12 @@ function CopilotDraftProbe() {
   );
 }
 
-describe("first Copilot draft on a blank agent", () => {
+describe("first Ember draft on a blank agent", () => {
   test("opens Editor once the draft has blocks", () => {
     renderStudio({
       path: "/workflows/wpid_1/studio?via=discover",
       hasBlocks: false,
-      children: <CopilotDraftProbe />,
+      children: <EmberDraftProbe />,
     });
     expect(panesText()).toBe("copilot,browser");
     fireEvent.click(screen.getByText("empty-draft-lands"));
@@ -610,8 +610,8 @@ describe("first Copilot draft on a blank agent", () => {
       hasBlocks: false,
       children: (
         <>
-          <CopilotRunProbe />
-          <CopilotDraftProbe />
+          <EmberRunProbe />
+          <EmberDraftProbe />
         </>
       ),
     });
@@ -625,7 +625,7 @@ describe("first Copilot draft on a blank agent", () => {
     renderStudio({
       path: "/workflows/wpid_1/studio?via=discover",
       hasBlocks: false,
-      children: <CopilotDraftProbe />,
+      children: <EmberDraftProbe />,
     });
     fireEvent.click(screen.getByText("draft-lands"));
     fireEvent.click(screen.getByText("close-editor"));
@@ -634,19 +634,19 @@ describe("first Copilot draft on a blank agent", () => {
   });
 });
 
-describe("Copilot test run", () => {
+describe("Ember test run", () => {
   test("opens the Browser pane on the Edit layout", () => {
-    renderStudio({ children: <CopilotRunProbe /> });
+    renderStudio({ children: <EmberRunProbe /> });
     expect(panesText()).toBe("copilot,editor");
     fireEvent.click(screen.getByText("copilot-run-started"));
     expect(addressText()).toBe("/workflows/wpid_1/studio?wr=wr_1&wrs=copilot");
     expect(panesText()).toBe("copilot,editor,browser");
   });
 
-  // #18330's narrow-stage rule: Copilot + Editor + Browser needs 868px at min
+  // #18330's narrow-stage rule: Ember + Editor + Browser needs 868px at min
   // widths, so the run's Browser displaces Editor instead of cramping all three.
-  test("keeps Copilot + Browser on a narrow stage", () => {
-    renderStudio({ stageWidth: 800, children: <CopilotRunProbe /> });
+  test("keeps Ember + Browser on a narrow stage", () => {
+    renderStudio({ stageWidth: 800, children: <EmberRunProbe /> });
     expect(panesText()).toBe("copilot,editor");
     fireEvent.click(screen.getByText("copilot-run-started"));
     expect(panesText()).toBe("copilot,browser");
@@ -656,7 +656,7 @@ describe("Copilot test run", () => {
   });
 
   test("reopens Editor in its slot when the run ends on a narrow stage", () => {
-    renderStudio({ stageWidth: 800, children: <CopilotRunProbe /> });
+    renderStudio({ stageWidth: 800, children: <EmberRunProbe /> });
     fireEvent.click(screen.getByText("copilot-run-started"));
     expect(panesText()).toBe("copilot,browser");
     fireEvent.click(screen.getByText("copilot-run-ended"));
@@ -668,19 +668,19 @@ describe("Copilot test run", () => {
     renderStudio({
       path: "/workflows/wpid_1/studio?via=discover",
       hasBlocks: false,
-      children: <CopilotRunProbe />,
+      children: <EmberRunProbe />,
     });
     expect(panesText()).toBe("copilot,browser");
     fireEvent.click(screen.getByText("copilot-run-ended"));
     expect(panesText()).toBe("copilot,browser,editor");
   });
 
-  test("shows Editor on a stage too narrow for Copilot beside it", () => {
+  test("shows Editor on a stage too narrow for Ember beside it", () => {
     renderStudio({
       path: "/workflows/wpid_1/studio?via=discover",
       hasBlocks: false,
       stageWidth: 400,
-      children: <CopilotRunProbe />,
+      children: <EmberRunProbe />,
     });
     expect(panesText()).toBe("copilot");
     fireEvent.click(screen.getByText("copilot-run-ended"));
@@ -688,7 +688,7 @@ describe("Copilot test run", () => {
   });
 
   test("leaves a Browser-only layout the user chose mid-run alone", () => {
-    renderStudio({ stageWidth: 800, children: <CopilotRunProbe /> });
+    renderStudio({ stageWidth: 800, children: <EmberRunProbe /> });
     fireEvent.click(screen.getByText("copilot-run-started"));
     expect(panesText()).toBe("copilot,browser");
     fireEvent.click(screen.getByText("user-shows-browser-only"));
@@ -697,7 +697,7 @@ describe("Copilot test run", () => {
   });
 
   test("leaves Editor closed when the user closed it during the session", () => {
-    renderStudio({ children: <CopilotRunProbe /> });
+    renderStudio({ children: <EmberRunProbe /> });
     fireEvent.click(screen.getByText("copilot-run-started"));
     fireEvent.click(screen.getByText("toggle-editor"));
     expect(panesText()).toBe("copilot,browser");
@@ -706,7 +706,7 @@ describe("Copilot test run", () => {
   });
 
   test("leaves Editor closed after the user closes it with the pane's close button", () => {
-    renderStudio({ children: <CopilotRunProbe /> });
+    renderStudio({ children: <EmberRunProbe /> });
     fireEvent.click(screen.getByText("close-editor"));
     fireEvent.click(screen.getByText("copilot-run-started"));
     fireEvent.click(screen.getByText("copilot-run-ended"));
@@ -714,7 +714,7 @@ describe("Copilot test run", () => {
   });
 
   test("reopens Editor again once anything has reopened it since the user's close", () => {
-    renderStudio({ stageWidth: 800, children: <CopilotRunProbe /> });
+    renderStudio({ stageWidth: 800, children: <EmberRunProbe /> });
     fireEvent.click(screen.getByText("toggle-editor"));
     fireEvent.click(screen.getByText("open-editor"));
     fireEvent.click(screen.getByText("copilot-run-started"));
@@ -724,7 +724,7 @@ describe("Copilot test run", () => {
   });
 
   test("keeps a user's Editor close across a run they switch to", () => {
-    renderStudio({ children: <CopilotRunProbe /> });
+    renderStudio({ children: <EmberRunProbe /> });
     fireEvent.click(screen.getByText("toggle-editor"));
     fireEvent.click(screen.getByText("copilot-run-started"));
     fireEvent.click(screen.getByText("user-opens-run"));
@@ -734,7 +734,7 @@ describe("Copilot test run", () => {
   });
 
   test("leaves a cramped layout with Browser already open alone", () => {
-    renderStudio({ stageWidth: 800, children: <CopilotRunProbe /> });
+    renderStudio({ stageWidth: 800, children: <EmberRunProbe /> });
     fireEvent.click(screen.getByText("open-browser"));
     expect(panesText()).toBe("copilot,editor,browser");
     fireEvent.click(screen.getByText("copilot-run-started"));
@@ -750,7 +750,7 @@ describe("Copilot test run", () => {
       renderStudio({
         path: "/workflows/wpid_1/studio?panes=copilot,overview",
         stageWidth,
-        children: <CopilotRunProbe />,
+        children: <EmberRunProbe />,
       });
       fireEvent.click(screen.getByText("copilot-run-started"));
       expect(panesText()).toBe(expected);
@@ -761,7 +761,7 @@ describe("Copilot test run", () => {
     renderStudio({
       path: "/workflows/wpid_1/studio?panes=editor,copilot",
       stageWidth: 800,
-      children: <CopilotRunProbe />,
+      children: <EmberRunProbe />,
     });
     fireEvent.click(screen.getByText("copilot-run-started"));
     expect(panesText()).toBe("copilot,browser");
@@ -772,7 +772,7 @@ describe("Copilot test run", () => {
   test("keeps a pane order the user arranged", () => {
     renderStudio({
       path: "/workflows/wpid_1/studio?panes=editor,copilot",
-      children: <CopilotRunProbe />,
+      children: <EmberRunProbe />,
     });
     fireEvent.click(screen.getByText("copilot-run-started"));
     expect(panesText()).toBe("editor,copilot,browser");
@@ -781,14 +781,14 @@ describe("Copilot test run", () => {
   test("leaves an open Browser pane where it is", () => {
     renderStudio({
       path: "/workflows/wpid_1/studio?panes=browser,copilot",
-      children: <CopilotRunProbe />,
+      children: <EmberRunProbe />,
     });
     fireEvent.click(screen.getByText("copilot-run-started"));
     expect(panesText()).toBe("browser,copilot");
   });
 
   test("a run during a narrow-stage sign-in keeps the sign-in layout", () => {
-    renderStudio({ stageWidth: 800, children: <CopilotRunProbe /> });
+    renderStudio({ stageWidth: 800, children: <EmberRunProbe /> });
     act(() => {
       useManualSignInStore.getState().setBrowserSessionId("pbs_1");
     });
@@ -798,7 +798,7 @@ describe("Copilot test run", () => {
     expect(panesText()).toBe(signInPanes);
   });
 
-  test("a reload of a Copilot-focused run keeps the Edit panes", () => {
+  test("a reload of an Ember-focused run keeps the Edit panes", () => {
     renderStudio({ path: "/workflows/wpid_1/studio?wr=wr_1&wrs=copilot" });
     expect(panesText()).toBe("copilot,editor");
   });

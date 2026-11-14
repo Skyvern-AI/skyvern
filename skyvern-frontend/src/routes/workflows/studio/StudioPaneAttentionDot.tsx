@@ -1,6 +1,6 @@
 import { cn } from "@/util/utils";
 
-/** Pulsing corner dot on a pane control: new Browser activity, or Copilot waiting on the person. */
+/** Pulsing corner dot on a pane control: new Browser activity, or Ember waiting on the person. */
 export function StudioPaneAttentionDot({
   tone,
   title,

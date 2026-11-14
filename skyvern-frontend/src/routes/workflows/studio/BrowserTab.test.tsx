@@ -252,7 +252,7 @@ function renderBrowserPane(initialPath: string) {
       <TooltipProvider delayDuration={0}>
         <StudioShellContext.Provider
           value={{
-            copilotPortalEl: null,
+            emberPortalEl: null,
             setEditorStreamSlot: () => {},
             setBrowserStreamSlot,
             setRunStreamSlot: () => {},
@@ -575,7 +575,7 @@ describe("BrowserTab view machine", () => {
     expect(screen.getByTestId("hero-recording")).toBeTruthy();
   });
 
-  it("keeps a finished Copilot-focused run that ran in the debug session on the live debug browser", () => {
+  it("keeps a finished Ember-focused run that ran in the debug session on the live debug browser", () => {
     seedRun({ status: Status.Completed, browserSessionId: "pbs_test" });
     mocks.timeline = [
       buildBlockItem(
@@ -592,7 +592,7 @@ describe("BrowserTab view machine", () => {
     expect(screen.queryByTestId("hero-screenshot")).toBeNull();
   });
 
-  it("replays a finished Copilot-focused run that ran in its own browser", () => {
+  it("replays a finished Ember-focused run that ran in its own browser", () => {
     seedRun({
       status: Status.Completed,
       browserSessionId: "pbs_run",
@@ -605,24 +605,24 @@ describe("BrowserTab view machine", () => {
     expect(screen.queryByTestId("browser-pane-stream-slot")).toBeNull();
   });
 
-  it("shows the debug browser live while Copilot works in it over a failed run", () => {
+  it("shows the debug browser live while Ember works in it over a failed run", () => {
     seedRun({
       status: Status.Failed,
       browserSessionId: "pbs_run",
       recordingUrl: "https://r.test/1.mp4",
     });
     mocks.debugSession = { browser_session_id: "pbs_test" };
-    useStudioBrowserStore.setState({ copilotTurnActive: true });
+    useStudioBrowserStore.setState({ emberTurnActive: true });
     renderBrowserPane(`${STUDIO_PATH}&wr=wr_1&wrs=pbs_test`);
 
     expect(screen.getByTestId("browser-pane-stream-slot")).toBeTruthy();
     expect(screen.queryByTestId("run-live-stream")).toBeNull();
   });
 
-  it("names Copilot's browser while the run it focused is not finished", () => {
+  it("names Ember's browser while the run it focused is not finished", () => {
     seedRun({ status: Status.Running, browserSessionId: "pbs_run" });
     mocks.debugSession = { browser_session_id: "pbs_test" };
-    useStudioBrowserStore.setState({ copilotTurnActive: true });
+    useStudioBrowserStore.setState({ emberTurnActive: true });
     renderBrowserPane(`${STUDIO_PATH}&wr=wr_1&wrs=pbs_test`);
 
     expect(screen.getByTestId("browser-pane-stream-slot")).toBeTruthy();
@@ -637,7 +637,7 @@ describe("BrowserTab view machine", () => {
     ["names a browser the studio cannot show", "pbs_other", true],
     ["is left over from a turn that is no longer running", "pbs_test", false],
   ])(
-    "keeps the failed run's replay when the Copilot pin %s",
+    "keeps the failed run's replay when the Ember pin %s",
     (_case, pinned, turnActive) => {
       seedRun({
         status: Status.Failed,
@@ -645,7 +645,7 @@ describe("BrowserTab view machine", () => {
         recordingUrl: "https://r.test/1.mp4",
       });
       mocks.debugSession = { browser_session_id: "pbs_test" };
-      useStudioBrowserStore.setState({ copilotTurnActive: turnActive });
+      useStudioBrowserStore.setState({ emberTurnActive: turnActive });
       renderBrowserPane(`${STUDIO_PATH}&wr=wr_1&wrs=${pinned}`);
 
       expect(screen.getByTestId("hero-screenshot")).toBeTruthy();
@@ -654,7 +654,7 @@ describe("BrowserTab view machine", () => {
     },
   );
 
-  it("streams a finished run's own browser while Copilot inspects it there", async () => {
+  it("streams a finished run's own browser while Ember inspects it there", async () => {
     seedRun({
       status: Status.Failed,
       browserSessionId: "pbs_run",
@@ -665,7 +665,7 @@ describe("BrowserTab view machine", () => {
       browser_session_id: "pbs_run",
       completed_at: null,
     };
-    useStudioBrowserStore.setState({ copilotTurnActive: true });
+    useStudioBrowserStore.setState({ emberTurnActive: true });
     renderBrowserPane(`${STUDIO_PATH}&wr=wr_1&wrs=pbs_run`);
 
     await waitFor(() =>
@@ -681,7 +681,7 @@ describe("BrowserTab view machine", () => {
     ).toBe("true");
   });
 
-  it("keeps the replay when Copilot names a finished run's browser that has closed", async () => {
+  it("keeps the replay when Ember names a finished run's browser that has closed", async () => {
     seedRun({
       status: Status.Failed,
       browserSessionId: "pbs_run",
@@ -692,7 +692,7 @@ describe("BrowserTab view machine", () => {
       browser_session_id: "pbs_run",
       completed_at: "2026-09-24T12:05:00",
     };
-    useStudioBrowserStore.setState({ copilotTurnActive: true });
+    useStudioBrowserStore.setState({ emberTurnActive: true });
     const { queryClient } = renderBrowserPane(
       `${STUDIO_PATH}&wr=wr_1&wrs=pbs_run`,
     );
@@ -1116,7 +1116,7 @@ describe("BrowserTab view machine", () => {
 });
 
 describe("BrowserTab pills and selection sync", () => {
-  it("keeps explicit view controls authoritative during Copilot focus", () => {
+  it("keeps explicit view controls authoritative during Ember focus", () => {
     seedRun({
       status: Status.Completed,
       browserSessionId: "pbs_test",

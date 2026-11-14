@@ -45,8 +45,8 @@ describe("WorkflowComparisonPanel diff summary", () => {
       <WorkflowComparisonPanel
         version1={version("Current")}
         version2={version("Copilot Suggestion", [block])}
-        mode="copilot"
-        onCopilotReviewClose={vi.fn()}
+        mode="ember"
+        onEmberReviewClose={vi.fn()}
       />,
     );
 
@@ -57,10 +57,10 @@ describe("WorkflowComparisonPanel diff summary", () => {
   });
 });
 
-describe("WorkflowComparisonPanel copilot review actions", () => {
+describe("WorkflowComparisonPanel Ember review actions", () => {
   test("a second click while Accept is settling does not settle again", async () => {
     let finish: () => void = () => {};
-    const onCopilotReviewClose = vi.fn(
+    const onEmberReviewClose = vi.fn(
       () =>
         new Promise<void>((resolve) => {
           finish = resolve;
@@ -71,8 +71,8 @@ describe("WorkflowComparisonPanel copilot review actions", () => {
       <WorkflowComparisonPanel
         version1={version("Current")}
         version2={version("Copilot Suggestion")}
-        mode="copilot"
-        onCopilotReviewClose={onCopilotReviewClose}
+        mode="ember"
+        onEmberReviewClose={onEmberReviewClose}
       />,
     );
 
@@ -86,8 +86,8 @@ describe("WorkflowComparisonPanel copilot review actions", () => {
       fireEvent.keyDown(window, { key: "Escape" });
     });
 
-    expect(onCopilotReviewClose).toHaveBeenCalledTimes(1);
-    expect(onCopilotReviewClose).toHaveBeenCalledWith("approve");
+    expect(onEmberReviewClose).toHaveBeenCalledTimes(1);
+    expect(onEmberReviewClose).toHaveBeenCalledWith("approve");
     expect(accept).toHaveProperty("disabled", true);
     expect(reject).toHaveProperty("disabled", true);
 

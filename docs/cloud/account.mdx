@@ -119,7 +119,7 @@ curl https://api.skyvern.com/.well-known/oauth-protected-resource
 
 The server advertises the scopes `openid`, `profile`, `email`, `public_metadata`, `private_metadata`, `offline_access` and `user:org:read`; the MCP server's metadata narrows them to `profile` and `email`. These are identity scopes, not API permissions (see [Permissions](#permissions)).
 
-Access tokens expire and can be refreshed when you request `offline_access`. A refresh token works once and is replaced on every exchange; replaying an old one revokes the whole token family. Every refresh also re-checks the role of the person who authorized the client: once they leave the organization or their role changes, the refresh fails with `invalid_grant`, the whole token family is revoked, and the client has to sign in again. Revoking the organization's API key also invalidates tokens issued against it.
+Access tokens expire and can be refreshed when you request `offline_access`. A refresh token works once and is replaced on every exchange; replaying an old one revokes the whole token family. Every refresh also re-checks the person who authorized the client: once they leave the organization, become a Billing Admin, or, in an organization, the client doesn't hold the key bound to them, the refresh fails with `invalid_grant`, the whole token family is revoked, and the client has to sign in again. Revoking the organization's API key also invalidates tokens issued against it.
 
 ### Permissions
 
@@ -128,7 +128,7 @@ Access tokens expire and can be refreshed when you request `offline_access`. A r
 Every credential belongs to one organization and reaches only that organization's agents, runs, credentials and data. A request can't read or change another organization's resources.
 
 - The organization API key can call every endpoint your organization can reach. There are no read-only, per-endpoint or per-agent keys.
-- An OAuth token acts as the person who signed in, in their organization, with their [role](#roles). Its OAuth scopes (`profile`, `email` and the like) describe who signed in. They don't limit what the token can do. An MCP client a Member signs in to gets a key bound to that Member, which can't read or rotate the organization's API key.
+- An OAuth token acts as the person who signed in, in their organization, with their [role](#roles). Its OAuth scopes (`profile`, `email` and the like) describe who signed in. They don't limit what the token can do. When anyone in an organization, Admin or Member, signs in to an MCP client, the client gets a key bound to that person, which can't read or rotate the organization's API key. Through that key an Admin can't use the actions that stay Admin-only whether or not role-based access control is on (see [Roles](#roles)); those need a signed-in session.
 - MCP tool scopes (`operate`, `build`, `browser`, `lean`, `all`) only change which tools a client sees. They are not a security boundary.
 - Usage from any credential is billed to the organization.
 
@@ -154,7 +154,7 @@ These limits also apply whether or not you enable role-based access control:
 - A browser session alone can't perform admin-only actions; those need a signed-in session.
 
 <Warning>
-Until an Admin turns on role-based access control, every Admin and Member can get the organization API key, from **Settings → API keys** or by signing in to the CLI. A Member's MCP sign-in doesn't return it. The key can do everything an Admin can except manage API keys, event triggers and member roles. Until then, treat every Admin and Member as able to use the API with full access, and use separate organizations where people must be kept apart.
+Until an Admin turns on role-based access control, every Admin and Member can get the organization API key, from **Settings → API keys** or by signing in to the CLI. An MCP sign-in, by an Admin or a Member, doesn't return it. The key can do everything an Admin can except manage API keys, event triggers and member roles. Until then, treat every Admin and Member as able to use the API with full access, and use separate organizations where people must be kept apart.
 </Warning>
 
 ### API versions and deprecations

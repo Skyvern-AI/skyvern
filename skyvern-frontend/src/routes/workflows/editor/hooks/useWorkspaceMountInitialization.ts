@@ -7,7 +7,7 @@ import {
   selectEditorMutationLocked,
   useWorkflowYamlEditorStore,
 } from "@/store/WorkflowYamlEditorStore";
-import { canonicalRecoveriesByWorkflow } from "../../copilot/WorkflowCopilotChat";
+import { canonicalRecoveriesByWorkflow } from "../../ember/EmberChat";
 
 import { useMountEffect } from "@/hooks/useMountEffect";
 
@@ -24,7 +24,7 @@ type WorkspaceMountInitializationOptions = {
 export function useWorkspaceDeferredEditCleanup(workflowId: string) {
   useEffect(() => {
     return () => {
-      // Copilot parks recovery in layout cleanup, before this passive cleanup.
+      // Ember parks recovery in layout cleanup, before this passive cleanup.
       // A remounted recovery may hold a lock or still be waiting for one.
       const state = useWorkflowYamlEditorStore.getState();
       const scalarLockBlocksCleanup =

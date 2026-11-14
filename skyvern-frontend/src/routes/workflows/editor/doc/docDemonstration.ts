@@ -1,4 +1,4 @@
-import type { WorkflowCopilotDemonstrationInsertion } from "../../copilot/workflowCopilotTypes";
+import type { EmberDemonstrationInsertion } from "../../ember/emberTypes";
 import type { DocItem } from "./buildDocTree";
 
 /**
@@ -9,7 +9,7 @@ import type { DocItem } from "./buildDocTree";
 export function demonstrationLineIndex(
   items: DocItem[],
   labelOf: (nodeId: string) => string | undefined,
-  insertion: WorkflowCopilotDemonstrationInsertion | null,
+  insertion: EmberDemonstrationInsertion | null,
 ): number {
   const stepAt = (label: string | null | undefined) =>
     label

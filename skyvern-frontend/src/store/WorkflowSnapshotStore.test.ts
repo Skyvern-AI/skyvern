@@ -308,8 +308,8 @@ describe("WorkflowSnapshotStore absorbs pre-first-edit materialization", () => {
   });
 });
 
-describe("WorkflowSnapshotStore markUserEdit (Copilot / gesture-less edits)", () => {
-  // A Copilot build lands async, outside the gesture window, so its change would
+describe("WorkflowSnapshotStore markUserEdit (Ember / gesture-less edits)", () => {
+  // An Ember build lands async, outside the gesture window, so its change would
   // be classified non-user-driven. markUserEdit is the source-level signal that
   // keeps it from being absorbed, so the dot lights and the summary itemizes it.
   it("surfaces a later non-user change instead of absorbing it", () => {
@@ -319,7 +319,7 @@ describe("WorkflowSnapshotStore markUserEdit (Copilot / gesture-less edits)", ()
     useWorkflowSnapshotStore.getState().markUserEdit();
     expect(useWorkflowSnapshotStore.getState().userHasEdited).toBe(true);
 
-    // Copilot mutates the canvas (no gesture) — must surface, not be absorbed.
+    // Ember mutates the canvas (no gesture) — must surface, not be absorbed.
     setDraft([
       block("a", { url: "x" }),
       block("b", { block_type: "code", code: "# copilot" }),
@@ -328,9 +328,9 @@ describe("WorkflowSnapshotStore markUserEdit (Copilot / gesture-less edits)", ()
     expect(useWorkflowSnapshotStore.getState().contentDirty).toBe(true);
   });
 
-  it("captures a pre-change baseline when a Copilot build is the first edit", () => {
+  it("captures a pre-change baseline when an Ember build is the first edit", () => {
     // No gesture yet → snapshot is null. markUserEdit freezes the current
-    // (pre-Copilot) draft so the build diffs against it.
+    // (pre-Ember) draft so the build diffs against it.
     expect(useWorkflowSnapshotStore.getState().snapshot).toBeNull();
     setDraft([block("a", { url: "x" })]);
     useWorkflowSnapshotStore.getState().markUserEdit();
