@@ -199,7 +199,6 @@ function startNode(
       errorCodeMapping: null,
       retryPolicy: null,
       label: "__start_block__",
-      showCode: false,
       ...overrides,
     },
   };

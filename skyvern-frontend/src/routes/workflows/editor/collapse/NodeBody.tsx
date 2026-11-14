@@ -15,10 +15,8 @@ type Props = {
 };
 
 // Chrome compositing layer staleness: after the `collapsible-down` keyframe
-// ends, the body's content can render into a parent compositing layer that
-// is promoted by Flippable's `transform-style: preserve-3d` plus the outer
-// block's `transition-all`. The painted snapshot is stale until any
-// subsequent interaction forces a recomposite.
+// ends, the body's content can keep a stale painted snapshot until an
+// interaction forces a recomposite.
 function forceRecomposite(el: HTMLElement) {
   const originalTransform = el.style.transform;
   el.style.transform = originalTransform

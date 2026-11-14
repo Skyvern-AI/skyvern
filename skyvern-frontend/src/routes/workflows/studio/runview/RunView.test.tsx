@@ -64,8 +64,6 @@ import { RunView } from "./RunView";
 const mocks = vi.hoisted(() => ({
   workflowRun: undefined as unknown,
   timeline: undefined as unknown,
-  fallbackEpisodes: undefined as unknown,
-  blockScripts: undefined as unknown,
   onboarding: null as null | {
     recoveryGuidanceAssignment: {
       organization_id: string;
@@ -75,13 +73,10 @@ const mocks = vi.hoisted(() => ({
     } | null;
   },
   recoverySurfaceEnabled: false,
-  codeGenerating: false,
   isPlaceholderData: false,
   statusUnavailable: false,
   refetchRunStatus: vi.fn(),
   refreshOnboarding: vi.fn(),
-  fallbackEpisodesQuery: vi.fn(),
-  blockScriptsQuery: vi.fn(),
   posthogCapture: vi.fn(),
 }));
 const { getSpy } = vi.hoisted(() => ({ getSpy: vi.fn() }));
@@ -113,44 +108,11 @@ vi.mock("../../hooks/useRefreshOnboardingOnRunCompletion", () => ({
   useRefreshOnboardingOnRunCompletion: (run: unknown) =>
     mocks.refreshOnboarding(run),
 }));
-vi.mock("../../hooks/useFallbackEpisodesQuery", () => ({
-  useFallbackEpisodesQuery: (options: unknown) => {
-    mocks.fallbackEpisodesQuery(options);
-    return { data: mocks.fallbackEpisodes };
-  },
-}));
-vi.mock("../../hooks/useBlockScriptsQuery", () => ({
-  useBlockScriptsQuery: (options: unknown) => {
-    mocks.blockScriptsQuery(options);
-    return { data: mocks.blockScripts };
-  },
-}));
 vi.mock("@/store/onboarding/useOnboardingState", () => ({
   useOnboardingStateOptional: () => mocks.onboarding,
 }));
 vi.mock("@/hooks/useFeatureFlag", () => ({
   useFeatureFlag: () => mocks.recoverySurfaceEnabled,
-}));
-vi.mock("../../workflowRun/ScriptUpdateCard", () => ({
-  ScriptUpdateCard: ({
-    episodes,
-    scriptId,
-  }: {
-    episodes: unknown[];
-    scriptId?: string | null;
-  }) => (
-    <div
-      data-testid="script-update-card"
-      data-episode-count={episodes.length}
-      data-script-id={scriptId}
-    />
-  ),
-}));
-vi.mock("../../editor/hooks/useIsGeneratingCode", () => ({
-  useIsGeneratingCode: () => mocks.codeGenerating,
-}));
-vi.mock("../../workflowRun/WorkflowRunCode", () => ({
-  WorkflowRunCode: () => <div data-testid="workflow-run-code" />,
 }));
 vi.mock("../../workflowRun/WorkflowRunVerificationCodeForm", () => ({
   WorkflowRunVerificationCodeForm: () => null,
@@ -507,17 +469,12 @@ afterEach(() => {
   cleanup();
   mocks.workflowRun = undefined;
   mocks.timeline = undefined;
-  mocks.fallbackEpisodes = undefined;
-  mocks.blockScripts = undefined;
   mocks.onboarding = null;
   mocks.recoverySurfaceEnabled = false;
-  mocks.codeGenerating = false;
   mocks.isPlaceholderData = false;
   mocks.statusUnavailable = false;
   mocks.refetchRunStatus.mockReset();
   mocks.refreshOnboarding.mockReset();
-  mocks.fallbackEpisodesQuery.mockReset();
-  mocks.blockScriptsQuery.mockReset();
   mocks.posthogCapture.mockReset();
 });
 beforeEach(() => {
@@ -604,37 +561,6 @@ describe("RunView legacy run-page parity", () => {
       ),
     );
   });
-
-  test("shows the fallback script update with the published script id", () => {
-    seedCompletedRun({
-      workflow: {
-        workflow_permanent_id: "wpid_1",
-        cache_key: "cache-key",
-        deleted_at: null,
-        workflow_definition: { blocks: [], finally_block_label: null },
-      },
-    });
-    mocks.fallbackEpisodes = {
-      episodes: [
-        {
-          episode_id: "episode_1",
-          new_script_revision_id: "revision_2",
-        },
-      ],
-    };
-    mocks.blockScripts = { script_id: "script_1" };
-
-    renderRunView({}, "/?panes=overview");
-
-    const scriptUpdateCard = screen.getByTestId("script-update-card");
-    expect(scriptUpdateCard.getAttribute("data-episode-count")).toBe("1");
-    expect(scriptUpdateCard.getAttribute("data-script-id")).toBe("script_1");
-    expect(mocks.fallbackEpisodesQuery).toHaveBeenCalledWith({
-      workflowPermanentId: "wpid_1",
-      workflowRunId: "wr_1",
-      enabled: true,
-    });
-  });
 });
 
 describe("RunView view toggles", () => {
@@ -696,13 +622,12 @@ describe("RunView view toggles", () => {
 
   test("opens and replaces the run subview requested by a legacy deep link", async () => {
     seedCompletedRun();
-    const { container } = renderRunView(
+    renderRunView(
       {},
-      "/?panes=overview&view=code&active=wrb_loop&iteration=2",
+      "/?panes=overview&view=outputs&active=wrb_loop&iteration=2",
     );
 
-    expect(within(container).queryByTestId("workflow-run-code")).not.toBeNull();
-    expect(useRunPaneViewStore.getState().view).toBe("code");
+    expect(useRunPaneViewStore.getState().view).toBe("outputs");
     expect(useRunViewStore.getState().pinnedFrameId).toBe("wrb_loop");
     expect(useRunViewStore.getState().activeIteration).toBe(2);
 
@@ -719,6 +644,14 @@ describe("RunView view toggles", () => {
         "view=timeline",
       );
     });
+  });
+
+  test("a link to the removed code view lands on the timeline", () => {
+    seedCompletedRun();
+    act(() => useRunPaneViewStore.getState().setView("outputs"));
+    renderRunView({}, "/?panes=overview&view=code");
+
+    expect(useRunPaneViewStore.getState().view).toBe("timeline");
   });
 
   test("reapplies the requested view when switching runs", () => {
@@ -829,7 +762,7 @@ describe("RunView view toggles", () => {
       pageSlots,
     );
     expect(overview.queryByTestId("milestone-card")).not.toBeNull();
-    for (const view of ["inputs", "outputs", "code"] as const) {
+    for (const view of ["inputs", "outputs"] as const) {
       act(() => useRunPaneViewStore.getState().setView(view));
       overview.rerenderRunView();
       expect(overview.queryByTestId("milestone-card")).not.toBeNull();
@@ -1079,35 +1012,6 @@ describe("RunView view toggles", () => {
     expect(scope.getByText("Webhook URL")).not.toBeNull();
     expect(scope.queryByText("TOTP URL")).toBeNull();
     expect(scope.queryByText("TOTP identifier")).toBeNull();
-  });
-
-  test("the '…' menu's Code item renders the shared WorkflowRunCode surface", async () => {
-    seedCompletedRun();
-    const { container } = renderRunView();
-    const scope = within(container);
-
-    expect(scope.queryByTestId("workflow-run-code")).toBeNull();
-    // The Code view lives in the header's "…" overflow menu, not a toggle.
-    fireEvent.pointerDown(scope.getByRole("button", { name: "More views" }), {
-      button: 0,
-      ctrlKey: false,
-    });
-    fireEvent.click(await screen.findByRole("menuitem", { name: "Code" }));
-    expect(scope.queryByTestId("workflow-run-code")).not.toBeNull();
-    // The menu trigger exposes aria-pressed while Code is the active view,
-    // matching the sibling view toggles.
-    expect(
-      scope.getByRole("button", { name: "More views", pressed: true }),
-    ).not.toBeNull();
-  });
-
-  test("the '…' trigger shows a spinner while cached code is generating", () => {
-    seedCompletedRun();
-    mocks.codeGenerating = true;
-    const { container } = renderRunView();
-    const scope = within(container);
-
-    expect(scope.queryByTestId("code-generating-spinner")).not.toBeNull();
   });
 
   test("Inputs and Outputs stay visible without data and show empty states", () => {

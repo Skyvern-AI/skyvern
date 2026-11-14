@@ -18,6 +18,15 @@ class FileInfo(BaseModel):
     artifact_id: str | None = Field(None, description="Artifact row id for refresh-on-read")
 
 
+class UploadedFileSignedUrl(BaseModel):
+    file_id: str
+    signed_url: str
+    expires_at: int | None = Field(
+        ..., description="Unix seconds after which the URL should not be used; null when it does not expire"
+    )
+    content_type: str = Field(..., description="The sniffed raster image type")
+
+
 class UploadedFile(BaseModel):
     """A file uploaded through ``POST /v1/upload_file``.
 

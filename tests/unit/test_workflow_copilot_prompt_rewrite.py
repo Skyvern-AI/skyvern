@@ -15,11 +15,6 @@ from skyvern.cli.mcp_tools.blocks import _parse_knowledge_topics, skyvern_block_
 from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.copilot.agent import _build_dynamic_system_prompt, _build_tool_usage_guide
-from skyvern.forge.sdk.copilot.code_block_security import (
-    CodeBlockSecurityInput,
-    author_time_code_security_errors,
-    runtime_code_security_errors,
-)
 from skyvern.forge.sdk.copilot.config import (
     AGENT_BLOCKS_ONLY,
     ALL_BLOCK_FAMILIES,
@@ -37,6 +32,11 @@ from skyvern.forge.sdk.copilot.tools.banned_blocks import (
 from skyvern.forge.sdk.copilot.tools.mcp_hooks import (
     _get_block_schema_post_hook,
     _get_workflow_knowledge_post_hook,
+)
+from skyvern.forge.sdk.workflow.code_block_security import (
+    CodeBlockSecurityInput,
+    author_time_code_security_errors,
+    runtime_code_security_errors,
 )
 from skyvern.schemas.workflows import AGENT_STEP_BLOCK_SUMMARY, CodeBlockYAML
 from tests.unit.copilot_test_helpers import make_copilot_ctx

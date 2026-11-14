@@ -42,7 +42,7 @@ LEGACY_TOOL_MANIFEST_DIGESTS = {
     # action deadline returns TIMEOUT. Description text only; the schemas are unchanged.
     "skyvern_clipboard_read": "57fda3c1e8126f99ee6d6654110cfad6fdd34f4508b3310dd4be56105e91a226",
     "skyvern_clipboard_write": "b7260b36ed2efcfcb307cca50ed327c59c8f18acc07490aa8851dc9d2b98c772",
-    "skyvern_code_block_lint": "bfe1a5c65f9f7769b53029064aa127c54abc501d991a1c7d5fe8879e38b4f152",
+    "skyvern_code_block_lint": "87daa03c115c13b22bc65c38e2e44e00ba9ad457c144bbecd92c95083bfd3493",
     # Re-frozen against main: #14971 (SKY-13929) changed a param description upstream. Not a lean-scope change.
     "skyvern_code_block_synthesize": "c707c194228d1c60625d662c975b478f222ef5e70f108ae9dc6a9fae9e41ab59",
     "skyvern_console_messages": "9ae534a61acf10fec6fae84dfdcda100e0f97cc8febbdfe7a73f82fcf37d07fa",

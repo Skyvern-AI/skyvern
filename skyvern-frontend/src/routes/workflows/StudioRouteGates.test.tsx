@@ -64,7 +64,7 @@ describe("WorkflowRunRoute", () => {
     ["output", "timeline", "overview,browser"],
     ["parameters", "timeline", "overview,browser"],
     ["recording", "recording", "browser,overview"],
-    ["code", "code", "overview,browser"],
+    ["code", "timeline", "overview,browser"],
   ])("preserves the legacy %s subview", (legacySubview, studioView, panes) => {
     render(
       <MemoryRouter
@@ -185,7 +185,7 @@ describe("WorkflowRunRoute", () => {
     );
 
     expect(screen.getByTestId("location").textContent).toBe(
-      "/runs/wr_1?embed=true&panes=browser&view=code",
+      "/runs/wr_1?embed=true&panes=browser&view=timeline",
     );
     expect(screen.getByTestId("panes").textContent).toBe("overview");
   });

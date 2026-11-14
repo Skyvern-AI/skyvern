@@ -1,4 +1,6 @@
 import type { WorkflowBlockType } from "../../types/workflowTypes";
+import { agentStepToolTitles } from "../nodes/AgentStepNode/types";
+import { workflowBlockTitle } from "../nodes/types";
 import { docDetailsText } from "./docDetailsText";
 
 export type DocMetaIcon =
@@ -65,7 +67,6 @@ const L = {
   errorCodes: "Error codes",
   url: "URL",
   terminateIf: "Terminate if",
-  cache: "Cache disabled",
   continueOnFailure: "Continue on failure",
   nextLoopOnFailure: "Next loop on failure",
   completeIfEmpty: "Complete if empty",
@@ -81,6 +82,7 @@ const L = {
   sender: "Sender",
   range: "Range",
   agent: "Agent",
+  tools: "Tools",
 } as const;
 
 const errorCodes = () => ({
@@ -102,6 +104,29 @@ const pageUrl = (
 export const DOC_FIELD_MAP: Partial<
   Record<WorkflowBlockType, readonly DocFieldSpec[]>
 > = {
+  agent_step: [
+    onLine(
+      {
+        ...field("tools", L.tools, "None"),
+        editorValue: (data) =>
+          Array.isArray(data.tools)
+            ? data.tools
+                .map((tool) => {
+                  const name = String(tool);
+                  return (
+                    agentStepToolTitles[name] ??
+                    (name === "browser_task"
+                      ? workflowBlockTitle.navigation
+                      : workflowBlockTitle[name as WorkflowBlockType]) ??
+                    name
+                  );
+                })
+                .join(", ")
+            : null,
+      },
+      { icon: "agent", emptyChip: "always" },
+    ),
+  ],
   navigation: [
     field("engine", L.engine, "Default"),
     field("max_steps_per_run", L.maxSteps, "Default"),
@@ -114,7 +139,6 @@ export const DOC_FIELD_MAP: Partial<
     field("engine", L.engine, "Default"),
     field("max_steps_per_run", L.maxSteps, "Default"),
     field("max_retries", L.maxRetries, "0"),
-    field("disable_cache", L.cache, "No"),
   ],
   login: [
     onLine(

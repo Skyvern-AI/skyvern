@@ -25,7 +25,6 @@ from skyvern.forge.sdk.copilot.browser_ablation import (
     CopilotToolSurfaceIdentity,
 )
 from skyvern.forge.sdk.copilot.budget_expiry import BudgetExpiryState
-from skyvern.forge.sdk.copilot.code_block_synthesis import CREDENTIAL_FILL_TOOL_NAME
 from skyvern.forge.sdk.copilot.code_write_diff import TURN_PATCH_CHAR_BUDGET, CodeWriteDiff
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
 from skyvern.forge.sdk.copilot.connected_accounts import ConnectionCardPayload
@@ -34,11 +33,12 @@ from skyvern.forge.sdk.copilot.human_input_wait import HumanInputWait
 from skyvern.forge.sdk.copilot.page_identity import page_location_fingerprint, safe_page_origin
 from skyvern.forge.sdk.copilot.review_gate import NarrativeReviewProjection
 from skyvern.forge.sdk.copilot.run_outcome import RunOutcomeRole
-from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_structured_prompt
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.workflow.block_notes import block_field_texts
+from skyvern.forge.sdk.workflow.code_block_steps import CREDENTIAL_FILL_TOOL_NAME
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
 from skyvern.schemas.proxy_location import ProxyLocationInput
+from skyvern.utils.raw_secret_redaction import redact_raw_secrets_for_structured_prompt
 from skyvern.utils.strings import join_phrases
 
 LOG = structlog.get_logger()

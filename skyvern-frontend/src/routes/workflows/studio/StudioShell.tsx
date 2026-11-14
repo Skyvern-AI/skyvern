@@ -845,7 +845,6 @@ function StudioStage(props: StudioWorkspaceProps) {
   const [copilotPortalEl, setCopilotPortalEl] = useState<HTMLElement | null>(
     null,
   );
-  const [panelPortalEl, setPanelPortalEl] = useState<HTMLElement | null>(null);
 
   // The live browser stream is mounted once into this detached host and
   // re-parented into the owning pane, so it never remounts on pane changes.
@@ -1057,7 +1056,6 @@ function StudioStage(props: StudioWorkspaceProps) {
     () => ({
       organizationId: props.workflow.organization_id,
       copilotPortalEl,
-      panelPortalEl,
       setEditorStreamSlot,
       setBrowserStreamSlot,
       setRunStreamSlot,
@@ -1068,7 +1066,6 @@ function StudioStage(props: StudioWorkspaceProps) {
     }),
     [
       copilotPortalEl,
-      panelPortalEl,
       props.workflow.organization_id,
       restoreExpandedPane,
       showPane,
@@ -1289,12 +1286,6 @@ function StudioStage(props: StudioWorkspaceProps) {
                 : null}
               {!embedded && panes.length === 0 ? <StudioStageLauncher /> : null}
               {embedded ? null : <StudioWorkflowPanels />}
-              {/* Overlay target for Workspace-wired panels (pointer-events off
-                  while empty so the stage stays clickable). */}
-              <div
-                ref={setPanelPortalEl}
-                className="pointer-events-none absolute inset-0 z-40"
-              />
               <span
                 role="status"
                 aria-live="polite"

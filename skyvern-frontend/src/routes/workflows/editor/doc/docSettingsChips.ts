@@ -72,7 +72,7 @@ export const DOC_SHOWN_ON_STEP: ReadonlySet<string> = new Set([
   "trailing_notes",
 ]);
 
-// Saved keys the Doc shows in its own place (a line, Inputs, Outputs, the step itself) or that only the editor writes.
+// Saved keys the Doc shows in its own place (a line, Inputs, Outputs, the step itself), that only the editor writes, or that no control edits.
 const SHOWN_ELSEWHERE = new Set<string>([
   ...DOC_SHOWN_ON_STEP,
   "description",
@@ -80,6 +80,7 @@ const SHOWN_ELSEWHERE = new Set<string>([
   "parameters",
   "data_schema",
   "json_schema",
+  "disable_cache",
   // Screenshots show under their lines; prompt images are carried through untouched.
   "doc_images",
   "prompt_images",
@@ -339,7 +340,12 @@ export function docKeySettings(
       {
         key: spec.keys[0]!,
         label: spec.label,
-        value: value === null ? spec.empty : shortValue(value),
+        value:
+          value === null
+            ? spec.empty
+            : spec.keys[0] === "tools"
+              ? value
+              : shortValue(value),
         unset: value === null,
         meta: spec.meta,
         addLabel: spec.addLabel,

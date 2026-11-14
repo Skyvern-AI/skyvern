@@ -42,11 +42,6 @@ from skyvern.forge.sdk.artifact.storage import s3 as s3_module
 from skyvern.forge.sdk.artifact.storage.local import LocalStorage
 from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
 from skyvern.forge.sdk.browser_network_egress_monitor import BrowserNetworkEgressMonitor
-from skyvern.forge.sdk.copilot.reached_download_target import (
-    block_output_has_registered_download,
-    code_is_download_intent,
-    generated_file_artifact_ids,
-)
 from skyvern.forge.sdk.copilot.tools.run_execution import build_test_evidence_packet
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.http_request_authorization import RunScopedRedirectHopAuthorizer
@@ -66,6 +61,11 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     ParameterType,
     WorkflowParameter,
     WorkflowParameterType,
+)
+from skyvern.forge.sdk.workflow.reached_download_target import (
+    block_output_has_registered_download,
+    code_is_download_intent,
+    generated_file_artifact_ids,
 )
 from skyvern.schemas.workflows import BlockResult, BlockStatus
 from skyvern.services import uploaded_file_service

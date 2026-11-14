@@ -1,4 +1,4 @@
-"""Deterministic AST denylist over Copilot-synthesized code blocks, enforced at authoring and at runtime pre-dispatch.
+"""Deterministic AST denylist over authored code blocks, enforced at authoring and at runtime pre-dispatch.
 Denies `page.request`, `page.context` and the dynamic attribute/namespace builtins that reach the live session's
 credentials; a guardrail on one code path, not a sandbox, and it does not cover exfiltration through `page.evaluate`."""
 
@@ -8,8 +8,6 @@ import ast
 import re
 from collections.abc import Collection, Iterable
 from dataclasses import dataclass
-
-COPILOT_CODE_SECURITY_FAILURE_CATEGORY = "COPILOT_CODE_SECURITY"
 
 _AUTHOR_ATTR_REASONS = {
     "request": "AUTHOR_PAGE_REQUEST",
@@ -42,14 +40,6 @@ class CodeBlockSecurityError(str):
         item.reason_code = reason_code
         item.surface = surface
         return item
-
-    def to_failure_category(self) -> dict[str, str | float]:
-        return {
-            "category": COPILOT_CODE_SECURITY_FAILURE_CATEGORY,
-            "reason_code": self.reason_code,
-            "confidence_float": 0.99,
-            "reasoning": f"{self.reason_code}: blocked {self.surface} before browser dispatch",
-        }
 
 
 def author_time_code_security_errors(*, label: str, code: str) -> list[CodeBlockSecurityError]:
@@ -282,7 +272,7 @@ def _message_for_reason(*, label: str, reason_code: str, surface: str) -> str:
             "only a literal value (string, number, boolean, null, or JSON list/object) may be rendered into code."
         )
     if reason_code == "AUTHOR_SYNTAX_ERROR":
-        return f"Code block `{label}` failed the Copilot code security check: the code does not parse as Python."
+        return f"Code block `{label}` failed the code security check: the code does not parse as Python."
     if reason_code.startswith("AUTHOR_"):
-        return f"Code block `{label}` failed the Copilot code security check: {surface} is not allowed."
-    return f"Code block `{label}` was blocked before browser dispatch: {surface} is not allowed at Copilot runtime."
+        return f"Code block `{label}` failed the code security check: {surface} is not allowed."
+    return f"Code block `{label}` was blocked before browser dispatch: {surface} is not allowed at runtime."

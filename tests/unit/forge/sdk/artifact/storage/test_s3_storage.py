@@ -430,6 +430,12 @@ class TestS3StorageBrowserSessionFiles:
         uri = f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{settings.ENV}/o_other/uploaded.pdf"
         with pytest.raises(PermissionError, match="No permission to access storage URI"):
             await s3_storage.download_managed_file(uri, TEST_ORGANIZATION_ID)
+        with pytest.raises(PermissionError, match="No permission to access storage URI"):
+            await s3_storage.read_managed_file_head(uri, TEST_ORGANIZATION_ID, 64)
+        with pytest.raises(PermissionError, match="No permission to access storage URI"):
+            await s3_storage.presign_managed_file(
+                uri, TEST_ORGANIZATION_ID, expiry_seconds=60, inline_content_type="image/png"
+            )
 
     async def test_storage_type_property(self, s3_storage: S3Storage) -> None:
         """Test storage_type returns 's3'."""

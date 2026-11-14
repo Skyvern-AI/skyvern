@@ -41,11 +41,11 @@ from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
 from skyvern.forge.sdk.copilot.output_utils import sanitize_tool_result_for_llm, summarize_tool_result
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, screen_raw_secret_safety
 from skyvern.forge.sdk.copilot.runtime import DemonstratedAction, staged_demonstrated_action
-from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt, redact_secretlike_filename
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.streaming_adapter import parse_tool_output
 from skyvern.forge.sdk.copilot.tools.scouting import record_scouted_interaction_fact
 from skyvern.forge.sdk.schemas.workflow_copilot import CopilotSteerMessage
+from skyvern.utils.raw_secret_redaction import redact_raw_secrets_for_prompt, redact_secretlike_filename
 
 LOG = structlog.get_logger()
 

@@ -122,11 +122,6 @@ from skyvern.forge.sdk.copilot.challenge_evidence import (
     composition_challenge_carrier,
     first_carrier_backed_anti_bot_source,
 )
-from skyvern.forge.sdk.copilot.code_block_security import (
-    COPILOT_CODE_SECURITY_FAILURE_CATEGORY,
-    CodeBlockSecurityInput,
-    runtime_code_security_errors,
-)
 from skyvern.forge.sdk.copilot.completion_output_grounding import page_evidence_prose_text
 from skyvern.forge.sdk.copilot.completion_verification import (
     CompletionVerificationResult,
@@ -190,7 +185,6 @@ from skyvern.forge.sdk.copilot.output_utils import (
     sanitize_tool_result_for_llm,
     screened_recorded_url,
 )
-from skyvern.forge.sdk.copilot.reached_download_target import generated_file_artifact_ids
 from skyvern.forge.sdk.copilot.repair_origin_run import (
     OriginExecutionSettings,
     OriginOutputRefusal,
@@ -247,7 +241,6 @@ from skyvern.forge.sdk.copilot.screenshot_utils import (
     enqueue_screenshot_from_result,
     stored_run_frame_provenance,
 )
-from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt, redact_totp_runtime_values
 from skyvern.forge.sdk.copilot.secret_scrub import (
     is_registered_scrub_value,
     register_secret_scrub_values_from_structure,
@@ -265,7 +258,6 @@ from skyvern.forge.sdk.copilot.workflow_yaml import (
     _process_workflow_yaml,
     runner_code_block_associations,
     stored_block_code,
-    workflow_to_copilot_yaml,
 )
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.enums import BrowserSeedSource
@@ -291,7 +283,13 @@ from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.services.request_principal import get_request_principal, requesting_user_id
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.utils.pdf_parser import PdfExtractStats
+from skyvern.forge.sdk.workflow.authoring_yaml import workflow_to_authoring_yaml
 from skyvern.forge.sdk.workflow.block_notes import drop_submitted_note_fields
+from skyvern.forge.sdk.workflow.code_block_security import (
+    CodeBlockSecurityError,
+    CodeBlockSecurityInput,
+    runtime_code_security_errors,
+)
 from skyvern.forge.sdk.workflow.document_text import SUPPORTED_DOCUMENT_EXTENSIONS, DocumentText
 from skyvern.forge.sdk.workflow.exceptions import FileParseTimeout
 from skyvern.forge.sdk.workflow.models.block import (
@@ -322,6 +320,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatus,
     workflow_definition_sha256,
 )
+from skyvern.forge.sdk.workflow.reached_download_target import generated_file_artifact_ids
 from skyvern.forge.sdk.workflow.runtime_secret_bridge import consume_copilot_runtime_secret_values
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
@@ -329,6 +328,7 @@ from skyvern.schemas.proxy_location import ProxyLocationInput, runtime_proxy_loc
 from skyvern.schemas.self_heal import HealEpisodeDetail, HealStatus
 from skyvern.schemas.workflows import BlockStatus, BlockType
 from skyvern.utils.files import initialize_skyvern_state_file
+from skyvern.utils.raw_secret_redaction import redact_raw_secrets_for_prompt, redact_totp_runtime_values
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, ActionStatus
 from skyvern.webeye.utils.page import SkyvernFrame
@@ -400,6 +400,17 @@ from .workflow_update import (
 )
 
 LOG = structlog.get_logger()
+
+COPILOT_CODE_SECURITY_FAILURE_CATEGORY = "COPILOT_CODE_SECURITY"
+
+
+def _code_security_failure_category(error: CodeBlockSecurityError) -> dict[str, str | float]:
+    return {
+        "category": COPILOT_CODE_SECURITY_FAILURE_CATEGORY,
+        "reason_code": error.reason_code,
+        "confidence_float": 0.99,
+        "reasoning": f"{error.reason_code}: blocked {error.surface} before browser dispatch",
+    }
 
 
 _MAX_REGISTERED_ARTIFACTS = 3
@@ -1794,7 +1805,7 @@ def _runtime_code_security_failure_for_selected_labels(
             "planned_block_labels": list(labels_to_execute),
             "frontier_start_label": frontier_start_label,
             "blocks": [],
-            "failure_categories": [error.to_failure_category() for error in errors],
+            "failure_categories": [_code_security_failure_category(error) for error in errors],
             "failure_category": COPILOT_CODE_SECURITY_FAILURE_CATEGORY,
         },
     }
@@ -4505,7 +4516,7 @@ async def _run_blocks_with_minted_browser_claim(
     workflow = snapshot.workflow
     execution = _RunExecution(
         snapshot=snapshot,
-        workflow_yaml=snapshot.workflow_yaml or workflow_to_copilot_yaml(workflow),
+        workflow_yaml=snapshot.workflow_yaml or workflow_to_authoring_yaml(workflow),
         metadata=copy.deepcopy(ctx.code_artifact_metadata),
         associations=copy.deepcopy(ctx.runner_code_block_associations_by_label),
         source_at_start=(

@@ -508,12 +508,8 @@ function PromptBoxImpl(
       attempt: AgentCreationAttempt;
     }) => {
       const client = await getClient(credentialGetter, "sans-api-v1");
-      const {
-        proxyLocation,
-        publishWorkflow,
-        generateScript,
-        maxStepsOverride,
-      } = taskRunSettings;
+      const { proxyLocation, publishWorkflow, maxStepsOverride } =
+        taskRunSettings;
       // The popover shows whitespace-only values as unchanged, so send them as unset.
       const webhookCallbackUrl = blankToNull(
         taskRunSettings.webhookCallbackUrl,
@@ -531,7 +527,6 @@ function PromptBoxImpl(
         totp_identifier: totpIdentifier,
         max_screenshot_scrolls: maxScreenshotScrolls,
         publish_workflow: publishWorkflow,
-        generate_script: generateScript,
         run_with: "agent",
         ai_fallback: true,
         extracted_information_schema: dataSchema

@@ -12,14 +12,14 @@ from skyvern.forge.sdk.api.llm.schema_validator import validate_and_fill_extract
 from skyvern.forge.sdk.copilot.challenge_evidence import (
     artifact_challenge_flag_key,
 )
-from skyvern.forge.sdk.copilot.reached_download_target import (
+from skyvern.forge.sdk.copilot.run_outcome import trusted_terminal_challenge_category_name
+from skyvern.forge.sdk.copilot.runtime import AgentContext
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
+from skyvern.forge.sdk.workflow.reached_download_target import (
     REGISTERED_DOWNLOAD_OUTPUT_KEYS,
     generated_file_artifact_ids,
     registered_download_proof_view,
 )
-from skyvern.forge.sdk.copilot.run_outcome import trusted_terminal_challenge_category_name
-from skyvern.forge.sdk.copilot.runtime import AgentContext
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
 from skyvern.schemas.workflows import BlockType
 
 from ._shared import (

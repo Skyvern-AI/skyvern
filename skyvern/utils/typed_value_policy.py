@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 
-from skyvern.forge.sdk.copilot.secret_redaction import RAW_SECRET_PATTERNS, contains_email_password_pair
+from skyvern.utils.raw_secret_redaction import RAW_SECRET_PATTERNS, contains_email_password_pair
 
 _SECRET_WORDS = r"password|passwd|passcode|token|secret|api[_ -]?key|credential|bearer|authorization|otp|totp|mfa|2fa"
 _SECRET_WORD_VALUE_RE = re.compile(rf"^(?:{_SECRET_WORDS})$", re.I)

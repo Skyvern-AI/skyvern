@@ -11,7 +11,7 @@ import uuid
 from collections.abc import Awaitable, Coroutine, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal, TypeVar, cast, get_args
+from typing import Annotated, Any, Literal, TypeVar, cast, get_args
 from urllib.parse import urlparse
 
 import structlog
@@ -102,6 +102,7 @@ from skyvern.forge.sdk.copilot.demonstration_recorder import (
 )
 from skyvern.forge.sdk.copilot.enforcement import EXPIRED_TURN_REPLY_SECONDS, TOTAL_TIMEOUT_SECONDS
 from skyvern.forge.sdk.copilot.eval_llm_overrides import (
+    EMBER_EVAL_LLM_OVERRIDES_HEADER,
     EVAL_LLM_OVERRIDES_HEADER,
     EvalLLMOverrides,
     admit_eval_llm_overrides,
@@ -155,15 +156,12 @@ from skyvern.forge.sdk.copilot.workflow_credential_utils import workflow_connect
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml as _copilot_process_workflow_yaml
 from skyvern.forge.sdk.copilot.workflow_yaml import _repair_next_block_label_chain as _repair_next_block_label_chain
 from skyvern.forge.sdk.copilot.workflow_yaml import (
-    _runs_in_list_order,
     dump_workflow_yaml,
     inherited_header_settings,
     merge_private_workflow_settings,
     private_workflow_settings_from_yaml,
-    strip_private_workflow_settings,
     submitted_private_workflow_settings,
     with_workflow_yaml_title,
-    workflow_to_copilot_yaml,
 )
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.event_source_stream import EventSourceStream, FastAPIEventSourceStream
@@ -257,9 +255,11 @@ from skyvern.forge.sdk.services.credential.credential_creation_service import (
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
 from skyvern.forge.sdk.services.request_principal import enforce_principal_role, get_request_principal, human_user_id
 from skyvern.forge.sdk.services.route_authorization import require_request_actions
+from skyvern.forge.sdk.workflow.authoring_yaml import runs_in_list_order, workflow_to_authoring_yaml
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException
 from skyvern.forge.sdk.workflow.models.credential_release import normalize_extra_site_urls
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
+from skyvern.forge.sdk.workflow.private_settings import strip_private_workflow_settings
 from skyvern.forge.sdk.workflow.secret_encryption import (
     mask_workflow_for_api,
     preserve_workflow_definition_secrets,
@@ -838,7 +838,8 @@ def _copilot_eval_cost_headers(ledger: CopilotCostLedger | None) -> dict[str, st
     if ledger is None:
         return {}
     receipt = {"receipt_id": uuid.uuid4().hex, "llm_cost": ledger.snapshot()}
-    return {"X-Copilot-Eval-LLM-Cost": json.dumps(receipt, separators=(",", ":"))}
+    value = json.dumps(receipt, separators=(",", ":"))
+    return {"X-Ember-Eval-LLM-Cost": value, "X-Copilot-Eval-LLM-Cost": value}
 
 
 class _FirstEventTimingStream:
@@ -2516,7 +2517,7 @@ def _run_grant_workflow_yaml(workflow: Workflow | None) -> str | None:
     definition = workflow.workflow_definition
     if definition is None or not definition.blocks:
         return None
-    return workflow_to_copilot_yaml(workflow)
+    return workflow_to_authoring_yaml(workflow)
 
 
 def _ensure_copilot_workflow_yaml(
@@ -2550,7 +2551,7 @@ def _ensure_copilot_workflow_yaml(
         and workflow_definition.blocks
     ):
         if persisted_workflow_yaml is None:
-            persisted_workflow_yaml = workflow_to_copilot_yaml(original_workflow)
+            persisted_workflow_yaml = workflow_to_authoring_yaml(original_workflow)
         if persisted_workflow_yaml:
             LOG.warning(
                 "Copilot agent chat request had no workflow blocks; using persisted workflow YAML",
@@ -3259,7 +3260,9 @@ async def _new_copilot_chat_post(
                     opening_workflow_title=original_workflow.title,
                     prior_executed_block_fingerprints=prior_executed_block_fingerprints,
                     eval_capture_case_id=(
-                        request.headers.get("x-copilot-eval-case") if settings.ENV == "local" else None
+                        (request.headers.get("x-ember-eval-case") or request.headers.get("x-copilot-eval-case"))
+                        if settings.ENV == "local"
+                        else None
                     ),
                     eval_mode=eval_mode,
                     eval_entrypoint_url=eval_entrypoint_url,
@@ -3813,10 +3816,12 @@ async def _validate_copilot_audio_artifact_id(
     return audio_artifact_id
 
 
+@base_router.post("/ember/chat-audio", include_in_schema=False)
 @base_router.post("/workflow/copilot/chat-audio", include_in_schema=False)
 async def workflow_copilot_chat_audio(
     workflow_permanent_id: str = Form(...),
     workflow_copilot_chat_id: str | None = Form(None),
+    ember_chat_id: Annotated[str | None, Form()] = None,
     file: UploadFile = File(...),
     organization: Organization = Depends(org_auth_service.get_current_org),
 ) -> WorkflowCopilotAudioUploadResponse:
@@ -3862,7 +3867,7 @@ async def workflow_copilot_chat_audio(
     chat = await _get_or_create_workflow_copilot_chat(
         organization_id=organization.organization_id,
         workflow_permanent_id=workflow_permanent_id,
-        workflow_copilot_chat_id=workflow_copilot_chat_id,
+        workflow_copilot_chat_id=ember_chat_id or workflow_copilot_chat_id,
     )
 
     LOG.info(
@@ -3899,7 +3904,7 @@ def _validated_eval_entrypoint_url(
     if (
         not settings.WORKFLOW_COPILOT_ODYSSEYS_EVAL_INPUTS_ENABLED
         or organization.organization_id not in settings.WORKFLOW_COPILOT_ODYSSEYS_EVAL_ORGANIZATION_IDS
-        or request.headers.get("x-copilot-eval") != "odysseys"
+        or (request.headers.get("x-ember-eval") or request.headers.get("x-copilot-eval")) != "odysseys"
     ):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -3928,6 +3933,7 @@ def _validated_eval_entrypoint_url(
     return eval_entrypoint_url
 
 
+@base_router.post("/ember/chat-post", include_in_schema=False)
 @base_router.post("/workflow/copilot/chat-post", include_in_schema=False)
 async def workflow_copilot_chat_post(
     request: Request,
@@ -3941,7 +3947,8 @@ async def workflow_copilot_chat_post(
     )
     chat_request.doc_editor_enabled = chat_request.doc_editor_enabled and server_doc_editor_enabled
     eval_llm_overrides = admit_eval_llm_overrides(
-        request.headers.get(EVAL_LLM_OVERRIDES_HEADER), organization.organization_id
+        request.headers.get(EMBER_EVAL_LLM_OVERRIDES_HEADER) or request.headers.get(EVAL_LLM_OVERRIDES_HEADER),
+        organization.organization_id,
     )
     eval_cost_enabled = _copilot_eval_cost_enabled(organization.organization_id)
     eval_entrypoint_url = _validated_eval_entrypoint_url(request, chat_request, organization)
@@ -3972,7 +3979,7 @@ async def workflow_copilot_chat_post(
         chat_request.attached_file_ids = list(dict.fromkeys([*chat_request.attached_file_ids, *demonstrated_file_ids]))[
             :MAX_ATTACHED_FILES_PER_MESSAGE
         ]
-    raw_eval_mode = request.headers.get("x-copilot-eval-mode")
+    raw_eval_mode = request.headers.get("x-ember-eval-mode") or request.headers.get("x-copilot-eval-mode")
     if raw_eval_mode is not None:
         try:
             eval_mode = CopilotEvalMode(raw_eval_mode)
@@ -4006,6 +4013,7 @@ async def workflow_copilot_chat_post(
     )
 
 
+@base_router.get("/ember/chats", include_in_schema=False)
 @base_router.get("/workflow/copilot/chats", include_in_schema=False)
 async def list_workflow_copilot_chats(
     workflow_permanent_id: str | None = None,
@@ -4293,6 +4301,7 @@ async def _history_proposal_state(
     return chat.proposed_workflow, metadata, run_facts, claim_expires_in
 
 
+@base_router.get("/ember/chat-history", include_in_schema=False)
 @base_router.get("/workflow/copilot/chat-history", include_in_schema=False)
 async def workflow_copilot_chat_history(
     credential_recovery_token: str | None = Header(None, alias="X-Copilot-Credential-Recovery-Token"),
@@ -4300,7 +4309,11 @@ async def workflow_copilot_chat_history(
     workflow_copilot_chat_id: str | None = None,
     request_cancel_token: str | None = None,
     organization: Organization = Depends(org_auth_service.get_current_org),
+    ember_credential_recovery_token: Annotated[str | None, Header(alias="X-Ember-Credential-Recovery-Token")] = None,
+    ember_chat_id: str | None = None,
 ) -> WorkflowCopilotChatHistoryResponse:
+    credential_recovery_token = ember_credential_recovery_token or credential_recovery_token
+    workflow_copilot_chat_id = ember_chat_id or workflow_copilot_chat_id
     if workflow_copilot_chat_id:
         chat = await app.DATABASE.workflow_params.get_workflow_copilot_chat_by_id(
             organization_id=organization.organization_id,
@@ -4521,6 +4534,7 @@ async def workflow_copilot_chat_history(
     )
 
 
+@base_router.post("/ember/question-response", include_in_schema=False)
 @base_router.post("/workflow/copilot/question-response", include_in_schema=False)
 async def workflow_copilot_question_response(
     request: Request,
@@ -4537,7 +4551,8 @@ async def workflow_copilot_question_response(
         organization.organization_id, _pending_turn_with_question(chat, question_response.interaction_id), "answer"
     )
     eval_llm_overrides = admit_eval_llm_overrides(
-        request.headers.get(EVAL_LLM_OVERRIDES_HEADER), organization.organization_id
+        request.headers.get(EMBER_EVAL_LLM_OVERRIDES_HEADER) or request.headers.get(EVAL_LLM_OVERRIDES_HEADER),
+        organization.organization_id,
     )
     response = QuestionResponse(
         answers=question_response.answers,
@@ -4692,6 +4707,7 @@ async def _record_credential_deletion(
     return await repo.fail_copilot_credential_deletion(organization_id, chat_id, interaction_id)
 
 
+@base_router.post("/ember/credential-deletion", include_in_schema=False)
 @base_router.post("/workflow/copilot/credential-deletion", include_in_schema=False)
 async def workflow_copilot_credential_deletion(
     deletion_request: WorkflowCopilotCredentialDeletionRequest,
@@ -4740,6 +4756,7 @@ async def workflow_copilot_credential_deletion(
     return await asyncio.shield(task)
 
 
+@base_router.post("/ember/steer", include_in_schema=False, response_model=CopilotSteerMessage)
 @base_router.post("/workflow/copilot/steer", include_in_schema=False, response_model=CopilotSteerMessage)
 async def workflow_copilot_steer(
     request: Request,
@@ -4759,7 +4776,8 @@ async def workflow_copilot_steer(
         organization.organization_id, _pending_turn_with_cancel_token(chat, steer_request.cancel_token), "steer"
     )
     eval_llm_overrides = admit_eval_llm_overrides(
-        request.headers.get(EVAL_LLM_OVERRIDES_HEADER), organization.organization_id
+        request.headers.get(EMBER_EVAL_LLM_OVERRIDES_HEADER) or request.headers.get(EVAL_LLM_OVERRIDES_HEADER),
+        organization.organization_id,
     )
 
     async def record(steer: CopilotSteerMessage | None = None) -> CopilotSteerMessage | None:
@@ -4812,6 +4830,7 @@ async def workflow_copilot_steer(
     return recorded
 
 
+@base_router.post("/ember/message-feedback", include_in_schema=False)
 @base_router.post("/workflow/copilot/message-feedback", include_in_schema=False)
 async def workflow_copilot_message_feedback(
     feedback_request: WorkflowCopilotMessageFeedbackRequest,
@@ -4865,6 +4884,7 @@ async def workflow_copilot_message_feedback(
     )
 
 
+@base_router.post("/ember/cancel", include_in_schema=False, status_code=status.HTTP_204_NO_CONTENT)
 @base_router.post("/workflow/copilot/cancel", include_in_schema=False, status_code=status.HTTP_204_NO_CONTENT)
 async def workflow_copilot_cancel(
     cancel_request: WorkflowCopilotCancelRequest,
@@ -4968,6 +4988,11 @@ async def _resolve_manual_sign_in(
     )
 
 
+@base_router.post(
+    "/ember/credential-response",
+    include_in_schema=False,
+    response_model=WorkflowCopilotCredentialResponseResult,
+)
 @base_router.post(
     "/workflow/copilot/credential-response",
     include_in_schema=False,
@@ -5229,6 +5254,7 @@ async def _demonstration_cache() -> BaseCache:
     return cache
 
 
+@base_router.post("/ember/demonstration/record", include_in_schema=False)
 @base_router.post("/workflow/copilot/demonstration/record", include_in_schema=False)
 async def workflow_copilot_demonstration_record(
     request: Request,
@@ -5292,6 +5318,11 @@ async def workflow_copilot_demonstration_record(
     return FastAPIEventSourceStream.create(request, handler)
 
 
+@base_router.post(
+    "/ember/demonstration/control",
+    include_in_schema=False,
+    response_model=WorkflowCopilotDemonstrationControlResult,
+)
 @base_router.post(
     "/workflow/copilot/demonstration/control",
     include_in_schema=False,
@@ -5359,6 +5390,11 @@ async def workflow_copilot_demonstration_control(
 
 
 @base_router.post(
+    "/ember/demonstration/upload",
+    include_in_schema=False,
+    response_model=WorkflowCopilotDemonstrationControlResult,
+)
+@base_router.post(
     "/workflow/copilot/demonstration/upload",
     include_in_schema=False,
     response_model=WorkflowCopilotDemonstrationControlResult,
@@ -5415,6 +5451,7 @@ async def workflow_copilot_demonstration_upload(
     return WorkflowCopilotDemonstrationControlResult(seq=seq, file_id=uploaded.file_id)
 
 
+@base_router.get("/ember/demonstration/active", include_in_schema=False)
 @base_router.get("/workflow/copilot/demonstration/active", include_in_schema=False)
 async def workflow_copilot_demonstration_active(
     workflow_permanent_id: str,
@@ -5540,6 +5577,11 @@ def _claim_seconds_left(deadline: datetime) -> float:
 
 
 @base_router.post(
+    "/ember/credential-generate",
+    include_in_schema=False,
+    response_model=WorkflowCopilotCredentialGenerateResult,
+)
+@base_router.post(
     "/workflow/copilot/credential-generate",
     include_in_schema=False,
     response_model=WorkflowCopilotCredentialGenerateResult,
@@ -5641,6 +5683,7 @@ async def workflow_copilot_credential_generate(
     )
 
 
+@base_router.post("/ember/clear-proposed-workflow", include_in_schema=False, status_code=status.HTTP_204_NO_CONTENT)
 @base_router.post(
     "/workflow/copilot/clear-proposed-workflow", include_in_schema=False, status_code=status.HTTP_204_NO_CONTENT
 )
@@ -5679,6 +5722,7 @@ async def workflow_copilot_clear_proposed_workflow(
     )
 
 
+@base_router.post("/ember/disable-auto-accept", include_in_schema=False, status_code=status.HTTP_204_NO_CONTENT)
 @base_router.post(
     "/workflow/copilot/disable-auto-accept", include_in_schema=False, status_code=status.HTTP_204_NO_CONTENT
 )
@@ -5696,6 +5740,7 @@ async def workflow_copilot_disable_auto_accept(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chat not found")
 
 
+@base_router.post("/ember/apply-proposed-workflow", include_in_schema=False)
 @base_router.post("/workflow/copilot/apply-proposed-workflow", include_in_schema=False)
 async def workflow_copilot_apply_proposed_workflow(
     apply_request: WorkflowCopilotApplyProposedWorkflowRequest,
@@ -5814,6 +5859,7 @@ def _served_turn_outcome(outcome: TurnOutcome | None) -> TurnOutcome | None:
     return outcome.model_copy(update={"interrupted_row_final": True})
 
 
+@base_router.post("/workflow/suggest-goal", include_in_schema=False)
 @base_router.post("/workflow/copilot/suggest-goal", include_in_schema=False)
 async def workflow_copilot_suggest_goal(
     suggestion_request: WorkflowCopilotGoalSuggestionRequest,
@@ -5841,6 +5887,7 @@ async def workflow_copilot_suggest_goal(
     return WorkflowCopilotGoalSuggestionResponse(goal=goal)
 
 
+@base_router.post("/workflow/convert-yaml-to-blocks", include_in_schema=False)
 @base_router.post("/workflow/copilot/convert-yaml-to-blocks", include_in_schema=False)
 async def workflow_copilot_convert_yaml_to_blocks(
     request: WorkflowYAMLConversionRequest,
@@ -5855,7 +5902,7 @@ async def workflow_copilot_convert_yaml_to_blocks(
         parsed_yaml = safe_load_no_dates(request.workflow_definition_yaml)
         workflow_definition_yaml = WorkflowDefinitionYAML.model_validate(parsed_yaml)
 
-        _repair_next_block_label_chain(workflow_definition_yaml.blocks, list_ordered=_runs_in_list_order(parsed_yaml))
+        _repair_next_block_label_chain(workflow_definition_yaml.blocks, list_ordered=runs_in_list_order(parsed_yaml))
 
         workflow_definition = convert_workflow_definition(
             workflow_definition_yaml=workflow_definition_yaml,

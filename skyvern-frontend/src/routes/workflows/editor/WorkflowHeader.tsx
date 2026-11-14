@@ -28,9 +28,7 @@ import { useIsGlobalWorkflow } from "../hooks/useIsGlobalWorkflow";
 import { MakeACopyButton } from "./MakeACopyButton";
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
-import { useCacheKeyValueStore } from "@/store/CacheKeyValueStore";
 import { useDebugStore } from "@/store/useDebugStore";
-import { useShowAllCodeStore } from "@/store/ShowAllCodeStore";
 import {
   SaveRefusedError,
   SaveStaleError,
@@ -48,30 +46,13 @@ import { cn } from "@/util/utils";
 import { EditableNodeTitle } from "./nodes/components/EditableNodeTitle";
 import { EditorOverflowMenu } from "./header/EditorOverflowMenu";
 import { InputsCountBadge } from "./WorkflowInputs";
-import { useIsGeneratingCode } from "./hooks/useIsGeneratingCode";
 import { SaveFailedError, useSaveWorkflow } from "./hooks/useSaveWorkflow";
 import { PendingGoalChangesDialog } from "./PendingGoalChangesDialog";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
-import { useToggleCodeView } from "./hooks/useToggleCodeView";
 import { getRunBlockingTooltipText } from "./runValidation/runBlockingCopy";
 import { useRunValidationStore } from "./runValidation/useRunValidationStore";
 import { useWorkflowHeaderCollapseStore } from "./useWorkflowHeaderCollapseStore";
 import { WorkflowHeaderCollapseTab } from "./WorkflowHeaderCollapseTab";
-
-function GeneratingCodeButton() {
-  const showAllCode = useShowAllCodeStore((s) => s.showAllCode);
-  const toggleCodeView = useToggleCodeView();
-  return (
-    <Button
-      className="size-10 min-w-[6rem]"
-      variant={showAllCode ? "default" : "tertiary"}
-      onClick={toggleCodeView}
-    >
-      <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
-      Code
-    </Button>
-  );
-}
 
 function BrowserModeButton() {
   const navigate = useNavigate();
@@ -340,17 +321,9 @@ function WorkflowHeader() {
   const workflowPermanentId = useWorkflowPermanentId();
   const { data: globalWorkflows } = useGlobalWorkflowsQuery();
   const { data: workflow } = useWorkflowQuery({ workflowPermanentId });
-  const cacheKey = workflow?.cache_key ?? "";
 
   const collapsed = useWorkflowHeaderCollapseStore((s) => s.collapsed);
   const toggleCollapsed = useWorkflowHeaderCollapseStore((s) => s.toggle);
-  const cacheKeyValue = useCacheKeyValueStore((s) => s.cacheKeyValue);
-
-  const isGeneratingCode = useIsGeneratingCode({
-    cacheKey,
-    cacheKeyValue,
-    workflowPermanentId,
-  });
 
   if (!globalWorkflows) {
     return null; // this should be loaded already by some other components
@@ -382,7 +355,6 @@ function WorkflowHeader() {
           ) : null}
         </div>
         <div className="flex h-full shrink-0 items-center justify-end gap-4">
-          {isGeneratingCode && <GeneratingCodeButton />}
           {isGlobalWorkflow ? <MakeACopyButton /> : <EditorActionToolbar />}
         </div>
       </div>

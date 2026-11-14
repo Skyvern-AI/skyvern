@@ -690,7 +690,22 @@ async def test_a_save_rejects_a_new_image_larger_than_4_mib(
     ("filename", "accepted"),
     [
         *((name, True) for name in ("a.png", "a.jpg", "a.JPG", "a.jpeg", "a.jfif", "a.gif", "a.webp")),
-        *((name, False) for name in ("a.svg", "a.bmp", "a.tiff", "a.pdf", "a.mp4", "screenshot", "a.png.gz", "a.xyz")),
+        *(
+            (name, False)
+            for name in (
+                "a.svg",
+                "a.bmp",
+                "a.tif",
+                "a.tiff",
+                "a.heic",
+                "a.avif",
+                "a.pdf",
+                "a.mp4",
+                "screenshot",
+                "a.png.gz",
+                "a.xyz",
+            )
+        ),
     ],
 )
 async def test_a_save_rejects_a_new_image_that_is_not_a_raster_upload(

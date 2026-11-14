@@ -22,6 +22,7 @@ from skyvern.cli.mcp_tools._element_state import DEFAULT_ACTION_TIMEOUT_MS, DEFA
 from skyvern.cli.mcp_tools.blocks import (
     CODE_BLOCK_RUNTIME_TOPIC,
     NOTES_KNOWLEDGE_TOPIC,
+    WORKFLOW_KNOWLEDGE_TOPIC_ALIASES,
     WORKFLOW_KNOWLEDGE_TOPIC_HEADERS,
     _parse_knowledge_topics,
 )
@@ -64,7 +65,6 @@ from skyvern.forge.sdk.copilot.output_utils import (
     sanitize_tool_result_for_llm,
 )
 from skyvern.forge.sdk.copilot.page_identity import safe_page_origin
-from skyvern.forge.sdk.copilot.reached_download_target import download_claim_helper_contract
 from skyvern.forge.sdk.copilot.request_policy import (
     CREDENTIAL_BINDING_FACTS,
     RequestPolicy,
@@ -81,7 +81,6 @@ from skyvern.forge.sdk.copilot.runtime import (
     tab_switch_refusal,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import viewport_visible_effect
-from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.secret_scrub import (
     registered_scrub_values,
     scrub_secrets_from_structure,
@@ -96,6 +95,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     open_page_cap_reached,
 )
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.forge.sdk.workflow.reached_download_target import download_claim_helper_contract
 from skyvern.forge.sdk.workflow.schedules import MIN_SCHEDULE_INTERVAL_SECONDS
 from skyvern.forge.sdk.workflow.web_search import WEB_SEARCH_HELPER_CONTRACT
 from skyvern.forge.sdk.workflow.web_search_client import SearchProvider, SearchResponse, SearchResult
@@ -105,6 +105,7 @@ from skyvern.schemas.workflows import (
     AgentStepBlockYAML,
     TaskBlockYAML,
 )
+from skyvern.utils.raw_secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.utils.secret_headers import SECRET_HEADER_MASK
 from skyvern.webeye.dialog_handler import DIALOG_POLICY_HELPER_CONTRACT
 
@@ -877,7 +878,7 @@ def _task_v3_block_schema_guidance() -> list[str]:
 
 # The shared section bans `task` and points at navigation/extraction. Every authoring capability either
 # allows `task` or bans those two, so the section is false on every Copilot turn.
-_TASK_UNAVAILABLE_KNOWLEDGE_TOPIC = "task_block_task_not_available_in_workflow_copilot"
+_TASK_UNAVAILABLE_KNOWLEDGE_TOPIC = "task_block_task_not_available_in_ember"
 _REQUESTED_WORKFLOW_KNOWLEDGE_TOPICS: ContextVar[list[Any] | None] = ContextVar(
     "requested_workflow_knowledge_topics", default=None
 )
@@ -887,7 +888,7 @@ def _hidden_knowledge_topics(ctx: AgentContext) -> set[str]:
     hidden = {_TASK_UNAVAILABLE_KNOWLEDGE_TOPIC}
     if not copilot_sees_notes(ctx):
         hidden.add(NOTES_KNOWLEDGE_TOPIC)
-    return hidden
+    return hidden | {alias for alias, topic in WORKFLOW_KNOWLEDGE_TOPIC_ALIASES.items() if topic in hidden}
 
 
 async def _get_workflow_knowledge_pre_hook(

@@ -11,11 +11,7 @@ from skyvern.forge.sdk.copilot.agent_context import OriginRunRedactionRegistry
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
-from skyvern.forge.sdk.copilot.secret_scrub import (
-    REDACTED_SECRET_PLACEHOLDER,
-    clear_session_scrub_values,
-    register_secret_scrub_value,
-)
+from skyvern.forge.sdk.copilot.secret_scrub import register_secret_scrub_value
 from skyvern.forge.sdk.copilot.tools import (
     _evaluate_post_hook,
     _inspect_page_for_composition_impl,
@@ -25,6 +21,7 @@ from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_modul
 from skyvern.forge.sdk.copilot.tools._shared import _append_flow_evidence
 from skyvern.forge.sdk.copilot.tools.mcp_hooks import _evaluate_pre_hook
 from skyvern.forge.sdk.schemas.credentials import CredentialType, TotpType
+from skyvern.utils.secret_scrub import REDACTED_SECRET_PLACEHOLDER, clear_session_scrub_values
 
 
 def _ctx() -> CopilotContext:

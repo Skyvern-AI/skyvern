@@ -152,6 +152,14 @@ describe("resolveOpenPanes", () => {
     expect(resolveOpenPanes("?wr=wr_123&panes=")).toEqual([]);
   });
 
+  test("a link to the removed code view still opens the Overview pane", () => {
+    expect(resolveOpenPanes("?view=code&panes=copilot,editor")).toEqual([
+      "overview",
+      "copilot",
+      "editor",
+    ]);
+  });
+
   test("unrelated params do not affect the default", () => {
     expect(resolveOpenPanes("?cache-key-value=x")).toEqual([
       "copilot",

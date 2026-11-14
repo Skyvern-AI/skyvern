@@ -89,7 +89,6 @@ from skyvern.forge.sdk.copilot.runtime import (
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotProvenance, enqueue_screenshot
 from skyvern.forge.sdk.copilot.secret_scrub import (
-    clear_session_scrub_values,
     register_secret_scrub_value,
     register_secret_scrub_values_from_structure,
 )
@@ -117,6 +116,7 @@ from skyvern.forge.sdk.copilot.tools.mcp_hooks import (
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.services.request_principal import AuthKind, RequestPrincipal
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.utils.secret_scrub import clear_session_scrub_values
 from skyvern.webeye.browser_state import PageCrashRecord
 from skyvern.webeye.persistent_sessions_manager import (
     BrowserOperation,
@@ -4283,8 +4283,12 @@ async def test_the_task_unavailable_topic_never_reaches_the_model(capability: Au
             "get_workflow_knowledge", {"topics": [_TASK_UNAVAILABLE_KNOWLEDGE_TOPIC, "for_loop_block"]}
         )
         alone = await call("get_workflow_knowledge", {"topics": [_TASK_UNAVAILABLE_KNOWLEDGE_TOPIC.upper()]})
+        retired_id = await call(
+            "get_workflow_knowledge", {"topics": ["task_block_task_not_available_in_workflow_copilot"]}
+        )
 
-    assert _TASK_UNAVAILABLE_KNOWLEDGE_TOPIC not in json.dumps(tools["get_workflow_knowledge"].inputSchema)
+    assert retired_id == catalog
+    assert "task_block_task_not_available" not in json.dumps(tools["get_workflow_knowledge"].inputSchema)
     topics = catalog["data"]["topics"]
     assert _TASK_UNAVAILABLE_KNOWLEDGE_TOPIC not in topics
     assert "for_loop_block" in topics

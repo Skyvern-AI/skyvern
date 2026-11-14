@@ -46,7 +46,7 @@ from sqlalchemy.pool import StaticPool
 
 import skyvern._cli_bootstrap as cli_bootstrap
 from skyvern.config import settings
-from skyvern.forge import app
+from skyvern.forge import app, log_redaction
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api import files
@@ -83,6 +83,7 @@ from skyvern.forge.sdk.workflow.models.block import BlockTypeVar, TaskBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.service import WorkflowService
+from skyvern.schemas.proxy_pinning import render_proxy_observability_value
 from skyvern.services import workflow_run_group_service as group_service
 from skyvern.webeye.browser_engine import SKYCDP_ENGINE_NAME, BrowserEngineMetadata, BrowserEngineSelection
 from skyvern.webeye.utils import page as page_module
@@ -268,6 +269,12 @@ structlog.configure(
 def setup_forge_stub_app():
     start_forge_stub_app()
     yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_proxy_observability_renderer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cloud app bootstrap registers its renderer globally; unit tests start with the OSS renderer."""
+    monkeypatch.setattr(log_redaction, "_proxy_observability_renderer", render_proxy_observability_value)
 
 
 def cancel_leftover_tasks(loop: asyncio.AbstractEventLoop) -> None:

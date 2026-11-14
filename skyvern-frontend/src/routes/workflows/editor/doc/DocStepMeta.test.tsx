@@ -4,9 +4,11 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import { useContext } from "react";
 
 import type { WorkflowBlockNode } from "../nodes";
+import { agentStepNodeDefaultData } from "../nodes/AgentStepNode/types";
 import { loginNodeDefaultData } from "../nodes/LoginNode/types";
 import { docKeySettings, docSettingRowsSplit } from "./docSettingsChips";
 import { DocStepMeta } from "./DocStepMeta";
+import { getDocMissingSettings } from "./docStepRegistry";
 import { WorkflowDocActionsContext } from "./WorkflowDocActionsContext";
 
 afterEach(cleanup);
@@ -56,6 +58,59 @@ describe("Doc step summary line", () => {
     });
     // A Login can run without either, so neither chip is marked required.
     expect(url.querySelector("[data-doc-meta-required]")).toBeNull();
+  });
+
+  test("an agent's tools are visible and an empty tools chip opens settings", () => {
+    const node = {
+      ...login({}),
+      type: "agentStep",
+      data: { ...agentStepNodeDefaultData, label: "agent", tools: [] },
+    } as unknown as WorkflowBlockNode;
+    const openSettings = renderMeta(node, true);
+    fireEvent.click(
+      screen.getByRole("button", { name: "Add Tools to agent (required)" }),
+    );
+    expect(
+      screen
+        .getByRole("button", { name: "Add Tools to agent (required)" })
+        .querySelector("[data-doc-meta-required]"),
+    ).toBeTruthy();
+    expect(openSettings).toHaveBeenCalledWith("n1");
+    cleanup();
+    renderMeta(
+      {
+        ...node,
+        data: { ...node.data, tools: ["web_search"] },
+      } as WorkflowBlockNode,
+      true,
+    );
+    expect(screen.getByText("Web Search")).toBeTruthy();
+    expect(getDocMissingSettings(node)).toEqual(["Tools"]);
+    expect(
+      getDocMissingSettings({
+        ...node,
+        data: { ...node.data, tools: ["web_search"] },
+      } as WorkflowBlockNode),
+    ).toEqual([]);
+    expect(
+      getDocMissingSettings({
+        ...node,
+        data: { ...node.data, tools: undefined },
+      } as unknown as WorkflowBlockNode),
+    ).toEqual(["Tools"]);
+  });
+
+  test("long tool lists remain complete in the summary tooltip", () => {
+    const tools = Array.from({ length: 20 }, (_, i) => `unknown_tool_${i}`);
+    const node = {
+      ...login({}),
+      type: "agentStep",
+      data: { ...agentStepNodeDefaultData, label: "agent", tools },
+    } as unknown as WorkflowBlockNode;
+    renderMeta(node, true);
+    expect(
+      screen.getByRole("button", { name: /Tools:/ }).getAttribute("title"),
+    ).toBe(tools.join(", "));
   });
 
   test("a filled login reads credential and host, never a user:password part; its values open the settings too", () => {

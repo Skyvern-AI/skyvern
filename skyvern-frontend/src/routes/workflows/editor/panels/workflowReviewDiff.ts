@@ -931,7 +931,7 @@ const SETTING_LABELS: Record<keyof WorkflowSettings, string> = {
   proxyLocation: "Proxy location",
   browserType: "Browser type",
   runWith: "Run with",
-  aiFallback: "AI fallback (cached scripts)",
+  aiFallback: "AI fallback",
   scriptCacheKey: "Code key",
   codeVersion: "Code version",
   maskSecrets: "Mask secrets",

@@ -1049,7 +1049,10 @@ async def test_click_ingress_routes_no_target_and_emits_nothing(monkeypatch: pyt
         ),
     )
 
-    scraped_page_after_open = SimpleNamespace(id_to_css_dict={"choice-id": "[data-id=choice-id]"})
+    scraped_page_after_open = SimpleNamespace(
+        id_to_css_dict={"choice-id": "[data-id=choice-id]"},
+        id_to_element_dict={"choice-id": {"interactable": True}},
+    )
     scraped_page = SimpleNamespace(
         url="https://test",
         id_to_css_dict={},

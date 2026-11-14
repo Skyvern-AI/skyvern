@@ -1634,37 +1634,6 @@ function FlowRenderer({
     doLayout(newNodes, edges);
   }
 
-  function toggleScript({
-    id,
-    label,
-    show,
-  }: {
-    id?: string;
-    label?: string;
-    show: boolean;
-  }) {
-    if (id) {
-      const node = nodes.find((node) => node.id === id);
-      if (!node) {
-        return;
-      }
-
-      node.data.showCode = show;
-    } else if (label) {
-      const node = nodes.find(
-        (node) => "label" in node.data && node.data.label === label,
-      );
-
-      if (!node) {
-        return;
-      }
-
-      node.data.showCode = show;
-    }
-
-    doLayout(nodes, edges);
-  }
-
   const editorElementRef = useRef<HTMLDivElement>(null);
 
   // A collapse/accordion animation settles the node at a new height; the layout
@@ -2787,8 +2756,8 @@ function FlowRenderer({
         <BlockActionContext.Provider
           value={{
             // Read-only canvases (WorkflowComparisonPanel) must not expose
-            // mutation callbacks. NodeHeader's transmute / delete /
-            // script-toggle menus would otherwise still drive real edits
+            // mutation callbacks. NodeHeader's transmute / delete menus
+            // would otherwise still drive real edits
             // and flip `setHasChanges(true)` on the main editor's store
             // while the user is only inspecting versions.
             requestDeleteNodeCallback: readOnly ? () => {} : requestDeleteNode,
@@ -2801,7 +2770,6 @@ function FlowRenderer({
               ? () => {}
               : (id: string, nodeName: string) =>
                   setTimeout(() => transmuteNode(id, nodeName), 0),
-            toggleScriptForNodeCallback: readOnly ? () => {} : toggleScript,
           }}
         >
           <DndContext

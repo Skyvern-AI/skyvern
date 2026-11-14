@@ -439,6 +439,8 @@ class RealBrowserState(BrowserState):
         self.external_browser = external_browser
         self._runtime_event_context = runtime_event_context or BrowserRuntimeLogContext.current()
         self._run_released = False
+        self._run_http_cache_bound = False
+        self._run_http_cache_seed_closed = False
         if engine_selection is not None:
             self._runtime_event_context = replace(self._runtime_event_context, browser_engine=engine_selection.name)
         self._acquisition_reported_context: BrowserRuntimeLogContext | None = None
@@ -549,12 +551,25 @@ class RealBrowserState(BrowserState):
         self._on_close_callbacks.append(callback)
 
     def bind_runtime_event_context(self, context: BrowserRuntimeLogContext) -> None:
+        previous = self._runtime_event_context
+        # A workflow's tasks share its authority. Reacquiring that same owner must not rotate a live
+        # generation (Task V2 acquires before its planned navigation), nor restore a revoked seed.
+        same_owner = (
+            self._run_http_cache_bound
+            and not self._run_released
+            and (context.workflow_run_id is not None or context.task_id is not None)
+            and previous.workflow_run_id == context.workflow_run_id
+            and (context.workflow_run_id is not None or previous.task_id == context.task_id)
+            and previous.browser_session_id == (context.browser_session_id or previous.browser_session_id)
+        )
         self._run_released = False
+        self._run_http_cache_bound = True
         self._runtime_event_context = replace(
             context,
             browser_session_id=context.browser_session_id or self._runtime_event_context.browser_session_id,
         ).with_browser_dimensions_of(self._runtime_event_context)
-        self._set_run_http_cache()
+        if not same_owner:
+            self._set_run_http_cache()
 
     @property
     def runtime_event_context(self) -> BrowserRuntimeLogContext:
@@ -562,15 +577,19 @@ class RealBrowserState(BrowserState):
 
     def mark_run_released(self) -> None:
         self._run_released = True
+        self._run_http_cache_seed_closed = True
         self._set_run_http_cache()
         app.AGENT_FUNCTION.on_browser_run_released(self.browser_context or self.browser_artifacts)
 
-    # Every bind gets a new generation and every release turns it off, so no response is reused across runs, even
-    # when a persistent or shared context outlives the run that filled it.
+    # A new owner/context gets a new generation and release turns it off, even when the context outlives its run.
     def _set_run_http_cache(self) -> None:
         if self._browser_context is not None:
             generation = None if self._run_released else uuid.uuid4().hex
-            app.AGENT_FUNCTION.set_browser_run_http_cache(self._browser_context, generation)
+            fresh_run = self._run_http_cache_bound and not self._run_released and not self._run_http_cache_seed_closed
+            if fresh_run:
+                # The seed opportunity belongs to the run owner, not to each replacement context.
+                self._run_http_cache_seed_closed = True
+            app.AGENT_FUNCTION.set_browser_run_http_cache(self._browser_context, generation, fresh_run=fresh_run)
 
     @property
     def _run_phase(self) -> RunPhase:

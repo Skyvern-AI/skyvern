@@ -377,7 +377,6 @@ describe("StudioPaneToggles run selector", () => {
           <StudioShellContext.Provider
             value={{
               copilotPortalEl: null,
-              panelPortalEl: null,
               setEditorStreamSlot: () => {},
               setBrowserStreamSlot: () => {},
               setRunStreamSlot: () => {},
@@ -410,7 +409,6 @@ describe("StudioPaneToggles run selector", () => {
           <StudioShellContext.Provider
             value={{
               copilotPortalEl: null,
-              panelPortalEl: null,
               setEditorStreamSlot: () => {},
               setBrowserStreamSlot: () => {},
               setRunStreamSlot: () => {},
@@ -441,7 +439,6 @@ describe("StudioPaneToggles run selector", () => {
           <StudioShellContext.Provider
             value={{
               copilotPortalEl: null,
-              panelPortalEl: null,
               setEditorStreamSlot: () => {},
               setBrowserStreamSlot: () => {},
               setRunStreamSlot: () => {},
@@ -527,7 +524,6 @@ describe("StudioPaneToggles run selector", () => {
           <StudioShellContext.Provider
             value={{
               copilotPortalEl: null,
-              panelPortalEl: null,
               setEditorStreamSlot: () => {},
               setBrowserStreamSlot: () => {},
               setRunStreamSlot: () => {},

@@ -8,7 +8,6 @@ import {
   useWorkflowYamlEditorStore,
 } from "@/store/WorkflowYamlEditorStore";
 import { canonicalRecoveriesByWorkflow } from "../../copilot/WorkflowCopilotChat";
-import type { QueryClient } from "@tanstack/react-query";
 
 import { useMountEffect } from "@/hooks/useMountEffect";
 
@@ -17,9 +16,7 @@ type WorkflowChangesStore = {
 };
 
 type WorkspaceMountInitializationOptions = {
-  cacheKey: string;
   closeWorkflowPanel: () => void;
-  queryClient: Pick<QueryClient, "invalidateQueries">;
   workflowChangesStore: WorkflowChangesStore;
   workflowPermanentId?: string;
 };
@@ -46,9 +43,7 @@ export function useWorkspaceDeferredEditCleanup(workflowId: string) {
 }
 
 function useWorkspaceMountInitialization({
-  cacheKey,
   closeWorkflowPanel,
-  queryClient,
   workflowChangesStore,
   workflowPermanentId,
 }: WorkspaceMountInitializationOptions) {
@@ -62,11 +57,6 @@ function useWorkspaceMountInitialization({
       getDeferredEditReplayRevision(workflowPermanentId) !==
         replayRevisionAtMount.current,
     );
-    if (workflowPermanentId) {
-      queryClient.invalidateQueries({
-        queryKey: ["cache-key-values", workflowPermanentId, cacheKey],
-      });
-    }
     closeWorkflowPanel();
   });
 }

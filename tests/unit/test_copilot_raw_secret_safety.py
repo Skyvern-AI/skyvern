@@ -19,7 +19,6 @@ from skyvern.forge.sdk.copilot.agent import (
     _store_request_policy_on_context,
 )
 from skyvern.forge.sdk.copilot.agent_context import ScoutedInteraction
-from skyvern.forge.sdk.copilot.code_block_synthesis import CREDENTIAL_FILL_TOOL_NAME
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import (
     ApprovedCredential,
@@ -50,6 +49,7 @@ from skyvern.forge.sdk.copilot.tools.guardrails import _authority_tool_error
 from skyvern.forge.sdk.integrations.connected_accounts import IncompleteConnectionRead, OrgConnection
 from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotStreamMessageType
+from skyvern.forge.sdk.workflow.code_block_steps import CREDENTIAL_FILL_TOOL_NAME
 from tests.unit.copilot_test_helpers import make_copilot_ctx, redact_mid_turn, resolve_exact_credential_data
 from tests.unit.scoped_asyncio import ScopedAsyncio
 from tests.unit.scoped_time import ScopedTime

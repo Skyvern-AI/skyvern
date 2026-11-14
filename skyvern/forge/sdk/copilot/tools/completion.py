@@ -52,13 +52,6 @@ from skyvern.forge.sdk.copilot.composition_evidence import model_visible_composi
 from skyvern.forge.sdk.copilot.llm_config import resolve_main_copilot_handler
 from skyvern.forge.sdk.copilot.outcome_verification_trace import record_completion_verification
 from skyvern.forge.sdk.copilot.output_utils import iter_failure_reasons
-from skyvern.forge.sdk.copilot.reached_download_target import (
-    REGISTERED_DOWNLOAD_OUTPUT_KEYS,
-    REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS,
-    derive_from_block_outputs,
-    generated_file_artifact_ids,
-    registered_download_proof_view,
-)
 from skyvern.forge.sdk.copilot.request_policy import (
     REQUESTED_OUTPUT_PATH_MINT_SOURCES,
     CompletionCriterion,
@@ -69,6 +62,13 @@ from skyvern.forge.sdk.copilot.request_policy import (
 )
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
+from skyvern.forge.sdk.workflow.reached_download_target import (
+    REGISTERED_DOWNLOAD_OUTPUT_KEYS,
+    REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS,
+    derive_from_block_outputs,
+    generated_file_artifact_ids,
+    registered_download_proof_view,
+)
 
 from ._shared import (
     _TASK_ENVELOPE_BLOCK_TYPES,

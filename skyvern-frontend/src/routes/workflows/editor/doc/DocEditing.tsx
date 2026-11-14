@@ -313,6 +313,7 @@ export function DocEditableLine({
   maxLength,
   collapse,
   onFiles,
+  onMenuActiveChange,
 }: {
   value: string;
   editable: boolean;
@@ -347,6 +348,8 @@ export function DocEditableLine({
   collapse?: DocTextCollapse;
   // Files pasted into the line; without it a paste is the browser's own.
   onFiles?: (files: File[]) => void;
+  // Reports each menu close after any focus restoration, including lock or unmount.
+  onMenuActiveChange?: (open: boolean) => void;
 }) {
   const [editing, setEditing] = useState(autoFocus);
   const [overLimit, setOverLimit] = useState(false);
@@ -371,6 +374,28 @@ export function DocEditableLine({
   const caret = useRef<Range | null>(null);
   // The caret when "/" opened the step picker, which also takes focus.
   const slashAt = useRef<Range | null>(null);
+  const menuActive = useRef(false);
+  const reportMenuRef = useRef(onMenuActiveChange);
+  reportMenuRef.current = onMenuActiveChange;
+  const reportMenu = (open: boolean) => {
+    if (menuActive.current === open) return;
+    menuActive.current = open;
+    reportMenuRef.current?.(open);
+  };
+  useEffect(() => {
+    if (!editable && menuActive.current) {
+      caret.current = null;
+      slashAt.current = null;
+      setReferenceGroups(null);
+      reportMenu(false);
+    }
+  }, [editable]);
+  useEffect(
+    () => () => {
+      if (menuActive.current) reportMenuRef.current?.(false);
+    },
+    [],
+  );
   const closeReferences = (insert: string) => {
     // Refocusing the line counts as leaving the menu, which calls this again; only the first call inserts.
     const range = caret.current;
@@ -378,7 +403,10 @@ export function DocEditableLine({
     caret.current = null;
     setReferenceGroups(null);
     const el = ref.current;
-    if (!el) return;
+    if (!el) {
+      reportMenu(false);
+      return;
+    }
     el.focus();
     const selection = window.getSelection();
     if (selection) {
@@ -392,6 +420,7 @@ export function DocEditableLine({
       el.closest(IN_DOC)?.querySelectorAll<HTMLElement>("[data-doc-line]") ??
         [],
     ).filter((line) => line.getAttribute("aria-label") === label);
+    reportMenu(false);
     rememberReferenceLine(
       label
         ? {
@@ -526,6 +555,7 @@ export function DocEditableLine({
       ? selection.getRangeAt(0).cloneRange()
       : null;
     slashAt.current = at;
+    reportMenu(true);
     opener((keepLine, typeSlash = keepLine) => {
       if (slashAt.current !== at) return;
       slashAt.current = null;
@@ -534,6 +564,7 @@ export function DocEditableLine({
         setEditing(false);
         setOverLimit(false);
         onDone?.(el?.innerText ?? value);
+        reportMenu(false);
         return;
       }
       if (el?.isConnected && at) {
@@ -542,9 +573,11 @@ export function DocEditableLine({
         window.getSelection()?.removeAllRanges();
         window.getSelection()?.addRange(at);
         if (typeSlash) document.execCommand("insertText", false, "/");
+        reportMenu(false);
         return;
       }
       if (typeSlash) onChange(`${before}/${after}`);
+      reportMenu(false);
     });
   };
 
@@ -647,6 +680,7 @@ export function DocEditableLine({
         caret.current.selectNodeContents(ref.current);
         caret.current.collapse(false);
       }
+      reportMenu(true);
       setReferenceQuery("");
       setReferenceGroups(references());
       return;

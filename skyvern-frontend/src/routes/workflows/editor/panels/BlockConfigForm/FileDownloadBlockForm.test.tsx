@@ -64,9 +64,9 @@ vi.mock("../../workflowEditorUtils", async () => {
 
 // Stub heavy components: WorkflowBlockInputTextarea, ParametersMultiSelect,
 // ErrorCodeMappingEditor, ModelSelector, RunEngineSelector,
-// BlockExecutionOptions, DisableCache. Each is replaced with a minimal stub
-// that exposes the props the form passes so we can drive the form's
-// contract without spinning up the full editor.
+// BlockExecutionOptions. Each is replaced with a minimal stub that exposes
+// the props the form passes so we can drive the form's contract without
+// spinning up the full editor.
 vi.mock("@/components/WorkflowBlockInputTextarea", () => ({
   WorkflowBlockInputTextarea: (props: {
     value: string;
@@ -189,20 +189,6 @@ vi.mock("../../nodes/components/BlockExecutionOptions", () => ({
         }
       />
     </div>
-  ),
-}));
-
-vi.mock("../../nodes/DisableCache", () => ({
-  DisableCache: (props: {
-    disableCache: boolean;
-    editable: boolean;
-    onDisableCacheChange: (next: boolean) => void;
-  }) => (
-    <button
-      data-testid="disable-cache-toggle"
-      data-disabled={String(props.disableCache)}
-      onClick={() => props.onDisableCacheChange(!props.disableCache)}
-    />
   ),
 }));
 
@@ -1006,7 +992,6 @@ describe("FileDownloadBlockForm (SKY-9361)", () => {
     fireEvent.change(screen.getByTestId("wbi-navigation_goal"), {
       target: { value: "blocked" },
     });
-    fireEvent.click(screen.getByTestId("disable-cache-toggle"));
     fireEvent.click(screen.getByTestId("error-code-mapping-switch"));
 
     expect(updateNodeData).not.toHaveBeenCalled();

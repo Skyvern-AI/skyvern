@@ -11,13 +11,105 @@ from urllib.parse import urlsplit
 import structlog
 import yaml
 
-from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
-from skyvern.forge.sdk.copilot.code_block_security import INERT_SLOT_NAME
-from skyvern.forge.sdk.copilot.code_block_synthesis import _RECORDING_REQUIRED_ACTION_TYPES, _RESERVED_PARAM_NAMES
+from skyvern.forge.sdk.workflow.code_block_security import INERT_SLOT_NAME
+from skyvern.forge.sdk.workflow.reached_download_target import DOWNLOAD_CLAIM_HELPER_NAME
 from skyvern.utils.templating import mask_jinja_control_blocks, strip_jinja_control_blocks
 from skyvern.utils.yaml_loader import dump_workflow_yaml, safe_load_no_dates
 
 LOG = structlog.get_logger()
+
+CREDENTIAL_FILL_TOOL_NAME = "fill_credential_field"
+# Recorded actions a workflow silently loses if dropped; a recording emits a repair step for them instead.
+# Dropped hovers are tolerated: they are usually incidental to a located click.
+RECORDING_REQUIRED_ACTION_TYPES = {
+    "click": "click",
+    "drag": "drag",
+    "set_dialog_policy": "input_text",
+    "type_text": "input_text",
+    CREDENTIAL_FILL_TOOL_NAME: "input_text",
+    "select_option": "select_option",
+    "upload_file": "upload_file",
+}
+
+ENTRY_TARGET_VAR = "_scout_entry_target"
+ENTRY_REUSED_VAR = "_scout_entry_reused_current_page"
+ENTRY_RESUME_AFTER_AUTH_VAR = "_scout_entry_resume_after_auth"
+ENTRY_RESUME_TARGET_VAR = "_scout_entry_resume_target"
+ENTRY_OPENER_VAR = "_scout_entry_opener"
+MONTH_HELPER_VAR = "_scout_month_to_iso"
+ISO_DATE_HELPER_VAR = "_scout_iso_date_to_year_month"
+PERIOD_DATE_PATTERN_HELPER_VAR = "_scout_period_date_pattern"
+# Base name for the download var bound by `async with page.expect_download() as <name>:`.
+DOWNLOAD_VAR_BASE = "dl_info"
+DOWNLOAD_FILENAME_VAR_BASE = "downloaded_file_name"
+_DOWNLOAD_PATH_VAR_BASE = "_downloaded_file_path"
+_DOWNLOAD_OUTPUT_VAR_BASE = "downloaded_files"
+
+# Names the code-block executor reserves in its exec() namespace (block.py build_safe_vars
+# plus the injected `page`). A parameter key colliding with one of these is shadowed by the
+# builtin at bind time (block.py's late safe globals let a persisted parameter keep its value,
+# but a new block must not rely on that), so the synthesized fill would stringify the builtin.
+# "username"/"password"/"totp"/"totp_identifier" are reserved too: CodeBlock.execute also
+# injects a bound credential's fields under those bare names, so a plain parameter named
+# `password` would resolve to the credential's secret value instead of the user input.
+RESERVED_PARAM_NAMES = frozenset(
+    {
+        "page",
+        "username",
+        "password",
+        "totp",
+        "totp_identifier",
+        "otp",
+        "solve_captcha",
+        "search_web",
+        "read_document_text",
+        "open_page",
+        "clear_browser_data",
+        "attach_authorized_file",
+        "set_dialog_policy",
+        DOWNLOAD_CLAIM_HELPER_NAME,
+        "print",
+        "len",
+        "range",
+        "str",
+        "int",
+        "float",
+        "dict",
+        "list",
+        "tuple",
+        "set",
+        "bool",
+        "isinstance",
+        "enumerate",
+        "any",
+        "all",
+        "max",
+        "min",
+        "sum",
+        "round",
+        "abs",
+        "sorted",
+        "sleep",
+        "asyncio",
+        "re",
+        "json",
+        "html",
+        "Exception",
+        ENTRY_TARGET_VAR,
+        ENTRY_REUSED_VAR,
+        ENTRY_RESUME_AFTER_AUTH_VAR,
+        ENTRY_RESUME_TARGET_VAR,
+        ENTRY_OPENER_VAR,
+        MONTH_HELPER_VAR,
+        ISO_DATE_HELPER_VAR,
+        PERIOD_DATE_PATTERN_HELPER_VAR,
+        DOWNLOAD_VAR_BASE,
+        f"{DOWNLOAD_VAR_BASE}_file",
+        DOWNLOAD_FILENAME_VAR_BASE,
+        _DOWNLOAD_PATH_VAR_BASE,
+        _DOWNLOAD_OUTPUT_VAR_BASE,
+    }
+)
 
 # Method name -> step action_type for the editor's static step preview (values are ActionType members,
 # kept as string literals so this module does not import skyvern.webeye, matching code_block_synthesis.py).
@@ -149,7 +241,7 @@ def analyze_code_actions(code: str) -> list[CodeActionSpan]:
         if isinstance(node, ast.Raise) and (repair_tool := _recording_repair_tool(node)) is not None:
             spans.append(
                 CodeActionSpan(
-                    action_type=_RECORDING_REQUIRED_ACTION_TYPES[repair_tool],
+                    action_type=RECORDING_REQUIRED_ACTION_TYPES[repair_tool],
                     line_start=node.lineno,
                     line_end=node.end_lineno or node.lineno,
                     method="raise",
@@ -218,7 +310,7 @@ def _recording_repair_tool(node: ast.Raise) -> str | None:
         return None
     match = _RECORDING_REPAIR_MESSAGE.match(_constant_str(node.exc.args[0]) or "")
     tool = match.group(1) if match else None
-    return tool if tool in _RECORDING_REQUIRED_ACTION_TYPES else None
+    return tool if tool in RECORDING_REQUIRED_ACTION_TYPES else None
 
 
 def _prompt_literal(call: ast.Call, method: str) -> str | None:
@@ -640,7 +732,7 @@ def derive_code_block_steps(code: str) -> list[dict[str, Any]]:
 def is_code_block_type(block_type: object) -> bool:
     """True for every spelling the schema later canonicalizes to ``code``, so a pre-normalization
     pass cannot be skipped by an alias."""
-    return isinstance(block_type, str) and normalize_copilot_block_type_alias(block_type) == "code"
+    return isinstance(block_type, str) and block_type.strip().lower() == "code"
 
 
 def _iter_code_block_dicts(node: Any) -> Iterator[dict[str, Any]]:
@@ -771,7 +863,7 @@ def bind_referenced_parameters_in_yaml(workflow_yaml: str) -> str:
         # A key colliding with an executor-reserved name is dropped at bind time, and the
         # credential-field names resolve to a bound credential's secret instead of the
         # parameter, so binding one would hand the block the wrong value entirely.
-        referenced = (declared & _referenced_names(code)) - _RESERVED_PARAM_NAMES
+        referenced = (declared & _referenced_names(code)) - RESERVED_PARAM_NAMES
         raw_keys = block.get("parameter_keys")
         existing = [key for key in raw_keys if isinstance(key, str)] if isinstance(raw_keys, list) else []
         missing = [key for key in sorted(referenced) if key not in existing]
@@ -944,7 +1036,7 @@ def carry_user_owned_goals_in_yaml(
         if label not in submitted_labels and isinstance(owned_block.get("prompt"), str)
     )
     if dropped:
-        LOG.info("copilot submission omitted user-owned goal blocks", dropped_labels=dropped)
+        LOG.info("submission omitted user-owned goal blocks", dropped_labels=dropped)
 
     carried_yaml = dump_workflow_yaml(data) if changed else workflow_yaml
     return UserOwnedGoalCarry(carried_yaml, sorted(kept), dropped)

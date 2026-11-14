@@ -47,7 +47,7 @@ from skyvern.forge.sdk.copilot.screenshot_utils import (
     ScreenshotProvenance,
     resize_screenshot_b64,
 )
-from skyvern.forge.sdk.copilot.secret_scrub import clear_session_scrub_values, register_secret_scrub_value
+from skyvern.forge.sdk.copilot.secret_scrub import register_secret_scrub_value
 from skyvern.forge.sdk.copilot.tools import (
     _build_skyvern_mcp_overlays,
 )
@@ -62,6 +62,7 @@ from skyvern.forge.sdk.copilot.tools import (
     update_and_run_blocks_tool,
 )
 from skyvern.forge.sdk.copilot.workflow_yaml import stored_block_code
+from skyvern.utils.secret_scrub import clear_session_scrub_values
 from skyvern.webeye.browser_errors import BrowserCdpConnectionError
 from skyvern.webeye.persistent_sessions_manager import BrowserRetirementReason
 from tests.unit._mcp_browser_fakes import logged_request_failures, make_request_failure, seed_request_failures

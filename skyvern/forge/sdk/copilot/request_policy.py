@@ -40,7 +40,6 @@ from skyvern.forge.sdk.copilot.credential_resolution import (
 from skyvern.forge.sdk.copilot.credential_resolution import url_parts as _url_parts
 from skyvern.forge.sdk.copilot.eval_llm_overrides import current_eval_llm_overrides
 from skyvern.forge.sdk.copilot.llm_config import WORKFLOW_COPILOT_RAW_SECRET_SAFETY_PROMPT_TYPE
-from skyvern.forge.sdk.copilot.reached_download_target import REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS
 from skyvern.forge.sdk.copilot.request_slots import (
     CanonicalRequestSlotV1,
     RequestSlotContractV1,
@@ -50,12 +49,6 @@ from skyvern.forge.sdk.copilot.request_slots import (
     request_slot_sources,
 )
 from skyvern.forge.sdk.copilot.router_fallback import router_fallback_llm_key
-from skyvern.forge.sdk.copilot.secret_redaction import (
-    RAW_SECRET_PATTERNS,
-    contains_email_password_pair,
-    raw_secret_spans_for_prompt,
-    redact_raw_secrets_for_prompt,
-)
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.vault_logins import vault_login_credential, vault_login_ref
 from skyvern.forge.sdk.copilot.workflow_credential_utils import (
@@ -79,7 +72,14 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
 from skyvern.forge.sdk.services.credential.credential_vault_service import VaultLogin, VaultLoginListing
 from skyvern.forge.sdk.workflow.models.credential_release import saved_site_urls
 from skyvern.forge.sdk.workflow.models.parameter import ParameterType
+from skyvern.forge.sdk.workflow.reached_download_target import REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS
 from skyvern.schemas.google_sheets import extract_spreadsheet_id
+from skyvern.utils.raw_secret_redaction import (
+    RAW_SECRET_PATTERNS,
+    contains_email_password_pair,
+    raw_secret_spans_for_prompt,
+    redact_raw_secrets_for_prompt,
+)
 from skyvern.utils.strings import escape_code_fences
 from skyvern.utils.yaml_loader import safe_load_no_dates
 

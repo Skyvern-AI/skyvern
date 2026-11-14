@@ -177,7 +177,7 @@ The agent presses single keys such as Enter, Tab, and Escape. It can't use brows
 </Accordion>
 
 <Accordion title="2FA code rejected or expired">
-Skyvern already waits for a fresh TOTP code when fewer than 20 seconds are left and the code goes into several boxes. A pushed code stays usable for 10 minutes, but the site's own code may expire sooner, so forward codes as soon as they arrive. Self-hosted servers need an accurate clock (NTP). `errors` shows `OTP_EXPIRED` in this case.
+Skyvern already waits for a fresh TOTP code when fewer than 20 seconds are left and the code goes into several boxes. A pushed code stays usable for 10 minutes, but the site's own code may expire sooner, so forward codes as soon as they arrive. Self-hosted servers need an accurate clock (NTP). If Skyvern entered the code but the site didn't confirm it before the page load timed out, `errors` shows `OTP_OUTCOME_UNCONFIRMED`.
 </Accordion>
 
 <Accordion title="2FA code never arrives">

@@ -112,7 +112,6 @@ describe("useStudioPanes visit-scoped Copilot selection", () => {
       <StudioShellContext.Provider
         value={{
           copilotPortalEl: null,
-          panelPortalEl: null,
           setEditorStreamSlot: vi.fn(),
           setBrowserStreamSlot: vi.fn(),
           setRunStreamSlot: vi.fn(),

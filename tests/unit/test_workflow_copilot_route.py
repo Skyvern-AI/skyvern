@@ -24,6 +24,7 @@ import pytest_asyncio
 import yaml
 from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
+from pydantic import BaseModel, ValidationError
 from sqlalchemy import update
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -91,7 +92,7 @@ from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_modul
 from skyvern.forge.sdk.copilot.tools import workflow_update
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.turn_outcome import build_minimal_turn_outcome
-from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml, dump_workflow_yaml, workflow_to_copilot_yaml
+from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml, dump_workflow_yaml
 from skyvern.forge.sdk.db.agent_db import AgentDB, _build_engine
 from skyvern.forge.sdk.db.base_alchemy_db import BaseAlchemyDB
 from skyvern.forge.sdk.db.exceptions import CopilotProposalConflictError, DatabaseConnectionUnavailableError
@@ -114,6 +115,7 @@ from skyvern.forge.sdk.routes.workflow_copilot import (
     workflow_copilot_demonstration_control,
     workflow_copilot_demonstration_record,
 )
+from skyvern.forge.sdk.schemas import workflow_copilot as workflow_copilot_schemas
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import (
     ConnectedAccountChoice,
     CopilotBrowserAllocation,
@@ -148,6 +150,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     copilot_proposal_metadata,
 )
 from skyvern.forge.sdk.services.request_principal import AuthKind, RequestPrincipal
+from skyvern.forge.sdk.workflow.authoring_yaml import workflow_to_authoring_yaml
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
@@ -2912,10 +2915,18 @@ async def test_browser_ablation_selector_is_rejected_while_disabled(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"x-ember-eval-mode": "browser_ablation"},
+        {"x-copilot-eval-mode": "browser_ablation"},
+        {"x-ember-eval-mode": "browser_ablation", "x-copilot-eval-mode": "unknown"},
+    ],
+)
 async def test_browser_ablation_selector_forces_v2_when_enabled(
-    monkeypatch: pytest.MonkeyPatch, anon_request: MagicMock, organization: SimpleNamespace
+    monkeypatch: pytest.MonkeyPatch, anon_request: MagicMock, organization: SimpleNamespace, headers: dict[str, str]
 ) -> None:
-    anon_request.headers = {"x-copilot-eval-mode": "browser_ablation"}
+    anon_request.headers = headers
     monkeypatch.setattr(settings, "WORKFLOW_COPILOT_BROWSER_ABLATION_ENABLED", True)
     monkeypatch.setattr(settings, "WORKFLOW_COPILOT_BROWSER_ABLATION_ORGANIZATION_IDS", ["org-1"])
     new_copilot = AsyncMock(return_value=object())
@@ -2945,8 +2956,11 @@ async def test_browser_ablation_selector_is_rejected_for_a_non_eval_organization
 
 
 @pytest.mark.asyncio
-async def test_unknown_eval_selector_is_rejected(anon_request: MagicMock, organization: SimpleNamespace) -> None:
-    anon_request.headers = {"x-copilot-eval-mode": "unknown"}
+@pytest.mark.parametrize("header", ["x-ember-eval-mode", "x-copilot-eval-mode"])
+async def test_unknown_eval_selector_is_rejected(
+    anon_request: MagicMock, organization: SimpleNamespace, header: str
+) -> None:
+    anon_request.headers = {header: "unknown"}
 
     with pytest.raises(HTTPException) as exc_info:
         await workflow_copilot_chat_post(anon_request, _make_chat_request(), organization)
@@ -4146,7 +4160,7 @@ async def test_route_error_recovery_keeps_the_committed_workflow_and_other_turns
         user_response="done",
         updated_workflow=committed,
         global_llm_context=None,
-        workflow_yaml=workflow_copilot_route.workflow_to_copilot_yaml(committed),
+        workflow_yaml=workflow_copilot_route.workflow_to_authoring_yaml(committed),
         proposal_disposition="auto_applicable",
         has_staged_proposal=True,
         staged_workflow=committed,
@@ -4292,7 +4306,7 @@ async def test_auto_accept_receipt_reports_whether_this_turn_moved_the_saved_wor
         user_response="done",
         updated_workflow=committed,
         global_llm_context=None,
-        workflow_yaml=workflow_copilot_route.workflow_to_copilot_yaml(committed),
+        workflow_yaml=workflow_copilot_route.workflow_to_authoring_yaml(committed),
         proposal_disposition="auto_applicable",
         has_staged_proposal=True,
         staged_workflow=committed,
@@ -5572,7 +5586,7 @@ async def test_a_pending_proposal_restores_over_the_canvas_of_a_blank_saved_work
     agent_mock = AsyncMock(return_value=agent_result)
     monkeypatch.setattr(workflow_copilot_route, "run_copilot_agent", agent_mock)
     request = _make_chat_request(mode="build")
-    request.workflow_yaml = workflow_copilot_route.workflow_to_copilot_yaml(original_workflow)
+    request.workflow_yaml = workflow_copilot_route.workflow_to_authoring_yaml(original_workflow)
 
     await workflow_copilot_chat_post(api_key_request, request, organization)
     await captured["handler"](copilot_stream)
@@ -5774,7 +5788,7 @@ async def test_pending_proposal_private_settings_follow_canvas_selection(
         agent.await_args.kwargs["chat_request"].workflow_yaml,
         agent.await_args.kwargs["prior_copilot_workflow_yaml"],
         agent.await_args.kwargs["persisted_workflow_yaml"],
-        workflow_copilot_route.workflow_to_copilot_yaml(Workflow.model_validate(pending_turn.pre_turn_workflow)),
+        workflow_copilot_route.workflow_to_authoring_yaml(Workflow.model_validate(pending_turn.pre_turn_workflow)),
     ):
         assert "proxy_location" not in yaml.safe_load(model_yaml)
         assert "synthetic-proxy" not in model_yaml
@@ -8569,9 +8583,9 @@ def test_a_client_side_http_error_stays_the_products_own_answer() -> None:
     )
 
 
-def _eval_header_request() -> MagicMock:
+def _eval_header_request(header: str = "x-copilot-eval") -> MagicMock:
     request = MagicMock()
-    request.headers = {"x-copilot-eval": "odysseys"}
+    request.headers = {header: "odysseys"}
     return request
 
 
@@ -8684,15 +8698,23 @@ async def test_a_non_http_eval_entrypoint_url_is_rejected_with_both_gates_open(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("eval_mode", [None, CopilotEvalMode.BROWSER_ABLATION])
+@pytest.mark.parametrize(
+    ("eval_header", "eval_mode_header"),
+    [("x-ember-eval", "x-ember-eval-mode"), ("x-copilot-eval", "x-copilot-eval-mode")],
+)
 async def test_an_admitted_eval_entrypoint_url_reaches_the_agent_path_byte_exact(
-    monkeypatch: pytest.MonkeyPatch, organization: SimpleNamespace, eval_mode: CopilotEvalMode | None
+    monkeypatch: pytest.MonkeyPatch,
+    organization: SimpleNamespace,
+    eval_mode: CopilotEvalMode | None,
+    eval_header: str,
+    eval_mode_header: str,
 ) -> None:
     new_copilot_mock = _install_v2_dispatch(monkeypatch, eval_inputs_enabled=True)
     monkeypatch.setattr(settings, "WORKFLOW_COPILOT_BROWSER_ABLATION_ENABLED", True)
     monkeypatch.setattr(settings, "WORKFLOW_COPILOT_BROWSER_ABLATION_ORGANIZATION_IDS", [organization.organization_id])
-    request = _eval_header_request()
+    request = _eval_header_request(eval_header)
     if eval_mode is not None:
-        request.headers["x-copilot-eval-mode"] = eval_mode.value
+        request.headers[eval_mode_header] = eval_mode.value
 
     await workflow_copilot_chat_post(
         request,
@@ -10508,7 +10530,7 @@ async def test_a_copilot_turn_never_saves_a_block_image_the_model_wrote(
         workflow_id=saved.workflow_id,
         workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
         message="Make the lookup step clearer",
-        workflow_yaml=workflow_to_copilot_yaml(saved),
+        workflow_yaml=workflow_to_authoring_yaml(saved),
         doc_editor_enabled=doc_editor_enabled,
     )
 
@@ -10547,3 +10569,33 @@ async def test_a_copilot_turn_never_saves_a_block_image_the_model_wrote(
         assert accepted.version > saved.version
     assert accepted.workflow_definition.blocks[0].navigation_goal == "Open the lookup page"
     assert _saved_image_ids(accepted) == {"lookup.doc_images": [live]}
+
+
+def test_every_chat_id_request_model_accepts_the_old_key_the_new_key_or_both() -> None:
+    models = [
+        model
+        for model in vars(workflow_copilot_schemas).values()
+        if isinstance(model, type)
+        and issubclass(model, BaseModel)
+        and model.__module__ == workflow_copilot_schemas.__name__
+        and (field := model.model_fields.get("workflow_copilot_chat_id")) is not None
+        and field.validation_alias is not None
+    ]
+    assert workflow_copilot_schemas.WorkflowCopilotQuestionResponseRequest in models
+    for model in models:
+        for body in (
+            {"workflow_copilot_chat_id": "wcc_1"},
+            {"ember_chat_id": "wcc_1"},
+            {"ember_chat_id": "wcc_1", "workflow_copilot_chat_id": "wcc_1"},
+        ):
+            try:
+                model.model_validate(body)
+            except ValidationError as error:
+                # Other required fields are absent on purpose; only chat-id errors matter here.
+                chat_id_errors = [
+                    e
+                    for e in error.errors()
+                    if e["type"] == "extra_forbidden"
+                    or {"ember_chat_id", "workflow_copilot_chat_id"} & set(map(str, e["loc"]))
+                ]
+                assert not chat_id_errors, (model.__name__, body, chat_id_errors)

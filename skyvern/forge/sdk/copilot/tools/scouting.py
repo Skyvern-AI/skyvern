@@ -96,11 +96,11 @@ from skyvern.forge.sdk.copilot.screenshot_utils import (
     screenshot_viewport_css_px,
 )
 from skyvern.forge.sdk.copilot.secret_scrub import (
-    REDACTED_SECRET_PLACEHOLDER,
     registered_scrub_values,
     scrub_secrets_from_structure,
     scrub_secrets_from_text,
 )
+from skyvern.utils.secret_scrub import REDACTED_SECRET_PLACEHOLDER
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.utils import challenge_signature
 

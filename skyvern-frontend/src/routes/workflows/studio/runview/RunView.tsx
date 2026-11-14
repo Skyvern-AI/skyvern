@@ -60,17 +60,12 @@ import {
   type RecoveryGuidanceTelemetryContext,
 } from "@/util/onboarding/recoveryGuidanceTelemetry";
 
-import { constructCacheKeyValue } from "../../editor/utils";
-import { useBlockScriptsQuery } from "../../hooks/useBlockScriptsQuery";
-import { useFallbackEpisodesQuery } from "../../hooks/useFallbackEpisodesQuery";
 import { useRefreshOnboardingOnRunCompletion } from "../../hooks/useRefreshOnboardingOnRunCompletion";
 import { useWorkflowRunTimelineQuery } from "../../hooks/useWorkflowRunTimelineQuery";
 import { useWorkflowRunWithWorkflowQuery } from "../../hooks/useWorkflowRunWithWorkflowQuery";
 import { ResizableTimelineSplit } from "../../workflowRun/ResizableTimelineSplit";
 import { WorkflowRunBlockDetail } from "../../workflowRun/WorkflowRunBlockDetail";
-import { WorkflowRunCode } from "../../workflowRun/WorkflowRunCode";
 import { WorkflowRunHumanInteraction } from "../../workflowRun/WorkflowRunHumanInteraction";
-import { ScriptUpdateCard } from "../../workflowRun/ScriptUpdateCard";
 import { WorkflowRunTimeline } from "../../workflowRun/WorkflowRunTimeline";
 import { WorkflowRunVerificationCodeForm } from "../../workflowRun/WorkflowRunVerificationCodeForm";
 import { findRunCodeBlockFailure } from "../../workflowRun/codeBlockFailure";
@@ -127,12 +122,7 @@ const RECOVERY_GUIDANCE_TREATMENT_SURFACE_FLAG =
   "RECOVERY_GUIDANCE_TREATMENT_SURFACE";
 
 function isRunPaneView(value: string | null): value is RunPaneView {
-  return (
-    value === "timeline" ||
-    value === "inputs" ||
-    value === "outputs" ||
-    value === "code"
-  );
+  return value === "timeline" || value === "inputs" || value === "outputs";
 }
 
 type RunViewProps = {
@@ -336,23 +326,6 @@ export function RunView({
       : false;
   const workflow = workflowRun?.workflow;
   const workflowPermanentId = workflow?.workflow_permanent_id;
-  const isWorkflowDeleted = Boolean(workflow?.deleted_at);
-  const cacheKey = workflow?.cache_key ?? "";
-  const cacheKeyValue =
-    constructCacheKeyValue({ codeKey: cacheKey, workflow, workflowRun }) ?? "";
-  const { data: blockScriptsPublished } = useBlockScriptsQuery({
-    cacheKey,
-    cacheKeyValue,
-    enabled: finalized && !isWorkflowDeleted,
-    workflowPermanentId,
-    status: "published",
-    workflowRunId: workflowRun?.workflow_run_id,
-  });
-  const { data: fallbackEpisodes } = useFallbackEpisodesQuery({
-    workflowPermanentId,
-    workflowRunId: workflowRun?.workflow_run_id,
-    enabled: finalized && !isWorkflowDeleted,
-  });
   const onboarding = useOnboardingStateOptional();
   const recoveryGuidanceTreatmentSurfaceEnabled =
     useFeatureFlag(RECOVERY_GUIDANCE_TREATMENT_SURFACE_FLAG) === true;
@@ -867,7 +840,6 @@ export function RunView({
       workflowRun?.browser_profile_id,
       (id) => `/browser-profiles/${id}`,
     );
-    pushMeta("Run with", workflowRun?.run_with);
     pushMeta("Max screenshot scrolls", workflowRun?.max_screenshot_scrolls);
     return { parameters, blockPrompts, meta };
   }, [workflowRun]);
@@ -1015,12 +987,6 @@ export function RunView({
           rerun={embedded ? undefined : milestoneRerun}
         />
       ) : null}
-      {fallbackEpisodes && fallbackEpisodes.episodes.length > 0 ? (
-        <ScriptUpdateCard
-          episodes={fallbackEpisodes.episodes}
-          scriptId={blockScriptsPublished?.script_id}
-        />
-      ) : null}
 
       {view === "timeline" ? (
         <div className="flex min-h-0 flex-1 flex-col gap-2">
@@ -1142,7 +1108,7 @@ export function RunView({
             </div>
           )}
         </div>
-      ) : view === "outputs" ? (
+      ) : (
         <div className="min-h-0 flex-1 overflow-y-auto">
           {hasOutputs ? (
             <RunOutputsSection
@@ -1167,13 +1133,6 @@ export function RunView({
                 : "Outputs appear when the run finishes"}
             </div>
           )}
-        </div>
-      ) : (
-        <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-          <WorkflowRunCode
-            workflowRunId={workflowRun.workflow_run_id}
-            showCacheKeyValueSelector
-          />
         </div>
       )}
     </div>

@@ -127,6 +127,18 @@ async def test_workflow_knowledge_returns_only_the_requested_authoritative_secti
 
 
 @pytest.mark.asyncio
+async def test_workflow_knowledge_answers_a_retired_topic_id_with_its_current_section() -> None:
+    old, new = "task_block_task_not_available_in_workflow_copilot", "task_block_task_not_available_in_ember"
+    current = (await skyvern_workflow_knowledge(topics=[new]))["data"]["sections"][new]
+
+    result = await skyvern_workflow_knowledge(topics=[old])
+
+    assert result["ok"] is True
+    assert result["data"]["sections"] == {old: current}
+    assert old not in (await skyvern_workflow_knowledge())["data"]["topics"]
+
+
+@pytest.mark.asyncio
 async def test_workflow_knowledge_rejects_unknown_topics_with_the_catalog() -> None:
     result = await skyvern_workflow_knowledge(topics=["does_not_exist"])
 

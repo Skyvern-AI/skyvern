@@ -1,6 +1,6 @@
 import { create } from "zustand";
 
-export type RunPaneView = "timeline" | "inputs" | "outputs" | "code";
+export type RunPaneView = "timeline" | "inputs" | "outputs";
 
 /**
  * Which body view the studio's Overview pane shows. Lives in a store because

@@ -784,7 +784,7 @@ describe("TitleSection title link + edit affordance", () => {
     renderTitleSection();
     const link = screen.getByRole("link", { name: "My Workflow" });
     expect(link.getAttribute("href")).toBe("/agents/wpid_abc/runs");
-    // jsdom can't evaluate :hover; pin the color cue (mirrors WorkflowScriptsPage's runs link).
+    // jsdom can't evaluate :hover; pin the color cue.
     expect(link.className).toContain("hover:text-blue-700");
     expect(link.className).toContain("dark:hover:text-blue-400");
     // Radix mounts the tooltip content on focus (visible + a11y copies), so

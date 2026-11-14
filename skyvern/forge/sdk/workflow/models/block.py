@@ -199,19 +199,6 @@ from skyvern.forge.sdk.api.llm.utils import (
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at, is_file_from_retry_attempt
 from skyvern.forge.sdk.artifact.storage.unique_pdfs import run_stoppable_comparison, unique_pdf_paths
-from skyvern.forge.sdk.copilot.code_block_security import (
-    INERT_SLOT_NAME,
-    SlottedReference,
-    is_inert_slot,
-    slot_template,
-)
-from skyvern.forge.sdk.copilot.code_block_steps import analyze_code_actions, code_typed_values
-from skyvern.forge.sdk.copilot.reached_download_target import (
-    REGISTERED_DOWNLOAD_OUTPUT_KEYS,
-    block_output_has_registered_download,
-    code_is_download_intent,
-    without_generated_file_stamp,
-)
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
@@ -285,6 +272,13 @@ from skyvern.forge.sdk.workflow.code_block_safety import (
     module_shims,
     safe_builtins,
 )
+from skyvern.forge.sdk.workflow.code_block_security import (
+    INERT_SLOT_NAME,
+    SlottedReference,
+    is_inert_slot,
+    slot_template,
+)
+from skyvern.forge.sdk.workflow.code_block_steps import analyze_code_actions, code_typed_values
 from skyvern.forge.sdk.workflow.constants import OUTPUT_PARAMETER_MAX_VALUE_BYTES
 from skyvern.forge.sdk.workflow.context_manager import (
     NON_SECRET_CREDENTIAL_FIELDS,
@@ -368,6 +362,12 @@ from skyvern.forge.sdk.workflow.page_derived_templates import (
     PageDerivedRender,
     loop_source_is_page_derived,
     render_page_derived,
+)
+from skyvern.forge.sdk.workflow.reached_download_target import (
+    REGISTERED_DOWNLOAD_OUTPUT_KEYS,
+    block_output_has_registered_download,
+    code_is_download_intent,
+    without_generated_file_stamp,
 )
 from skyvern.forge.sdk.workflow.secret_encryption import (
     SENSITIVE_DESTINATION_FIELDS,

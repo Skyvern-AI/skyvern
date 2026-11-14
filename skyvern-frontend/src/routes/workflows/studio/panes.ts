@@ -216,6 +216,7 @@ export function resolveOpenPanes(
     );
   const view = params.get("view");
   const requiredPane = view === "recording" ? "browser" : "overview";
+  // "code" is a removed view; its old links still open the Overview pane, which shows the timeline.
   const hasContentView =
     view !== null &&
     ["recording", "timeline", "outputs", "inputs", "code"].includes(view);

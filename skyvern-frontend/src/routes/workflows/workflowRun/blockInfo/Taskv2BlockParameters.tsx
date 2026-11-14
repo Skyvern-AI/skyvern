@@ -1,6 +1,5 @@
 import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
 import { Input } from "@/components/ui/input";
-import { Switch } from "@/components/ui/switch";
 
 type Props = {
   prompt: string;
@@ -8,7 +7,6 @@ type Props = {
   maxSteps: number | null;
   totpVerificationUrl: string | null;
   totpIdentifier: string | null;
-  disableCache: boolean;
 };
 
 function Taskv2BlockParameters({
@@ -17,7 +15,6 @@ function Taskv2BlockParameters({
   maxSteps,
   totpVerificationUrl,
   totpIdentifier,
-  disableCache,
 }: Props) {
   return (
     <div className="space-y-4">
@@ -60,19 +57,6 @@ function Taskv2BlockParameters({
             <h1 className="text-lg">TOTP Identifier</h1>
           </div>
           <Input value={totpIdentifier} readOnly />
-        </div>
-      ) : null}
-      {disableCache ? (
-        <div className="flex gap-16">
-          <div className="w-80">
-            <h1 className="text-lg">Cache Disabled</h1>
-          </div>
-          <div className="flex w-full items-center gap-3">
-            <Switch checked={true} disabled />
-            <span className="text-sm text-muted-foreground">
-              Cache is disabled for this block
-            </span>
-          </div>
         </div>
       ) : null}
     </div>

@@ -47,13 +47,6 @@ from skyvern.forge.sdk.copilot.code_block_preflight import (
     advisory_code_block_diagnostics,
     scanner_advisory_diagnostics,
 )
-from skyvern.forge.sdk.copilot.code_block_security import CodeBlockSecurityError, author_time_code_security_errors
-from skyvern.forge.sdk.copilot.code_block_steps import (
-    bind_referenced_parameters_in_yaml,
-    carry_user_owned_goals_in_yaml,
-    fill_missing_code_block_goals_in_yaml,
-    user_owned_goal_carry_disclosure,
-)
 from skyvern.forge.sdk.copilot.code_block_synthesis import wrapped_code_ast as _wrapped_code_ast
 from skyvern.forge.sdk.copilot.code_write_diff import CodeWriteDiff, build_code_write_diffs
 from skyvern.forge.sdk.copilot.composition_evidence import (
@@ -78,11 +71,6 @@ from skyvern.forge.sdk.copilot.output_utils import (
     INTERNAL_VALIDATION_FAILURE_PREFIX,
     sanitize_block_label_for_display,
 )
-from skyvern.forge.sdk.copilot.reached_download_target import (
-    REGISTERED_DOWNLOAD_OUTPUT_KEYS,
-    code_captures_download,
-    code_uses_download_claim,
-)
 from skyvern.forge.sdk.copilot.request_policy import (
     REQUESTED_OUTPUT_PATH_MINT_SOURCES,
     CompletionCriterion,
@@ -100,7 +88,6 @@ from skyvern.forge.sdk.copilot.schema_incompatibility import (
     render_schema_incompatibility_agent_steer,
     render_schema_incompatibility_user_reason,
 )
-from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.secret_scrub import registered_scrub_values, scrub_secrets_from_text
 from skyvern.forge.sdk.copilot.streaming_adapter import emit_workflow_draft, maybe_emit_design_end
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
@@ -109,7 +96,6 @@ from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     workflow_blocks,
 )
 from skyvern.forge.sdk.copilot.workflow_yaml import (
-    _PRIVATE_WORKFLOW_SETTINGS_FIELDS,
     _canonicalize_copilot_proxy_location,
     _normalize_copilot_yaml,
     _normalize_copilot_yaml_with_dropped_links,
@@ -127,22 +113,36 @@ from skyvern.forge.sdk.copilot.workflow_yaml import (
     resolve_totp_verification_url,
     resolve_webhook_callback_url,
     runner_code_block_associations,
-    strip_private_workflow_settings,
-    strip_runtime_block_fields,
     submitted_private_workflow_settings,
     with_workflow_yaml_title,
-    workflow_to_copilot_yaml,
 )
 from skyvern.forge.sdk.db.exceptions import CopilotProposalConflictError, CopilotProposalConflictReason
 from skyvern.forge.sdk.schemas.workflow_copilot import COPILOT_PRIVATE_SETTINGS_KEY, copilot_proposal_metadata
+from skyvern.forge.sdk.workflow.authoring_yaml import strip_runtime_block_fields, workflow_to_authoring_yaml
 from skyvern.forge.sdk.workflow.block_notes import (
     carry_block_notes_from_versions,
     drop_submitted_note_fields,
     stored_notes_for_labels,
 )
+from skyvern.forge.sdk.workflow.code_block_security import CodeBlockSecurityError, author_time_code_security_errors
+from skyvern.forge.sdk.workflow.code_block_steps import (
+    bind_referenced_parameters_in_yaml,
+    carry_user_owned_goals_in_yaml,
+    fill_missing_code_block_goals_in_yaml,
+    user_owned_goal_carry_disclosure,
+)
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException, InsecureCodeDetected
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
+from skyvern.forge.sdk.workflow.private_settings import (
+    PRIVATE_WORKFLOW_SETTINGS_FIELDS,
+    strip_private_workflow_settings,
+)
+from skyvern.forge.sdk.workflow.reached_download_target import (
+    REGISTERED_DOWNLOAD_OUTPUT_KEYS,
+    code_captures_download,
+    code_uses_download_claim,
+)
 from skyvern.forge.sdk.workflow.runtime_completion import contract_from_code_artifact_metadata
 from skyvern.forge.sdk.workflow.secret_encryption import mask_workflow_definition_secrets
 from skyvern.schemas.proxy_location import ProxyLocationInput, runtime_proxy_location
@@ -155,6 +155,7 @@ from skyvern.schemas.workflows import (
     WhileLoopBlockYAML,
     WorkflowCreateYAMLRequest,
 )
+from skyvern.utils.raw_secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.utils.secret_headers import SECRET_HEADER_MASK, merge_masked_headers
 from skyvern.utils.url_validators import validate_webhook_url
 from skyvern.utils.yaml_loader import safe_load_no_dates
@@ -3867,7 +3868,7 @@ def _effective_private_settings(*sources: Mapping[str, object]) -> dict[str, obj
     # The first source that names a setting wins; Accept fills settings the proposal omits from the saved workflow.
     return {
         name: _effective_private_setting(name, next((source[name] for source in sources if name in source), None))
-        for name in _PRIVATE_WORKFLOW_SETTINGS_FIELDS
+        for name in PRIVATE_WORKFLOW_SETTINGS_FIELDS
     }
 
 
@@ -3971,7 +3972,7 @@ def saved_workflow_canvas(ctx: CopilotContext, saved: Workflow | None = None) ->
     saved = saved or ctx.saved_workflow
     if ctx.persisted_workflow_yaml is not None or saved is None:
         return ctx.persisted_workflow_yaml
-    return workflow_to_copilot_yaml(saved)
+    return workflow_to_authoring_yaml(saved)
 
 
 async def restore_pending_workflow_proposal(
@@ -4137,7 +4138,7 @@ async def adopt_stored_workflow_candidate(ctx: CopilotContext) -> ProposalAdopti
     elif canonical is not None:
         # With no candidate left the saved row is the only source; omitted settings make edits inherit its own.
         ctx.workflow_id = canonical.workflow_id
-        ctx.workflow_yaml = workflow_to_copilot_yaml(canonical)
+        ctx.workflow_yaml = workflow_to_authoring_yaml(canonical)
         ctx.authored_private_workflow_settings = {}
         ctx.private_workflow_settings = {}
     else:

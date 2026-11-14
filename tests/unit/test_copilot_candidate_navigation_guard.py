@@ -73,7 +73,7 @@ class _AgentFunction:
     async def setup_browser_context_extensions(self, _browser_context, **_kwargs) -> None:
         return None
 
-    def set_browser_run_http_cache(self, _browser_context, _generation) -> None:
+    def set_browser_run_http_cache(self, _browser_context, _generation, *, fresh_run: bool = False) -> None:
         return None
 
 

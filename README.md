@@ -79,8 +79,10 @@ Additionally, for Windows:
 #### 1. Install Skyvern
 
 ```bash
-pip install "skyvern[all]"
+pip install "skyvern[server]"
 ```
+
+The `server` extra installs the local API server. `pip install skyvern` without it installs only the client SDK. The pip package does not include the web UI; for the UI, use [Docker Compose](#option-b-docker-compose) or a source checkout.
 
 #### 2. Run Skyvern
 
@@ -134,9 +136,10 @@ uv pip install skyvern
 
 **Installation:**
 - Python SDK / cloud API: `pip install skyvern`
-- Local server + packaged UI: `pip install "skyvern[all]"` then run `skyvern quickstart`
-- Local server + packaged UI with Postgres: `pip install "skyvern[all]"` then run `skyvern quickstart --database-string=postgresql+psycopg://user:pass@host:5432/dbname`
-- Packaged UI for an existing API: `pip install "skyvern[ui]"` then set `VITE_API_BASE_URL` (and `VITE_SKYVERN_API_KEY` if your API requires a key) and run `skyvern run ui`
+- Python SDK with browser and page commands, including `Skyvern.local()`: `pip install "skyvern[local]"`
+- Local API server: `pip install "skyvern[server]"` then run `skyvern quickstart`
+- Local API server with your own Postgres: `pip install "skyvern[server]"` then run `skyvern quickstart --database-string=postgresql+psycopg://user:pass@host:5432/dbname`
+- Web UI: not included in the pip package. Use [Docker Compose](#option-b-docker-compose), or run `skyvern run ui` from a source checkout.
 - TypeScript: `npm install @skyvern/client`
 
 ### AI-Powered Page Commands
@@ -208,10 +211,10 @@ summary = await page.prompt("Summarize what's on this page")
 ```bash
 skyvern run all
 ```
-Navigate to http://localhost:8080 to run tasks through the web interface. If the packaged UI is missing, `skyvern run ui` will offer to install the matching UI package.
+From a source checkout, navigate to http://localhost:8080 to run tasks through the web interface. A pip install does not include the web UI, so there `skyvern run all` starts only the API server at http://localhost:8000.
 
-To run only the packaged UI against an existing Skyvern API, install `skyvern[ui]` and set the
-environment variables below before running `skyvern run ui`:
+To run only the UI against an existing Skyvern API, clone this repository, install Node.js, and set the
+environment variables below before running `skyvern run ui` from the repository root:
 
 - `VITE_API_BASE_URL` (e.g. `http://localhost:8000/api/v1`) — points the UI at your Skyvern API
 - `VITE_SKYVERN_API_KEY` — the API key if your API requires one

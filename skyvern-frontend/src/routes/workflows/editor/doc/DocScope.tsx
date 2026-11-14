@@ -268,6 +268,20 @@ function DocNode({
   const actions = useContext(WorkflowDocActionsContext);
   const open = actions.loopOpen(item.nodeId);
   const node = byId.get(item.nodeId);
+  const canEdit = Boolean(
+    node &&
+    actions.editable &&
+    !readOnly &&
+    !item.readOnlyReason &&
+    node.data.editable,
+  );
+  useLayoutEffect(() => {
+    if (!canEdit && inserting) {
+      finishSlash.current?.(false);
+      finishSlash.current = null;
+      setInserting(false);
+    }
+  }, [canEdit, inserting]);
   if (!node || !isWorkflowBlockNode(node)) return null;
   const editable =
     actions.editable && !readOnly && !item.readOnlyReason && node.data.editable;

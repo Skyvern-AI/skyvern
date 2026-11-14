@@ -118,10 +118,6 @@ from skyvern.forge.sdk.artifact.storage.unique_pdfs import (
 from skyvern.forge.sdk.browser_action_policy import BrowserActionPolicy
 from skyvern.forge.sdk.cache import extraction_cache
 from skyvern.forge.sdk.cache.factory import CacheFactory
-from skyvern.forge.sdk.copilot.reached_download_target import (
-    REGISTERED_DOWNLOAD_OUTPUT_KEYS,
-    generated_file_artifact_ids,
-)
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -330,6 +326,10 @@ from skyvern.forge.sdk.workflow.private_settings import (
     resolve_totp_identifier,
     resolve_totp_verification_url,
     resolve_webhook_callback_url,
+)
+from skyvern.forge.sdk.workflow.reached_download_target import (
+    REGISTERED_DOWNLOAD_OUTPUT_KEYS,
+    generated_file_artifact_ids,
 )
 from skyvern.forge.sdk.workflow.response_value_caps import (
     capped_loop_values,
@@ -2408,7 +2408,7 @@ async def _delete_backend_schedule(backend_schedule_id: str, slots: asyncio.Sema
             await app.AGENT_FUNCTION.delete_workflow_schedule(backend_schedule_id)
 
 
-def _block_image_ids(blocks: list[BLOCK_YAML_TYPES] | list[BlockTypeVar]) -> list[tuple[str, str]]:
+def block_image_ids(blocks: list[BLOCK_YAML_TYPES] | list[BlockTypeVar]) -> list[tuple[str, str]]:
     return [
         (block.label, image.file_id)
         for block in get_all_blocks(blocks)
@@ -13063,7 +13063,7 @@ class WorkflowService:
             )
             if validate_code_block_templates:
                 self._validate_code_block_templates(workflow_definition)
-            if validate_block_image_files and _block_image_ids(workflow_definition.blocks):
+            if validate_block_image_files and block_image_ids(workflow_definition.blocks):
                 image_organization_id = organization_id
                 if image_organization_id is None:
                     owner = await app.DATABASE.workflows.get_workflow(workflow_id=workflow_id)
@@ -19009,8 +19009,8 @@ class WorkflowService:
         organization_id: str,
     ) -> None:
         """Every image a save adds must be a live upload of the saving organization; saved ones were checked."""
-        saved = {file_id for _, file_id in _block_image_ids(previous_blocks)}
-        added = [(label, file_id) for label, file_id in _block_image_ids(blocks) if file_id not in saved]
+        saved = {file_id for _, file_id in block_image_ids(previous_blocks)}
+        added = [(label, file_id) for label, file_id in block_image_ids(blocks) if file_id not in saved]
         live = await uploaded_file_service.live_uploaded_files(
             file_ids=[file_id for _, file_id in added], organization_id=organization_id
         )

@@ -63,13 +63,13 @@ from skyvern.forge.sdk.copilot.context import (
     PageObstructionSelectorCandidate,
 )
 from skyvern.forge.sdk.copilot.page_identity import safe_page_origin
-from skyvern.forge.sdk.copilot.secret_redaction import (
+from skyvern.forge.sdk.workflow.private_settings import strip_private_workflow_settings
+from skyvern.utils.raw_secret_redaction import (
     redact_raw_secrets_for_prompt,
     redact_raw_secrets_in_object,
     redact_totp_runtime_values,
 )
-from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER
-from skyvern.forge.sdk.copilot.workflow_yaml import strip_private_workflow_settings
+from skyvern.utils.secret_scrub import REDACTED_SECRET_PLACEHOLDER
 
 if TYPE_CHECKING:
     from agents.result import RunResultStreaming

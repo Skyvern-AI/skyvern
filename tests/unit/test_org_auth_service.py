@@ -1343,10 +1343,8 @@ def _principal_app() -> FastAPI:
         return principal()
 
     @fastapi_app.websocket("/stream")
-    async def stream(websocket: WebSocket, apikey: str | None = None, token: str | None = None) -> None:
-        await streaming_auth(
-            apikey, token, websocket, folder_action="workflow_run.read", folder_resource={"workflow_run_id": "wr_1"}
-        )
+    async def stream(websocket: WebSocket) -> None:
+        await streaming_auth(websocket, folder_action="workflow_run.read", folder_resource={"workflow_run_id": "wr_1"})
         await websocket.send_json(principal())
         await websocket.close()
 
@@ -1878,12 +1876,15 @@ async def test_unexpected_identity_lookup_failure_is_logged_without_rejecting_re
 
 
 @pytest.mark.asyncio
-async def test_websocket_in_body_auth_resolves_the_principal(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_websocket_handshake_auth_resolves_the_principal(monkeypatch: pytest.MonkeyPatch) -> None:
     headers, organization_id, _ = await _principal_credentials(monkeypatch, "api", None)
 
     with (
         TestClient(_principal_app()) as client,
-        client.websocket_connect(f"/stream?apikey={headers['x-api-key']}&token=Bearer%20member-bearer") as websocket,
+        client.websocket_connect(
+            "/stream",
+            subprotocols=["skyvern.v1", f"apikey.{headers['x-api-key']}", "bearer.member-bearer"],
+        ) as websocket,
     ):
         principal = websocket.receive_json()
 

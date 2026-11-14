@@ -21,8 +21,8 @@ import yaml
 from pydantic import Field
 
 from skyvern.client.errors import BadRequestError, NotFoundError
-from skyvern.forge.sdk.copilot.code_block_steps import derive_code_block_steps
 from skyvern.forge.sdk.workflow.block_notes import block_labels, carry_forward_block_notes
+from skyvern.forge.sdk.workflow.code_block_steps import derive_code_block_steps
 from skyvern.forge.sdk.workflow.models.parameter import (
     ParameterType,
     WorkflowParameterType,

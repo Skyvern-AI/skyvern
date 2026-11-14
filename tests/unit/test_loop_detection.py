@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from skyvern.forge.sdk.copilot.loop_detection import (
+from skyvern.forge.sdk.agents.loop_detection import (
     detect_failed_tool_step_loop,
     detect_tool_loop,
     record_tool_step_result,

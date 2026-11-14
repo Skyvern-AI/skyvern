@@ -16,10 +16,10 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
-from skyvern.forge.sdk.copilot import secret_scrub
-from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.trace import record_span_exception, traced_span
+from skyvern.utils import secret_scrub
+from skyvern.utils.secret_scrub import REDACTED_SECRET_PLACEHOLDER
 
 _REGISTERED_CREDENTIAL = "fake-span-pa55w0rd-4b7e2d"
 _REPO_ROOT = Path(__file__).resolve().parents[2]
