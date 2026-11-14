@@ -29,30 +29,26 @@ class StreamCredentials(t.NamedTuple):
     subprotocol: str | None
 
 
-def credentials_from_websocket(websocket: WebSocket, apikey: str | None, token: str | None) -> StreamCredentials:
-    """Read the stream credential from `Sec-WebSocket-Protocol`, falling back to the deprecated query params.
+def credentials_from_websocket(websocket: WebSocket) -> StreamCredentials:
+    """Read the stream credential from `Sec-WebSocket-Protocol`.
 
     Browsers cannot set headers on a WebSocket handshake, so the web app offers
-    `skyvern.v1, bearer.<jwt>` / `apikey.<key>` as subprotocols instead of putting the credential in the URL.
+    `skyvern.v1, bearer.<jwt>` / `apikey.<key>` as subprotocols. The credential never travels in the
+    URL: load balancer access logs record full URLs, which would persist an org API key (HIPAA).
     """
-    header_apikey: str | None = None
-    header_authorization: str | None = None
+    apikey: str | None = None
+    authorization: str | None = None
     subprotocol: str | None = None
     for item in websocket.headers.get("sec-websocket-protocol", "").split(","):
         item = item.strip()
         if item == STREAM_SUBPROTOCOL:
             subprotocol = STREAM_SUBPROTOCOL
         elif item.startswith(_BEARER_SUBPROTOCOL_PREFIX) and len(item) > len(_BEARER_SUBPROTOCOL_PREFIX):
-            header_authorization = f"Bearer {item[len(_BEARER_SUBPROTOCOL_PREFIX) :]}"
+            authorization = f"Bearer {item[len(_BEARER_SUBPROTOCOL_PREFIX) :]}"
         elif item.startswith(_APIKEY_SUBPROTOCOL_PREFIX) and len(item) > len(_APIKEY_SUBPROTOCOL_PREFIX):
-            header_apikey = item[len(_APIKEY_SUBPROTOCOL_PREFIX) :]
+            apikey = item[len(_APIKEY_SUBPROTOCOL_PREFIX) :]
 
-    # Any credential in the header wins outright; query values are not merged in.
-    if header_apikey or header_authorization:
-        return StreamCredentials(header_apikey, header_authorization, subprotocol)
-    if apikey or token:
-        LOG.info("Streaming credential supplied in query string (deprecated)", path=websocket.url.path)
-    return StreamCredentials(apikey, token, subprotocol)
+    return StreamCredentials(apikey, authorization, subprotocol)
 
 
 def require_client_id(client_id: str | None, **log_kwargs: t.Any) -> bool:
@@ -140,8 +136,6 @@ async def folder_access_denied(websocket: WebSocket, action: str, resource: t.Ma
 
 
 async def auth(
-    apikey: str | None,
-    token: str | None,
     websocket: WebSocket,
     *,
     folder_action: str,
@@ -155,7 +149,7 @@ async def auth(
     determined.
     """
 
-    credentials = credentials_from_websocket(websocket, apikey, token)
+    credentials = credentials_from_websocket(websocket)
     try:
         await websocket.accept(subprotocol=credentials.subprotocol)
         if not credentials.authorization and not credentials.apikey:

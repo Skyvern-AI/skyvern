@@ -110,7 +110,7 @@ _ARTIFACT_CONTENT_URL_QUERY_RE = re.compile(r"(/v1/artifacts/[^/\s\"'<>]+/conten
 # pass `?token=Bearer%20<jwt>` as a query string. The token class spans base64url,
 # standard base64 (`+ / =`) and opaque values (`~`), so a credential is consumed whole.
 _BEARER_TOKEN_RE = re.compile(r"(?i)(token=)(?:Bearer(?:%20|\s+))?[A-Za-z0-9._%~+/=-]+")
-# Deprecated `?apikey=<key>` streaming query credential.
+# Streaming auth no longer honors `?apikey=<key>`, but a stale client can still put a live key in a URL.
 _APIKEY_QUERY_RE = re.compile(r"(?i)(\bapikey=)[A-Za-z0-9._%~+/=-]+")
 # Streaming credentials carried as `Sec-WebSocket-Protocol` items: `bearer.<jwt>` / `apikey.<key>`.
 _WS_PROTOCOL_CREDENTIAL_RE = re.compile(r"(?i)\b(bearer|apikey)\.[A-Za-z0-9._~+/=-]+")

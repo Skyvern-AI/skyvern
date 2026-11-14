@@ -27,16 +27,12 @@ LOG = structlog.get_logger()
 async def browser_session_messages(
     websocket: WebSocket,
     browser_session_id: str,
-    apikey: str | None = None,
     client_id: str | None = None,
-    token: str | None = None,
 ) -> None:
     return await messages(
         websocket=websocket,
         browser_session_id=browser_session_id,
-        apikey=apikey,
         client_id=client_id,
-        token=token,
     )
 
 
@@ -44,16 +40,12 @@ async def browser_session_messages(
 async def workflow_run_messages(
     websocket: WebSocket,
     workflow_run_id: str,
-    apikey: str | None = None,
     client_id: str | None = None,
-    token: str | None = None,
 ) -> None:
     return await messages(
         websocket=websocket,
         workflow_run_id=workflow_run_id,
-        apikey=apikey,
         client_id=client_id,
-        token=token,
     )
 
 
@@ -61,13 +53,9 @@ async def messages(
     websocket: WebSocket,
     browser_session_id: str | None = None,
     workflow_run_id: str | None = None,
-    apikey: str | None = None,
     client_id: str | None = None,
-    token: str | None = None,
 ) -> None:
     organization_id = await auth(
-        apikey=apikey,
-        token=token,
         websocket=websocket,
         # The message loop navigates, pastes and clears cookies, so it needs execute, not read.
         folder_action="workflow_run.execute",

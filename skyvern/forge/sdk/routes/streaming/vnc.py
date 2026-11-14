@@ -33,43 +33,35 @@ LOG = structlog.get_logger()
 async def browser_session_stream(
     websocket: WebSocket,
     browser_session_id: str,
-    apikey: str | None = None,
     client_id: str | None = None,
-    token: str | None = None,
 ) -> None:
-    await stream(websocket, apikey=apikey, client_id=client_id, browser_session_id=browser_session_id, token=token)
+    await stream(websocket, client_id=client_id, browser_session_id=browser_session_id)
 
 
 @legacy_base_router.websocket("/stream/vnc/task/{task_id}")
 async def task_stream(
     websocket: WebSocket,
     task_id: str,
-    apikey: str | None = None,
     client_id: str | None = None,
-    token: str | None = None,
 ) -> None:
-    await stream(websocket, apikey=apikey, client_id=client_id, task_id=task_id, token=token)
+    await stream(websocket, client_id=client_id, task_id=task_id)
 
 
 @legacy_base_router.websocket("/stream/vnc/workflow_run/{workflow_run_id}")
 async def workflow_run_stream(
     websocket: WebSocket,
     workflow_run_id: str,
-    apikey: str | None = None,
     client_id: str | None = None,
-    token: str | None = None,
 ) -> None:
-    await stream(websocket, apikey=apikey, client_id=client_id, workflow_run_id=workflow_run_id, token=token)
+    await stream(websocket, client_id=client_id, workflow_run_id=workflow_run_id)
 
 
 async def stream(
     websocket: WebSocket,
     *,
-    apikey: str | None = None,
     browser_session_id: str | None = None,
     client_id: str | None = None,
     task_id: str | None = None,
-    token: str | None = None,
     workflow_run_id: str | None = None,
 ) -> None:
     if not require_client_id(
@@ -91,8 +83,6 @@ async def stream(
 
     # VNC carries input as well as the picture, so it needs the right to act on the run.
     organization_id = await auth(
-        apikey=apikey,
-        token=token,
         websocket=websocket,
         folder_action="workflow_run.execute",
         folder_resource={
