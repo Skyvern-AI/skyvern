@@ -13,6 +13,10 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           token: ${{ secrets.SKYVERN_OSS_GITHUB_TOKEN }}
+      - name: Install Fern
+        # fern-api 5.215.0 and later refuse the CLI version pinned in fern/fern.config.json (0.94.3), and sync-openapi
+        # installs the latest unless fern is already installed. Unpin once that version is upgraded.
+        run: npm install -g fern-api@5.214.0
       - name: Update OpenAPI Spec
         uses: fern-api/sync-openapi@8e936a4bac8ad11d698d7114f3074fa3397398ea # v2
         with:
