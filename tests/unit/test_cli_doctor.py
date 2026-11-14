@@ -171,4 +171,4 @@ async def test_stream_doctor_stops_when_browser_session_has_expired(monkeypatch:
     monkeypatch.setattr("websockets.connect", lambda *args, **kwargs: _StreamConnection())
 
     with pytest.raises(RuntimeError, match="stream ended before a frame arrived: session_expired"):
-        await doctor._wait_for_stream_frame("ws://example.test", timeout_seconds=1)
+        await doctor._wait_for_stream_frame("ws://example.test", timeout_seconds=1, api_key="key")
