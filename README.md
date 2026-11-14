@@ -3,8 +3,8 @@
 <h1 align="center">
  <a href="https://www.skyvern.com">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="fern/images/skyvern_logo.png"/>
-    <img height="120" src="fern/images/skyvern_logo_blackbg.png"/>
+    <source media="(prefers-color-scheme: dark)" srcset=".github/assets/readme/skyvern_logo.png"/>
+    <img height="120" src=".github/assets/readme/skyvern_logo_blackbg.png"/>
   </picture>
  </a>
  <br />
@@ -26,7 +26,7 @@
 [Skyvern](https://www.skyvern.com) automates browser-based workflows using LLMs and computer vision. It provides a Playwright-compatible SDK that adds AI functionality on top of playwright, as well as a no-code workflow builder to help both technical and non-technical users automate manual workflows on any website, replacing brittle or unreliable automation solutions.
 
 <p align="center">
-  <img src="fern/images/geico_shu_recording_cropped.gif"/>
+  <img src=".github/assets/readme/geico_shu_recording_cropped.gif"/>
 </p>
 
 Traditional approaches to browser automations required writing custom scripts for websites, often relying on DOM parsing and XPath-based interactions which would break whenever the website layouts changed.
@@ -39,8 +39,8 @@ Skyvern was inspired by the Task-Driven autonomous agent design popularized by [
 Skyvern uses a swarm of agents to comprehend a website, and plan and execute its actions:
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="fern/images/skyvern_2_0_system_diagram.png" />
-  <img src="fern/images/skyvern_2_0_system_diagram.png" />
+  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/readme/skyvern_2_0_system_diagram.png" />
+  <img src=".github/assets/readme/skyvern_2_0_system_diagram.png" />
 </picture>
 
 This approach has a few advantages:
@@ -394,7 +394,7 @@ skyvern stop server
 Skyvern has SOTA performance on the [WebBench benchmark](webbench.ai) with a 64.4% accuracy. The technical report + evaluation can be found [here](https://www.skyvern.com/blog/web-bench-a-new-way-to-compare-ai-browser-agents/)
 
 <p align="center">
-  <img src="fern/images/performance/webbench_overall.png"/>
+  <img src=".github/assets/readme/performance/webbench_overall.png"/>
 </p>
 
 ## Performance on WRITE tasks (eg filling out forms, logging in, downloading files, etc)
@@ -402,7 +402,7 @@ Skyvern has SOTA performance on the [WebBench benchmark](webbench.ai) with a 64.
 Skyvern is the best performing agent on WRITE tasks (eg filling out forms, logging in, downloading files, etc), which is primarily used for RPA (Robotic Process Automation) adjacent tasks.
 
 <p align="center">
-  <img src="fern/images/performance/webbench_write.png"/>
+  <img src=".github/assets/readme/performance/webbench_write.png"/>
 </p>
 
 # Skyvern Features
@@ -413,7 +413,7 @@ Tasks are the fundamental building block inside Skyvern. Each task is a single r
 Tasks require you to specify a `url`, `prompt`, and can optionally include a `data schema` (if you want the output to conform to a specific schema) and `error codes` (if you want Skyvern to stop running in specific situations).
 
 <p align="center">
-  <img src="fern/images/skyvern_2_0_screenshot.png"/>
+  <img src=".github/assets/readme/skyvern_2_0_screenshot.png"/>
 </p>
 
 
@@ -439,7 +439,7 @@ Supported workflow features include:
 1. (Coming soon) Conditionals
 
 <p align="center">
-  <img src="fern/images/block_example_v2.png"/>
+  <img src=".github/assets/readme/block_example_v2.png"/>
 </p>
 
 ## Livestreaming
@@ -460,7 +460,7 @@ Skyvern is also capable of downloading files from a website. All downloaded file
 Skyvern supports a number of different authentication methods to make it easier to automate tasks behind a login. If you'd like to try it out, please reach out to us [via email](mailto:founders@skyvern.com) or [discord](https://discord.gg/fG2XXEuQX3).
 
 <p align="center">
-  <img src="fern/images/secure_password_task_example.png"/>
+  <img src=".github/assets/readme/secure_password_task_example.png"/>
 </p>
 
 
@@ -505,45 +505,45 @@ We love to see how Skyvern is being used in the wild. Here are some examples of 
 [Book a demo to see it live](https://meetings.hubspot.com/skyvern/demo)
 
 <p align="center">
-  <img src="fern/images/invoice_downloading.gif"/>
+  <img src=".github/assets/readme/invoice_downloading.gif"/>
 </p>
 
 ## Automate the job application process
 [💡 See it in action](https://app.skyvern.com/tasks/create/job_application)
 <p align="center">
-  <img src="fern/images/job_application_demo.gif"/>
+  <img src=".github/assets/readme/job_application_demo.gif"/>
 </p>
 
 ## Automate materials procurement for a manufacturing company
 [💡 See it in action](https://app.skyvern.com/tasks/create/finditparts)
 <p align="center">
-  <img src="fern/images/finditparts_recording_crop.gif"/>
+  <img src=".github/assets/readme/finditparts_recording_crop.gif"/>
 </p>
 
 ## Navigating to government websites to register accounts or fill out forms
 [💡 See it in action](https://app.skyvern.com/tasks/create/california_edd)
 <p align="center">
-  <img src="fern/images/edd_services.gif"/>
+  <img src=".github/assets/readme/edd_services.gif"/>
 </p>
 <!-- Add example of delaware entity lookups x2 -->
 
 ## Filling out random contact us forms
 [💡 See it in action](https://app.skyvern.com/tasks/create/contact_us_forms)
 <p align="center">
-  <img src="fern/images/contact_forms.gif"/>
+  <img src=".github/assets/readme/contact_forms.gif"/>
 </p>
 
 
 ## Retrieving insurance quotes from insurance providers in any language
 [💡 See it in action](https://app.skyvern.com/tasks/create/bci_seguros)
 <p align="center">
-  <img src="fern/images/bci_seguros_recording.gif"/>
+  <img src=".github/assets/readme/bci_seguros_recording.gif"/>
 </p>
 
 [💡 See it in action](https://app.skyvern.com/tasks/create/geico)
 
 <p align="center">
-  <img src="fern/images/geico_shu_recording_cropped.gif"/>
+  <img src=".github/assets/readme/geico_shu_recording_cropped.gif"/>
 </p>
 
 # Contributor Setup
