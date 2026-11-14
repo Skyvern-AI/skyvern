@@ -3,7 +3,6 @@ import {
   type WorkflowBlockImage,
   type WorkflowModel,
 } from "../../types/workflowTypes";
-import type { CodeBlockTitleSource } from "../../types/scriptTypes";
 import type {
   BlockReviewAnnotation,
   FoldReviewAnnotation,
@@ -23,7 +22,6 @@ export type NodeBaseData = {
   promptImages?: WorkflowBlockImage[] | null;
   // A person picked the block's engine; only task-like blocks read it.
   enginePinned?: boolean;
-  showCode?: boolean;
   review?: BlockReviewAnnotation | FoldReviewAnnotation;
   ignoreWorkflowSystemPrompt?: boolean;
   /**
@@ -73,6 +71,10 @@ function truncateTitle(value: string): string {
   }
   return `${value.slice(0, CODE_BLOCK_TITLE_MAX_LENGTH - 1).trimEnd()}…`;
 }
+
+type CodeBlockTitleSource = {
+  prompt?: string | null;
+};
 
 export function getCodeBlockTitle(source: CodeBlockTitleSource): string {
   return truncateTitle(

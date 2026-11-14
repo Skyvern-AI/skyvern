@@ -1,5 +1,4 @@
 import { flushSync } from "react-dom";
-import { QueryClient } from "@tanstack/react-query";
 import {
   act,
   cleanup,
@@ -83,17 +82,13 @@ afterEach(() => {
 
 describe("useWorkspaceMountInitialization", () => {
   test("keeps the global sidebar expanded when the workflow builder opens", () => {
-    const queryClient = new QueryClient();
-    const invalidateQueries = vi.spyOn(queryClient, "invalidateQueries");
     const workflowChangesStore = { setHasChanges: vi.fn() };
     const closeWorkflowPanel = vi.fn();
     useSidebarStore.setState({ collapsed: false });
 
     renderHook(() =>
       useWorkspaceMountInitialization({
-        cacheKey: "default",
         closeWorkflowPanel,
-        queryClient,
         workflowChangesStore,
         workflowPermanentId: "wpid_abc",
       }),
@@ -101,18 +96,13 @@ describe("useWorkspaceMountInitialization", () => {
 
     expect(useSidebarStore.getState().collapsed).toBe(false);
     expect(workflowChangesStore.setHasChanges).toHaveBeenCalledWith(false);
-    expect(invalidateQueries).toHaveBeenCalledWith({
-      queryKey: ["cache-key-values", "wpid_abc", "default"],
-    });
     expect(closeWorkflowPanel).toHaveBeenCalledOnce();
   });
 });
 
 function MountedWorkspace({ children }: { children: ReactNode }) {
   useWorkspaceMountInitialization({
-    cacheKey: "default",
     closeWorkflowPanel: () => {},
-    queryClient: new QueryClient(),
     workflowChangesStore: useWorkflowHasChangesStore.getState(),
     workflowPermanentId: "workflow-a",
   });
@@ -371,9 +361,7 @@ test.each(["title", "field", "label"])(
     const workflowBChanges = { setHasChanges: vi.fn() };
     function WorkflowB() {
       useWorkspaceMountInitialization({
-        cacheKey: "default",
         closeWorkflowPanel: () => {},
-        queryClient: new QueryClient(),
         workflowChangesStore: workflowBChanges,
         workflowPermanentId: "workflow-b",
       });

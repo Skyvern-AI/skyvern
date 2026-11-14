@@ -7,9 +7,6 @@ type StudioShellContextValue = {
   // Left-column target Workspace portals the docked Copilot into; null when
   // collapsed or when Workspace isn't embedded in the studio shell.
   copilotPortalEl: HTMLElement | null;
-  // Stage-level overlay target for Workspace-wired panels that must outlive a
-  // hidden Editor pane (e.g. the code-cache key/value panel).
-  panelPortalEl: HTMLElement | null;
   // Tabs register their stream container so the shell can re-parent the single
   // persistent stream node into the active surface without remounting it.
   setEditorStreamSlot: (el: HTMLElement | null) => void;
@@ -32,7 +29,6 @@ type StudioShellContextValue = {
 export const StudioShellContext = createContext<StudioShellContextValue>({
   organizationId: null,
   copilotPortalEl: null,
-  panelPortalEl: null,
   setEditorStreamSlot: () => {},
   setBrowserStreamSlot: () => {},
   setRunStreamSlot: () => {},

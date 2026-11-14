@@ -26,7 +26,6 @@ import {
 } from "../../helpContent";
 import { useHasInteractedThisSession } from "../../panels/useHasInteractedThisSession";
 import { type AppNode } from "..";
-import { DisableCache } from "../DisableCache";
 import { IgnoreWorkflowSystemPrompt } from "../IgnoreWorkflowSystemPrompt";
 import { BlockExecutionOptions } from "../components/BlockExecutionOptions";
 import { useSelectedCredentialTotpIdentifier } from "../../hooks/useSelectedCredentialTotpIdentifier";
@@ -206,13 +205,6 @@ function NavigationEditorBody({
                 />
               </div>
               <Separator />
-              <DisableCache
-                disableCache={data.disableCache}
-                editable={editable}
-                onDisableCacheChange={(disableCache) =>
-                  update({ disableCache })
-                }
-              />
               <IgnoreWorkflowSystemPrompt
                 ignoreWorkflowSystemPrompt={
                   data.ignoreWorkflowSystemPrompt ?? false
@@ -467,13 +459,6 @@ function NavigationEditorBody({
                 }
                 onIncludeActionHistoryInVerificationChange={(checked) =>
                   update({ includeActionHistoryInVerification: checked })
-                }
-              />
-              <DisableCache
-                disableCache={data.disableCache}
-                editable={editable}
-                onDisableCacheChange={(disableCache) =>
-                  update({ disableCache })
                 }
               />
               <Separator />

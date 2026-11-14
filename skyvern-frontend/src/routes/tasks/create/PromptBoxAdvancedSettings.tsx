@@ -70,12 +70,6 @@ const FIELDS: Record<SettingKey, FieldDef> = {
     tab: "output",
     chip: () => "Data schema",
   },
-  generateScript: {
-    label: "Generate Script",
-    description: "Generate a script for this task run when it succeeds.",
-    tab: "output",
-    chip: () => "Generate script",
-  },
   publishWorkflow: {
     label: "Publish Agent",
     description: "Create an agent alongside this task run.",
@@ -196,7 +190,6 @@ function SettingControl({
           fontSize={12}
         />
       );
-    case "generateScript":
     case "publishWorkflow":
       return (
         <Switch
@@ -241,10 +234,7 @@ function SettingField(props: SettingsChangeProps & { settingKey: SettingKey }) {
       <div className="text-xs text-muted-foreground">{description}</div>
     </div>
   );
-  if (
-    props.settingKey === "generateScript" ||
-    props.settingKey === "publishWorkflow"
-  ) {
+  if (props.settingKey === "publishWorkflow") {
     return (
       <div className="flex items-start justify-between gap-4">
         {heading}

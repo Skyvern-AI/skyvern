@@ -130,7 +130,7 @@ function RunRouter() {
         output: "outputs",
         parameters: "inputs",
         recording: "recording",
-        code: "code",
+        code: "timeline",
       }[legacySubview]
     : undefined;
   const searchParams = new URLSearchParams(location.search);

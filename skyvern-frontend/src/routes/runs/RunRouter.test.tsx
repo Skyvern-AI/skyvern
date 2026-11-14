@@ -213,7 +213,7 @@ describe("RunRouter", () => {
     ["output", "timeline", "overview,browser"],
     ["parameters", "timeline", "overview,browser"],
     ["recording", "recording", "browser,overview"],
-    ["code", "code", "overview,browser"],
+    ["code", "timeline", "overview,browser"],
   ])("preserves the direct %s subview", (legacySubview, studioView, panes) => {
     renderAt(`/runs/wr_1/${legacySubview}?active=act_1`);
 

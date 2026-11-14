@@ -88,9 +88,6 @@ vi.mock("@/routes/workflows/hooks/useWorkflowQuery", () => ({
 vi.mock("@/routes/workflows/hooks/useCredentialsQuery", () => ({
   useCredentialsQuery: () => ({ data: [] }),
 }));
-vi.mock("@/routes/workflows/hooks/useBlockScriptsQuery", () => ({
-  useBlockScriptsQuery: () => ({ data: undefined }),
-}));
 vi.mock("@/hooks/useWorkflowStudioEnabled", () => ({
   useWorkflowStudioEnabled: () => false,
 }));

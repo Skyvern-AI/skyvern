@@ -12,7 +12,6 @@ export type BranchContext = {
 type WorkflowPanelState = {
   active: boolean;
   content:
-    | "cacheKeyValues"
     | "parameters"
     | "nodeLibrary"
     | "history"

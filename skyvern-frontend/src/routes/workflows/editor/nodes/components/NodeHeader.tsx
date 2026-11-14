@@ -48,7 +48,6 @@ import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChan
 import { useDuplicateNodeCallback } from "@/routes/workflows/hooks/useDuplicateNodeCallback";
 import { useRequestDeleteNodeCallback } from "@/routes/workflows/hooks/useRequestDeleteNodeCallback";
 import { useTransmuteNodeCallback } from "@/routes/workflows/hooks/useTransmuteNodeCallback";
-import { useToggleScriptForNodeCallback } from "@/routes/workflows/hooks/useToggleScriptForNodeCallback";
 import { useBrowserSessionRateLimit } from "@/routes/workflows/hooks/useBrowserSessionRateLimit";
 import { useCredentialsQuery } from "@/routes/workflows/hooks/useCredentialsQuery";
 import { useDebugSessionQuery } from "@/routes/workflows/hooks/useDebugSessionQuery";
@@ -65,7 +64,6 @@ import {
 } from "@/routes/workflows/debugger/debugSessionProfileCompatibility";
 import {
   debuggableWorkflowBlockTypes,
-  scriptableWorkflowBlockTypes,
   type WorkflowBlockType,
   type WorkflowApiResponse,
   type WorkflowParameter,
@@ -314,7 +312,6 @@ function NodeHeader({
   const duplicateNodeCallback = useDuplicateNodeCallback();
   const requestDeleteNodeCallback = useRequestDeleteNodeCallback();
   const transmuteNodeCallback = useTransmuteNodeCallback();
-  const toggleScriptForNodeCallback = useToggleScriptForNodeCallback();
   const credentialGetter = useCredentialGetter();
   const navigate = useNavigate();
   const studioEnabled = useWorkflowStudioEnabled();
@@ -322,7 +319,6 @@ function NodeHeader({
   const location = useLocation();
   const { resolveLivePanes, preserveNextEntry } = useStudioPanes();
   const isDebuggable = debuggableWorkflowBlockTypes.has(type);
-  const isScriptable = scriptableWorkflowBlockTypes.has(type);
   const {
     data: workflowRun,
     isError: statusUnavailable,
@@ -1532,7 +1528,6 @@ function NodeHeader({
                   isDuplicable={
                     !isReadOnlyScope && Boolean(duplicateNodeCallback)
                   }
-                  isScriptable={isScriptable}
                   isCanvasLocked={isCanvasLocked}
                   onDuplicate={
                     isReadOnlyScope || !duplicateNodeCallback
@@ -1544,9 +1539,6 @@ function NodeHeader({
                   onDelete={() => {
                     requestDeleteNodeCallback(nodeId, blockLabel);
                   }}
-                  onShowScript={() =>
-                    toggleScriptForNodeCallback({ id: nodeId, show: true })
-                  }
                 />
               </div>
             </div>

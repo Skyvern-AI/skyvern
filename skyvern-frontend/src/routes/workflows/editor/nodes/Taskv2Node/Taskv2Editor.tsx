@@ -15,7 +15,6 @@ import { Separator } from "@/components/ui/separator";
 
 import { AI_IMPROVE_CONFIGS } from "../../constants";
 import { helpTooltips, placeholders } from "../../helpContent";
-import { DisableCache } from "../DisableCache";
 import { IgnoreWorkflowSystemPrompt } from "../IgnoreWorkflowSystemPrompt";
 import {
   MAX_STEPS_DEFAULT,
@@ -105,13 +104,6 @@ function Taskv2EditorBody({
                 />
               </div>
               <Separator />
-              <DisableCache
-                disableCache={data.disableCache}
-                editable={editable}
-                onDisableCacheChange={(disableCache) =>
-                  update({ disableCache })
-                }
-              />
               <IgnoreWorkflowSystemPrompt
                 ignoreWorkflowSystemPrompt={
                   data.ignoreWorkflowSystemPrompt ?? false

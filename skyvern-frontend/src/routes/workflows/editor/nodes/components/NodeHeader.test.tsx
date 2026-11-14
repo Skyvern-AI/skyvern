@@ -77,7 +77,6 @@ const blockActionStub = {
   requestDeleteNodeCallback: () => {},
   duplicateNodeCallback: () => {},
   transmuteNodeCallback: () => {},
-  toggleScriptForNodeCallback: () => {},
 };
 
 function renderNodeHeader(

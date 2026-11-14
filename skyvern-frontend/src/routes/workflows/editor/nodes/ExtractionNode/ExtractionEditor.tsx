@@ -22,7 +22,6 @@ import { helpTooltips, placeholders } from "../../helpContent";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { type AppNode } from "..";
 import { BlockExecutionOptions } from "../components/BlockExecutionOptions";
-import { DisableCache } from "../DisableCache";
 import { IgnoreWorkflowSystemPrompt } from "../IgnoreWorkflowSystemPrompt";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
 import {
@@ -326,13 +325,6 @@ function ExtractionEditorBody({
                 }
                 onNextLoopOnFailureChange={(checked) =>
                   update({ nextLoopOnFailure: checked })
-                }
-              />
-              <DisableCache
-                disableCache={data.disableCache}
-                editable={editable}
-                onDisableCacheChange={(disableCache) =>
-                  update({ disableCache })
                 }
               />
               <IgnoreWorkflowSystemPrompt

@@ -253,7 +253,6 @@ function renderBrowserPane(initialPath: string) {
         <StudioShellContext.Provider
           value={{
             copilotPortalEl: null,
-            panelPortalEl: null,
             setEditorStreamSlot: () => {},
             setBrowserStreamSlot,
             setRunStreamSlot: () => {},

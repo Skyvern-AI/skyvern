@@ -26,7 +26,6 @@ import {
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { useHasInteractedThisSession } from "../../panels/useHasInteractedThisSession";
 import { BlockExecutionOptions } from "../components/BlockExecutionOptions";
-import { DisableCache } from "../DisableCache";
 import { IgnoreWorkflowSystemPrompt } from "../IgnoreWorkflowSystemPrompt";
 import { useSelectedCredentialTotpIdentifier } from "../../hooks/useSelectedCredentialTotpIdentifier";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
@@ -240,13 +239,6 @@ function ActionEditorBody({
                 }
                 onNextLoopOnFailureChange={(checked) =>
                   update({ nextLoopOnFailure: checked })
-                }
-              />
-              <DisableCache
-                disableCache={data.disableCache}
-                editable={editable}
-                onDisableCacheChange={(disableCache) =>
-                  update({ disableCache })
                 }
               />
               <IgnoreWorkflowSystemPrompt

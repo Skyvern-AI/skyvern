@@ -975,7 +975,6 @@ export function hasSettingsBeyondText(node: AppNode): boolean {
     // Screenshots move with the text into the note; prompt images are read by the agent and stay a setting.
     "docImages",
     "review",
-    "showCode",
   ]);
   const defaults = createNode({ id: node.id }, node.type, node.data.label)
     .data as Record<string, unknown>;

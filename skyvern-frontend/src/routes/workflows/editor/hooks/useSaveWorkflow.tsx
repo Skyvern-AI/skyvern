@@ -1,18 +1,14 @@
 import { useReactFlow } from "@xyflow/react";
-import { useQueryClient } from "@tanstack/react-query";
-import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 import { useCallback } from "react";
 
 import { toast } from "@/components/ui/use-toast";
 import { flushBufferedEditorEdits } from "@/hooks/useDeferredLockedEdit";
-import { useCacheKeyValueStore } from "@/store/CacheKeyValueStore";
 import {
   SaveRefusedError,
   SaveStaleError,
   useWorkflowHasChangesStore,
   useWorkflowSave,
 } from "@/store/WorkflowHasChangesStore";
-import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import {
   selectEditorMutationLocked,
   SAVE_STALE_MESSAGE,
@@ -30,13 +26,8 @@ export class SaveFailedError extends Error {
 }
 
 export function useSaveWorkflow(): () => Promise<void> {
-  const workflowPermanentId = useWorkflowPermanentId();
   const reactFlow = useReactFlow<AppNode>();
   const saveWorkflow = useWorkflowSave({ status: "published" });
-  const setFilter = useCacheKeyValueStore((s) => s.setFilter);
-  const queryClient = useQueryClient();
-  const { data: workflow } = useWorkflowQuery({ workflowPermanentId });
-  const cacheKey = workflow?.cache_key ?? "";
 
   return useCallback(async () => {
     const changes = useWorkflowHasChangesStore.getState();
@@ -79,20 +70,7 @@ export function useSaveWorkflow(): () => Promise<void> {
     }
 
     await saveWorkflow.mutateAsync({ codeCacheDeletionApproved });
-
-    queryClient.invalidateQueries({
-      queryKey: ["cache-key-values", workflowPermanentId, cacheKey],
-    });
-
-    setFilter(null);
-  }, [
-    reactFlow,
-    saveWorkflow,
-    queryClient,
-    workflowPermanentId,
-    cacheKey,
-    setFilter,
-  ]);
+  }, [reactFlow, saveWorkflow]);
 }
 
 export async function confirmCodeCacheDeletion(

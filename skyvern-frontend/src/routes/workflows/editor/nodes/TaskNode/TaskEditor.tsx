@@ -29,7 +29,6 @@ import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow"
 import { useHasInteractedThisSession } from "../../panels/useHasInteractedThisSession";
 import { type AppNode, isWorkflowBlockNode } from "..";
 import { BlockExecutionOptions } from "../components/BlockExecutionOptions";
-import { DisableCache } from "../DisableCache";
 import { IgnoreWorkflowSystemPrompt } from "../IgnoreWorkflowSystemPrompt";
 import { useSelectedCredentialTotpIdentifier } from "../../hooks/useSelectedCredentialTotpIdentifier";
 import { ParametersMultiSelect } from "./ParametersMultiSelect";
@@ -341,13 +340,6 @@ function TaskEditorBody({ blockId }: { blockId: string }) {
                 }
                 onIncludeActionHistoryInVerificationChange={(checked) =>
                   update({ includeActionHistoryInVerification: checked })
-                }
-              />
-              <DisableCache
-                disableCache={data.disableCache}
-                editable={editable}
-                onDisableCacheChange={(disableCache) =>
-                  update({ disableCache })
                 }
               />
               <IgnoreWorkflowSystemPrompt

@@ -7,23 +7,13 @@ import { useCallback, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import {
   ActivityLogIcon,
-  CodeIcon,
-  DotsHorizontalIcon,
   FileTextIcon,
   ListBulletIcon,
-  ReloadIcon,
   Share1Icon,
 } from "@radix-ui/react-icons";
-import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import { ApiWebhookActionsMenu } from "@/components/ApiWebhookActionsMenu";
 import { WebhookReplayDialog } from "@/components/WebhookReplayDialog";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
 import {
   Tooltip,
   TooltipContent,
@@ -39,8 +29,6 @@ import { type ApiCommandOptions } from "@/util/apiCommands";
 import { runsApiBaseUrl } from "@/util/env";
 import { cn } from "@/util/utils";
 
-import { useIsGeneratingCode } from "../../editor/hooks/useIsGeneratingCode";
-import { constructCacheKeyValue } from "../../editor/utils";
 import { useWorkflowRunWithWorkflowQuery } from "../../hooks/useWorkflowRunWithWorkflowQuery";
 import { WorkflowRunStatusAlert } from "../../workflowRun/WorkflowRunStatusAlert";
 import { studioPanelId } from "../constants";
@@ -52,14 +40,12 @@ import { toReadableSearch } from "../panes";
 
 /**
  * Left header cluster of the Overview pane: the Timeline / Inputs / Outputs
- * view toggles plus a "…" overflow menu holding the Code view, and the Live
- * handoff chip while the run executes. The selected view lives in
+ * view toggles, and the Live handoff chip while the run executes. The selected view lives in
  * useRunPaneViewStore; RunView renders the body.
  */
 export function RunPaneViewToggles() {
   const compact = useStudioPaneCompact();
   const { runId } = useStudioInspectedRun();
-  const workflowPermanentId = useWorkflowPermanentId();
   const { data: workflowRun, isError: statusUnavailable } =
     useWorkflowRunWithWorkflowQuery({ workflowRunId: runId });
   const view = useRunPaneViewStore((s) => s.view);
@@ -69,20 +55,6 @@ export function RunPaneViewToggles() {
   const jumpToLive = useRunViewStore((s) => s.jumpToLive);
   const setBrowserPaneView = useStudioBrowserStore((s) => s.setView);
   const { openPane, resolveLivePanes } = useStudioPanes();
-  const cacheKey = workflowRun?.workflow?.cache_key ?? "";
-  const codeGenerating = useIsGeneratingCode({
-    cacheKey,
-    cacheKeyValue: constructCacheKeyValue({
-      codeKey: cacheKey,
-      workflow: workflowRun?.workflow,
-      workflowRun,
-    }),
-    // Script queries 404 once the source agent is deleted.
-    workflowPermanentId: workflowRun?.workflow?.deleted_at
-      ? undefined
-      : workflowPermanentId,
-    workflowRunId: runId,
-  });
   const selectView = useCallback(
     (nextView: Parameters<typeof setView>[0]) => {
       setView(nextView);
@@ -150,51 +122,6 @@ export function RunPaneViewToggles() {
           label="Outputs"
           icon={<FileTextIcon className="h-3 w-3" />}
         />
-        <DropdownMenu>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <DropdownMenuTrigger asChild>
-                <button
-                  type="button"
-                  aria-label="More views"
-                  aria-pressed={view === "code"}
-                  className={cn(
-                    "inline-flex h-7 items-center gap-1.5 rounded-md px-1.5 text-xs font-medium",
-                    "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
-                    view === "code"
-                      ? "bg-foreground text-background"
-                      : "text-muted-foreground hover:bg-accent/50 hover:text-foreground",
-                  )}
-                >
-                  {codeGenerating ? (
-                    <ReloadIcon
-                      data-testid="code-generating-spinner"
-                      className="h-3 w-3 animate-spin"
-                    />
-                  ) : (
-                    <DotsHorizontalIcon className="h-3 w-3" />
-                  )}
-                </button>
-              </DropdownMenuTrigger>
-            </TooltipTrigger>
-            <TooltipContent side="bottom">
-              {codeGenerating
-                ? "Generating cached code for this run"
-                : "More views"}
-            </TooltipContent>
-          </Tooltip>
-          {/* Sized to the pane-header control grammar (11px, h-7 rows) so the
-              menu reads as part of the toggle cluster, not a full-size menu. */}
-          <DropdownMenuContent align="start" sideOffset={6} className="min-w-0">
-            <DropdownMenuItem
-              onSelect={() => selectView("code")}
-              className="cursor-pointer gap-1.5 rounded px-2 py-1.5 pr-3 text-xs font-medium text-muted-foreground focus:text-foreground"
-            >
-              <CodeIcon className="h-3 w-3" />
-              Code
-            </DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
       </div>
       {showLive
         ? (() => {

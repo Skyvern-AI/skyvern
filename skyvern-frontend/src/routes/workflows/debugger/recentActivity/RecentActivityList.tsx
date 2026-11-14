@@ -9,7 +9,6 @@ import {
   getRunActivityKey,
   getRunAgoLabel,
   getRunDurationLabel,
-  getRunModeLabel,
   getRunStatusKind,
   getRunStatusLabel,
   normalizeReason,
@@ -84,9 +83,6 @@ function RecentActivityRow({
         <div className="flex items-center gap-1.5 pl-[1.625rem]">
           <span className="rounded bg-muted/70 px-1.5 py-0.5 text-[10px] font-medium text-tertiary-foreground dark:bg-slate-700/70">
             {getBlockTypeTitle(blockType)}
-          </span>
-          <span className="rounded border border-border px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground dark:border-white/10">
-            {getRunModeLabel(run)}
           </span>
           <span
             className={cn(
