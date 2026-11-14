@@ -137,6 +137,7 @@ from skyvern.forge.sdk.routes.trigger_type import (
     workflow_run_trigger_type_from_user_agent,
 )
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestionBase, AISuggestionRequest
+from skyvern.forge.sdk.schemas.files import UploadedFileSignedUrl
 from skyvern.forge.sdk.schemas.organizations import (
     GetOrganizationAPIKeysResponse,
     GetOrganizationsResponse,
@@ -207,6 +208,7 @@ from skyvern.forge.sdk.workflow.retry_policy import is_retry_pending
 from skyvern.forge.sdk.workflow.secret_encryption import mask_workflow_for_api
 from skyvern.forge.sdk.workflow.service import (
     TimelineDownloads,
+    block_image_ids,
     cap_action_payloads,
     capped_task_v1_response,
     capped_task_v2,
@@ -7380,6 +7382,48 @@ async def delete_file(
     if not deleted:
         raise HTTPException(status_code=404, detail=f"File {file_id} not found")
     return Response(status_code=204)
+
+
+FILE_NO_LONGER_AVAILABLE = "File is no longer available"
+
+
+@base_router.get(
+    "/files/{file_id}/signed-url",
+    tags=["Files"],
+    response_model=UploadedFileSignedUrl,
+    summary="Mint a short-lived URL for a file a workflow names",
+    description=(
+        "Mint an inline URL of at most one hour for an uploaded PNG, JPEG, GIF or WebP image of up to 4 MiB that "
+        "the named workflow version references. Any other file answers 404."
+    ),
+    responses={404: {"description": "The workflow, its reference or the file is not available"}},
+    include_in_schema=False,
+)
+@base_router.get("/files/{file_id}/signed-url/", response_model=UploadedFileSignedUrl, include_in_schema=False)
+async def get_file_signed_url(
+    file_id: str,
+    workflow_permanent_id: str = Query(..., description="The workflow whose definition names the file"),
+    version: Annotated[
+        int | None, Query(ge=1, le=MAX_INT4, description="The workflow version; the latest when omitted")
+    ] = None,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> UploadedFileSignedUrl:
+    await _enforce_folder_access("workflow.read", {"workflow_permanent_id": workflow_permanent_id})
+    try:
+        workflow = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
+            workflow_permanent_id=workflow_permanent_id,
+            organization_id=current_org.organization_id,
+            version=version,
+        )
+    except WorkflowNotFound:
+        raise HTTPException(status_code=404, detail=FILE_NO_LONGER_AVAILABLE) from None
+    if file_id not in {named for _, named in block_image_ids(workflow.workflow_definition.blocks)}:
+        raise HTTPException(status_code=404, detail=FILE_NO_LONGER_AVAILABLE)
+    # The file must belong to the workflow's organization, not only be named by it.
+    signed = await uploaded_file_service.mint_file_url(file_id=file_id, organization_id=workflow.organization_id)
+    if signed is None:
+        raise HTTPException(status_code=404, detail=FILE_NO_LONGER_AVAILABLE)
+    return signed
 
 
 @legacy_v2_router.post(

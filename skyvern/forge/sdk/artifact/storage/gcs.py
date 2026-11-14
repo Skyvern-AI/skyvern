@@ -1086,6 +1086,29 @@ class GcsStorage(BaseStorage, StreamingArtifactStorage):
         size = info.get("ContentLength") if info else None
         return size if isinstance(size, int) else None
 
+    async def read_managed_file_head(self, uri: str, organization_id: str, length: int) -> bytes | None:
+        self.assert_managed_file_access(uri, organization_id)
+        head = await self.async_client.download_file(uri, log_exception=False, length=length)
+        if head is None:
+            LOG.warning("GCS managed file head read failed", uri=uri)
+        return head
+
+    async def presign_managed_file(
+        self,
+        uri: str,
+        organization_id: str,
+        *,
+        expiry_seconds: int,
+        inline_content_type: str,
+    ) -> str | None:
+        self.assert_managed_file_access(uri, organization_id)
+        urls = await self.async_client.create_signed_urls(
+            [uri],
+            expiry_hours=max(1, expiry_seconds // 3600),
+            inline_content_type=inline_content_type,
+        )
+        return urls[0] if urls else None
+
     async def file_exists(self, uri: str) -> bool:
         """Check if a file exists at the given GCS URI."""
         try:

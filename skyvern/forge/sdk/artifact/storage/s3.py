@@ -1373,6 +1373,43 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
         size = info.get("ContentLength") if info else None
         return size if isinstance(size, int) else None
 
+    async def read_managed_file_head(self, uri: str, organization_id: str, length: int) -> bytes | None:
+        self.assert_managed_file_access(uri, organization_id)
+        stream: S3ObjectStream | None = None
+        try:
+            stream = await self.async_client.open_download_stream(uri, byte_range=(0, length - 1))
+            head = b""
+            async for chunk in stream.iter_chunks(length):
+                head += chunk
+                if len(head) >= length:
+                    break
+            return head[:length]
+        except Exception as e:
+            # S3 answers a ranged read of a zero-byte object with InvalidRange.
+            if isinstance(e, ClientError) and e.response.get("Error", {}).get("Code") == "InvalidRange":
+                return b""
+            self.async_client.log_download_failure(e, uri)
+            return None
+        finally:
+            if stream is not None:
+                await stream.aclose()
+
+    async def presign_managed_file(
+        self,
+        uri: str,
+        organization_id: str,
+        *,
+        expiry_seconds: int,
+        inline_content_type: str,
+    ) -> str | None:
+        self.assert_managed_file_access(uri, organization_id)
+        urls = await self.async_client.create_presigned_urls(
+            [uri],
+            expires_in=expiry_seconds,
+            inline_content_type=inline_content_type,
+        )
+        return urls[0] if urls else None
+
     async def file_exists(self, uri: str) -> bool:
         """Check if a file exists at the given S3 URI."""
         try:

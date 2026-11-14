@@ -1479,9 +1479,11 @@ class AsyncAWSClient:
         uris: list[str],
         expires_in: int | None = None,
         attachment_filenames: list[str | None] | None = None,
+        inline_content_type: str | None = None,
     ) -> list[str] | None:
         """With ``attachment_filenames`` (one per uri, None for the key basename), the URLs force an
-        attachment download as octet-stream so stored user content never renders on the bucket origin."""
+        attachment download as octet-stream so stored user content never renders on the bucket origin.
+        ``inline_content_type`` instead serves every uri inline as that type; callers pass only sniffed media."""
         # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/generate_presigned_url.html
         expiration = settings.PRESIGNED_URL_EXPIRATION if expires_in is None else expires_in
         if attachment_filenames is not None and len(attachment_filenames) != len(uris):
@@ -1498,6 +1500,9 @@ class AsyncAWSClient:
                         # The agent's file fetcher takes the extension from this filename before Content-Type.
                         params["ResponseContentDisposition"] = build_attachment_disposition(filename)
                         params["ResponseContentType"] = "application/octet-stream"
+                    elif inline_content_type is not None:
+                        params["ResponseContentDisposition"] = "inline"
+                        params["ResponseContentType"] = inline_content_type
                     url = await client.generate_presigned_url(
                         "get_object",
                         Params=params,

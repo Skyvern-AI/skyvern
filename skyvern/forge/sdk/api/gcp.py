@@ -66,7 +66,7 @@ class AsyncGcsStorageClient(Protocol):
         metadata: dict[str, str] | None = None,
     ) -> str: ...
 
-    async def download_file(self, uri: str, log_exception: bool = True) -> bytes | None: ...
+    async def download_file(self, uri: str, log_exception: bool = True, length: int | None = None) -> bytes | None: ...
 
     async def delete_file(self, uri: str) -> None: ...
 
@@ -79,9 +79,11 @@ class AsyncGcsStorageClient(Protocol):
         uris: list[str],
         expiry_hours: int = 24,
         attachment_filenames: list[str | None] | None = None,
+        inline_content_type: str | None = None,
     ) -> list[str] | None:
         """With ``attachment_filenames`` (one per uri, None for the object basename), the URLs force an
-        attachment download as octet-stream so stored user content never renders on the bucket origin."""
+        attachment download as octet-stream so stored user content never renders on the bucket origin.
+        ``inline_content_type`` instead serves every uri inline as that type."""
         ...
 
     async def close(self) -> None: ...

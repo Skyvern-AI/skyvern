@@ -50,6 +50,7 @@ ROUTE_ACTIONS: Mapping[str, str] = {
     "skyvern.forge.sdk.routes.agent_protocol.get_artifacts": "artifact.list",
     "skyvern.forge.sdk.routes.agent_protocol.get_browser_types": "browser_type.list",
     "skyvern.forge.sdk.routes.agent_protocol.get_current_organization": "organization.settings.read",
+    "skyvern.forge.sdk.routes.agent_protocol.get_file_signed_url": "workflow.read",
     "skyvern.forge.sdk.routes.agent_protocol.get_folder": "workflow_folder.read",
     "skyvern.forge.sdk.routes.agent_protocol.get_folders": "workflow_folder.list",
     "skyvern.forge.sdk.routes.agent_protocol.get_organizations": "organization.settings.read",

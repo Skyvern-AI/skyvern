@@ -174,6 +174,30 @@ async def test_delete_legacy_file_rejects_other_organization_path(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_a_managed_png_presigns_to_its_own_uri_and_another_organization_is_refused(tmp_path: Path) -> None:
+    storage = LocalStorage(artifact_path=str(tmp_path))
+    png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + b"\x00" * 32
+    own = tmp_path / settings.ENV / TEST_ORGANIZATION_ID / "uploads" / "shot.png"
+    other = tmp_path / settings.ENV / "other-organization" / "uploads" / "shot.png"
+    for path in (own, other):
+        path.parent.mkdir(parents=True)
+        path.write_bytes(png)
+
+    url = await storage.presign_managed_file(
+        f"file://{own}", TEST_ORGANIZATION_ID, expiry_seconds=60, inline_content_type="image/png"
+    )
+
+    assert url == f"file://{own}"
+    assert await storage.read_managed_file_head(url, TEST_ORGANIZATION_ID, 8) == png[:8]
+    with pytest.raises(PermissionError):
+        await storage.presign_managed_file(
+            f"file://{other}", TEST_ORGANIZATION_ID, expiry_seconds=60, inline_content_type="image/png"
+        )
+    with pytest.raises(PermissionError):
+        await storage.read_managed_file_head(f"file://{other}", TEST_ORGANIZATION_ID, 8)
+
+
+@pytest.mark.asyncio
 async def test_get_downloaded_files_carries_local_artifact_attribution(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
