@@ -434,7 +434,8 @@ _TYPE_REACH: ContextVar[dict[str, bool] | None] = ContextVar("taskv3_type_reach"
 # A click that raised after the page received it (a slow submit whose navigation had not committed).
 _CLICK_DISPATCHED: ContextVar[bool] = ContextVar("taskv3_click_dispatched", default=False)
 # How a token click went: locator, handle (the resolver's element, after the locator never resolved),
-# handle_failed (that fallback raised), or stale (the node was gone or no longer held the token).
+# handle_failed (that fallback raised), stale (the node was gone or no longer held the token), or navigated (the
+# press replaced the document before the driver's wait ended; it overwrites handle_failed on the handle fallback).
 _CLICK_PATH: ContextVar[str | None] = ContextVar("taskv3_click_path", default=None)
 # Which field shape a field-entry read-back judged (field_commit), so an unconfirmed entry is countable per variant.
 _ENTRY_RECORD: ContextVar[dict[str, Any] | None] = ContextVar("taskv3_entry_record", default=None)
