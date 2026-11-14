@@ -1021,6 +1021,7 @@ class _ListWindow:
     eps: float
     walk_pass: int = 0
     chain: bool = True
+    viewport_bottom: float = 0.0
 
 
 def _finite(v: Any) -> float | None:
@@ -1062,17 +1063,19 @@ def _list_window(raw: Any, state: Any, *, walk_pass: int = 0, chain: bool = True
     if not isinstance(state, dict):
         return _ListWindow(rows, 0.0, 0.0, None, (), 1.0, walk_pass, chain)
     height = float(state.get("scrollHeight") or 0)
+    top = float(state.get("scrollTop") or 0)
     fillers = tuple(span for f in state.get("fillers") or [] if (span := _span(f)) is not None)
     dpr = _finite(state.get("dpr"))
     return _ListWindow(
         rows=rows,
-        scroll_top=float(state.get("scrollTop") or 0),
+        scroll_top=top,
         scroll_height=height,
         content=(float(state.get("padTop") or 0), height - float(state.get("padBottom") or 0)),
         fillers=fillers,
         eps=1 / dpr if dpr is not None and dpr > 0 else 1.0,
         walk_pass=walk_pass,
         chain=chain,
+        viewport_bottom=top + float(state.get("clientHeight") or 0),
     )
 
 
@@ -1184,6 +1187,22 @@ def _rows_tile(chain: Sequence[_ListWindow]) -> bool:
     return all(slot < limit for slot in [_slot(start, boxes[0][0]), _slot(bottom, end), *interior])
 
 
+def _visited_band_tiles(window: _ListWindow, previous: _ListWindow | None) -> bool:
+    if window.content is None:
+        return False
+    band = [previous, window] if previous is not None else [window]
+    start = (
+        min((r.box[0] for r in previous.rows if r.text and r.box is not None), default=None)
+        if previous is not None
+        else window.content[0]
+    )
+    bottom = max((r.box[1] for w in band for r in w.rows if r.text and r.box is not None), default=None)
+    if start is None or bottom is None:
+        return False
+    bottom = max(bottom, min(window.viewport_bottom, window.content[1]))
+    return _rows_tile([*band[:-1], dataclasses.replace(window, content=(start, bottom))])
+
+
 @dataclasses.dataclass(frozen=True)
 class _ListLog:
     """Every window a walk read, in order. Appending returns a new log, so no read is ever overwritten."""
@@ -1225,7 +1244,9 @@ def _log_rows(windows: Sequence[_ListWindow]) -> list[_ListRow]:
 def _first_scroll_top(windows: Sequence[_ListWindow], text: str) -> float | None:
     last = max((w.walk_pass for w in windows), default=0)
     holding = [w for w in windows if any(r.text == text for r in w.rows)]
-    return next((w.scroll_top for w in holding if w.walk_pass == last), holding[0].scroll_top if holding else None)
+    latest = [w for w in holding if w.walk_pass == last]
+    preferred = [w for w in latest if w.chain] or latest or holding
+    return preferred[0].scroll_top if preferred else None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -9723,16 +9744,16 @@ _LIST_POLL_HARD_S = 8.0
 _MENU_WINDOW_FINGERPRINT_JS = (
     r"""() => {"""
     + _PIERCED_QUERY_JS
+    + _LIST_BOX_JS
     + r"""
   const sc = pQS('[data-tv3-menu-scroller]');
   if (!sc) return null;
   // querySelector cannot see a row inside a component's shadow root, and a fingerprint that never
   // changes makes every window pay the full settle instead of reading as soon as it re-rendered.
-  const scTop = sc.getBoundingClientRect().top;
   let best = null;
   for (const row of pQSA('[role="option"],[role="menuitem"],[role="menuitemradio"],[role="treeitem"],li')) {
-    if (row === sc || !pContains(sc, row)) continue;
-    const pos = Math.round(row.getBoundingClientRect().top - scTop + sc.scrollTop);
+    if (row === sc || !pContains(sc, row) || pinned(row, sc)) continue;
+    const pos = Math.round(contentBox(row, sc)[0]);
     if (!best || pos < best.pos) best = { row, pos };
   }
   if (!best) return '';
@@ -9758,13 +9779,13 @@ _MENU_SCROLLER_STEP_JS = (
     .map((s) => contentBox(s, el))
     .filter((b) => b[1] > b[0]);
   const cs = getComputedStyle(el);
-  // A CSS animation or transition running on the scroller, inside it or above it moves the boxes a read takes.
   let moving = true;
   try {
-    moving = document.getAnimations().some((a) => {
+    const animations = document.getAnimations().filter((a) => {
       const t = a.playState === 'running' && a.effect ? a.effect.target : null;
       return !!t && (pContains(el, t) || pContains(t, el));
     });
+    moving = animations.length > 0;
   } catch (e) { moving = true; }
   return {
     moving,
@@ -22030,11 +22051,8 @@ def build_browser_tools(
                         fp = None
                     if (isinstance(fp, str) and fp != last_fingerprint) or time.monotonic() >= settle_until:
                         break
-                last_fingerprint = fp if isinstance(fp, str) else last_fingerprint
                 # Re-read the scroller AFTER the settle: a page appended during the wait must show in the extent
-                # this scan reports. A read taken while an animation runs on the list, or at a scroll offset other
-                # than the one asked for (short of the list end), may catch rows mid-move, so that window is taken
-                # on two equal reads in a row; a still read is taken as it is.
+                # this scan reports. Animated reads must agree within the existing wait cap.
                 texts_raw: Any = None
                 prior: Any = None
                 steady_until = time.monotonic() + 0.4
@@ -22050,14 +22068,31 @@ def build_browser_tools(
                         texts_raw = await page.evaluate(_MENU_OPTION_TEXTS_JS, {"attr": "menu"})
                     except Exception:
                         texts_raw = None
-                    if (
-                        (prior is None and not _unsteady(state, top))
-                        or (state, texts_raw) == prior
-                        or time.monotonic() >= steady_until
-                    ):
+                    stable = (state, texts_raw) == prior
+                    if stable and state.get("moving") is not False:
+                        candidate = _list_window(texts_raw, state, walk_pass=walk_pass, chain=chain)
+                        previous = next(
+                            (
+                                w
+                                for w in reversed(log.windows)
+                                if w.chain
+                                and w.walk_pass == walk_pass
+                                and (chain or abs(w.scroll_top - candidate.scroll_top) <= max(w.eps, candidate.eps))
+                            ),
+                            None,
+                        )
+                        if chain or previous is not None:
+                            stable = _visited_band_tiles(candidate, previous)
+                    if (prior is None and not _unsteady(state, top)) or stable or time.monotonic() >= steady_until:
                         break
                     prior = (state, texts_raw)
                     await asyncio.sleep(0.02)
+                # Compare the next scroll with the accepted phase, not an earlier animation frame.
+                try:
+                    fp = await page.evaluate(_MENU_WINDOW_FINGERPRINT_JS)
+                except Exception:
+                    fp = None
+                last_fingerprint = fp if isinstance(fp, str) else last_fingerprint
                 window = _list_window(texts_raw, state, walk_pass=walk_pass, chain=chain)
                 log = log.appended(window)
                 return state, [dict(r.read) for r in window.rows if r.text]
@@ -22196,7 +22231,6 @@ def build_browser_tools(
                 definitive: bool,
                 idx: int | None = None,
                 hit: str | None = None,
-                unproven_row: dict[str, Any] | None = None,
             ) -> _WalkResult:
                 twins = _twin_keys()
                 flagged = tuple(
@@ -22210,7 +22244,6 @@ def build_browser_tools(
                     complete=complete,
                     twins=want in twins,
                     twin_rows=_rows_per_key(log.windows)[want] if want in twins else 0,
-                    unproven=unproven_row,
                     seen=tuple(o for o in flagged if not o.get("nav")),
                 )
 
@@ -22233,20 +22266,27 @@ def build_browser_tools(
                         return _result(current, definitive=reached_end, idx=n, hit=text)
                 if verdict != "commit":
                     unproven = unproven or (text if verdict == "incomplete" else None)
-            # Leave the list where the open-click rendered it so the model's next look() matches the
-            # window it already reasoned about, or at the row the refusal will name. `data-tv3-menu` numbers from
-            # earlier windows are not identities, so a full scan reports the option TEXTS it saw and a cut-short
-            # one reports only the rows live in the restored window.
-            restore = _first_scroll_top(log.windows, unproven) if unproven else None
-            _, current = await _scan(start_top if restore is None else restore, chain=False)
-            n_unproven = _row_n(current, unproven) if unproven else None
             # A walk that reached the end but left gaps is reported as cut short: its rows are not the
             # whole list, so the definitive no-match/ambiguity verdicts do not apply.
             definitive = reached_end and (_is_ambiguous(hit_text) if hit_text is not None else coverage != "incomplete")
-            return _result(
-                current,
-                definitive=definitive,
-                unproven_row=None
+            # Keep observed twins fixed during positioning; otherwise retain new rivals before filtering.
+            refusal = _result(current, definitive=definitive) if want in _twin_keys() else None
+            # Restore a row the verdict names, otherwise the open-click window. Earlier menu numbers are not
+            # identities, so a cut-short scan reports only rows live in the restored window.
+            restore_text = unproven or hit_text
+            restore = _first_scroll_top(log.windows, restore_text) if restore_text else None
+            _, current = await _scan(start_top if restore is None else restore, chain=False)
+            n_unproven = _row_n(current, unproven) if unproven else None
+            if refusal is None:
+                refusal = _result(
+                    current,
+                    definitive=reached_end
+                    and (_is_ambiguous(hit_text) if hit_text is not None else coverage != "incomplete"),
+                )
+            return dataclasses.replace(
+                refusal,
+                rows=refusal.rows if refusal.definitive else tuple(current),
+                unproven=None
                 if n_unproven is None
                 else {
                     "n": n_unproven,
