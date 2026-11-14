@@ -254,6 +254,7 @@ const requiredSettings: Record<string, Array<[string, string]>> = {
   workflowTrigger: [["workflowPermanentId", "Agent"]],
   wait: [["waitInSeconds", "Seconds"]],
   sendEmail: [["recipients", "Recipients"]],
+  agentStep: [["tools", "Tools"]],
 };
 
 export function getDocMissingSettings(
@@ -273,7 +274,8 @@ export const docRequiredSettingKeys = (node: Node): string[] =>
 function settingIsSet(node: Node, key: string): boolean {
   if (node.type === "wait")
     return /^\d+$/.test(text(node, key)) && Number(text(node, key)) >= 1;
-  return Boolean(text(node, key));
+  const value = node.data[key];
+  return Array.isArray(value) ? value.length > 0 : Boolean(text(node, key));
 }
 
 const text = (node: Node, key: string) =>

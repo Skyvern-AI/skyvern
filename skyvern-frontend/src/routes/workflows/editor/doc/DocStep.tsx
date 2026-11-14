@@ -87,6 +87,7 @@ import {
   useDocStepPending,
 } from "./DocProposalView";
 import { DocOneActionHint } from "./DocOneActionHint";
+import { isDocUrlOfferVisible } from "./docOneAction";
 import { DocStepMeta } from "./DocStepMeta";
 import { DocStepName } from "./DocStepName";
 import { useDocGoalBuild } from "./useDocGoalBuild";
@@ -698,16 +699,36 @@ export function DocStepBody({
       settingRows.details.includes(f) ||
       (metaRows.includes(f) && (lineTouched(f.key) || !settingRows.editable)),
   );
-  // Hidden while the main line is being typed in, so a half-typed URL ("https://exa") is not offered. Focus is kept per
-  // rendering of the line, because React fires no blur when the focused line unmounts; a run or a demonstration that
-  // takes editing away clears it, so the same rendering coming back is not read as still focused.
+  // Keep a pre-existing offer reachable on focus, but hide it after typing until the line is left.
   const lineMode = `${editable}-${isProse}`;
   const [focusedMode, setFocusedMode] = useState<string | null>(null);
+  const menuActive = useRef(false);
+  const lineContainer = useRef<HTMLDivElement>(null);
+  const [focusStart, setFocusStart] = useState<{
+    text: string;
+    requiredOffer: boolean;
+  } | null>(null);
+  // A lock can unmount the focused line without a blur, so discard its snapshot.
   if (!editable && focusedMode !== null) setFocusedMode(null);
+  const candidate =
+    editable && actions.edit ? actions.promptUrlOffer(node) : null;
+  const focused = focusedMode === lineMode;
   const urlOffer =
-    editable && actions.edit && focusedMode !== lineMode
-      ? actions.promptUrlOffer(node)
-      : null;
+    !focused || focusStart?.text === stringOf(shownMainKey) ? candidate : null;
+  const [, refreshHint] = useState(0);
+  const urlOfferVisible = isDocUrlOfferVisible(node, urlOffer);
+  const requiredUrlOfferVisible =
+    urlOfferVisible && Boolean(urlOffer?.required);
+  const hideUrlChip = focused
+    ? Boolean(focusStart?.requiredOffer)
+    : requiredUrlOfferVisible;
+  const hint = editableProp && (
+    <DocOneActionHint
+      node={node}
+      urlOffer={urlOffer}
+      onDismiss={() => refreshHint((n) => n + 1)}
+    />
+  );
   const textCollapse = {
     open: actions.textOpen(node.id),
     setOpen: (open: boolean) => actions.setTextOpen(node.id, open),
@@ -726,6 +747,14 @@ export function DocStepBody({
     className: string,
   ) => (
     <DocEditableLine
+      onMenuActiveChange={(open) => {
+        menuActive.current = open;
+        if (!open && !lineContainer.current?.contains(document.activeElement)) {
+          setFocusedMode(null);
+          setFocusStart(null);
+          setHeldRestInView(null);
+        }
+      }}
       onFiles={addFiles ?? undefined}
       value={value}
       editable={editable}
@@ -855,18 +884,37 @@ export function DocStepBody({
   );
   return (
     <>
-      <DocStepMeta node={node} rows={metaRows} />
+      <DocStepMeta
+        node={node}
+        rows={metaRows.filter(
+          (row) => !(hideUrlChip && row.key === "url" && row.unset),
+        )}
+      />
       <div
+        ref={lineContainer}
         className="min-h-[1.55em] text-base font-normal leading-[1.55]"
         {...docImageDropProps(addFiles)}
         onFocus={(event) => {
-          if (isCollapseControl(event.target)) return;
+          if (isCollapseControl(event.target) || menuActive.current) return;
+          setFocusStart({
+            text: stringOf(shownMainKey),
+            requiredOffer: Boolean(
+              candidate?.required && isDocUrlOfferVisible(node, candidate),
+            ),
+          });
           setFocusedMode(lineMode);
           setHeldRestInView((held) => held ?? liveRestInView);
         }}
         onBlur={(event) => {
-          if (isCollapseControl(event.target)) return;
+          if (isCollapseControl(event.target) || menuActive.current) return;
+          if (
+            focused &&
+            focusStart?.text !== stringOf(shownMainKey) &&
+            isDocUrlOfferVisible(node, candidate)
+          )
+            announceDoc("A URL suggestion is available.");
           setFocusedMode(null);
+          setFocusStart(null);
           setHeldRestInView(null);
         }}
       >
@@ -941,6 +989,7 @@ export function DocStepBody({
           <DocText value={settingSummary} />
         </div>
       )}
+      {requiredUrlOfferVisible && hint}
       <DocStepSummary
         node={node}
         lineKeys={lineKeys}
@@ -954,7 +1003,7 @@ export function DocStepBody({
         keySettings={keySettings}
         onAddNote={editableProp ? onAddNote : undefined}
       />
-      {editableProp && <DocOneActionHint node={node} urlOffer={urlOffer} />}
+      {!requiredUrlOfferVisible && hint}
     </>
   );
 }

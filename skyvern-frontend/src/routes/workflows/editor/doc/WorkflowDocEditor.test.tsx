@@ -871,7 +871,7 @@ describe("WorkflowDocEditor navigation", () => {
     expect(document.querySelector('[data-doc-missing="URL"]')).toBeTruthy();
   });
 
-  test("a step offers its prompt's URL for its empty URL field after Details, with the reason, and not while typing or read-only", () => {
+  test("a step offers its prompt URL with the reason, and not while typing or read-only", () => {
     const task = block("task", "search_step", "next_step", {
       url: "",
       navigation_goal: "Go to https://example.com/page and search for shoes",
@@ -895,6 +895,9 @@ describe("WorkflowDocEditor navigation", () => {
       screen.getByText("This step needs a page to start on."),
     ).toBeTruthy();
     expect(
+      screen.queryByRole("button", { name: /Add Page URL to Search step/ }),
+    ).toBeNull();
+    expect(
       screen.getByText(
         "Without a URL, this step starts on the previous step's page.",
       ),
@@ -903,13 +906,27 @@ describe("WorkflowDocEditor navigation", () => {
     const mainLine = screen.getByRole("textbox", {
       name: "search_step navigationGoal",
     });
-    fireEvent.focus(mainLine);
-    expect(offer()).toBe(null);
+    act(() => mainLine.focus());
+    expect(document.activeElement?.getAttribute("aria-label")).toBe(
+      "search_step navigationGoal",
+    );
+    expect(offer()).not.toBeNull();
+    expect(
+      screen.queryByRole("button", { name: /Add Page URL to Search step/ }),
+    ).toBeNull();
+    const focusedTabStops = [
+      ...document.querySelectorAll<HTMLElement>('[role="textbox"], button'),
+    ];
+    expect(focusedTabStops.indexOf(offer()!)).toBeLessThan(
+      focusedTabStops.indexOf(
+        screen.getByRole("button", { name: /^Details for .*search/i }),
+      ),
+    );
     fireEvent.blur(
       screen.getByRole("textbox", { name: "search_step navigationGoal" }),
     );
 
-    // Forward Tab follows the DOM: the prompt, then Details, then the offer.
+    // The required URL offer is above Details, after the prompt.
     const tabbable = [
       ...document.querySelectorAll<HTMLElement>('[role="textbox"], button'),
     ];
@@ -920,11 +937,11 @@ describe("WorkflowDocEditor navigation", () => {
     const options = screen.getByRole("button", {
       name: /^Details for .*search/i,
     });
-    expect(at(prompt)).toBeLessThan(at(options));
-    expect(at(options)).toBeLessThan(at(offer()!));
+    expect(at(prompt)).toBeLessThan(at(offer()!));
+    expect(at(offer()!)).toBeLessThan(at(options));
     expect(
       tabbable
-        .slice(at(options) + 1, at(offer()!))
+        .slice(at(offer()!) + 1, at(options))
         .some((el) => el.getAttribute("role") === "textbox"),
     ).toBe(false);
 
@@ -944,9 +961,9 @@ describe("WorkflowDocEditor navigation", () => {
     );
 
     // Dismissing an offer puts focus back on its step's prompt line.
-    const nextOffer = document.querySelector<HTMLElement>(
-      '[data-doc-suggestion="url"]',
-    )!;
+    const nextOffer = screen
+      .getByRole("button", { name: "Use https://example.com/other as the URL" })
+      .closest<HTMLElement>('[data-doc-suggestion="url"]')!;
     fireEvent.click(within(nextOffer).getByRole("button", { name: "Dismiss" }));
     expect(nextOffer.isConnected).toBe(false);
     expect(document.activeElement?.getAttribute("aria-label")).toBe(
@@ -958,16 +975,392 @@ describe("WorkflowDocEditor navigation", () => {
     expect(offer()).toBe(null);
   });
 
-  test("a step's URL offer comes back after a demonstration takes editing away while its prompt is focused and focus moves on", () => {
+  test("typing after focus hides the offer without inserting a chip above the prompt", () => {
+    const doc = renderLiveDoc([
+      block("task", "typing_step", null, {
+        url: "",
+        navigation_goal: "Go to https://example.com/page",
+      }),
+    ]);
+    const prompt = screen.getByRole("textbox", {
+      name: "typing_step navigationGoal",
+    });
+    fireEvent.focus(prompt);
+    expect(
+      screen.getByRole("button", {
+        name: "Use https://example.com/page as the URL",
+      }),
+    ).toBeTruthy();
+    const focusedPrompt = screen.getByRole("textbox", {
+      name: "typing_step navigationGoal",
+    });
+    Object.defineProperty(focusedPrompt, "innerText", {
+      value: "Go to https://exa",
+      configurable: true,
+    });
+    fireEvent.input(focusedPrompt);
+    expect(
+      (
+        doc.graph().nodes.find((node) => node.data.label === "typing_step")!
+          .data as Record<string, unknown>
+      ).navigationGoal,
+    ).toBe("Go to https://exa");
+    doc.rerender();
+    expect(
+      screen.queryByRole("button", { name: /Use .* as the URL/ }),
+    ).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: /Add Page URL to Typing step/ }),
+    ).toBeNull();
+  });
+
+  test("opening the reference menu does not reset the prompt focus snapshot", async () => {
+    Object.defineProperty(document, "execCommand", {
+      value: vi.fn(() => true),
+      configurable: true,
+    });
+    onTestFinished(() => {
+      Reflect.deleteProperty(document, "execCommand");
+    });
+    const doc = renderLiveDoc([
+      block("task", "reference_step", null, {
+        url: "",
+        navigation_goal: "Search ",
+      }),
+    ]);
+    act(() =>
+      screen
+        .getByRole("textbox", { name: "reference_step navigationGoal" })
+        .focus(),
+    );
+    const prompt = screen.getByRole("textbox", {
+      name: "reference_step navigationGoal",
+    });
+    Object.defineProperty(prompt, "innerText", {
+      value: "Search https://example.com/page ",
+      configurable: true,
+    });
+    fireEvent.input(prompt);
+    doc.rerender();
+    const focusedPrompt = screen.getByRole("textbox", {
+      name: "reference_step navigationGoal",
+    });
+    const selection = window.getSelection()!;
+    const range = document.createRange();
+    range.selectNodeContents(focusedPrompt);
+    range.collapse(false);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    fireEvent.keyDown(focusedPrompt, { key: "@" });
+    const menu = await screen.findByPlaceholderText("Insert a reference…");
+    expect(document.activeElement).toBe(menu);
+    clearDocAnnouncement();
+    fireEvent.blur(menu, { relatedTarget: document.body });
+    expect(docAnnouncement()).toBe("");
+    expect(
+      screen.getByRole("button", { name: /Add Page URL to Reference step/ }),
+    ).toBeTruthy();
+    expect(
+      screen.queryByRole("button", { name: /Use .* as the URL/ }),
+    ).toBeNull();
+    fireEvent.keyDown(menu, { key: "Escape" });
+    await waitFor(() =>
+      expect(screen.queryByPlaceholderText("Insert a reference…")).toBeNull(),
+    );
+    expect(
+      screen.getByRole("button", { name: /Add Page URL to Reference step/ }),
+    ).toBeTruthy();
+    expect(
+      screen.queryByRole("button", { name: /Use .* as the URL/ }),
+    ).toBeNull();
+    clearDocAnnouncement();
+    fireEvent.blur(focusedPrompt);
+    expect(docAnnouncement()).toBe("A URL suggestion is available.");
+  });
+
+  test("the slash picker preserves the prompt snapshot when focus leaves its menu", async () => {
+    Object.defineProperty(document, "execCommand", {
+      value: vi.fn(() => true),
+      configurable: true,
+    });
+    onTestFinished(() => {
+      Reflect.deleteProperty(document, "execCommand");
+    });
+    const doc = renderLiveDoc([
+      block("task", "slash_step", null, {
+        url: "",
+        navigation_goal: "Search ",
+      }),
+    ]);
+    act(() =>
+      screen
+        .getByRole("textbox", { name: "slash_step navigationGoal" })
+        .focus(),
+    );
+    const prompt = screen.getByRole("textbox", {
+      name: "slash_step navigationGoal",
+    });
+    Object.defineProperty(prompt, "innerText", {
+      value: "Search https://example.com/page\n",
+      configurable: true,
+    });
+    fireEvent.input(prompt);
+    doc.rerender();
+    const line = screen.getByRole("textbox", {
+      name: "slash_step navigationGoal",
+    });
+    line.textContent = "Search https://example.com/page\n";
+    const range = document.createRange();
+    range.selectNodeContents(line);
+    range.collapse(false);
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(range);
+    clearDocAnnouncement();
+    fireEvent.keyDown(line, { key: "/" });
+    const menu = await screen.findByPlaceholderText("Add a step…");
+    expect(document.activeElement).toBe(menu);
+    fireEvent.blur(menu, { relatedTarget: document.body });
+    expect(docAnnouncement()).toBe("");
+    expect(
+      screen.getByRole("button", { name: /Add Page URL to Slash step/ }),
+    ).toBeTruthy();
+    expect(
+      screen.queryByRole("button", { name: /Use .* as the URL/ }),
+    ).toBeNull();
+    fireEvent.keyDown(menu, { key: "Escape" });
+    await waitFor(() =>
+      expect(screen.queryByPlaceholderText("Add a step…")).toBeNull(),
+    );
+    clearDocAnnouncement();
+    fireEvent.blur(
+      screen.getByRole("textbox", { name: "slash_step navigationGoal" }),
+    );
+    expect(docAnnouncement()).toBe("A URL suggestion is available.");
+  });
+
+  test("picking a loop releases the prompt focus snapshot", async () => {
+    const doc = renderLiveDoc([
+      block("task", "pick_step", null, { url: "", navigation_goal: "Search " }),
+    ]);
+    act(() =>
+      screen.getByRole("textbox", { name: "pick_step navigationGoal" }).focus(),
+    );
+    const prompt = screen.getByRole("textbox", {
+      name: "pick_step navigationGoal",
+    });
+    Object.defineProperty(prompt, "innerText", {
+      value: "Search https://example.com/page\n",
+      configurable: true,
+    });
+    fireEvent.input(prompt);
+    doc.rerender();
+    const line = screen.getByRole("textbox", {
+      name: "pick_step navigationGoal",
+    });
+    line.textContent = "Search https://example.com/page\n";
+    const range = document.createRange();
+    range.selectNodeContents(line);
+    range.collapse(false);
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(range);
+    fireEvent.keyDown(line, { key: "/" });
+    const menu = await screen.findByPlaceholderText("Add a step…");
+    fireEvent.change(menu, { target: { value: "loop" } });
+    fireEvent.click(screen.getAllByRole("option")[0]!);
+    doc.rerender();
+    expect(
+      screen.getByRole("button", {
+        name: "Use https://example.com/page as the URL",
+      }),
+    ).toBeTruthy();
+  });
+
+  test.each(["", "Search "])(
+    "locking a %s prompt closes its reference menu and resets focus",
+    async (text) => {
+      const doc = renderLiveDoc([
+        block("task", "lock_step", null, { url: "", navigation_goal: text }),
+      ]);
+      act(() =>
+        screen
+          .getByRole("textbox", { name: "lock_step navigationGoal" })
+          .focus(),
+      );
+      const line = screen.getByRole("textbox", {
+        name: "lock_step navigationGoal",
+      });
+      const range = document.createRange();
+      range.selectNodeContents(line);
+      range.collapse(false);
+      window.getSelection()!.removeAllRanges();
+      window.getSelection()!.addRange(range);
+      fireEvent.keyDown(line, { key: "@" });
+      await screen.findByPlaceholderText("Insert a reference…");
+      doc.rerender(true);
+      expect(screen.queryByPlaceholderText("Insert a reference…")).toBeNull();
+      doc.rerender(false);
+      act(() =>
+        screen
+          .getByRole("textbox", { name: "lock_step navigationGoal" })
+          .focus(),
+      );
+      const prompt = screen.getByRole("textbox", {
+        name: "lock_step navigationGoal",
+      });
+      Object.defineProperty(prompt, "innerText", {
+        value: "Search https://exa",
+        configurable: true,
+      });
+      fireEvent.input(prompt);
+      doc.rerender();
+      expect(
+        screen.queryByRole("button", { name: /Use .* as the URL/ }),
+      ).toBeNull();
+      expect(
+        screen.getByRole("button", { name: /Add Page URL to Lock step/ }),
+      ).toBeTruthy();
+    },
+  );
+
+  test("locking a prompt closes its slash picker", async () => {
+    const doc = renderLiveDoc([
+      block("task", "locked_slash", null, {
+        url: "",
+        navigation_goal: "Search ",
+      }),
+    ]);
+    act(() =>
+      screen
+        .getByRole("textbox", { name: "locked_slash navigationGoal" })
+        .focus(),
+    );
+    const line = screen.getByRole("textbox", {
+      name: "locked_slash navigationGoal",
+    });
+    line.textContent = "Search\n";
+    const range = document.createRange();
+    range.selectNodeContents(line);
+    range.collapse(false);
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(range);
+    fireEvent.keyDown(line, { key: "/" });
+    await screen.findByPlaceholderText("Add a step…");
+    doc.rerender(true);
+    expect(screen.queryByPlaceholderText("Add a step…")).toBeNull();
+    doc.rerender(false);
+    expect(screen.queryByPlaceholderText("Add a step…")).toBeNull();
+  });
+
+  test("unchanged or URL-free edits do not announce a suggestion on blur", () => {
+    const doc = renderLiveDoc([
+      block("task", "quiet_step", null, {
+        url: "",
+        navigation_goal: "Go to https://example.com/page",
+      }),
+    ]);
+    act(() =>
+      screen
+        .getByRole("textbox", { name: "quiet_step navigationGoal" })
+        .focus(),
+    );
+    clearDocAnnouncement();
+    fireEvent.blur(
+      screen.getByRole("textbox", { name: "quiet_step navigationGoal" }),
+    );
+    expect(docAnnouncement()).toBe("");
+    act(() =>
+      screen
+        .getByRole("textbox", { name: "quiet_step navigationGoal" })
+        .focus(),
+    );
+    const prompt = screen.getByRole("textbox", {
+      name: "quiet_step navigationGoal",
+    });
+    Object.defineProperty(prompt, "innerText", {
+      value: "Search for results",
+      configurable: true,
+    });
+    fireEvent.input(prompt);
+    doc.rerender();
+    clearDocAnnouncement();
+    fireEvent.blur(
+      screen.getByRole("textbox", { name: "quiet_step navigationGoal" }),
+    );
+    expect(docAnnouncement()).toBe("");
+  });
+
+  test("an optional later-step URL suggestion is announced without a position", () => {
+    const doc = renderLiveDoc([
+      block("task", "first_page", "later_step", {
+        url: "https://example.com",
+        navigation_goal: "Open page",
+      }),
+      block("task", "later_step", null, { url: "", navigation_goal: "Search" }),
+    ]);
+    act(() =>
+      screen
+        .getByRole("textbox", { name: "later_step navigationGoal" })
+        .focus(),
+    );
+    const prompt = screen.getByRole("textbox", {
+      name: "later_step navigationGoal",
+    });
+    Object.defineProperty(prompt, "innerText", {
+      value: "Search https://example.com/later",
+      configurable: true,
+    });
+    fireEvent.input(prompt);
+    doc.rerender();
+    clearDocAnnouncement();
+    fireEvent.blur(
+      screen.getByRole("textbox", { name: "later_step navigationGoal" }),
+    );
+    expect(docAnnouncement()).toBe("A URL suggestion is available.");
+    expect(
+      screen.getByRole("button", {
+        name: "Use https://example.com/later as the URL",
+      }),
+    ).toBeTruthy();
+  });
+
+  test("dismissing a required URL offer restores the URL settings chip", () => {
     renderDoc(
       [
-        block("task", "focus_step", null, {
+        block("task", "offer_step", null, {
           url: "",
-          navigation_goal: "Go to https://example.com/focus and search",
+          navigation_goal: "Go to https://example.com/page and search",
         }),
       ],
       { apply: vi.fn(), update: vi.fn(), addStep: vi.fn(), duplicate: vi.fn() },
     );
+    expect(
+      screen.queryByRole("button", { name: /Add Page URL to Offer step/ }),
+    ).toBeNull();
+    const suggestion = document.querySelector<HTMLElement>(
+      '[data-doc-suggestion="url"]',
+    )!;
+    fireEvent.click(
+      within(suggestion).getByRole("button", { name: "Dismiss" }),
+    );
+    expect(
+      screen.getByRole("button", { name: /Add Page URL to Offer step/ }),
+    ).toBeTruthy();
+  });
+
+  test("an invalid browser URL shows the existing address validation on the step", () => {
+    renderDoc([block("navigation", "bad_page", null, { url: "shop" })]);
+    expect(
+      screen.getByText("Enter a full web address, like example.com."),
+    ).toBeTruthy();
+  });
+
+  test("a step's URL offer comes back after a demonstration takes editing away while its prompt is focused and focus moves on", () => {
+    const doc = renderLiveDoc([
+      block("task", "focus_step", null, {
+        url: "",
+        navigation_goal: "Go to https://example.com/focus and search",
+      }),
+    ]);
     const offer = () =>
       screen.queryByRole("button", {
         name: "Use https://example.com/focus as the URL",
@@ -975,7 +1368,17 @@ describe("WorkflowDocEditor navigation", () => {
     fireEvent.focus(
       screen.getByRole("textbox", { name: "focus_step navigationGoal" }),
     );
-    expect(offer()).toBe(null);
+    expect(offer()).not.toBeNull();
+    const prompt = screen.getByRole("textbox", {
+      name: "focus_step navigationGoal",
+    });
+    Object.defineProperty(prompt, "innerText", {
+      value: "Go to https://example.com/focus and search now",
+      configurable: true,
+    });
+    fireEvent.input(prompt);
+    doc.rerender();
+    expect(offer()).toBeNull();
     act(() =>
       useRecordingLauncherStore.setState({
         demonstration: {

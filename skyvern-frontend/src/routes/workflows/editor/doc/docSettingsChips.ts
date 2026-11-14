@@ -340,7 +340,12 @@ export function docKeySettings(
       {
         key: spec.keys[0]!,
         label: spec.label,
-        value: value === null ? spec.empty : shortValue(value),
+        value:
+          value === null
+            ? spec.empty
+            : spec.keys[0] === "tools"
+              ? value
+              : shortValue(value),
         unset: value === null,
         meta: spec.meta,
         addLabel: spec.addLabel,
