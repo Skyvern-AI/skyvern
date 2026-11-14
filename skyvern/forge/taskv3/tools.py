@@ -160,6 +160,7 @@ from skyvern.webeye.utils.challenge_signature import (
     CHALLENGE_VENDOR_SIGNATURE,
     rendered_challenge_vendor_reading,
 )
+from skyvern.webeye.utils.dom import is_post_dispatch_click_timeout
 from skyvern.webeye.utils.flutter_semantics import (
     FLUTTER_STATE_JS,
     FLUTTER_TEXT_FIELD_JS,
@@ -8834,6 +8835,7 @@ _CLICK_SAME_DOC_PLANT_JS = """() => {
 }"""
 _CLICK_SAME_DOC_CHECK_JS = "() => window.__tv3_click_same === 1"
 _CLICK_SEEN_CHECK_JS = "() => window.__tv3_click_seen === 1"
+_NAVIGATION_WAIT_LOG_LINE = "- waiting for scheduled navigations to finish"
 
 
 async def _note_click_dispatch(page: Any, *, marker_armed: bool) -> None:
@@ -8845,6 +8847,16 @@ async def _note_click_dispatch(page: Any, *, marker_armed: bool) -> None:
         seen = True
     if seen:
         record_click_dispatched()
+
+
+async def _document_replaced(realm: input_dispatch.Realm) -> bool:
+    # A read made while the new document commits raises (its context is destroyed), so one more read follows it.
+    for _ in range(2):
+        try:
+            return not await realm.evaluate(_CLICK_SAME_DOC_CHECK_JS)
+        except Exception:
+            continue
+    return False
 
 
 async def _act_token(handle: Any) -> str | None:
@@ -17440,6 +17452,7 @@ def build_browser_tools(
             except Exception:
                 checked_before = None
 
+        document_replaced = False
         if skinned and label_click:
             if _acted_realm:
                 # The coordinates come from a getBoundingClientRect inside the element's own realm, so
@@ -17483,10 +17496,25 @@ def build_browser_tools(
                 marker_armed = False
             click_path = "locator"
             try:
-                # With label_over_control the probe already answered: the only thing "over" this control is
-                # its own label (slotted, or a sibling for=id), which the driver's containment check would
-                # wait 15s to reject.
-                click_path = await _click_marker(page, selector, force=bool(label_over_control))
+                try:
+                    # With label_over_control the probe already answered: the only thing "over" this control is
+                    # its own label (slotted, or a sibling for=id), which the driver's containment check would
+                    # wait 15s to reject.
+                    click_path = await _click_marker(page, selector, force=bool(label_over_control))
+                except Exception as wait_exc:
+                    # A press whose navigation (a slow form POST) outlasts the driver's wait landed if the document
+                    # was replaced, as v1's click chain reports it. The call log quotes page text, so only the
+                    # driver's own line counts, split on "\n" alone: page text can carry other line breaks.
+                    waited = _NAVIGATION_WAIT_LOG_LINE in (line.strip() for line in str(wait_exc).split("\n"))
+                    if not (
+                        marker_armed
+                        and waited
+                        and is_post_dispatch_click_timeout(wait_exc)
+                        and await _document_replaced(page)
+                    ):
+                        raise
+                    click_path = "navigated"
+                    document_replaced = True
             except Exception as e:
                 await _note_click_dispatch(page, marker_armed=marker_armed)
                 gone = False
@@ -17575,6 +17603,8 @@ def build_browser_tools(
                     error_class="stale_selector",
                 )
             base = f"clicked {selector} — now at {await _url(page)}"
+            if document_replaced:
+                base += f" — {_navigated_phrase()}"
 
         # url_after vs url_before is the real page-transition signal the shadow net-progress ledger
         # reads (loop.py _ProgressLedger). Surfaced, not newly computed: _url is the page.url property,
@@ -17594,6 +17624,9 @@ def build_browser_tools(
             "url_before": page_url_before,
             CLICK_DISPATCHED_DATA_KEY: True,
         }
+        if document_replaced:
+            # A form posting back to its own URL replaces the document without moving the URL.
+            transition_data["page_state_changed"] = True
         if page_url_before and page_url_after and page_url_after != page_url_before:
             # Click-driven transitions feed the same visited-URL ring navigate reads, so a later
             # navigate back to a click-reached page is classified as a revisit, not fresh territory.
@@ -17612,7 +17645,7 @@ def build_browser_tools(
             and bool(skin_probe.get("radio"))
             and checked_before is True
         )
-        if (skinned or verify_toggle or toggle) and not already_checked_radio:
+        if (skinned or verify_toggle or toggle) and not already_checked_radio and not document_replaced:
             try:
                 checked_after = await _probe_evaluate(
                     page, _CHECKBOX_CHECKED_JS, selector, await _probe_arg(page, selector)
