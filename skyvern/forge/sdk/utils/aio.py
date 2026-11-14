@@ -12,6 +12,9 @@ async def collect(tasks: Sequence[asyncio.Task]) -> list[Any]:
     Returns the results of all tasks (if all tasks succeed).
     """
 
+    if not tasks:
+        return []
+
     done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
 
     for p in pending:
@@ -24,4 +27,6 @@ async def collect(tasks: Sequence[asyncio.Task]) -> list[Any]:
         if exc:
             raise exc
 
-    return [task.result() for task in done]
+    # `done` is a set, so reading results from it yields them in arbitrary order. Report them in the
+    # caller's task order instead, as `gather` does, so a positional lookup cannot read another task's value.
+    return [task.result() for task in tasks]
