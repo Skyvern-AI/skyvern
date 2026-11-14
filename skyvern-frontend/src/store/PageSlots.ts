@@ -1,4 +1,4 @@
-import type { CreatedTrigger } from "@/routes/workflows/copilot/narrativeState";
+import type { CreatedTrigger } from "@/routes/workflows/ember/narrativeState";
 import type { WorkflowReliability } from "@/routes/workflows/types/reliabilityTypes";
 import { createContext, useContext } from "react";
 import type { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
@@ -122,7 +122,7 @@ export type PageSlots = {
   >;
   workflowAnalyticsPanel?: React.ComponentType<WorkflowAnalyticsPanelProps>;
   workflowTriggersPanel?: React.ComponentType<WorkflowTriggersPanelProps>;
-  // The Copilot trigger card with the trigger's live state and a Turn on switch.
+  // The Ember trigger card with the trigger's live state and a Turn on switch.
   triggerCreatedCard?: React.ComponentType<TriggerCreatedCardSlotProps>;
   workflowRunsFilterControls?: React.ComponentType;
   workflowRunMilestoneCard?: React.ComponentType<WorkflowRunMilestoneCardProps>;

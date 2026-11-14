@@ -262,7 +262,7 @@ function proxyLocationsEqual(left: unknown, right: unknown): boolean {
 }
 
 // Webhook and TOTP URLs can contain credentials in userinfo, paths, or queries.
-const withheldCopilotSettings = [
+const withheldEmberSettings = [
   "cdp_connect_headers",
   "extra_http_headers",
   "totp_identifier",
@@ -270,7 +270,7 @@ const withheldCopilotSettings = [
   "webhook_callback_url",
 ] as const;
 
-export function buildWorkflowCopilotContext(
+export function buildEmberContext(
   input: Parameters<typeof buildWorkflowYamlDocument>[0],
 ): {
   document: WorkflowCreateYAMLRequest;
@@ -298,7 +298,7 @@ export function buildWorkflowCopilotContext(
     { explicitDocFields: true },
   );
   const document = { ...snapshot };
-  for (const field of withheldCopilotSettings) delete document[field];
+  for (const field of withheldEmberSettings) delete document[field];
   const proxy = document.proxy_location;
   if (isPrivateProxyLocation(proxy)) {
     delete document.proxy_location;
@@ -306,7 +306,7 @@ export function buildWorkflowCopilotContext(
   return { snapshot, document };
 }
 
-export function restoreWorkflowCopilotSettings(
+export function restoreEmberSettings(
   workflow: WorkflowApiResponse,
   snapshot: WorkflowSettings,
   settings = apiWorkflowToSettings(workflow),
@@ -314,7 +314,7 @@ export function restoreWorkflowCopilotSettings(
   const snapshotProxy = snapshot.proxyLocation;
   const appliedProxy = workflow.proxy_location;
   let proxySettings: Pick<WorkflowSettings, "proxyLocation"> | undefined;
-  // Null can be a schema default when Copilot never received the proxy.
+  // Null can be a schema default when Ember never received the proxy.
   if (
     appliedProxy === undefined ||
     (appliedProxy === null && isPrivateProxyLocation(snapshotProxy))
@@ -326,7 +326,7 @@ export function restoreWorkflowCopilotSettings(
     !proxyLocationsEqual(appliedProxy ?? null, proxySettings.proxyLocation);
   const restoredSettings = { ...settings };
   let withheldSettingsChanged = false;
-  for (const field of withheldCopilotSettings) {
+  for (const field of withheldEmberSettings) {
     const setting = settingFields[field];
     const value = snapshot[setting];
     restoredSettings[setting] = value;

@@ -66,7 +66,7 @@ type Props = {
   workflowRunId: string | undefined;
   onThoughtSelect?: (thought: ObserverThought) => void;
   onViewScreenshot?: (workflowRunBlockId: string) => void;
-  // Opens Copilot on this run for the given block label; the card offers it only once the run is final.
+  // Opens Ember on this run for the given block label; the card offers it only once the run is final.
   onFix?: (blockLabel: string | null) => void;
   // The block the run-level line's headline is actually about, and that
   // headline's exact text. Both must match — the ID alone (a block can fail

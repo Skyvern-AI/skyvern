@@ -140,7 +140,7 @@ describe("GoogleOAuthCallback", () => {
     ["missing parameters", "?state=state_1", false],
     ["an expired or failed exchange", "?code=code_1&state=state_1", true],
   ])(
-    "closes the copilot card's popup on %s and stays put otherwise",
+    "closes the Ember card's popup on %s and stays put otherwise",
     async (_case, query, exchangeFails) => {
       if (exchangeFails) {
         submitCallback.mockRejectedValue(new Error("consent expired"));

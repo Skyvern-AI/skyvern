@@ -27,7 +27,7 @@ export function RunTab() {
   const { data: workflowRun } = useWorkflowRunWithWorkflowQuery({
     workflowRunId: runId,
   });
-  // Fix (Copilot) and Retry both mutate/rerun the workflow — gone with the
+  // Fix (Ember) and Retry both mutate/rerun the workflow — gone with the
   // source agent, so the CTAs go too (the run stays viewable).
   const workflowDeleted = useStudioWorkflowDeletedAt() !== null;
   // ?bl= marks a block-scoped run; "Retry" would rerun the whole workflow,
@@ -61,7 +61,7 @@ export function RunTab() {
               // location.state, so the pane write can't race a state-only navigation.
               openPane("copilot", {
                 state: {
-                  copilotAction: {
+                  emberAction: {
                     kind: "diagnose_run",
                     workflowRunId: runId,
                     nonce: crypto.randomUUID(),

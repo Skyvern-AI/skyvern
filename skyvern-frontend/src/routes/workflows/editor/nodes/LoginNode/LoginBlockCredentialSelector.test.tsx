@@ -561,7 +561,7 @@ describe("LoginBlockCredentialSelector browser session reuse", () => {
       fireEvent.click(toggle);
       expect(mocks.nodes[0]!.data[setting]).toBe(true);
       expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
-      expect(useWorkflowTitleStore.getState().copilotMetadataEdits).toEqual({});
+      expect(useWorkflowTitleStore.getState().emberMetadataEdits).toEqual({});
     },
   );
 
@@ -589,7 +589,7 @@ describe("LoginBlockCredentialSelector browser session reuse", () => {
         commitInProgress: guard === "YAML transaction lock",
       });
       useWorkflowTitleStore.setState({
-        copilotMetadataEdits: {
+        emberMetadataEdits: {
           wpid_test: { proposal: "proposal-1", edits: {} },
         },
       });
@@ -614,7 +614,7 @@ describe("LoginBlockCredentialSelector browser session reuse", () => {
       expect(mocks.nodes[0]!.data[setting]).toBe(false);
       expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(false);
       expect(
-        useWorkflowTitleStore.getState().copilotMetadataEdits.wpid_test
+        useWorkflowTitleStore.getState().emberMetadataEdits.wpid_test
           ?.graphEdited,
       ).toBeUndefined();
     },

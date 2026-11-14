@@ -1,6 +1,6 @@
 import { type ActionsApiResponse, Status } from "@/api/types";
 import { statusIsFinalized } from "@/routes/tasks/types";
-import { parseUtcIsoMs } from "@/routes/workflows/copilot/narrativeState";
+import { parseUtcIsoMs } from "@/routes/workflows/ember/narrativeState";
 
 import { agentStepToolTitles } from "../editor/nodes/AgentStepNode/types";
 import { workflowBlockTitle } from "../editor/nodes/types";

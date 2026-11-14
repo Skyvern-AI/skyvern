@@ -14,7 +14,7 @@ describe("experimentConfig", () => {
   it("has two equally-weighted variants", () => {
     expect(VARIANT_LIST).toHaveLength(2);
     expect(VARIANT_LIST).toContain(VARIANTS.TEMPLATE_FIRST);
-    expect(VARIANT_LIST).toContain(VARIANTS.COPILOT_FIRST);
+    expect(VARIANT_LIST).toContain(VARIANTS.EMBER_FIRST);
     expect(EXPERIMENT.rolloutWeights["template-first"]).toBe(50);
     expect(EXPERIMENT.rolloutWeights["copilot-first"]).toBe(50);
   });

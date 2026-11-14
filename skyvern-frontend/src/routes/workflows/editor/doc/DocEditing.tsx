@@ -28,7 +28,7 @@ import {
 } from "@/components/ui/popover";
 import { useFeatureFlag } from "@/hooks/useFeatureFlag";
 import { useIntegrationCatalogQuery } from "@/hooks/useIntegrationCatalogQuery";
-import { useCopilotActionStore } from "@/store/useCopilotActionStore";
+import { useEmberActionStore } from "@/store/useEmberActionStore";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
 import { useWorkflowSnapshotStore } from "@/store/WorkflowSnapshotStore";
@@ -1052,7 +1052,7 @@ export function DocMoveToDialog({
 /** Unsaved marker, undo/redo and Save. Each shows only when it applies. */
 // `floating` (sm and up) lays the bar over the page's top padding (the parent positions it), so it adds no height
 // and the Inputs row sits where v26 puts it, while the doc still doesn't jump on the first edit or on Save.
-// While a Copilot proposal is pending its Accept / Reject bar is the one decision, so this bar steps aside.
+// While an Ember proposal is pending its Accept / Reject bar is the one decision, so this bar steps aside.
 export function DocEditBar({
   floating = false,
   proposalPending = false,
@@ -1076,7 +1076,7 @@ export function DocEditBar({
   const matchesSaved = useWorkflowSnapshotStore(
     (s) => s.snapshot !== null && s.userHasEdited && !s.contentDirty,
   );
-  const pendingGoalChangeCount = useCopilotActionStore(
+  const pendingGoalChangeCount = useEmberActionStore(
     (state) => state.pendingGoalChanges.length,
   );
   const [goalDialogOpen, setGoalDialogOpen] = useState(false);

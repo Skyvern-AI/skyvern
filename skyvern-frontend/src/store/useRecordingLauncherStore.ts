@@ -1,6 +1,6 @@
 import { create } from "zustand";
 
-import { type WorkflowCopilotDemonstrationInsertion } from "@/routes/workflows/copilot/workflowCopilotTypes";
+import { type EmberDemonstrationInsertion } from "@/routes/workflows/ember/emberTypes";
 
 export function noteDemonstrationStartFailed() {
   useRecordingLauncherStore.setState((state) => ({
@@ -9,7 +9,7 @@ export function noteDemonstrationStartFailed() {
 }
 
 export type StartDemonstrationOptions = {
-  insertion?: WorkflowCopilotDemonstrationInsertion;
+  insertion?: EmberDemonstrationInsertion;
   // The Doc stays open beside the Browser; the canvas steps aside for it.
   keepEditor?: boolean;
 };
@@ -19,7 +19,7 @@ export type DemonstrationStatus = {
   phase: "recording" | "stopped";
   actionCount: number;
   interrupted: boolean;
-  insertion: WorkflowCopilotDemonstrationInsertion | null;
+  insertion: EmberDemonstrationInsertion | null;
 };
 
 type RecordingLauncherState = {

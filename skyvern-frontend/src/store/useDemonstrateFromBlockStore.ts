@@ -2,13 +2,13 @@ import { create } from "zustand";
 
 import { Status } from "@/api/types";
 import { statusIsFinalized } from "@/routes/tasks/types";
-import type { WorkflowCopilotDemonstrationInsertion } from "@/routes/workflows/copilot/workflowCopilotTypes";
+import type { EmberDemonstrationInsertion } from "@/routes/workflows/ember/emberTypes";
 
 export type DemonstrateFromBlockTarget = {
   workflowPermanentId: string;
   blockLabel: string;
   prefixLabels: string[];
-  insertion: WorkflowCopilotDemonstrationInsertion;
+  insertion: EmberDemonstrationInsertion;
   // Set when the earlier blocks can't be run for this block; the user starts from the current page instead.
   runUnavailableReason?: string | null;
 };

@@ -24,8 +24,8 @@ import { ReactFlowProvider } from "@xyflow/react";
 import { MemoryRouter } from "react-router-dom";
 
 import { ProxyLocation } from "@/api/types";
-import { useCopilotProposalStore } from "@/store/CopilotProposalStore";
-import { useCopilotActionStore } from "@/store/useCopilotActionStore";
+import { useEmberProposalStore } from "@/store/EmberProposalStore";
+import { useEmberActionStore } from "@/store/useEmberActionStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 
 import {
@@ -46,7 +46,7 @@ import { docDetailsText } from "./docDetailsText";
 import { useDocRunCheckStore } from "./docRunCheckStore";
 import { WorkflowScopeContext } from "../WorkflowScopeContext";
 import { StudioShellContext } from "../../studio/StudioShellContext";
-import { DOC_COPILOT_NUDGE } from "./DocStarter";
+import { DOC_EMBER_NUDGE } from "./DocStarter";
 import { WorkflowDocEditor } from "./WorkflowDocEditor";
 import { useDocUnfinishedStore } from "./docUnfinished";
 import { splitAtCaret } from "./docCaret";
@@ -227,14 +227,14 @@ describe("WorkflowDocEditor navigation", () => {
     vi.unstubAllGlobals();
   });
 
-  describe("the Copilot suggestion", () => {
+  describe("the Ember suggestion", () => {
     const edits = {
       apply: vi.fn(),
       update: vi.fn(),
       addStep: vi.fn(),
       duplicate: vi.fn(),
     };
-    const nudge = () => document.querySelector("[data-doc-copilot-nudge]");
+    const nudge = () => document.querySelector("[data-doc-ember-nudge]");
     const checklist = () =>
       screen.queryByRole("region", { name: "Getting started" }) ??
       screen.queryByLabelText(/^Getting started/);
@@ -245,14 +245,14 @@ describe("WorkflowDocEditor navigation", () => {
     });
     afterEach(() => {
       localStorage.removeItem("skyvern.doc.gettingStarted");
-      useCopilotProposalStore.getState().setProposal(null);
+      useEmberProposalStore.getState().setProposal(null);
     });
 
-    test("a fresh empty Doc suggests Copilot alone; Dismiss hides it for good and the getting-started aids come back", () => {
+    test("a fresh empty Doc suggests Ember alone; Dismiss hides it for good and the getting-started aids come back", () => {
       renderDoc([], edits, "/", "wpid_1");
       // One onboarding aid at a time: no tip and no checklist beside the suggestion.
       const tipOrChecklist = () =>
-        document.querySelector('[role="note"]:not([data-doc-copilot-nudge])') ??
+        document.querySelector('[role="note"]:not([data-doc-ember-nudge])') ??
         checklist();
       expect(nudge()).not.toBeNull();
       expect(tipOrChecklist()).toBeNull();
@@ -264,7 +264,7 @@ describe("WorkflowDocEditor navigation", () => {
       expect(nudge()).toBeNull();
     });
 
-    test("Try Copilot opens the Copilot pane and the suggestion does not come back", () => {
+    test("Try Ember opens the Ember pane and the suggestion does not come back", () => {
       renderDoc([], edits);
       fireEvent.click(screen.getByRole("button", { name: "Try Copilot" }));
       expect(openPane).toHaveBeenCalledWith("copilot");
@@ -300,7 +300,7 @@ describe("WorkflowDocEditor navigation", () => {
       expect(nudge()).toBeNull();
     });
 
-    test("asking Copilot while the suggestion shows answers it: it stays answered after the proposal clears", () => {
+    test("asking Ember while the suggestion shows answers it: it stays answered after the proposal clears", () => {
       renderDoc([], edits, "/", "wpid_1");
       expect(nudge()).not.toBeNull();
       const proposed = {
@@ -315,7 +315,7 @@ describe("WorkflowDocEditor navigation", () => {
         },
       } as unknown as WorkflowApiResponse;
       act(() =>
-        useCopilotProposalStore.getState().setProposal({
+        useEmberProposalStore.getState().setProposal({
           proposed,
           baseline: {
             ...proposed,
@@ -328,7 +328,7 @@ describe("WorkflowDocEditor navigation", () => {
         }),
       );
       expect(nudge()).toBeNull();
-      act(() => useCopilotProposalStore.getState().setProposal(null));
+      act(() => useEmberProposalStore.getState().setProposal(null));
       expect(nudge()).toBeNull();
       cleanup();
       renderDoc([], edits, "/", "wpid_1");
@@ -339,7 +339,7 @@ describe("WorkflowDocEditor navigation", () => {
       ["closed, folded, or open but not on screen", false, true],
       ["on screen beside the Doc", true, false],
     ])(
-      "with Copilot %s, the suggestion offers Try Copilot only when Copilot is not on screen",
+      "with Ember %s, the suggestion offers Try Ember only when Ember is not on screen",
       (_state, onScreen, offersTry) => {
         render(
           <QueryClientProvider client={new QueryClient()}>
@@ -347,7 +347,7 @@ describe("WorkflowDocEditor navigation", () => {
               <ReactFlowProvider>
                 <StudioShellContext.Provider
                   value={{
-                    copilotPortalEl: null,
+                    emberPortalEl: null,
                     setEditorStreamSlot: () => {},
                     setBrowserStreamSlot: () => {},
                     setRunStreamSlot: () => {},
@@ -361,7 +361,7 @@ describe("WorkflowDocEditor navigation", () => {
           </QueryClientProvider>,
         );
         expect(nudge()?.textContent).toContain(
-          offersTry ? DOC_COPILOT_NUDGE.text : DOC_COPILOT_NUDGE.textBeside,
+          offersTry ? DOC_EMBER_NUDGE.text : DOC_EMBER_NUDGE.textBeside,
         );
         expect(
           screen.queryByRole("button", { name: "Try Copilot" }) !== null,
@@ -3770,9 +3770,9 @@ describe("naming a step from its title", () => {
     useWorkflowYamlEditorStore.setState(
       useWorkflowYamlEditorStore.getInitialState(),
     );
-    useCopilotProposalStore.getState().setProposal(null);
+    useEmberProposalStore.getState().setProposal(null);
     useRecordingLauncherStore.setState({ demonstration: null });
-    useCopilotActionStore.setState({
+    useEmberActionStore.setState({
       generatingBlockLabel: null,
       queuedBuilds: [],
     });
@@ -4088,7 +4088,7 @@ describe("naming a step from its title", () => {
       "a Copilot proposal",
       (_doc, on) =>
         act(() =>
-          useCopilotProposalStore
+          useEmberProposalStore
             .getState()
             .setProposal(on ? proposalOf("proposed_step") : null),
         ),
@@ -4120,7 +4120,7 @@ describe("naming a step from its title", () => {
       fireEvent.click(titleOf("First"));
       fireEvent.change(field()!, { target: { value: "Write the note" } });
       lock(doc, true);
-      // A proposal shows Copilot's steps instead; every other lock leaves the field on screen, read-only, with the caret.
+      // A proposal shows Ember's steps instead; every other lock leaves the field on screen, read-only, with the caret.
       if (name !== "a Copilot proposal") {
         expect(field()?.readOnly).toBe(true);
         expect(document.activeElement).toBe(field());
@@ -4154,7 +4154,7 @@ describe("naming a step from its title", () => {
     fireEvent.click(titleOf("Build it"));
     fireEvent.change(field()!, { target: { value: "Write the note" } });
     act(() =>
-      useCopilotActionStore.setState({ generatingBlockLabel: "build_it" }),
+      useEmberActionStore.setState({ generatingBlockLabel: "build_it" }),
     );
     fireEvent.blur(field()!);
     expect(doc.graph()).toBe(before);

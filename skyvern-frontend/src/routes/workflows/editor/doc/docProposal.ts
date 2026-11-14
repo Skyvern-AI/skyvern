@@ -1,5 +1,5 @@
 import type { Edge } from "@xyflow/react";
-import type { ReviewProjection } from "../../copilot/narrativeState";
+import type { ReviewProjection } from "../../ember/narrativeState";
 import type { WorkflowBlock } from "../../types/workflowTypes";
 import type { AppNode } from "../nodes";
 import {
@@ -268,7 +268,7 @@ export function buildDocProposal({
     removed,
     topologyOf(baselineBlocks as BlockLike[]),
   );
-  // Copilot conversion can regenerate branch IDs, so render removals against the proposed IDs.
+  // Ember conversion can regenerate branch IDs, so render removals against the proposed IDs.
   const matchedBranchRemovals = removed.map((step) => {
     const anchor = step.anchor;
     if (anchor?.side !== "branch") return step;
@@ -284,7 +284,7 @@ export function buildDocProposal({
     const stillThere = (
       afterConditional.branch_conditions as BlockLike[] | undefined
     )?.some((branch) => branch?.id === anchor.branchId);
-    // A branch Copilot dropped has nowhere to render, so its steps sit after the conditional.
+    // A branch Ember dropped has nowhere to render, so its steps sit after the conditional.
     return stillThere
       ? step
       : { ...step, anchor: { label: anchor.label, side: "after" as const } };

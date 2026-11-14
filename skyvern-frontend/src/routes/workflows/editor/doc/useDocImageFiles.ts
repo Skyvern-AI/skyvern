@@ -106,7 +106,7 @@ export function useDocImageFiles(slot: DocImageSlot) {
     // Resolved before the row goes, so the render that drops the row shows the tile.
     resolveDocImageHandle(upload.id, fileId);
     drop(upload.id);
-    // Dismissed, undone, or replaced by a Copilot accept, a restore or a YAML commit: nothing to announce.
+    // Dismissed, undone, or replaced by an Ember accept, a restore or a YAML commit: nothing to announce.
     if (!inLiveGraph(fileId)) return;
     keepBaselineWithout(before);
     announceDoc("Screenshot added");

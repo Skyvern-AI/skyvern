@@ -231,7 +231,7 @@ function EditableBlockTitle({
       value={label}
       editable
       onChange={(value) => {
-        useWorkflowTitleStore.getState().recordCopilotGraphEdit();
+        useWorkflowTitleStore.getState().recordEmberGraphEdit();
         handleLabelChange(value);
       }}
       titleClassName="text-sm font-medium text-foreground"
@@ -343,7 +343,7 @@ function BlockLibrarySidebarBody({
 
 type BlockConfigSidebarProps = {
   onAddNode?: (props: AddNodeProps) => void;
-  // In the studio shell the panel's top/bottom edges align with the Copilot
+  // In the studio shell the panel's top/bottom edges align with the Ember
   // column's py-3 inset rather than the legacy editor's header offsets.
   embedded?: boolean;
 };

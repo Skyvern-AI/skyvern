@@ -10,7 +10,6 @@ export type RuntimeConfigResponse = {
   browser_streaming_mode?: string;
   browser_streaming_label?: string;
   environment?: string;
-  workflow_copilot_code_block_mode?: boolean;
   code_block_access?: boolean;
   warnings?: string[];
 };

@@ -6,7 +6,7 @@ import { type ReactNode } from "react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
-import { useCopilotHeaderStore } from "@/store/useCopilotHeaderStore";
+import { useEmberHeaderStore } from "@/store/useEmberHeaderStore";
 import { useManualSignInStore } from "@/store/useManualSignInStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 
@@ -30,10 +30,10 @@ vi.mock("./BrowserPaneHeader", () => ({
   BrowserPaneActions: () => null,
   BrowserPaneViewPills: () => null,
 }));
-vi.mock("./CopilotPaneHeader", () => ({
-  CopilotActiveDot: () => null,
-  CopilotPaneControls: () => null,
-  CopilotPaneStatus: () => null,
+vi.mock("./EmberPaneHeader", () => ({
+  EmberActiveDot: () => null,
+  EmberPaneControls: () => null,
+  EmberPaneStatus: () => null,
 }));
 vi.mock("./EditorPaneHeader", () => ({
   EditorPaneBlockSearch: () => null,
@@ -53,7 +53,7 @@ vi.mock("./panes", async (importOriginal) => {
   };
 });
 vi.mock("./BrowserTab", () => ({ BrowserTab: () => null }));
-// The Editor reports whether the shell has Copilot on screen, as the Doc's Copilot note reads it.
+// The Editor reports whether the shell has Ember on screen, as the Doc's Ember note reads it.
 vi.mock("./EditorTab", async () => {
   const { useStudioShellContext } = await import("./StudioShellContext");
   return {
@@ -210,19 +210,19 @@ describe("StudioShell with a pane folded for the Doc", () => {
     expect(shown()).toEqual(["Browser"]);
   });
 
-  const copilotOnScreen = () =>
+  const emberOnScreen = () =>
     screen.getAllByTestId("copilot-on-screen")[0]!.textContent;
 
-  test("Copilot folded into a strip is not on screen", () => {
+  test("Ember folded into a strip is not on screen", () => {
     const open = renderDoc("editor,copilot");
-    expect(copilotOnScreen()).toBe("true");
+    expect(emberOnScreen()).toBe("true");
     open.unmount();
     docFold.folded = ["copilot"];
     renderDoc("editor,copilot");
-    expect(copilotOnScreen()).toBe("false");
+    expect(emberOnScreen()).toBe("false");
   });
 
-  test("the Editor growing over the stage leaves Copilot not on screen", () => {
+  test("the Editor growing over the stage leaves Ember not on screen", () => {
     // A measurable pane and an animation that has not finished: the row is still mounted under the Editor.
     vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({
       left: 0,
@@ -236,25 +236,25 @@ describe("StudioShell with a pane folded for the Doc", () => {
     });
     try {
       renderDoc("editor,copilot");
-      expect(copilotOnScreen()).toBe("true");
+      expect(emberOnScreen()).toBe("true");
       fireEvent.click(
         screen.getByRole("button", {
           name: `Expand ${paneAccessibleName("editor")} pane`,
         }),
       );
-      expect(copilotOnScreen()).toBe("false");
+      expect(emberOnScreen()).toBe("false");
     } finally {
       vi.restoreAllMocks();
       Reflect.deleteProperty(HTMLElement.prototype, "animate");
     }
   });
 
-  test("a folded Copilot opened over the stage is on screen", () => {
+  test("a folded Ember opened over the stage is on screen", () => {
     docFold.folded = ["copilot"];
     renderDoc("editor,copilot");
-    expect(copilotOnScreen()).toBe("false");
+    expect(emberOnScreen()).toBe("false");
     fireEvent.click(screen.getByRole("button", { name: /^Show Copilot pane/ }));
-    expect(copilotOnScreen()).toBe("true");
+    expect(emberOnScreen()).toBe("true");
   });
 
   test("signing in yourself shows a folded Browser", () => {
@@ -367,7 +367,7 @@ describe("StudioShell at phone width", () => {
     ).toBe("true");
   });
 
-  test("Copilot behind the shown pane is not on screen", () => {
+  test("Ember behind the shown pane is not on screen", () => {
     renderPhone();
     const onScreen = () =>
       screen.getAllByTestId("copilot-on-screen")[0]!.textContent;
@@ -389,9 +389,9 @@ describe("StudioShell at phone width", () => {
     expect(shown()).toEqual(["Run"]);
   });
 
-  test("the pane switch flags Browser activity and a waiting Copilot on panes not shown", () => {
+  test("the pane switch flags Browser activity and a waiting Ember on panes not shown", () => {
     useStudioBrowserStore.setState({ hasUnseenActivity: true });
-    useCopilotHeaderStore.setState({ attention: "question" });
+    useEmberHeaderStore.setState({ attention: "question" });
     try {
       renderPhone();
       expect(
@@ -399,7 +399,7 @@ describe("StudioShell at phone width", () => {
           name: "Browser, new activity",
         }),
       ).toBeTruthy();
-      // Copilot is the shown pane, so it carries no dot yet.
+      // Ember is the shown pane, so it carries no dot yet.
       expect(
         within(paneSwitch()).getByRole("button", { name: "Copilot" }),
       ).toBeTruthy();
@@ -414,7 +414,7 @@ describe("StudioShell at phone width", () => {
       ).toBeTruthy();
     } finally {
       useStudioBrowserStore.setState({ hasUnseenActivity: false });
-      useCopilotHeaderStore.setState({ attention: null });
+      useEmberHeaderStore.setState({ attention: null });
     }
   });
 

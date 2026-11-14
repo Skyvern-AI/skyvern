@@ -69,6 +69,7 @@ test("a failed display does not consume the run's notice", () => {
 test.each([
   ["wr_copilot_fail", Status.Failed, "chat_1", "", []],
   ["wr_copilot_pass", Status.Completed, "chat_1", "", []],
+  ["wr_ember_key_fail", Status.Failed, "chat_1", "&ember_key=1", []],
   ["wr_user_fail", Status.Failed, null, "", [["Run Failed", "destructive"]]],
   [
     "wr_user_fail_in_chat",
@@ -79,8 +80,11 @@ test.each([
   ],
   ["wr_user_pass", Status.Completed, null, "", [["Run Completed", "success"]]],
 ] as const)(
-  "run %s ending %s with copilot session %s under %j toasts %j",
-  (runId, finalStatus, copilotSessionId, extraQuery, toasts) => {
+  "run %s ending %s with Ember session %s under %j toasts %j",
+  (runId, finalStatus, emberSessionId, extraQuery, toasts) => {
+    const sessionKey = extraQuery.includes("ember_key")
+      ? "ember_session_id"
+      : "copilot_session_id";
     const wrapper = ({ children }: { children: ReactNode }) => (
       <MemoryRouter initialEntries={[`/studio?wr=${runId}${extraQuery}`]}>
         {children}
@@ -92,7 +96,7 @@ test.each([
         useRunCompletionToast({
           workflow_run_id: runId,
           status,
-          copilot_session_id: copilotSessionId,
+          [sessionKey]: emberSessionId,
         });
         return state.toasts;
       },

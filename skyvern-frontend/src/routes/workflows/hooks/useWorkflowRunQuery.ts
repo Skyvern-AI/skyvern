@@ -121,7 +121,7 @@ function workflowRunByIdQueryOptions(
       activeOrgQueryKeyScope,
     ),
     // The by-run-id route still serves a run whose workflow version was retired
-    // (a Copilot test version), where the per-workflow route answers 404.
+    // (an Ember test version), where the per-workflow route answers 404.
     queryFn: ({ signal }: { signal: AbortSignal }) =>
       fetchWorkflowRunById(credentialGetter, workflowRunId, signal),
     refetchInterval: (query: RunStatusQuery) =>

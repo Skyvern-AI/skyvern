@@ -2,7 +2,7 @@ import { PauseIcon } from "@radix-ui/react-icons";
 import { cn } from "@/util/utils";
 import type { DemonstrationStatus } from "@/store/useRecordingLauncherStore";
 
-// The Copilot composer's recording bar, drawn where the recorded steps will land. Done and Discard stay in Copilot.
+// The Ember composer's recording bar, drawn where the recorded steps will land. Done and Discard stay in Ember.
 export function DocDemonstrationLine({
   status,
 }: {

@@ -1,5 +1,5 @@
 import { graphNoteReadings } from "./noteSequences";
-import type { WorkflowCopilotDemonstrationInsertion } from "../../copilot/workflowCopilotTypes";
+import type { EmberDemonstrationInsertion } from "../../ember/emberTypes";
 import {
   type HTMLAttributes,
   type Ref,
@@ -113,8 +113,8 @@ import { publishDocCriticalProblems } from "./docRunCheckStore";
 import { docPromptUrlOffer } from "./docPromptUrl";
 import { stepsLeftBy, useDocUnfinishedStore } from "./docUnfinished";
 import {
-  DOC_COPILOT_NUDGE,
-  DocCopilotNudge,
+  DOC_EMBER_NUDGE,
+  DocEmberNudge,
   DocGettingStarted,
   DocStarterNote,
   DocTip,
@@ -233,7 +233,7 @@ export function WorkflowDocEditor({
   );
   const scopeReadOnly = useWorkflowScopeReadOnly();
   const locked = useWorkflowYamlEditorStore(selectEditorMutationLocked);
-  // While Copilot's proposal is pending, the Doc shows it read-only, as the comparison does.
+  // While Ember's proposal is pending, the Doc shows it read-only, as the comparison does.
   const proposal = useDocProposal(workflowId, liveNodes, liveEdges);
   const description = proposal ? proposal.description : liveDescription;
   const parameters = proposal?.parameters ?? liveParameters;
@@ -460,7 +460,7 @@ export function WorkflowDocEditor({
   // An empty step a recording is meant to replace goes only once the recording is open, so a refused or failed start leaves it.
   const replaceOnRecording = useRef<{
     id: string;
-    insertion: WorkflowCopilotDemonstrationInsertion;
+    insertion: EmberDemonstrationInsertion;
     failures: number;
     timer: ReturnType<typeof setTimeout>;
   } | null>(null);
@@ -756,8 +756,8 @@ export function WorkflowDocEditor({
   };
   const { openPane } = useStudioPanes();
   const { isPaneOnScreen } = useStudioShellContext();
-  const copilotBeside = isPaneOnScreen?.("copilot") === true;
-  // Building from nothing is Copilot's job: an empty Doc, or one step whose text is still blank, suggests it once per browser.
+  const emberBeside = isPaneOnScreen?.("copilot") === true;
+  // Building from nothing is Ember's job: an empty Doc, or one step whose text is still blank, suggests it once per browser.
   const nearlyEmpty =
     stepCount <= 1 &&
     !description?.trim() &&
@@ -765,28 +765,28 @@ export function WorkflowDocEditor({
       .filter(isWorkflowBlockNode)
       // A step with no text to write (a wait, a loop) is already configured, not blank.
       .every((node) => isBlankStep(node) && getDocProseFields(node).length > 0);
-  const copilotNudge =
+  const emberNudge =
     Boolean(edit) &&
     !proposal &&
     nearlyEmpty &&
-    !starter.seenTips.includes(DOC_COPILOT_NUDGE.tip);
-  // Writing in the Doc or asking Copilot while it shows answers the suggestion, so it does not come back.
+    !starter.seenTips.includes(DOC_EMBER_NUDGE.tip);
+  // Writing in the Doc or asking Ember while it shows answers the suggestion, so it does not come back.
   const nudgeShown = useRef(false);
   const editing = Boolean(edit);
   const { seeTip } = starter;
   useEffect(() => {
     if (
       nudgeShown.current &&
-      !copilotNudge &&
+      !emberNudge &&
       (proposal !== null || (editing && !nearlyEmpty))
     )
-      seeTip(DOC_COPILOT_NUDGE.tip);
-    nudgeShown.current = copilotNudge;
-  }, [copilotNudge, nearlyEmpty, proposal, editing, seeTip]);
-  // One onboarding aid at a time: the tip and the checklist wait while the Copilot suggestion or a tip shows.
+      seeTip(DOC_EMBER_NUDGE.tip);
+    nudgeShown.current = emberNudge;
+  }, [emberNudge, nearlyEmpty, proposal, editing, seeTip]);
+  // One onboarding aid at a time: the tip and the checklist wait while the Ember suggestion or a tip shows.
   const showTip =
     starter.active &&
-    !copilotNudge &&
+    !emberNudge &&
     docTipIndex(starterProgress, starter.seenTips) >= 0;
   const reached = docStarterDone(starterProgress);
   const { markDone } = starter;
@@ -1244,7 +1244,7 @@ export function WorkflowDocEditor({
                 const inDoc =
                   Boolean(edit) && parameter && isDocEditableInput(parameter);
                 const chip = (
-                  // A proposal's inputs are Copilot's, not the live workflow's, so they don't open the Inputs panel.
+                  // A proposal's inputs are Ember's, not the live workflow's, so they don't open the Inputs panel.
                   <InputChip
                     key={input.key}
                     onClick={
@@ -1435,17 +1435,17 @@ export function WorkflowDocEditor({
               </p>
             )}
             {proposal && <DocProposalCard proposal={proposal} goTo={goTo} />}
-            {copilotNudge && (
-              <DocCopilotNudge
+            {emberNudge && (
+              <DocEmberNudge
                 onTry={
-                  copilotBeside
+                  emberBeside
                     ? null
                     : () => {
-                        starter.seeTip(DOC_COPILOT_NUDGE.tip);
+                        starter.seeTip(DOC_EMBER_NUDGE.tip);
                         openPane("copilot");
                       }
                 }
-                onDismiss={() => starter.seeTip(DOC_COPILOT_NUDGE.tip)}
+                onDismiss={() => starter.seeTip(DOC_EMBER_NUDGE.tip)}
               />
             )}
             {edit && stepCount === 0 && !description?.trim() && (
@@ -1484,7 +1484,7 @@ export function WorkflowDocEditor({
         {edit &&
           starter.active &&
           !showTip &&
-          !copilotNudge &&
+          !emberNudge &&
           !(panelOpen && !wide) && (
             <DocGettingStarted
               progress={starterProgress}

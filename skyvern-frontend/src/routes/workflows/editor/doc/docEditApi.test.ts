@@ -15,7 +15,7 @@ import { buildDocTree } from "./buildDocTree";
 import { useLocateBlockStore } from "../runValidation/useLocateBlockStore";
 import { block, code, conditional, forLoop, settings } from "./docTestBlocks";
 import { docStepProblems, loopSchemaStepId } from "./docProblems";
-import { useCopilotActionStore } from "@/store/useCopilotActionStore";
+import { useEmberActionStore } from "@/store/useEmberActionStore";
 import { useDocUnfinishedStore } from "./docUnfinished";
 import { newDocImageHandle } from "./docImageHandles";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
@@ -805,16 +805,16 @@ describe("building from scratch in the doc", () => {
       (byLabel(latest(), "gen").data as Record<string, unknown>).prompt;
     api.setText(gen.id, "prompt", "first goal");
     expect(prompt()).toBe("first goal");
-    useCopilotActionStore.setState({ generatingBlockLabel: "gen" });
+    useEmberActionStore.setState({ generatingBlockLabel: "gen" });
     api.setText(gen.id, "prompt", "second goal");
     expect(prompt()).toBe("first goal");
-    useCopilotActionStore.setState({
+    useEmberActionStore.setState({
       generatingBlockLabel: null,
       queuedBuilds: [{ blockLabel: "gen" } as never],
     });
     api.setText(gen.id, "prompt", "third goal");
     expect(prompt()).toBe("first goal");
-    useCopilotActionStore.setState({ queuedBuilds: [] });
+    useEmberActionStore.setState({ queuedBuilds: [] });
     api.setText(gen.id, "prompt", "fourth goal");
     expect(prompt()).toBe("fourth goal");
   });

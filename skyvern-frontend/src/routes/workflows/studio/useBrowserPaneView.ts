@@ -21,7 +21,7 @@ import {
   type BrowserPaneView,
 } from "./browserPaneView";
 import {
-  copilotBrowserFocusSessionId,
+  emberBrowserFocusSessionId,
   SYSTEM_RUN_FOCUS_PARAM,
   toReadableSearch,
 } from "./panes";
@@ -44,7 +44,7 @@ type BrowserPaneViewState = {
   // What the Live view shows: the shared debug-session singleton, or the
   // inspected run's own per-run stream (running outside the debug session).
   liveSurface: "debug" | "run";
-  copilotBrowserFocused: boolean;
+  emberBrowserFocused: boolean;
   recordingAvailable: boolean;
   screenshotsAvailable: boolean;
   liveAvailable: boolean;
@@ -144,27 +144,27 @@ export function useBrowserPaneView(): BrowserPaneViewState {
     visuals.workflowRun?.browser_session_id != null &&
     visuals.workflowRun.browser_session_id === debugBrowserSessionId;
   const blockRunInDebugSession = searchParams.has("bl") && runInDebugSession;
-  const copilotTurnActive = useStudioBrowserStore((s) => s.copilotTurnActive);
-  const copilotFocusSessionId = copilotTurnActive
-    ? copilotBrowserFocusSessionId(searchParams)
+  const emberTurnActive = useStudioBrowserStore((s) => s.emberTurnActive);
+  const emberFocusSessionId = emberTurnActive
+    ? emberBrowserFocusSessionId(searchParams)
     : null;
   const runBrowserSessionId = visuals.workflowRun?.browser_session_id ?? null;
-  const copilotOnRunBrowser =
-    copilotFocusSessionId != null &&
-    copilotFocusSessionId !== debugBrowserSessionId &&
-    copilotFocusSessionId === runBrowserSessionId;
+  const emberOnRunBrowser =
+    emberFocusSessionId != null &&
+    emberFocusSessionId !== debugBrowserSessionId &&
+    emberFocusSessionId === runBrowserSessionId;
   const runBrowserOpen = useBrowserSessionOpen(
-    copilotOnRunBrowser ? runBrowserSessionId : null,
+    emberOnRunBrowser ? runBrowserSessionId : null,
   );
-  const copilotBrowserSurface =
-    copilotFocusSessionId == null
+  const emberBrowserSurface =
+    emberFocusSessionId == null
       ? null
-      : copilotFocusSessionId === debugBrowserSessionId
+      : emberFocusSessionId === debugBrowserSessionId
         ? "debug"
-        : copilotOnRunBrowser && runBrowserOpen
+        : emberOnRunBrowser && runBrowserOpen
           ? "run"
           : null;
-  const copilotBrowserFocused = copilotBrowserSurface != null;
+  const emberBrowserFocused = emberBrowserSurface != null;
 
   const { recordingAvailable, screenshotsAvailable } =
     resolveReplayAvailability(visuals);
@@ -176,7 +176,7 @@ export function useBrowserPaneView(): BrowserPaneViewState {
     inspectingRun: explicit,
     blockRunInDebugSession,
     systemFocused: searchParams.has(SYSTEM_RUN_FOCUS_PARAM),
-    copilotBrowserFocused,
+    emberBrowserFocused,
     runInDebugSession,
     running: visuals.running,
     hasRecording: visuals.recordingUrls.length > 0,
@@ -190,7 +190,7 @@ export function useBrowserPaneView(): BrowserPaneViewState {
 
   const liveSurface = resolveLiveSurface({
     recording: userDrivingDebugBrowser,
-    copilotBrowserSurface,
+    emberBrowserSurface,
     running: visuals.running,
     runInDebugSession,
     hasRunId: runId != null,
@@ -205,11 +205,11 @@ export function useBrowserPaneView(): BrowserPaneViewState {
     debugBrowserSessionId,
     runInDebugSession,
     liveSurface,
-    copilotBrowserFocused,
+    emberBrowserFocused,
     recordingAvailable,
     screenshotsAvailable,
     liveAvailable:
-      visuals.running || debugBrowserSessionId != null || copilotBrowserFocused,
+      visuals.running || debugBrowserSessionId != null || emberBrowserFocused,
   };
 }
 

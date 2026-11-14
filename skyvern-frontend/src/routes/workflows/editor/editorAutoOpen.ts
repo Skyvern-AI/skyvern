@@ -1,4 +1,4 @@
-// One-shot arm/fire decision for auto-opening the Editor pane when Copilot's
+// One-shot arm/fire decision for auto-opening the Editor pane when Ember's
 // first build or mid-turn draft lands blocks on a previously-empty agent.
 // Snap-backs never fire it, and once it fires it stays disarmed for the rest
 // of the state's lifetime.

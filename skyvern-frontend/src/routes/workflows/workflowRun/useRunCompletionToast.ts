@@ -11,14 +11,15 @@ type RunLike = {
   status: Status;
   failure_reason?: string | null;
   copilot_session_id?: string | null;
+  ember_session_id?: string | null;
 } & WorkflowRunRetryFields;
 
 export function useRunCompletionToast(run: RunLike | null | undefined) {
   const { workflowRunId, blockLabel } = useBlockRunTarget();
   const observedActiveRunIds = useRef(new Set<string>());
   useEffect(() => {
-    // Copilot reports its own test runs in the chat card.
-    if (!run || run.copilot_session_id) return;
+    // Ember reports its own test runs in the chat card.
+    if (!run || (run.ember_session_id ?? run.copilot_session_id)) return;
     const runId = run.workflow_run_id;
     if (runIsLogicallyActive(run)) {
       observedActiveRunIds.current.add(runId);

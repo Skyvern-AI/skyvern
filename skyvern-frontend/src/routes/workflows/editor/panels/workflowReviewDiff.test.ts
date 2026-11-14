@@ -13,7 +13,7 @@ import {
 
 let idCounter = 0;
 
-// Every call mints fresh ids and timestamps, the way a rehydrated Copilot
+// Every call mints fresh ids and timestamps, the way a rehydrated Ember
 // proposal does for blocks whose content did not change.
 function block(
   label: string,

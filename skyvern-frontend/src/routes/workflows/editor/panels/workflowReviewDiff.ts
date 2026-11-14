@@ -410,7 +410,7 @@ function recordSubtree(
   }
 }
 
-// A removed block can share its label with a block Copilot added (a type
+// A removed block can share its label with a block Ember added (a type
 // change), and the canvas needs unique labels, so a clashing one is renamed.
 function removedCopy(block: WorkflowBlock, state: DiffState): WorkflowBlock {
   const copy = clone(block);

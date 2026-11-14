@@ -6,12 +6,12 @@ export type ABVariant = "template-first" | "copilot-first";
 
 export const VARIANTS = {
   TEMPLATE_FIRST: "template-first" as const,
-  COPILOT_FIRST: "copilot-first" as const,
+  EMBER_FIRST: "copilot-first" as const,
 };
 
 export const VARIANT_LIST: readonly ABVariant[] = [
   VARIANTS.TEMPLATE_FIRST,
-  VARIANTS.COPILOT_FIRST,
+  VARIANTS.EMBER_FIRST,
 ];
 
 export const DEFAULT_VARIANT: ABVariant = VARIANTS.TEMPLATE_FIRST;
@@ -119,5 +119,5 @@ export const POWER_ANALYSIS = {
 // -- Helpers --
 
 export function isABVariant(value: unknown): value is ABVariant {
-  return value === VARIANTS.TEMPLATE_FIRST || value === VARIANTS.COPILOT_FIRST;
+  return value === VARIANTS.TEMPLATE_FIRST || value === VARIANTS.EMBER_FIRST;
 }

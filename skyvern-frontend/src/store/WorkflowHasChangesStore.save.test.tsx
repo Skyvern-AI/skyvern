@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { useCopilotProposalStore } from "@/store/CopilotProposalStore";
+import { useEmberProposalStore } from "@/store/EmberProposalStore";
 import { AxiosError } from "axios";
 import { useEffect, useState, type ReactNode } from "react";
 import {
@@ -47,16 +47,16 @@ import { useWorkflowParametersStore } from "./WorkflowParametersStore";
 import { useWorkflowTitleStore } from "./WorkflowTitleStore";
 import {
   beginSaveTransaction,
-  beginCopilotAcceptance,
+  beginEmberAcceptance,
   beginYamlCommit,
   commitYamlDraft,
   registerEditorOwner,
   unregisterEditorOwner,
   createYamlCommitOwner,
-  finishCopilotAcceptance,
+  finishEmberAcceptance,
   finishYamlCommit,
   useWorkflowYamlEditorStore,
-  withCopilotAcceptance,
+  withEmberAcceptance,
 } from "./WorkflowYamlEditorStore";
 
 import {
@@ -206,7 +206,7 @@ describe("workflow save reservation", () => {
     ).toBeDefined();
   });
 
-  it("holds Save, YAML commit, and Copilot apply after reload with an unchanged canonical version and offers Discard and Reload", async () => {
+  it("holds Save, YAML commit, and Ember apply after reload with an unchanged canonical version and offers Discard and Reload", async () => {
     sessionStorage.setItem(
       "workflow-pending-save:wpid-1",
       JSON.stringify({
@@ -240,8 +240,8 @@ describe("workflow save reservation", () => {
         "A save is in progress",
       );
       expect(await commitYamlDraft(true)).toBe(false);
-      expect(beginCopilotAcceptance()).toBeNull();
-      expect(withCopilotAcceptance(undefined, apply)).toBe(false);
+      expect(beginEmberAcceptance()).toBeNull();
+      expect(withEmberAcceptance(undefined, apply)).toBe(false);
     });
     expect(mocks.put).not.toHaveBeenCalled();
     expect(commit).not.toHaveBeenCalled();
@@ -378,7 +378,7 @@ describe("workflow save reservation", () => {
     expect(sessionStorage.getItem("workflow-pending-save:wpid-1")).toBe(marker);
     expect(hydrate).not.toHaveBeenCalled();
     expect(beginSaveTransaction(owner)).toBe(false);
-    expect(beginCopilotAcceptance()).toBeNull();
+    expect(beginEmberAcceptance()).toBeNull();
     const canonical = {
       ...saveData.workflow,
       version: 2,
@@ -905,7 +905,7 @@ describe("workflow save reservation", () => {
           useWorkflowYamlEditorStore.getState().pendingSaves["wpid-1"],
         ).toMatchObject({ persisting: true });
         expect(beginSaveTransaction(owner)).toBe(false);
-        expect(beginCopilotAcceptance()).toBeNull();
+        expect(beginEmberAcceptance()).toBeNull();
         expect(screen.getByRole("status").textContent).toContain(
           "Reload protection for this save is unavailable because session storage is unavailable.",
         );
@@ -1524,7 +1524,7 @@ describe("workflow save reservation", () => {
         (error: Error) => error,
       );
       await waitFor(() => expect(mocks.put).toHaveBeenCalledOnce());
-      expect(beginCopilotAcceptance()).toBeNull();
+      expect(beginEmberAcceptance()).toBeNull();
       expect(beginYamlCommit(createYamlCommitOwner("wpid-1"))).toBe(false);
       expect(await commitYamlDraft(true)).toBe(false);
       expect(commit).not.toHaveBeenCalled();
@@ -1543,7 +1543,7 @@ describe("workflow save reservation", () => {
         else rejectPut(failure);
         expect(await settled).toEqual(outcome === "success" ? null : failure);
       });
-      const token = beginCopilotAcceptance();
+      const token = beginEmberAcceptance();
       if (outcome === "abort") {
         expect(token).toBeNull();
         expect(
@@ -1551,7 +1551,7 @@ describe("workflow save reservation", () => {
         ).toMatchObject({ persisting: true, slow: true });
       } else {
         expect(token).not.toBeNull();
-        finishCopilotAcceptance(token!);
+        finishEmberAcceptance(token!);
       }
     },
   );
@@ -1576,7 +1576,7 @@ describe("workflow save reservation", () => {
     unmount();
     unregisterEditorOwner(owner);
     useWorkflowYamlEditorStore.getState().setCommitInProgress(false);
-    expect(beginCopilotAcceptance()).toBeNull();
+    expect(beginEmberAcceptance()).toBeNull();
     await act(async () => {
       resolvePut({
         data: {
@@ -1587,9 +1587,9 @@ describe("workflow save reservation", () => {
       });
       await saving;
     });
-    const token = beginCopilotAcceptance();
+    const token = beginEmberAcceptance();
     expect(token).not.toBeNull();
-    finishCopilotAcceptance(token!);
+    finishEmberAcceptance(token!);
   });
 
   it.each(
@@ -1743,9 +1743,9 @@ describe("workflow save reservation", () => {
     },
   );
 
-  it("refuses Save when Copilot already reserves the workflow", async () => {
+  it("refuses Save when Ember already reserves the workflow", async () => {
     useWorkflowHasChangesStore.setState({ hasChanges: true });
-    const reservation = beginCopilotAcceptance()!;
+    const reservation = beginEmberAcceptance()!;
     const { result } = renderHook(() => useWorkflowSave(), { wrapper });
     await expect(
       act(async () => result.current.mutateAsync(undefined)),
@@ -1755,7 +1755,7 @@ describe("workflow save reservation", () => {
     expect(useWorkflowHasChangesStore.getState()).toMatchObject({
       hasChanges: true,
     });
-    finishCopilotAcceptance(reservation);
+    finishEmberAcceptance(reservation);
   });
 
   it("reserves Save before credentials load and refuses a competing Save", async () => {
@@ -1772,20 +1772,20 @@ describe("workflow save reservation", () => {
       saving = result.current.mutateAsync(undefined);
     });
     await waitFor(() => expect(mocks.getClient).toHaveBeenCalledOnce());
-    expect(beginCopilotAcceptance()).toBeNull();
+    expect(beginEmberAcceptance()).toBeNull();
     expect(beginYamlCommit(createYamlCommitOwner("wpid-1"))).toBe(false);
     await expect(
       act(async () => result.current.mutateAsync(undefined)),
     ).rejects.toThrow("A save is in progress");
-    expect(beginCopilotAcceptance()).toBeNull();
+    expect(beginEmberAcceptance()).toBeNull();
     await act(async () => {
       resolveClient({ put: mocks.put });
       await saving;
     });
     expect(mocks.put).toHaveBeenCalledOnce();
-    const token = beginCopilotAcceptance();
+    const token = beginEmberAcceptance();
     expect(token).not.toBeNull();
-    finishCopilotAcceptance(token!);
+    finishEmberAcceptance(token!);
   });
 
   it("allows only the matching YAML transaction to save", async () => {
@@ -1826,9 +1826,9 @@ describe("workflow save reservation", () => {
       act(async () => result.current.mutateAsync(undefined)),
     ).rejects.toThrow("credentials unavailable");
     expect(mocks.put).not.toHaveBeenCalled();
-    const token = beginCopilotAcceptance();
+    const token = beginEmberAcceptance();
     expect(token).not.toBeNull();
-    finishCopilotAcceptance(token!);
+    finishEmberAcceptance(token!);
   });
 
   it("initializes another workflow clean while the previous workflow save stays pending", async () => {
@@ -1919,20 +1919,20 @@ describe("workflow save reservation", () => {
   });
 
   it.each(["before save", "while credentials load"])(
-    "refuses Save when Copilot reserves the workflow %s",
+    "refuses Save when Ember reserves the workflow %s",
     async (timing) => {
       useWorkflowHasChangesStore.setState({ hasChanges: true });
       let reservation: symbol | null = null;
       if (timing === "before save") {
-        reservation = beginCopilotAcceptance();
+        reservation = beginEmberAcceptance();
       } else {
         mocks.getClient.mockImplementationOnce(async () => {
-          expect(beginCopilotAcceptance()).toBeNull();
+          expect(beginEmberAcceptance()).toBeNull();
           // Revalidate even if a writer bypasses the transaction entry point.
           reservation = Symbol("competing Copilot reservation");
           useWorkflowYamlEditorStore.setState({
-            copilotAcceptance: reservation,
-            lockKind: "copilot",
+            emberAcceptance: reservation,
+            lockKind: "ember",
           });
           return { put: mocks.put };
         });
@@ -1952,7 +1952,7 @@ describe("workflow save reservation", () => {
       expect(useWorkflowHasChangesStore.getState().getSaveData()).toBe(
         saveData,
       );
-      finishCopilotAcceptance(reservation!);
+      finishEmberAcceptance(reservation!);
     },
   );
 
@@ -2232,14 +2232,14 @@ describe("blocked saves", () => {
   });
 
   // Every Save button, the leave-page dialog, Save as Template and Save inputs go through this save.
-  it("refuses to write a staged Copilot proposal, so only Accept can make it durable", async () => {
+  it("refuses to write a staged Ember proposal, so only Accept can make it durable", async () => {
     mocks.put.mockClear();
     mocks.getClient.mockResolvedValue({ put: mocks.put });
     useWorkflowHasChangesStore.setState({
       getSaveData: () => saveData,
       hasChanges: true,
     });
-    useCopilotProposalStore.setState({ proposal: {} as never });
+    useEmberProposalStore.setState({ proposal: {} as never });
     const { result } = renderHook(() => useWorkflowSave(), { wrapper });
 
     try {
@@ -2251,7 +2251,7 @@ describe("blocked saves", () => {
       expect(mocks.put).not.toHaveBeenCalled();
       expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
     } finally {
-      useCopilotProposalStore.setState({ proposal: null });
+      useEmberProposalStore.setState({ proposal: null });
     }
   });
 });
@@ -2264,14 +2264,14 @@ describe("YAML draft dirtiness", () => {
     useWorkflowHasChangesStore.setState({ hasChanges: false });
   });
 
-  it("opens a clean YAML view during a Copilot turn without tripping its lock", () => {
+  it("opens a clean YAML view during an Ember turn without tripping its lock", () => {
     useWorkflowHasChangesStore.setState({ hasChanges: true });
-    const token = beginCopilotAcceptance()!;
+    const token = beginEmberAcceptance()!;
     vi.mocked(toast).mockClear();
     reflectYamlDraftDirtiness(true, false);
     expect(toast).not.toHaveBeenCalled();
     expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
-    finishCopilotAcceptance(token);
+    finishEmberAcceptance(token);
 
     const revision = useWorkflowYamlEditorStore.getState().revision;
     reflectYamlDraftDirtiness(true, true);
