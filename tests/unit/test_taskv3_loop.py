@@ -6174,6 +6174,8 @@ _OBSERVE_SUMMARY_FIELDS = (
     "modal_listed",
     "modal_truncated",
     "ready_state_when_empty",
+    "links_listed",
+    "link_capped",
 )
 
 
