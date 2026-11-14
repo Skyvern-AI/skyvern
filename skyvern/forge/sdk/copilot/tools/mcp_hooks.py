@@ -22,6 +22,7 @@ from skyvern.cli.mcp_tools._element_state import DEFAULT_ACTION_TIMEOUT_MS, DEFA
 from skyvern.cli.mcp_tools.blocks import (
     CODE_BLOCK_RUNTIME_TOPIC,
     NOTES_KNOWLEDGE_TOPIC,
+    WORKFLOW_KNOWLEDGE_TOPIC_ALIASES,
     WORKFLOW_KNOWLEDGE_TOPIC_HEADERS,
     _parse_knowledge_topics,
 )
@@ -877,7 +878,7 @@ def _task_v3_block_schema_guidance() -> list[str]:
 
 # The shared section bans `task` and points at navigation/extraction. Every authoring capability either
 # allows `task` or bans those two, so the section is false on every Copilot turn.
-_TASK_UNAVAILABLE_KNOWLEDGE_TOPIC = "task_block_task_not_available_in_workflow_copilot"
+_TASK_UNAVAILABLE_KNOWLEDGE_TOPIC = "task_block_task_not_available_in_ember"
 _REQUESTED_WORKFLOW_KNOWLEDGE_TOPICS: ContextVar[list[Any] | None] = ContextVar(
     "requested_workflow_knowledge_topics", default=None
 )
@@ -887,7 +888,7 @@ def _hidden_knowledge_topics(ctx: AgentContext) -> set[str]:
     hidden = {_TASK_UNAVAILABLE_KNOWLEDGE_TOPIC}
     if not copilot_sees_notes(ctx):
         hidden.add(NOTES_KNOWLEDGE_TOPIC)
-    return hidden
+    return hidden | {alias for alias, topic in WORKFLOW_KNOWLEDGE_TOPIC_ALIASES.items() if topic in hidden}
 
 
 async def _get_workflow_knowledge_pre_hook(

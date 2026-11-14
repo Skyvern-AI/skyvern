@@ -43,6 +43,7 @@ SENSITIVE_HEADERS = {
     "sec-websocket-protocol",
     "x-posthog-attribution",
     "x-copilot-credential-recovery-token",
+    "x-ember-credential-recovery-token",
     "x-skyvern-signature",
     "stripe-signature",
 }

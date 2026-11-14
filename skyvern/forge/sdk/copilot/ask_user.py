@@ -609,6 +609,7 @@ async def wait_for_interaction(ctx: CopilotContext, interaction: QuestionInterac
                     "type": "question_required",
                     "turn_id": ctx.turn_id,
                     "workflow_copilot_chat_id": chat_id,
+                    "ember_chat_id": chat_id,
                     "interactions": [interaction.model_dump(mode="json")],
                     "cancel_token": ctx.copilot_cancel_token,
                 }

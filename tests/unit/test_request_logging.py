@@ -13,6 +13,7 @@ import psycopg.errors
 import pytest
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from sqlalchemy.exc import OperationalError
 from starlette.requests import ClientDisconnect, Request
@@ -45,6 +46,7 @@ from skyvern.forge.request_logging import (
     set_request_organization,
 )
 from skyvern.forge.sdk.core.run_submission_gate import RunSubmissionGate
+from skyvern.forge.sdk.routes import workflow_copilot as workflow_copilot_routes
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services.org_auth_service import apply_request_org_context
 
@@ -167,6 +169,7 @@ class TestIsSensitiveKey:
             "x-api-key",
             "X-Api-Key",
             "X-Copilot-Credential-Recovery-Token",
+            "X-Ember-Credential-Recovery-Token",
             "credential_recovery_token",
             "resume_token",
             # Whole header dicts, masked wholesale because their inner key names are
@@ -628,24 +631,33 @@ class TestSanitizeBody:
         assert "customer-login" not in result
         assert "otp@example.com" not in result
 
-    @pytest.mark.parametrize(
-        "path",
-        [
-            "/v1/workflow/copilot/chat-post",
-            "/v1/workflow/copilot/question-response",
-            "/v1/workflow/copilot/steer",
-            "/v1/workflow/copilot/credential-response",
-            "/v1/workflow/copilot/convert-yaml-to-blocks",
-        ],
-    )
-    def test_workflow_copilot_request_is_fully_redacted_before_semantic_screening(self, path: str) -> None:
-        request = _make_request("POST", path)
+    def test_every_ember_post_body_is_opaque_and_each_old_route_has_a_twin(self) -> None:
+        routes = [
+            route
+            for route in workflow_copilot_routes.base_router.routes
+            if isinstance(route, APIRoute) and route.endpoint.__module__ == workflow_copilot_routes.__name__
+        ]
+        neutral = {"/workflow/suggest-goal", "/workflow/convert-yaml-to-blocks"}
+        old = {
+            (route.path.removeprefix("/workflow/copilot/"), frozenset(route.methods), route.endpoint)
+            for route in routes
+            if route.path.startswith("/workflow/copilot/")
+        }
+        new = {
+            (route.path.removeprefix("/ember/").removeprefix("/workflow/"), frozenset(route.methods), route.endpoint)
+            for route in routes
+            if route.path.startswith("/ember/") or route.path in neutral
+        }
+        assert len(old) == 20
+        assert old == new
+
         literal = b'{"mode":"ask","message":"password InlineSecret123!"}'
-
-        result = _sanitize_body(request, literal, "application/json")
-
-        assert result == REDACTED
-        assert "InlineSecret123" not in result
+        for route in routes:
+            if "POST" in route.methods and (
+                route.path.startswith(("/workflow/copilot/", "/ember/")) or route.path in neutral
+            ):
+                result = _sanitize_body(_make_request("POST", "/v1" + route.path), literal, "application/json")
+                assert result == REDACTED, route.path
 
     @pytest.mark.parametrize(
         "path",
@@ -1554,8 +1566,11 @@ class TestRawRequestLogLevel:
 
 
 @pytest.mark.parametrize("status_code", [200, 403, 500])
+@pytest.mark.parametrize(
+    "recovery_header", ["X-Ember-Credential-Recovery-Token", "X-Copilot-Credential-Recovery-Token"]
+)
 def test_copilot_recovery_capabilities_never_enter_request_logs(
-    log_mock: MagicMock, monkeypatch: pytest.MonkeyPatch, status_code: int
+    log_mock: MagicMock, monkeypatch: pytest.MonkeyPatch, status_code: int, recovery_header: str
 ) -> None:
     monkeypatch.setattr(request_logging.settings, "LOG_RAW_API_REQUESTS_SUCCESSFUL_READS", True)
     app = _make_app()
@@ -1572,14 +1587,14 @@ def test_copilot_recovery_capabilities_never_enter_request_logs(
 
     response = TestClient(app, raise_server_exceptions=False).get(
         "/v1/workflow/copilot/chat-history",
-        headers={"X-Copilot-Credential-Recovery-Token": recovery_proof, "X-Request-ID": "request"},
+        headers={recovery_header: recovery_proof, "X-Request-ID": "request"},
     )
     assert response.status_code == status_code
     logger = log_mock.info if status_code == 200 else log_mock.warning if status_code == 403 else log_mock.error
     logger.assert_called_once()
     fields = logger.call_args.kwargs
     assert fields["headers"]["x-request-id"] == "request"
-    assert "x-copilot-credential-recovery-token" not in fields["headers"]
+    assert recovery_header.lower() not in fields["headers"]
     assert recovery_proof not in str(log_mock.mock_calls)
     assert selection_token not in str(log_mock.mock_calls)
     if status_code == 200:

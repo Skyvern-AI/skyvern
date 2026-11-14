@@ -60,15 +60,9 @@ _SENSITIVE_ENDPOINTS = {
     "POST /api/v1/google/oauth/callback",
     "POST /v1/recipes/jobs/apply",
     "POST /v1/browser_sessions/external",
-    # Copilot messages may contain credentials before the route's semantic
-    # safety screen runs. The request audit keeps endpoint metadata while the
-    # body stays opaque; the route persists only its canonical redacted form.
-    "POST /v1/workflow/copilot/chat-post",
-    "POST /v1/workflow/copilot/question-response",
-    "POST /v1/workflow/copilot/steer",
-    "POST /v1/workflow/copilot/credential-response",
-    "POST /v1/workflow/copilot/demonstration/control",
-    "POST /v1/workflow/copilot/convert-yaml-to-blocks",
+    # Editor-assist bodies carry workflow YAML and code, which can hold secrets.
+    "POST /v1/workflow/suggest-goal",
+    "POST /v1/workflow/convert-yaml-to-blocks",
     # Payment-provider events carry customer billing details (name, email, address, card metadata).
     "POST /api/v1/stripe_webhook",
     # Identity-provider session events embed the full user record (email, name, linked Google account).
@@ -93,6 +87,9 @@ _SENSITIVE_ENDPOINT_PATTERNS = (
     _SIGNED_TRIGGER_RECEIVER_ENDPOINT,
     # Skyplane authority calls carry runtime capabilities, tool arguments, agent feedback text and delivered files.
     re.compile(r"^[^ ]+ /api/v1/skyplane(?:/.*)?$"),
+    # Ember chat bodies can hold pasted credentials before the route's safety screen runs. Old paths stay listed
+    # after their routes go, because a POST that 404s still logs its body.
+    re.compile(r"^POST /v1/(?:workflow/copilot|ember)/.+$"),
 )
 _STREAMING_REQUEST_ENDPOINT_PATTERNS = (
     re.compile(r"^POST /(?:api/)?v1/email/(?:inbound/[^/]+|sns-inbound)$"),
