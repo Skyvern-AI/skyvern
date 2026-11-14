@@ -43,6 +43,7 @@ from playwright.async_api import TimeoutError as _PlaywrightTimeout
 from playwright.async_api import async_playwright
 from structlog.testing import capture_logs
 
+import skyvern.forge.taskv3.goal_check as taskv3_goal_check
 import skyvern.forge.taskv3.loop as taskv3_loop
 import skyvern.forge.taskv3.tools as taskv3_tools
 import skyvern.webeye.action_deadline as action_deadline
@@ -10329,8 +10330,11 @@ class _ClickFakePage:
         doc_same: bool | None = True,
         click_seen: bool | None = False,
         plant_raises: bool = False,
+        same_doc_reads: list[bool | Exception] | None = None,
     ) -> None:
         self.url = "https://example.test/results"
+        # consumed in order by the click's same-document token reads; an Exception entry is raised
+        self._same_doc_reads = list(same_doc_reads or [])
         # whether the document received the press; None => the page cannot be asked
         self._click_seen = click_seen
         self._plant_raises = plant_raises
@@ -10366,6 +10370,11 @@ class _ClickFakePage:
             return self._doc_same
         if "__tv3_click_doc = 1" in js:
             return None
+        if "__tv3_click_same === 1" in js and self._same_doc_reads:
+            same = self._same_doc_reads.pop(0)
+            if isinstance(same, Exception):
+                raise same
+            return same
         if "__tv3_click_hook" in js and self._plant_raises:
             raise RuntimeError("plant refused")
         if "__tv3_click_seen === 1" in js:
@@ -12814,6 +12823,146 @@ async def test_a_raised_click_reports_whether_the_page_received_it(
         assert taskv3_loop._CLICK_DISPATCHED.get() is dispatched
     finally:
         taskv3_loop._CLICK_DISPATCHED.reset(token)
+
+
+_POST_DISPATCH_TIMEOUT = (
+    "Page.click: Timeout 1000ms exceeded.\n  - click action done\n  - waiting for scheduled navigations to finish"
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("click_raises", "plant_raises", "same_doc_reads"),
+    [
+        (_PlaywrightTimeout(_POST_DISPATCH_TIMEOUT), True, [False]),
+        (_PlaywrightTimeout(_POST_DISPATCH_TIMEOUT), False, [RuntimeError("detached"), RuntimeError("detached")]),
+        (_PlaywrightTimeout("Page.click: Timeout 1000ms exceeded."), False, [False]),
+        (
+            _PlaywrightTimeout(
+                "Page.click: Timeout 1000ms exceeded.\nCall log:\n  - <div>Please hold: waiting for scheduled "
+                "navigations to finish</div> intercepts pointer events\n  - retrying click action"
+            ),
+            False,
+            [False],
+        ),
+        *(
+            (
+                _PlaywrightTimeout(
+                    f"Page.click: Timeout 1000ms exceeded.\nCall log:\n  - <div>Please hold{sep}- waiting for "
+                    f"scheduled navigations to finish{sep}</div> intercepts pointer events\n  - retrying click action"
+                ),
+                False,
+                [False],
+            )
+            for sep in ("\x85", "\u2028")
+        ),
+    ],
+    ids=[
+        "marker_never_armed",
+        "document_unreadable",
+        "timeout_before_the_press",
+        "cover_text_quotes_the_wait",
+        "cover_text_breaks_the_line_with_nel",
+        "cover_text_breaks_the_line_with_line_separator",
+    ],
+)
+async def test_a_click_timeout_without_proof_the_press_replaced_the_document_keeps_its_error(
+    click_raises: Exception, plant_raises: bool, same_doc_reads: list[bool | Exception]
+) -> None:
+    page = _ClickFakePage(click_raises=click_raises, plant_raises=plant_raises, same_doc_reads=same_doc_reads)
+    tools = build_browser_tools(_fixed_page_provider(page))
+    with pytest.raises(_PlaywrightTimeout):
+        await _tool(tools, "click").handler({"selector": "#submit"})
+
+
+async def _click_submit_on_a_slow_form(
+    page: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    status: int = 200,
+    submit_attrs: str = "",
+    fields: str = "<input name='q' value='1'>",
+    target: str = "Send application",
+) -> Any:
+    monkeypatch.setattr(taskv3_tools, "_ACTION_TIMEOUT_MS", 1000)
+
+    async def _serve(route: Route) -> None:
+        if route.request.method == "POST":
+            await asyncio.sleep(2.5)
+            body = "" if status == 204 else "<!doctype html><h1>Application received</h1>"
+            await route.fulfill(status=status, content_type="text/html", body=body)
+            return
+        await route.fulfill(
+            status=200,
+            content_type="text/html",
+            body=f"<!doctype html><h1>Apply</h1><form method='post'>{fields}"
+            f"<input type='submit' value='Send application'{submit_attrs}></form>",
+        )
+
+    await page.route("**/*", _serve)
+    await page.goto("http://slow-form.test/apply")
+    tools = build_browser_tools(_fixed_page_provider(page))
+    ref = _ref_line((await _tool(tools, "observe").handler({})).content, target)
+    return await _tool(tools, "click").handler({"selector": ref})
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_submit_whose_response_outlasts_the_click_wait_reports_the_landed_click(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _content_page("") as page:
+        r = await _click_submit_on_a_slow_form(page, monkeypatch)
+        assert (r.status, r.error_class) == ("ok", None), r.content
+        assert "the page navigated" in r.content and "re-observe" not in r.content
+        reported = taskv3_goal_check._REPORTED_URL_RES["click"].match(r.content)
+        assert reported is not None and reported.group(1) == page.url
+        assert r.data["page_state_changed"] is True
+        assert r.data[taskv3_loop.CLICK_DISPATCHED_DATA_KEY] is True
+        # The form posts back to its own URL, so only page_state_changed says the page moved.
+        assert r.data["page_transitioned"] is False
+        assert await page.locator("h1").inner_text() == "Application received"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_checkbox_whose_change_submits_a_slow_form_reports_the_landed_click(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _content_page("") as page:
+        r = await _click_submit_on_a_slow_form(
+            page,
+            monkeypatch,
+            fields="<label><input type='checkbox' name='renew' onchange='this.form.submit()'> Renew yearly</label>",
+            target="Renew yearly",
+        )
+        assert (r.status, r.error_class, r.entry_unconfirmed) == ("ok", None, False), r.content
+        assert "the page navigated" in r.content
+        assert await page.locator("h1").inner_text() == "Application received"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_submit_removed_before_the_press_on_a_slow_form_still_fails_loud(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _content_page("") as page:
+        r = await _click_submit_on_a_slow_form(
+            page, monkeypatch, submit_attrs=" onpointerover='this.remove()' onmouseover='this.remove()'"
+        )
+        assert (r.status, r.error_class) == ("error", "stale_selector"), r.content
+        assert await page.locator("h1").inner_text() == "Apply"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_submit_whose_slow_response_leaves_the_document_in_place_keeps_its_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _content_page("") as page:
+        with pytest.raises(_PlaywrightTimeout, match="scheduled navigations"):
+            await _click_submit_on_a_slow_form(page, monkeypatch, status=204)
+        assert await page.locator("h1").inner_text() == "Apply"
 
 
 # --- DOM-level tests: the REAL precheck/finder/after JS against live Chromium, on a faithful mimic
