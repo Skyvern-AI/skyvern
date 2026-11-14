@@ -128,39 +128,31 @@ async def accept_copilot_proposal(
 ) -> tuple[Workflow, tuple[str, ...]]:
     """Stamp v1, write a new copilot-attributed version and clear the proposal; refusals raise HTTPException."""
 
-    def log_accept_refused(status_code: int) -> None:
+    def refused(status_code: int, detail: str, reason: str | None = None) -> HTTPException:
+        # The response body is opaque in request logs, so this line is where the refusal reason survives.
         LOG.info(
             "Copilot proposal accept refused",
             organization_id=organization.organization_id,
             workflow_permanent_id=chat.workflow_permanent_id,
             workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
             status_code=status_code,
+            reason=reason or detail,
         )
+        return HTTPException(status_code=status_code, detail=detail)
 
     proposal = chat.proposed_workflow
     if not proposal:
-        log_accept_refused(status.HTTP_400_BAD_REQUEST)
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No proposed workflow to apply")
+        raise refused(status.HTTP_400_BAD_REQUEST, "No proposed workflow to apply")
 
     metadata = copilot_proposal_metadata(proposal)
     if COPILOT_PROPOSAL_METADATA_KEY in proposal and metadata is None:
-        log_accept_refused(status.HTTP_409_CONFLICT)
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Copilot proposal metadata is invalid; reload required",
-        )
+        raise refused(status.HTTP_409_CONFLICT, "Copilot proposal metadata is invalid; reload required")
     if metadata is not None:
         untokenized_client = _client_sent_no_proposal_token(owner_turn_id, revision)
         if not untokenized_client and (owner_turn_id != metadata.owner_turn_id or revision != metadata.revision):
-            log_accept_refused(status.HTTP_409_CONFLICT)
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT, detail="Copilot proposal changed; reload required"
-            )
+            raise refused(status.HTTP_409_CONFLICT, "Copilot proposal changed; reload required")
         if metadata.claim_is_live(datetime.now(UTC)):
-            log_accept_refused(status.HTTP_409_CONFLICT)
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT, detail="Copilot proposal is already being accepted"
-            )
+            raise refused(status.HTTP_409_CONFLICT, "Copilot proposal is already being accepted")
     # A lapsed claim is being taken over, so the disposition to restore on failure is the
     # reviewable one this accept started from, never the dead claim's own marker.
     original_disposition: ProposalDisposition = (
@@ -170,11 +162,7 @@ async def accept_copilot_proposal(
     )
 
     if not proposal.get("_copilot_yaml"):
-        log_accept_refused(status.HTTP_400_BAD_REQUEST)
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Proposed workflow has no copilot YAML to apply",
-        )
+        raise refused(status.HTTP_400_BAD_REQUEST, "Proposed workflow has no copilot YAML to apply")
 
     # Claim before the canonical check and the write: a history read that overtakes this POST must
     # already see a write in flight, or it reports the proposal unsaved and releases the Save hold.
@@ -196,8 +184,7 @@ async def accept_copilot_proposal(
                 expected_revision=metadata.revision,
             )
     except CopilotProposalConflictError:
-        log_accept_refused(status.HTTP_409_CONFLICT)
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Copilot proposal changed; reload required")
+        raise refused(status.HTTP_409_CONFLICT, "Copilot proposal changed; reload required")
     claim = copilot_proposal_metadata(claimed.proposed_workflow)
     if claim is None:
         raise RuntimeError("Copilot proposal claim returned no ownership token")
@@ -207,8 +194,7 @@ async def accept_copilot_proposal(
         if metadata is None and base_version is None:
             # With no saved version at the claim there is nothing to hold a later save against.
             workflow_changed = True
-            log_accept_refused(status.HTTP_409_CONFLICT)
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Workflow changed after this proposal")
+            raise refused(status.HTTP_409_CONFLICT, "Workflow changed after this proposal")
         canonical = await app.DATABASE.workflows.get_workflow_by_permanent_id(
             workflow_permanent_id=chat.workflow_permanent_id,
             organization_id=organization.organization_id,
@@ -218,8 +204,7 @@ async def accept_copilot_proposal(
             and not proposal_workflow_fingerprint_matches(canonical, metadata.canonical_fingerprint)
         ):
             workflow_changed = True
-            log_accept_refused(status.HTTP_409_CONFLICT)
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Workflow changed after this proposal")
+            raise refused(status.HTTP_409_CONFLICT, "Workflow changed after this proposal")
         try:
             yaml_request = await _resolve_proposal_for_accept(
                 proposal,
@@ -227,10 +212,10 @@ async def accept_copilot_proposal(
                 workflow_permanent_id=chat.workflow_permanent_id,
             )
         except (yaml.YAMLError, ValidationError) as e:
-            log_accept_refused(status.HTTP_400_BAD_REQUEST)
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Proposed copilot YAML is invalid: {e}",
+            raise refused(
+                status.HTTP_400_BAD_REQUEST,
+                f"Proposed copilot YAML is invalid: {e}",
+                reason="Proposed copilot YAML is invalid",
             )
         live_title = _accepted_workflow_title(yaml_request.title, canonical, metadata)
         if live_title != yaml_request.title:
@@ -259,10 +244,7 @@ async def accept_copilot_proposal(
         except (WorkflowVersionConflict, WorkflowNotFound) as e:
             # A save or delete landed after the claim; this is the refusal the client reads as "nothing written".
             workflow_changed = True
-            log_accept_refused(status.HTTP_409_CONFLICT)
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT, detail="Workflow changed after this proposal"
-            ) from e
+            raise refused(status.HTTP_409_CONFLICT, "Workflow changed after this proposal") from e
     except Exception:
         with contextlib.suppress(Exception):
             # A failed release must not replace the refusal the caller needs to see.

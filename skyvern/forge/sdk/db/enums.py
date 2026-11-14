@@ -86,6 +86,13 @@ class WorkflowBuildSource(StrEnum):
     api = "api"
     internal = "internal"
 
+    @classmethod
+    def _missing_(cls, value: object) -> "WorkflowBuildSource | None":
+        # Newer releases store "ember" for this member, so this image must still load those rows after a rollback.
+        if value == "ember":
+            return cls.copilot
+        return None
+
 
 MANUAL_LIKE_WORKFLOW_RUN_TRIGGER_TYPES = frozenset(
     {
