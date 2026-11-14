@@ -1,5 +1,6 @@
 import { isLoginBlockMissingCredentials } from "../../runValidation";
 import { isWorkflowBlockNode, type AppNode } from "../nodes";
+import { getNodeBrowserUrlError } from "../browserBlockUrl";
 import { docStepCaption, loopHasNoList } from "./docStepRegistry";
 import type { DocItem } from "./buildDocTree";
 import { docDetailsText } from "./docDetailsText";
@@ -223,6 +224,8 @@ export function docStepFixes(
         message: "This step has no URL. Type it on the line, or use @.",
         field: "url",
       });
+    const urlError = getNodeBrowserUrlError(node);
+    if (urlError) found.push({ message: urlError, field: "url" });
     if (
       node.type === "login" &&
       isLoginBlockMissingCredentials({
@@ -344,12 +347,17 @@ export function docProblemEntries({
     ),
     ...problems.map((problem, i) => {
       const nodeId = idsByLabel.get(problem.block_label ?? "") ?? null;
+      const node = nodeId ? byId.get(nodeId) : undefined;
       return {
         key: `server:${i}`,
         nodeId,
         message: problem.message,
         blocking: !checkFailed && ASKING_SERVER_CODES.has(problem.code),
-        inDetails: inDetails(nodeId, problem.field ?? null),
+        inDetails:
+          (problem.field === "parameter_keys" &&
+            node?.type === "login" &&
+            node.data.parameterKeys.length > 1) ||
+          inDetails(nodeId, problem.field ?? null),
       };
     }),
   ]) {

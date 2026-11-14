@@ -3,22 +3,24 @@ import { useContext, useId, useState } from "react";
 import { Button } from "@/components/ui/button";
 import type { AppNode } from "../nodes";
 import { announceDoc } from "./docAnnounce";
-import { docOneActionStepWantsTask } from "./docOneAction";
+import {
+  dismissedDocSuggestions,
+  docOneActionStepWantsTask,
+} from "./docOneAction";
 import { docShortUrl, type DocPromptUrlOffer } from "./docPromptUrl";
 import { WorkflowDocActionsContext } from "./WorkflowDocActionsContext";
 
 const NO_START_PAGE_REASON = "This step needs a page to start on.";
 
-// Dismissals outlive the component: switching an If branch unmounts its steps' hints.
-const dismissed = new Set<string>();
-
 // One suggestion under a step at a time: the Browser Task hint first, then the prompt's URL for an empty URL field.
 export function DocOneActionHint({
   node,
   urlOffer = null,
+  onDismiss,
 }: {
   node: AppNode;
   urlOffer?: DocPromptUrlOffer | null;
+  onDismiss?: () => void;
 }) {
   const actions = useContext(WorkflowDocActionsContext);
   const { edit } = actions;
@@ -26,12 +28,16 @@ export function DocOneActionHint({
   if (!edit) return null;
   // A dismissed suggestion's button leaves the page, so focus goes back to the step's prompt line.
   const dismiss = (key: string) => () => {
-    dismissed.add(key);
+    dismissedDocSuggestions.add(key);
     rerender((n) => n + 1);
+    onDismiss?.();
     requestAnimationFrame(() => actions.setFocusId(node.id));
   };
   const oneActionKey = `one-action:${node.id}`;
-  if (!dismissed.has(oneActionKey) && docOneActionStepWantsTask(node))
+  if (
+    !dismissedDocSuggestions.has(oneActionKey) &&
+    docOneActionStepWantsTask(node)
+  )
     return (
       <DocSuggestion
         key={oneActionKey}
@@ -43,7 +49,7 @@ export function DocOneActionHint({
       />
     );
   const urlKey = urlOffer && `url:${node.id}:${urlOffer.url}`;
-  if (!urlOffer || !urlKey || dismissed.has(urlKey)) return null;
+  if (!urlOffer || !urlKey || dismissedDocSuggestions.has(urlKey)) return null;
   const { url } = urlOffer;
   return (
     <DocSuggestion
