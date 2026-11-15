@@ -1676,6 +1676,10 @@ class AgentFunction:
     def get_cloud_integration_entries(self) -> list[IntegrationEntry]:
         return []
 
+    def integration_setup_path(self, entry: IntegrationEntry) -> str | None:
+        """App path Copilot links for setting up this catalog entry, or None to link no page."""
+        return None
+
     async def get_cloud_integration_accounts(self, organization_id: str, user_id: str | None = None) -> AccountsById:
         return {}
 

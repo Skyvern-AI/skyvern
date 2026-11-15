@@ -226,6 +226,20 @@ def test_enriched_label_quotes_the_name_over_the_kinds_noun() -> None:
     assert compose_target_intention("type", "Airfield", "textbox", set()) == 'Typed into the "Airfield" field'
 
 
+def test_a_bound_name_a_reader_cannot_see_follows_the_visible_text() -> None:
+    assert (
+        compose_target_intention("click", "Apply", "button", set(), shown="View")
+        == 'Clicked the "View" button (labeled "Apply")'
+    )
+    # Each name clears the shape filter and the secret matcher on its own; the one that fails is dropped.
+    assert compose_target_intention("click", "Apply", "button", set(), shown="4111 1111 1111 1111") == (
+        'Clicked the "Apply" button'
+    )
+    assert compose_target_intention(
+        "click", "correct horse battery", "button", {"correct horse battery"}, shown="View"
+    ) == ('Clicked the "View" button')
+
+
 def test_secret_matcher_floors_a_word_shaped_registered_secret() -> None:
     # "correct horse battery" is ordinary prose -- the shape filter alone lets it through -- so only
     # the secret matcher (layer 3) can catch it once it is REGISTERED for this run.

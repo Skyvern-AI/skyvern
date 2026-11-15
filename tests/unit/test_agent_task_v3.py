@@ -2077,12 +2077,13 @@ async def test_execute_task_v3_persists_the_captured_target_name_as_the_action_i
     # assertion can pass on a field nobody wrote.
     from skyvern.forge import agent as agent_mod
 
-    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click", "type", "click"])
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click", "type", "click", "click"])
     rounds = [
         [
             RoundAction("click", {"selector": "#a"}, True, "Sign In"),
             RoundAction("type", {"selector": "#b", "text": "x"}, True, "Email address"),
             RoundAction("click", {"selector": "#c"}, True, None),
+            RoundAction("click", {"selector": "#d"}, True, "Apply", "button", target_shown="View"),
         ]
     ]
     _step, _task, _loop, _post = await _run_execute_task_v3(
@@ -2099,6 +2100,7 @@ async def test_execute_task_v3_persists_the_captured_target_name_as_the_action_i
         'Clicked "Sign In"',
         'Typed into the "Email address" field',
         "Clicked an element",
+        'Clicked the "View" button (labeled "Apply")',
     ]
     assert all(a.reasoning is None for a in persisted)
 

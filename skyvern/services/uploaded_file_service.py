@@ -843,20 +843,31 @@ _JPEG_FILL = re.compile(rb"\xff+")
 _IMAGE_HEADER_MAX_STEPS = 4096
 
 
+class _HeaderRunsPastHead(Exception):
+    """The bytes read end before the header answers; only more of the file can."""
+
+
 def _jpeg_pixels(head: bytes) -> int | None:
     offset, pixels = 2, None
     for _ in range(_IMAGE_HEADER_MAX_STEPS):
         fill = _JPEG_FILL.match(head, offset)
-        if fill is None or fill.end() + 2 >= len(head):
+        if offset >= len(head) or (fill is not None and fill.end() + 2 >= len(head)):
+            raise _HeaderRunsPastHead
+        if fill is None:
             return None
         marker, offset = head[fill.end()], fill.end() + 1
         if marker == 0xDA:
             return pixels
+        # libjpeg refuses a second SOI and an EOI before SOS; ImageIO restarts at the SOI and sizes the SOF inside it.
+        if marker in (0xD8, 0xD9):
+            return None
         if marker in _JPEG_BARE_MARKERS:
             continue
         if marker in _JPEG_SOF_MARKERS:
-            if pixels is not None or offset + 7 > len(head):
+            if pixels is not None:
                 return None
+            if offset + 7 > len(head):
+                raise _HeaderRunsPastHead
             height, width = struct.unpack(">HH", head[offset + 3 : offset + 7])
             pixels = width * height
         offset += int.from_bytes(head[offset : offset + 2], "big")
@@ -868,7 +879,9 @@ def _gif_pixels(head: bytes) -> int | None:
     width, height, flags = struct.unpack("<HHB", head[6:11])
     offset, in_extension = 13 + (3 << ((flags & 7) + 1) if flags & 0x80 else 0), False
     for _ in range(_IMAGE_HEADER_MAX_STEPS):
-        if offset >= len(head) or not (in_extension or head[offset] == 0x21):
+        if offset >= len(head):
+            raise _HeaderRunsPastHead
+        if not (in_extension or head[offset] == 0x21):
             break
         if in_extension:
             in_extension, offset = head[offset] > 0, offset + 1 + head[offset]
@@ -876,14 +889,17 @@ def _gif_pixels(head: bytes) -> int | None:
             in_extension, offset = True, offset + 2
     else:
         return None
-    if offset + 9 > len(head) or head[offset] != 0x2C:
+    if head[offset] != 0x2C:
         return None
+    if offset + 9 > len(head):
+        raise _HeaderRunsPastHead
     left, top, frame_width, frame_height = struct.unpack("<HHHH", head[offset + 1 : offset + 9])
     return max(width, left + frame_width) * max(height, top + frame_height)
 
 
 def declared_pixels(head: bytes) -> int | None:
-    """Width times height as the image header declares it, read without decoding; None when it cannot be read."""
+    """Width times height as the image header declares it, read without decoding; None when it is refused.
+    Raises _HeaderRunsPastHead when ``head`` ends before a JPEG or GIF header answers."""
     chunk = head[12:16]
     if head.startswith(b"\x89PNG\r\n\x1a\n") and chunk == b"IHDR" and len(head) >= 24:
         width, height = struct.unpack(">II", head[16:24])
@@ -930,12 +946,18 @@ async def mint_file_url(*, file_id: str, organization_id: str) -> UploadedFileSi
     sniffed = filetype.guess(head)
     if sniffed is None or sniffed.mime not in BLOCK_IMAGE_MEDIA_TYPES:
         return None
-    pixels = declared_pixels(head)
-    if pixels is None and len(head) == _IMAGE_HEAD_BYTES:
-        whole = await app.STORAGE.read_managed_file_head(
-            uploaded_file.storage_uri, organization_id, BLOCK_IMAGE_MAX_BYTES
-        )
-        pixels = declared_pixels(whole or b"")
+    try:
+        pixels = declared_pixels(head)
+    except _HeaderRunsPastHead:
+        pixels = None
+        if len(head) == _IMAGE_HEAD_BYTES:
+            whole = await app.STORAGE.read_managed_file_head(
+                uploaded_file.storage_uri, organization_id, BLOCK_IMAGE_MAX_BYTES
+            )
+            try:
+                pixels = declared_pixels(whole or b"")
+            except _HeaderRunsPastHead:
+                pass
     if pixels is None or pixels > BLOCK_IMAGE_MAX_PIXELS:
         return None
     now = datetime.now(timezone.utc)

@@ -1378,12 +1378,12 @@ class S3Storage(BaseStorage, StreamingArtifactStorage):
         stream: S3ObjectStream | None = None
         try:
             stream = await self.async_client.open_download_stream(uri, byte_range=(0, length - 1))
-            head = b""
+            head = bytearray()
             async for chunk in stream.iter_chunks(length):
                 head += chunk
                 if len(head) >= length:
                     break
-            return head[:length]
+            return bytes(head[:length])
         except Exception as e:
             # S3 answers a ranged read of a zero-byte object with InvalidRange.
             if isinstance(e, ClientError) and e.response.get("Error", {}).get("Code") == "InvalidRange":

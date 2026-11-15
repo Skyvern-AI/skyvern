@@ -633,6 +633,7 @@ def _taskv3_row_intention(
             round_action.target_kind,
             _taskv3_label_secret_values(task, secret_values),
             succeeded=round_action.succeeded,
+            shown=round_action.target_shown,
         )
     except Exception:
         LOG.warning("task_v3 failed to compose action label", task_id=task.task_id)

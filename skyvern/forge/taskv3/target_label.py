@@ -220,33 +220,46 @@ _FAILED_TARGET_VERBS = {
 }
 
 
-def describe_target(tool: str, name: Any, kind: Any, secret_values: Collection[str]) -> str:
+def describe_target(tool: str, name: Any, kind: Any, secret_values: Collection[str], shown: str | None = None) -> str:
     """How one acted-on element reads to a person: `the "Continue" button`, or the kind floor
     (`a button`) when the page's own name cannot be shown. `kind` is only a lookup key, so the floor
     never contains page text, and `name` enriches it only after passing the shape filter and the secret
     matcher -- shared by the timeline label below and the loop's action-loop verdict, so a control
-    reads the same way in both."""
+    reads the same way in both. `shown` is the visible text of a control whose bound name does not
+    contain it; it leads, so the label matches the screenshot, and the bound name follows it."""
     resolved_kind = kind if isinstance(kind, str) and kind in _KIND_NOUNS else _DEFAULT_KIND_BY_TOOL.get(tool)
     floor_phrase, named_noun = _GENERIC_KIND_NOUNS if resolved_kind is None else _KIND_NOUNS[resolved_kind]
     display = _enrichable_name(name, secret_values)
+    shown_display = _enrichable_name(shown, secret_values)
+    labeled = ""
+    if shown_display is not None:
+        if display is not None and display.casefold() != shown_display.casefold():
+            labeled = f' (labeled "{display}")'
+        display = shown_display
     if display is None:
         return floor_phrase
     if named_noun is None:
-        return f'"{display}"'
+        return f'"{display}"{labeled}'
     folded = display.casefold()
     if folded == named_noun or folded.endswith(f" {named_noun}"):
-        return f'the "{display}"'
-    return f'the "{display}" {named_noun}'
+        return f'the "{display}"{labeled}'
+    return f'the "{display}" {named_noun}{labeled}'
 
 
 def compose_target_intention(
-    tool: str, name: Any, kind: Any, secret_values: Collection[str], *, succeeded: bool = True
+    tool: str,
+    name: Any,
+    kind: Any,
+    secret_values: Collection[str],
+    *,
+    succeeded: bool = True,
+    shown: str | None = None,
 ) -> str | None:
     """The LLM-free timeline label for one v3 tool call."""
     verb = (TARGET_VERBS if succeeded else _FAILED_TARGET_VERBS).get(tool)
     if verb is None:
         return None
-    return f"{verb} {describe_target(tool, name, kind, secret_values)}"
+    return f"{verb} {describe_target(tool, name, kind, secret_values, shown)}"
 
 
 def _enrichable_name(name: Any, secret_values: Collection[str]) -> str | None:

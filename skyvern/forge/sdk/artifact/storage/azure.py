@@ -208,7 +208,7 @@ class AzureStorage(BaseStorage, StreamingArtifactStorage):
             artifacts,
             presign=self.async_client.create_sas_urls,
             presign_sensitive=lambda uris: self.async_client.create_sas_urls(
-                uris, expiry_hours=SENSITIVE_SHARE_URL_EXPIRY_HOURS
+                uris, expiry_seconds=SENSITIVE_SHARE_URL_EXPIRY_HOURS * 60 * 60
             ),
             presign_download=lambda uris: self.async_client.create_sas_urls(
                 uris, attachment_filenames=[None] * len(uris)
@@ -1057,7 +1057,7 @@ class AzureStorage(BaseStorage, StreamingArtifactStorage):
         self.assert_managed_file_access(uri, organization_id)
         urls = await self.async_client.create_sas_urls(
             [uri],
-            expiry_hours=max(1, expiry_seconds // 3600),
+            expiry_seconds=expiry_seconds,
             inline_content_type=inline_content_type,
         )
         return urls[0] if urls else None

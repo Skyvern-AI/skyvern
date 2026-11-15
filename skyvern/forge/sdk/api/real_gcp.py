@@ -338,7 +338,7 @@ class RealAsyncGcsStorageClient(AsyncGcsStorageClient):
     def _create_signed_url(
         self,
         uri: str,
-        expiry_hours: int = 24,
+        expiry_seconds: int = 24 * 60 * 60,
         signing_kwargs: dict | None = None,
         attachment_filename: str | None = None,
         client: storage.Client | None = None,
@@ -363,7 +363,7 @@ class RealAsyncGcsStorageClient(AsyncGcsStorageClient):
             blob = self._get_blob(uri, client)
             return blob.generate_signed_url(
                 version="v4",
-                expiration=timedelta(hours=expiry_hours),
+                expiration=timedelta(seconds=expiry_seconds),
                 method="GET",
                 **response_overrides,
                 **signing_kwargs,
@@ -375,7 +375,7 @@ class RealAsyncGcsStorageClient(AsyncGcsStorageClient):
     async def create_signed_urls(
         self,
         uris: list[str],
-        expiry_hours: int = 24,
+        expiry_seconds: int = 24 * 60 * 60,
         attachment_filenames: list[str | None] | None = None,
         inline_content_type: str | None = None,
         deadline: float | None = None,
@@ -402,7 +402,7 @@ class RealAsyncGcsStorageClient(AsyncGcsStorageClient):
                     attachment_filename = attachment_filenames[index] or os.path.basename(GcsUri(uri).object_path)
                 url = self._create_signed_url(
                     uri,
-                    expiry_hours,
+                    expiry_seconds,
                     signing_kwargs=signing_kwargs,
                     attachment_filename=attachment_filename,
                     client=client,

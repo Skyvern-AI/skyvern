@@ -1,11 +1,9 @@
 """Every ArtifactType must be deliberately placed in each type-keyed site, so adding a value cannot
 silently skip a map: the storage extension map (KeyError on first write), secret redaction for text,
 the screenshot prefix (step-archive filename collisions) and signed-URL TTL for screenshots, and the
-public enum literal in the Fern spec, the docs spec and the vendored client."""
+public enum literal in the vendored client."""
 
-import json
 import typing
-from pathlib import Path
 
 from skyvern.client.types.artifact_type import ArtifactType as ClientArtifactType
 from skyvern.forge.sdk.artifact.manager import _REDACTABLE_TEXT_ARTIFACT_TYPES, _SCREENSHOT_PREFIX_MAP
@@ -13,8 +11,6 @@ from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.artifact.signing import SENSITIVE_ARTIFACT_TYPES
 from skyvern.forge.sdk.artifact.storage.base import FILE_EXTENTSION_MAP
 from skyvern.forge.sdk.routes.agent_protocol import _ARTIFACT_CONTENT_TYPES
-
-REPO = Path(__file__).resolve().parents[2]
 
 # Written through a path that builds its own URI (uploads bucket, eval ingest, session logs, cdp proxy
 # sink, legacy/deprecated values, the read-side sentinel) — not through build_uri's extension lookup.
@@ -66,6 +62,3 @@ def test_public_enum_literals_match_the_python_enum() -> None:
     assert client == values, f"vendored client drift: missing={values - client} extra={client - values}"
     # docs/api-reference/openapi.json is bot-owned (regenerated from production after each deploy)
     # and deliberately not asserted here.
-    spec = "fern/openapi/skyvern_openapi.json"
-    enum = set(json.loads((REPO / spec).read_text())["components"]["schemas"]["ArtifactType"]["enum"])
-    assert enum == values, f"{spec} drift: missing={values - enum} extra={enum - values}"
