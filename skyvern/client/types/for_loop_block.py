@@ -49,7 +49,7 @@ from .context_parameter import ContextParameter  # noqa: E402, F401, I001
 # Manual patch: Fern v4.31.1 emits bottom-cross-imports that deadlock at module
 # load (for_loop <-> while_loop <-> *_loop_blocks_item). Catch the mid-load
 # ImportError; the symmetric *_loop_blocks_item module back-resolves once both
-# unions are fully defined. Reapplied on every regen by scripts/patch_generated_client.py.
+# unions are fully defined.
 try:
     from .while_loop_block import WhileLoopBlock  # noqa: E402, F401, I001
     from .for_loop_block_loop_blocks_item import ForLoopBlockLoopBlocksItem  # noqa: E402, F401, I001
