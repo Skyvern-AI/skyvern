@@ -15,7 +15,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { FeatureFlagContext } from "@/hooks/useFeatureFlag";
 import { useEmberHeaderStore } from "@/store/useEmberHeaderStore";
-import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
+import {
+  storePendingAccept,
+  useWorkflowYamlEditorStore,
+} from "@/store/WorkflowYamlEditorStore";
 
 import type {
   QuestionInteraction,
@@ -28,6 +31,7 @@ type HistoryData = {
   pending_question_cancel_token?: string | null;
   pending_credential_requests?: EmberCredentialRequiredUpdate[];
   workflow_copilot_chat_id: string | null;
+  workflow_permanent_id?: string | null;
   chat_history: unknown[];
   proposed_workflow: Record<string, unknown> | null;
   proposed_workflow_metadata?: Record<string, unknown> | null;
@@ -57,6 +61,8 @@ const {
   historySignals,
   boolFlags,
   routeWpid,
+  routeSearch,
+  navigate,
   announceRef,
 } = vi.hoisted(() => {
   const calls: StreamCall[] = [];
@@ -85,6 +91,8 @@ const {
     historySignals: [] as Array<AbortSignal | undefined>,
     boolFlags: { current: {} as Record<string, boolean> },
     routeWpid: { current: "wpid_1" },
+    routeSearch: { current: "" },
+    navigate: vi.fn(),
     announceRef: { current: null as ((message: unknown) => void) | null },
   };
 });
@@ -134,10 +142,10 @@ vi.mock("react-router-dom", async (importOriginal) => {
       workflowRunId: undefined,
     }),
     useSearchParams: () => [new URLSearchParams(), vi.fn()],
-    useNavigate: () => vi.fn(),
+    useNavigate: () => navigate,
     useLocation: () => ({
       pathname: "/",
-      search: "",
+      search: routeSearch.current,
       hash: "",
       state: null,
       key: "default",
@@ -354,6 +362,8 @@ beforeEach(() => {
   hasLocalChanges.current = false;
   boolFlags.current = {};
   routeWpid.current = "wpid_1";
+  routeSearch.current = "";
+  navigate.mockReset();
   announceRef.current = null;
 });
 
@@ -3249,5 +3259,215 @@ describe("EmberChat — first chat selection", () => {
         }
       ).workflow_copilot_chat_id,
     ).toBe("chat_other");
+  });
+});
+
+describe("EmberChat — ?chat= link seeds the first history read", () => {
+  const userRow = (content: string) => ({
+    sender: "user" as const,
+    content,
+    created_at: "2026-07-15T00:00:00Z",
+  });
+  const newestChat = historyData({
+    workflow_copilot_chat_id: "chat_b",
+    workflow_permanent_id: "wpid_1",
+    chat_history: [userRow("message in newest chat")],
+  });
+  const strippedSearches = () =>
+    navigate.mock.calls
+      .filter(([, options]) => options?.replace)
+      .map(([to]) => (to as { search: string }).search);
+
+  it("opens the linked chat and drops chat= from the URL", async () => {
+    routeSearch.current = "?chat=chat_a&panes=copilot,editor";
+    await renderChat({ docked: true });
+    await flushHistory(
+      historyData({
+        workflow_copilot_chat_id: "chat_a",
+        workflow_permanent_id: "wpid_1",
+        chat_history: [userRow("message in linked chat")],
+      }),
+    );
+
+    expect(historyParams[0]).toEqual({
+      workflow_permanent_id: "wpid_1",
+      workflow_copilot_chat_id: "chat_a",
+    });
+    await waitFor(() =>
+      expect(screen.getByText("message in linked chat")).toBeTruthy(),
+    );
+    expect(historyParams).toHaveLength(1);
+    await waitFor(() =>
+      expect(strippedSearches()).toEqual(["?panes=copilot,editor"]),
+    );
+  });
+
+  it("opens the newest chat when the linked chat is refused", async () => {
+    routeSearch.current = "?chat=chat_c";
+    await renderChat({ docked: true });
+    await waitFor(() => expect(historyRejects.length).toBeGreaterThan(0));
+    historyQueue.shift();
+    const reject = historyRejects.shift()!;
+    await act(async () => {
+      reject({ response: { status: 403 } });
+      await Promise.resolve();
+    });
+    await flushHistory(newestChat);
+
+    expect(historyParams[1]).toEqual({ workflow_permanent_id: "wpid_1" });
+    await waitFor(() =>
+      expect(screen.getByText("message in newest chat")).toBeTruthy(),
+    );
+    await waitFor(() => expect(strippedSearches()).toEqual([""]));
+  });
+
+  it.each([
+    [
+      "another workflow's chat",
+      { workflow_copilot_chat_id: "chat_c", workflow_permanent_id: "wpid_2" },
+    ],
+    [
+      "an unknown chat",
+      { workflow_copilot_chat_id: null, workflow_permanent_id: null },
+    ],
+    ["a reply without the workflow", { workflow_copilot_chat_id: "chat_c" }],
+  ])("falls back to the newest chat for %s", async (_label, reply) => {
+    routeSearch.current = "?chat=chat_c";
+    await renderChat({ docked: true });
+    await flushHistory(
+      historyData({
+        ...reply,
+        chat_history: [userRow("message in rejected chat")],
+        proposed_workflow: { workflow_id: "wf_p", _copilot_unvalidated: true },
+      }),
+    );
+    await flushHistory(newestChat);
+
+    expect(historyParams).toEqual([
+      { workflow_permanent_id: "wpid_1", workflow_copilot_chat_id: "chat_c" },
+      { workflow_permanent_id: "wpid_1" },
+    ]);
+    await waitFor(() =>
+      expect(screen.getByText("message in newest chat")).toBeTruthy(),
+    );
+    expect(screen.queryByText("message in rejected chat")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Accept" })).toBeNull();
+    await waitFor(() => expect(strippedSearches()).toEqual([""]));
+  });
+
+  it("lets a stored pending Accept decide the chat over chat=", async () => {
+    routeSearch.current = "?chat=chat_a";
+    storePendingAccept("wpid_1", {
+      chatId: "chat_stored",
+      acceptAttempt: {
+        owner_turn_id: "turn-1",
+        revision: 1,
+        disposition: "review_untested",
+      },
+      alwaysAccept: false,
+    });
+    await renderChat({ docked: true });
+    await flushHistory(
+      historyData({
+        workflow_copilot_chat_id: "chat_stored",
+        workflow_permanent_id: "wpid_1",
+      }),
+    );
+
+    expect(historyParams[0]).toEqual({
+      workflow_permanent_id: "wpid_1",
+      workflow_copilot_chat_id: "chat_stored",
+    });
+  });
+
+  it("ignores chat= outside the Studio", async () => {
+    routeSearch.current = "?chat=chat_a";
+    await renderChat();
+    await flushHistory(newestChat);
+
+    expect(historyParams).toEqual([{ workflow_permanent_id: "wpid_1" }]);
+    expect(strippedSearches()).toEqual([]);
+  });
+
+  it("drops the link when the route moves to another workflow before the read lands", async () => {
+    routeSearch.current = "?chat=chat_a";
+    const handle = await renderChat({ docked: true });
+    await waitFor(() => expect(historyQueue).toHaveLength(1));
+
+    routeWpid.current = "wpid_2";
+    await act(async () => {
+      handle.rerender(chatUi({ docked: true }));
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(historyParams).toHaveLength(2));
+
+    expect(historyParams[1]).toEqual({ workflow_permanent_id: "wpid_2" });
+  });
+
+  it("strips chat= once and leaves a later, different link alone", async () => {
+    routeSearch.current = "?chat=chat_a";
+    const handle = await renderChat({ docked: true });
+    await flushHistory(
+      historyData({
+        workflow_copilot_chat_id: "chat_a",
+        workflow_permanent_id: "wpid_1",
+      }),
+    );
+    await waitFor(() => expect(strippedSearches()).toEqual([""]));
+
+    routeSearch.current = "?chat=chat_z";
+    await act(async () => {
+      handle.rerender(chatUi({ docked: true }));
+      await Promise.resolve();
+    });
+
+    expect(strippedSearches()).toEqual([""]);
+    expect(historyParams).toHaveLength(1);
+  });
+
+  it("shows nothing from a rejected reply before the fallback lands", async () => {
+    routeSearch.current = "?chat=chat_c";
+    await renderChat({ docked: true });
+    await flushHistory(
+      historyData({
+        workflow_copilot_chat_id: "chat_c",
+        workflow_permanent_id: "wpid_2",
+        chat_history: [userRow("message in rejected chat")],
+      }),
+    );
+    await waitFor(() => expect(historyParams).toHaveLength(2));
+
+    expect(screen.queryByText("message in rejected chat")).toBeNull();
+    expect(useEmberHeaderStore.getState().controls?.currentChatId).toBeNull();
+  });
+
+  it("drops the fallback reply when the workflow changes during it", async () => {
+    routeSearch.current = "?chat=chat_c";
+    const portalTarget = document.createElement("div");
+    document.body.appendChild(portalTarget);
+    portalTargets.push(portalTarget);
+    const handle = render(chatUi({ docked: true, portalTarget }));
+    await flushHistory(
+      historyData({
+        workflow_copilot_chat_id: "chat_c",
+        workflow_permanent_id: "wpid_2",
+      }),
+    );
+    await waitFor(() => expect(historyParams).toHaveLength(2));
+    routeWpid.current = "wpid_2";
+    await act(async () => {
+      handle.rerender(chatUi({ docked: true, portalTarget }));
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(historyParams).toHaveLength(3));
+    await flushHistory(
+      historyData({
+        workflow_copilot_chat_id: "chat_b",
+        workflow_permanent_id: "wpid_1",
+        chat_history: [userRow("stale wpid_1 newest")],
+      }),
+    );
+
+    expect(screen.queryByText("stale wpid_1 newest")).toBeNull();
   });
 });

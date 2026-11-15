@@ -238,6 +238,7 @@ import { WorkPlanCard } from "./cards/WorkPlanCard";
 import { nextAnsweringMessage, previousAskingMessage } from "./cardAdjacency";
 import { composerPlaceholder } from "./composerPlaceholder";
 import {
+  CredentialRecoveryHistoryError,
   ensureCredentialRecoveryToken,
   readCredentialRecoveryHistory as readCredentialRecoveryHistoryRequest,
   type CredentialRecoveryHistoryResponse,
@@ -300,6 +301,10 @@ import {
   liveLocationState,
   liveSearch,
 } from "@/routes/workflows/studio/liveSearch";
+import {
+  STUDIO_CHAT_PARAM,
+  toReadableSearch,
+} from "@/routes/workflows/studio/panes";
 import { useStudioPanes } from "@/routes/workflows/studio/useStudioPanes";
 import { useStudioPaneDefaults } from "@/routes/workflows/studio/StudioPaneDefaultsContext";
 import {
@@ -2852,6 +2857,27 @@ export function EmberChat({
   const releaseEmberBrowser = useCallback(() => {
     if (docked) replaceStudioSearch(searchWithEmberBrowserReleased);
   }, [docked, replaceStudioSearch]);
+  const [initialChatLink] = useState(() => {
+    const chatId = docked
+      ? new URLSearchParams(liveSearch(location.search)).get(STUDIO_CHAT_PARAM)
+      : null;
+    return chatId && workflowPermanentId
+      ? { workflowPermanentId, chatId }
+      : null;
+  });
+  // Seeds only the first history read of the workflow it arrived with.
+  const chatLinkRef = useRef(initialChatLink);
+  const [consumedChatLink, setConsumedChatLink] = useState<string | null>(null);
+  useEffect(() => {
+    if (consumedChatLink === null) return;
+    replaceStudioSearch((search) => {
+      const params = new URLSearchParams(search);
+      if (params.get(STUDIO_CHAT_PARAM) !== consumedChatLink) return search;
+      params.delete(STUDIO_CHAT_PARAM);
+      return toReadableSearch(params);
+    });
+    setConsumedChatLink(null);
+  }, [consumedChatLink, replaceStudioSearch]);
   const recoverCredentialTurn = useRef<
     (chatId: string, turnId: string) => boolean
   >(() => false);
@@ -6860,6 +6886,8 @@ export function EmberChat({
     // writing fresh empty arrays on first mount can restart this async effect
     // before its history request records completion.
     stopRecoveryPolls();
+    if (chatLinkRef.current?.workflowPermanentId !== workflowPermanentId)
+      chatLinkRef.current = null;
     const stored = readStoredAccept(workflowPermanentId);
     const parked =
       useWorkflowYamlEditorStore.getState().pendingAccepts[workflowPermanentId];
@@ -6901,31 +6929,54 @@ export function EmberChat({
       repin();
       // A later navigation must not restore the old chat's auto-accept setting.
       const navEpochAtStart = chatNavEpochRef.current;
+      const chatLink = chatLinkRef.current;
+      const linkedChatId = parked || stored ? null : chatLink?.chatId;
       try {
         const client = await getClient(credentialGetter, "sans-api-v1");
-        const response =
-          await readCredentialRecoveryHistory<EmberChatHistoryResponse>(
+        const readHistory = (chatId: string | null | undefined) =>
+          readCredentialRecoveryHistory<EmberChatHistoryResponse>(
             client,
             workflowPermanentId,
             {
               params: {
                 workflow_permanent_id: workflowPermanentId,
-                ...(parked || stored
-                  ? {
-                      workflow_copilot_chat_id:
-                        parked?.snapshot.chatId ?? stored?.chatId,
-                    }
-                  : {}),
+                ...(chatId ? { workflow_copilot_chat_id: chatId } : {}),
               },
             },
             { retryTransientFailure: true },
           );
+        const first = await readHistory(
+          parked?.snapshot.chatId ?? stored?.chatId ?? linkedChatId,
+        ).catch((error: unknown) => {
+          // The folder guard answers 403 for a linked chat the user cannot read.
+          if (
+            linkedChatId &&
+            error instanceof CredentialRecoveryHistoryError &&
+            (error.status === 403 || error.status === 404)
+          )
+            return null;
+          throw error;
+        });
 
+        if (!isMounted || chatNavEpochRef.current !== navEpochAtStart) return;
+
+        // The server looks a chat id up across the whole org, so a linked chat
+        // is kept only when the reply names this workflow.
+        const keepFirst =
+          first !== null &&
+          (!linkedChatId ||
+            (Boolean(emberChatIdOf(first.data)) &&
+              first.data.workflow_permanent_id === workflowPermanentId));
+        const response = keepFirst ? first : await readHistory(null);
         if (!isMounted || chatNavEpochRef.current !== navEpochAtStart) return;
 
         applyHistoryResponse(response.data);
         adoptRecoveredTurns(response.data, response.hadCredentialRecoveryToken);
         historyLoadedForRef.current = workflowPermanentId;
+        if (chatLink) {
+          chatLinkRef.current = null;
+          setConsumedChatLink(chatLink.chatId);
+        }
         if (!deferredStartupClaim.current)
           setStartupReadyFor(workflowPermanentId);
       } catch (error) {
