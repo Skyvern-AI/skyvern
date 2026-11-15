@@ -57,6 +57,7 @@ async def test_taskv2_block_uses_pre_run_loop_state_for_download_filtering(
     outer_workflow_run = SimpleNamespace(
         proxy_location=None,
         max_screenshot_scrolls=None,
+        max_scrape_screenshots=None,
         browser_address=None,
         extra_http_headers=None,
         cdp_connect_headers=None,

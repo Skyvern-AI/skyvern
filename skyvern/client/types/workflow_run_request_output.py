@@ -89,6 +89,8 @@ class WorkflowRunRequestOutput(UniversalBaseModel):
     ID of a browser profile to reuse for this workflow run
     """
 
+    max_scrape_screenshots: typing.Optional[int] = None
+
     max_screenshot_scrolls: typing.Optional[int] = pydantic.Field(default=None)
     """
     The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.

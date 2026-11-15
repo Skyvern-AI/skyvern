@@ -37,6 +37,8 @@ export interface TaskRunResponse {
     browser_profile_id?: string;
     /** The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot */
     max_screenshot_scrolls?: number;
+    /** Maximum screenshots per scrape; omitted uses the server default. */
+    max_scrape_screenshots?: number;
     /** The script run result */
     script_run?: Skyvern.ScriptRunResponse;
     /** The errors for the run */

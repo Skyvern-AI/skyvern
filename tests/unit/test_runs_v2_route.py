@@ -786,6 +786,7 @@ async def test_retry_workflow_run_preserves_recipe_trigger_and_derives_ordinary_
         start_fresh_browser=None,
         reuse_browser_session=None,
         max_screenshot_scrolls=3,
+        max_scrape_screenshots=2,
         max_elapsed_time_minutes=None,
         extra_http_headers={"X-Test": "1"},
         cdp_connect_headers={"X-CDP-Auth": "secret"},
@@ -911,6 +912,7 @@ async def test_retry_workflow_run_preserves_recipe_trigger_and_derives_ordinary_
     assert call_kwargs["workflow_request"].browser_session_id == "pbs_123"
     assert call_kwargs["workflow_request"].browser_profile_id == "bprof_123"
     assert call_kwargs["workflow_request"].max_screenshot_scrolls == 3
+    assert call_kwargs["workflow_request"].max_scrape_screenshots == 2
     assert call_kwargs["workflow_request"].extra_http_headers == {"X-Test": "1"}
     assert call_kwargs["workflow_request"].cdp_connect_headers == {"X-CDP-Auth": "secret"}
     assert call_kwargs["workflow_request"].browser_address == "http://127.0.0.1:9222"
@@ -993,6 +995,7 @@ async def test_retry_workflow_run_replays_template_runs_as_templates(monkeypatch
         start_fresh_browser=None,
         reuse_browser_session=None,
         max_screenshot_scrolls=None,
+        max_scrape_screenshots=None,
         max_elapsed_time_minutes=None,
         extra_http_headers=None,
         cdp_connect_headers=None,

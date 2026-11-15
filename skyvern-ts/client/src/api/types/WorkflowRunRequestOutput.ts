@@ -62,6 +62,8 @@ export interface WorkflowRunRequestOutput {
     browser_profile_id?: string;
     /** The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot. */
     max_screenshot_scrolls?: number;
+    /** Maximum screenshots per scrape; omitted uses the server default. */
+    max_scrape_screenshots?: number;
     /** Timeout this workflow run after the configured elapsed runtime in minutes. When omitted, the platform default is 240 minutes. The maximum configurable value is 480 minutes. */
     max_elapsed_time_minutes?: number;
     /** The extra HTTP headers for the requests in browser. */

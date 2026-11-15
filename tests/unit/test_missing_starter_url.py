@@ -128,6 +128,7 @@ def _workflow_run_for_create_task() -> SimpleNamespace:
         organization_id="o_test",
         proxy_location=None,
         max_screenshot_scrolls=None,
+        max_scrape_screenshots=None,
         extra_http_headers=None,
         cdp_connect_headers=None,
         browser_address=None,

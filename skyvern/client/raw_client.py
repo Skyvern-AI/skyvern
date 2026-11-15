@@ -109,6 +109,7 @@ class RawSkyvern:
         publish_workflow: typing.Optional[bool] = OMIT,
         include_action_history_in_verification: typing.Optional[bool] = OMIT,
         max_screenshot_scrolls: typing.Optional[int] = OMIT,
+        max_scrape_screenshots: typing.Optional[int] = OMIT,
         browser_address: typing.Optional[str] = OMIT,
         run_with: typing.Optional[str] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
@@ -216,6 +217,9 @@ class RawSkyvern:
         include_action_history_in_verification : typing.Optional[bool]
             Whether to include action history when verifying that the task is complete
 
+        max_scrape_screenshots : typing.Optional[int]
+            Maximum screenshots per scrape for this run. Omit to use the server default.
+
         max_screenshot_scrolls : typing.Optional[int]
             The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.
 
@@ -261,6 +265,7 @@ class RawSkyvern:
                 "publish_workflow": publish_workflow,
                 "include_action_history_in_verification": include_action_history_in_verification,
                 "max_screenshot_scrolls": max_screenshot_scrolls,
+                "max_scrape_screenshots": max_scrape_screenshots,
                 "browser_address": browser_address,
                 "run_with": run_with,
             },
@@ -324,6 +329,7 @@ class RawSkyvern:
         browser_session_id: typing.Optional[str] = OMIT,
         browser_profile_id: typing.Optional[str] = OMIT,
         max_screenshot_scrolls: typing.Optional[int] = OMIT,
+        max_scrape_screenshots: typing.Optional[int] = OMIT,
         max_elapsed_time_minutes: typing.Optional[int] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         cdp_connect_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
@@ -407,6 +413,9 @@ class RawSkyvern:
         browser_profile_id : typing.Optional[str]
             ID of a browser profile to reuse for this workflow run
 
+        max_scrape_screenshots : typing.Optional[int]
+            Maximum screenshots per scrape for this run. Omit to use the server default.
+
         max_screenshot_scrolls : typing.Optional[int]
             The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.
 
@@ -458,6 +467,7 @@ class RawSkyvern:
                 "browser_session_id": browser_session_id,
                 "browser_profile_id": browser_profile_id,
                 "max_screenshot_scrolls": max_screenshot_scrolls,
+                "max_scrape_screenshots": max_scrape_screenshots,
                 "max_elapsed_time_minutes": max_elapsed_time_minutes,
                 "extra_http_headers": extra_http_headers,
                 "cdp_connect_headers": cdp_connect_headers,
@@ -5811,6 +5821,7 @@ class AsyncRawSkyvern:
         publish_workflow: typing.Optional[bool] = OMIT,
         include_action_history_in_verification: typing.Optional[bool] = OMIT,
         max_screenshot_scrolls: typing.Optional[int] = OMIT,
+        max_scrape_screenshots: typing.Optional[int] = OMIT,
         browser_address: typing.Optional[str] = OMIT,
         run_with: typing.Optional[str] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
@@ -5918,6 +5929,9 @@ class AsyncRawSkyvern:
         include_action_history_in_verification : typing.Optional[bool]
             Whether to include action history when verifying that the task is complete
 
+        max_scrape_screenshots : typing.Optional[int]
+            Maximum screenshots per scrape for this run. Omit to use the server default.
+
         max_screenshot_scrolls : typing.Optional[int]
             The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.
 
@@ -5963,6 +5977,7 @@ class AsyncRawSkyvern:
                 "publish_workflow": publish_workflow,
                 "include_action_history_in_verification": include_action_history_in_verification,
                 "max_screenshot_scrolls": max_screenshot_scrolls,
+                "max_scrape_screenshots": max_scrape_screenshots,
                 "browser_address": browser_address,
                 "run_with": run_with,
             },
@@ -6026,6 +6041,7 @@ class AsyncRawSkyvern:
         browser_session_id: typing.Optional[str] = OMIT,
         browser_profile_id: typing.Optional[str] = OMIT,
         max_screenshot_scrolls: typing.Optional[int] = OMIT,
+        max_scrape_screenshots: typing.Optional[int] = OMIT,
         max_elapsed_time_minutes: typing.Optional[int] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         cdp_connect_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
@@ -6109,6 +6125,9 @@ class AsyncRawSkyvern:
         browser_profile_id : typing.Optional[str]
             ID of a browser profile to reuse for this workflow run
 
+        max_scrape_screenshots : typing.Optional[int]
+            Maximum screenshots per scrape for this run. Omit to use the server default.
+
         max_screenshot_scrolls : typing.Optional[int]
             The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.
 
@@ -6160,6 +6179,7 @@ class AsyncRawSkyvern:
                 "browser_session_id": browser_session_id,
                 "browser_profile_id": browser_profile_id,
                 "max_screenshot_scrolls": max_screenshot_scrolls,
+                "max_scrape_screenshots": max_scrape_screenshots,
                 "max_elapsed_time_minutes": max_elapsed_time_minutes,
                 "extra_http_headers": extra_http_headers,
                 "cdp_connect_headers": cdp_connect_headers,

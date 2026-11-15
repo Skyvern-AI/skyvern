@@ -400,6 +400,7 @@ async def test_create_workflow_run_non_force_path_single_create_no_update(monkey
         totp_identifier=request.totp_identifier,
         parent_workflow_run_id=None,
         max_screenshot_scrolling_times=request.max_screenshot_scrolls,
+        max_scrape_screenshots=request.max_scrape_screenshots,
         max_elapsed_time_minutes=None,
         extra_http_headers=request.extra_http_headers,
         cdp_connect_headers=request.cdp_connect_headers,

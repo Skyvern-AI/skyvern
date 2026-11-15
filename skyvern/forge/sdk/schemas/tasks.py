@@ -19,7 +19,7 @@ from skyvern.forge.sdk.api.llm.custom_llm_registry import is_custom_llm_model_na
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.settings_manager import SettingsManager
-from skyvern.forge.sdk.workflow.models.run_limits import MaxScreenshotScrolls
+from skyvern.forge.sdk.workflow.models.run_limits import MaxScrapeScreenshots, MaxScreenshotScrolls
 from skyvern.schemas.docs.doc_strings import PROXY_LOCATION_DOC_STRING
 from skyvern.schemas.runs import ProxyLocationInput, _validate_browser_address
 from skyvern.utils.prompt_truncation import EXTRACTION_GOAL_MAX_TOKENS
@@ -122,6 +122,7 @@ class TaskBase(BaseModel):
         description="Whether to include the action history when verifying the task is complete",
         examples=[True, False],
     )
+    max_scrape_screenshots: MaxScrapeScreenshots = None
     max_screenshot_scrolls: MaxScreenshotScrolls = Field(
         default=None,
         description="The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.",
@@ -425,6 +426,7 @@ class Task(TaskBase):
             max_steps_per_run=self.max_steps_per_run,
             workflow_run_id=self.workflow_run_id,
             max_screenshot_scrolls=self.max_screenshot_scrolls,
+            max_scrape_screenshots=self.max_scrape_screenshots,
             step_count=step_count,
             browser_session_id=self.browser_session_id,
         )
@@ -453,6 +455,7 @@ class TaskResponse(BaseModel):
     queued_at: datetime | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
+    max_scrape_screenshots: MaxScrapeScreenshots = None
     max_screenshot_scrolls: int | None = None
     step_count: int | None = None
     browser_session_id: str | None = None

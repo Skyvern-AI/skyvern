@@ -60,6 +60,7 @@ async def test_taskv2_block_forwards_browser_connection_fields_to_child(
     outer_workflow_run = SimpleNamespace(
         proxy_location=None,
         max_screenshot_scrolls=None,
+        max_scrape_screenshots=2,
         browser_address=browser_address,
         extra_http_headers={"x-api-key": "sk-test"},
         cdp_connect_headers={"x-cdp-auth": "tok"},
@@ -151,6 +152,7 @@ async def test_taskv2_block_forwards_browser_connection_fields_to_child(
     )
 
     assert init_mock.await_count == 1
+    assert init_mock.await_args.kwargs["max_scrape_screenshots"] == 2
     kwargs = init_mock.await_args.kwargs
     assert kwargs["browser_address"] == browser_address
     assert "browser_session_id" not in kwargs
@@ -187,6 +189,7 @@ async def test_taskv2_block_settles_the_child_capture_when_the_runner_raises(
                     return_value=SimpleNamespace(
                         proxy_location=None,
                         max_screenshot_scrolls=None,
+                        max_scrape_screenshots=None,
                         browser_address=None,
                         extra_http_headers=None,
                         cdp_connect_headers=None,
@@ -268,6 +271,7 @@ async def test_taskv2_block_reports_a_child_browser_loss_from_the_child_run_entr
     workflow_run = SimpleNamespace(
         proxy_location=None,
         max_screenshot_scrolls=None,
+        max_scrape_screenshots=None,
         browser_address=None,
         extra_http_headers=None,
         cdp_connect_headers=None,
@@ -369,6 +373,7 @@ def _nested_rows(
         parent_workflow_run_id=None,
         proxy_location=None,
         max_screenshot_scrolls=None,
+        max_scrape_screenshots=None,
         browser_address=None,
         extra_http_headers=None,
         cdp_connect_headers=None,
@@ -451,6 +456,7 @@ def _nested_rows(
             model=None,
             webhook_callback_url=None,
             max_screenshot_scrolls=None,
+            max_scrape_screenshots=None,
             output=None,
             summary=None,
             failure_category=None,

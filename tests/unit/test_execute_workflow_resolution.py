@@ -70,6 +70,7 @@ async def test_execute_workflow_canceled_run_skips_resolution(monkeypatch: pytes
     monkeypatch.setattr(service, "get_workflow_run", AsyncMock(return_value=workflow_run))
     get_workflow = AsyncMock(side_effect=AssertionError("must not resolve a canceled run's workflow"))
     monkeypatch.setattr(service, "get_workflow_by_workflow_run_id", get_workflow)
+    monkeypatch.setattr(service_module.skyvern_context, "current", lambda: None)
 
     organization = SimpleNamespace(organization_id="o_1")
     result = await service.execute_workflow(

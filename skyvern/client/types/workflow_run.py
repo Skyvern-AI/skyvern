@@ -31,6 +31,8 @@ class WorkflowRun(UniversalBaseModel):
     failure_category: typing.Optional[typing.List[typing.Dict[str, typing.Optional[typing.Any]]]] = None
     parent_workflow_run_id: typing.Optional[str] = None
     workflow_title: typing.Optional[str] = None
+    max_scrape_screenshots: typing.Optional[int] = None
+
     max_screenshot_scrolls: typing.Optional[int] = None
     max_elapsed_time_minutes: typing.Optional[int] = None
     browser_address: typing.Optional[str] = None

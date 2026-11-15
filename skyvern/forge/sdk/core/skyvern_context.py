@@ -855,6 +855,7 @@ class SkyvernContext:
     empty_page_recovery_attempts: dict[str, int] = field(default_factory=dict)
     frame_index_map: dict[Frame, int] = field(default_factory=dict)
     dropped_css_svg_element_map: dict[str, bool] = field(default_factory=dict)
+    max_scrape_screenshots: int | None = None
     max_screenshot_scrolls: int | None = None
     browser_container_ip: str | None = None
     browser_container_task_arn: str | None = None

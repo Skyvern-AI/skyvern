@@ -70,6 +70,7 @@ def workflow_request_body_from_existing_run(
             "start_fresh_browser": bool(workflow_run.start_fresh_browser),
             "reuse_browser_session": workflow_run.reuse_browser_session,
             "max_screenshot_scrolls": workflow_run.max_screenshot_scrolls,
+            "max_scrape_screenshots": workflow_run.max_scrape_screenshots,
             "max_elapsed_time_minutes": workflow_run.max_elapsed_time_minutes,
             "extra_http_headers": workflow_run.extra_http_headers,
             "cdp_connect_headers": workflow_run.cdp_connect_headers,
@@ -523,6 +524,7 @@ async def get_workflow_run_response(
         browser_seed_source=workflow_run.browser_seed_source,
         browser_settings_receipt=workflow_run.browser_settings_receipt,
         max_screenshot_scrolls=workflow_run.max_screenshot_scrolls,
+        max_scrape_screenshots=workflow_run.max_scrape_screenshots,
         script_run=workflow_run.script_run,
         script_id=workflow_run.script_run.script_id if workflow_run.script_run else None,
         run_request=WorkflowRunRequest.model_validate(
@@ -535,6 +537,7 @@ async def get_workflow_run_response(
                 "totp_url": workflow_run.totp_verification_url or None,
                 "totp_identifier": workflow_run.totp_identifier,
                 "max_screenshot_scrolls": workflow_run.max_screenshot_scrolls,
+                "max_scrape_screenshots": workflow_run.max_scrape_screenshots,
                 "browser_address": workflow_run.browser_address if echo_attachment else None,
                 "browser_profile_id": None if fresh_browser else workflow_run.browser_profile_id,
                 "browser_session_id": workflow_run.browser_session_id

@@ -210,6 +210,7 @@ async def test_first_iteration_goto_url_has_no_completion_criterion(
         url="https://example.test",
         workflow_run_id="workflow_run_test",
         max_screenshot_scrolls=None,
+        max_scrape_screenshots=1,
         proxy_location=None,
     )
     queued_run = SimpleNamespace(
@@ -325,6 +326,7 @@ async def test_first_iteration_goto_url_has_no_completion_criterion(
     )
 
     assert result == (workflow, running_run, task_v2)
+    assert context.max_scrape_screenshots == 1
     request = persisted_requests[-1]
     assert request.extra_http_headers == {"X-Request": "synthetic-http"}
     assert request.cdp_connect_headers == {"X-Request-CDP": "synthetic-cdp"}
@@ -345,6 +347,7 @@ async def test_missing_task_type_failure_finalizes_with_organization_scope(
         url="https://example.test",
         workflow_run_id="workflow_run_test",
         max_screenshot_scrolls=None,
+        max_scrape_screenshots=1,
         proxy_location=None,
         workflow_system_prompt=None,
         started_at=now,
@@ -438,6 +441,7 @@ async def test_missing_task_type_failure_finalizes_with_organization_scope(
     )
 
     assert result == (workflow, running_run, task_v2)
+    assert context.max_scrape_screenshots == 1
     assert task_v2.status == TaskV2Status.failed
     failed_update = next(
         call for call in observer.update_task_v2.await_args_list if call.kwargs.get("status") == TaskV2Status.failed

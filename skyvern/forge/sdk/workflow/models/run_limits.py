@@ -1,6 +1,6 @@
 from typing import Annotated
 
-from pydantic import AfterValidator
+from pydantic import AfterValidator, Field
 
 from skyvern.constants import MAX_SCREENSHOT_SCROLLS
 
@@ -24,6 +24,20 @@ def clamp_max_screenshot_scrolls(value: int | None) -> int | None:
 
 
 MaxScreenshotScrolls = Annotated[int | None, AfterValidator(clamp_max_screenshot_scrolls)]
+
+MaxScrapeScreenshots = Annotated[
+    int | None,
+    Field(
+        strict=True,
+        gt=0,
+        le=2_147_483_647,
+        description=(
+            "Maximum screenshots per scrape for this run, including extraction refreshes. "
+            "Omit to use MAX_NUM_SCREENSHOTS. Cannot increase the server or engine limit. "
+            "Does not affect post-action or final screenshots."
+        ),
+    ),
+]
 
 
 def reject_bool_max_elapsed_time_minutes(max_elapsed_time_minutes: object) -> object:

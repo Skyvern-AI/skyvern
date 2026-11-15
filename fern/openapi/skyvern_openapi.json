@@ -26065,6 +26065,21 @@
                 "file_123456789"
               ]
             ]
+          },
+          "max_scrape_screenshots": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 2147483647.0,
+                "exclusiveMinimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Scrape Screenshots",
+            "description": "Maximum screenshots per scrape for this run, including extraction refreshes. Omit to use MAX_NUM_SCREENSHOTS. Cannot increase the server or engine limit. Does not affect post-action or final screenshots.",
+            "default": null
           }
         },
         "type": "object",
@@ -26406,6 +26421,21 @@
                 "file_123456789"
               ]
             ]
+          },
+          "max_scrape_screenshots": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 2147483647.0,
+                "exclusiveMinimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Scrape Screenshots",
+            "description": "Maximum screenshots per scrape for this run, including extraction refreshes. Omit to use MAX_NUM_SCREENSHOTS. Cannot increase the server or engine limit. Does not affect post-action or final screenshots.",
+            "default": null
           }
         },
         "type": "object",
@@ -26698,6 +26728,21 @@
               }
             ],
             "description": "The original request parameters used to start this task run"
+          },
+          "max_scrape_screenshots": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 2147483647.0,
+                "exclusiveMinimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Scrape Screenshots",
+            "description": "Maximum screenshots per scrape for this run, including extraction refreshes. Omit to use MAX_NUM_SCREENSHOTS. Cannot increase the server or engine limit. Does not affect post-action or final screenshots.",
+            "default": null
           }
         },
         "type": "object",
@@ -32112,6 +32157,21 @@
             "type": "string",
             "format": "date-time",
             "title": "Modified At"
+          },
+          "max_scrape_screenshots": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 2147483647.0,
+                "exclusiveMinimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Scrape Screenshots",
+            "description": "Maximum screenshots per scrape for this run, including extraction refreshes. Omit to use MAX_NUM_SCREENSHOTS. Cannot increase the server or engine limit. Does not affect post-action or final screenshots.",
+            "default": null
           }
         },
         "type": "object",
@@ -33045,6 +33105,21 @@
                 "file_123456789"
               ]
             ]
+          },
+          "max_scrape_screenshots": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 2147483647.0,
+                "exclusiveMinimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Scrape Screenshots",
+            "description": "Maximum screenshots per scrape for this run, including extraction refreshes. Omit to use MAX_NUM_SCREENSHOTS. Cannot increase the server or engine limit. Does not affect post-action or final screenshots.",
+            "default": null
           }
         },
         "type": "object",
@@ -33344,6 +33419,21 @@
                 "file_123456789"
               ]
             ]
+          },
+          "max_scrape_screenshots": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 2147483647.0,
+                "exclusiveMinimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Scrape Screenshots",
+            "description": "Maximum screenshots per scrape for this run, including extraction refreshes. Omit to use MAX_NUM_SCREENSHOTS. Cannot increase the server or engine limit. Does not affect post-action or final screenshots.",
+            "default": null
           }
         },
         "type": "object",
@@ -33723,6 +33813,21 @@
               }
             ],
             "description": "The original request parameters used to start this workflow run"
+          },
+          "max_scrape_screenshots": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 2147483647.0,
+                "exclusiveMinimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Scrape Screenshots",
+            "description": "Maximum screenshots per scrape for this run, including extraction refreshes. Omit to use MAX_NUM_SCREENSHOTS. Cannot increase the server or engine limit. Does not affect post-action or final screenshots.",
+            "default": null
           }
         },
         "type": "object",
