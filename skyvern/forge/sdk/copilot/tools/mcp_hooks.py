@@ -667,6 +667,7 @@ _FOR_LOOP_GUIDANCE = "\n".join(
             "{{ current_value }} (also {{ current_item }}) is the current item and {{ current_index }} its position."
         ),
         "- complete_if_empty: true completes the loop successfully when the list is empty.",
+        "- A for_loop runs its items one after another in the run's one browser, within the run's time limit.",
         "",
         "Example - loop over a parser's rows (the parser's output is the list):",
         yaml.safe_dump(_FOR_LOOP_EXAMPLE, sort_keys=False).rstrip(),

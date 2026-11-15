@@ -33,7 +33,12 @@ from pydantic import JsonValue
 from skyvern.forge.sdk.agents.context import compact_agent_messages_for_llm, get_agent_message_field
 from skyvern.forge.sdk.agents.skills import LOAD_SKILL_TOOL_NAME
 from skyvern.forge.sdk.copilot import streaming_adapter
-from skyvern.forge.sdk.copilot.ask_user import ACCOUNT_GROUP_SUBMIT_TOOL_NAME, ASK_USER_TOOL_NAME, SINGLE_RUN_TOOL_NAME
+from skyvern.forge.sdk.copilot.ask_user import (
+    ACCOUNT_GROUP_SUBMIT_TOOL_NAME,
+    ASK_USER_TOOL_NAME,
+    INPUT_GROUP_TOOL_NAME,
+    SINGLE_RUN_TOOL_NAME,
+)
 from skyvern.forge.sdk.copilot.budget_expiry import (
     BudgetExpiredReplyObservation,
     BudgetExpirySource,
@@ -170,7 +175,7 @@ ToolT = TypeVar("ToolT", bound=Tool)
 BUDGET_DRAIN_EXCLUDED_TOOLS = (
     WORKFLOW_MUTATION_TOOLS
     | BLOCK_RUNNING_TOOLS
-    | {ACCOUNT_GROUP_SUBMIT_TOOL_NAME, SINGLE_RUN_TOOL_NAME, CREATE_WEBHOOK_TRIGGER_TOOL_NAME}
+    | {ACCOUNT_GROUP_SUBMIT_TOOL_NAME, INPUT_GROUP_TOOL_NAME, SINGLE_RUN_TOOL_NAME, CREATE_WEBHOOK_TRIGGER_TOOL_NAME}
 )
 HARD_BACKSTOP_ALLOWANCE_SECONDS = 90
 # A turn whose budget is already spent may have no backstop time left for its one final reply, so

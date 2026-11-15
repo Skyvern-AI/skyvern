@@ -29,6 +29,7 @@ from skyvern.forge.sdk.copilot.ask_user import (
     ACCOUNT_GROUP_STATUS_TOOL_NAME,
     ACCOUNT_GROUP_SUBMIT_TOOL_NAME,
     CREDENTIAL_DELETE_TOOL_NAME,
+    INPUT_GROUP_TOOL_NAME,
     SINGLE_RUN_TOOL_NAME,
     AskUserArguments,
     QuestionInput,
@@ -93,6 +94,7 @@ from skyvern.forge.sdk.copilot.screenshot_utils import (
 )
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.tools.account_groups import (
+    INPUT_GROUP_TOOL_DESCRIPTION,
     SINGLE_RUN_TOOL_DESCRIPTION,
 )
 from skyvern.forge.sdk.copilot.tools.account_groups import (
@@ -103,6 +105,7 @@ from skyvern.forge.sdk.copilot.tools.account_groups import (
     account_group_submit_enabled,
     cancel_account_group,
     run_for_accounts,
+    run_for_inputs,
     run_saved_workflow,
     single_run_submit_enabled,
 )
@@ -1214,6 +1217,26 @@ async def run_workflow_for_accounts_tool(
 
 @function_tool(
     failure_error_function=copilot_tool_failure,
+    name_override=INPUT_GROUP_TOOL_NAME,
+    description_override=INPUT_GROUP_TOOL_DESCRIPTION,
+    strict_mode=False,
+)
+async def run_workflow_for_inputs_tool(
+    ctx: ToolContext[CopilotContext], rows: list[dict[str, JsonValue]], at_once: int, action_summary: str
+) -> str:
+    authority_error = _authority_tool_error(ctx.context, INPUT_GROUP_TOOL_NAME)
+    if authority_error is not None:
+        return json.dumps({"ok": False, "dispatched": False, "error": authority_error})
+    result = await run_for_inputs(
+        ctx.context, tool_call_id=ctx.tool_call_id, rows=rows, at_once=at_once, action_summary=action_summary
+    )
+    return result.model_dump_json(
+        exclude_none=True, exclude={"repeated_after_prior_effect": {"__all__": {"identity", "inputs"}}}
+    )
+
+
+@function_tool(
+    failure_error_function=copilot_tool_failure,
     name_override=SINGLE_RUN_TOOL_NAME,
     description_override=SINGLE_RUN_TOOL_DESCRIPTION,
     strict_mode=False,
@@ -1231,16 +1254,21 @@ async def run_saved_workflow_tool(
 
 
 @function_tool(failure_error_function=copilot_tool_failure, name_override=ACCOUNT_GROUP_STATUS_TOOL_NAME)
-async def get_account_group_status_tool(ctx: ToolContext[CopilotContext], workflow_run_group_id: str) -> str:
-    """Read each account's run id, status and outcome for a group started by run_workflow_for_accounts.
-    A failed outcome means the run stopped before it could have acted; unknown means it may have acted."""
-    return (await account_group_status(ctx.context, workflow_run_group_id)).model_dump_json(exclude_none=True)
+async def get_account_group_status_tool(
+    ctx: ToolContext[CopilotContext], workflow_run_group_id: str, offset: int = 0
+) -> str:
+    """Read each run's id, status and outcome for a group started by run_workflow_for_accounts or
+    run_workflow_for_inputs, 25 rows per page in submission order, with counts by outcome for the whole group; pass
+    next_offset as offset for the next page. A failed outcome means the run stopped before it could have acted;
+    unknown means it may have acted."""
+    return (await account_group_status(ctx.context, workflow_run_group_id, offset)).model_dump_json(exclude_none=True)
 
 
 @function_tool(failure_error_function=copilot_tool_failure, name_override=ACCOUNT_GROUP_CANCEL_TOOL_NAME)
 async def cancel_account_group_tool(ctx: ToolContext[CopilotContext], workflow_run_group_id: str) -> str:
-    """Ask the user to stop every unfinished run of a group this chat started with run_workflow_for_accounts.
-    Nothing is canceled unless the user approves; returns every row's status and whether they approved."""
+    """Ask the user to stop every unfinished run of a group this chat started with run_workflow_for_accounts or
+    run_workflow_for_inputs. Nothing is canceled unless the user approves; returns the group's status, shaped as
+    get_account_group_status returns it, and whether they approved."""
     result = await cancel_account_group(
         ctx.context, tool_call_id=ctx.tool_call_id, workflow_run_group_id=workflow_run_group_id
     )
@@ -1578,7 +1606,8 @@ async def test_workflow_from_blank_browser_tool(
     For a raw secret value (for example, a password), use a saved credential reference instead.
 
     By default the test stops when a loop iteration ends on a failed block and returns that failure.
-    Set `run_every_loop_iteration` true to run every iteration, as a saved run would.
+    Set `run_every_loop_iteration` true to run every iteration, as a saved run would. A loop runs its
+    items one after another in the run's one browser, within the run's time limit.
     """
     copilot_ctx = ctx.context
     await await_pending_credential_pause(copilot_ctx)
@@ -2511,6 +2540,7 @@ NATIVE_TOOLS = [
     load_skill_tool,
     read_skill_resource_tool,
     run_workflow_for_accounts_tool,
+    run_workflow_for_inputs_tool,
     run_saved_workflow_tool,
     get_account_group_status_tool,
     cancel_account_group_tool,
@@ -2534,6 +2564,7 @@ BROWSER_BOUND_TOOL_NAMES = BLOCK_RUNNING_TOOLS | frozenset(
         SESSION_EXTENSION_TOOL_NAME,
         UPLOAD_TOOL_NAME,
         ACCOUNT_GROUP_SUBMIT_TOOL_NAME,
+        INPUT_GROUP_TOOL_NAME,
         SINGLE_RUN_TOOL_NAME,
     }
 )
@@ -2546,6 +2577,7 @@ _PAGE_STATE_TOOL_NAMES = (
     - {
         SESSION_EXTENSION_TOOL_NAME,
         ACCOUNT_GROUP_SUBMIT_TOOL_NAME,
+        INPUT_GROUP_TOOL_NAME,
         SINGLE_RUN_TOOL_NAME,
     }
 )
@@ -2678,6 +2710,7 @@ def copilot_native_tools(
     run_tools_available: bool,
     supports_account_group_card: bool = False,
     supports_single_run_card: bool = False,
+    supports_input_group_card: bool = False,
     supports_credential_delete_card: bool = False,
     supports_connection_card: bool = False,
     supports_demonstration_offer: bool = False,
@@ -2699,6 +2732,10 @@ def copilot_native_tools(
             or (tool.name == DEMONSTRATION_OFFER_TOOL_NAME and not supports_demonstration_offer)
             or (tool.name in SKILL_TOOL_NAMES and not skills_available)
             or (tool.name == ACCOUNT_GROUP_SUBMIT_TOOL_NAME and not account_group_submit_enabled())
+            or (
+                tool.name == INPUT_GROUP_TOOL_NAME
+                and not (supports_input_group_card and supports_account_group_card and account_group_submit_enabled())
+            )
             or (tool.name == SINGLE_RUN_TOOL_NAME and not (supports_single_run_card and single_run_submit_enabled()))
             or (
                 tool.name == CREDENTIAL_DELETE_TOOL_NAME

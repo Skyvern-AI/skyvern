@@ -11,7 +11,7 @@ from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import StrEnum
-from typing import Annotated, Any, Literal, NamedTuple, cast
+from typing import Annotated, Any, Literal, NamedTuple, Protocol, cast, runtime_checkable
 
 import structlog
 import yaml
@@ -3632,7 +3632,10 @@ def strip_copilot_yaml_headers(workflow_yaml: str | None) -> str | None:
 
 
 def copilot_workflow_yaml_matches(
-    submitted_yaml: str | None, *known_sources: str | None, inherited_proxy_location: ProxyLocationInput = None
+    submitted_yaml: str | None,
+    *known_sources: str | None,
+    inherited_proxy_location: ProxyLocationInput = None,
+    inherited_code_version: int | None = None,
 ) -> bool:
     submitted_yaml = strip_copilot_yaml_headers(submitted_yaml)
     if not submitted_yaml:
@@ -3643,7 +3646,9 @@ def copilot_workflow_yaml_matches(
             if not sanitized_source:
                 continue
             source_canvas = _normalized_canvas_for_proposal_restore(
-                sanitized_source, inherited_proxy_location=inherited_proxy_location
+                sanitized_source,
+                inherited_code_version=inherited_code_version,
+                inherited_proxy_location=inherited_proxy_location,
             )
             submitted_with_notes, _, _ = carry_block_notes_from_versions(submitted_yaml, sanitized_source, None)
             if (
@@ -3659,6 +3664,11 @@ def copilot_workflow_yaml_matches(
     except Exception:  # noqa: BLE001 - Normalization reparses YAML with the same constructor failures.
         return False
     return False
+
+
+@runtime_checkable
+class _ParameterKeyedBlock(Protocol):
+    parameter_keys: list[str] | None
 
 
 def _normalized_canvas_for_proposal_restore(
@@ -3691,9 +3701,11 @@ def _normalized_canvas_for_proposal_restore(
             block.notes = block.notes or None
             block.trailing_notes = block.trailing_notes or None
             block.description = block.description or None
+            # The editor sends parameter_keys: [] on every block and the converter reads [] and null alike.
+            if isinstance(block, _ParameterKeyedBlock):
+                block.parameter_keys = block.parameter_keys or None
             if isinstance(block, CodeBlockYAML):
                 block.steps = block.steps or None
-                block.parameter_keys = block.parameter_keys or None
             elif isinstance(block, (ForLoopBlockYAML, WhileLoopBlockYAML)) and block.loop_blocks:
                 normalize_blocks(block.loop_blocks)
 
@@ -3825,6 +3837,7 @@ async def _validated_pending_workflow_proposal(
         sanitized_yaml,
         saved_workflow_canvas(ctx, canonical),
         inherited_proxy_location=canonical.proxy_location if canonical is not None else None,
+        inherited_code_version=canonical.code_version if canonical is not None else None,
     ):
         LOG.info(
             "copilot_pending_proposal_restore_rejected",
@@ -4186,7 +4199,12 @@ def proposal_conflict_result(
     adoption: ProposalAdoptionOutcome,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {"ok": False, "conflict_reason": reason, "adoption": adoption}
-    if adoption == "adopted":
+    if reason == "run_bound":
+        result["error"] = (
+            f"{lost} Another test of this proposal had already started, and a proposal can be bound to only one "
+            "test run. This turn's draft is unchanged."
+        )
+    elif adoption == "adopted":
         result["error"] = f"{lost} Another change replaced the pending proposal, and this turn now works on it."
         adopted_yaml = redact_raw_secrets_for_prompt(ctx.staged_workflow_yaml or "")
         adopted_yaml = drop_submitted_note_fields(adopted_yaml, keep_notes=copilot_sees_notes(ctx))

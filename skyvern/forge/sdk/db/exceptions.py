@@ -65,6 +65,7 @@ CopilotProposalConflictReason = Literal[
     "content_changed",
     "claim_changed",
     "disposition_changed",
+    "run_bound",
 ]
 
 

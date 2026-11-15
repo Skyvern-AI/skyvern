@@ -8,13 +8,14 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Sequence
-from typing import Any, Literal
+from dataclasses import dataclass
+from typing import Any, Literal, TypedDict
 
 import structlog
 
 from skyvern.forge.sdk.copilot.budget_expiry import BudgetExpiryState
 from skyvern.forge.sdk.copilot.signature import compute_signature
-from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice, ResponseKind, TurnOutcome
 
 LOG = structlog.get_logger()
 
@@ -36,6 +37,46 @@ def selected_connected_account_id(outcome: TurnOutcome | None, current_user_mess
         (choice.connection_id for choice in choices if choice.connection_id == current_user_message),
         None,
     )
+
+
+@dataclass(frozen=True)
+class AccountPickTestResume:
+    proposal_owner_turn_id: str
+    proposal_revision: int
+    proposal_workflow_run_id: str | None
+    connection_id: str
+
+
+def account_pick_test_resume(
+    outcome: TurnOutcome | None, current_user_message: str, explicit_selection: str | None
+) -> AccountPickTestResume | None:
+    """A pick answering the picker a Test end-to-end turn offered, bound to the proposal that turn left stored."""
+    if outcome is None or outcome.test_proposal_owner_turn_id is None or outcome.test_proposal_revision is None:
+        return None
+    pick = selected_connected_account_id(outcome, current_user_message)
+    if pick is None or explicit_selection not in (None, pick):
+        return None
+    return AccountPickTestResume(
+        outcome.test_proposal_owner_turn_id, outcome.test_proposal_revision, outcome.test_proposal_workflow_run_id, pick
+    )
+
+
+class CarriedAccountChoiceFields(TypedDict, total=False):
+    connected_account_choices: list[ConnectedAccountChoice] | None
+    test_proposal_owner_turn_id: str | None
+    test_proposal_revision: int | None
+    test_proposal_workflow_run_id: str | None
+
+
+def carried_account_choice_fields(prior_turn_outcome: TurnOutcome | None) -> CarriedAccountChoiceFields:
+    if prior_turn_outcome is None:
+        return {}
+    return {
+        "connected_account_choices": prior_turn_outcome.connected_account_choices,
+        "test_proposal_owner_turn_id": prior_turn_outcome.test_proposal_owner_turn_id,
+        "test_proposal_revision": prior_turn_outcome.test_proposal_revision,
+        "test_proposal_workflow_run_id": prior_turn_outcome.test_proposal_workflow_run_id,
+    }
 
 
 def connected_account_choice_context(

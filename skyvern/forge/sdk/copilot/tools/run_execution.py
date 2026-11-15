@@ -260,6 +260,7 @@ from skyvern.forge.sdk.copilot.workflow_yaml import (
     stored_block_code,
 )
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.db._sentinels import _UNSET
 from skyvern.forge.sdk.db.enums import BrowserSeedSource
 from skyvern.forge.sdk.db.exceptions import CopilotProposalConflictError, CopilotProposalConflictReason
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
@@ -4993,6 +4994,7 @@ async def _run_blocks_with_minted_browser_claim(
     run_task: asyncio.Task | None = None
     secret_run_session_lock: asyncio.Lock | None = None
     interim_run_id: str | None = None
+    prepared_run_id: str | None = None
     # Set only where the run may already be executing, so an unwind before either executor call
     # can still retract the run-start record.
     run_submission_attempted = False
@@ -5222,6 +5224,7 @@ async def _run_blocks_with_minted_browser_claim(
                 created_by=COPILOT_RUN_CREATOR,
                 requested_by=requesting_user_id(ctx.organization_id),
             )
+            prepared_run_id = workflow_run.workflow_run_id
         except (BrowserSessionClosed, BrowserSessionStartupTimeout) as refused:
             # Submission refuses a session that has already ended, so no run exists to carry the
             # lease-seam reason code; report the same typed browser loss that run would have.
@@ -5337,6 +5340,9 @@ async def _run_blocks_with_minted_browser_claim(
                         expected_revision=execution.proposal_revision,
                         expected_workflow_yaml=execution.snapshot.proposal_bind_yaml or execution.workflow_yaml,
                         workflow_run_id=workflow_run.workflow_run_id,
+                        expected_workflow_run_id=ctx.proposal_workflow_run_id
+                        if ctx.proposal_bind_checks_run_id
+                        else _UNSET,
                     )
                 except CopilotProposalConflictError as conflict:
                     # A token or source this call no longer shares with ctx belongs to a candidate the turn replaced.
@@ -5344,9 +5350,12 @@ async def _run_blocks_with_minted_browser_claim(
                         execution.proposal_owner_turn_id,
                         execution.proposal_revision,
                     ) and execution.source_is_current(ctx)
+                    # Adopting on run_bound would take the other turn's run id, letting a retry bind a second run.
                     bind_conflict = (
                         conflict.reason,
-                        await adopt_stored_workflow_candidate(ctx) if ctx_holds_call_token else "kept",
+                        await adopt_stored_workflow_candidate(ctx)
+                        if ctx_holds_call_token and conflict.reason != "run_bound"
+                        else "kept",
                     )
                 except Exception:
                     bind_unexpected = True
@@ -5368,6 +5377,8 @@ async def _run_blocks_with_minted_browser_claim(
                     cancel_reason = "The Copilot test run could not be bound to its proposal."
                 elif bind_conflict[0] == "being_accepted":
                     cancel_reason = "The Copilot proposal was being accepted, so its test run was not started."
+                elif bind_conflict[0] == "run_bound":
+                    cancel_reason = "Another test of this Copilot proposal had already started, so this one was not."
                 else:
                     cancel_reason = "The Copilot proposal changed before its test run started."
                 await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled_if_not_final(
@@ -5541,6 +5552,17 @@ async def _run_blocks_with_minted_browser_claim(
             secret_run_session_lock = None
         if interim_run_id is not None and not run_submission_attempted:
             _forget_interim_run_start(ctx, interim_run_id)
+        # No executor ever received this run, and a proposal it is bound to must not read as having a live test.
+        if prepared_run_id is not None and not run_submission_attempted:
+            try:
+                await asyncio.shield(
+                    app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final(
+                        workflow_run_id=prepared_run_id,
+                        failure_reason="The test run could not be set up, so execution was not started.",
+                    )
+                )
+            except Exception:
+                LOG.warning("copilot_unsubmitted_run_fail_write_failed", workflow_run_id=prepared_run_id, exc_info=True)
         # The poll's finally never runs on this path, and a None entry is neither superseded nor checked for a run
         # still using the browser at turn end.
         if (
