@@ -31,7 +31,7 @@ from skyvern.forge.sdk.copilot.ask_user import (
 from skyvern.forge.sdk.copilot.completion_criteria_store import criteria_from_json, criterion_authority_projection
 from skyvern.forge.sdk.copilot.context import ProposalDisposition, TurnNarrativePayload
 from skyvern.forge.sdk.db._error_handling import db_operation
-from skyvern.forge.sdk.db._sentinels import _UNSET
+from skyvern.forge.sdk.db._sentinels import _UNSET, _Unset
 from skyvern.forge.sdk.db.base_alchemy_db import _SessionFactory, read_with_disconnect_recovery
 from skyvern.forge.sdk.db.base_repository import BaseRepository
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
@@ -956,6 +956,7 @@ class WorkflowParametersRepository(BaseRepository):
         expected_revision: int,
         expected_workflow_yaml: str,
         workflow_run_id: str,
+        expected_workflow_run_id: str | None | _Unset = _UNSET,
     ) -> WorkflowCopilotChat:
         async with self.Session() as session:
             chat = await self._locked_copilot_chat(session, organization_id, workflow_copilot_chat_id)
@@ -966,6 +967,8 @@ class WorkflowParametersRepository(BaseRepository):
                 raise CopilotProposalConflictError("Copilot proposal is being accepted", reason="being_accepted")
             if chat.proposed_workflow.get("_copilot_yaml") != expected_workflow_yaml:
                 raise CopilotProposalConflictError("Copilot proposal bytes changed", reason="bytes_changed")
+            if expected_workflow_run_id is not _UNSET and current.workflow_run_id != expected_workflow_run_id:
+                raise CopilotProposalConflictError("Copilot proposal run changed", reason="run_bound")
             # A new run is not yet proof. Turn end re-records the disposition from its result, but a turn
             # that exits without one must not leave a stale Tested beside this run.
             proven = current.disposition in ("review_tested", "auto_applicable")
@@ -1724,6 +1727,13 @@ class WorkflowParametersRepository(BaseRepository):
             await self._patch_narrative_questions(session, organization_id, chat_id, [resolved])
             await session.commit()
             return resolved
+
+    @db_operation("get_copilot_history_question")
+    async def get_copilot_history_question(
+        self, organization_id: str, chat_id: str, interaction_id: str
+    ) -> QuestionInteraction | None:
+        async with self.Session() as session:
+            return await self._narrative_question(session, organization_id, chat_id, interaction_id)
 
     @staticmethod
     async def _narrative_question(

@@ -89,6 +89,7 @@ ACCOUNT_GROUP_SUBMIT_TOOL_NAME = "run_workflow_for_accounts"
 ACCOUNT_GROUP_STATUS_TOOL_NAME = "get_account_group_status"
 ACCOUNT_GROUP_CANCEL_TOOL_NAME = "cancel_account_group"
 SINGLE_RUN_TOOL_NAME = "run_saved_workflow"
+INPUT_GROUP_TOOL_NAME = "run_workflow_for_inputs"
 ASK_USER_TOOL_NAME = "ask_user"
 
 REPEAT_RISK_OUTCOMES = (
@@ -98,12 +99,20 @@ REPEAT_RISK_OUTCOMES = (
     WorkflowRunGroupItemOutcome.in_progress,
 )
 
+ROW_GROUP_PAGE_SIZE = 25
+
 
 class AccountGroupDecision(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     approved: bool
     credential_ids: list[str] = Field(default_factory=list)
+    # An input group's row keys travel here, never in credential_ids, which the folder guard reads as logins.
+    item_keys: list[str] | None = Field(default=None, exclude_if=lambda keys: keys is None)
+
+    @property
+    def selected_ids(self) -> list[str]:
+        return self.item_keys if self.item_keys is not None else self.credential_ids
 
 
 class AccountGroupRow(BaseModel):
@@ -114,6 +123,9 @@ class AccountGroupRow(BaseModel):
     last_group_id: str | None = None
     preselected: bool = True
     parameter_key: str | None = Field(default=None, exclude_if=lambda key: key is None)
+    # A row group's label carries up to 80 characters of these values into tool results, and status reads labels
+    # from any chat on the same workflow.
+    inputs: dict[str, JsonValue] | None = Field(default=None, exclude_if=lambda inputs: inputs is None)
 
 
 class RunCostFacts(BaseModel):
@@ -152,6 +164,9 @@ class AccountGroupReview(BaseModel):
     action_summary: str
     common_inputs: dict[str, JsonValue] = Field(default_factory=dict)
     single_run: bool = Field(default=False, exclude_if=lambda single_run: not single_run)
+    # One run per input row: a row's credential_id holds the row's key, and its inputs are that run's parameters.
+    row_group: bool = Field(default=False, exclude_if=lambda row_group: not row_group)
+    max_concurrency: int | None = Field(default=None, exclude_if=lambda count: count is None)
     credential_inputs: dict[str, str] = Field(default_factory=dict, exclude_if=lambda inputs: not inputs)
     workflow_run_id: str | None = Field(default=None, exclude_if=lambda run_id: run_id is None)
     # A single run that first saves the chat's unsaved draft, bound to the proposal token the user reviewed.
@@ -194,6 +209,7 @@ class AccountGroupRunRow(BaseModel):
 class AccountGroupCancelReview(BaseModel):
     workflow_run_group_id: str
     unfinished_rows: list[AccountGroupRunRow]
+    unfinished_count: int | None = Field(default=None, exclude_if=lambda count: count is None)
     decision: AccountGroupDecision | None = Field(default=None, exclude_if=lambda decision: decision is None)
 
 
@@ -324,10 +340,26 @@ class QuestionInteraction(BaseModel):
             return result
         if self.account_group_review is not None:
             decision = self.account_group_decision
-            approved_ids = decision.credential_ids if decision is not None and decision.approved else []
+            approved_ids = decision.selected_ids if decision is not None and decision.approved else []
             group_id = self.account_group_review.workflow_run_group_id
             # None: approved, but no group is linked, so whether it was submitted is unknown.
             dispatched = True if group_id is not None else (None if approved_ids else False)
+            if self.account_group_review.row_group:
+                repeated = self.account_group_review.repeated_after_prior_effect(approved_ids)
+                return {
+                    "ok": True,
+                    "interaction_id": self.interaction_id,
+                    "tool_call_id": self.tool_call_id,
+                    "approved": bool(approved_ids),
+                    "approved_count": len(approved_ids),
+                    "repeated_count": len(repeated),
+                    "repeated_after_prior_effect": [
+                        row.model_dump(mode="json", include={"label", "prior_outcome"})
+                        for row in repeated[:ROW_GROUP_PAGE_SIZE]
+                    ],
+                    "dispatched": dispatched,
+                    "workflow_run_group_id": group_id,
+                }
             return {
                 "ok": True,
                 "interaction_id": self.interaction_id,
@@ -457,7 +489,7 @@ def _validate_account_group_decision(
             raise ValueError("A cancel review takes only a decision")
         if decision is None and not response.skipped:
             raise ValueError("A cancel review requires a decision")
-        if decision is not None and decision.credential_ids:
+        if decision is not None and (decision.credential_ids or decision.item_keys is not None):
             raise ValueError("A cancel review stops the whole group, not chosen accounts")
         return
     if review is None:
@@ -470,20 +502,26 @@ def _validate_account_group_decision(
         if not response.skipped:
             raise ValueError("An account review requires a decision")
         return
+    if decision.item_keys is not None and not review.row_group:
+        raise ValueError("Only an input group review takes item_keys")
     if not decision.approved:
-        if decision.credential_ids:
+        if decision.credential_ids or decision.item_keys:
             raise ValueError("A declined review approves no accounts")
         return
     if review.single_run:
         if sorted(decision.credential_ids) != sorted(row.credential_id for row in review.rows):
             raise ValueError("A single run is approved with exactly the accounts it showed")
         return
-    if not decision.credential_ids:
-        raise ValueError("Approve at least one account")
-    if len(set(decision.credential_ids)) != len(decision.credential_ids):
-        raise ValueError("An approval lists an account twice")
-    if not set(decision.credential_ids) <= {row.credential_id for row in review.rows}:
-        raise ValueError("An approval lists an account the review did not")
+    if review.row_group and (decision.credential_ids or decision.item_keys is None):
+        raise ValueError("An input group approval lists its rows in item_keys")
+    item = "row" if review.row_group else "account"
+    selected = decision.selected_ids
+    if not selected:
+        raise ValueError(f"Approve at least one {item}")
+    if len(set(selected)) != len(selected):
+        raise ValueError(f"An approval lists the same {item} twice")
+    if not set(selected) <= {row.credential_id for row in review.rows}:
+        raise ValueError(f"An approval lists {item}s the review did not")
 
 
 def resolve_question_response(
