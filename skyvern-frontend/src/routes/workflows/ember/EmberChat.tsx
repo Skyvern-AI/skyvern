@@ -9126,6 +9126,7 @@ export function EmberChat({
             supports_question_tool: true,
             supports_account_group_card: true,
             supports_single_run_card: true,
+            supports_input_group_card: true,
             supports_credential_delete_card: true,
             supports_connection_card: true,
             supports_demonstration_offer:
@@ -11963,12 +11964,16 @@ export function EmberChat({
             lockReason={acceptUnresolved ? acceptHoldReason : null}
             collapsed={questionTrayCollapsed}
             onCollapsedChange={setQuestionTrayCollapsed}
-            onApprove={(credentialIds) =>
+            onApprove={(selectedIds) =>
               void handleQuestionAnswer(trayQuestion, {
-                account_group_decision: {
-                  approved: true,
-                  credential_ids: credentialIds,
-                },
+                account_group_decision: trayQuestion.account_group_review
+                  ?.row_group
+                  ? {
+                      approved: true,
+                      credential_ids: [],
+                      item_keys: selectedIds,
+                    }
+                  : { approved: true, credential_ids: selectedIds },
               })
             }
             onDecline={() =>

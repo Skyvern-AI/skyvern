@@ -33,6 +33,7 @@ from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.artifact.models import ArtifactType, LogEntityType
 from skyvern.forge.sdk.cache.base import BaseCache
 from skyvern.forge.sdk.copilot.agent import (
+    ACCOUNT_PICK_PROPOSAL_CHANGED_REPLY,
     completed_tool_names,
     run_copilot_agent,
     stopped_turn_facts,
@@ -140,16 +141,21 @@ from skyvern.forge.sdk.copilot.tools.credential_deletion import (
     credential_delete_enabled,
     enforce_credential_delete_access,
 )
+from skyvern.forge.sdk.copilot.tools.credentials import UNAPPROVED_CONNECTION_REASON_CODE
 from skyvern.forge.sdk.copilot.tools.workflow_update import (
     _validated_pending_workflow_proposal,
+    copilot_workflow_yaml_matches,
     private_workflow_settings_from_proposal,
     proposal_is_displayable,
     proposal_workflow_fingerprint,
     strip_copilot_yaml_headers,
 )
 from skyvern.forge.sdk.copilot.turn_outcome import (
+    AccountPickTestResume,
     CopilotComposerMode,
+    account_pick_test_resume,
     build_minimal_turn_outcome,
+    carried_account_choice_fields,
     with_copilot_code_mode_metadata,
 )
 from skyvern.forge.sdk.copilot.workflow_credential_utils import workflow_connection_ids
@@ -1076,7 +1082,7 @@ def _build_recoverable_route_agent_result(
             response_kind=ResponseKind.RECOVER,
             reason_code=failure.failure_kind,
             terminal_reason=COPILOT_RECOVERABLE_FAILURE_TERMINAL_REASON,
-        ).model_copy(update={"connected_account_choices": connected_account_choices}),
+        ).model_copy(update=carried_account_choice_fields(prior_turn_outcome)),
     )
     _record_recoverable_failure_span_attrs(failure, proposal_disposition="no_proposal")
     return agent_result, failure
@@ -1233,6 +1239,34 @@ def _discard_superseded_proposal(agent_result: AgentResult) -> None:
     agent_result.has_staged_proposal = False
     agent_result.proposal_disposition = "no_proposal"
     agent_result.clear_proposed_workflow = False
+
+
+def _record_offered_test_proposal(
+    chat_request: WorkflowCopilotChatRequest, chat: WorkflowCopilotChat, agent_result: AgentResult
+) -> None:
+    outcome = agent_result.turn_outcome
+    metadata = copilot_proposal_metadata(chat.proposed_workflow)
+    # Only the unapproved-connection blocker pauses the Test on an account; a model-asked picker is a question.
+    # A recovery outcome only carries an earlier turn's picker, so it keeps that turn's token.
+    if (
+        chat_request.product_action != "test_end_to_end"
+        or outcome is None
+        or outcome.response_kind == ResponseKind.RECOVER
+        or outcome.reason_code != UNAPPROVED_CONNECTION_REASON_CODE
+        or not outcome.connected_account_choices
+        or metadata is None
+        or _proposal_disposition(agent_result) == "no_proposal"
+        or (metadata.owner_turn_id, metadata.revision)
+        != (agent_result.proposal_owner_turn_id, agent_result.proposal_revision)
+    ):
+        return
+    agent_result.turn_outcome = outcome.model_copy(
+        update={
+            "test_proposal_owner_turn_id": metadata.owner_turn_id,
+            "test_proposal_revision": metadata.revision,
+            "test_proposal_workflow_run_id": metadata.workflow_run_id,
+        }
+    )
 
 
 async def _persist_proposed_workflow_state(
@@ -1651,9 +1685,7 @@ def _interrupted_turn_outcome(
         copilot_runtime="agent",
         copilot_turn_id=turn_id,
         idempotency_digest=idempotency_digest,
-        connected_account_choices=(
-            prior_turn_outcome.connected_account_choices if prior_turn_outcome is not None else None
-        ),
+        **carried_account_choice_fields(prior_turn_outcome),
         copilot_effective_mode=effective_mode,
         copilot_code_available=code_available or False,
         interrupted_row_final=True,
@@ -2142,6 +2174,7 @@ async def _finalise_normal_turn(
     )
     # Proposal persistence can add a reason when no safe candidate could be published.
     user_response = agent_result.user_response
+    _record_offered_test_proposal(chat_request, chat, agent_result)
     # Read after persisting, never before: persisting drops this turn's proposal when a newer
     # candidate owns the row, and the frame below must not pair a dropped draft with that
     # candidate's token.
@@ -2471,10 +2504,13 @@ def _pending_proposal_connected_account_id(pending_proposal_yaml: str) -> str | 
     return bound[0]
 
 
-def _apply_test_end_to_end_action(chat_request: WorkflowCopilotChatRequest, pending_proposal_yaml: str) -> None:
-    # The button posts a structured action, so the message is the server's own
-    # receipt line rather than client prose the turn would have to interpret.
-    chat_request.message = TEST_END_TO_END_TURN_MESSAGE
+def _apply_test_end_to_end_action(
+    chat_request: WorkflowCopilotChatRequest, pending_proposal_yaml: str, *, write_receipt: bool = True
+) -> None:
+    # The button's turn reads the server's own receipt line, never client prose; a resumed pick keeps the pick
+    # text instead, because that is what resolves the account against the picker.
+    if write_receipt:
+        chat_request.message = TEST_END_TO_END_TURN_MESSAGE
     chat_request.workflow_yaml = strip_copilot_yaml_headers(pending_proposal_yaml) or ""
     derived_account_id = (
         _pending_proposal_connected_account_id(pending_proposal_yaml)
@@ -2485,6 +2521,53 @@ def _apply_test_end_to_end_action(chat_request: WorkflowCopilotChatRequest, pend
     # client-sent value never survives to mislabel the selection.
     chat_request.selected_connected_account_id = chat_request.selected_connected_account_id or derived_account_id
     chat_request.selected_connected_account_from_pending_proposal = derived_account_id is not None
+
+
+def _account_pick_test_promotion(
+    prior_turn_outcome: TurnOutcome | None,
+    chat_request: WorkflowCopilotChatRequest,
+    proposed_workflow: dict[str, Any] | None,
+    canonical: Workflow,
+) -> AccountPickTestResume | None:
+    """The Test a pick resumes, or None for a plain pick turn; raises when the offered proposal was replaced."""
+    if chat_request.product_action not in (None, "test_end_to_end") or proposed_workflow is None:
+        return None
+    resume = account_pick_test_resume(
+        prior_turn_outcome, chat_request.message, chat_request.selected_connected_account_id
+    )
+    if resume is None:
+        return None
+    metadata = copilot_proposal_metadata(proposed_workflow)
+    if metadata is None or (metadata.owner_turn_id, metadata.revision) != (
+        resume.proposal_owner_turn_id,
+        resume.proposal_revision,
+    ):
+        LOG.info("copilot_account_pick_test_refused", reason="offered_proposal_changed")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=ACCOUNT_PICK_PROPOSAL_CHANGED_REPLY)
+    if metadata.workflow_run_id != resume.proposal_workflow_run_id:
+        # A run was bound to the proposal after the picker was offered, so a re-pick on a carried picker must not
+        # start another.
+        LOG.info("copilot_account_pick_test_not_resumed", reason="run_bound_since_picker")
+        return None
+    proposal_yaml = proposed_workflow.get("_copilot_yaml")
+    if not isinstance(proposal_yaml, str) or resume.connection_id not in workflow_connection_ids(proposal_yaml):
+        return None
+    # The Test action runs the proposal, not the canvas, so a canvas edited since the picker (even back to the saved
+    # workflow) stays the model's input on a plain turn rather than being replaced unseen.
+    if chat_request.workflow_yaml and not copilot_workflow_yaml_matches(
+        chat_request.workflow_yaml,
+        proposal_yaml,
+        inherited_proxy_location=canonical.proxy_location,
+        inherited_code_version=canonical.code_version,
+    ):
+        LOG.info("copilot_account_pick_test_not_resumed", reason="canvas_edited_since_picker")
+        return None
+    LOG.info(
+        "copilot_account_pick_test_resumed",
+        proposal_owner_turn_id=resume.proposal_owner_turn_id,
+        proposal_revision=resume.proposal_revision,
+    )
+    return resume
 
 
 def _workflow_yaml_block_count(workflow_yaml: str | None) -> int:
@@ -2989,6 +3072,12 @@ async def _new_copilot_chat_post(
             persisted_workflow_yaml = _run_grant_workflow_yaml(original_workflow)
 
             submitted_private_settings = private_workflow_settings_from_yaml(chat_request.workflow_yaml)
+            account_pick_test = _account_pick_test_promotion(
+                prior_turn_outcome, chat_request, chat.proposed_workflow, original_workflow
+            )
+            if account_pick_test is not None:
+                chat_request.product_action = "test_end_to_end"
+                chat_request.selected_connected_account_id = account_pick_test.connection_id
             proposal_context = CopilotContext(
                 organization_id=organization.organization_id,
                 workflow_id=original_workflow.workflow_id,
@@ -3026,7 +3115,9 @@ async def _new_copilot_chat_post(
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail="No pending proposal to test end to end.",
                     )
-                _apply_test_end_to_end_action(chat_request, validated_proposal["_copilot_yaml"])
+                _apply_test_end_to_end_action(
+                    chat_request, validated_proposal["_copilot_yaml"], write_receipt=account_pick_test is None
+                )
                 # The Test action runs the proposal under its own settings, never the editor's.
                 submitted_private_settings = {}
 

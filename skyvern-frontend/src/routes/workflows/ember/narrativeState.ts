@@ -900,6 +900,7 @@ export const AUTHORING_TOOLS = new Set([
 ]);
 export const ACCOUNT_GROUP_SUBMIT_TOOL = "run_workflow_for_accounts";
 export const SINGLE_RUN_TOOL = "run_saved_workflow";
+export const INPUT_GROUP_TOOL = "run_workflow_for_inputs";
 
 export const RUN_TOOLS = new Set([
   "update_and_run_blocks",
@@ -973,7 +974,8 @@ const ACTIVITY_TOOL_DISPLAY_LABELS: Record<string, string> = {
   synthesize_demonstrated_block: "Building a block from the recorded steps",
   [ACCOUNT_GROUP_SUBMIT_TOOL]: "Reviewing the accounts with you",
   [SINGLE_RUN_TOOL]: "Reviewing the run with you",
-  get_account_group_status: "Checking the account runs",
+  [INPUT_GROUP_TOOL]: "Reviewing the runs with you",
+  get_account_group_status: "Checking the group runs",
   cancel_account_group: "Reviewing a cancel with you",
   delete_saved_credentials: "Reviewing a credential deletion with you",
 };
@@ -1035,6 +1037,7 @@ const TOOL_CALL_KINDS: Record<string, ToolCallKind> = {
   delete_workflow_schedule: "other",
   [ACCOUNT_GROUP_SUBMIT_TOOL]: "run",
   [SINGLE_RUN_TOOL]: "run",
+  [INPUT_GROUP_TOOL]: "run",
   get_account_group_status: "other",
   cancel_account_group: "other",
   delete_saved_credentials: "other",

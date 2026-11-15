@@ -4,6 +4,7 @@ import {
   ActivityEntry,
   AUTHORING_TOOLS,
   BlockState,
+  INPUT_GROUP_TOOL,
   RUN_TOOLS,
   SINGLE_RUN_TOOL,
   ToolCallKind,
@@ -245,7 +246,11 @@ export function rowIndexOfToolCall(
   );
 }
 
-const SAVED_RUN_TOOLS = new Set([ACCOUNT_GROUP_SUBMIT_TOOL, SINGLE_RUN_TOOL]);
+const SAVED_RUN_TOOLS = new Set([
+  ACCOUNT_GROUP_SUBMIT_TOOL,
+  SINGLE_RUN_TOOL,
+  INPUT_GROUP_TOOL,
+]);
 
 // A call whose card renders after its row ends that row, so work done after the
 // user answered or the plan changed never sits above the card.
@@ -254,6 +259,7 @@ const CARD_TOOLS = new Set([
   "set_work_plan",
   ACCOUNT_GROUP_SUBMIT_TOOL,
   SINGLE_RUN_TOOL,
+  INPUT_GROUP_TOOL,
   "cancel_account_group",
   "delete_saved_credentials",
 ]);
@@ -600,12 +606,20 @@ function kindPhrase(
       const singles = entries.filter(
         (e) => e.toolName === SINGLE_RUN_TOOL,
       ).length;
-      const tests = entries.length - groups - singles;
+      const inputGroups = entries.filter(
+        (e) => e.toolName === INPUT_GROUP_TOOL,
+      ).length;
+      const tests = entries.length - groups - singles - inputGroups;
       return [
         groups > 0
           ? live
             ? "reviewing account runs with you"
             : "reviewed account runs with you"
+          : null,
+        inputGroups > 0
+          ? live
+            ? "reviewing runs with you"
+            : "reviewed runs with you"
           : null,
         singles > 0
           ? live

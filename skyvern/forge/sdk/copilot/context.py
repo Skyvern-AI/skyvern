@@ -1601,6 +1601,9 @@ class CopilotContext(AgentContext):
     proposal_adoptions_seen_by_model: int = 0
     proposal_canonical_fingerprint: str | None = None
     proposal_workflow_run_id: str | None = None
+    # When set, a run binds only while the stored run id still equals proposal_workflow_run_id, so two turns
+    # resuming one account pick cannot both bind a run.
+    proposal_bind_checks_run_id: bool = False
     run_card_saved_workflow: Workflow | None = None
     # A restored candidate whose request private settings differ from its own; its stored bytes cannot vouch
     # for what a test under this token would run, so binding a run to it is refused.

@@ -314,7 +314,9 @@ from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.turn_outcome import (
     CANCEL_TERMINAL_REASON,
     UNEXPECTED_ERROR_TERMINAL_REASON,
+    account_pick_test_resume,
     apply_repeated_reply_guard,
+    carried_account_choice_fields,
     connected_account_choice_context,
     selected_connected_account_id,
     stopped_exit_response_kind,
@@ -781,6 +783,8 @@ def _format_chat_history(chat_history: list[WorkflowCopilotChatHistoryMessage]) 
                 review_name = (
                     "saved workflow single run review"
                     if review is not None and review.single_run
+                    else "input group run review"
+                    if review is not None and review.row_group
                     else f"account group {review_kind} review"
                 )
                 lines.append(f"{review_name}: {json.dumps(summary)}")
@@ -4684,19 +4688,32 @@ PENDING_PROPOSAL_TEST_NOT_RESTORED_REPLY = (
     "Nothing was run: the pending Copilot proposal changed before this test started, so it would not have "
     "run the proposal as offered. Reload and test the current proposal."
 )
+ACCOUNT_PICK_PROPOSAL_CHANGED_REPLY = (
+    "Nothing was run: the pending Copilot proposal changed after the account picker was shown. "
+    "Test the current proposal again."
+)
+PICKED_ACCOUNT_NOT_ACTIVE_REPLY = (
+    "Nothing was run: Copilot could not confirm the account you picked is an active connection this test can use. "
+    "Pick it again, or reconnect it on the Integrations page if it was disconnected."
+)
 
 
 def _build_pending_proposal_test_refusal_result(
     ctx: CopilotContext,
     prior_global_llm_context: str | None,
     prior_workflow_yaml: str | None,
+    *,
+    reply: str = PENDING_PROPOSAL_TEST_NOT_RESTORED_REPLY,
+    reason_code: str = "pending_proposal_test_not_restored",
+    keep_picker_from: TurnOutcome | None = None,
 ) -> AgentResult:
     final_text, outcome = apply_repeated_reply_guard(
-        final_text=PENDING_PROPOSAL_TEST_NOT_RESTORED_REPLY,
+        final_text=reply,
         attempted_kind=ResponseKind.REFUSE,
         blocked_signatures=list(ctx.blocked_reply_signatures),
-        reason_code="pending_proposal_test_not_restored",
+        reason_code=reason_code,
     )
+    outcome = outcome.model_copy(update=carried_account_choice_fields(keep_picker_from))
     return _make_agent_result(
         ctx,
         user_response=final_text,
@@ -5680,6 +5697,41 @@ async def _run_copilot_turn_impl(
         # refused at bind.
         LOG.info("copilot_pending_proposal_test_refused", reason="proposal_not_restored")
         return _build_pending_proposal_test_refusal_result(ctx, global_llm_context, chat_request.workflow_yaml)
+    account_pick_test = (
+        account_pick_test_resume(prior_turn_outcome, chat_request.message, chat_request.selected_connected_account_id)
+        if chat_request.product_action == "test_end_to_end"
+        else None
+    )
+    if account_pick_test is not None and (
+        ctx.proposal_owner_turn_id,
+        ctx.proposal_revision,
+        ctx.proposal_workflow_run_id,
+    ) != (
+        account_pick_test.proposal_owner_turn_id,
+        account_pick_test.proposal_revision,
+        account_pick_test.proposal_workflow_run_id,
+    ):
+        LOG.info("copilot_pending_proposal_test_refused", reason="offered_proposal_changed")
+        return _build_pending_proposal_test_refusal_result(
+            ctx,
+            global_llm_context,
+            chat_request.workflow_yaml,
+            reply=ACCOUNT_PICK_PROPOSAL_CHANGED_REPLY,
+            reason_code="offered_proposal_changed",
+        )
+    if account_pick_test is not None and (
+        request_policy is None or request_policy.selected_connected_account_id != account_pick_test.connection_id
+    ):
+        LOG.info("copilot_pending_proposal_test_refused", reason="picked_account_not_active")
+        return _build_pending_proposal_test_refusal_result(
+            ctx,
+            global_llm_context,
+            chat_request.workflow_yaml,
+            reply=PICKED_ACCOUNT_NOT_ACTIVE_REPLY,
+            reason_code="picked_account_not_active",
+            keep_picker_from=prior_turn_outcome,
+        )
+    ctx.proposal_bind_checks_run_id = account_pick_test is not None
 
     validated_browser_session_id = await _resolve_live_browser_session_id(chat_request, organization_id, ctx)
     ctx.browser_session_id = validated_browser_session_id
@@ -5824,6 +5876,7 @@ async def _run_copilot_turn_impl(
             supports_account_group_card=chat_request.supports_account_group_card,
             supports_connection_card=chat_request.supports_connection_card,
             supports_single_run_card=chat_request.supports_single_run_card,
+            supports_input_group_card=chat_request.supports_input_group_card,
             supports_demonstration_offer=chat_request.supports_demonstration_offer,
             supports_credential_delete_card=chat_request.supports_credential_delete_card,
             browser_code_available=browser_code_mode != CopilotBrowserCodeMode.OFF

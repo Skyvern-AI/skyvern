@@ -535,6 +535,9 @@ class WorkflowCopilotChatRequest(BaseModel):
     supports_single_run_card: bool = Field(
         False, description="The client can display the single saved-workflow run review and its receipt."
     )
+    supports_input_group_card: bool = Field(
+        False, description="The client can display the one-run-per-input-row group review, receipt and cancel cards."
+    )
     supports_credential_delete_card: bool = Field(
         False, description="The client can display the credential deletion card and post its confirmation."
     )
