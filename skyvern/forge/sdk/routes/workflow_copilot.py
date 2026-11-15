@@ -16,7 +16,19 @@ from urllib.parse import urlparse
 
 import structlog
 import yaml
-from fastapi import BackgroundTasks, Depends, File, Form, Header, HTTPException, Request, Response, UploadFile, status
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+    status,
+)
 from opentelemetry import trace as otel_trace
 from pydantic import ValidationError
 from sse_starlette import EventSourceResponse
@@ -117,6 +129,7 @@ from skyvern.forge.sdk.copilot.interruption import (
     cancel_notice,
     render_interrupted_message,
 )
+from skyvern.forge.sdk.copilot.live_narrative import read_live_turn_narrative
 from skyvern.forge.sdk.copilot.llm_config import resolve_main_copilot_handler, resolve_raw_secret_safety_handler
 from skyvern.forge.sdk.copilot.proposal_accept import (
     _accepted_workflow_title,
@@ -4399,6 +4412,8 @@ async def workflow_copilot_chat_history(
     workflow_permanent_id: str | None = None,
     workflow_copilot_chat_id: str | None = None,
     request_cancel_token: str | None = None,
+    include_live_narrative: bool = False,
+    message_limit: Annotated[int | None, Query(ge=1)] = None,
     organization: Organization = Depends(org_auth_service.get_current_org),
     ember_credential_recovery_token: Annotated[str | None, Header(alias="X-Ember-Credential-Recovery-Token")] = None,
     ember_chat_id: str | None = None,
@@ -4583,6 +4598,11 @@ async def workflow_copilot_chat_history(
         key=lambda entry: _as_utc(entry.started_at),
         default=None,
     )
+    live_narrative = (
+        await read_live_turn_narrative(organization.organization_id, chat.workflow_copilot_chat_id, live_entry.turn_id)
+        if include_live_narrative and chat is not None and live_entry is not None
+        else None
+    )
     turns_without_answer = await _copilot_turns_without_control(organization.organization_id, chat, "answer")
     turns_without_cancel = await _copilot_turns_without_control(organization.organization_id, chat, "cancel")
     return WorkflowCopilotChatHistoryResponse(
@@ -4596,6 +4616,8 @@ async def workflow_copilot_chat_history(
                 cancel_token=live_entry.cancel_token if live_entry.turn_id not in turns_without_cancel else None,
                 latest_draft=live_entry.latest_draft,
                 latest_draft_at=live_entry.latest_draft_at,
+                steer_messages=[item for item in live_entry.steer_messages if item.delivered_at is not None],
+                narrative=live_narrative,
             )
             if live_entry is not None
             else None
@@ -4614,7 +4636,9 @@ async def workflow_copilot_chat_history(
             ),
             None,
         ),
-        chat_history=resolved_chat_history,
+        chat_history=resolved_chat_history[-message_limit:] if message_limit else resolved_chat_history,
+        workflow_permanent_id=chat.workflow_permanent_id if chat else None,
+        app_url=settings.SKYVERN_APP_URL.rstrip("/"),
         accepted_turn_ids=accepted_turn_ids,
         proposed_workflow=proposed_workflow,
         proposed_workflow_metadata=proposed_workflow_metadata,

@@ -26,6 +26,7 @@ from skyvern.forge.sdk.copilot.code_write_diff import CodeWriteDiff
 from skyvern.forge.sdk.copilot.context import (
     ActivityBucket,
     CopilotTestInput,
+    LiveTurnNarrative,
     ProposalDisposition,
     ResponseType,
     SkippedPrefixBlock,
@@ -211,6 +212,9 @@ class CopilotInFlightTurn(BaseModel):
     cancel_token: str | None = None
     latest_draft: ClientVisibleProposedWorkflow | None = None
     latest_draft_at: datetime | None = None
+    steer_messages: list[CopilotSteerMessage] = Field(default_factory=list)
+    # The running turn's narrative as last copied to the cache; set only when the caller asks for it.
+    narrative: LiveTurnNarrative | None = None
 
 
 class CopilotAcceptedTestedRun(BaseModel):
@@ -825,6 +829,11 @@ class WorkflowCopilotChatSummary(BaseModel):
         False,
         description="Whether the chat has a pending question record still waiting on the user",
     )
+    in_flight: bool = Field(
+        False,
+        description="Whether the chat has a turn marker no reply has answered and recovery has not claimed;"
+        " a dead turn reads true until a chat-history read reconciles it",
+    )
 
 
 class WorkflowCopilotAudioUploadResponse(BaseModel):
@@ -1354,6 +1363,8 @@ class WorkflowCopilotChatHistoryResponse(BaseModel):
     request_browser_allocations: CopilotRequestBrowserAllocations | None = None
     in_flight_turn: CopilotInFlightTurn | None = None
     chat_history: list[WorkflowCopilotChatHistoryMessage] = Field(default_factory=list, description="Chat messages")
+    workflow_permanent_id: str | None = Field(None, description="Workflow the chat belongs to")
+    app_url: str | None = Field(None, description="Base URL of the web app, without a trailing slash")
     accepted_turn_ids: list[str] = Field(
         default_factory=list, description="Turns whose manual Accept completed on the server"
     )
