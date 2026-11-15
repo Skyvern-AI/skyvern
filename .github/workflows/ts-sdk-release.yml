@@ -59,7 +59,7 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
       - name: Upgrade npm to a Trusted Publishing-capable version
         run: npm i -g npm@^11.5.1
-      - name: Install Fern dependencies
+      - name: Install patch-package
         run: npm install -g patch-package
       - name: Install dependencies
         run: npm ci

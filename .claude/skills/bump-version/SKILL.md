@@ -1,6 +1,6 @@
 ---
 name: bump-version
-description: Bump Skyvern OSS version, build Python and TypeScript SDKs with Fern, and create release PR. Use when releasing a new version or when the user asks to bump version.
+description: Bump the Skyvern OSS version in every file that carries it and create the release PR. Use when releasing a new version or when the user asks to bump version.
 argument-hint: [version]
 disable-model-invocation: true
 ---
@@ -13,11 +13,10 @@ Automate the complete OSS version bump and release workflow for Skyvern.
 
 
 1. Validates and updates version in `pyproject.toml`
-2. Builds Python SDK with Fern
-3. Builds TypeScript SDK with Fern
-4. Creates commit with all changes
-5. Optionally runs SDK tests
-6. Pushes branch and creates PR
+2. Sets the same version in the UI package, the TypeScript SDK and `uv.lock`
+3. Creates commit with all changes
+4. Optionally runs SDK tests
+5. Pushes branch and creates PR
 
 ## Version argument
 
@@ -59,52 +58,42 @@ version = "{new_version}"
 
 Use the Edit tool to make this single-line change.
 
-### 4. Build Python SDK
+### 4. Update the other version files
 
-```bash
-bash scripts/fern_build_python_sdk.sh
-```
+The same version lives in four more files. Set each to `{new_version}` with the Edit tool:
 
-- Wait for completion
-- Check output for errors
-- Fern reads version from `pyproject.toml`
+- `packages/skyvern-ui/pyproject.toml`: `version` on line 3
+- `skyvern-ts/client/package.json`: the `version` field
+- `skyvern-ts/client/package-lock.json`: the top-level `version`, and the `version` under `packages[""]`
+- `uv.lock`: the `version` in the `[[package]]` entry whose `name` is `"skyvern"`
 
-### 5. Build TypeScript SDK
+The SDK clients are ordinary source. A release changes their version only; nothing is regenerated.
 
-```bash
-bash scripts/fern_build_ts_sdk.sh
-```
-
-- Wait for completion
-- Check output for errors
-- Verify `skyvern-ts/client/package.json` version matches new version
-
-### 6. Review changes
+### 5. Review changes
 
 ```bash
 git status
 git diff --stat
 ```
 
-Show user:
+Expect exactly five files, one or two lines each. Show user:
 - Number of files changed
 - Which files were modified
 - Summary of changes
 
-### 7. Commit changes
+### 6. Commit changes
 
 ```bash
-git add .
+git add pyproject.toml packages/skyvern-ui/pyproject.toml uv.lock skyvern-ts/client/package.json skyvern-ts/client/package-lock.json
 git commit -m "Bump version to {version}
 
-- Update version in pyproject.toml
-- Regenerate Python SDK with Fern
-- Regenerate TypeScript SDK with Fern
+- Update version in pyproject.toml, packages/skyvern-ui/pyproject.toml and uv.lock
+- Update version in skyvern-ts/client/package.json and package-lock.json
 
 Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>"
 ```
 
-### 8. Verify SDKs (optional)
+### 7. Verify SDKs (optional)
 
 Ask user: "Would you like to run SDK tests to verify nothing broke?"
 
@@ -117,7 +106,7 @@ If yes:
 If no:
 - Skip to push step
 
-### 9. Push and create PR
+### 8. Push and create PR
 
 Ask user: "Ready to push and create PR?"
 
@@ -130,9 +119,8 @@ gh pr create --title "Bump version to {version}" --body "## Summary
 Bump Skyvern OSS version to {version}
 
 ## Changes
-- Updated version in \`pyproject.toml\`
-- Regenerated Python SDK with Fern
-- Regenerated TypeScript SDK with Fern
+- Updated version in \`pyproject.toml\`, \`packages/skyvern-ui/pyproject.toml\` and \`uv.lock\`
+- Updated version in \`skyvern-ts/client/package.json\` and \`package-lock.json\`
 
 ## Deployment
 After merge, GitHub will automatically:
@@ -150,8 +138,8 @@ Display the PR URL to the user.
 
 ## Important notes
 
-- **Single PR**: All changes (version bump, SDK generation, commit) happen in one PR
-- **Fern sync**: Fern reads version from `pyproject.toml` and syncs to `package.json`
+- **Single PR**: All changes (the five version edits and the commit) happen in one PR
+- **Five files**: the version is set by hand in each; no tool copies it from `pyproject.toml`
 - **Testing**: SDK tests require `.env` with `SKYVERN_API_KEY`
 - **Deployment**: Automatic on PR merge via GitHub Actions
 - **No force push**: Never use `--force` when pushing
