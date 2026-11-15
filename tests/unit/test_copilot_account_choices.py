@@ -22,6 +22,7 @@ from skyvern.forge.sdk.copilot.connected_accounts import (
     resolve_connection_reference,
 )
 from skyvern.forge.sdk.copilot.context import (
+    AgentResult,
     ApprovedCredential,
     CopilotContext,
     StructuredContext,
@@ -46,6 +47,8 @@ from skyvern.forge.sdk.copilot.tools.credentials import (
 )
 from skyvern.forge.sdk.copilot.tools.integrations import _read_google_sheet
 from skyvern.forge.sdk.copilot.turn_outcome import (
+    AccountPickTestResume,
+    account_pick_test_resume,
     connected_account_choice_context,
     selected_connected_account_id,
 )
@@ -65,6 +68,7 @@ from skyvern.forge.sdk.schemas.copilot_turn_outcome import (
 from skyvern.forge.sdk.schemas.google_oauth import GoogleOAuthCredentialBase
 from skyvern.forge.sdk.schemas.microsoft_oauth import MicrosoftOAuthCredentialBase
 from skyvern.forge.sdk.schemas.workflow_copilot import (
+    COPILOT_PROPOSAL_METADATA_KEY,
     WorkflowCopilotChatMessage,
     WorkflowCopilotChatRequest,
     WorkflowCopilotChatSender,
@@ -1688,6 +1692,93 @@ def test_test_end_to_end_explicit_client_pick_is_still_labelled_as_a_user_picker
 
     assert chat_request.selected_connected_account_id == UNBOUND_ACCOUNT_ID
     assert '"selection_source":"user_picker"' in context
+
+
+def _test_picker_outcome(*, token: bool) -> TurnOutcome:
+    return TurnOutcome(
+        response_kind=ResponseKind.CLARIFY,
+        connected_account_choices=[
+            ConnectedAccountChoice(connection_id=PROPOSAL_BOUND_ACCOUNT_ID, name="Google Sheets", state="active")
+        ],
+        test_proposal_owner_turn_id="turn-test" if token else None,
+        test_proposal_revision=2 if token else None,
+        test_proposal_workflow_run_id="wr_offered" if token else None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("token", "message", "explicit", "resumes"),
+    [
+        pytest.param(True, PROPOSAL_BOUND_ACCOUNT_ID, PROPOSAL_BOUND_ACCOUNT_ID, True, id="test-picker-pick"),
+        pytest.param(True, PROPOSAL_BOUND_ACCOUNT_ID, None, True, id="test-picker-message-only"),
+        pytest.param(False, PROPOSAL_BOUND_ACCOUNT_ID, PROPOSAL_BOUND_ACCOUNT_ID, False, id="build-time-picker"),
+        pytest.param(True, "use my other sheet", PROPOSAL_BOUND_ACCOUNT_ID, False, id="typed-message"),
+        pytest.param(True, PROPOSAL_BOUND_ACCOUNT_ID, UNBOUND_ACCOUNT_ID, False, id="conflicting-selection"),
+    ],
+)
+def test_end_to_end_resumes_only_on_a_pick_from_a_test_picker(
+    token: bool, message: str, explicit: str | None, resumes: bool
+) -> None:
+    resume = account_pick_test_resume(_test_picker_outcome(token=token), message, explicit)
+
+    assert resume == (
+        AccountPickTestResume("turn-test", 2, "wr_offered", PROPOSAL_BOUND_ACCOUNT_ID) if resumes else None
+    )
+
+
+def _stored_test_proposal(owner_turn_id: str, revision: int, workflow_run_id: str | None) -> dict[str, Any]:
+    return {
+        "_copilot_yaml": _sheets_workflow_yaml(PROPOSAL_BOUND_ACCOUNT_ID),
+        COPILOT_PROPOSAL_METADATA_KEY: {
+            "owner_turn_id": owner_turn_id,
+            "revision": revision,
+            "canonical_fingerprint": "fingerprint",
+            "disposition": "review_untested",
+            "workflow_run_id": workflow_run_id,
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("result_token", "disposition", "minted"),
+    [
+        pytest.param(("turn-test", 2), "review_untested", True, id="own-proposal"),
+        pytest.param(("turn-test", 1), "review_untested", False, id="superseded-revision"),
+        pytest.param(("turn-test", 2), "no_proposal", False, id="discarded-proposal"),
+    ],
+)
+def test_end_to_end_picker_token_names_only_the_turns_own_proposal(
+    result_token: tuple[str, int], disposition: str, minted: bool
+) -> None:
+    agent_result = AgentResult(
+        user_response="Choose one of the connected accounts below so I can run the workflow.",
+        updated_workflow=None,
+        global_llm_context=None,
+        proposal_disposition=disposition,
+        proposal_owner_turn_id=result_token[0],
+        proposal_revision=result_token[1],
+        turn_outcome=_test_picker_outcome(token=False).model_copy(
+            update={"reason_code": UNAPPROVED_CONNECTION_REASON_CODE}
+        ),
+    )
+    chat_request = WorkflowCopilotChatRequest(
+        workflow_permanent_id="wpid_test",
+        workflow_id="wf_test",
+        message="",
+        workflow_yaml=EMPTY_WORKFLOW_YAML,
+        product_action="test_end_to_end",
+    )
+
+    workflow_copilot_route._record_offered_test_proposal(
+        chat_request,
+        SimpleNamespace(proposed_workflow=_stored_test_proposal("turn-test", 2, "wr_offered")),
+        agent_result,
+    )
+
+    assert agent_result.turn_outcome is not None
+    assert account_pick_test_resume(agent_result.turn_outcome, PROPOSAL_BOUND_ACCOUNT_ID, None) == (
+        AccountPickTestResume("turn-test", 2, "wr_offered", PROPOSAL_BOUND_ACCOUNT_ID) if minted else None
+    )
 
 
 def _ctx_with_denial(policy: request_policy_module.RequestPolicy, refs: list[str]) -> tuple[CopilotContext, object]:

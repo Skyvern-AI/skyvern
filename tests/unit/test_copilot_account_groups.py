@@ -40,6 +40,7 @@ from skyvern.forge.sdk.copilot.tools.account_groups import (
     account_group_status,
     cancel_account_group,
     run_for_accounts,
+    run_for_inputs,
     run_saved_workflow,
 )
 from skyvern.forge.sdk.copilot.tools.workflow_update import (
@@ -95,6 +96,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatus,
 )
 from skyvern.schemas.workflow_run_groups import (
+    RunGroupLimits,
     WorkflowRunGroupCreateRequest,
     WorkflowRunGroupItemOutcome,
     WorkflowRunGroupItemRequest,
@@ -351,6 +353,7 @@ async def test_http_approval_submits_exactly_the_checked_subset_without_secrets(
     assert review["rows"][2]["label"] == "Billing (al***@example.com)"
     assert (review["version"], review["workflow_id"]) == (1, "wf_1")
 
+    assert await _decide(chat, card, {"approved": True, "item_keys": ["cred_1", "cred_3"]}) == 409
     assert await _decide(chat, card, {"approved": True, "credential_ids": ["cred_1", "cred_3"]}) == 200
     result = await asyncio.wait_for(task, 5)
 
@@ -2373,3 +2376,359 @@ async def test_an_older_accept_does_not_replace_the_tested_run_receipt_of_a_newe
     await accept(newer, None)
     receipt = (await _chat_row(chat)).accepted_tested_run
     assert receipt is not None and (receipt.modified_at, receipt.workflow_run_id) == (newer, None)
+
+
+def _limit_groups(monkeypatch: pytest.MonkeyPatch, max_items: int, max_concurrency: int) -> None:
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "workflow_run_group_limits",
+        AsyncMock(return_value=RunGroupLimits(max_items, max_concurrency)),
+    )
+
+
+def _start_rows(
+    chat: Chat, rows: list[dict[str, JsonValue]], at_once: int = 3
+) -> asyncio.Task[AccountGroupSubmission | AccountGroupRefusal]:
+    with _as_requester(request_principal.get_request_principal() or ORG_KEY):
+        return asyncio.create_task(
+            run_for_inputs(
+                chat.ctx, tool_call_id=uuid4().hex, rows=rows, at_once=at_once, action_summary="Look up the note"
+            )
+        )
+
+
+async def _approve_every_row(
+    chat: Chat, task: asyncio.Task[AccountGroupSubmission | AccountGroupRefusal]
+) -> AccountGroupSubmission:
+    card = await _card(chat)
+    keys = [row["credential_id"] for row in card["account_group_review"]["rows"]]
+    assert await _decide(chat, card, {"approved": True, "item_keys": keys}) == 200
+    result = await asyncio.wait_for(task, 5)
+    assert isinstance(result, AccountGroupSubmission) and result.workflow_run_group_id is not None
+    return result
+
+
+async def _complete_first(chat: Chat, group_id: str, count: int) -> None:
+    completed: set[str] = set()
+    while len(completed) < count:
+        await group_service.advance_workflow_run_group(group_id)
+        for item in await chat.env.database.workflow_run_groups.get_items(group_id):
+            if item.state == WorkflowRunGroupItemState.dispatched and len(completed) < count:
+                await chat.env.database.workflow_runs.update_workflow_run(
+                    item.workflow_run_id, status=WorkflowRunStatus.completed
+                )
+                completed.add(item.item_key)
+    await group_service.advance_workflow_run_group(group_id)
+    while not chat.frames.empty():
+        chat.frames.get_nowait()
+
+
+@pytest.mark.asyncio
+async def test_input_rows_run_once_each_under_one_card_and_rerun_rows_start_unchecked(
+    chat: Chat, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _limit_groups(monkeypatch, max_items=100, max_concurrency=2)
+    _metered(monkeypatch)
+    rows: list[dict[str, JsonValue]] = [{"note": "alpha"}, {"note": "beta"}, {"note": "gamma"}]
+
+    task = _start_rows(chat, rows, at_once=5)
+    card = await _card(chat)
+    review = card["account_group_review"]
+    assert (review["row_group"], review["max_concurrency"]) == (True, 2)
+    assert [row["label"] for row in review["rows"]] == ["note: alpha", "note: beta", "note: gamma"]
+    assert [row["inputs"] for row in review["rows"]] == rows
+    assert review["cost"]["runs_to_start"] == 3
+    keys = [row["credential_id"] for row in review["rows"]]
+    assert await _decide(chat, card, {"approved": True, "credential_ids": keys}) == 409
+    assert await _decide(chat, card, {"approved": True, "item_keys": keys}) == 200
+    result = await asyncio.wait_for(task, 5)
+
+    assert isinstance(result, AccountGroupSubmission) and result.dispatched
+    assert result.note.startswith("Up to 2 runs execute at a time.")
+    group_id = result.workflow_run_group_id
+    assert group_id is not None
+    items = await chat.env.database.workflow_run_groups.get_items(group_id)
+    assert [item.parameters for item in items] == rows
+    async with chat.env.database.Session() as session:
+        stored = await session.get(WorkflowRunGroupModel, group_id)
+        assert stored is not None and stored.max_concurrency == 2
+
+    await _complete_first(chat, group_id, 1)
+    status = await account_group_status(chat.ctx, group_id)
+    assert isinstance(status, AccountGroupState) and status.next_offset is None
+    assert [(row.label, row.outcome) for row in status.rows] == [
+        ("note: alpha", WorkflowRunGroupItemOutcome.completed),
+        ("note: beta", WorkflowRunGroupItemOutcome.in_progress),
+        ("note: gamma", WorkflowRunGroupItemOutcome.in_progress),
+    ]
+
+    later = _start_rows(chat, [{"note": "gamma"}, {"note": "delta"}, {"note": "alpha"}, {"note": "beta"}])
+    later_card = await _card(chat)
+    assert [(row["label"], row["preselected"]) for row in later_card["account_group_review"]["rows"]] == [
+        ("note: gamma", False),
+        ("note: delta", True),
+        ("note: alpha", False),
+        ("note: beta", False),
+    ]
+    assert await _decide(chat, later_card, {"approved": False}) == 200
+    await asyncio.wait_for(later, 5)
+
+    cancel = asyncio.create_task(
+        cancel_account_group(chat.ctx, tool_call_id="call-cancel", workflow_run_group_id=group_id)
+    )
+    cancel_card = await _card(chat)
+    unfinished = cancel_card["account_group_cancel"]
+    assert unfinished["unfinished_count"] == 2
+    assert [row["label"] for row in unfinished["unfinished_rows"]] == ["note: beta", "note: gamma"]
+    assert await _decide(chat, cancel_card, {"approved": True, "credential_ids": []}) == 200
+    canceled = await asyncio.wait_for(cancel, 5)
+    assert isinstance(canceled, AccountGroupState) and canceled.cancel_approved is True
+    assert canceled.counts == {WorkflowRunGroupItemOutcome.completed: 1, WorkflowRunGroupItemOutcome.canceled: 2}
+
+
+async def _keep_browser_session(chat: Chat) -> None:
+    async with chat.env.database.Session() as session:
+        await session.execute(
+            update(WorkflowModel).where(WorkflowModel.workflow_id == "wf_1").values(persist_browser_session=True)
+        )
+        await session.commit()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "rows", "way_through"),
+    [
+        ("credential_input", [{"note": "a"}, {"login": "cred_1"}], "run_workflow_for_accounts"),
+        ("key_order_duplicate", [{"note": "a", "city": "b"}, {"city": "b", "note": "a"}], "Pass each row once"),
+        ("saved_default_duplicate", [{"note": "a"}, {"note": "a", "city": "none"}], "Pass each row once"),
+        ("null_duplicate", [{"note": "a", "city": None}, {"note": "a"}], "Pass each row once"),
+        ("object_as_text_duplicate", [{"city": {"x": 1}}, {"city": '{"x": 1}'}], "Pass each row once"),
+        ("flag_off", [{"note": "a"}], "run_saved_workflow"),
+        ("over_limit", [{"note": "a"}, {"note": "b"}, {"note": "c"}], "Split the rows"),
+        ("unknown_input", [{"town": "a"}], "input keys"),
+        ("not_fresh_browser", [{"note": "a"}], "persist_browser_session"),
+        ("secret_value", [{"note": SECRET}], "saved credential"),
+        ("no_rows", [], "at least one row"),
+    ],
+)
+async def test_a_refused_input_group_shows_no_card_and_names_a_way_through(
+    chat: Chat, monkeypatch: pytest.MonkeyPatch, case: str, rows: list[dict[str, JsonValue]], way_through: str
+) -> None:
+    await chat.env.database.workflow_params.create_workflow_parameter(
+        workflow_id="wf_1", workflow_parameter_type=WorkflowParameterType.STRING, key="city", default_value="none"
+    )
+    if case == "flag_off":
+        monkeypatch.setattr(settings, "WORKFLOW_RUN_GROUPS_SUBMIT_ENABLED", False)
+    if case == "over_limit":
+        _limit_groups(monkeypatch, max_items=2, max_concurrency=1)
+    if case == "not_fresh_browser":
+        await _keep_browser_session(chat)
+    if case == "secret_value":
+        register_secret_scrub_value(chat.ctx, SECRET)
+
+    result = await asyncio.wait_for(_start_rows(chat, rows), 5)
+
+    assert isinstance(result, AccountGroupRefusal) and result.dispatched is False
+    assert way_through in result.error and SECRET not in result.error
+    assert chat.frames.empty()
+    assert await _groups_from_this_chat(chat) == 0
+
+
+@pytest.mark.asyncio
+async def test_an_input_that_takes_a_login_after_the_review_refuses_the_approval(chat: Chat) -> None:
+    task = _start_rows(chat, [{"note": "alpha"}])
+    card = await _card(chat)
+    async with chat.env.database.Session() as session:
+        await session.execute(
+            update(WorkflowParameterModel)
+            .where(WorkflowParameterModel.key == "note")
+            .values(workflow_parameter_type=WorkflowParameterType.CREDENTIAL_ID.value)
+        )
+        await session.commit()
+
+    keys = [row["credential_id"] for row in card["account_group_review"]["rows"]]
+    assert await _decide(chat, card, {"approved": True, "item_keys": keys}) == 200
+    result = await asyncio.wait_for(task, 5)
+
+    assert isinstance(result, AccountGroupRefusal) and "run_workflow_for_accounts" in result.error
+    assert await _groups_from_this_chat(chat) == 0
+
+
+@pytest.mark.asyncio
+async def test_a_large_input_group_pages_in_submission_order_and_its_results_stay_bounded(
+    chat: Chat, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _limit_groups(monkeypatch, max_items=100, max_concurrency=4)
+    rows: list[dict[str, JsonValue]] = [{"note": f"n{i}"} for i in range(60)]
+    submitted = await _approve_every_row(chat, _start_rows(chat, rows, at_once=4))
+    group_id = submitted.workflow_run_group_id
+    assert group_id is not None
+    assert (len(submitted.rows), submitted.next_offset, submitted.repeated_count) == (25, 25, 0)
+    assert "n59" not in submitted.model_dump_json() and '"inputs"' not in submitted.model_dump_json()
+    history = await chat.client.get("/history", params={"workflow_copilot_chat_id": chat.ctx.workflow_copilot_chat_id})
+    recorded = QuestionInteraction.model_validate(history.json()["question_interactions"][0]).tool_result()
+    assert recorded["approved_count"] == 60 and "approved_credential_ids" not in recorded
+    assert "n0" not in to_json(recorded).decode()
+
+    await _complete_first(chat, group_id, 28)
+    first = await account_group_status(chat.ctx, group_id)
+    second = await account_group_status(chat.ctx, group_id, offset=25)
+    third = await account_group_status(chat.ctx, group_id, offset=50)
+    assert isinstance(first, AccountGroupState) and isinstance(second, AccountGroupState)
+    assert isinstance(third, AccountGroupState)
+    assert {row.outcome for row in first.rows} == {WorkflowRunGroupItemOutcome.completed}
+    assert [row.label for row in first.rows + second.rows + third.rows] == [f"note: n{i}" for i in range(60)]
+    assert (first.next_offset, second.next_offset, third.next_offset) == (25, 50, None)
+    assert first.counts is not None and first.counts[WorkflowRunGroupItemOutcome.completed] == 28
+    assert sum(first.counts.values()) == 60
+
+    cancel = asyncio.create_task(
+        cancel_account_group(chat.ctx, tool_call_id="call-cancel", workflow_run_group_id=group_id)
+    )
+    cancel_card = await _card(chat)
+    unfinished = cancel_card["account_group_cancel"]
+    assert (unfinished["unfinished_count"], len(unfinished["unfinished_rows"])) == (32, 25)
+    assert unfinished["unfinished_rows"][0]["label"] == "note: n28"
+    assert await _decide(chat, cancel_card, {"approved": True, "credential_ids": []}) == 200
+    canceled = await asyncio.wait_for(cancel, 5)
+    assert isinstance(canceled, AccountGroupState) and canceled.cancel_approved is True and len(canceled.rows) == 25
+
+
+@pytest.mark.asyncio
+async def test_history_links_an_input_group_whose_record_failed_by_rebuilding_its_request(
+    chat: Chat, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _limit_groups(monkeypatch, max_items=100, max_concurrency=2)
+    monkeypatch.setattr(
+        chat.env.database.workflow_params,
+        "record_copilot_account_group_submission",
+        AsyncMock(side_effect=RuntimeError("record failed")),
+    )
+    submitted = await _approve_every_row(chat, _start_rows(chat, [{"note": "a"}, {"note": "b"}], at_once=2))
+
+    history = await chat.client.get("/history", params={"workflow_copilot_chat_id": chat.ctx.workflow_copilot_chat_id})
+    (restored,) = history.json()["question_interactions"]
+    assert restored["account_group_review"]["workflow_run_group_id"] == submitted.workflow_run_group_id
+
+
+@pytest.mark.parametrize(
+    ("supports_input_group_card", "supports_account_group_card", "submit_enabled"),
+    [(True, True, True), (False, True, True), (True, False, True), (True, True, False)],
+)
+def test_the_input_group_tool_is_offered_only_to_clients_that_render_its_card(
+    monkeypatch: pytest.MonkeyPatch,
+    supports_input_group_card: bool,
+    supports_account_group_card: bool,
+    submit_enabled: bool,
+) -> None:
+    monkeypatch.setattr(settings, "WORKFLOW_RUN_GROUPS_SUBMIT_ENABLED", submit_enabled)
+    names = {
+        tool.name
+        for tool in copilot_native_tools(
+            supports_question_tool=True,
+            supports_account_group_card=supports_account_group_card,
+            supports_input_group_card=supports_input_group_card,
+            browser_code_available=False,
+            run_tools_available=True,
+        )
+    }
+
+    assert ("run_workflow_for_inputs" in names) is (
+        supports_input_group_card and supports_account_group_card and submit_enabled
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lookup", ["read_error", "chat_on_another_workflow"])
+async def test_input_group_status_labels_rows_by_position_when_its_review_cannot_be_tied_to_the_workflow(
+    chat: Chat, monkeypatch: pytest.MonkeyPatch, lookup: str
+) -> None:
+    submitted = await _approve_every_row(chat, _start_rows(chat, [{"note": "a"}, {"note": "b"}, {"note": "c"}]))
+    group_id = submitted.workflow_run_group_id
+    assert group_id is not None
+    await _complete_first(chat, group_id, 1)
+    repository = chat.env.database.workflow_params
+    read_chat = repository.get_workflow_copilot_chat_by_id
+
+    async def other_workflows_chat(*args: Any, **kwargs: Any) -> WorkflowCopilotChat:
+        found = await read_chat(*args, **kwargs)
+        assert found is not None
+        return found.model_copy(update={"workflow_permanent_id": "wpid_other"})
+
+    monkeypatch.setattr(
+        repository,
+        "get_workflow_copilot_chat_by_id",
+        AsyncMock(side_effect=RuntimeError("read failed")) if lookup == "read_error" else other_workflows_chat,
+    )
+    status = await account_group_status(chat.ctx, group_id)
+
+    assert isinstance(status, AccountGroupState)
+    assert [row.label for row in status.rows] == ["Row 1", "Row 2", "Row 3"]
+    assert status.rows[0].outcome == WorkflowRunGroupItemOutcome.completed and status.rows[0].workflow_run_id
+    assert status.counts is not None and status.counts[WorkflowRunGroupItemOutcome.completed] == 1
+    assert sum(status.counts.values()) == 3
+
+
+@pytest.mark.asyncio
+async def test_login_group_status_keeps_logins_hidden_from_this_user_out_of_its_rows(
+    chat: Chat, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    group_id = await _running_group_of_three(chat)
+    monkeypatch.setattr(account_groups, "load_credentials", AsyncMock(return_value=[]))
+
+    status = await account_group_status(chat.ctx, group_id)
+
+    assert isinstance(status, AccountGroupState)
+    assert status.rows == []
+    assert status.counts is not None and sum(status.counts.values()) == 3
+
+
+@pytest.mark.asyncio
+async def test_a_completed_row_proposed_again_with_its_number_as_text_starts_unchecked(chat: Chat) -> None:
+    await chat.env.database.workflow_params.create_workflow_parameter(
+        workflow_id="wf_1", workflow_parameter_type=WorkflowParameterType.INTEGER, key="count", default_value=None
+    )
+    submitted = await _approve_every_row(chat, _start_rows(chat, [{"count": 5}]))
+    assert submitted.workflow_run_group_id is not None
+    await _complete_first(chat, submitted.workflow_run_group_id, 1)
+
+    later = _start_rows(chat, [{"count": "5"}])
+    card = await _card(chat)
+    assert [row["preselected"] for row in card["account_group_review"]["rows"]] == [False]
+    assert await _decide(chat, card, {"approved": False}) == 200
+    await asyncio.wait_for(later, 5)
+
+
+@pytest.mark.asyncio
+async def test_a_json_null_input_is_a_different_row_from_one_that_leaves_it_to_its_default(chat: Chat) -> None:
+    await chat.env.database.workflow_params.create_workflow_parameter(
+        workflow_id="wf_1", workflow_parameter_type=WorkflowParameterType.JSON, key="options", default_value={"x": 1}
+    )
+    proposed = _start_rows(chat, [{"note": "a"}, {"note": "a", "options": "null"}])
+    card = await _card(chat)
+    assert len(card["account_group_review"]["rows"]) == 2
+    assert await _decide(chat, card, {"approved": False}) == 200
+    await asyncio.wait_for(proposed, 5)
+
+
+@pytest.mark.asyncio
+async def test_an_input_group_cancel_card_lists_unfinished_runs_by_position_without_its_review(
+    chat: Chat, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    submitted = await _approve_every_row(chat, _start_rows(chat, [{"note": "a"}, {"note": "b"}, {"note": "c"}]))
+    group_id = submitted.workflow_run_group_id
+    assert group_id is not None
+    await _complete_first(chat, group_id, 1)
+    monkeypatch.setattr(account_groups, "_row_group_review", AsyncMock(return_value=None))
+
+    cancel = asyncio.create_task(
+        cancel_account_group(chat.ctx, tool_call_id="call-cancel", workflow_run_group_id=group_id)
+    )
+    card = await _card(chat)
+    unfinished = card["account_group_cancel"]
+    assert unfinished["unfinished_count"] == 2
+    assert [row["label"] for row in unfinished["unfinished_rows"]] == ["Row 2", "Row 3"]
+    assert await _decide(chat, card, {"approved": False}) == 200
+    kept = await asyncio.wait_for(cancel, 5)
+    assert isinstance(kept, AccountGroupState) and kept.cancel_approved is False
+    assert kept.counts is not None and sum(kept.counts.values()) == 3
