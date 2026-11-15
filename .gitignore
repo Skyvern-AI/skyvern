@@ -167,7 +167,7 @@ videos/
 skyvern/artifacts/
 artifacts/
 # The bare artifacts/ rule above is unanchored, so it would otherwise swallow the
-# Fern-generated SDK resources of the same name in BOTH clients, breaking the npm
+# SDK resources of the same name in BOTH clients, breaking the npm
 # release build and leaving skyvern.client.artifacts unimportable in CI.
 !skyvern-ts/client/src/api/resources/artifacts/
 !skyvern/client/artifacts/
