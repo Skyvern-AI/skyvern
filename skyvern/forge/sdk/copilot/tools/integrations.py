@@ -7,13 +7,14 @@ from typing import Any, Literal
 
 import structlog
 
+from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.connected_accounts import ConnectionCardPayload, request_user_id
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
-from skyvern.forge.sdk.integrations.catalog import copilot_payload, integrations_for_org
+from skyvern.forge.sdk.integrations.catalog import IntegrationEntry, copilot_payload, integrations_for_org
 from skyvern.forge.sdk.integrations.connected_accounts import OrgConnection, org_connections_by_id
 from skyvern.forge.sdk.schemas.google_oauth import STATE_ACTIVE, GoogleOAuthCredentialBase
 from skyvern.forge.sdk.services import google_oauth_service, google_sheets_service
@@ -50,6 +51,13 @@ async def _list_integrations(params: dict[str, Any], ctx: AgentContext) -> dict[
     return {"ok": True, "data": {"integrations": integrations, "count": len(integrations)}}
 
 
+def _setup_url(entry: IntegrationEntry) -> str | None:
+    if entry.kind == "external":
+        return entry.learn_more_url
+    path = app.AGENT_FUNCTION.integration_setup_path(entry)
+    return f"{settings.SKYVERN_APP_URL.rstrip('/')}{path}" if path else None
+
+
 async def _request_connection(integration_id: str, connection_id: str | None, ctx: CopilotContext) -> dict[str, Any]:
     user_id = human_user_id(get_request_principal(), ctx.organization_id)
     entry = next(
@@ -65,8 +73,27 @@ async def _request_connection(integration_id: str, connection_id: str | None, ct
             "ok": False,
             "error": f"No integration has the id `{integration_id}`; use an `id` from list_integrations.",
         }
+    unavailable = {"accounts_unavailable": entry.accounts_unavailable} if entry.accounts_unavailable else {}
+    # A not_enabled entry's page shows it as unavailable on this deployment, so it is no way through.
+    offered_elsewhere = entry.status == "live" and entry.accounts_unavailable != "not_enabled"
+    setup_url = _setup_url(entry) if offered_elsewhere else None
+    if setup_url is not None:
+        return {
+            "ok": True,
+            "data": {
+                "status": "setup_page",
+                "integration_id": entry.id,
+                "kind": entry.kind,
+                "url": setup_url,
+                "accounts": copilot_payload(entry)["accounts"],
+                **unavailable,
+            },
+        }
     if entry.status != "live" or entry.oauth_provider is None:
-        return {"ok": True, "data": {"status": "not_offered", "integration_status": entry.status, "kind": entry.kind}}
+        return {
+            "ok": True,
+            "data": {"status": "not_offered", "integration_status": entry.status, "kind": entry.kind, **unavailable},
+        }
     required_scopes = list(entry.required_scopes or [])
     target: OrgConnection | None = None
     if connection_id is not None:

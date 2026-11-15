@@ -43,6 +43,7 @@ _SENSITIVE_ENDPOINTS = {
     "POST /api/v1/internal/gmail/inbox",
     "POST /api/v1/internal/gmail/send",
     "POST /api/v1/internal/gmail/attachment",
+    "POST /api/v1/internal/gmail/trigger-read",
     # Agent reports can contain credentials before route redaction.
     "POST /v1/agent_feedback",
     "GET /api/v1/users/me/onboarding",

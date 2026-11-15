@@ -102,6 +102,7 @@ from skyvern.forge.taskv3.loop import (
     TARGET_KIND_DATA_KEY,
     TARGET_LABEL_DATA_KEY,
     TARGET_LABEL_IS_PLACEHOLDER_DATA_KEY,
+    TARGET_SHOWN_TEXT_DATA_KEY,
     BlockingLayer,
     CoveredBranch,
     CoveredLayerKind,
@@ -6199,6 +6200,9 @@ _TARGET_NAME_JS = (
   const _labelText = """
     + _LABEL_TEXT_JS
     + r""";
+  const _shownText = """
+    + _SHOWN_TEXT_JS
+    + r""";
 """
     + _NATIVE_LABEL_JS
     + r"""
@@ -6340,7 +6344,31 @@ _TARGET_NAME_JS = (
       kind = 'textbox';
     }
   }
-  return { name: finalName, kind: kind, placeholder: Boolean(hint) && finalName !== null };
+  // The same gate as observe's shows=, limited to plain action controls, whose visible text is a caption. A
+  // link's text is often row data, and a value, checkable, pressed or popup control shows its current state.
+  const captioned = _matches(el, 'button,summary,[role=button],[role=menuitem],[role=tab]')
+    && !_matches(el, '[role]:not([role=button],[role=menuitem],[role=tab]),[aria-checked],[aria-pressed],'
+      + '[aria-haspopup]:not([aria-haspopup=false])');
+  // innerText keeps screen-reader-only text, which stays rendered while clipped, shrunk to a pixel or moved
+  // off the control. A control holding any such text has no caption this probe can vouch for.
+  const hidesText = (root) => {
+    try {
+      const box = Element.prototype.getBoundingClientRect.call(root);
+      for (const d of _qsa(root, '*')) {
+        if (!String(d.textContent || '').trim() || Element.prototype.getClientRects.call(d).length === 0) continue;
+        const cs = getComputedStyle(d);
+        const r = Element.prototype.getBoundingClientRect.call(d);
+        if (cs.opacity === '0' || cs.clip !== 'auto' || cs.clipPath !== 'none' || r.width <= 1 || r.height <= 1
+          || r.right <= box.left || r.left >= box.right || r.bottom <= box.top || r.top >= box.bottom) return true;
+      }
+      return false;
+    } catch (e) {
+      return true;
+    }
+  };
+  const visibleText = finalName && captioned ? _shownText(el, finalName) : '';
+  const shown = visibleText && !hidesText(el) ? visibleText : '';
+  return { name: finalName, kind: kind, placeholder: Boolean(hint) && finalName !== null, shown: shown };
 }"""
 )
 
@@ -16722,6 +16750,7 @@ def build_browser_tools(
             selector = args.get("selector")
             name: str | None = None
             kind: str | None = None
+            shown: str | None = None
             from_placeholder = False
             # The page comes from the preflight handoff, read and not popped -- the handler's own
             # _resolve_page consumes it. Never page_provider(): a second must_get_working_page can
@@ -16760,6 +16789,8 @@ def build_browser_tools(
                     name = raw_name if isinstance(raw_name, str) and raw_name.strip() else None
                     raw_kind = raw.get("kind")
                     kind = raw_kind if isinstance(raw_kind, str) and raw_kind else None
+                    raw_shown = raw.get("shown")
+                    shown = raw_shown if name is not None and isinstance(raw_shown, str) and raw_shown.strip() else None
                     from_placeholder = raw.get("placeholder") is True
             result = await handler(args)
             # Only a call that acted carries a name/kind. The probe resolves the selector on its own,
@@ -16775,6 +16806,8 @@ def build_browser_tools(
                 data[TARGET_LABEL_DATA_KEY] = name
                 if from_placeholder:
                     data[TARGET_LABEL_IS_PLACEHOLDER_DATA_KEY] = True
+                if shown is not None:
+                    data[TARGET_SHOWN_TEXT_DATA_KEY] = shown
             if kind is not None:
                 data[TARGET_KIND_DATA_KEY] = kind
             # `replace`, not a positional rebuild: this carries every field the result already has,

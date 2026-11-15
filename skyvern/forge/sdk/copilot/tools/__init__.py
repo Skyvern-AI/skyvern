@@ -1357,14 +1357,18 @@ async def request_connection_tool(
     integration_id: str,
     connection_id: str | None = None,
 ) -> str:
-    """Show the user a card in this chat for connecting an account to one `list_integrations` entry,
-    named by its `id`. The card asks for that entry's `required_scopes`.
+    """Show the user how to connect an account to one `list_integrations` entry, named by its `id`.
+    A live entry with an `oauth_provider` gets a card in this chat that asks for its `required_scopes`.
 
     The card appears with your reply. The user connects through the provider's consent and then picks
     the account on the card; that pick reaches you on the next turn as CONNECTED ACCOUNT CHOICE FACTS
     and is approved for runs. This call does not start consent, does not wait for it and does not
     change the workflow, so nothing is connected when it returns (`status` is `offered`). An entry
-    that is not `live` gets no card (`status` is `not_offered`).
+    that is not `live` gets no card (`status` is `not_offered`). A live `credential_form`, `internal`
+    or `external` entry is set up outside this chat and gets no card either: `status` is
+    `setup_page` and `url` is where the user sets it up (for a `credential_form`, the entry's form on
+    the Integrations page). When this deployment has no page for the entry, or its `accounts_unavailable`
+    is `not_enabled`, `status` is `not_offered`.
 
     With `connection_id`, the card reauthorizes that connection in place when `reconnect_in_place`
     is true: its id stays the same. Otherwise the user connects a new account, which gets a new id.

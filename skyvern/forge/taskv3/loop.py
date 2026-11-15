@@ -387,6 +387,8 @@ OPENED_LIST_ERROR_CLASSES = frozenset({"list_no_match", "list_unread", "list_amb
 TARGET_KIND_DATA_KEY = "target_kind"
 # Set when the target label is the field's placeholder, a hint rather than its question.
 TARGET_LABEL_IS_PLACEHOLDER_DATA_KEY = "target_label_is_placeholder"
+# The control's visible text, set only when its bound name (aria-label, <label>, aria-labelledby) lacks it.
+TARGET_SHOWN_TEXT_DATA_KEY = "target_shown_text"
 # A refusal whose data carries a GuardEnd under this key ends the run with that guard's verdict.
 GUARD_END_DATA_KEY = "guard_end"
 
@@ -678,6 +680,9 @@ class RoundAction(NamedTuple):
     # can say about itself -- a refusal the engine issued on purpose reads as an unexplained failed
     # row without it. Model-facing prose, so a caller that persists it must redact and cap it.
     error: str | None = None
+    # The target's visible text when its bound name lacks it (see TARGET_SHOWN_TEXT_DATA_KEY); raw page
+    # text, cleared for display by target_label.py like target_name.
+    target_shown: str | None = None
 
 
 class ActionRoundSink(Protocol):
@@ -2486,6 +2491,8 @@ def _verdict_target(
     kind: Any,
     label_secret_values: Callable[[], Collection[str]] | None,
     ctx: SkyvernContext | None,
+    *,
+    shown: str | None = None,
 ) -> str | None:
     """The control a verdict names, or None when the acting call reported neither a name nor a kind.
 
@@ -2508,7 +2515,7 @@ def _verdict_target(
         return describe_target(tool, None, kind, ())
     # Unfloored, and read live: a code minted this turn is not in the resolver's floored view.
     secret_values |= set(ctx.runtime_secret_values)
-    return describe_target(tool, name, kind, secret_values)
+    return describe_target(tool, name, kind, secret_values, shown)
 
 
 def _action_loop_reason(target: str | None, *, page_unchanged: bool) -> str:
@@ -6380,6 +6387,7 @@ async def run_agent_tool_loop(
                         result_data.get(TARGET_KIND_DATA_KEY),
                         label_secret_values,
                         skyvern_ctx,
+                        shown=result_data.get(TARGET_SHOWN_TEXT_DATA_KEY),
                     )
                     page_unchanged = streak_fp is not None and batch_fp_before is not None and not streak_moved
                     st.outcome = _guard_verdict(
@@ -6422,6 +6430,7 @@ async def run_agent_tool_loop(
                         call_charged,
                         round_outcome,
                         result.content if result.status == "error" else None,
+                        result_data.get(TARGET_SHOWN_TEXT_DATA_KEY) or None,
                     )
                 )
                 if spec.billable and result.status == "ok":
