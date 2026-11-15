@@ -15800,8 +15800,9 @@ async def test_action_loop_verdict_names_a_control_the_customer_can_find() -> No
     # itself, so it matches nothing in the customer's markup and points at an element they cannot
     # locate. The control's own accessible name is what they can.
     clicks: list[tuple[str, dict[str, Any]]] = []
+    data = {"target_label": "Continue", "target_kind": "button", "target_shown_text": "Next step"}
     tools = [
-        _billable_tool("click", clicks, data={"target_label": "Continue", "target_kind": "button"}),
+        _billable_tool("click", clicks, data=data),
         _perception_tool("observe", _REJECTION_OBSERVE),
         make_finish_tool(),
     ]
@@ -15811,7 +15812,10 @@ async def test_action_loop_verdict_names_a_control_the_customer_can_find() -> No
     )
 
     _assert_customer_facing_verdict(
-        outcome, guard=ACTION_LOOP_GUARD, names='the "Continue" button', hides=("#submit", "[data-tv3")
+        outcome,
+        guard=ACTION_LOOP_GUARD,
+        names='the "Next step" button (labeled "Continue")',
+        hides=("#submit", "[data-tv3"),
     )
 
 

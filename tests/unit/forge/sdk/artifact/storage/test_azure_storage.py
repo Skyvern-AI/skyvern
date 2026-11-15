@@ -435,16 +435,16 @@ class TestAzureShareLinkSensitiveCap:
         download = make_artifact(f"azure://{TEST_CONTAINER}/file.pdf", artifact_type=ArtifactType.DOWNLOAD)
 
         async def fake_sas(
-            uris: list[str], expiry_hours: int = 24, attachment_filenames: list[str | None] | None = None
+            uris: list[str], expiry_seconds: int = 86400, attachment_filenames: list[str | None] | None = None
         ) -> list[str]:
             suffix = "&attachment" if attachment_filenames is not None else ""
-            return [f"{uri}?h={expiry_hours}{suffix}" for uri in uris]
+            return [f"{uri}?s={expiry_seconds}{suffix}" for uri in uris]
 
         azure_storage.async_client.create_sas_urls = AsyncMock(side_effect=fake_sas)
         urls = await azure_storage.get_share_links([recording, download])
         assert urls == [
-            f"{recording.uri}?h={SENSITIVE_SHARE_URL_EXPIRY_HOURS}",
-            f"{download.uri}?h=24&attachment",
+            f"{recording.uri}?s={SENSITIVE_SHARE_URL_EXPIRY_HOURS * 3600}",
+            f"{download.uri}?s=86400&attachment",
         ]
 
 
@@ -460,6 +460,26 @@ async def test_download_sas_urls_sign_an_octet_stream_attachment() -> None:
     assert query["rscd"] == ["attachment; filename=\"page.html\"; filename*=UTF-8''page.html"]
     assert query["rsct"] == ["application/octet-stream"]
     assert "rscd" not in parse_qs(urlparse(inline[0]).query)
+
+
+@pytest.mark.asyncio
+async def test_a_managed_file_sas_expires_at_the_exact_lifetime_under_an_hour(
+    azure_storage: AzureStorageForTests,
+) -> None:
+    azure_storage.async_client = RealAsyncAzureStorageClient(
+        account_name="acct", account_key=base64.b64encode(b"k" * 32).decode()
+    )
+    uri = f"azure://{settings.AZURE_STORAGE_CONTAINER_UPLOADS}/{settings.ENV}/{TEST_ORGANIZATION_ID}/doc/shot.png"
+
+    before = datetime.now(UTC).replace(microsecond=0)
+    url = await azure_storage.presign_managed_file(
+        uri, TEST_ORGANIZATION_ID, expiry_seconds=1799, inline_content_type="image/png"
+    )
+    after = datetime.now(UTC)
+
+    assert url is not None
+    expiry = datetime.strptime(parse_qs(urlparse(url).query)["se"][0], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+    assert before + timedelta(seconds=1799) <= expiry <= after + timedelta(seconds=1799)
 
 
 @pytest.mark.asyncio
