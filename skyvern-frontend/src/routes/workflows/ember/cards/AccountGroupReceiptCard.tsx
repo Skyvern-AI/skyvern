@@ -1,5 +1,6 @@
 import { QuestionMarkCircledIcon } from "@radix-ui/react-icons";
 import { useQuery } from "@tanstack/react-query";
+import { useState } from "react";
 import { isAxiosError } from "axios";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
@@ -137,6 +138,9 @@ export function AccountGroupReceiptCard({
   );
   const decision = review.decision;
   const singleRun = Boolean(review.single_run);
+  const rowGroup = Boolean(review.row_group);
+  const [showRows, setShowRows] = useState(!rowGroup);
+  const reviewNoun = singleRun ? "run" : rowGroup ? "runs" : "account";
 
   if (interaction.status === "pending") {
     return (
@@ -151,7 +155,7 @@ export function AccountGroupReceiptCard({
           title={
             singleRun
               ? "Copilot asked you to review a run"
-              : `Copilot asked you to review ${plural(review.rows.length, "account")}`
+              : `Copilot asked you to review ${plural(review.rows.length, rowGroup ? "run" : "account")}`
           }
         />
       </div>
@@ -171,8 +175,8 @@ export function AccountGroupReceiptCard({
           tone={interrupted ? "error" : "neutral"}
           title={
             interaction.status === "resolved"
-              ? `You declined the ${singleRun ? "run" : "account"} review. Nothing ran.`
-              : `The ${singleRun ? "run" : "account"} review ended. Nothing ran.`
+              ? `You declined the ${reviewNoun} review. Nothing ran.`
+              : `The ${reviewNoun} review ended. Nothing ran.`
           }
         />
         {interrupted ? (
@@ -250,6 +254,7 @@ export function AccountGroupReceiptCard({
       </div>
     );
   }
+  const approvedCount = (decision.item_keys ?? decision.credential_ids).length;
   return (
     <div
       data-interaction-id={interaction.interaction_id}
@@ -260,10 +265,20 @@ export function AccountGroupReceiptCard({
     >
       <Heading
         tone="answered"
-        title={`You approved ${plural(decision.credential_ids.length, "account run")}`}
+        title={`You approved ${plural(approvedCount, rowGroup ? "run" : "account run")}`}
         meta={group ? groupMeta(group) : null}
       />
-      {group ? (
+      {group && rowGroup ? (
+        <button
+          type="button"
+          className="self-start pl-4 underline underline-offset-2"
+          aria-expanded={showRows}
+          onClick={() => setShowRows((open) => !open)}
+        >
+          {showRows ? "Hide runs" : `Show ${plural(group.items.length, "run")}`}
+        </button>
+      ) : null}
+      {group && showRows ? (
         <ul className="flex flex-col gap-0.5 pl-4">
           {group.items.map((item) => (
             <li
@@ -319,7 +334,7 @@ export function AccountGroupReceiptCard({
       <RunCostFactList
         cost={review.cost}
         basedOnInputs={review.based_on_inputs}
-        runs={review.workflow_run_group_id ? decision.credential_ids.length : 0}
+        runs={review.workflow_run_group_id ? approvedCount : 0}
         receipt
         className="pl-4"
       />
@@ -351,7 +366,7 @@ export function AccountGroupCancelReceipt({
   interaction: QuestionInteraction;
   review: AccountGroupCancelReview;
 }) {
-  const count = review.unfinished_rows.length;
+  const count = review.unfinished_count ?? review.unfinished_rows.length;
   const approved = review.decision?.approved;
   const group = useGroup(approved ? review.workflow_run_group_id : null).data;
   if (interaction.status === "pending") {
@@ -364,7 +379,7 @@ export function AccountGroupCancelReceipt({
               className="size-3.5 shrink-0"
             />
           }
-          title={`Copilot asked whether to stop ${plural(count, "account run")}`}
+          title={`Copilot asked whether to stop ${plural(count, "run")}`}
         />
       </div>
     );
@@ -382,9 +397,9 @@ export function AccountGroupCancelReceipt({
         tone={interrupted ? "error" : "neutral"}
         title={
           approved
-            ? `You asked to stop ${plural(count, "unfinished account run")}`
+            ? `You asked to stop ${plural(count, "unfinished run")}`
             : interaction.status === "resolved"
-              ? "You kept the account runs going. Nothing was canceled."
+              ? "You kept the runs going. Nothing was canceled."
               : "The cancel review ended. Nothing was canceled."
         }
         meta={group ? groupMeta(group) : null}

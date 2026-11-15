@@ -76,6 +76,7 @@ export interface AccountGroupRow {
   prior_outcome: AccountGroupOutcome | null;
   preselected: boolean;
   parameter_key?: string;
+  inputs?: Record<string, unknown> | null;
 }
 
 export interface AccountGroupReview {
@@ -91,6 +92,8 @@ export interface AccountGroupReview {
   rows: AccountGroupRow[];
   workflow_run_group_id: string | null;
   single_run?: boolean;
+  row_group?: boolean;
+  max_concurrency?: number | null;
   workflow_run_id?: string | null;
   saves_draft?: boolean;
   proposal_owner_turn_id?: string | null;
@@ -127,12 +130,14 @@ export interface AccountGroupRunRow {
 export interface AccountGroupCancelReview {
   workflow_run_group_id: string;
   unfinished_rows: AccountGroupRunRow[];
+  unfinished_count?: number | null;
   decision?: AccountGroupDecision | null;
 }
 
 export interface AccountGroupDecision {
   approved: boolean;
   credential_ids: string[];
+  item_keys?: string[] | null;
 }
 
 export type CredentialDeleteOutcomeKind = "deleted" | "not_found" | "failed";
@@ -271,6 +276,7 @@ export interface EmberChatRequest {
   supports_question_tool?: boolean;
   supports_account_group_card?: boolean;
   supports_single_run_card?: boolean;
+  supports_input_group_card?: boolean;
   supports_credential_delete_card?: boolean;
   supports_connection_card?: boolean;
   supports_demonstration_offer?: boolean;

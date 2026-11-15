@@ -215,6 +215,102 @@ describe("account group review", () => {
     expect(onDecide.mock.calls).toEqual([[false], [true]]);
   });
 
+  it("counts the unfinished runs a cancel card does not list", () => {
+    render(
+      <AccountGroupCancelCard
+        review={{
+          workflow_run_group_id: "wrg_1",
+          unfinished_rows: [],
+          unfinished_count: 3,
+        }}
+        disabled={false}
+        lockReason={null}
+        collapsed={false}
+        onCollapsedChange={() => {}}
+        onDecide={() => {}}
+      />,
+    );
+
+    expect(screen.getByText("and 3 more runs")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Stop 3 runs" })).toBeTruthy();
+  });
+
+  it("shows every input a row run sends once the user opens the runs", () => {
+    const onApprove = vi.fn();
+    render(
+      <AccountGroupReviewCard
+        review={{
+          ...review,
+          credential_parameter_key: "",
+          common_inputs: {},
+          row_group: true,
+          max_concurrency: 1,
+          rows: [
+            {
+              credential_id: "key_a",
+              label: "note: alpha, city: a very long…",
+              inputs: { note: "alpha", city: "a very long city name" },
+              prior_outcome: "completed",
+              preselected: false,
+            },
+            {
+              credential_id: "key_b",
+              label: "note: beta",
+              inputs: { note: "beta" },
+              prior_outcome: null,
+              preselected: true,
+            },
+            {
+              credential_id: "key_c",
+              label: "Row 3",
+              inputs: {},
+              prior_outcome: null,
+              preselected: true,
+            },
+            {
+              credential_id: "key_d",
+              label: "note: delta",
+              inputs: { note: "delta" },
+              prior_outcome: "in_progress",
+              preselected: false,
+            },
+          ],
+        }}
+        disabled={false}
+        lockReason={null}
+        collapsed={false}
+        onCollapsedChange={() => {}}
+        onApprove={onApprove}
+        onDecline={() => {}}
+      />,
+    );
+    expect(screen.getByText(/one at a time/)).toBeTruthy();
+    expect(
+      screen.getByText(
+        "4 runs · 2 unchecked · 1 ran before · 1 in another group",
+      ),
+    ).toBeTruthy();
+    const toggle = screen.getByRole("button", { name: "Show runs" });
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+
+    fireEvent.click(toggle);
+
+    expect(screen.getByText("a very long city name")).toBeTruthy();
+    expect(screen.getByText("Row 3")).toBeTruthy();
+    expect(screen.getByText("running in another group")).toBeTruthy();
+    expect(
+      screen.getByText(/leaves out use the workflow's saved/),
+    ).toBeTruthy();
+    fireEvent.click(screen.getAllByRole("checkbox")[2]!);
+    expect(
+      screen.getByText(
+        "4 runs · 3 unchecked · 1 ran before · 1 in another group",
+      ),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Approve 1 run" }));
+    expect(onApprove).toHaveBeenCalledWith(["key_b"]);
+  });
+
   it("states the cost facts of a metered run and multiplies the estimate by the checked accounts", () => {
     const cost: RunCostFacts = {
       runs_to_start: 2,
@@ -409,9 +505,9 @@ describe("account group receipt", () => {
   const renderReceipt = (shape: Partial<AccountGroupReview>) => {
     const stored = interaction({
       ...review,
-      ...shape,
       cost,
       decision: { approved: true, credential_ids: ["cred_b", "cred_c"] },
+      ...shape,
     });
     render(
       <QueryClientProvider client={new QueryClient()}>
@@ -453,6 +549,20 @@ describe("account group receipt", () => {
       ).toBe("500 credits");
     },
   );
+
+  it("counts every approved row of an input group", () => {
+    const facts = renderReceipt({
+      row_group: true,
+      workflow_run_group_id: "wrg_1",
+      decision: {
+        approved: true,
+        credential_ids: [],
+        item_keys: ["r1", "r2", "r3", "r4", "r5"],
+      },
+    });
+    expect(screen.getByText("You approved 5 runs")).toBeTruthy();
+    expect(facts.getByText("Runs approved").nextSibling?.textContent).toBe("5");
+  });
 
   it.each([
     ["one run with no linked run", { single_run: true }],
