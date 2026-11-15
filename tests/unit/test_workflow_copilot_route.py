@@ -36,9 +36,14 @@ from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot import agent as agent_module
-from skyvern.forge.sdk.copilot import credential_pause, streaming_adapter
+from skyvern.forge.sdk.copilot import credential_pause, live_narrative, streaming_adapter
 from skyvern.forge.sdk.copilot import tools as copilot_tools
-from skyvern.forge.sdk.copilot.ask_user import QuestionInteraction, QuestionResponse
+from skyvern.forge.sdk.copilot.ask_user import (
+    AskUserArguments,
+    QuestionInteraction,
+    QuestionResponse,
+    create_question_interaction,
+)
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.browser_ablation import CopilotEvalMode
 from skyvern.forge.sdk.copilot.build_test_connect_failure import (
@@ -57,6 +62,7 @@ from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
 from skyvern.forge.sdk.copilot.context import (
     AgentResult,
     CopilotContext,
+    LiveTurnNarrative,
     ProposalDisposition,
     TurnNarrativePayload,
 )
@@ -128,6 +134,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     COPILOT_PROPOSAL_METADATA_KEY,
     CopilotAttachedFile,
     CopilotPendingTurn,
+    CopilotSteerMessage,
     CopilotVideoEvidenceArtifact,
     CopilotVideoObservation,
     WorkflowCopilotApplyProposedWorkflowRequest,
@@ -7795,6 +7802,149 @@ async def test_request_browser_receipt_survives_terminal_pending_handoff(sqlite_
         await repo.record_copilot_browser_allocation(
             **dict(arguments, request_cancel_token="d" * 32), browser_session_id="pbs_88"
         )
+
+
+class _CountingCache(_FakeCache):
+    def __init__(self) -> None:
+        super().__init__()
+        self.get_calls = 0
+
+    async def get(self, key: str) -> Any:
+        self.get_calls += 1
+        return await super().get(key)
+
+
+@pytest.mark.asyncio
+async def test_chat_history_serves_the_running_turns_live_narrative_only_when_asked(sqlite_engine, monkeypatch):
+    repo = WorkflowParametersRepository(BaseAlchemyDB(sqlite_engine).Session, db_engine=sqlite_engine)
+    monkeypatch.setattr(app.DATABASE, "workflow_params", repo)
+    monkeypatch.setattr(workflow_copilot_route, "pending_credential_requests", AsyncMock(return_value=[]))
+    monkeypatch.setattr(workflow_copilot_route, "credential_pause_is_active", AsyncMock(return_value=False))
+    monkeypatch.setattr(settings, "SKYVERN_APP_URL", "https://app.example.com/")
+    monkeypatch.setattr(live_narrative, "LIVE_TURN_NARRATIVE_GET_TIMEOUT_SECONDS", 0.05)
+    cache = _CountingCache()
+    monkeypatch.setattr(app, "CACHE", cache)
+    chat = await repo.create_workflow_copilot_chat(organization_id="org", workflow_permanent_id="wpid")
+    chat_id = chat.workflow_copilot_chat_id
+    for index, sender in enumerate([WorkflowCopilotChatSender.USER, WorkflowCopilotChatSender.AI] * 2):
+        await repo.create_workflow_copilot_chat_message(
+            organization_id="org", workflow_copilot_chat_id=chat_id, sender=sender, content=f"message {index}"
+        )
+    turn = "a" * 32
+    await repo.start_copilot_turn(
+        "org", chat_id, CopilotPendingTurn(turn_id=turn, started_at=datetime.now(UTC), cancel_token="stop"), "Build it"
+    )
+    await repo.start_copilot_question(
+        "org",
+        chat_id,
+        create_question_interaction(
+            AskUserArguments.model_validate({"parts": [{"prompt": "Format?"}]}), turn_id=turn, tool_call_id="call"
+        ),
+    )
+    delivered_at = datetime.now(UTC)
+    async with repo.Session() as session:
+        model = await session.get(WorkflowCopilotChatModel, chat_id)
+        entry = CopilotPendingTurn.model_validate(model.pending_turns[turn])
+        entry.steer_messages = [
+            CopilotSteerMessage(steer_id="s1", text="Use the CSV", created_at=delivered_at, delivered_at=delivered_at),
+            CopilotSteerMessage(steer_id="s2", text="Skip the header", created_at=delivered_at),
+        ]
+        await session.execute(
+            update(WorkflowCopilotChatModel)
+            .where(WorkflowCopilotChatModel.workflow_copilot_chat_id == chat_id)
+            .values(pending_turns={turn: entry.model_dump(mode="json")})
+        )
+        await session.commit()
+
+    snapshot: LiveTurnNarrative = {
+        "turnId": turn,
+        "turnIndex": 1,
+        "designStarted": True,
+        "designEnded": False,
+        "draft": None,
+        "blocks": [],
+        "terminal": "running",
+        "terminalMessage": None,
+        "narrativeSummary": None,
+        "priorBlockCount": None,
+        "designActivity": [{"kind": "tool_call", "text": "Reading the page", "iteration": 1, "id": "call"}],
+        "startedAt": None,
+        "endedAt": None,
+        "browserSessionId": "pbs_1",
+        "pausedFor": "question",
+    }
+    writer = asyncio.create_task(
+        live_narrative.write_live_turn_narrative(
+            live_narrative.live_turn_narrative_key("org", chat_id, turn), lambda: snapshot, asyncio.Event()
+        )
+    )
+    async with asyncio.timeout(5):
+        while not cache.set_calls:
+            await asyncio.sleep(0)
+    writer.cancel()
+
+    api = FastAPI()
+    api.dependency_overrides[workflow_copilot_route.org_auth_service.get_current_org] = lambda: SimpleNamespace(
+        organization_id="org"
+    )
+    api.add_api_route("/history", workflow_copilot_chat_history)
+    async with AsyncClient(transport=ASGITransport(app=api), base_url="http://test") as client:
+
+        async def history(**params: Any) -> dict[str, Any]:
+            response = await client.get("/history", params=params)
+            assert response.status_code == 200, response.text
+            return response.json()
+
+        default = await history(workflow_copilot_chat_id=chat_id)
+        assert cache.get_calls == 0
+        assert default["in_flight_turn"]["narrative"] is None
+        assert [steer["steer_id"] for steer in default["in_flight_turn"]["steer_messages"]] == ["s1"]
+        assert default["in_flight_turn"]["steer_messages"][0]["delivered_at"] is not None
+        assert default["workflow_permanent_id"] == "wpid"
+        assert default["app_url"] == "https://app.example.com"
+        assert (await history(workflow_permanent_id="wpid"))["workflow_permanent_id"] == "wpid"
+        no_chat = await history(workflow_permanent_id="wpid_without_chat")
+        assert (no_chat["workflow_permanent_id"], no_chat["app_url"]) == (None, "https://app.example.com")
+
+        live = await history(workflow_copilot_chat_id=chat_id, include_live_narrative="true")
+        assert live["in_flight_turn"]["narrative"] == snapshot
+        assert f"ember:turn_narrative:org:{chat_id}:{turn}" in cache.store
+        ember_live = await history(ember_chat_id=chat_id, include_live_narrative="true")
+        assert ember_live["in_flight_turn"]["narrative"] == snapshot
+
+        assert len(default["chat_history"]) > 2
+        assert any(item["status"] == "pending" for item in default["question_interactions"])
+        limited = await history(workflow_copilot_chat_id=chat_id, message_limit=2)
+        assert limited["chat_history"] == default["chat_history"][-2:]
+        assert {**limited, "chat_history": None} == {**default, "chat_history": None}
+        assert (
+            await client.get("/history", params={"workflow_copilot_chat_id": chat_id, "message_limit": 0})
+        ).status_code == 422
+
+        del cache.store[live_narrative.live_turn_narrative_key("org", chat_id, turn)]
+        earlier_key = live_narrative.live_turn_narrative_key("org", chat_id, "an-earlier-turn")
+        cache.store[earlier_key] = json.dumps({"turnId": "an-earlier-turn", "terminal": "running"})
+        assert (await history(workflow_copilot_chat_id=chat_id, include_live_narrative="true"))["in_flight_turn"][
+            "narrative"
+        ] is None
+
+        live_key = live_narrative.live_turn_narrative_key("org", chat_id, turn)
+        for malformed in (json.dumps({"turnId": turn, "terminal": "running"}), "not json"):
+            cache.store[live_key] = malformed
+            with capture_logs() as logs:
+                mismatched = await history(workflow_copilot_chat_id=chat_id, include_live_narrative="true")
+            assert mismatched["in_flight_turn"]["narrative"] is None
+            assert any(log["event"] == "Live turn narrative did not match its schema" for log in logs)
+
+        async def hang(key: str) -> Any:
+            await asyncio.Event().wait()
+
+        for failing_get in (AsyncMock(side_effect=RuntimeError("cache unavailable")), hang):
+            monkeypatch.setattr(cache, "get", failing_get)
+            with capture_logs() as logs:
+                failed = await history(workflow_copilot_chat_id=chat_id, include_live_narrative="true")
+            assert failed["in_flight_turn"]["narrative"] is None
+            assert any(log["event"] == "Live turn narrative read failed" for log in logs)
 
 
 @pytest.mark.asyncio

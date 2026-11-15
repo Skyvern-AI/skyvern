@@ -2545,6 +2545,26 @@ class WorkflowParametersRepository(BaseRepository):
                 )
                 .subquery()
             )
+            # Same rule chat-history uses for its in-flight turn: not being recovered and no outcome recorded yet.
+            pending_turn = func.jsonb_path_query(
+                cast(WorkflowCopilotChatModel.pending_turns, JSONB), cast("$.*", JSONPATH), type_=JSONB
+            ).column_valued("pending_turn")
+            answered = (
+                select(WorkflowCopilotChatMessageModel.workflow_copilot_chat_message_id)
+                .where(
+                    WorkflowCopilotChatMessageModel.workflow_copilot_chat_id
+                    == WorkflowCopilotChatModel.workflow_copilot_chat_id,
+                    cast(WorkflowCopilotChatMessageModel.turn_outcome, JSONB)["copilot_turn_id"].astext
+                    == pending_turn["turn_id"].astext,
+                )
+                .correlate_except(WorkflowCopilotChatMessageModel)
+            )
+            in_flight = (
+                select(pending_turn)
+                .where(pending_turn["recovering_at"].astext.is_(None), ~answered.exists())
+                .exists()
+                .label("in_flight")
+            )
             query = (
                 select(
                     WorkflowCopilotChatModel,
@@ -2553,6 +2573,7 @@ class WorkflowParametersRepository(BaseRepository):
                         cast(WorkflowCopilotChatModel.pending_turns, JSONB),
                         cast('$.* ? (@.question_interactions[*].status == "pending").question_heartbeat_at', JSONPATH),
                     ).label("question_heartbeats"),
+                    in_flight,
                 )
                 .options(defer(WorkflowCopilotChatModel.pending_turns))
                 .join(first_message, first_message.c.chat_id == WorkflowCopilotChatModel.workflow_copilot_chat_id)
@@ -2575,7 +2596,7 @@ class WorkflowParametersRepository(BaseRepository):
             rows = (await session.execute(query)).all()
 
             workflow_titles: dict[str, str] = {}
-            permanent_ids = {chat.workflow_permanent_id for chat, _, _ in rows}
+            permanent_ids = {chat.workflow_permanent_id for chat, _, _, _ in rows}
             if permanent_ids:
                 title_rows = (
                     await session.execute(
@@ -2601,8 +2622,9 @@ class WorkflowParametersRepository(BaseRepository):
                         question_wait_is_live(_parse_pending_turn_timestamp(heartbeat), datetime.now(timezone.utc))
                         for heartbeat in (question_heartbeats or [])
                     ),
+                    in_flight=bool(chat_in_flight),
                 )
-                for chat, content, question_heartbeats in rows
+                for chat, content, question_heartbeats, chat_in_flight in rows
             ]
 
     @db_operation("get_latest_workflow_copilot_completion_criteria_set")

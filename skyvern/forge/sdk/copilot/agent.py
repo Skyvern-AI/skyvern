@@ -104,6 +104,7 @@ from skyvern.forge.sdk.copilot.context import (
     CopilotContext,
     HistoricalNarrativeTurnFacts,
     HistoricalTurnFactsProjection,
+    LiveTurnNarrative,
     NarrativeActivityEntry,
     NarrativeBlock,
     NarrativeDraft,
@@ -155,6 +156,7 @@ from skyvern.forge.sdk.copilot.entrypoint import (
 from skyvern.forge.sdk.copilot.failure_tracking import block_shape_hashes_by_label
 from skyvern.forge.sdk.copilot.hooks import FinalReplyRunHooks
 from skyvern.forge.sdk.copilot.interruption import INTERRUPTED_TERMINAL_SUPERSEDED_HEADLINE, StoppedTurnFacts
+from skyvern.forge.sdk.copilot.live_narrative import live_turn_narrative_key, write_live_turn_narrative
 from skyvern.forge.sdk.copilot.llm_errors import CopilotEmptyCompletionError
 from skyvern.forge.sdk.copilot.llm_errors import is_retriable_llm_error as _is_retriable_llm_error
 from skyvern.forge.sdk.copilot.model_resolver import copilot_token_budget
@@ -2363,13 +2365,8 @@ def _block_ui_state(raw_status: str | None, *, drafted_fallback: bool) -> str:
     return _BLOCK_STATUS_TO_UI_STATE.get(raw_status, "queued")
 
 
-def _build_narrative_payload(
-    ctx: CopilotContext,
-    *,
-    terminal: str,
-    terminal_message: str | None,
-    narrative_summary: str | None,
-) -> TurnNarrativePayload:
+def _narrative_turn_core(ctx: CopilotContext) -> TurnNarrativePayload:
+    """Return the turn's narrative as recorded so far, unsealed."""
     narrator_state = ctx.narrator_state
     block_activity: dict[str, list[NarrativeActivityEntry]] = (
         narrator_state.block_activity if narrator_state is not None else {}
@@ -2423,29 +2420,68 @@ def _build_narrative_payload(
         if ctx.has_staged_proposal
         else None
     )
-    # First terminal builder to reach here seals the turn-level end time;
-    # later exit paths reuse it so the persisted elapsed matches the live one.
-    if ctx.turn_ended_at is None:
-        ctx.turn_ended_at = datetime.now(UTC).isoformat()
     payload: TurnNarrativePayload = {
         "turnId": ctx.turn_id,
         "turnIndex": ctx.turn_index,
         "designStarted": True,
-        "designEnded": True,
+        "designEnded": False,
         "draft": draft,
         "blocks": blocks,
-        "terminal": terminal,
-        "terminalMessage": terminal_message,
-        "narrativeSummary": narrative_summary or terminal_message,
+        "terminal": "running",
+        "terminalMessage": None,
+        "narrativeSummary": None,
         "priorBlockCount": ctx.prior_block_count,
         "designActivity": list(design_activity),
         "startedAt": ctx.turn_started_at,
-        "endedAt": ctx.turn_ended_at,
+        "endedAt": None,
     }
     if narrator_state is not None and narrator_state.work_plan is not None:
         payload["workPlan"] = narrator_state.work_plan
     if narrator_state is not None and narrator_state.screenshots:
         payload["screenshots"] = list(narrator_state.screenshots)
+    return payload
+
+
+def _without_bulky_activity_fields(entries: list[NarrativeActivityEntry]) -> list[NarrativeActivityEntry]:
+    trimmed: list[NarrativeActivityEntry] = []
+    for entry in entries:
+        copy = entry.copy()
+        copy.pop("codeDiffs", None)
+        copy.pop("testInputs", None)
+        trimmed.append(copy)
+    return trimmed
+
+
+def _live_turn_narrative(ctx: CopilotContext) -> LiveTurnNarrative:
+    core = _narrative_turn_core(ctx)
+    core["designActivity"] = _without_bulky_activity_fields(core["designActivity"])
+    for block in core["blocks"]:
+        block["activity"] = _without_bulky_activity_fields(block["activity"])
+    kinds = ctx.human_input_wait.kinds
+    return {
+        **core,
+        "browserSessionId": ctx.tool_browser_session_id,
+        "pausedFor": "credential" if kinds["credential"] else ("question" if kinds else None),
+    }
+
+
+def _build_narrative_payload(
+    ctx: CopilotContext,
+    *,
+    terminal: str,
+    terminal_message: str | None,
+    narrative_summary: str | None,
+) -> TurnNarrativePayload:
+    # First terminal builder to reach here seals the turn-level end time;
+    # later exit paths reuse it so the persisted elapsed matches the live one.
+    if ctx.turn_ended_at is None:
+        ctx.turn_ended_at = datetime.now(UTC).isoformat()
+    payload = _narrative_turn_core(ctx)
+    payload["designEnded"] = True
+    payload["terminal"] = terminal
+    payload["terminalMessage"] = terminal_message
+    payload["narrativeSummary"] = narrative_summary or terminal_message
+    payload["endedAt"] = ctx.turn_ended_at
     budget_state = _budget_expiry_state_with_staged_draft(ctx)
     if budget_state.source is not None:
         payload["budgetExpiry"] = {
@@ -5239,11 +5275,13 @@ async def run_copilot_agent(
             finally:
                 turn_end_ctx = ctx_sink[0] if ctx_sink else None
                 if turn_end_ctx is not None:
-                    # These three run synchronously before any awaited cleanup, so a later step that raises or is
+                    # These run synchronously before any awaited cleanup, so a later step that raises or is
                     # cancelled cannot leave a pre-start running or a minted browser stamped for this process's life.
                     turn_end_ctx.prestart_teardown_started = True
                     cancel_ledgered_build_test_prestarts(turn_end_ctx)
                     end_minted_browser_renewals(turn_end_ctx)
+                    if turn_end_ctx.live_narrative_task is not None:
+                        turn_end_ctx.live_narrative_task.cancel()
                 _log_authoring_turn_summary(turn_end_ctx)
                 finalize_outcome_verification_trace(turn_end_ctx, turn_span)
                 if turn_end_ctx is not None:
@@ -5457,6 +5495,14 @@ async def _run_copilot_turn_impl(
     # can see on the sunk context, so expose it before any await that might attach.
     if ctx_sink is not None:
         ctx_sink.append(ctx)
+        if ctx.workflow_copilot_chat_id:
+            ctx.live_narrative_task = asyncio.create_task(
+                write_live_turn_narrative(
+                    live_turn_narrative_key(organization_id, ctx.workflow_copilot_chat_id, ctx.turn_id),
+                    functools.partial(_live_turn_narrative, ctx),
+                    ctx.human_input_wait.changed,
+                )
+            )
     if chat_request.product_action == "diagnose_run":
         await restore_pending_workflow_proposal(
             ctx,

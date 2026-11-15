@@ -387,6 +387,11 @@ class TurnNarrativePayload(TypedDict):
     demonstrationItems: NotRequired[list[str]]
 
 
+class LiveTurnNarrative(TurnNarrativePayload):
+    browserSessionId: str | None
+    pausedFor: Literal["question", "credential"] | None
+
+
 if TYPE_CHECKING:
     from agents.items import ModelResponse
 
@@ -1622,6 +1627,9 @@ class CopilotContext(AgentContext):
     narrative_block_attempts: dict[str, NarrativeBlockAttempt] = field(default_factory=dict)
     turn_started_at: str | None = None
     turn_ended_at: str | None = None
+    # Browser predicted for the latest browser tool call, as on its tool_call frame; kept when a call predicts none.
+    tool_browser_session_id: str | None = None
+    live_narrative_task: asyncio.Task[None] | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         parent_post_init = getattr(super(), "__post_init__", None)

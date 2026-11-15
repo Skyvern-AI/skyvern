@@ -804,9 +804,10 @@ class TestEnforcementStateUpdates:
         ("update_workflow", {"target": "debug"}, None),
     ],
 )
+@pytest.mark.parametrize("client_gone", [False, True])
 @pytest.mark.asyncio
 async def test_tool_call_carries_the_browser_session_its_call_resolves_to(
-    tool_name: str, arguments: dict[str, Any], expected: str | None
+    tool_name: str, arguments: dict[str, Any], expected: str | None, client_gone: bool
 ) -> None:
     ctx = _test_copilot_context(
         browser_session_id="pbs_debug",
@@ -834,11 +835,16 @@ async def test_tool_call_carries_the_browser_session_its_call_resolves_to(
         )
     )
     stream = FakeCopilotStream()
+    stream.is_disconnected = AsyncMock(return_value=client_gone)  # type: ignore[method-assign]
 
     await stream_to_sse(result, stream, ctx)
 
-    (tool_call,) = (p for p in stream.sent if p.type == WorkflowCopilotStreamMessageType.TOOL_CALL)
-    assert tool_call.browser_session_id == expected
+    assert ctx.tool_browser_session_id == expected
+    tool_calls = [p for p in stream.sent if p.type == WorkflowCopilotStreamMessageType.TOOL_CALL]
+    if client_gone:
+        assert tool_calls == []
+    else:
+        assert [tool_call.browser_session_id for tool_call in tool_calls] == [expected]
 
 
 @pytest.mark.asyncio

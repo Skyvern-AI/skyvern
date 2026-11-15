@@ -499,6 +499,9 @@ async def stream_to_sse(
                     )
                 )
 
+                call_browser_session_id = _call_browser_session_id(ctx, event.item, tool_name, tool_input)
+                if call_browser_session_id is not None:
+                    ctx.tool_browser_session_id = call_browser_session_id
                 if not client_gone:
                     await stream.send(
                         WorkflowCopilotToolCallUpdate(
@@ -511,7 +514,7 @@ async def stream_to_sse(
                             iteration=iteration,
                             tool_call_id=call_id,
                             timestamp=presentation.started_at or tool_call_ts,
-                            browser_session_id=_call_browser_session_id(ctx, event.item, tool_name, tool_input),
+                            browser_session_id=call_browser_session_id,
                         )
                     )
 

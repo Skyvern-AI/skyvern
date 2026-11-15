@@ -22,6 +22,7 @@ export const STUDIO_PANE_IDS: readonly StudioPaneId[] = [
 ];
 
 export const STUDIO_PANES_PARAM = "panes";
+export const STUDIO_CHAT_PARAM = "chat";
 
 // Accepted forever on parse so pre-rename ?panes= links keep working; the
 // canonical id is what serializes back out. "ember" is accepted before it

@@ -383,6 +383,7 @@ export interface EmberChatHistoryResponse {
   question_interactions?: QuestionInteraction[];
   pending_question_cancel_token?: string | null;
   workflow_copilot_chat_id: string | null;
+  workflow_permanent_id?: string | null;
   ember_chat_id?: string | null;
   request_turn_id?: string | null;
   in_flight_turn?: EmberInFlightTurn | null;
