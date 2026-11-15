@@ -14,7 +14,7 @@ import functools
 from typing import Callable, ParamSpec, TypeVar
 
 import structlog
-from sqlalchemy.exc import SQLAlchemyError, StatementError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError, StatementError
 
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.statement_timeout import is_statement_timeout
@@ -28,6 +28,29 @@ R = TypeVar("R")
 # being logged as unexpected errors.  These are normal control-flow signals,
 # not infrastructure failures.
 _PASSTHROUGH_EXCEPTIONS: tuple[type[Exception], ...] = (NotFoundError,)
+
+
+UNIQUE_VIOLATION_SQLSTATE = "23505"
+
+
+def unique_violation_constraint(error: IntegrityError) -> str | None:
+    """Name of the index or constraint a Postgres unique violation hit, or None for any other error."""
+    # SQLAlchemy wraps the driver error; asyncpg puts the constraint on the cause, psycopg on `diag`.
+    original: BaseException | None = error.orig
+    seen: set[int] = set()
+    while original is not None and id(original) not in seen:
+        seen.add(id(original))
+        diagnostic = getattr(original, "diag", None)
+        constraint_name = getattr(original, "constraint_name", None) or getattr(diagnostic, "constraint_name", None)
+        if constraint_name is not None:
+            sqlstate = (
+                getattr(original, "sqlstate", None)
+                or getattr(original, "pgcode", None)
+                or getattr(diagnostic, "sqlstate", None)
+            )
+            return constraint_name if sqlstate == UNIQUE_VIOLATION_SQLSTATE else None
+        original = original.__cause__
+    return None
 
 
 def register_passthrough_exception(exc_type: type[Exception]) -> None:

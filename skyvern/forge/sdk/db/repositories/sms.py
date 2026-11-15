@@ -12,7 +12,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from sqlalchemy.pool import QueuePool
 
-from skyvern.forge.sdk.db._error_handling import db_operation, register_passthrough_exception
+from skyvern.forge.sdk.db._error_handling import (
+    db_operation,
+    register_passthrough_exception,
+    unique_violation_constraint,
+)
 from skyvern.forge.sdk.db._sentinels import _UNSET
 from skyvern.forge.sdk.db.base_repository import BaseRepository
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
@@ -64,15 +68,8 @@ register_passthrough_exception(SMSConfigHasActivePhoneNumbers)
 
 
 def _is_phone_number_unique_violation(error: IntegrityError) -> bool:
-    original: BaseException | None = error.orig
-    seen: set[int] = set()
-    while original is not None and id(original) not in seen:
-        seen.add(id(original))
-        diagnostic = getattr(original, "diag", None)
-        constraint_name = getattr(original, "constraint_name", None) or getattr(diagnostic, "constraint_name", None)
-        if constraint_name is not None:
-            return constraint_name == _PHONE_NUMBER_UNIQUE_INDEX
-        original = original.__cause__
+    if unique_violation_constraint(error) == _PHONE_NUMBER_UNIQUE_INDEX:
+        return True
     return str(error.orig) == _PHONE_NUMBER_SQLITE_UNIQUE_ERROR
 
 
