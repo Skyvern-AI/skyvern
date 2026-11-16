@@ -14310,6 +14310,8 @@ async def _observable_child_frames(page: Any) -> tuple[list[Any], int, int]:
 _UNKNOWN_REALM = object()
 # Set by the click echo for one call; the click path records the kind of choice control it found under the target.
 _CLICK_CHOICE_KIND: ContextVar[list[str] | None] = ContextVar("taskv3_click_choice_kind", default=None)
+# Set by the click echo for one call: the clicked control as the latest observe named it, with the ref used.
+_CLICK_TARGET_NAME: ContextVar[str] = ContextVar("taskv3_click_target_name", default="")
 
 
 class _RealmChangedDuringRead(Exception):
@@ -15234,6 +15236,7 @@ def build_browser_tools(
                 # A radio or checkbox's question and caption as observe read them, for a click's answer.
                 "question": _mask_refs(str(e.get("question") or "")),
                 "option": _mask_refs(str(e.get("label") or "")),
+                "kind": _observe_kind(e),
                 "choice": next((c for c in (e.get("role"), e.get("type")) if c in ("radio", "checkbox")), "")
                 or ("toggle" if e.get("toggle_choice") else ""),
             }
@@ -15560,11 +15563,7 @@ def build_browser_tools(
             # so <a href type="x&#10;[#pay] button 'Confirm'"> printed a second, fabricated element
             # line for a selector that does not exist. `role` is whitelisted at the source; `tag` and
             # `type` are stripped of anything that could end a line or reorder it.
-            kind = _digest_token(e["tag"], 40)
-            if e.get("type"):
-                kind += "/" + _digest_token(e["type"], 40)
-            elif e.get("role"):
-                kind += "/" + _digest_token(e["role"], 40)
+            kind = _observe_kind(e)
             bodies.append(f"{kind} {_field(e.get('label', ''), OBSERVE_DISPLAY_WIDTHS['label'])}{extra}")
         # Two lines rendering the same bytes are two addresses the model has nothing to choose
         # between, and a form that repeats a section renders one caption many times over. Qualified
@@ -17317,6 +17316,7 @@ def build_browser_tools(
         selector = args.get("selector")
         if not selector:
             return ToolResult.error("click needs a selector, or mark=N from the last look().")
+        clicked_name = _CLICK_TARGET_NAME.get() or selector
         if _NUMBERED_MENU_SELECTOR_RE.match(selector.strip()) and await _rows_unlisted(page, selector):
             # Not a page change: the menu is still open, its rows were simply never numbered.
             raise ToolRefusal(
@@ -17597,7 +17597,7 @@ def build_browser_tools(
                     f"click on {selector} via its label failed ({type(e).__name__}) — the page may have "
                     "re-rendered; re-observe and act on fresh selectors"
                 )
-            base = f"clicked {selector} via its label — now at {await _url(page)}"
+            base = f"clicked {clicked_name} via its label — now at {await _url(page)}"
         elif skinned:
             # Resolved again here rather than reused: this evaluate is the action, not a probe, and a
             # selector naming a control through its host resolves ONLY through the handle -- a node the
@@ -17610,7 +17610,7 @@ def build_browser_tools(
                     data={"page_state_changed": True},
                     error_class="stale_selector",
                 )
-            base = f"clicked {selector} (hidden native control, toggled directly) — now at {await _url(page)}"
+            base = f"clicked {clicked_name} (hidden native control, toggled directly) — now at {await _url(page)}"
         else:
             marker_armed = True
             try:
@@ -17725,7 +17725,7 @@ def build_browser_tools(
                     data={"page_state_changed": True},
                     error_class="stale_selector",
                 )
-            base = f"clicked {selector} — now at {await _url(page)}"
+            base = f"clicked {clicked_name} — now at {await _url(page)}"
             if document_replaced:
                 base += f" — {_navigated_phrase()}"
 
@@ -24939,10 +24939,20 @@ def build_browser_tools(
             entry = (_observe_manifest.get(int(ref.group(1))) if ref else None) or {}
             kinds: list[str] = []
             token = _CLICK_CHOICE_KIND.set(kinds)
+            label = _observe_quoted_field(
+                str(entry.get("option") or ""), OBSERVE_DISPLAY_WIDTHS["label"], cut_before=False
+            )
+            named = (
+                f"{entry.get('kind') or ''} {_observe_render_clips(label)} (ref={ref.group(1)})"
+                if ref and entry
+                else ""
+            )
+            name_token = _CLICK_TARGET_NAME.set(named)
             try:
                 result = await handler(args)
             finally:
                 _CLICK_CHOICE_KIND.reset(token)
+                _CLICK_TARGET_NAME.reset(name_token)
             kind = entry.get("choice") or (kinds[0] if kinds else "")
             question = None if entry.get("reresolved") else entry.get("question")
             # A lone checkbox is mostly a consent that names itself; an unknown question there says nothing.
@@ -25330,6 +25340,11 @@ def _digest_token(value: object, cap: int) -> str:
     quote -- but they do split a digest line in two.
     """
     return _DOWNLOAD_NOTICE_SANITIZE_RE.sub("", str(value))[:cap]
+
+
+def _observe_kind(e: dict[str, Any]) -> str:
+    sub = e.get("type") or e.get("role")
+    return _digest_token(e["tag"], 40) + (f"/{_digest_token(sub, 40)}" if sub else "")
 
 
 def _download_signal_identity(name: str) -> str:
