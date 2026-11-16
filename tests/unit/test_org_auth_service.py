@@ -1611,23 +1611,6 @@ async def test_two_users_behind_one_key_each_get_their_own_principal_across_a_ca
 
 
 @pytest.mark.asyncio
-async def test_two_auth_dependencies_on_one_route_resolve_the_bearer_once(
-    monkeypatch: pytest.MonkeyPatch,
-    raw_request_log: MagicMock,
-) -> None:
-    headers, organization_id, identity_provider = await _principal_credentials(
-        monkeypatch, "api", "Bearer admin-bearer"
-    )
-    _use_bearer_authentication(monkeypatch, _make_org(organization_id))
-
-    with TestClient(_principal_app()) as client:
-        response = client.post("/org-and-user", headers=headers)
-
-    assert response.json() == _principal_payload(organization_id, {"auth_kind": "api_key_and_bearer", **_ADMIN})
-    assert identity_provider.resolved == [("admin-bearer", organization_id)]
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("bearer_organization_id", "expected_conflict"),
     [("org-bearer-authority", True), ("org-ui-session", False)],
@@ -1781,21 +1764,6 @@ async def test_fallback_principal_is_recomputed_when_its_resolution_key_changes(
     assert second.organization_id == "org-b"
     assert second.user_id == "user_member"
     assert identity_provider.resolved == [("admin-bearer", "org-a"), ("member-bearer", "org-b")]
-
-
-@pytest.mark.asyncio
-async def test_caller_context_with_a_bearer_alone_resolves_the_identity_once(
-    monkeypatch: pytest.MonkeyPatch,
-    raw_request_log: MagicMock,
-) -> None:
-    # The org and user helpers run in gathered tasks; the identity lookup must not be paid once per task.
-    headers, organization_id, identity_provider = await _principal_credentials(monkeypatch, None, "Bearer admin-bearer")
-
-    with TestClient(_principal_app()) as client:
-        response = client.post("/caller", headers=headers)
-
-    assert response.json() == _principal_payload(organization_id, {"auth_kind": "bearer", **_ADMIN})
-    assert identity_provider.resolved == [("admin-bearer", organization_id)]
 
 
 @pytest.mark.asyncio

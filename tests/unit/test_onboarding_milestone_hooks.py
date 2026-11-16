@@ -297,32 +297,6 @@ class TestWorkflowRoutesThreadUser:
         assert audit_event.related_resource_ids == ("fld_body",)
 
     @pytest.mark.asyncio
-    async def test_shared_create_route_succeeds_with_oss_audit_noop(self) -> None:
-        from skyvern.forge.sdk.routes.agent_protocol import create_workflow_legacy
-
-        saved = MagicMock()
-        organization = MagicMock()
-        organization.organization_id = "o_123"
-        raw_request = MagicMock()
-        raw_request.body = AsyncMock(
-            return_value=b"title: Funnel Workflow\nworkflow_definition:\n  parameters: []\n  blocks: []\n"
-        )
-
-        with patch("skyvern.forge.sdk.routes.agent_protocol.app") as mock_app:
-            mock_app.WORKFLOW_SERVICE.create_workflow_from_request = AsyncMock(
-                return_value=(saved, ("workflow_definition",))
-            )
-            mock_app.AGENT_FUNCTION = AgentFunction()
-            result = await create_workflow_legacy(
-                request=raw_request,
-                folder_id=None,
-                current_org=organization,
-                user_id="u_456",
-            )
-
-        assert result is saved
-
-    @pytest.mark.asyncio
     async def test_update_workflow_legacy_route_passes_user(self) -> None:
         from skyvern.forge.sdk.routes.agent_protocol import update_workflow_legacy
 

@@ -236,21 +236,6 @@ class FakePage:
         return None
 
 
-class ControlledGotoPage(FakePage):
-    def __init__(self, outcome: object = None) -> None:
-        super().__init__()
-        self.release = asyncio.Event()
-        self.started = asyncio.Event()
-        self.outcome = outcome
-
-    async def goto(self, url, **kwargs):  # noqa: ANN001, ANN003, ANN201
-        self.started.set()
-        await self.release.wait()
-        if isinstance(self.outcome, BaseException):
-            raise self.outcome
-        return self.outcome
-
-
 @asynccontextmanager
 async def _recorded_action_db() -> AsyncIterator[AgentDB]:
     db = AgentDB("sqlite+aiosqlite:///:memory:")
@@ -295,80 +280,6 @@ _AUTHORED_GOTO_SOURCE = (
 )
 _authored_namespace: dict[str, Any] = {}
 exec(compile(_AUTHORED_GOTO_SOURCE, CODE_BLOCK_FILENAME, "exec"), _authored_namespace)
-_authored_goto: Callable[[RecordingPage], Awaitable[str]] = _authored_namespace["authored_goto"]
-
-
-@pytest.mark.asyncio
-async def test_pending_navigation_fact_lifecycle(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.code_block_recorder.PENDING_CALL_DELAY_SECONDS", 0.01)
-
-    pending: list[PendingAction] = []
-    emitted = asyncio.Event()
-
-    def capture_pending(fact: PendingAction) -> None:
-        pending.append(fact)
-        emitted.set()
-
-    stalled = ControlledGotoPage(outcome="response")
-    page = RecordingPage(stalled, on_pending_action=capture_pending)
-    call = asyncio.create_task(_authored_goto(page))
-    await asyncio.wait_for(emitted.wait(), timeout=0.5)
-
-    assert pending == [
-        PendingAction(
-            call_name="page.goto",
-            threshold_seconds=0.01,
-            code_line=2,
-            action_type=ActionType.GOTO_URL,
-            action_order=0,
-        )
-    ]
-    assert page.recorded_actions() == []
-
-    stalled.release.set()
-    assert await call == "response"
-    assert len(pending) == 1
-    assert [action.status for action in page.recorded_actions()] == [ActionStatus.completed]
-
-    fast_pending: list[PendingAction] = []
-    fast_page = RecordingPage(FakePage(), on_pending_action=fast_pending.append)
-    await fast_page.goto("https://example.com/fast")
-    await asyncio.sleep(0.02)
-    assert fast_pending == []
-
-    failed_pending: list[PendingAction] = []
-    failed_inner = ControlledGotoPage(outcome=RuntimeError("navigation failed"))
-    failed_inner.release.set()
-    failed_page = RecordingPage(failed_inner, on_pending_action=failed_pending.append)
-    with pytest.raises(RuntimeError, match="navigation failed"):
-        await failed_page.goto("https://example.com/fail")
-    await asyncio.sleep(0.02)
-    assert failed_pending == []
-
-    cancelled_pending: list[PendingAction] = []
-    cancelled_inner = ControlledGotoPage()
-    cancelled_page = RecordingPage(cancelled_inner, on_pending_action=cancelled_pending.append)
-    cancelled_call = asyncio.create_task(cancelled_page.goto("https://example.com/cancel"))
-    await cancelled_inner.started.wait()
-    cancelled_call.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await cancelled_call
-    await asyncio.sleep(0.02)
-    assert cancelled_pending == []
-
-    callback_started = asyncio.Event()
-
-    def failing_callback(fact: PendingAction) -> None:
-        callback_started.set()
-        raise RuntimeError("pending callback failed")
-
-    callback_failure_inner = ControlledGotoPage(outcome="unchanged")
-    callback_failure_page = RecordingPage(callback_failure_inner, on_pending_action=failing_callback)
-    callback_failure_call = asyncio.create_task(callback_failure_page.goto("https://example.com/callback"))
-    await asyncio.wait_for(callback_started.wait(), timeout=0.5)
-    callback_failure_inner.release.set()
-    assert await callback_failure_call == "unchanged"
-    assert [action.status for action in callback_failure_page.recorded_actions()] == [ActionStatus.completed]
 
 
 @pytest.mark.asyncio

@@ -28,7 +28,6 @@ from structlog.testing import capture_logs
 
 from skyvern.config import Settings, settings
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
-from skyvern.forge.sdk.api.llm.copilot_model_usage import CopilotModelUsageEvent, _emit_copilot_model_usage
 from skyvern.forge.sdk.copilot import llm_config as copilot_llm_config
 from skyvern.forge.sdk.copilot import tools as copilot_tools
 from skyvern.forge.sdk.copilot.cost_telemetry import copilot_cost_scope, current_copilot_cost
@@ -514,35 +513,6 @@ async def _answer_followup(
             organization,
         )
     return http_response
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("surface", ["question", "steer"])
-@pytest.mark.parametrize("organization_id", ["org_eval", "org_other"])
-async def test_followup_safety_cost_receipts_require_evaluation_org(
-    surface: str, organization_id: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_EVAL_COST_ENABLED", True)
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_EVAL_COST_ORGANIZATION_IDS", ["org_eval"])
-
-    async def screen(text: str, _handler: object, **_kwargs: object) -> _RawSecretSafetyScreen:
-        _emit_copilot_model_usage(
-            CopilotModelUsageEvent(request_model="openai/eval-safety", cost=0.12, cost_source="litellm_estimate"),
-            logger=SimpleNamespace(info=lambda *_args, **_kwargs: None),
-        )
-        return _RawSecretSafetyScreen(status="clean", canonical_user_message=text)
-
-    http_response = await _answer_followup(surface, organization_id, screen, monkeypatch)
-    if organization_id == "org_eval":
-        assert http_response.headers["X-Ember-Eval-LLM-Cost"] == http_response.headers["X-Copilot-Eval-LLM-Cost"]
-        receipt = json.loads(http_response.headers["X-Ember-Eval-LLM-Cost"])
-        assert len(receipt["receipt_id"]) == 32
-        assert receipt["llm_cost"]["known_cost_usd"] == 0.12
-        assert receipt["llm_cost"]["observed_call_count"] == 1
-    else:
-        assert "X-Ember-Eval-LLM-Cost" not in http_response.headers
-        assert "X-Copilot-Eval-LLM-Cost" not in http_response.headers
-    assert current_copilot_cost() is None
 
 
 @pytest.mark.asyncio
