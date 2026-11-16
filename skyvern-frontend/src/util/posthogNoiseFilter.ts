@@ -13,6 +13,9 @@ const NOISE_PATTERNS: ReadonlyArray<RegExp> = [
   // reaches the browser log sink with its message and request URL intact, which
   // is where this stays diagnosable.
   /^ClerkJS: Network error at /,
+  // An automated link scanner's embedded browser rejects with this string from
+  // its own host bridge while it renders our pages; no app code produces it.
+  /^Non-Error promise rejection captured with value: Object Not Found Matching Id:\d+, MethodName:\w+, ParamCount:\d+$/,
 ];
 
 function isNoiseException(entry: ExceptionEntry): boolean {
