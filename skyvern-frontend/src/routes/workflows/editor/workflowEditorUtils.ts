@@ -3916,7 +3916,10 @@ function getWorkflowBlock(
           file_attachments: splitEmailList(node.data.fileAttachments).filter(
             (attachment) => attachment !== SKYVERN_DOWNLOAD_DIRECTORY,
           ),
-          reply_to_message_id: node.data.replyToMessageId || null,
+          ...(node.data.replyToMessageId &&
+            node.data.credentialSource !== "nango" && {
+              reply_to_message_id: node.data.replyToMessageId,
+            }),
         };
       }
       return {
@@ -4175,7 +4178,11 @@ function getWorkflowBlock(
         max_results: node.data.maxResults,
         include_body: node.data.includeBody,
         download_attachments: node.data.downloadAttachments,
-        message_id: node.data.messageId || null,
+        ...(node.data.messageId &&
+          node.data.emailClient === "gmail" &&
+          node.data.credentialSource !== "nango" && {
+            message_id: node.data.messageId,
+          }),
         parameter_keys: node.data.parameterKeys,
       };
     }

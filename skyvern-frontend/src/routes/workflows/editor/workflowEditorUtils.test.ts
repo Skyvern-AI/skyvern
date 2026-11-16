@@ -252,6 +252,64 @@ test("Gmail message ids survive load, save and export", () => {
   expect(convert(source).workflow_definition.blocks).toMatchObject(expected);
 });
 
+test("Gmail message ids are written only when set on a native account", () => {
+  const send = {
+    block_type: "send_email",
+    label: "send",
+    transport: "gmail",
+    credential_id: "cred_1",
+    sender: "",
+    recipients: ["a@example.com"],
+    subject: "Hi",
+    body: "Hi",
+    file_attachments: [],
+    continue_on_failure: false,
+    next_loop_on_failure: false,
+    model: null,
+  };
+  const read = {
+    block_type: "email_inbox",
+    label: "read",
+    email_client: "gmail",
+    credential_id: "cred_1",
+    folder: "INBOX",
+    prompt: "",
+    max_results: 25,
+    include_body: true,
+    download_attachments: false,
+    parameters: [],
+    continue_on_failure: false,
+    next_loop_on_failure: false,
+    model: null,
+  };
+  const stored = [
+    { ...send, label: "unset" },
+    { ...read, label: "unset_read" },
+    {
+      ...send,
+      label: "broker",
+      credential_id: null,
+      credential_source: "nango",
+      connection_id: "conn_1",
+      reply_to_message_id: "{{ email.id }}",
+    },
+    {
+      ...read,
+      label: "broker_read",
+      credential_id: null,
+      credential_source: "nango",
+      connection_id: "conn_1",
+      message_id: "{{ email.id }}",
+    },
+  ] as unknown as Array<WorkflowBlock>;
+  const { nodes, edges } = getElements(stored, SETTINGS, true);
+
+  for (const block of getWorkflowBlocks(nodes, edges)) {
+    expect(block).not.toHaveProperty("reply_to_message_id");
+    expect(block).not.toHaveProperty("message_id");
+  }
+});
+
 describe("withGoalUndoRecordsFrom", () => {
   const edited = {
     ...codeBlock(true),
