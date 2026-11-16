@@ -5554,10 +5554,20 @@ async def workflow_copilot_demonstration_upload(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"A demonstration can attach at most {MAX_ATTACHED_FILES_PER_MESSAGE} files",
         )
-    # Demonstrations replay the user's own file into the target site, so any type that site accepts must pass.
-    await uploaded_file_service.validate_passthrough_upload(
-        file, max_size_bytes=app.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE, purpose="copilot_demonstration"
-    )
+    try:
+        await uploaded_file_service.validate_upload(
+            file,
+            purpose="copilot_demonstration",
+            organization_id=organization.organization_id,
+            max_size_bytes=app.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE,
+        )
+    except HTTPException as refused:
+        if refused.status_code != status.HTTP_415_UNSUPPORTED_MEDIA_TYPE:
+            raise
+        raise HTTPException(
+            status_code=refused.status_code,
+            detail=f"{refused.detail}. Choose another file type, or skip the file: the upload step is still recorded.",
+        ) from refused
     try:
         uploaded, _ = await uploaded_file_service.save_uploaded_file(
             file=file, organization_id=organization.organization_id
