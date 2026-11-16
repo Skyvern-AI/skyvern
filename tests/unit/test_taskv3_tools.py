@@ -15,6 +15,7 @@ import gc
 import html
 import html as html_lib
 import inspect
+import io
 import itertools
 import json
 import os
@@ -36,6 +37,7 @@ from urllib.parse import urlparse
 import pyotp
 import pytest
 import pytest_asyncio
+from PIL import Image
 from playwright.async_api import Browser, BrowserContext, ElementHandle
 from playwright.async_api import Error as _PlaywrightError
 from playwright.async_api import Frame, Page, Playwright, Route
@@ -694,6 +696,87 @@ async def test_observe_renders_checkbox_checked_state() -> None:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
     assert _ref_line(r.content, "I agree") and "checked=" in r.content
+
+
+_PAY_ROW_HTML = (
+    "<!doctype html><html><body><h1>Pay with</h1>"
+    '<a href="#w"><svg role="img" aria-label="Wallet" width="80" height="30"><rect width="80" height="30"/></svg></a>'
+    "<button>Card</button><button>Bank transfer</button></body></html>"
+)
+
+
+@_skip_no_browser
+@pytest.mark.parametrize(
+    ("viewport", "width", "expected_size"),
+    [
+        pytest.param((1024, 900), 768, (768, 675), id="scaled_down"),
+        pytest.param((400, 300), 768, (400, 300), id="never_upscaled"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_observe_attaches_a_viewport_screenshot_only_when_a_width_is_set(
+    monkeypatch: pytest.MonkeyPatch, viewport: tuple[int, int], width: int, expected_size: tuple[int, int]
+) -> None:
+    async with _content_page(_PAY_ROW_HTML) as page:
+        await page.set_viewport_size({"width": viewport[0], "height": viewport[1]})
+        real_screenshot = page.screenshot
+        screenshot_calls: list[str] = []
+
+        async def counted_screenshot(**kwargs: Any) -> bytes:
+            screenshot_calls.append("shot")
+            return await real_screenshot(**kwargs)
+
+        monkeypatch.setattr(page, "screenshot", counted_screenshot)
+        off_tools = build_browser_tools(_fixed_page_provider(page), observe_screenshot_width=0)
+        off = await _tool(off_tools, "observe").handler({})
+        assert screenshot_calls == []
+        on_tools = build_browser_tools(_fixed_page_provider(page), observe_screenshot_width=width)
+        with capture_logs() as logs:
+            on = await _tool(on_tools, "observe").handler({})
+
+    assert off.status == "ok" and off.screenshots is None and "screenshot" not in off.content
+    assert "screenshot_at" not in (off.data or {})
+    assert _tool(off_tools, "observe").description == (
+        taskv3_tools._OBSERVE_DESCRIPTION_BASE + taskv3_tools._OBSERVE_DESCRIPTION_FRAME_REACH
+    )
+    assert _tool(on_tools, "observe").description.endswith(taskv3_tools._OBSERVE_DESCRIPTION_SCREENSHOT)
+    assert on.status == "ok" and len(on.screenshots or []) == 1
+    assert Image.open(io.BytesIO(on.screenshots[0])).size == expected_size
+    assert on.content[: on.data["screenshot_at"]] == off.content
+    line = on.content[on.data["screenshot_at"] :]
+    assert line.startswith("\nscreenshot: attached") and f"({expected_size[0]}x{expected_size[1]})" in line
+    shots = [entry for entry in logs if entry["event"] == "taskv3 observe screenshot"]
+    assert [(e["outcome"], e["width"], e["height"], e["bytes"]) for e in shots] == [
+        ("attached", *expected_size, len(on.screenshots[0]))
+    ]
+
+
+@_skip_no_browser
+@pytest.mark.parametrize(
+    ("failure", "outcome"),
+    [pytest.param("raises", "error", id="raises"), pytest.param("slow", "timeout", id="slow")],
+)
+@pytest.mark.asyncio
+async def test_a_failed_or_slow_observe_screenshot_still_returns_the_reading(
+    monkeypatch: pytest.MonkeyPatch, failure: str, outcome: str
+) -> None:
+    async def broken_screenshot(**_kwargs: Any) -> bytes:
+        if failure == "slow":
+            await asyncio.sleep(5)
+        raise RuntimeError("Target page, context or browser has been closed")
+
+    monkeypatch.setattr(taskv3_tools, "OBSERVE_SCREENSHOT_TIMEOUT_SECONDS", 0.05)
+    async with _content_page(_PAY_ROW_HTML) as page:
+        off = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+        monkeypatch.setattr(page, "screenshot", broken_screenshot)
+        tools = build_browser_tools(_fixed_page_provider(page), observe_screenshot_width=512)
+        with capture_logs() as logs:
+            result = await _tool(tools, "observe").handler({})
+
+    assert result.status == "ok" and result.screenshots is None
+    assert result.content.startswith(off.content + "\nscreenshot: not attached (")
+    assert result.data["screenshot_at"] == len(off.content)
+    assert [e["outcome"] for e in logs if e["event"] == "taskv3 observe screenshot"] == [outcome]
 
 
 _MARKER = f"group={_NO_QUESTION_MARKER}"

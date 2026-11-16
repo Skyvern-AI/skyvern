@@ -611,6 +611,9 @@ class Settings(BaseSettings):
     # as before. Force-on term only: where it is off, organizations are gated by the flag of the same name.
     # Retry policies match on stored codes, so turning this on can change which runs retry.
     TASK_V3_ERROR_CODE_ON_FINISH: bool = False
+    # Maximum width in px of the viewport picture each Task V3 observe result carries; 0 is off, valid 256-1024.
+    # A non-zero value wins over the organization's flag of the same name; set it only in local and self-hosted runs.
+    TASK_V3_OBSERVE_SCREENSHOT_WIDTH: int = 0
     # Kill switch for the hold on a Task V3 run's first terminated verdict that asks for what prevents the task.
     # On: every terminated verdict stands as the model gave it.
     DISABLE_TASK_V3_JUSTIFY_HOLD: bool = False

@@ -421,6 +421,11 @@ async def run_task_v3_agent_loop(
             is_vision_fallback_prompt=prompt_name in VISION_FALLBACK_PROMPT_NAMES
         )
     )
+    observe_screenshot_width = (
+        await app.AGENT_FUNCTION.task_v3_observe_screenshot_width(organization_id=organization_id)
+        if vision_enabled and not page_free
+        else 0
+    )
     # Page-free mode is structural, not advisory: no browser tools exist to call and the system
     # prompt never mentions perception, so a data-only validation cannot read the live DOM.
     # The tier only ever increments under the verify flag, so the kill switch and the omit-vs-zero
@@ -473,6 +478,7 @@ async def run_task_v3_agent_loop(
             resolve_totp_placeholder=resolve_totp_placeholder,
             opaque_refs=refs,
             vision_enabled=vision_enabled,
+            observe_screenshot_width=observe_screenshot_width,
             semantic_commit_stats=semantic_commit_stats,
             unseen_text=unseen_text,
             download_failures=failure_watch,

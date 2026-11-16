@@ -31,10 +31,11 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import (
     LLMCaller,
 )
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.core.skyvern_context import EnrichTreeMode, SkyvernContext
 from skyvern.forge.sdk.workflow.context_manager import RANDOM_SECRET_ID_PREFIX
 from skyvern.forge.taskv3 import engine as engine_mod
 from skyvern.forge.taskv3 import loop as loop_mod
+from skyvern.forge.taskv3 import tools as tools_mod
 from skyvern.forge.taskv3.engine import (
     DEFAULT_MAX_TOOL_CALLS,
     DEFAULT_MAX_TURNS,
@@ -1019,6 +1020,51 @@ async def test_engine_omits_semantic_commit_stats_when_the_verify_kill_switch_is
         max_turns=4,
     )
     assert loop_stats == [None], loop_stats
+
+
+@pytest.mark.parametrize(
+    ("supports_vision", "enrich_tree_mode", "expected_width"),
+    [
+        pytest.param(True, EnrichTreeMode.CONTROL, 768, id="vision"),
+        pytest.param(False, EnrichTreeMode.CONTROL, 0, id="non_vision_model"),
+        pytest.param(True, EnrichTreeMode.ENRICHED_TREE_NO_IMAGES, 0, id="no_images_policy"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_engine_reads_the_observe_screenshot_width_only_when_the_model_receives_images(
+    monkeypatch: pytest.MonkeyPatch, supports_vision: bool, enrich_tree_mode: EnrichTreeMode, expected_width: int
+) -> None:
+    widths: list[int] = []
+    real_build = engine_mod.build_browser_tools
+
+    def capturing_build(*args: Any, **kwargs: Any) -> Any:
+        widths.append(kwargs["observe_screenshot_width"])
+        return real_build(*args, **kwargs)
+
+    width_setting = AsyncMock(return_value=768)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_observe_screenshot_width", width_setting)
+    monkeypatch.setattr(engine_mod, "build_browser_tools", capturing_build)
+    caller = _ScriptedCaller([[("observe", {})], [("finish", {"status": "completed", "reason": "done"})]])
+    caller.llm_config = SimpleNamespace(supports_vision=supports_vision)
+    page = _FakePage()
+    page.screenshot = AsyncMock(return_value=b"")
+    skyvern_context.set(SkyvernContext(organization_id="o_width", enrich_tree_mode=enrich_tree_mode))
+    try:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(page), llm_caller=caller, goal="g", organization_id="o_width"
+        )
+    finally:
+        skyvern_context.reset()
+
+    assert widths == [expected_width]
+    assert width_setting.await_count == (1 if expected_width else 0)
+    assert page.screenshot.await_count == (1 if expected_width else 0)
+    observe_tool = next(t for t in caller.sent_tools or [] if t["function"]["name"] == "observe")
+    assert observe_tool["function"]["description"] == (
+        tools_mod._OBSERVE_DESCRIPTION_BASE
+        + tools_mod._OBSERVE_DESCRIPTION_FRAME_REACH
+        + (tools_mod._OBSERVE_DESCRIPTION_SCREENSHOT if expected_width else "")
+    )
 
 
 @pytest.mark.asyncio

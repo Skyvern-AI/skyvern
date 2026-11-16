@@ -656,6 +656,66 @@ async def test_a_raising_look_hook_does_not_change_the_run() -> None:
     assert any(log["event"] == "taskv3 on_look_screenshots callback failed" for log in logs)
 
 
+def _scripted_image_tool(name: str, results: list[ToolResult | Exception]) -> ToolSpec:
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        item = results.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    return ToolSpec(name=name, description=name, parameters={"type": "object", "properties": {}}, handler=handler)
+
+
+@pytest.mark.asyncio
+async def test_look_and_observe_images_each_ride_the_next_call_once_in_latest_result_order() -> None:
+    observe_tool = _scripted_image_tool(
+        "observe", [ToolResult.ok(f"read {n}", screenshots=[f"o{n}".encode()]) for n in (1, 2, 3)]
+    )
+    look_tool = _scripted_image_tool(
+        "look", [ToolResult.ok(f"marks {n}", screenshots=[f"l{n}".encode()]) for n in (1, 2)]
+    )
+    script = [
+        [("look", {}), ("observe", {})],
+        [("observe", {}), ("look", {}), ("observe", {})],
+        [("click", {})],
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    outcome, caller = await _run(script, [observe_tool, look_tool, _recording_tool("click", []), make_finish_tool()])
+
+    assert outcome.status == "completed"
+    assert caller.screenshots_per_call == [None, [b"l1", b"o1"], [b"l2", b"o3"], None]
+
+
+@pytest.mark.parametrize(
+    ("second_observe", "expected_images"),
+    [
+        pytest.param(
+            ToolResult.ok("read 2\nscreenshot: not attached (timed out after 3s)", data={"screenshot_at": 6}),
+            [b"l1"],
+            id="ok_not_attached_drops_it",
+        ),
+        pytest.param(
+            ToolResult.error("observe could not read this page's controls"), [b"l1", b"o1"], id="error_keeps_it"
+        ),
+        pytest.param(RuntimeError("page crashed"), [b"l1", b"o1"], id="raises_keeps_it"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_later_observe_replaces_the_earlier_observe_image_only_when_it_succeeds(
+    second_observe: ToolResult | Exception, expected_images: list[bytes]
+) -> None:
+    observe_tool = _scripted_image_tool("observe", [ToolResult.ok("read 1", screenshots=[b"o1"]), second_observe])
+    look_tool = _scripted_image_tool("look", [ToolResult.ok("marks 1", screenshots=[b"l1"])])
+    script = [
+        [("look", {}), ("observe", {}), ("observe", {})],
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    outcome, caller = await _run(script, [observe_tool, look_tool, make_finish_tool()])
+
+    assert outcome.status == "completed"
+    assert caller.screenshots_per_call == [None, expected_images]
+
+
 def test_loop_takes_no_screenshot_of_its_own() -> None:
     # The look image is stored from bytes the tool already captured; the loop itself never captures.
     source = Path(loop_module.__file__).read_text()
@@ -5918,6 +5978,37 @@ async def test_finish_completed_is_held_on_text_a_result_in_its_own_batch_report
 
 
 @pytest.mark.asyncio
+async def test_unseen_text_never_holds_the_observe_screenshot_line() -> None:
+    failure = "\nRequest failed: POST /api/export returned HTTP 503"
+    line = "\nscreenshot: attached (observe) to your next turn, the viewport as rendered now (768x432)"
+    content = "observed" + _ROWS_SECTION + failure + line
+    data = {
+        "delta_at": 8,
+        "delta_end": 8 + len(_ROWS_SECTION),
+        "download_failure_at": 8 + len(_ROWS_SECTION),
+        "screenshot_at": len(content) - len(line),
+    }
+
+    async def observe(_args: dict[str, Any]) -> ToolResult:
+        return ToolResult(status="ok", content=content, data=data)
+
+    observe_spec = ToolSpec(
+        name="observe", description="observe", parameters={"type": "object", "properties": {}}, handler=observe
+    )
+    unseen = _unseen([])
+    finish = make_finish_tool(settle_wait_seconds=0.0, unseen_text=unseen)
+    script = [
+        [("observe", {}), ("finish", {"status": "completed", "reason": "the list is empty"})],
+        [("finish", {"status": "completed", "reason": "deleted the listed item"})],
+    ]
+    outcome, _ = await _run(script, [observe_spec, finish], unseen_text=unseen)
+
+    finish_contents = [str(m.get("content")) for m in outcome.messages if m.get("name") == "finish"]
+    assert any('"Cart A"' in c for c in finish_contents), finish_contents
+    assert not any("screenshot:" in c for c in finish_contents), finish_contents
+
+
+@pytest.mark.asyncio
 async def test_finish_held_on_unseen_text_has_its_own_budget_even_with_settle_deferrals_off() -> None:
     # Bare tasks run with settle deferrals off; the hold still applies there, and still ends.
     unseen = _unseen([f'\npage newly shows: "Rotating banner {i}"' for i in range(20)])
@@ -6242,6 +6333,51 @@ def _perception_tool(name: str, contents: str | list[str]) -> ToolSpec:
     return ToolSpec(
         name=name, description=name, parameters={"type": "object", "properties": {}}, handler=handler, compactable=True
     )
+
+
+def _observe_with_alternating_screenshot_lines(body: str) -> ToolSpec:
+    lines = [
+        "screenshot: attached (observe) to your next turn, the viewport as rendered now (768x432); "
+        "a later observe in this turn replaces it",
+        "screenshot: not attached (timed out after 3s)",
+    ]
+    calls = {"n": 0}
+
+    async def observe(_args: dict[str, Any]) -> ToolResult:
+        calls["n"] += 1
+        return ToolResult.ok(f"{body}\n{lines[calls['n'] % 2]}", data={"screenshot_at": len(body)})
+
+    return ToolSpec(
+        name="observe",
+        description="observe",
+        parameters={"type": "object", "properties": {}},
+        handler=observe,
+        compactable=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_observe_screenshot_line_never_makes_an_unchanged_page_look_changed() -> None:
+    body = "url=x frozen behind a gate"
+    script = [[("observe", {})] for _ in range(20)]
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    kwargs: dict[str, Any] = {"max_turns": 200, "max_tool_calls": 500, "stall_terminate_after": 3}
+    outcome, caller = await _run(
+        script, [_observe_with_alternating_screenshot_lines(body), make_finish_tool()], **kwargs
+    )
+    baseline, baseline_caller = await _run(script, [_perception_tool("observe", body), make_finish_tool()], **kwargs)
+
+    assert baseline.guard == PERCEPTION_STALL_GUARD
+    assert outcome.guard == PERCEPTION_STALL_GUARD
+    assert caller.calls == baseline_caller.calls
+
+    # A re-read of the same page is marked unchanged, and the new screenshot line still reaches the model.
+    long_body = "url=x " + "frozen behind a gate " * 40
+    reread = [[("observe", {})], [("observe", {})], [("finish", {"status": "completed", "reason": "done"})]]
+    outcome, _ = await _run(reread, [_observe_with_alternating_screenshot_lines(long_body), make_finish_tool()])
+    reads = _tool_contents(outcome, "observe")
+    assert reads[1].startswith(f"[observe returned the same {len(long_body)} chars")
+    assert reads[1].split("\n", 1)[1].startswith("screenshot: attached (observe)")
 
 
 @pytest.mark.asyncio
