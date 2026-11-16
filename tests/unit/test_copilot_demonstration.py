@@ -1141,8 +1141,16 @@ async def test_client_upload_control_cannot_name_a_file() -> None:
 
 
 @pytest.mark.asyncio
-async def test_demonstration_upload_passes_a_restricted_type_through_to_the_recorder(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("filename", "content", "accepted"),
+    [
+        ("invoice.pdf", b"%PDF-1.7 demonstration", True),
+        ("logo.svg", b'<svg xmlns="http://www.w3.org/2000/svg"><circle r="4"/></svg>', False),
+        ("capture.har", b'{"log": {}}', False),
+    ],
+)
+async def test_demonstration_upload_takes_only_the_expected_file_types(
+    monkeypatch: pytest.MonkeyPatch, filename: str, content: bytes, accepted: bool
 ) -> None:
     cache = _SharedCache()
     cache.store[demonstration_record_key("org-1", "demo-1")] = encode_demonstration_record(
@@ -1169,19 +1177,26 @@ async def test_demonstration_upload_passes_a_restricted_type_through_to_the_reco
             SETTINGS_MANAGER=SimpleNamespace(MAX_UPLOAD_FILE_SIZE=1024 * 1024),
         ),
     )
-    save = AsyncMock(return_value=(SimpleNamespace(file_id="file-svg"), "https://storage.example/logo.svg"))
+    save = AsyncMock(return_value=(SimpleNamespace(file_id="file-1"), f"https://storage.example/{filename}"))
     monkeypatch.setattr(uploaded_file_service, "save_uploaded_file", save)
-    svg = b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'
-    file = UploadFile(file=io.BytesIO(svg), filename="logo.svg", size=len(svg))
+    file = UploadFile(file=io.BytesIO(content), filename=filename, size=len(content))
 
-    result = await copilot_routes.workflow_copilot_demonstration_upload(
-        demonstration_id="demo-1", file=file, organization=SimpleNamespace(organization_id="org-1")
-    )
+    async def upload() -> object:
+        return await copilot_routes.workflow_copilot_demonstration_upload(
+            demonstration_id="demo-1", file=file, organization=SimpleNamespace(organization_id="org-1")
+        )
 
-    assert result.file_id == "file-svg"
-    assert save.await_args.kwargs["file"].file.read() == svg
-    controls = json.loads(cache.store[demonstration_controls_key("org-1", "demo-1")])
-    assert [control.get("file_id") for control in controls] == ["file-svg"]
+    controls_key = demonstration_controls_key("org-1", "demo-1")
+    if accepted:
+        assert (await upload()).file_id == "file-1"  # type: ignore[attr-defined]
+        assert [control.get("file_id") for control in json.loads(cache.store[controls_key])] == ["file-1"]
+        return
+    with pytest.raises(HTTPException) as refused:
+        await upload()
+    assert refused.value.status_code == 415
+    assert "skip the file" in refused.value.detail
+    save.assert_not_awaited()
+    assert json.loads(cache.store[controls_key]) == []
 
 
 @pytest.mark.asyncio
