@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -14,6 +15,7 @@ import structlog.testing
 from skyvern.exceptions import FailedToGetTOTPVerificationCode, NoTOTPVerificationCodeFound
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.forge_log import add_log_context, escape_reserved_log_keys
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.parameter import (
@@ -1449,6 +1451,111 @@ class TestPollOtpValueRetry:
     """poll_otp_value retries fetch failures across the full wall-clock timeout window."""
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "url_result,email_result,expected_source",
+        [
+            ("code", None, "verification_url"),
+            (None, "code", "connected_email"),
+            (None, None, "stored_code"),
+            ("rejected", "code", "connected_email"),
+            ("rejected", "rejected", "stored_code"),
+        ],
+    )
+    async def test_success_source_names_the_accepted_path_after_fallback(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        url_result: str | None,
+        email_result: str | None,
+        expected_source: str,
+    ) -> None:
+        code = OTPValue(value="246810", type=OTPType.TOTP)
+        rejected = OTPValue(value="135790", type=OTPType.TOTP)
+        values = {"code": code, "rejected": rejected, None: None}
+        config_before = structlog.get_config()
+        capture_factory = structlog.testing.CapturingLoggerFactory()
+        monkeypatch.setattr(
+            otp_service,
+            "LOG",
+            structlog.wrap_logger(
+                capture_factory(),
+                processors=[add_log_context, escape_reserved_log_keys, structlog.processors.JSONRenderer()],
+                cache_logger_on_first_use=False,
+            ),
+        )
+        monkeypatch.setattr(otp_service, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
+        monkeypatch.setattr(otp_service, "_get_otp_value_from_url", AsyncMock(return_value=values[url_result]))
+        monkeypatch.setattr(otp_service, "_get_otp_value_from_email", AsyncMock(return_value=values[email_result]))
+        monkeypatch.setattr(otp_service, "_get_otp_value_from_db", AsyncMock(return_value=code))
+        monkeypatch.setattr(otp_service.app.AGENT_FUNCTION, "enforce_totp_identifier_credential_use", AsyncMock())
+        monkeypatch.setattr(
+            otp_service.app.DATABASE.organizations,
+            "get_valid_org_auth_token",
+            AsyncMock(return_value=_mock_org_token()),
+        )
+        result = await poll_otp_value(
+            organization_id="o_test",
+            totp_identifier="otp@example.test",
+            totp_verification_url="https://example.test/poll?token=synthetic-secret",
+            rejected_code_hash=hashlib.sha256(rejected.value.encode()).hexdigest(),
+        )
+
+        assert result == code
+        assert structlog.get_config() == config_before
+        logs = [json.loads(call.args[0]) for call in capture_factory.logger.calls]
+        (success,) = (record for record in logs if record["event"] == "Got otp value")
+        assert success["otp_poll_source"] == expected_source
+        assert "source" not in success
+        assert "event_source" not in success
+        for secret in (code.value, rejected.value, "otp@example.test", "synthetic-secret", "fake-token"):
+            assert secret not in repr(logs)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "has_url,has_identifier,expires_before_poll,expected_source",
+        [
+            (True, False, False, "verification_url"),
+            (False, True, False, "stored_code"),
+            (True, True, False, "stored_code"),
+            (True, True, True, "not_polled"),
+            (False, False, False, "not_polled"),
+        ],
+    )
+    async def test_timeout_source_names_the_last_attempted_path(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        has_url: bool,
+        has_identifier: bool,
+        expires_before_poll: bool,
+        expected_source: str,
+    ) -> None:
+        base = datetime(2026, 1, 1, tzinfo=timezone.utc).replace(tzinfo=None)
+        ticks = iter([base, base + timedelta(seconds=1), base + timedelta(minutes=16)])
+        monkeypatch.setattr(otp_service, "datetime", SimpleNamespace(utcnow=lambda: next(ticks)))
+        monkeypatch.setattr(otp_service, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
+        monkeypatch.setattr(otp_service, "_get_otp_value_from_url", AsyncMock(return_value=None))
+        monkeypatch.setattr(otp_service, "_get_otp_value_from_email", AsyncMock(return_value=None))
+        monkeypatch.setattr(otp_service, "_get_otp_value_from_db", AsyncMock(return_value=None))
+        monkeypatch.setattr(otp_service.app.AGENT_FUNCTION, "enforce_totp_identifier_credential_use", AsyncMock())
+        monkeypatch.setattr(
+            otp_service.app.DATABASE.organizations,
+            "get_valid_org_auth_token",
+            AsyncMock(return_value=_mock_org_token()),
+        )
+
+        with structlog.testing.capture_logs() as logs, pytest.raises(NoTOTPVerificationCodeFound):
+            await poll_otp_value(
+                organization_id="o_test",
+                totp_identifier="otp@example.test" if has_identifier else None,
+                totp_verification_url="https://example.test/poll" if has_url else None,
+                max_wait_seconds=0.0 if expires_before_poll else None,
+            )
+
+        (timeout,) = (record for record in logs if record["event"] == "Polling otp value timed out")
+        assert timeout["otp_poll_source"] == expected_source
+        assert "otp@example.test" not in repr(logs)
+        assert "https://example.test/poll" not in repr(logs)
+
+    @pytest.mark.asyncio
     @patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock)
     @patch("skyvern.services.otp_service._get_otp_value_from_url", new_callable=AsyncMock)
     @patch("skyvern.services.otp_service.app")
@@ -1798,6 +1905,7 @@ class TestPollOtpValueRetry:
                 None,
             )
             assert timeout_log is not None
+            assert timeout_log["otp_poll_source"] == "verification_url"
             assert timeout_log["last_error_reason"] == exc_info.value.reason
             for record in logs:
                 assert raw_identifier not in repr(record)
@@ -1870,7 +1978,7 @@ class TestPollOtpValueRetry:
             mock_app.DATABASE.organizations.get_valid_org_auth_token = AsyncMock(return_value=_mock_org_token())
             mock_post.return_value = webhook_response
 
-            with pytest.raises(NoTOTPVerificationCodeFound) as exc_info:
+            with structlog.testing.capture_logs() as logs, pytest.raises(NoTOTPVerificationCodeFound) as exc_info:
                 await poll_otp_value(
                     organization_id="o_test",
                     task_id="tsk_test",
@@ -1878,6 +1986,8 @@ class TestPollOtpValueRetry:
                 )
 
         assert exc_info.value.webhook_diagnostics == expected_diagnostics
+        (timeout,) = (record for record in logs if record["event"].startswith("Polling otp value timed out"))
+        assert timeout["otp_poll_source"] == "verification_url"
 
     @pytest.mark.asyncio
     @patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock)

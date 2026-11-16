@@ -5680,14 +5680,17 @@ async def test_execute_task_v3_reports_the_last_code_tool_status_as_the_failure_
         state.last_status = status_text
 
     model_reason = "Login failed: the MFA code was rejected"
-    _step, task, _loop_mock, _post = await _run_execute_task_v3(
-        monkeypatch,
-        LoopOutcome(status=finish_status.value, reason=model_reason, billable_actions=[]),
-        task_block=_make_block(NavigationBlock, navigation_goal="Sign in"),
-        on_loop=_reported,
-        data_extraction_goal=None,
-        extracted_information_schema=None,
-    )
+    with capture_logs() as logs:
+        _step, task, _loop_mock, _post = await _run_execute_task_v3(
+            monkeypatch,
+            LoopOutcome(status=finish_status.value, reason=model_reason, billable_actions=[]),
+            task_block=_make_block(NavigationBlock, navigation_goal="Sign in"),
+            on_loop=_reported,
+            data_extraction_goal=None,
+            extracted_information_schema=None,
+        )
+    endings = [record for record in logs if record["event"] == "task_v3 ended on a verification code status"]
+    assert [record["last_status"] for record in endings] == ([status_text] if status_text is not None else [])
     state = seen["state"]
     assert "get_verification_code" in [tool.name for tool in seen["tools"]]
     assert seen["resolver"] == state.resolve_totp_placeholder
@@ -5700,6 +5703,34 @@ async def test_execute_task_v3_reports_the_last_code_tool_status_as_the_failure_
     assert task.failure_reason is not None and model_reason in task.failure_reason
     assert status_text in task.failure_reason if status_text else task.failure_reason == model_reason
     assert [error["error_code"] for error in written] == (["MISSING_TOTP_SOURCE"] if last_status == "no_source" else [])
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_redacts_secrets_in_the_terminal_code_status_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "synthetic-status-secret"
+    status_text = f"verification lookup failed: {secret}"
+    monkeypatch.setattr("skyvern.forge.agent._task_v3_run_secret_values", lambda _task: {secret})
+
+    def _reported(kwargs: dict[str, Any]) -> None:
+        kwargs["verification_blocker"].__self__.last_status = status_text
+
+    with capture_logs() as logs:
+        _step, task, _loop_mock, _post = await _run_execute_task_v3(
+            monkeypatch,
+            LoopOutcome(status="terminated", reason="Code source unavailable", billable_actions=[]),
+            task_block=_make_block(NavigationBlock, navigation_goal="Sign in"),
+            on_loop=_reported,
+            data_extraction_goal=None,
+            extracted_information_schema=None,
+        )
+
+    (ending,) = (record for record in logs if record["event"] == "task_v3 ended on a verification code status")
+    assert ending["last_status"] == f"verification lookup failed: {REDACTED_SECRET_PLACEHOLDER}"
+    assert secret not in repr(ending)
+    assert task.status == TaskStatus.terminated
+    assert secret not in (task.failure_reason or "")
 
 
 @pytest.mark.asyncio
