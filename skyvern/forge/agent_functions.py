@@ -102,6 +102,7 @@ from skyvern.services.email.gmail_client import GmailAPIError
 from skyvern.services.otp_email import EmailOTPSearchError, EmailOTPVerificationContext, build_email_otp_sources
 from skyvern.services.webhook_delivery import WebhookDeliveryAttempts, bound_webhook_request
 from skyvern.services.workflow_run_group_service import schedule_advance_after_terminal
+from skyvern.settings_manager import SettingsManager
 from skyvern.utils.email_validation import normalize_identifier_if_email
 from skyvern.utils.url_validators import pinned_ip_client
 from skyvern.webeye.actions.actions import Action
@@ -1070,6 +1071,18 @@ class RecordingVideoSizeResolution:
     raw_output_bound: dict[str, int] | None
 
 
+TASK_V3_OBSERVE_SCREENSHOT_WIDTH_MIN = 256
+TASK_V3_OBSERVE_SCREENSHOT_WIDTH_MAX = 1024
+
+
+def observe_screenshot_width(value: int, *, source: str) -> int:
+    if TASK_V3_OBSERVE_SCREENSHOT_WIDTH_MIN <= value <= TASK_V3_OBSERVE_SCREENSHOT_WIDTH_MAX:
+        return value
+    if value != 0:
+        LOG.warning("taskv3 observe screenshot width invalid; off", width=value, source=source)
+    return 0
+
+
 OnePasswordTelemetryEvent = Literal[
     "onepassword.token_saved",
     "onepassword.token_cleared",
@@ -1530,6 +1543,10 @@ class AgentFunction:
     # offered the codes either way. The setting forces it on; where it is off, cloud gates this per organization.
     async def task_v3_error_code_on_finish(self, *, organization_id: str) -> bool:
         return settings.TASK_V3_ERROR_CODE_ON_FINISH
+
+    # Width of the viewport picture a v3 observe attaches, 0 for none. Read once per task.
+    async def task_v3_observe_screenshot_width(self, *, organization_id: str | None) -> int:
+        return observe_screenshot_width(SettingsManager.get_settings().TASK_V3_OBSERVE_SCREENSHOT_WIDTH, source="env")
 
     # Read once when a run group is submitted; the group stores its bound, so a later change never reaches it.
     async def workflow_run_group_limits(self, *, organization_id: str) -> RunGroupLimits:

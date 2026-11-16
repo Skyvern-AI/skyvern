@@ -222,6 +222,11 @@ _OBSERVE_DESCRIPTION_FRAME_REACH = (
     "reports the frames present and names any whose contents could NOT be read, so a frame missing from "
     "the element list is stated rather than silent. Call once per page, then act by ref."
 )
+_OBSERVE_DESCRIPTION_SCREENSHOT = (
+    " A screenshot of the viewport is attached to your next turn when one could be taken; if look also attaches "
+    "one that turn, the pictures arrive in the order of the two results."
+)
+OBSERVE_SCREENSHOT_TIMEOUT_SECONDS = 3.0
 
 # Cap on what get_html returns, for markup and for rendered text alike.
 HTML_MAX_CHARS = 20000
@@ -14637,6 +14642,7 @@ def build_browser_tools(
     resolve_totp_placeholder: TotpPlaceholderResolver | None = None,
     opaque_refs: OpaqueUrlRefs | None = None,
     vision_enabled: bool = True,
+    observe_screenshot_width: int = 0,
     semantic_commit_stats: SemanticCommitStats | None = None,
     unseen_text: UnseenPageText | None = None,
     download_failures: DownloadFailureWatch | None = None,
@@ -24149,6 +24155,59 @@ def build_browser_tools(
         legend = header + "\n" + "\n".join(lines)
         return ToolResult.ok(legend, data=renumbered, screenshots=[annotated])
 
+    def _scaled_viewport(png: bytes) -> tuple[bytes, int, int]:
+        scaled = _annotate_screenshot(png, [], 0, max_width=observe_screenshot_width)
+        width, height = Image.open(io.BytesIO(scaled)).size
+        return scaled, width, height
+
+    def _with_observe_screenshot(handler: ToolHandler) -> ToolHandler:
+        async def wrapped(args: dict[str, Any]) -> ToolResult:
+            result = await handler(args)
+            if result.status != "ok":
+                return result
+            started = time.monotonic()
+            top = _current_page()
+            image: bytes | None = None
+            width = height = 0
+            outcome = "attached"
+            try:
+                if top is None:
+                    raise RuntimeError("no page")
+                async with asyncio.timeout(OBSERVE_SCREENSHOT_TIMEOUT_SECONDS):
+                    # Playwright runs one screenshot per page at a time; without its own timeout a cancelled
+                    # capture keeps the driver busy for 30s and queues every later observe and look behind it.
+                    png = await top.screenshot(timeout=OBSERVE_SCREENSHOT_TIMEOUT_SECONDS * 1000)
+                    image, width, height = await asyncio.to_thread(_scaled_viewport, png)
+                line = (
+                    f"screenshot: attached (observe) to your next turn, the viewport as rendered now "
+                    f"({width}x{height}); a later observe in this turn replaces it"
+                )
+            except Exception as exc:
+                # By class name, so Playwright's and Patchright's TimeoutError count as a timeout too.
+                if type(exc).__name__ == "TimeoutError":
+                    outcome = "timeout"
+                    line = f"screenshot: not attached (timed out after {OBSERVE_SCREENSHOT_TIMEOUT_SECONDS:g}s)"
+                else:
+                    outcome = "error"
+                    line = f"screenshot: not attached (capture failed: {type(exc).__name__})"
+            LOG.info(
+                "taskv3 observe screenshot",
+                width=width,
+                height=height,
+                bytes=len(image) if image is not None else 0,
+                capture_ms=round((time.monotonic() - started) * 1000),
+                outcome=outcome,
+                target_width=observe_screenshot_width,
+            )
+            return dataclasses.replace(
+                result,
+                content=result.content + "\n" + line,
+                data={**(result.data or {}), "screenshot_at": len(result.content)},
+                screenshots=[image] if image is not None else None,
+            )
+
+        return wrapped
+
     async def _holders(target: Any, selector: str) -> int:
         """How many elements the engine sees for `selector` IN `target`'s document, without leaking the
         handles it made. `target` is the page (its main frame) or the child frame owning the element.
@@ -24977,7 +25036,9 @@ def build_browser_tools(
     tools = [
         _spec(
             "observe",
-            _OBSERVE_DESCRIPTION_BASE + _OBSERVE_DESCRIPTION_FRAME_REACH,
+            _OBSERVE_DESCRIPTION_BASE
+            + _OBSERVE_DESCRIPTION_FRAME_REACH
+            + (_OBSERVE_DESCRIPTION_SCREENSHOT if observe_screenshot_width else ""),
             _obj({}),
             observe,
         ),
@@ -25233,6 +25294,11 @@ def build_browser_tools(
     # Inside the download signal, so download lines and failures follow the page-text delta.
     _apply_text_delta(tools)
     _apply_download_signal(tools, downloads_dir, download_failures, download_wait, page_provider)
+    if observe_screenshot_width:
+        # Outermost, so the screenshot line is the result's last line, after text-delta and download lines.
+        for _tool_spec in tools:
+            if _tool_spec.name == "observe":
+                _tool_spec.handler = _with_observe_screenshot(_tool_spec.handler)
     if unseen_text is not None:
         unseen_text.unreported = _unreported_text
     return tools

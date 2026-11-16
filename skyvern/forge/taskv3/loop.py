@@ -280,8 +280,8 @@ class ToolResult:
     status: ToolStatus
     content: str
     data: dict[str, Any] | None = None
-    # Transient images the loop must show the model on the NEXT call only (the on-demand `look`
-    # tool's annotated screenshot). Threaded into one .call()'s ephemeral screenshots= arg and never
+    # Transient images the loop must show the model on the NEXT call only (`look`'s annotated screenshot,
+    # `observe`'s viewport picture). Threaded into one .call()'s ephemeral screenshots= arg and never
     # appended to the transcript, so it costs one image on one turn and is gone the turn after.
     screenshots: list[bytes] | None = None
     # Telemetry only, and deliberately NOT in `data`: callers and tests pin `data` by equality, so a
@@ -4132,7 +4132,8 @@ class LoopState:
     refresh_cycles: int = 0
     refresh_nudge_due: bool = False
     reload_failed_nudge_due: bool = False
-    pending_screenshots: list[bytes] = field(default_factory=list)
+    # Latest images per tool for the next request, in the order of each tool's latest result.
+    pending_screenshots: dict[str, list[bytes]] = field(default_factory=dict)
     # The action round of the latest positive page-change evidence (SKY-15264, SKY-15666); the
     # budget-extension gate reads it, so what counts as evidence is load-bearing, not cosmetic.
     last_change_evidence_step: int | None = None
@@ -4596,7 +4597,7 @@ async def run_agent_tool_loop(
         st.perception.reset()
         if activity is not None:
             activity.perception_stall_imminent = False
-        st.pending_screenshots = []
+        st.pending_screenshots = {}
         st.pending_nav_dead_end = None
         st.stall_nudges_due = []
         if st.progress is not None:
@@ -4818,7 +4819,7 @@ async def run_agent_tool_loop(
                 return True
         return False
 
-    # Images produced by an on-demand `look` this turn, to show the model on the NEXT call only. Passed
+    # Images produced by `look` or `observe` this turn, to show the model on the NEXT call only. Passed
     # as the transient screenshots= arg once, then cleared, so a look costs one image on one turn and
     # never enters `messages` (the transcript re-seeds message_history each turn, so it's structurally
     # gone the turn after).
@@ -5086,7 +5087,7 @@ async def run_agent_tool_loop(
         rewritten_at = st.reads.compact(st.messages)
         llm_caller.message_history = list(st.messages)
         if anthropic_cache_markers:
-            # Not -1: a look image rides after the transcript for this call only. The mark before the newest
+            # Not -1: a look or observe image rides after the transcript for this call only. The mark before the newest
             # observe writes the entry that the call superseding it reads back at the rewrite mark.
             marked = {0, len(st.messages) - 1}
             newest_observe = max(
@@ -5103,10 +5104,10 @@ async def run_agent_tool_loop(
             active_call_kwargs["cache_control_injection_points"] = [
                 {"location": "message", "index": i} for i in sorted(marked)
             ]
-        # Consume any pending look image into THIS call only, then clear: the image rides one request
+        # Consume any pending tool images into THIS call only, then clear: the image rides one request
         # and is never appended to `messages`, so the turn after carries zero image blocks.
-        screenshots_for_call = st.pending_screenshots or None
-        st.pending_screenshots = []
+        screenshots_for_call = [image for images in st.pending_screenshots.values() for image in images] or None
+        st.pending_screenshots = {}
         # Retry only the LLM call on transient provider errors. No browser tool has run this
         # turn, so re-issuing the same call is side-effect-free — unlike a whole-task retry,
         # which would re-execute prior clicks/types. This restores the step engine's transient
@@ -5967,13 +5968,15 @@ async def run_agent_tool_loop(
                 and (spec.compactable or fresh_delta)
             ):
                 activity.record_read(tool_started_at)
+            screenshot_at = (result.data or {}).get("screenshot_at")
+            page_text_end = screenshot_at if type(screenshot_at) is int else len(result.content)
             if unseen_text is not None and result.status == "ok" and type(news_at) is int:
                 news_end = (result.data or {}).get("delta_end")
-                end = news_end if type(news_end) is int and news_at <= news_end else len(result.content)
+                end = news_end if type(news_end) is int and news_at <= news_end else page_text_end
                 unseen_text.batch.append(result.content[news_at:end])
             failure_at = (result.data or {}).get("download_failure_at")
             if unseen_text is not None and type(failure_at) is int:
-                unseen_text.batch.append(result.content[failure_at:])
+                unseen_text.batch.append(result.content[failure_at:page_text_end])
             # A dispatched page action consumes a step even if it errors (it may mutate before failing),
             # unless the tool refused it before acting on the page, within the grace. Billing counts
             # successes only.
@@ -6118,7 +6121,12 @@ async def run_agent_tool_loop(
             reported_delta_end = reported.get("delta_end")
             reported_failure_at = reported.get("download_failure_at")
             failure_at = reported_failure_at if type(reported_failure_at) is int else None
-            digest_source = perception_digest_source(result.content, failure_at)
+            reported_screenshot_at = reported.get("screenshot_at")
+            digest_cut = min(
+                (at for at in (failure_at, reported_screenshot_at) if type(at) is int),
+                default=None,
+            )
+            digest_source = perception_digest_source(result.content, digest_cut)
             if spec is not None and spec.compactable and result.status == "ok":
                 content_digest = hashlib.sha256(
                     _canonical_perception_content(
@@ -6215,8 +6223,9 @@ async def run_agent_tool_loop(
             # Masking can change lengths, so the tool's offset is re-found as the masked delta's suffix
             # position; if masking broke the suffix, the whole result counts as the read.
             delta_at: int | None = None
-            # Download failures follow any delta and report the network, so without a delta they open the tail.
-            tail_at = reported_delta_at if type(reported_delta_at) is int else failure_at
+            # Download failures and the observe screenshot line follow any delta and are not page text, so without a
+            # delta the earlier of them opens the tail.
+            tail_at = reported_delta_at if type(reported_delta_at) is int else digest_cut
             if tail_at is not None and 0 <= tail_at <= len(result.content):
                 delta = result.content[tail_at:]
                 if skyvern_ctx is not None:
@@ -6265,12 +6274,12 @@ async def run_agent_tool_loop(
                         url_before=_trail_url_before(result, skyvern_ctx),
                     )
                 )
-            # A look's annotated screenshot is shown to the model on the next call only, never stored in
-            # the transcript. Consumed and cleared at the top of the next turn. Only the LATEST snapshot
-            # survives: a second look in the same turn supersedes the first (its marks replace the prior
-            # ones), so re-sending the stale image would just hand the model a dead numbering.
+            # Tool images ride the next call only, never the transcript. Each tool keeps only its latest images
+            # (a second look's marks replace the first's); an ok observe replaces observe's, a failed one keeps them.
+            if result.screenshots or (tool_name == "observe" and result.status == "ok"):
+                st.pending_screenshots.pop(tool_name, None)
             if result.screenshots:
-                st.pending_screenshots = list(result.screenshots)
+                st.pending_screenshots[tool_name] = list(result.screenshots)
                 if on_look_screenshots is not None:
                     try:
                         on_look_screenshots(list(result.screenshots))
