@@ -20484,6 +20484,33 @@ async def test_click_still_refuses_a_transparent_checkbox_nothing_reaches(select
         assert await page.eval_on_selector(selector, "el => el.checked") is False
 
 
+# Rows with no role or ref in a popup the trigger toggles; the row clicked by its text while the popup is closed.
+_CLOSED_POPUP_ROWS_HTML = """<!doctype html><html><body>
+<div id="pop" style="display:none"><ul id="rows"><li><div>12 ELM ST</div><div>004-0017</div></li></ul></div>
+<span id="trigger" style="cursor:pointer">004-0001</span>
+<script>
+document.getElementById('trigger').onclick = () => {
+  const pop = document.getElementById('pop');
+  pop.style.display = pop.style.display === 'none' ? 'block' : 'none';
+};
+document.getElementById('rows').onclick = (e) => { document.getElementById('trigger').textContent = e.target.closest('li').lastElementChild.textContent; };
+</script>
+</body></html>"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_click_by_text_on_a_closed_popup_row_is_diagnosed_not_rendered(expected_action_timeout: None) -> None:
+    async with _content_page(_CLOSED_POPUP_ROWS_HTML) as page:
+        click = _tool(build_browser_tools(_fixed_page_provider(page)), "click")
+        closed = await click.handler({"selector": 'text="004-0017"'})
+        assert closed.status == "error" and "is not rendered" in closed.content, closed.content
+        assert (await click.handler({"selector": "#trigger"})).status == "ok"
+        opened = await click.handler({"selector": 'text="004-0017"'})
+        assert opened.status == "ok", opened.content
+        assert await page.inner_text("#trigger") == "004-0017"
+
+
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_a_pre_seeded_marker_holding_a_line_separator_cannot_forge_a_line() -> None:

@@ -17086,7 +17086,21 @@ def build_browser_tools(
             return None
         # The element the driver waited on, which is not always the one the caller named.
         acted = _acted_selector.get(selector, selector)
-        return _inert_target_error(acted) if await _target_is_inert(acted) else None
+        probe: str | None = acted
+        if _ENGINE_SELECTOR_RE.match(acted.strip()) and _acted_page:
+            # The isolated probe reads CSS only, so a text= or xpath target is first named by the driver's own engine.
+            realm = _acted_realm[0] if _acted_realm else _acted_page[0]
+            handle = None
+            try:
+                handle = await realm.locator(acted).first.element_handle(timeout=1000)
+                probe = await _resolve_handle_selector(realm, handle) if handle is not None else None
+            except Exception:
+                probe = None
+            finally:
+                if handle is not None:
+                    with contextlib.suppress(Exception):
+                        await handle.dispose()
+        return _inert_target_error(acted) if probe is not None and await _target_is_inert(probe) else None
 
     async def _typing_target(page: Any, selector: str) -> str:
         """The element a type call acts on: the one its selector names, or the control a named shadow host mirrors."""
@@ -25355,7 +25369,8 @@ def build_browser_tools(
             'menu of options, the result lists them with [data-tv3-menu="N"] selectors — click one of '
             "those to select (verified: you get a loud error, not a silent no-op, if the selection does "
             "not commit; do not blindly repeat a failed click). If the click triggers a file download, "
-            "the tool result reports it when detected.",
+            "the tool result reports it when detected. For text that observe and look do not list, selector "
+            'text="<exact visible text>" clicks the element showing exactly that text.',
             _obj(
                 {
                     "selector": {"type": "string"},

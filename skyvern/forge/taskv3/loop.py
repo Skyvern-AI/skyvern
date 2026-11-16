@@ -2378,8 +2378,7 @@ def _action_nudge_text(
     if page_moved:
         state = (
             f"You are repeating the same action: {symptoms}. The page has changed since before the streak "
-            f"began, and the repeat attempts land on that same state, so repeating it will not change it "
-            f"further. {read_the_page}"
+            f"began. {read_the_page}"
         )
     elif page_moved is None:
         state = f"You are repeating the same action: {symptoms}. {read_the_page}"
