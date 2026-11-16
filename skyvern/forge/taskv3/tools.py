@@ -23569,8 +23569,14 @@ def build_browser_tools(
             return ToolResult.ok(
                 f"selected on {selector} — it now holds {len(held)} option(s): {_selection_report(held)}", data=data
             )
+        receipt = (
+            f" — read back selected option: {_selection_report([shown])}"
+            if isinstance(shown, str) and shown.strip()
+            else ""
+        )
         return ToolResult.ok(
-            f"selected on {selector} (hidden native select, set directly)" if force else f"selected on {selector}",
+            (f"selected on {selector} (hidden native select, set directly)" if force else f"selected on {selector}")
+            + receipt,
             data=data,
         )
 
