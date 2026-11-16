@@ -1416,6 +1416,34 @@ async def test_engine_forwards_download_hooks_without_a_download_order(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_engine_hands_an_unsaved_download_completion_back_once_through_the_finish_tool() -> None:
+    reads: list[int] = []
+
+    async def unsaved_downloads() -> dict[str, int]:
+        reads.append(1)
+        return {"capture_failed": 1}
+
+    outcome = await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=_ScriptedCaller(
+            [
+                [("finish", {"status": "completed", "reason": "the export finished"})],
+                [("finish", {"status": "failed", "reason": "the browser did not save the export"})],
+            ]
+        ),
+        goal="download the file",
+        download_settle=_no_download_pending,
+        unsaved_downloads=unsaved_downloads,
+    )
+
+    assert outcome.status == "failed"
+    assert reads == [1]
+    results = [str(m["content"]) for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "finish"]
+    assert len(results) == 2, results
+    assert "capture_failed: 1" in results[0]
+
+
+@pytest.mark.asyncio
 async def test_engine_drops_download_hooks_in_page_free_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     loop_kwargs: dict[str, Any] = {}
     finish_kwargs: dict[str, Any] = {}

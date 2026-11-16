@@ -130,6 +130,7 @@ from skyvern.webeye.actions.actions import (
     UploadFileAction,
 )
 from skyvern.webeye.browser_artifacts import DownloadBinding
+from skyvern.webeye.cdp_download_interceptor import DownloadTally
 from skyvern.webeye.native_downloads import NativeDownloads
 from tests.unit._download_provider_fakes import (
     _ActionDownloadSource,
@@ -3032,6 +3033,91 @@ async def test_execute_task_v3_finalized_download_completes_on_a_blank_page(
         monkeypatch, tmp_path, drop_file=True, block_cls=FileDownloadBlock, loop_fn=_download_then_blank
     )
     assert captured["probe_reason"]
+    assert captured["task"].status == TaskStatus.completed
+
+
+def _tally(failures: dict[str, int], generation: str = "g1", discarded: int = 0) -> DownloadTally:
+    return DownloadTally(
+        generation=generation, saved=0, unsolicited_failures=failures, pending=False, discarded_candidates=discarded
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("before", "after", "file_mode", "complete_on_download", "expected"),
+    [
+        (_tally({}), _tally({"capture_failed": 1}), "none", True, {"capture_failed": 1}),
+        (_tally({}), _tally({"capture_failed": 1}), "finalized", True, {}),
+        (_tally({}), _tally({"capture_failed": 1}), "unfinalized", True, {}),
+        (_tally({}), _tally({}), "none", True, {}),
+        (_tally({"capture_failed": 1}), _tally({"capture_failed": 1}), "none", True, {}),
+        (_tally({}), _tally({"file_size_limit": 1}), "none", True, {}),
+        (_tally({}), _tally({"capture_failed": 1}), "none", False, None),
+        (_tally({"capture_failed": 1}), _tally({"capture_failed": 1}, "g2"), "none", True, {"capture_failed": 1}),
+        (_tally({}), _tally({"capture_failed": 2}, discarded=1), "none", True, {"capture_failed": 1}),
+        (
+            _tally({"capture_failed": 1}, discarded=1),
+            _tally({"capture_failed": 2}, discarded=1),
+            "none",
+            True,
+            {"capture_failed": 1},
+        ),
+    ],
+    ids=[
+        "capture_failed_no_file",
+        "file_finalized",
+        "file_landed_unfinalized",
+        "no_capture_failure",
+        "capture_failed_before_block",
+        "limit_refusal_only",
+        "not_complete_on_download",
+        "counts_restarted",
+        "capture_failed_and_discarded_candidate",
+        "candidate_discarded_before_block",
+    ],
+)
+async def test_execute_task_v3_unsaved_downloads_counts_the_block_unsaved_downloads_and_never_fails_the_completion(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    before: DownloadTally,
+    after: DownloadTally,
+    file_mode: str,
+    complete_on_download: bool,
+    expected: dict[str, int] | None,
+) -> None:
+    monkeypatch.setattr(agent_module, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
+    tally = {"now": before}
+    read_contexts: list[Any] = []
+
+    def _tally_for(context: Any) -> DownloadTally:
+        read_contexts.append(context)
+        return tally["now"]
+
+    monkeypatch.setattr(agent_module, "download_tally_for_context", _tally_for)
+
+    async def _loop(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
+        tally["now"] = after
+        if file_mode != "none":
+            (tmp_path / "report.pdf").write_bytes(b"file-bytes")
+        if file_mode == "finalized":
+            assert await kwargs["download_settle"](frozenset())
+            # A finalized file counts even once it has left the local directory.
+            for landed in tmp_path.iterdir():
+                landed.unlink()
+        unsaved_downloads = kwargs["unsaved_downloads"]
+        captured["unsaved"] = None if unsaved_downloads is None else await unsaved_downloads()
+        return LoopOutcome(status="completed", reason="downloaded", billable_actions=["click"])
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=False,
+        block_cls=FileDownloadBlock,
+        loop_fn=_loop,
+        complete_on_download=complete_on_download,
+    )
+    assert captured["unsaved"] == expected
+    assert read_contexts and all(c is captured["browser_state"].browser_context for c in read_contexts)
     assert captured["task"].status == TaskStatus.completed
 
 
