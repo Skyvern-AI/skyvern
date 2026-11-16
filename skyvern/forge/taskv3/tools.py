@@ -23978,9 +23978,9 @@ def build_browser_tools(
         # lands here: the recoverable error this used to be drew no retry from the model either.
         return ToolResult.ok(
             f"uploaded 1 file to {selector}: the input holds it, and the site sent no upload request yet — "
-            f"normal for a form that sends the file when it is submitted. A hidden file input does not show "
-            f"in observe, so re-checking it will not show the file; look instead for an upload error or a "
-            f"still-required file field on the page",
+            f"normal for a form that sends the file when it is submitted. When observe lists this input, it shows "
+            f"value=C:\\fakepath\\<file name> while the input holds the file; listed with no value, it holds none "
+            f"(a form re-rendered after a rejected submit comes back empty)",
             staged,
             ok_class="attached_no_activity",
         )
