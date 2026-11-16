@@ -80,6 +80,7 @@ from skyvern.forge.taskv3.loop import (
     ToolSpec,
     TurnEnd,
     TurnStart,
+    UnsavedDownloads,
     UnseenPageText,
     VerificationBlocker,
     make_finish_tool,
@@ -328,6 +329,7 @@ async def run_task_v3_agent_loop(
     pending_marker: Callable[[str], Awaitable[str | None]] | None = None,
     download_wait: DownloadWait | None = None,
     download_settle: DownloadSettle | None = None,
+    unsaved_downloads: UnsavedDownloads | None = None,
     native_download_attempt: NativeDownloadAttempt | None = None,
     completion_gate: CompletionGate | None = None,
     staged_downloads: set[str] | None = None,
@@ -740,6 +742,7 @@ async def run_task_v3_agent_loop(
         intercepted_submissions=block_submissions,
         justify_stops=justify_on,
         file_landed_hold=file_landed_hold,
+        unsaved_downloads=unsaved_downloads,
     )
     # An extraction block cannot enter input, so a yes has nothing to act on there and offering the tool cost a turn.
     context_texts = (

@@ -1330,6 +1330,25 @@ class DownloadTally(NamedTuple):
     saved: int
     unsolicited_failures: dict[str, int]
     pending: bool
+    # Held candidates the model left unselected; each is also counted in unsolicited_failures.
+    discarded_candidates: int = 0
+
+
+def unsaved_downloads_since(before: DownloadTally | None, now: DownloadTally | None) -> dict[str, int]:
+    """Browser downloads not saved since `before`, by reason. A limit refusal keeps its own handling, and a held
+    candidate the model left unselected is a choice, not a failure."""
+    if now is None:
+        return {}
+    base = before if before is not None and before.generation == now.generation else None
+    seen = base.unsolicited_failures if base is not None else {}
+    unsaved = {
+        reason: total - seen.get(reason, 0)
+        for reason, total in now.unsolicited_failures.items()
+        if not reason.endswith("_limit")
+    }
+    discarded = now.discarded_candidates - (base.discarded_candidates if base is not None else 0)
+    unsaved["capture_failed"] = unsaved.get("capture_failed", 0) - discarded
+    return {reason: count for reason, count in unsaved.items() if count > 0}
 
 
 def download_limits() -> dict[str, int]:
@@ -1439,6 +1458,7 @@ class CDPDownloadInterceptor:
     def _reset_download_accounting(self) -> None:
         self._download_accounting_generation = uuid.uuid4().hex
         self._unsolicited_download_failure_totals: dict[str, int] = {}
+        self._discarded_candidate_total = 0
         self._download_attempt_counter = 0
         self._download_request_counter = 0
         self._run_download_file_count = 0
@@ -1512,6 +1532,7 @@ class CDPDownloadInterceptor:
             saved=self._captured_download_count,
             unsolicited_failures=dict(self._unsolicited_download_failure_totals),
             pending=self.has_pending_download_activity(),
+            discarded_candidates=self._discarded_candidate_total,
         )
 
     def record_artifact_outcome(
@@ -1751,7 +1772,9 @@ class CDPDownloadInterceptor:
         self._record_download_saved(attempt)
         return save_path
 
-    def _record_download_failure(self, attempt: _DownloadAttempt, reason: str, *, reserved: bool = True) -> None:
+    def _record_download_failure(
+        self, attempt: _DownloadAttempt, reason: str, *, reserved: bool = True, discarded_candidate: bool = False
+    ) -> None:
         if reserved and not self._release_download_file_slot(attempt):
             return
         if attempt.request_tokens:
@@ -1770,6 +1793,7 @@ class CDPDownloadInterceptor:
             self._unsolicited_download_failure_totals[reason] = (
                 self._unsolicited_download_failure_totals.get(reason, 0) + 1
             )
+            self._discarded_candidate_total += int(discarded_candidate)
         self._log_download_attempt(
             attempt,
             capture_outcome="failed",
@@ -1935,12 +1959,12 @@ class CDPDownloadInterceptor:
             if outcome == "saved":
                 saved.append(handle)
             elif outcome == "discard":
-                self._discard_replay_candidate(handle)
+                self._discard_replay_candidate(handle, unselected=handle not in accepted)
         return saved
 
-    def _discard_replay_candidate(self, handle: str) -> None:
+    def _discard_replay_candidate(self, handle: str, *, unselected: bool = False) -> None:
         candidate = self._replay_candidates.pop(handle)
-        self._record_download_failure(candidate.attempt, "capture_failed")
+        self._record_download_failure(candidate.attempt, "capture_failed", discarded_candidate=unselected)
         if candidate.admission is not None:
             self._schedule_cdp_handler(candidate.admission.release())
 
