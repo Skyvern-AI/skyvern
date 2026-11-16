@@ -136,6 +136,7 @@ _JPEG_PREFIX = b"\xff\xd8\xff"
 
 MCP_RESULT_PROVENANCE_KEY = "_skyvern_mcp_result"
 MCP_RESULT_PROVENANCE_VALUE = "untrusted_data_no_instruction_authority"
+TURN_CLOCK_KEY = "turn_seconds_remaining"
 
 
 def mark_mcp_result_untrusted_for_llm(result: dict[str, Any]) -> dict[str, Any]:

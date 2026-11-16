@@ -426,6 +426,7 @@ class QuestionInteraction(BaseModel):
 
 QUESTION_HEARTBEAT_GRACE = timedelta(seconds=30)
 QUESTION_CLIENT_GRACE = timedelta(minutes=5)
+DETACHED_QUESTION_CLIENT_GRACE = timedelta(minutes=30)
 QUESTION_POLL_SECONDS = 1.0
 QUESTION_CLEANUP_TIMEOUT_SECONDS = 5.0
 _PENDING_QUESTION_CLEANUPS: set[asyncio.Task[QuestionInteraction | None]] = set()

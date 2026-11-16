@@ -56,6 +56,7 @@ from skyvern.forge.sdk.copilot.ask_user import (
     CREDENTIAL_DELETE_RECORD_ATTEMPTS,
     CREDENTIAL_DELETE_RECORD_RETRY_DELAY,
     CREDENTIAL_DELETE_TIMEOUT,
+    DETACHED_QUESTION_CLIENT_GRACE,
     CredentialDeleteOutcome,
     QuestionInteraction,
     QuestionResponse,
@@ -3212,6 +3213,9 @@ async def _new_copilot_chat_post(
                         turn_id=turn_id,
                         started_at=datetime.now(UTC),
                         cancel_token=chat_request.cancel_token,
+                        question_client_grace_seconds=int(DETACHED_QUESTION_CLIENT_GRACE.total_seconds())
+                        if chat_request.client_detached
+                        else None,
                         starter_user_id=human_user_id(get_request_principal(), organization.organization_id),
                         request_browser_allocations=CopilotRequestBrowserAllocations(
                             organization_id=organization.organization_id,
@@ -4618,6 +4622,16 @@ async def workflow_copilot_chat_history(
                 latest_draft_at=live_entry.latest_draft_at,
                 steer_messages=[item for item in live_entry.steer_messages if item.delivered_at is not None],
                 narrative=live_narrative,
+                question_open_until=min(
+                    (
+                        live_entry.question_client_deadline(item)
+                        for item in live_entry.question_interactions
+                        if item.awaiting_answer
+                    ),
+                    default=None,
+                )
+                if live_entry.turn_id not in turns_without_answer
+                else None,
             )
             if live_entry is not None
             else None

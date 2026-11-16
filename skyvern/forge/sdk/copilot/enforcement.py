@@ -100,6 +100,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
     MCP_RESULT_PROVENANCE_KEY,
     MCP_RESULT_PROVENANCE_VALUE,
     REGISTERED_OUTPUTS_NOTICE_PREFIX,
+    TURN_CLOCK_KEY,
     _bounded_packet_string,
     bound_output_value,
     extract_final_text,
@@ -917,10 +918,14 @@ def _summarize_tool_output(output: str) -> str:
     if not isinstance(parsed, dict):
         return _truncated_output_fallback(output)
 
-    # Page facts ride on browser results; they must not be what pushes a short result into compaction.
-    if parsed.keys() & PAGE_FACT_KEYS:
-        without_page_facts = {key: value for key, value in parsed.items() if key not in PAGE_FACT_KEYS}
-        if len(json.dumps(without_page_facts)) <= _TOOL_OUTPUT_SUMMARIZE_THRESHOLD:
+    # Page facts and the native turn clock must not be what pushes a short result into compaction. An MCP
+    # result's clock is not excluded, so a server cannot pad its way out of compaction.
+    stamped_keys = PAGE_FACT_KEYS
+    if MCP_RESULT_PROVENANCE_KEY not in parsed and isinstance(parsed.get(TURN_CLOCK_KEY), int):
+        stamped_keys = PAGE_FACT_KEYS | {TURN_CLOCK_KEY}
+    if parsed.keys() & stamped_keys:
+        unstamped = {key: value for key, value in parsed.items() if key not in stamped_keys}
+        if len(json.dumps(unstamped, ensure_ascii=output.isascii())) <= _TOOL_OUTPUT_SUMMARIZE_THRESHOLD:
             return output
 
     # An ask_user result is the user's own answer; reduced to {"ok": true}, the model re-asks what

@@ -76,6 +76,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
     _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY as _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
 )
 from skyvern.forge.sdk.copilot.output_utils import (
+    TURN_CLOCK_KEY,
     sanitize_tool_result_for_llm,
 )
 from skyvern.forge.sdk.copilot.pending_operation import pending_operation
@@ -156,6 +157,7 @@ from ._shared import RUN_BLOCKS_SAFETY_CEILING_SECONDS as RUN_BLOCKS_SAFETY_CEIL
 from ._shared import AdmittedOutputRead as AdmittedOutputRead
 from ._shared import RequestedOutputRead as RequestedOutputRead
 from ._shared import _composition_get_html as _composition_get_html
+from ._shared import _copilot_seconds_remaining
 from ._shared import _current_workflow_has_evidence_block as _current_workflow_has_evidence_block
 from ._shared import _fallback_page_info as _fallback_page_info
 from ._shared import _is_meaningful_extracted_data as _is_meaningful_extracted_data
@@ -195,7 +197,6 @@ from .completion import _is_unfinished_run_verification_candidate as _is_unfinis
 from .completion import (
     _maybe_run_completion_verification_from_page_observation as _maybe_run_completion_verification_from_page_observation,
 )
-from .completion import _stamp_turn_budget_on_result as _stamp_turn_budget_on_result
 from .composition_capture import _capture_composition_evidence as _capture_composition_evidence
 from .composition_capture import (
     _composition_evidence_after_navigation_failure as _composition_evidence_after_navigation_failure,
@@ -1582,10 +1583,7 @@ async def run_blocks_tool(
                 provenance=run_result_screenshot_provenance(result, source_tool="run_blocks_and_collect_debug"),
             )
 
-    sanitized = _stamp_turn_budget_on_result(
-        copilot_ctx, sanitize_tool_result_for_llm("run_blocks_and_collect_debug", result)
-    )
-    return json.dumps(sanitized)
+    return json.dumps(sanitize_tool_result_for_llm("run_blocks_and_collect_debug", result))
 
 
 @function_tool(
@@ -1625,8 +1623,7 @@ async def test_workflow_from_blank_browser_tool(
         result,
         provenance=run_result_screenshot_provenance(result, source_tool="test_workflow_from_blank_browser"),
     )
-    sanitized = sanitize_tool_result_for_llm("test_workflow_from_blank_browser", result)
-    return json.dumps(_stamp_turn_budget_on_result(copilot_ctx, sanitized))
+    return json.dumps(sanitize_tool_result_for_llm("test_workflow_from_blank_browser", result))
 
 
 _GET_RUN_RESULTS_DESCRIPTION = f"""Fetch results from a previous workflow run.
@@ -1964,10 +1961,7 @@ async def _run_updated_workflow_blocks(
                 run_result,
                 provenance=run_result_screenshot_provenance(run_result, source_tool=tool_name),
             )
-    sanitized = _stamp_turn_budget_on_result(
-        copilot_ctx, sanitize_tool_result_for_llm("run_blocks_and_collect_debug", run_result)
-    )
-    return json.dumps(sanitized)
+    return json.dumps(sanitize_tool_result_for_llm("run_blocks_and_collect_debug", run_result))
 
 
 @function_tool(
@@ -2637,13 +2631,34 @@ def _with_action_reason(tool: FunctionTool) -> FunctionTool:
             try:
                 ordinary = json.loads(arguments)
             except (json.JSONDecodeError, TypeError):
-                return await tool.on_invoke_tool(ctx, arguments)
+                output = await tool.on_invoke_tool(ctx, arguments)
+                return _with_turn_clock(ctx.context, output) if isinstance(output, str) else output
             if isinstance(ordinary, dict):
                 ordinary.pop(USER_FACING_REASON_PARAM, None)
                 arguments = json.dumps(ordinary)
-            return await tool.on_invoke_tool(ctx, arguments)
+            output = await tool.on_invoke_tool(ctx, arguments)
+            return _with_turn_clock(ctx.context, output) if isinstance(output, str) else output
 
     return dataclasses.replace(tool, params_json_schema=schema, strict_json_schema=False, on_invoke_tool=invoke)
+
+
+def _with_turn_clock(copilot_ctx: CopilotContext, output: str) -> str:
+    remaining = _copilot_seconds_remaining(copilot_ctx)
+    if remaining is None:
+        return output
+    try:
+        result = json.loads(output)
+    except ValueError:
+        return output
+    # An empty result is the fail-closed answer, and a stamp would turn it into a successful call.
+    if not isinstance(result, dict) or not result:
+        return output
+    clock = max(0, round(remaining))
+    if TURN_CLOCK_KEY in result:
+        del result[TURN_CLOCK_KEY]
+        return json.dumps({TURN_CLOCK_KEY: clock, **result}, ensure_ascii=False)
+    # Spliced rather than re-encoded, so the tool's own escaping and separators reach the model unchanged.
+    return f'{{"{TURN_CLOCK_KEY}": {clock}, {output.lstrip()[1:]}'
 
 
 # Each parameter takes a reference only the browser-code tool produces, so a surface without that tool

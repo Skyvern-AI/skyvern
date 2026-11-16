@@ -5472,9 +5472,10 @@ async def _run_copilot_turn_impl(
         target_block_label=getattr(chat_request, "target_block_label", None),
         selected_block_label=getattr(chat_request, "selected_block_label", None),
         doc_editor_enabled=chat_request.doc_editor_enabled,
-        client_supports_credential_pause=getattr(chat_request, "supports_credential_pause", False),
+        client_supports_credential_pause=chat_request.supports_credential_pause,
         client_supports_credential_pause_recovery=chat_request.supports_credential_pause_recovery,
         client_supports_credential_generation=chat_request.supports_credential_generation,
+        credential_recovery_armed=chat_request.client_detached,
         credential_recovery_token_digest=credential_recovery_token_digest(
             chat_request.credential_recovery_token.get_secret_value()
             if chat_request.credential_recovery_token

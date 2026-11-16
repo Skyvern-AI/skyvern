@@ -1357,10 +1357,7 @@ class WorkflowParametersRepository(BaseRepository):
     def _expire_absent_question_client(cls, entry: CopilotPendingTurn, now: datetime) -> bool:
         expired = cls._expire_credential_deletion_leases(entry, now)
         for item in entry.question_interactions:
-            if (
-                item.awaiting_answer
-                and now - (entry.question_client_seen_at or item.created_at) >= QUESTION_CLIENT_GRACE
-            ):
+            if item.awaiting_answer and now >= entry.question_client_deadline(item):
                 item.status = "interrupted"
                 expired = True
         return expired
