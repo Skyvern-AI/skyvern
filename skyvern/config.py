@@ -617,6 +617,9 @@ class Settings(BaseSettings):
     # Kill switch for the hold on a Task V3 run's first terminated verdict that asks for what prevents the task.
     # On: every terminated verdict stands as the model gave it.
     DISABLE_TASK_V3_JUSTIFY_HOLD: bool = False
+    # Kill switch for the hand-back of a Task V3 download block's failed or terminated verdict when a file landed.
+    # On: such verdicts stand without settling the block's downloads.
+    DISABLE_TASK_V3_FILE_LANDED_HOLD: bool = False
     # Which browser surface the v3 loop offers: today's action tools ("off"), those plus a code
     # tool ("add"), or the code tool instead of them ("replace"). Three states rather than a boolean
     # because the benchmark separated add from replace on speed alone, not on success. The code tool

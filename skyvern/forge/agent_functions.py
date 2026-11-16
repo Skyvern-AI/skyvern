@@ -125,7 +125,7 @@ if TYPE_CHECKING:
 
     from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
     from skyvern.forge.sdk.db.models import FolderModel
-    from skyvern.forge.sdk.integrations.catalog import AccountsById, IntegrationEntry
+    from skyvern.forge.sdk.integrations.catalog import AccountsById, IntegrationEntry, IntegrationTrigger
     from skyvern.forge.sdk.integrations.connected_accounts import OrgConnection
     from skyvern.forge.sdk.schemas.totp_codes import OTPType
     from skyvern.forge.sdk.schemas.workflow_copilot import CopilotTurnControl
@@ -1692,6 +1692,10 @@ class AgentFunction:
 
     def get_cloud_integration_entries(self) -> list[IntegrationEntry]:
         return []
+
+    def get_cloud_integration_triggers(self) -> dict[str, list[IntegrationTrigger]]:
+        """Triggers cloud adds to entries it does not define, keyed by entry id."""
+        return {}
 
     def integration_setup_path(self, entry: IntegrationEntry) -> str | None:
         """App path Copilot links for setting up this catalog entry, or None to link no page."""
