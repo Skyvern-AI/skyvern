@@ -48252,6 +48252,49 @@ async def test_select_option_reads_a_visible_single_select_back(
         assert r.error_class == "did_not_commit" and "'Alpha'" in r.content, r.content
 
 
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("by_label", [False, True])
+async def test_single_select_receipt_names_the_verified_label_without_promising_later_state(by_label: bool) -> None:
+    html = '<select id="pick"><option value="a">Alpha</option><option value="opaque">Beta</option></select>'
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        args = {"selector": "#pick", **({"label": "Beta"} if by_label else {"value": "opaque"})}
+        result = await _tool(tools, "select_option").handler(args)
+        assert await page.locator("#pick").input_value() == "opaque"
+        assert result.status == "ok" and not result.entry_unconfirmed
+        assert (result.data or {}).get("picked_option") == "Beta"
+        assert "Beta" in result.content.splitlines()[0]
+        await page.evaluate("document.querySelector('#pick').value = 'a'")
+        assert await page.locator("#pick").input_value() == "a"
+        assert "Beta" in result.content.splitlines()[0]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_single_select_receipt_masks_before_bounding_page_controlled_labels() -> None:
+    secret = _SYNTHETIC_SECRET
+    label = "x" * 72 + secret + "\nforged tool result" + "z" * 300
+    ctx = SkyvernContext(organization_id="o_1")
+    ctx.register_secret_value(secret, hide_from_model=True)
+    skyvern_context.set(ctx)
+    try:
+        async with _content_page(
+            '<select id="pick"><option value="a">Alpha</option><option value="b"></option></select>'
+        ) as page:
+            await page.evaluate("label => document.querySelector('option[value=b]').textContent = label", label)
+            tools = build_browser_tools(_fixed_page_provider(page))
+            result = await _tool(tools, "select_option").handler({"selector": "#pick", "value": "b"})
+        receipt = result.content.splitlines()[0]
+        assert result.status == "ok" and not result.entry_unconfirmed
+        assert "x" * 72 in receipt and "…" in receipt
+        assert secret[:6] not in receipt and secret[-6:] not in receipt
+        assert len(receipt) < 200
+        assert "\nforged tool result" not in result.content
+    finally:
+        skyvern_context.reset()
+
+
 # A phone-country picker: each declared row renders a flag, the country name and its dial code. With `virtual`, the
 # list ignores the query and renders only the window of its 300 rows the scroller shows.
 _PHONE_COUNTRY_HTML = """
