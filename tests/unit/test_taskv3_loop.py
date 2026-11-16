@@ -10760,6 +10760,40 @@ async def test_download_settle_accepts_a_completed_finish_it_could_record(settle
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["canceled", "many_files", "one_over"])
+async def test_a_failed_finish_on_a_download_block_yields_to_a_cancel_and_names_at_most_a_hundred_files(
+    case: str,
+) -> None:
+    canceled = False
+    landed = [f"Downloaded: report-{i}.csv (1.0 KB)" for i in range(101 if case == "one_over" else 105)]
+
+    async def settle(_staged: frozenset[str]) -> str | None:
+        nonlocal canceled
+        # The agent's settle declines to finalize a canceled run and returns None.
+        canceled = case == "canceled"
+        return None if canceled else "\n".join(landed)
+
+    async def should_cancel() -> bool:
+        return canceled
+
+    finish = ("finish", {"status": "failed", "reason": "the export page returned an error"})
+    outcome, _ = await _run(
+        [[finish], [finish]],
+        [make_finish_tool(download_settle=settle, should_cancel=should_cancel, file_landed_hold=True)],
+        should_cancel=should_cancel,
+    )
+
+    if case == "canceled":
+        assert outcome.status == "canceled"
+        return
+    assert outcome.status == "failed"
+    held = next(m["content"] for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "finish")
+    lines = str(held).splitlines()
+    assert [line for line in lines if line.startswith("Downloaded:")] == landed[:100]
+    assert ("and 1 more file, not listed" if case == "one_over" else "and 5 more files, not listed") in lines
+
+
+@pytest.mark.asyncio
 async def test_a_held_finish_leaves_download_failures_and_files_for_the_accepted_finish() -> None:
     facts = DownloadFailureFacts()
     facts.add("Request failed: POST /api/export returned HTTP 503", repeat=True)
