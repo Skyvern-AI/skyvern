@@ -4670,6 +4670,7 @@ class ForgeAgent:
         if verification_state.last_status is not None:
             LOG.info(
                 "task_v3 ended on a verification code status",
+                last_status=redact_secrets_from_text(verification_state.last_status, run_secrets),
                 task_id=task.task_id,
                 organization_id=task.organization_id,
                 workflow_run_id=task.workflow_run_id,
