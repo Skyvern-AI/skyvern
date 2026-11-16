@@ -1064,7 +1064,7 @@ async def _connected_accounts(organization_id: str | None, workflow_run_id: str)
         if parent is None:
             break
         root = parent
-    if chain_unresolved and settings.COPILOT_NARROW_AGENT_STEP_ACCOUNTS:
+    if chain_unresolved and settings.EMBER_NARROW_AGENT_STEP_ACCOUNTS:
         # The top run's creator is unknown, so whether a record holds this run is too.
         LOG.warning(
             "agent_step_run_chain_unresolved", workflow_run_id=workflow_run_id, last_run_id=root.workflow_run_id
@@ -1084,7 +1084,7 @@ async def _connected_accounts(organization_id: str | None, workflow_run_id: str)
                 record_run_id=root.workflow_run_id,
                 cache_shared=app.CACHE.is_shared,
             )
-        if allowed is not None or settings.COPILOT_NARROW_AGENT_STEP_ACCOUNTS:
+        if allowed is not None or settings.EMBER_NARROW_AGENT_STEP_ACCOUNTS:
             connections = [connection for connection in connections if connection.id in (allowed or set())]
     return [connection for connection in connections if connection.active and connection.agent_step_usable]
 

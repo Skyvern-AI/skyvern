@@ -174,7 +174,7 @@ RESOLVED_SCOPE_SIZES: dict[MCPScope, int] = {"operate": 31, "build": 63, "browse
 
 # Same ratchet for the unfiltered (`all`) surface. Kept in one place because duplicated copies
 # drift: a registration that bumps only its own copy leaves the others to fail in CI.
-TOTAL_TOOL_COUNT: int = 118
+TOTAL_TOOL_COUNT: int = 121
 
 
 @pytest.mark.asyncio

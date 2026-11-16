@@ -5958,7 +5958,7 @@ async def test_candidate_run_bind_uses_the_call_owned_source_and_token(
 async def test_a_test_run_records_the_approved_accounts_for_its_run_before_dispatch(
     monkeypatch: pytest.MonkeyPatch, record_fails: bool, narrowing_on: bool
 ) -> None:
-    monkeypatch.setattr(settings, "COPILOT_NARROW_AGENT_STEP_ACCOUNTS", narrowing_on)
+    monkeypatch.setattr(settings, "EMBER_NARROW_AGENT_STEP_ACCOUNTS", narrowing_on)
     harness = await install_run_blocks_harness(
         monkeypatch,
         workflow_yaml=HANDBACK_WORKFLOW_YAML,

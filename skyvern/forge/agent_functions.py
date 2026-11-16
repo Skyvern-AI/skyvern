@@ -205,7 +205,7 @@ def developer_checkout_opted_into_inline_copilot_code() -> bool:
     # ENV=local, so a packaged deployment would look identical to a laptop.
     if settings.is_cloud_environment() or running_in_packaged_deployment():
         return False
-    return settings.COPILOT_ALLOW_INLINE_CODE_EXECUTION
+    return settings.EMBER_ALLOW_INLINE_CODE_EXECUTION
 
 
 USELESS_SHAPE_ATTRIBUTE = [SKYVERN_ID_ATTR, "id", "aria-describedby"]
@@ -3650,7 +3650,7 @@ class AgentFunction:
         """The mode for a turn whose request states none: False is agent blocks only, None lets the model
         choose per step, True is code blocks only."""
         del organization_id
-        return None if settings.WORKFLOW_COPILOT_CODE_BLOCK_MODE else False
+        return None if settings.EMBER_CODE_BLOCK_MODE else False
 
     async def agent_step_enabled(self, organization_id: str | None) -> bool:
         del organization_id

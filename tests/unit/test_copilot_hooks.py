@@ -2482,7 +2482,7 @@ class TestScoutedInteractionCapture:
         """Report as though the click returned longer ago than the settle window, so nothing waits."""
         monkeypatch.setattr(mcp_hooks, "_start_scout_challenge_settle", lambda _ctx: None)
         ctx.pending_scout_challenge_armed_at = (
-            time.monotonic() - settings.COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS - 1.0
+            time.monotonic() - settings.EMBER_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS - 1.0
         )
 
     @pytest.mark.asyncio
@@ -2500,7 +2500,7 @@ class TestScoutedInteractionCapture:
 
         result = await self._post(ctx)
 
-        assert sleeps == [pytest.approx(settings.COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS - 0.1)]
+        assert sleeps == [pytest.approx(settings.EMBER_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS - 0.1)]
         assert result["data"]["observed_effects"]["challenge_raised"] is True
         assert result["data"]["challenge_vendor"] == "turnstile"
 
@@ -2666,7 +2666,7 @@ class TestScoutedInteractionCapture:
 
         await self._post(ctx)
 
-        assert sleeps == [pytest.approx(settings.COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS - 0.1)]
+        assert sleeps == [pytest.approx(settings.EMBER_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS - 0.1)]
 
     @pytest.mark.asyncio
     async def test_a_widget_mounted_while_the_click_is_being_armed_is_credited_when_revealed(
@@ -2742,7 +2742,7 @@ class TestScoutedInteractionCapture:
 
         result = await self._post(ctx)
 
-        assert sleeps == [pytest.approx(settings.COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS - 0.1)]
+        assert sleeps == [pytest.approx(settings.EMBER_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS - 0.1)]
         assert result["data"]["challenge_vendor"] == "turnstile"
 
     async def _navigate(

@@ -318,11 +318,11 @@ async def _require_save_permission(chat_id: str) -> None:
 
 
 def single_run_submit_enabled() -> bool:
-    return settings.COPILOT_ACCOUNT_GROUP_SUBMIT_ENABLED
+    return settings.EMBER_ACCOUNT_GROUP_SUBMIT_ENABLED
 
 
 def account_group_submit_enabled() -> bool:
-    return settings.COPILOT_ACCOUNT_GROUP_SUBMIT_ENABLED and settings.WORKFLOW_RUN_GROUPS_SUBMIT_ENABLED
+    return settings.EMBER_ACCOUNT_GROUP_SUBMIT_ENABLED and settings.WORKFLOW_RUN_GROUPS_SUBMIT_ENABLED
 
 
 def workflow_definition_hash(workflow: Workflow) -> str:

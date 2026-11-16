@@ -1896,7 +1896,7 @@ async def test_agent_step_is_served_listed_and_saved_only_with_the_org_grant_and
 async def test_the_agent_step_grant_survives_from_the_request_config_to_the_turn_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_CODE_BLOCK_MODE", True)
+    monkeypatch.setattr(settings, "EMBER_CODE_BLOCK_MODE", True)
     agent_function = AgentFunction()
     monkeypatch.setattr(agent_function, "has_code_block_access", AsyncMock(return_value=True))
     monkeypatch.setattr(agent_function, "agent_step_enabled", AsyncMock(return_value=True))

@@ -1780,7 +1780,7 @@ async def test_codegen_progress_throttles_no_new_label_deltas_then_emits_keepali
 
 @pytest.mark.asyncio
 async def test_codegen_progress_disabled_by_kill_switch(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(streaming_adapter_module.settings, "WORKFLOW_COPILOT_CODEGEN_PROGRESS_ENABLED", False)
+    monkeypatch.setattr(streaming_adapter_module.settings, "EMBER_CODEGEN_PROGRESS_ENABLED", False)
 
     events = [
         _item_added_event(0, "update_and_run_blocks"),
@@ -2268,7 +2268,7 @@ async def test_real_runner_streams_actor_reason_before_held_action_returns(
     ctx = _new_ctx()
     ctx.api_key = "test-in-process-key"
     monkeypatch.setattr(streaming_adapter_module.settings, "ENV", "local")
-    monkeypatch.setenv("COPILOT_DUMP_MODEL_INPUTS", str(tmp_path))
+    monkeypatch.setenv("EMBER_DUMP_MODEL_INPUTS", str(tmp_path))
     stream = FakeCopilotStream()
     ctx.stream = stream
     server = None
@@ -2366,7 +2366,7 @@ async def test_reason_custody_reversed_results_iteration_reset_secret_scrub_and_
 ) -> None:
     ctx = _new_ctx()
     monkeypatch.setattr(streaming_adapter_module.settings, "ENV", "local")
-    monkeypatch.setenv("COPILOT_DUMP_MODEL_INPUTS", str(tmp_path))
+    monkeypatch.setenv("EMBER_DUMP_MODEL_INPUTS", str(tmp_path))
     stream = FakeCopilotStream()
     secret = "safe-test-secret/value"
     register_secret_scrub_value(ctx, secret)
@@ -2432,7 +2432,7 @@ async def test_actor_dispatch_capture_writes_only_declared_names_and_no_model_au
     ctx = _new_ctx()
     ctx.api_key = "test-in-process-key"
     monkeypatch.setattr(streaming_adapter_module.settings, "ENV", "local")
-    monkeypatch.setenv("COPILOT_DUMP_MODEL_INPUTS", str(tmp_path))
+    monkeypatch.setenv("EMBER_DUMP_MODEL_INPUTS", str(tmp_path))
     server = None
     if schema_source == "native":
         tool = _with_action_reason(function_tool(leaf, name_override="probe", strict_mode=False))

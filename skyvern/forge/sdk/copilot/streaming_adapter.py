@@ -398,7 +398,7 @@ async def stream_to_sse(
     # carry the same iteration value; it advances after the matching result.
     iteration = 0
 
-    codegen_tracker = _CodegenProgressTracker() if settings.WORKFLOW_COPILOT_CODEGEN_PROGRESS_ENABLED else None
+    codegen_tracker = _CodegenProgressTracker() if settings.EMBER_CODEGEN_PROGRESS_ENABLED else None
 
     narrator_state = ctx.narrator_state or NarratorState()
     ctx.narrator_state = narrator_state
@@ -931,7 +931,7 @@ async def _capture_actor_dispatch(
     item: RunItem,
 ) -> None:
     """Best-effort local actor output evidence; never participates in dispatch."""
-    root = os.environ.get("COPILOT_DUMP_MODEL_INPUTS")
+    root = os.environ.get("EMBER_DUMP_MODEL_INPUTS") or os.environ.get("COPILOT_DUMP_MODEL_INPUTS")
     if settings.ENV != "local" or not root:
         return
     try:

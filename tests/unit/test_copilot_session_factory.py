@@ -641,12 +641,14 @@ class TestSessionInputCallback:
 
 
 class TestModelInputCapture:
-    """COPILOT_DUMP_MODEL_INPUTS records what the model actually receives, so a prompt or
+    """EMBER_DUMP_MODEL_INPUTS records what the model actually receives, so a prompt or
     tool-schema change can be replayed offline instead of re-run live.
     """
 
     def test_capture_is_inert_and_lossless_when_unset(self, tmp_path: Any, monkeypatch: Any) -> None:
         from skyvern.forge.sdk.copilot.session_factory import copilot_call_model_input_filter
+
+        monkeypatch.delenv("EMBER_DUMP_MODEL_INPUTS", raising=False)
 
         monkeypatch.delenv("COPILOT_DUMP_MODEL_INPUTS", raising=False)
         items = [{"role": "user", "content": "build me a workflow"}]
@@ -662,7 +664,7 @@ class TestModelInputCapture:
         from skyvern.forge.sdk.copilot.model_input_capture import attach_tool_surface_to_pending_capture
         from skyvern.forge.sdk.copilot.session_factory import copilot_call_model_input_filter
 
-        monkeypatch.setenv("COPILOT_DUMP_MODEL_INPUTS", str(tmp_path))
+        monkeypatch.setenv("EMBER_DUMP_MODEL_INPUTS", str(tmp_path))
         items = [
             {"role": "user", "content": "output the number of azure errors"},
             {"type": "function_call_output", "call_id": "c1", "output": '{"ok": true}'},
@@ -725,7 +727,7 @@ class TestModelInputCapture:
     def test_capture_records_the_authoring_capability_the_turn_resolved(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setenv("COPILOT_DUMP_MODEL_INPUTS", str(tmp_path))
+        monkeypatch.setenv("EMBER_DUMP_MODEL_INPUTS", str(tmp_path))
         items = [{"role": "user", "content": "add a step that reads the support email"}]
 
         copilot_call_model_input_filter(
@@ -757,7 +759,7 @@ class TestModelInputCapture:
 
         from skyvern.forge.sdk.copilot.session_factory import copilot_call_model_input_filter
 
-        monkeypatch.setenv("COPILOT_DUMP_MODEL_INPUTS", str(tmp_path))
+        monkeypatch.setenv("EMBER_DUMP_MODEL_INPUTS", str(tmp_path))
         items = [{"role": "user", "content": "read the visitor count"}]
 
         copilot_call_model_input_filter(_mk_input_data(items, context=SimpleNamespace()))

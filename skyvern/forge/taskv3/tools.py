@@ -439,15 +439,14 @@ def _escape_tags_in_text(text: str) -> str:
 
 # The exact selector shapes our own enrichment mints: data-tv3 by observe(), data-tv3-menu by the
 # click menu probe, data-tv3-act by act-by-mark (written on the look-resolved element at act time and
-# kept for the life of the document, so the submit watch can still resolve it turns later), data-tv3-close by
-# the covered probe for an unmarked onclick close. Each
-# exists only where we set it, so one that matches nothing now cannot reappear without a fresh
-# observe / menu-opening click / look.
+# kept for the life of the document, so the submit watch can still resolve it turns later), data-tv3-ctl by
+# the covered probe for a covering layer's control that has no other address. These exist only where we set them,
+# so one that matches nothing now cannot reappear without a fresh observe / menu-opening click / look / covered probe.
 _TV3_MARKER_SELECTOR_RE = re.compile(
-    r'^\[data-tv3(?:(?:-menu|-act|-close)?="[^"\\]+"\]|-sugg="[^"\\]+"\](?:\[data-tv3-pick="[^"\\]+"\])?)$'
+    r'^\[data-tv3(?:(?:-menu|-act|-ctl)?="[^"\\]+"\]|-sugg="[^"\\]+"\](?:\[data-tv3-pick="[^"\\]+"\])?)$'
 )
 # Any v3 marker inside a selector, including one observe composed a host-anchored selector around.
-_TV3_MARKER_ANYWHERE_RE = re.compile(r'\[data-tv3(?:-menu|-act|-sugg|-close)?="')
+_TV3_MARKER_ANYWHERE_RE = re.compile(r'\[data-tv3(?:-menu|-act|-sugg|-ctl)?="')
 # An opaque identifier (a uuid, or a run of 12+ hex digits) does not survive a model's copy: one
 # transposed pair sends every later call to a selector that matches nothing. observe addresses its
 # own elements by ref for that reason; this is what look()'s legend refuses to use as a label.
@@ -1866,6 +1865,16 @@ OBSERVE_POINTER_ROOT_CAP = 40
 # Pointer roots the collector records per realm, ahead of the listing cap, before it stops scanning; elements it rejects
 # do not count toward it.
 _POINTER_ROOT_SCAN_CEILING = 400
+
+
+def _pointer_state_js(retain: str) -> str:
+    return (
+        "{ pointer: new Map(), covered: new Set(), roots: new Map(), holders: new Set(), represented: new Set(), "
+        "held: new Set(), extra: new Set(), extraCount: 0, icons: new Set(), iconCount: 0, iconOverflow: 0, "
+        f"notIcon: 0, notIconRoots: new Set(), heldCount: 0, heldCap: {OBSERVE_POINTER_ROOT_CAP}, count: 0, "
+        f"retain: {retain}, ceiling: {_POINTER_ROOT_SCAN_CEILING} }}"
+    )
+
 
 # A color paints nothing only when its ALPHA is zero. Parse the alpha channel, never a trailing ",0)",
 # which also matches an opaque color whose last channel is 0 (`rgb(0,0,0)`, `rgb(255,0,0)`). A form that
@@ -5744,7 +5753,7 @@ _LOOK_ENUM_JS = (
 )
 
 _ACT_ATTR_RE = re.compile(r'\s*data-tv3-act="[^"]*"')
-_CLOSE_ATTR_RE = re.compile(r' data-tv3-close="[^"]*"')
+_CTL_ATTR_RE = re.compile(r' data-tv3-ctl="[^"]*"')
 # A withheld menu's rows carry a salted tag so no position can be guessed; printing it would hand the model one.
 _SALTED_MENU_ATTR_RE = re.compile(r'\s*data-tv3-menu="w[^"]*"')
 # Visible only: a closed menu's lingering rows are stale, not an open menu whose rows went unnumbered.
@@ -6792,7 +6801,6 @@ _TYPE_TARGET_PROBE_JS = (
     + r"""
   try { _q.all('[data-tv3-cover]').forEach((n) => n.removeAttribute('data-tv3-cover')); } catch (e) { /* best-effort */ }
   try { _q.all('[data-tv3-catcher]').forEach((n) => n.removeAttribute('data-tv3-catcher')); } catch (e) { /* best-effort */ }
-  try { _q.all('[data-tv3-close]').forEach((n) => n.removeAttribute('data-tv3-close')); } catch (e) { /* best-effort */ }
 """
     + _TARGET_READONLY_JS
     + r"""  const RETEST_SCROLLABLE_CLIP = false;
@@ -7516,15 +7524,30 @@ _TYPE_TARGET_PROBE_JS = (
     const _shownText = """
     + _SHOWN_TEXT_JS
     + r""";
-    for (const c of found) {
+    // observe's pointer-cursor scan, run on this layer alone, merged with the named controls in document order, so an
+    // href-less <a> or a <div> styled as a button is listed.
+    const pointerState = """
+    + _pointer_state_js("60")
+    + r""";
+    const ordered = [];
+    try {
+      const _withPointerRoots = """
+    + _WITH_POINTER_ROOTS_JS
+    + r""";
+      _withPointerRoots(layer, """
+    + json.dumps(_BASE_CONTROL_SEL)
+    + r""", found, pointerState, (n) => { ordered.push(n); }, (c) => visible(c) && !isDisabled(c));
+    } catch (e) { ordered.length = 0; for (const c of found) ordered.push(c); }
+    const picked = [];
+    for (const c of ordered) {
       if (c === el || !visible(c) || isDisabled(c)) continue;
-      const csel = idSelector(c) || markerSelector(c);
+      const pointerRoot = pointerState.roots.has(c);
+      if (pointerRoot && c.contains(el)) continue;
       // ownName covers aria-label and root-scoped aria-labelledby, same priority order and same
       // shadow-aware resolution the layer's own name uses.
-      const label = boundedClean(ownName(c) || c.textContent || c.value || (c.getAttribute && c.getAttribute('title')) || '', 60);
-      if (!label && !csel) continue;
-      const shows = boundedClean(_shownText(c, label), 60);
-      allControls.push(shows ? { selector: csel, label, shows } : { selector: csel, label });
+      const label = boundedClean(ownName(c) || c.textContent || c.value || (c.getAttribute && c.getAttribute('title'))
+        || (pointerRoot ? pointerState.roots.get(c) : '') || '', 60);
+      picked.push({ c, label });
     }
     // A real dismisser (Accept, Confirm, Close) routinely comes AFTER a list of category rows or
     // toggles in document order -- a Privacy Preference Center's footer buttons follow its list of
@@ -7532,13 +7555,44 @@ _TYPE_TARGET_PROBE_JS = (
     // needs and keep only the toggles it was already flailing between, reproducing the ticket's own
     // motivating bug with more words. Keep both ends: the first few for context, the last few
     // because that is where a footer actually lives.
-    const truncated = allControls.length > 8;
+    const truncated = picked.length > 8;
+    // Page script can replace Math.random, so a key passed in from Python is used whenever one is given.
+    const ctlNonce = typeof arg.ctl === 'string' && /^[a-z0-9]{5}$/.test(arg.ctl)
+      ? arg.ctl : Math.random().toString(36).slice(2, 7);
+    let minted = 0;
+    // A key an earlier probe minted is reused while this element alone holds it, and taken off every holder once a
+    // clone copies it, so a printed address finds its element or nothing. A new key is kept only if it names it alone.
+    const ctlAddress = (c) => {
+      const prior = c.getAttribute && c.getAttribute('data-tv3-ctl');
+      if (prior && /^[a-z0-9]{1,8}-\d{1,4}$/.test(prior)) {
+        const priorSel = '[data-tv3-ctl="' + prior + '"]';
+        const s = uniqueSelector(priorSel, c);
+        if (s) return s;
+        try { _q.all(priorSel).forEach((n) => n.removeAttribute('data-tv3-ctl')); } catch (e) { /* best-effort */ }
+      }
+      for (let tries = 0; tries < 8; tries++) {
+        const key = ctlNonce + '-' + minted++;
+        try { c.setAttribute('data-tv3-ctl', key); } catch (e) { return null; }
+        const s = uniqueSelector('[data-tv3-ctl="' + key + '"]', c);
+        if (s) return s;
+        try { c.removeAttribute('data-tv3-ctl'); } catch (e) { return null; }
+      }
+      return null;
+    };
+    const listed = new Set();
+    for (const { c, label } of truncated ? picked.slice(0, 5).concat(picked.slice(-3)) : picked) {
+      const csel = idSelector(c) || markerSelector(c) || ctlAddress(c);
+      if (!label && !csel) continue;
+      const shows = boundedClean(_shownText(c, label), 60);
+      allControls.push(shows ? { selector: csel, label, shows } : { selector: csel, label });
+      listed.add(c);
+    }
     // An icon-only close is often a bare <div onclick>, which no tag or role above names. Only a leaf
     // handler counts (a row, card or body handler wraps other controls), and at most two are added
     // after the named ones, so a list of row handlers cannot displace the layer's own controls.
     const leaves = [];
     for (const c of deepAll(layer, '[onclick]').slice(0, 200)) {
-      if (c === layer || c === el || !visible(c) || isDisabled(c)) continue;
+      if (c === layer || c === el || !visible(c) || isDisabled(c) || listed.has(c)) continue;
       if (c.matches && c.matches(controlSel)) continue;
       if (c.contains(el) || c.querySelector('[onclick],' + controlSel)) continue;
       if (c.parentElement && c.parentElement.closest(controlSel)) continue;
@@ -7547,23 +7601,18 @@ _TYPE_TARGET_PROBE_JS = (
     }
     // An icon close has no text, so unlabeled leaves go first; a run of labelled rows cannot fill the slots ahead of it.
     leaves.sort((a, b) => (a.label ? 1 : 0) - (b.label ? 1 : 0));
-    // Fresh per probe, so a selector an earlier probe printed matches nothing rather than another element.
-    const closeNonce = Math.random().toString(36).slice(2, 7);
     const onclickControls = [];
     for (const { c, label } of leaves) {
       if (onclickControls.length >= 2) break;
-      let csel = idSelector(c) || markerSelector(c);
-      if (!csel) {
-        // A close that appeared after the last observe carries no marker, so the probe names it itself.
-        const key = closeNonce + '-' + onclickControls.length;
-        try { c.setAttribute('data-tv3-close', key); csel = '[data-tv3-close="' + key + '"]'; } catch (e) { continue; }
-      }
+      const csel = idSelector(c) || markerSelector(c) || ctlAddress(c);
+      if (!csel) continue;
       onclickControls.push({ selector: csel, label });
     }
-    const controls = (truncated ? allControls.slice(0, 5).concat(allControls.slice(-3)) : allControls)
-      .concat(onclickControls);
+    const controls = allControls.concat(onclickControls);
     try { layer.setAttribute('data-tv3-cover', '1'); } catch (e) { /* best-effort */ }
     out.occluder = { selector: layerSelector, name: layerName, controls, truncated };
+    // The scan above reads only this document, so a frame's own controls are never listed.
+    if (/^i?frame$/i.test(String(layer.tagName || ''))) out.occluder.frame = true;
     if (layerText.join('').trim()) { out.occluder.text = layerText; out.occluder.textCut = layerTextCut; }
     out.occluder.layerKind = layerKind;
     // Which layer node this is, and the state of its controls, kept only in a realm the page cannot read or patch
@@ -11219,11 +11268,9 @@ async (__tv3TextArgs) => {
   const _screenListable = (el) => {
     try { return _screen(el, false).why === null; } catch (e) { return false; }
   };
-  const _pointerState = { pointer: new Map(), covered: new Set(), roots: new Map(), holders: new Set(), represented: new Set(), held: new Set(), extra: new Set(), extraCount: 0, icons: new Set(), iconCount: 0, iconOverflow: 0, notIcon: 0, notIconRoots: new Set(), heldCount: 0, heldCap: """
-    + str(OBSERVE_POINTER_ROOT_CAP)
-    + r""", count: 0, retain: _RETAIN_WIDTH, ceiling: """
-    + str(_POINTER_ROOT_SCAN_CEILING)
-    + r""" };
+  const _pointerState = """
+    + _pointer_state_js("_RETAIN_WIDTH")
+    + r""";
   let pointerListed = 0;
   // Anchors listed beside the root that misses them (`extra`): a budget of their own, so none takes a root's place.
   let extraListed = 0;
@@ -16521,7 +16568,7 @@ def build_browser_tools(
         # The click/type reaction gate stamps data-tv3-pre on every visible element and the reach probe
         # marks the layer it names; bookkeeping that, left in place, costs truncation budget in noise.
         html = html.replace(' data-tv3-pre="1"', "").replace(' data-tv3-cover="1"', "")
-        html = _CLOSE_ATTR_RE.sub("", html)
+        html = _CTL_ATTR_RE.sub("", html)
         html = _COLLATERAL_ATTR_RE.sub("", html)
         html = _DATE_SEGMENT_ATTR_RE.sub("", html)
         # The act-by-mark tag outlives its call, so unlike the other data-tv3-* bookkeeping it is
@@ -16739,6 +16786,8 @@ def build_browser_tools(
         controls_desc = "; ".join(parts) if parts else "none named"
         if (occluder or {}).get("truncated"):
             controls_desc += "; more controls exist (re-observe to see the rest)"
+        is_frame = bool((occluder or {}).get("frame"))
+        frame_note = "It is a frame, and the probe does not read inside frames"
         if branch == "challenge":
             return ToolResult.error(
                 f"{selector} is covered by {layer_desc}, which contains a challenge frame "
@@ -16769,10 +16818,14 @@ def build_browser_tools(
         # A layer that is quoted is reported, not prescribed for: its text may be the page answering the last action,
         # which closing it and retrying the same field does not address.
         if said and not parts:
+            none_found = (
+                frame_note
+                if is_frame
+                else "The probe found no named controls on it; one without a label (an icon or an ×) would show "
+                f"in get_html of {layer_selector or 'the layer'}"
+            )
             return ToolResult.error(
-                f"{selector} is covered by {layer_desc}, so it cannot be {verb}{also}.{said} The probe found no "
-                f"named controls on it; one without a label (an icon or an ×) would show in get_html of "
-                f"{layer_selector or 'the layer'}.",
+                f"{selector} is covered by {layer_desc}, so it cannot be {verb}{also}.{said} {none_found}.",
                 data=blocker,
                 error_class="covered",
             )
@@ -16784,12 +16837,17 @@ def build_browser_tools(
                 error_class="covered",
             )
         if not parts:
-            # The probe names controls by tag, role and inline onclick; a close wired by a script listener is
-            # none of those, so an empty list is no evidence the layer has no way out.
+            # The probe names controls by tag, role, pointer cursor and inline onclick; a close wired by a script
+            # listener is none of those, so an empty list is no evidence the layer has no way out.
+            none_found = (
+                frame_note
+                if is_frame
+                else "The probe found no named controls on it, but it may still have an unlabeled close (an icon or "
+                f"an ×): read get_html of {layer_selector or 'the layer'} to find it, close the layer, then retry "
+                f"{selector}"
+            )
             return ToolResult.error(
-                f"{selector} is covered by {layer_desc}, so it cannot be {verb}{also}. The probe found no named "
-                "controls on it, but it may still have an unlabeled close (an icon or an ×): read get_html of "
-                f"{layer_selector or 'the layer'} to find it, close the layer, then retry {selector}.",
+                f"{selector} is covered by {layer_desc}, so it cannot be {verb}{also}. {none_found}.",
                 data=blocker,
                 error_class="covered",
             )
@@ -16819,13 +16877,14 @@ def build_browser_tools(
         # action will actually land on -- consulted only where the per-root lookup finds nothing.
         # Only a composed selector needs it, and hostAnchored composes with a space, so anything
         # without one keeps its single round trip. A quoted space costs a spare lookup, never a miss.
+        ctl = secrets.token_hex(3)[:5]
         if " " not in selector:
-            return {"sel": selector, "el": None}
+            return {"sel": selector, "el": None, "ctl": ctl}
         try:
             element = await page.query_selector(selector)
         except Exception:
             element = None
-        return {"sel": selector, "el": element}
+        return {"sel": selector, "el": element, "ctl": ctl}
 
     def _no_point_refusal(selector: str, cause: str) -> str:
         return f"{selector} was not clicked: it has no on-screen point of its own, and {cause}"
