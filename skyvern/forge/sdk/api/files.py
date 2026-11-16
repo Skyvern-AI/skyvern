@@ -396,6 +396,7 @@ async def fetch_file_bytes(
     download_scope: str | None = None,
     approved_initial_url: str | None = None,
     normalize_query_backslashes: bool = False,
+    check_active: Callable[[], None] | None = None,
 ) -> GuardedFileResponse:
     """Fetch a bounded HTTP file through the validated, pinned, per-hop authorization seam.
 
@@ -408,8 +409,11 @@ async def fetch_file_bytes(
     if max_size_mb <= 0:
         raise ValueError("max_size_mb must be greater than zero")
 
+    check_active = check_active or (lambda: None)
+    check_active()
     resolver = SSRFGuardedResolver()
     current_url = await validate_and_pin_fetch_url(url, resolver)
+    check_active()
     origin_source = _origin_authorizable_url(current_url) if normalize_query_backslashes else current_url
     if canonicalize_origin(origin_source) is None:
         raise HttpException(400, "[redacted]", "URL has no browser-canonicalizable HTTP origin")
@@ -430,13 +434,16 @@ async def fetch_file_bytes(
     max_size_bytes = max_size_mb * 1024 * 1024
     async with aiohttp.ClientSession(connector=ssrf_guarded_tcp_connector(resolver)) as session:
         for _ in range(MAX_SAFE_REDIRECTS + 1):
+            check_active()
             encoded_url = encode_url(current_url)
             authz_target_url = _origin_authorizable_url(current_url) if normalize_query_backslashes else current_url
 
             async def dispatch(_resolved_values: tuple[str, ...]) -> GuardedFileFetchHopResult:
+                check_active()
                 async with session.get(
                     URL(encoded_url, encoded=True), headers=request_headers, allow_redirects=False
                 ) as response:
+                    check_active()
                     location = response.headers.get("Location")
                     if response.status in SAFE_REDIRECT_STATUS_CODES and location:
                         return GuardedFileRedirect(location=location)
@@ -446,7 +453,14 @@ async def fetch_file_bytes(
                         raise DownloadFileMaxSizeExceeded(max_size_mb)
 
                     body = bytearray()
-                    async for chunk in response.content.iter_chunked(1024):
+                    chunks = response.content.iter_chunked(1024).__aiter__()
+                    while True:
+                        check_active()
+                        try:
+                            chunk = await anext(chunks)
+                        except StopAsyncIteration:
+                            break
+                        check_active()
                         body.extend(chunk)
                         if len(body) > max_size_bytes:
                             raise DownloadFileMaxSizeExceeded(max_size_mb)
@@ -469,10 +483,12 @@ async def fetch_file_bytes(
                 ),
                 dispatch,
             )
+            check_active()
             if isinstance(result, GuardedFileResponse):
                 return result
 
             next_url = await validate_and_pin_redirect_url(current_url, result.location, resolver)
+            check_active()
             next_origin_source = _origin_authorizable_url(next_url) if normalize_query_backslashes else next_url
             if canonicalize_origin(next_origin_source) is None:
                 raise HttpException(400, "[redacted]", "Redirect has no browser-canonicalizable HTTP origin")
