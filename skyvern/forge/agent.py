@@ -3161,6 +3161,7 @@ class ForgeAgent:
             _observable_child_frames,
             _realm_document_id,
             _recorded_work_frames,
+            downloaded_line,
             pending_marker,
         )
 
@@ -3441,8 +3442,8 @@ class ForgeAgent:
         download_finalized = False
         # Files settle already recorded, as the finalizer left them, so a later settle records only files new since.
         recorded_files: list[str] = []
-        recorded_count = 0
         download_completion_reason: str | None = None
+        landed_lines: list[str] = []
 
         # Owned here (not by the engine) so the final clean_up_task below can also exclude names
         # tools staged into the downloads dir this run, whether or not a download settle ever finalized.
@@ -3552,8 +3553,16 @@ class ForgeAgent:
                 replay_drain_until = None
                 return True
 
+            def _local_sizes() -> dict[str, int]:
+                assert workflow_download_directory is not None
+                sizes: dict[str, int] = {}
+                for f in list_files_in_directory(workflow_download_directory):
+                    with contextlib.suppress(OSError):  # a file can vanish between the listing and the stat
+                        sizes[f] = os.path.getsize(f)
+                return sizes
+
             async def _settle_downloads(staged: frozenset[str]) -> str | None:
-                nonlocal download_finalized, download_completion_reason, recorded_files, recorded_count
+                nonlocal download_finalized, download_completion_reason, recorded_files, landed_lines
                 assert workflow_download_directory is not None  # set alongside complete_on_download above
                 if not await _drain_held_replays():
                     return None
@@ -3564,6 +3573,7 @@ class ForgeAgent:
                     # browser-session download re-fetched, twice; with none new this returns the recorded result.
                     recorded_now: list[str] = []
                     before = [*(download_baseline_files or []), *staged_paths, *recorded_files]
+                    sizes = _local_sizes()
                     later = await self._finalize_downloaded_files_for_task(
                         task,
                         organization_id=organization.organization_id,
@@ -3576,8 +3586,10 @@ class ForgeAgent:
                     )
                     if later:
                         recorded_files = [*recorded_files, *_kept_after_recording(later, recorded_now)]
-                        recorded_count += len(later)
-                        download_completion_reason = f"download completed ({recorded_count} new file(s))"
+                        landed_lines += [
+                            downloaded_line(Path(f).name, sizes.get(f), f.startswith(("s3://", "gs://"))) for f in later
+                        ]
+                        download_completion_reason = "\n".join(landed_lines)
                         LOG.info("Task V3 download finalized", task_id=task.task_id, num_new_files=len(later))
                     return download_completion_reason
                 cancelled = await self._wait_for_in_flight_downloads(
@@ -3606,6 +3618,7 @@ class ForgeAgent:
                     return None
                 recorded_now = []
                 before = [*(download_baseline_files or []), *staged_paths]
+                sizes = _local_sizes()
                 new_files = await self._finalize_downloaded_files_for_task(
                     task,
                     organization_id=organization.organization_id,
@@ -3622,8 +3635,10 @@ class ForgeAgent:
                     context.download_completed_task_ids.add(task.task_id)
                 download_finalized = True
                 recorded_files = _kept_after_recording(new_files, recorded_now)
-                recorded_count = len(new_files)
-                download_completion_reason = f"download completed ({len(new_files)} new file(s))"
+                landed_lines = [
+                    downloaded_line(Path(f).name, sizes.get(f), f.startswith(("s3://", "gs://"))) for f in new_files
+                ]
+                download_completion_reason = "\n".join(landed_lines)
                 LOG.info(
                     "Task V3 download finalized",
                     task_id=task.task_id,

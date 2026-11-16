@@ -25631,6 +25631,13 @@ _DOWNLOAD_FAILURE_URL_MAX = 120
 _DOWNLOAD_NAME_WAIT_SECONDS = 1.0
 
 
+def downloaded_line(name: str, size: int | None, in_session: bool = False) -> str:
+    display = _DOWNLOAD_NOTICE_SANITIZE_RE.sub("", name)[:_DOWNLOAD_FAILURE_URL_MAX]
+    if in_session:
+        return f"Downloaded: {display} (in the browser session's storage)"
+    return f"Downloaded: {display}" if size is None else f"Downloaded: {display} ({_human_download_size(size)})"
+
+
 class DownloadFailureWatch:
     """Records, on a download block, xhr/fetch requests and documents a call started that came back 4xx/5xx or failed,
     and browser downloads the interceptor could not save, into `facts` for the next tool result to report."""
@@ -26020,8 +26027,7 @@ def _apply_download_signal(
                 size = os.path.getsize(os.path.join(downloads_dir or "", name))
             except OSError:
                 size = 0
-            display = _DOWNLOAD_NOTICE_SANITIZE_RE.sub("", page_names.get(name, name))[:_DOWNLOAD_FAILURE_URL_MAX]
-            new_lines.append(f"Downloaded: {display} ({_human_download_size(size)})")
+            new_lines.append(downloaded_line(page_names.get(name, name), size))
         for uri in session_files:
             if uri in seen_session:
                 continue
@@ -26030,8 +26036,7 @@ def _apply_download_signal(
             # A blob: download is written to downloads_dir as well; its local line already names it.
             if not name or name in seen_completed or name.endswith(BROWSER_DOWNLOADING_SUFFIX):
                 continue
-            display = _DOWNLOAD_NOTICE_SANITIZE_RE.sub("", name)[:_DOWNLOAD_FAILURE_URL_MAX]
-            new_lines.append(f"Downloaded: {display} (in the browser session's storage)")
+            new_lines.append(downloaded_line(name, None, in_session=True))
         for name in in_progress:
             identity = _download_signal_identity(name)
             if identity in seen_started or identity in seen_completed:

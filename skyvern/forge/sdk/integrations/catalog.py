@@ -33,7 +33,8 @@ from skyvern.schemas.workflows import (
 LOG = structlog.get_logger()
 
 IntegrationStatus = Literal["live", "comingSoon"]
-IntegrationKind = Literal["oauth", "credential_form", "external", "internal"]
+# "trigger": the entry only offers triggers, so there is nothing to connect.
+IntegrationKind = Literal["oauth", "credential_form", "external", "internal", "trigger"]
 IntegrationCategory = Literal[
     "Workspace",
     "Communication",
@@ -646,7 +647,13 @@ def integration_entries(
     gmail_available: bool = False,
     hidden_ids: frozenset[str] = frozenset(),
 ) -> list[IntegrationEntry]:
-    entries = [*SKYVERN_INTEGRATIONS, *app.AGENT_FUNCTION.get_cloud_integration_entries()]
+    added_triggers = app.AGENT_FUNCTION.get_cloud_integration_triggers()
+    entries = [
+        entry.model_copy(update={"triggers": [*entry.triggers, *added_triggers[entry.id]]})
+        if entry.id in added_triggers
+        else entry
+        for entry in [*SKYVERN_INTEGRATIONS, *app.AGENT_FUNCTION.get_cloud_integration_entries()]
+    ]
     if not email_forwarding_available:
         hidden_ids = hidden_ids | {"email_forwarding"}
     entries = [entry for entry in entries if entry.id not in hidden_ids]
@@ -709,12 +716,15 @@ async def integration_entries_for_org(organization_id: str) -> list[IntegrationE
         gmail_available = await app.AGENT_FUNCTION.nango_gmail_catalog_available(organization_id)
     except Exception:  # noqa: BLE001 - availability failures leave Gmail dark.
         gmail_available = False
-    return integration_entries(
+    entries = integration_entries(
         email_forwarding_available=email_forwarding_available,
         powerbi_available=powerbi_available,
         gmail_available=gmail_available,
         hidden_ids=await app.AGENT_FUNCTION.hidden_integration_ids(organization_id),
     )
+    # Neither the page nor Copilot's integration list has a use for an entry with nothing to connect yet;
+    # Copilot reads every trigger through its trigger tools.
+    return [entry for entry in entries if entry.kind != "trigger"]
 
 
 def integration_is_live(integration_id: str) -> bool:

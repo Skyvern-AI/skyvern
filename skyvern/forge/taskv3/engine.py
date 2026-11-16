@@ -40,6 +40,7 @@ from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderErrorRetryableTask
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import RunArm
+from skyvern.forge.sdk.experimentation.providers import NoOpExperimentationProvider
 from skyvern.forge.sdk.workflow.models.credential_release import CredentialReleaseGuard
 from skyvern.forge.taskv3.answer_basis_audit import apply_answer_basis_audit
 from skyvern.forge.taskv3.application_context import DECLARE_NOTICE, ApplicationContext, payload_check_reasons
@@ -117,6 +118,7 @@ DEFAULT_DEADLINE_SECONDS = 1800  # wall-clock runaway guard
 # runaway trips this as budget_exhausted instead of surfacing as a provider context-window error.
 DEFAULT_MAX_TOKENS = 1_500_000
 DEFAULT_MAX_CALL_RETRIES = 2
+FILE_LANDED_HOLD_KILL_SWITCH = "DISABLE_TASK_V3_FILE_LANDED_HOLD"
 # A productive action round is at most a few perception turns plus one (possibly heavily batched)
 # action turn. Size the turn/tool-call runaway guards off the action-step budget with generous
 # per-round headroom so a real run is bounded by max_action_steps, not by these guards; only a run
@@ -190,6 +192,25 @@ def taskv3_runaway_backstops(max_action_steps: int | None) -> tuple[int, int, in
         max(DEFAULT_MAX_TOOL_CALLS, max_action_steps * MAX_TOOL_CALLS_PER_ACTION_STEP),
         min(MAX_TOKENS_CEILING, max(DEFAULT_MAX_TOKENS, max_action_steps * MAX_TOKENS_PER_ACTION_STEP)),
     )
+
+
+async def _file_landed_hold_enabled(task_id: str | None, organization_id: str | None) -> bool:
+    if settings.DISABLE_TASK_V3_FILE_LANDED_HOLD:
+        return False
+    provider = app.EXPERIMENTATION_PROVIDER
+    distinct_id = task_id or organization_id
+    if not distinct_id or isinstance(provider, NoOpExperimentationProvider):
+        return True
+    try:
+        disabled = await provider.is_feature_enabled_cached(
+            FILE_LANDED_HOLD_KILL_SWITCH, distinct_id, {"organization_id": organization_id}
+        )
+    except Exception:
+        LOG.warning("taskv3 file landed hold kill switch lookup failed; hold on", exc_info=True)
+        return True
+    if disabled:
+        LOG.info("taskv3 file landed hold disabled", organization_id=organization_id, task_id=task_id)
+    return not disabled
 
 
 def coerce_v3_parameters(navigation_payload: dict[str, Any] | list[Any] | str | None) -> dict[str, Any] | None:
@@ -548,6 +569,9 @@ async def run_task_v3_agent_loop(
             task_id=ctx.task_id if ctx is not None else None, organization_id=organization_id
         )
     )
+    file_landed_hold = download_settle is not None and await _file_landed_hold_enabled(
+        ctx.task_id if ctx is not None else None, organization_id
+    )
     block_check_on = single_action_block and block_completion_judge is not None and judge_eligible
     tool_trail = ToolTrail() if reask_on or premise_on or block_check_on else None
     reasks: list[UnlistedReask] = []
@@ -715,6 +739,7 @@ async def run_task_v3_agent_loop(
         error_code_mapping=error_code_mapping,
         intercepted_submissions=block_submissions,
         justify_stops=justify_on,
+        file_landed_hold=file_landed_hold,
     )
     # An extraction block cannot enter input, so a yes has nothing to act on there and offering the tool cost a turn.
     context_texts = (

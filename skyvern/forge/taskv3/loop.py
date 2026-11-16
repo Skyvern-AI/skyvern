@@ -730,6 +730,7 @@ class _OpenTurn:
 # Awaited after a billable/download-signaling result; it never ends the run. A settle hook awaited from
 # finish(completed) lets a download land, skips files tools staged this run, and never refuses.
 DownloadWait = Callable[[], Awaitable[None]]
+# Its return value is shown to the model verbatim, so it must hold only the `Downloaded:` lines.
 DownloadSettle = Callable[[frozenset[str]], Awaitable[str | None]]
 # Consulted from finish for EVERY verdict, unlike DownloadSettle: it takes the finish status and
 # gates on state the caller already tracks (e.g. a sign-in link polling budget), not on staged
@@ -785,6 +786,10 @@ JUSTIFY_HOLD_MESSAGE = (
     "the task: continue it. If a field the form requires has no value in the data, finish again and name that field."
 )
 _JUSTIFY_HOLD_SKIP = "queued after a finish that was held; read the hold above, then decide"
+FILE_LANDED_HOLD_MESSAGE = (
+    "verdict held once: these files landed in this block:\n{landed}\nFinish again; that verdict will stand."
+)
+_LANDED_FILES_SHOWN = 100
 # Telemetry only: the loop never reads it, so no verdict depends on a model's wording.
 _REFUSAL_SHAPED = re.compile(r"\bI (can['’]t|cannot|won['’]t|will not|am unable to|am not able to)\b", re.IGNORECASE)
 
@@ -3020,6 +3025,7 @@ def make_finish_tool(
     error_code_mapping: dict[str, str] | None = None,
     intercepted_submissions: Callable[[], Sequence[InterceptedSubmission]] | None = None,
     justify_stops: bool = False,
+    file_landed_hold: bool = False,
 ) -> ToolSpec:
     """`page_fingerprint` samples an opaque fingerprint of the page's rendered content (None when no
     page is available). A finish(completed) is deferred (bounded by `max_settle_deferrals`, then
@@ -3079,6 +3085,9 @@ def make_finish_tool(
 
     `justify_stops` holds once per run, with `activity` and headroom, the first terminated verdict that no hold above
     already held, asking for the source of the stop or a continuation; a failed verdict is never held.
+
+    `file_landed_hold` settles `download_settle` before a failed or terminated verdict and, when a file landed in the
+    block, hands that verdict back once per run naming the landed files, ahead of the justification hold.
     """
     error_code_mapping = _offered_error_codes(error_code_mapping)
     deferrals = 0
@@ -3101,6 +3110,7 @@ def make_finish_tool(
     retry_granted_on: tuple[tuple[tuple[int, SubmissionOutcome], ...], float | None] | None = None
     # Spent by the first verdict the justification hold could apply to, held or not.
     justify_spent = False
+    file_landed_held = False
     held_reason_key: str | None = None
 
     def _submission_state() -> tuple[tuple[tuple[int, SubmissionOutcome], ...], float | None]:
@@ -3390,7 +3400,7 @@ def make_finish_tool(
         nonlocal deferrals, stale_holds, failure_deferrals, reask_asked, premise_checks
         nonlocal submission_hold_turn, submission_hold_message
         nonlocal retry_offered, retry_would_offer, retry_granted_on
-        nonlocal justify_spent, held_reason_key
+        nonlocal justify_spent, held_reason_key, file_landed_held
         status = args.get("status")
         if status not in ("completed", "failed", "terminated"):
             return ToolResult.error(
@@ -3652,6 +3662,51 @@ def make_finish_tool(
             activity.attempts_at_hold_gate = activity.action_attempts
             activity.perceptions_at_hold_gate = activity.perceptions
             activity.status_at_hold_gate = status
+
+        def _verdict_turn_left() -> bool:
+            # Candidate facts need only the next verdict, not the failure-evidence reserve _has_hold_headroom keeps.
+            return (deadline_at is None or deadline_at > time.monotonic()) and (
+                activity is None
+                or not activity.final_turn_active
+                and (activity.turns_remaining is None or activity.turns_remaining > 0)
+                and (activity.tool_calls_remaining is None or activity.tool_calls_remaining > 0)
+            )
+
+        async def _canceled_during_settle() -> bool:
+            try:
+                return should_cancel is not None and await should_cancel()
+            except Exception:
+                return False
+
+        if file_landed_hold and download_settle is not None and status != "completed":
+            started = time.monotonic()
+            try:
+                landed = await download_settle(frozenset(staged_downloads or ()))
+            except Exception:
+                LOG.warning("taskv3 download settle failed on a non-completed finish", exc_info=True)
+                landed = None
+            if await _canceled_during_settle():
+                return ToolResult.error("the run was canceled while the verdict was being checked.")
+            hand_back = not file_landed_held and bool(landed) and _verdict_turn_left()
+            LOG.info(
+                "taskv3 finish on a download block",
+                status=status,
+                file_landed=bool(landed),
+                files_landed=len((landed or "").splitlines()),
+                held=hand_back,
+                settle_seconds=round(time.monotonic() - started, 3),
+            )
+            if hand_back:
+                file_landed_held = True
+                # Spends the justification hold too, so the two never stack on one verdict.
+                justify_spent = True
+                lines = (landed or "").splitlines()
+                more = len(lines) - _LANDED_FILES_SHOWN
+                rest = [f"and {more} more file{'' if more == 1 else 's'}, not listed"] if more > 0 else []
+                shown = "\n".join(lines[:_LANDED_FILES_SHOWN] + rest)
+                return ToolResult.error(
+                    FILE_LANDED_HOLD_MESSAGE.format(landed=shown), {"stop_batch": _JUSTIFY_HOLD_SKIP}
+                )
         if justify_stops and activity is not None and status in ("failed", "terminated"):
             reason = str(args.get("reason") or "")
             if not justify_spent and status == "terminated":
@@ -3731,15 +3786,6 @@ def make_finish_tool(
             candidates = None
         unselected: list[str] = []
 
-        def _verdict_turn_left() -> bool:
-            # Candidate facts need only the next verdict, not the failure-evidence reserve _has_hold_headroom keeps.
-            return (deadline_at is None or deadline_at > time.monotonic()) and (
-                activity is None
-                or not activity.final_turn_active
-                and (activity.turns_remaining is None or activity.turns_remaining > 0)
-                and (activity.tool_calls_remaining is None or activity.tool_calls_remaining > 0)
-            )
-
         if candidates is not None:
             assert candidates.held_candidates is not None and candidates.resolve_candidates is not None
             selection = args.get("accept_download_candidates")
@@ -3803,14 +3849,10 @@ def make_finish_tool(
                     "finish(status=completed), or finish with the non-completed status the finish tool's own "
                     "rule gives this outcome."
                 )
-            try:
-                canceled_during_settle = should_cancel is not None and await should_cancel()
-            except Exception:
-                canceled_during_settle = False
-            if canceled_during_settle:
+            if await _canceled_during_settle():
                 # The settle declines to finalize a canceled run, so its silence must not become completed.
                 return ToolResult.error("the run was canceled while the verdict was being checked.")
-            LOG.info("taskv3 finish on a download block", file_landed=bool(landed), reason=landed)
+            LOG.info("taskv3 finish on a download block", file_landed=bool(landed))
             if candidates is not None:
                 assert candidates.held_candidates is not None and candidates.resolve_candidates is not None
                 late = candidates.held_candidates()
