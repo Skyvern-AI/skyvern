@@ -24,7 +24,7 @@ import pytest_asyncio
 import yaml
 from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, SecretStr, ValidationError
 from sqlalchemy import update
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -39,6 +39,7 @@ from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot import credential_pause, live_narrative, streaming_adapter
 from skyvern.forge.sdk.copilot import tools as copilot_tools
 from skyvern.forge.sdk.copilot.ask_user import (
+    DETACHED_QUESTION_CLIENT_GRACE,
     AskUserArguments,
     QuestionInteraction,
     QuestionResponse,
@@ -7916,6 +7917,9 @@ async def test_chat_history_serves_the_running_turns_live_narrative_only_when_as
         assert any(item["status"] == "pending" for item in default["question_interactions"])
         limited = await history(workflow_copilot_chat_id=chat_id, message_limit=2)
         assert limited["chat_history"] == default["chat_history"][-2:]
+        # Each read checks the question's client in, which moves its deadline.
+        for read in (limited, default):
+            read["in_flight_turn"].pop("question_open_until")
         assert {**limited, "chat_history": None} == {**default, "chat_history": None}
         assert (
             await client.get("/history", params={"workflow_copilot_chat_id": chat_id, "message_limit": 0})
@@ -10581,6 +10585,47 @@ async def test_a_copilot_turn_records_the_person_who_started_it(
 
     pending_turn = app.DATABASE.workflow_params.start_copilot_turn.await_args.kwargs["pending_turn"]
     assert pending_turn.starter_user_id == recorded
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("client_detached", [True, False])
+async def test_a_detached_turn_stores_the_longer_question_grace(
+    monkeypatch: pytest.MonkeyPatch,
+    api_key_request: MagicMock,
+    copilot_stream: MagicMock,
+    organization: SimpleNamespace,
+    client_detached: bool,
+) -> None:
+    captured = install_fake_create(monkeypatch)
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(
+        workflow_id="wf-canonical", title="Original", description="Original description", workflow_definition=None
+    )
+    result = AgentResult(user_response="done", updated_workflow=None, global_llm_context=None)
+    setup_new_copilot_mocks(monkeypatch, chat, original_workflow, result)
+    monkeypatch.setattr(workflow_copilot_route, "run_copilot_agent", AsyncMock(return_value=result))
+    chat_request = _make_chat_request().model_copy(
+        update={
+            "client_detached": client_detached,
+            "supports_credential_pause": True,
+            "supports_credential_pause_recovery": True,
+            "credential_recovery_token": SecretStr("a" * 64),
+        }
+    )
+
+    await workflow_copilot_chat_post(api_key_request, chat_request, organization)
+    await captured["handler"](copilot_stream)
+
+    pending_turn = app.DATABASE.workflow_params.start_copilot_turn.await_args.kwargs["pending_turn"]
+    assert pending_turn.question_client_grace_seconds == (
+        DETACHED_QUESTION_CLIENT_GRACE.total_seconds() if client_detached else None
+    )
 
 
 @pytest_asyncio.fixture

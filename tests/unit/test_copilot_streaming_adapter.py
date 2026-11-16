@@ -5,6 +5,8 @@ import base64
 import hashlib
 import io
 import json
+import time
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +17,7 @@ from urllib.parse import quote
 import pytest
 from agents import (
     Agent,
+    FunctionTool,
     RunConfig,
     Runner,
     function_tool,
@@ -41,6 +44,7 @@ from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.artifact.storage.local import LocalStorage
 from skyvern.forge.sdk.copilot import streaming_adapter as streaming_adapter_module
+from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.agent import (
     _build_narrative_payload,
     _build_system_prompt,
@@ -51,6 +55,7 @@ from skyvern.forge.sdk.copilot.context import (
     CopilotContext,
     InFlightStreamToolCall,
 )
+from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
 from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
 from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay, SkyvernOverlayMCPServer
 from skyvern.forge.sdk.copilot.model_input_capture import serialize_tool_surface
@@ -58,6 +63,7 @@ from skyvern.forge.sdk.copilot.narration import (
     MAX_DESIGN_ACTIVITY_ENTRIES,
     NarratorState,
 )
+from skyvern.forge.sdk.copilot.output_utils import TURN_CLOCK_KEY
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotProvenance, capturing_tool_call, enqueue_screenshot
 from skyvern.forge.sdk.copilot.secret_scrub import register_secret_scrub_value
 from skyvern.forge.sdk.copilot.streaming_adapter import (
@@ -2117,6 +2123,118 @@ def test_every_native_tool_but_reply_requires_a_nullable_reason() -> None:
     for name, schema in by_name.items():
         assert "user_facing_reason" in schema["required"], name
         assert schema["properties"]["user_facing_reason"]["type"] == ["string", "null"], name
+
+
+def _native_tools_answering(monkeypatch: pytest.MonkeyPatch, output: str) -> dict[str, FunctionTool]:
+    async def answer(ctx: ToolContext[CopilotContext], arguments: str) -> str:
+        return output
+
+    monkeypatch.setattr(
+        tools_module,
+        "NATIVE_TOOLS",
+        [replace(tool, on_invoke_tool=answer) for tool in tools_module.NATIVE_TOOLS],
+    )
+    monkeypatch.setattr(
+        tools_module,
+        "read_page_state_on_page",
+        AsyncMock(return_value=({"url": "https://example.com/", "title": "Example"}, None)),
+    )
+    tools = copilot_native_tools(supports_question_tool=True, browser_code_available=True, run_tools_available=True)
+    return {tool.name: tool for tool in tools}
+
+
+async def _invoke_native(
+    tool: FunctionTool, ctx: CopilotContext, arguments: str = json.dumps({"user_facing_reason": "checking"})
+) -> str:
+    tool_ctx = ToolContext(context=ctx, tool_name=tool.name, tool_call_id="call-1", tool_arguments=arguments)
+    return await tool.on_invoke_tool(tool_ctx, arguments)
+
+
+def _ctx_started_seconds_ago(elapsed: float) -> CopilotContext:
+    return _test_copilot_context(copilot_run_start_monotonic=time.monotonic() - elapsed)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool_name",
+    ["search_web", "run_browser_code", "update_workflow", "run_blocks_and_collect_debug", "ask_user"],
+)
+async def test_native_tool_result_leads_with_the_turn_clock(monkeypatch: pytest.MonkeyPatch, tool_name: str) -> None:
+    tools = _native_tools_answering(monkeypatch, json.dumps({"ok": True, "data": {"n": 1}}))
+
+    result = json.loads(await _invoke_native(tools[tool_name], _ctx_started_seconds_ago(30.0)))
+
+    assert next(iter(result)) == TURN_CLOCK_KEY
+    assert isinstance(result[TURN_CLOCK_KEY], int)
+    assert result[TURN_CLOCK_KEY] == pytest.approx(TOTAL_TIMEOUT_SECONDS - 30, abs=2)
+    assert result["ok"] is True and result["data"] == {"n": 1}
+
+
+@pytest.mark.asyncio
+async def test_turn_clock_leads_a_result_called_with_non_json_arguments(monkeypatch: pytest.MonkeyPatch) -> None:
+    tools = _native_tools_answering(monkeypatch, json.dumps({"ok": False, "error": "bad arguments"}))
+
+    result = json.loads(await _invoke_native(tools["search_web"], _ctx_started_seconds_ago(30.0), "not json"))
+
+    assert next(iter(result)) == TURN_CLOCK_KEY
+    assert result["error"] == "bad arguments"
+
+
+@pytest.mark.asyncio
+async def test_server_turn_clock_replaces_one_the_tool_returned(monkeypatch: pytest.MonkeyPatch) -> None:
+    tools = _native_tools_answering(monkeypatch, json.dumps({"ok": True, TURN_CLOCK_KEY: 5}))
+
+    result = json.loads(await _invoke_native(tools["search_web"], _ctx_started_seconds_ago(30.0)))
+
+    assert list(result) == [TURN_CLOCK_KEY, "ok"]
+    assert result[TURN_CLOCK_KEY] == pytest.approx(TOTAL_TIMEOUT_SECONDS - 30, abs=2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["search_web", "run_browser_code"])
+async def test_turn_clock_leaves_the_inner_result_bytes_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tool_name: str
+) -> None:
+    output = json.dumps({"ok": True, "text": "Überblick über die Ergebnisse — 東京の天気 " * 40}, ensure_ascii=False)
+    tools = _native_tools_answering(monkeypatch, output)
+
+    unstamped = await _invoke_native(tools[tool_name], _new_ctx())
+    stamped = await _invoke_native(tools[tool_name], _ctx_started_seconds_ago(30.0))
+
+    clock = json.loads(stamped)[TURN_CLOCK_KEY]
+    assert stamped == f'{{"{TURN_CLOCK_KEY}": {clock}, ' + unstamped.lstrip()[1:]
+
+
+@pytest.mark.asyncio
+async def test_reply_result_carries_no_turn_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    output = json.dumps({"ok": True})
+    tools = _native_tools_answering(monkeypatch, output)
+
+    assert await _invoke_native(tools["reply"], _ctx_started_seconds_ago(30.0), "{}") == output
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("output", ["", "[1]", "{}", "not json"])
+async def test_empty_or_non_object_result_is_not_stamped(monkeypatch: pytest.MonkeyPatch, output: str) -> None:
+    tools = _native_tools_answering(monkeypatch, output)
+
+    assert await _invoke_native(tools["search_web"], _ctx_started_seconds_ago(30.0)) == output
+
+
+@pytest.mark.asyncio
+async def test_turn_clock_is_clamped_at_zero_after_the_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    tools = _native_tools_answering(monkeypatch, json.dumps({"ok": True}))
+    ctx = _ctx_started_seconds_ago(TOTAL_TIMEOUT_SECONDS + 50.0)
+
+    assert json.loads(await _invoke_native(tools["search_web"], ctx))[TURN_CLOCK_KEY] == 0
+
+
+@pytest.mark.asyncio
+async def test_turn_clock_is_omitted_before_the_loop_starts(monkeypatch: pytest.MonkeyPatch) -> None:
+    output = json.dumps({"ok": True})
+    tools = _native_tools_answering(monkeypatch, output)
+
+    assert await _invoke_native(tools["search_web"], _new_ctx()) == output
 
 
 @pytest.mark.asyncio
