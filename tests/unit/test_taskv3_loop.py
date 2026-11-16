@@ -10793,6 +10793,68 @@ async def test_a_failed_finish_on_a_download_block_yields_to_a_cancel_and_names_
     assert ("and 1 more file, not listed" if case == "one_over" else "and 5 more files, not listed") in lines
 
 
+_REPORT_LANDED = "Downloaded: report.csv (1.0 KB)"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "statuses", "settles", "unsaved_held", "landed_held"),
+    [
+        ("held_then_completed", ["completed", "completed"], [None, None], [0], []),
+        ("held_then_failed", ["completed", "failed"], [None, None], [0], []),
+        ("nothing_unsaved", ["completed"], [None], [], []),
+        ("file_landed", ["completed"], [_REPORT_LANDED], [], []),
+        ("hold_switched_off", ["completed"], [None], [], []),
+        ("landed_hold_first", ["failed", "completed", "completed"], [_REPORT_LANDED, None, None], [1], [0]),
+        ("unsaved_hold_first", ["completed", "failed", "failed"], [None, _REPORT_LANDED, _REPORT_LANDED], [0], [1]),
+        ("justification_hold_not_stacked", ["completed", "terminated"], [None, None], [0], []),
+        ("no_verdict_turn_left", ["completed"], [None], [], []),
+        ("read_raises", ["completed"], [None], [], []),
+    ],
+)
+async def test_a_completed_finish_with_no_file_and_unsaved_downloads_is_handed_back_once(
+    case: str, statuses: list[str], settles: list[str | None], unsaved_held: list[int], landed_held: list[int]
+) -> None:
+    # One settle per finish the run should take: a held finish is followed by another one.
+    settle_results = iter(settles)
+    reads: list[int] = []
+
+    async def settle(_staged: frozenset[str]) -> str | None:
+        return next(settle_results, None)
+
+    async def unsaved_downloads() -> dict[str, int]:
+        reads.append(1)
+        if case == "read_raises":
+            raise RuntimeError("tally unavailable")
+        return {} if case == "nothing_unsaved" else {"capture_failed": 2}
+
+    activity = None if case not in ("no_verdict_turn_left", "justification_hold_not_stacked") else ActivityRecency()
+    outcome, _ = await _run(
+        [[("finish", {"status": status, "reason": "the export finished"})] for status in statuses],
+        [
+            make_finish_tool(
+                download_settle=settle,
+                file_landed_hold=case != "hold_switched_off",
+                unsaved_downloads=unsaved_downloads,
+                activity=activity,
+                justify_stops=case == "justification_hold_not_stacked",
+            )
+        ],
+        **({"max_turns": 1} if case == "no_verdict_turn_left" else {}),
+        **({"activity": activity} if activity is not None else {}),
+    )
+
+    results = [str(m["content"]) for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "finish"]
+    assert len(results) == len(statuses), results
+    assert outcome.status == statuses[-1]
+    assert [i for i, result in enumerate(results) if "capture_failed: 2" in result] == unsaved_held
+    assert [i for i, result in enumerate(results) if "these files landed" in result] == landed_held
+    for index in unsaved_held:
+        assert "no new file has landed" in results[index] and "retry it" in results[index]
+    if case == "file_landed":
+        assert reads == []
+
+
 @pytest.mark.asyncio
 async def test_a_held_finish_leaves_download_failures_and_files_for_the_accepted_finish() -> None:
     facts = DownloadFailureFacts()

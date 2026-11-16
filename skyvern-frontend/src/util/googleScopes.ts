@@ -18,6 +18,11 @@ export const GOOGLE_GMAIL_SEND_REQUIRED_SCOPES = [
   "https://www.googleapis.com/auth/gmail.send",
 ] as const;
 
+export const GOOGLE_GMAIL_REPLY_REQUIRED_SCOPES = [
+  ...GOOGLE_GMAIL_REQUIRED_SCOPES,
+  ...GOOGLE_GMAIL_SEND_REQUIRED_SCOPES,
+] as const;
+
 export const GOOGLE_DRIVE_REQUIRED_SCOPES = [
   "https://www.googleapis.com/auth/drive",
 ] as const;

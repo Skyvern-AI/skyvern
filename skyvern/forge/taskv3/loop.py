@@ -732,6 +732,8 @@ class _OpenTurn:
 DownloadWait = Callable[[], Awaitable[None]]
 # Its return value is shown to the model verbatim, so it must hold only the `Downloaded:` lines.
 DownloadSettle = Callable[[frozenset[str]], Awaitable[str | None]]
+# Browser downloads the block started that were not saved, by reason; empty once a file of the block landed.
+UnsavedDownloads = Callable[[], Awaitable[dict[str, int]]]
 # Consulted from finish for EVERY verdict, unlike DownloadSettle: it takes the finish status and
 # gates on state the caller already tracks (e.g. a sign-in link polling budget), not on staged
 # downloads. One callback, because a completed claim made on a blank verification step and a
@@ -788,6 +790,10 @@ JUSTIFY_HOLD_MESSAGE = (
 _JUSTIFY_HOLD_SKIP = "queued after a finish that was held; read the hold above, then decide"
 FILE_LANDED_HOLD_MESSAGE = (
     "verdict held once: these files landed in this block:\n{landed}\nFinish again; that verdict will stand."
+)
+UNSAVED_DOWNLOAD_HOLD_MESSAGE = (
+    "verdict held once: no new file has landed in this block, and downloads the browser did not save were recorded "
+    "during this block ({unsaved}). If the goal needs the file, retry it; otherwise finish again; that verdict stands."
 )
 _LANDED_FILES_SHOWN = 100
 # Telemetry only: the loop never reads it, so no verdict depends on a model's wording.
@@ -3026,6 +3032,7 @@ def make_finish_tool(
     intercepted_submissions: Callable[[], Sequence[InterceptedSubmission]] | None = None,
     justify_stops: bool = False,
     file_landed_hold: bool = False,
+    unsaved_downloads: UnsavedDownloads | None = None,
 ) -> ToolSpec:
     """`page_fingerprint` samples an opaque fingerprint of the page's rendered content (None when no
     page is available). A finish(completed) is deferred (bounded by `max_settle_deferrals`, then
@@ -3087,7 +3094,8 @@ def make_finish_tool(
     already held, asking for the source of the stop or a continuation; a failed verdict is never held.
 
     `file_landed_hold` settles `download_settle` before a failed or terminated verdict and, when a file landed in the
-    block, hands that verdict back once per run naming the landed files, ahead of the justification hold.
+    block, hands that verdict back once per run naming the landed files, ahead of the justification hold. With
+    `unsaved_downloads` it also hands a completed verdict with no file landed back once per run, naming them.
     """
     error_code_mapping = _offered_error_codes(error_code_mapping)
     deferrals = 0
@@ -3111,6 +3119,7 @@ def make_finish_tool(
     # Spent by the first verdict the justification hold could apply to, held or not.
     justify_spent = False
     file_landed_held = False
+    unsaved_held = False
     held_reason_key: str | None = None
 
     def _submission_state() -> tuple[tuple[tuple[int, SubmissionOutcome], ...], float | None]:
@@ -3400,7 +3409,7 @@ def make_finish_tool(
         nonlocal deferrals, stale_holds, failure_deferrals, reask_asked, premise_checks
         nonlocal submission_hold_turn, submission_hold_message
         nonlocal retry_offered, retry_would_offer, retry_granted_on
-        nonlocal justify_spent, held_reason_key, file_landed_held
+        nonlocal justify_spent, held_reason_key, file_landed_held, unsaved_held
         status = args.get("status")
         if status not in ("completed", "failed", "terminated"):
             return ToolResult.error(
@@ -3866,6 +3875,19 @@ def make_finish_tool(
                     candidates.resolve_candidates(frozenset())
                     unselected.extend(sorted(late))
             if not landed:
+                not_saved: dict[str, int] = {}
+                if file_landed_hold and not unsaved_held and unsaved_downloads is not None and _verdict_turn_left():
+                    try:
+                        not_saved = await unsaved_downloads()
+                    except Exception:
+                        LOG.warning("taskv3 unsaved download read failed; accepting the verdict", exc_info=True)
+                if not_saved:
+                    unsaved_held = justify_spent = True
+                    LOG.info("taskv3 finish held on unsaved downloads", unsaved=not_saved)
+                    shown = ", ".join(f"{reason}: {count}" for reason, count in sorted(not_saved.items()))
+                    return ToolResult.error(
+                        UNSAVED_DOWNLOAD_HOLD_MESSAGE.format(unsaved=shown), {"stop_batch": _JUSTIFY_HOLD_SKIP}
+                    )
                 no_file_line = [DOWNLOAD_NO_FILE_FACT, *no_file_line]
         if unselected:
             no_file_line.append(f"Download candidate(s) {', '.join(unselected)} not selected, so not saved.")

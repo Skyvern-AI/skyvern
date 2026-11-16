@@ -37,6 +37,10 @@ vi.mock("../../workflowEditorUtils", () => ({
   getAvailableOutputParameterKeys: () => [],
 }));
 
+vi.mock("@/components/WorkflowBlockInput", () => ({
+  WorkflowBlockInput: () => <input />,
+}));
+
 vi.mock("@/components/WorkflowBlockInputTextarea", () => ({
   WorkflowBlockInputTextarea: () => <textarea />,
 }));
@@ -156,6 +160,26 @@ describe("EmailInboxBlockForm", () => {
       credentialId: "{{ gmail_credential_id }}",
       parameterKeys: ["gmail_credential_id"],
     });
+  });
+
+  test("changing the Gmail account clears a message ID from the old mailbox", () => {
+    mockNodes.set("email-1", {
+      id: "email-1",
+      type: "emailInbox",
+      data: {
+        ...emailInboxNodeDefaultData,
+        credentialId: "native_old",
+        messageId: "{{ email.id }}",
+      },
+    });
+    render(<EmailInboxBlockForm blockId="email-1" />);
+
+    fireEvent.click(screen.getByTestId("gmail-template-change"));
+
+    expect(updateNodeData).toHaveBeenCalledWith(
+      "email-1",
+      expect.objectContaining({ messageId: "" }),
+    );
   });
 
   test("switching to Nango clears the native credential through serialization", async () => {
