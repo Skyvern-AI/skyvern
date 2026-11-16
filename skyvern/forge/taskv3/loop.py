@@ -240,10 +240,11 @@ CoveredBranch = Literal[
     # condition as `error_class="unreachable"` -- union them for a reachability census.
     "clipped",
     # No reading at all: the probe reported occlusion without naming anything and without locating a
-    # clip. Four producers, and for some of them "something is on top of it" is exactly right: an
+    # clip. Five producers, and for some of them "something is on top of it" is exactly right: an
     # ancestor drawing its own ::before veil (a busy card), a scrim drawn as `body::before` (which
     # hit-tests AS body and so never reaches the naming walk at all), a pinned cover the field
-    # collapsed under, and a skinned control whose own label covers it.
+    # collapsed under, a skinned control whose own label covers it, and a hidden control whose own
+    # label the driver found under another element.
     "unnamed",
     # The layer intercepts the pointer but paints nothing, so it is absent from the screenshot.
     "invisible",
