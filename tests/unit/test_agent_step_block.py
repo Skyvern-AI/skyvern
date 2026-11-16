@@ -1064,7 +1064,7 @@ async def test_a_copilot_run_offers_and_accepts_only_the_account_the_chat_approv
         "goc_b",
         "goc_c",
     }
-    monkeypatch.setattr(settings, "COPILOT_NARROW_AGENT_STEP_ACCOUNTS", True)
+    monkeypatch.setattr(settings, "EMBER_NARROW_AGENT_STEP_ACCOUNTS", True)
     assert await agent_step_loop._connected_accounts(ORG, RUN) == []
     await record_run_connection_ids(ORG, RUN, ["goc_a"])
     monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
@@ -1164,7 +1164,7 @@ async def test_a_copilot_runs_record_holds_whatever_the_workers_setting_and_a_br
     assert await offered(RUN) == []
     assert await offered("wr_dangling") == ["goc_a", "goc_b"]
 
-    monkeypatch.setattr(settings, "COPILOT_NARROW_AGENT_STEP_ACCOUNTS", True)
+    monkeypatch.setattr(settings, "EMBER_NARROW_AGENT_STEP_ACCOUNTS", True)
     assert await offered("wr_dangling") == []
     assert await offered(f"wr_hop_{agent_step_loop._MAX_PARENT_RUN_HOPS + 1}") == []
 

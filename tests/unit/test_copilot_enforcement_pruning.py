@@ -839,23 +839,23 @@ def test_aggressive_prune_logs_content_free_pair_validity_telemetry() -> None:
 
 def test_copilot_config_qa_budget_defaults_off(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "ENV", "local")
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_QA_TOKEN_BUDGET", None)
+    monkeypatch.setattr(settings, "EMBER_QA_TOKEN_BUDGET", None)
 
     assert CopilotConfig().token_budget is None
 
 
 def test_copilot_config_uses_typed_qa_budget_locally(monkeypatch: pytest.MonkeyPatch) -> None:
-    local_settings = Settings(_env_file=None, ENV="local", WORKFLOW_COPILOT_QA_TOKEN_BUDGET=3_000)
-    assert local_settings.WORKFLOW_COPILOT_QA_TOKEN_BUDGET == 3_000
+    local_settings = Settings(_env_file=None, ENV="local", EMBER_QA_TOKEN_BUDGET=3_000)
+    assert local_settings.EMBER_QA_TOKEN_BUDGET == 3_000
     monkeypatch.setattr(settings, "ENV", "local")
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_QA_TOKEN_BUDGET", 3_000)
+    monkeypatch.setattr(settings, "EMBER_QA_TOKEN_BUDGET", 3_000)
 
     assert CopilotConfig().token_budget == 3_000
 
 
 def test_copilot_config_ignores_qa_budget_in_cloud(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "ENV", "production")
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_QA_TOKEN_BUDGET", 3_000)
+    monkeypatch.setattr(settings, "EMBER_QA_TOKEN_BUDGET", 3_000)
 
     assert CopilotConfig().token_budget is None
 
@@ -1578,7 +1578,7 @@ def test_deadline_flag_still_written_when_fingerprint_is_suppressed() -> None:
 
 def test_shared_tools_bind_the_configured_total_timeout() -> None:
     assert shared_total_timeout_seconds == TOTAL_TIMEOUT_SECONDS
-    assert TOTAL_TIMEOUT_SECONDS == (settings.WORKFLOW_COPILOT_TOTAL_TIMEOUT_SECONDS or 900)
+    assert TOTAL_TIMEOUT_SECONDS == (settings.EMBER_TOTAL_TIMEOUT_SECONDS or 900)
 
 
 class TestMcpProvenanceSurvivesPruning:

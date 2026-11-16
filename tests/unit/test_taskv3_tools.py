@@ -27955,12 +27955,193 @@ async def test_an_icon_only_onclick_close_is_named_and_clicking_it_clears_the_fi
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "type").handler({"selector": "#city", "text": "x"})
         assert r.status == "error", r.content
-        minted = re.search(r'\[data-tv3-close="[^"]+"\]', r.content)
+        minted = re.search(r'\[data-tv3-ctl="[^"]+"\]', r.content)
         assert minted, r.content
         closed = await _tool(tools, "click").handler({"selector": minted.group(0)})
         assert closed.status == "ok", closed.content
         typed = await _tool(tools, "type").handler({"selector": "#city", "text": "x"})
         assert typed.status == "ok", typed.content
+
+
+_COOKIE_BAR_OVER_SEND_HTML = """
+<button id="send" style="position:fixed;left:20px;bottom:20px;width:120px;height:40px">Send</button>
+<div class="bar" style="position:fixed;left:0;bottom:0;width:100%;height:120px;background:#036;color:#fff">
+  <p>We use cookies. Read our <a href="https://elsewhere.example/privacy" style="color:#fff">Privacy Policy.</a></p>
+  <a class="ok" style="cursor:pointer;display:inline-block;padding:4px 12px;background:#fff;color:#036">Ok</a>
+</div>
+<script>document.querySelector('.ok').addEventListener('click', () => document.querySelector('.bar').remove());</script>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_covering_layers_pointer_styled_control_gets_an_address_that_survives_the_next_probe() -> None:
+    async with _content_page(_COOKIE_BAR_OVER_SEND_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        refused = await _tool(tools, "click").handler({"selector": "#send"})
+        assert refused.status == "error", refused.content
+        minted = re.search(r'(\[data-tv3-ctl="[^"]+"\]) "Ok"', refused.content)
+        assert minted, refused.content
+        controls = refused.content.partition("Its controls:")[2]
+        assert re.search(r'\[data-tv3(?:-[a-z]+)?="[^"]+"\] "Privacy Policy\."', controls), refused.content
+        await _tool(tools, "observe").handler({})
+        again = await _tool(tools, "click").handler({"selector": "#send"})
+        assert again.status == "error", again.content
+        closed = await _tool(tools, "click").handler({"selector": minted.group(1)})
+        assert closed.status == "ok", closed.content
+        sent = await _tool(tools, "click").handler({"selector": "#send"})
+        assert sent.status == "ok", sent.content
+
+
+_FRAME_OVER_BUTTON_HTML = """
+<button id="cta" style="position:fixed;left:20px;top:20px;width:200px;height:40px">Interested</button>
+<iframe srcdoc="<button>Close</button>" style="position:fixed;left:0;top:0;width:400px;height:200px;border:0"></iframe>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_frame_over_the_target_is_reported_as_a_frame_the_probe_does_not_read() -> None:
+    async with _content_page(_FRAME_OVER_BUTTON_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "click").handler({"selector": "#cta"})
+        assert r.status == "error", r.content
+        assert "It is a frame, and the probe does not read inside frames." in r.content, r.content
+        assert "no named controls" not in r.content, r.content
+
+
+_TWO_BARS_AND_A_PATCHED_RANDOM_HTML = """
+<script>Math.random = () => 0.5;</script>
+<button id="t1" style="position:fixed;left:20px;top:20px;width:120px;height:40px">One</button>
+<button id="t2" style="position:fixed;left:20px;bottom:20px;width:120px;height:40px">Two</button>
+<div id="bar1" style="position:fixed;left:0;top:0;width:100%;height:100px;background:#036">
+  <a style="cursor:pointer;color:#fff" onclick="this.parentNode.remove()">Ok</a>
+</div>
+<div id="bar2" style="position:fixed;left:0;bottom:0;width:100%;height:100px;background:#036">
+  <a style="cursor:pointer;color:#fff" onclick="this.parentNode.remove()">Ok</a>
+</div>
+"""
+_A_THIRD_BAR_OVER_T1_HTML = (
+    '<div style="position:fixed;left:0;top:0;width:100%;height:100px;background:#036">'
+    '<a style="cursor:pointer;color:#fff">Ok</a></div>'
+)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_page_world_probe_mints_a_distinct_address_for_every_covering_control(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _no_isolated_world(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(taskv3_tools, "_evaluate_isolated", _no_isolated_world)
+    address = re.compile(r'(\[data-tv3-ctl="[^"]+"\]) "Ok"')
+    async with _content_page(_TWO_BARS_AND_A_PATCHED_RANDOM_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        first = address.search((await _tool(tools, "click").handler({"selector": "#t1"})).content)
+        second = address.search((await _tool(tools, "click").handler({"selector": "#t2"})).content)
+        assert first and second
+        assert first.group(1) != second.group(1)
+        closed = await _tool(tools, "click").handler({"selector": second.group(1)})
+        assert closed.status == "ok", closed.content
+        assert await page.evaluate("[!!document.getElementById('bar1'), !!document.getElementById('bar2')]") == [
+            True,
+            False,
+        ]
+        await _tool(tools, "click").handler({"selector": first.group(1)})
+        assert await page.evaluate("!document.getElementById('bar1')")
+        await page.evaluate("(h) => document.body.insertAdjacentHTML('beforeend', h)", _A_THIRD_BAR_OVER_T1_HTML)
+        third = address.search((await _tool(tools, "click").handler({"selector": "#t1"})).content)
+        assert third
+        assert third.group(1) not in {first.group(1), second.group(1)}
+        await page.evaluate(
+            "(s) => { const ok = document.querySelector(s); ok.parentNode.appendChild(ok.cloneNode(true)); }",
+            third.group(1),
+        )
+        after_clone = (await _tool(tools, "click").handler({"selector": "#t1"})).content
+        assert third.group(1) not in after_clone, after_clone
+        assert len(set(re.findall(r'\[data-tv3-ctl="[^"]+"\]', after_clone))) == 2, after_clone
+        assert await page.locator(third.group(1)).count() == 0
+
+
+_BAR_WITH_ONLY_AN_OFF_PAGE_LINK_HTML = """
+<button id="send" style="position:fixed;left:20px;bottom:20px;width:120px;height:40px">Send</button>
+<div id="bar" style="position:fixed;left:0;bottom:0;width:100%;height:120px;background:#036;color:#fff">
+  <a href="https://elsewhere.example/privacy" style="color:#fff">Privacy Policy.</a>
+  <span>We use cookies.</span>
+</div>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_layers_link_to_another_page_is_listed_with_an_address_like_any_other_control() -> None:
+    async with _content_page(_BAR_WITH_ONLY_AN_OFF_PAGE_LINK_HTML) as page:
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "click").handler({"selector": "#send"})
+        assert r.error_class == "covered", r.content
+        assert re.search(r'Its controls: \[data-tv3(?:-[a-z]+)?="[^"]+"\] "Privacy Policy\."', r.content), r.content
+
+
+_DIALOG_WITH_A_POINTER_SVG_CLOSE_AMONG_MANY_CONTROLS_HTML = (
+    """
+<input id="city" type="text" style="width:200px;height:30px">
+<div id="prefs" role="dialog" aria-label="Preferences" style="position:fixed;left:0;top:0;width:100%;height:100%;background:#fff">
+"""
+    + "".join(f'<span style="cursor:pointer;display:block">Option {i}</span>' for i in range(5))
+    + """
+  <svg id="x" onclick="this.closest('[role=dialog]').remove()" style="cursor:pointer" width="24" height="24">
+    <path d="M4 4L20 20M20 4L4 20" stroke="#000" stroke-width="3"></path>
+  </svg>
+"""
+    + "".join(f'<span style="cursor:pointer;display:block">Option {i}</span>' for i in range(5, 10))
+    + "</div>"
+)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_pointer_styled_onclick_close_cut_by_truncation_is_still_listed_as_an_onclick_control() -> None:
+    async with _content_page(_DIALOG_WITH_A_POINTER_SVG_CLOSE_AMONG_MANY_CONTROLS_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#city", "text": "x"})
+        assert r.error_class == "covered", r.content
+        assert "more controls exist" in r.content and "#x" in r.content, r.content
+        closed = await _tool(tools, "click").handler({"selector": "#x"})
+        assert closed.status == "ok", closed.content
+        typed = await _tool(tools, "type").handler({"selector": "#city", "text": "x"})
+        assert typed.status == "ok", typed.content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("extra", "ending"),
+    [
+        (
+            {"text": ["We use cookies."], "textCut": False},
+            "would show in get_html of #bar.",
+        ),
+        ({}, "close the layer, then retry #name."),
+        ({"frame": True}, "does not read inside frames."),
+        (
+            {"layerKind": "hit_fallback"},
+            "named no controls on that element. Re-observe and reach #name another way or act on a different control.",
+        ),
+        (
+            {"challengeFrame": "iframe[title=challenge]"},
+            "Its controls: none named.",
+        ),
+    ],
+    ids=["quoted", "plain", "frame", "hit_fallback", "challenge"],
+)
+async def test_a_refusal_listing_no_control_keeps_its_next_step(extra: dict[str, Any], ending: str) -> None:
+    occluder = {"selector": "#bar", "name": "Notice", "controls": [], "truncated": False, "layerKind": "qualified"}
+    page = _CoveredProbeFakePage({**occluder, **extra})
+    r = await _tool(build_browser_tools(_fixed_page_provider(page)), "type").handler(
+        {"selector": "#name", "text": "Jane Doe"}
+    )
+    assert r.error_class == "covered", r.content
+    assert r.content.endswith(ending), r.content
 
 
 _DIALOG_FULL_OF_ONCLICK_WRAPPERS_AND_ROWS_HTML = (
@@ -31672,7 +31853,7 @@ def test_the_page_fingerprint_scrubs_every_marker_name_our_tools_write() -> None
     assert written - {"ref"} <= scrubbed, sorted(written - {"ref"} - scrubbed)
 
 
-_TV3_MARKERS = ("data-tv3-pre", "data-tv3-menu", "data-tv3-close", "data-tv3-focus", "data-tv3-look", "data-tv3-act")
+_TV3_MARKERS = ("data-tv3-pre", "data-tv3-menu", "data-tv3-ctl", "data-tv3-focus", "data-tv3-look", "data-tv3-act")
 
 
 @_skip_no_browser

@@ -2497,7 +2497,7 @@ async def test_a_copilot_test_run_needs_only_the_account_the_chat_picked(monkeyp
         picked_off, definition, labels=None, run_parameters=None, narrow_agent_step_accounts=True
     )
     assert off.blocker is not None
-    monkeypatch.setattr(settings, "COPILOT_NARROW_AGENT_STEP_ACCOUNTS", True)
+    monkeypatch.setattr(settings, "EMBER_NARROW_AGENT_STEP_ACCOUNTS", True)
     unapproved = _gate_ctx(monkeypatch)
     cited = _gate_ctx(monkeypatch, message=f"send it from {DRIVE_ACCOUNT_ID}")
 
@@ -2531,7 +2531,7 @@ async def test_a_copilot_test_run_needs_only_the_account_the_chat_picked(monkeyp
 async def test_a_triggered_childs_account_need_reaches_the_card_and_the_record(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(settings, "COPILOT_NARROW_AGENT_STEP_ACCOUNTS", True)
+    monkeypatch.setattr(settings, "EMBER_NARROW_AGENT_STEP_ACCOUNTS", True)
     child = {
         "parameters": [],
         "blocks": [{"label": "agent", "block_type": "agent_step", "prompt": "email it", "tools": ["send_email"]}],
@@ -2558,7 +2558,7 @@ async def test_a_triggered_childs_account_need_reaches_the_card_and_the_record(
     assert narrowed.blocker is None and narrowed.agent_step_connection_ids == (DRIVE_ACCOUNT_ID,)
 
     # Off, the child is not read, so nothing new needs approval, but every account is recorded for a worker that is on.
-    monkeypatch.setattr(settings, "COPILOT_NARROW_AGENT_STEP_ACCOUNTS", False)
+    monkeypatch.setattr(settings, "EMBER_NARROW_AGENT_STEP_ACCOUNTS", False)
     off = await run_credential_gate(
         _gate_ctx(monkeypatch), definition, labels=None, run_parameters=None, narrow_agent_step_accounts=True
     )
@@ -2583,7 +2583,7 @@ async def test_a_triggered_childs_account_need_reaches_the_card_and_the_record(
     assert refused.error is not None and refused.agent_step_connection_ids is None
 
     # On, a triggered child with no account tool adds nothing to record.
-    monkeypatch.setattr(settings, "COPILOT_NARROW_AGENT_STEP_ACCOUNTS", True)
+    monkeypatch.setattr(settings, "EMBER_NARROW_AGENT_STEP_ACCOUNTS", True)
     monkeypatch.setattr(
         app.DATABASE.workflows,
         "get_workflow_by_permanent_id",
@@ -2654,7 +2654,7 @@ async def test_the_triggered_workflow_walk(
     blocks: bool,
     reads: int,
 ) -> None:
-    monkeypatch.setattr(settings, "COPILOT_NARROW_AGENT_STEP_ACCOUNTS", narrowing_on)
+    monkeypatch.setattr(settings, "EMBER_NARROW_AGENT_STEP_ACCOUNTS", narrowing_on)
 
     async def read(*, workflow_permanent_id: str, organization_id: str) -> SimpleNamespace | None:
         if workflow_permanent_id in workflows and workflows[workflow_permanent_id] is None:

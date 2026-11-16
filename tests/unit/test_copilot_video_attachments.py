@@ -818,7 +818,7 @@ async def test_video_safety_screen_chunks_the_five_minute_frame_set() -> None:
 
 @pytest.mark.asyncio
 async def test_video_safety_chunks_share_one_total_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(video_attachment_module.settings, "COPILOT_RAW_SECRET_SAFETY_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(video_attachment_module.settings, "EMBER_RAW_SECRET_SAFETY_TIMEOUT_SECONDS", 0.01)
 
     async def slow_screen(**_kwargs):
         await asyncio.sleep(60)

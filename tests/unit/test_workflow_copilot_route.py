@@ -2914,7 +2914,7 @@ async def test_browser_ablation_selector_is_rejected_while_disabled(
     monkeypatch: pytest.MonkeyPatch, anon_request: MagicMock, organization: SimpleNamespace
 ) -> None:
     anon_request.headers = {"x-copilot-eval-mode": "browser_ablation"}
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_BROWSER_ABLATION_ENABLED", False)
+    monkeypatch.setattr(settings, "EMBER_BROWSER_ABLATION_ENABLED", False)
 
     with pytest.raises(HTTPException) as exc_info:
         await workflow_copilot_chat_post(anon_request, _make_chat_request(), organization)
@@ -2935,8 +2935,8 @@ async def test_browser_ablation_selector_forces_v2_when_enabled(
     monkeypatch: pytest.MonkeyPatch, anon_request: MagicMock, organization: SimpleNamespace, headers: dict[str, str]
 ) -> None:
     anon_request.headers = headers
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_BROWSER_ABLATION_ENABLED", True)
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_BROWSER_ABLATION_ORGANIZATION_IDS", ["org-1"])
+    monkeypatch.setattr(settings, "EMBER_BROWSER_ABLATION_ENABLED", True)
+    monkeypatch.setattr(settings, "EMBER_BROWSER_ABLATION_ORGANIZATION_IDS", ["org-1"])
     new_copilot = AsyncMock(return_value=object())
     monkeypatch.setattr(workflow_copilot_route, "_new_copilot_chat_post", new_copilot)
 
@@ -2951,8 +2951,8 @@ async def test_browser_ablation_selector_is_rejected_for_a_non_eval_organization
     monkeypatch: pytest.MonkeyPatch, anon_request: MagicMock, organization: SimpleNamespace
 ) -> None:
     anon_request.headers = {"x-copilot-eval-mode": "browser_ablation"}
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_BROWSER_ABLATION_ENABLED", True)
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_BROWSER_ABLATION_ORGANIZATION_IDS", ["org-eval"])
+    monkeypatch.setattr(settings, "EMBER_BROWSER_ABLATION_ENABLED", True)
+    monkeypatch.setattr(settings, "EMBER_BROWSER_ABLATION_ORGANIZATION_IDS", ["org-eval"])
     new_copilot = AsyncMock(return_value=object())
     monkeypatch.setattr(workflow_copilot_route, "_new_copilot_chat_post", new_copilot)
 
@@ -7026,7 +7026,7 @@ async def test_redis_failure_briefly_protects_a_recent_question_handoff(
 async def test_redis_failure_eventually_releases_an_old_question_handoff(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    age = RECONCILE_ABANDON_AFTER_SECONDS + settings.WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS + 60
+    age = RECONCILE_ABANDON_AFTER_SECONDS + settings.EMBER_CREDENTIAL_PAUSE_TIMEOUT_SECONDS + 60
     interaction = QuestionInteraction(
         interaction_id="question-1",
         turn_id="turn-a",
@@ -8169,7 +8169,7 @@ async def test_browser_allocation_recorder_requires_admitted_request_override(
     _, workflow_params = setup_new_copilot_mocks(
         monkeypatch, chat, SimpleNamespace(workflow_id="wf-canonical", workflow_definition=None), result
     )
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_EVAL_LLM_OVERRIDES_ORGANIZATION_IDS", ["org-1"])
+    monkeypatch.setattr(settings, "EMBER_EVAL_LLM_OVERRIDES_ORGANIZATION_IDS", ["org-1"])
     monkeypatch.setattr(
         eval_llm_overrides.LLMConfigRegistry,
         "_configs",
@@ -8746,10 +8746,10 @@ def _eval_header_request(header: str = "x-copilot-eval") -> MagicMock:
 def _install_v2_dispatch(
     monkeypatch: pytest.MonkeyPatch, *, eval_inputs_enabled: bool, eval_organization_ids: list[str] | None = None
 ) -> AsyncMock:
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_ODYSSEYS_EVAL_INPUTS_ENABLED", eval_inputs_enabled)
+    monkeypatch.setattr(settings, "EMBER_ODYSSEYS_EVAL_INPUTS_ENABLED", eval_inputs_enabled)
     monkeypatch.setattr(
         settings,
-        "WORKFLOW_COPILOT_ODYSSEYS_EVAL_ORGANIZATION_IDS",
+        "EMBER_ODYSSEYS_EVAL_ORGANIZATION_IDS",
         ["org-1"] if eval_organization_ids is None else eval_organization_ids,
     )
     new_copilot_mock = AsyncMock(return_value=object())
@@ -8864,8 +8864,8 @@ async def test_an_admitted_eval_entrypoint_url_reaches_the_agent_path_byte_exact
     eval_mode_header: str,
 ) -> None:
     new_copilot_mock = _install_v2_dispatch(monkeypatch, eval_inputs_enabled=True)
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_BROWSER_ABLATION_ENABLED", True)
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_BROWSER_ABLATION_ORGANIZATION_IDS", [organization.organization_id])
+    monkeypatch.setattr(settings, "EMBER_BROWSER_ABLATION_ENABLED", True)
+    monkeypatch.setattr(settings, "EMBER_BROWSER_ABLATION_ORGANIZATION_IDS", [organization.organization_id])
     request = _eval_header_request(eval_header)
     if eval_mode is not None:
         request.headers[eval_mode_header] = eval_mode.value
@@ -8885,7 +8885,7 @@ async def test_the_entrypoint_gate_answers_before_the_eval_mode_gate(
     monkeypatch: pytest.MonkeyPatch, organization: SimpleNamespace
 ) -> None:
     new_copilot_mock = _install_v2_dispatch(monkeypatch, eval_inputs_enabled=False)
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_BROWSER_ABLATION_ENABLED", False)
+    monkeypatch.setattr(settings, "EMBER_BROWSER_ABLATION_ENABLED", False)
     request = _eval_header_request()
     request.headers["x-copilot-eval-mode"] = CopilotEvalMode.BROWSER_ABLATION.value
 

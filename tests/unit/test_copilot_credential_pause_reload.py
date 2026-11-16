@@ -449,7 +449,7 @@ async def test_signing_in_survives_a_reload_and_done_resumes_the_same_call_with_
             started = await client.post("/credential-response", json={**body, "action": "signing_in"})
             assert started.status_code == 200
             extended = datetime.fromisoformat(started.json()["expires_at"])
-            manual_window = timedelta(seconds=settings.WORKFLOW_COPILOT_MANUAL_SIGN_IN_TIMEOUT_SECONDS)
+            manual_window = timedelta(seconds=settings.EMBER_MANUAL_SIGN_IN_TIMEOUT_SECONDS)
             assert extended - card.expires_at > manual_window - timedelta(seconds=30)
             again = await client.post("/credential-response", json={**body, "action": "signing_in"})
             assert datetime.fromisoformat(again.json()["expires_at"]) == extended
