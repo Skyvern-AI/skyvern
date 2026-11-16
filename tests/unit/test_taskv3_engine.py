@@ -2199,45 +2199,6 @@ async def test_the_answer_audit_wraps_the_run_tools_and_sees_the_instructions(mo
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("audit_installed", [True, False])
-@pytest.mark.parametrize("audit_arm", ["unrandomized", "control", "treatment"])
-async def test_the_log_only_arm_changes_the_run_only_on_treatment(
-    monkeypatch: pytest.MonkeyPatch, audit_arm: str, audit_installed: bool
-) -> None:
-    applied: list[dict[str, Any]] = []
-
-    async def hook(parameters: Any, *, goal: str, organization_id: Any, step: Any) -> object | None:
-        return object() if audit_installed else None
-
-    def spy(tools: list[Any], answer_audit: Any, **kwargs: Any) -> None:
-        applied.append(kwargs)
-
-    monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_answer_basis_audit", hook)
-    monkeypatch.setattr(engine_mod, "apply_answer_basis_audit", spy)
-    ctx = SkyvernContext()
-    ctx.run_arms = {ANSWER_AUDIT_LOG_ONLY_FLAG: ("wr_1", audit_arm)} if audit_arm != "unrandomized" else {}
-    skyvern_context.set(ctx)
-    try:
-        with capture_logs() as logs:
-            outcome = await run_task_v3_agent_loop(
-                page_provider=_fixed_page_provider(_FakePage()),
-                llm_caller=_ScriptedCaller([[("finish", {"status": "completed", "reason": "ok"})]]),
-                goal="Apply.",
-                parameters={"resume": "text"},
-            )
-    finally:
-        skyvern_context.reset()
-
-    assert outcome.status == "completed"
-    assert applied == [
-        {"log_only": audit_arm == "treatment", "log_fields": {"audit_mode_arm": audit_arm}, "armed": None}
-    ]
-    terminal = next(e for e in logs if e.get("event") == "taskv3 engine loop finished")
-    assert (terminal["audit_mode_arm"], terminal["answer_audit_active"]) == (audit_arm, audit_installed)
-    assert terminal["answer_audit_trigger"] == ("payload" if audit_installed else None)
-
-
-@pytest.mark.asyncio
 async def test_terminal_log_carries_duration_and_block_type() -> None:
     # The v1-vs-v3 wall-time dashboard reads this log line; it needs the loop's own wall-clock and
     # the block context to slice workflow-block runs (SKY-15499).

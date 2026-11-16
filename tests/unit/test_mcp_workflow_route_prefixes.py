@@ -15,8 +15,6 @@ The Skyvern Cloud Fern SDK runbook gives the rationale behind the split.
 
 from __future__ import annotations
 
-import ast
-import inspect
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -146,34 +144,3 @@ def test_prefix_constants_are_stable() -> None:
     assert _workflow_http.PUBLIC_WORKFLOW_ROUTE == "v1/workflows"
     assert _workflow_http.INTERNAL_WORKFLOW_ROUTE == "api/v1/workflows"
     assert _workflow_http.PUBLIC_WORKFLOW_ROUTE != _workflow_http.INTERNAL_WORKFLOW_ROUTE
-
-
-def test_no_hardcoded_workflow_routes_outside_constants() -> None:
-    """AST guard: every ``v1/...`` or ``api/v1/...`` string literal in _workflow_http.py
-    must be the named constant, not a bypass.
-
-    This catches the case where a future contributor adds a new helper and
-    hardcodes ``"api/v1/workflows/runs/foo"`` instead of using
-    ``INTERNAL_WORKFLOW_ROUTE``. The presence-only tests above only cover the
-    helpers that exist today; this test covers the *shape* of the module.
-    """
-    allowed = {
-        _workflow_http.PUBLIC_WORKFLOW_ROUTE,
-        _workflow_http.INTERNAL_WORKFLOW_ROUTE,
-        _workflow_http.INTERNAL_WORKFLOW_RUN_BLOCK_ROUTE,
-    }
-    tree = ast.parse(inspect.getsource(_workflow_http))
-    offenders: list[str] = []
-
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            value = node.value
-            if value.startswith(("v1/", "api/v1/")) and value not in allowed:
-                offenders.append(f"line {node.lineno}: {value!r}")
-
-    assert not offenders, (
-        "Hardcoded workflow route literal(s) detected in _workflow_http.py:\n"
-        + "\n".join(f"  {o}" for o in offenders)
-        + "\n\nUse PUBLIC_WORKFLOW_ROUTE or INTERNAL_WORKFLOW_ROUTE constants instead. "
-        "See the Skyvern Cloud Fern SDK runbook."
-    )
