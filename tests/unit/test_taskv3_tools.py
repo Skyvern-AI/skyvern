@@ -22093,6 +22093,20 @@ async def test_observe_role_links_never_take_an_icons_place(hidden: int) -> None
 
 @_skip_no_browser
 @pytest.mark.asyncio
+async def test_observe_a_pages_role_links_never_take_a_frames_icons_place_in_the_page_wide_budget() -> None:
+    frame = _buttons(50) + _POINTER_ICON * 20
+    html = _cursorless_links(40) + _buttons(150) + f"<iframe srcdoc='{frame}' width='800' height='600'></iframe>"
+    async with _live_page(html) as page:
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+        summary = r.data["summary"]
+        assert (summary["icons_listed"], summary["icons_truncated"]) == (20, 0), (
+            "250 page-wide minus the 200 buttons leaves 50 for icons; the 40 role=links must not count against it",
+            r.content,
+        )
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
 async def test_observe_a_second_added_role_also_stays_out_of_the_element_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
