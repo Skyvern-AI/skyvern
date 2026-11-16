@@ -64,6 +64,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotCredentialRequiredUpdate,
     WorkflowCopilotCredentialSiteQuestion,
     WorkflowCopilotStreamMessageType,
+    credential_recovery_token_is_valid,
 )
 from skyvern.forge.sdk.services.request_principal import get_request_principal
 from skyvern.forge.sdk.workflow.models.credential_release import login_site_url, saved_site_urls
@@ -401,13 +402,7 @@ def _validate_pending_pause(record: _ActivePauseRecord | None, resume_token: str
 
 def credential_recovery_token_digest(token: str | None) -> str | None:
     """Hash a 32-byte browser capability without retaining the bearer value."""
-    if not isinstance(token, str) or len(token) != 64:
-        return None
-    try:
-        decoded = bytes.fromhex(token)
-    except ValueError:
-        return None
-    if len(decoded) != 32:
+    if not isinstance(token, str) or not credential_recovery_token_is_valid(token):
         return None
     return hashlib.sha256(token.encode()).hexdigest()
 

@@ -1740,12 +1740,6 @@ async def _completion_verification_from_run_result(
     )
 
 
-def _stamp_turn_budget_on_result(copilot_ctx: Any, result: dict[str, Any]) -> dict[str, Any]:
-    """Expose the remaining loop budget without interpreting the run result."""
-    result["turn_seconds_remaining"] = _copilot_seconds_remaining(copilot_ctx)
-    return result
-
-
 def _emit_completion_verification_trace(
     copilot_ctx: Any, completion_verification: CompletionVerificationResult
 ) -> None:
