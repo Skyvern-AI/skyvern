@@ -797,7 +797,7 @@ async def run_credential_gate(
     resolved_labels = {block.get("label") for block in workflow_blocks(parsed, selected_labels=selected)}
     executing_labels = selected if selected and selected <= resolved_labels else None
     executing_refs = workflow_connection_refs(parsed, selected_labels=executing_labels, run_parameters=parameters)
-    narrowing_on = narrow_agent_step_accounts and settings.COPILOT_NARROW_AGENT_STEP_ACCOUNTS
+    narrowing_on = narrow_agent_step_accounts and settings.EMBER_NARROW_AGENT_STEP_ACCOUNTS
     agent_tools = await _executing_agent_tool_names(ctx.organization_id, parsed, executing_labels, narrow=narrowing_on)
     try:
         agent_refs, agent_acts = await _agent_step_connection_ids(

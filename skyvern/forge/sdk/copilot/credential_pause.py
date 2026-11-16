@@ -114,8 +114,8 @@ def _credential_pause_record_ttl(timeout_seconds: int) -> timedelta:
 def longest_credential_pause_seconds() -> int:
     """A sign-in can start as the card's wait expires and then hold a Done claim, so all three add up."""
     return (
-        settings.WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS
-        + settings.WORKFLOW_COPILOT_MANUAL_SIGN_IN_TIMEOUT_SECONDS
+        settings.EMBER_CREDENTIAL_PAUSE_TIMEOUT_SECONDS
+        + settings.EMBER_MANUAL_SIGN_IN_TIMEOUT_SECONDS
         + MANUAL_SIGN_IN_CLAIM_SECONDS
     )
 
@@ -542,7 +542,7 @@ async def resolve_credential_pause(
         if declined_site:
             question = _bound_site_question(record, credential_id)
             site_answer = _site_answer("no", record, question)
-        ttl = _credential_pause_record_ttl(settings.WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS)
+        ttl = _credential_pause_record_ttl(settings.EMBER_CREDENTIAL_PAUSE_TIMEOUT_SECONDS)
         await cache.set(
             active_key,
             _encode_active_pause(
@@ -884,7 +884,7 @@ async def start_manual_sign_in(
             return record.expires_at
         record = _extend_pause(
             replace(record, manual_sign_in=replace(sign_in, started=True)),
-            settings.WORKFLOW_COPILOT_MANUAL_SIGN_IN_TIMEOUT_SECONDS,
+            settings.EMBER_MANUAL_SIGN_IN_TIMEOUT_SECONDS,
             signing_in=True,
         )
         await cache.set(active_key, _encode_record(record), ex=_longest_credential_pause_record_ttl())
@@ -1029,7 +1029,7 @@ async def finish_credential_generation(
             registration = claim.registration.model_copy(update={"outcome": outcome})
             reopened = _extend_pause(
                 replace(record, status="pending", claim_id=None, claim_deadline=None, registration=registration),
-                settings.WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS,
+                settings.EMBER_CREDENTIAL_PAUSE_TIMEOUT_SECONDS,
             )
             await cache.set(active_key, _encode_record(reopened), ex=ttl)
             return reopened.expires_at

@@ -5295,7 +5295,7 @@ async def _run_blocks_with_minted_browser_claim(
                     exc_info=True,
                 )
                 # Off, the record holds every account and a worker without one offers every account anyway.
-                if settings.COPILOT_NARROW_AGENT_STEP_ACCOUNTS:
+                if settings.EMBER_NARROW_AGENT_STEP_ACCOUNTS:
                     await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final(
                         workflow_run_id=workflow_run.workflow_run_id,
                         failure_reason="The test run's approved accounts could not be recorded.",
@@ -5307,7 +5307,7 @@ async def _run_blocks_with_minted_browser_claim(
                         "ok": False,
                         "error": "The test run's approved accounts could not be recorded; execution was not started.",
                     }
-            if settings.COPILOT_NARROW_AGENT_STEP_ACCOUNTS:
+            if settings.EMBER_NARROW_AGENT_STEP_ACCOUNTS:
                 # The result names the accounts the agent steps got, so a switch the model read can raise the card.
                 offered = set(credential_gate.agent_step_connection_ids)
                 try:

@@ -99,10 +99,10 @@ class ForgeApp:
     SCRIPT_GENERATION_LLM_API_HANDLER: LLMAPIHandler
     SCRIPT_REVIEWER_LLM_API_HANDLER: LLMAPIHandler
     ADAPTIVE_SCRIPT_GEN_LLM_API_HANDLER: LLMAPIHandler
-    WORKFLOW_COPILOT_LLM_API_HANDLER: LLMAPIHandler
-    WORKFLOW_COPILOT_AGENT_LLM_API_HANDLER: LLMAPIHandler
-    WORKFLOW_COPILOT_FAST_LLM_API_HANDLER: LLMAPIHandler
-    WORKFLOW_COPILOT_LITE_LLM_API_HANDLER: LLMAPIHandler | None
+    EMBER_LLM_API_HANDLER: LLMAPIHandler
+    EMBER_AGENT_LLM_API_HANDLER: LLMAPIHandler
+    EMBER_FAST_LLM_API_HANDLER: LLMAPIHandler
+    EMBER_LITE_LLM_API_HANDLER: LLMAPIHandler | None
     WORKFLOW_CONTEXT_MANAGER: WorkflowContextManager
     WORKFLOW_SERVICE: WorkflowService
     AGENT_FUNCTION: AgentFunction
@@ -244,25 +244,25 @@ def create_forge_app() -> ForgeApp:
         if settings.ADAPTIVE_SCRIPT_GEN_LLM_KEY
         else app.LLM_API_HANDLER
     )
-    app.WORKFLOW_COPILOT_LLM_API_HANDLER = (
-        LLMAPIHandlerFactory.get_llm_api_handler(settings.WORKFLOW_COPILOT_LLM_KEY)
-        if settings.WORKFLOW_COPILOT_LLM_KEY
+    app.EMBER_LLM_API_HANDLER = (
+        LLMAPIHandlerFactory.get_llm_api_handler(settings.EMBER_LLM_KEY)
+        if settings.EMBER_LLM_KEY
         else app.LLM_API_HANDLER
     )
-    app.WORKFLOW_COPILOT_AGENT_LLM_API_HANDLER = (
-        LLMAPIHandlerFactory.get_llm_api_handler(settings.WORKFLOW_COPILOT_AGENT_LLM_KEY)
-        if settings.WORKFLOW_COPILOT_AGENT_LLM_KEY
-        else app.WORKFLOW_COPILOT_LLM_API_HANDLER
+    app.EMBER_AGENT_LLM_API_HANDLER = (
+        LLMAPIHandlerFactory.get_llm_api_handler(settings.EMBER_AGENT_LLM_KEY)
+        if settings.EMBER_AGENT_LLM_KEY
+        else app.EMBER_LLM_API_HANDLER
     )
-    app.WORKFLOW_COPILOT_FAST_LLM_API_HANDLER = (
-        LLMAPIHandlerFactory.get_llm_api_handler(settings.WORKFLOW_COPILOT_FAST_LLM_KEY)
-        if settings.WORKFLOW_COPILOT_FAST_LLM_KEY
+    app.EMBER_FAST_LLM_API_HANDLER = (
+        LLMAPIHandlerFactory.get_llm_api_handler(settings.EMBER_FAST_LLM_KEY)
+        if settings.EMBER_FAST_LLM_KEY
         else app.SECONDARY_LLM_API_HANDLER
     )
-    app.WORKFLOW_COPILOT_LITE_LLM_API_HANDLER = (
-        LLMAPIHandlerFactory.get_llm_api_handler(settings.WORKFLOW_COPILOT_LITE_LLM_KEY)
-        if settings.WORKFLOW_COPILOT_LITE_LLM_KEY
-        else app.WORKFLOW_COPILOT_LLM_API_HANDLER
+    app.EMBER_LITE_LLM_API_HANDLER = (
+        LLMAPIHandlerFactory.get_llm_api_handler(settings.EMBER_LITE_LLM_KEY)
+        if settings.EMBER_LITE_LLM_KEY
+        else app.EMBER_LLM_API_HANDLER
     )
     app.WORKFLOW_CONTEXT_MANAGER = WorkflowContextManager()
     app.WORKFLOW_SERVICE = WorkflowService()

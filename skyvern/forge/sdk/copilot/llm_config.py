@@ -18,7 +18,7 @@ WORKFLOW_COPILOT_RAW_SECRET_SAFETY_PROMPT_TYPE = "workflow-copilot-raw-secret-sa
 
 def get_workflow_copilot_handler() -> Any | None:
     try:
-        handler = app.WORKFLOW_COPILOT_LLM_API_HANDLER
+        handler = app.EMBER_LLM_API_HANDLER
     except (RuntimeError, AttributeError):
         handler = None
     if handler is not None:
@@ -31,7 +31,7 @@ def get_workflow_copilot_handler() -> Any | None:
 
 def get_main_copilot_handler() -> Any | None:
     try:
-        handler = app.WORKFLOW_COPILOT_AGENT_LLM_API_HANDLER
+        handler = app.EMBER_AGENT_LLM_API_HANDLER
     except (RuntimeError, AttributeError):
         handler = None
     if handler is not None:
@@ -41,7 +41,7 @@ def get_main_copilot_handler() -> Any | None:
 
 def get_fast_copilot_handler() -> Any | None:
     try:
-        handler = app.WORKFLOW_COPILOT_FAST_LLM_API_HANDLER
+        handler = app.EMBER_FAST_LLM_API_HANDLER
     except (RuntimeError, AttributeError):
         handler = None
     if handler is not None:
@@ -54,7 +54,7 @@ def get_fast_copilot_handler() -> Any | None:
 
 def get_raw_secret_safety_handler() -> LLMAPIHandler | None:
     try:
-        return app.WORKFLOW_COPILOT_LITE_LLM_API_HANDLER
+        return app.EMBER_LITE_LLM_API_HANDLER
     except (RuntimeError, AttributeError):
         return None
 

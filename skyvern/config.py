@@ -250,7 +250,10 @@ class Settings(BaseSettings):
 
     ENV: str = "local"
     # Synthetic browser fixture: never installed outside staging, disabled by default.
-    COPILOT_EVAL_AUTH_FIXTURE_ENABLED: bool = False
+    EMBER_EVAL_AUTH_FIXTURE_ENABLED: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("EMBER_EVAL_AUTH_FIXTURE_ENABLED", "COPILOT_EVAL_AUTH_FIXTURE_ENABLED"),
+    )
     BROWSER_STREAMING_MODE: str = "vnc"
     EXECUTE_ALL_STEPS: bool = True
     JSON_LOGGING: bool = False
@@ -266,63 +269,157 @@ class Settings(BaseSettings):
     # this a no-op: an empty org list samples nothing and rate 1.0 keeps all.
     LOG_SAMPLING_RATE: float = 1.0
     LOG_SAMPLING_ORG_IDS: list[str] = []
-    COPILOT_RAW_SECRET_SAFETY_TIMEOUT_SECONDS: float = 12.0
-    COPILOT_RAW_SECRET_SAFETY_HEDGE_ENABLED: bool = True
-    COPILOT_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS: float = 3.0
-    COPILOT_COMPLETION_JUDGE_TIMEOUT_SECONDS: float = 12.0
-    COPILOT_OUTPUT_DESIGNATION_TIMEOUT_SECONDS: float = 12.0
+    EMBER_RAW_SECRET_SAFETY_TIMEOUT_SECONDS: float = Field(
+        default=12.0,
+        validation_alias=AliasChoices(
+            "EMBER_RAW_SECRET_SAFETY_TIMEOUT_SECONDS", "COPILOT_RAW_SECRET_SAFETY_TIMEOUT_SECONDS"
+        ),
+    )
+    EMBER_RAW_SECRET_SAFETY_HEDGE_ENABLED: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "EMBER_RAW_SECRET_SAFETY_HEDGE_ENABLED", "COPILOT_RAW_SECRET_SAFETY_HEDGE_ENABLED"
+        ),
+    )
+    EMBER_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS: float = Field(
+        default=3.0,
+        validation_alias=AliasChoices(
+            "EMBER_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS", "COPILOT_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS"
+        ),
+    )
+    EMBER_COMPLETION_JUDGE_TIMEOUT_SECONDS: float = Field(
+        default=12.0,
+        validation_alias=AliasChoices(
+            "EMBER_COMPLETION_JUDGE_TIMEOUT_SECONDS", "COPILOT_COMPLETION_JUDGE_TIMEOUT_SECONDS"
+        ),
+    )
     # A capture that runs out of time yields no page evidence at all, so the scout falls back to
     # dumping the page. Measured attaches on a live dashboard reach 8.6s; the former 4s bound cut the
     # tail off and a third of captures returned nothing.
-    COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS: float = 12.0
+    EMBER_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS: float = Field(
+        default=12.0,
+        validation_alias=AliasChoices(
+            "EMBER_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS", "COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS"
+        ),
+    )
     # Let an asynchronously rendered page settle before the scout's one factual evidence recapture.
-    COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS: float = 0.6
+    EMBER_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS: float = Field(
+        default=0.6,
+        validation_alias=AliasChoices(
+            "EMBER_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS", "COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS"
+        ),
+    )
     # Kill switch for the factual clickable-controls evidence channel.
-    COPILOT_CLICKABLE_CONTROLS_EVIDENCE_ENABLED: bool = True
+    EMBER_CLICKABLE_CONTROLS_EVIDENCE_ENABLED: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "EMBER_CLICKABLE_CONTROLS_EVIDENCE_ENABLED", "COPILOT_CLICKABLE_CONTROLS_EVIDENCE_ENABLED"
+        ),
+    )
     # Staged rollout for treating omitted runtime workflow proxy values as direct/no-proxy.
     # Off preserves the historical implicit residential default for anti-bot-sensitive traffic.
     RUNTIME_PROXY_DEFAULT_NONE_ENABLED: bool = False
     # Internal eval-only selector for the least-privileged direct-browser Copilot surface.
-    WORKFLOW_COPILOT_BROWSER_ABLATION_ENABLED: bool = False
+    EMBER_BROWSER_ABLATION_ENABLED: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("EMBER_BROWSER_ABLATION_ENABLED", "WORKFLOW_COPILOT_BROWSER_ABLATION_ENABLED"),
+    )
     # Enabling the process-level kill switch is insufficient on a shared deployment: only API
     # credentials belonging to these explicitly configured eval organizations may select the mode.
-    WORKFLOW_COPILOT_BROWSER_ABLATION_ORGANIZATION_IDS: list[str] = []
+    EMBER_BROWSER_ABLATION_ORGANIZATION_IDS: list[str] = Field(
+        default=[],
+        validation_alias=AliasChoices(
+            "EMBER_BROWSER_ABLATION_ORGANIZATION_IDS", "WORKFLOW_COPILOT_BROWSER_ABLATION_ORGANIZATION_IDS"
+        ),
+    )
     # Experimental Workflow Copilot code-first authoring mode.
     # Off = standard block authoring. On = prefer code blocks for browser work.
-    WORKFLOW_COPILOT_CODE_BLOCK_MODE: bool = False
+    EMBER_CODE_BLOCK_MODE: bool = Field(
+        default=False, validation_alias=AliasChoices("EMBER_CODE_BLOCK_MODE", "WORKFLOW_COPILOT_CODE_BLOCK_MODE")
+    )
     # Offer a Copilot test run's agent steps only the accounts the chat approved. Turn on for every worker fleet
     # before any API (and off in the reverse order): a worker that is off offers every account when a record is lost.
-    COPILOT_NARROW_AGENT_STEP_ACCOUNTS: bool = False
-    WORKFLOW_COPILOT_QA_TOKEN_BUDGET: int | None = Field(default=None, gt=0)
+    EMBER_NARROW_AGENT_STEP_ACCOUNTS: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("EMBER_NARROW_AGENT_STEP_ACCOUNTS", "COPILOT_NARROW_AGENT_STEP_ACCOUNTS"),
+    )
+    EMBER_QA_TOKEN_BUDGET: int | None = Field(
+        default=None, gt=0, validation_alias=AliasChoices("EMBER_QA_TOKEN_BUDGET", "WORKFLOW_COPILOT_QA_TOKEN_BUDGET")
+    )
     # Process-global override of the per-turn copilot deadline, read once at import;
     # changing it needs a hard restart. QA/debug only -- unset keeps the 900s default.
-    WORKFLOW_COPILOT_TOTAL_TIMEOUT_SECONDS: int | None = Field(default=None, gt=0)
+    EMBER_TOTAL_TIMEOUT_SECONDS: int | None = Field(
+        default=None,
+        gt=0,
+        validation_alias=AliasChoices("EMBER_TOTAL_TIMEOUT_SECONDS", "WORKFLOW_COPILOT_TOTAL_TIMEOUT_SECONDS"),
+    )
     # Pause a BUILD turn in place on a typed mid-loop credential ask instead of ending it;
     # the FE resumes the same turn via a credential-connect card. Off = today's turn-terminal behavior.
     # Requires app.CACHE to be a shared cache (Redis) -- a same-process-only cache can't
     # coordinate the poller with a /credential-response POST that may land on another worker,
     # so this is a guaranteed no-op behind app.CACHE.is_shared regardless of this flag.
-    WORKFLOW_COPILOT_CREDENTIAL_PAUSE_ENABLED: bool = True
-    WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS: int = 300
+    EMBER_CREDENTIAL_PAUSE_ENABLED: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("EMBER_CREDENTIAL_PAUSE_ENABLED", "WORKFLOW_COPILOT_CREDENTIAL_PAUSE_ENABLED"),
+    )
+    EMBER_CREDENTIAL_PAUSE_TIMEOUT_SECONDS: int = Field(
+        default=300,
+        validation_alias=AliasChoices(
+            "EMBER_CREDENTIAL_PAUSE_TIMEOUT_SECONDS", "WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS"
+        ),
+    )
     # Replaces the pause countdown once when the user chooses to sign in themselves in the live browser.
-    WORKFLOW_COPILOT_MANUAL_SIGN_IN_TIMEOUT_SECONDS: int = 900
+    EMBER_MANUAL_SIGN_IN_TIMEOUT_SECONDS: int = Field(
+        default=900,
+        validation_alias=AliasChoices(
+            "EMBER_MANUAL_SIGN_IN_TIMEOUT_SECONDS", "WORKFLOW_COPILOT_MANUAL_SIGN_IN_TIMEOUT_SECONDS"
+        ),
+    )
     # Kill switch for the live codegen-progress SSE frame (drafted block labels while an authoring
     # tool call streams). Off restores exact pre-change behavior; old frontends drop the frame either way.
-    WORKFLOW_COPILOT_CODEGEN_PROGRESS_ENABLED: bool = True
+    EMBER_CODEGEN_PROGRESS_ENABLED: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("EMBER_CODEGEN_PROGRESS_ENABLED", "WORKFLOW_COPILOT_CODEGEN_PROGRESS_ENABLED"),
+    )
     # Admits the Odysseys benchmark's typed entry-point input on the copilot chat route, and only
     # together with the X-Copilot-Eval header. Never enabled outside the dedicated eval lane.
-    WORKFLOW_COPILOT_ODYSSEYS_EVAL_INPUTS_ENABLED: bool = False
+    EMBER_ODYSSEYS_EVAL_INPUTS_ENABLED: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "EMBER_ODYSSEYS_EVAL_INPUTS_ENABLED", "WORKFLOW_COPILOT_ODYSSEYS_EVAL_INPUTS_ENABLED"
+        ),
+    )
     # The caller-supplied header is not an authorization: on a shared deployment only API
     # credentials belonging to these explicitly configured eval organizations may seed an entry point.
-    WORKFLOW_COPILOT_ODYSSEYS_EVAL_ORGANIZATION_IDS: list[str] = []
+    EMBER_ODYSSEYS_EVAL_ORGANIZATION_IDS: list[str] = Field(
+        default=[],
+        validation_alias=AliasChoices(
+            "EMBER_ODYSSEYS_EVAL_ORGANIZATION_IDS", "WORKFLOW_COPILOT_ODYSSEYS_EVAL_ORGANIZATION_IDS"
+        ),
+    )
     # Request-scoped model overrides require an authenticated organization in this allowlist.
-    WORKFLOW_COPILOT_EVAL_LLM_OVERRIDES_ORGANIZATION_IDS: list[str] = []
-    WORKFLOW_COPILOT_EVAL_COST_ENABLED: bool = False
-    WORKFLOW_COPILOT_EVAL_COST_ORGANIZATION_IDS: list[str] = []
+    EMBER_EVAL_LLM_OVERRIDES_ORGANIZATION_IDS: list[str] = Field(
+        default=[],
+        validation_alias=AliasChoices(
+            "EMBER_EVAL_LLM_OVERRIDES_ORGANIZATION_IDS", "WORKFLOW_COPILOT_EVAL_LLM_OVERRIDES_ORGANIZATION_IDS"
+        ),
+    )
+    EMBER_EVAL_COST_ENABLED: bool = Field(
+        default=False, validation_alias=AliasChoices("EMBER_EVAL_COST_ENABLED", "WORKFLOW_COPILOT_EVAL_COST_ENABLED")
+    )
+    EMBER_EVAL_COST_ORGANIZATION_IDS: list[str] = Field(
+        default=[],
+        validation_alias=AliasChoices(
+            "EMBER_EVAL_COST_ORGANIZATION_IDS", "WORKFLOW_COPILOT_EVAL_COST_ORGANIZATION_IDS"
+        ),
+    )
     # Cloud-image local-development escape hatch: run a copilot block test run in the API process when
     # sandbox dispatch is unavailable, instead of failing closed. Grants nothing on its own -- see
     # developer_checkout_opted_into_inline_copilot_code for the conditions it is ANDed with.
-    COPILOT_ALLOW_INLINE_CODE_EXECUTION: bool = False
+    EMBER_ALLOW_INLINE_CODE_EXECUTION: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("EMBER_ALLOW_INLINE_CODE_EXECUTION", "COPILOT_ALLOW_INLINE_CODE_EXECUTION"),
+    )
     RUN_HEARTBEAT_TIMEOUT_MINUTES: int = 30
     PORT: int = 8000
     # uvicorn answers 503 without dispatching to ASGI once *either* open connections or in-flight
@@ -534,10 +631,18 @@ class Settings(BaseSettings):
     SCRIPT_GENERATION_LLM_KEY: str | None = None
     SCRIPT_REVIEWER_LLM_KEY: str | None = None
     ADAPTIVE_SCRIPT_GEN_LLM_KEY: str | None = None
-    WORKFLOW_COPILOT_LLM_KEY: str | None = None
-    WORKFLOW_COPILOT_AGENT_LLM_KEY: str | None = None
-    WORKFLOW_COPILOT_FAST_LLM_KEY: str | None = None
-    WORKFLOW_COPILOT_LITE_LLM_KEY: str | None = None
+    EMBER_LLM_KEY: str | None = Field(
+        default=None, validation_alias=AliasChoices("EMBER_LLM_KEY", "WORKFLOW_COPILOT_LLM_KEY")
+    )
+    EMBER_AGENT_LLM_KEY: str | None = Field(
+        default=None, validation_alias=AliasChoices("EMBER_AGENT_LLM_KEY", "WORKFLOW_COPILOT_AGENT_LLM_KEY")
+    )
+    EMBER_FAST_LLM_KEY: str | None = Field(
+        default=None, validation_alias=AliasChoices("EMBER_FAST_LLM_KEY", "WORKFLOW_COPILOT_FAST_LLM_KEY")
+    )
+    EMBER_LITE_LLM_KEY: str | None = Field(
+        default=None, validation_alias=AliasChoices("EMBER_LITE_LLM_KEY", "WORKFLOW_COPILOT_LITE_LLM_KEY")
+    )
     # COMMON
     LLM_CONFIG_TIMEOUT: int = 300
     # The client-side timeout is a per-read gap applied per SDK attempt, so a provider that drips
@@ -1064,10 +1169,16 @@ class Settings(BaseSettings):
     WORKFLOW_RUN_GROUPS_SUBMIT_ENABLED: bool = True
     """Accept new serial workflow run groups. Turning it off stops submission only; reads, cancels and
     dispatch of already-submitted groups continue."""
-    COPILOT_ACCOUNT_GROUP_SUBMIT_ENABLED: bool = True
+    EMBER_ACCOUNT_GROUP_SUBMIT_ENABLED: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("EMBER_ACCOUNT_GROUP_SUBMIT_ENABLED", "COPILOT_ACCOUNT_GROUP_SUBMIT_ENABLED"),
+    )
     """Offer Copilot's run_workflow_for_accounts, run_workflow_for_inputs and run_saved_workflow tools. Turning it off
     keeps status, cancel and receipts."""
-    COPILOT_CREDENTIAL_DELETE_ENABLED: bool = True
+    EMBER_CREDENTIAL_DELETE_ENABLED: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("EMBER_CREDENTIAL_DELETE_ENABLED", "COPILOT_CREDENTIAL_DELETE_ENABLED"),
+    )
     """Offer Copilot's delete_saved_credentials card. Turning it off hides the tool and refuses confirmations."""
 
     # OpenTelemetry Settings

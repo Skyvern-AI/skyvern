@@ -1022,8 +1022,9 @@ def _turn_context_trace_fields(packet: TurnContextPacket | None) -> dict[str, st
 
 
 def _transcript_anchor_disabled() -> bool:
-    """Test-isolation knob: COPILOT_DISABLE_TRANSCRIPT_ANCHOR (1/true/yes)."""
-    return os.getenv("COPILOT_DISABLE_TRANSCRIPT_ANCHOR", "").strip().lower() in {"1", "true", "yes"}
+    """Test-isolation knob: EMBER_DISABLE_TRANSCRIPT_ANCHOR (1/true/yes)."""
+    value = os.getenv("EMBER_DISABLE_TRANSCRIPT_ANCHOR") or os.getenv("COPILOT_DISABLE_TRANSCRIPT_ANCHOR") or ""
+    return value.strip().lower() in {"1", "true", "yes"}
 
 
 def _transcript_anchor_for_turn(packet: TurnContextPacket | None, chat_history_len: int) -> str:
@@ -4389,7 +4390,7 @@ def _dump_model_attempt_packet(
     tool_call_count: int,
     retry_allowed: bool | None,
 ) -> None:
-    root_value = os.environ.get("COPILOT_DUMP_MODEL_ATTEMPTS")
+    root_value = os.environ.get("EMBER_DUMP_MODEL_ATTEMPTS") or os.environ.get("COPILOT_DUMP_MODEL_ATTEMPTS")
     if not root_value:
         return
     try:
@@ -5191,7 +5192,7 @@ async def run_copilot_agent(
     try:
         # Initialize tracing before opening the turn span so Logfire's OTel provider
         # is installed; otherwise the very first turn lands the parent span on
-        # OTel's no-op ProxyTracer when running locally with COPILOT_TRACING_ENABLED.
+        # OTel's no-op ProxyTracer when running locally with EMBER_TRACING_ENABLED.
         ensure_tracing_initialized()
         with _copilot_turn_span(
             chat_request=chat_request,
