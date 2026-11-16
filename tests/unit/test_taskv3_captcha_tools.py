@@ -15,7 +15,10 @@ from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.taskv3 import captcha_tools, input_dispatch
 from skyvern.webeye.utils import captcha_solver as captcha_solver_module
 from skyvern.webeye.utils.captcha_solver import ChallengeOutcome, ChallengeStatus
-from tests.unit.conftest import OcrRecordingAgentFunction, ScopeRecordingAgentFunction
+from tests.unit.conftest import (
+    OcrRecordingAgentFunction,
+    ScopeRecordingAgentFunction,
+)
 
 _SOLVED = ChallengeOutcome(ChallengeStatus.SOLVED, arm="dom_checkbox")
 _ABSENT = ChallengeOutcome(ChallengeStatus.ABSENT, page_state="clear")
@@ -73,6 +76,66 @@ async def test_solve_captcha_solved_returns_ok(monkeypatch: pytest.MonkeyPatch) 
     result = await tools[0].handler({})
     assert result.status == "ok"
     assert "solved" in result.content.lower()
+    assert captcha_tools._RECAPTCHA_RESPONSE_LIFETIME not in result.content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stalled_lookup", ["count", "token"])
+async def test_solved_captcha_returns_when_response_probe_stalls(
+    monkeypatch: pytest.MonkeyPatch, stalled_lookup: str
+) -> None:
+    async def never_returns(*args: Any) -> bool:
+        await asyncio.Event().wait()
+        return False
+
+    monkeypatch.setattr(captcha_tools, "_RECAPTCHA_RESPONSE_PROBE_TIMEOUT_SECONDS", 0.01, raising=False)
+    monkeypatch.setattr(captcha_tools, "solve_challenge", AsyncMock(return_value=_SOLVED))
+    monkeypatch.setattr(
+        captcha_tools,
+        "_recaptcha_token_populated",
+        never_returns if stalled_lookup == "token" else AsyncMock(return_value=True),
+    )
+    count = never_returns if stalled_lookup == "count" else AsyncMock(return_value=0)
+    page = SimpleNamespace(locator=lambda selector: SimpleNamespace(count=count))
+    tools, _ = captcha_tools.build_captcha_tools(_task(), _provider(page), organization_id="o_1")
+    with capture_logs() as logs:
+        async with asyncio.timeout(0.5):
+            result = await tools[0].handler({})
+
+    assert (result.status, result.ok_class) == ("ok", "solved")
+    assert captcha_tools._RECAPTCHA_RESPONSE_LIFETIME not in result.content
+    [outcome] = [line for line in logs if line["event"] == "taskv3 captcha solve outcome"]
+    assert outcome["recaptcha_response_present"] is None
+
+
+@pytest.mark.asyncio
+async def test_response_probe_propagates_cancellation() -> None:
+    started = asyncio.Event()
+
+    async def count() -> int:
+        started.set()
+        await asyncio.Event().wait()
+        return 0
+
+    page = SimpleNamespace(locator=lambda selector: SimpleNamespace(count=count))
+    async with asyncio.timeout(0.5):
+        probe = asyncio.create_task(captcha_tools._recaptcha_response_present(page))
+        await started.wait()
+        probe.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await probe
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("hcaptcha", "response", "expected"), [(False, True, True), (False, False, False), (True, True, None)]
+)
+async def test_response_probe_preserves_ordinary_results(
+    monkeypatch: pytest.MonkeyPatch, hcaptcha: bool, response: bool, expected: bool | None
+) -> None:
+    monkeypatch.setattr(captcha_tools, "_recaptcha_token_populated", AsyncMock(return_value=response))
+    page = SimpleNamespace(locator=lambda selector: SimpleNamespace(count=AsyncMock(return_value=int(hcaptcha))))
+    assert await captcha_tools._recaptcha_response_present(page) is expected
 
 
 @pytest.mark.asyncio

@@ -64,7 +64,7 @@ from skyvern.forge.sdk.workflow.models.credential_release import (
     CredentialReleaseGuard,
 )
 from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter
-from skyvern.forge.taskv3 import input_dispatch
+from skyvern.forge.taskv3 import captcha_tools, input_dispatch
 from skyvern.forge.taskv3.answer_basis_audit import RecordedAnswer, apply_answer_basis_audit
 from skyvern.forge.taskv3.auth_tools import VerificationState
 from skyvern.forge.taskv3.code_surface import (
@@ -130,6 +130,7 @@ from skyvern.forge.taskv3.tools import (
 )
 from skyvern.webeye.actions.handler import get_actual_value_of_parameter_if_secret_with_task
 from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
+from skyvern.webeye.utils.captcha_solver import ChallengeOutcome, ChallengeStatus
 from tests.unit.conftest import CARD_SECRET_RUN_ID
 from tests.unit.copilot_test_helpers import page_with_unprobeable_vendor_embedder
 from tests.unit.scoped_asyncio import ScopedAsyncio
@@ -1548,6 +1549,35 @@ async def test_filled_state_probe_counts_an_attached_file_input(tmp_path: Any) -
         assert await _count_filled_fields(page) >= 1
         await page.fill("#name", "John Doe")
         assert await _count_filled_fields(page) >= 2
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_shows_whether_a_file_input_still_holds_its_file(tmp_path: Any) -> None:
+    # file_upload tells the model observe lists an input holding a file with its value and an emptied one without,
+    # hidden native inputs included: that is how it sees a form re-rendered after a rejected submit lost the file.
+    cv = tmp_path / "cv.pdf"
+    cv.write_bytes(b"%PDF-1.4 cv")
+    html = (
+        '<form id="f"><label for="cv">Resume</label><input type="file" id="cv">'
+        '<label for="cover" style="display:inline-block;width:120px;height:24px">Cover letter</label>'
+        '<input type="file" id="cover" style="position:absolute;width:0;height:0;opacity:0"></form>'
+    )
+
+    def file_line(digest: str, label: str) -> str:
+        return next(line for line in digest.splitlines() if "input/file" in line and f"'{label}'" in line)
+
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        await page.set_input_files("#cv", str(cv))
+        await page.set_input_files("#cover", str(cv))
+        held = (await _tool(tools, "observe").handler({})).content
+        await page.evaluate("() => { const form = document.getElementById('f'); form.outerHTML = form.outerHTML; }")
+        emptied = (await _tool(tools, "observe").handler({})).content
+    assert "hidden-native" in file_line(held, "Cover letter"), held
+    for label in ("Resume", "Cover letter"):
+        assert "cv.pdf" in file_line(held, label), held
+        assert "value=" not in file_line(emptied, label), emptied
 
 
 def _readiness_tools(
@@ -53746,3 +53776,82 @@ async def test_a_page_is_freed_after_a_cdp_probe_and_recorded_frame_work() -> No
     gc.collect()
 
     assert released() is None
+
+
+def _captcha_task() -> SimpleNamespace:
+    return SimpleNamespace(
+        task_id="tsk_1",
+        workflow_run_id="wr_1",
+        browser_session_id="bs_1",
+        error_code_mapping=None,
+        started_at=None,
+        created_at=None,
+    )
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("widget", "response", "present"),
+    [
+        ('<div class="g-recaptcha" data-sitekey="k"></div>', "03AFcWeA_issued_response", True),
+        ('<div class="g-recaptcha" data-sitekey="k"></div>', "", False),
+        # hCaptcha fills the same legacy field under its own token rules, so the reCAPTCHA lifetime is not claimed.
+        ('<div class="h-captcha" data-sitekey="k"></div>', "P1_issued_passcode", None),
+    ],
+)
+async def test_a_solve_states_the_recaptcha_response_lifetime_only_when_the_page_holds_one(
+    monkeypatch: pytest.MonkeyPatch, widget: str, response: str, present: bool | None
+) -> None:
+    # Field presence is observable; issuance time and server verification are not.
+    monkeypatch.setattr(
+        captcha_tools,
+        "solve_challenge",
+        AsyncMock(return_value=ChallengeOutcome(ChallengeStatus.SOLVED, arm="dom_checkbox")),
+    )
+    async with _page_context() as context:
+        page = await context.new_page()
+        await page.set_content(
+            f'<form>{widget}<textarea name="g-recaptcha-response" style="display:none">{response}</textarea></form>'
+        )
+        tools, _ = captcha_tools.build_captcha_tools(_captcha_task(), _fixed_page_provider(page), organization_id="o_1")
+        with capture_logs() as logs:
+            result = await tools[0].handler({})
+
+    assert (result.status, result.ok_class) == ("ok", "solved")
+    [line] = [e for e in logs if e["event"] == "taskv3 captcha solve outcome"]
+    assert line["recaptcha_response_present"] is present
+    assert (captcha_tools._RECAPTCHA_RESPONSE_LIFETIME in result.content) is bool(present)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("client_blocked", [False, True])
+async def test_a_nonempty_response_does_not_establish_freshness_or_require_another_solve(
+    monkeypatch: pytest.MonkeyPatch, client_blocked: bool
+) -> None:
+    monkeypatch.setattr(
+        captcha_tools,
+        "solve_challenge",
+        AsyncMock(return_value=ChallengeOutcome(ChallengeStatus.SOLVED, arm="dom_checkbox")),
+    )
+    async with _page_context() as context:
+        page = await context.new_page()
+        await page.set_content(
+            '<form><input required><textarea name="g-recaptcha-response" style="display:none" '
+            'data-issued-at="0">stale-response</textarea><button>Submit</button></form>'
+        )
+        requests: list[str] = []
+        page.on("request", lambda request: requests.append(request.method))
+        if client_blocked:
+            await page.locator("button").click()
+            assert not await page.locator("input").evaluate("el => el.validity.valid")
+        tools, _ = captcha_tools.build_captcha_tools(_captcha_task(), _fixed_page_provider(page), organization_id="o_1")
+        result = await tools[0].handler({})
+
+        assert requests == []
+        assert await page.locator("textarea").input_value() == "stale-response"
+        assert (result.status, result.ok_class) == ("ok", "solved")
+        assert "does not establish" in result.content
+        assert all(fact in result.content for fact in ("issuance time", "freshness", "consumption", "site acceptance"))
+        assert "needs a new solve first" not in result.content
