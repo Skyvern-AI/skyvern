@@ -337,10 +337,11 @@ class Settings(BaseSettings):
     EMBER_CODE_BLOCK_MODE: bool = Field(
         default=False, validation_alias=AliasChoices("EMBER_CODE_BLOCK_MODE", "WORKFLOW_COPILOT_CODE_BLOCK_MODE")
     )
-    # Offer a Copilot test run's agent steps only the accounts the chat approved. Turn on for every worker fleet
-    # before any API (and off in the reverse order): a worker that is off offers every account when a record is lost.
+    # Offer a Copilot test run's agent steps only the accounts the chat approved. Turn off for every API before any
+    # worker fleet (and on in the reverse order): a worker that is off offers every account when a record is lost.
+    # Workers need the API's shared cache (ENABLE_REDIS_CACHE), or Copilot test runs get no account.
     EMBER_NARROW_AGENT_STEP_ACCOUNTS: bool = Field(
-        default=False,
+        default=True,
         validation_alias=AliasChoices("EMBER_NARROW_AGENT_STEP_ACCOUNTS", "COPILOT_NARROW_AGENT_STEP_ACCOUNTS"),
     )
     EMBER_QA_TOKEN_BUDGET: int | None = Field(
