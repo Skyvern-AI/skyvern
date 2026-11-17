@@ -79,8 +79,8 @@ Each connected card lists its accounts. From there you can:
 
 - **Add another account**: click **Add another Gmail account** (or the matching name) to connect a second inbox or Google account.
 - **Rename** or **Disconnect**: open the **...** menu on the account row. The name you set is what agent blocks show in their account picker.
-- **Turn on reading or sending** (Gmail): the account row shows **Read inbox** and **Send email**. Click the one that isn't on yet and approve the extra permission. Sending needs the account's address, so an older connection may ask you to reconnect first.
-- **Reconnect** (Google only): if the card shows **Needs reconnect**, the authorization expired or you didn't approve every permission. Click **Reconnect** and approve again. Agents that use the account resume without edits.
+- **Turn on reading or sending** (Gmail): the account row shows **Read inbox** and **Send email**. Click the one that isn't on yet and approve the extra permission. Sending needs the account's address, so a connection with no Google account on record asks you to confirm the account in **Set Google account?** first.
+- **Reconnect** (Google only): if the card shows **Needs reconnect**, the authorization expired or you didn't approve every permission. Click **Reconnect** and sign in with the same account. Skyvern asks Google for the permissions the connection already has, plus any it is missing, and keeps the connection itself, so agents that use the account resume without edits. Sign in with a different account, or leave a permission unapproved, and the previous connection is left unchanged. A connection with no Google account on record asks **Set Google account?** first, and records the account you then sign in with as the one agents use.
 
 With role-based access control on, these controls follow the same grants. Without them, you see the account list without **Add another account**, the **...** menu or the Sheets and Drive **Reconnect** button, and Gmail's **Read inbox**, **Send email** and **Reconnect** buttons are disabled.
 
