@@ -2582,19 +2582,155 @@ async def test_the_target_action_reserve_is_bounded() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_multi_action_block_gets_no_target_action_reserve() -> None:
+async def test_a_download_action_block_lands_its_click_after_hovers_and_gets_no_round_after_it() -> None:
+    # A block that completes on a download has no judge and no completion offer, but its cap of 1 is for its click:
+    # a hover the goal asks for commits nothing, so it must not leave that click refused.
     hovers: list[tuple[str, dict[str, Any]]] = []
+    waits: list[tuple[str, dict[str, Any]]] = []
     clicks: list[dict[str, Any]] = []
-    script = [[("hover", {})], [("click", {})], [("click", {})]]
+    script = [
+        [("hover", {})],
+        [("wait", {})],
+        [("hover", {})],
+        [("click", {})],
+        [("finish", {"status": "completed", "reason": "clicked the export link"})],
+    ]
     outcome, _ = await _run(
         script,
-        [_recording_tool("hover", hovers, billable=True), _flaky_click(clicks, fail_first=0), make_finish_tool()],
+        [
+            _recording_tool("hover", hovers, billable=True),
+            _recording_tool("wait", waits),
+            _flaky_click(clicks, fail_first=0),
+            make_finish_tool(),
+        ],
         max_action_steps=1,
         target_action_reserve=ACTION_BLOCK_TARGET_ACTION_RESERVE,
+        completes_on_download=True,
+    )
+
+    assert outcome.status == "completed"
+    assert len(hovers) == 2
+    assert len(clicks) == 1
+
+    # A second click could start a second download: after a click that landed the reserve refuses.
+    hovers = []
+    clicks = []
+    script = [[("hover", {})], [("click", {})], [("click", {})], [("click", {})]]
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            script,
+            [_recording_tool("hover", hovers, billable=True), _flaky_click(clicks, fail_first=0), make_finish_tool()],
+            max_action_steps=1,
+            target_action_reserve=ACTION_BLOCK_TARGET_ACTION_RESERVE,
+            completes_on_download=True,
+        )
+
+    assert outcome.status == "budget_exhausted"
+    assert len(clicks) == 1
+    rounds = [(e["granted"], e["reason"]) for e in logs if e.get("event") == TARGET_ACTION_ROUND_EVENT]
+    assert rounds[0] == (True, "nothing_committed")
+    assert (True, "nothing_committed") not in rounds[1:]
+    assert all(not granted for granted, _ in rounds[1:])
+
+    # A click that opened a menu and started a download landed: the menu can stay open, so no round may click again.
+    clicks = []
+    script = [[("click", {})], [("click", {})], [("click", {})]]
+    outcome, _ = await _run(
+        script,
+        [_flaky_click(clicks, fail_first=0, landed={"menu_note": "listed", "download_new": True}), make_finish_tool()],
+        max_action_steps=1,
+        target_action_reserve=ACTION_BLOCK_TARGET_ACTION_RESERVE,
+        completes_on_download=True,
     )
 
     assert outcome.status == "budget_exhausted"
-    assert clicks == []
+    assert len(clicks) == 1
+
+    # A click that failed after it was dispatched committed nothing but may have started the download; with no
+    # judge, may_have_landed alone refuses the round.
+    dispatched: list[tuple[str, dict[str, Any]]] = []
+    script = [[("click", {})], [("click", {})], [("click", {})]]
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            script,
+            [
+                _erroring_tool("click", dispatched, billable=True, error_data={CLICK_DISPATCHED_DATA_KEY: True}),
+                make_finish_tool(),
+            ],
+            max_action_steps=1,
+            target_action_reserve=ACTION_BLOCK_TARGET_ACTION_RESERVE,
+            completes_on_download=True,
+        )
+
+    assert outcome.status == "budget_exhausted"
+    assert len(dispatched) == 1
+    [decision] = [entry for entry in logs if entry.get("event") == TARGET_ACTION_ROUND_EVENT]
+    assert (decision["granted"], decision["reason"]) == (False, "may_have_landed")
+
+    # A file that reached the block ends its rounds, ok or failed, billable or not: a failed hover that reported one.
+    hovers = []
+    clicks = []
+    script = [[("hover", {})], [("click", {})], [("click", {})]]
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            script,
+            [
+                _erroring_tool("hover", hovers, billable=True, error_data={"download_new": True}),
+                _flaky_click(clicks, fail_first=0),
+                make_finish_tool(),
+            ],
+            max_action_steps=1,
+            target_action_reserve=ACTION_BLOCK_TARGET_ACTION_RESERVE,
+            completes_on_download=True,
+        )
+
+    assert outcome.status == "budget_exhausted"
+    assert (len(hovers), len(clicks)) == (1, 0)
+    [decision] = [entry for entry in logs if entry.get("event") == TARGET_ACTION_ROUND_EVENT]
+    assert (decision["granted"], decision["reason"]) == (False, "may_have_landed")
+
+    # A wait, which is not billable, that reported the file the menu click started.
+    waits = []
+    clicks = []
+    script = [[("click", {})], [("wait", {})], [("click", {})], [("click", {})]]
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            script,
+            [
+                _flaky_click(clicks, fail_first=0, landed={"menu_note": "listed"}),
+                _recording_tool("wait", waits, ok_data={"download_new": True}),
+                make_finish_tool(),
+            ],
+            max_action_steps=1,
+            target_action_reserve=ACTION_BLOCK_TARGET_ACTION_RESERVE,
+            completes_on_download=True,
+        )
+
+    assert outcome.status == "budget_exhausted"
+    assert len(clicks) == 1
+    [decision] = [entry for entry in logs if entry.get("event") == TARGET_ACTION_ROUND_EVENT]
+    assert (decision["granted"], decision["reason"]) == (False, "may_have_landed")
+
+    # A plain block keeps main's rule: a stray file on a hover or a menu click does not refuse its click.
+    hovers = []
+    clicks = []
+    script = [[("hover", {})], [("click", {})], [("click", {})], [("click", {})]]
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            script,
+            [
+                _recording_tool("hover", hovers, billable=True, ok_data={"download_new": True}),
+                _flaky_click(clicks, fail_first=0, landed={"menu_note": "listed", "download_new": True}),
+                make_finish_tool(),
+            ],
+            single_action_block=True,
+            max_action_steps=1,
+            target_action_reserve=ACTION_BLOCK_TARGET_ACTION_RESERVE,
+        )
+
+    assert len(clicks) == 2
+    rounds = [(e["granted"], e["reason"]) for e in logs if e.get("event") == TARGET_ACTION_ROUND_EVENT]
+    assert rounds == [(True, "nothing_committed"), (True, "nothing_committed")]
 
 
 @pytest.mark.asyncio

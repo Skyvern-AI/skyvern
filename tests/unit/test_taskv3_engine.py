@@ -379,10 +379,12 @@ async def test_engine_forwards_single_action_block_to_the_loop(
         goal="x",
         single_action_block=single_action_block,
         block_completion_judge=_achieving_judge([]),
+        download_settle=None if single_action_block else _no_download_pending,
     )
 
     assert captured["single_action_block"] is single_action_block
     assert (captured["block_completion_check"] is not None) is single_action_block
+    assert captured["completes_on_download"] is (not single_action_block)
 
 
 def _achieving_judge(prompts: list[str]):
@@ -1853,6 +1855,7 @@ async def test_application_context_arm_off_leaves_the_run_as_today(monkeypatch: 
 async def test_a_declared_yes_delivers_the_defaults_once_after_the_first_reply(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_authorized_agent_default", lambda: "AGENT TEXT")
     outcome, caller, terminal, _ = await _run_with_application_context_arm(
         monkeypatch,
         "treatment",
@@ -1864,7 +1867,10 @@ async def test_a_declared_yes_delivers_the_defaults_once_after_the_first_reply(
     )
     assert "declare_application_context" in _sent_tool_names(caller)
     users = _user_texts(outcome)
-    assert users[0].endswith("\n\nTIER ONE")
+    # First, so the Tier 1 legal-standing text after it outranks it as "anything above".
+    assert users[0].endswith("\n\nAGENT TEXT\n\nTIER ONE")
+    assert sum(text.count("AGENT TEXT") for text in users) == 1
+    assert terminal["authorized_agent_default_rendered"] is True
     assert users.count("AGE TEXT\n\nSIX TEXT") == 1
     assert terminal["application_context"] == "yes_declared"
     assert terminal["application_defaults_delivered"] is True
@@ -2155,15 +2161,24 @@ async def test_operator_defaults_ride_the_task_message_only_and_leave_the_system
 ) -> None:
     Hook = tuple[str | None, str] | None
 
-    async def run(age: Hook, application: Hook) -> tuple[str, str, dict[str, Any]]:
+    async def run(
+        age: Hook,
+        application: Hook,
+        agent: str | None = None,
+        block_type: BlockType | None = None,
+        page_free: bool = False,
+    ) -> tuple[str, str, dict[str, Any]]:
         monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_age_default", lambda parameters: age)
         monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_application_defaults", lambda parameters: application)
+        monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_authorized_agent_default", lambda: agent)
         with capture_logs() as logs:
             outcome = await run_task_v3_agent_loop(
                 page_provider=_fixed_page_provider(_FakePage()),
                 llm_caller=_ScriptedCaller([[("finish", {"status": "completed", "reason": "ok"})]]),
                 goal="Apply.",
                 parameters={"resume": "text"},
+                block_type=block_type,
+                page_free=page_free,
             )
         by_role = {m["role"]: m["content"] for m in outcome.messages if m.get("role") in ("system", "user")}
         terminal = next(e for e in logs if e.get("event") == "taskv3 engine loop finished")
@@ -2188,6 +2203,17 @@ async def test_operator_defaults_ride_the_task_message_only_and_leave_the_system
     # Each default keeps its own field, so one entry's outcome read never counts the other's renders.
     assert (both_log["age_default_rendered"], both_log["application_defaults_rendered"]) == (False, True)
     assert (age_log["application_defaults_rendered"], age_log["application_defaults_reason"]) == (False, None)
+
+    # The authorized-agent default renders on every page-aware run except extraction and validation blocks, first.
+    agent_system, agent_user, agent_log = await run(("AGE DEFAULT TEXT", "rendered"), None, "AGENT TEXT")
+    assert agent_system == base_system
+    assert agent_user == base_user + "\n\nAGENT TEXT\n\nAGE DEFAULT TEXT"
+    assert agent_log["authorized_agent_default_rendered"] is True
+    assert base_log["authorized_agent_default_rendered"] is False
+    for block_type, page_free in ((BlockType.EXTRACTION, False), (BlockType.VALIDATION, False), (None, True)):
+        _, user, log = await run(None, None, "AGENT TEXT", block_type, page_free)
+        assert "AGENT TEXT" not in user
+        assert log["authorized_agent_default_rendered"] is False
 
 
 @pytest.mark.asyncio
