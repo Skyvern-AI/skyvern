@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from playwright.async_api import Error as SdkError
 
 from skyvern.cli.core.browser_ops import (
     do_network_request_detail,
@@ -26,8 +27,14 @@ from skyvern.cli.mcp_tools.inspection import (
     skyvern_network_route,
     skyvern_network_unroute,
 )
+from skyvern.webeye import http_interception as interception
+from skyvern.webeye.cdp_errors import CdpError, CdpProtocolError, CdpTimeoutError
+from skyvern.webeye.cdp_fetch import Request, Route, Settlement
+from skyvern.webeye.http_interception import _SdkSession, http_interception
+from tests.unit._mcp_browser_fakes import make_cdp_page as _make_cdp_page
 from tests.unit._mcp_browser_fakes import make_page as _make_page
 from tests.unit._mcp_browser_fakes import make_session_state as _make_state
+from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
 def _patch(monkeypatch: pytest.MonkeyPatch, state: SessionState) -> None:
@@ -347,20 +354,75 @@ class TestDoNetworkRequestDetail:
 
 class TestDoNetworkRoute:
     @pytest.mark.asyncio
-    async def test_abort_route(self) -> None:
+    @pytest.mark.parametrize(
+        ("error", "expected_error", "settlement"),
+        [(None, None, None)]
+        + [
+            (
+                SdkError("CDPSession.send: Protocol error (Fetch.fulfillRequest): Invalid InterceptionId."),
+                None,
+                Settlement.CLOSED,
+            ),
+            (
+                SdkError("CDPSession.send: Protocol error (Fetch.fulfillRequest): Session with given id not found."),
+                None,
+                Settlement.CLOSED,
+            ),
+            (
+                SdkError("CDPSession.send: Protocol error (Fetch.fulfillRequest): Invalid parameters"),
+                CdpProtocolError,
+                Settlement.PENDING,
+            ),
+            (SdkError("CDPSession.send: Invalid InterceptionId."), CdpError, Settlement.UNKNOWN),
+            (
+                SdkError("CDPSession.send: Protocol error (Fetch.failRequest): Invalid InterceptionId."),
+                CdpError,
+                Settlement.UNKNOWN,
+            ),
+            (RuntimeError("acknowledgment lost"), CdpError, Settlement.UNKNOWN),
+            (TimeoutError(), CdpTimeoutError, Settlement.UNKNOWN),
+            (asyncio.CancelledError(), asyncio.CancelledError, Settlement.UNKNOWN),
+        ],
+    )
+    async def test_abort_route(self, error, expected_error, settlement) -> None:
+        if error is not None:
+            await _case_sdk_terminal_rejection_preserves_settlement_ownership(error, expected_error, settlement)
+            return
         state = _make_state()
-        raw_page = AsyncMock()
+        raw_page = _make_cdp_page()
         result = await do_network_route(raw_page, state, url_pattern="**/api/*", action="abort")
         assert result.url_pattern == "**/api/*"
         assert result.action == "abort"
         assert "**/api/*" in result.active_routes
         assert "**/api/*" in state.active_routes.get(id(raw_page), set())
-        raw_page.route.assert_awaited_once()
+        raw_page.route.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_mock_route(self) -> None:
+    @pytest.mark.parametrize(
+        "cache_case",
+        [
+            None,
+            "enable_rejected",
+            "enable_unknown",
+            "enable_cancelled",
+            "network_rejected",
+            "network_unknown",
+            "network_cancelled",
+            "disable_rejected",
+            "restore_rejected",
+            "cancel_close",
+            "restore_and_detach_timeout",
+            "restore_protocol_detach_timeout",
+            "detach_timeout",
+            "cancel_restore_detach_timeout",
+        ],
+    )
+    async def test_mock_route(self, cache_case, monkeypatch) -> None:
+        if cache_case is not None:
+            await _case_sdk_cache_lifecycle(cache_case, monkeypatch)
+            return
         state = _make_state()
-        raw_page = AsyncMock()
+        raw_page = _make_cdp_page()
         result = await do_network_route(
             raw_page,
             state,
@@ -376,23 +438,24 @@ class TestDoNetworkRoute:
     @pytest.mark.asyncio
     async def test_re_register_unroutes_first(self) -> None:
         state = _make_state()
-        raw_page = AsyncMock()
+        raw_page = _make_cdp_page()
         state.active_routes.setdefault(id(raw_page), set()).add("**/api/*")
         await do_network_route(raw_page, state, url_pattern="**/api/*", action="abort")
-        raw_page.unroute.assert_awaited_once_with("**/api/*")
-        raw_page.route.assert_awaited_once()
+        assert state.active_routes[id(raw_page)] == {"**/api/*"}
+        raw_page.unroute.assert_not_awaited()
+        raw_page.route.assert_not_awaited()
 
 
 class TestDoNetworkUnroute:
     @pytest.mark.asyncio
     async def test_removes_active_route(self) -> None:
         state = _make_state()
-        raw_page = AsyncMock()
+        raw_page = _make_cdp_page()
         state.active_routes.setdefault(id(raw_page), set()).add("**/api/*")
         result = await do_network_unroute(raw_page, state, "**/api/*")
         assert result.removed is True
         assert "**/api/*" not in state.active_routes.get(id(raw_page), set())
-        raw_page.unroute.assert_awaited_once_with("**/api/*")
+        raw_page.unroute.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_noop_for_unknown_pattern(self) -> None:
@@ -401,6 +464,186 @@ class TestDoNetworkUnroute:
         result = await do_network_unroute(raw_page, state, "**/nope/*")
         assert result.removed is False
         raw_page.unroute.assert_not_awaited()
+
+
+async def _case_sdk_cache_lifecycle(case: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    page = _make_cdp_page()
+    session = await page.context.new_cdp_session(page)
+    commands = []
+    cache = {"disabled": False, "detached": False}
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def command(method, params):
+        commands.append((method, dict(params or {})))
+        if method == "Network.enable":
+            if case == "network_rejected":
+                raise SdkError(f"CDPSession.send: Protocol error ({method}): Invalid parameters")
+            if case == "network_unknown":
+                raise RuntimeError("synthetic acknowledgment loss")
+            if case == "network_cancelled":
+                raise asyncio.CancelledError
+        if method == "Network.setCacheDisabled":
+            if not params["cacheDisabled"] and case == "restore_rejected":
+                raise SdkError(f"CDPSession.send: Protocol error ({method}): Invalid parameters")
+            if not params["cacheDisabled"] and case == "cancel_close":
+                entered.set()
+                await release.wait()
+            cache["disabled"] = params["cacheDisabled"]
+        if method == "Fetch.enable":
+            if case == "enable_rejected":
+                raise SdkError(f"CDPSession.send: Protocol error ({method}): Invalid parameters")
+            if case == "enable_unknown":
+                raise RuntimeError("synthetic acknowledgment loss")
+            if case == "enable_cancelled":
+                raise asyncio.CancelledError
+        if method == "Fetch.disable" and case == "disable_rejected":
+            raise SdkError(f"CDPSession.send: Protocol error ({method}): Invalid parameters")
+        return {}
+
+    async def detach():
+        cache.update(disabled=False, detached=True)
+
+    session.send.side_effect = command
+    session.detach.side_effect = detach
+    adapter = _SdkSession(session, page)
+    closing = None
+    if case.endswith("_timeout"):
+        second = _make_cdp_page()
+        second.context = page.context
+        completed = []
+        next_session = MagicMock(send=AsyncMock(return_value={}), detach=AsyncMock())
+
+        async def detach_second():
+            completed.append(second)
+
+        next_session.detach.side_effect = detach_second
+        page.context.new_cdp_session.side_effect = [session, next_session]
+        monkeypatch.setattr(interception, "asyncio", ScopedAsyncio(timeout=lambda _: asyncio.timeout(0.02)))
+        failure = CdpProtocolError("Network.setCacheDisabled", -32602, "restoration rejected")
+
+        async def stalled_command(method, params):
+            if method == "Network.setCacheDisabled" and not params["cacheDisabled"]:
+                entered.set()
+                if case == "restore_protocol_detach_timeout":
+                    raise failure
+                if case != "detach_timeout":
+                    await release.wait()
+            return {}
+
+        async def stalled_detach():
+            await release.wait()
+
+        session.send.side_effect = stalled_command
+        session.detach.side_effect = stalled_detach
+        await do_network_route(page, _make_state(), url_pattern="**/first", action="abort")
+        await do_network_route(second, _make_state(), url_pattern="**/second", action="abort")
+        owner = http_interception(page.context)
+        second_binding = owner._pages[second]
+        cancelling = case == "cancel_restore_detach_timeout"
+        closing = asyncio.create_task(owner._pages[page].session.detach() if cancelling else owner.close())
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+            if cancelling:
+                closing.cancel()
+            done, _ = await asyncio.wait([closing], timeout=0.3)
+            assert done, "Expired restoration deadline left detach and the next page pending"
+            result = (await asyncio.gather(closing, return_exceptions=True))[0]
+            if cancelling:
+                assert isinstance(result, asyncio.CancelledError) and closing.cancelled()
+                release.set()
+                await owner.close()
+            elif case == "restore_protocol_detach_timeout":
+                assert result is failure
+            else:
+                assert isinstance(result, (TimeoutError, CdpTimeoutError))
+            assert owner._closed and second not in owner._pages and completed == [second]
+            assert second_binding.session not in owner._router._sessions
+        finally:
+            release.set()
+            await asyncio.wait_for(asyncio.gather(closing, return_exceptions=True), 1)
+        return
+    try:
+        if case.startswith("network_"):
+            expected = {
+                "network_rejected": CdpProtocolError,
+                "network_unknown": CdpError,
+                "network_cancelled": asyncio.CancelledError,
+            }[case]
+            with pytest.raises(expected):
+                await adapter.send("Fetch.enable", {})
+            assert [method for method, _ in commands] == ["Network.enable"]
+            assert not cache["disabled"] and not adapter._cache_disabled
+            return
+        if case == "cancel_close":
+            await do_network_route(page, _make_state(), url_pattern="**/api", action="abort")
+            owner = http_interception(page.context)
+            closing = asyncio.create_task(owner.close())
+            await asyncio.wait_for(entered.wait(), 1)
+            closing.cancel()
+            await asyncio.sleep(0)
+            assert not closing.done() and cache["disabled"] and not cache["detached"]
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await closing
+            assert owner._closed and not owner._pages and not owner._router._sessions
+            assert not cache["disabled"] and cache["detached"]
+            return
+        if case in {"enable_rejected", "enable_unknown", "enable_cancelled"}:
+            expected = {
+                "enable_rejected": CdpProtocolError,
+                "enable_unknown": CdpError,
+                "enable_cancelled": asyncio.CancelledError,
+            }[case]
+            with pytest.raises(expected):
+                await adapter.send("Fetch.enable", {})
+            assert cache["disabled"] == adapter._cache_disabled == (case != "enable_rejected")
+        else:
+            await adapter.send("Fetch.enable", {})
+            assert cache["disabled"] and adapter._cache_disabled
+            if case == "disable_rejected":
+                with pytest.raises(CdpProtocolError):
+                    await adapter.send("Fetch.disable")
+                assert cache["disabled"] and adapter._cache_disabled
+            else:
+                with pytest.raises(CdpProtocolError) as caught:
+                    await adapter.detach()
+                assert caught.value.method == "Network.setCacheDisabled"
+                assert cache["detached"] and not cache["disabled"] and not adapter._cache_disabled
+        methods = [method for method, _ in commands if method.startswith("Fetch.")]
+        assert methods == (["Fetch.enable", "Fetch.disable"] if case == "disable_rejected" else ["Fetch.enable"])
+    finally:
+        release.set()
+        if closing is not None:
+            await asyncio.wait_for(asyncio.gather(closing, return_exceptions=True), 1)
+        if not cache["detached"]:
+            await adapter.detach()
+
+
+async def _case_sdk_terminal_rejection_preserves_settlement_ownership(
+    error: BaseException, expected_error: type[BaseException] | None, settlement: Settlement
+) -> None:
+    page = _make_cdp_page()
+    session = await page.context.new_cdp_session(page)
+    commands = {}
+
+    async def rejected(method, params):
+        request_id = params["requestId"]
+        assert request_id not in commands, "A terminal request was sent twice"
+        commands[request_id] = (method, params["body"])
+        raise error
+
+    session.send.side_effect = rejected
+    route = Route(_SdkSession(session, page), "paused", Request({}))
+    if expected_error is None:
+        await route.fulfill(body="mocked")
+    else:
+        with pytest.raises(expected_error) as caught:
+            await route.fulfill(body="mocked")
+        assert type(caught.value) is expected_error
+    assert route._state is settlement
+    assert route.settled == (settlement is Settlement.CLOSED)
+    assert route.can_settle == (settlement is Settlement.PENDING)
+    assert commands == {"paused": ("Fetch.fulfillRequest", "bW9ja2Vk")}
 
 
 # --- MCP tool: skyvern_network_requests (refactored) ---
@@ -466,7 +709,7 @@ class TestNetworkRouteMCP:
     @pytest.mark.asyncio
     async def test_abort(self, monkeypatch: pytest.MonkeyPatch) -> None:
         state = _make_state()
-        raw = MagicMock()
+        raw = _make_cdp_page()
         raw.on = MagicMock()
         raw.route = AsyncMock()
         raw.unroute = AsyncMock()
@@ -490,7 +733,7 @@ class TestNetworkUnrouteMCP:
     @pytest.mark.asyncio
     async def test_remove(self, monkeypatch: pytest.MonkeyPatch) -> None:
         state = _make_state()
-        raw = MagicMock()
+        raw = _make_cdp_page()
         raw.on = MagicMock()
         raw.route = AsyncMock()
         raw.unroute = AsyncMock()

@@ -20,6 +20,7 @@ from skyvern.cli.core import client as client_mod
 from skyvern.cli.core import copilot_sessions, hosted_driver
 from skyvern.cli.core import result as result_mod
 from skyvern.cli.core import session_manager, session_ops
+from skyvern.cli.core.browser_ops import do_network_route
 from skyvern.cli.core.result import BrowserContext
 from skyvern.cli.core.session_ops import SessionCloseResult, coerce_proxy_location
 from skyvern.cli.mcp_tools import mcp
@@ -35,6 +36,7 @@ from skyvern.library.skyvern_browser import SkyvernBrowser
 from skyvern.library.skyvern_browser_page_ai import SdkSkyvernPageAi
 from skyvern.schemas.runs import GeoTarget, ProxyLocation
 from skyvern.services import hosted_driver_sweep
+from tests.unit._mcp_browser_fakes import make_cdp_page
 
 CAPTCHA_SOLVER_EXTENSION: Extensions = "captcha-solver"
 
@@ -2314,8 +2316,95 @@ async def test_close_current_session_skips_api_close_for_local_session(monkeypat
     assert session_manager.get_current_session().browser is None
 
 
+async def _case_close_current_session_finishes_after_interceptor_failure(
+    monkeypatch: pytest.MonkeyPatch, cancel: bool, browser_fails: bool, second_fails: bool
+) -> None:
+    calls: list[str] = []
+    entered, release = asyncio.Event(), asyncio.Event()
+    owner_error = RuntimeError("auxiliary detach failed")
+    browser_error = RuntimeError("browser shutdown failed")
+    replacements: list[session_manager.SessionState] = []
+    browser = MagicMock()
+    state = session_manager.SessionState(browser=browser, context=BrowserContext(mode="local"))
+    session_manager.set_current_session(state)
+    session_manager.replace_session_ref_map({"e1": {"tag": "button"}})
+    for page in (make_cdp_page(), make_cdp_page()):
+        await do_network_route(page, state, url_pattern="**/api", action="mock", mock_body="held")
+    first, second = tuple(state._http_interceptors)
+    first_binding = next(iter(first._pages.values()))
+    second_binding = next(iter(second._pages.values()))
+    second_detach = second_binding.session.detach
+
+    async def fail_first() -> None:
+        calls.append("first")
+        entered.set()
+        await release.wait()
+        raise owner_error
+
+    async def close_second() -> None:
+        calls.append("second")
+        if second_fails:
+            raise owner_error
+        await second_detach()
+
+    async def close_browser() -> None:
+        calls.append("browser")
+        assert not state.active_routes and not state._http_interceptors
+        if browser_fails:
+            raise browser_error
+
+    async def close_current() -> None:
+        try:
+            await session_manager.close_current_session()
+        finally:
+            replacements.append(session_manager.get_current_session())
+
+    monkeypatch.setattr(first_binding.session, "detach", fail_first)
+    monkeypatch.setattr(second_binding.session, "detach", close_second)
+    browser.close = AsyncMock(side_effect=close_browser)
+    closing = asyncio.create_task(close_current())
+    try:
+        with capture_logs() as logs:
+            await asyncio.wait_for(entered.wait(), 1)
+            if cancel:
+                closing.cancel()
+                await asyncio.sleep(0)
+                closing.cancel()
+                await asyncio.sleep(0)
+                assert not closing.done() and not replacements
+            release.set()
+            (outcome,) = await asyncio.wait_for(asyncio.gather(closing, return_exceptions=True), 1)
+        assert calls == ["first", "second", "browser"]
+        assert not state._http_interceptors and not state.active_routes and not state._observed_refs
+        assert len(replacements) == 1 and replacements[0] is not state and replacements[0].browser is None
+        warnings = [entry for entry in logs if entry["event"] == "Best-effort HTTP interception close failed"]
+        assert len(warnings) == 1 + second_fails and all(entry["exc_info"] for entry in warnings)
+        if cancel:
+            assert isinstance(outcome, asyncio.CancelledError)
+        elif browser_fails:
+            assert outcome is browser_error
+        else:
+            assert outcome is None
+        assert not any(
+            task.get_name() in {"http-interception-close", "browser-session-close"} for task in asyncio.all_tasks()
+        )
+    finally:
+        release.set()
+        if not closing.done():
+            closing.cancel()
+        await asyncio.wait_for(asyncio.gather(closing, return_exceptions=True), 1)
+
+
 @pytest.mark.asyncio
-async def test_close_current_session_still_closes_browser_when_api_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    "auxiliary",
+    [None]
+    + [(False, False, False), (False, False, True), (False, True, False), (True, False, False), (True, True, True)],
+)
+async def test_close_current_session_still_closes_browser_when_api_fails(monkeypatch, auxiliary) -> None:
+    if auxiliary is not None:
+        await _case_close_current_session_finishes_after_interceptor_failure(monkeypatch, *auxiliary)
+        return
     """When do_session_close raises, browser.close() should still run and state should be cleared."""
     browser = MagicMock()
     browser.close = AsyncMock()
