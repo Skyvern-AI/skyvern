@@ -874,9 +874,8 @@ class SkyvernContext:
     vertex_cache_key: str | None = None  # Logical cache key (includes variant + llm key)
     vertex_cache_variant: str | None = None  # Variant identifier used when creating the cache
     prompt_caching_settings: dict[str, bool] | None = None
-    # SKY-9718 Layer 1 — gates apply_lean_recipe in prompt_engine + agent.
-    # PostHog flag ENABLE_LEAN_ELEMENT_TREE, evaluated once per run at scrape time
-    # and read sync from prompt-build sites.
+    # Set by the agent step before it builds its prompt; prompt-build sites read it to apply the lean
+    # element-tree transforms. Paths that never run an agent step keep rendering the full tree.
     enable_lean_element_tree: bool = False
     # PRESERVE_TRANSIENT_UI_CAPTURE experiment arm, resolved per run. Tri-state: True=treatment
     # (suppress a scroll that would dismiss an open transient popup), False=control (shadow-detect

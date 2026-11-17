@@ -97,10 +97,10 @@ def load_prompt_with_elements_tracked(
     *,
     # SKY-9718 Layer 1 — deterministic lean-tree transforms. Each flag toggles
     # one transform independently. Callers decide which to enable (typically by
-    # AND-ing with `skyvern_context.current().enable_lean_element_tree` if they
-    # want the experiment gate). To drop Skyvern internal IDs from the rendered
-    # HTML, callers pass `html_need_skyvern_attrs=False` — that's the existing
-    # `json_to_html` mechanism and stacks on top of any lean flags chosen here.
+    # AND-ing with `skyvern_context.current().enable_lean_element_tree`). To drop
+    # Skyvern internal IDs from the rendered HTML, callers pass
+    # `html_need_skyvern_attrs=False` — that's the existing `json_to_html`
+    # mechanism and stacks on top of any lean flags chosen here.
     lean_compress_long_href: bool = False,
     lean_compress_image_src: bool = False,
     lean_strip_url_query_strings: bool = False,
