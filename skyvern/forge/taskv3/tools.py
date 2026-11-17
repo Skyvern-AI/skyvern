@@ -4237,6 +4237,8 @@ def _shows_omitted_note(count: int) -> str:
 LINK_DESTINATION_MAX = 60
 # Per reading across every frame, framing included; what it leaves off is reported, never silent.
 LINK_DESTINATION_TOTAL_CAP = 1200
+# The same for the in= of same-caption links that only to= tells apart.
+LINK_BOX_TEXT_TOTAL_CAP = 2400
 _LINK_EXTENSION_RE = re.compile(r"\.[a-z0-9]{1,5}$", re.IGNORECASE)
 
 
@@ -10045,16 +10047,20 @@ _OBSERVE_QUALIFIER_PASSES = 4
 
 
 def _disambiguate_digest_bodies(
-    elements: list[dict[str, Any]], bodies: list[str], field: Callable[[str, int], str]
-) -> tuple[list[str], int]:
+    elements: list[dict[str, Any]], bodies: list[str], field: Callable[[str, int], str], keys: list[str]
+) -> tuple[list[str], int, int, int]:
     """Two element lines that render the same bytes are two addresses with nothing to choose between
     them. `field` renders a value exactly as the digest prints it: quoted, clip span included. Append to
     each of a colliding set the shallowest thing the page itself says about where that control sits --
     its own identity, the identity of what encloses it, the heading it is filed under -- that tells the
-    set apart. Returns the bodies and how many lines are still identical to
-    another afterwards, which is what production has to be able to see."""
+    set apart. Lines whose `keys` (each line without a captioned link's to=) still match after that get the
+    text of their own enclosing box (in=) only where each gets a different one. Returns the bodies, how many
+    lines are still identical to another afterwards, which is what production has to be able to see, and how
+    many lines that second pass qualified and how many its budget left off."""
     parsed: list[tuple[list[tuple[str, str]], list[tuple[str, str]], str | None, str | None]] = []
     located: list[tuple[list[str], str | None]] = []
+    boxes: list[str | None] = []
+    holds: list[set[str]] = []
     for e in elements:
         owns: list[tuple[str, str]] = []
         within: list[tuple[str, str]] = []
@@ -10062,6 +10068,8 @@ def _disambiguate_digest_bodies(
         section: str | None = None
         units: list[str] = []
         nth: str | None = None
+        box: str | None = None
+        held: set[str] = set()
         for entry in e.get("placement") or []:
             if not isinstance(entry, (list, tuple)) or len(entry) != 2:
                 continue
@@ -10070,6 +10078,12 @@ def _disambiguate_digest_bodies(
             if kind == _OBSERVE_UNIT_KIND:
                 if value:
                     units.append(value)
+                continue
+            if kind == "in.apart":
+                box = box or value or None
+                continue
+            if kind == "in.holds":
+                held = set(value.split())
                 continue
             if kind == _OBSERVE_NTH_KIND:
                 nth = nth or value or None
@@ -10092,6 +10106,8 @@ def _disambiguate_digest_bodies(
                 section = value
         parsed.append((owns, within, field_label, section))
         located.append((units, nth))
+        boxes.append(box)
+        holds.append(held)
 
     tiers: list[tuple[str, int]] = [("own", i) for i in range(max((len(o) for o, _, _, _ in parsed), default=1) or 1)]
     tiers.append((_OBSERVE_FIELD_KIND, 0))
@@ -10163,8 +10179,32 @@ def _disambiguate_digest_bodies(
                     progressed = True
         if not progressed:
             break
+    # These lines are already apart, so only the text of each link's own box is added, and only when every one
+    # differs: a shared or missing box would be worse than none.
+    apart: dict[str, list[int]] = defaultdict(list)
+    for i, body in enumerate(final):
+        if body == bodies[i]:
+            apart[_observe_line_identity(keys[i])].append(i)
+    qualified, omitted, left = 0, 0, LINK_BOX_TEXT_TOTAL_CAP
+    for ix in apart.values():
+        if len(ix) < 2 or len({_observe_line_identity(bodies[i]) for i in ix}) < len(ix):
+            continue
+        width = OBSERVE_DISPLAY_WIDTHS["qualifier"]
+        # A box that also holds another line of this set is not that link's alone, so the set stays bare.
+        ids = {str(elements[i].get("i")) for i in ix}
+        mine = ((boxes[i], holds[i]) for i in ix)
+        rendered = [f" {_OBSERVE_UNIT_KIND}={field(box, width)}" for box, held in mine if box and not held & ids]
+        if len({_observe_line_identity(r) for r in rendered}) == len(ix):
+            for i, appended in zip(ix, rendered):
+                # As with to=, once one is left off every later one is too, so the note's count is a tail.
+                if omitted or len(appended) > left:
+                    omitted += 1
+                    continue
+                left -= len(appended)
+                final[i] += appended
+                qualified += 1
     counts = Counter(_observe_line_identity(body) for body in final)
-    return final, sum(n for n in counts.values() if n > 1)
+    return final, sum(n for n in counts.values() if n > 1), qualified, omitted
 
 
 OBSERVE_GROUP_TEXT_TOTAL_CAP = 4000
@@ -12771,6 +12811,16 @@ async (__tv3TextArgs) => {
         if (members.length > 1) where.push(['nth', `${members.indexOf(el) + 1} of ${members.length}`]);
         for (const w of where) place.push(w);
       } catch (e) { /* fail open: this control keeps the qualifiers it had */ }
+    } else if (rec.to && rec.label && out.some((o) => o !== rec && o.to && o.label === rec.label)) {
+      try {
+        // Not this link's alone if it holds a control of this caption; the renderer checks captions that print alike.
+        const u = unitsOf(el)[0];
+        const inside = out.filter((o) => o !== rec && Node.prototype.contains.call(u, elOfRec.get(o) || null));
+        if (u && !inside.some((o) => o.label === rec.label)) {
+          place.push(['in.apart', String(unitText.get(u)).slice(0, _RETAIN_WIDTH)]);
+          place.push(['in.holds', inside.filter((o) => o.to).map((o) => o.i).join(' ')]);
+        }
+      } catch (e) { /* fail open: the link is listed without its box text */ }
     }
     if (place.length) rec.placement = place;
   }
@@ -15577,6 +15627,7 @@ def build_browser_tools(
             )
 
         bodies: list[str] = []
+        keys: list[str] = []
         near_suffixes: list[str] = []
 
         def _realm_of(idx: int) -> Any:
@@ -15606,13 +15657,14 @@ def build_browser_tools(
         to_left = LINK_DESTINATION_TOTAL_CAP
         to_omitted = 0
         for _render_idx, e in enumerate(elements):
-            extra = shows_parts.get(_render_idx, "")
+            lead = shows_parts.get(_render_idx, "")
+            to_shown = extra = ""
             if e.get("to") and _link_destination_adds(str(e["to"]), str(e.get("label", ""))):
                 to_part = f" to={_field(e['to'], LINK_DESTINATION_MAX)}"
                 # As with shows=, once one is left off every later one is too, so the note's count is a tail.
                 if not to_omitted and len(to_part) <= to_left:
                     to_left -= len(to_part)
-                    extra += to_part
+                    to_shown = to_part
                 else:
                     to_omitted += 1
             if e.get("value"):
@@ -15702,13 +15754,16 @@ def build_browser_tools(
             # line for a selector that does not exist. `role` is whitelisted at the source; `tag` and
             # `type` are stripped of anything that could end a line or reorder it.
             kind = _observe_kind(e)
-            bodies.append(f"{kind} {_field(e.get('label', ''), OBSERVE_DISPLAY_WIDTHS['label'])}{extra}")
+            head = f"{kind} {_field(e.get('label', ''), OBSERVE_DISPLAY_WIDTHS['label'])}{lead}"
+            bodies.append(f"{head}{to_shown}{extra}")
+            # A text-less link keeps its to= in the key: with no caption, its destination is what names it.
+            keys.append(f"{head}{extra}" if e.get("label") else bodies[-1])
         # Two lines rendering the same bytes are two addresses the model has nothing to choose
         # between, and a form that repeats a section renders one caption many times over. Qualified
         # here rather than at the record build: whether a line is ambiguous is a property of the
         # whole reading, and it is not knowable until every line of it has been rendered.
         unqualified = list(bodies)
-        bodies, _ = _disambiguate_digest_bodies(elements, bodies, _field)
+        bodies, _, qualified_by_destination, in_omitted = _disambiguate_digest_bodies(elements, bodies, _field, keys)
         # An unnamed control's place in its row is printed even when its line is already unique: the icons of one row
         # differ by tag alone (a copy <button>, a trash <div>), and which is which is said by position ("the right icon").
         for index, e in enumerate(elements):
@@ -15752,6 +15807,8 @@ def build_browser_tools(
             lines.append(_shows_omitted_note(shows_omitted))
         if to_omitted:
             lines.append(_link_destination_omitted_note(to_omitted))
+        if in_omitted:
+            lines.append(f"(in= left off {in_omitted} more link(s): this reading's budget for it ran out.)")
         # Counts only, for the per-call log record: every perception change that alters only what
         # this function renders is otherwise invisible to production telemetry.
         frame_census = data.get("frameCensus") or {}
@@ -15784,6 +15841,8 @@ def build_browser_tools(
                 ).values()
                 if n > 1
             ),
+            # Lines given a location because they differed from another only in to=.
+            "qualified_by_destination": qualified_by_destination,
             # SKY-15590. These ride the per-call record so EVERY observe is counted, frame-free
             # ones included: a channel that speaks only when frames exist cannot state a rate.
             # Deliberately not `iframes.total`, which is filtered for the model.
