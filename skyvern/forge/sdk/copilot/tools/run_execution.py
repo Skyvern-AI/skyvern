@@ -4889,6 +4889,7 @@ async def _run_blocks_with_minted_browser_claim(
     debug_session_id: str | None = None
     run_session_id: str | None
     new_exit_receipt: FreshExitReceipt | None = None
+    run_proxy_location: ProxyLocationInput = None
     if not use_fresh_session:
         discard_build_test_prestart(ctx, "resume" if resumes_a_build_test_browser else "chat_browser")
     elif new_exit:
@@ -4927,7 +4928,9 @@ async def _run_blocks_with_minted_browser_claim(
                 }
             run_session_id = new_exit_receipt.new_browser_session_id
         else:
-            run_proxy_location = runtime_proxy_location(snapshot.workflow.proxy_location)
+            run_proxy_location = snapshot.workflow.proxy_location
+            if run_proxy_location is None and settings.RUNTIME_PROXY_DEFAULT_NONE_ENABLED:
+                run_proxy_location = runtime_proxy_location(None)
             run_session_id = await claim_build_test_prestart(ctx, run_proxy_location)
             if run_session_id is None:
                 acquisition_ctx = replace(ctx)
@@ -6010,7 +6013,7 @@ async def _run_blocks_with_minted_browser_claim(
             and browser_seed is None
             and new_exit_receipt is None
         ):
-            start_build_test_prestart(ctx, runtime_proxy_location(snapshot.workflow.proxy_location))
+            start_build_test_prestart(ctx, run_proxy_location)
 
         action_observations = _retained_action_observations(results)
         per_block_action_observations = _retained_action_observations_by_label(results)
