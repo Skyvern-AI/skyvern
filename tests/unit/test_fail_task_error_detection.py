@@ -12,6 +12,7 @@ import pytest
 from skyvern.errors.errors import UserDefinedError
 from skyvern.exceptions import CaptchaNotSolvedInTime, MissingBrowserStatePage, get_user_facing_exception_message
 from skyvern.forge.agent import ForgeAgent
+from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.failure_classifier import derive_failure_attribution
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
@@ -664,6 +665,7 @@ async def _classify_browser_loss_after(agent: ForgeAgent, outcomes: list) -> lis
         mock_update_task.side_effect = _echo_persisted_reason(task)
         mock_app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled.return_value = False
         mock_app.WORKFLOW_CONTEXT_MANAGER.runtime_secret_values_for_artifacts.return_value = set()
+        mock_app.AGENT_FUNCTION.classify_failure = AgentFunction().classify_failure
         mock_app.DATABASE.tasks.get_task_steps = AsyncMock(return_value=[*prior, terminal])
 
         await agent.fail_task(task, terminal, get_user_facing_exception_message(browser_loss), exception=browser_loss)

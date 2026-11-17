@@ -93,7 +93,6 @@ from skyvern.forge.failure_classifier import (
     DIAGNOSABLE_FAILURE_STATUSES,
     TASK_V2_ROOT_USER_ERRORS_REASON_CODE,
     FailureCategory,
-    classify_from_failure_reason,
     derive_failure_attribution,
     with_saved_profile_signed_out,
     with_sign_in_form_visible,
@@ -12012,10 +12011,10 @@ class WorkflowService:
         failure_reason: str | None,
     ) -> list[dict] | None:
         if status in (WorkflowRunStatus.failed, WorkflowRunStatus.timed_out):
-            return classify_from_failure_reason(failure_reason, fallback_to_unknown=True)
+            return app.AGENT_FUNCTION.classify_failure(failure_reason, fallback_to_unknown=True, status=status)
         if status == WorkflowRunStatus.terminated:
             # Termination may be user-guided, so an unknown category is optional.
-            return classify_from_failure_reason(failure_reason)
+            return app.AGENT_FUNCTION.classify_failure(failure_reason, status=status)
         return None
 
     async def _apply_finally_block_result(

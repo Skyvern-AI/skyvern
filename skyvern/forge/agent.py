@@ -103,9 +103,9 @@ from skyvern.forge import app
 from skyvern.forge.antibot_evidence import prompt_evidence_str
 from skyvern.forge.async_operations import AgentPhase, AsyncOperationPool
 from skyvern.forge.failure_classifier import (
+    CLASSIFIER_LABEL_REASON_CODES,
     FailureCategory,
     bounded_failure_categories,
-    classify_from_failure_reason,
     is_captcha_solve_failure,
 )
 from skyvern.forge.final_failure_diagnostic import annotate_failed_task
@@ -2319,8 +2319,13 @@ def _v3_failure_category(
     if task_status == TaskStatus.failed:
         # Same code-level failure classification fail_task records, so v3 failures carry a
         # failure_category like step-engine failures.
-        failure_category = classify_from_failure_reason(failure_reason, fallback_to_unknown=not cap_is_the_cause)
-        if failure_category is None and cap_is_the_cause:
+        failure_category = app.AGENT_FUNCTION.classify_failure(
+            failure_reason, fallback_to_unknown=not cap_is_the_cause, status=TaskStatus.failed
+        )
+        rule_categories = [
+            c for c in failure_category or [] if c.get("reason_code") not in CLASSIFIER_LABEL_REASON_CODES
+        ]
+        if not rule_categories and cap_is_the_cause:
             return [
                 {
                     "category": FailureCategory.BUDGET_EXHAUSTED.value,
@@ -5609,7 +5614,7 @@ class ForgeAgent:
                     task,
                     status=TaskStatus.terminated,
                     failure_reason=reason,
-                    failure_category=classify_from_failure_reason(reason),
+                    failure_category=app.AGENT_FUNCTION.classify_failure(reason, status=TaskStatus.terminated),
                 )
             except (TaskAlreadyCanceled, TaskAlreadyTimeout, InvalidTaskStatusTransition, ValueError):
                 LOG.warning("Task isn't marked as terminated, after completion gate termination. NOT clean up the task")
@@ -6105,15 +6110,18 @@ class ForgeAgent:
             if reason and run_secrets:
                 reason = redact_secrets_from_text(reason, run_secrets)
 
-            failure_category = classify_from_failure_reason(reason, exception=exception, fallback_to_unknown=True)
+            failure_category = app.AGENT_FUNCTION.classify_failure(
+                reason, exception=exception, fallback_to_unknown=True, status=TaskStatus.failed
+            )
             if any(category.get("category") == FailureCategory.BROWSER_ERROR for category in failure_category or []):
                 unsolved_captcha_exception = await self._unsolved_captcha_exception(task)
                 if unsolved_captcha_exception:
-                    failure_category = classify_from_failure_reason(
+                    failure_category = app.AGENT_FUNCTION.classify_failure(
                         reason,
                         exception=exception,
                         fallback_to_unknown=True,
                         unsolved_captcha_exception=unsolved_captcha_exception,
+                        status=TaskStatus.failed,
                     )
             LOG.info(
                 "Task failure classified",
@@ -10609,8 +10617,8 @@ class ForgeAgent:
                     completion_updates["extracted_information"] = extracted_information
                 if failure_reason:
                     completion_updates["failure_reason"] = failure_reason
-                    completion_updates["failure_category"] = classify_from_failure_reason(
-                        failure_reason, fallback_to_unknown=True
+                    completion_updates["failure_category"] = app.AGENT_FUNCTION.classify_failure(
+                        failure_reason, fallback_to_unknown=True, status=TaskStatus.failed
                     )
                 try:
                     task = await self.update_task(
@@ -11863,7 +11871,7 @@ class ForgeAgent:
                 if persisted_action.errors:
                     failure_reason = "; ".join(error.reasoning for error in persisted_action.errors)
                 failure_category = bounded_failure_categories(persisted_action.failure_categories) or (
-                    classify_from_failure_reason(failure_reason)
+                    app.AGENT_FUNCTION.classify_failure(failure_reason, status=TaskStatus.terminated)
                 )
                 LOG.info(
                     "Task failure classified",
@@ -12028,8 +12036,8 @@ class ForgeAgent:
             errors = [ReachMaxStepsError().model_dump()] + [
                 error.model_dump() for error in generated_failure_reason.errors
             ]
-            failure_category = generated_failure_reason.failure_categories or classify_from_failure_reason(
-                failure_reason, fallback_to_unknown=True
+            failure_category = generated_failure_reason.failure_categories or app.AGENT_FUNCTION.classify_failure(
+                failure_reason, fallback_to_unknown=True, status=TaskStatus.failed
             )
             LOG.info(
                 "Task failure classified",
@@ -12080,7 +12088,9 @@ class ForgeAgent:
         )
         if step_errors:
             failure_reason = "; ".join(error.reasoning for error in step_errors)
-            failure_category = classify_from_failure_reason(failure_reason, fallback_to_unknown=True)
+            failure_category = app.AGENT_FUNCTION.classify_failure(
+                failure_reason, fallback_to_unknown=True, status=TaskStatus.failed
+            )
             existing_errors = {
                 (error.get("error_code"), error.get("reasoning"))
                 for error in (task.errors or [])
@@ -12168,8 +12178,8 @@ class ForgeAgent:
                 failure_reason = (
                     f"Max retries per step ({max_retries_per_step}) exceeded. {ReachMaxRetriesError().reasoning}"
                 )
-            failure_category = failure_response.failure_categories or classify_from_failure_reason(
-                failure_reason, fallback_to_unknown=True
+            failure_category = failure_response.failure_categories or app.AGENT_FUNCTION.classify_failure(
+                failure_reason, fallback_to_unknown=True, status=TaskStatus.failed
             )
             LOG.info(
                 "Task failure classified",
@@ -12606,7 +12616,9 @@ class ForgeAgent:
             f"Workflow run reached the maximum total steps ({max_steps_per_workflow_run}) set on the organization."
         )
         errors = [ReachMaxStepsError().model_dump()]
-        failure_category = classify_from_failure_reason(failure_reason, fallback_to_unknown=True)
+        failure_category = app.AGENT_FUNCTION.classify_failure(
+            failure_reason, fallback_to_unknown=True, status=TaskStatus.failed
+        )
         LOG.info(
             "Task failure classified",
             task_id=task.task_id,
@@ -12770,7 +12782,7 @@ class ForgeAgent:
                     **llm_response_log_metadata(step.output.model_dump() if step.output is not None else None),
                 )
                 last_step = await self.update_step(step, is_last=True)
-                failure_category = classify_from_failure_reason(failure_reason)
+                failure_category = app.AGENT_FUNCTION.classify_failure(failure_reason, status=TaskStatus.terminated)
                 # handle_terminate_action already resolved the block's error_code_mapping against the
                 # page and left the codes on the action. Persist them, as the sibling terminal paths
                 # (terminate_check_goal, max_retries, max_steps) do: without this a mapped
@@ -12880,8 +12892,8 @@ class ForgeAgent:
             errors = [ReachMaxStepsError().model_dump()] + [
                 error.model_dump() for error in generated_failure_reason.errors
             ]
-            failure_category = generated_failure_reason.failure_categories or classify_from_failure_reason(
-                failure_reason, fallback_to_unknown=True
+            failure_category = generated_failure_reason.failure_categories or app.AGENT_FUNCTION.classify_failure(
+                failure_reason, fallback_to_unknown=True, status=TaskStatus.failed
             )
             LOG.info(
                 "Task failure classified",
