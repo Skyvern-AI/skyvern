@@ -99,6 +99,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     LoopSelectedInput,
     RecordedBuildTestOutcome,
     SolverAttempt,
+    SolverFacts,
     append_omission_notice,
     authored_block_parameter_keys_from_workflow,
     authored_structure_signature_from_workflow,
@@ -1375,9 +1376,11 @@ def _capture_solver_facts_and_strip_traces(results: list[dict[str, Any]]) -> Sol
     placed after it would silently report every run as unresolved. ``get_run_results`` remains the
     heavier inspection path for the traces themselves.
     """
+    solver_facts: SolverFacts = solver_facts_from_traces(results)
+    code_block_solver_facts: SolverFacts = solver_facts_from_traces(results, code_block_only=True)
     solver_attempt: SolverAttempt = {
-        **solver_facts_from_traces(results),
-        "code_block": solver_facts_from_traces(results, code_block_only=True),
+        **solver_facts,
+        "code_block": code_block_solver_facts,
     }
     receipt = governing_solver_receipt(results)
     if receipt is not None:
