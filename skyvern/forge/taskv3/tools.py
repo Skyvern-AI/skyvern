@@ -8285,6 +8285,19 @@ _CARET_TO_END_JS = """el => {
   }
 }"""
 
+# Puts the caret at the end of the focused input or textarea only when it holds exactly the given text.
+_FOCUSED_HOLDING_CARET_TO_END_JS = """(text) => {
+  let el = document.activeElement;
+  while (el && el.shadowRoot && el.shadowRoot.activeElement) el = el.shadowRoot.activeElement;
+  if (!el || !["INPUT", "TEXTAREA"].includes(el.tagName) || el.value !== text) return false;
+  try {
+    el.setSelectionRange(text.length, text.length);
+    return true;
+  } catch (e) {
+    return "end_key";
+  }
+}"""
+
 
 # Design-system forms render a <select> at zero size behind a styled listbox proxy. Playwright's
 # actionability wait never resolves against it, so select_option probes visibility first and only
@@ -20104,6 +20117,10 @@ def build_browser_tools(
             "range",
         }
     )
+    # The browser takes these values only whole: a key in them steps or picks, it does not insert a character.
+    _VALUE_SET_TYPES = frozenset({"date", "datetime-local", "month", "time", "week", "color", "range"})
+    # Playwright's fill throws on a number field given text that is not a number, such as "-" or "1e".
+    _NUMBER_PREFIX_RE = re.compile(r"\s*[-+]?\d+(\.\d*)?\s*")
 
     async def _unverifiable_because(page: Any, selector: str) -> str | None:
         # Returns the clause explaining why a check could not be run, or None when it could. "The
@@ -21349,7 +21366,55 @@ def build_browser_tools(
                         "after the field was focused, so nothing was typed. Re-observe the field before typing again.",
                         error_class="text_not_held",
                     )
-            await input_dispatch.fill(page, selector, written, timeout=_ACTION_TIMEOUT_MS)
+            # A field that registers its value only from key events gets the last character as a real key.
+            cut = len(written) - 1
+            key_last = bool(
+                written
+                and written[-1].isprintable()
+                and not written[-1].isspace()
+                and not (typed_secret or box_text or flutter_field or field_type in _VALUE_SET_TYPES)
+                and (field_type != "number" or _NUMBER_PREFIX_RE.fullmatch(written[:cut]))
+            )
+            sent = 0
+            gone = False
+            if key_last:
+                # fill("") on an empty field still sends Delete, which drops a chip or re-mounts some inputs.
+                if cut or await _read_field_value(page, selector) != "":
+                    await input_dispatch.fill(page, selector, written[:cut], timeout=_ACTION_TIMEOUT_MS)
+                # A field re-mounted by the prefix write is followed to its replacement. One that cannot be followed
+                # gets no whole fill, which would wait out the timeout on the detached node.
+                with contextlib.suppress(Exception):
+                    gone = not await page.locator(selector).count() and not await _follow_replaced_field(page, selector)
+                caret: bool | str = False
+                if gone:
+                    # A replacement a look() mark cannot follow gets the key if it has focus and holds the prefix.
+                    with contextlib.suppress(Exception):
+                        caret = await page.evaluate(_FOCUSED_HOLDING_CARET_TO_END_JS, written[:cut])
+                elif await _read_field_value(page, selector) is not None:
+                    # The key goes where the page put the caret, such as a mask's next slot, unless the text after the
+                    # caret is the end of what was just written: then the caret sits inside the tool's own text.
+                    with contextlib.suppress(Exception):
+                        caret = await page.eval_on_selector(
+                            selector,
+                            "(el, prefix) => el.getRootNode().activeElement === el && el.selectionStart > 0"
+                            " && !prefix.endsWith(el.value.slice(el.selectionStart))",
+                            written[:cut],
+                        )
+                    if not caret:
+                        with contextlib.suppress(Exception):
+                            caret = await page.eval_on_selector(selector, _CARET_TO_END_JS)
+                if caret:
+                    with contextlib.suppress(Exception):
+                        sent = await _type_keys_before_deadline(written[cut:], press_end=caret == "end_key")
+            if gone and not sent:
+                record_entry_variant(f"native_{field_type}" if field_type in _ENTRY_VARIANT_TYPES else "native_other")
+                return ToolResult.error(
+                    f"typed into {selector}, but the field left the page before its last character could be typed, "
+                    "so the text is NOT entered. Re-observe the field before typing again.",
+                    error_class="text_not_held",
+                )
+            if not sent:
+                await input_dispatch.fill(page, selector, written, timeout=_ACTION_TIMEOUT_MS)
             if box_text and await _read_field_value(page, selector) != text:
                 return ToolResult.error(
                     f"typed into {selector}, but it takes one character and does not hold the typed text "
