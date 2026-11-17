@@ -23,6 +23,7 @@ import {
   type CodeBlock,
   type EmailInboxBlock,
   type ForLoopBlock,
+  type IntegrationActionBlock,
   type OutputParameter,
   type PowerBIQueryBlock,
   type SendEmailBlock,
@@ -448,6 +449,58 @@ describe("round-trip reorder → save → reload (M1 top-level)", () => {
     expect(getWorkflowBlocks([node], [])[0]).toMatchObject({
       block_type: "powerbi_query",
       credential_source: "nango",
+    });
+  });
+
+  test("integration action keeps its ids, account and typed inputs through load and save", () => {
+    const block: IntegrationActionBlock = {
+      label: "add_invoice_row",
+      block_type: "integration_action",
+      continue_on_failure: false,
+      model: null,
+      next_block_label: null,
+      output_parameter: makeOutputParameter("add_invoice_row"),
+      integration_id: "google_sheets",
+      action_id: "add_row",
+      connection_id: "goc_1",
+      inputs: {
+        sheet_name: "Invoices",
+        values: "{{ agent_step.amount }}",
+        row_count: 2,
+        create_if_missing: true,
+        column_mapping: { amount: "B" },
+      },
+      parameters: [makeWorkflowParameter("sheet_id")],
+    };
+    const { nodes, edges } = getElements([block], DEFAULT_SETTINGS, true);
+    expect(
+      nodes.find((node) => node.type === "integrationAction")?.data,
+    ).toMatchObject({
+      integrationId: "google_sheets",
+      actionId: "add_row",
+      connectionId: "goc_1",
+      inputs: block.inputs,
+    });
+    const expected = {
+      block_type: "integration_action",
+      integration_id: "google_sheets",
+      action_id: "add_row",
+      connection_id: "goc_1",
+      inputs: block.inputs,
+      parameter_keys: ["sheet_id"],
+    };
+    expect(getWorkflowBlocks(nodes, edges)[0]).toMatchObject(expected);
+    expect(
+      convert({
+        workflow_definition: { version: 2, parameters: [], blocks: [block] },
+      } as unknown as WorkflowApiResponse).workflow_definition.blocks[0],
+    ).toMatchObject(expected);
+
+    const fresh = createNode({ id: "new" }, "integrationAction", "block_1");
+    expect(getWorkflowBlocks([fresh], [])[0]).toMatchObject({
+      block_type: "integration_action",
+      connection_id: null,
+      inputs: {},
     });
   });
 

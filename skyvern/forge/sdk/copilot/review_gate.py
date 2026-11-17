@@ -14,6 +14,7 @@ from skyvern.forge.sdk.copilot.data_write_defaults import DATA_WRITE_BLOCK_TYPES
 from skyvern.forge.sdk.copilot.input_references import block_read_keys
 from skyvern.forge.sdk.copilot.workflow_credential_utils import parse_workflow_yaml, workflow_blocks
 from skyvern.forge.sdk.copilot.workflow_yaml import canonical_copilot_workflow
+from skyvern.forge.sdk.integrations.connected_accounts import as_run_block
 from skyvern.forge.sdk.services import google_drive_service
 from skyvern.forge.sdk.workflow.block_notes import annotate_notes_read, definition_step_notes, strip_inert_block_fields
 from skyvern.forge.sdk.workflow.models.parameter import ParameterType, WorkflowParameterType
@@ -519,11 +520,12 @@ def _duplicate_writes(
 ) -> list[NarrativeDuplicateWrite]:
     labels_by_destination: dict[tuple[str, ...], list[str]] = {}
     for block in staged_blocks:
-        block_type = _block_type(block)
+        run_block = dict(as_run_block(block))
+        block_type = _block_type(run_block)
         adapter = DESTINATION_ADAPTERS.get(block_type)
         if adapter is None:
             continue
-        destination = adapter(block, defaults)
+        destination = adapter(run_block, defaults)
         label = block.get("label")
         if destination is None or not isinstance(label, str):
             continue

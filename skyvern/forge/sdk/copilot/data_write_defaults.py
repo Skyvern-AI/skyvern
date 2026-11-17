@@ -5,6 +5,7 @@ from typing import Any
 import yaml
 
 from skyvern.forge.sdk.copilot.workflow_credential_utils import parse_workflow_yaml, workflow_blocks
+from skyvern.forge.sdk.integrations.connected_accounts import as_run_block
 from skyvern.schemas.workflows import BlockType
 
 # Block types that persist a payload to an external store, where a swallowed
@@ -21,7 +22,7 @@ DATA_WRITE_BLOCK_TYPES: frozenset[str] = frozenset(
 
 
 def _block_type_name(block: dict[str, Any]) -> str:
-    return str(block.get("block_type") or "").strip().lower()
+    return str(as_run_block(block).get("block_type") or "").strip().lower()
 
 
 def _data_write_labels_with_truthy_continue_on_failure(parsed: Any) -> set[str]:

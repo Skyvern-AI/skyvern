@@ -57,8 +57,6 @@ async def _available_block_summaries() -> dict[str, str]:
         available.pop(BlockType.POWERBI_QUERY.value)
     if not await _agent_step_enabled():
         available.pop(BlockType.AGENT_STEP.value)
-    # Not offered until the editor can open it and Copilot's write safeguards see the block it wraps.
-    available.pop(BlockType.INTEGRATION_ACTION.value, None)
     return available
 
 
@@ -677,17 +675,6 @@ async def skyvern_block_schema(
     if task_redirect:
         normalized = "navigation"
 
-    if normalized == BlockType.INTEGRATION_ACTION.value:
-        return make_result(
-            action,
-            ok=False,
-            error=make_error(
-                ErrorCode.INVALID_INPUT,
-                "Integration action blocks are not available to author yet.",
-                f"Available types: {', '.join(sorted(await _available_block_summaries()))}.",
-            ),
-        )
-
     if normalized == BlockType.POWERBI_QUERY.value and not _powerbi_queries_available():
         return make_result(
             action,
@@ -822,17 +809,6 @@ async def skyvern_block_validate(
                 ErrorCode.INVALID_INPUT,
                 f"Expected a JSON object, got {type(raw).__name__}",
                 "Provide a JSON object with at least block_type and label fields",
-            ),
-        )
-
-    if _contains_block_type(raw, BlockType.INTEGRATION_ACTION.value):
-        return make_result(
-            action,
-            ok=False,
-            error=make_error(
-                ErrorCode.INVALID_INPUT,
-                "Integration action blocks are not available to author yet.",
-                "Use a currently available block type from skyvern_block_schema.",
             ),
         )
 

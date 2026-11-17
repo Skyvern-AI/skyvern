@@ -232,7 +232,8 @@ export type WorkflowBlock =
   | GoogleSheetsWriteBlock
   | PowerBIQueryBlock
   | PdfFillBlock
-  | SplitPdfBlock;
+  | SplitPdfBlock
+  | IntegrationActionBlock;
 
 export const WorkflowBlockTypes = {
   Task: "task",
@@ -270,6 +271,7 @@ export const WorkflowBlockTypes = {
   PowerBIQuery: "powerbi_query",
   PDFFill: "pdf_fill",
   SplitPDF: "split_pdf",
+  IntegrationAction: "integration_action",
 } as const;
 
 // all of them
@@ -817,6 +819,15 @@ export type PdfFillBlock = WorkflowBlockBase & {
   prompt: string;
   payload: Record<string, unknown> | Array<unknown> | string | null;
   llm_key: string | null;
+  parameters: Array<WorkflowParameter>;
+};
+
+export type IntegrationActionBlock = WorkflowBlockBase & {
+  block_type: "integration_action";
+  integration_id: string;
+  action_id: string;
+  connection_id: string | null;
+  inputs: Record<string, unknown>;
   parameters: Array<WorkflowParameter>;
 };
 

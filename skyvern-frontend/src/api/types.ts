@@ -430,6 +430,8 @@ export interface GoogleOAuthCredential {
   // Decided by the server: active, send permission granted, and a verified account identity on record.
   gmail_send_ready?: boolean;
   account_recorded?: boolean;
+  // The server's fit for each catalog action, keyed "<integration id>.<action id>". Labels only.
+  action_fit?: Record<string, "yes" | "no" | "unknown">;
   created_at: string;
   modified_at: string;
 }
@@ -441,6 +443,7 @@ export interface GoogleOAuthCredentialResponse {
 
 export interface GoogleOAuthCredentialListResponse {
   credentials: GoogleOAuthCredential[];
+  action_fit?: Record<string, Record<string, "yes" | "no" | "unknown">>;
 }
 
 export interface GoogleOAuthClientConfigSafe {

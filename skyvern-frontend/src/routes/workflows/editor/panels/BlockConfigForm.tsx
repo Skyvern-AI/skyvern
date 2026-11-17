@@ -39,6 +39,7 @@ import { AgentStepBlockForm } from "./BlockConfigForm/AgentStepBlockForm";
 import { WaitBlockForm } from "./BlockConfigForm/WaitBlockForm";
 import { WorkflowSettingsBlockForm } from "./BlockConfigForm/WorkflowSettingsBlockForm";
 import { WorkflowTriggerBlockForm } from "./BlockConfigForm/WorkflowTriggerBlockForm";
+import { IntegrationActionBlockForm } from "./BlockConfigForm/IntegrationActionBlockForm";
 
 type WorkflowBlockNodeType = WorkflowBlockNode["type"];
 
@@ -79,6 +80,7 @@ const BLOCK_FORMS: Record<WorkflowBlockNodeType, BlockFormComponent> = {
   powerBIQuery: PowerBIQueryBlockForm,
   splitPdf: SplitPdfBlockForm,
   dataExport: DataExportBlockForm,
+  integrationAction: IntegrationActionBlockForm,
 };
 
 function BlockConfigForm({ blockId }: Readonly<{ blockId: string }>) {

@@ -119,5 +119,6 @@ export const workflowBlockTitle: {
   powerbi_query: "Power BI Query",
   pdf_fill: "PDF Fill",
   split_pdf: "Split PDF",
+  integration_action: "App Action",
   data_export: "Data Export",
 };

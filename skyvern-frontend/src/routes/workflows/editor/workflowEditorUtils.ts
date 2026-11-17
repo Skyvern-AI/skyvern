@@ -3,6 +3,9 @@ import { buildWorkflowSaveRequest } from "./workflowYamlDocument";
 import { normalizeRetryPolicy } from "./nodes/StartNode/retryPolicyUtils";
 import Dagre from "@dagrejs/dagre";
 import type { QueryClient } from "@tanstack/react-query";
+import { queryClient as appQueryClient } from "@/api/QueryClient";
+import { integrationCatalogQueryOptions } from "@/hooks/useIntegrationCatalogQuery";
+import type { ActiveOrgId } from "@/store/ActiveOrgContext";
 import {
   applyNodeChanges,
   applyEdgeChanges,
@@ -86,6 +89,7 @@ import {
   EmailInboxBlockYAML,
   GoogleSheetsReadBlockYAML,
   GoogleSheetsWriteBlockYAML,
+  IntegrationActionBlockYAML,
   PowerBIQueryBlockYAML,
   PdfFillBlockYAML,
   SplitPdfBlockYAML,
@@ -210,6 +214,12 @@ import {
   isGoogleSheetsWriteNode,
 } from "./nodes/GoogleSheetsWriteNode/types";
 import { validateGoogleSheetsWriteNode } from "./nodes/GoogleSheetsWriteNode/validate";
+import {
+  integrationActionNodeDefaultData,
+  isIntegrationActionNode,
+  type IntegrationCatalogEntryWithActions,
+} from "./nodes/IntegrationActionNode/types";
+import { validateIntegrationActionNode } from "./nodes/IntegrationActionNode/validate";
 import {
   POWERBI_QUERY_DEFAULT_MAX_ROWS,
   isPowerBIQueryNode,
@@ -1596,6 +1606,21 @@ function convertToNode(
             ? JSON.stringify(block.column_mapping, null, 2)
             : "",
           createSheetIfMissing: block.create_sheet_if_missing ?? false,
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
+        },
+      };
+    }
+    case "integration_action": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "integrationAction",
+        data: {
+          ...commonData,
+          integrationId: block.integration_id,
+          actionId: block.action_id,
+          connectionId: block.connection_id ?? "",
+          inputs: block.inputs ?? {},
           parameterKeys: (block.parameters ?? []).map((p) => p.key),
         },
       };
@@ -3260,6 +3285,17 @@ function createNode(
         },
       };
     }
+    case "integrationAction": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "integrationAction",
+        data: {
+          ...integrationActionNodeDefaultData,
+          label,
+        },
+      };
+    }
     case "conditional": {
       const branches = createDefaultBranchConditions();
       return {
@@ -4230,6 +4266,17 @@ function getWorkflowBlock(
         values: node.data.values,
         column_mapping: parsedColumnMapping,
         create_sheet_if_missing: node.data.createSheetIfMissing,
+        parameter_keys: node.data.parameterKeys,
+      };
+    }
+    case "integrationAction": {
+      return {
+        ...base,
+        block_type: "integration_action",
+        integration_id: node.data.integrationId,
+        action_id: node.data.actionId,
+        connection_id: node.data.connectionId || null,
+        inputs: node.data.inputs,
         parameter_keys: node.data.parameterKeys,
       };
     }
@@ -5887,6 +5934,18 @@ function convertBlocksToBlockYAML(
         };
         return blockYaml;
       }
+      case "integration_action": {
+        const blockYaml: IntegrationActionBlockYAML = {
+          ...base,
+          block_type: "integration_action",
+          integration_id: block.integration_id,
+          action_id: block.action_id,
+          connection_id: block.connection_id,
+          inputs: block.inputs,
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
+        };
+        return blockYaml;
+      }
     }
   });
 }
@@ -6148,14 +6207,19 @@ function pendingGoalErrors(nodes: Array<AppNode>): Array<string> {
 function blockRunErrors(
   nodes: Array<AppNode>,
   blockLabel: string,
+  activeOrgId?: ActiveOrgId,
 ): Array<string> {
   const pendingGoals = new Set(pendingGoalErrors(nodes));
-  return getWorkflowErrors(nodes).filter(
+  return getWorkflowErrors(nodes, activeOrgId).filter(
     (error) => error.startsWith(`${blockLabel}:`) || pendingGoals.has(error),
   );
 }
 
-function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
+// activeOrgId picks that org's cached app catalog for app action checks; without it they check ids only.
+function getWorkflowErrors(
+  nodes: Array<AppNode>,
+  activeOrgId?: ActiveOrgId,
+): Array<string> {
   const errors: Array<string> = [...pendingGoalErrors(nodes)];
 
   const workflowBlockNodes = nodes.filter(isWorkflowBlockNode);
@@ -6556,6 +6620,18 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
   nodes
     .filter(isGoogleSheetsWriteNode)
     .forEach((node) => errors.push(...validateGoogleSheetsWriteNode(node)));
+
+  const integrationCatalog =
+    activeOrgId === undefined
+      ? undefined
+      : appQueryClient.getQueryData<IntegrationCatalogEntryWithActions[]>(
+          integrationCatalogQueryOptions(null, activeOrgId).queryKey,
+        );
+  nodes
+    .filter(isIntegrationActionNode)
+    .forEach((node) =>
+      errors.push(...validateIntegrationActionNode(node, integrationCatalog)),
+    );
 
   nodes
     .filter(isPdfFillNode)

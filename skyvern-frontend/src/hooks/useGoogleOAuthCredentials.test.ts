@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { GoogleOAuthCredential } from "@/api/types";
 import {
   attemptedGoogleOAuthIntegrationScopes,
+  credentialsWithActionFit,
   getGoogleOAuthCredentialScopesGranted,
   getGoogleOAuthCredentialScopesRequested,
   hasGoogleOAuthCredentialScopes,
@@ -113,6 +114,18 @@ describe("Google OAuth credential scope helpers", () => {
         "drive.metadata",
       ]),
     ).toBe(false);
+  });
+});
+
+describe("credentialsWithActionFit", () => {
+  it("puts each account's server fit on that account only", () => {
+    const other = { ...baseCredential, id: "credential_2" };
+    const [first, second] = credentialsWithActionFit({
+      credentials: [baseCredential, other],
+      action_fit: { credential_1: { "gmail.send_email": "no" } },
+    });
+    expect(first?.action_fit).toEqual({ "gmail.send_email": "no" });
+    expect(second?.action_fit).toBeUndefined();
   });
 });
 

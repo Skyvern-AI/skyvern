@@ -325,18 +325,8 @@ async def test_block_schema_no_type_lists_all() -> None:
             },
             "Power BI queries are not currently available.",
         ),
-        (
-            {
-                "block_type": "integration_action",
-                "label": "read_rows",
-                "integration_id": "google_sheets",
-                "action_id": "read_rows",
-                "connection_id": "goac_owner",
-            },
-            "Integration action blocks are not available to author yet.",
-        ),
     ],
-    ids=["unavailable-powerbi", "integration-action"],
+    ids=["unavailable-powerbi"],
 )
 @pytest.mark.asyncio
 async def test_hidden_block_types_are_left_out_of_schema_and_nested_validation(
@@ -460,6 +450,7 @@ CONNECTED_ACCOUNT_FIELDS = {
     ("email_inbox", "credential_id"),
     ("google_sheets_write", "credential_id"),
     ("powerbi_query", "connection_id"),
+    ("integration_action", "connection_id"),
 }
 
 
