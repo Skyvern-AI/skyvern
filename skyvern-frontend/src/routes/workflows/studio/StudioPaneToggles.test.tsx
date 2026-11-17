@@ -214,7 +214,7 @@ describe("StudioPaneToggles structure", () => {
 
   test("explicit ?panes= wins over a run deep link", () => {
     runsQueryMock.mockReturnValue({ data: [{ status: Status.Completed }] });
-    renderAt("/workflows/wpid_abc/studio?wr=run_1&panes=copilot");
+    renderAt("/workflows/wpid_abc/studio?wr=run_1&panes=ember");
     expect(tab(/^Copilot/).getAttribute("aria-expanded")).toBe("true");
     // The inspected-run control reports whether its pane is open.
     expect(runsTab().getAttribute("aria-pressed")).toBe("false");
@@ -238,9 +238,9 @@ describe("StudioPaneToggles pane toggling", () => {
   });
 
   test("closing Ember keeps the committed panes URL unchanged", () => {
-    renderAt("/workflows/wpid_abc/studio?panes=editor,copilot,browser");
+    renderAt("/workflows/wpid_abc/studio?panes=editor,ember,browser");
     fireEvent.click(tab(/^Copilot/));
-    expect(urlPanes()).toBe("editor,copilot,browser");
+    expect(urlPanes()).toBe("editor,ember,browser");
     expect(currentPanes()).toBe("editor,browser");
     expect(tab(/^Copilot/).getAttribute("aria-expanded")).toBe("false");
   });
@@ -331,26 +331,26 @@ describe("StudioPaneToggles run selector", () => {
   });
 
   test("clicking the Past Runs tab opens the selector without toggling the pane", async () => {
-    renderAt("/workflows/wpid_abc/studio?panes=copilot");
+    renderAt("/workflows/wpid_abc/studio?panes=ember");
     fireEvent.click(runsTab());
     // The selector popover opens (its "Past runs" header renders)...
     expect(await screen.findByText("Past runs")).toBeTruthy();
     // ...and the run pane is never toggled onto the stage by opening it.
-    expect(currentPanes()).toBe("copilot");
+    expect(currentPanes()).toBe("ember");
   });
 
   test("clicking the current run tab reopens its closed pane directly", () => {
-    renderAt("/workflows/wpid_abc/studio?panes=copilot&wr=wr_current");
+    renderAt("/workflows/wpid_abc/studio?panes=ember&wr=wr_current");
 
     fireEvent.click(tab("View Run: wr_current"));
 
     expect(currentPanes()?.split(",")).toContain("overview");
-    expect(urlPanes()).toBe("copilot");
+    expect(urlPanes()).toBe("ember");
     expect(screen.queryByText("Past runs")).toBeNull();
   });
 
   test("clicking the current run tab closes its open pane", () => {
-    renderAt("/workflows/wpid_abc/studio?panes=copilot,overview&wr=wr_current");
+    renderAt("/workflows/wpid_abc/studio?panes=ember,overview&wr=wr_current");
 
     fireEvent.click(tab("View Run: wr_current"));
 
@@ -370,7 +370,7 @@ describe("StudioPaneToggles run selector", () => {
     render(
       <MemoryRouter
         initialEntries={[
-          "/workflows/wpid_abc/studio?panes=copilot,overview&wr=wr_current",
+          "/workflows/wpid_abc/studio?panes=ember,overview&wr=wr_current",
         ]}
       >
         <StudioPaneDefaultsProvider hasBlocks={true}>
@@ -403,7 +403,7 @@ describe("StudioPaneToggles run selector", () => {
     const showPane = vi.fn();
     render(
       <MemoryRouter
-        initialEntries={["/workflows/wpid_abc/studio?panes=copilot,browser"]}
+        initialEntries={["/workflows/wpid_abc/studio?panes=ember,browser"]}
       >
         <StudioPaneDefaultsProvider hasBlocks={true}>
           <StudioShellContext.Provider
@@ -455,7 +455,7 @@ describe("StudioPaneToggles run selector", () => {
   test("opening a closed pane from its toggle asks to show it, since it may fold as it opens", () => {
     const showPane = vi.fn();
     // Closed, so not folded yet: only the render after the open can fold it.
-    renderFolded("/workflows/wpid_abc/studio?panes=copilot", showPane, []);
+    renderFolded("/workflows/wpid_abc/studio?panes=ember", showPane, []);
 
     fireEvent.click(tab(/^Browser/));
 
@@ -466,7 +466,7 @@ describe("StudioPaneToggles run selector", () => {
   test("a folded Browser's toggle flags new activity", () => {
     useStudioBrowserStore.setState({ hasUnseenActivity: true });
     try {
-      renderFolded("/workflows/wpid_abc/studio?panes=copilot,browser", vi.fn());
+      renderFolded("/workflows/wpid_abc/studio?panes=ember,browser", vi.fn());
       expect(tab("Browser, new activity")).toBeTruthy();
     } finally {
       useStudioBrowserStore.setState({ hasUnseenActivity: false });
@@ -474,12 +474,12 @@ describe("StudioPaneToggles run selector", () => {
   });
 
   test("the separate Past runs button opens the selector without toggling the run pane", async () => {
-    renderAt("/workflows/wpid_abc/studio?panes=copilot&wr=wr_current");
+    renderAt("/workflows/wpid_abc/studio?panes=ember&wr=wr_current");
 
     fireEvent.click(tab("Past Runs"));
 
     expect(await screen.findByText("Past runs")).toBeTruthy();
-    expect(currentPanes()).toBe("copilot");
+    expect(currentPanes()).toBe("ember");
   });
 
   test("selecting a run opens the run pane and closes the popover", async () => {
@@ -493,7 +493,7 @@ describe("StudioPaneToggles run selector", () => {
       ]),
     );
     // A different current run so the picked row is clickable (not the current).
-    renderAt("/workflows/wpid_abc/studio?panes=copilot&wr=wr_other");
+    renderAt("/workflows/wpid_abc/studio?panes=ember&wr=wr_other");
     fireEvent.click(tab("Past Runs"));
     fireEvent.click(await screen.findByText("wr_pick"));
 
@@ -551,7 +551,7 @@ describe("StudioPaneToggles run selector", () => {
         },
       ]),
     );
-    renderInBrowser("/workflows/wpid_abc/studio?panes=copilot&wr=wr_other", {
+    renderInBrowser("/workflows/wpid_abc/studio?panes=ember&wr=wr_other", {
       emberMessage: "Fix run A",
     });
 
@@ -582,12 +582,12 @@ describe("StudioPaneToggles run selector", () => {
         },
       ]),
     );
-    renderAt("/workflows/wpid_abc/studio?panes=copilot&wr=wr_same");
+    renderAt("/workflows/wpid_abc/studio?panes=ember&wr=wr_same");
     fireEvent.click(tab("Past Runs"));
     fireEvent.click(await screen.findByText("wr_same"));
 
     expect(currentPanes()?.split(",")).toContain("overview");
-    expect(urlPanes()).toBe("copilot");
+    expect(urlPanes()).toBe("ember");
   });
 });
 
@@ -657,7 +657,7 @@ describe("StudioPaneToggles run-status dot", () => {
 describe("StudioPaneToggles browser activity", () => {
   test("exposes unseen activity on the Browser tab while its pane is closed", () => {
     useStudioBrowserStore.getState().markActivity();
-    renderAt("/workflows/wpid_abc/studio?panes=copilot");
+    renderAt("/workflows/wpid_abc/studio?panes=ember");
     expect(
       screen.getByRole("button", { name: "Browser, new activity" }),
     ).toBeTruthy();
@@ -673,18 +673,18 @@ describe("StudioPaneToggles browser activity", () => {
 
   test("clears unseen activity when the Browser pane is opened", () => {
     useStudioBrowserStore.getState().markActivity();
-    renderAt("/workflows/wpid_abc/studio?panes=copilot");
+    renderAt("/workflows/wpid_abc/studio?panes=ember");
     fireEvent.click(tab(/Browser/));
     expect(useStudioBrowserStore.getState().hasUnseenActivity).toBe(false);
-    expect(currentPanes()).toBe("copilot,browser");
-    expect(urlPanes()).toBe("copilot");
+    expect(currentPanes()).toBe("ember,browser");
+    expect(urlPanes()).toBe("ember");
   });
 });
 
 describe("StudioPaneToggles Ember question", () => {
   afterEach(() => useEmberHeaderStore.getState().setAttention(null));
 
-  test.each(["copilot", "browser"])(
+  test.each(["ember", "browser"])(
     "flags the Ember tab while a question waits (panes=%s)",
     (panes) => {
       useEmberHeaderStore.getState().setAttention("question");
@@ -707,7 +707,7 @@ describe("StudioPaneToggles Ember question", () => {
 
   test("drops the flag once the question is answered", () => {
     useEmberHeaderStore.getState().setAttention("question");
-    renderAt("/workflows/wpid_abc/studio?panes=copilot");
+    renderAt("/workflows/wpid_abc/studio?panes=ember");
     act(() => useEmberHeaderStore.getState().setAttention(null));
     expect(
       screen.queryByRole("button", {

@@ -756,7 +756,7 @@ export function WorkflowDocEditor({
   };
   const { openPane } = useStudioPanes();
   const { isPaneOnScreen } = useStudioShellContext();
-  const emberBeside = isPaneOnScreen?.("copilot") === true;
+  const emberBeside = isPaneOnScreen?.("ember") === true;
   // Building from nothing is Ember's job: an empty Doc, or one step whose text is still blank, suggests it once per browser.
   const nearlyEmpty =
     stepCount <= 1 &&
@@ -1442,7 +1442,7 @@ export function WorkflowDocEditor({
                     ? null
                     : () => {
                         starter.seeTip(DOC_EMBER_NUDGE.tip);
-                        openPane("copilot");
+                        openPane("ember");
                       }
                 }
                 onDismiss={() => starter.seeTip(DOC_EMBER_NUDGE.tip)}

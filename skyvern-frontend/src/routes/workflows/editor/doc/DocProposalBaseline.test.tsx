@@ -107,9 +107,7 @@ it("converts an unstaged reload baseline's parameter keys before classifying cha
   });
   await renderProposal();
   expect(post).toHaveBeenCalledOnce();
-  expect(post.mock.calls[0]![0]).toBe(
-    "/workflow/copilot/convert-yaml-to-blocks",
-  );
+  expect(post.mock.calls[0]![0]).toBe("/workflow/convert-yaml-to-blocks");
   expect(
     parseYaml(post.mock.calls[0]![1].workflow_definition_yaml).blocks[0]
       .parameter_keys,

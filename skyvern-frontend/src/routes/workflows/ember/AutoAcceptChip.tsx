@@ -7,6 +7,7 @@ import { useLogging } from "@/hooks/useLogging";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 import { EMBER_CHANGE_PENDING_MESSAGE } from "@/store/WorkflowYamlEditorStore";
 import { EMBER_EVENTS } from "./emberEvents";
+import { EMBER_API_PREFIX } from "./emberTypes";
 import { getEmberFailureLogFields } from "./emberFailureLogFields";
 
 type Props = {
@@ -47,8 +48,8 @@ export function AutoAcceptChip({
     try {
       await waitForAccept(chatId);
       const client = await getClient(credentialGetter, "sans-api-v1");
-      await client.post("/workflow/copilot/disable-auto-accept", {
-        workflow_copilot_chat_id: chatId,
+      await client.post(`${EMBER_API_PREFIX}/disable-auto-accept`, {
+        ember_chat_id: chatId,
       });
       captureProductEvent?.(EMBER_EVENTS.autoAcceptToggled, {
         org_id: organizationId,

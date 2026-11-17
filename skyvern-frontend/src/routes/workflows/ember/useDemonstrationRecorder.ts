@@ -7,16 +7,17 @@ import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { getErrorDetail } from "@/util/getErrorDetail";
 
-import type {
-  EmberAttachedFile,
-  EmberActiveDemonstration,
-  EmberDemonstrationActionUpdate,
-  EmberDemonstrationControlRequest,
-  EmberDemonstrationControlResult,
-  EmberDemonstrationFileRequestedUpdate,
-  EmberDemonstrationInsertion,
-  EmberDemonstrationSensitiveFieldUpdate,
-  EmberDemonstrationUpdate,
+import {
+  EMBER_API_PREFIX,
+  type EmberAttachedFile,
+  type EmberActiveDemonstration,
+  type EmberDemonstrationActionUpdate,
+  type EmberDemonstrationControlRequest,
+  type EmberDemonstrationControlResult,
+  type EmberDemonstrationFileRequestedUpdate,
+  type EmberDemonstrationInsertion,
+  type EmberDemonstrationSensitiveFieldUpdate,
+  type EmberDemonstrationUpdate,
 } from "./emberTypes";
 
 type DemonstrationPhase = "idle" | "recording" | "stopped";
@@ -220,7 +221,7 @@ export function useDemonstrationRecorder({
         const client = await getSseClient(credentialGetter);
         if (controller.signal.aborted) return;
         await client.postStreaming<EmberDemonstrationUpdate>(
-          "/workflow/copilot/demonstration/record",
+          `${EMBER_API_PREFIX}/demonstration/record`,
           {
             workflow_permanent_id: workflowPermanentId,
             browser_session_id: browserSessionId,
@@ -300,7 +301,7 @@ export function useDemonstrationRecorder({
       if (!id) throw new Error("No demonstration is active.");
       const client = await getClient(credentialGetter, "sans-api-v1");
       const response = await client.post<EmberDemonstrationControlResult>(
-        "/workflow/copilot/demonstration/control",
+        `${EMBER_API_PREFIX}/demonstration/control`,
         { demonstration_id: id, ...request },
       );
       return response.data;
@@ -389,7 +390,7 @@ export function useDemonstrationRecorder({
       formData.append("demonstration_id", id);
       formData.append("file", file);
       const response = await client.post<EmberDemonstrationControlResult>(
-        "/workflow/copilot/demonstration/upload",
+        `${EMBER_API_PREFIX}/demonstration/upload`,
         formData,
         { headers: { "Content-Type": "multipart/form-data" } },
       );
@@ -573,7 +574,7 @@ export function useDemonstrationRecorder({
       try {
         const client = await getClient(credentialGetter, "sans-api-v1");
         const response = await client.get<EmberActiveDemonstration | null>(
-          "/workflow/copilot/demonstration/active",
+          `${EMBER_API_PREFIX}/demonstration/active`,
           {
             params: {
               workflow_permanent_id: workflowPermanentId,

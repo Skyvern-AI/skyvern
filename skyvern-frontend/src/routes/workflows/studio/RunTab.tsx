@@ -59,7 +59,7 @@ export function RunTab() {
           : (failingLabel) => {
               // One replace-navigation opens the pane and arms the action via
               // location.state, so the pane write can't race a state-only navigation.
-              openPane("copilot", {
+              openPane("ember", {
                 state: {
                   emberAction: {
                     kind: "diagnose_run",
