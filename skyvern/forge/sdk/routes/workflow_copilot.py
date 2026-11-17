@@ -305,10 +305,7 @@ _process_workflow_yaml = _copilot_process_workflow_yaml
 # Wall clock, unlike TOTAL_TIMEOUT_SECONDS: that budget excludes time parked in a
 # credential pause, so a legitimately live turn can outlast it in real time.
 RECONCILE_ABANDON_AFTER_SECONDS = (
-    TOTAL_TIMEOUT_SECONDS
-    + settings.WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS
-    + EXPIRED_TURN_REPLY_SECONDS
-    + 120
+    TOTAL_TIMEOUT_SECONDS + settings.EMBER_CREDENTIAL_PAUSE_TIMEOUT_SECONDS + EXPIRED_TURN_REPLY_SECONDS + 120
 )
 ALLOWED_WORKFLOW_COPILOT_AUDIO_CONTENT_TYPES = {
     "audio/mp4",
@@ -848,10 +845,7 @@ RouteExit = Literal["completed", "error", "cancelled", "duplicate", "refused"]
 
 
 def _copilot_eval_cost_enabled(organization_id: str) -> bool:
-    return (
-        settings.WORKFLOW_COPILOT_EVAL_COST_ENABLED
-        and organization_id in settings.WORKFLOW_COPILOT_EVAL_COST_ORGANIZATION_IDS
-    )
+    return settings.EMBER_EVAL_COST_ENABLED and organization_id in settings.EMBER_EVAL_COST_ORGANIZATION_IDS
 
 
 def _copilot_eval_cost_headers(ledger: CopilotCostLedger | None) -> dict[str, str]:
@@ -4010,8 +4004,8 @@ def _validated_eval_entrypoint_url(
         return None
     eval_entrypoint_url = chat_request.eval_entrypoint_url
     if (
-        not settings.WORKFLOW_COPILOT_ODYSSEYS_EVAL_INPUTS_ENABLED
-        or organization.organization_id not in settings.WORKFLOW_COPILOT_ODYSSEYS_EVAL_ORGANIZATION_IDS
+        not settings.EMBER_ODYSSEYS_EVAL_INPUTS_ENABLED
+        or organization.organization_id not in settings.EMBER_ODYSSEYS_EVAL_ORGANIZATION_IDS
         or (request.headers.get("x-ember-eval") or request.headers.get("x-copilot-eval")) != "odysseys"
     ):
         raise HTTPException(
@@ -4097,8 +4091,8 @@ async def workflow_copilot_chat_post(
                 detail="Unsupported Copilot eval mode",
             ) from exc
         if (
-            not settings.WORKFLOW_COPILOT_BROWSER_ABLATION_ENABLED
-            or organization.organization_id not in settings.WORKFLOW_COPILOT_BROWSER_ABLATION_ORGANIZATION_IDS
+            not settings.EMBER_BROWSER_ABLATION_ENABLED
+            or organization.organization_id not in settings.EMBER_BROWSER_ABLATION_ORGANIZATION_IDS
         ):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Copilot eval mode is disabled")
         return await _new_copilot_chat_post(
@@ -4273,8 +4267,7 @@ async def _reconcile_interrupted_copilot_turns(chat: WorkflowCopilotChat, organi
         if (
             credential_pause_active is None
             and has_recovery_handoff
-            and last_activity
-            > abandoned_before - timedelta(seconds=settings.WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS)
+            and last_activity > abandoned_before - timedelta(seconds=settings.EMBER_CREDENTIAL_PAUSE_TIMEOUT_SECONDS)
         ):
             # A transient Redis failure must not reclaim a possible second
             # credential wait, while an unrelated stale turn must eventually

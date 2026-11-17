@@ -163,6 +163,7 @@ import {
   EmberSteerDeliveredUpdate,
   EmberSteerRequest,
   EmberScreenshotUpdate,
+  EMBER_API_PREFIX,
   emberChatIdOf,
   emberChatMessageIdOf,
 } from "./emberTypes";
@@ -356,7 +357,7 @@ type EmberFailureOperation =
   | "resume_token";
 
 export const REQUEST_CANCEL_TOKEN_KEY_PREFIX = "ember-request-cancel-token:";
-// Still the key this bundle writes, so a tab rolled back to an older bundle finds the token.
+// Read when the Ember key is absent: older bundles wrote this key.
 export const LEGACY_REQUEST_CANCEL_TOKEN_KEY_PREFIX =
   "copilot-request-cancel-token:";
 
@@ -408,7 +409,7 @@ async function readCredentialRecoveryHistory<
         ...config,
         params: {
           ...config.params,
-          workflow_copilot_chat_id: emberChatIdOf(response.data),
+          ember_chat_id: emberChatIdOf(response.data),
           request_cancel_token: token,
         },
       },
@@ -2760,7 +2761,7 @@ export function EmberChat({
       const target = event.target;
       if (
         !(target instanceof Element) ||
-        !target.closest(`#${studioPanelId("copilot")}`)
+        !target.closest(`#${studioPanelId("ember")}`)
       ) {
         buildFollowEngaged.current = false;
       }
@@ -2923,7 +2924,7 @@ export function EmberChat({
               workflowPermanentId,
               {
                 params: {
-                  workflow_copilot_chat_id: emberChatIdOf(frame),
+                  ember_chat_id: emberChatIdOf(frame),
                 },
               },
             );
@@ -2976,7 +2977,7 @@ export function EmberChat({
         if (!isEmberTurnCurrent(reservation)) return;
         const pauseIds = {
           turn_id: frame.turn_id,
-          workflow_copilot_chat_id: emberChatIdOf(frame),
+          ember_chat_id: emberChatIdOf(frame),
           resume_token: frame.resume_token,
         };
         let generated: EmberCredentialGenerateResult | null = null;
@@ -2988,7 +2989,7 @@ export function EmberChat({
           updateRegistration(frame, { attempted: true });
           generated = (
             await client.post<EmberCredentialGenerateResult>(
-              "/workflow/copilot/credential-generate",
+              `${EMBER_API_PREFIX}/credential-generate`,
               pauseIds,
             )
           ).data;
@@ -3002,7 +3003,7 @@ export function EmberChat({
             }));
           }
           const response = await client.post<EmberCredentialResponseResult>(
-            "/workflow/copilot/credential-response",
+            `${EMBER_API_PREFIX}/credential-response`,
             {
               ...pauseIds,
               action,
@@ -4082,10 +4083,10 @@ export function EmberChat({
                 const client = await getClient(credentialGetter, "sans-api-v1");
                 if (stopped || !isCurrent()) return;
                 await client.post(
-                  "/workflow/copilot/cancel",
+                  `${EMBER_API_PREFIX}/cancel`,
                   {
                     cancel_token: cancelToken,
-                    workflow_copilot_chat_id: chatId,
+                    ember_chat_id: chatId,
                     source: "stop_button",
                   },
                   { timeout: CANONICAL_READ_TIMEOUT_MS },
@@ -4221,7 +4222,7 @@ export function EmberChat({
               {
                 params: {
                   ...(chatId
-                    ? { workflow_copilot_chat_id: chatId }
+                    ? { ember_chat_id: chatId }
                     : { workflow_permanent_id: workflowPermanentId }),
                   ...(holdingReservation && turnId === null
                     ? { request_cancel_token: requestId }
@@ -4959,7 +4960,7 @@ export function EmberChat({
             {
               params: {
                 workflow_permanent_id: workflowPermanentId,
-                workflow_copilot_chat_id: chatId,
+                ember_chat_id: chatId,
               },
             },
           );
@@ -5215,9 +5216,9 @@ export function EmberChat({
         const client = await getClient(credentialGetter, "sans-api-v1");
         if (signal.aborted) throw new Error("Proposal refresh cancelled");
         return client.get<EmberChatHistoryResponse>(
-          "/workflow/copilot/chat-history",
+          `${EMBER_API_PREFIX}/chat-history`,
           {
-            params: { workflow_copilot_chat_id: chatId },
+            params: { ember_chat_id: chatId },
             timeout: ACCEPT_SETTLE_CEILING_MS,
             signal,
           },
@@ -5506,7 +5507,7 @@ export function EmberChat({
                   client,
                   workflowPermanentId,
                   {
-                    params: { workflow_copilot_chat_id: pending.acceptChatId },
+                    params: { ember_chat_id: pending.acceptChatId },
                     signal: controller.signal,
                   },
                 );
@@ -5564,9 +5565,9 @@ export function EmberChat({
                 pending.retryAccept = false;
                 try {
                   const applied = await client.post<WorkflowApiResponse>(
-                    "/workflow/copilot/apply-proposed-workflow",
+                    `${EMBER_API_PREFIX}/apply-proposed-workflow`,
                     {
-                      workflow_copilot_chat_id: pending.acceptChatId,
+                      ember_chat_id: pending.acceptChatId,
                       auto_accept: pending.gateAttempt?.alwaysAccept ?? false,
                       owner_turn_id: attempt?.owner_turn_id,
                       revision: attempt?.revision,
@@ -6003,9 +6004,9 @@ export function EmberChat({
           if (signal.aborted || !isEmberTurnCurrent(acceptance))
             throw new Error("Accept request cancelled");
           return client.post<WorkflowApiResponse>(
-            "/workflow/copilot/apply-proposed-workflow",
+            `${EMBER_API_PREFIX}/apply-proposed-workflow`,
             {
-              workflow_copilot_chat_id: chatId,
+              ember_chat_id: chatId,
               auto_accept: alwaysAccept,
               owner_turn_id: acceptAttempt?.owner_turn_id ?? null,
               revision: acceptAttempt?.revision ?? null,
@@ -6531,12 +6532,12 @@ export function EmberChat({
       formData.append("workflow_permanent_id", workflowPermanentId);
       const chatId = emberChatIdRef.current?.trim();
       if (chatId) {
-        formData.append("workflow_copilot_chat_id", chatId);
+        formData.append("ember_chat_id", chatId);
       }
       formData.append("file", audioBlob, `dictation-${Date.now()}.webm`);
 
       const response = await client.post<EmberAudioUploadResponse>(
-        "/workflow/copilot/chat-audio",
+        `${EMBER_API_PREFIX}/chat-audio`,
         formData,
         {
           headers: {
@@ -6565,10 +6566,10 @@ export function EmberChat({
       }
       const client = await getClient(credentialGetter, "sans-api-v1");
       const response = await client.post<EmberMessageFeedbackResponse>(
-        "/workflow/copilot/message-feedback",
+        `${EMBER_API_PREFIX}/message-feedback`,
         {
-          workflow_copilot_chat_id: chatId,
-          workflow_copilot_chat_message_id: target.messageId ?? null,
+          ember_chat_id: chatId,
+          ember_chat_message_id: target.messageId ?? null,
           turn_id: target.turnId ?? null,
           rating,
           reason: reason ?? null,
@@ -6685,9 +6686,9 @@ export function EmberChat({
       const client = await getClient(credentialGetter, "sans-api-v1");
       if (!isEmberTurnCurrent(reservation)) return false;
       await client.post<EmberClearProposedWorkflowRequest>(
-        "/workflow/copilot/clear-proposed-workflow",
+        `${EMBER_API_PREFIX}/clear-proposed-workflow`,
         {
-          workflow_copilot_chat_id: chatId,
+          ember_chat_id: chatId,
           auto_accept: autoAcceptValue,
           owner_turn_id: pendingProposalMetadata?.owner_turn_id ?? null,
           revision: pendingProposalMetadata?.revision ?? null,
@@ -6940,7 +6941,7 @@ export function EmberChat({
             {
               params: {
                 workflow_permanent_id: workflowPermanentId,
-                ...(chatId ? { workflow_copilot_chat_id: chatId } : {}),
+                ...(chatId ? { ember_chat_id: chatId } : {}),
               },
             },
             { retryTransientFailure: true },
@@ -7242,8 +7243,8 @@ export function EmberChat({
     setPendingSteers(pendingSteersRef.current);
     try {
       const client = await getClient(credentialGetter, "sans-api-v1");
-      await client.post("/workflow/copilot/steer", {
-        workflow_copilot_chat_id: chatId,
+      await client.post(`${EMBER_API_PREFIX}/steer`, {
+        ember_chat_id: chatId,
         cancel_token: cancelToken,
         steer_id: steer.steerId,
         message: steer.text,
@@ -7363,7 +7364,7 @@ export function EmberChat({
         if (!isCurrent()) return;
         cancelRequestStarted = true;
         await client.post<void>(
-          "/workflow/copilot/cancel",
+          `${EMBER_API_PREFIX}/cancel`,
           { cancel_token: cancelToken, source } as EmberCancelRequest,
           { timeout: 15_000, signal: controllerAtCancel.signal },
         );
@@ -7483,7 +7484,7 @@ export function EmberChat({
     async (
       interaction: QuestionInteraction,
       response: QuestionResponse | { credential_ids: string[] },
-      path = "/workflow/copilot/question-response",
+      path = `${EMBER_API_PREFIX}/question-response`,
     ) => {
       if (!emberChatId || submittingQuestion.current || acceptUnresolved)
         return false;
@@ -7507,7 +7508,7 @@ export function EmberChat({
         const client = await getClient(credentialGetter, "sans-api-v1");
         if (!isEmberTurnCurrent(reservation)) return false;
         const accepted = await client.post<QuestionInteraction>(path, {
-          workflow_copilot_chat_id: emberChatId,
+          ember_chat_id: emberChatId,
           interaction_id: interaction.interaction_id,
           ...response,
         });
@@ -8124,7 +8125,7 @@ export function EmberChat({
             client,
             workflowPermanentId,
             {
-              params: { workflow_copilot_chat_id: emberChatId },
+              params: { ember_chat_id: emberChatId },
             },
           );
         if (
@@ -8504,7 +8505,7 @@ export function EmberChat({
       try {
         if (workflowPermanentId)
           sessionStorage.setItem(
-            `${LEGACY_REQUEST_CANCEL_TOKEN_KEY_PREFIX}${workflowPermanentId}`,
+            `${REQUEST_CANCEL_TOKEN_KEY_PREFIX}${workflowPermanentId}`,
             cancelToken,
           );
       } catch {
@@ -9141,11 +9142,11 @@ export function EmberChat({
         const credentialRecoveryToken =
           ensureCredentialRecoveryToken(workflowPermanentId);
         await client.postStreaming<EmberSsePayload>(
-          "/workflow/copilot/chat-post",
+          `${EMBER_API_PREFIX}/chat-post`,
           {
             workflow_id: workflowId,
             workflow_permanent_id: workflowPermanentId,
-            workflow_copilot_chat_id: chatIdForRequest,
+            ember_chat_id: chatIdForRequest,
             workflow_run_id: productAction?.workflowRunId ?? workflowRunId,
             browser_session_id: liveBrowserSessionId ?? null,
             message: messageContent,
@@ -9683,8 +9684,7 @@ export function EmberChat({
       // Ember holds Done and Discard, so it opens too.
       const panes = panesRef.current;
       // showPane keeps one pending request, so the Browser opens last to be the one a folded Doc layout expands.
-      if (!panes.resolveLivePanes().includes("copilot"))
-        panes.openPane("copilot");
+      if (!panes.resolveLivePanes().includes("ember")) panes.openPane("ember");
       panes.openPane("browser");
       const live = panes.resolveLivePanes();
       if (live.includes("editor") && !keepEditor) {
@@ -10953,9 +10953,9 @@ export function EmberChat({
     if (stopBlockedByDeletionRef.current) return;
     try {
       const client = await getClient(credentialGetter, "sans-api-v1");
-      await client.post("/workflow/copilot/cancel", {
+      await client.post(`${EMBER_API_PREFIX}/cancel`, {
         cancel_token: questionCancelToken,
-        workflow_copilot_chat_id: emberChatId,
+        ember_chat_id: emberChatId,
         source: "stop_button",
       });
       if (emberChatId) await loadChatInPlace(emberChatId);
@@ -12047,7 +12047,7 @@ export function EmberChat({
               void handleQuestionAnswer(
                 trayQuestion,
                 { credential_ids: credentialIds },
-                "/workflow/copilot/credential-deletion",
+                `${EMBER_API_PREFIX}/credential-deletion`,
               );
               // handleQuestionAnswer runs synchronously up to its send, so this is set only when a confirm went out.
               if (submittingQuestion.current)

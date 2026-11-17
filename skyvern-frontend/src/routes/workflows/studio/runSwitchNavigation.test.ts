@@ -48,7 +48,7 @@ beforeEach(() => {
 describe("searchWithoutRun", () => {
   it("drops the inspected run and its selection but keeps the pane layout", () => {
     expect(
-      searchWithoutRun("?panes=browser&wr=wr_1&wrs=copilot&active=b1&bl=x"),
+      searchWithoutRun("?panes=browser&wr=wr_1&wrs=ember&active=b1&bl=x"),
     ).toBe("?panes=browser");
   });
 });
@@ -58,16 +58,16 @@ describe("searchWithRunSwitched system focus", () => {
     const focused = searchWithRunSwitched("?panes=browser", "wr_1", {
       systemFocus: true,
     });
-    expect(focused).toBe("?panes=browser&wr=wr_1&wrs=copilot");
+    expect(focused).toBe("?panes=browser&wr=wr_1&wrs=ember");
     expect(searchWithRunSwitched(focused, "wr_2")).toBe("?wr=wr_2");
   });
 
   it("keeps the marker when the Ember hands off between its own runs", () => {
     expect(
-      searchWithRunSwitched("?wr=wr_1&wrs=copilot", "wr_2", {
+      searchWithRunSwitched("?wr=wr_1&wrs=ember", "wr_2", {
         systemFocus: true,
       }),
-    ).toBe("?wr=wr_2&wrs=copilot");
+    ).toBe("?wr=wr_2&wrs=ember");
   });
 
   it("leaves a run the user opened in the run class, unmarked", () => {
@@ -84,14 +84,14 @@ describe("searchWithRunSwitched system focus", () => {
 
 describe("searchWithEmberBrowserFocus", () => {
   it("pins an Ember-focused run's pane to the browser the call names", () => {
-    expect(
-      searchWithEmberBrowserFocus("?wr=wr_1&wrs=copilot", "pbs_debug"),
-    ).toBe("?wr=wr_1&wrs=pbs_debug");
+    expect(searchWithEmberBrowserFocus("?wr=wr_1&wrs=ember", "pbs_debug")).toBe(
+      "?wr=wr_1&wrs=pbs_debug",
+    );
   });
 
   it("follows the latest call when it names a different browser", () => {
     const onDebug = searchWithEmberBrowserFocus(
-      "?wr=wr_1&wrs=copilot",
+      "?wr=wr_1&wrs=ember",
       "pbs_debug",
     );
     const onRun = searchWithEmberBrowserFocus(onDebug, "pbs_run");
@@ -117,24 +117,24 @@ describe("searchWithEmberBrowserFocus", () => {
 
   it("hands the pane back to the next run Ember starts", () => {
     const inspecting = searchWithEmberBrowserFocus(
-      "?wr=wr_1&wrs=copilot",
+      "?wr=wr_1&wrs=ember",
       "pbs_debug",
     );
     expect(
       searchWithRunSwitched(inspecting, "wr_2", { systemFocus: true }),
-    ).toBe("?wr=wr_2&wrs=copilot");
+    ).toBe("?wr=wr_2&wrs=ember");
   });
 });
 
 describe("searchWithEmberBrowserReleased", () => {
   it("returns a pinned pane to the Ember run focus", () => {
     expect(searchWithEmberBrowserReleased("?wr=wr_1&wrs=pbs_debug")).toBe(
-      "?wr=wr_1&wrs=copilot",
+      "?wr=wr_1&wrs=ember",
     );
   });
 
   it("leaves an unpinned or user-opened run alone", () => {
-    for (const search of ["?wr=wr_1&wrs=copilot", "?wr=wr_user", ""]) {
+    for (const search of ["?wr=wr_1&wrs=ember", "?wr=wr_user", ""]) {
       expect(searchWithEmberBrowserReleased(search)).toBe(search);
     }
   });
@@ -143,7 +143,7 @@ describe("searchWithEmberBrowserReleased", () => {
 describe("useSwitchStudioRun", () => {
   it("pushes a run the user picked, so Back returns to the previous one", () => {
     const { result } = renderHook(() => useSwitchStudioRun(), {
-      wrapper: wrapperFor("/studio?panes=copilot,browser"),
+      wrapper: wrapperFor("/studio?panes=ember,browser"),
     });
     result.current("wr_1");
     expect(navigate).toHaveBeenCalledWith(
@@ -167,11 +167,11 @@ describe("useSwitchStudioRun", () => {
   it("replaces and marks a run focused on the user's behalf", () => {
     const { result } = renderHook(
       () => useSwitchStudioRun({ replace: true, systemFocus: true }),
-      { wrapper: wrapperFor("/studio?panes=copilot,browser") },
+      { wrapper: wrapperFor("/studio?panes=ember,browser") },
     );
     result.current("wr_1");
     expect(navigate).toHaveBeenCalledWith(
-      { search: "?panes=copilot,browser&wr=wr_1&wrs=copilot" },
+      { search: "?panes=ember,browser&wr=wr_1&wrs=ember" },
       { replace: true },
     );
   });

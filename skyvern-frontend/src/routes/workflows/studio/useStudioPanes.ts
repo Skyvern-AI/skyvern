@@ -75,8 +75,8 @@ export function useStudioPanes() {
         const next = compute(current, slots);
         if (
           !workflowDeleted &&
-          !current.includes("copilot") &&
-          next.includes("copilot")
+          !current.includes("ember") &&
+          next.includes("ember")
         ) {
           posthog.capture(EMBER_EVENTS.paneOpened, {
             org_id: organizationId,

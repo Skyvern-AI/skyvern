@@ -754,7 +754,7 @@ _PAGE_FINGERPRINT_PROBE_JS = (
     # action, so a page that never moved would still hash differently the first time a tool touches it: the stall
     # detector reads that as progress and the action-effect check as an effect. Page-authored data-tv3 values stay
     # significant, as in loop.py's canonicalization. OTP bookkeeping attributes are ignored for the same reason.
-    " const scrub = (s) => s.replace(/ data-(?:tv3-(?:act|catcher|cellgrid|close|codebox|collateral|cover|dateseg"
+    " const scrub = (s) => s.replace(/ data-(?:tv3-(?:act|catcher|cellgrid|codebox|collateral|cover|ctl|dateseg"
     "|filter-base|focus|liveparent|look|menu|menu-scroller|pick|popup-filter|pre|prerow|sugg|sugglist)"
     '|skyvern-otp-[^\\s=]+)="[^"]*"'
     "| data-tv3=\"t\\d+(?:-\\d+)?\"/gi, '');"
@@ -4670,6 +4670,7 @@ class ForgeAgent:
         if verification_state.last_status is not None:
             LOG.info(
                 "task_v3 ended on a verification code status",
+                last_status=redact_secrets_from_text(verification_state.last_status, run_secrets),
                 task_id=task.task_id,
                 organization_id=task.organization_id,
                 workflow_run_id=task.workflow_run_id,

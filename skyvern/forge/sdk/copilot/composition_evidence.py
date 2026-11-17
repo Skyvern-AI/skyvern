@@ -383,7 +383,7 @@ def _collapsed_disclosure_controls(controls: Any) -> list[dict[str, Any]]:
 
 def has_satisfiable_collapsed_disclosure_path(evidence: dict[str, Any]) -> bool:
     """Return whether evidence carries an enabled control for a collapsed region."""
-    if not settings.COPILOT_CLICKABLE_CONTROLS_EVIDENCE_ENABLED:
+    if not settings.EMBER_CLICKABLE_CONTROLS_EVIDENCE_ENABLED:
         return False
     controls = list(evidence.get("clickable_controls") or [])
     controls.extend(
@@ -1785,7 +1785,7 @@ def _selector_for(
 
 
 def _clickable_controls_channel(controls: list[dict[str, Any]] | None) -> dict[str, Any]:
-    if not settings.COPILOT_CLICKABLE_CONTROLS_EVIDENCE_ENABLED:
+    if not settings.EMBER_CLICKABLE_CONTROLS_EVIDENCE_ENABLED:
         return {}
     return {"clickable_controls": controls or []}
 

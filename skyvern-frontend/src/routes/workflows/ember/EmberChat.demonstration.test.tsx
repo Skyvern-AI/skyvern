@@ -73,7 +73,7 @@ const {
   };
   const post = vi.fn().mockResolvedValue({ data: { seq: 1 } });
   const get = vi.fn((path: string) => {
-    if (path === "/workflow/copilot/demonstration/active") {
+    if (path === "/ember/demonstration/active") {
       return Promise.resolve({ data: active.value });
     }
     if (path === "/credentials") {
@@ -208,7 +208,7 @@ let closeEmberPane: (() => void) | null = null;
 
 function StudioPanesProbe() {
   const { panes, closePane } = useStudioPanes();
-  closeEmberPane = () => closePane("copilot");
+  closeEmberPane = () => closePane("ember");
   return <output data-testid="studio-panes">{panes.join(",")}</output>;
 }
 
@@ -417,10 +417,10 @@ describe("EmberChat demonstration", () => {
     });
     try {
       const panes = () => screen.getByTestId("studio-panes").textContent;
-      expect(panes()).toBe("copilot,editor");
+      expect(panes()).toBe("ember,editor");
 
       const call = await startDemonstration();
-      expect(panes()).toBe("copilot,browser");
+      expect(panes()).toBe("ember,browser");
       act(() => {
         call.onMessage({
           type: "demonstration_action",
@@ -443,7 +443,7 @@ describe("EmberChat demonstration", () => {
         ).toBe(true),
       );
       // The build turn is still streaming; Editor must not wait for it to end.
-      await waitFor(() => expect(panes()).toBe("copilot,editor,browser"));
+      await waitFor(() => expect(panes()).toBe("ember,editor,browser"));
     } finally {
       removePortalTarget();
     }
@@ -553,14 +553,11 @@ describe("EmberChat demonstration", () => {
     fireEvent.keyDown(textbox, { key: "Enter" });
 
     await waitFor(() =>
-      expect(sansApiPost).toHaveBeenCalledWith(
-        "/workflow/copilot/demonstration/control",
-        {
-          demonstration_id: "demonstration-1",
-          action: "note",
-          text: "Pick the cheapest",
-        },
-      ),
+      expect(sansApiPost).toHaveBeenCalledWith("/ember/demonstration/control", {
+        demonstration_id: "demonstration-1",
+        action: "note",
+        text: "Pick the cheapest",
+      }),
     );
     await waitFor(() => expect(textbox.value).toBe(""));
     expect(
@@ -609,10 +606,10 @@ describe("EmberChat demonstration", () => {
       }),
     );
     await waitFor(() =>
-      expect(sansApiPost).toHaveBeenCalledWith(
-        "/workflow/copilot/demonstration/control",
-        { demonstration_id: "demonstration-1", action: "stop" },
-      ),
+      expect(sansApiPost).toHaveBeenCalledWith("/ember/demonstration/control", {
+        demonstration_id: "demonstration-1",
+        action: "stop",
+      }),
     );
     expect(streamCalls.some((item) => item.path.endsWith("/chat-post"))).toBe(
       false,
@@ -703,10 +700,10 @@ describe("EmberChat demonstration", () => {
         }) as HTMLButtonElement
       ).disabled,
     ).toBe(true);
-    expect(sansApiPost).toHaveBeenCalledWith(
-      "/workflow/copilot/demonstration/control",
-      { demonstration_id: "demonstration-1", action: "stop" },
-    );
+    expect(sansApiPost).toHaveBeenCalledWith("/ember/demonstration/control", {
+      demonstration_id: "demonstration-1",
+      action: "stop",
+    });
   });
 
   it("removes a failed start message, then discards a recording", async () => {
@@ -760,10 +757,10 @@ describe("EmberChat demonstration", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Discard" }));
 
     await waitFor(() =>
-      expect(sansApiPost).toHaveBeenCalledWith(
-        "/workflow/copilot/demonstration/control",
-        { demonstration_id: "demonstration-1", action: "cancel" },
-      ),
+      expect(sansApiPost).toHaveBeenCalledWith("/ember/demonstration/control", {
+        demonstration_id: "demonstration-1",
+        action: "cancel",
+      }),
     );
     await waitFor(() => {
       expect(screen.queryByText("Demonstrating · 1 action")).toBeNull();
@@ -852,16 +849,13 @@ describe("EmberChat demonstration", () => {
     fireEvent.click(await screen.findByText("Saved login"));
 
     await waitFor(() =>
-      expect(sansApiPost).toHaveBeenCalledWith(
-        "/workflow/copilot/demonstration/control",
-        {
-          demonstration_id: "demonstration-1",
-          action: "fill_credential",
-          credential_id: "credential-1",
-          selector: "#password",
-          field: "password",
-        },
-      ),
+      expect(sansApiPost).toHaveBeenCalledWith("/ember/demonstration/control", {
+        demonstration_id: "demonstration-1",
+        action: "fill_credential",
+        credential_id: "credential-1",
+        selector: "#password",
+        field: "password",
+      }),
     );
 
     act(() => {
@@ -955,10 +949,10 @@ describe("EmberChat demonstration", () => {
       await screen.findByRole("button", { name: "Done, build the workflow" }),
     );
     await waitFor(() =>
-      expect(sansApiPost).toHaveBeenCalledWith(
-        "/workflow/copilot/demonstration/control",
-        { demonstration_id: "demonstration-1", action: "stop" },
-      ),
+      expect(sansApiPost).toHaveBeenCalledWith("/ember/demonstration/control", {
+        demonstration_id: "demonstration-1",
+        action: "stop",
+      }),
     );
     act(() => {
       call.onMessage({
@@ -1006,7 +1000,7 @@ describe("EmberChat demonstration", () => {
   it("disables Demonstrate task when the backend refuses demonstrations", async () => {
     const answer = sansApiGet.getMockImplementation()!;
     sansApiGet.mockImplementation(((path: string) =>
-      path === "/workflow/copilot/demonstration/active"
+      path === "/ember/demonstration/active"
         ? Promise.reject(
             new AxiosError(
               "not implemented",
@@ -1098,14 +1092,11 @@ describe("EmberChat demonstration", () => {
         /The browser restarted, so the demonstration was interrupted/,
       ),
     ).toBeTruthy();
-    expect(sansApiPost).toHaveBeenCalledWith(
-      "/workflow/copilot/demonstration/control",
-      {
-        demonstration_id: "demonstration-1",
-        action: "stop",
-        stop_reason: "browser_gone",
-      },
-    );
+    expect(sansApiPost).toHaveBeenCalledWith("/ember/demonstration/control", {
+      demonstration_id: "demonstration-1",
+      action: "stop",
+      stop_reason: "browser_gone",
+    });
     await waitFor(() =>
       expect(
         (

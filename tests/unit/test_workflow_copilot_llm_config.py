@@ -2,8 +2,8 @@
 
 Optional settings give operators independent control over the main Copilot lane,
 agent-specific lane, and fast-consumer lane:
-``WORKFLOW_COPILOT_LLM_KEY``, ``WORKFLOW_COPILOT_AGENT_LLM_KEY``, and
-``WORKFLOW_COPILOT_FAST_LLM_KEY``. ``WORKFLOW_COPILOT_LITE_LLM_KEY`` selects the
+``EMBER_LLM_KEY``, ``EMBER_AGENT_LLM_KEY``, and
+``EMBER_FAST_LLM_KEY``. ``EMBER_LITE_LLM_KEY`` selects the
 dedicated raw-secret safety model; the resolver itself never falls back to the
 acting model; when the key is empty, open-source startup supplies the base
 Copilot handler.
@@ -52,16 +52,16 @@ from skyvern.schemas.llm import LLMConfig
 
 
 def test_workflow_copilot_agent_llm_key_default_is_none() -> None:
-    assert Settings.model_fields["WORKFLOW_COPILOT_LLM_KEY"].default is None
-    assert Settings.model_fields["WORKFLOW_COPILOT_AGENT_LLM_KEY"].default is None
+    assert Settings.model_fields["EMBER_LLM_KEY"].default is None
+    assert Settings.model_fields["EMBER_AGENT_LLM_KEY"].default is None
 
 
 def test_workflow_copilot_fast_llm_key_default_is_none() -> None:
-    assert Settings.model_fields["WORKFLOW_COPILOT_FAST_LLM_KEY"].default is None
+    assert Settings.model_fields["EMBER_FAST_LLM_KEY"].default is None
 
 
 def test_workflow_copilot_lite_llm_key_default_is_none() -> None:
-    assert Settings.model_fields["WORKFLOW_COPILOT_LITE_LLM_KEY"].default is None
+    assert Settings.model_fields["EMBER_LITE_LLM_KEY"].default is None
 
 
 @pytest.mark.asyncio
@@ -84,7 +84,7 @@ async def test_resolve_raw_secret_safety_handler_has_no_main_fallback(monkeypatc
         return None
 
     monkeypatch.setattr(copilot_llm_config, "get_llm_handler_for_prompt_type", _lookup)
-    monkeypatch.setattr(copilot_llm_config, "app", SimpleNamespace(WORKFLOW_COPILOT_LITE_LLM_API_HANDLER=None))
+    monkeypatch.setattr(copilot_llm_config, "app", SimpleNamespace(EMBER_LITE_LLM_API_HANDLER=None))
     assert await copilot_llm_config.resolve_raw_secret_safety_handler("wpid_1", "org_1") is None
 
 
@@ -137,8 +137,8 @@ async def test_resolve_main_copilot_handler_posthog_override_wins(monkeypatch: p
         copilot_llm_config,
         "app",
         SimpleNamespace(
-            WORKFLOW_COPILOT_AGENT_LLM_API_HANDLER=dedicated,
-            WORKFLOW_COPILOT_LLM_API_HANDLER=primary,
+            EMBER_AGENT_LLM_API_HANDLER=dedicated,
+            EMBER_LLM_API_HANDLER=primary,
             LLM_API_HANDLER=primary,
         ),
     )
@@ -160,7 +160,7 @@ async def test_resolve_main_copilot_handler_falls_back_to_dedicated(monkeypatch:
         copilot_llm_config,
         "app",
         SimpleNamespace(
-            WORKFLOW_COPILOT_AGENT_LLM_API_HANDLER=dedicated,
+            EMBER_AGENT_LLM_API_HANDLER=dedicated,
             LLM_API_HANDLER=primary,
         ),
     )
@@ -184,8 +184,8 @@ async def test_resolve_main_copilot_handler_falls_back_to_workflow_copilot_key(
         copilot_llm_config,
         "app",
         SimpleNamespace(
-            WORKFLOW_COPILOT_AGENT_LLM_API_HANDLER=None,
-            WORKFLOW_COPILOT_LLM_API_HANDLER=workflow_copilot,
+            EMBER_AGENT_LLM_API_HANDLER=None,
+            EMBER_LLM_API_HANDLER=workflow_copilot,
             LLM_API_HANDLER=primary,
         ),
     )
@@ -205,8 +205,8 @@ async def test_resolve_main_copilot_handler_falls_back_to_workflow_copilot_key(
         # A custom forge-app initializer that sets the new attribute to None must fall through.
         pytest.param(
             lambda primary: SimpleNamespace(
-                WORKFLOW_COPILOT_AGENT_LLM_API_HANDLER=None,
-                WORKFLOW_COPILOT_LLM_API_HANDLER=primary,
+                EMBER_AGENT_LLM_API_HANDLER=None,
+                EMBER_LLM_API_HANDLER=primary,
                 LLM_API_HANDLER=object(),
             ),
             id="dedicated_is_none",
@@ -274,7 +274,7 @@ async def test_composition_visual_handler_uses_fast_copilot_lane(
 
 @pytest.fixture
 def eval_llm_registry(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_EVAL_LLM_OVERRIDES_ORGANIZATION_IDS", ["org_eval"])
+    monkeypatch.setattr(settings, "EMBER_EVAL_LLM_OVERRIDES_ORGANIZATION_IDS", ["org_eval"])
     monkeypatch.setattr(
         LLMConfigRegistry,
         "_configs",
@@ -353,7 +353,7 @@ def test_eval_overrides_reject_invalid_or_unavailable_configuration(raw: str, ev
 def test_eval_overrides_require_allowlisted_evaluation_org(
     allowed_organizations: list[str], organization_id: str, eval_llm_registry: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_EVAL_LLM_OVERRIDES_ORGANIZATION_IDS", allowed_organizations)
+    monkeypatch.setattr(settings, "EMBER_EVAL_LLM_OVERRIDES_ORGANIZATION_IDS", allowed_organizations)
     raw = '{"workflow-copilot":"EVAL_ACTOR"}'
     with pytest.raises(HTTPException) as error:
         admit_eval_llm_overrides(raw, organization_id)
@@ -401,8 +401,8 @@ async def test_eval_override_scope_covers_detached_stream_and_terminal_receipt(
 ) -> None:
     captured: dict[str, Any] = {}
     started, release = asyncio.Event(), asyncio.Event()
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_EVAL_COST_ENABLED", True)
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_EVAL_COST_ORGANIZATION_IDS", ["org_eval"])
+    monkeypatch.setattr(settings, "EMBER_EVAL_COST_ENABLED", True)
+    monkeypatch.setattr(settings, "EMBER_EVAL_COST_ORGANIZATION_IDS", ["org_eval"])
 
     def detached_stream(request: Request, handler: Any) -> object:
         captured["handler"] = handler

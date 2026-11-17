@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 export const DISCOVER_EMBER_HANDOFF_STORAGE_PREFIX =
   "skyvern.discoverEmberHandoff";
-// Still the key this bundle writes, so a tab rolled back to an older bundle finds the prompt.
+// Read when the Ember key is absent: older bundles wrote this key.
 export const LEGACY_DISCOVER_HANDOFF_STORAGE_PREFIX =
   "skyvern.discoverCopilotHandoff";
 
@@ -37,7 +37,7 @@ export function rememberDiscoverEmberPrompt(
   }
 
   try {
-    getSessionStorage()?.setItem(legacyStorageKey(workflowPermanentId), prompt);
+    getSessionStorage()?.setItem(storageKey(workflowPermanentId), prompt);
   } catch {
     return;
   }
@@ -118,7 +118,7 @@ export function useDiscoverEmberPromptRecovery({
 // prompt seeded but only the default editor+browser panes open, so the pane must
 // be opened explicitly to surface the handed-off prompt. Off in the legacy
 // (non-embedded) editor, which already opens Ember from the seed, and a no-op
-// when the pane is already open (e.g. a shared ?panes=copilot link).
+// when the pane is already open (e.g. a shared ?panes=ember link).
 export function shouldOpenEmberPaneForHandoff(params: {
   embedded: boolean;
   hasInitialEmberMessage: boolean;

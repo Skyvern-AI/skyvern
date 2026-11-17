@@ -58,10 +58,13 @@ from skyvern.forge.sdk.copilot.workflow_credential_utils import (
 from skyvern.forge.sdk.copilot.workflow_yaml import dump_workflow_yaml
 from skyvern.forge.sdk.credential_site_policy import describe_login_sites
 from skyvern.forge.sdk.db.id import GOOGLE_OAUTH_CREDENTIAL_PREFIX, MICROSOFT_OAUTH_CREDENTIAL_PREFIX
+from skyvern.forge.sdk.integrations.account_fit import connection_fit
+from skyvern.forge.sdk.integrations.catalog import SKYVERN_INTEGRATIONS
 from skyvern.forge.sdk.integrations.connected_accounts import (
     IncompleteConnectionRead,
     OrgConnection,
     agent_step_org_connections,
+    block_connection_refs,
     connected_account_fields,
     org_connections,
     org_connections_by_id,
@@ -610,6 +613,19 @@ def _credential_run_approval_error(
     return _unapproved_credential_reference_tool_error(unapproved_ids)
 
 
+def _unapproved_connection_refs(
+    refs: Collection[str],
+    request_policy: RequestPolicy | None,
+    *,
+    admitted_ids: Collection[str],
+    acting_refs: Collection[str] = (),
+) -> list[str]:
+    """`acting_refs` need a citation, a card pick or the saved workflow; a reads-only approval does not cover them."""
+    approved_ids = _approved_run_credential_ids(request_policy) | set(admitted_ids)
+    reads_only = set(request_policy.reads_only_connection_ids) - set(admitted_ids) if request_policy else set()
+    return [ref for ref in dict.fromkeys(refs) if ref not in approved_ids or (ref in reads_only and ref in acting_refs)]
+
+
 def _connection_approval_blocker_signal(
     refs: Collection[str],
     request_policy: RequestPolicy | None,
@@ -619,12 +635,7 @@ def _connection_approval_blocker_signal(
     blocked_tool: str,
     acting_refs: Collection[str] = (),
 ) -> CopilotToolBlockerSignal | None:
-    """`acting_refs` need a citation, a card pick or the saved workflow; a reads-only approval does not cover them."""
-    approved_ids = _approved_run_credential_ids(request_policy) | set(admitted_ids)
-    reads_only = set(request_policy.reads_only_connection_ids) - set(admitted_ids) if request_policy else set()
-    unapproved = [
-        ref for ref in dict.fromkeys(refs) if ref not in approved_ids or (ref in reads_only and ref in acting_refs)
-    ]
+    unapproved = _unapproved_connection_refs(refs, request_policy, admitted_ids=admitted_ids, acting_refs=acting_refs)
     if not unapproved:
         return None
     return CopilotToolBlockerSignal(
@@ -660,12 +671,46 @@ def _retire_stale_connection_denial(
     ctx.connected_account_recovery_choices = []
 
 
-async def connected_account_choices(organization_id: str) -> list[ConnectedAccountChoice] | None:
+def _block_can_use(block: dict[str, Any], connection: OrgConnection) -> bool:
+    if block.get("credential_source") == "nango":
+        return connection.provider == "nango"
+    # The catalog actions this block runs: same block type, and every input the action pins (e.g. email_client).
+    actions = [
+        (entry, action)
+        for entry in SKYVERN_INTEGRATIONS
+        for action in entry.actions
+        if action.runs_via == f"block:{block.get('block_type')}"
+        and all(
+            block.get(name, spec["const"]) == spec["const"]
+            for name, spec in action.inputs.get("properties", {}).items()
+            if "const" in spec
+        )
+    ]
+    if not actions:
+        return True
+    return any(
+        entry.oauth_provider == connection.provider and connection_fit(connection, action) != "no"
+        for entry, action in actions
+    )
+
+
+async def connected_account_choices(
+    organization_id: str, blocks: Sequence[dict[str, Any]], blocked_ids: Collection[str]
+) -> list[ConnectedAccountChoice] | None:
+    """The accounts the user may approve in place of `blocked_ids`: those ids first, then accounts that can serve the
+    blocks naming them (ADR 0033: fit only filters). An id no block field names, such as one an agent step reads, or a
+    filter that would leave nothing, keeps every account so the user can still pick one and reach reconnect."""
     try:
         connections = await org_connections_by_id(organization_id, request_user_id(organization_id))
     except Exception:
         LOG.warning("copilot_connected_account_recovery_lookup_failed", organization_id=organization_id, exc_info=True)
         return None
+    blocked = set(blocked_ids)
+    naming = [block for block in blocks if blocked & set(block_connection_refs(block))]
+    if blocked <= {ref for block in naming for ref in block_connection_refs(block)}:
+        fitting = [c for c in connections if c.id in blocked or any(_block_can_use(b, c) for b in naming)]
+        connections = fitting or connections
+    connections.sort(key=lambda connection: connection.id not in blocked)
     return [connection.choice() for connection in connections] or None
 
 
@@ -797,7 +842,7 @@ async def run_credential_gate(
     resolved_labels = {block.get("label") for block in workflow_blocks(parsed, selected_labels=selected)}
     executing_labels = selected if selected and selected <= resolved_labels else None
     executing_refs = workflow_connection_refs(parsed, selected_labels=executing_labels, run_parameters=parameters)
-    narrowing_on = narrow_agent_step_accounts and settings.COPILOT_NARROW_AGENT_STEP_ACCOUNTS
+    narrowing_on = narrow_agent_step_accounts and settings.EMBER_NARROW_AGENT_STEP_ACCOUNTS
     agent_tools = await _executing_agent_tool_names(ctx.organization_id, parsed, executing_labels, narrow=narrowing_on)
     try:
         agent_refs, agent_acts = await _agent_step_connection_ids(
@@ -864,7 +909,18 @@ async def run_credential_gate(
         acting_refs=acting_refs if listing_admits_reads else executing_refs,
     )
     if blocker is not None:
-        ctx.connected_account_recovery_choices = await connected_account_choices(ctx.organization_id) or []
+        blocked = _unapproved_connection_refs(
+            executing_refs,
+            policy,
+            admitted_ids=admitted,
+            acting_refs=acting_refs if listing_admits_reads else executing_refs,
+        )
+        ctx.connected_account_recovery_choices = (
+            await connected_account_choices(
+                ctx.organization_id, workflow_blocks(parsed, selected_labels=executing_labels), blocked
+            )
+            or []
+        )
         return CredentialGateResult(error=stash_blocker_signal(ctx, blocker), blocker=blocker)
     _retire_stale_connection_denial(ctx, workflow_refs=workflow_refs, admitted_ids=admitted)
 

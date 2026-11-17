@@ -269,7 +269,7 @@ describe("useSelectedBlockUrlSync", () => {
     window.history.replaceState(
       null,
       "",
-      "/workflows/wpid_abc/studio?wr=run_1&panes=copilot,editor",
+      "/workflows/wpid_abc/studio?wr=run_1&panes=ember,editor",
     );
     try {
       const { result } = renderHook(() => useTestHarness(), {
@@ -284,10 +284,10 @@ describe("useSelectedBlockUrlSync", () => {
         expect(result.current.search).toContain("selected-block=Checkout+step");
       });
       const params = new URLSearchParams(result.current.search);
-      expect(params.get("panes")).toBe("copilot,editor");
+      expect(params.get("panes")).toBe("ember,editor");
       expect(params.get("wr")).toBe("run_1");
       // The mirror write must not re-encode the panes commas to %2C.
-      expect(result.current.search).toContain("panes=copilot,editor");
+      expect(result.current.search).toContain("panes=ember,editor");
     } finally {
       window.history.replaceState(null, "", "/");
     }

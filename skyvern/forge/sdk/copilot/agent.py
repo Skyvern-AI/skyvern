@@ -40,7 +40,7 @@ from pydantic import JsonValue, TypeAdapter, ValidationError
 from skyvern.exceptions import NO_ADDRESS_RECORD_NAV_ERROR_MARKER
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.agents.skills import LOAD_SKILL_TOOL_NAME, SkillSession
+from skyvern.forge.sdk.agents.skills import LOAD_SKILL_TOOL_NAME, SkillSession, render_skills_catalog
 from skyvern.forge.sdk.copilot.agent_naming import schedule_agent_naming
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
@@ -285,7 +285,6 @@ from skyvern.forge.sdk.copilot.tools.scouting import (
     hydrate_prior_carried_trajectory,
     read_page_state_on_page,
 )
-from skyvern.forge.sdk.copilot.tools.skills import render_skills_catalog
 from skyvern.forge.sdk.copilot.tools.workflow_update import (
     CANONICAL_WORKFLOW_UNAVAILABLE_ERROR,
     CopilotCanonicalWorkflowUnavailableError,
@@ -338,6 +337,7 @@ from skyvern.forge.sdk.copilot.video_attachment import (
     screened_image_attachment_message,
 )
 from skyvern.forge.sdk.copilot.work_plan import hydrate_work_plan, work_plan_prompt
+from skyvern.forge.sdk.copilot.workflow_credential_utils import parse_workflow_yaml, workflow_blocks
 from skyvern.forge.sdk.copilot.workflow_yaml import (
     redact_credentials_in_workflow_yaml,
     runner_code_block_associations,
@@ -1022,8 +1022,9 @@ def _turn_context_trace_fields(packet: TurnContextPacket | None) -> dict[str, st
 
 
 def _transcript_anchor_disabled() -> bool:
-    """Test-isolation knob: COPILOT_DISABLE_TRANSCRIPT_ANCHOR (1/true/yes)."""
-    return os.getenv("COPILOT_DISABLE_TRANSCRIPT_ANCHOR", "").strip().lower() in {"1", "true", "yes"}
+    """Test-isolation knob: EMBER_DISABLE_TRANSCRIPT_ANCHOR (1/true/yes)."""
+    value = os.getenv("EMBER_DISABLE_TRANSCRIPT_ANCHOR") or os.getenv("COPILOT_DISABLE_TRANSCRIPT_ANCHOR") or ""
+    return value.strip().lower() in {"1", "true", "yes"}
 
 
 def _transcript_anchor_for_turn(packet: TurnContextPacket | None, chat_history_len: int) -> str:
@@ -3851,12 +3852,16 @@ async def _server_verified_connected_account_recovery_choices(
     request_policy: RequestPolicy,
     *,
     organization_id: str,
+    workflow_yaml: str | None,
 ) -> list[ConnectedAccountChoice] | None:
     """Display-only rows when a connected-account field staged at turn start lacks run authority.
     The lookup supplies org ownership and display state; these rows do not grant authority."""
-    if set(request_policy.existing_workflow_connection_ids) <= set(request_policy.run_approved_connection_ids):
+    unapproved = set(request_policy.existing_workflow_connection_ids) - set(request_policy.run_approved_connection_ids)
+    if not unapproved:
         return None
-    return await connected_account_choices(organization_id)
+    parsed = parse_workflow_yaml(workflow_yaml) if workflow_yaml else None
+    blocks = workflow_blocks(parsed) if isinstance(parsed, dict) else []
+    return await connected_account_choices(organization_id, blocks, unapproved)
 
 
 async def _translate_to_agent_result(
@@ -4389,7 +4394,7 @@ def _dump_model_attempt_packet(
     tool_call_count: int,
     retry_allowed: bool | None,
 ) -> None:
-    root_value = os.environ.get("COPILOT_DUMP_MODEL_ATTEMPTS")
+    root_value = os.environ.get("EMBER_DUMP_MODEL_ATTEMPTS") or os.environ.get("COPILOT_DUMP_MODEL_ATTEMPTS")
     if not root_value:
         return
     try:
@@ -5191,7 +5196,7 @@ async def run_copilot_agent(
     try:
         # Initialize tracing before opening the turn span so Logfire's OTel provider
         # is installed; otherwise the very first turn lands the parent span on
-        # OTel's no-op ProxyTracer when running locally with COPILOT_TRACING_ENABLED.
+        # OTel's no-op ProxyTracer when running locally with EMBER_TRACING_ENABLED.
         ensure_tracing_initialized()
         with _copilot_turn_span(
             chat_request=chat_request,
@@ -5622,6 +5627,7 @@ async def _run_copilot_turn_impl(
             await _server_verified_connected_account_recovery_choices(
                 request_policy,
                 organization_id=organization_id,
+                workflow_yaml=policy_inputs.workflow_yaml,
             )
             or []
         )

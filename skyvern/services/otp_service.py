@@ -1062,6 +1062,7 @@ async def poll_otp_value(
     raw_otp_context = raw_context if raw_context is not None else RawOTPVerificationContext()
     webhook_otp_context = webhook_context if webhook_context is not None else WebhookOTPVerificationContext()
     sleep_seconds = min(10.0, timeout.total_seconds())
+    source = "not_polled"
     while True:
         await asyncio.sleep(sleep_seconds)
         now = datetime.utcnow()
@@ -1072,6 +1073,7 @@ async def poll_otp_value(
                     "Polling otp value timed out while webhook was still failing",
                     consecutive_failures=consecutive_failures,
                     last_error_reason=last_error_reason,
+                    otp_poll_source=source,
                 )
                 raise FailedToGetTOTPVerificationCode(
                     task_id=task_id,
@@ -1090,11 +1092,12 @@ async def poll_otp_value(
                     "Polling otp value timed out; totp_verification_url never returned the documented response",
                     webhook_diagnostics=webhook_diagnostics,
                     expected_response_shape=TOTP_WEBHOOK_EXPECTED_RESPONSE_SHAPE,
+                    otp_poll_source=source,
                     task_id=task_id,
                     workflow_run_id=workflow_run_id,
                 )
             else:
-                LOG.warning("Polling otp value timed out")
+                LOG.warning("Polling otp value timed out", otp_poll_source=source)
             raise NoTOTPVerificationCodeFound(
                 task_id=task_id,
                 workflow_run_id=workflow_run_id,
@@ -1115,6 +1118,7 @@ async def poll_otp_value(
                 if not org_token:
                     LOG.error("Failed to get organization token when trying to get otp value")
                     return None
+                source = "verification_url"
                 otp_value = await _get_otp_value_from_url(
                     organization_id,
                     totp_verification_url,
@@ -1129,6 +1133,7 @@ async def poll_otp_value(
                 otp_value, rejected_code_hash, multi_field_expected_digits, task_id=task_id
             )
             if otp_value is None and totp_identifier:
+                source = "connected_email"
                 otp_value = await _get_otp_value_from_email(
                     organization_id=organization_id,
                     totp_identifier=totp_identifier,
@@ -1144,6 +1149,7 @@ async def poll_otp_value(
             if otp_value is None and totp_identifier:
                 # Preserve the historical DB behavior: callers that omit
                 # created_after may still read codes inserted before this poll began.
+                source = "stored_code"
                 otp_value = await _get_otp_value_from_db(
                     organization_id,
                     totp_identifier,
@@ -1175,6 +1181,7 @@ async def poll_otp_value(
         if otp_value:
             LOG.info(
                 "Got otp value",
+                otp_poll_source=source,
                 task_id=task_id,
                 workflow_run_id=workflow_run_id,
                 workflow_permanent_id=workflow_permanent_id,

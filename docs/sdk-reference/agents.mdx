@@ -1134,6 +1134,8 @@ await skyvern.get_workflow_runs(
     status: WorkflowRunStatus | Sequence[WorkflowRunStatus] | None = None,
     search_key: str | None = None,
     error_code: str | None = None,
+    created_at_start: datetime | None = None,
+    created_at_end: datetime | None = None,
 ) -> list[WorkflowRun]
 ```
 
@@ -1172,6 +1174,18 @@ Default: `None`
 Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution.
 
 Default: `None`
+</ParamField>
+
+<ParamField path={"created_at_start"} type={"datetime | None"}>
+Only include runs created at or after this time. Pass a timezone-aware datetime: a naive one is sent with the local timezone of the machine making the call, not as UTC. Supplying it replaces the 30-day default window of a free-text search_key.
+
+Default: `None` · Python only
+</ParamField>
+
+<ParamField path={"created_at_end"} type={"datetime | None"}>
+Only include runs created strictly before this time. Pass a timezone-aware datetime: a naive one is sent with the local timezone of the machine making the call, not as UTC. Without created_at_start, a free-text search_key covers the 30 days before this time.
+
+Default: `None` · Python only
 </ParamField>
 
 **Returns** `list[WorkflowRun]` · TypeScript `Promise<WorkflowRun[]>`

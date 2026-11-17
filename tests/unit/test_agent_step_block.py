@@ -42,6 +42,16 @@ from skyvern.core.script_generations import real_skyvern_page_ai
 from skyvern.core.script_generations.real_skyvern_page_ai import _render_template_with_label
 from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
 from skyvern.forge import app
+from skyvern.forge.sdk.agents.skills import (
+    EVERYONE_SKILL_LABEL,
+    MAX_PACKAGE_FILES,
+    MAX_SKILL_RESULT_CHARS,
+    AvailableSkill,
+    SkillLoaded,
+    SkillPackage,
+    SkillResource,
+    skill_result_chars,
+)
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.copilot_model_usage import CopilotModelUsageEvent, _observe_copilot_model_usage
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
@@ -60,8 +70,10 @@ from skyvern.forge.sdk.integrations.connected_accounts import (
 )
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
+from skyvern.forge.sdk.schemas.google_oauth import GOOGLE_GMAIL_SEND_SCOPE
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import AgentStepToolCall
+from skyvern.forge.sdk.services.google_oauth_service import GOOGLE_GMAIL_READONLY_SCOPE, GOOGLE_SHEETS_DATA_SCOPE
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager, WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import InvalidWorkflowDefinition
@@ -102,7 +114,14 @@ from skyvern.services import script_service
 from skyvern.utils.secret_redaction import REDACTED_SECRET_PLACEHOLDER
 from skyvern.webeye.actions.actions import ActionStatus, UploadFileAction
 from tests.unit.conftest import make_block_output_parameter
-from tests.unit.copilot_test_helpers import scripted_call, scripted_text, tool_outputs_for
+from tests.unit.copilot_test_helpers import (
+    RecordingSkills,
+    available_skill,
+    scripted_call,
+    scripted_text,
+    skill_md,
+    tool_outputs_for,
+)
 from tests.unit.test_context_manager import _initialize_smtp_workflow, _make_workflow, _platform_email
 from tests.unit.test_send_email_block import offline_address_validation  # noqa: F401
 
@@ -475,8 +494,11 @@ async def test_authors_are_shown_exactly_the_tools_the_step_gets(
     (given,) = model.tool_descriptions
     run_block = given.pop("run_block")
     assert given == {name: shown[name] for name in given}
-    # This run has no credential parameter, so the step is not given login.
-    assert set(given) | set(agent_step_tools.RUN_BLOCK_TYPES) | {"login"} == set(shown)
+    # This run has no credential parameter and no skills, so the step is not given login or load_skill.
+    assert set(given) | set(agent_step_tools.RUN_BLOCK_TYPES) | {"login", "load_skill"} == set(shown)
+    options = {option.name for option in agent_step_tools.tool_options()}
+    assert "load_skill" in options
+    assert "read_skill_resource" not in options
     assert all(shown[name].rstrip(".") in run_block for name in agent_step_tools.RUN_BLOCK_TYPES)
 
 
@@ -996,15 +1018,12 @@ def test_every_block_type_is_an_agent_tool_or_says_why_not() -> None:
             continue
         assert tool.yaml_class.model_fields["block_type"].default == block_type
         assert set(tool.fields) - {"credential", "files"} <= set(tool.yaml_class.model_fields)
-
-
-def test_each_block_tool_offers_exactly_the_account_fields_its_schema_marks() -> None:
+    # The account fields each tool offers: one dropped here leaves that tool unable to pick an account.
     offered = {
         block_type.value: tool.arguments[len(tool.fields) :]
         for block_type, tool in agent_step_tools.AGENT_BLOCK_TOOLS.items()
         if isinstance(tool, agent_step_tools.BlockTool) and len(tool.arguments) > len(tool.fields)
     }
-
     assert offered == {
         "file_upload": ("google_credential_id",),
         "send_email": ("credential_id",),
@@ -1014,7 +1033,7 @@ def test_each_block_tool_offers_exactly_the_account_fields_its_schema_marks() ->
     }
 
 
-SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets.readonly"
+SHEETS_SCOPE = GOOGLE_SHEETS_DATA_SCOPE
 
 
 async def _google_accounts(database: AgentDB) -> None:
@@ -1058,13 +1077,14 @@ async def test_a_copilot_run_offers_and_accepts_only_the_account_the_chat_approv
         )
         await session.commit()
     monkeypatch.setattr(app, "CACHE", LocalCache())
+    monkeypatch.setattr(settings, "EMBER_NARROW_AGENT_STEP_ACCOUNTS", False)
     # With no record, narrowing off keeps every account (an older API required them all); on offers none.
     assert {account.id for account in await agent_step_loop._connected_accounts(ORG, RUN)} == {
         "goc_a",
         "goc_b",
         "goc_c",
     }
-    monkeypatch.setattr(settings, "COPILOT_NARROW_AGENT_STEP_ACCOUNTS", True)
+    monkeypatch.setattr(settings, "EMBER_NARROW_AGENT_STEP_ACCOUNTS", True)
     assert await agent_step_loop._connected_accounts(ORG, RUN) == []
     await record_run_connection_ids(ORG, RUN, ["goc_a"])
     monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
@@ -1156,6 +1176,7 @@ async def test_a_copilot_runs_record_holds_whatever_the_workers_setting_and_a_br
         return sorted(account.id for account in await agent_step_loop._connected_accounts(ORG, run_id))
 
     # Narrowing off on this worker: a record is still enforced, and an unreadable one offers none.
+    monkeypatch.setattr(settings, "EMBER_NARROW_AGENT_STEP_ACCOUNTS", False)
     assert await offered(RUN) == ["goc_a"]
     assert await offered(f"wr_hop_{agent_step_loop._MAX_PARENT_RUN_HOPS}") == ["goc_a"]
     await cache.set(_run_accounts_key(ORG, RUN), "not json")
@@ -1164,7 +1185,7 @@ async def test_a_copilot_runs_record_holds_whatever_the_workers_setting_and_a_br
     assert await offered(RUN) == []
     assert await offered("wr_dangling") == ["goc_a", "goc_b"]
 
-    monkeypatch.setattr(settings, "COPILOT_NARROW_AGENT_STEP_ACCOUNTS", True)
+    monkeypatch.setattr(settings, "EMBER_NARROW_AGENT_STEP_ACCOUNTS", True)
     assert await offered("wr_dangling") == []
     assert await offered(f"wr_hop_{agent_step_loop._MAX_PARENT_RUN_HOPS + 1}") == []
 
@@ -1264,6 +1285,66 @@ async def test_an_account_outside_the_runs_active_accounts_is_refused_with_the_v
         assert "goc_active" in output and "goc_errored@" not in output and "goc_foreign@" not in output
     rows = await database.observer.get_workflow_run_blocks(workflow_run_id=RUN, organization_id=ORG)
     assert [row.block_type for row in rows] == [BlockType.AGENT_STEP]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("accounts", "senders", "readers", "refusal_names"),
+    [
+        (
+            [
+                ("goc_reader", [GOOGLE_GMAIL_READONLY_SCOPE]),
+                ("goc_sender", [GOOGLE_GMAIL_READONLY_SCOPE, GOOGLE_GMAIL_SEND_SCOPE]),
+                # No recorded grant: whether it can send is unknown, so it must stay offered everywhere.
+                ("goc_unrecorded", []),
+            ],
+            ["goc_sender", "goc_unrecorded"],
+            ["goc_reader", "goc_sender", "goc_unrecorded"],
+            "goc_sender",
+        ),
+        # Only a read-only account: none can send, so the refusal names the permission to reconnect with.
+        ([("goc_reader", [GOOGLE_GMAIL_READONLY_SCOPE])], [], ["goc_reader"], GOOGLE_GMAIL_SEND_SCOPE),
+    ],
+)
+async def test_a_read_only_gmail_account_is_not_offered_for_send_but_stays_for_reading(
+    monkeypatch: pytest.MonkeyPatch,
+    database: AgentDB,
+    accounts: list[tuple[str, list[str]]],
+    senders: list[str],
+    readers: list[str],
+    refusal_names: str,
+) -> None:
+    async with database.Session() as session:
+        for account_id, scopes in accounts:
+            session.add(
+                GoogleOAuthCredentialModel(
+                    id=account_id,
+                    organization_id=ORG,
+                    credential_name=account_id,
+                    email_address=f"{account_id}@example.com",
+                    state="active",
+                    scopes_granted=scopes,
+                )
+            )
+        await session.commit()
+    monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
+    email = {**EMAIL, "transport": "gmail", "recipients": ["ops@example.com"], "credential_id": "goc_reader"}
+    model = _ScriptedModel(
+        [[scripted_call("run_block", {"block_type": "send_email", "arguments": email}, call_id="send")], VALID_FINISH]
+    )
+
+    await _run_agent_block(monkeypatch, LUNA_MEDIUM, model, tools=["email_inbox", "send_email"])
+
+    (run_block,) = (tool for tool in model.tools[0] if isinstance(tool, FunctionTool) and tool.name == "run_block")
+    schema = run_block.params_json_schema
+
+    def offered(field: str) -> list[str]:
+        branch = next(b for b in schema["properties"]["arguments"]["anyOf"] if field in b["properties"])
+        return sorted(schema["$defs"][branch["properties"]["credential_id"]["$ref"].rpartition("/")[2]].get("enum", []))
+
+    assert (offered("recipients"), offered("folder")) == (senders, readers)
+    (refused,) = tool_outputs_for(model.inputs[1][1], "send")
+    assert "invalid_arguments" in refused and refusal_names in refused and "goc_reader@" not in refused
 
 
 CHILD_OUTPUT = "agent_text_prompt_1_output"
@@ -2638,3 +2719,240 @@ async def test_a_call_cut_off_mid_run_keeps_its_entry_and_the_final_tool_calls_h
     output = app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts[RUN].values["agent_output"]
     assert output["tool_calls"] == []
     assert _billed_decisions(billing_hook) == 0
+
+
+EVERYONE_NAME = "shared-menu-helper"
+EVERYONE_DESCRIPTION = "Handle the example.com menu quirk."
+EVERYONE_BODY = "Open the hidden menu before the form.\n"
+EVERYONE_FILE = "The menu sits behind the gear icon."
+EVERYONE_SKILL = available_skill(
+    EVERYONE_NAME, "everyone", EVERYONE_BODY, EVERYONE_DESCRIPTION, **{"notes/menu.md": EVERYONE_FILE}
+)
+ORG_BODY = "Tick 'Remember this device' before submitting.\n"
+ORG_SKILL = available_skill("example-portal-login", "organization", ORG_BODY, **{"reference/form.md": "Form notes"})
+WORKFLOW_SKILL = available_skill("invoice-download", "workflow", "Download the newest invoice.\n")
+
+
+def _skills_hook(monkeypatch: pytest.MonkeyPatch, skills: list[AvailableSkill] | Exception) -> RecordingSkills:
+    hook = RecordingSkills(skills)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "agent_skills", hook.agent_skills)
+    return hook
+
+
+def _reports(model: _ScriptedModel, *call_ids: str) -> dict[str, Any]:
+    return {call_id: json.loads(tool_outputs_for(model.inputs[-1][1], call_id)[0]) for call_id in call_ids}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tools", "skills", "ignore_workflow_system_prompt", "offered"),
+    [
+        (["page_goto", "load_skill"], [ORG_SKILL, EVERYONE_SKILL], False, True),
+        (["page_goto", "load_skill"], [ORG_SKILL, EVERYONE_SKILL], True, True),
+        (["page_goto"], [ORG_SKILL, EVERYONE_SKILL], False, False),
+        (["page_goto", "load_skill"], [], False, False),
+        (["page_goto", "load_skill"], RuntimeError("skill store down"), False, False),
+    ],
+)
+async def test_a_step_gets_the_skill_list_and_skill_tools_only_when_it_lists_load_skill_and_the_run_has_skills(
+    monkeypatch: pytest.MonkeyPatch,
+    database: AgentDB,
+    tools: list[str],
+    skills: list[AvailableSkill] | Exception,
+    ignore_workflow_system_prompt: bool,
+    offered: bool,
+) -> None:
+    monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
+    app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts[RUN].inherited_workflow_system_prompt = "Answer in French."
+    hook = _skills_hook(monkeypatch, skills)
+    model = _ScriptedModel([VALID_FINISH])
+
+    with capture_logs() as logs:
+        result, _ = await _run_agent_block(
+            monkeypatch, LUNA_MEDIUM, model, tools=tools, ignore_workflow_system_prompt=ignore_workflow_system_prompt
+        )
+
+    assert result.status == BlockStatus.completed
+    assert hook.calls == ([(ORG, WPID, "agent_step")] if "load_skill" in tools else [])
+    warned = [log for log in logs if log["event"] == "Failed to list the agent step's skills"]
+    assert len(warned) == isinstance(skills, Exception)
+    system = str(model.inputs[0][0])
+    descriptions = [ORG_SKILL.package.description, EVERYONE_DESCRIPTION]
+    assert all((description in system) is offered for description in descriptions)
+    if offered and not ignore_workflow_system_prompt:
+        assert system.index("Answer in French.") < min(system.index(description) for description in descriptions)
+    skill_tools = ["load_skill", "read_skill_resource"] if offered else []
+    assert model.tool_names == [["read_run_data", "page_goto", *skill_tools, "finish"]]
+
+
+def _largest_skill_with_secret() -> tuple[AvailableSkill, str]:
+    files = {f"reference/{index:03d}.md": "é" for index in range(MAX_PACKAGE_FILES - 1)}
+    body = ""
+    low, high = 0, MAX_SKILL_RESULT_CHARS
+    while low <= high:
+        middle = (low + high) // 2
+        candidate = "é" * 2_000 + SECRET + "a" * middle
+        try:
+            SkillPackage.from_files({"SKILL.md": skill_md("example-max-skill", candidate), **files})
+            body, low = candidate, middle + 1
+        except ValueError:
+            high = middle - 1
+    return available_skill("example-max-skill", "organization", body, **files), body
+
+
+@pytest.mark.asyncio
+async def test_skill_tools_return_uncut_masked_results_and_refusals_as_completed_billed_calls(
+    monkeypatch: pytest.MonkeyPatch, database: AgentDB, billing_hook: AsyncMock
+) -> None:
+    monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
+    largest, body = _largest_skill_with_secret()
+    _skills_hook(monkeypatch, [EVERYONE_SKILL, ORG_SKILL, WORKFLOW_SKILL, largest])
+    name = largest.package.name
+    loaded = SkillLoaded(name=name, version=largest.version, body=body, files=largest.package.resource_paths)
+    text = skill_md(name, body)
+    assert len(largest.package.resource_paths) == MAX_PACKAGE_FILES - 1
+    sizes = [skill_result_chars(loaded), skill_result_chars(SkillResource(name=name, path="SKILL.md", text=text))]
+    assert max(sizes) == MAX_SKILL_RESULT_CHARS
+    org = "example-portal-login"
+    model = _ScriptedModel(
+        [
+            [scripted_call("read_skill_resource", {"name": org, "path": "reference/form.md"}, call_id="r")],
+            [scripted_call("load_skill", {"name": name}, call_id="load")],
+            [scripted_call("read_skill_resource", {"name": name, "path": "SKILL.md"}, call_id="read")],
+            [scripted_call("load_skill", {"name": org}, call_id="first")],
+            [scripted_call("load_skill", {"name": org}, call_id="again")],
+            [scripted_call("load_skill", {"name": "nope"}, call_id="unknown")],
+            [scripted_call("read_skill_resource", {"name": "nope", "path": "SKILL.md"}, call_id="unknown_read")],
+            [scripted_call("read_skill_resource", {"name": org, "path": "nope.md"}, call_id="no_file")],
+            VALID_FINISH,
+        ]
+    )
+
+    with capture_logs() as logs:
+        await _run_agent_block(monkeypatch, LUNA_MEDIUM, model, tools=["load_skill"])
+
+    reports = _reports(model, "r", "load", "read", "first", "again", "unknown", "unknown_read", "no_file")
+    assert SECRET not in json.dumps(reports)
+    assert all((report["status"], report["error"]) == ("completed", None) for report in reports.values())
+    assert reports["r"]["output"] == {"name": org, "path": "reference/form.md", "text": "Form notes"}
+    assert reports["load"]["output"] == {**loaded, "body": body.replace(SECRET, "*****")}
+    assert reports["read"]["output"]["text"] == text.replace(SECRET, "*****")
+    assert reports["first"]["output"]["body"] == ORG_BODY
+    assert reports["again"]["output"] == {"status": "already_loaded", "name": org, "version": ORG_SKILL.version}
+    unknown = {
+        "error": "unknown_skill",
+        "message": "No skill is named 'nope'.",
+        "names": [name, org, "invoice-download"],
+    }
+    assert reports["unknown"]["output"] == reports["unknown_read"]["output"] == unknown
+    assert reports["no_file"]["output"] == {
+        "error": "unknown_file",
+        "message": f"{org} has no file 'nope.md'.",
+        "files": ["SKILL.md", "reference/form.md"],
+    }
+    assert _billed_decisions(billing_hook) == 8
+    rows = await database.observer.get_workflow_run_blocks(workflow_run_id=RUN, organization_id=ORG)
+    (agent_row,) = (row for row in rows if row.block_type == BlockType.AGENT_STEP)
+    events = [log for log in logs if log["event"].startswith("agent_skill_")]
+    assert [log["event"] for log in events].count("agent_skill_list_shown") == 1
+    assert {log["event"] for log in events} == {
+        "agent_skill_list_shown",
+        "agent_skill_loaded",
+        "agent_skill_resource_read",
+    }
+    assert all(
+        (log["agent"], log["organization_id"], log["workflow_run_id"], log["workflow_run_block_id"])
+        == ("agent_step", ORG, RUN, agent_row.workflow_run_block_id)
+        for log in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_everyone_skill_calls_leave_no_skill_name_or_text_in_the_trail_tool_calls_or_stored_model_calls(
+    monkeypatch: pytest.MonkeyPatch, database: AgentDB, tmp_path: Path
+) -> None:
+    monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
+    monkeypatch.setattr(app, "ARTIFACT_MANAGER", ArtifactManager())
+    monkeypatch.setattr(app, "STORAGE", LocalStorage(str(tmp_path)))
+    _skills_hook(monkeypatch, [EVERYONE_SKILL, ORG_SKILL])
+    running: dict[int, AgentStepToolCall] = {}
+    publish = agent_step_loop._publish_trail
+
+    def recording_publish(state: agent_step_loop._RunState) -> asyncio.Task[None]:
+        if state.running is not None:
+            running[state.running.index] = state.running
+        return publish(state)
+
+    monkeypatch.setattr(agent_step_loop, "_publish_trail", recording_publish)
+    unparseable = ResponseFunctionToolCall(
+        id="fc_bad", call_id="bad", name="load_skill", arguments=f'{{"name": "{EVERYONE_NAME}"', type="function_call"
+    )
+    model = _ScriptedModel(
+        [
+            [scripted_call("load_skill", {"name": EVERYONE_NAME}, call_id="e1")],
+            [scripted_call("read_skill_resource", {"name": EVERYONE_NAME, "path": "notes/menu.md"}, call_id="e2")],
+            [scripted_call("read_skill_resource", {"name": "example-portal-login", "path": "reference/form.md"}, "o")],
+            [scripted_call("load_skill", {"name": "example-portal-login"}, call_id="o1")],
+            [scripted_call("load_skill", {"name": "missing-skill"}, call_id="u")],
+            [unparseable],
+            VALID_FINISH,
+        ]
+    )
+
+    result, _ = await _run_agent_block(monkeypatch, LUNA_MEDIUM, model, tools=["load_skill"])
+
+    hidden = {"name": EVERYONE_SKILL_LABEL}
+    org_read = {"name": "example-portal-login", "path": "reference/form.md"}
+    org_load = {"name": "example-portal-login"}
+    assert [(call.tool, json.loads(call.arguments)) for call in running.values()] == [
+        ("load_skill", hidden),
+        ("read_skill_resource", hidden),
+        ("read_skill_resource", org_read),
+        ("load_skill", org_load),
+        ("load_skill", hidden),
+        ("load_skill", hidden),
+        ("finish", {"answer": "42"}),
+    ]
+    rows = await database.observer.get_workflow_run_blocks(
+        workflow_run_id=RUN, organization_id=ORG, with_tool_calls=True
+    )
+    (agent_row,) = (row for row in rows if row.block_type == BlockType.AGENT_STEP)
+    assert agent_row.tool_calls is not None
+    assert [(call.tool, call.status, json.loads(call.arguments)) for call in agent_row.tool_calls] == [
+        ("load_skill", "completed", hidden),
+        ("read_skill_resource", "completed", hidden),
+        ("read_skill_resource", "completed", org_read),
+        ("load_skill", "completed", org_load),
+        ("load_skill", "completed", hidden),
+        ("load_skill", "invalid_arguments", hidden),
+        ("finish", "completed", {"answer": "42"}),
+    ]
+    output = result.output_parameter_value
+    assert isinstance(output, dict)
+    assert [(call["tool"], json.loads(call["arguments"])) for call in output["tool_calls"]] == [
+        ("load_skill", hidden),
+        ("read_skill_resource", hidden),
+        ("read_skill_resource", org_read),
+        ("load_skill", org_load),
+        ("load_skill", hidden),
+        ("finish", {"answer": "42"}),
+    ]
+    hidden_text = [EVERYONE_NAME, EVERYONE_DESCRIPTION, EVERYONE_BODY.strip(), EVERYONE_FILE, "missing-skill"]
+    received = json.dumps(pydantic_core.to_jsonable_python(model.inputs))
+    assert all(text in received for text in hidden_text)
+    artifacts = await database.artifacts.get_artifacts_by_entity_id(
+        organization_id=ORG,
+        workflow_run_block_id=agent_row.workflow_run_block_id,
+        artifact_types=[ArtifactType.LLM_REQUEST, ArtifactType.LLM_RESPONSE],
+    )
+    stored: list[str] = []
+    for artifact in artifacts:
+        data = await app.ARTIFACT_MANAGER.retrieve_artifact(artifact)
+        assert data is not None
+        stored.append(data.decode())
+    assert len(stored) == 2 * len(model.inputs)
+    assert not [text for text in hidden_text for body in stored if text in body]
+    requests = [body for body in map(json.loads, stored) if "system_prompt" in body]
+    assert len(requests) == len(model.inputs)
+    assert all(f"{EVERYONE_SKILL_LABEL} [everyone]" in request["system_prompt"] for request in requests)
+    assert any(ORG_BODY.strip() in body for body in stored)

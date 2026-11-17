@@ -1134,7 +1134,7 @@ async def test_route_writes_flag_for_skip_without_credential_id(monkeypatch: pyt
     assert cache.store[expected_key] == encode_credential_response("skip", None, "tok-1")
     response_set = next(call for call in cache.set_calls if call[0] == expected_key)
     assert response_set[1] == encode_credential_response("skip", None, "tok-1")
-    assert response_set[2] == timedelta(seconds=settings.WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS + 300)
+    assert response_set[2] == timedelta(seconds=settings.EMBER_CREDENTIAL_PAUSE_TIMEOUT_SECONDS + 300)
 
 
 @pytest.mark.asyncio
@@ -1877,7 +1877,7 @@ async def test_an_unanswered_card_returns_past_the_deadline_and_counts_against_t
     ctx = _tool_ctx(monkeypatch, cache)
     ctx.copilot_config = CopilotConfig(credential_pause_enabled=True, credential_pause_timeout_seconds=1)
     ctx.browser_session_id = "pbs_debug"
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_MANUAL_SIGN_IN_TIMEOUT_SECONDS", 1)
+    monkeypatch.setattr(settings, "EMBER_MANUAL_SIGN_IN_TIMEOUT_SECONDS", 1)
     _stub_credential_lookup(monkeypatch, _make_credential())
     ctx.stream.send = AsyncMock(side_effect=_answer_each_card(cache, [(first_card, None), ("connected", "cred_1")]))
 
@@ -4429,7 +4429,7 @@ async def test_registration_card_reopened_after_its_deadline_passed_mid_save_is_
     assert record is not None and record.status == "pending"
     assert result.expires_at == record.expires_at
     assert record.expires_at > datetime.now(timezone.utc) + timedelta(
-        seconds=settings.WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS - 5
+        seconds=settings.EMBER_CREDENTIAL_PAUSE_TIMEOUT_SECONDS - 5
     )
     await resolve_credential_pause(
         cache,
@@ -4523,7 +4523,7 @@ async def test_registration_card_reopened_after_an_unconfirmed_save_reports_it_w
     ctx = _tool_ctx(monkeypatch, cache)
     ctx.client_supports_credential_generation = True
     ctx.copilot_config = CopilotConfig(credential_pause_enabled=True, credential_pause_timeout_seconds=1)
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS", 1)
+    monkeypatch.setattr(settings, "EMBER_CREDENTIAL_PAUSE_TIMEOUT_SECONDS", 1)
     _registration_database(monkeypatch, _make_credential())
     vault = _RegistrationVault(_make_credential(), fail=True)
     vault.install(monkeypatch)
@@ -4563,7 +4563,7 @@ async def test_registration_card_that_ran_out_mid_create_reports_unknown(monkeyp
     ctx = _tool_ctx(monkeypatch, cache)
     ctx.client_supports_credential_generation = True
     ctx.copilot_config = CopilotConfig(credential_pause_enabled=True, credential_pause_timeout_seconds=1)
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS", 1)
+    monkeypatch.setattr(settings, "EMBER_CREDENTIAL_PAUSE_TIMEOUT_SECONDS", 1)
     monkeypatch.setattr(credential_pause_module, "MANUAL_SIGN_IN_CLAIM_SECONDS", 1)
 
     async def claim_and_abandon(

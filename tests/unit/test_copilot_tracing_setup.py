@@ -36,6 +36,7 @@ def _nested_mapping(value: object, depth: int = 22) -> object:
 def _reset_module_state(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(tracing_setup, "_TRACING_INITIALIZED", False)
     monkeypatch.setattr(tracing_setup, "_SPAN_RENAME_WARNED", threading.Event())
+    monkeypatch.delenv("EMBER_TRACING_ENABLED", raising=False)
     monkeypatch.delenv("COPILOT_TRACING_ENABLED", raising=False)
 
 
@@ -222,7 +223,7 @@ def test_enabled_with_logfire(
     monkeypatch: pytest.MonkeyPatch,
     agents_stub: tuple[list[bool], list[Any]],
 ) -> None:
-    monkeypatch.setenv("COPILOT_TRACING_ENABLED", "1")
+    monkeypatch.setenv("EMBER_TRACING_ENABLED", "1")
     _, processors_calls = agents_stub
 
     configure_calls: list[dict[str, Any]] = []
@@ -259,7 +260,7 @@ def test_enabled_without_logfire(
     agents_stub: tuple[list[bool], list[Any]],
     stub_logger: list[tuple[str, dict[str, Any]]],
 ) -> None:
-    monkeypatch.setenv("COPILOT_TRACING_ENABLED", "1")
+    monkeypatch.setenv("EMBER_TRACING_ENABLED", "1")
     _, processors_calls = agents_stub
 
     # Setting sys.modules[name] = None makes subsequent `import name` raise ImportError.
@@ -289,13 +290,14 @@ class TestTracingSetup:
         monkeypatch: pytest.MonkeyPatch,
         value: str,
     ) -> None:
-        monkeypatch.setenv("COPILOT_TRACING_ENABLED", value)
+        monkeypatch.setenv("EMBER_TRACING_ENABLED", value)
 
         from skyvern.forge.sdk.copilot.tracing_setup import is_tracing_enabled
 
         assert is_tracing_enabled() is True
 
     def test_is_tracing_enabled_defaults_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("EMBER_TRACING_ENABLED", raising=False)
         monkeypatch.delenv("COPILOT_TRACING_ENABLED", raising=False)
 
         from skyvern.forge.sdk.copilot.tracing_setup import is_tracing_enabled
@@ -307,6 +309,8 @@ class TestTracingSetup:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         import skyvern.forge.sdk.copilot.tracing_setup as tracing_setup
+
+        monkeypatch.delenv("EMBER_TRACING_ENABLED", raising=False)
 
         monkeypatch.delenv("COPILOT_TRACING_ENABLED", raising=False)
         monkeypatch.setattr(
@@ -326,7 +330,7 @@ class TestTracingSetup:
     ) -> None:
         import skyvern.forge.sdk.copilot.tracing_setup as tracing_setup
 
-        monkeypatch.setenv("COPILOT_TRACING_ENABLED", "1")
+        monkeypatch.setenv("EMBER_TRACING_ENABLED", "1")
         monkeypatch.setattr(tracing_setup, "ensure_tracing_initialized", lambda: None)
 
         captured: dict[str, Any] = {}
@@ -356,7 +360,7 @@ class TestTracingSetup:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setenv("COPILOT_TRACING_ENABLED", "1")
+        monkeypatch.setenv("EMBER_TRACING_ENABLED", "1")
         monkeypatch.setattr(tracing_setup, "ensure_tracing_initialized", lambda: None)
         captured: dict[str, Any] = {}
         fake_span = object()
@@ -391,7 +395,7 @@ class TestTracingSetup:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setenv("COPILOT_TRACING_ENABLED", "1")
+        monkeypatch.setenv("EMBER_TRACING_ENABLED", "1")
         monkeypatch.setattr(tracing_setup, "ensure_tracing_initialized", lambda: None)
         captured: dict[str, Any] = {}
 
@@ -416,7 +420,7 @@ class TestTracingSetup:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setenv("COPILOT_TRACING_ENABLED", "1")
+        monkeypatch.setenv("EMBER_TRACING_ENABLED", "1")
         monkeypatch.setattr(tracing_setup, "ensure_tracing_initialized", lambda: None)
         captured: dict[str, Any] = {}
         fake_span = object()

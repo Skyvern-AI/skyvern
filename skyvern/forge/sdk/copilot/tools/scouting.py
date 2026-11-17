@@ -1172,7 +1172,7 @@ async def _scout_act_observe_page_evidence(
     """
     if getattr(ctx, "discovery_mcp_server", None) is None:
         return None
-    timeout_seconds = settings.COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS
+    timeout_seconds = settings.EMBER_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS
     started = time.monotonic()
     ctx.last_scout_act_observe_recapture_attempted = False
     ctx.last_scout_act_observe_recapture_result = ""
@@ -1210,7 +1210,7 @@ async def _scout_act_observe_page_evidence(
                 ctx.last_scout_act_observe_recapture_attempted = True
                 if unchanged_after_interaction:
                     settle_seconds = min(
-                        settings.COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS,
+                        settings.EMBER_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS,
                         remaining_seconds,
                     )
                     if settle_seconds > 0:
@@ -1539,7 +1539,7 @@ def _build_scout_page_summary(
     disclosure_controls: list[dict[str, Any]] = []
     seen_disclosures: set[tuple[str, str]] = set()
     controls_for_summary: list[dict[str, Any]] = []
-    if settings.COPILOT_CLICKABLE_CONTROLS_EVIDENCE_ENABLED:
+    if settings.EMBER_CLICKABLE_CONTROLS_EVIDENCE_ENABLED:
         controls_for_summary.extend(evidence.get("clickable_controls") or [])
         controls_for_summary.extend(
             control
@@ -2339,7 +2339,7 @@ async def read_page_state_on_page(
         return unread_page_state(ctx), None
     deadline = _PAGE_STATE_READ_TIMEOUT_SECONDS
     if settle:
-        deadline += settings.COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS
+        deadline += settings.EMBER_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS
     failure: str
     started = time.monotonic()
     try:
@@ -2395,7 +2395,7 @@ async def _read_live_page_state(ctx: AgentContext, *, settle: bool) -> _LivePage
         # Only a page that already has a vendor frame waits for it to mount or grow, so a page without one
         # pays no delay.
         settle_started = ctx.pending_scout_challenge_armed_at or time.monotonic()
-        owed = settings.COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS - (time.monotonic() - settle_started)
+        owed = settings.EMBER_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS - (time.monotonic() - settle_started)
         if owed > 0:
             await asyncio.sleep(owed)
         vendor, unmeasured = await _rendered_vendor_reading(_child_frames(page))
@@ -2440,7 +2440,7 @@ async def _maybe_attach_observed_challenge(ctx: AgentContext, result: dict[str, 
         # The window started when the click returned, and the observation between then and now usually
         # outlasts it by itself. Wait only for what is left of it, so a widget
         # that mounts or grows a beat late still lands without adding a delay to every click.
-        owed = settings.COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS - (time.monotonic() - armed_at)
+        owed = settings.EMBER_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS - (time.monotonic() - armed_at)
         if owed > 0:
             await asyncio.sleep(owed)
         vendor = await _on_screen_challenge_vendor(ctx)

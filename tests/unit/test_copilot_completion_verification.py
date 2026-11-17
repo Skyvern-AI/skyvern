@@ -2635,7 +2635,7 @@ async def test_evaluate_handler_exception_is_unavailable() -> None:
 
 @pytest.mark.asyncio
 async def test_evaluate_uses_completion_judge_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_COMPLETION_JUDGE_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(settings, "EMBER_COMPLETION_JUDGE_TIMEOUT_SECONDS", 0.01)
 
     async def handler(**_: object) -> dict[str, object]:
         await asyncio.sleep(0.05)
@@ -8961,7 +8961,7 @@ async def test_maybe_run_completion_verification_mixed_criteria_still_fail_close
         await asyncio.sleep(1)
         return {"verdicts": []}
 
-    monkeypatch.setattr(settings, "COPILOT_COMPLETION_JUDGE_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(settings, "EMBER_COMPLETION_JUDGE_TIMEOUT_SECONDS", 0.01)
     _patch_completion_handler(monkeypatch, slow_handler)
     ctx = _run_ctx()
     ctx.request_policy = RequestPolicy(

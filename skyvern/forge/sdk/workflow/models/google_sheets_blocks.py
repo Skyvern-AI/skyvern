@@ -79,7 +79,7 @@ def _maybe_dump_sheets_write(record: dict[str, Any]) -> None:
     The range actually sent is otherwise not observable from a run, so writing it takes both an
     explicit path and a local environment: the record carries the rendered cell values.
     """
-    dump_dir = os.getenv("COPILOT_DUMP_SHEETS_WRITE")
+    dump_dir = os.getenv("SKYVERN_DUMP_SHEETS_WRITE") or os.getenv("COPILOT_DUMP_SHEETS_WRITE")
     if not dump_dir or settings.ENV != "local":
         return
     try:

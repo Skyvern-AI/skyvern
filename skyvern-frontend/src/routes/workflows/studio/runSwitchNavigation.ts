@@ -21,7 +21,7 @@ import { useStudioPaneDefaults } from "./StudioPaneDefaultsContext";
 // Which panes an Ember run keeps on a narrow stage, first to last.
 const NARROW_RUN_PANE_RANK: Record<StudioPaneId, number> = {
   browser: 0,
-  copilot: 1,
+  ember: 1,
   overview: 2,
   editor: 3,
 };

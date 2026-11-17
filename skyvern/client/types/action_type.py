@@ -6,6 +6,7 @@ ActionType = typing.Union[
     typing.Literal[
         "click",
         "input_text",
+        "paste_text",
         "upload_file",
         "download_file",
         "select_option",

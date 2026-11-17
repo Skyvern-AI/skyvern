@@ -258,7 +258,6 @@ class EmailInboxBlock(Block):
                                         max_bytes=max_bytes,
                                         destination=file,
                                     )
-                                    # A stream cut short can still end cleanly; the listed size catches it.
                                     if attachment.size is not None and written != attachment.size:
                                         raise email.GmailAPIError(
                                             status=502, code="download_failed", message="Incomplete attachment"

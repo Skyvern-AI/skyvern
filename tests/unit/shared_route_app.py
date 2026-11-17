@@ -116,7 +116,7 @@ def api_app_build_settings() -> dict[str, object]:
         "ALLOWED_ORIGINS": list(settings.ALLOWED_ORIGINS),
         "ALLOWED_ORIGIN_REGEX": settings.ALLOWED_ORIGIN_REGEX,
         "ADDITIONAL_MODULES": list(settings.ADDITIONAL_MODULES),
-        "COPILOT_EVAL_AUTH_FIXTURE_ENABLED": settings.COPILOT_EVAL_AUTH_FIXTURE_ENABLED,
+        "EMBER_EVAL_AUTH_FIXTURE_ENABLED": settings.EMBER_EVAL_AUTH_FIXTURE_ENABLED,
     }
 
 

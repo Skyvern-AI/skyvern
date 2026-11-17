@@ -30,7 +30,7 @@ describe("credentialRecovery", () => {
     expect(first).toMatch(/^[0-9a-f]{64}$/);
     expect(currentCredentialRecoveryToken("wpid-1")).toBe(first);
     expect(credentialRecoveryHeaders("wpid-1")).toEqual({
-      "X-Copilot-Credential-Recovery-Token": first,
+      "X-Ember-Credential-Recovery-Token": first,
     });
 
     const second = ensureCredentialRecoveryToken("wpid-1");
@@ -39,18 +39,18 @@ describe("credentialRecovery", () => {
     expect(currentCredentialRecoveryToken("wpid-1")).toBe(second);
   });
 
-  it("reads the Ember key first, falls back to the old key, and still writes the old key", () => {
+  it("reads the Ember key first, falls back to the old key, and writes the Ember key", () => {
     sessionStorage.setItem("copilot-credential-recovery:wpid-1", "old");
     expect(currentCredentialRecoveryToken("wpid-1")).toBe("old");
     sessionStorage.setItem("ember-credential-recovery:wpid-1", "new");
     expect(currentCredentialRecoveryToken("wpid-1")).toBe("new");
 
     const minted = ensureCredentialRecoveryToken("wpid-2");
-    expect(sessionStorage.getItem("copilot-credential-recovery:wpid-2")).toBe(
+    expect(sessionStorage.getItem("ember-credential-recovery:wpid-2")).toBe(
       minted,
     );
     expect(
-      sessionStorage.getItem("ember-credential-recovery:wpid-2"),
+      sessionStorage.getItem("copilot-credential-recovery:wpid-2"),
     ).toBeNull();
   });
 
@@ -66,7 +66,7 @@ describe("credentialRecovery", () => {
       get: async () => {
         throw {
           response: { status: 403 },
-          config: { headers: { "X-Copilot-Credential-Recovery-Token": token } },
+          config: { headers: { "X-Ember-Credential-Recovery-Token": token } },
         };
       },
     };
@@ -126,9 +126,7 @@ describe("credentialRecovery", () => {
       expect(get).toHaveBeenCalledTimes(2);
       expect(
         Boolean(
-          get.mock.calls[1]?.[1]?.headers[
-            "X-Copilot-Credential-Recovery-Token"
-          ],
+          get.mock.calls[1]?.[1]?.headers["X-Ember-Credential-Recovery-Token"],
         ),
       ).toBe(hadToken);
       expect(response.hadCredentialRecoveryToken).toBe(hadToken);

@@ -41,7 +41,7 @@ import { isStudioNarrow } from "./useStudioNarrow";
 // Browser, first to last; Editor leads so a one-pane stage still shows it.
 const REOPEN_EDITOR_PANE_RANK: Record<StudioPaneId, number> = {
   editor: 0,
-  copilot: 1,
+  ember: 1,
   overview: 2,
   browser: 3,
 };

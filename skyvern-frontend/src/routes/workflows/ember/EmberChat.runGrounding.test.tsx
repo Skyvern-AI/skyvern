@@ -326,7 +326,7 @@ describe("EmberChat — run grounding bridge", () => {
     });
 
     expect(historyGet).toHaveBeenCalledWith(
-      "/workflow/copilot/chat-history",
+      "/ember/chat-history",
       expect.objectContaining({
         params: {
           request_cancel_token: streamCalls[0]?.body.cancel_token,
@@ -448,10 +448,10 @@ describe("EmberChat — run grounding bridge", () => {
         await vi.advanceTimersByTimeAsync(0);
       });
       expect(cancelPost).toHaveBeenCalledWith(
-        "/workflow/copilot/cancel",
+        "/ember/cancel",
         {
           cancel_token: streamCalls[0]!.body.cancel_token,
-          workflow_copilot_chat_id: "chat-delayed",
+          ember_chat_id: "chat-delayed",
           source: "stop_button",
         },
         expect.anything(),
@@ -549,11 +549,11 @@ describe("EmberChat — run grounding bridge", () => {
     });
 
     expect(historyGet).toHaveBeenCalledWith(
-      "/workflow/copilot/chat-history",
+      "/ember/chat-history",
       expect.objectContaining({
         params: {
           request_cancel_token: streamCalls[0]?.body.cancel_token,
-          workflow_copilot_chat_id: "chat-existing",
+          ember_chat_id: "chat-existing",
         },
       }),
     );
@@ -767,7 +767,7 @@ describe("EmberChat — run grounding bridge", () => {
     };
     await act(async () => vi.advanceTimersByTimeAsync(2_000));
     expect(historyGet).toHaveBeenCalledWith(
-      "/workflow/copilot/chat-history",
+      "/ember/chat-history",
       expect.objectContaining({
         params: expect.objectContaining({
           request_cancel_token: streamCalls[0]!.body.cancel_token,

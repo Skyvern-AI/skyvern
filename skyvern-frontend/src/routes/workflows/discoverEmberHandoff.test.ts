@@ -260,7 +260,7 @@ describe("withoutDiscoverViaParam", () => {
 });
 
 describe("handoff prompt storage keys", () => {
-  it("reads the Ember key first, writes the old key, and forgets both", () => {
+  it("reads the Ember key first, falls back to the old key, writes the Ember key, and forgets both", () => {
     sessionStorage.setItem("skyvern.discoverCopilotHandoff:wpid_1", "old");
     expect(readDiscoverEmberPrompt("wpid_1")).toBe("old");
     sessionStorage.setItem("skyvern.discoverEmberHandoff:wpid_1", "new");
@@ -269,11 +269,11 @@ describe("handoff prompt storage keys", () => {
     expect(sessionStorage.length).toBe(0);
 
     rememberDiscoverEmberPrompt("wpid_2", "seed");
+    expect(sessionStorage.getItem("skyvern.discoverEmberHandoff:wpid_2")).toBe(
+      "seed",
+    );
     expect(
       sessionStorage.getItem("skyvern.discoverCopilotHandoff:wpid_2"),
-    ).toBe("seed");
-    expect(
-      sessionStorage.getItem("skyvern.discoverEmberHandoff:wpid_2"),
     ).toBeNull();
   });
 });

@@ -278,43 +278,50 @@ async def test_a_microsoft_read_failure_still_verifies_google_choices(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_staged_unapproved_google_connection_offers_server_verified_recovery_choices(
+async def test_recovery_choices_for_a_drive_upload_offer_the_staged_account_then_only_drive_accounts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    drive = ["https://www.googleapis.com/auth/drive"]
+
     async def visible_for_org(organization_id: str) -> list[GoogleOAuthCredentialBase]:
         assert organization_id == "org-1"
         return [
-            _google("goac_first", "First account", email_address="first@example.test"),
-            _google("goac_second", "Second account", state="error", email_address="second@example.test"),
+            _google("goac_sheets", "Sheets account"),
+            _google("goac_drive", "Drive account", state="error", email_address="drive@example.test"),
+            _google("goac_staged", "Staged account"),
         ]
 
-    monkeypatch.setattr(
-        google_oauth_service,
-        "get_visible_credentials_for_org",
-        visible_for_org,
-    )
+    async def visible_drive_scopes(organization_id: str) -> list[GoogleOAuthCredentialBase]:
+        rows = await visible_for_org(organization_id)
+        return [row.model_copy(update={"scopes_granted": drive}) if row.id == "goac_drive" else row for row in rows]
+
+    monkeypatch.setattr(google_oauth_service, "get_visible_credentials_for_org", visible_drive_scopes)
     policy = request_policy_module.RequestPolicy(
-        existing_workflow_connection_ids=["goac_model_staged"],
-        run_approved_connection_ids=[],
+        existing_workflow_connection_ids=["goac_staged", "goac_sheets"],
+        run_approved_connection_ids=["goac_sheets"],
+    )
+    staged = (
+        "workflow_definition:\n  parameters: []\n  blocks:\n"
+        "    - block_type: file_upload\n      label: upload\n      storage_type: google_drive\n"
+        "      google_credential_id: goac_staged\n      google_drive_folder_id: folder\n"
+        "    - block_type: agent_step\n      label: unrelated_agent\n      prompt: Summarize the page\n"
+        "    - block_type: google_sheets_read\n      label: read\n      credential_id: goac_sheets\n"
+        "      spreadsheet_url: https://docs.google.com/spreadsheets/d/sheet-reference-123/edit\n"
     )
 
     choices = await agent_module._server_verified_connected_account_recovery_choices(
         policy,
         organization_id="org-1",
+        workflow_yaml=staged,
     )
 
     assert choices == [
+        ConnectedAccountChoice(connection_id="goac_staged", name="Staged account", state="active"),
         ConnectedAccountChoice(
-            connection_id="goac_first",
-            name="First account",
-            state="active",
-            email_address="first@example.test",
-        ),
-        ConnectedAccountChoice(
-            connection_id="goac_second",
-            name="Second account",
+            connection_id="goac_drive",
+            name="Drive account",
             state="error",
-            email_address="second@example.test",
+            email_address="drive@example.test",
         ),
     ]
 
@@ -338,6 +345,7 @@ async def test_recovery_choices_are_omitted_without_an_unapproved_staged_google_
         await agent_module._server_verified_connected_account_recovery_choices(
             policy,
             organization_id="org-1",
+            workflow_yaml=None,
         )
         is None
     )
@@ -2491,13 +2499,14 @@ async def test_a_copilot_test_run_needs_only_the_account_the_chat_picked(monkeyp
     agent = {"label": "agent", "block_type": "agent_step", "prompt": "email the summary", "tools": ["send_email"]}
     definition = {"parameters": [], "blocks": [agent]}
     # Off, every account still needs approval, so a single pick does not let the run through.
+    monkeypatch.setattr(settings, "EMBER_NARROW_AGENT_STEP_ACCOUNTS", False)
     picked_off = _gate_ctx(monkeypatch)
     picked_off.request_policy.run_approved_connection_ids = [DRIVE_ACCOUNT_ID]
     off = await run_credential_gate(
         picked_off, definition, labels=None, run_parameters=None, narrow_agent_step_accounts=True
     )
     assert off.blocker is not None
-    monkeypatch.setattr(settings, "COPILOT_NARROW_AGENT_STEP_ACCOUNTS", True)
+    monkeypatch.setattr(settings, "EMBER_NARROW_AGENT_STEP_ACCOUNTS", True)
     unapproved = _gate_ctx(monkeypatch)
     cited = _gate_ctx(monkeypatch, message=f"send it from {DRIVE_ACCOUNT_ID}")
 
@@ -2531,7 +2540,7 @@ async def test_a_copilot_test_run_needs_only_the_account_the_chat_picked(monkeyp
 async def test_a_triggered_childs_account_need_reaches_the_card_and_the_record(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(settings, "COPILOT_NARROW_AGENT_STEP_ACCOUNTS", True)
+    monkeypatch.setattr(settings, "EMBER_NARROW_AGENT_STEP_ACCOUNTS", True)
     child = {
         "parameters": [],
         "blocks": [{"label": "agent", "block_type": "agent_step", "prompt": "email it", "tools": ["send_email"]}],
@@ -2558,7 +2567,7 @@ async def test_a_triggered_childs_account_need_reaches_the_card_and_the_record(
     assert narrowed.blocker is None and narrowed.agent_step_connection_ids == (DRIVE_ACCOUNT_ID,)
 
     # Off, the child is not read, so nothing new needs approval, but every account is recorded for a worker that is on.
-    monkeypatch.setattr(settings, "COPILOT_NARROW_AGENT_STEP_ACCOUNTS", False)
+    monkeypatch.setattr(settings, "EMBER_NARROW_AGENT_STEP_ACCOUNTS", False)
     off = await run_credential_gate(
         _gate_ctx(monkeypatch), definition, labels=None, run_parameters=None, narrow_agent_step_accounts=True
     )
@@ -2583,7 +2592,7 @@ async def test_a_triggered_childs_account_need_reaches_the_card_and_the_record(
     assert refused.error is not None and refused.agent_step_connection_ids is None
 
     # On, a triggered child with no account tool adds nothing to record.
-    monkeypatch.setattr(settings, "COPILOT_NARROW_AGENT_STEP_ACCOUNTS", True)
+    monkeypatch.setattr(settings, "EMBER_NARROW_AGENT_STEP_ACCOUNTS", True)
     monkeypatch.setattr(
         app.DATABASE.workflows,
         "get_workflow_by_permanent_id",
@@ -2654,7 +2663,7 @@ async def test_the_triggered_workflow_walk(
     blocks: bool,
     reads: int,
 ) -> None:
-    monkeypatch.setattr(settings, "COPILOT_NARROW_AGENT_STEP_ACCOUNTS", narrowing_on)
+    monkeypatch.setattr(settings, "EMBER_NARROW_AGENT_STEP_ACCOUNTS", narrowing_on)
 
     async def read(*, workflow_permanent_id: str, organization_id: str) -> SimpleNamespace | None:
         if workflow_permanent_id in workflows and workflows[workflow_permanent_id] is None:

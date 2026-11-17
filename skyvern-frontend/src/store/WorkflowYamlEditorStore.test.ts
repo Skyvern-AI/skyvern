@@ -221,7 +221,7 @@ describe("Ember turn reservations", () => {
     expect(getWorkflowLockMessage()).toBe(message);
   });
 
-  test("pending-accept markers read the Ember key first, write the old key, and clear both", () => {
+  test("pending-accept markers read the Ember key first, fall back to the old key, write the Ember key, and clear both", () => {
     sessionStorage.clear();
     const marker = (chatId: string) =>
       JSON.stringify({ chatId, acceptAttempt: null, alwaysAccept: false });
@@ -236,9 +236,9 @@ describe("Ember turn reservations", () => {
       alwaysAccept: false,
     });
     expect(
-      sessionStorage.getItem("copilot-pending-accept:wpid_2"),
+      sessionStorage.getItem("ember-pending-accept:wpid_2"),
     ).not.toBeNull();
-    expect(sessionStorage.getItem("ember-pending-accept:wpid_2")).toBeNull();
+    expect(sessionStorage.getItem("copilot-pending-accept:wpid_2")).toBeNull();
 
     const token = beginEmberAcceptance()!;
     useWorkflowYamlEditorStore.setState({

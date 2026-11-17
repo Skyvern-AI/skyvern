@@ -253,7 +253,10 @@ RUN_TOOL_DESCRIPTIONS: dict[str, str] = {
     "page_fill": "Type value into the field prompt describes." + _NO_SECOND_AGENT,
     "page_extract": "Read what prompt asks for from the page, shaped by schema, a JSON schema. For a yes/no check, "
     'pass {"type": "boolean"}.' + _NO_SECOND_AGENT,
+    "load_skill": "Return the instructions and other file paths of the skill named name. read_skill_resource(name, "
+    "path) returns one of those files. Offered only when this run has skills.",
 }
+READ_SKILL_RESOURCE_DESCRIPTION = "Return the text of the file at path in the skill named name."
 FILES_DESCRIPTION = (
     "files: names of this run's files (see read_run_data) to hand to the browser agent; it receives their values and "
     "can upload them."
