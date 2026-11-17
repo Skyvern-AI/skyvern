@@ -14857,6 +14857,27 @@
             "title": "Download Attachments",
             "default": false
           },
+          "organize_action": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EmailOrganizeAction"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "organize_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Organize Label"
+          },
           "parameters": {
             "items": {
               "oneOf": [
@@ -15105,6 +15126,30 @@
             "description": "Download non-inline attachments from matched emails for downstream blocks.",
             "default": false
           },
+          "organize_action": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EmailOrganizeAction"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Change every matched email: add a label, archive, move to a label, or mark read. Needs a Connected Gmail account (credential_source nango)."
+          },
+          "organize_label": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 256
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Organize Label",
+            "description": "Existing Gmail label name for organize_action label or move. Must be literal text."
+          },
           "parameter_keys": {
             "anyOf": [
               {
@@ -15126,6 +15171,17 @@
           "email_client"
         ],
         "title": "EmailInboxBlockYAML"
+      },
+      "EmailOrganizeAction": {
+        "type": "string",
+        "enum": [
+          "label",
+          "archive",
+          "move",
+          "mark_read"
+        ],
+        "title": "EmailOrganizeAction",
+        "description": "One change an Email Inbox block applies to every email it matched."
       },
       "EmailTransport": {
         "type": "string",
