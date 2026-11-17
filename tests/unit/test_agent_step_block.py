@@ -1058,6 +1058,7 @@ async def test_a_copilot_run_offers_and_accepts_only_the_account_the_chat_approv
         )
         await session.commit()
     monkeypatch.setattr(app, "CACHE", LocalCache())
+    monkeypatch.setattr(settings, "EMBER_NARROW_AGENT_STEP_ACCOUNTS", False)
     # With no record, narrowing off keeps every account (an older API required them all); on offers none.
     assert {account.id for account in await agent_step_loop._connected_accounts(ORG, RUN)} == {
         "goc_a",
@@ -1156,6 +1157,7 @@ async def test_a_copilot_runs_record_holds_whatever_the_workers_setting_and_a_br
         return sorted(account.id for account in await agent_step_loop._connected_accounts(ORG, run_id))
 
     # Narrowing off on this worker: a record is still enforced, and an unreadable one offers none.
+    monkeypatch.setattr(settings, "EMBER_NARROW_AGENT_STEP_ACCOUNTS", False)
     assert await offered(RUN) == ["goc_a"]
     assert await offered(f"wr_hop_{agent_step_loop._MAX_PARENT_RUN_HOPS}") == ["goc_a"]
     await cache.set(_run_accounts_key(ORG, RUN), "not json")

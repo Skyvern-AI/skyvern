@@ -2491,6 +2491,7 @@ async def test_a_copilot_test_run_needs_only_the_account_the_chat_picked(monkeyp
     agent = {"label": "agent", "block_type": "agent_step", "prompt": "email the summary", "tools": ["send_email"]}
     definition = {"parameters": [], "blocks": [agent]}
     # Off, every account still needs approval, so a single pick does not let the run through.
+    monkeypatch.setattr(settings, "EMBER_NARROW_AGENT_STEP_ACCOUNTS", False)
     picked_off = _gate_ctx(monkeypatch)
     picked_off.request_policy.run_approved_connection_ids = [DRIVE_ACCOUNT_ID]
     off = await run_credential_gate(
