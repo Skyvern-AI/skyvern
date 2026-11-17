@@ -5472,6 +5472,8 @@ class RawSkyvern:
         status: typing.Optional[typing.Union[WorkflowRunStatus, typing.Sequence[WorkflowRunStatus]]] = None,
         search_key: typing.Optional[str] = None,
         error_code: typing.Optional[str] = None,
+        created_at_start: typing.Optional[dt.datetime] = None,
+        created_at_end: typing.Optional[dt.datetime] = None,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> HttpResponse[typing.List[WorkflowRun]]:
         """
@@ -5521,6 +5523,12 @@ class RawSkyvern:
         error_code : typing.Optional[str]
             Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution.
 
+        created_at_start : typing.Optional[dt.datetime]
+            Only include runs created at or after this time. Pass a timezone-aware datetime: a naive one is sent with the local timezone of the machine making the call, not as UTC. Supplying it replaces the 30-day default window of a free-text search_key.
+
+        created_at_end : typing.Optional[dt.datetime]
+            Only include runs created strictly before this time. Pass a timezone-aware datetime: a naive one is sent with the local timezone of the machine making the call, not as UTC. Without created_at_start, a free-text search_key covers the 30 days before this time.
+
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -5538,6 +5546,8 @@ class RawSkyvern:
                 "status": status,
                 "search_key": search_key,
                 "error_code": error_code,
+                "created_at_start": serialize_datetime(created_at_start) if created_at_start is not None else None,
+                "created_at_end": serialize_datetime(created_at_end) if created_at_end is not None else None,
             },
             request_options=request_options,
         )
@@ -11174,6 +11184,8 @@ class AsyncRawSkyvern:
         status: typing.Optional[typing.Union[WorkflowRunStatus, typing.Sequence[WorkflowRunStatus]]] = None,
         search_key: typing.Optional[str] = None,
         error_code: typing.Optional[str] = None,
+        created_at_start: typing.Optional[dt.datetime] = None,
+        created_at_end: typing.Optional[dt.datetime] = None,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> AsyncHttpResponse[typing.List[WorkflowRun]]:
         """
@@ -11223,6 +11235,12 @@ class AsyncRawSkyvern:
         error_code : typing.Optional[str]
             Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution.
 
+        created_at_start : typing.Optional[dt.datetime]
+            Only include runs created at or after this time. Pass a timezone-aware datetime: a naive one is sent with the local timezone of the machine making the call, not as UTC. Supplying it replaces the 30-day default window of a free-text search_key.
+
+        created_at_end : typing.Optional[dt.datetime]
+            Only include runs created strictly before this time. Pass a timezone-aware datetime: a naive one is sent with the local timezone of the machine making the call, not as UTC. Without created_at_start, a free-text search_key covers the 30 days before this time.
+
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -11240,6 +11258,8 @@ class AsyncRawSkyvern:
                 "status": status,
                 "search_key": search_key,
                 "error_code": error_code,
+                "created_at_start": serialize_datetime(created_at_start) if created_at_start is not None else None,
+                "created_at_end": serialize_datetime(created_at_end) if created_at_end is not None else None,
             },
             request_options=request_options,
         )
