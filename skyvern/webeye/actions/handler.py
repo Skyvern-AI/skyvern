@@ -381,7 +381,6 @@ _MULTI_FIELD_TOTP_OPERATION_TIMEOUT_SECONDS = _MULTI_FIELD_TOTP_OPERATION_TIMEOU
 
 FIX_TEL_INPUT_DIGIT_DROP_FLAG = "FIX_TEL_INPUT_DIGIT_DROP"
 COLLAPSE_SELECT_FANOUT_FLAG = "COLLAPSE_SELECT_FANOUT"
-COLLAPSE_CUSTOM_SELECT_FANOUT_FLAG = "COLLAPSE_CUSTOM_SELECT_FANOUT"
 COLLAPSE_AUTOCOMPLETE_FANOUT_FLAG = "COLLAPSE_AUTOCOMPLETE_FANOUT"
 COLLAPSE_XP_ASSIGNMENT_FLAG = "COLLAPSE_XP_ASSIGNMENT"
 # Nested dispatch replaces contexts, so run-stickiness is process-local and keyed by run ID.
@@ -3172,7 +3171,7 @@ async def _resolve_collapse_xp_assignment(
 
 async def _resolve_collapse_gate(
     task: Task,
-    family_flag: str,
+    family_flag: str | None,
     log_label: str,
     *,
     consult_assignment: bool = True,
@@ -3194,7 +3193,7 @@ async def _resolve_collapse_gate(
             "workflow_permanent_id": workflow_permanent_id or "",
             "script_mode": "true" if script_mode_run else "false",
         }
-        family_enabled = bool(
+        family_enabled = family_flag is None or bool(
             await experimentation_provider.is_feature_enabled_cached(
                 family_flag,
                 organization_id,
@@ -3236,14 +3235,6 @@ async def _is_collapse_select_fanout_enabled(task: Task) -> bool:
         consult_assignment=False,
     )
     return gate.family_enabled
-
-
-async def _is_collapse_custom_select_fanout_enabled(task: Task) -> bool:
-    return await _is_collapse_fanout_enabled(
-        task,
-        COLLAPSE_CUSTOM_SELECT_FANOUT_FLAG,
-        "collapse-custom-select-fanout",
-    )
 
 
 async def _is_collapse_autocomplete_fanout_enabled(task: Task) -> bool:
@@ -8155,7 +8146,7 @@ async def _build_after_click_verify_prompt(
     # SKY-9718 Layer 1: sequential-click after-dropdown verifier path. Keep
     # Skyvern IDs (default html_need_skyvern_attrs=True) because
     # `new_elements_ids` is threaded and the LLM compares those IDs to what's
-    # rendered. Gate lean on the PostHog flag.
+    # rendered.
     _ctx = skyvern_context.current()
     lean_enabled = bool(_ctx and _ctx.enable_lean_element_tree)
     slim_output = await get_slim_output_template_value("check-user-goal")
@@ -15116,8 +15107,8 @@ async def _select_deterministic_custom_option(
     script_mode_run = bool(context and context.script_mode)
     gate = await _resolve_collapse_gate(
         task,
-        COLLAPSE_CUSTOM_SELECT_FANOUT_FLAG,
-        "collapse-custom-select-fanout",
+        family_flag=None,
+        log_label="collapse-custom-select-fanout",
     )
     if gate.gate_error and not post_failed_click_commit_recovery:
         emit(CustomSelectFamilyOutcome.llm_fallback_gate_error)

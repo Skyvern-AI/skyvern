@@ -8061,8 +8061,7 @@ class ForgeAgent:
 
         slim_output = await get_slim_output_template_value(template_name)
 
-        # SKY-9718 Layer 1: gate the lean recipe on the PostHog flag at the
-        # call site. complete_verify only needs the visual page state to
+        # complete_verify only needs the visual page state to
         # decide is_complete / is_terminate / continue — no element-id refs,
         # no new_elements_ids threading — so we also drop Skyvern IDs.
         _ctx = skyvern_context.current()
@@ -8921,32 +8920,7 @@ class ForgeAgent:
         # If we don't have pre-scraped data, scrape normally
         if scraped_page is None:
             if context:
-                # SKY-9718 Layer 1: local-override env var for bench / debugging.
-                # `FORCE_ENABLE_LEAN_ELEMENT_TREE=true` bypasses the PostHog gate
-                # and forces lean ON for every run in this process. Never set in
-                # production — the PostHog flag is the only prod control.
-                if os.getenv("FORCE_ENABLE_LEAN_ELEMENT_TREE", "").lower() in ("true", "1", "yes"):
-                    context.enable_lean_element_tree = True
-                    LOG.info(
-                        "ENABLE_LEAN_ELEMENT_TREE forced ON via env var (bypasses PostHog gate)",
-                        task_id=task.task_id,
-                    )
-                else:
-                    try:
-                        distinct_id = task.workflow_run_id if task.workflow_run_id else task.task_id
-                        context.enable_lean_element_tree = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                            "ENABLE_LEAN_ELEMENT_TREE",
-                            distinct_id,
-                            properties={"organization_id": task.organization_id},
-                        )
-                    except Exception:
-                        LOG.warning(
-                            "Failed to check ENABLE_LEAN_ELEMENT_TREE feature flag",
-                            exc_info=True,
-                            task_id=task.task_id,
-                        )
-                        context.enable_lean_element_tree = False
-
+                context.enable_lean_element_tree = True
                 await resolve_transient_ui_capture_arm(context)
 
             # start the async tasks while running scrape_website

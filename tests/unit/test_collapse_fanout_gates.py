@@ -12,7 +12,7 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.webeye.actions import handler
 
 UMBRELLA_FLAG = "COLLAPSE_XP_ASSIGNMENT"
-CUSTOM_FLAG = handler.COLLAPSE_CUSTOM_SELECT_FANOUT_FLAG
+FAMILY_FLAG = handler.COLLAPSE_AUTOCOMPLETE_FANOUT_FLAG
 
 
 class CaptureLogger:
@@ -76,13 +76,18 @@ def _umbrella_calls(
     return [call for call in provider.calls if call[1] == UMBRELLA_FLAG]
 
 
+async def _custom_select_assigned(task: SimpleNamespace) -> bool:
+    gate = await handler._resolve_collapse_gate(task, None, "custom-select")
+    return gate.family_enabled and gate.assigned is True
+
+
 @pytest.mark.asyncio
 async def test_resolve_collapse_gate_family_off_skips_assignment_and_reports_null(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    provider = FakeExperimentationProvider({CUSTOM_FLAG: False})
+    provider = FakeExperimentationProvider({FAMILY_FLAG: False})
     _set_provider(monkeypatch, provider)
-    gate = await handler._resolve_collapse_gate(_task(), CUSTOM_FLAG, "custom-select")
+    gate = await handler._resolve_collapse_gate(_task(), FAMILY_FLAG, "autocomplete")
     assert gate == handler._CollapseGateResult(family_enabled=False, assigned=None, gate_error=False)
     assert _umbrella_calls(provider) == []
 
@@ -91,8 +96,8 @@ async def test_resolve_collapse_gate_family_off_skips_assignment_and_reports_nul
 @pytest.mark.parametrize(
     ("results", "raises_for", "expected"),
     [
-        ({CUSTOM_FLAG: True, UMBRELLA_FLAG: False}, set(), handler._CollapseGateResult(True, False, False)),
-        ({CUSTOM_FLAG: True}, {CUSTOM_FLAG}, handler._CollapseGateResult(False, None, True)),
+        ({FAMILY_FLAG: True, UMBRELLA_FLAG: False}, set(), handler._CollapseGateResult(True, False, False)),
+        ({FAMILY_FLAG: True}, {FAMILY_FLAG}, handler._CollapseGateResult(False, None, True)),
     ],
 )
 async def test_resolve_collapse_gate_separates_control_family_off_and_gate_error(
@@ -104,7 +109,7 @@ async def test_resolve_collapse_gate_separates_control_family_off_and_gate_error
     handler._COLLAPSE_XP_ASSIGNMENT_MEMO.clear()
     provider = FakeExperimentationProvider(results, raises_for=raises_for)
     _set_provider(monkeypatch, provider)
-    actual = await handler._resolve_collapse_gate(_task(), CUSTOM_FLAG, "custom-select")
+    actual = await handler._resolve_collapse_gate(_task(), FAMILY_FLAG, "autocomplete")
     assert actual == expected
 
 
@@ -189,30 +194,20 @@ def test_posthog_local_wpid_exclusion_requires_a_present_property() -> None:
 
 
 @pytest.mark.asyncio
-async def test_collapse_family_and_umbrella_on_uses_workflow_run_id(monkeypatch: pytest.MonkeyPatch) -> None:
-    provider = FakeExperimentationProvider(
-        {
-            handler.COLLAPSE_CUSTOM_SELECT_FANOUT_FLAG: True,
-            UMBRELLA_FLAG: True,
-        }
-    )
+async def test_custom_select_gate_reads_only_the_umbrella_by_workflow_run_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = FakeExperimentationProvider({UMBRELLA_FLAG: True})
     _set_provider(monkeypatch, provider)
 
-    assert await handler._is_collapse_custom_select_fanout_enabled(_task()) is True
-    assert _umbrella_calls(provider) == [("unrecorded", UMBRELLA_FLAG, "wr_456", {"organization_id": "o_123"})]
+    assert await _custom_select_assigned(_task()) is True
+    assert provider.calls == [("unrecorded", UMBRELLA_FLAG, "wr_456", {"organization_id": "o_123"})]
 
 
 @pytest.mark.asyncio
 async def test_collapse_umbrella_falls_back_to_task_id(monkeypatch: pytest.MonkeyPatch) -> None:
-    provider = FakeExperimentationProvider(
-        {
-            handler.COLLAPSE_CUSTOM_SELECT_FANOUT_FLAG: True,
-            UMBRELLA_FLAG: True,
-        }
-    )
+    provider = FakeExperimentationProvider({UMBRELLA_FLAG: True})
     _set_provider(monkeypatch, provider)
 
-    assert await handler._is_collapse_custom_select_fanout_enabled(_task(workflow_run_id=None)) is True
+    assert await _custom_select_assigned(_task(workflow_run_id=None)) is True
     assert _umbrella_calls(provider) == [("unrecorded", UMBRELLA_FLAG, "tsk_789", {"organization_id": "o_123"})]
 
 
@@ -258,7 +253,6 @@ async def test_collapse_gates_share_one_umbrella_cohort(monkeypatch: pytest.Monk
     provider = FakeExperimentationProvider(
         {
             handler.COLLAPSE_SELECT_FANOUT_FLAG: True,
-            handler.COLLAPSE_CUSTOM_SELECT_FANOUT_FLAG: True,
             handler.COLLAPSE_AUTOCOMPLETE_FANOUT_FLAG: True,
             UMBRELLA_FLAG: True,
         }
@@ -268,7 +262,7 @@ async def test_collapse_gates_share_one_umbrella_cohort(monkeypatch: pytest.Monk
 
     with skyvern_context.scoped(SkyvernContext()):
         assert await handler._is_collapse_select_fanout_enabled(task) is True
-        assert await handler._is_collapse_custom_select_fanout_enabled(task) is True
+        assert await _custom_select_assigned(task) is True
         assert await handler._is_collapse_autocomplete_fanout_enabled(task) is True
 
     assert _umbrella_calls(provider) == [("unrecorded", UMBRELLA_FLAG, "wr_456", {"organization_id": "o_123"})]
@@ -311,7 +305,6 @@ async def test_normal_collapse_gate_does_not_seed_custom_assignment(monkeypatch:
     provider = FakeExperimentationProvider(
         {
             handler.COLLAPSE_SELECT_FANOUT_FLAG: True,
-            handler.COLLAPSE_CUSTOM_SELECT_FANOUT_FLAG: True,
             UMBRELLA_FLAG: True,
         }
     )
@@ -322,12 +315,12 @@ async def test_normal_collapse_gate_does_not_seed_custom_assignment(monkeypatch:
     assert _umbrella_calls(provider) == []
     assert task.workflow_run_id not in handler._COLLAPSE_XP_ASSIGNMENT_MEMO
 
-    assert await handler._is_collapse_custom_select_fanout_enabled(task) is True
+    assert await _custom_select_assigned(task) is True
     assert _umbrella_calls(provider) == [("unrecorded", UMBRELLA_FLAG, "wr_456", {"organization_id": "o_123"})]
     assert handler._COLLAPSE_XP_ASSIGNMENT_MEMO[task.workflow_run_id] is True
 
     provider.results[UMBRELLA_FLAG] = False
-    gate = await handler._resolve_collapse_gate(task, CUSTOM_FLAG, "custom-select")
+    gate = await handler._resolve_collapse_gate(task, None, "custom-select")
     assert gate == handler._CollapseGateResult(family_enabled=True, assigned=True, gate_error=False)
     assert len(_umbrella_calls(provider)) == 1
 
@@ -355,10 +348,7 @@ async def test_family_only_mode_wins_over_script_mode_pinning(monkeypatch: pytes
 
 @pytest.mark.asyncio
 async def test_custom_select_executor_fails_closed_on_umbrella_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    provider = FakeExperimentationProvider(
-        {handler.COLLAPSE_CUSTOM_SELECT_FANOUT_FLAG: True},
-        raises_for={UMBRELLA_FLAG},
-    )
+    provider = FakeExperimentationProvider({}, raises_for={UMBRELLA_FLAG})
     _set_provider(monkeypatch, provider)
     logger = CaptureLogger()
     monkeypatch.setattr(handler, "LOG", logger)
@@ -387,41 +377,31 @@ async def test_custom_select_executor_fails_closed_on_umbrella_error(monkeypatch
 
 @pytest.mark.asyncio
 async def test_collapse_umbrella_assignment_stays_sticky_for_run(monkeypatch: pytest.MonkeyPatch) -> None:
-    provider = FakeExperimentationProvider(
-        {
-            handler.COLLAPSE_CUSTOM_SELECT_FANOUT_FLAG: True,
-            UMBRELLA_FLAG: True,
-        }
-    )
+    provider = FakeExperimentationProvider({UMBRELLA_FLAG: True})
     _set_provider(monkeypatch, provider)
     task = _task()
 
     with skyvern_context.scoped(SkyvernContext()):
-        assert await handler._is_collapse_custom_select_fanout_enabled(task) is True
+        assert await _custom_select_assigned(task) is True
         provider.results[UMBRELLA_FLAG] = False
-        assert await handler._is_collapse_custom_select_fanout_enabled(task) is True
-        assert await handler._is_collapse_custom_select_fanout_enabled(task) is True
+        assert await _custom_select_assigned(task) is True
+        assert await _custom_select_assigned(task) is True
 
     assert _umbrella_calls(provider) == [("unrecorded", UMBRELLA_FLAG, "wr_456", {"organization_id": "o_123"})]
 
 
 @pytest.mark.asyncio
 async def test_collapse_umbrella_assignment_survives_context_replacement(monkeypatch: pytest.MonkeyPatch) -> None:
-    provider = FakeExperimentationProvider(
-        {
-            handler.COLLAPSE_CUSTOM_SELECT_FANOUT_FLAG: True,
-            UMBRELLA_FLAG: True,
-        }
-    )
+    provider = FakeExperimentationProvider({UMBRELLA_FLAG: True})
     _set_provider(monkeypatch, provider)
     task = _task()
 
     with skyvern_context.scoped(SkyvernContext(workflow_run_id=task.workflow_run_id)):
-        assert await handler._is_collapse_custom_select_fanout_enabled(task) is True
+        assert await _custom_select_assigned(task) is True
         skyvern_context.replace(SkyvernContext(workflow_run_id=task.workflow_run_id))
         provider.results[UMBRELLA_FLAG] = False
-        assert await handler._is_collapse_custom_select_fanout_enabled(task) is True
-        assert await handler._is_collapse_custom_select_fanout_enabled(task) is True
+        assert await _custom_select_assigned(task) is True
+        assert await _custom_select_assigned(task) is True
 
     assert _umbrella_calls(provider) == [("unrecorded", UMBRELLA_FLAG, "wr_456", {"organization_id": "o_123"})]
 
@@ -430,19 +410,14 @@ async def test_collapse_umbrella_assignment_survives_context_replacement(monkeyp
 async def test_collapse_umbrella_never_records_against_ambient_child_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    provider = FakeExperimentationProvider(
-        {
-            handler.COLLAPSE_CUSTOM_SELECT_FANOUT_FLAG: True,
-            UMBRELLA_FLAG: True,
-        }
-    )
+    provider = FakeExperimentationProvider({UMBRELLA_FLAG: True})
     _set_provider(monkeypatch, provider)
     logger = CaptureLogger()
     monkeypatch.setattr(handler, "LOG", logger)
     task = _task(workflow_run_id="wr_parent")
 
     with skyvern_context.scoped(SkyvernContext(workflow_run_id="wr_child")) as context:
-        assert await handler._is_collapse_custom_select_fanout_enabled(task) is True
+        assert await _custom_select_assigned(task) is True
         assert handler._COLLAPSE_XP_ASSIGNMENT_MEMO["wr_parent"] is True
         assert UMBRELLA_FLAG not in context.feature_flag_entries
 
@@ -463,20 +438,15 @@ async def test_collapse_umbrella_never_records_against_ambient_child_context(
 
 @pytest.mark.asyncio
 async def test_collapse_umbrella_first_writer_logs_once_without_lock(monkeypatch: pytest.MonkeyPatch) -> None:
-    provider = FakeExperimentationProvider(
-        {
-            handler.COLLAPSE_CUSTOM_SELECT_FANOUT_FLAG: True,
-            UMBRELLA_FLAG: True,
-        }
-    )
+    provider = FakeExperimentationProvider({UMBRELLA_FLAG: True})
     _set_provider(monkeypatch, provider)
     logger = CaptureLogger()
     monkeypatch.setattr(handler, "LOG", logger)
     task = _task()
 
     assert await asyncio.gather(
-        handler._is_collapse_custom_select_fanout_enabled(task),
-        handler._is_collapse_custom_select_fanout_enabled(task),
+        _custom_select_assigned(task),
+        _custom_select_assigned(task),
     ) == [True, True]
     assert len(_umbrella_calls(provider)) == 2
     assert len([record for record in logger.records if record[1] == "collapse_xp_assignment"]) == 1
@@ -486,7 +456,6 @@ async def test_collapse_umbrella_first_writer_logs_once_without_lock(monkeypatch
 async def test_collapse_umbrella_error_pins_run_to_control(monkeypatch: pytest.MonkeyPatch) -> None:
     provider = FakeExperimentationProvider(
         {
-            handler.COLLAPSE_CUSTOM_SELECT_FANOUT_FLAG: True,
             handler.COLLAPSE_AUTOCOMPLETE_FANOUT_FLAG: True,
             UMBRELLA_FLAG: True,
         },
@@ -498,10 +467,10 @@ async def test_collapse_umbrella_error_pins_run_to_control(monkeypatch: pytest.M
     task = _task()
 
     with skyvern_context.scoped(SkyvernContext(workflow_run_id=task.workflow_run_id)) as context:
-        assert await handler._is_collapse_custom_select_fanout_enabled(task) is False
+        assert await _custom_select_assigned(task) is False
         assert UMBRELLA_FLAG not in context.feature_flag_entries
         provider.raises_for.remove(UMBRELLA_FLAG)
-        assert await handler._is_collapse_custom_select_fanout_enabled(task) is False
+        assert await _custom_select_assigned(task) is False
         assert await handler._is_collapse_autocomplete_fanout_enabled(task) is False
 
     assert _umbrella_calls(provider) == [("unrecorded", UMBRELLA_FLAG, "wr_456", {"organization_id": "o_123"})]
@@ -550,18 +519,16 @@ def _custom_select_outcomes(logger: CaptureLogger) -> list[dict[str, Any]]:
 
 
 @pytest.mark.asyncio
-async def test_script_mode_skips_umbrella_but_honors_family_kill_switch_on(
+async def test_script_mode_skips_umbrella_for_custom_select(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    provider = FakeExperimentationProvider({CUSTOM_FLAG: True}, raises_for={UMBRELLA_FLAG})
+    provider = FakeExperimentationProvider({}, raises_for={UMBRELLA_FLAG})
     logger = CaptureLogger()
 
     with skyvern_context.scoped(SkyvernContext(script_mode=True)):
         await _run_deterministic_custom_select(monkeypatch, provider, logger)
 
-    family_calls = [call for call in provider.calls if call[1] == CUSTOM_FLAG]
-    assert family_calls and family_calls[0][3]["script_mode"] == "true"
-    assert _umbrella_calls(provider) == []
+    assert provider.calls == []
     (outcome,) = _custom_select_outcomes(logger)
     assert outcome["script_mode"] is True
     assert outcome["family_gate_enabled"] is True
@@ -572,41 +539,10 @@ async def test_script_mode_skips_umbrella_but_honors_family_kill_switch_on(
 
 
 @pytest.mark.asyncio
-async def test_script_mode_family_flag_off_still_kills_deterministic_path(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    provider = FakeExperimentationProvider({CUSTOM_FLAG: False})
-    logger = CaptureLogger()
-
-    with skyvern_context.scoped(SkyvernContext(script_mode=True)):
-        await _run_deterministic_custom_select(monkeypatch, provider, logger)
-
-    (outcome,) = _custom_select_outcomes(logger)
-    assert outcome["script_mode"] is True
-    assert outcome["family_gate_enabled"] is False
-    assert outcome["outcome"] == "llm_fallback_family_off"
-
-
-@pytest.mark.asyncio
-async def test_agent_mode_flag_off_keeps_custom_select_llm_path(monkeypatch: pytest.MonkeyPatch) -> None:
-    provider = FakeExperimentationProvider({CUSTOM_FLAG: False})
-    logger = CaptureLogger()
-
-    with skyvern_context.scoped(SkyvernContext()):
-        await _run_deterministic_custom_select(monkeypatch, provider, logger)
-
-    assert [call for call in provider.calls if call[1] == CUSTOM_FLAG]
-    (outcome,) = _custom_select_outcomes(logger)
-    assert outcome["script_mode"] is False
-    assert outcome["family_gate_enabled"] is False
-    assert outcome["outcome"] == "llm_fallback_family_off"
-
-
-@pytest.mark.asyncio
 async def test_deterministic_seam_does_not_request_intercept_js_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     """The deterministic seam keeps the physical fallback chain: its option click must not request the
     early synthetic JS fallback, whose readback here is not strict enough to prevent a false success."""
-    provider = FakeExperimentationProvider({CUSTOM_FLAG: True, UMBRELLA_FLAG: True})
+    provider = FakeExperimentationProvider({UMBRELLA_FLAG: True})
     _set_provider(monkeypatch, provider)
     monkeypatch.setattr(handler.app, "AGENT_FUNCTION", AgentFunction())
     monkeypatch.setattr(handler, "_read_custom_select_matched_state", AsyncMock(return_value=None))
