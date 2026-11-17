@@ -337,6 +337,7 @@ from skyvern.forge.sdk.copilot.video_attachment import (
     screened_image_attachment_message,
 )
 from skyvern.forge.sdk.copilot.work_plan import hydrate_work_plan, work_plan_prompt
+from skyvern.forge.sdk.copilot.workflow_credential_utils import parse_workflow_yaml, workflow_blocks
 from skyvern.forge.sdk.copilot.workflow_yaml import (
     redact_credentials_in_workflow_yaml,
     runner_code_block_associations,
@@ -3851,12 +3852,16 @@ async def _server_verified_connected_account_recovery_choices(
     request_policy: RequestPolicy,
     *,
     organization_id: str,
+    workflow_yaml: str | None,
 ) -> list[ConnectedAccountChoice] | None:
     """Display-only rows when a connected-account field staged at turn start lacks run authority.
     The lookup supplies org ownership and display state; these rows do not grant authority."""
-    if set(request_policy.existing_workflow_connection_ids) <= set(request_policy.run_approved_connection_ids):
+    unapproved = set(request_policy.existing_workflow_connection_ids) - set(request_policy.run_approved_connection_ids)
+    if not unapproved:
         return None
-    return await connected_account_choices(organization_id)
+    parsed = parse_workflow_yaml(workflow_yaml) if workflow_yaml else None
+    blocks = workflow_blocks(parsed) if isinstance(parsed, dict) else []
+    return await connected_account_choices(organization_id, blocks, unapproved)
 
 
 async def _translate_to_agent_result(
@@ -5622,6 +5627,7 @@ async def _run_copilot_turn_impl(
             await _server_verified_connected_account_recovery_choices(
                 request_policy,
                 organization_id=organization_id,
+                workflow_yaml=policy_inputs.workflow_yaml,
             )
             or []
         )
