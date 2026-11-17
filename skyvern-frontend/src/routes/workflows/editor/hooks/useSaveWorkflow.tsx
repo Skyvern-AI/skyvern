@@ -1,3 +1,4 @@
+import { useActiveOrgId } from "@/store/ActiveOrgContext";
 import { useReactFlow } from "@xyflow/react";
 import { useCallback } from "react";
 
@@ -27,6 +28,7 @@ export class SaveFailedError extends Error {
 
 export function useSaveWorkflow(): () => Promise<void> {
   const reactFlow = useReactFlow<AppNode>();
+  const activeOrgId = useActiveOrgId();
   const saveWorkflow = useWorkflowSave({ status: "published" });
 
   return useCallback(async () => {
@@ -53,7 +55,7 @@ export function useSaveWorkflow(): () => Promise<void> {
     useWorkflowYamlEditorStore.getState().flushDraft?.();
     flushBufferedEditorEdits();
     const nodes = reactFlow.getNodes();
-    const errors = getWorkflowErrors(nodes);
+    const errors = getWorkflowErrors(nodes, activeOrgId);
     if (errors.length > 0) {
       toast({
         title: "Encountered error while trying to save workflow:",
@@ -70,7 +72,7 @@ export function useSaveWorkflow(): () => Promise<void> {
     }
 
     await saveWorkflow.mutateAsync({ codeCacheDeletionApproved });
-  }, [reactFlow, saveWorkflow]);
+  }, [activeOrgId, reactFlow, saveWorkflow]);
 }
 
 export async function confirmCodeCacheDeletion(

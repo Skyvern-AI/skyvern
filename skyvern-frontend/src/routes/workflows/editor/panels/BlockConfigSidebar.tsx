@@ -78,6 +78,7 @@ const NODE_TYPE_TO_BLOCK_TYPE: Record<
   pdfFill: "pdf_fill",
   splitPdf: "split_pdf",
   dataExport: "data_export",
+  integrationAction: "integration_action",
 };
 
 function getBlockTypeFromNode(node: AppNode): WorkflowBlockType | null {

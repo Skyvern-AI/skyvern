@@ -1,3 +1,4 @@
+import { useActiveOrgId } from "@/store/ActiveOrgContext";
 import {
   TEMPLATE_VIA,
   buildTemplateGuidanceMessage,
@@ -351,6 +352,7 @@ export type AddNodeProps = {
   select?: boolean;
   // A step that leaves the graph in the same pass that adds this one.
   replacing?: string;
+  integrationAction?: { integrationId: string; actionId: string };
 };
 
 // eslint-disable-next-line react-refresh/only-export-components -- Exercise the production apply callback without mounting the entire workspace.
@@ -604,6 +606,7 @@ function Workspace({
     [postHog],
   );
   const { getNodes, getEdges } = useReactFlow();
+  const activeOrgId = useActiveOrgId();
   const {
     nodes,
     edges,
@@ -1633,6 +1636,7 @@ function Workspace({
     label,
     select = true,
     replacing,
+    integrationAction,
   }: AddNodeProps): string | undefined {
     if (refuseMutationDuringYamlCommit()) return;
     const newNodes: Array<AppNode> = [];
@@ -1669,6 +1673,9 @@ function Workspace({
     );
     // Track the new label
     usedLabelsRef.current.add(newLabel);
+    if (integrationAction && node.type === "integrationAction") {
+      node.data = { ...node.data, ...integrationAction };
+    }
 
     if (branch && "data" in node) {
       node.data = {
@@ -2080,7 +2087,7 @@ function Workspace({
       if (!isWorkflowYamlDirty(yamlStore)) {
         let savedWorkflow: WorkflowVersion | undefined;
         if (persist) {
-          const errors = getWorkflowErrors(nodes);
+          const errors = getWorkflowErrors(nodes, activeOrgId);
           if (errors.length > 0) {
             toast({
               title: "Can not save workflow because of errors:",
@@ -2203,7 +2210,7 @@ function Workspace({
       // carries live metadata explicitly so a hydrate cannot replay stale values.
       version.description = mergedSaveData.description;
       if (persist) {
-        const repairedErrors = getWorkflowErrors(repairedNodes);
+        const repairedErrors = getWorkflowErrors(repairedNodes, activeOrgId);
         if (repairedErrors.length > 0) {
           toast({
             title: "Can not save workflow because of errors:",

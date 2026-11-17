@@ -65,6 +65,7 @@ const BLOCK_TYPES: Record<WorkflowBlockNode["type"], true> = {
   googleSheetsWrite: true,
   agentStep: true,
   powerBIQuery: true,
+  integrationAction: true,
 };
 
 describe("docCustomSettings", () => {

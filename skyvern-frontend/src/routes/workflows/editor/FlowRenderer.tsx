@@ -1,3 +1,4 @@
+import { useActiveOrgId } from "@/store/ActiveOrgContext";
 import { useWorkflowDocEditorFlag } from "@/hooks/useWorkflowDocEditorFlag";
 import { useWorkflowPresentationStore } from "@/store/WorkflowPresentationStore";
 import { WorkflowDocEditor } from "./doc/WorkflowDocEditor";
@@ -577,6 +578,7 @@ function FlowRenderer({
   }, [embedded, readOnly, workflow.workflow_permanent_id, docEnabled]);
   const { blockLabel: targettedBlockLabel } = useParams();
   const reactFlowInstance = useReactFlow();
+  const activeOrgId = useActiveOrgId();
   const postHog = usePostHog();
   const debugStore = useDebugStore();
   const isCanvasLocked = useIsCanvasLocked();
@@ -1427,7 +1429,7 @@ function FlowRenderer({
     useWorkflowYamlEditorStore.getState().flushDraft?.();
     flushBufferedEditorEdits();
     const currentNodes = reactFlowInstance.getNodes() as Array<AppNode>;
-    const errors = getWorkflowErrors(currentNodes);
+    const errors = getWorkflowErrors(currentNodes, activeOrgId);
     if (errors.length > 0) {
       toast({
         title: "Can not save workflow because of errors:",

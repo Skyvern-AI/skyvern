@@ -77,6 +77,16 @@ export function getGoogleOAuthCredentialScopesRequested(
   return normalizeGoogleOAuthScopes(credential.scopes_requested) ?? [];
 }
 
+// The list response keys each account's per-action fit by credential id; carry it on the credential.
+export function credentialsWithActionFit(
+  data: GoogleOAuthCredentialListResponse,
+): GoogleOAuthCredential[] {
+  return data.credentials.map((credential) => ({
+    ...credential,
+    action_fit: data.action_fit?.[credential.id],
+  }));
+}
+
 export function isGoogleOAuthCredentialActive(
   credential: GoogleOAuthCredential,
 ): boolean {
@@ -199,7 +209,9 @@ export function useGoogleOAuthCredentials({
           ? "/google/oauth/credentials?include_email=true"
           : "/google/oauth/credentials",
       );
-      return (response.data as GoogleOAuthCredentialListResponse).credentials;
+      return credentialsWithActionFit(
+        response.data as GoogleOAuthCredentialListResponse,
+      );
     },
     // Moderate staleness so multiple GoogleOAuthCredentialSelector instances
     // (one per Google Sheets block in a workflow) don't all refetch on every
