@@ -13,6 +13,7 @@ AGENT_STEP_TOOL_NAMES = frozenset(
         "google_sheets_write",
         "http_request",
         "human_interaction",
+        "load_skill",
         "login",
         "page_click",
         "page_extract",
