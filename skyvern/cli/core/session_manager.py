@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from skyvern.library.skyvern_browser import SkyvernBrowser
     from skyvern.library.skyvern_browser_page import SkyvernBrowserPage
     from skyvern.webeye.browser_engine import EngineFrame
+    from skyvern.webeye.http_interception import HttpInterception
 
     from .hosted_driver import HostedDriver
 
@@ -150,6 +151,7 @@ class SessionState:
     _page_pending_tasks: dict[int, set[asyncio.Task[None]]] = field(default_factory=dict)
     # Routes keyed by page id — Playwright registers routes per-page, so tracking must match.
     active_routes: dict[int, set[str]] = field(default_factory=dict)
+    _http_interceptors: set[HttpInterception] = field(default_factory=set)
     # -- Iframe frame context --
     _working_frame: EngineFrame | None = None
     _observed_refs: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -868,6 +870,29 @@ async def _reconnect_extension_session(
 
 
 async def _close_session_state(current: SessionState, *, close_via_active_client: bool) -> None:
+    # Callers replace the state afterward, so cancellation must retain the entire cleanup tail.
+    closing = asyncio.create_task(
+        _finish_close_session_state(current, close_via_active_client=close_via_active_client),
+        name="browser-session-close",
+    )
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            await asyncio.shield(closing)
+            break
+        except asyncio.CancelledError as error:
+            if closing.cancelled():
+                raise
+            cancellation = error
+        except Exception:
+            if cancellation is not None:
+                raise cancellation
+            raise
+    if cancellation is not None:
+        raise cancellation
+
+
+async def _finish_close_session_state(current: SessionState, *, close_via_active_client: bool) -> None:
     from .session_ops import do_session_close
 
     try:
@@ -896,6 +921,13 @@ async def _close_session_state(current: SessionState, *, close_via_active_client
         for task in current._pending_tasks:
             task.cancel()
         current._pending_tasks.clear()
+        for owner in tuple(current._http_interceptors):
+            try:
+                await owner.close()
+            except Exception:
+                LOG.warning("Best-effort HTTP interception close failed", exc_info=True)
+            finally:
+                current._http_interceptors.discard(owner)
         current.active_routes.clear()
         if current.browser is not None:
             await current.browser.close()

@@ -1009,7 +1009,10 @@ def network_route_cmd(
     cdp: str | None = typer.Option(None, "--cdp", help="CDP WebSocket URL."),
     json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
 ) -> None:
-    """Intercept network requests matching a URL pattern (abort or mock)."""
+    """Intercept network requests matching a URL pattern (abort or mock).
+    Mock/abort covers the top-level page and same-process frames only; requests originating in separate
+    out-of-process cross-site iframe targets are not intercepted and may reach the real server.
+    """
     from skyvern.cli.mcp_tools.inspection import skyvern_network_route
 
     if action not in ("abort", "mock"):

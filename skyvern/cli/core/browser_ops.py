@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Iterator, Literal, Sequence
+from urllib.parse import urlsplit
 
 import structlog
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
@@ -26,6 +27,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from skyvern.exceptions import BlockedHost, SkyvernHTTPException
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.utils.url_validators import validate_fetch_url
+from skyvern.webeye.http_interception import http_interception
 from skyvern.webeye.utils.page import JS_FUNCTION_DEFS, SkyvernFrame
 
 from .guards import CREDENTIAL_HINT, GuardError, validate_wait_until
@@ -729,7 +731,7 @@ async def do_network_route(
     mock_body: str | None = None,
     mock_content_type: str | None = None,
 ) -> NetworkRouteResult:
-    """Register a route handler on the Playwright page and track in SessionState."""
+    """Register owned Fetch interception for the page and track it in SessionState."""
 
     async def _handler(route: Any) -> None:
         try:
@@ -741,6 +743,29 @@ async def do_network_route(
                     headers["content-type"] = mock_content_type
                 elif mock_body is not None:
                     headers["content-type"] = "application/json"
+                request = route.request
+                request_headers = {name.lower(): value for name, value in request.headers.items()}
+                origin = request_headers.get("origin")
+                target = urlsplit(request.url)
+                if (
+                    origin
+                    and target.scheme in {"http", "https"}
+                    and origin.strip() != f"{target.scheme}://{target.netloc}"
+                ):
+                    cors_headers = {
+                        "access-control-allow-origin": origin,
+                        "access-control-allow-credentials": "true",
+                        "vary": "Origin",
+                    }
+                    if request.method == "OPTIONS" and "access-control-request-method" in request_headers:
+                        cors_headers["access-control-allow-methods"] = request_headers["access-control-request-method"]
+                        if "access-control-request-headers" in request_headers:
+                            cors_headers["access-control-allow-headers"] = request_headers[
+                                "access-control-request-headers"
+                            ]
+                        await route.fulfill(status=204, headers=cors_headers, body="")
+                        return
+                    headers.update(cors_headers)
                 await route.fulfill(
                     status=mock_status,
                     headers=headers if headers else None,
@@ -756,16 +781,15 @@ async def do_network_route(
 
     page_id = id(raw_page)
     page_routes = state.active_routes.setdefault(page_id, set())
+    owner = http_interception(raw_page.context)
+    state._http_interceptors.add(owner)
 
     # Re-register: unroute existing handler for this pattern first
     if url_pattern in page_routes:
-        try:
-            await raw_page.unroute(url_pattern)
-            page_routes.discard(url_pattern)
-        except Exception:
-            pass
+        await owner.unroute_page(raw_page, url_pattern)
+        page_routes.discard(url_pattern)
 
-    await raw_page.route(url_pattern, _handler)
+    await owner.route_page(raw_page, url_pattern, _handler)
     page_routes.add(url_pattern)
 
     return NetworkRouteResult(
@@ -781,7 +805,7 @@ async def do_network_unroute(raw_page: Any, state: Any, url_pattern: str) -> Net
     page_routes = state.active_routes.get(page_id, set())
     removed = url_pattern in page_routes
     if removed:
-        await raw_page.unroute(url_pattern)
+        await http_interception(raw_page.context).unroute_page(raw_page, url_pattern)
         page_routes.discard(url_pattern)
 
     return NetworkUnrouteResult(

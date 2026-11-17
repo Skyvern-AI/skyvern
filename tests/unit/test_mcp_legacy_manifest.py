@@ -82,7 +82,7 @@ LEGACY_TOOL_MANIFEST_DIGESTS = {
     "skyvern_navigate_extract_and_screenshot": "1b700d5a6d082a91664376adb95284f2f8c7f30a74e7f73e39ef287006fd73a1",
     "skyvern_network_request_detail": "d74674521e56b4c1028c684d8e2d90bd9c3f65f2a233e28717721d0fd11bf477",
     "skyvern_network_requests": "0ea881741bebf2bec8468b3225ebdde4432ddb12e444e2c43a41d44aff89eddc",
-    "skyvern_network_route": "89d7310782a90b19aab0600ab842e5ceaa114d75a0efbc79d42e23d28f17bf80",
+    "skyvern_network_route": "25968e1c6abdbf623e33931a58f61dfd506b58c257f7776fd8f9336860841b25",
     "skyvern_network_unroute": "a5c480635e3cb9fc91ed14935a4c654ef375366c0a99882543a8ea54280b5c89",
     "skyvern_observe": "136835d77007121a9c8a493814ab8ece29a8cc73139dfb652157e501b192c558",
     "skyvern_onepassword_config_clear": "3be70bda330d83d0dd67eb1e41d6ba4586a0868f9620a40ead1c3bdf369c6fab",
