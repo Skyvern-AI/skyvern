@@ -221,6 +221,7 @@ AGENT_BLOCK_TOOLS: dict[BlockType, BlockTool | str] = {
     BlockType.GOTO_URL: _OVERLAPS,
     BlockType.POWERBI_QUERY: "Power BI queries require a user-authorized connection and are not available in agent-step authoring.",
     BlockType.AGENT_STEP: "No recursion.",
+    BlockType.INTEGRATION_ACTION: "Runs an existing integration block, which is offered as its own tool.",
 }
 DEDICATED_BLOCK_TOOLS: dict[str, tuple[BlockType, BlockTool]] = {
     tool.tool_name: (block_type, tool)

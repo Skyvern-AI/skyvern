@@ -75,7 +75,7 @@ class IntegrationAction(BaseModel):
     # Provider scope strings, compared against IntegrationAccount.scopes_granted.
     needs: list[str] = Field(default_factory=list)
     acts: bool = False
-    # "block:<BlockType value>" or "nango:<provider>:<action name>".
+    # "block:<BlockType value>": the existing block that runs the action.
     runs_via: str
     agent_step: Literal["tool", "saved_block_only"] = "tool"
 
@@ -681,6 +681,11 @@ def integration_entries(
             for entry in entries
         ]
     return sorted(entries, key=lambda entry: entry.position)
+
+
+def all_integration_entries() -> list[IntegrationEntry]:
+    """Every entry with every backend it can have, for lookups that must not depend on an org's availability gates."""
+    return integration_entries(powerbi_available=True, gmail_available=True)
 
 
 async def integration_entries_for_org(organization_id: str) -> list[IntegrationEntry]:

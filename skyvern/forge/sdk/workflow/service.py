@@ -1523,6 +1523,36 @@ async def _validate_agent_step_workflow_save(
     )
 
 
+INTEGRATION_ACTION_NOT_AVAILABLE_MESSAGE = (
+    "The integration_action block cannot be saved yet: the workflow editor cannot open it. Use the integration's own "
+    "block instead."
+)
+
+
+def _integration_action_count(workflow_definition: WorkflowDefinition | None) -> int:
+    if workflow_definition is None:
+        return 0
+    return sum(block.block_type == BlockType.INTEGRATION_ACTION for block in get_all_blocks(workflow_definition.blocks))
+
+
+async def _validate_integration_action_workflow_save(
+    workflow_definition: WorkflowDefinition,
+    prior_definition: Callable[[], Awaitable[WorkflowDefinition | None]] | None = None,
+) -> None:
+    """Refuse a save that adds integration_action blocks until the editor can open them. Counts against the replaced
+    version, like the agent step, so an existing workflow is never wedged."""
+    count = _integration_action_count(workflow_definition)
+    if not count:
+        return
+    if prior_definition is not None and count <= _integration_action_count(await prior_definition()):
+        return
+    raise SkyvernHTTPException(
+        INTEGRATION_ACTION_NOT_AVAILABLE_MESSAGE,
+        status_code=HTTPStatus.BAD_REQUEST,
+        error_code="integration_action_not_available",
+    )
+
+
 async def _validate_powerbi_workflow_save(
     organization_id: str,
     workflow_definition: WorkflowDefinition,
@@ -13061,6 +13091,9 @@ class WorkflowService:
                 workflow_definition,
                 lambda: self._replaced_definition(workflow_id, organization_id, prior_definition),
             )
+            await _validate_integration_action_workflow_save(
+                workflow_definition, lambda: self._replaced_definition(workflow_id, organization_id, prior_definition)
+            )
             if validate_code_block_templates:
                 self._validate_code_block_templates(workflow_definition)
             if validate_block_image_files and block_image_ids(workflow_definition.blocks):
@@ -18930,6 +18963,7 @@ class WorkflowService:
             organization_id, workflow_definition, workflow_permanent_id=workflow_permanent_id
         )
         await _validate_agent_step_workflow_save(organization_id, workflow_definition)
+        await _validate_integration_action_workflow_save(workflow_definition)
         self.validate_workflow_block_graph(workflow_definition)
         self._validate_payload_templates(workflow_definition)
         self._validate_new_code_block_safety(workflow_definition, None)

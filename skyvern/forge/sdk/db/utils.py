@@ -5,8 +5,11 @@ from collections.abc import Iterable
 from typing import Any
 
 import pydantic
-import pydantic.json
 import structlog
+
+# Imported eagerly: `pydantic.json` loads this lazily, and a first load under freezegun keys its encoders on the fake
+# datetime class, so real datetimes stop serializing for the rest of the process.
+from pydantic.deprecated.json import pydantic_encoder
 from sqlalchemy import Column, ColumnElement, Table, func, inspect, or_
 
 from skyvern.constants import SCRUBBED_VALUE
@@ -318,7 +321,7 @@ def _custom_json_serializer(*args, **kwargs) -> str:
     """
     if args:
         args = (_scrub_nul_chars(args[0]),) + args[1:]
-    return json.dumps(*args, default=pydantic.json.pydantic_encoder, **kwargs)
+    return json.dumps(*args, default=pydantic_encoder, **kwargs)
 
 
 def as_stored_json(value: typing.Any) -> typing.Any:

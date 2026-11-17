@@ -6122,6 +6122,7 @@ def _sheets_read_output_keys(workflow_run_context: WorkflowRunContext) -> set[st
         block.output_parameter.key
         for block in get_all_blocks(workflow.workflow_definition.blocks)
         if block.block_type == BlockType.GOOGLE_SHEETS_READ
+        or (isinstance(block, IntegrationActionBlock) and block.runs_block_type() == BlockType.GOOGLE_SHEETS_READ)
     }
 
 
@@ -21852,6 +21853,7 @@ from skyvern.forge.sdk.workflow.models.google_sheets_blocks import (  # noqa: E4
     GoogleSheetsReadBlock,
     GoogleSheetsWriteBlock,
 )
+from skyvern.forge.sdk.workflow.models.integration_action_block import IntegrationActionBlock  # noqa: E402
 from skyvern.forge.sdk.workflow.models.pdf_fill_block import PdfFillBlock  # noqa: E402
 from skyvern.forge.sdk.workflow.models.powerbi_query_block import PowerBIQueryBlock  # noqa: E402
 from skyvern.forge.sdk.workflow.models.split_pdf_block import SplitPdfBlock  # noqa: E402
@@ -21889,6 +21891,7 @@ BlockSubclasses = Union[
     EmailInboxBlock,
     GoogleSheetsWriteBlock,
     PowerBIQueryBlock,
+    IntegrationActionBlock,
     PdfFillBlock,
     SplitPdfBlock,
     DataExportBlock,
