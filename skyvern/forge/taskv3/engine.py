@@ -792,6 +792,12 @@ async def run_task_v3_agent_loop(
             application_payload_qualified, age_text_withheld=context_age_text is None
         )
         defaults_text = context_task_text or ""
+    authorized_agent_text = (
+        None
+        if page_free or refuse_input_entry or refuse_navigation
+        else app.AGENT_FUNCTION.task_v3_authorized_agent_default()
+    )
+    defaults_text = "\n\n".join(text for text in (authorized_agent_text, defaults_text) if text)
     declaring = application_context is not None
     # Read before each wrapped call: a declaring run's audit stays out of the way until this turns true.
     armed = application_context.audit_armed if application_context else None
@@ -903,6 +909,7 @@ async def run_task_v3_agent_loop(
             tool_trail=tool_trail,
             single_action_block=single_action_block,
             target_action_reserve=target_action_reserve,
+            completes_on_download=download_settle is not None,
             block_completion_check=_block_completion_check if block_check_on else None,
             unseen_text=unseen_text,
             anthropic_cache_markers=anthropic_cache_markers,
@@ -982,6 +989,7 @@ async def run_task_v3_agent_loop(
             else application_context.delivered and bool(context_age_text)
         ),
         age_default_reason=age_default_reason,
+        authorized_agent_default_rendered=bool(authorized_agent_text),
         application_defaults_rendered=(
             bool(application_defaults_text) if application_context is None else application_context.delivered
         ),

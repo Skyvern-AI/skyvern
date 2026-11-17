@@ -134,6 +134,9 @@ def create_forge_stub_app() -> ForgeApp:
     # Class constant, not a method — _LazyNamespace would auto-mock it into a non-iterable AsyncMock
     # and break every caller that scans it for close-page phrases.
     fake_app_module.AGENT_FUNCTION.MAGIC_LINK_CLOSE_SIGNALS = base_agent_function.MAGIC_LINK_CLOSE_SIGNALS
+    fake_app_module.AGENT_FUNCTION.task_v3_authorized_agent_default = (
+        base_agent_function.task_v3_authorized_agent_default
+    )
     fake_app_module.AGENT_FUNCTION.task_v3_age_default = base_agent_function.task_v3_age_default
     fake_app_module.AGENT_FUNCTION.task_v3_application_defaults = base_agent_function.task_v3_application_defaults
     fake_app_module.AGENT_FUNCTION.task_v3_application_context_texts = (

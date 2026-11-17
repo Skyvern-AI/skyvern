@@ -6688,12 +6688,20 @@ async def test_execute_task_v3_failed_run_carries_failure_category(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("block_cls", "complete_on_download", "single_action"),
-    [(ActionBlock, False, True), (ActionBlock, True, False), (TaskBlock, False, False)],
+    ("block_cls", "complete_on_download", "single_action", "reserve"),
+    [
+        (ActionBlock, False, True, ACTION_BLOCK_TARGET_ACTION_RESERVE),
+        (ActionBlock, True, False, ACTION_BLOCK_TARGET_ACTION_RESERVE),
+        (TaskBlock, False, False, 0),
+    ],
     ids=["action", "action_complete_on_download", "task"],
 )
 async def test_execute_task_v3_action_block_budget_exit_is_not_converted_after_the_loop(
-    monkeypatch: pytest.MonkeyPatch, block_cls: type[BaseTaskBlock], complete_on_download: bool, single_action: bool
+    monkeypatch: pytest.MonkeyPatch,
+    block_cls: type[BaseTaskBlock],
+    complete_on_download: bool,
+    single_action: bool,
+    reserve: int,
 ) -> None:
     # The loop alone offers an action block's completion, through the finish tool's guards; a step-cap exit it
     # returns means a guard refused that completion, so it stays failed. A download-completing block is not
@@ -6710,7 +6718,9 @@ async def test_execute_task_v3_action_block_budget_exit_is_not_converted_after_t
         extracted_information_schema=None,
     )
     assert task.status == TaskStatus.failed
-    assert loop_mock.call_args.kwargs["single_action_block"] is single_action
+    # Every action block gets the reserve: a download block's hover must not spend the click its cap of 1 is for.
+    kwargs = loop_mock.call_args.kwargs
+    assert (kwargs["single_action_block"], kwargs["target_action_reserve"]) == (single_action, reserve)
 
 
 @pytest.mark.asyncio

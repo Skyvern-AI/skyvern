@@ -4248,10 +4248,11 @@ class ForgeAgent:
                 if task.task_type != TaskType.validation
                 else None
             )
-            # A block that completes on a download is not done by its one action.
+            # A block that completes on a download is not done by its one action, so it gets no completion offer;
+            # every action block still gets the reserve for its own action.
             single_action_block = isinstance(task_block, ActionBlock) and not task_block.complete_on_download
             target_action_reserve = 0
-            if single_action_block:
+            if isinstance(task_block, ActionBlock):
                 # The pinned ceiling above refuses the extension; the reserve answers to the org's run-wide pool.
                 target_action_reserve = ACTION_BLOCK_TARGET_ACTION_RESERVE
                 if workflow_pool_ceiling is not None:
