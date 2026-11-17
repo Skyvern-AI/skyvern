@@ -68,6 +68,11 @@ class WorkflowRunTriggerType(StrEnum):
     seo_recipe_submit = "seo_recipe_submit"
 
 
+PERSON_STARTED_TRIGGER_TYPES = frozenset(
+    {None, WorkflowRunTriggerType.manual, WorkflowRunTriggerType.mcp, WorkflowRunTriggerType.api}
+)
+
+
 class WorkflowBuildSource(StrEnum):
     """Which surface wrote a workflow version.
 
