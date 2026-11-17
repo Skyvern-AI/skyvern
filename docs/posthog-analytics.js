@@ -34,6 +34,7 @@
       "/healthcare",
       "/insurance",
       "/fintech",
+      "/finance",
       "/hr-tech",
       "/pricing",
       "/integrations",
