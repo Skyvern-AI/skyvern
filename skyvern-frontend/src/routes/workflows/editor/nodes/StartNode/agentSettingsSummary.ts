@@ -17,7 +17,7 @@ type SummaryLabels = {
   browserTypeOptions?: Array<BrowserTypeOption>;
 };
 
-type GroupId = "model" | "runs" | "safety" | "browser" | "runwith" | "webhook";
+type GroupId = "model" | "runs" | "safety" | "browser" | "webhook";
 
 type SummarySegment = { text: string; changed: boolean; title?: string };
 
@@ -28,15 +28,11 @@ type ChangedSetting = {
   title?: string;
 };
 
-// The backend stores this key on workflows saved without an explicit one.
-const DEFAULT_SCRIPT_CACHE_KEY = "default";
-
 const GROUP_IDS: ReadonlyArray<GroupId> = [
   "model",
   "runs",
   "safety",
   "browser",
-  "runwith",
   "webhook",
 ];
 
@@ -64,11 +60,6 @@ function headerCount(headers: WorkflowStartNodeData["extraHttpHeaders"]) {
   } catch {
     return 0;
   }
-}
-
-// A null, empty or "agent" run_with runs the agent, which is the default every New Agent path creates.
-function runsWithCode(data: WorkflowStartNodeData): boolean {
-  return data.runWith === "code";
 }
 
 function changedSettings(
@@ -155,17 +146,6 @@ function changedSettings(
     `${data.maxScreenshotScrolls} scrolls`,
   );
 
-  add(runsWithCode(data), "runWith", "runwith", "Code");
-  if (runsWithCode(data)) {
-    add(data.aiFallback === false, "aiFallback", "runwith", "AI fallback off");
-    add(
-      data.scriptCacheKey && data.scriptCacheKey !== DEFAULT_SCRIPT_CACHE_KEY,
-      "codeKey",
-      "runwith",
-      "Code key set",
-    );
-  }
-
   add(
     data.webhookCallbackUrl,
     "webhook",
@@ -202,9 +182,6 @@ function buildGroupSummaries(
       ["proxy", proxyLabel(ProxyLocation.Residential)],
       ["reuse", "Fresh session"],
     ],
-    runwith: runsWithCode(data)
-      ? [["aiFallback", "AI fallback on"]]
-      : [["runWith", "Skyvern Agent"]],
     webhook: [["webhook", "No webhook"]],
   };
   const out = {} as Record<GroupId, Array<SummarySegment>>;

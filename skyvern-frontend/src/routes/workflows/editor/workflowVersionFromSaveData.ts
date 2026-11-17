@@ -1,6 +1,6 @@
 import { stringify as convertToYAML } from "yaml";
 import type { AxiosInstance } from "axios";
-import type { WorkflowYAMLConversionResponse } from "../copilot/workflowCopilotTypes";
+import type { WorkflowYAMLConversionResponse } from "../ember/emberTypes";
 
 import type { WorkflowSaveData } from "@/store/WorkflowHasChangesStore";
 import { parseHeaderJson } from "@/util/secretHeaders";
@@ -153,7 +153,7 @@ export async function convertWorkflowReviewBaseline(
 ): Promise<WorkflowVersion> {
   const definition = baseline.workflow_definition;
   const { data } = await client.post<WorkflowYAMLConversionResponse>(
-    "/workflow/copilot/convert-yaml-to-blocks",
+    "/workflow/convert-yaml-to-blocks",
     {
       workflow_definition_yaml: convertToYAML({
         version: definition.version,
@@ -239,6 +239,7 @@ const managedKeys = new Set([
   "created_by",
   "edited_by",
   "copilot_authored",
+  "ember_authored",
   "is_template",
   "enable_self_healing",
 ]);

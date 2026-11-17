@@ -24,8 +24,8 @@ Skyvern-AI/skyvern-cloud:
   - source: evaluation/
     dest: evaluation/
     deleteOrphaned: true
-  - source: fern/
-    dest: fern/
+  - source: skyvern-ts/
+    dest: skyvern-ts/
     deleteOrphaned: true
   - source: docs/
     dest: docs/

@@ -489,8 +489,8 @@ async def _named_run_settings(
     # A session-bound run's row repeats the version's proxy, not the one its browser was launched with.
     if run.browser_session_id is not None:
         return await browser_session_settings(run_workflow, organization_id, run.browser_session_id, run)
-    # link_workflow_browser_profile_if_unset stamps only live versions, so a test version's stamp always lands
-    # before its soft delete, which then hides it; a version profile the run row did not record is unproven.
+    # A test version's soft delete re-stamps modified_at and hides any earlier settings write; a version profile the
+    # run row did not record is unproven.
     if (
         run.browser_profile_id is None
         and run_workflow.browser_profile_id is not None

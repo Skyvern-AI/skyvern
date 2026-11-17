@@ -4,6 +4,7 @@ import asyncio
 import copy
 import json
 import re
+import time
 import uuid
 from collections.abc import Mapping
 from contextvars import ContextVar
@@ -12,6 +13,7 @@ from typing import Any, get_args
 
 import structlog
 import yaml
+from fastapi import HTTPException
 from pydantic import JsonValue
 
 from skyvern.cli.core.guards import VALID_WAIT_UNTIL
@@ -20,6 +22,7 @@ from skyvern.cli.mcp_tools._element_state import DEFAULT_ACTION_TIMEOUT_MS, DEFA
 from skyvern.cli.mcp_tools.blocks import (
     CODE_BLOCK_RUNTIME_TOPIC,
     NOTES_KNOWLEDGE_TOPIC,
+    WORKFLOW_KNOWLEDGE_TOPIC_ALIASES,
     WORKFLOW_KNOWLEDGE_TOPIC_HEADERS,
     _parse_knowledge_topics,
 )
@@ -27,7 +30,6 @@ from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.agent_context import ScoutedDragDestination, ScoutedInteraction, ScoutedSelectorCandidate
 from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
-from skyvern.forge.sdk.copilot.blocker_signal import stash_blocker_signal
 from skyvern.forge.sdk.copilot.composition_browser_expressions import scout_control_state_expression
 from skyvern.forge.sdk.copilot.config import (
     AuthoringCapability,
@@ -63,7 +65,6 @@ from skyvern.forge.sdk.copilot.output_utils import (
     sanitize_tool_result_for_llm,
 )
 from skyvern.forge.sdk.copilot.page_identity import safe_page_origin
-from skyvern.forge.sdk.copilot.reached_download_target import download_claim_helper_contract
 from skyvern.forge.sdk.copilot.request_policy import (
     CREDENTIAL_BINDING_FACTS,
     RequestPolicy,
@@ -80,12 +81,12 @@ from skyvern.forge.sdk.copilot.runtime import (
     tab_switch_refusal,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import viewport_visible_effect
-from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.secret_scrub import (
     registered_scrub_values,
     scrub_secrets_from_structure,
 )
 from skyvern.forge.sdk.schemas.credentials import Credential
+from skyvern.forge.sdk.services.request_principal import enforce_principal_role, get_request_principal
 from skyvern.forge.sdk.workflow.block_notes import CARRIED_FIELDS, remove_note_fields
 from skyvern.forge.sdk.workflow.models.agent_step_tools import tool_descriptions
 from skyvern.forge.sdk.workflow.models.block import (
@@ -94,10 +95,17 @@ from skyvern.forge.sdk.workflow.models.block import (
     open_page_cap_reached,
 )
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.forge.sdk.workflow.reached_download_target import download_claim_helper_contract
 from skyvern.forge.sdk.workflow.schedules import MIN_SCHEDULE_INTERVAL_SECONDS
 from skyvern.forge.sdk.workflow.web_search import WEB_SEARCH_HELPER_CONTRACT
 from skyvern.forge.sdk.workflow.web_search_client import SearchProvider, SearchResponse, SearchResult
-from skyvern.schemas.workflows import AGENT_STEP_BLOCK_SUMMARY, AgentStepBlockYAML, TaskBlockYAML
+from skyvern.schemas.workflows import (
+    AGENT_STEP_BLOCK_SUMMARY,
+    BLOCK_IMAGE_FIELDS,
+    AgentStepBlockYAML,
+    TaskBlockYAML,
+)
+from skyvern.utils.raw_secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.utils.secret_headers import SECRET_HEADER_MASK
 from skyvern.webeye.dialog_handler import DIALOG_POLICY_HELPER_CONTRACT
 
@@ -128,12 +136,9 @@ from .banned_blocks import (
     workflow_run_names,
 )
 from .credentials import (
-    _credential_run_approval_blocker_signal,
     _credential_run_approval_error,
     _extract_credential_ids_from_tool_value,
-    _extract_credential_ids_from_workflow_definition,
-    _google_connection_reference_ids,
-    _server_verified_google_account_choices,
+    run_credential_gate,
 )
 from .page_observation import (
     _record_composition_page_observation,
@@ -385,19 +390,29 @@ def _bound_failed_click_result(ctx: AgentContext, result: dict[str, Any]) -> Non
         bound_enrichment_text(container, key, max(minimum_chars, len(value) // 2))
 
 
-def _without_note_fields(value: Any) -> Any:
+def _without_note_fields(value: Any, fields: tuple[str, ...]) -> Any:
     if isinstance(value, dict):
         properties = value.get("properties")
         if isinstance(properties, dict):
-            for name in CARRIED_FIELDS:
+            for name in fields:
                 if isinstance(properties.get(name), dict) and properties[name].get("x-internal"):
                     del properties[name]
         for child in value.values():
-            _without_note_fields(child)
+            _without_note_fields(child, fields)
     elif isinstance(value, list):
         for child in value:
-            _without_note_fields(child)
+            _without_note_fields(child, fields)
     return value
+
+
+def _without_unreferenced_internal_defs(schema: dict[str, Any]) -> None:
+    definitions = schema.get("$defs")
+    if not isinstance(definitions, dict):
+        return
+    for name in [name for name, item in definitions.items() if isinstance(item, dict) and item.get("x-internal")]:
+        definition = definitions.pop(name)
+        if f'"#/$defs/{name}"' in json.dumps(schema):
+            definitions[name] = definition
 
 
 def _note_field_properties() -> dict[str, Any]:
@@ -419,15 +434,20 @@ def _block_property_maps(schema: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _note_fields_for_doc_editor(result: dict[str, Any] | None, ctx: AgentContext) -> dict[str, Any] | None:
-    """The MCP block schema leaves note fields out for every client; Copilot sees them only with the Doc editor."""
+    """The MCP block schema leaves note fields out for every client; Copilot sees them only with the Doc editor.
+
+    Image fields are not shown to the model, and a model-written image id is stripped before the carry.
+    """
     if result is None:
         return result
     data = result.get("data")
     schema = data.get("schema") if isinstance(data, dict) else None
     if not isinstance(schema, dict):
         return result
-    if not copilot_sees_notes(ctx):
-        _without_note_fields(schema)
+    notes_visible = copilot_sees_notes(ctx)
+    _without_note_fields(schema, BLOCK_IMAGE_FIELDS if notes_visible else (*CARRIED_FIELDS, *BLOCK_IMAGE_FIELDS))
+    _without_unreferenced_internal_defs(schema)
+    if not notes_visible:
         return result
     note_properties = _note_field_properties()
     for properties in _block_property_maps(schema):
@@ -647,6 +667,7 @@ _FOR_LOOP_GUIDANCE = "\n".join(
             "{{ current_value }} (also {{ current_item }}) is the current item and {{ current_index }} its position."
         ),
         "- complete_if_empty: true completes the loop successfully when the list is empty.",
+        "- A for_loop runs its items one after another in the run's one browser, within the run's time limit.",
         "",
         "Example - loop over a parser's rows (the parser's output is the list):",
         yaml.safe_dump(_FOR_LOOP_EXAMPLE, sort_keys=False).rstrip(),
@@ -858,7 +879,7 @@ def _task_v3_block_schema_guidance() -> list[str]:
 
 # The shared section bans `task` and points at navigation/extraction. Every authoring capability either
 # allows `task` or bans those two, so the section is false on every Copilot turn.
-_TASK_UNAVAILABLE_KNOWLEDGE_TOPIC = "task_block_task_not_available_in_workflow_copilot"
+_TASK_UNAVAILABLE_KNOWLEDGE_TOPIC = "task_block_task_not_available_in_ember"
 _REQUESTED_WORKFLOW_KNOWLEDGE_TOPICS: ContextVar[list[Any] | None] = ContextVar(
     "requested_workflow_knowledge_topics", default=None
 )
@@ -868,7 +889,7 @@ def _hidden_knowledge_topics(ctx: AgentContext) -> set[str]:
     hidden = {_TASK_UNAVAILABLE_KNOWLEDGE_TOPIC}
     if not copilot_sees_notes(ctx):
         hidden.add(NOTES_KNOWLEDGE_TOPIC)
-    return hidden
+    return hidden | {alias for alias, topic in WORKFLOW_KNOWLEDGE_TOPIC_ALIASES.items() if topic in hidden}
 
 
 async def _get_workflow_knowledge_pre_hook(
@@ -945,8 +966,8 @@ async def _get_org_workflow_post_hook(
     data = result.get("data")
     definition = data.get("workflow_definition") if isinstance(data, dict) else None
     blocks = definition.get("blocks") if isinstance(definition, dict) else None
-    if isinstance(blocks, list) and not copilot_sees_notes(ctx):
-        remove_note_fields(blocks)
+    if isinstance(blocks, list):
+        remove_note_fields(blocks, keep_notes=copilot_sees_notes(ctx))
     return result
 
 
@@ -1270,6 +1291,8 @@ async def _navigate_post_hook(
         _release_scout_challenge_listeners(ctx)
 
 
+# Set by the pre-hook and read by the post-hook of the same call, which run in one task.
+_NAVIGATION_TARGET: ContextVar[tuple[str | None, float | None]] = ContextVar("navigation_target", default=(None, None))
 _NAVIGATE_READ_GUIDANCE = " Use {readers} when you need the page's structure or selectors before responding."
 
 
@@ -1308,13 +1331,16 @@ async def _navigate_post_hook_body(
             source_tool="navigate_browser",
             captured_url=source_url,
         )
-    return await attribute_navigation_failure(ctx, result)
+    target_url, started_wall = _NAVIGATION_TARGET.get()
+    return await attribute_navigation_failure(ctx, result, target_url=target_url, since_wall=started_wall)
 
 
 async def _navigate_pre_hook(
     params: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
+    url = params.get("url")
+    _NAVIGATION_TARGET.set((url if isinstance(url, str) else None, time.time()))
     await _capture_scout_source_url(ctx)
     await _arm_scout_challenge_listener(ctx)
     return None
@@ -2367,11 +2393,12 @@ def get_skyvern_mcp_alias_map() -> dict[str, str]:
     }
 
 
-_PENDING_PROPOSAL_SCHEDULE_ERROR = (
-    "No schedule was created: this chat has a workflow proposal that is not saved yet, and a schedule "
-    "runs the saved workflow. Ask the user to accept the proposal, which saves it, or to reject it to "
-    "schedule the saved version as it is; then create the schedule."
+PENDING_PROPOSAL_FACT = (
+    "this chat has a workflow change that is not saved yet, and only the saved version runs. The user saves the "
+    "change by accepting it, or rejects it to keep the saved version."
 )
+
+_PENDING_PROPOSAL_SCHEDULE_ERROR = f"No schedule was created: {PENDING_PROPOSAL_FACT}"
 
 
 async def _schedule_parameters_credential_pre_hook(
@@ -2401,8 +2428,6 @@ async def _schedule_parameters_credential_pre_hook(
                 if value != SECRET_HEADER_MASK or key in stored
             }
             params["parameters"] = parameters
-    credential_ids = _extract_credential_ids_from_tool_value(parameters or {})
-    google_reference_ids: list[str] = []
     workflow = (
         await app.DATABASE.workflows.get_workflow_by_permanent_id(
             workflow_permanent_id=ctx.workflow_permanent_id, organization_id=ctx.organization_id
@@ -2410,31 +2435,22 @@ async def _schedule_parameters_credential_pre_hook(
         if ctx.workflow_permanent_id
         else None
     )
-    if workflow is not None:
-        credential_ids = list(
-            dict.fromkeys(
-                credential_ids + _extract_credential_ids_from_workflow_definition(workflow.workflow_definition)
-            )
+    if workflow is None:
+        error = _credential_run_approval_error(
+            _extract_credential_ids_from_tool_value(parameters or {}), ctx.request_policy
         )
-        # ponytail: no same-turn Sheets listing admission like the run path; schedule turns rarely list sheets.
-        google_reference_ids = _google_connection_reference_ids(workflow.workflow_definition, None)
-    google_approval_blocker = _credential_run_approval_blocker_signal(
-        credential_ids,
-        ctx.request_policy,
-        google_reference_ids=google_reference_ids,
+        return {"ok": False, "error": error} if error is not None else None
+    gate = await run_credential_gate(
+        ctx,
+        workflow.workflow_definition,
+        labels=None,
+        run_parameters=parameters if isinstance(parameters, dict) else None,
         action="schedule the workflow",
         blocked_tool="workflow_schedule",
+        # ADR 0038: a schedule runs unattended, so only an account the user cited, picked or saved may bind.
+        listing_admits_reads=False,
     )
-    if google_approval_blocker is not None:
-        ctx.connected_account_recovery_choices = (
-            await _server_verified_google_account_choices(ctx.organization_id) or []
-        )
-        tool_error = stash_blocker_signal(ctx, google_approval_blocker)
-        return {"ok": False, "error": tool_error}
-    credential_approval_error = _credential_run_approval_error(credential_ids, ctx.request_policy)
-    if credential_approval_error is not None:
-        return {"ok": False, "error": credential_approval_error}
-    return None
+    return {"ok": False, "error": gate.error} if gate.error is not None else None
 
 
 async def _chat_has_pending_proposal(ctx: AgentContext) -> bool:
@@ -2504,6 +2520,30 @@ async def _workflow_run_list_post_hook(
     return result
 
 
+_SCHEDULE_ROLE_DENIED_ERROR = (
+    "Nothing was changed: your role can view schedules but can't change them. Ask an Admin to make this change."
+)
+
+
+def _schedule_denial_error(exc: HTTPException) -> str:
+    message = exc.detail.get("message") if isinstance(exc.detail, dict) else exc.detail
+    return f"Nothing was changed: {message}" if isinstance(message, str) and message else _SCHEDULE_ROLE_DENIED_ERROR
+
+
+def _schedule_role_pre_hook(action: str, inner: PreHook | None) -> PreHook:
+    # Schedule tools call the API with the org key, which the role check admits; judge the chat user instead.
+    async def pre_hook(params: dict[str, Any], ctx: AgentContext) -> dict[str, Any] | None:
+        try:
+            await enforce_principal_role(get_request_principal(), action)
+        except HTTPException as exc:
+            return {"ok": False, "error": _schedule_denial_error(exc)}
+        return await inner(params, ctx) if inner is not None else None
+
+    # The tool-surface fingerprint reads pre-hooks by qualified name; name the action and inner hook in it.
+    pre_hook.__qualname__ = f"{pre_hook.__qualname__}[{action}:{getattr(inner, '__qualname__', None)}]"
+    return pre_hook
+
+
 def _workflow_schedule_overlay(
     description: str,
     *,
@@ -2511,14 +2551,17 @@ def _workflow_schedule_overlay(
     param_patches: dict[str, dict[str, Any]] | None = None,
     pre_hook: PreHook | None = None,
     mutates: bool = True,
+    role_action: str | None = None,
 ) -> SchemaOverlay:
+    if mutates and role_action is None:
+        raise ValueError("A schedule write overlay needs role_action so the chat user's role is checked")
     return SchemaOverlay(
         description=description,
         hide_params=hide_params | {"workflow_permanent_id"},
         param_patches=param_patches or {},
         binds_chat_workflow=True,
         requires_run_authority=mutates,
-        pre_hook=pre_hook,
+        pre_hook=_schedule_role_pre_hook(role_action, pre_hook) if role_action is not None else pre_hook,
         post_hook=_workflow_schedule_post_hook,
         post_hook_fails_closed=True,
     )
@@ -2938,6 +2981,7 @@ def _build_skyvern_mcp_overlays(
                 }
             },
             pre_hook=_create_workflow_schedule_pre_hook,
+            role_action="workflow_schedule.create",
         ),
         "update_workflow_schedule": _workflow_schedule_overlay(
             "Change a schedule by wfs_ ID, passing only the fields that change; parameters, name and paused "
@@ -2956,21 +3000,26 @@ def _build_skyvern_mcp_overlays(
                 }
             },
             pre_hook=_schedule_parameters_credential_pre_hook,
+            role_action="workflow_schedule.update",
         ),
         "enable_workflow_schedule": _workflow_schedule_overlay(
             "Resume a paused schedule by wfs_ ID. Ask which one when several could match.",
             pre_hook=_schedule_parameters_credential_pre_hook,
+            role_action="workflow_schedule.update",
         ),
         "disable_workflow_schedule": _workflow_schedule_overlay(
-            "Pause a schedule by wfs_ ID without deleting it. Ask which one when several could match."
+            "Pause a schedule by wfs_ ID without deleting it. Ask which one when several could match.",
+            role_action="workflow_schedule.update",
         ),
         "cancel_workflow_schedule": _workflow_schedule_overlay(
             "Cancel a one-time schedule by wfs_ ID before it fires; it stays listed with dispatch_status canceled. "
-            "Pause or delete a recurring schedule instead. Ask which one when several could match."
+            "Pause or delete a recurring schedule instead. Ask which one when several could match.",
+            role_action="workflow_schedule.cancel",
         ),
         "delete_workflow_schedule": _workflow_schedule_overlay(
             "Delete a schedule by wfs_ ID; irreversible. Pass force=true only when the user clearly asked to "
-            "remove that schedule, then list schedules to confirm it is gone."
+            "remove that schedule, then list schedules to confirm it is gone.",
+            role_action="workflow_schedule.delete",
         ),
         "list_browser_profiles": SchemaOverlay(
             description=(

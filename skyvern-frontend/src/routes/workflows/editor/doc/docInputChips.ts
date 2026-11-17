@@ -1,19 +1,17 @@
 import type { Node } from "@xyflow/react";
 import type { ParametersState } from "../types";
 import { getAffectedBlocks } from "../jinjaReferences";
+import { docInputValuePreview } from "./docValuePreview";
 
 export type DocInputChip = {
   key: string;
   value: string | null;
+  valueTitle?: string;
   missing: boolean;
   unused: boolean;
 };
 
-const shown = (value: unknown): string | null => {
-  if (value === null || value === undefined || value === "") return null;
-  const text = typeof value === "string" ? value : JSON.stringify(value);
-  return text.replace(/^https?:\/\//, "");
-};
+export const NOT_USED_TITLE = "Not used by any step";
 
 export function getDocInputChips(
   parameters: ParametersState,
@@ -21,8 +19,11 @@ export function getDocInputChips(
 ): DocInputChip[] {
   return parameters.map((p) => {
     const isWorkflowInput = p.parameterType === "workflow";
+    const preview = isWorkflowInput
+      ? docInputValuePreview(p.defaultValue)
+      : null;
     const value = isWorkflowInput
-      ? shown(p.defaultValue)
+      ? (preview?.text ?? null)
       : p.parameterType === "context"
         ? `from ${p.sourceParameterKey}`
         : "credential";
@@ -37,6 +38,11 @@ export function getDocInputChips(
     return {
       key: p.key,
       value,
+      // The value's own title hides the chip's, so it repeats the unused note.
+      valueTitle:
+        preview?.title && !used
+          ? `${preview.title}\n${NOT_USED_TITLE}`
+          : preview?.title,
       missing: isWorkflowInput && value === null,
       unused: !used,
     };

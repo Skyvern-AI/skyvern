@@ -30,14 +30,13 @@ from skyvern.forge.sdk.copilot.agent_context import OriginRunRedactionRegistry, 
 from skyvern.forge.sdk.copilot.build_test_connect_failure import SUPERSEDED_BY_NEWER_TEST_REASON
 from skyvern.forge.sdk.copilot.code_block_synthesis import synthesize_code_block
 from skyvern.forge.sdk.copilot.config import AGENT_BLOCKS_ONLY, CODE_BLOCKS_ONLY, BlockAuthoringPolicy
+from skyvern.forge.sdk.copilot.connected_accounts import listed_connection_ids
 from skyvern.forge.sdk.copilot.context import StructuredContext
 from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
 from skyvern.forge.sdk.copilot.output_utils import MCP_RESULT_PROVENANCE_KEY, MCP_RESULT_PROVENANCE_VALUE
 from skyvern.forge.sdk.copilot.result_evidence import EVALUATE_TOOL_NAME
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.secret_scrub import (
-    REDACTED_SECRET_PLACEHOLDER,
-    clear_session_scrub_values,
     register_secret_scrub_value,
     register_secret_scrub_values_from_structure,
 )
@@ -51,7 +50,6 @@ from skyvern.forge.sdk.copilot.tools import (
 )
 from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
 from skyvern.forge.sdk.copilot.tools.credential_fill import _fill_observed_effects
-from skyvern.forge.sdk.copilot.tools.credentials import _latest_listing_google_sheet_ids
 from skyvern.forge.sdk.copilot.tools.integrations import _list_integrations
 from skyvern.forge.sdk.copilot.tools.mcp_hooks import (
     ScoutReadbackOutcome,
@@ -71,9 +69,9 @@ from skyvern.forge.sdk.copilot.turn_halt import CopilotTurnHalt, TurnHaltKind
 from skyvern.forge.sdk.integrations import catalog
 from skyvern.forge.sdk.schemas.google_oauth import GoogleOAuthCredentialBase
 from skyvern.forge.sdk.schemas.microsoft_oauth import MicrosoftOAuthCredentialBase
-from skyvern.forge.sdk.services import google_oauth_service
 from skyvern.forge.sdk.workflow.web_search import WEB_SEARCH_HELPER_CONTRACT
 from skyvern.forge.sdk.workflow.web_search_client import SearchProvider, SearchResponse, SearchResult
+from skyvern.utils.secret_scrub import REDACTED_SECRET_PLACEHOLDER, clear_session_scrub_values
 from skyvern.webeye.persistent_sessions_manager import BrowserOperation, BrowserRetirement
 from skyvern.webeye.utils import challenge_signature as challenge_signature_module
 from tests.unit._mcp_browser_fakes import crash_free_browser_state
@@ -390,12 +388,9 @@ async def test_on_tool_end_list_integrations_keeps_the_sheets_connections_a_flat
     assert sorted(row["connection_id"] for row in activity["integrations"]) == sorted(
         [credential.id for credential in google_credentials] + ["msoac_1"]
     )
-    assert _latest_listing_google_sheet_ids(ctx.tool_activity) == {
-        credential.id
-        for credential in google_credentials
-        if credential.state == "active"
-        and google_oauth_service.has_required_scopes(credential.scopes_granted, [sheets_scope])
-    }
+    assert listed_connection_ids(ctx.tool_activity) == {
+        credential.id for credential in google_credentials if credential.state == "active"
+    } | {"msoac_1"}
 
 
 @pytest.mark.asyncio
@@ -2487,7 +2482,7 @@ class TestScoutedInteractionCapture:
         """Report as though the click returned longer ago than the settle window, so nothing waits."""
         monkeypatch.setattr(mcp_hooks, "_start_scout_challenge_settle", lambda _ctx: None)
         ctx.pending_scout_challenge_armed_at = (
-            time.monotonic() - settings.COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS - 1.0
+            time.monotonic() - settings.EMBER_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS - 1.0
         )
 
     @pytest.mark.asyncio
@@ -2505,7 +2500,7 @@ class TestScoutedInteractionCapture:
 
         result = await self._post(ctx)
 
-        assert sleeps == [pytest.approx(settings.COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS - 0.1)]
+        assert sleeps == [pytest.approx(settings.EMBER_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS - 0.1)]
         assert result["data"]["observed_effects"]["challenge_raised"] is True
         assert result["data"]["challenge_vendor"] == "turnstile"
 
@@ -2671,7 +2666,7 @@ class TestScoutedInteractionCapture:
 
         await self._post(ctx)
 
-        assert sleeps == [pytest.approx(settings.COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS - 0.1)]
+        assert sleeps == [pytest.approx(settings.EMBER_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS - 0.1)]
 
     @pytest.mark.asyncio
     async def test_a_widget_mounted_while_the_click_is_being_armed_is_credited_when_revealed(
@@ -2747,7 +2742,7 @@ class TestScoutedInteractionCapture:
 
         result = await self._post(ctx)
 
-        assert sleeps == [pytest.approx(settings.COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS - 0.1)]
+        assert sleeps == [pytest.approx(settings.EMBER_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS - 0.1)]
         assert result["data"]["challenge_vendor"] == "turnstile"
 
     async def _navigate(

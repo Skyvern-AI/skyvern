@@ -484,7 +484,7 @@ describe("agent that 404s", () => {
     expect(screen.getByText("Old Agent (deleted)")).toBeTruthy();
     expect(screen.getByText("Past Runs")).toBeTruthy();
     expect(screen.queryByText("Not Found")).toBeNull();
-    for (const name of ["Scripts", "Edit", "Run"]) {
+    for (const name of ["Edit", "Run"]) {
       expect(screen.queryByRole("link", { name })).toBeNull();
     }
   });

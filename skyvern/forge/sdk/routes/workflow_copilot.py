@@ -11,21 +11,32 @@ import uuid
 from collections.abc import Awaitable, Coroutine, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal, TypeVar, cast, get_args
+from typing import Annotated, Any, Literal, TypeVar, cast, get_args
 from urllib.parse import urlparse
 
 import structlog
 import yaml
-from fastapi import BackgroundTasks, Depends, File, Form, Header, HTTPException, Request, Response, UploadFile, status
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+    status,
+)
 from opentelemetry import trace as otel_trace
 from pydantic import ValidationError
 from sse_starlette import EventSourceResponse
 
 from skyvern import analytics
 from skyvern.config import settings
-from skyvern.constants import DEFAULT_WORKFLOW_TITLES
 from skyvern.exceptions import HttpException as VaultHttpException
-from skyvern.exceptions import SkyvernHTTPException, WorkflowNotFound, WorkflowPinnedByRunGroup
+from skyvern.exceptions import SkyvernHTTPException, WorkflowPinnedByRunGroup
 from skyvern.forge import app
 from skyvern.forge.agent_functions import AuditEvent, record_request_audit_event
 from skyvern.forge.sdk.api.files import is_uploaded_file_id
@@ -34,6 +45,7 @@ from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.artifact.models import ArtifactType, LogEntityType
 from skyvern.forge.sdk.cache.base import BaseCache
 from skyvern.forge.sdk.copilot.agent import (
+    ACCOUNT_PICK_PROPOSAL_CHANGED_REPLY,
     completed_tool_names,
     run_copilot_agent,
     stopped_turn_facts,
@@ -44,6 +56,7 @@ from skyvern.forge.sdk.copilot.ask_user import (
     CREDENTIAL_DELETE_RECORD_ATTEMPTS,
     CREDENTIAL_DELETE_RECORD_RETRY_DELAY,
     CREDENTIAL_DELETE_TIMEOUT,
+    DETACHED_QUESTION_CLIENT_GRACE,
     CredentialDeleteOutcome,
     QuestionInteraction,
     QuestionResponse,
@@ -86,12 +99,14 @@ from skyvern.forge.sdk.copilot.credential_pause import (
 )
 from skyvern.forge.sdk.copilot.credential_resolution import load_credentials, loggable_origin
 from skyvern.forge.sdk.copilot.demonstration_recorder import (
+    DemonstrationRecord,
     DemonstrationRecorder,
     DemonstrationRejection,
     active_demonstration,
     append_demonstration_control,
     claim_demonstration_recording,
     demonstration_action_labels,
+    demonstration_cache,
     demonstration_file_ids,
     demonstration_limit_reached,
     demonstration_owner_is_live,
@@ -101,6 +116,7 @@ from skyvern.forge.sdk.copilot.demonstration_recorder import (
 )
 from skyvern.forge.sdk.copilot.enforcement import EXPIRED_TURN_REPLY_SECONDS, TOTAL_TIMEOUT_SECONDS
 from skyvern.forge.sdk.copilot.eval_llm_overrides import (
+    EMBER_EVAL_LLM_OVERRIDES_HEADER,
     EVAL_LLM_OVERRIDES_HEADER,
     EvalLLMOverrides,
     admit_eval_llm_overrides,
@@ -114,7 +130,14 @@ from skyvern.forge.sdk.copilot.interruption import (
     cancel_notice,
     render_interrupted_message,
 )
+from skyvern.forge.sdk.copilot.live_narrative import read_live_turn_narrative
 from skyvern.forge.sdk.copilot.llm_config import resolve_main_copilot_handler, resolve_raw_secret_safety_handler
+from skyvern.forge.sdk.copilot.proposal_accept import (
+    _accepted_workflow_title,
+    _client_sent_no_proposal_token,
+    _resolve_proposal_for_accept,
+    accept_copilot_proposal,
+)
 from skyvern.forge.sdk.copilot.recoverable_failure import (
     RecoverableFailure,
     build_recoverable_failure,
@@ -127,38 +150,38 @@ from skyvern.forge.sdk.copilot.request_policy import raw_secret_safety_log_field
 from skyvern.forge.sdk.copilot.review_gate import parse_execution_receipts, serialize_execution_receipts
 from skyvern.forge.sdk.copilot.runtime import close_browser_session_quietly
 from skyvern.forge.sdk.copilot.steer import STEER_DOORBELL_TTL, copilot_steer_key
-from skyvern.forge.sdk.copilot.tools.account_groups import recover_account_group_links
+from skyvern.forge.sdk.copilot.tools.account_groups import recover_account_group_links, single_run_submit_enabled
 from skyvern.forge.sdk.copilot.tools.credential_deletion import (
     credential_delete_enabled,
     enforce_credential_delete_access,
 )
+from skyvern.forge.sdk.copilot.tools.credentials import UNAPPROVED_CONNECTION_REASON_CODE
 from skyvern.forge.sdk.copilot.tools.workflow_update import (
     _validated_pending_workflow_proposal,
+    copilot_workflow_yaml_matches,
     private_workflow_settings_from_proposal,
     proposal_is_displayable,
     proposal_workflow_fingerprint,
-    proposal_workflow_fingerprint_matches,
     strip_copilot_yaml_headers,
 )
 from skyvern.forge.sdk.copilot.turn_outcome import (
+    AccountPickTestResume,
     CopilotComposerMode,
+    account_pick_test_resume,
     build_minimal_turn_outcome,
+    carried_account_choice_fields,
     with_copilot_code_mode_metadata,
 )
-from skyvern.forge.sdk.copilot.workflow_credential_utils import workflow_credential_ids
-from skyvern.forge.sdk.copilot.workflow_yaml import _normalize_copilot_yaml as _normalize_copilot_yaml
+from skyvern.forge.sdk.copilot.workflow_credential_utils import workflow_connection_ids
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml as _copilot_process_workflow_yaml
 from skyvern.forge.sdk.copilot.workflow_yaml import _repair_next_block_label_chain as _repair_next_block_label_chain
 from skyvern.forge.sdk.copilot.workflow_yaml import (
-    _runs_in_list_order,
     dump_workflow_yaml,
     inherited_header_settings,
     merge_private_workflow_settings,
     private_workflow_settings_from_yaml,
-    strip_private_workflow_settings,
     submitted_private_workflow_settings,
     with_workflow_yaml_title,
-    workflow_to_copilot_yaml,
 )
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.event_source_stream import EventSourceStream, FastAPIEventSourceStream
@@ -204,6 +227,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     CopilotProposalMetadata,
     CopilotProposalRunFacts,
     CopilotSteerMessage,
+    CopilotTurnControl,
     CopilotVideoEvidenceArtifact,
     WorkflowCopilotApplyProposedWorkflowRequest,
     WorkflowCopilotAudioUploadResponse,
@@ -249,11 +273,13 @@ from skyvern.forge.sdk.services.credential.credential_creation_service import (
     store_new_credential,
 )
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
-from skyvern.forge.sdk.services.request_principal import enforce_principal_role, get_request_principal
+from skyvern.forge.sdk.services.request_principal import enforce_principal_role, get_request_principal, human_user_id
 from skyvern.forge.sdk.services.route_authorization import require_request_actions
-from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException, WorkflowVersionConflict
+from skyvern.forge.sdk.workflow.authoring_yaml import runs_in_list_order, workflow_to_authoring_yaml
+from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException
 from skyvern.forge.sdk.workflow.models.credential_release import normalize_extra_site_urls
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
+from skyvern.forge.sdk.workflow.private_settings import strip_private_workflow_settings
 from skyvern.forge.sdk.workflow.secret_encryption import (
     mask_workflow_for_api,
     preserve_workflow_definition_secrets,
@@ -262,7 +288,6 @@ from skyvern.forge.sdk.workflow.service import workflow_changed_fields
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.workflows import (
-    WorkflowCreateYAMLRequest,
     WorkflowDefinitionYAML,
 )
 from skyvern.services import uploaded_file_service
@@ -280,10 +305,7 @@ _process_workflow_yaml = _copilot_process_workflow_yaml
 # Wall clock, unlike TOTAL_TIMEOUT_SECONDS: that budget excludes time parked in a
 # credential pause, so a legitimately live turn can outlast it in real time.
 RECONCILE_ABANDON_AFTER_SECONDS = (
-    TOTAL_TIMEOUT_SECONDS
-    + settings.WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS
-    + EXPIRED_TURN_REPLY_SECONDS
-    + 120
+    TOTAL_TIMEOUT_SECONDS + settings.EMBER_CREDENTIAL_PAUSE_TIMEOUT_SECONDS + EXPIRED_TURN_REPLY_SECONDS + 120
 )
 ALLOWED_WORKFLOW_COPILOT_AUDIO_CONTENT_TYPES = {
     "audio/mp4",
@@ -298,6 +320,14 @@ ALLOWED_WORKFLOW_COPILOT_AUDIO_CONTENT_TYPES = {
 LOG = structlog.get_logger()
 _T = TypeVar("_T")
 
+_AUTO_ACCEPT_DEFERRED_FOR_UNFINISHED_RUN = (
+    "I did not apply this change automatically because run {workflow_run_id} of the saved version has not finished "
+    "yet. Accept the change when you are ready; it is saved as a new version and that run is not affected."
+)
+_AUTO_ACCEPT_DEFERRED_FOR_UNCHECKED_RUNS = (
+    "I did not apply this change automatically because I could not check whether a run of the saved version is "
+    "still waiting to start. Accept the change when you are ready; it is saved as a new version."
+)
 _AUTO_ACCEPT_DEFERRED_FOR_RUN_GROUP = (
     "I did not apply this change automatically because a group of account runs is still running the saved "
     "version. Accept the change when you are ready; it is saved as a new version and the running group is "
@@ -562,7 +592,10 @@ async def _resolve_copilot_request_config(
 
 
 async def _resolve_copilot_api_key(request: Request, organization_id: str) -> str | None:
-    return request.headers.get("x-api-key") or await app.AGENT_FUNCTION.resolve_org_api_key(organization_id)
+    request_key = request.headers.get("x-api-key") or await app.AGENT_FUNCTION.resolve_org_api_key(organization_id)
+    return await app.AGENT_FUNCTION.resolve_copilot_loopback_api_key(
+        get_request_principal(), organization_id, request_key
+    )
 
 
 def _with_current_copilot_code_mode_metadata(
@@ -592,6 +625,135 @@ COPILOT_CANCEL_POLL_SECONDS = 1.5
 
 def _copilot_cancel_key(organization_id: str, cancel_token: str) -> str:
     return f"copilot_cancel:{organization_id}:{cancel_token}"
+
+
+COPILOT_SUPERSEDE_REFUSED = (
+    "Another member's Copilot turn is still running in this chat. Wait for it to finish, or ask an Admin to stop it."
+)
+
+
+async def _copilot_control_allowed(
+    organization_id: str, starter_user_id: str | None, control: CopilotTurnControl
+) -> bool:
+    try:
+        return await app.AGENT_FUNCTION.copilot_turn_control_allowed(
+            get_request_principal(), organization_id, starter_user_id, control
+        )
+    except Exception:
+        LOG.warning(
+            "Copilot turn control check failed", organization_id=organization_id, control=control, exc_info=True
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Copilot could not check whether you can do this. Retry shortly.",
+            headers={"Retry-After": "2"},
+        ) from None
+
+
+async def _require_copilot_turn_control(
+    organization_id: str, turn: CopilotPendingTurn | None, control: CopilotTurnControl
+) -> None:
+    # Steer and credential-deletion reject an unmatched id downstream (409 or 404); so does an answer, unless the stored
+    # question is already resolved, which returns that record (200) and writes nothing. Cancel accepts it, because the
+    # token is the proof and an unmatched one only sets that token's stop flag.
+    if turn is None:
+        return
+    if not await _copilot_control_allowed(organization_id, turn.starter_user_id, control):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the person who started this Copilot turn, or an Admin, can stop it."
+            if control == "cancel"
+            else "Only the person who started this Copilot turn can respond to it.",
+        )
+
+
+async def _copilot_turns_without_control(
+    organization_id: str, chat: WorkflowCopilotChat | None, control: CopilotTurnControl
+) -> set[str]:
+    """Turn ids on which the caller may not use `control`, so chat-history hides that control's fields."""
+    # Fails closed (hide) on purpose, unlike _copilot_control_allowed's 503: a poll must not fail on a lookup.
+    hidden: set[str] = set()
+    allowed_by_starter: dict[str | None, bool] = {}
+    for turn in chat.pending_turns.values() if chat else []:
+        if turn.starter_user_id not in allowed_by_starter:
+            try:
+                allowed = await app.AGENT_FUNCTION.copilot_turn_control_allowed(
+                    get_request_principal(), organization_id, turn.starter_user_id, control
+                )
+            except Exception:
+                LOG.warning("Copilot turn control check failed", organization_id=organization_id, exc_info=True)
+                allowed = False
+            allowed_by_starter[turn.starter_user_id] = allowed
+        if not allowed_by_starter[turn.starter_user_id]:
+            hidden.add(turn.turn_id)
+    return hidden
+
+
+async def _require_demonstration_control(
+    organization_id: str, demonstration: DemonstrationRecord | None, control: CopilotTurnControl
+) -> None:
+    # A demonstration drives its starter's browser session, so it follows the same rule as a running turn.
+    if demonstration is None:
+        return
+    if not await _copilot_control_allowed(organization_id, demonstration.human_user_id, control):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the person who started this demonstration, or an Admin, can stop it."
+            if control == "cancel"
+            else "Only the person who started this demonstration can use it.",
+        )
+
+
+async def _cancel_already_requested(cache: BaseCache | None, organization_id: str, cancel_token: str) -> bool:
+    if cache is None:
+        return False
+    try:
+        return bool(await cache.get(_copilot_cancel_key(organization_id, cancel_token)))
+    except Exception:
+        LOG.debug("Copilot cancel flag read failed; treating the turn as live", exc_info=True)
+        return False
+
+
+async def _turns_a_new_turn_supersedes(
+    cache: BaseCache | None,
+    organization_id: str,
+    chat: WorkflowCopilotChat,
+    turn_id: str,
+    own_cancel_token: str | None,
+) -> list[CopilotPendingTurn]:
+    # A turn already told to stop is skipped: its entry can outlive a dead task until reconcile claims it,
+    # and an Admin Stop has to unblock the chat before then.
+    return [
+        entry
+        for entry in chat.pending_turns.values()
+        if entry.turn_id != turn_id
+        and entry.cancel_token
+        and entry.cancel_token != own_cancel_token
+        and entry.recovering_at is None
+        and not await _cancel_already_requested(cache, organization_id, entry.cancel_token)
+    ]
+
+
+async def _require_control_of_superseded_turns(organization_id: str, turns: list[CopilotPendingTurn]) -> None:
+    # Starting a turn stops these, so the caller needs the right to stop each one.
+    for turn in turns:
+        if not await _copilot_control_allowed(organization_id, turn.starter_user_id, "cancel"):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=COPILOT_SUPERSEDE_REFUSED)
+
+
+def _pending_turn_with_cancel_token(chat: WorkflowCopilotChat, cancel_token: str) -> CopilotPendingTurn | None:
+    return next((turn for turn in chat.pending_turns.values() if turn.cancel_token == cancel_token), None)
+
+
+def _pending_turn_with_question(chat: WorkflowCopilotChat, interaction_id: str) -> CopilotPendingTurn | None:
+    return next(
+        (
+            turn
+            for turn in chat.pending_turns.values()
+            if any(item.interaction_id == interaction_id for item in turn.question_interactions)
+        ),
+        None,
+    )
 
 
 def _copilot_idempotency_digest(
@@ -659,17 +821,12 @@ async def _stop_older_live_turns(
     organization_id: str,
     chat: WorkflowCopilotChat,
     turn_id: str,
-    own_cancel_token: str | None,
+    superseded_turns: list[CopilotPendingTurn],
 ) -> None:
     # ponytail: the markers come from the chat load, so a turn saved after this request loaded the chat is not seen.
     # Returning the other markers from start_copilot_turn's locked read would close that window.
-    for entry in chat.pending_turns.values():
-        if (
-            entry.turn_id == turn_id
-            or not entry.cancel_token
-            or entry.cancel_token == own_cancel_token
-            or entry.recovering_at is not None
-        ):
+    for entry in superseded_turns:
+        if not entry.cancel_token:
             continue
         key = _copilot_cancel_key(organization_id, entry.cancel_token)
         with contained_effect("copilot older-turn stop", workflow_copilot_chat_id=chat.workflow_copilot_chat_id):
@@ -688,17 +845,15 @@ RouteExit = Literal["completed", "error", "cancelled", "duplicate", "refused"]
 
 
 def _copilot_eval_cost_enabled(organization_id: str) -> bool:
-    return (
-        settings.WORKFLOW_COPILOT_EVAL_COST_ENABLED
-        and organization_id in settings.WORKFLOW_COPILOT_EVAL_COST_ORGANIZATION_IDS
-    )
+    return settings.EMBER_EVAL_COST_ENABLED and organization_id in settings.EMBER_EVAL_COST_ORGANIZATION_IDS
 
 
 def _copilot_eval_cost_headers(ledger: CopilotCostLedger | None) -> dict[str, str]:
     if ledger is None:
         return {}
     receipt = {"receipt_id": uuid.uuid4().hex, "llm_cost": ledger.snapshot()}
-    return {"X-Copilot-Eval-LLM-Cost": json.dumps(receipt, separators=(",", ":"))}
+    value = json.dumps(receipt, separators=(",", ":"))
+    return {"X-Ember-Eval-LLM-Cost": value, "X-Copilot-Eval-LLM-Cost": value}
 
 
 class _FirstEventTimingStream:
@@ -808,13 +963,19 @@ def _effective_auto_accept(auto_accept: bool | None, agent_result: AgentResult |
     """Only auto-applicable proposals may honor an explicit ``auto_accept=True``; a verified build
     never commits on the user's behalf, it lands as a pending proposal for the review gate. A
     recorded build-test failure downgrades the disposition before the result reaches this gate."""
-    if agent_result is None or agent_result.cancelled is True:
+    if agent_result is None or agent_result.cancelled is True or agent_result.run_card_saved_workflow is not None:
         return False
     if agent_result.updated_workflow is None and not agent_result.has_staged_proposal:
         return False
     if _proposal_disposition(agent_result) != "auto_applicable":
         return False
     return auto_accept is True
+
+
+def _rollback_target(original_workflow: Workflow | None, agent_result: AgentResult | None) -> Workflow | None:
+    if agent_result is not None and agent_result.run_card_saved_workflow is not None:
+        return agent_result.run_card_saved_workflow
+    return original_workflow
 
 
 def _should_restore_persisted_workflow(auto_accept: bool | None, agent_result: AgentResult | None) -> bool:
@@ -929,7 +1090,7 @@ def _build_recoverable_route_agent_result(
             response_kind=ResponseKind.RECOVER,
             reason_code=failure.failure_kind,
             terminal_reason=COPILOT_RECOVERABLE_FAILURE_TERMINAL_REASON,
-        ).model_copy(update={"connected_account_choices": connected_account_choices}),
+        ).model_copy(update=carried_account_choice_fields(prior_turn_outcome)),
     )
     _record_recoverable_failure_span_attrs(failure, proposal_disposition="no_proposal")
     return agent_result, failure
@@ -1058,16 +1219,6 @@ def _output_policy_blocked_final_response(agent_result: AgentResult) -> bool:
     return isinstance(diagnostics, dict) and diagnostics.get("final_output_policy_allowed") is False
 
 
-def _client_sent_no_proposal_token(owner_turn_id: str | None, revision: int | None) -> bool:
-    """Whether the caller predates proposal tokens entirely.
-
-    A frontend deployed before this change never sends them, and one already open in a tab outlives
-    the rollout. Such a client is acting on whatever the chat currently holds, which is how this
-    endpoint behaved before tokens existed; the canonical and claim checks still apply.
-    """
-    return owner_turn_id is None and revision is None
-
-
 async def _proposal_ownership_is_current(chat: Any, agent_result: AgentResult) -> bool:
     """Whether the candidate this result authored is still the one the chat row holds.
 
@@ -1096,6 +1247,34 @@ def _discard_superseded_proposal(agent_result: AgentResult) -> None:
     agent_result.has_staged_proposal = False
     agent_result.proposal_disposition = "no_proposal"
     agent_result.clear_proposed_workflow = False
+
+
+def _record_offered_test_proposal(
+    chat_request: WorkflowCopilotChatRequest, chat: WorkflowCopilotChat, agent_result: AgentResult
+) -> None:
+    outcome = agent_result.turn_outcome
+    metadata = copilot_proposal_metadata(chat.proposed_workflow)
+    # Only the unapproved-connection blocker pauses the Test on an account; a model-asked picker is a question.
+    # A recovery outcome only carries an earlier turn's picker, so it keeps that turn's token.
+    if (
+        chat_request.product_action != "test_end_to_end"
+        or outcome is None
+        or outcome.response_kind == ResponseKind.RECOVER
+        or outcome.reason_code != UNAPPROVED_CONNECTION_REASON_CODE
+        or not outcome.connected_account_choices
+        or metadata is None
+        or _proposal_disposition(agent_result) == "no_proposal"
+        or (metadata.owner_turn_id, metadata.revision)
+        != (agent_result.proposal_owner_turn_id, agent_result.proposal_revision)
+    ):
+        return
+    agent_result.turn_outcome = outcome.model_copy(
+        update={
+            "test_proposal_owner_turn_id": metadata.owner_turn_id,
+            "test_proposal_revision": metadata.revision,
+            "test_proposal_workflow_run_id": metadata.workflow_run_id,
+        }
+    )
 
 
 async def _persist_proposed_workflow_state(
@@ -1514,9 +1693,7 @@ def _interrupted_turn_outcome(
         copilot_runtime="agent",
         copilot_turn_id=turn_id,
         idempotency_digest=idempotency_digest,
-        connected_account_choices=(
-            prior_turn_outcome.connected_account_choices if prior_turn_outcome is not None else None
-        ),
+        **carried_account_choice_fields(prior_turn_outcome),
         copilot_effective_mode=effective_mode,
         copilot_code_available=code_available or False,
         interrupted_row_final=True,
@@ -1680,7 +1857,9 @@ async def _persist_cancel_turn(
         restore_failed = False
         if restored:
             try:
-                await asyncio.shield(_restore_workflow_definition(original_workflow, organization_id))
+                await asyncio.shield(
+                    _restore_workflow_definition(_rollback_target(original_workflow, agent_result), organization_id)
+                )
             except Exception:
                 LOG.warning(
                     "Workflow restore failed inside cancel-turn handler",
@@ -1907,7 +2086,7 @@ async def _finalise_normal_turn(
     restore_failed = False
     if restored:
         try:
-            await _restore_workflow_definition(original_workflow, organization_id)
+            await _restore_workflow_definition(_rollback_target(original_workflow, agent_result), organization_id)
         except Exception:
             LOG.warning("copilot restore failed in _finalise_normal_turn", exc_info=True)
             restore_failed = True
@@ -1918,7 +2097,28 @@ async def _finalise_normal_turn(
 
     applied_workflow = agent_result.updated_workflow
     staged_commit_landed = False
-    if _should_commit_staged_workflow(chat.auto_accept, agent_result):
+    should_commit = _should_commit_staged_workflow(chat.auto_accept, agent_result)
+    holding_run_id = (
+        await _run_holding_version(organization_id, chat.workflow_permanent_id, chat_request.workflow_id)
+        if should_commit and single_run_submit_enabled()
+        else None
+    )
+    if holding_run_id is not None:
+        LOG.info(
+            "copilot auto-accept deferred while a run of the saved version is unfinished",
+            auto_accept_deferred_reason="workflow_run_unfinished",
+            holding_workflow_run_id=holding_run_id,
+        )
+        otel_trace.get_current_span().set_attribute("copilot.auto_accept_deferred_reason", "workflow_run_unfinished")
+        agent_result.proposal_disposition = "review_tested"
+        deferred = (
+            _AUTO_ACCEPT_DEFERRED_FOR_UNFINISHED_RUN.format(workflow_run_id=holding_run_id)
+            if holding_run_id
+            else _AUTO_ACCEPT_DEFERRED_FOR_UNCHECKED_RUNS
+        )
+        agent_result.user_response = f"{user_response}\n\n{deferred}"
+        user_response = agent_result.user_response
+    elif should_commit:
         try:
             applied_workflow = await _commit_staged_workflow(
                 organization_id=organization_id,
@@ -1968,7 +2168,7 @@ async def _finalise_normal_turn(
             # atomically instead of leaving canonical on a partial intermediate.
             LOG.warning("copilot auto-accept commit failed; rolling back canonical", exc_info=True)
             with contextlib.suppress(Exception):
-                await _restore_workflow_definition(original_workflow, organization_id)
+                await _restore_workflow_definition(_rollback_target(original_workflow, agent_result), organization_id)
             raise
 
     await _persist_proposed_workflow_state(
@@ -1982,6 +2182,7 @@ async def _finalise_normal_turn(
     )
     # Proposal persistence can add a reason when no safe candidate could be published.
     user_response = agent_result.user_response
+    _record_offered_test_proposal(chat_request, chat, agent_result)
     # Read after persisting, never before: persisting drops this turn's proposal when a newer
     # candidate owns the row, and the frame below must not pair a dropped draft with that
     # candidate's token.
@@ -2066,52 +2267,16 @@ async def _finalise_normal_turn(
         await stream.send(WorkflowCopilotStreamResponseUpdate(**response_data))
 
 
-async def _resolve_proposal_for_accept(
-    proposal: dict[str, Any], *, organization_id: str, workflow_permanent_id: str
-) -> WorkflowCreateYAMLRequest:
-    data = safe_load_no_dates(proposal["_copilot_yaml"])
-    if not isinstance(data, dict):
-        return _normalize_copilot_yaml(proposal["_copilot_yaml"])
-    submitted = private_workflow_settings_from_proposal(proposal)
-    stored = await app.DATABASE.workflows.get_workflow_by_permanent_id(
-        workflow_permanent_id=workflow_permanent_id, organization_id=organization_id
-    )
-    private_settings = merge_private_workflow_settings(
-        submitted,
-        inherited_settings=inherited_header_settings(stored) if stored is not None else None,
-    )
-    strip_private_workflow_settings(data)
-    data.pop("extra_http_headers", None)
-    data.pop("cdp_connect_headers", None)
-    data.update({key: value for key, value in private_settings.items() if key not in data})
-    yaml_request = _normalize_copilot_yaml(dump_workflow_yaml(data))
-    if "workflow_definition" in proposal:
-        # Header snapshots can be masked or stale; only authored YAML overrides saved headers.
-        resolved = Workflow.model_validate(proposal).model_dump(mode="json")
-        if (
-            "max_elapsed_time_minutes" not in yaml_request.model_fields_set
-            and resolved["max_elapsed_time_minutes"] is None
-        ):
-            # Pre-upgrade proposals used null for an omitted limit; retain save-service inheritance.
-            resolved.pop("max_elapsed_time_minutes")
-        if "extra_http_headers" not in yaml_request.model_fields_set:
-            resolved.pop("extra_http_headers")
-        if "cdp_connect_headers" not in yaml_request.model_fields_set:
-            resolved.pop("cdp_connect_headers")
-        if "proxy_location" not in yaml_request.model_fields_set:
-            resolved.pop("proxy_location")
-        if "totp_identifier" not in yaml_request.model_fields_set:
-            resolved.pop("totp_identifier")
-        if "totp_verification_url" not in yaml_request.model_fields_set:
-            resolved.pop("totp_verification_url")
-        if "webhook_callback_url" not in yaml_request.model_fields_set:
-            resolved.pop("webhook_callback_url")
-        resolved.update(yaml_request.model_dump(exclude_unset=True))
-        if "cdp_connect_headers" in yaml_request.model_fields_set:
-            resolved["cdp_connect_headers"] = yaml_request.cdp_connect_headers
-        yaml_request = WorkflowCreateYAMLRequest.model_validate(resolved)
-
-    return yaml_request
+async def _run_holding_version(organization_id: str, workflow_permanent_id: str, workflow_id: str) -> str | None:
+    """An unfinished run reads its version row when its worker starts, so an in-place save would change what it runs.
+    A failed lookup returns "" and holds the version, so the change waits for a manual Accept instead of failing."""
+    try:
+        return await app.DATABASE.workflow_runs.get_unfinished_run_id_on_version(
+            organization_id, workflow_permanent_id, workflow_id
+        )
+    except Exception:
+        LOG.warning("Could not check for unfinished runs before auto-accept", exc_info=True)
+        return ""
 
 
 async def _commit_staged_workflow(
@@ -2254,6 +2419,8 @@ async def _restore_workflow_definition(original_workflow: Workflow | None, organ
     await app.WORKFLOW_SERVICE.update_workflow_definition(
         workflow_id=original_workflow.workflow_id,
         organization_id=organization_id,
+        # A rollback restores a state that saved; a file deleted since must not block it.
+        validate_block_image_files=False,
         title=restored_title,
         description=original_workflow.description,
         workflow_definition=restored_definition,
@@ -2337,19 +2504,21 @@ def _prior_copilot_workflow_yaml(
 
 
 def _pending_proposal_connected_account_id(pending_proposal_yaml: str) -> str | None:
-    """Zero or several bound accounts leave the choice to the picker rather than guessing one."""
-    bound = [
-        credential_id
-        for credential_id in workflow_credential_ids(pending_proposal_yaml)
-        if credential_id.startswith("goac_")
-    ]
-    return bound[0] if len(bound) == 1 else None
+    """Zero or several bound accounts leave the choice to the picker rather than guessing one. An account a
+    sending or uploading field uses is never picked by the button: the user names or picks it on the card."""
+    bound = workflow_connection_ids(pending_proposal_yaml)
+    if len(bound) != 1 or bound[0] in workflow_connection_ids(pending_proposal_yaml, acting_only=True):
+        return None
+    return bound[0]
 
 
-def _apply_test_end_to_end_action(chat_request: WorkflowCopilotChatRequest, pending_proposal_yaml: str) -> None:
-    # The button posts a structured action, so the message is the server's own
-    # receipt line rather than client prose the turn would have to interpret.
-    chat_request.message = TEST_END_TO_END_TURN_MESSAGE
+def _apply_test_end_to_end_action(
+    chat_request: WorkflowCopilotChatRequest, pending_proposal_yaml: str, *, write_receipt: bool = True
+) -> None:
+    # The button's turn reads the server's own receipt line, never client prose; a resumed pick keeps the pick
+    # text instead, because that is what resolves the account against the picker.
+    if write_receipt:
+        chat_request.message = TEST_END_TO_END_TURN_MESSAGE
     chat_request.workflow_yaml = strip_copilot_yaml_headers(pending_proposal_yaml) or ""
     derived_account_id = (
         _pending_proposal_connected_account_id(pending_proposal_yaml)
@@ -2360,6 +2529,53 @@ def _apply_test_end_to_end_action(chat_request: WorkflowCopilotChatRequest, pend
     # client-sent value never survives to mislabel the selection.
     chat_request.selected_connected_account_id = chat_request.selected_connected_account_id or derived_account_id
     chat_request.selected_connected_account_from_pending_proposal = derived_account_id is not None
+
+
+def _account_pick_test_promotion(
+    prior_turn_outcome: TurnOutcome | None,
+    chat_request: WorkflowCopilotChatRequest,
+    proposed_workflow: dict[str, Any] | None,
+    canonical: Workflow,
+) -> AccountPickTestResume | None:
+    """The Test a pick resumes, or None for a plain pick turn; raises when the offered proposal was replaced."""
+    if chat_request.product_action not in (None, "test_end_to_end") or proposed_workflow is None:
+        return None
+    resume = account_pick_test_resume(
+        prior_turn_outcome, chat_request.message, chat_request.selected_connected_account_id
+    )
+    if resume is None:
+        return None
+    metadata = copilot_proposal_metadata(proposed_workflow)
+    if metadata is None or (metadata.owner_turn_id, metadata.revision) != (
+        resume.proposal_owner_turn_id,
+        resume.proposal_revision,
+    ):
+        LOG.info("copilot_account_pick_test_refused", reason="offered_proposal_changed")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=ACCOUNT_PICK_PROPOSAL_CHANGED_REPLY)
+    if metadata.workflow_run_id != resume.proposal_workflow_run_id:
+        # A run was bound to the proposal after the picker was offered, so a re-pick on a carried picker must not
+        # start another.
+        LOG.info("copilot_account_pick_test_not_resumed", reason="run_bound_since_picker")
+        return None
+    proposal_yaml = proposed_workflow.get("_copilot_yaml")
+    if not isinstance(proposal_yaml, str) or resume.connection_id not in workflow_connection_ids(proposal_yaml):
+        return None
+    # The Test action runs the proposal, not the canvas, so a canvas edited since the picker (even back to the saved
+    # workflow) stays the model's input on a plain turn rather than being replaced unseen.
+    if chat_request.workflow_yaml and not copilot_workflow_yaml_matches(
+        chat_request.workflow_yaml,
+        proposal_yaml,
+        inherited_proxy_location=canonical.proxy_location,
+        inherited_code_version=canonical.code_version,
+    ):
+        LOG.info("copilot_account_pick_test_not_resumed", reason="canvas_edited_since_picker")
+        return None
+    LOG.info(
+        "copilot_account_pick_test_resumed",
+        proposal_owner_turn_id=resume.proposal_owner_turn_id,
+        proposal_revision=resume.proposal_revision,
+    )
+    return resume
 
 
 def _workflow_yaml_block_count(workflow_yaml: str | None) -> int:
@@ -2392,7 +2608,7 @@ def _run_grant_workflow_yaml(workflow: Workflow | None) -> str | None:
     definition = workflow.workflow_definition
     if definition is None or not definition.blocks:
         return None
-    return workflow_to_copilot_yaml(workflow)
+    return workflow_to_authoring_yaml(workflow)
 
 
 def _ensure_copilot_workflow_yaml(
@@ -2426,7 +2642,7 @@ def _ensure_copilot_workflow_yaml(
         and workflow_definition.blocks
     ):
         if persisted_workflow_yaml is None:
-            persisted_workflow_yaml = workflow_to_copilot_yaml(original_workflow)
+            persisted_workflow_yaml = workflow_to_authoring_yaml(original_workflow)
         if persisted_workflow_yaml:
             LOG.warning(
                 "Copilot agent chat request had no workflow blocks; using persisted workflow YAML",
@@ -2666,7 +2882,9 @@ async def _new_copilot_chat_post(
             restore_failed = False
             if restored:
                 try:
-                    await _restore_workflow_definition(original_workflow, organization.organization_id)
+                    await _restore_workflow_definition(
+                        _rollback_target(original_workflow, agent_result), organization.organization_id
+                    )
                 except Exception:
                     LOG.warning(
                         f"Workflow restore failed inside {restore_log_context}",
@@ -2808,6 +3026,10 @@ async def _new_copilot_chat_post(
             )
             proposed_workflow_at_turn_start = chat.proposed_workflow
             chat_request.workflow_copilot_chat_id = chat.workflow_copilot_chat_id
+            superseded_turns = await _turns_a_new_turn_supersedes(
+                getattr(app, "CACHE", None), organization.organization_id, chat, turn_id, chat_request.cancel_token
+            )
+            await _require_control_of_superseded_turns(organization.organization_id, superseded_turns)
             # Before any await that could raise into the recovery writer: that writer opens the row
             # with the product sender, so the caller's prose must already be gone.
             await _apply_diagnose_run_action(
@@ -2858,6 +3080,12 @@ async def _new_copilot_chat_post(
             persisted_workflow_yaml = _run_grant_workflow_yaml(original_workflow)
 
             submitted_private_settings = private_workflow_settings_from_yaml(chat_request.workflow_yaml)
+            account_pick_test = _account_pick_test_promotion(
+                prior_turn_outcome, chat_request, chat.proposed_workflow, original_workflow
+            )
+            if account_pick_test is not None:
+                chat_request.product_action = "test_end_to_end"
+                chat_request.selected_connected_account_id = account_pick_test.connection_id
             proposal_context = CopilotContext(
                 organization_id=organization.organization_id,
                 workflow_id=original_workflow.workflow_id,
@@ -2895,7 +3123,9 @@ async def _new_copilot_chat_post(
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail="No pending proposal to test end to end.",
                     )
-                _apply_test_end_to_end_action(chat_request, validated_proposal["_copilot_yaml"])
+                _apply_test_end_to_end_action(
+                    chat_request, validated_proposal["_copilot_yaml"], write_receipt=account_pick_test is None
+                )
                 # The Test action runs the proposal under its own settings, never the editor's.
                 submitted_private_settings = {}
 
@@ -2977,6 +3207,10 @@ async def _new_copilot_chat_post(
                         turn_id=turn_id,
                         started_at=datetime.now(UTC),
                         cancel_token=chat_request.cancel_token,
+                        question_client_grace_seconds=int(DETACHED_QUESTION_CLIENT_GRACE.total_seconds())
+                        if chat_request.client_detached
+                        else None,
+                        starter_user_id=human_user_id(get_request_principal(), organization.organization_id),
                         request_browser_allocations=CopilotRequestBrowserAllocations(
                             organization_id=organization.organization_id,
                             workflow_permanent_id=chat.workflow_permanent_id,
@@ -3038,9 +3272,7 @@ async def _new_copilot_chat_post(
             # request while starting the turn.
             cache = getattr(app, "CACHE", None)
             if cache is not None:
-                await _stop_older_live_turns(
-                    cache, organization.organization_id, chat, turn_id, chat_request.cancel_token
-                )
+                await _stop_older_live_turns(cache, organization.organization_id, chat, turn_id, superseded_turns)
             if chat_request.cancel_token and cache is not None:
                 handler_task = asyncio.current_task()
                 if handler_task is not None:
@@ -3130,7 +3362,9 @@ async def _new_copilot_chat_post(
                     opening_workflow_title=original_workflow.title,
                     prior_executed_block_fingerprints=prior_executed_block_fingerprints,
                     eval_capture_case_id=(
-                        request.headers.get("x-copilot-eval-case") if settings.ENV == "local" else None
+                        (request.headers.get("x-ember-eval-case") or request.headers.get("x-copilot-eval-case"))
+                        if settings.ENV == "local"
+                        else None
                     ),
                     eval_mode=eval_mode,
                     eval_entrypoint_url=eval_entrypoint_url,
@@ -3280,7 +3514,9 @@ async def _new_copilot_chat_post(
                 and await turn_owned_or_left_to_reconcile()
             ):
                 try:
-                    await _restore_workflow_definition(original_workflow, organization.organization_id)
+                    await _restore_workflow_definition(
+                        _rollback_target(original_workflow, agent_result), organization.organization_id
+                    )
                 except Exception:
                     LOG.warning(
                         "Workflow restore failed inside HTTPException handler",
@@ -3316,7 +3552,11 @@ async def _new_copilot_chat_post(
                 agent_result,
             ):
                 try:
-                    await tracked_write(_restore_workflow_definition(original_workflow, organization.organization_id))
+                    await tracked_write(
+                        _restore_workflow_definition(
+                            _rollback_target(original_workflow, agent_result), organization.organization_id
+                        )
+                    )
                 except Exception:
                     LOG.warning(
                         "Workflow restore failed inside cancel-error handler",
@@ -3678,20 +3918,12 @@ async def _validate_copilot_audio_artifact_id(
     return audio_artifact_id
 
 
-def _has_audio_container_signature(data: bytes) -> bool:
-    """The declared content type is client-controlled, so the bytes must open as a container browsers record into."""
-    return (
-        data.startswith((b"\x1a\x45\xdf\xa3", b"OggS", b"ID3", b"fLaC"))
-        or (data[:4] == b"RIFF" and data[8:12] == b"WAVE")
-        or data[4:8] == b"ftyp"
-        or (len(data) > 1 and data[0] == 0xFF and data[1] & 0xE0 == 0xE0)
-    )
-
-
+@base_router.post("/ember/chat-audio", include_in_schema=False)
 @base_router.post("/workflow/copilot/chat-audio", include_in_schema=False)
 async def workflow_copilot_chat_audio(
     workflow_permanent_id: str = Form(...),
     workflow_copilot_chat_id: str | None = Form(None),
+    ember_chat_id: Annotated[str | None, Form()] = None,
     file: UploadFile = File(...),
     organization: Organization = Depends(org_auth_service.get_current_org),
 ) -> WorkflowCopilotAudioUploadResponse:
@@ -3720,18 +3952,24 @@ async def workflow_copilot_chat_audio(
             detail=f"Audio file exceeds the maximum allowed size ({max_upload_bytes / 1024 / 1024:.0f} MB)",
         )
 
-    if not _has_audio_container_signature(audio_bytes):
+    # The declared content type is client-controlled, so the bytes must open as a container browsers record into.
+    if not uploaded_file_service.has_audio_container_signature(audio_bytes):
         raise HTTPException(
             status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="File content is not a supported audio format"
         )
     await asyncio.to_thread(
-        uploaded_file_service.validate_upload_type, UploadFile(file=io.BytesIO(audio_bytes), filename=file.filename)
+        uploaded_file_service.validate_upload_type,
+        UploadFile(file=io.BytesIO(audio_bytes), filename=file.filename),
+        purpose="copilot_dictation",
+        organization_id=organization.organization_id,
+        allowed=uploaded_file_service.VOICE_NOTE_UPLOAD_EXTENSIONS,
+        any_audio_container=True,
     )
 
     chat = await _get_or_create_workflow_copilot_chat(
         organization_id=organization.organization_id,
         workflow_permanent_id=workflow_permanent_id,
-        workflow_copilot_chat_id=workflow_copilot_chat_id,
+        workflow_copilot_chat_id=ember_chat_id or workflow_copilot_chat_id,
     )
 
     LOG.info(
@@ -3766,9 +4004,9 @@ def _validated_eval_entrypoint_url(
         return None
     eval_entrypoint_url = chat_request.eval_entrypoint_url
     if (
-        not settings.WORKFLOW_COPILOT_ODYSSEYS_EVAL_INPUTS_ENABLED
-        or organization.organization_id not in settings.WORKFLOW_COPILOT_ODYSSEYS_EVAL_ORGANIZATION_IDS
-        or request.headers.get("x-copilot-eval") != "odysseys"
+        not settings.EMBER_ODYSSEYS_EVAL_INPUTS_ENABLED
+        or organization.organization_id not in settings.EMBER_ODYSSEYS_EVAL_ORGANIZATION_IDS
+        or (request.headers.get("x-ember-eval") or request.headers.get("x-copilot-eval")) != "odysseys"
     ):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -3797,6 +4035,7 @@ def _validated_eval_entrypoint_url(
     return eval_entrypoint_url
 
 
+@base_router.post("/ember/chat-post", include_in_schema=False)
 @base_router.post("/workflow/copilot/chat-post", include_in_schema=False)
 async def workflow_copilot_chat_post(
     request: Request,
@@ -3810,20 +4049,16 @@ async def workflow_copilot_chat_post(
     )
     chat_request.doc_editor_enabled = chat_request.doc_editor_enabled and server_doc_editor_enabled
     eval_llm_overrides = admit_eval_llm_overrides(
-        request.headers.get(EVAL_LLM_OVERRIDES_HEADER), organization.organization_id
+        request.headers.get(EMBER_EVAL_LLM_OVERRIDES_HEADER) or request.headers.get(EVAL_LLM_OVERRIDES_HEADER),
+        organization.organization_id,
     )
     eval_cost_enabled = _copilot_eval_cost_enabled(organization.organization_id)
     eval_entrypoint_url = _validated_eval_entrypoint_url(request, chat_request, organization)
-    if app.CACHE is None or not app.CACHE.is_shared:
-        # Demonstrations live in the shared cache, so Copilot must not offer one this backend cannot start.
+    if demonstration_cache() is None:
+        # Copilot must not offer a demonstration this backend cannot start.
         chat_request.supports_demonstration_offer = False
     if chat_request.product_action == "demonstrate":
-        cache = app.CACHE
-        if cache is None or not cache.is_shared:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Copilot demonstration requires a shared cache",
-            )
+        cache = await _demonstration_cache()
         if not chat_request.demonstration_id:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -3838,6 +4073,7 @@ async def workflow_copilot_chat_post(
             )
         except DemonstrationRejection as rejection:
             raise HTTPException(status_code=rejection.status_code, detail=rejection.detail) from rejection
+        await _require_demonstration_control(organization.organization_id, demonstration, "steer")
         # A reloaded card no longer holds the files it attached; the recorded upload events still do.
         demonstrated_file_ids = await demonstration_file_ids(
             cache, organization.organization_id, chat_request.demonstration_id, demonstration.event_count
@@ -3845,7 +4081,7 @@ async def workflow_copilot_chat_post(
         chat_request.attached_file_ids = list(dict.fromkeys([*chat_request.attached_file_ids, *demonstrated_file_ids]))[
             :MAX_ATTACHED_FILES_PER_MESSAGE
         ]
-    raw_eval_mode = request.headers.get("x-copilot-eval-mode")
+    raw_eval_mode = request.headers.get("x-ember-eval-mode") or request.headers.get("x-copilot-eval-mode")
     if raw_eval_mode is not None:
         try:
             eval_mode = CopilotEvalMode(raw_eval_mode)
@@ -3855,8 +4091,8 @@ async def workflow_copilot_chat_post(
                 detail="Unsupported Copilot eval mode",
             ) from exc
         if (
-            not settings.WORKFLOW_COPILOT_BROWSER_ABLATION_ENABLED
-            or organization.organization_id not in settings.WORKFLOW_COPILOT_BROWSER_ABLATION_ORGANIZATION_IDS
+            not settings.EMBER_BROWSER_ABLATION_ENABLED
+            or organization.organization_id not in settings.EMBER_BROWSER_ABLATION_ORGANIZATION_IDS
         ):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Copilot eval mode is disabled")
         return await _new_copilot_chat_post(
@@ -3879,6 +4115,7 @@ async def workflow_copilot_chat_post(
     )
 
 
+@base_router.get("/ember/chats", include_in_schema=False)
 @base_router.get("/workflow/copilot/chats", include_in_schema=False)
 async def list_workflow_copilot_chats(
     workflow_permanent_id: str | None = None,
@@ -4030,8 +4267,7 @@ async def _reconcile_interrupted_copilot_turns(chat: WorkflowCopilotChat, organi
         if (
             credential_pause_active is None
             and has_recovery_handoff
-            and last_activity
-            > abandoned_before - timedelta(seconds=settings.WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS)
+            and last_activity > abandoned_before - timedelta(seconds=settings.EMBER_CREDENTIAL_PAUSE_TIMEOUT_SECONDS)
         ):
             # A transient Redis failure must not reclaim a possible second
             # credential wait, while an unrelated stale turn must eventually
@@ -4166,14 +4402,21 @@ async def _history_proposal_state(
     return chat.proposed_workflow, metadata, run_facts, claim_expires_in
 
 
+@base_router.get("/ember/chat-history", include_in_schema=False)
 @base_router.get("/workflow/copilot/chat-history", include_in_schema=False)
 async def workflow_copilot_chat_history(
     credential_recovery_token: str | None = Header(None, alias="X-Copilot-Credential-Recovery-Token"),
     workflow_permanent_id: str | None = None,
     workflow_copilot_chat_id: str | None = None,
     request_cancel_token: str | None = None,
+    include_live_narrative: bool = False,
+    message_limit: Annotated[int | None, Query(ge=1)] = None,
     organization: Organization = Depends(org_auth_service.get_current_org),
+    ember_credential_recovery_token: Annotated[str | None, Header(alias="X-Ember-Credential-Recovery-Token")] = None,
+    ember_chat_id: str | None = None,
 ) -> WorkflowCopilotChatHistoryResponse:
+    credential_recovery_token = ember_credential_recovery_token or credential_recovery_token
+    workflow_copilot_chat_id = ember_chat_id or workflow_copilot_chat_id
     if workflow_copilot_chat_id:
         chat = await app.DATABASE.workflow_params.get_workflow_copilot_chat_by_id(
             organization_id=organization.organization_id,
@@ -4190,12 +4433,19 @@ async def workflow_copilot_chat_history(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="workflow_permanent_id or workflow_copilot_chat_id is required",
         )
+    # Only the caller's answerable questions count as seen by a client. The refresh can return turns committed after
+    # this read, so the response's redaction is recomputed from the refreshed turns below.
+    turns_not_seen = await _copilot_turns_without_control(organization.organization_id, chat, "answer")
     if chat:
         if any(
             item.status == "pending" for entry in chat.pending_turns.values() for item in entry.question_interactions
         ):
             chat.pending_turns = await app.DATABASE.workflow_params.refresh_copilot_question_client(
-                organization.organization_id, chat.workflow_copilot_chat_id
+                organization.organization_id,
+                chat.workflow_copilot_chat_id,
+                seen_turn_ids={
+                    entry.turn_id for entry in chat.pending_turns.values() if entry.turn_id not in turns_not_seen
+                },
             )
         await _reconcile_interrupted_copilot_turns(chat, organization.organization_id)
         chat_messages = await app.DATABASE.workflow_params.get_workflow_copilot_chat_messages(
@@ -4345,6 +4595,13 @@ async def workflow_copilot_chat_history(
         key=lambda entry: _as_utc(entry.started_at),
         default=None,
     )
+    live_narrative = (
+        await read_live_turn_narrative(organization.organization_id, chat.workflow_copilot_chat_id, live_entry.turn_id)
+        if include_live_narrative and chat is not None and live_entry is not None
+        else None
+    )
+    turns_without_answer = await _copilot_turns_without_control(organization.organization_id, chat, "answer")
+    turns_without_cancel = await _copilot_turns_without_control(organization.organization_id, chat, "cancel")
     return WorkflowCopilotChatHistoryResponse(
         pending_credential_requests=pending_credentials,
         workflow_copilot_chat_id=chat.workflow_copilot_chat_id if chat else None,
@@ -4353,23 +4610,42 @@ async def workflow_copilot_chat_history(
         in_flight_turn=(
             CopilotInFlightTurn(
                 turn_id=live_entry.turn_id,
-                cancel_token=live_entry.cancel_token,
+                cancel_token=live_entry.cancel_token if live_entry.turn_id not in turns_without_cancel else None,
                 latest_draft=live_entry.latest_draft,
                 latest_draft_at=live_entry.latest_draft_at,
+                steer_messages=[item for item in live_entry.steer_messages if item.delivered_at is not None],
+                narrative=live_narrative,
+                question_open_until=min(
+                    (
+                        live_entry.question_client_deadline(item)
+                        for item in live_entry.question_interactions
+                        if item.awaiting_answer
+                    ),
+                    default=None,
+                )
+                if live_entry.turn_id not in turns_without_answer
+                else None,
             )
             if live_entry is not None
             else None
         ),
-        question_interactions=question_interactions,
+        question_interactions=[
+            item
+            for item in question_interactions
+            if not (item.status == "pending" and item.turn_id in turns_without_answer)
+        ],
         pending_question_cancel_token=next(
             (
                 entry.cancel_token
                 for entry in (chat.pending_turns.values() if chat else [])
-                if any(item.interaction_id in pending_ids for item in entry.question_interactions)
+                if entry.turn_id not in turns_without_cancel
+                and any(item.interaction_id in pending_ids for item in entry.question_interactions)
             ),
             None,
         ),
-        chat_history=resolved_chat_history,
+        chat_history=resolved_chat_history[-message_limit:] if message_limit else resolved_chat_history,
+        workflow_permanent_id=chat.workflow_permanent_id if chat else None,
+        app_url=settings.SKYVERN_APP_URL.rstrip("/"),
         accepted_turn_ids=accepted_turn_ids,
         proposed_workflow=proposed_workflow,
         proposed_workflow_metadata=proposed_workflow_metadata,
@@ -4380,6 +4656,7 @@ async def workflow_copilot_chat_history(
     )
 
 
+@base_router.post("/ember/question-response", include_in_schema=False)
 @base_router.post("/workflow/copilot/question-response", include_in_schema=False)
 async def workflow_copilot_question_response(
     request: Request,
@@ -4392,8 +4669,12 @@ async def workflow_copilot_question_response(
     )
     if chat is None:
         raise HTTPException(status_code=404, detail="Unknown Copilot chat")
+    await _require_copilot_turn_control(
+        organization.organization_id, _pending_turn_with_question(chat, question_response.interaction_id), "answer"
+    )
     eval_llm_overrides = admit_eval_llm_overrides(
-        request.headers.get(EVAL_LLM_OVERRIDES_HEADER), organization.organization_id
+        request.headers.get(EMBER_EVAL_LLM_OVERRIDES_HEADER) or request.headers.get(EVAL_LLM_OVERRIDES_HEADER),
+        organization.organization_id,
     )
     response = QuestionResponse(
         answers=question_response.answers,
@@ -4548,6 +4829,7 @@ async def _record_credential_deletion(
     return await repo.fail_copilot_credential_deletion(organization_id, chat_id, interaction_id)
 
 
+@base_router.post("/ember/credential-deletion", include_in_schema=False)
 @base_router.post("/workflow/copilot/credential-deletion", include_in_schema=False)
 async def workflow_copilot_credential_deletion(
     deletion_request: WorkflowCopilotCredentialDeletionRequest,
@@ -4565,6 +4847,13 @@ async def workflow_copilot_credential_deletion(
         "workflow_copilot.update",
         {"workflow_copilot_chat_id": deletion_request.workflow_copilot_chat_id},
     )
+    chat = await app.DATABASE.workflow_params.get_workflow_copilot_chat_by_id(
+        organization_id, deletion_request.workflow_copilot_chat_id
+    )
+    if chat is not None:
+        await _require_copilot_turn_control(
+            organization_id, _pending_turn_with_question(chat, deletion_request.interaction_id), "answer"
+        )
     try:
         claimed = await app.DATABASE.workflow_params.claim_copilot_credential_deletion(
             organization_id,
@@ -4589,6 +4878,7 @@ async def workflow_copilot_credential_deletion(
     return await asyncio.shield(task)
 
 
+@base_router.post("/ember/steer", include_in_schema=False, response_model=CopilotSteerMessage)
 @base_router.post("/workflow/copilot/steer", include_in_schema=False, response_model=CopilotSteerMessage)
 async def workflow_copilot_steer(
     request: Request,
@@ -4604,8 +4894,12 @@ async def workflow_copilot_steer(
     )
     if chat is None:
         raise HTTPException(status_code=404, detail="Unknown Copilot chat")
+    await _require_copilot_turn_control(
+        organization.organization_id, _pending_turn_with_cancel_token(chat, steer_request.cancel_token), "steer"
+    )
     eval_llm_overrides = admit_eval_llm_overrides(
-        request.headers.get(EVAL_LLM_OVERRIDES_HEADER), organization.organization_id
+        request.headers.get(EMBER_EVAL_LLM_OVERRIDES_HEADER) or request.headers.get(EVAL_LLM_OVERRIDES_HEADER),
+        organization.organization_id,
     )
 
     async def record(steer: CopilotSteerMessage | None = None) -> CopilotSteerMessage | None:
@@ -4658,6 +4952,7 @@ async def workflow_copilot_steer(
     return recorded
 
 
+@base_router.post("/ember/message-feedback", include_in_schema=False)
 @base_router.post("/workflow/copilot/message-feedback", include_in_schema=False)
 async def workflow_copilot_message_feedback(
     feedback_request: WorkflowCopilotMessageFeedbackRequest,
@@ -4711,6 +5006,7 @@ async def workflow_copilot_message_feedback(
     )
 
 
+@base_router.post("/ember/cancel", include_in_schema=False, status_code=status.HTTP_204_NO_CONTENT)
 @base_router.post("/workflow/copilot/cancel", include_in_schema=False, status_code=status.HTTP_204_NO_CONTENT)
 async def workflow_copilot_cancel(
     cancel_request: WorkflowCopilotCancelRequest,
@@ -4726,6 +5022,14 @@ async def workflow_copilot_cancel(
     """
     cancelled_questions = False
     if cancel_request.workflow_copilot_chat_id:
+        chat = await app.DATABASE.workflow_params.get_workflow_copilot_chat_by_id(
+            organization.organization_id, cancel_request.workflow_copilot_chat_id
+        )
+        if chat is None:
+            raise HTTPException(status_code=404, detail="Unknown Copilot chat")
+        await _require_copilot_turn_control(
+            organization.organization_id, _pending_turn_with_cancel_token(chat, cancel_request.cancel_token), "cancel"
+        )
         try:
             cancelled_questions = await app.DATABASE.workflow_params.cancel_copilot_questions(
                 organization.organization_id, cancel_request.workflow_copilot_chat_id, cancel_request.cancel_token
@@ -4806,6 +5110,11 @@ async def _resolve_manual_sign_in(
     )
 
 
+@base_router.post(
+    "/ember/credential-response",
+    include_in_schema=False,
+    response_model=WorkflowCopilotCredentialResponseResult,
+)
 @base_router.post(
     "/workflow/copilot/credential-response",
     include_in_schema=False,
@@ -5057,15 +5366,17 @@ async def _change_credential_site(
 
 
 async def _demonstration_cache() -> BaseCache:
-    cache = app.CACHE
-    if cache is None or not cache.is_shared:
+    cache = demonstration_cache()
+    if cache is None:
+        # 501, not 403: the server's setup refuses this, not the caller's credentials.
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Copilot demonstration requires a shared cache",
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail="Run this server as one process to record demonstrations",
         )
     return cache
 
 
+@base_router.post("/ember/demonstration/record", include_in_schema=False)
 @base_router.post("/workflow/copilot/demonstration/record", include_in_schema=False)
 async def workflow_copilot_demonstration_record(
     request: Request,
@@ -5088,6 +5399,17 @@ async def workflow_copilot_demonstration_record(
     )
     if browser_session is None or workflow is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown workflow or browser session")
+    if record_request.demonstration_id is not None:
+        await _require_demonstration_control(
+            organization.organization_id,
+            await load_demonstration_record(cache, organization.organization_id, record_request.demonstration_id),
+            "steer",
+        )
+
+    async def authorize_replace(replaced: DemonstrationRecord) -> None:
+        # A new recording cancels the browser's current demonstration, so it needs the right to stop that one.
+        await _require_demonstration_control(organization.organization_id, replaced, "cancel")
+
     try:
         claim = await claim_demonstration_recording(
             cache,
@@ -5096,6 +5418,8 @@ async def workflow_copilot_demonstration_record(
             browser_session_id=record_request.browser_session_id,
             demonstration_id=record_request.demonstration_id,
             insertion=record_request.insertion.model_dump() if record_request.insertion is not None else None,
+            human_user_id=human_user_id(get_request_principal(), organization.organization_id),
+            authorize_replace=authorize_replace,
         )
     except DemonstrationRejection as rejection:
         raise HTTPException(status_code=rejection.status_code, detail=rejection.detail) from rejection
@@ -5116,6 +5440,11 @@ async def workflow_copilot_demonstration_record(
     return FastAPIEventSourceStream.create(request, handler)
 
 
+@base_router.post(
+    "/ember/demonstration/control",
+    include_in_schema=False,
+    response_model=WorkflowCopilotDemonstrationControlResult,
+)
 @base_router.post(
     "/workflow/copilot/demonstration/control",
     include_in_schema=False,
@@ -5154,6 +5483,11 @@ async def workflow_copilot_demonstration_control(
             "workflow_copilot.manage",
             {"workflow_permanent_id": demonstration.workflow_permanent_id},
         )
+    await _require_demonstration_control(
+        organization.organization_id,
+        demonstration,
+        "cancel" if control_request.action in {"stop", "cancel"} else "steer",
+    )
     try:
         seq = await append_demonstration_control(
             cache,
@@ -5178,6 +5512,11 @@ async def workflow_copilot_demonstration_control(
 
 
 @base_router.post(
+    "/ember/demonstration/upload",
+    include_in_schema=False,
+    response_model=WorkflowCopilotDemonstrationControlResult,
+)
+@base_router.post(
     "/workflow/copilot/demonstration/upload",
     include_in_schema=False,
     response_model=WorkflowCopilotDemonstrationControlResult,
@@ -5196,6 +5535,7 @@ async def workflow_copilot_demonstration_upload(
         "workflow_copilot.manage",
         {"workflow_permanent_id": demonstration.workflow_permanent_id},
     )
+    await _require_demonstration_control(organization.organization_id, demonstration, "steer")
     if demonstration.status != "recording":
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Demonstration is not recording")
     attached_file_ids = await demonstration_file_ids(
@@ -5207,10 +5547,20 @@ async def workflow_copilot_demonstration_upload(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"A demonstration can attach at most {MAX_ATTACHED_FILES_PER_MESSAGE} files",
         )
-    # Demonstrations replay the user's own file into the target site, so any type that site accepts must pass.
-    await uploaded_file_service.validate_passthrough_upload(
-        file, max_size_bytes=app.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE, purpose="copilot_demonstration"
-    )
+    try:
+        await uploaded_file_service.validate_upload(
+            file,
+            purpose="copilot_demonstration",
+            organization_id=organization.organization_id,
+            max_size_bytes=app.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE,
+        )
+    except HTTPException as refused:
+        if refused.status_code != status.HTTP_415_UNSUPPORTED_MEDIA_TYPE:
+            raise
+        raise HTTPException(
+            status_code=refused.status_code,
+            detail=f"{refused.detail}. Choose another file type, or skip the file: the upload step is still recorded.",
+        ) from refused
     try:
         uploaded, _ = await uploaded_file_service.save_uploaded_file(
             file=file, organization_id=organization.organization_id
@@ -5233,6 +5583,7 @@ async def workflow_copilot_demonstration_upload(
     return WorkflowCopilotDemonstrationControlResult(seq=seq, file_id=uploaded.file_id)
 
 
+@base_router.get("/ember/demonstration/active", include_in_schema=False)
 @base_router.get("/workflow/copilot/demonstration/active", include_in_schema=False)
 async def workflow_copilot_demonstration_active(
     workflow_permanent_id: str,
@@ -5249,6 +5600,10 @@ async def workflow_copilot_demonstration_active(
     if active is None:
         return None
     demonstration_id, record = active
+    # The id is the handle /control stop and cancel take, so a caller who may stop the demonstration receives it;
+    # the controls they may not use still answer 403.
+    if not await _copilot_control_allowed(organization.organization_id, record.human_user_id, "cancel"):
+        return None
     copilot_config = await app.AGENT_FUNCTION.get_copilot_config_for_request(
         organization.organization_id,
         code_block_mode=None,
@@ -5354,6 +5709,11 @@ def _claim_seconds_left(deadline: datetime) -> float:
 
 
 @base_router.post(
+    "/ember/credential-generate",
+    include_in_schema=False,
+    response_model=WorkflowCopilotCredentialGenerateResult,
+)
+@base_router.post(
     "/workflow/copilot/credential-generate",
     include_in_schema=False,
     response_model=WorkflowCopilotCredentialGenerateResult,
@@ -5455,6 +5815,7 @@ async def workflow_copilot_credential_generate(
     )
 
 
+@base_router.post("/ember/clear-proposed-workflow", include_in_schema=False, status_code=status.HTTP_204_NO_CONTENT)
 @base_router.post(
     "/workflow/copilot/clear-proposed-workflow", include_in_schema=False, status_code=status.HTTP_204_NO_CONTENT
 )
@@ -5493,6 +5854,7 @@ async def workflow_copilot_clear_proposed_workflow(
     )
 
 
+@base_router.post("/ember/disable-auto-accept", include_in_schema=False, status_code=status.HTTP_204_NO_CONTENT)
 @base_router.post(
     "/workflow/copilot/disable-auto-accept", include_in_schema=False, status_code=status.HTTP_204_NO_CONTENT
 )
@@ -5510,24 +5872,7 @@ async def workflow_copilot_disable_auto_accept(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chat not found")
 
 
-def _accepted_workflow_title(
-    frozen_title: str, canonical: Workflow | None, metadata: CopilotProposalMetadata | None
-) -> str:
-    """The title an Accept writes: a rename that landed since publication outranks the frozen one."""
-    live_title = canonical.title if canonical is not None else None
-    if not live_title or live_title == frozen_title:
-        return frozen_title
-    if metadata is not None and metadata.canonical_title is not None:
-        renamed_since_publication = live_title != metadata.canonical_title
-    else:
-        # A proposal published before the title was recorded has nothing to compare against, so
-        # only a placeholder it froze yields to the live name.
-        renamed_since_publication = frozen_title in DEFAULT_WORKFLOW_TITLES and (
-            live_title not in DEFAULT_WORKFLOW_TITLES
-        )
-    return live_title if renamed_since_publication else frozen_title
-
-
+@base_router.post("/ember/apply-proposed-workflow", include_in_schema=False)
 @base_router.post("/workflow/copilot/apply-proposed-workflow", include_in_schema=False)
 async def workflow_copilot_apply_proposed_workflow(
     apply_request: WorkflowCopilotApplyProposedWorkflowRequest,
@@ -5540,193 +5885,12 @@ async def workflow_copilot_apply_proposed_workflow(
     )
     if chat is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chat not found")
-
-    def log_accept_refused(status_code: int) -> None:
-        LOG.info(
-            "Copilot proposal accept refused",
-            organization_id=organization.organization_id,
-            workflow_permanent_id=chat.workflow_permanent_id,
-            workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
-            status_code=status_code,
-        )
-
-    proposal = chat.proposed_workflow
-    if not proposal:
-        log_accept_refused(status.HTTP_400_BAD_REQUEST)
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No proposed workflow to apply")
-
-    metadata = copilot_proposal_metadata(proposal)
-    if COPILOT_PROPOSAL_METADATA_KEY in proposal and metadata is None:
-        log_accept_refused(status.HTTP_409_CONFLICT)
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Copilot proposal metadata is invalid; reload required",
-        )
-    if metadata is not None:
-        untokenized_client = _client_sent_no_proposal_token(apply_request.owner_turn_id, apply_request.revision)
-        if not untokenized_client and (
-            apply_request.owner_turn_id != metadata.owner_turn_id or apply_request.revision != metadata.revision
-        ):
-            log_accept_refused(status.HTTP_409_CONFLICT)
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT, detail="Copilot proposal changed; reload required"
-            )
-        if metadata.claim_is_live(datetime.now(UTC)):
-            log_accept_refused(status.HTTP_409_CONFLICT)
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT, detail="Copilot proposal is already being accepted"
-            )
-    # A lapsed claim is being taken over, so the disposition to restore on failure is the
-    # reviewable one this accept started from, never the dead claim's own marker.
-    original_disposition: ProposalDisposition = (
-        cast(ProposalDisposition, metadata.disposition)
-        if metadata is not None and metadata.disposition != "accepting"
-        else "review_untested"
-    )
-
-    if not proposal.get("_copilot_yaml"):
-        log_accept_refused(status.HTTP_400_BAD_REQUEST)
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Proposed workflow has no copilot YAML to apply",
-        )
-
-    # Claim before the canonical check and the write: a history read that overtakes this POST must
-    # already see a write in flight, or it reports the proposal unsaved and releases the Save hold.
-    base_version: int | None = None
-    try:
-        if metadata is None:
-            # A tokenless proposal has nothing to claim, so it gets a token that is claimed from the start.
-            claimed, base_version = await app.DATABASE.workflow_params.claim_untokened_workflow_copilot_candidate(
-                organization_id=organization.organization_id,
-                workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
-                expected_proposal=proposal,
-                owner_turn_id=apply_request.owner_turn_id or uuid.uuid4().hex,
-            )
-        else:
-            claimed = await app.DATABASE.workflow_params.claim_workflow_copilot_candidate(
-                organization_id=organization.organization_id,
-                workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
-                expected_owner_turn_id=metadata.owner_turn_id,
-                expected_revision=metadata.revision,
-            )
-    except CopilotProposalConflictError:
-        log_accept_refused(status.HTTP_409_CONFLICT)
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Copilot proposal changed; reload required")
-    claim = copilot_proposal_metadata(claimed.proposed_workflow)
-    if claim is None:
-        raise RuntimeError("Copilot proposal claim returned no ownership token")
-
-    workflow_changed = False
-    try:
-        if metadata is None and base_version is None:
-            # With no saved version at the claim there is nothing to hold a later save against.
-            workflow_changed = True
-            log_accept_refused(status.HTTP_409_CONFLICT)
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Workflow changed after this proposal")
-        canonical = await app.DATABASE.workflows.get_workflow_by_permanent_id(
-            workflow_permanent_id=chat.workflow_permanent_id,
-            organization_id=organization.organization_id,
-        )
-        if canonical is None or (
-            metadata is not None
-            and not proposal_workflow_fingerprint_matches(canonical, metadata.canonical_fingerprint)
-        ):
-            workflow_changed = True
-            log_accept_refused(status.HTTP_409_CONFLICT)
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Workflow changed after this proposal")
-        try:
-            yaml_request = await _resolve_proposal_for_accept(
-                proposal,
-                organization_id=organization.organization_id,
-                workflow_permanent_id=chat.workflow_permanent_id,
-            )
-        except (yaml.YAMLError, ValidationError) as e:
-            log_accept_refused(status.HTTP_400_BAD_REQUEST)
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Proposed copilot YAML is invalid: {e}",
-            )
-        live_title = _accepted_workflow_title(yaml_request.title, canonical, metadata)
-        if live_title != yaml_request.title:
-            LOG.info(
-                "copilot_accept_title_refreshed",
-                workflow_permanent_id=chat.workflow_permanent_id,
-                frozen_title=yaml_request.title,
-            )
-            yaml_request.title = live_title
-
-        # The proposal can name another workflow's seed profile or session, so it is checked like a direct save.
-        await app.AGENT_FUNCTION.enforce_folder_access_for_references(
-            get_request_principal(), "workflow.run", yaml_request.model_dump(exclude={"folder_id"})
-        )
-        try:
-            new_workflow, changed_fields = await app.WORKFLOW_SERVICE.create_workflow_from_request(
-                organization=organization,
-                request=yaml_request,
-                workflow_permanent_id=chat.workflow_permanent_id,
-                edited_by="copilot",
-                build_source=WorkflowBuildSource.copilot,
-                validate_code_block_templates=False,
-                expected_version=canonical.version if metadata is not None else base_version,
-                return_write_result=True,
-            )
-        except (WorkflowVersionConflict, WorkflowNotFound) as e:
-            # A save or delete landed after the claim; this is the refusal the client reads as "nothing written".
-            workflow_changed = True
-            log_accept_refused(status.HTTP_409_CONFLICT)
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT, detail="Workflow changed after this proposal"
-            ) from e
-    except Exception:
-        with contextlib.suppress(Exception):
-            # A failed release must not replace the refusal the caller needs to see.
-            await app.DATABASE.workflow_params.release_workflow_copilot_candidate_claim(
-                organization_id=organization.organization_id,
-                workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
-                expected_owner_turn_id=claim.owner_turn_id,
-                expected_revision=claim.revision,
-                expected_claimed_at=claim.claimed_at,
-                disposition=original_disposition,
-                # A tokenless proposal the workflow moved past keeps its minted token, whose empty fingerprint
-                # hides it, so a second Accept cannot claim against the newer save and write over it.
-                restore_untokened=metadata is None and not workflow_changed,
-            )
-        raise
-
-    # Best-effort: a 500 here would invite a retry that creates a duplicate version. The version has
-    # landed, so a second attempt records the acceptance rather than re-offering the proposal.
-    for attempt in range(2):
-        try:
-            await app.DATABASE.workflow_params.clear_workflow_copilot_candidate(
-                organization_id=organization.organization_id,
-                workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
-                expected_owner_turn_id=claim.owner_turn_id,
-                expected_revision=claim.revision,
-                expected_disposition="accepting",
-                expected_claimed_at=claim.claimed_at,
-                auto_accept=apply_request.auto_accept,
-                # A server-minted legacy claim is not a receipt unless the client can match it to a turn.
-                record_acceptance=metadata is not None or bool(apply_request.owner_turn_id),
-            )
-            break
-        except Exception as e:
-            LOG.warning(
-                "Failed to clear copilot proposal after applying it; new workflow version was created",
-                workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
-                new_workflow_id=new_workflow.workflow_id,
-                attempt=attempt + 1,
-                exc_info=True,
-            )
-            if isinstance(e, CopilotProposalConflictError):
-                # The claim moved to another holder; a second attempt cannot match it.
-                break
-
-    LOG.info(
-        "Copilot proposal accepted",
-        organization_id=organization.organization_id,
-        workflow_permanent_id=chat.workflow_permanent_id,
-        workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+    new_workflow, changed_fields = await accept_copilot_proposal(
+        organization,
+        chat,
+        owner_turn_id=apply_request.owner_turn_id,
+        revision=apply_request.revision,
+        auto_accept=apply_request.auto_accept,
     )
     if changed_fields:
         await app.AGENT_FUNCTION.record_audit_event(
@@ -5827,6 +5991,7 @@ def _served_turn_outcome(outcome: TurnOutcome | None) -> TurnOutcome | None:
     return outcome.model_copy(update={"interrupted_row_final": True})
 
 
+@base_router.post("/workflow/suggest-goal", include_in_schema=False)
 @base_router.post("/workflow/copilot/suggest-goal", include_in_schema=False)
 async def workflow_copilot_suggest_goal(
     suggestion_request: WorkflowCopilotGoalSuggestionRequest,
@@ -5854,6 +6019,7 @@ async def workflow_copilot_suggest_goal(
     return WorkflowCopilotGoalSuggestionResponse(goal=goal)
 
 
+@base_router.post("/workflow/convert-yaml-to-blocks", include_in_schema=False)
 @base_router.post("/workflow/copilot/convert-yaml-to-blocks", include_in_schema=False)
 async def workflow_copilot_convert_yaml_to_blocks(
     request: WorkflowYAMLConversionRequest,
@@ -5868,7 +6034,7 @@ async def workflow_copilot_convert_yaml_to_blocks(
         parsed_yaml = safe_load_no_dates(request.workflow_definition_yaml)
         workflow_definition_yaml = WorkflowDefinitionYAML.model_validate(parsed_yaml)
 
-        _repair_next_block_label_chain(workflow_definition_yaml.blocks, list_ordered=_runs_in_list_order(parsed_yaml))
+        _repair_next_block_label_chain(workflow_definition_yaml.blocks, list_ordered=runs_in_list_order(parsed_yaml))
 
         workflow_definition = convert_workflow_definition(
             workflow_definition_yaml=workflow_definition_yaml,

@@ -26,7 +26,7 @@ from skyvern.forge.sdk.copilot.context import (
     sanitize_global_llm_context_for_prompt,
 )
 from skyvern.forge.sdk.copilot.page_identity import page_location_fingerprint
-from skyvern.forge.sdk.copilot.secret_redaction import (
+from skyvern.utils.raw_secret_redaction import (
     redact_raw_secrets_for_structured_prompt,
     redact_raw_secrets_in_object,
 )

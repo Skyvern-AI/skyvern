@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
 import * as toastModule from "@/components/ui/use-toast";
+import { useWorkflowHistoryAccessStore } from "@/store/WorkflowHistoryAccessStore";
 
 import { isWorkflowBlockNode, type AppNode } from "../nodes";
 import {
@@ -13,9 +14,10 @@ import type { DocGraph } from "./docGraphEdits";
 import { buildDocTree } from "./buildDocTree";
 import { useLocateBlockStore } from "../runValidation/useLocateBlockStore";
 import { block, code, conditional, forLoop, settings } from "./docTestBlocks";
-import { docStepProblems } from "./docProblems";
-import { useCopilotActionStore } from "@/store/useCopilotActionStore";
+import { docStepProblems, loopSchemaStepId } from "./docProblems";
+import { useEmberActionStore } from "@/store/useEmberActionStore";
 import { useDocUnfinishedStore } from "./docUnfinished";
+import { newDocImageHandle } from "./docImageHandles";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 
 afterEach(() => vi.restoreAllMocks());
@@ -63,6 +65,41 @@ describe("doc edit api", () => {
         description: expect.stringContaining('"use"'),
       }),
     );
+  });
+
+  test("a rename from the title rewrites references like any rename but shows no toast", () => {
+    const graph = getElements(
+      [code("read", "use"), code("use", null, { code: "{{ read_output }}" })],
+      settings(),
+      true,
+    ) as DocGraph;
+    const read = graph.nodes.find((node) => node.data.label === "read")!;
+    const notification = vi
+      .spyOn(toastModule, "toast")
+      .mockReturnValue({ id: "test", dismiss: vi.fn(), update: vi.fn() });
+    let applied = graph;
+    const api = createDocEditApi({
+      ...graph,
+      edits: {
+        apply: (next) => {
+          applied = next;
+        },
+        update: () => {},
+        addStep: () => null,
+        duplicate: () => {},
+      },
+      finallyId: null,
+      workflowId: "wpid_test",
+      selectBranch: () => {},
+      selectedBranch: () => undefined,
+      inputKeys: [],
+      credentialKeys: new Set(),
+    });
+
+    expect(api.rename(read.id, "fetch", { fromTitle: true })).toBeNull();
+    const use = applied.nodes.find((node) => node.data.label === "use")!;
+    expect(JSON.stringify(use.data)).toContain("{{ fetch_output }}");
+    expect(notification).not.toHaveBeenCalled();
   });
 
   test("notes offer parameters but not block outputs, while prompts keep earlier outputs", () => {
@@ -345,7 +382,7 @@ describe("building from scratch in the doc", () => {
     ) as DocGraph;
     const loop = byLabel(graph, "books");
     expect(docStepProblems(graph.nodes).get(loop.id)).toEqual([
-      "Pick the list to go through with @",
+      "This loop has no list to go through. Type @ on its line and pick a list.",
     ]);
     const { api, latest } = editing(graph);
     api.setText(loop.id, "description", "For each book in {{ list_output }}");
@@ -356,8 +393,8 @@ describe("building from scratch in the doc", () => {
     expect(docStepProblems(latest().nodes).has(loop.id)).toBe(false);
   });
 
-  const extractionHint =
-    "Pick the list inside extraction_1_output, for example extraction_1_output.extracted_information.<field>, with <field> listed in extraction_1's data schema. Use extraction_1_output.extracted_information only if that data schema is an array.";
+  const noSchemaList =
+    "extraction_1 has no top-level list in its Data Schema, so the loop has nothing to go through. Add a list field at the top level of its Data Schema, then pick it here with @.";
   const loopAfter = (source: ReturnType<typeof block>, extra = {}) =>
     getElements(
       [
@@ -387,7 +424,6 @@ describe("building from scratch in the doc", () => {
     ["{{ extraction_1_output.extracted_information.titles }}", null, false],
     ["{{ extraction_1_output | map(attribute='x') }}", null, false],
     ["{{ book_list }}", null, false],
-    ["{{ extraction_1_output }}", { type: "array" }, true],
   ])(
     "a loop over %s (data schema %j) is flagged only when it goes through a whole result record",
     (reference, dataSchema, flagged) => {
@@ -396,15 +432,88 @@ describe("building from scratch in the doc", () => {
           loop_variable_reference: reference,
         }),
       );
-      if (flagged) expect(problems).toEqual([extractionHint]);
+      if (flagged) expect(problems).toEqual([noSchemaList]);
       else expect(problems).toBeUndefined();
     },
   );
 
-  const recordHint = (path: string) =>
-    path === "extracted_information.<field>"
-      ? "Pick the list inside task_1_output, for example task_1_output.extracted_information.<field>, with <field> listed in task_1's data schema. Use task_1_output.extracted_information only if that data schema is an array."
-      : `Pick the list inside task_1_output, for example task_1_output.${path}.`;
+  test("a loop over an extraction's whole result says what to pick, by what its Data Schema holds", () => {
+    const resultsSchema = {
+      type: "object",
+      properties: { results: { type: "array" } },
+    };
+    const over = (
+      dataSchema: unknown,
+      reference = "{{ extraction_1_output }}",
+    ) =>
+      loopAfter(extraction(dataSchema), { loop_variable_reference: reference });
+    const noSchema = over(null);
+    expect(loopProblems(noSchema)).toEqual([noSchemaList]);
+    expect(loopSchemaStepId(byLabel(noSchema, "books"), noSchema.nodes)).toBe(
+      byLabel(noSchema, "extraction_1").id,
+    );
+    const withList = over(resultsSchema);
+    expect(loopProblems(withList)).toEqual([
+      "extraction_1_output is the whole result of extraction_1, not a list. Pick one of its list fields with @.",
+    ]);
+    expect(loopSchemaStepId(byLabel(withList, "books"), withList.nodes)).toBe(
+      null,
+    );
+    expect(loopProblems(over({ type: "array" }))).toEqual([
+      "extraction_1_output is the whole result of extraction_1, not a list. Its Data Schema is a list, so use extraction_1_output.extracted_information.",
+    ]);
+    // The backend reads a nullable array schema as an array.
+    expect(
+      loopProblems(
+        over({ type: ["array", "null"], items: { type: "object" } }),
+      ),
+    ).toEqual([
+      "extraction_1_output is the whole result of extraction_1, not a list. Its Data Schema is a list, so use extraction_1_output.extracted_information.",
+    ]);
+    // A union takes its first non-null type, as the backend does: this one is an object.
+    expect(
+      loopProblems(
+        over({ ...resultsSchema, type: ["object", "array", "null"] }),
+      ),
+    ).toEqual([
+      "extraction_1_output is the whole result of extraction_1, not a list. Pick one of its list fields with @.",
+    ]);
+    const nested = over({
+      type: "object",
+      properties: {
+        page: { type: "object", properties: { books: { type: "array" } } },
+      },
+    });
+    // A list one level down is not offered by @, so the message says top-level.
+    expect(loopProblems(nested)).toEqual([noSchemaList]);
+    expect(
+      loopProblems(
+        over({ type: "object", properties: { items: { type: "array" } } }),
+      ),
+    ).toEqual([
+      `Rename the list field "items" in the earlier step's data schema. A loop can't go through a field with that name.`,
+    ]);
+    expect(loopProblems(over("{ not json"))).toEqual([
+      "extraction_1_output is the whole result of extraction_1, not a list. Pick one of its list fields with @.",
+    ]);
+    expect(
+      loopProblems(
+        over(
+          resultsSchema,
+          "{{ extraction_1_output.extracted_information.results }}",
+        ),
+      ),
+    ).toBeUndefined();
+  });
+
+  const recordHint = (blockType: string, path: string) =>
+    blockType === "task"
+      ? /^.+ has no top-level list in its Data Schema, so the loop has nothing to go through\./
+      : blockType === "navigation"
+        ? /^task_1_output is the whole result of .+, not a list, and this step's result usually holds no list\. Pick a list from an earlier extraction with @\.$/
+        : new RegExp(
+            `^task_1_output is the whole result of .+, not a list\\. Pick the list inside it, for example task_1_output\\.${path}\\.$`,
+          );
 
   test.each([
     ["task", {}, "extracted_information.<field>"],
@@ -427,7 +536,10 @@ describe("building from scratch in the doc", () => {
           loop_variable_reference: "{{ task_1_output }}",
         }),
       );
-      if (path) expect(problems).toEqual([recordHint(path)]);
+      if (path)
+        expect(problems).toEqual([
+          expect.stringMatching(recordHint(blockType, path)),
+        ]);
       else expect(problems).toBeUndefined();
     },
   );
@@ -450,7 +562,7 @@ describe("building from scratch in the doc", () => {
       true,
     ) as DocGraph;
     expect(loopProblems(graph)).toEqual([
-      "Pick the list inside titles_output_output, for example titles_output_output.extracted_information.<field>, with <field> listed in titles_output's data schema. Use titles_output_output.extracted_information only if that data schema is an array.",
+      "Titles output has no top-level list in its Data Schema, so the loop has nothing to go through. Add a list field at the top level of its Data Schema, then pick it here with @.",
     ]);
   });
 
@@ -502,7 +614,7 @@ describe("building from scratch in the doc", () => {
     expect(loopProblems(picked.latest())).toBeUndefined();
   });
 
-  test("an extraction without an array field offers no list, and its bare result still holds Run", () => {
+  test("an extraction without an array field offers no list, and its bare result still asks before Run", () => {
     const graph = loopAfter(
       extraction({
         type: "object",
@@ -513,7 +625,9 @@ describe("building from scratch in the doc", () => {
     expect(loopListItems(graph).map((item) => item.key)).toEqual([
       "extraction_1_output",
     ]);
-    expect(loopProblems(graph)).toEqual([extractionHint]);
+    expect(loopProblems(graph)).toEqual([
+      "extraction_1 has no top-level list in its Data Schema, so the loop has nothing to go through. Add a list field at the top level of its Data Schema, then pick it here with @.",
+    ]);
   });
 
   test("a Unicode list field is offered and saves its dotted path; a name with a space or a dash is not", () => {
@@ -549,7 +663,7 @@ describe("building from scratch in the doc", () => {
     expect(loopProblems(latest())).toBeUndefined();
   });
 
-  test("a list field named like a dict method or a keyword is not offered and holds Run when typed, and a note on the loop gets no list", () => {
+  test("a list field named like a dict method or a keyword is not offered and asks before Run when typed, and a note on the loop gets no list", () => {
     const schema = {
       type: "object",
       properties: {
@@ -691,16 +805,16 @@ describe("building from scratch in the doc", () => {
       (byLabel(latest(), "gen").data as Record<string, unknown>).prompt;
     api.setText(gen.id, "prompt", "first goal");
     expect(prompt()).toBe("first goal");
-    useCopilotActionStore.setState({ generatingBlockLabel: "gen" });
+    useEmberActionStore.setState({ generatingBlockLabel: "gen" });
     api.setText(gen.id, "prompt", "second goal");
     expect(prompt()).toBe("first goal");
-    useCopilotActionStore.setState({
+    useEmberActionStore.setState({
       generatingBlockLabel: null,
       queuedBuilds: [{ blockLabel: "gen" } as never],
     });
     api.setText(gen.id, "prompt", "third goal");
     expect(prompt()).toBe("first goal");
-    useCopilotActionStore.setState({ queuedBuilds: [] });
+    useEmberActionStore.setState({ queuedBuilds: [] });
     api.setText(gen.id, "prompt", "fourth goal");
     expect(prompt()).toBe("fourth goal");
   });
@@ -906,6 +1020,326 @@ describe("building from scratch in the doc", () => {
     const turned = latest().nodes.find((n) => n.id === step.id)!;
     expect(turned.type).toBe("extraction");
     expect(turned.data.label).toBe("extraction_1");
+  });
+
+  const shot = (file_id: string, placement: string) => ({
+    file_id,
+    caption: null,
+    placement,
+  });
+  const imagesOf = (graph: DocGraph, label: string) =>
+    (byLabel(graph, label).data as Record<string, unknown>).docImages ?? null;
+
+  test("turning a step into another type keeps its screenshots, and the save still sends them", () => {
+    const graph = getElements(
+      [
+        code("first", null, {
+          prompt: "Read the plan",
+          notes: "See the picture",
+          doc_images: [shot("file_a", "above"), shot("file_b", "block")],
+          prompt_images: [shot("file_p", "block")],
+        }),
+      ],
+      settings(),
+      true,
+    ) as DocGraph;
+    const step = byLabel(graph, "first");
+    const { api, latest } = editing(graph);
+    api.turnInto(step.id, "extraction");
+    const turned = latest().nodes.find((n) => n.id === step.id)!;
+    expect(turned.type).toBe("extraction");
+    expect(turned.data).toMatchObject({
+      docImages: [shot("file_a", "above"), shot("file_b", "block")],
+      promptImages: [shot("file_p", "block")],
+    });
+    const saved = getWorkflowBlocks(latest().nodes, latest().edges)[0]!;
+    expect(saved).toMatchObject({
+      doc_images: [shot("file_a", "above"), shot("file_b", "block")],
+      prompt_images: [shot("file_p", "block")],
+    });
+  });
+
+  test("Tab and Shift+Tab move a note's screenshots with its text", () => {
+    const graph = getElements(
+      [
+        forLoop("books", "after", [
+          code("inner", null, { doc_images: [shot("file_i", "block")] }),
+        ]),
+        code("after", null, {
+          notes: "Skip sold out books",
+          doc_images: [shot("file_a", "above"), shot("file_s", "block")],
+        }),
+      ],
+      settings(),
+      true,
+    ) as DocGraph;
+    const after = byLabel(graph, "after");
+    const inner = byLabel(graph, "inner");
+    const { api, latest } = editing(graph);
+    api.nestNote({ ownerNodeId: after.id, placement: "above" }, false);
+    expect(imagesOf(latest(), "inner")).toEqual([
+      shot("file_i", "block"),
+      shot("file_a", "trailing"),
+    ]);
+    expect(imagesOf(latest(), "after")).toEqual([shot("file_s", "block")]);
+
+    const back = editing(latest());
+    back.api.nestNote({ ownerNodeId: inner.id, placement: "trailing" }, true);
+    expect(imagesOf(back.latest(), "books")).toEqual([
+      shot("file_a", "trailing"),
+    ]);
+    expect(imagesOf(back.latest(), "inner")).toEqual([shot("file_i", "block")]);
+  });
+
+  test("Tab moves a note that holds only a screenshot", () => {
+    const graph = getElements(
+      [
+        forLoop("books", "after", [code("inner", null)]),
+        code("after", null, { doc_images: [shot("file_a", "above")] }),
+      ],
+      settings(),
+      true,
+    ) as DocGraph;
+    const after = byLabel(graph, "after");
+    const inner = byLabel(graph, "inner");
+    const { api, latest } = editing(graph);
+    expect(
+      api.nestNote({ ownerNodeId: after.id, placement: "above" }, false),
+    ).toEqual({ ownerNodeId: inner.id, placement: "trailing" });
+    expect(imagesOf(latest(), "inner")).toEqual([shot("file_a", "trailing")]);
+    expect(imagesOf(latest(), "after")).toBeNull();
+  });
+
+  test("Tab won't move screenshots past the step's limit, and moves nothing then", () => {
+    const ten = Array.from({ length: 10 }, (_, i) =>
+      shot(`file_${i}`, "block"),
+    );
+    const graph = getElements(
+      [
+        forLoop("books", "after", [code("inner", null, { doc_images: ten })]),
+        code("after", null, {
+          notes: "Skip sold out books",
+          doc_images: [shot("file_a", "above")],
+        }),
+      ],
+      settings(),
+      true,
+    ) as DocGraph;
+    const after = byLabel(graph, "after");
+    const notification = vi
+      .spyOn(toastModule, "toast")
+      .mockReturnValue({ id: "test", dismiss: vi.fn(), update: vi.fn() });
+    const { api, latest } = editing(graph);
+    expect(
+      api.nestNote({ ownerNodeId: after.id, placement: "above" }, false),
+    ).toBeNull();
+    expect(latest()).toBe(graph);
+    expect(notification).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: expect.stringContaining("up to 10 screenshots"),
+      }),
+    );
+  });
+
+  test("the step picked under an empty loop takes the note's screenshots, uploads included, under its text", () => {
+    const uploading = newDocImageHandle();
+    const graph = getElements(
+      [forLoop("books", null, [])],
+      settings(),
+      true,
+    ) as DocGraph;
+    const books = byLabel(graph, "books");
+    const { api, latest } = editingAdding({
+      ...graph,
+      nodes: graph.nodes.map((n) =>
+        n.id === books.id
+          ? ({
+              ...n,
+              data: {
+                ...n.data,
+                trailingNotes: "Open each book page",
+                docImages: [
+                  shot("file_a", "trailing"),
+                  shot(uploading, "trailing"),
+                ],
+              },
+            } as AppNode)
+          : n,
+      ),
+    });
+    const id = api.adoptNote(
+      { ownerNodeId: books.id, placement: "trailing" },
+      { parentId: books.id, conditionalBranchId: null },
+      "extraction",
+    );
+    const step = latest().nodes.find((n) => n.id === id)!;
+    expect((step.data as Record<string, unknown>).docImages).toEqual([
+      shot("file_a", "block"),
+      shot(uploading, "block"),
+    ]);
+    expect(imagesOf(latest(), "books")).toBeNull();
+  });
+
+  test("a note holding only an uploading screenshot gives it to the step picked under an empty loop", () => {
+    const uploading = newDocImageHandle();
+    const graph = getElements(
+      [forLoop("books", null, [])],
+      settings(),
+      true,
+    ) as DocGraph;
+    const books = byLabel(graph, "books");
+    const { api, latest } = editingAdding({
+      ...graph,
+      nodes: graph.nodes.map((n) =>
+        n.id === books.id
+          ? ({
+              ...n,
+              data: { ...n.data, docImages: [shot(uploading, "trailing")] },
+            } as AppNode)
+          : n,
+      ),
+    });
+    const id = api.adoptNote(
+      { ownerNodeId: books.id, placement: "trailing" },
+      { parentId: books.id, conditionalBranchId: null },
+      "extraction",
+    );
+    const step = latest().nodes.find((n) => n.id === id)!;
+    expect((step.data as Record<string, unknown>).docImages).toEqual([
+      shot(uploading, "block"),
+    ]);
+  });
+
+  test("a step that holds only screenshots, or only one still uploading, is not empty, so / won't replace it", () => {
+    const graph = getElements(
+      [
+        code("shots", null, { doc_images: [shot("file_a", "block")] }),
+        code("uploading", null, {
+          doc_images: [shot(newDocImageHandle(), "block")],
+        }),
+      ],
+      settings(),
+      true,
+    ) as DocGraph;
+    const { api } = editing(graph);
+    expect(api.isEmptyStep(byLabel(graph, "shots").id)).toBe(false);
+    expect(api.isEmptyStep(byLabel(graph, "uploading").id)).toBe(false);
+  });
+
+  test("a paste reserves all its screenshots in one undo step, and the reservations count toward the cap", async () => {
+    const eight = Array.from({ length: 8 }, (_, i) =>
+      shot(`file_${i}`, "block"),
+    );
+    const graph = getElements(
+      [code("shots", null, { doc_images: eight })],
+      settings(),
+      true,
+    ) as DocGraph;
+    const id = byLabel(graph, "shots").id;
+    const reserved = () => ({
+      file_id: newDocImageHandle(),
+      caption: null,
+      placement: "above" as const,
+    });
+    const captured = vi.fn();
+    useWorkflowHistoryAccessStore.setState({ captureImmediately: captured });
+    const { api, latest } = editing(graph);
+    const two = [reserved(), reserved()];
+    expect(await api.addImages(id, two)).toBe("added");
+    expect(captured).toHaveBeenCalledTimes(1);
+    expect(imagesOf(latest(), "shots")).toEqual([...eight, ...two]);
+
+    const full = editing(latest());
+    expect(full.api.imageCount(id)).toBe(10);
+    expect(await full.api.addImages(id, [reserved()])).toBe("full");
+    expect(full.latest()).toBe(latest());
+    useWorkflowHistoryAccessStore.getState().reset();
+  });
+
+  test("two adds read from the same render both pass its count; the second is refused by the latest graph", async () => {
+    const eight = Array.from({ length: 8 }, (_, i) =>
+      shot(`file_${i}`, "block"),
+    );
+    const graph = getElements(
+      [code("shots", null, { doc_images: eight })],
+      settings(),
+      true,
+    ) as DocGraph;
+    const id = byLabel(graph, "shots").id;
+    const reserved = () => ({
+      file_id: newDocImageHandle(),
+      caption: null,
+      placement: "above" as const,
+    });
+    const { api, latest } = editing(graph);
+    const first = api.addImages(id, [reserved(), reserved()]);
+    const second = api.addImages(id, [reserved()]);
+    expect(await first).toBe("added");
+    expect(await second).toBe("full");
+    expect(imagesOf(latest(), "shots")).toHaveLength(10);
+    useWorkflowHistoryAccessStore.getState().reset();
+  });
+
+  test("Tab onto a step at nine screenshots and one upload is refused by the cap", () => {
+    const nine = Array.from({ length: 9 }, (_, i) =>
+      shot(`file_${i}`, "block"),
+    );
+    const graph = getElements(
+      [
+        forLoop("books", "after", [
+          code("inner", null, {
+            doc_images: [...nine, shot(newDocImageHandle(), "trailing")],
+          }),
+        ]),
+        code("after", null, {
+          notes: "Skip sold out books",
+          doc_images: [shot("file_a", "above")],
+        }),
+      ],
+      settings(),
+      true,
+    ) as DocGraph;
+    vi.spyOn(toastModule, "toast").mockReturnValue({
+      id: "test",
+      dismiss: vi.fn(),
+      update: vi.fn(),
+    });
+    const { api, latest } = editing(graph);
+    expect(
+      api.nestNote(
+        { ownerNodeId: byLabel(graph, "after").id, placement: "above" },
+        false,
+      ),
+    ).toBeNull();
+    expect(latest()).toBe(graph);
+  });
+
+  test("plain text won't push the step it joins past 10 screenshots, and 10 exactly is fine", () => {
+    const many = (prefix: string, n: number) =>
+      Array.from({ length: n }, (_, i) => shot(`${prefix}_${i}`, "above"));
+    const graphWith = (moving: number) =>
+      getElements(
+        [
+          code("shots", "next", { doc_images: many("m", moving) }),
+          code("next", null, {
+            prompt: "Send it",
+            doc_images: many("n", 5),
+          }),
+        ],
+        settings(),
+        true,
+      ) as DocGraph;
+    vi.spyOn(toastModule, "toast").mockReturnValue({
+      id: "test",
+      dismiss: vi.fn(),
+      update: vi.fn(),
+    });
+    const over = editing(graphWith(6));
+    expect(over.api.toPlainText(byLabel(graphWith(6), "shots").id)).toBeNull();
+    const fits = graphWith(5);
+    const exact = editing(fits);
+    expect(exact.api.toPlainText(byLabel(fits, "shots").id)).not.toBeNull();
+    expect(imagesOf(exact.latest(), "next")).toHaveLength(10);
   });
 
   test("turning a step that something refers to keeps its name", () => {

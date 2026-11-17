@@ -47,7 +47,7 @@ class CredentialDeletionRefusal(BaseModel):
 
 
 def credential_delete_enabled() -> bool:
-    return settings.COPILOT_CREDENTIAL_DELETE_ENABLED
+    return settings.EMBER_CREDENTIAL_DELETE_ENABLED
 
 
 async def enforce_credential_delete_access(credential_id: str) -> None:

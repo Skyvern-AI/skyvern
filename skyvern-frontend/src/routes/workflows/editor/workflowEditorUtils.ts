@@ -105,7 +105,7 @@ import type {
   CodeEditedBlock,
   GoalSuggestion,
   PendingGoalChange,
-} from "@/store/useCopilotActionStore";
+} from "@/store/useEmberActionStore";
 import { dataExportNodeDefaultData } from "./nodes/DataExportNode/types";
 import { downloadNodeDefaultData } from "./nodes/DownloadNode/types";
 import {
@@ -237,6 +237,7 @@ import {
   transformStringFieldsInObject,
   type AffectedBlock,
 } from "./jinjaReferences";
+import { resolveDocImages } from "./doc/docImageHandles";
 import {
   findFinallyBlockNodeId,
   isBlockFinallyGated,
@@ -254,29 +255,41 @@ export function inferBranchCriteriaTypeFromExpression(
   return BranchCriteriaTypes.Prompt;
 }
 
+type DocFieldsData = Pick<
+  NodeBaseData,
+  "notes" | "trailingNotes" | "description" | "docImages" | "promptImages"
+>;
+
 // Loaded only when set, so a block without them (or with the server's null default)
 // saves exactly as it would without these fields.
-function docFieldsFromBlock(
-  block: WorkflowBlockDocFields,
-): Pick<NodeBaseData, "notes" | "trailingNotes" | "description"> {
+function docFieldsFromBlock(block: WorkflowBlockDocFields): DocFieldsData {
   return {
     ...(block.notes != null && { notes: block.notes }),
     ...(block.trailing_notes != null && {
       trailingNotes: block.trailing_notes,
     }),
     ...(block.description != null && { description: block.description }),
+    ...(block.doc_images != null && { docImages: block.doc_images }),
+    ...(block.prompt_images != null && { promptImages: block.prompt_images }),
   };
 }
 
-function docFieldsFromNodeData(
-  data: Pick<NodeBaseData, "notes" | "trailingNotes" | "description">,
-): WorkflowBlockDocFields {
+function docFieldsFromNodeData(data: DocFieldsData): WorkflowBlockDocFields {
+  // Screenshots still uploading leave the save; a step holding only those saves as if it held none.
+  const docImages = data.docImages?.length
+    ? resolveDocImages(data.docImages)
+    : data.docImages;
   return {
     ...(data.notes != null && { notes: data.notes }),
     ...(data.trailingNotes != null && {
       trailing_notes: data.trailingNotes,
     }),
     ...(data.description != null && { description: data.description }),
+    ...(docImages != null &&
+      (docImages.length > 0 || !data.docImages?.length) && {
+        doc_images: docImages,
+      }),
+    ...(data.promptImages != null && { prompt_images: data.promptImages }),
   };
 }
 
@@ -1218,6 +1231,8 @@ function convertToNode(
           customSmtpPassword: block.custom_smtp_password ?? null,
           transport: block.transport ?? "smtp",
           credentialId: block.credential_id ?? "",
+          credentialSource: block.credential_source ?? "native",
+          connectionId: block.connection_id ?? "",
           cc: (block.cc ?? []).join(", "),
           bcc: (block.bcc ?? []).join(", "),
           replyToMessageId: block.reply_to_message_id ?? "",
@@ -2158,7 +2173,6 @@ function reconstructConditionalStructure(
           withWorkflowSettings: false,
           editable: true,
           label: "__start_block__",
-          showCode: false,
           parentNodeType: "conditional",
         },
         conditionalNode.id,
@@ -2191,6 +2205,7 @@ function reconstructConditionalStructure(
             conditionalLabel: block.label,
             conditionalNodeId: conditionalNode.id,
             conditionalMergeLabel: block.next_block_label ?? null,
+            loadedNextLabel: blocksByLabel.get(label)?.next_block_label ?? null,
           };
           targetNode.parentId = conditionalNode.id;
         }
@@ -2562,7 +2577,6 @@ function getElements(
       aiFallback: settings.aiFallback ?? true,
       maskSecrets: settings.maskSecrets,
       label: "__start_block__",
-      showCode: false,
       runSequentially: settings.runSequentially,
       sequentialKey: settings.sequentialKey,
       finallyBlockLabel: settings.finallyBlockLabel ?? null,
@@ -2609,7 +2623,6 @@ function getElements(
           withWorkflowSettings: false,
           editable,
           label: "__start_block__",
-          showCode: false,
         },
         block.id,
       ),
@@ -3328,12 +3341,119 @@ function serializeLoopNodeToYAML(
   };
 }
 
-function findNextBlockLabel(
+// A branch's last block in `visiting` has its inherited merge decided further
+// up the call stack, so it counts as having none. `decided` reuses a merge only
+// while none of the blocks it consulted is in `visiting`.
+type InheritedMergeWalk = {
+  visiting: Set<string>;
+  consulted: Set<string>;
+  decided: Map<string, { label: string | null; consulted: Set<string> }>;
+  index?: GraphIndex;
+};
+
+type GraphIndex = {
+  nodes: Array<AppNode>;
+  edges: Array<Edge>;
+  byId: Map<string, AppNode>;
+  byLabel: Map<string, AppNode>;
+  outgoing: Map<string, Array<Edge>>;
+  branchHeads: Map<string, string | null>;
+};
+
+function newInheritedMergeWalk(): InheritedMergeWalk {
+  return { visiting: new Set(), consulted: new Set(), decided: new Map() };
+}
+
+// The index keeps reach checks from rescanning nodes and edges at every step,
+// which would make saving a long chain of conditionals cubic.
+function graphIndex(
+  walk: InheritedMergeWalk,
+  nodes: Array<AppNode>,
+  edges: Array<Edge>,
+): GraphIndex {
+  if (walk.index?.nodes === nodes && walk.index.edges === edges) {
+    return walk.index;
+  }
+  const byLabel = new Map<string, AppNode>();
+  for (const n of nodes) {
+    if (isWorkflowBlockNode(n) && !byLabel.has(n.data.label)) {
+      byLabel.set(n.data.label, n);
+    }
+  }
+  const outgoing = new Map<string, Array<Edge>>();
+  for (const e of edges) {
+    const list = outgoing.get(e.source);
+    if (list) {
+      list.push(e);
+    } else {
+      outgoing.set(e.source, [e]);
+    }
+  }
+  walk.index = {
+    nodes,
+    edges,
+    byId: new Map(nodes.map((n) => [n.id, n])),
+    byLabel,
+    outgoing,
+    branchHeads: new Map(),
+  };
+  return walk.index;
+}
+
+// Follows the links the backend follows when deciding to skip a merge link:
+// each block's next, including the merge a branch's last block inherits, and a
+// conditional's branch heads but not its own next.
+function labelReachesNode(
+  startLabel: string,
   nodeId: string,
   nodes: Array<AppNode>,
   edges: Array<Edge>,
+  walk: InheritedMergeWalk,
+): boolean {
+  const index = graphIndex(walk, nodes, edges);
+  const seen = new Set<string>();
+  const pending: Array<string | null> = [startLabel];
+  while (pending.length > 0) {
+    const label = pending.pop();
+    const node = label == null ? undefined : index.byLabel.get(label);
+    if (!node || seen.has(node.id)) {
+      continue;
+    }
+    if (node.id === nodeId) {
+      return true;
+    }
+    seen.add(node.id);
+    if (node.type === "conditional") {
+      for (const branch of (node as ConditionalNode).data.branches) {
+        const key = `${node.id}\u0000${branch.id}`;
+        if (!index.branchHeads.has(key)) {
+          index.branchHeads.set(
+            key,
+            getConditionalBranchNodeSequence(
+              node.id,
+              branch.id,
+              nodes,
+              edges,
+            )[0]?.data.label ?? null,
+          );
+        }
+        pending.push(index.branchHeads.get(key) ?? null);
+      }
+      continue;
+    }
+    pending.push(findNextBlockLabel(node.id, nodes, edges, walk));
+  }
+  return false;
+}
+
+export function findNextBlockLabel(
+  nodeId: string,
+  nodes: Array<AppNode>,
+  edges: Array<Edge>,
+  walk: InheritedMergeWalk = newInheritedMergeWalk(),
 ): string | null {
-  const currentNode = nodes.find((n) => n.id === nodeId);
+  const index = graphIndex(walk, nodes, edges);
+  const currentNode = index.byId.get(nodeId);
 
   // Helper: get conditional node's merge label
   const getConditionalMergeLabel = (): string | null => {
@@ -3355,23 +3475,60 @@ function findNextBlockLabel(
     if (!conditionalNodeId) {
       return null;
     }
-
-    // Find the conditional node itself
-    const conditionalNode = nodes.find((n) => n.id === conditionalNodeId);
-    if (!conditionalNode || !isWorkflowBlockNode(conditionalNode)) {
+    walk.consulted.add(nodeId);
+    if (walk.visiting.has(nodeId)) {
       return null;
     }
+    const cached = walk.decided.get(nodeId);
+    if (cached && ![...cached.consulted].some((id) => walk.visiting.has(id))) {
+      cached.consulted.forEach((id) => walk.consulted.add(id));
+      return cached.label;
+    }
 
-    // Use the conditional node's next_block_label (computed from edges)
-    return findNextBlockLabel(conditionalNodeId, nodes, edges);
+    // A merge point that already reaches this block would close a loop, so
+    // fall back to the merge of the conditional enclosing that one.
+    const outerConsulted = walk.consulted;
+    walk.consulted = new Set();
+    let label: string | null = null;
+    let enclosingId: string | null | undefined = conditionalNodeId;
+    while (enclosingId) {
+      const conditionalNode = index.byId.get(enclosingId);
+      if (!conditionalNode || !isWorkflowBlockNode(conditionalNode)) {
+        break;
+      }
+      const mergeLabel = findNextBlockLabel(enclosingId, nodes, edges, walk);
+      if (!mergeLabel) {
+        break;
+      }
+      // The backend never skips an explicit next, so an authored link to this merge stays even if it loops.
+      if (mergeLabel === currentNode.data.loadedNextLabel) {
+        label = mergeLabel;
+        break;
+      }
+      walk.visiting.add(nodeId);
+      const reaches = labelReachesNode(mergeLabel, nodeId, nodes, edges, walk);
+      walk.visiting.delete(nodeId);
+      if (!reaches) {
+        label = mergeLabel;
+        break;
+      }
+      enclosingId = conditionalNode.data.conditionalNodeId;
+    }
+    const consulted = walk.consulted;
+    walk.consulted = outerConsulted;
+    consulted.forEach((id) => outerConsulted.add(id));
+    if (![...consulted].some((id) => walk.visiting.has(id))) {
+      walk.decided.set(nodeId, { label, consulted });
+    }
+    return label;
   };
 
   // Find the outgoing edge from this node. Synthetic edges are display-only
   // (see the finally-block chaining in getElements) and must never become a
   // real next_block_label.
-  const outgoingEdge = edges.find(
-    (edge) => edge.source === nodeId && !isSyntheticEdge(edge),
-  );
+  const outgoingEdge = index.outgoing
+    .get(nodeId)
+    ?.find((edge) => !isSyntheticEdge(edge));
 
   if (!outgoingEdge) {
     // No outgoing edge - check if this node is inside a conditional branch
@@ -3393,7 +3550,7 @@ function findNextBlockLabel(
     visited.add(currentTargetId);
     iterations++;
 
-    const targetNode = nodes.find((n) => n.id === currentTargetId);
+    const targetNode = index.byId.get(currentTargetId);
 
     if (!targetNode) {
       return null;
@@ -3406,7 +3563,7 @@ function findNextBlockLabel(
 
     // If it's a utility node (NodeAdder, Start), keep following edges
     if (targetNode.type === "nodeAdder" || targetNode.type === "start") {
-      const nextEdge = edges.find((edge) => edge.source === currentTargetId);
+      const nextEdge = index.outgoing.get(currentTargetId)?.[0];
       if (!nextEdge) {
         // Reached end of edges at a utility node
         // If the original node is inside a conditional branch, look up the conditional's merge point
@@ -3434,9 +3591,10 @@ function getWorkflowBlock(
   node: WorkflowBlockNode,
   nodes: Array<AppNode>,
   edges: Array<Edge>,
+  walk: InheritedMergeWalk,
 ): BlockYAML {
   // Compute next_block_label from edges/graph structure
-  const nextBlockLabel = findNextBlockLabel(node.id, nodes, edges);
+  const nextBlockLabel = findNextBlockLabel(node.id, nodes, edges, walk);
 
   const base = {
     label: node.data.label,
@@ -3742,6 +3900,12 @@ function getWorkflowBlock(
           block_type: "send_email",
           transport: "gmail",
           credential_id: node.data.credentialId || null,
+          ...(node.data.credentialSource === "nango"
+            ? {
+                credential_source: "nango",
+                connection_id: node.data.connectionId || null,
+              }
+            : {}),
           sender: "",
           recipients: splitEmailList(node.data.recipients),
           cc: splitEmailList(node.data.cc),
@@ -3752,7 +3916,10 @@ function getWorkflowBlock(
           file_attachments: splitEmailList(node.data.fileAttachments).filter(
             (attachment) => attachment !== SKYVERN_DOWNLOAD_DIRECTORY,
           ),
-          reply_to_message_id: node.data.replyToMessageId || null,
+          ...(node.data.replyToMessageId &&
+            node.data.credentialSource !== "nango" && {
+              reply_to_message_id: node.data.replyToMessageId,
+            }),
         };
       }
       return {
@@ -4011,7 +4178,11 @@ function getWorkflowBlock(
         max_results: node.data.maxResults,
         include_body: node.data.includeBody,
         download_attachments: node.data.downloadAttachments,
-        message_id: node.data.messageId || null,
+        ...(node.data.messageId &&
+          node.data.emailClient === "gmail" &&
+          node.data.credentialSource !== "nango" && {
+            message_id: node.data.messageId,
+          }),
         parameter_keys: node.data.parameterKeys,
       };
     }
@@ -4095,6 +4266,7 @@ function getOrderedChildrenBlocks(
   nodes: Array<AppNode>,
   edges: Array<Edge>,
   parentId: string,
+  walk: InheritedMergeWalk = newInheritedMergeWalk(),
 ): Array<BlockYAML> {
   const nodesById = new Map(nodes.map((n) => [n.id, n]));
   const includedIds = new Set<string>();
@@ -4148,12 +4320,12 @@ function getOrderedChildrenBlocks(
       children.push(
         serializeLoopNodeToYAML(
           node as LoopNode,
-          getOrderedChildrenBlocks(nodes, edges, node.id),
-          findNextBlockLabel(node.id, nodes, edges),
+          getOrderedChildrenBlocks(nodes, edges, node.id, walk),
+          findNextBlockLabel(node.id, nodes, edges, walk),
         ),
       );
     } else {
-      children.push(getWorkflowBlock(node, nodes, edges));
+      children.push(getWorkflowBlock(node, nodes, edges, walk));
     }
   };
   let currentNode: WorkflowBlockNode | undefined = firstChild;
@@ -4194,6 +4366,7 @@ function getWorkflowBlocksUtil(
   edges: Array<Edge>,
 ): Array<BlockYAML> {
   const nodesById = new Map(nodes.map((n) => [n.id, n]));
+  const walk = newInheritedMergeWalk();
 
   const isInsideLoop = (nodeId: string): boolean => {
     let current = nodesById.get(nodeId);
@@ -4209,15 +4382,15 @@ function getWorkflowBlocksUtil(
 
   const emit = (node: AppNode): BlockYAML | null => {
     if (node.type === "loop") {
-      const nextBlockLabel = findNextBlockLabel(node.id, nodes, edges);
+      const nextBlockLabel = findNextBlockLabel(node.id, nodes, edges, walk);
       return serializeLoopNodeToYAML(
         node as LoopNode,
-        getOrderedChildrenBlocks(nodes, edges, node.id),
+        getOrderedChildrenBlocks(nodes, edges, node.id, walk),
         nextBlockLabel,
       );
     }
     if (isWorkflowBlockNode(node)) {
-      return getWorkflowBlock(node as WorkflowBlockNode, nodes, edges);
+      return getWorkflowBlock(node as WorkflowBlockNode, nodes, edges, walk);
     }
     return null;
   };
@@ -4306,7 +4479,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
     maxElapsedTimeMinutes: null,
     extraHttpHeaders: null,
     cdpConnectHeaders: null,
-    runWith: "code",
+    runWith: "agent",
     codeVersion: 2,
     scriptCacheKey: null,
     aiFallback: true,
@@ -4606,6 +4779,9 @@ function getUpdatedNodesAfterLabelUpdateForParameterKeys(
               ? newLabel
               : node.data.inferredMergeLabel,
         }),
+        ...(node.data.loadedNextLabel === oldLabel && {
+          loadedNextLabel: newLabel,
+        }),
         // Update the label for the node being renamed
         label: node.id === id ? newLabel : node.data.label,
       },
@@ -4739,6 +4915,12 @@ function getAvailableOutputParameterKeys(
 // well as a Drive URL, and lowercases the host before comparing it. A templated URL can
 // still resolve to a Drive link at run time, so treat it as a maybe.
 const bareDriveFileId = /^[A-Za-z0-9_-]+$/;
+// Publish-to-web Doc links (/document/d/e/<public-id>) are not Drive file ids.
+const driveFilePathByHost: Record<string, RegExp> = {
+  "drive.google.com": /^\/file\/(?:u\/\d+\/)?d\/[A-Za-z0-9_-]+(?:\/|$)/,
+  "docs.google.com":
+    /^\/document\/(?:u\/\d+\/)?d\/(?!e(?:\/|$))[A-Za-z0-9_-]+(?:\/|$)/,
+};
 
 function urlMayBeGoogleDrive(url: string): boolean {
   const candidate = url.trim();
@@ -4750,8 +4932,7 @@ function urlMayBeGoogleDrive(url: string): boolean {
     const parsed = new URL(candidate);
     return (
       parsed.protocol === "https:" &&
-      parsed.hostname === "drive.google.com" &&
-      parsed.pathname.startsWith("/file/d/")
+      (driveFilePathByHost[parsed.hostname]?.test(parsed.pathname) ?? false)
     );
   } catch {
     return false;
@@ -4785,7 +4966,8 @@ function leavesBrowserState(node: AppNode, nodes: Array<AppNode>): boolean {
     case "navigation":
       return node.data.engine !== RunEngine.SkyvernV2;
     case "loop":
-      // A container itself navigates nothing; its children do.
+      // A container itself navigates nothing; its children do. A loop that runs zero times opens nothing
+      // either; counting it anyway is a deliberate approximation that can only hide this warning.
       return nodes.some(
         (child) =>
           child.parentId === node.id && leavesBrowserState(child, nodes),
@@ -4822,15 +5004,8 @@ function isFirstBrowserTaskBlock(
   });
 }
 
-// A run starts on about:blank, so the backend fails a first page-opening block that has no
-// URL (MissingStarterUrl).
-function isMissingRequiredStartUrl(
-  nodes: Array<AppNode>,
-  edges: Array<Edge>,
-  id: string,
-): boolean {
-  const node = nodes.find((node) => node.id === id);
-  if (!node) return false;
+// A page-opening block with an empty URL field starts on whatever page the run has open.
+function opensPageWithoutUrl(node: AppNode, nodes: Array<AppNode>): boolean {
   switch (node.type) {
     case "task":
     case "navigation":
@@ -4839,14 +5014,86 @@ function isMissingRequiredStartUrl(
     case "login":
     case "url":
     case "fileDownload":
-      return (
-        node.data.url.trim() === "" &&
-        leavesBrowserState(node, nodes) &&
-        isFirstBrowserTaskBlock(nodes, edges, id)
-      );
+      return node.data.url.trim() === "" && leavesBrowserState(node, nodes);
     default:
       return false;
   }
+}
+
+// A run starts on about:blank, so the backend fails a first page-opening block that has no
+// URL (MissingStarterUrl).
+function isMissingRequiredStartUrl(
+  nodes: Array<AppNode>,
+  edges: Array<Edge>,
+  id: string,
+): boolean {
+  const node = nodes.find((node) => node.id === id);
+  return (
+    node !== undefined &&
+    opensPageWithoutUrl(node, nodes) &&
+    isFirstBrowserTaskBlock(nodes, edges, id)
+  );
+}
+
+/** The ids `isMissingRequiredStartUrl` holds for, found in one pass over the graph. */
+function startUrlRequiredIds(
+  nodes: Array<AppNode>,
+  edges: Array<Edge>,
+): Set<string> {
+  const byId = new Map(nodes.map((node) => [node.id, node]));
+  // `getPreviousNodeIds` follows the first edge into each node.
+  const sourceOf = new Map<string, string>();
+  for (const edge of edges)
+    if (!sourceOf.has(edge.target)) sourceOf.set(edge.target, edge.source);
+  const leaves = new Map<string, boolean>();
+  const leavesById = (id: string) => {
+    let value = leaves.get(id);
+    if (value === undefined) {
+      const node = byId.get(id);
+      value = node !== undefined && leavesBrowserState(node, nodes);
+      leaves.set(id, value);
+    }
+    return value;
+  };
+  // Whether a page is open before `id` runs: its predecessors, then its container's. Walked with an explicit stack, as
+  // a chain of thousands of steps would overflow a recursive walk.
+  const opened = new Map<string, boolean>();
+  const visiting = new Set<string>();
+  const openedBefore = (first: string): boolean => {
+    const stack = [first];
+    while (stack.length) {
+      const id = stack[stack.length - 1]!;
+      const source = sourceOf.get(id);
+      const parentId = byId.get(id)?.parentId;
+      if (visiting.has(id)) {
+        visiting.delete(id);
+        opened.set(
+          id,
+          (source !== undefined &&
+            (leavesById(source) || opened.get(source) === true)) ||
+            (parentId !== undefined && opened.get(parentId) === true),
+        );
+        stack.pop();
+      } else if (opened.has(id)) {
+        stack.pop();
+      } else {
+        // A cycle is an invalid graph (it would loop forever in `getPreviousNodeIds`). This provisional false is
+        // memoized for the nodes visited mid-cycle, so there the result can depend on iteration order.
+        opened.set(id, false);
+        visiting.add(id);
+        if (parentId !== undefined && !opened.has(parentId))
+          stack.push(parentId);
+        if (source !== undefined && !leavesById(source) && !opened.has(source))
+          stack.push(source);
+      }
+    }
+    return opened.get(first) === true;
+  };
+  const ids = new Set<string>();
+  for (const node of nodes)
+    if (opensPageWithoutUrl(node, nodes) && !openedBefore(node.id))
+      ids.add(node.id);
+  return ids;
 }
 
 function convertParametersToParameterYAML(
@@ -5470,6 +5717,12 @@ function convertBlocksToBlockYAML(
             ? {
                 transport: block.transport,
                 credential_id: block.credential_id ?? null,
+                ...(block.credential_source === "nango"
+                  ? {
+                      credential_source: block.credential_source,
+                      connection_id: block.connection_id ?? null,
+                    }
+                  : {}),
                 cc: block.cc ?? [],
                 bcc: block.bcc ?? [],
                 reply_to_message_id: block.reply_to_message_id ?? null,
@@ -6395,6 +6648,8 @@ export {
   getAvailableOutputParameterKeys,
   isFirstBrowserTaskBlock,
   isMissingRequiredStartUrl,
+  opensPageWithoutUrl,
+  startUrlRequiredIds,
   urlMayBeGoogleDrive,
   getBlockNameOfOutputParameterKey,
   getDefaultValueForParameterType,
@@ -6455,18 +6710,18 @@ function workflowGraphContent(items: AppNode[], connections: Edge[]) {
   }
 }
 
-// Marker class for the copilot's gold-ring block-highlight flash. Kept off
+// Marker class for the Ember's gold-ring block-highlight flash. Kept off
 // React Flow's `.selected` so a normal editor node click (which sets
 // `selected` to open the sidebar) doesn't trigger the flash. Must match the
 // selector in reactFlowOverrideStyles.css.
-const COPILOT_BLOCK_HIGHLIGHT_CLASS = "sk-copilot-block-highlight";
-const COPILOT_BLOCK_HIGHLIGHT_MS = 1500;
+const EMBER_BLOCK_HIGHLIGHT_CLASS = "sk-ember-block-highlight";
+const EMBER_BLOCK_HIGHLIGHT_MS = 1500;
 
 function setBlockHighlightClass(node: AppNode, on: boolean): AppNode {
   const tokens = (node.className ?? "")
     .split(/\s+/)
-    .filter((token) => token && token !== COPILOT_BLOCK_HIGHLIGHT_CLASS);
-  if (on) tokens.push(COPILOT_BLOCK_HIGHLIGHT_CLASS);
+    .filter((token) => token && token !== EMBER_BLOCK_HIGHLIGHT_CLASS);
+  if (on) tokens.push(EMBER_BLOCK_HIGHLIGHT_CLASS);
   const next = tokens.join(" ") || undefined;
   if ((node.className ?? undefined) === next) return node;
   return { ...node, className: next };
@@ -6511,7 +6766,7 @@ export function useWorkflowGraphState(
       const workflowId =
         useWorkflowYamlEditorStore.getState().editorOwner?.workflowPermanentId;
       const trackedProposal = workflowId
-        ? useWorkflowTitleStore.getState().copilotMetadataEdits[workflowId]
+        ? useWorkflowTitleStore.getState().emberMetadataEdits[workflowId]
         : undefined;
       if (
         fromUser &&
@@ -6520,7 +6775,7 @@ export function useWorkflowGraphState(
         JSON.stringify(getWorkflowBlocks(previous, currentEdges.current)) !==
           JSON.stringify(getWorkflowBlocks(next, currentEdges.current))
       )
-        useWorkflowTitleStore.getState().recordCopilotGraphEdit();
+        useWorkflowTitleStore.getState().recordEmberGraphEdit();
       updateNodes(next);
     },
     [updateNodes],
@@ -6540,7 +6795,7 @@ export function useWorkflowGraphState(
       const workflowId =
         useWorkflowYamlEditorStore.getState().editorOwner?.workflowPermanentId;
       const trackedProposal = workflowId
-        ? useWorkflowTitleStore.getState().copilotMetadataEdits[workflowId]
+        ? useWorkflowTitleStore.getState().emberMetadataEdits[workflowId]
         : undefined;
       if (
         fromUser &&
@@ -6549,7 +6804,7 @@ export function useWorkflowGraphState(
         JSON.stringify(getWorkflowBlocks(currentNodes.current, previous)) !==
           JSON.stringify(getWorkflowBlocks(currentNodes.current, next))
       )
-        useWorkflowTitleStore.getState().recordCopilotGraphEdit();
+        useWorkflowTitleStore.getState().recordEmberGraphEdit();
       updateEdges(next);
     },
     [updateEdges],
@@ -6581,7 +6836,7 @@ export function useWorkflowGraphState(
     [setEdges, updateEdges],
   );
   // A highlight is presentation, not an edit, so it bypasses the edit lock a
-  // running Copilot turn holds.
+  // running Ember turn holds.
   const highlightBlock = useCallback(
     (blockLabel: string) => {
       const matches = (node: AppNode) =>
@@ -6597,7 +6852,7 @@ export function useWorkflowGraphState(
             matches(node) ? setBlockHighlightClass(node, false) : node,
           ),
         );
-      }, COPILOT_BLOCK_HIGHLIGHT_MS);
+      }, EMBER_BLOCK_HIGHLIGHT_MS);
     },
     [updateNodes],
   );

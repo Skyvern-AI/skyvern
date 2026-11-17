@@ -1,39 +1,43 @@
-export type StudioPaneId = "copilot" | "editor" | "browser" | "overview";
+export type StudioPaneId = "ember" | "editor" | "browser" | "overview";
 
 export const SYSTEM_RUN_FOCUS_PARAM = "wrs";
-export const COPILOT_RUN_FOCUS = "copilot";
+export const EMBER_RUN_FOCUS = "ember";
+// Both values mark an Ember-owned focus, whichever one a link was written with.
+const EMBER_RUN_FOCUS_MARKERS = new Set(["copilot", "ember"]);
 
-// While Copilot acts in a page between runs, SYSTEM_RUN_FOCUS_PARAM holds that
-// browser's session id in place of COPILOT_RUN_FOCUS.
-export function copilotBrowserFocusSessionId(
+// While Ember acts in a page between runs, SYSTEM_RUN_FOCUS_PARAM holds that
+// browser's session id in place of EMBER_RUN_FOCUS.
+export function emberBrowserFocusSessionId(
   params: URLSearchParams,
 ): string | null {
   const value = params.get(SYSTEM_RUN_FOCUS_PARAM);
-  return value && value !== COPILOT_RUN_FOCUS ? value : null;
+  return value && !EMBER_RUN_FOCUS_MARKERS.has(value) ? value : null;
 }
 
 export const STUDIO_PANE_IDS: readonly StudioPaneId[] = [
-  "copilot",
+  "ember",
   "editor",
   "browser",
   "overview",
 ];
 
 export const STUDIO_PANES_PARAM = "panes";
+export const STUDIO_CHAT_PARAM = "chat";
 
 // Accepted forever on parse so pre-rename ?panes= links keep working; the
-// canonical id ("overview") is what serializes back out.
+// canonical id is what serializes back out.
 const STUDIO_PANE_ID_ALIASES: Record<string, StudioPaneId> = {
   run: "overview",
   timeline: "overview",
+  copilot: "ember",
 };
 
 export const CREATE_STUDIO_PANES: readonly StudioPaneId[] = [
-  "copilot",
+  "ember",
   "browser",
 ];
 export const DEFAULT_STUDIO_PANES: readonly StudioPaneId[] = [
-  "copilot",
+  "ember",
   "editor",
 ];
 
@@ -45,11 +49,11 @@ export const RUN_APPEND_PANES: readonly StudioPaneId[] = [
   "browser",
 ];
 
-// Panes that mutate the workflow (Copilot builds, Editor saves), as opposed to
+// Panes that mutate the workflow (Ember builds, Editor saves), as opposed to
 // the ones that only watch a run. The top bar keys its authoring controls off
 // this, and it is also what a deleted agent blocks.
 export const WORKFLOW_AUTHORING_PANES: readonly StudioPaneId[] = [
-  "copilot",
+  "ember",
   "editor",
 ];
 
@@ -63,12 +67,12 @@ export function panesWithoutDeletedBlocked(
   return panes.filter((id) => !WORKFLOW_AUTHORING_PANES.includes(id));
 }
 
-// Copilot / Editor / Overview share one narrow floor; the browser viewport
+// Ember / Editor / Overview share one narrow floor; the browser viewport
 // keeps a little more room. The stage clamps shared links and nudges on
 // over-tight opens against these numbers (fitPanesToWidth below), and divider
 // resizes clamp against them too.
 export const STUDIO_PANE_MIN_WIDTH: Record<StudioPaneId, number> = {
-  copilot: 260,
+  ember: 260,
   editor: 260,
   browser: 300,
   overview: 260,
@@ -87,7 +91,7 @@ export const STUDIO_PANE_STRIP_WIDTH_PX = 36;
 const DOC_COLLAPSE_ORDER: readonly StudioPaneId[] = [
   "browser",
   "overview",
-  "copilot",
+  "ember",
 ];
 
 // Panes to collapse into strips so the Editor's Doc keeps STUDIO_DOC_MIN_WIDTH.
@@ -216,6 +220,7 @@ export function resolveOpenPanes(
     );
   const view = params.get("view");
   const requiredPane = view === "recording" ? "browser" : "overview";
+  // "code" is a removed view; its old links still open the Overview pane, which shows the timeline.
   const hasContentView =
     view !== null &&
     ["recording", "timeline", "outputs", "inputs", "code"].includes(view);
@@ -301,7 +306,7 @@ export function withPaneClosed(
   return panes.filter((p) => p !== id);
 }
 // Commas are legal unencoded in query values and parse back identically; keep
-// ?panes=copilot,browser readable no matter which writer serialized last.
+// ?panes=ember,browser readable no matter which writer serialized last.
 export function toReadableSearch(params: URLSearchParams): string {
   const raw = params.toString().replace(/%2C/g, ",");
   return raw ? `?${raw}` : "";
@@ -322,7 +327,7 @@ export function searchWithRunReference(
     return search;
   }
   params.set("wr", runId);
-  // This run came from outside the query, so it is the user's, not a copilot
+  // This run came from outside the query, so it is the user's, not an Ember
   // focus. Any marker left in the search belongs to a run that is gone —
   // keeping it would pin a genuine run view to the edit class.
   params.delete(SYSTEM_RUN_FOCUS_PARAM);

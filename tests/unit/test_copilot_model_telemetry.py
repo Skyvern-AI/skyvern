@@ -46,10 +46,12 @@ from skyvern.forge.sdk.copilot.cache_envelope import CacheableSystemInstructions
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.cost_telemetry import copilot_cost_scope, current_copilot_cost
 from skyvern.forge.sdk.copilot.enforcement import (
+    _TOOL_OUTPUT_TRUNCATION_SUFFIX,
     NUDGE_SENTINEL,
     SCREENSHOT_SENTINEL,
     CopilotTotalTimeoutError,
     _prune_input_list,
+    estimate_tokens,
 )
 from skyvern.forge.sdk.copilot.llm_errors import is_retriable_llm_error
 from skyvern.forge.sdk.copilot.mcp_adapter import _copilot_to_call_tool_result
@@ -68,9 +70,13 @@ from skyvern.forge.sdk.copilot.pending_operation import (
     pending_operation_fields,
 )
 from skyvern.forge.sdk.copilot.recoverable_failure import build_recoverable_failure
-from skyvern.forge.sdk.copilot.session_factory import copilot_session_input_callback
+from skyvern.forge.sdk.copilot.session_factory import (
+    copilot_session_input_callback,
+    make_copilot_call_model_input_filter,
+)
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
 from skyvern.schemas.llm import LLMConfig
+from tests.unit.copilot_test_helpers import make_model_input_data
 
 pytestmark = pytest.mark.usefixtures("gpt56_litellm_models")
 
@@ -1878,7 +1884,7 @@ async def test_anthropic_route_marks_stable_system_prefix_and_the_stable_anchor(
 )
 @pytest.mark.parametrize(
     ("mid_history", "anchor_call_id"),
-    [([_FRAME, _NUDGE], "call_1"), ([_NUDGE], "call_2")],
+    [([_FRAME, _NUDGE], "call_1"), ([_NUDGE], "call_4")],
     ids=["frame_then_nudge", "nudge"],
 )
 async def test_anthropic_rolling_marker_prefix_is_resent_unchanged_on_the_next_call(
@@ -1928,6 +1934,47 @@ async def test_anthropic_rolling_marker_prefix_is_resent_unchanged_on_the_next_c
     rolling = _marked_indices(provider_messages)[-1]
     assert requests[0]["messages"][: rolling + 1] == requests[1]["messages"][: rolling + 1]
     assert provider_messages[rolling]["tool_call_id"] == anchor_call_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_name", _SONNET_ROUTES)
+async def test_anthropic_over_budget_rolling_marker_sits_before_the_summary_window_and_resends_unchanged(
+    monkeypatch: pytest.MonkeyPatch, model_name: str
+) -> None:
+    def page_round(index: int, output: str) -> list[TResponseInputItem]:
+        return [
+            {"type": "function_call", "call_id": f"call_{index}", "name": "run_browser_code", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": f"call_{index}", "output": output},
+        ]
+
+    def json_round(index: int) -> list[TResponseInputItem]:
+        return page_round(index, json.dumps({"ok": True, "text": f"page {index} " * 400}))
+
+    history: list[TResponseInputItem] = [
+        {"role": "user", "content": "Build the workflow"},
+        *page_round(0, "Plain page text. " * 300),
+        *(item for index in range(1, 6) for item in json_round(index)),
+    ]
+    next_history = [*history, *json_round(6)]
+    model_input_filter = make_copilot_call_model_input_filter(token_budget=estimate_tokens(next_history) // 2)
+    requests = []
+    for turn in (history, next_history):
+        filtered = model_input_filter(make_model_input_data(turn)).input
+        assert filtered[2]["output"].endswith(_TOOL_OUTPUT_TRUNCATION_SUFFIX)
+        requests.append(
+            await _sent_request(
+                monkeypatch,
+                CopilotLitellmModel(model=model_name, next_model_call_index=lambda: 1),
+                filtered,
+                None,
+                system_instructions=_CACHED_PROMPT,
+            )
+        )
+
+    provider_messages = _provider_messages(model_name, requests[0])
+    rolling = _marked_indices(provider_messages)[-1]
+    assert provider_messages[rolling]["tool_call_id"] == "call_2"
+    assert requests[0]["messages"][: rolling + 1] == requests[1]["messages"][: rolling + 1]
 
 
 @pytest.mark.asyncio
@@ -2141,9 +2188,9 @@ _USER_BUILD: TResponseInputItem = {"role": "user", "content": "Build the workflo
 _GPT_TOOL_HISTORY: list[TResponseInputItem] = [
     _USER_BUILD,
     *_tool_round("call_0"),
-    *_LIST_OUTPUT_ROUND,
     *_tool_round("call_2"),
     *_tool_round("call_3"),
+    *_LIST_OUTPUT_ROUND,
     *_tool_round("call_4"),
 ]
 

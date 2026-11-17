@@ -27,6 +27,8 @@ export type SendEmailNodeData = NodeBaseData & {
   customSmtpPassword: string | null;
   transport: EmailTransport;
   credentialId: string;
+  credentialSource?: "native" | "nango";
+  connectionId?: string;
   cc: string;
   bcc: string;
   replyToMessageId: string;
@@ -50,6 +52,8 @@ export const sendEmailNodeDefaultData: SendEmailNodeData = {
   customSmtpPassword: null,
   transport: "smtp",
   credentialId: "",
+  credentialSource: "native",
+  connectionId: "",
   cc: "",
   bcc: "",
   replyToMessageId: "",

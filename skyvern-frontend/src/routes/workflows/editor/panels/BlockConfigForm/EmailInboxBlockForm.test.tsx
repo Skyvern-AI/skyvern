@@ -37,6 +37,10 @@ vi.mock("../../workflowEditorUtils", () => ({
   getAvailableOutputParameterKeys: () => [],
 }));
 
+vi.mock("@/components/WorkflowBlockInput", () => ({
+  WorkflowBlockInput: () => <input />,
+}));
+
 vi.mock("@/components/WorkflowBlockInputTextarea", () => ({
   WorkflowBlockInputTextarea: () => <textarea />,
 }));
@@ -158,6 +162,26 @@ describe("EmailInboxBlockForm", () => {
     });
   });
 
+  test("changing the Gmail account clears a message ID from the old mailbox", () => {
+    mockNodes.set("email-1", {
+      id: "email-1",
+      type: "emailInbox",
+      data: {
+        ...emailInboxNodeDefaultData,
+        credentialId: "native_old",
+        messageId: "{{ email.id }}",
+      },
+    });
+    render(<EmailInboxBlockForm blockId="email-1" />);
+
+    fireEvent.click(screen.getByTestId("gmail-template-change"));
+
+    expect(updateNodeData).toHaveBeenCalledWith(
+      "email-1",
+      expect.objectContaining({ messageId: "" }),
+    );
+  });
+
   test("switching to Nango clears the native credential through serialization", async () => {
     mockNodes.set("email-1", {
       id: "email-1",
@@ -217,7 +241,7 @@ describe("EmailInboxBlockForm", () => {
     });
   });
 
-  test("allows a saved unavailable Gmail account to switch to native without enabling attachments", async () => {
+  test("allows a saved unavailable Gmail account to switch to native", async () => {
     mockNodes.set("email-1", {
       id: "email-1",
       type: "emailInbox",
@@ -250,16 +274,13 @@ describe("EmailInboxBlockForm", () => {
       connection_id: null,
       credential_id: "{{ gmail_credential_id }}",
     });
-    expect(
-      (
-        screen.getByRole("switch", {
-          name: "Download Attachments",
-        }) as HTMLButtonElement
-      ).disabled,
-    ).toBe(true);
   });
 
-  test("enables attachment downloads from the block editor", () => {
+  test.each([
+    {},
+    { emailClient: "gmail", credentialSource: "nango", connectionId: "nc_x" },
+  ])("enables attachment downloads from the block editor: %o", (overrides) => {
+    Object.assign(mockNodes.get("email-1")!.data!, overrides);
     render(<EmailInboxBlockForm blockId="email-1" />);
 
     const toggle = screen.getByRole("switch", { name: "Download Attachments" });

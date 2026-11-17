@@ -15,10 +15,10 @@ import { useDeferredLockedEdit } from "@/hooks/useDeferredLockedEdit";
 import { TSON } from "@/util/tson";
 import { WorkflowScopeContext } from "@/routes/workflows/editor/WorkflowScopeContext";
 import {
-  beginCopilotAcceptance,
+  beginEmberAcceptance,
   beginSaveTransaction,
   createYamlCommitOwner,
-  finishCopilotAcceptance,
+  finishEmberAcceptance,
   finishSaveTransaction,
   useWorkflowYamlEditorStore,
 } from "@/store/WorkflowYamlEditorStore";
@@ -162,10 +162,10 @@ function lockEditor(kind: "save" | "copilot") {
   }
   let token: symbol | null = null;
   act(() => {
-    token = beginCopilotAcceptance();
+    token = beginEmberAcceptance();
   });
   expect(token).not.toBeNull();
-  return () => act(() => finishCopilotAcceptance(token!));
+  return () => act(() => finishEmberAcceptance(token!));
 }
 
 function openGenerationPrompt() {

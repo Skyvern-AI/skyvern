@@ -25,7 +25,7 @@ type SubmitBody = {
 
 /**
  * Thumbs for a finished run. The feedback route lives on base_router (/v1),
- * so requests go through the sans-api-v1 client like the copilot routes. Loads the saved rating so a reload shows the
+ * so requests go through the sans-api-v1 client like the Ember routes. Loads the saved rating so a reload shows the
  * user's earlier choice; every tap round-trips through POST /feedback.
  */
 function RunFeedback({

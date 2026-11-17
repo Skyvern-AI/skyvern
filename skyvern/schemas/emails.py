@@ -13,6 +13,46 @@ class EmailTransport(StrEnum):
     GMAIL = "gmail"
 
 
+class GmailHopRefusal(StrEnum):
+    """Why a run got no capability for a connected Gmail account, recorded per block when the run is prepared."""
+
+    reconnect = "reconnect"
+    run_not_supported = "run_not_supported"
+    account_unavailable = "account_unavailable"
+    resave_required = "resave_required"
+    owner_unconfirmed = "owner_unconfirmed"
+    copilot_test_run = "copilot_test_run"
+
+
+# Shared by the inbox and send blocks, which word the rest of their refusal differently.
+CONNECTED_ACCOUNT_RESAVE_REASON = (
+    "This Gmail account can be used only by whoever last saved this workflow. Have the person this run belongs to "
+    "open and save it — for a schedule, whoever last created or changed the schedule; for an event trigger, whoever "
+    "last changed its mapping or secret."
+)
+CONNECTED_ACCOUNT_OWNER_UNCONFIRMED_REASON = (
+    "This Gmail account was not used because Skyvern could not confirm the person this run acts for. That person "
+    "(who started the run, or last changed its schedule or trigger) must still be a member, and a Trigger block may pass "
+    "this workflow only its own inputs. If both hold, run it again."
+)
+
+# ponytail: the prefix only words the failure; authority still comes from the account lookup (ADR 0033).
+_CONNECTED_GMAIL_ID_PREFIX = "ngc_"
+CONNECTED_ACCOUNT_IN_CREDENTIAL_ID_REASON = (
+    "This block's credential_id holds a Connected Gmail account. Set credential_source to nango and put the "
+    "account in connection_id."
+)
+
+
+def is_connected_gmail_id(value: str | None) -> bool:
+    return bool(value) and str(value).startswith(_CONNECTED_GMAIL_ID_PREFIX)
+
+
+CONNECTED_ACCOUNT_COPILOT_TEST_RUN_REASON = (
+    "Copilot test runs can't use a Connected Gmail account. Save the workflow, then run it to use this account."
+)
+
+
 class GmailSendOutcome(StrEnum):
     ACCEPTED = "accepted"
     FAILED = "failed"
@@ -43,6 +83,8 @@ class EmailAttachment(BaseModel):
     is_inline: bool = Field(default=False, exclude=True)
     # Gmail stores small attachment bytes in body.data instead of issuing an attachmentId.
     embedded_data: str | None = Field(default=None, exclude=True, repr=False)
+    # Opaque proof, issued with the listing, that a connected-account download targets a listed attachment.
+    download_grant: str | None = Field(default=None, exclude=True, repr=False)
 
     @field_validator("name")
     @classmethod

@@ -17,12 +17,12 @@ from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.llm_config import resolve_raw_secret_safety_handler
 from skyvern.forge.sdk.copilot.request_policy import screen_raw_secret_safety
 from skyvern.forge.sdk.copilot.runtime import AgentContext, CopilotBrowserSessionUnavailable
-from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt, redact_secretlike_filename
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 from skyvern.forge.sdk.schemas.workflow_copilot import CopilotAttachedFile
 from skyvern.forge.sdk.utils.capped_subprocess import CappedSubprocessError
 from skyvern.forge.sdk.utils.pdf_parser import extract_docx_file, extract_pdf_file, scrambled_text_layer_reason
 from skyvern.services.uploaded_file_service import upload_extension
+from skyvern.utils.raw_secret_redaction import redact_raw_secrets_for_prompt, redact_secretlike_filename
 
 from ._shared import browser_is_lost, on_working_page
 

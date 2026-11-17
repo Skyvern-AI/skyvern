@@ -5,7 +5,6 @@ import structlog
 
 from skyvern.config import settings
 from skyvern.constants import DEFAULT_LOGIN_PROMPT
-from skyvern.forge.sdk.copilot.code_block_steps import derive_code_block_steps
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.id import (
     generate_aws_secret_parameter_id,
@@ -18,6 +17,7 @@ from skyvern.forge.sdk.db.id import (
     generate_output_parameter_id,
     generate_workflow_parameter_id,
 )
+from skyvern.forge.sdk.workflow.code_block_steps import derive_code_block_steps
 from skyvern.forge.sdk.workflow.exceptions import (
     ContextParameterSourceNotDefined,
     InvalidWaitBlockTime,
@@ -95,6 +95,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
 )
 from skyvern.schemas.emails import EmailTransport
 from skyvern.schemas.workflows import (
+    BLOCK_IMAGE_FIELDS,
     BLOCK_YAML_TYPES,
     BlockType,
     ForLoopBlockYAML,
@@ -434,7 +435,7 @@ def _build_block_kwargs(
         "model": block_yaml.model,
         "ignore_workflow_system_prompt": block_yaml.ignore_workflow_system_prompt,
     }
-    for field in ("notes", "trailing_notes", "description"):
+    for field in ("notes", "trailing_notes", "description", *BLOCK_IMAGE_FIELDS):
         if field in block_yaml.model_fields_set:
             kwargs[field] = getattr(block_yaml, field)
     return kwargs
@@ -705,8 +706,11 @@ def block_yaml_to_block(
             file_attachments=block_yaml.file_attachments or [],
             transport=block_yaml.transport,
             credential_id=block_yaml.credential_id,
+            credential_source=block_yaml.credential_source,
+            connection_id=block_yaml.connection_id,
             cc=block_yaml.cc,
             bcc=block_yaml.bcc,
+            reply_to_message_id=block_yaml.reply_to_message_id,
         )
     elif block_yaml.block_type == BlockType.FILE_URL_PARSER:
         return FileParserBlock(
@@ -1058,6 +1062,7 @@ def block_yaml_to_block(
             credential_source=block_yaml.credential_source,
             connection_id=block_yaml.connection_id,
             credential_id=block_yaml.credential_id,
+            message_id=block_yaml.message_id,
             folder=block_yaml.folder,
             prompt=block_yaml.prompt,
             sender=block_yaml.sender,

@@ -1,6 +1,6 @@
 """Serializable capture of the frontier planner, edit invalidation, and the terminal-ready latch.
 
-Enabled by ``COPILOT_DUMP_FRONTIER_PROVENANCE=<directory>``; see
+Enabled by ``EMBER_DUMP_FRONTIER_PROVENANCE=<directory>``; see
 ``dev_scripts/replay_frontier_provenance.py`` for the replayer that consumes these packets.
 
 Local development only. Packets carry unredacted workflow definitions and extracted block
@@ -27,7 +27,7 @@ LOG = structlog.get_logger()
 
 
 def frontier_dump_root() -> Path | None:
-    root = os.getenv("COPILOT_DUMP_FRONTIER_PROVENANCE")
+    root = os.getenv("EMBER_DUMP_FRONTIER_PROVENANCE") or os.getenv("COPILOT_DUMP_FRONTIER_PROVENANCE")
     return Path(root).expanduser() if root else None
 
 

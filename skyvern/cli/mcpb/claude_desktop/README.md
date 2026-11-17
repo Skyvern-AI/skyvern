@@ -16,5 +16,4 @@ To refresh the stable public download that syncs to the OSS repo:
   skyvern/cli/mcpb/releases/skyvern-claude-desktop.mcpb
 ```
 
-Cloud maintainers (skyvern-cloud repo only): the full release + security-audit +
-publish-chain runbook lives at `cloud_docs/mcp/CLAUDE_DESKTOP_BUNDLE_RELEASE.md`.
+Cloud maintainers: the release runbook is in the internal MCP docs.

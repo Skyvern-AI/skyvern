@@ -33,7 +33,13 @@ jobs:
           # Return to current commit
           git checkout -
 
-          if [ "$CURRENT_VERSION" != "$PREVIOUS_VERSION" ]; then
+          if [ "$CURRENT_VERSION" != "$PREVIOUS_VERSION" ] && git ls-remote --exit-code --tags origin "refs/tags/v$CURRENT_VERSION" > /dev/null; then
+            # A sync can move main back to an older version and later forward again; both land on a released tag.
+            echo "Version changed from $PREVIOUS_VERSION to $CURRENT_VERSION, but v$CURRENT_VERSION is already tagged; not a release"
+            echo "version_changed=false" >> $GITHUB_OUTPUT
+            echo "new_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+            echo "previous_version=$PREVIOUS_VERSION" >> $GITHUB_OUTPUT
+          elif [ "$CURRENT_VERSION" != "$PREVIOUS_VERSION" ]; then
             echo "Version changed from $PREVIOUS_VERSION to $CURRENT_VERSION"
             echo "version_changed=true" >> $GITHUB_OUTPUT
             echo "new_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT

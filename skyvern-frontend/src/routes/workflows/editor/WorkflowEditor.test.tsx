@@ -37,9 +37,9 @@ import { summarizeWorkflowChanges, snapshotOf } from "./workflowChangesSummary";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { ProxySelector } from "@/components/ProxySelector";
 import { TitleSection } from "../studio/StudioTopBar";
-import { useCopilotActionStore } from "@/store/useCopilotActionStore";
+import { useEmberActionStore } from "@/store/useEmberActionStore";
 import { useWorkflowSnapshotStore } from "@/store/WorkflowSnapshotStore";
-import type { WorkflowCopilotChatHistoryResponse } from "../copilot/workflowCopilotTypes";
+import type { EmberChatHistoryResponse } from "../ember/emberTypes";
 import { Status } from "@/api/types";
 import { toast } from "@/components/ui/use-toast";
 import {
@@ -48,7 +48,7 @@ import {
   useDeferredLockedEdit,
 } from "@/hooks/useDeferredLockedEdit";
 
-import { useCopilotProposalStore } from "@/store/CopilotProposalStore";
+import { useEmberProposalStore } from "@/store/EmberProposalStore";
 import * as workflowHasChangesModule from "@/store/WorkflowHasChangesStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import {
@@ -66,8 +66,8 @@ import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import {
   AUTHORING_SAVE_MESSAGE,
   commitYamlDraft,
-  beginCopilotAcceptance,
-  finishCopilotAcceptance,
+  beginEmberAcceptance,
+  finishEmberAcceptance,
   filterWorkflowChanges,
   beginSaveTransaction,
   beginYamlCommit,
@@ -76,7 +76,7 @@ import {
   finishYamlCommit,
   registerEditorOwner,
   useWorkflowYamlEditorStore,
-  withCopilotAcceptance,
+  withEmberAcceptance,
 } from "@/store/WorkflowYamlEditorStore";
 import type {
   CredentialParameter,
@@ -90,7 +90,7 @@ import * as flowRendererModule from "./FlowRenderer";
 import { apiWorkflowToSettings } from "./apiWorkflowToSettings";
 import { MAX_DIMENSION_LAYOUT_PASSES } from "./dimensionConvergence";
 import {
-  buildWorkflowCopilotContext,
+  buildEmberContext,
   buildWorkflowSaveRequest,
   buildWorkflowYamlDocument,
 } from "./workflowYamlDocument";
@@ -118,7 +118,7 @@ import type { AppNode } from "./nodes";
 import { codeBlockNodeDefaultData } from "./nodes/CodeBlockNode/types";
 import { BlockActionContext } from "@/store/BlockActionContext";
 import * as axiosClientModule from "@/api/AxiosClient";
-import * as copilotChatModule from "../copilot/WorkflowCopilotChat";
+import * as emberChatModule from "../ember/EmberChat";
 import * as comparisonPanelModule from "./panels/WorkflowComparisonPanel";
 import * as saveWorkflowModule from "./hooks/useSaveWorkflow";
 import { EditorOverflowMenu } from "./header/EditorOverflowMenu";
@@ -243,12 +243,6 @@ vi.mock("../hooks/useWorkflowRunWithWorkflowQuery", () => ({
 vi.mock("../hooks/useWorkflowRunsQuery", () => ({
   useWorkflowRunsQuery: () => runsQueryMock(),
 }));
-vi.mock("../hooks/useBlockScriptsQuery", () => ({
-  useBlockScriptsQuery: () => ({ data: undefined }),
-}));
-vi.mock("../hooks/useCacheKeyValuesQuery", () => ({
-  useCacheKeyValuesQuery: () => ({ data: undefined, isLoading: false }),
-}));
 vi.mock("../hooks/useDebugSessionQuery", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../hooks/useDebugSessionQuery")>()),
   useDebugSessionQuery: () => debugQueryMock(),
@@ -303,20 +297,13 @@ vi.mock("./WorkflowHeader", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./WorkflowHeader")>()),
   WorkflowHeader: () => null,
 }));
-vi.mock("../copilot/WorkflowCopilotChat", async (importOriginal) => {
-  const actual =
-    await importOriginal<typeof import("../copilot/WorkflowCopilotChat")>();
+vi.mock("../ember/EmberChat", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../ember/EmberChat")>();
   return {
     ...actual,
-    WorkflowCopilotChat: (
-      props: Parameters<typeof actual.WorkflowCopilotChat>[0],
-    ) =>
+    EmberChat: (props: Parameters<typeof actual.EmberChat>[0]) =>
       integration.chat ? (
-        <actual.WorkflowCopilotChat
-          {...props}
-          isOpen
-          requiresLiveBrowser={false}
-        />
+        <actual.EmberChat {...props} isOpen requiresLiveBrowser={false} />
       ) : null,
   };
 });
@@ -550,7 +537,7 @@ describe("WorkflowEditor deleted-agent run fallback", () => {
     expect(screen.getByTestId("run-view-body")).toBeTruthy();
     expect(screen.getByTestId("browser-tab-body")).toBeTruthy();
 
-    // Workflow-mutating surfaces degrade: legacy tag, no editor/copilot
+    // Workflow-mutating surfaces degrade: legacy tag, no editor/Ember
     // bodies, blocked toggles, no save/run actions.
     expect(screen.getByText(/Agent deleted on/)).toBeTruthy();
     expect(screen.queryByTestId("editor-tab-body")).toBeNull();
@@ -663,9 +650,9 @@ describe("Workspace deferred draft cleanup", () => {
     );
     useWorkflowTitleStore.setState(useWorkflowTitleStore.getInitialState());
     clearDeferredEdits();
-    copilotChatModule.canonicalRecoveriesByWorkflow.clear();
+    emberChatModule.canonicalRecoveriesByWorkflow.clear();
     const chat = vi
-      .spyOn(copilotChatModule, "WorkflowCopilotChat")
+      .spyOn(emberChatModule, "EmberChat")
       .mockImplementation(() => null);
     const workflowA = liveWorkflow as WorkflowApiResponse;
     const workflowB = {
@@ -750,7 +737,7 @@ describe("Workspace deferred draft cleanup", () => {
       other.client.clear();
       chat.mockRestore();
       clearDeferredEdits();
-      copilotChatModule.canonicalRecoveriesByWorkflow.clear();
+      emberChatModule.canonicalRecoveriesByWorkflow.clear();
       useWorkflowYamlEditorStore.setState(
         useWorkflowYamlEditorStore.getInitialState(),
       );
@@ -768,15 +755,16 @@ describe("Workspace deferred draft cleanup", () => {
         useWorkflowHasChangesStore.getInitialState(),
       );
       clearDeferredEdits();
-      copilotChatModule.canonicalRecoveriesByWorkflow.clear();
+      emberChatModule.canonicalRecoveriesByWorkflow.clear();
       const parkRecovery = (workflowPermanentId: string) => {
-        copilotChatModule.canonicalRecoveriesByWorkflow.set(
+        emberChatModule.canonicalRecoveriesByWorkflow.set(workflowPermanentId, {
           workflowPermanentId,
-          { workflowPermanentId, waitingForUnlock: false, yaml: null },
-        );
+          waitingForUnlock: false,
+          yaml: null,
+        });
       };
       const chat = vi
-        .spyOn(copilotChatModule, "WorkflowCopilotChat")
+        .spyOn(emberChatModule, "EmberChat")
         .mockImplementation(function RecoveryChat() {
           useLayoutEffect(() => {
             return () => {
@@ -802,7 +790,7 @@ describe("Workspace deferred draft cleanup", () => {
         if (recovery === "other") parkRecovery("wpid_other");
         if (recovery === "adopted") {
           act(() => {
-            beginCopilotAcceptance();
+            beginEmberAcceptance();
           });
         }
         if (recovery === "waiting") {
@@ -821,7 +809,7 @@ describe("Workspace deferred draft cleanup", () => {
         ).toBe(recovery !== "none" && recovery !== "other");
         if (recovery === "outgoing") {
           expect(
-            copilotChatModule.canonicalRecoveriesByWorkflow.has("wpid_live"),
+            emberChatModule.canonicalRecoveriesByWorkflow.has("wpid_live"),
           ).toBe(true);
         }
       } finally {
@@ -829,7 +817,7 @@ describe("Workspace deferred draft cleanup", () => {
         view.client.clear();
         chat.mockRestore();
         clearDeferredEdits();
-        copilotChatModule.canonicalRecoveriesByWorkflow.clear();
+        emberChatModule.canonicalRecoveriesByWorkflow.clear();
         useWorkflowYamlEditorStore.setState(
           useWorkflowYamlEditorStore.getInitialState(),
         );
@@ -1054,7 +1042,7 @@ describe("save failures stop navigation and block runs", () => {
     );
     workflowQueryMock.mockReturnValue({ data: liveWorkflow, isLoading: false });
     let reservation!: symbol;
-    if (lockFirst) reservation = beginCopilotAcceptance()!;
+    if (lockFirst) reservation = beginEmberAcceptance()!;
     let revealed = false;
     const initialized = vi
       .spyOn(xyflowModule, "useNodesInitialized")
@@ -1143,7 +1131,7 @@ describe("save failures stop navigation and block runs", () => {
       await settle();
     };
     const dispose = () => {
-      if (reservation) finishCopilotAcceptance(reservation);
+      if (reservation) finishEmberAcceptance(reservation);
       view.unmount();
       client.clear();
       initialized.mockRestore();
@@ -1153,7 +1141,7 @@ describe("save failures stop navigation and block runs", () => {
     const lock = async () => {
       await settle();
       act(() => {
-        reservation = beginCopilotAcceptance()!;
+        reservation = beginEmberAcceptance()!;
       });
     };
     return {
@@ -1169,7 +1157,7 @@ describe("save failures stop navigation and block runs", () => {
       dispose,
     };
   }
-  test("lays out a canvas revealed during a Copilot turn without unlocking edits or recording undo", async () => {
+  test("lays out a canvas revealed during an Ember turn without unlocking edits or recording undo", async () => {
     const canvas = renderLockedCanvas();
     try {
       await canvas.lock();
@@ -1210,7 +1198,7 @@ describe("save failures stop navigation and block runs", () => {
       );
       act(() => canvas.harness.targetBlock());
       expect(useWorkflowHasChangesStore.getState().internalUpdateCount).toBe(1);
-      act(() => finishCopilotAcceptance(canvas.reservation));
+      act(() => finishEmberAcceptance(canvas.reservation));
       expect(useWorkflowHasChangesStore.getState().internalUpdateCount).toBe(0);
       act(() =>
         canvas.harness.graph.onNodesChange([{ type: "remove", id: "node_2" }]),
@@ -1224,10 +1212,10 @@ describe("save failures stop navigation and block runs", () => {
       canvas.dispose();
     }
   });
-  test("an editor mounted after the Copilot lock is taken lays out the draft and refuses edits", async () => {
+  test("an editor mounted after the Ember lock is taken lays out the draft and refuses edits", async () => {
     const canvas = renderLockedCanvas(false, true);
     try {
-      expect(useWorkflowYamlEditorStore.getState().lockKind).toBe("copilot");
+      expect(useWorkflowYamlEditorStore.getState().lockKind).toBe("ember");
       expect(canvas.isPreLayout()).toBe(true);
       vi.mocked(toast).mockClear();
       await canvas.reveal();
@@ -1245,8 +1233,8 @@ describe("save failures stop navigation and block runs", () => {
           title: "Wait for the Copilot change to finish",
         }),
       );
-      expect(useWorkflowYamlEditorStore.getState().lockKind).toBe("copilot");
-      act(() => finishCopilotAcceptance(canvas.reservation));
+      expect(useWorkflowYamlEditorStore.getState().lockKind).toBe("ember");
+      act(() => finishEmberAcceptance(canvas.reservation));
       act(() =>
         canvas.harness.graph.onNodesChange([{ type: "remove", id: "node_2" }]),
       );
@@ -1266,11 +1254,9 @@ describe("save failures stop navigation and block runs", () => {
     );
     useWorkflowTitleStore.setState(useWorkflowTitleStore.getInitialState());
     workflowQueryMock.mockReturnValue({ data: liveWorkflow, isLoading: false });
-    let chat!: NonNullable<
-      Parameters<typeof copilotChatModule.WorkflowCopilotChat>[0]
-    >;
+    let chat!: NonNullable<Parameters<typeof emberChatModule.EmberChat>[0]>;
     const chatSpy = vi
-      .spyOn(copilotChatModule, "WorkflowCopilotChat")
+      .spyOn(emberChatModule, "EmberChat")
       .mockImplementation((props) => {
         chat = props!;
         return null;
@@ -1302,7 +1288,7 @@ describe("save failures stop navigation and block runs", () => {
       lock: async () => {
         await settle();
         act(() => {
-          reservation = beginCopilotAcceptance()!;
+          reservation = beginEmberAcceptance()!;
         });
       },
       reveal: () =>
@@ -1312,7 +1298,7 @@ describe("save failures stop navigation and block runs", () => {
         }),
       applyDraft: (blocks: unknown[]) =>
         act(() => {
-          withCopilotAcceptance(reservation, () =>
+          withEmberAcceptance(reservation, () =>
             chat.onWorkflowUpdate!(
               {
                 ...(liveWorkflow as WorkflowApiResponse),
@@ -1323,7 +1309,7 @@ describe("save failures stop navigation and block runs", () => {
           );
         }),
       dispose: () => {
-        if (reservation) finishCopilotAcceptance(reservation);
+        if (reservation) finishEmberAcceptance(reservation);
         view.unmount();
         view.client.clear();
         chatSpy.mockRestore();
@@ -1332,7 +1318,7 @@ describe("save failures stop navigation and block runs", () => {
       },
     };
   }
-  test("a mid-turn draft applied while a Copilot-locked layout settles is one undo step", async () => {
+  test("a mid-turn draft applied while an Ember-locked layout settles is one undo step", async () => {
     const workspace = renderLockedWorkspace();
     try {
       await workspace.lock();
@@ -1348,7 +1334,7 @@ describe("save failures stop navigation and block runs", () => {
         window.dispatchEvent(new Event("loop-header-resized"));
       });
       await workspace.settle();
-      act(() => finishCopilotAcceptance(workspace.reservation));
+      act(() => finishEmberAcceptance(workspace.reservation));
       expect(useWorkflowHistoryAccessStore.getState().canUndo).toBe(true);
       act(() => useWorkflowHistoryAccessStore.getState().undo());
       expect(workspace.nodeIds()).toEqual(before);
@@ -1357,17 +1343,17 @@ describe("save failures stop navigation and block runs", () => {
       workspace.dispose();
     }
   });
-  test("a metadata-only Copilot change in a locked layout's settle window leaves the layout out of undo", async () => {
+  test("a metadata-only Ember change in a locked layout's settle window leaves the layout out of undo", async () => {
     const workspace = renderLockedWorkspace();
     try {
       await workspace.lock();
       workspace.reveal();
       expect(useWorkflowHasChangesStore.getState().internalUpdateCount).toBe(1);
       act(() => {
-        withCopilotAcceptance(workspace.reservation, () => {
+        withEmberAcceptance(workspace.reservation, () => {
           useWorkflowTitleStore
             .getState()
-            .setTitleFromCopilotIfDefault("Renamed");
+            .setTitleFromEmberIfDefault("Renamed");
           useWorkflowHasChangesStore.getState().setHasChanges(true);
         });
       });
@@ -1381,12 +1367,12 @@ describe("save failures stop navigation and block runs", () => {
       workspace.dispose();
     }
   });
-  test("a Copilot draft committed with the canvas reveal is one undo step", async () => {
+  test("an Ember draft committed with the canvas reveal is one undo step", async () => {
     const canvas = renderLockedCanvas();
     try {
       await canvas.lock();
       await canvas.reveal(() =>
-        withCopilotAcceptance(canvas.reservation, () => {
+        withEmberAcceptance(canvas.reservation, () => {
           canvas.harness.graph.updateNodes((nodes) => [
             ...nodes,
             {
@@ -1401,7 +1387,7 @@ describe("save failures stop navigation and block runs", () => {
       );
       expect(canvas.isPreLayout()).toBe(false);
       expect(canvas.harness.history.canUndo).toBe(true);
-      act(() => finishCopilotAcceptance(canvas.reservation));
+      act(() => finishEmberAcceptance(canvas.reservation));
       act(() => canvas.harness.history.undo());
       expect(canvas.harness.graph.nodes.map((node) => node.id)).toEqual([
         "node_1",
@@ -1442,7 +1428,7 @@ describe("save failures stop navigation and block runs", () => {
     const ys = canvas.harness.graph.nodes.map((node) => node.position.y);
     expect(new Set(ys).size).toBe(ys.length);
   }
-  test("a dimension layout pending when the Copilot lock is taken still lands under the lock, once", async () => {
+  test("a dimension layout pending when the Ember lock is taken still lands under the lock, once", async () => {
     const canvas = renderLockedCanvas();
     let reservation: symbol | null = null;
     try {
@@ -1456,10 +1442,10 @@ describe("save failures stop navigation and block runs", () => {
       measure(canvas, ["draft_a", "draft_b", "draft_c"], 40);
       canvas.layout.mockClear();
       act(() => {
-        reservation = beginCopilotAcceptance();
+        reservation = beginEmberAcceptance();
       });
       await canvas.settle();
-      expect(useWorkflowYamlEditorStore.getState().lockKind).toBe("copilot");
+      expect(useWorkflowYamlEditorStore.getState().lockKind).toBe("ember");
       expectDraftLaidOut(canvas);
       expect(canvas.layout).toHaveBeenCalledOnce();
       act(() =>
@@ -1478,19 +1464,19 @@ describe("save failures stop navigation and block runs", () => {
         }),
       );
     } finally {
-      if (reservation) finishCopilotAcceptance(reservation);
+      if (reservation) finishEmberAcceptance(reservation);
       canvas.dispose();
     }
   });
   function replaceWithDraft(canvas: ReturnType<typeof renderLockedCanvas>) {
     act(() => {
-      withCopilotAcceptance(canvas.reservation, () => {
+      withEmberAcceptance(canvas.reservation, () => {
         canvas.harness.graph.updateNodes(draftNodes());
         canvas.harness.graph.updateEdges(draftEdges);
       });
     });
   }
-  test("a draft measured in the frame of a Copilot-locked layout is laid out once more", async () => {
+  test("a draft measured in the frame of an Ember-locked layout is laid out once more", async () => {
     const canvas = renderLockedCanvas();
     try {
       await canvas.lock();
@@ -1512,7 +1498,7 @@ describe("save failures stop navigation and block runs", () => {
       canvas.dispose();
     }
   });
-  test("a node that keeps resizing in each layout's frame stops relaying out under the Copilot lock", async () => {
+  test("a node that keeps resizing in each layout's frame stops relaying out under the Ember lock", async () => {
     const canvas = renderLockedCanvas();
     try {
       await canvas.lock();
@@ -1580,7 +1566,7 @@ describe("save failures stop navigation and block runs", () => {
       canvas.dispose();
     }
   });
-  test("a layout deferred by a save lands when the lock passes straight to Copilot", async () => {
+  test("a layout deferred by a save lands when the lock passes straight to Ember", async () => {
     const canvas = renderLockedCanvas();
     let reservation: symbol | null = null;
     try {
@@ -1598,18 +1584,18 @@ describe("save failures stop navigation and block runs", () => {
       expect(canvas.layout).not.toHaveBeenCalled();
       act(() => {
         finishSaveTransaction(owner);
-        reservation = beginCopilotAcceptance();
+        reservation = beginEmberAcceptance();
       });
       await canvas.settle();
-      expect(useWorkflowYamlEditorStore.getState().lockKind).toBe("copilot");
+      expect(useWorkflowYamlEditorStore.getState().lockKind).toBe("ember");
       expectDraftLaidOut(canvas);
       expect(canvas.layout).toHaveBeenCalledOnce();
     } finally {
-      if (reservation) finishCopilotAcceptance(reservation);
+      if (reservation) finishEmberAcceptance(reservation);
       canvas.dispose();
     }
   });
-  test("a read-only canvas lays out under the Copilot lock without an internal update", async () => {
+  test("a read-only canvas lays out under the Ember lock without an internal update", async () => {
     const canvas = renderLockedCanvas(true);
     const counts: number[] = [];
     const unsubscribe = useWorkflowHasChangesStore.subscribe((state) =>
@@ -1632,7 +1618,7 @@ describe("save failures stop navigation and block runs", () => {
     vi.unstubAllGlobals();
   });
   test.each(
-    (["save", "yaml", "copilot"] as const).flatMap((lockKind) =>
+    (["save", "yaml", "ember"] as const).flatMap((lockKind) =>
       (["unchanged", "replaced", "restored"] as const).map((propChange) => ({
         lockKind,
         propChange,
@@ -1762,7 +1748,7 @@ describe("save failures stop navigation and block runs", () => {
           else if (lockKind === "yaml")
             expect(beginYamlCommit(owner)).toBe(true);
           else {
-            token = beginCopilotAcceptance();
+            token = beginEmberAcceptance();
             expect(token).not.toBeNull();
           }
           expect(saved()).toMatchObject({
@@ -1799,7 +1785,7 @@ describe("save failures stop navigation and block runs", () => {
         expect(label.disabled).toBe(true);
         expect(code.readOnly).toBe(true);
         act(() => {
-          if (token) finishCopilotAcceptance(token);
+          if (token) finishEmberAcceptance(token);
           else if (lockKind === "yaml") finishYamlCommit(owner);
           else finishSaveTransaction(owner);
         });
@@ -1911,7 +1897,7 @@ describe("save failures stop navigation and block runs", () => {
       .spyOn(flowRendererModule, "FlowRenderer")
       .mockImplementation(() => <></>);
     const chat = vi
-      .spyOn(copilotChatModule, "WorkflowCopilotChat")
+      .spyOn(emberChatModule, "EmberChat")
       .mockImplementation(() => null);
     const client = new QueryClient({
       defaultOptions: { queries: { retry: false } },
@@ -1966,7 +1952,7 @@ describe("save failures stop navigation and block runs", () => {
       );
       expect(put).not.toHaveBeenCalled();
       expect(post).not.toHaveBeenCalledWith(
-        "/workflow/copilot/convert-yaml-to-blocks",
+        "/workflow/convert-yaml-to-blocks",
         expect.anything(),
       );
       expect(saveSpy).not.toHaveBeenCalled();
@@ -2173,11 +2159,9 @@ describe("save failures stop navigation and block runs", () => {
     useWorkflowPanelStore.setState(useWorkflowPanelStore.getInitialState());
     useWorkflowTitleStore.setState(useWorkflowTitleStore.getInitialState());
     workflowQueryMock.mockReturnValue({ data: liveWorkflow, isLoading: false });
-    let chat!: NonNullable<
-      Parameters<typeof copilotChatModule.WorkflowCopilotChat>[0]
-    >;
+    let chat!: NonNullable<Parameters<typeof emberChatModule.EmberChat>[0]>;
     const chatSpy = vi
-      .spyOn(copilotChatModule, "WorkflowCopilotChat")
+      .spyOn(emberChatModule, "EmberChat")
       .mockImplementation((props) => {
         chat = props!;
         return null;
@@ -2260,7 +2244,7 @@ describe("save failures stop navigation and block runs", () => {
       const review = useWorkflowPanelStore.getState().workflowPanelState.data!;
       const revision = useWorkflowYamlEditorStore.getState().revision;
       await act(async () => {
-        await review.onCopilotReviewClose!("approve");
+        await review.onEmberReviewClose!("approve");
       });
       expect(settle).toHaveBeenLastCalledWith("approve");
       expect(useWorkflowPanelStore.getState().workflowPanelState.data).toBe(
@@ -2268,7 +2252,7 @@ describe("save failures stop navigation and block runs", () => {
       );
       expect(screen.getByTestId("comparison")).toBeTruthy();
       await act(async () => {
-        await review.onCopilotReviewClose!("approve");
+        await review.onEmberReviewClose!("approve");
       });
       expect(screen.queryByTestId("comparison")).toBeNull();
       // The chat's Accept owns the apply; the comparison never writes the canvas itself.
@@ -2887,7 +2871,7 @@ describe("save failures stop navigation and block runs", () => {
     useWorkflowHasChangesStore.setState(
       useWorkflowHasChangesStore.getInitialState(),
     );
-    useCopilotActionStore.setState({
+    useEmberActionStore.setState({
       pendingGoalChanges: [
         { label: "read_account", goal: "New", previousGoal: null },
       ],
@@ -2954,7 +2938,7 @@ describe("save failures stop navigation and block runs", () => {
       cleanup();
       client.clear();
       integration.realNavigation = false;
-      useCopilotActionStore.setState({ pendingGoalChanges: [] });
+      useEmberActionStore.setState({ pendingGoalChanges: [] });
     }
   });
   test.each([new SaveRefusedError(), new SaveStaleError()])(
@@ -2995,7 +2979,6 @@ describe("save failures stop navigation and block runs", () => {
                           requestDeleteNodeCallback: vi.fn(),
                           duplicateNodeCallback: vi.fn(),
                           transmuteNodeCallback: vi.fn(),
-                          toggleScriptForNodeCallback: vi.fn(),
                         }}
                       >
                         <NodeHeader
@@ -3157,7 +3140,6 @@ describe("save failures stop navigation and block runs", () => {
                         requestDeleteNodeCallback: vi.fn(),
                         duplicateNodeCallback: vi.fn(),
                         transmuteNodeCallback: vi.fn(),
-                        toggleScriptForNodeCallback: vi.fn(),
                       }}
                     >
                       <NodeHeader
@@ -3260,7 +3242,7 @@ describe("save failures stop navigation and block runs", () => {
   });
 
   const PROPOSAL_HOLD = "Resolve the Copilot proposal before saving.";
-  test("a pending Copilot proposal disables Save as Template and hides version history, so Accept stays the only way to save it", async () => {
+  test("a pending Ember proposal disables Save as Template and hides version history, so Accept stays the only way to save it", async () => {
     useWorkflowYamlEditorStore.setState(
       useWorkflowYamlEditorStore.getInitialState(),
     );
@@ -3275,7 +3257,7 @@ describe("save failures stop navigation and block runs", () => {
     const client = new QueryClient({
       defaultOptions: { queries: { retry: false } },
     });
-    useCopilotProposalStore.setState({ proposal: {} as never });
+    useEmberProposalStore.setState({ proposal: {} as never });
     const control = render(
       <QueryClientProvider client={client}>
         <MemoryRouter>
@@ -3306,7 +3288,7 @@ describe("save failures stop navigation and block runs", () => {
       fireEvent.click(held);
       expect(save).not.toHaveBeenCalled();
 
-      act(() => useCopilotProposalStore.setState({ proposal: null }));
+      act(() => useEmberProposalStore.setState({ proposal: null }));
       expect(
         screen.getByRole("menuitem", { name: "Version history" }),
       ).toBeTruthy();
@@ -3316,7 +3298,7 @@ describe("save failures stop navigation and block runs", () => {
       expect(released.getAttribute("aria-disabled")).toBeNull();
       expect(released.getAttribute("aria-describedby")).toBeNull();
     } finally {
-      useCopilotProposalStore.setState({ proposal: null });
+      useEmberProposalStore.setState({ proposal: null });
       control.unmount();
       client.clear();
       saveHook.mockRestore();
@@ -3349,9 +3331,7 @@ test("the editor browser stops indicating execution during a retry wait and resu
   const header = vi
     .spyOn(workflowHeaderModule, "WorkflowHeader")
     .mockReturnValue(null);
-  const chat = vi
-    .spyOn(copilotChatModule, "WorkflowCopilotChat")
-    .mockReturnValue(null);
+  const chat = vi.spyOn(emberChatModule, "EmberChat").mockReturnValue(null);
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
@@ -3568,9 +3548,7 @@ test("hydrates a revisited workflow before clearing dirty state when its dispose
   const header = vi
     .spyOn(workflowHeaderModule, "WorkflowHeader")
     .mockReturnValue(null);
-  const chat = vi
-    .spyOn(copilotChatModule, "WorkflowCopilotChat")
-    .mockReturnValue(null);
+  const chat = vi.spyOn(emberChatModule, "EmberChat").mockReturnValue(null);
   workflowQueryMock.mockReturnValue({ data: workflow });
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
@@ -3801,9 +3779,7 @@ test.each([
     const header = vi
       .spyOn(workflowHeaderModule, "WorkflowHeader")
       .mockReturnValue(null);
-    const chat = vi
-      .spyOn(copilotChatModule, "WorkflowCopilotChat")
-      .mockReturnValue(null);
+    const chat = vi.spyOn(emberChatModule, "EmberChat").mockReturnValue(null);
     workflowQueryMock.mockReturnValue({ data: workflow });
     runQueryMock.mockReturnValue({ data: undefined });
     const client = new QueryClient({
@@ -4030,7 +4006,7 @@ describe("A49 metadata authorship through editor actions", () => {
     description: "B",
     version: 2,
   };
-  let history: WorkflowCopilotChatHistoryResponse;
+  let history: EmberChatHistoryResponse;
   let client: QueryClient;
 
   beforeEach(() => {
@@ -4195,7 +4171,7 @@ describe("A49 metadata authorship through editor actions", () => {
           element: <EditorRoute />,
         },
       ],
-      { initialEntries: ["/agents/wpid_live/studio?panes=editor,copilot"] },
+      { initialEntries: ["/agents/wpid_live/studio?panes=editor,ember"] },
     );
     const tree = () => (
       <QueryClientProvider client={client}>
@@ -4470,7 +4446,7 @@ describe("A49 metadata authorship through editor actions", () => {
       history.proposed_workflow = null;
       history.proposed_workflow_metadata = null;
       let finishHistory!: (response: {
-        data: WorkflowCopilotChatHistoryResponse;
+        data: EmberChatHistoryResponse;
       }) => void;
       if (integration.chat)
         historyGet.mockImplementationOnce(
@@ -4805,7 +4781,7 @@ describe("A49 metadata authorship through editor actions", () => {
       fireEvent.click(await screen.findByRole("button", { name: choice }));
       await waitFor(() =>
         expect(
-          useWorkflowYamlEditorStore.getState().copilotAcceptance,
+          useWorkflowYamlEditorStore.getState().emberAcceptance,
         ).toBeNull(),
       );
       const saved = useWorkflowHasChangesStore.getState().getSaveData()!;
@@ -4899,10 +4875,10 @@ describe("A49 metadata authorship through editor actions", () => {
       mountEditor({ ...staged, workflow_id: workflow.workflow_id, version: 1 });
       await screen.findByRole("button", { name: "Accept" });
       expect(
-        useWorkflowTitleStore.getState().copilotMetadataEdits.wpid_live,
+        useWorkflowTitleStore.getState().emberMetadataEdits.wpid_live,
       ).toBeDefined();
       expect(
-        useWorkflowTitleStore.getState().copilotMetadataEdits.wpid_live
+        useWorkflowTitleStore.getState().emberMetadataEdits.wpid_live
           ?.graphEdited,
       ).toBeUndefined();
       act(() =>
@@ -4929,7 +4905,7 @@ describe("A49 metadata authorship through editor actions", () => {
       );
       await waitFor(() =>
         expect(
-          useWorkflowYamlEditorStore.getState().copilotAcceptance,
+          useWorkflowYamlEditorStore.getState().emberAcceptance,
         ).toBeNull(),
       );
       const saved = useWorkflowHasChangesStore.getState().getSaveData()!;
@@ -4972,7 +4948,7 @@ describe("A49 metadata authorship through editor actions", () => {
       );
       await waitFor(() =>
         expect(
-          useWorkflowYamlEditorStore.getState().copilotAcceptance,
+          useWorkflowYamlEditorStore.getState().emberAcceptance,
         ).toBeNull(),
       );
       const saved = useWorkflowHasChangesStore.getState().getSaveData()!;
@@ -5009,7 +4985,7 @@ describe("A49 metadata authorship through editor actions", () => {
       ).toBeNull(),
     );
     expect(
-      useWorkflowTitleStore.getState().copilotMetadataEdits["wpid_live"]
+      useWorkflowTitleStore.getState().emberMetadataEdits["wpid_live"]
         ?.graphEdited,
     ).toBeUndefined();
     await accept();
@@ -5018,7 +4994,7 @@ describe("A49 metadata authorship through editor actions", () => {
   });
 
   test.each([false, true])(
-    "A53 a Copilot settings draft records no edit (metadata-only YAML commit: %s)",
+    "A53 an Ember settings draft records no edit (metadata-only YAML commit: %s)",
     async (commitMetadata) => {
       mountEditor();
       await screen.findByRole("button", { name: "Accept" });
@@ -5056,7 +5032,7 @@ describe("A49 metadata authorship through editor actions", () => {
         );
       }
       expect(
-        useWorkflowTitleStore.getState().copilotMetadataEdits["wpid_live"]
+        useWorkflowTitleStore.getState().emberMetadataEdits["wpid_live"]
           ?.graphEdited,
       ).toBeUndefined();
       await accept();
@@ -5085,7 +5061,7 @@ describe("A49 metadata authorship through editor actions", () => {
       fireEvent.click(await screen.findByRole("button", { name: choice }));
       await waitFor(() =>
         expect(
-          useWorkflowYamlEditorStore.getState().copilotAcceptance,
+          useWorkflowYamlEditorStore.getState().emberAcceptance,
         ).toBeNull(),
       );
       const data = useWorkflowHasChangesStore.getState().getSaveData()!;
@@ -5099,7 +5075,7 @@ describe("A49 metadata authorship through editor actions", () => {
     },
   );
 
-  test("A51 a Copilot draft does not author a graph edit", async () => {
+  test("A51 an Ember draft does not author a graph edit", async () => {
     const staged = stageGraphProposal();
     mountEditor();
     await screen.findByRole("button", { name: "Accept" });
@@ -5157,7 +5133,7 @@ describe("A49 metadata authorship through editor actions", () => {
       fireEvent.click(await screen.findByRole("button", { name: choice }));
       await waitFor(() =>
         expect(
-          useWorkflowYamlEditorStore.getState().copilotAcceptance,
+          useWorkflowYamlEditorStore.getState().emberAcceptance,
         ).toBeNull(),
       );
       expect(useWorkflowParametersStore.getState().parameters).toHaveLength(
@@ -5200,9 +5176,7 @@ describe("A49 metadata authorship through editor actions", () => {
       await screen.findByRole("button", { name: "Keep my edits" }),
     );
     await waitFor(() =>
-      expect(
-        useWorkflowYamlEditorStore.getState().copilotAcceptance,
-      ).toBeNull(),
+      expect(useWorkflowYamlEditorStore.getState().emberAcceptance).toBeNull(),
     );
     expect(
       useWorkflowHasChangesStore.getState().getSaveData()!.blocks[0],
@@ -5231,9 +5205,7 @@ describe("A49 metadata authorship through editor actions", () => {
       await screen.findByRole("button", { name: "Keep my edits" }),
     );
     await waitFor(() =>
-      expect(
-        useWorkflowYamlEditorStore.getState().copilotAcceptance,
-      ).toBeNull(),
+      expect(useWorkflowYamlEditorStore.getState().emberAcceptance).toBeNull(),
     );
     expect(
       useWorkflowHasChangesStore.getState().getSaveData()!.blocks[0],
@@ -5340,7 +5312,7 @@ describe("A49 metadata authorship through editor actions", () => {
     await screen.findByRole("button", { name: "Accept" });
     editStagedBlock();
     expect(
-      useWorkflowTitleStore.getState().copilotMetadataEdits["wpid_live"],
+      useWorkflowTitleStore.getState().emberMetadataEdits["wpid_live"],
     ).toMatchObject({ graphEdited: true });
     fireEvent.click(screen.getByRole("link", { name: "Leave editor" }));
     fireEvent.click(
@@ -5352,7 +5324,7 @@ describe("A49 metadata authorship through editor actions", () => {
     await accept();
     expect(screen.queryByRole("button", { name: "Keep my edits" })).toBeNull();
     expect(
-      useWorkflowTitleStore.getState().copilotMetadataEdits["wpid_live"],
+      useWorkflowTitleStore.getState().emberMetadataEdits["wpid_live"],
     ).not.toMatchObject({ graphEdited: true });
     expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(false);
   });
@@ -5422,8 +5394,7 @@ describe("A49 metadata authorship through editor actions", () => {
       await act(async () => expect(await commitYamlDraft(false)).toBe(true));
       expect(useWorkflowYamlEditorStore.getState().active).toBe(false);
       expect(
-        useWorkflowTitleStore.getState().copilotMetadataEdits["wpid_live"]
-          ?.edits,
+        useWorkflowTitleStore.getState().emberMetadataEdits["wpid_live"]?.edits,
       ).toEqual(editTitle ? { title: "YAML rename" } : {});
       await accept();
       fireEvent.click(
@@ -5431,7 +5402,7 @@ describe("A49 metadata authorship through editor actions", () => {
       );
       await waitFor(() =>
         expect(
-          useWorkflowYamlEditorStore.getState().copilotAcceptance,
+          useWorkflowYamlEditorStore.getState().emberAcceptance,
         ).toBeNull(),
       );
       expect(useWorkflowTitleStore.getState().description).toBe("B");
@@ -5492,9 +5463,7 @@ describe("A49 metadata authorship through editor actions", () => {
   );
 
   test("a rename while history loads belongs to the loaded proposal", async () => {
-    let finishHistory!: (response: {
-      data: WorkflowCopilotChatHistoryResponse;
-    }) => void;
+    let finishHistory!: (response: { data: EmberChatHistoryResponse }) => void;
     historyGet.mockImplementationOnce(
       () =>
         new Promise((resolve) => {
@@ -5531,7 +5500,7 @@ describe("A49 metadata authorship through editor actions", () => {
     "selecting a saved variant discards only earlier metadata edits (history loading: %s)",
     async (historyLoading) => {
       let finishHistory:
-        | ((response: { data: WorkflowCopilotChatHistoryResponse }) => void)
+        | ((response: { data: EmberChatHistoryResponse }) => void)
         | undefined;
       if (historyLoading)
         historyGet.mockImplementationOnce(
@@ -5662,7 +5631,7 @@ describe("A49 metadata authorship through editor actions", () => {
     "//proxy.example.com:8080",
     "http://[2001:db8::1]:3128",
   ])(
-    "YAML-to-Visual commits a custom proxy URL with a host and withholds it from Copilot (%s)",
+    "YAML-to-Visual commits a custom proxy URL with a host and withholds it from Ember (%s)",
     async (url) => {
       mountEditor();
       await screen.findByRole("button", { name: "Accept" });
@@ -5684,7 +5653,7 @@ describe("A49 metadata authorship through editor actions", () => {
       const saved = useWorkflowHasChangesStore.getState().getSaveData()!;
       expect(saved.settings.proxyLocation).toEqual(proxy);
       expect(buildWorkflowSaveRequest(saved).proxy_location).toEqual(proxy);
-      const context = buildWorkflowCopilotContext({
+      const context = buildEmberContext({
         ...saved,
         definitionVersion: saved.workflowDefinitionVersion,
       });

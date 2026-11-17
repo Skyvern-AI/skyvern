@@ -164,6 +164,16 @@ MAX_FILE_PARSE_INPUT_TOKENS = 256_000
 # fallback. Each page is a separate LLM call, so this bounds cost; MAX_FILE_PARSE_INPUT_TOKENS
 # still bounds the concatenated text handed to downstream extraction.
 MAX_PDF_OCR_PAGES = 50
+# Scanned pages are rendered for OCR at 300 dpi: at 150 dpi the vision model misread degraded fax text (letters in
+# names, digits in dates) that it read correctly at 300; a provider that prices images by size can charge more. The
+# whole document is rendered again at 150 dpi when its 300 dpi images exceed the parser child's limits or any page
+# image is over the caps below.
+PDF_OCR_RENDER_RESOLUTION = 300
+PDF_OCR_FALLBACK_RENDER_RESOLUTION = 150
+# Anthropic documents 5 MB base64 per image on Bedrock (about 3.75 MB raw) and 8,000 px per side
+# (platform.claude.com/docs/en/build-with-claude/vision, "Request limits"); these keep a margin under both.
+PDF_OCR_MAX_PAGE_IMAGE_BYTES = 3_500_000
+PDF_OCR_MAX_PAGE_IMAGE_EDGE_PX = 7_900
 # Max concurrent per-page OCR calls when transcribing a scanned PDF.
 PDF_OCR_PAGE_CONCURRENCY = 5
 # Wall-clock ceiling for one blocking file-parse step (validation, text extraction, page

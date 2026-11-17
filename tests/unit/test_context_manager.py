@@ -82,6 +82,7 @@ from skyvern.schemas.workflows import (
     AWSSecretParameterYAML,
     BlockResult,
     BlockStatus,
+    BlockType,
     BranchConditionYAML,
     BranchCriteriaYAML,
     CodeBlockYAML,
@@ -188,6 +189,33 @@ async def _initialize_smtp_workflow(
         secret_parameters=secrets,
         workflow=workflow,
     )
+
+
+@pytest.mark.asyncio
+async def test_powerbi_refusal_is_handed_to_run_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skyvern.forge.sdk.workflow.models.powerbi_query_block import PowerBIQueryBlock
+
+    workflow = _make_workflow([])
+    workflow.workflow_definition.blocks = [
+        PowerBIQueryBlock.model_construct(
+            block_type=BlockType.POWERBI_QUERY,
+            label="query",
+            connection_id="connection",
+            dataset_id="dataset",
+            query="query",
+        )
+    ]
+    monkeypatch.setattr(
+        cm.app,
+        "AGENT_FUNCTION",
+        SimpleNamespace(
+            request_gmail_hop_tokens=AsyncMock(),
+            get_powerbi_query_hop_tokens=AsyncMock(return_value={}),
+            get_powerbi_query_hop_refusals=AsyncMock(return_value={"query": "account_disconnected"}),
+        ),
+    )
+    context = await _initialize_smtp_workflow(workflow, [], MagicMock())
+    assert context.get_powerbi_hop_refusal("query") == "account_disconnected"
 
 
 @pytest.mark.asyncio

@@ -5,7 +5,7 @@ import {
 } from "../templateGuidance";
 import { removeBlock } from "./doc/docGraphEdits";
 import {
-  bindCopilotReviewClose,
+  bindEmberReviewClose,
   captureEditorState,
   restoreEditorState,
   type EditorStateSnapshot,
@@ -36,7 +36,6 @@ import {
   useMemo,
   useRef,
   useState,
-  MutableRefObject,
   type ReactNode,
 } from "react";
 import { nanoid } from "nanoid";
@@ -45,7 +44,6 @@ import {
   ChevronRightIcon,
   ChevronLeftIcon,
   GlobeIcon,
-  PlayIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
 import {
@@ -65,17 +63,17 @@ import { isPaymentRequiredError } from "@/api/paymentRequired";
 import { DebugSessionApiResponse } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { isEditableTarget } from "./editableTarget";
-import { useCopilotProposalStore } from "@/store/CopilotProposalStore";
+import { useEmberProposalStore } from "@/store/EmberProposalStore";
 import { useMountEffect } from "@/hooks/useMountEffect";
 import { useBrowserSessionRateLimit } from "../hooks/useBrowserSessionRateLimit";
 import { useActiveRunSessionQuery } from "../hooks/useActiveRunSessionQuery";
 import {
   shouldPollDebugSessionInvalidation,
+  adoptDebugSession,
   useDebugSessionQuery,
 } from "../hooks/useDebugSessionQuery";
 import { useIsGlobalWorkflow } from "../hooks/useIsGlobalWorkflow";
 import { resolveWorkspaceBrowserSessionBindings } from "./browserSessionBindings";
-import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
 import { BrowserSessionStream } from "@/routes/browserSessions/BrowserSessionStream";
 import { useStreamTransport } from "@/hooks/useRuntimeConfig";
 import {
@@ -83,20 +81,16 @@ import {
   StreamStatusPanel,
 } from "@/routes/streaming/StreamDiagnostics";
 import { type BrowserSession as BrowserSessionData } from "@/routes/workflows/types/browserSessionTypes";
-import { useCacheKeyValuesQuery } from "../hooks/useCacheKeyValuesQuery";
 import {
   DEBUG_SESSION_EXPIRY_STATUS_REFETCH_MS,
   DEBUG_SESSION_EXPIRY_WARNING_THRESHOLD_MS,
   formatBrowserSessionRemainingTime,
   getBrowserSessionRemainingMs,
 } from "../hooks/debugSessionLease";
-import { useBlockScriptStore } from "@/store/BlockScriptStore";
 import { useBlockSidebarWidthStore } from "@/store/BlockSidebarWidthStore";
-import { useCacheKeyValueStore } from "@/store/CacheKeyValueStore";
 import { useWorkflowSettingsStore } from "@/store/WorkflowSettingsStore";
 import { useStudioPaneDefaults } from "../studio/StudioPaneDefaultsContext";
-import { useCopilotActionStore } from "@/store/useCopilotActionStore";
-import { useShowAllCodeStore } from "@/store/ShowAllCodeStore";
+import { useEmberActionStore } from "@/store/useEmberActionStore";
 import { useSidebarSaveStateStore } from "@/store/SidebarSaveStateStore";
 import { useWorkflowHistoryAccessStore } from "@/store/WorkflowHistoryAccessStore";
 import { useBrowserLoadingFlag } from "../hooks/useBrowserLoadingFlag";
@@ -117,7 +111,6 @@ import {
   DialogFooter,
   DialogHeader,
   DialogTitle,
-  DialogTrigger,
 } from "@/components/ui/dialog";
 import { toast } from "@/components/ui/use-toast";
 import { PaneErrorBoundary } from "@/components/PaneErrorBoundary";
@@ -125,11 +118,7 @@ import { useLogging } from "@/hooks/useLogging";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { AffectedBlocksNotice } from "./AffectedBlocksNotice";
 import { BrowserStream } from "@/components/BrowserStream";
-import {
-  runIsLogicallyFinal,
-  runIsExecuting,
-} from "@/routes/workflows/workflowRun/runRetryState";
-import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
+import { runIsExecuting } from "@/routes/workflows/workflowRun/runRetryState";
 import { DebuggerRun } from "@/routes/workflows/debugger/DebuggerRun";
 import { DebuggerRunMinimal } from "@/routes/workflows/debugger/DebuggerRunMinimal";
 import { RecentActivityRunSelector } from "@/routes/workflows/debugger/recentActivity/RecentActivityRunSelector";
@@ -156,18 +145,11 @@ import {
   applyYamlCommitMetadata,
   useWorkflowTitleStore,
 } from "@/store/WorkflowTitleStore";
-import {
-  getCode,
-  getOrderedBlockLabels,
-  shouldPollForGeneratedCode,
-} from "@/routes/workflows/utils";
-import { CopyButton } from "@/components/CopyButton";
 import { isMacPlatform } from "@/util/platform";
 import { parseHeaderJson } from "@/util/secretHeaders";
 import { getJsonParseErrorDetail } from "@/util/jsonParseError";
 import { cn } from "@/util/utils";
 import { FlowRenderer, type FlowRendererProps } from "./FlowRenderer";
-import { useCacheKeyValueUrlSync } from "./hooks/useCacheKeyValueUrlSync";
 import {
   getInitialSelectedBlockId,
   useSelectedBlockUrlSync,
@@ -188,7 +170,6 @@ import {
   isConditionalNode,
 } from "./nodes/ConditionalNode/types";
 import { WorkflowParametersPanel } from "./panels/WorkflowParametersPanel";
-import { WorkflowCacheKeyValuesPanel } from "./panels/WorkflowCacheKeyValuesPanel";
 import { WorkflowComparisonPanel } from "./panels/WorkflowComparisonPanel";
 import {
   getElements,
@@ -236,27 +217,23 @@ import { WorkflowDefinition, WorkflowSettings } from "../types/workflowTypes";
 import { useAgentsPathMatch } from "../useAgentsPathMatch";
 import { shouldKeepExistingEdgeForInsertion } from "./workflowInsertion";
 
-import { constructCacheKeyValue, getInitialParameters } from "./utils";
-import {
-  WorkflowCopilotChat,
-  type WorkflowUpdateOptions,
-} from "../copilot/WorkflowCopilotChat";
+import { getInitialParameters } from "./utils";
+import { EmberChat, type WorkflowUpdateOptions } from "../ember/EmberChat";
 import { useStudioRunId } from "../studio/useStudioRunId";
 import { SYSTEM_RUN_FOCUS_PARAM } from "../studio/panes";
-import { copilotRunId } from "./copilotRunId";
+import { emberRunId } from "./emberRunId";
 import {
-  shouldOpenCopilotPaneForHandoff,
-  useDiscoverCopilotPromptRecovery,
+  shouldOpenEmberPaneForHandoff,
+  useDiscoverEmberPromptRecovery,
   withoutDiscoverViaParam,
-} from "../discoverCopilotHandoff";
+} from "../discoverEmberHandoff";
 import {
   initialEditorAutoOpenState,
   shouldAutoOpenEditor,
 } from "./editorAutoOpen";
 import { useStudioShellContext } from "../studio/StudioShellContext";
-import { StudioShellPanelPortal } from "../studio/StudioShellPanelPortal";
 import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
-import type { CopilotAttachedFile } from "@/routes/workflows/copilot/workflowCopilotTypes";
+import type { EmberAttachedFile } from "@/routes/workflows/ember/emberTypes";
 import {
   demonstrationInsertionFromNodes,
   resolveAppendInsertionPoint,
@@ -267,13 +244,13 @@ import {
 import { DemonstrateFromBlockStatus } from "./DemonstrateFromBlockStatus";
 import { paneWidthsKey } from "../studio/paneLayout";
 import { useStudioPanes } from "../studio/useStudioPanes";
-import { WorkflowCopilotButton } from "../copilot/WorkflowCopilotButton";
-import { resolveCopilotLiveBrowserReady } from "../copilot/browserReadiness";
+import { EmberButton } from "../ember/EmberButton";
+import { resolveEmberLiveBrowserReady } from "../ember/browserReadiness";
 
 import type {
-  CopilotProductAction,
+  EmberProductAction,
   WorkflowYAMLConversionResponse,
-} from "../copilot/workflowCopilotTypes";
+} from "../ember/emberTypes";
 import {
   WorkflowYamlEditor,
   WorkflowSaveConflictNotice,
@@ -290,21 +267,24 @@ import {
 } from "./workflowVersionFromSaveData";
 import "./workspace-styles.css";
 
-function readCopilotAttachedFiles(
+// The chat pane's crash-report `pane` value in PostHog and Datadog, kept so those series stay continuous.
+const EMBER_PANE_CRASH_LABEL = "copilot";
+
+function readEmberAttachedFiles(
   value: unknown,
-): Array<CopilotAttachedFile> | undefined {
+): Array<EmberAttachedFile> | undefined {
   if (!Array.isArray(value)) return undefined;
   const files = value.filter(
-    (item): item is CopilotAttachedFile =>
+    (item): item is EmberAttachedFile =>
       typeof item === "object" &&
       item !== null &&
-      typeof (item as CopilotAttachedFile).file_id === "string" &&
-      typeof (item as CopilotAttachedFile).filename === "string",
+      typeof (item as EmberAttachedFile).file_id === "string" &&
+      typeof (item as EmberAttachedFile).filename === "string",
   );
   return files.length > 0 ? files : undefined;
 }
 
-function readCopilotProductAction(value: unknown): CopilotProductAction | null {
+function readEmberProductAction(value: unknown): EmberProductAction | null {
   if (!value || typeof value !== "object") {
     return null;
   }
@@ -373,79 +353,8 @@ export type AddNodeProps = {
   replacing?: string;
 };
 
-interface Dom {
-  splitLeft: MutableRefObject<HTMLInputElement | null>;
-}
-
-function bash(text: string, alternateText?: string) {
-  return (
-    <div className="flex items-center justify-start gap-1">
-      <CopyButton className="min-w-[2.25rem]" value={alternateText ?? text} />
-      <code className="text-xs text-neutral-600 dark:text-neutral-300">
-        {text}
-      </code>
-    </div>
-  );
-}
-
-function CopyAndExplainCode({
-  code,
-  showCopy = true,
-}: {
-  code: string;
-  showCopy?: boolean;
-}) {
-  const [isOpen, setIsOpen] = useState(false);
-  const numCodeLines = code.split("\n").length;
-
-  return (
-    <div className="flex items-center justify-end">
-      <Dialog open={isOpen} onOpenChange={setIsOpen}>
-        <DialogTrigger asChild>
-          <Button variant="tertiary" size="sm">
-            <div className="flex items-center justify-center gap-2">
-              <div>Run Locally</div>
-              <PlayIcon />
-            </div>
-          </Button>
-        </DialogTrigger>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Run This Code</DialogTitle>
-            <DialogDescription>
-              Set up skyvern in your environment and run the code on your own.
-            </DialogDescription>
-          </DialogHeader>
-          <div>
-            <div>1. Install skyvern: {bash("pip install skyvern")}</div>
-            <div>2. Set up skyvern: {bash("skyvern quickstart")}</div>
-            <div>
-              3. Copy-paste the code and save it in a file, for example{" "}
-              <code>main.py</code>{" "}
-              {bash(`copy code [${numCodeLines} line(s)]`, code)}
-            </div>
-            <div>
-              4. Run the code:{" "}
-              {bash(
-                'skyvern run code --params \'{"param1": "val1", "param2": "val2"}\' main.py',
-              )}
-            </div>
-          </div>
-
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setIsOpen(false)}>
-              Ok
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-      {showCopy ? <CopyButton value={code} /> : null}
-    </div>
-  );
-}
-
 // eslint-disable-next-line react-refresh/only-export-components -- Exercise the production apply callback without mounting the entire workspace.
-export function useWorkspaceCopilotUpdate({
+export function useWorkspaceEmberUpdate({
   applyWorkflowUpdate,
   embedded = false,
   initialBlockCount = 0,
@@ -464,7 +373,7 @@ export function useWorkspaceCopilotUpdate({
   const editorAutoOpenStateRef = useRef(
     initialEditorAutoOpenState(initialBlockCount),
   );
-  // A run the user opened owns the stage; Copilot's own run focus does not.
+  // A run the user opened owns the stage; Ember's own run focus does not.
   const [searchParams] = useSearchParams();
   const studioRunId = useStudioRunId();
   const inspectingUserRunRef = useRef(false);
@@ -472,7 +381,7 @@ export function useWorkspaceCopilotUpdate({
     Boolean(studioRunId) && !searchParams.has(SYSTEM_RUN_FOCUS_PARAM);
   return (workflowData: WorkflowVersion, options?: WorkflowUpdateOptions) => {
     try {
-      // All Copilot-driven applies are user edits (mid-turn draft, accept,
+      // All Ember-driven applies are user edits (mid-turn draft, accept,
       // snap-back); only version-restore/load call applyWorkflowUpdate
       // without this and stay a clean baseline.
       if (
@@ -493,7 +402,7 @@ export function useWorkspaceCopilotUpdate({
       if (fire && !inspectingUserRunRef.current) reopenEditor();
     } catch (error) {
       console.error("Failed to parse and apply agent", error, workflowData);
-      logging.error("Copilot agent apply failed", {
+      logging.error("Ember agent apply failed", {
         workflow_permanent_id: workflowData.workflow_permanent_id,
         error,
       });
@@ -529,41 +438,41 @@ function Workspace({
   const logging = useLogging();
   const { blockLabel } = useParams();
   const workflowPermanentId = useWorkflowPermanentId();
-  const { copilotPortalEl: studioCopilotPortalEl } = useStudioShellContext();
+  const { emberPortalEl: studioEmberPortalEl } = useStudioShellContext();
   const { panes: studioPanes, openPane: openStudioPane } = useStudioPanes();
   const { paneWidths: studioPaneWidths, entryId: studioEntryId } =
     useStudioPaneDefaults();
-  const studioCopilotOpen = studioPanes.includes("copilot");
+  const studioEmberOpen = studioPanes.includes("ember");
   const location = useLocation();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const locationState = location.state as {
-    copilotMessage?: unknown;
-    copilotAttachedFiles?: unknown;
-    copilotAction?: unknown;
+    emberMessage?: unknown;
+    emberAttachedFiles?: unknown;
+    emberAction?: unknown;
   } | null;
-  const routeInitialCopilotAttachments = useMemo(
-    () => readCopilotAttachedFiles(locationState?.copilotAttachedFiles),
-    [locationState?.copilotAttachedFiles],
+  const routeInitialEmberAttachments = useMemo(
+    () => readEmberAttachedFiles(locationState?.emberAttachedFiles),
+    [locationState?.emberAttachedFiles],
   );
-  const routeInitialCopilotMessage =
-    typeof locationState?.copilotMessage === "string"
-      ? locationState.copilotMessage
+  const routeInitialEmberMessage =
+    typeof locationState?.emberMessage === "string"
+      ? locationState.emberMessage
       : null;
   // Identity has to survive re-renders: this gates a timer that re-arms whenever it changes.
-  const copilotActionState = locationState?.copilotAction;
-  const initialCopilotAction = useMemo(
-    () => readCopilotProductAction(copilotActionState),
-    [copilotActionState],
+  const emberActionState = locationState?.emberAction;
+  const initialEmberAction = useMemo(
+    () => readEmberProductAction(emberActionState),
+    [emberActionState],
   );
-  const { storedInitialCopilotMessage, clearStoredInitialCopilotMessage } =
-    useDiscoverCopilotPromptRecovery({
+  const { storedInitialEmberMessage, clearStoredInitialEmberMessage } =
+    useDiscoverEmberPromptRecovery({
       shouldRead: searchParams.get("via") === "discover",
       workflowPermanentId,
     });
-  const initialCopilotMessage = useMemo(
-    () => routeInitialCopilotMessage ?? storedInitialCopilotMessage,
-    [routeInitialCopilotMessage, storedInitialCopilotMessage],
+  const initialEmberMessage = useMemo(
+    () => routeInitialEmberMessage ?? storedInitialEmberMessage,
+    [routeInitialEmberMessage, storedInitialEmberMessage],
   );
   const templateGuidance = useMemo(
     () =>
@@ -578,55 +487,51 @@ function Workspace({
       state: location.state,
     });
   }, [location.pathname, location.search, location.state, navigate]);
-  const handleInitialCopilotMessageConsumed = useCallback(() => {
-    if (!initialCopilotMessage && !initialCopilotAction) return;
-    clearStoredInitialCopilotMessage();
+  const handleInitialEmberMessageConsumed = useCallback(() => {
+    if (!initialEmberMessage && !initialEmberAction) return;
+    clearStoredInitialEmberMessage();
     navigate(location.pathname + withoutDiscoverViaParam(location.search), {
       replace: true,
       state: null,
     });
   }, [
-    initialCopilotMessage,
-    initialCopilotAction,
-    clearStoredInitialCopilotMessage,
+    initialEmberMessage,
+    initialEmberAction,
+    clearStoredInitialEmberMessage,
     location.pathname,
     location.search,
     navigate,
   ]);
   // A handoff (Discover or the onboarding CTA) lands with the prompt seeded but
-  // only the default editor+browser panes open; open the Copilot pane once on
+  // only the default editor+browser panes open; open the Ember pane once on
   // mount so the handed-off prompt is visible (the non-embedded editor opens
-  // Copilot via isCopilotOpen's initializer below instead). Thread the handoff
+  // Ember via isEmberOpen's initializer below instead). Thread the handoff
   // route state through the pane-open navigation: the CTA seeds the prompt via
   // location.state alone (Discover also has a sessionStorage fallback), so a
-  // state-wiping open would drop it before the Copilot consumes it.
+  // state-wiping open would drop it before the Ember consumes it.
   useMountEffect(() => {
     if (
-      shouldOpenCopilotPaneForHandoff({
+      shouldOpenEmberPaneForHandoff({
         embedded,
-        hasInitialCopilotMessage:
-          Boolean(initialCopilotMessage) || Boolean(templateGuidance),
-        copilotPaneOpen: studioCopilotOpen,
+        hasInitialEmberMessage:
+          Boolean(initialEmberMessage) || Boolean(templateGuidance),
+        emberPaneOpen: studioEmberOpen,
       })
     ) {
-      openStudioPane("copilot", { state: location.state });
+      openStudioPane("ember", { state: location.state });
     }
   });
-  const cacheKeyValueParam = searchParams.get("cache-key-value");
   const headlessTurnDrainEnabled = ["1", "true"].includes(
-    (searchParams.get("copilotHeadlessTurnDrain") ?? "").toLowerCase(),
+    (
+      searchParams.get("emberHeadlessTurnDrain") ??
+      searchParams.get("copilotHeadlessTurnDrain") ??
+      ""
+    ).toLowerCase(),
   );
   const [timelineMode, setTimelineMode] = useState("wide");
-  const [page, setPage] = useState(1);
   const [nudge, setNudge] = useState(false);
   const { workflowPanelState, setWorkflowPanelState, closeWorkflowPanel } =
     useWorkflowPanelStore();
-  const showAllCode = useShowAllCodeStore((s) => s.showAllCode);
-  const setShowAllCode = useShowAllCodeStore((s) => s.setShowAllCode);
-  const cacheKeyValue = useCacheKeyValueStore((s) => s.cacheKeyValue);
-  const setExplicitCacheKeyValue = useCacheKeyValueStore((s) => s.setExplicit);
-  const cacheKeyValueFilter = useCacheKeyValueStore((s) => s.filter);
-  const setCacheKeyValueFilter = useCacheKeyValueStore((s) => s.setFilter);
   const headerCollapsed = useWorkflowHeaderCollapseStore((s) => s.collapsed);
   const editorMode = useWorkflowEditorMode();
   const selectedBlockId = useWorkflowPanelStore((s) => s.selectedBlockId);
@@ -675,11 +580,11 @@ function Workspace({
     registerEditorOwner(owner);
     useWorkflowTitleStore
       .getState()
-      .startCopilotMetadata(owner.workflowPermanentId);
+      .startEmberMetadata(owner.workflowPermanentId);
     return () => {
       unregisterEditorOwner(owner);
       const titleStore = useWorkflowTitleStore.getState();
-      titleStore.clearCopilotMetadata(owner.workflowPermanentId);
+      titleStore.clearEmberMetadata(owner.workflowPermanentId);
       titleStore.resetTitleSession(owner.workflowPermanentId);
       titleStore.resetDescriptionSession(owner.workflowPermanentId);
       useWorkflowParametersStore
@@ -822,35 +727,32 @@ function Workspace({
 
   const { data: workflowRun } = useWorkflowRunQuery();
   const studioRunId = useStudioRunId();
-  const isFinalized = workflowRun ? runIsLogicallyFinal(workflowRun) : false;
 
   const [openCycleBrowserDialogue, setOpenCycleBrowserDialogue] =
     useState(false);
-  const [isCopilotOpen, setIsCopilotOpen] = useState(
-    () => !!initialCopilotMessage || !initialNodes.some(isWorkflowBlockNode),
+  const [isEmberOpen, setIsEmberOpen] = useState(
+    () => !!initialEmberMessage || !initialNodes.some(isWorkflowBlockNode),
   );
-  // Open the copilot panel when a code block requests a goal-driven (re)build,
+  // Open the Ember panel when a code block requests a goal-driven (re)build,
   // so the user can watch the scout and the generated block apply.
-  const copilotPendingBuild = useCopilotActionStore(
-    (state) => state.pendingBuild,
-  );
+  const emberPendingBuild = useEmberActionStore((state) => state.pendingBuild);
   useEffect(() => {
-    if (copilotPendingBuild) {
-      setIsCopilotOpen(true);
+    if (emberPendingBuild) {
+      setIsEmberOpen(true);
     }
-  }, [copilotPendingBuild]);
+  }, [emberPendingBuild]);
   useEffect(() => {
-    if (initialCopilotAction) {
-      setIsCopilotOpen(true);
+    if (initialEmberAction) {
+      setIsEmberOpen(true);
     }
-  }, [initialCopilotAction]);
-  // Opening an already-open studio pane still restores a maximized pane, which would otherwise hide Copilot.
-  const openCopilot = useCallback(() => {
-    if (!embedded) setIsCopilotOpen(true);
-    else openStudioPane("copilot", { state: location.state });
+  }, [initialEmberAction]);
+  // Opening an already-open studio pane still restores a maximized pane, which would otherwise hide Ember.
+  const openEmber = useCallback(() => {
+    if (!embedded) setIsEmberOpen(true);
+    else openStudioPane("ember", { state: location.state });
   }, [embedded, openStudioPane, location.state]);
-  const [copilotMessageCount, setCopilotMessageCount] = useState(0);
-  const copilotButtonRef = useRef<HTMLButtonElement>(null);
+  const [emberMessageCount, setEmberMessageCount] = useState(0);
+  const emberButtonRef = useRef<HTMLButtonElement>(null);
   const [readyBrowserSessionId, setReadyBrowserSessionId] = useState<
     string | null
   >(null);
@@ -878,12 +780,10 @@ function Workspace({
   // restores the pre-YAML dirty state instead of leaving it stuck true.
   const yamlEntryHadChangesRef = useRef(false);
   const [shouldFetchDebugSession, setShouldFetchDebugSession] = useState(false);
-  const [isCopilotTurnActive, setIsCopilotTurnActive] = useState(false);
-  const blockScriptStore = useBlockScriptStore();
+  const [isEmberTurnActive, setIsEmberTurnActive] = useState(false);
   const finallyBlockLabel = useWorkflowSettingsStore(
     (state) => state.finallyBlockLabel,
   );
-  const cacheKey = workflow?.cache_key ?? "";
 
   // Block delete confirmation dialog state
   const [deleteBlockDialogState, setDeleteBlockDialogState] = useState<{
@@ -940,14 +840,6 @@ function Workspace({
     },
     [affectedBlocksForBlockDelete],
   );
-
-  const [leftSideLayoutMode, setLeftSideLayoutMode] = useState<
-    "single" | "side-by-side"
-  >("single");
-
-  const dom: Dom = {
-    splitLeft: useRef<HTMLInputElement>(null),
-  };
 
   // Track all used labels globally (including those in saved branch states)
   // Initialize with labels from initial nodes
@@ -1018,42 +910,6 @@ function Workspace({
     };
   }, [undoWorkflowEdit, redoWorkflowEdit, isMac]);
 
-  const { data: blockScriptsPublished } = useBlockScriptsQuery({
-    cacheKey,
-    cacheKeyValue,
-    workflowPermanentId,
-    status: "published",
-  });
-
-  const publishedLabelCount = Object.keys(
-    blockScriptsPublished?.blocks ?? {},
-  ).length;
-  const hasPublishedScript =
-    publishedLabelCount > 0 || Boolean(blockScriptsPublished?.main_script);
-
-  const isGeneratingCode =
-    Boolean(workflowRun) &&
-    shouldPollForGeneratedCode(workflow, isFinalized, hasPublishedScript);
-
-  const { data: blockScriptsPending } = useBlockScriptsQuery({
-    cacheKey,
-    cacheKeyValue,
-    enabled: isGeneratingCode,
-    workflowPermanentId,
-    pollIntervalMs: isGeneratingCode ? 3000 : undefined,
-    status: "pending",
-    workflowRunId: workflowRun?.workflow_run_id,
-  });
-
-  const { data: cacheKeyValues, isLoading: cacheKeyValuesLoading } =
-    useCacheKeyValuesQuery({
-      cacheKey,
-      debounceMs: 100,
-      filter: cacheKeyValueFilter || undefined,
-      page,
-      workflowPermanentId,
-    });
-
   const { isRateLimited, recordAttempt, resetOnSuccess } =
     useBrowserSessionRateLimit(workflowPermanentId);
 
@@ -1108,7 +964,7 @@ function Workspace({
     workflowPermanentId,
     enabled:
       shouldFetchDebugSession && Boolean(workflowPermanentId) && !isRateLimited,
-    isTurnActive: isCopilotTurnActive,
+    isTurnActive: isEmberTurnActive,
   });
 
   const activeDebugSession = debugSession ?? null;
@@ -1173,7 +1029,6 @@ function Workspace({
             data: {
               ...node.data,
               ...hydrated.data,
-              showCode: node.data.showCode,
             },
           };
         }),
@@ -1207,14 +1062,14 @@ function Workspace({
     (!activeDebugSession || activeDebugSession.vnc_streaming_supported);
   const showCdpBrowserPanel =
     isCdpStreamingMode && shouldFetchDebugSession && !isRateLimited;
-  // Embedded: the shell owns the stream, so bind the copilot once the backend
+  // Embedded: the shell owns the stream, so bind the Ember once the backend
   // session exists — else it gets a null id and the backend spins a separate browser.
-  const copilotRequiresLiveBrowser =
+  const emberRequiresLiveBrowser =
     (showBrowser || embedded) && shouldFetchDebugSession && !isRateLimited;
   // readyBrowserSessionId is keyed to the browser session id rather than a
   // bare boolean: when activeDebugSession's id changes, stale ready state
   // from the previous session cannot leak into the next render.
-  const copilotLiveBrowserReady = resolveCopilotLiveBrowserReady({
+  const emberLiveBrowserReady = resolveEmberLiveBrowserReady({
     displayReady: Boolean(
       readyBrowserSessionId && readyBrowserSessionId === debugBrowserSessionId,
     ),
@@ -1344,8 +1199,8 @@ function Workspace({
   // `useMountEffect`, but the Workspace instance can be reused across
   // workflows when the parent route doesn't key by workflowPermanentId
   // (e.g. /agents/A/build → /agents/B/build); in that case the
-  // mount-only initializer would skip and selectedBlockId / showAllCode /
-  // sidebar save timestamps would leak from A into B. Keying this on
+  // mount-only initializer would skip and selectedBlockId / sidebar save
+  // timestamps would leak from A into B. Keying this on
   // `workflowPermanentId` fires the reset on every workflow change,
   // including a same-instance route swap.
   //
@@ -1353,12 +1208,7 @@ function Workspace({
   // refetches (e.g. `useWorkflowSave` invalidates `['workflow', id]` after a
   // sidebar save) produce a new `workflow` object reference; if we included
   // `workflow` here the reset would fire mid-session and wipe the user's
-  // current block selection, sidebar save state, and cache-key filter.
-  // Tracks which wpid the cache-key store was last initialized against, so a
-  // same-wpid refetch (object-identity change on `workflow`) doesn't clobber
-  // the user's current filter, while an A→B nav still re-initializes once B's
-  // payload resolves.
-  const cacheKeyInitWpidRef = useRef<string | null>(null);
+  // current block selection and sidebar save state.
   useEffect(() => {
     // empty), unless the URL asks for a specific block; fires only on workflow
     // change, so tab-switch selection persists.
@@ -1368,13 +1218,11 @@ function Workspace({
       searchParams,
     });
     useWorkflowPanelStore.getState().setSelectedBlockId(initialSelectedBlockId);
-    useShowAllCodeStore.getState().reset();
     useSidebarSaveStateStore.getState().reset();
     // Drop A's unsaved-changes baseline on an A→B same-instance route swap;
     // a carried snapshot would diff B's graph against A's and surface phantom
     // "edited" lines. clearSnapshot resets contentDirty + userHasEdited too.
     useWorkflowSnapshotStore.getState().clearSnapshot();
-    cacheKeyInitWpidRef.current = null;
     setReadyBrowserSessionId(null);
     if (workflowPermanentId) {
       queryClient.removeQueries({
@@ -1388,28 +1236,6 @@ function Workspace({
     // would re-fire this reset on every workflow refetch.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workflowPermanentId, queryClient]);
-
-  useEffect(() => {
-    // Gate on workflow payload matching the route wpid: `useWorkflowQuery`
-    // can serve placeholderData from the prior workflow on an A→B nav, and
-    // initializing with that stale payload would lock in A's cache-key for
-    // B. Wait until B's payload resolves, then init once per wpid.
-    if (!workflowPermanentId) return;
-    if (workflow.workflow_permanent_id !== workflowPermanentId) return;
-    if (cacheKeyInitWpidRef.current === workflowPermanentId) return;
-    cacheKeyInitWpidRef.current = workflowPermanentId;
-    useCacheKeyValueStore
-      .getState()
-      .initialize(
-        cacheKey === ""
-          ? ""
-          : cacheKeyValueParam
-            ? cacheKeyValueParam
-            : constructCacheKeyValue({ codeKey: cacheKey, workflow }),
-        !!cacheKeyValueParam,
-      );
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [workflowPermanentId, workflow.workflow_permanent_id]);
 
   // Prune persisted collapse labels every time the workflow id or
   // definition changes. Same Workspace-instance-reuse failure mode as the
@@ -1452,14 +1278,11 @@ function Workspace({
   }, [workflowPermanentId]);
 
   useWorkspaceMountInitialization({
-    cacheKey,
     closeWorkflowPanel,
-    queryClient,
     workflowChangesStore,
     workflowPermanentId,
   });
 
-  useCacheKeyValueUrlSync(cacheKeyInitWpidRef.current === workflowPermanentId);
   useSelectedBlockUrlSync({
     enabled: embedded,
     nodes,
@@ -1486,7 +1309,6 @@ function Workspace({
   useEffect(() => {
     if (workflowPanelState.data?.showComparison) {
       clearComparisonViewAndShowFreshIfActive(false);
-      setShowAllCode(false);
     }
     // We intentionally omit workflowPanelState.data?.showComparison from deps
     // to avoid clearing comparison immediately when it's set
@@ -1494,7 +1316,7 @@ function Workspace({
   }, [showBrowser, clearComparisonViewAndShowFreshIfActive]);
 
   useEffect(() => {
-    // Header-anchored panels (cacheKeyValues, parameters, schedules, history)
+    // Header-anchored panels (parameters, schedules, history)
     // sit at top-[8.5rem] and slide off with the header; nodeLibrary lives in
     // the right sidebar and stays put, so don't auto-dismiss it on collapse.
     if (
@@ -1527,7 +1349,6 @@ function Workspace({
   });
 
   // Add window resize listener to trigger NoVNC canvas resize
-  // invalidate block scripts (so we always fetch latest on mount)
   useEffect(() => {
     const handleResize = () => {
       setWindowResizeTrigger((prev) => prev + 1);
@@ -1535,30 +1356,8 @@ function Workspace({
 
     window.addEventListener("resize", handleResize);
 
-    queryClient.invalidateQueries({
-      queryKey: ["block-scripts"],
-    });
-
     return () => window.removeEventListener("resize", handleResize);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  useEffect(() => {
-    if (isFinalized) {
-      queryClient.invalidateQueries({
-        queryKey: ["block-scripts"],
-      });
-
-      queryClient.invalidateQueries({
-        queryKey: ["cache-key-values"],
-      });
-    }
-  }, [isFinalized, queryClient, workflowRun]);
-
-  useEffect(() => {
-    blockScriptStore.setScripts(blockScriptsPublished?.blocks ?? {});
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [blockScriptsPublished]);
 
   const afterCycleBrowser = () => {
     setOpenCycleBrowserDialogue(false);
@@ -1580,16 +1379,8 @@ function Workspace({
       return client.post<DebugSessionApiResponse>(`/debug-session/${id}/new`);
     },
     onSuccess: (response) => {
-      const newDebugSession = response.data;
       resetOnSuccess();
-
-      queryClient.setQueryData(
-        ["debugSession", workflowPermanentId],
-        newDebugSession,
-      );
-      void queryClient.invalidateQueries({
-        queryKey: ["debugSession", workflowPermanentId],
-      });
+      adoptDebugSession(queryClient, workflowPermanentId, response.data);
 
       toast({
         title: "Browser cycled",
@@ -1609,34 +1400,6 @@ function Workspace({
       });
 
       afterCycleBrowser();
-    },
-  });
-
-  const deleteCacheKeyValue = useMutation({
-    mutationFn: async ({
-      workflowPermanentId,
-      cacheKeyValue,
-    }: {
-      workflowPermanentId: string;
-      cacheKeyValue: string;
-    }) => {
-      const client = await getClient(credentialGetter, "sans-api-v1");
-      const encodedCacheKeyValue = encodeURIComponent(cacheKeyValue);
-      return client.delete(
-        `/scripts/${workflowPermanentId}/value?cache-key-value=${encodedCacheKeyValue}`,
-      );
-    },
-    onSuccess: () => {
-      queryClient.invalidateQueries({
-        queryKey: ["cache-key-values", workflowPermanentId, cacheKey],
-      });
-    },
-    onError: (error: AxiosError) => {
-      toast({
-        variant: "destructive",
-        title: "Failed to delete code key value",
-        description: error.message,
-      });
     },
   });
 
@@ -1709,32 +1472,6 @@ function Workspace({
     }
   }, [debugSession?.browser_session_id, resetOnSuccess]);
 
-  useEffect(() => {
-    const splitLeft = dom.splitLeft.current;
-
-    if (!splitLeft) {
-      return;
-    }
-
-    const parent = splitLeft.parentElement;
-
-    if (!parent) {
-      return;
-    }
-
-    const observer = new ResizeObserver(() => {
-      setLeftSideLayoutMode(
-        parent.offsetWidth < 1100 ? "single" : "side-by-side",
-      );
-    });
-
-    observer.observe(parent);
-
-    return () => {
-      observer.disconnect();
-    };
-  }, [dom.splitLeft]);
-
   const doLayout = useCallback(
     (nodes: Array<AppNode>, edges: Array<Edge>) => {
       const layoutedElements = layout(nodes, edges, blockLabel);
@@ -1755,7 +1492,7 @@ function Workspace({
   }, [getEdges, getNodes]);
   const authoringActionAvailability =
     resolveWorkspaceAuthoringActionAvailability({
-      browserReady: copilotLiveBrowserReady,
+      browserReady: emberLiveBrowserReady,
       isGlobalWorkflow,
       isWorkflowDeleted: Boolean(workflow.deleted_at),
       hasActiveRun: Boolean(viewerState?.active_run_session_id),
@@ -1768,7 +1505,7 @@ function Workspace({
   const authoringBlocked = useWorkflowYamlEditorStore(
     (state) =>
       state.commitInProgress ||
-      state.copilotAcceptance !== null ||
+      state.emberAcceptance !== null ||
       state.authoringInProgress,
   );
   const startRecordingAtEnd = useCallback(() => {
@@ -1814,20 +1551,20 @@ function Workspace({
     authoringBlocked,
     startRecordingAtEnd,
   ]);
-  // `/discover`'s "Upload an SOP" lands here with ?sop=1; stage the SOP file in Copilot once its
+  // `/discover`'s "Upload an SOP" lands here with ?sop=1; stage the SOP file in Ember once its
   // composer can take a file.
   const sopHandoffRequested = searchParams.get("sop") === "1";
   const sopHandoffHandledRef = useRef(false);
   // A boolean, not the function: the chat re-registers the stager whenever its callbacks change,
   // and subscribing to the identity would re-render this component into a loop.
-  const copilotCanStageAttachment = useCopilotActionStore(
+  const emberCanStageAttachment = useEmberActionStore(
     (state) => state.stageAttachment !== null,
   );
   useEffect(() => {
     if (
       !sopHandoffRequested ||
       sopHandoffHandledRef.current ||
-      !copilotCanStageAttachment
+      !emberCanStageAttachment
     ) {
       return;
     }
@@ -1844,7 +1581,7 @@ function Workspace({
           description:
             "The SOP file did not reach the editor. Use Upload an SOP in the Copilot panel to try again.",
         });
-      // After staging: opening the Copilot pane navigates with the current URL, which would
+      // After staging: opening the Ember pane navigates with the current URL, which would
       // put the marker back if it ran after this rewrite.
       setRecordSearchParams(
         (current) => {
@@ -1858,7 +1595,7 @@ function Workspace({
     return () => window.clearTimeout(timer);
   }, [
     sopHandoffRequested,
-    copilotCanStageAttachment,
+    emberCanStageAttachment,
     setRecordSearchParams,
     workflow.workflow_permanent_id,
   ]);
@@ -1991,7 +1728,6 @@ function Workspace({
             withWorkflowSettings: false,
             editable: true,
             label: "__start_block__",
-            showCode: false,
           },
           id,
         ),
@@ -2011,7 +1747,6 @@ function Workspace({
             withWorkflowSettings: false,
             editable: true,
             label: "__start_block__",
-            showCode: false,
             parentNodeType: "conditional",
           },
           id,
@@ -2084,15 +1819,6 @@ function Workspace({
     if (select) useWorkflowPanelStore.getState().setSelectedBlockId(id);
     return id;
   }
-
-  const orderedBlockLabels = getOrderedBlockLabels(workflow);
-  const code = getCode(orderedBlockLabels, blockScriptsPublished?.blocks).join(
-    "",
-  );
-  const codePending = getCode(
-    orderedBlockLabels,
-    blockScriptsPending?.blocks,
-  ).join("");
 
   const handleCompareVersions = (
     version1: WorkflowVersion,
@@ -2187,7 +1913,7 @@ function Workspace({
       const titleStore = useWorkflowTitleStore.getState();
       if (typeof workflowData.title === "string") {
         if (options?.midTurnDraft) {
-          titleStore.setTitleFromCopilotIfDefault(workflowData.title);
+          titleStore.setTitleFromEmberIfDefault(workflowData.title);
         } else {
           titleStore.syncTitleFromWorkflow(workflowData.title, options);
         }
@@ -2223,7 +1949,7 @@ function Workspace({
     } else {
       workflowChangesStore.setHasChanges(true, options);
       if (options?.userDriven) {
-        // A Copilot build has no canvas gesture but is user-driven; mark it so
+        // An Ember build has no canvas gesture but is user-driven; mark it so
         // the dot/summary surface it instead of the baseline absorbing it.
         useWorkflowSnapshotStore.getState().markUserEdit();
       }
@@ -2231,7 +1957,7 @@ function Workspace({
     return true;
   };
 
-  const handleCopilotWorkflowUpdate = useWorkspaceCopilotUpdate({
+  const handleEmberWorkflowUpdate = useWorkspaceEmberUpdate({
     applyWorkflowUpdate,
     embedded,
     initialBlockCount: workflow.workflow_definition.blocks.length,
@@ -2329,7 +2055,7 @@ function Workspace({
     return () => store.registerEnterYamlMode(null);
   }, [embedded, isGlobalWorkflow]);
 
-  // Commit-on-switch: reparse the edited YAML into the graph via the Copilot's
+  // Commit-on-switch: reparse the edited YAML into the graph via the Ember's
   // non-persisting convert endpoint. Returns false on invalid YAML (stays open).
   const commitYaml = async (
     persist: boolean = false,
@@ -2443,7 +2169,7 @@ function Workspace({
       const client = await getClient(credentialGetter, "sans-api-v1");
       if (!isYamlCommitOwnerCurrent(owner)) return false;
       const response = await client.post<WorkflowYAMLConversionResponse>(
-        "/workflow/copilot/convert-yaml-to-blocks",
+        "/workflow/convert-yaml-to-blocks",
         {
           workflow_definition_yaml: definitionYaml,
           workflow_id: saveData.workflow.workflow_id,
@@ -2542,7 +2268,7 @@ function Workspace({
             JSON.stringify(value) !== JSON.stringify(baselineSettings[key]),
         )
       )
-        useWorkflowTitleStore.getState().recordCopilotGraphEdit();
+        useWorkflowTitleStore.getState().recordEmberGraphEdit();
       yamlStore.close();
       return true;
     } catch (error) {
@@ -2590,8 +2316,8 @@ function Workspace({
 
   const handleSelectState = (selectedVersion: WorkflowVersion) => {
     if (refuseMutationDuringYamlCommit()) return;
-    // A restore would replace the canvas a pending Copilot proposal is staged on.
-    if (useCopilotProposalStore.getState().proposal) {
+    // A restore would replace the canvas a pending Ember proposal is staged on.
+    if (useEmberProposalStore.getState().proposal) {
       toast({
         title: "Resolve the Copilot proposal before restoring a version.",
         variant: "destructive",
@@ -2626,10 +2352,10 @@ function Workspace({
     );
     setEdges(elements.edges);
     const titleStore = useWorkflowTitleStore.getState();
-    titleStore.clearCopilotMetadata(selectedVersion.workflow_permanent_id);
-    titleStore.trackCopilotMetadata(
+    titleStore.clearEmberMetadata(selectedVersion.workflow_permanent_id);
+    titleStore.trackEmberMetadata(
       selectedVersion.workflow_permanent_id,
-      titleStore.copilotMetadataEdits[selectedVersion.workflow_permanent_id]
+      titleStore.emberMetadataEdits[selectedVersion.workflow_permanent_id]
         ?.proposal,
     );
     titleStore.setTitle(selectedVersion.title, { source: "workflow" });
@@ -2789,9 +2515,7 @@ function Workspace({
                 version2={workflowPanelState.data.version2}
                 onSelectState={handleSelectState}
                 mode={workflowPanelState.data.mode}
-                onCopilotReviewClose={
-                  workflowPanelState.data.onCopilotReviewClose
-                }
+                onEmberReviewClose={workflowPanelState.data.onEmberReviewClose}
                 lockReason={workflowChangesStore.saveBlockedReason}
                 onExit={embedded ? exitVersionHistory : undefined}
               />
@@ -2828,9 +2552,7 @@ function Workspace({
               version2={workflowPanelState.data.version2}
               onSelectState={handleSelectState}
               mode={workflowPanelState.data.mode}
-              onCopilotReviewClose={
-                workflowPanelState.data.onCopilotReviewClose
-              }
+              onEmberReviewClose={workflowPanelState.data.onEmberReviewClose}
               lockReason={workflowChangesStore.saveBlockedReason}
               onExit={embedded ? exitVersionHistory : undefined}
             />
@@ -2860,29 +2582,6 @@ function Workspace({
                 opacity: !embedded && headerCollapsed ? 0 : 1,
               }}
             >
-              {!embedded && workflowPanelState.content === "cacheKeyValues" && (
-                <WorkflowCacheKeyValuesPanel
-                  cacheKeyValues={cacheKeyValues}
-                  pending={cacheKeyValuesLoading}
-                  scriptKey={workflow.cache_key ?? "default"}
-                  filter={cacheKeyValueFilter ?? undefined}
-                  onFilterChange={setCacheKeyValueFilter}
-                  onDelete={(cacheKeyValue) => {
-                    deleteCacheKeyValue.mutate({
-                      workflowPermanentId: workflowPermanentId!,
-                      cacheKeyValue,
-                    });
-                  }}
-                  onPaginate={(page) => {
-                    setPage(page);
-                  }}
-                  onSelect={(cacheKeyValue) => {
-                    setExplicitCacheKeyValue(cacheKeyValue);
-                    setCacheKeyValueFilter("");
-                    closeWorkflowPanel();
-                  }}
-                />
-              )}
               {workflowPanelState.content === "parameters" && (
                 <div className="z-30">
                   <WorkflowParametersPanel />
@@ -3003,30 +2702,6 @@ function Workspace({
                     }}
                   >
                     {!embedded &&
-                      workflowPanelState.content === "cacheKeyValues" && (
-                        <WorkflowCacheKeyValuesPanel
-                          cacheKeyValues={cacheKeyValues}
-                          pending={cacheKeyValuesLoading}
-                          scriptKey={workflow.cache_key ?? "default"}
-                          filter={cacheKeyValueFilter ?? undefined}
-                          onFilterChange={setCacheKeyValueFilter}
-                          onDelete={(cacheKeyValue) => {
-                            deleteCacheKeyValue.mutate({
-                              workflowPermanentId: workflowPermanentId!,
-                              cacheKeyValue,
-                            });
-                          }}
-                          onPaginate={(page) => {
-                            setPage(page);
-                          }}
-                          onSelect={(cacheKeyValue) => {
-                            setExplicitCacheKeyValue(cacheKeyValue);
-                            setCacheKeyValueFilter("");
-                            closeWorkflowPanel();
-                          }}
-                        />
-                      )}
-                    {!embedded &&
                       workflowPanelState.content === "parameters" && (
                         <div className="z-30">
                           <WorkflowParametersPanel />
@@ -3076,29 +2751,6 @@ function Workspace({
                 opacity: headerCollapsed ? 0 : 1,
               }}
             >
-              {!embedded && workflowPanelState.content === "cacheKeyValues" && (
-                <WorkflowCacheKeyValuesPanel
-                  cacheKeyValues={cacheKeyValues}
-                  pending={cacheKeyValuesLoading}
-                  scriptKey={workflow.cache_key ?? "default"}
-                  filter={cacheKeyValueFilter ?? undefined}
-                  onFilterChange={setCacheKeyValueFilter}
-                  onDelete={(cacheKeyValue) => {
-                    deleteCacheKeyValue.mutate({
-                      workflowPermanentId: workflowPermanentId!,
-                      cacheKeyValue,
-                    });
-                  }}
-                  onPaginate={(page) => {
-                    setPage(page);
-                  }}
-                  onSelect={(cacheKeyValue) => {
-                    setExplicitCacheKeyValue(cacheKeyValue);
-                    setCacheKeyValueFilter("");
-                    closeWorkflowPanel();
-                  }}
-                />
-              )}
               {workflowPanelState.content === "parameters" && (
                 <WorkflowParametersPanel />
               )}
@@ -3118,7 +2770,7 @@ function Workspace({
           </>
         )}
 
-      {/* code, infinite canvas, browser, timeline, and node library sub panel when in debug mode */}
+      {/* infinite canvas, browser, timeline, and node library sub panel when in debug mode */}
       {showBrowser && !workflowPanelState.data?.showComparison && (
         <div className="relative flex h-full w-full overflow-hidden overflow-x-hidden">
           <Splitter
@@ -3128,51 +2780,11 @@ function Workspace({
             split={{ left: workflowWidth }}
             onResize={() => setContainerResizeTrigger((prev) => prev + 1)}
           >
-            {/* code + canvas; recording overlays the panel without unmounting FlowRenderer */}
+            {/* canvas; recording overlays the panel without unmounting FlowRenderer */}
             <div className="relative h-full w-full">
-              <div
-                className={cn(
-                  "skyvern-split-left flex h-full w-[200%] translate-x-[-50%] transition-none duration-300",
-                  {
-                    "w-[100%] translate-x-0":
-                      leftSideLayoutMode === "side-by-side",
-                  },
-                  {
-                    "translate-x-0": showAllCode,
-                  },
-                )}
-                ref={dom.splitLeft}
-              >
-                {/* code */}
-                <div
-                  className={cn("h-full w-[50%]", {
-                    "w-[0%]":
-                      leftSideLayoutMode === "side-by-side" && !showAllCode,
-                  })}
-                >
-                  <div className="relative mt-[8.5rem] w-full p-6 pr-5 pt-0">
-                    <div className="absolute right-[2rem] top-[0.75rem] z-20">
-                      <CopyAndExplainCode code={code} />
-                    </div>
-                    <CodeEditor
-                      className={cn("w-full overflow-y-scroll", {
-                        "animate-pulse": isGeneratingCode,
-                      })}
-                      language="python"
-                      value={isGeneratingCode ? codePending : code}
-                      lineWrap={false}
-                      readOnly
-                      fontSize={10}
-                    />
-                  </div>
-                </div>
+              <div className="flex h-full w-full">
                 {/* infinite canvas */}
-                <div
-                  className={cn("relative h-full w-[50%]", {
-                    "w-[100%]":
-                      leftSideLayoutMode === "side-by-side" && !showAllCode,
-                  })}
-                >
+                <div className="relative h-full w-full">
                   <FlowRenderer
                     showZoomControls={false}
                     nodes={nodes}
@@ -3278,10 +2890,10 @@ function Workspace({
                       )}
                     </div>
                     <footer className="flex h-[2rem] w-full items-center justify-start gap-4 text-muted-foreground">
-                      <WorkflowCopilotButton
-                        ref={copilotButtonRef}
-                        messageCount={copilotMessageCount}
-                        onClick={() => setIsCopilotOpen((prev) => !prev)}
+                      <EmberButton
+                        ref={emberButtonRef}
+                        messageCount={emberMessageCount}
+                        onClick={() => setIsEmberOpen((prev) => !prev)}
                       />
                       <div className="flex items-center gap-2 text-muted-foreground">
                         <GlobeIcon /> Live Browser
@@ -3350,10 +2962,10 @@ function Workspace({
                       )}
                     </div>
                     <footer className="flex h-[2rem] w-full items-center justify-start gap-4 text-muted-foreground">
-                      <WorkflowCopilotButton
-                        ref={copilotButtonRef}
-                        messageCount={copilotMessageCount}
-                        onClick={() => setIsCopilotOpen((prev) => !prev)}
+                      <EmberButton
+                        ref={emberButtonRef}
+                        messageCount={emberMessageCount}
+                        onClick={() => setIsEmberOpen((prev) => !prev)}
                       />
                       <div className="flex items-center gap-2 text-muted-foreground">
                         <GlobeIcon /> Live Browser
@@ -3497,8 +3109,8 @@ function Workspace({
 
       <DemonstrateFromBlockStatus />
       {withStudioPaneBoundary(
-        "copilot",
-        <WorkflowCopilotChat
+        EMBER_PANE_CRASH_LABEL,
+        <EmberChat
           templateGuidance={templateGuidance}
           onTemplateGuidanceShown={handleTemplateGuidanceShown}
           organizationId={workflow.organization_id}
@@ -3510,25 +3122,25 @@ function Workspace({
               .getState()
               .recordPersistedSave(workflowPermanentId)
           }
-          isOpen={embedded ? studioCopilotOpen : showBrowser && isCopilotOpen}
+          isOpen={embedded ? studioEmberOpen : showBrowser && isEmberOpen}
           docked={embedded}
           chromeless={embedded}
-          portalTarget={embedded ? studioCopilotPortalEl : undefined}
-          onClose={() => setIsCopilotOpen(false)}
-          onMessageCountChange={setCopilotMessageCount}
-          buttonRef={copilotButtonRef}
+          portalTarget={embedded ? studioEmberPortalEl : undefined}
+          onClose={() => setIsEmberOpen(false)}
+          onMessageCountChange={setEmberMessageCount}
+          buttonRef={emberButtonRef}
           liveBrowserSessionId={
-            copilotLiveBrowserReady ? debugBrowserSessionId : null
+            emberLiveBrowserReady ? debugBrowserSessionId : null
           }
-          onTurnActivityChange={setIsCopilotTurnActive}
-          workflowRunId={copilotRunId({ embedded, studioRunId })}
-          requiresLiveBrowser={copilotRequiresLiveBrowser}
-          isLiveBrowserReady={copilotLiveBrowserReady}
-          initialMessage={initialCopilotMessage ?? undefined}
-          initialAttachments={routeInitialCopilotAttachments}
-          initialAction={initialCopilotAction ?? undefined}
-          onInitialMessageConsumed={handleInitialCopilotMessageConsumed}
-          onRequestOpen={openCopilot}
+          onTurnActivityChange={setIsEmberTurnActive}
+          workflowRunId={emberRunId({ embedded, studioRunId })}
+          requiresLiveBrowser={emberRequiresLiveBrowser}
+          isLiveBrowserReady={emberLiveBrowserReady}
+          initialMessage={initialEmberMessage ?? undefined}
+          initialAttachments={routeInitialEmberAttachments}
+          initialAction={initialEmberAction ?? undefined}
+          onInitialMessageConsumed={handleInitialEmberMessageConsumed}
+          onRequestOpen={openEmber}
           onRecordTask={startRecordingAtEnd}
           canRecordTask={authoringActionAvailability.canRecordTask}
           runOwnsBrowser={Boolean(viewerState?.active_run_session_id)}
@@ -3602,7 +3214,7 @@ function Workspace({
               // exactly as the chat's own buttons do. A refused decision keeps the
               // panel open; an Accept failure renders on the chat's review gate,
               // so the panel closes to reveal it.
-              const handleCopilotReviewClose = bindCopilotReviewClose(
+              const handleEmberReviewClose = bindEmberReviewClose(
                 () => settle("reject"),
                 async (status) => {
                   if (status === "approve" && !(await settle("approve"))) {
@@ -3617,13 +3229,13 @@ function Workspace({
                       version2: undefined,
                     },
                   });
-                  setIsCopilotOpen(true);
+                  setIsEmberOpen(true);
                 },
               );
 
               // Hide chat and show comparison. The comparison renders on the
               // editor canvas, so surface the Editor pane when docked in the studio.
-              setIsCopilotOpen(false);
+              setIsEmberOpen(false);
               if (embedded) {
                 openStudioPane("editor");
               }
@@ -3634,8 +3246,8 @@ function Workspace({
                   version1: currentVersion,
                   version2: pendingWorkflow,
                   showComparison: true,
-                  mode: "copilot",
-                  onCopilotReviewClose: handleCopilotReviewClose,
+                  mode: "ember",
+                  onEmberReviewClose: handleEmberReviewClose,
                 },
               });
             } catch (error) {
@@ -3648,9 +3260,9 @@ function Workspace({
               });
             }
           }}
-          onWorkflowUpdate={handleCopilotWorkflowUpdate}
+          onWorkflowUpdate={handleEmberWorkflowUpdate}
         />,
-        studioCopilotPortalEl,
+        studioEmberPortalEl,
       )}
       <ConfirmDialog
         open={deleteBlockDialogState.open}
@@ -3683,41 +3295,6 @@ function Workspace({
         <AffectedBlocksNotice affectedBlocks={affectedBlocksForDelete} />
       </ConfirmDialog>
 
-      {/* Studio: the cache key/value panel escapes the Editor pane via the
-          shell-level portal, so the Overview pane's Code view can open it (and
-          close it) even with the Editor pane hidden. */}
-      {embedded ? (
-        <StudioShellPanelPortal
-          open={
-            workflowPanelState.active &&
-            workflowPanelState.content === "cacheKeyValues"
-          }
-          onDismiss={closeWorkflowPanel}
-        >
-          <WorkflowCacheKeyValuesPanel
-            cacheKeyValues={cacheKeyValues}
-            pending={cacheKeyValuesLoading}
-            scriptKey={workflow.cache_key ?? "default"}
-            filter={cacheKeyValueFilter ?? undefined}
-            onFilterChange={setCacheKeyValueFilter}
-            onClose={closeWorkflowPanel}
-            onDelete={(cacheKeyValue) => {
-              deleteCacheKeyValue.mutate({
-                workflowPermanentId: workflowPermanentId!,
-                cacheKeyValue,
-              });
-            }}
-            onPaginate={(page) => {
-              setPage(page);
-            }}
-            onSelect={(cacheKeyValue) => {
-              setExplicitCacheKeyValue(cacheKeyValue);
-              setCacheKeyValueFilter("");
-              closeWorkflowPanel();
-            }}
-          />
-        </StudioShellPanelPortal>
-      ) : null}
       {/* Studio: Code mode swaps the Editor pane's content (sibling panes stay
           usable); legacy keeps the original full-screen modal overlay. */}
       {yamlEditorActive
@@ -3733,4 +3310,4 @@ function Workspace({
   );
 }
 
-export { CopyAndExplainCode, Workspace };
+export { Workspace };

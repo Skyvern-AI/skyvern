@@ -24,6 +24,7 @@ from skyvern.forge.sdk.copilot.demonstration_recorder import (
     DemonstrationRecord,
     DemonstrationRejection,
     decode_demonstration_record,
+    demonstration_cache,
     demonstration_event_key,
     demonstration_lock_key,
     demonstration_record_key,
@@ -40,11 +41,11 @@ from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
 from skyvern.forge.sdk.copilot.output_utils import sanitize_tool_result_for_llm, summarize_tool_result
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, screen_raw_secret_safety
 from skyvern.forge.sdk.copilot.runtime import DemonstratedAction, staged_demonstrated_action
-from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt, redact_secretlike_filename
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.streaming_adapter import parse_tool_output
 from skyvern.forge.sdk.copilot.tools.scouting import record_scouted_interaction_fact
 from skyvern.forge.sdk.schemas.workflow_copilot import CopilotSteerMessage
+from skyvern.utils.raw_secret_redaction import redact_raw_secrets_for_prompt, redact_secretlike_filename
 
 LOG = structlog.get_logger()
 
@@ -59,9 +60,9 @@ _TYPED_VALUE_SCREEN_CONCURRENCY = 4
 
 
 async def replay_demonstration(ctx: CopilotContext, mcp_server: SkyvernOverlayMCPServer) -> list[dict[str, Any]]:
-    cache = app.CACHE
+    cache = demonstration_cache()
     demonstration_id = ctx.demonstration_id
-    if cache is None or not cache.is_shared or not demonstration_id:
+    if cache is None or not demonstration_id:
         return []
     record = await _claim_replay(cache, ctx, demonstration_id)
     replay_token = record.replay_token

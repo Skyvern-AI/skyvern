@@ -35,8 +35,7 @@ class _DisconnectedWebSocket:
     def __init__(self) -> None:
         self.sent: list[dict] = []
         self._disconnect_delivered = False
-        self.headers: dict[str, str] = {}
-        self.url = SimpleNamespace(path="/v1/stream/test")
+        self.headers = {"sec-websocket-protocol": "skyvern.v1, apikey.key"}
 
     async def accept(self, subprotocol: str | None = None) -> None:
         return None
@@ -101,7 +100,6 @@ async def test_workflow_run_streaming_stops_sending_once_the_client_is_gone(
             screenshot.workflow_run_streaming(
                 websocket=cast(WebSocket, websocket),
                 workflow_run_id="wr_1",
-                apikey="key",
             ),
             timeout=10,
         )
@@ -115,8 +113,7 @@ class _WatchingWebSocket:
     def __init__(self, send_error: Exception | None = None) -> None:
         self.sent: list[dict] = []
         self._send_error = send_error
-        self.headers: dict[str, str] = {}
-        self.url = SimpleNamespace(path="/v1/stream/test")
+        self.headers = {"sec-websocket-protocol": "skyvern.v1, apikey.key"}
 
     async def accept(self, subprotocol: str | None = None) -> None:
         return None
@@ -227,10 +224,10 @@ def run_stream(monkeypatch: pytest.MonkeyPatch) -> Callable[..., Awaitable[_Watc
         monkeypatch.setattr(screenshot, "STREAMING_TIMEOUT", timeout_seconds)
         websocket = _WatchingWebSocket(send_error)
         if task_id:
-            route = screenshot.task_stream(websocket=cast(WebSocket, websocket), task_id=task_id, apikey="key")
+            route = screenshot.task_stream(websocket=cast(WebSocket, websocket), task_id=task_id)
         else:
             route = screenshot.workflow_run_streaming(
-                websocket=cast(WebSocket, websocket), workflow_run_id=workflow_run_id, apikey="key"
+                websocket=cast(WebSocket, websocket), workflow_run_id=workflow_run_id
             )
         await asyncio.wait_for(route, timeout=10)
         return websocket
@@ -470,7 +467,6 @@ async def test_session_screencast_counts_a_run_only_while_it_holds_the_session(
                 screenshot.browser_session_streaming(
                     websocket=cast(WebSocket, viewer),
                     browser_session_id=session_id,
-                    apikey="key",
                     force_cdp=True,
                 ),
                 timeout=10,
@@ -621,7 +617,6 @@ def watch_over_vnc(monkeypatch: pytest.MonkeyPatch) -> Callable[..., Awaitable[_
             vnc_route.browser_session_stream(
                 websocket=cast(WebSocket, viewer),
                 browser_session_id=session_id,
-                apikey="key",
                 client_id=f"client_{session_id}",
             ),
             timeout=10,

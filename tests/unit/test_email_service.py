@@ -819,6 +819,33 @@ async def test_outlook_otp_search_returns_strong_then_hidden_fallback(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("identifier", "expected_message_ids"),
+    [("user+tag@example.com", ["confirmation"]), ("user@example.com", [])],
+)
+async def test_outlook_otp_search_accepts_confirmation_mail_only_for_plus_addresses(
+    monkeypatch: pytest.MonkeyPatch,
+    identifier: str,
+    expected_message_ids: list[str],
+) -> None:
+    message = _outlook_otp_message(
+        "confirmation",
+        recipient=identifier,
+        subject="Confirm your signup",
+        body="Thanks for joining. Use the link below to finish.",
+    )
+    _patch_outlook_otp_graph(monkeypatch, [message])
+
+    candidates = await email.outlook.search_recent_otp_messages(
+        access_token="AT",
+        totp_identifier=identifier,
+        created_after=datetime(2026, 7, 30, 12, 0, tzinfo=timezone.utc),
+    )
+
+    assert [candidate.message_id for candidate in candidates] == expected_message_ids
+
+
+@pytest.mark.asyncio
 async def test_outlook_otp_search_distinguishes_empty_body_from_missing_hydration_body(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1709,3 +1736,24 @@ async def test_outlook_list_folder_messages_keeps_message_when_attachment_fetch_
         )
     assert messages[0].attachment_list_error is None
     assert requested[0].attachment_list_error == "ServiceUnavailable"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["rateLimitExceeded", "userRateLimitExceeded"])
+async def test_gmail_get_json_retries_403_rate_limits(monkeypatch: pytest.MonkeyPatch, reason: str) -> None:
+    calls = 0
+
+    async def fake_sleep(_seconds: float) -> None:
+        pass
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(403, json={"error": {"errors": [{"reason": reason}]}})
+
+    monkeypatch.setattr(gmail_client, "asyncio", ScopedAsyncio(sleep=fake_sleep))
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(email.GmailAPIError) as exc_info:
+            await gmail_client.get_json(client, "https://gmail.example/messages", access_token="AT")
+    assert calls == 3
+    assert exc_info.value.code == reason

@@ -3,7 +3,7 @@
 Two properties matter here and neither is about CDP: the engine must be *unselectable* by any
 production browser source until someone deliberately carves one in, and it must fail *loud* rather
 than silently degrade when asked for something it cannot do. The second rule is not hypothetical —
-a driver that logged a capability it had quietly dropped once cost this fleet its stealth posture.
+a driver that logged a capability it had quietly dropped once caused a silent fleet-wide regression.
 """
 
 from __future__ import annotations

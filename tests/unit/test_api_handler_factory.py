@@ -39,13 +39,13 @@ from skyvern.forge.sdk.api.llm.exceptions import (
 from skyvern.forge.sdk.api.llm.models import LLMConfig
 from skyvern.forge.sdk.api.llm.utils import uses_only_anthropic_models
 from skyvern.forge.sdk.artifact.models import ArtifactType
-from skyvern.forge.sdk.copilot import secret_scrub
-from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.prompting import PromptEngine
 from skyvern.forge.sdk.schemas.custom_llms import CustomLLMConfig, CustomLLMProvider
 from skyvern.schemas.llm import LLMRouterConfig, LLMRouterModelConfig
+from skyvern.utils import secret_scrub
+from skyvern.utils.secret_scrub import REDACTED_SECRET_PLACEHOLDER
 from tests.unit.forge_log_capture import capture_runtime_logs
 from tests.unit.helpers import DummyLogger, FakeLLMResponse, fallback_receipts, router_test_context
 
@@ -1398,6 +1398,54 @@ async def test_router_anthropic_prompt_caching_requires_all_anthropic_models(
         assert "".join(block["text"] for block in user_content[1:]) == dynamic_prompt
     else:
         assert not marked_blocks
+
+
+@pytest.mark.parametrize(
+    ("provider_models", "prompt_name", "cached"),
+    [
+        (["anthropic/claude-haiku-test", "bedrock/us.anthropic.claude-test"], "failure_classifier_shadow", True),
+        (["anthropic/claude-haiku-test", "openai/gpt-5.5"], "failure_classifier_shadow", False),
+        (["anthropic/claude-haiku-test", "bedrock/us.anthropic.claude-test"], "extract-actions", False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_opted_in_system_prompt_is_cached_only_on_anthropic(
+    monkeypatch: pytest.MonkeyPatch, provider_models: list[str], prompt_name: str, cached: bool
+) -> None:
+    captured_messages: list[dict[str, Any]] = []
+
+    class _CapturingRouter:
+        def __init__(self, **_: Any) -> None:
+            pass
+
+        async def acompletion(self, *, model: str, messages: list[dict[str, Any]], **_: Any) -> FakeLLMResponse:
+            captured_messages.extend(messages)
+            return FakeLLMResponse(model)
+
+    llm_key = f"TEST_SYSTEM_PROMPT_CACHE_{prompt_name}_{cached}"
+    config = LLMRouterConfig(
+        model_name="test-router",
+        required_env_vars=[],
+        supports_vision=False,
+        add_assistant_prefix=False,
+        model_list=[
+            LLMRouterModelConfig(model_name=f"group-{index}", litellm_params={"model": provider_model})
+            for index, provider_model in enumerate(provider_models)
+        ],
+        main_model_group="group-0",
+        fallback_model_group="group-1",
+    )
+    _stub_for_router_test(monkeypatch, llm_key=llm_key, config=config)
+    monkeypatch.setattr(api_handler_factory.litellm, "Router", _CapturingRouter)
+
+    handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router(llm_key)
+    await handler(prompt="per-run evidence", prompt_name=prompt_name, system_prompt="static rules")
+
+    expected_block: dict[str, Any] = {"type": "text", "text": "static rules"}
+    if cached:
+        expected_block["cache_control"] = {"type": "ephemeral"}
+    assert captured_messages[0] == {"role": "system", "content": [expected_block]}
+    assert all("cache_control" not in str(message) for message in captured_messages[1:])
 
 
 def test_uses_only_anthropic_models_rejects_openai_claude_proxy() -> None:

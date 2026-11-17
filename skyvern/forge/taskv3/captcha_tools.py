@@ -38,9 +38,11 @@ from skyvern.forge.taskv3 import input_dispatch
 from skyvern.forge.taskv3.loop import REF_SELECTOR_RE, ToolResult, ToolSpec, current_tool_call_seq
 from skyvern.forge.taskv3.tools import PageProvider, _invalid_selector_result, _normalize_selector
 from skyvern.webeye.utils.captcha_solver import (
+    _HCAPTCHA_MARKER_SELECTOR,
     CAPTCHA_IMAGE_TAGS,
     MAX_IMAGE_CAPTCHA_READS,
     ChallengeStatus,
+    _recaptcha_token_populated,
     resolve_captcha_image,
     solve_challenge,
 )
@@ -101,6 +103,26 @@ _ABSENT = (
     "no captcha challenge was detected in the page or its visible frames; nothing was solved. "
     "Re-observe before calling solve_captcha again."
 )
+
+# Google documents a reCAPTCHA response as valid for two minutes and for a single verification.
+_RECAPTCHA_RESPONSE_LIFETIME = (
+    " The page's reCAPTCHA response field holds a value. Google documents responses as expiring 2 minutes "
+    "after issuance and usable for one server-side verification. This observation does not establish issuance time, "
+    "freshness, consumption, or site acceptance."
+)
+_RECAPTCHA_RESPONSE_PROBE_TIMEOUT_SECONDS = 1.0
+
+
+async def _recaptcha_response_present(page: Any) -> bool | None:
+    """Whether the page's reCAPTCHA response field holds a value; None when it cannot be read, or on an hCaptcha
+    page, which fills the same field for compatibility under its own token rules."""
+    try:
+        async with asyncio.timeout(_RECAPTCHA_RESPONSE_PROBE_TIMEOUT_SECONDS):
+            if await page.locator(_HCAPTCHA_MARKER_SELECTOR).count():
+                return None
+            return await _recaptcha_token_populated(page)
+    except Exception:
+        return None
 
 
 async def _describe_element(locator: Any) -> str:
@@ -325,13 +347,14 @@ def build_captcha_tools(
         except Exception:
             vendor_frame_present = None
 
-        def record(receipt: dict[str, str | None]) -> None:
+        def record(receipt: dict[str, str | None], recaptcha_response_present: bool | None = None) -> None:
             # Prefixed: `arm` and `status` are already facets other lines write with other meanings.
             fields = {f"solve_{key}": value for key, value in receipt.items()}
             LOG.info(
                 "taskv3 captcha solve outcome",
                 **fields,
                 vendor_frame_present=vendor_frame_present,
+                recaptcha_response_present=recaptcha_response_present,
                 tool_call_seq=current_tool_call_seq(),
             )
 
@@ -365,7 +388,8 @@ def build_captcha_tools(
             return ToolResult.error(
                 "captcha solve failed unexpectedly; re-observe the page and continue.", error_class="solve_raised"
             )
-        record(outcome.receipt())
+        response_present = await _recaptcha_response_present(page) if outcome.status is ChallengeStatus.SOLVED else None
+        record(outcome.receipt(), response_present)
         # When the run can report its own error codes, the model reads the recorded solve outcomes at finish.
         evidence = prompt_evidence_str(task) if task.error_code_mapping else None
         recorded = f"\nRecorded challenge solves for this task: {evidence}" if evidence else ""
@@ -386,8 +410,9 @@ def build_captcha_tools(
         if outcome.status is ChallengeStatus.SOLVED:
             # A real solve is progress; clear the failure streak so a later genuine captcha isn't disabled.
             failed_attempts = 0
+            lifetime = _RECAPTCHA_RESPONSE_LIFETIME if response_present else ""
             return ToolResult.ok(
-                "captcha solved; re-observe the page and continue (e.g. retry submit)." + recorded,
+                "captcha solved; re-observe the page and continue (e.g. retry submit)." + lifetime + recorded,
                 ok_class="solved",
             )
         # Absent: no challenge is presented, including a widget the page loaded but never showed. No solver

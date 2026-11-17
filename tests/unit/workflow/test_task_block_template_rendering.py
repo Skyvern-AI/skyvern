@@ -632,13 +632,14 @@ def test_secret_transformed_inside_a_json_typed_value_is_redacted_after_decoding
     assert [redact_secrets_from_text(value, run_secrets) for value in values] == expected
 
 
-def test_cyclic_template_data_still_renders_and_fails_closed() -> None:
+@pytest.mark.parametrize("template", ["{{ data.token|upper }}", "{{ data.self.token|upper }}"])
+def test_cyclic_template_data_still_renders_and_fails_closed(template: str) -> None:
     data: dict[str, Any] = {"token": _SECRET}
     data["self"] = data
     ctx = _context_with_registered_secret(data=data)
     block = TaskBlock(label="sign_in", output_parameter=_make_output_parameter(), title="sign in")
 
-    rendered = block.render_templatable_field("navigation_goal", "{{ data.token|upper }}", ctx)
+    rendered = block.render_templatable_field("navigation_goal", template, ctx)
 
     assert rendered == "HUNTER2X9"
     assert ctx.mask_secrets_in_data(rendered) == "*****"

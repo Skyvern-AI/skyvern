@@ -10,14 +10,14 @@ import {
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { WorkflowScopeContext } from "@/routes/workflows/editor/WorkflowScopeContext";
-import { useCopilotActionStore } from "@/store/useCopilotActionStore";
+import { useEmberActionStore } from "@/store/useEmberActionStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { WorkflowParameterValueType } from "@/routes/workflows/types/workflowTypes";
 import {
-  beginCopilotAcceptance,
+  beginEmberAcceptance,
   beginSaveTransaction,
   createYamlCommitOwner,
-  finishCopilotAcceptance,
+  finishEmberAcceptance,
   finishSaveTransaction,
   registerEditorOwner,
   useWorkflowYamlEditorStore,
@@ -157,7 +157,7 @@ beforeEach(() => {
   useWorkflowYamlEditorStore.setState(
     useWorkflowYamlEditorStore.getInitialState(),
   );
-  useCopilotActionStore.setState(useCopilotActionStore.getInitialState());
+  useEmberActionStore.setState(useEmberActionStore.getInitialState());
   node.data = { ...baseData };
   extraNodes = [];
   useWorkflowParametersStore.setState({ parameters: [] });
@@ -167,7 +167,7 @@ beforeEach(() => {
 
 afterEach(cleanup);
 afterEach(() => {
-  useCopilotActionStore.setState({
+  useEmberActionStore.setState({
     pendingBuild: null,
     generatingBlockLabel: null,
     queuedBuilds: [],
@@ -678,7 +678,7 @@ describe("CodeBlockEditor for a code-first block", () => {
         goalNeedsRegeneration: null,
       },
     });
-    expect(useCopilotActionStore.getState().pendingBuild).toBeNull();
+    expect(useEmberActionStore.getState().pendingBuild).toBeNull();
   });
 
   test("a further edit keeps the goal the first edit replaced", () => {
@@ -710,7 +710,7 @@ describe("CodeBlockEditor for a code-first block", () => {
     });
   });
 
-  test("a pending goal change shows the banner, and Apply asks the copilot to follow it", () => {
+  test("a pending goal change shows the banner, and Apply asks the Ember to follow it", () => {
     node.data = pendingGoalData;
     renderEditor();
 
@@ -723,7 +723,7 @@ describe("CodeBlockEditor for a code-first block", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Apply new Goal" }));
 
-    expect(useCopilotActionStore.getState().pendingBuild).toEqual({
+    expect(useEmberActionStore.getState().pendingBuild).toEqual({
       blockLabel: "code_block",
       prompt: "Open {{ link }}",
       applyingGoalChange: true,
@@ -777,21 +777,21 @@ describe("CodeBlockEditor for a code-first block", () => {
 
   test("Apply while another block is generating waits its turn", () => {
     node.data = pendingGoalData;
-    useCopilotActionStore.setState({ generatingBlockLabel: "other" });
+    useEmberActionStore.setState({ generatingBlockLabel: "other" });
     renderEditor();
 
     fireEvent.click(screen.getByRole("button", { name: "Apply new Goal" }));
 
-    expect(useCopilotActionStore.getState().pendingBuild).toBeNull();
+    expect(useEmberActionStore.getState().pendingBuild).toBeNull();
     expect(screen.getByTestId("goal-change-banner").textContent).toContain(
       "Waiting to apply the new Goal",
     );
 
     act(() => {
-      useCopilotActionStore.getState().finishGenerating();
+      useEmberActionStore.getState().finishGenerating();
     });
 
-    expect(useCopilotActionStore.getState().pendingBuild).toEqual({
+    expect(useEmberActionStore.getState().pendingBuild).toEqual({
       blockLabel: "code_block",
       prompt: "Open {{ link }}",
       applyingGoalChange: true,
@@ -809,7 +809,7 @@ describe("CodeBlockEditor for a code-first block", () => {
     ],
   ])("the goal cannot be edited while the block is %s", (_, state) => {
     node.data = pendingGoalData;
-    useCopilotActionStore.setState(state);
+    useEmberActionStore.setState(state);
     renderEditor();
 
     const [goalTextarea] = screen.getAllByTestId("block-input-textarea");
@@ -956,7 +956,7 @@ describe("CodeBlockEditor after a hand code edit", () => {
     actions.updateGoal.mockClear();
     actions.keepGoal.mockClear();
     actions.acceptGoal.mockClear();
-    useCopilotActionStore.setState(actions);
+    useEmberActionStore.setState(actions);
   });
 
   test("in the code view the banner sits below the code so typing does not shift the editor", () => {
@@ -986,7 +986,7 @@ describe("CodeBlockEditor after a hand code edit", () => {
   });
 
   test("a suggestion for the current code and Goal is shown for acceptance", () => {
-    useCopilotActionStore.setState({
+    useEmberActionStore.setState({
       goalSuggestions: {
         code_block: {
           forCode: codeEditedData.code,
@@ -1009,7 +1009,7 @@ describe("CodeBlockEditor after a hand code edit", () => {
     ["the code changed after it was requested", { forCode: "print(2)" }],
     ["the Goal changed after it was requested", { forGoal: "Open the page" }],
   ])("a suggestion is not offered when %s", (_, stale) => {
-    useCopilotActionStore.setState({
+    useEmberActionStore.setState({
       goalSuggestions: {
         code_block: {
           forCode: codeEditedData.code,
@@ -1037,7 +1037,7 @@ describe("CodeBlockEditor after a hand code edit", () => {
   ])(
     "Update Goal and Keep Goal are disabled while the block is %s",
     (_, state) => {
-      useCopilotActionStore.setState(state);
+      useEmberActionStore.setState(state);
       renderEditor();
 
       for (const name of ["Update Goal", "Keep Goal"]) {
@@ -1161,7 +1161,7 @@ describe("CodeBlockEditor for a newly-added block from the node adder", () => {
 
     expect(screen.getByText("Goal")).toBeTruthy();
     expect(screen.getByText("View")).toBeTruthy();
-    // Steps are copilot-authored annotations, so a hand-added block has none yet.
+    // Steps are Ember-authored annotations, so a hand-added block has none yet.
     expect(screen.getByText(/No steps yet/)).toBeTruthy();
   });
 });
@@ -1305,22 +1305,22 @@ describe("CodeBlockEditor generate gating", () => {
       act(() => {
         if (lock === "save") expect(beginSaveTransaction(owner)).toBe(true);
         else {
-          reservation = beginCopilotAcceptance();
+          reservation = beginEmberAcceptance();
           expect(reservation).not.toBeNull();
         }
       });
       expect(button.disabled).toBe(true);
       fireEvent.click(button);
-      expect(useCopilotActionStore.getState().pendingBuild).toBeNull();
-      expect(useCopilotActionStore.getState().generatingBlockLabel).toBeNull();
+      expect(useEmberActionStore.getState().pendingBuild).toBeNull();
+      expect(useEmberActionStore.getState().generatingBlockLabel).toBeNull();
 
       act(() => {
         if (lock === "save") finishSaveTransaction(owner);
-        else finishCopilotAcceptance(reservation!);
+        else finishEmberAcceptance(reservation!);
       });
       expect(button.disabled).toBe(false);
       fireEvent.click(button);
-      expect(useCopilotActionStore.getState().pendingBuild).toEqual({
+      expect(useEmberActionStore.getState().pendingBuild).toEqual({
         blockLabel: "code_block",
         prompt: "Read the page title",
       });

@@ -4,15 +4,25 @@ import os
 import re
 from typing import Annotated, Any, Literal
 
+import structlog
 from pydantic import Field
 
 from skyvern.browser_extension.errors import BrowserExtensionBrokerError
 from skyvern.browser_extension.protocol import ERROR_CODES
-from skyvern.browser_extension.runtime import BrowserExtensionRuntime, broker_mode_enabled
+from skyvern.browser_extension.runtime import (
+    BrowserExtensionRuntime,
+    broker_mode_enabled,
+    release_broker_place_after_session_close,
+)
 from skyvern.cli.core.action_log import drain_action_log_events
 from skyvern.cli.core.api_key_hash import hash_api_key_for_cache
 from skyvern.cli.core.client import get_active_api_key
-from skyvern.cli.core.session_manager import BrowserSessionConnectionError, is_stateless_http_mode
+from skyvern.cli.core.session_manager import (
+    BrowserSessionConnectionError,
+    _extension_browser_is_connected,
+    _matches_current,
+    is_stateless_http_mode,
+)
 from skyvern.cli.core.session_ops import (
     coerce_proxy_location,
     do_session_arm_generate_browser_profile,
@@ -36,6 +46,15 @@ from ._session import (
     set_current_session,
 )
 
+LOG = structlog.get_logger(__name__)
+
+
+async def _release_extension_broker_place() -> None:
+    try:
+        await release_broker_place_after_session_close()
+    except Exception:
+        LOG.warning("browser_extension_broker_place_release_failed", exc_info=True)
+
 
 def _extension_not_connected_guidance(*, pairing_opened: bool) -> str:
     if pairing_opened:
@@ -50,11 +69,16 @@ def _extension_not_connected_guidance(*, pairing_opened: bool) -> str:
     )
 
 
-def _broker_extension_not_connected_guidance(*, pairing_opened: bool) -> str:
+def _broker_extension_not_connected_guidance(*, pairing_opened: bool, approved: bool) -> str:
     if pairing_opened:
         return (
             "Skyvern browser extension is not connected. A pairing tab was opened in Chrome. Approve pairing in "
             "the Skyvern Agent confirmation tab (one click), then retry."
+        )
+    if approved:
+        return (
+            "Skyvern browser extension is not connected. This agent is already approved, so no pairing is needed. "
+            "Keep Chrome open with the Skyvern Agent extension enabled, then retry."
         )
     return (
         "Skyvern browser extension is not connected. Keep Chrome and the Skyvern extension open, then retry. "
@@ -85,6 +109,11 @@ def _browser_extension_start_hint(error: Exception) -> str:
             return (
                 "Inspect ~/.skyvern/run/browser-extension/<port>/startup.log, stop any stale Skyvern MCP "
                 "process, and retry."
+            )
+        if error.code == "BROKER_BUSY":
+            return (
+                "The Chrome bridge is busy, or other agent sessions hold every place. "
+                "Close browser sessions you no longer need, or end idle agent sessions, then retry."
             )
         if error.code == "PORT_IN_USE":
             return (
@@ -226,6 +255,15 @@ async def skyvern_browser_session_create(
     ] = None,
     local: Annotated[bool, Field(description="Launch local browser instead of cloud")] = False,
     headless: Annotated[bool, Field(description="Run local browser in headless mode")] = False,
+    use_shared_tab: Annotated[
+        bool,
+        Field(
+            description=(
+                "Browser-extension broker mode only; the legacy relay ignores it. Start in a tab that the user shared "
+                "with Skyvern (the lowest-numbered free shared tab) instead of a new tab."
+            )
+        ),
+    ] = False,
 ) -> dict[str, Any]:
     """Create a new browser session to start interacting with websites. Cloud session results include app_url to watch the run live. Creates a cloud-hosted browser by default with geographic proxy support. This must be called before using any browser tools (navigate, click, extract, etc.).
 
@@ -267,10 +305,16 @@ async def skyvern_browser_session_create(
                 broker_mode = broker_mode_enabled()
                 runtime = await BrowserExtensionRuntime.get_or_start()
                 pairing_opened = False
+                client_approved = False
                 if not await runtime.wait_for_extension(8.0):
-                    # One-step pairing: open the approval page now and wait for the
-                    # user's single click instead of failing and demanding a retry.
-                    pairing_opened = await runtime.begin_pairing()
+                    # An approved client only needs the extension to finish its reconnect
+                    # backoff, which reaches 30s; the approval click would travel over that
+                    # same socket, so a pairing page cannot help it and only costs a tab.
+                    client_approved = broker_mode and await runtime.is_client_approved()
+                    if not client_approved:
+                        # One-step pairing: open the approval page now and wait for the
+                        # user's single click instead of failing and demanding a retry.
+                        pairing_opened = await runtime.begin_pairing()
                     if pairing_opened:
                         remaining_wait = 30.0
                     elif broker_mode:
@@ -279,7 +323,10 @@ async def skyvern_browser_session_create(
                         remaining_wait = 2.0
                     if not await runtime.wait_for_extension(remaining_wait):
                         guidance = (
-                            _broker_extension_not_connected_guidance(pairing_opened=pairing_opened)
+                            _broker_extension_not_connected_guidance(
+                                pairing_opened=pairing_opened,
+                                approved=client_approved,
+                            )
                             if broker_mode
                             else _extension_not_connected_guidance(pairing_opened=pairing_opened)
                         )
@@ -307,6 +354,13 @@ async def skyvern_browser_session_create(
                 )
 
             try:
+                current = get_current_session()
+                if not (
+                    _matches_current(current, extension_runtime=runtime)
+                    and current.browser is not None
+                    and _extension_browser_is_connected(current.browser)
+                ):
+                    runtime.set_shared_tab_start(use_shared_tab)
                 _browser, ctx = await resolve_browser(extension_runtime=runtime)
                 timer.mark("sdk")
             except Exception as e:
@@ -323,7 +377,7 @@ async def skyvern_browser_session_create(
                         ),
                     )
                 guidance = (
-                    _broker_extension_not_connected_guidance(pairing_opened=False)
+                    _broker_extension_not_connected_guidance(pairing_opened=False, approved=client_approved)
                     if broker_mode
                     else _extension_not_connected_guidance(pairing_opened=False)
                 )
@@ -621,6 +675,8 @@ async def skyvern_browser_session_close(
                 )
 
             if current.browser is None:
+                # A failed session_create can leave a connected broker client with no session.
+                await _release_extension_broker_place()
                 return make_result(
                     "skyvern_browser_session_close",
                     ok=False,
@@ -632,7 +688,12 @@ async def skyvern_browser_session_close(
                 )
 
             closed_id = current.context.session_id if current.context else None
-            await close_current_session()
+            is_extension_session = current.context is not None and current.context.mode == "extension"
+            try:
+                await close_current_session()
+            finally:
+                if is_extension_session:
+                    await _release_extension_broker_place()
             timer.mark("sdk")
 
         except Exception as e:

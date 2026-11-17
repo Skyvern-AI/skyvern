@@ -1049,7 +1049,10 @@ async def test_click_ingress_routes_no_target_and_emits_nothing(monkeypatch: pyt
         ),
     )
 
-    scraped_page_after_open = SimpleNamespace(id_to_css_dict={"choice-id": "[data-id=choice-id]"})
+    scraped_page_after_open = SimpleNamespace(
+        id_to_css_dict={"choice-id": "[data-id=choice-id]"},
+        id_to_element_dict={"choice-id": {"interactable": True}},
+    )
     scraped_page = SimpleNamespace(
         url="https://test",
         id_to_css_dict={},
@@ -1077,94 +1080,6 @@ async def test_click_ingress_routes_no_target_and_emits_nothing(monkeypatch: pyt
     options = select_from_emerging_elements.await_args.kwargs["options"]
     assert options.target_value is None
     assert [log for log in logs if log.get("event") == "custom_select_family_outcome"] == []
-
-
-@pytest.mark.asyncio
-async def test_outcome_event_once_per_dropdown_level_with_group_id(monkeypatch: pytest.MonkeyPatch) -> None:
-    handler._COLLAPSE_XP_ASSIGNMENT_MEMO.clear()
-    monkeypatch.setattr(
-        handler.app,
-        "EXPERIMENTATION_PROVIDER",
-        SimpleNamespace(
-            is_feature_enabled_cached=AsyncMock(return_value=True),
-            resolve_feature_enabled_unrecorded=AsyncMock(return_value=False),
-        ),
-    )
-    monkeypatch.setattr(
-        handler.app,
-        "AGENT_FUNCTION",
-        SimpleNamespace(
-            resolve_field_option=AsyncMock(
-                return_value=SimpleNamespace(
-                    fallback_to_llm=False,
-                    matched_index=0,
-                    matched_label="Choice",
-                    matched_tier="exact",
-                )
-            )
-        ),
-    )
-    monkeypatch.setattr(
-        handler.app,
-        "CUSTOM_SELECT_AGENT_LLM_API_HANDLER",
-        AsyncMock(return_value={"id": "matched-id", "value": "Choice", "action_type": "input_text"}),
-    )
-    monkeypatch.setattr(handler.prompt_engine, "load_prompt", Mock(return_value="prompt"))
-    monkeypatch.setattr(handler, "get_input_value", AsyncMock(return_value=""))
-    monkeypatch.setattr(
-        handler, "get_actual_value_of_parameter_if_secret_with_task", Mock(side_effect=lambda _, value: value)
-    )
-
-    dropdown = MagicMock(
-        get_element_handler=AsyncMock(return_value=MagicMock()),
-        get_locator=Mock(return_value=MagicMock(count=AsyncMock(return_value=1))),
-    )
-    input_element = MagicMock(
-        get_tag_name=Mock(return_value="input"),
-        get_locator=Mock(return_value=MagicMock()),
-        scroll_into_view=AsyncMock(),
-        is_readonly=AsyncMock(return_value=False),
-        input_clear=AsyncMock(),
-        input_sequentially=AsyncMock(),
-    )
-    skyvern_frame = MagicMock(
-        safe_wait_for_animation_end=AsyncMock(),
-        get_element_scrollable=AsyncMock(return_value=False),
-        get_element_visible=AsyncMock(return_value=True),
-    )
-    incremental_scraped = MagicMock(get_incremental_element_tree=AsyncMock(return_value=[_SHADOW_OPTION]))
-    incremental_scraped.build_element_tree.return_value = "<div>Choice</div>"
-    monkeypatch.setattr(handler, "try_to_find_potential_scrollable_element", AsyncMock(return_value=dropdown))
-    monkeypatch.setattr(handler.SkyvernElement, "create_from_incremental", AsyncMock(return_value=input_element))
-
-    action = SelectOptionAction(
-        element_id="field-id",
-        option=SelectOption(label="Choice"),
-        input_or_select_context=InputOrSelectContext(field="Field"),
-    )
-    with skyvern_context.scoped(SkyvernContext(tz_info=ZoneInfo("UTC"))):
-        with structlog.testing.capture_logs() as logs:
-            await handler.sequentially_select_from_dropdown(
-                action=action,
-                input_or_select_context=InputOrSelectContext(field="Field"),
-                page=MagicMock(),
-                dom=MagicMock(),
-                skyvern_element=MagicMock(),
-                skyvern_frame=skyvern_frame,
-                incremental_scraped=incremental_scraped,
-                step=SimpleNamespace(step_id="step"),
-                task=_OUTCOME_TASK,
-                dropdown_menu_element=dropdown,
-                force_select=True,
-                target_value="Choice",
-            )
-
-    events = [log for log in logs if log.get("event") == "custom_select_family_outcome"]
-    assert len(events) == 3
-    assert [event["outcome"] for event in events] == ["llm_fallback_control"] * 3
-    assert events[0]["selection_group_id"]
-    assert len({event["selection_group_id"] for event in events}) == 1
-    assert [event["select_depth"] for event in events] == [0, 1, 2]
 
 
 async def _run_post_reset_fallback_case(
@@ -1299,29 +1214,6 @@ async def test_post_reset_llm_failure_emits_single_terminal_outcome(
     assert isinstance(result.action_result, handler.ActionFailure)
     assert result.action_result.skip_remaining_actions is True
     assert [event["outcome"] for event in events] == ["terminal_llm_fallback_exception"]
-    assert events[0]["entry_action_type"] == "input_text"
-    assert events[0]["selection_group_id"] == "group-1"
-    assert events[0]["select_depth"] == 0
-    assert events[0]["family_gate_enabled"] is True
-    assert events[0]["assigned"] is True
-    assert events[0]["llm_fallback_requested"] is True
-
-
-@pytest.mark.asyncio
-async def test_post_reset_restored_text_is_retyped_and_emits_single_proceeded_outcome(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    result, events, input_element, reset_locator, raised, _ = await _run_post_reset_fallback_case(
-        monkeypatch,
-        llm_response={"id": "matched-id", "value": "Committed Value", "action_type": "input_text"},
-    )
-
-    assert raised is None
-    assert isinstance(result.action_result, handler.ActionSuccess)
-    input_element.input_clear.assert_awaited_once()
-    input_element.input_sequentially.assert_awaited_once_with("Committed Value")
-    assert [c.args for c in reset_locator.fill.await_args_list] == [("",), ("Committed Value",)]
-    assert [event["outcome"] for event in events] == ["llm_fallback_reset_verified"]
     assert events[0]["entry_action_type"] == "input_text"
     assert events[0]["selection_group_id"] == "group-1"
     assert events[0]["select_depth"] == 0

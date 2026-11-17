@@ -2,6 +2,7 @@ import { usePostHog } from "posthog-js/react";
 import { useSearchParams } from "react-router-dom";
 
 import { useMountEffect } from "@/hooks/useMountEffect";
+import { EMBER_EVENTS } from "@/routes/workflows/ember/emberEvents";
 import { TEMPLATE_VIA } from "../templateGuidance";
 
 // Fires once on mount when a `?via=` entry point is present. Lives in a hook so
@@ -13,7 +14,7 @@ export function useViaEntryPointCapture(): void {
   useMountEffect(() => {
     const via = searchParams.get("via");
     if (via && via !== TEMPLATE_VIA) {
-      posthog?.capture("copilot.discover.started", { entry_point: via });
+      posthog?.capture(EMBER_EVENTS.discoverStarted, { entry_point: via });
     }
   });
 }

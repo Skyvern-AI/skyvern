@@ -219,10 +219,15 @@ class RealAsyncGcsStorageClient(AsyncGcsStorageClient):
         await asyncio.to_thread(_do)
         return uri
 
-    async def download_file(self, uri: str, log_exception: bool = True) -> bytes | None:
+    async def download_file(self, uri: str, log_exception: bool = True, length: int | None = None) -> bytes | None:
+        """The whole object, or only its first ``length`` bytes."""
+
         def _do() -> bytes | None:
             try:
-                return self._get_blob(uri).download_as_bytes()
+                blob = self._get_blob(uri)
+                if length is None:
+                    return blob.download_as_bytes()
+                return blob.download_as_bytes(start=0, end=length - 1)
             except NotFound:
                 if log_exception:
                     LOG.warning("GCS object not found", uri=uri)
@@ -333,10 +338,11 @@ class RealAsyncGcsStorageClient(AsyncGcsStorageClient):
     def _create_signed_url(
         self,
         uri: str,
-        expiry_hours: int = 24,
+        expiry_seconds: int = 24 * 60 * 60,
         signing_kwargs: dict | None = None,
         attachment_filename: str | None = None,
         client: storage.Client | None = None,
+        inline_content_type: str | None = None,
     ) -> str | None:
         # Private + synchronous: does blocking signing I/O (and, under Workload
         # Identity, a token refresh). Call only from create_signed_urls, which
@@ -351,11 +357,13 @@ class RealAsyncGcsStorageClient(AsyncGcsStorageClient):
                 "response_disposition": build_attachment_disposition(attachment_filename),
                 "response_type": "application/octet-stream",
             }
+        elif inline_content_type is not None:
+            response_overrides = {"response_disposition": "inline", "response_type": inline_content_type}
         try:
             blob = self._get_blob(uri, client)
             return blob.generate_signed_url(
                 version="v4",
-                expiration=timedelta(hours=expiry_hours),
+                expiration=timedelta(seconds=expiry_seconds),
                 method="GET",
                 **response_overrides,
                 **signing_kwargs,
@@ -367,8 +375,9 @@ class RealAsyncGcsStorageClient(AsyncGcsStorageClient):
     async def create_signed_urls(
         self,
         uris: list[str],
-        expiry_hours: int = 24,
+        expiry_seconds: int = 24 * 60 * 60,
         attachment_filenames: list[str | None] | None = None,
+        inline_content_type: str | None = None,
         deadline: float | None = None,
     ) -> list[str] | None:
         if attachment_filenames is not None and len(attachment_filenames) != len(uris):
@@ -393,10 +402,11 @@ class RealAsyncGcsStorageClient(AsyncGcsStorageClient):
                     attachment_filename = attachment_filenames[index] or os.path.basename(GcsUri(uri).object_path)
                 url = self._create_signed_url(
                     uri,
-                    expiry_hours,
+                    expiry_seconds,
                     signing_kwargs=signing_kwargs,
                     attachment_filename=attachment_filename,
                     client=client,
+                    inline_content_type=inline_content_type,
                 )
                 if url is None:
                     if request is not None:

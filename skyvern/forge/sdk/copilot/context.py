@@ -17,6 +17,7 @@ import structlog
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError, field_validator
 from typing_extensions import NotRequired, TypedDict
 
+from skyvern.forge.sdk.agents.skills import SkillSession
 from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
 from skyvern.forge.sdk.copilot.agent_context import AgentContext
 from skyvern.forge.sdk.copilot.browser_ablation import (
@@ -24,24 +25,20 @@ from skyvern.forge.sdk.copilot.browser_ablation import (
     CopilotToolSurfaceIdentity,
 )
 from skyvern.forge.sdk.copilot.budget_expiry import BudgetExpiryState
-from skyvern.forge.sdk.copilot.code_block_synthesis import CREDENTIAL_FILL_TOOL_NAME
 from skyvern.forge.sdk.copilot.code_write_diff import TURN_PATCH_CHAR_BUDGET, CodeWriteDiff
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
+from skyvern.forge.sdk.copilot.connected_accounts import ConnectionCardPayload
 from skyvern.forge.sdk.copilot.credential_resolution import loggable_origin, safe_admitted_url
-from skyvern.forge.sdk.copilot.google_connection_notice import (
-    GoogleConnectionNotice,
-    GoogleConnectionNoticePayload,
-    GoogleSheetConnectionBinding,
-)
 from skyvern.forge.sdk.copilot.human_input_wait import HumanInputWait
 from skyvern.forge.sdk.copilot.page_identity import page_location_fingerprint, safe_page_origin
 from skyvern.forge.sdk.copilot.review_gate import NarrativeReviewProjection
 from skyvern.forge.sdk.copilot.run_outcome import RunOutcomeRole
-from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_structured_prompt
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.workflow.block_notes import block_field_texts
+from skyvern.forge.sdk.workflow.code_block_steps import CREDENTIAL_FILL_TOOL_NAME
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
 from skyvern.schemas.proxy_location import ProxyLocationInput
+from skyvern.utils.raw_secret_redaction import redact_raw_secrets_for_structured_prompt
 from skyvern.utils.strings import join_phrases
 
 LOG = structlog.get_logger()
@@ -81,6 +78,7 @@ UPDATE_WORKFLOW_TOOL_NAME = "update_workflow"
 RUN_BLOCKS_TOOL_NAME = "run_blocks_and_collect_debug"
 BLANK_BROWSER_TEST_TOOL_NAME = "test_workflow_from_blank_browser"
 CREATE_WEBHOOK_TRIGGER_TOOL_NAME = "create_webhook_trigger"
+FRESH_BROWSER_TOOL_NAME = "start_fresh_browser"
 BLOCK_RUNNING_TOOLS = frozenset(
     {RUN_BLOCKS_TOOL_NAME, UPDATE_AND_RUN_BLOCKS_TOOL_NAME, EDIT_BLOCK_AND_RUN_TOOL_NAME, BLANK_BROWSER_TEST_TOOL_NAME}
 )
@@ -163,6 +161,7 @@ class NarrativeBlock(TypedDict):
     label: str
     workflowRunBlockId: NotRequired[str]
     workflowRunId: NotRequired[str]
+    parentWorkflowRunBlockId: NotRequired[str]
     blockType: str
     state: str
     lastSeenIteration: int
@@ -183,6 +182,7 @@ MAX_NARRATIVE_BLOCK_ATTEMPTS = 200
 class NarrativeBlockAttempt(TypedDict):
     workflowRunBlockId: str
     workflowRunId: str | None
+    parentWorkflowRunBlockId: NotRequired[str]
     label: str
     blockType: str
     rawStatus: str
@@ -213,6 +213,7 @@ def upsert_narrative_block_attempt(
     iteration: int,
     started_at: str | None,
     ended_at: str | None,
+    parent_workflow_run_block_id: str | None = None,
 ) -> NarrativeBlockAttempt:
     attempt = archive.get(workflow_run_block_id)
     if attempt is None:
@@ -226,12 +227,16 @@ def upsert_narrative_block_attempt(
             "startedAt": started_at,
             "endedAt": ended_at,
         }
+        if parent_workflow_run_block_id:
+            attempt["parentWorkflowRunBlockId"] = parent_workflow_run_block_id
         archive[workflow_run_block_id] = attempt
         while len(archive) > MAX_NARRATIVE_BLOCK_ATTEMPTS:
             del archive[next(iter(archive))]
         return attempt
 
     attempt["workflowRunId"] = workflow_run_id or attempt["workflowRunId"]
+    if parent_workflow_run_block_id:
+        attempt["parentWorkflowRunBlockId"] = parent_workflow_run_block_id
     attempt["label"] = label or attempt["label"]
     attempt["blockType"] = block_type or attempt["blockType"]
     attempt["rawStatus"] = status
@@ -312,6 +317,20 @@ class NarrativeScreenshot(TypedDict):
     toolCallId: str | None
 
 
+class NarrativeTriggerFilter(TypedDict):
+    label: str
+    value: str
+
+
+class NarrativeCreatedTrigger(TypedDict):
+    eventTriggerId: str
+    sourceKind: str
+    filters: list[NarrativeTriggerFilter]
+    firesOnItsOwn: bool
+    # The account the source reads through, if any, so the card can name it without storing it here.
+    connectionId: str | None
+
+
 class CanonicalWorkflowUnavailableFacts(TypedDict):
     workflow_permanent_id: str
     candidate_published: NotRequired[Literal[False]]
@@ -342,8 +361,9 @@ class TurnNarrativePayload(TypedDict):
     credentialAutoBound: NotRequired[dict[str, str]]
     connectedAccountChoices: NotRequired[list[NarrativeConnectedAccountChoice]]
     outputFiles: NotRequired[list[NarrativeOutputFile]]
-    googleConnectionNotices: NotRequired[list[GoogleConnectionNoticePayload]]
+    connectionCards: NotRequired[list[ConnectionCardPayload]]
     demonstrationOffer: NotRequired[bool]
+    createdTriggers: NotRequired[list[NarrativeCreatedTrigger]]
     canonicalWorkflowUnavailable: NotRequired[CanonicalWorkflowUnavailableFacts]
     designStarted: bool
     designEnded: bool
@@ -365,6 +385,11 @@ class TurnNarrativePayload(TypedDict):
     budgetExpiry: NotRequired[NarrativeBudgetExpiry]
     turnFacts: NotRequired[NarrativeTurnFacts]
     demonstrationItems: NotRequired[list[str]]
+
+
+class LiveTurnNarrative(TurnNarrativePayload):
+    browserSessionId: str | None
+    pausedFor: Literal["question", "credential"] | None
 
 
 if TYPE_CHECKING:
@@ -414,6 +439,9 @@ class ApprovedCredential(BaseModel):
     # Set for a credential-card selection or an answered carried proposal. The approval stays
     # bound to that origin. Empty for a credential the user named without an origin.
     admitted_url: str = ""
+    # A connected account Test end to end derived from the pending proposal: it admits fields that read, never one
+    # that acts.
+    reads_only: bool = False
 
 
 ProposedCredentialOrigin = Literal["live_page_admitted", "executed_credential_fill"]
@@ -909,12 +937,16 @@ def record_approved_credentials_in_global_llm_context(ctx: CopilotContext, raw_c
     if policy is None or not (policy.resolved_credentials or policy.selected_connected_account_id):
         return raw_context
     sc = StructuredContext.from_json_str(raw_context)
-    if policy.selected_connected_account_id is not None and policy.selected_connected_account_id not in {
-        record.credential_id for record in sc.approved_connections
-    }:
-        sc.approved_connections.append(ApprovedCredential(credential_id=policy.selected_connected_account_id))
-        if len(sc.approved_connections) > _MAX_APPROVED_CREDENTIALS:
-            sc.approved_connections = sc.approved_connections[-_MAX_APPROVED_CREDENTIALS:]
+    selected = policy.selected_connected_account_id
+    if selected is not None:
+        reads_only = policy.selected_connected_account_from_pending_proposal
+        prior = next((record for record in sc.approved_connections if record.credential_id == selected), None)
+        if prior is None:
+            sc.approved_connections.append(ApprovedCredential(credential_id=selected, reads_only=reads_only))
+            if len(sc.approved_connections) > _MAX_APPROVED_CREDENTIALS:
+                sc.approved_connections = sc.approved_connections[-_MAX_APPROVED_CREDENTIALS:]
+        elif not reads_only:
+            prior.reads_only = False
     existing_records = {record.credential_id: record for record in sc.approved_credentials}
     for credential in policy.resolved_credentials:
         # A credential the user picked from the card is durable approval even though the resume
@@ -1240,6 +1272,8 @@ class AgentResult:
     # The turn took over another turn's stored candidate and authored nothing since, so it has no turn-end write.
     proposal_adopted: bool = False
     proposal_workflow_run_id: str | None = None
+    # The version a run card saved this turn: the turn's rollback target, and it rules out an auto-accept commit.
+    run_card_saved_workflow: Workflow | None = None
     code_artifact_metadata: dict[str, dict[str, Any]] | None = None
     executed_block_fingerprints: dict[str, set[str]] = field(default_factory=dict)
     # Legacy marker for turns that wrote canonical before snapshot isolation.
@@ -1339,9 +1373,10 @@ class CopilotContext(AgentContext):
     earlier_chat_history_rows: Callable[[], tuple[ChatHistoryRow, ...]] = tuple
     chat_history_oldest_shown_id: str | None = None
     earlier_chat_history_unavailable: bool = False
+    skill_session: SkillSession = field(default_factory=lambda: SkillSession([], agent="copilot"))
     prior_turn_outcome: TurnOutcome | None = None
-    # Server-verified display data for recovering from a model-staged Google
-    # connection that has no run authority. This never grants authority itself.
+    # Server-verified display data for recovering from a model-staged connected
+    # account that has no run authority. This never grants authority itself.
     connected_account_recovery_choices: list[ConnectedAccountChoice] = field(default_factory=list)
     latest_diagnosis_repair_contract: DiagnosisRepairContract | None = None
     blocked_reply_signatures: list[str] = field(default_factory=list)
@@ -1371,6 +1406,8 @@ class CopilotContext(AgentContext):
     demonstration_insertion: dict[str, str | None] | None = None
     demonstration_items: list[str] = field(default_factory=list)
     demonstration_offered: bool = False
+    # Each trigger created this turn gets a card that opens it, switched off, in the Studio Triggers panel.
+    created_triggers: list[NarrativeCreatedTrigger] = field(default_factory=list)
     # Set while a ``request_credential`` ask is open, so tool calls issued alongside it in the same
     # model response wait for the user's answer instead of racing it.
     credential_pause_settled: asyncio.Event | None = None
@@ -1383,10 +1420,7 @@ class CopilotContext(AgentContext):
     # The saved row's title as the turn opened. Independent of the saved YAML, which a workflow with
     # no blocks does not have, and of the submitted canvas, which can carry an unsaved rename.
     opening_workflow_title: str | None = None
-    google_connection_turn_start_bindings: tuple[GoogleSheetConnectionBinding, ...] | None = None
-    google_connection_notices: list[GoogleConnectionNotice] = field(default_factory=list)
-    # Kept apart from google_connection_notices, which each workflow save recomputes wholesale.
-    google_setup_notices: list[GoogleConnectionNotice] = field(default_factory=list)
+    connection_cards: list[ConnectionCardPayload] = field(default_factory=list)
     canonical_workflow_unavailable: CanonicalWorkflowUnavailableFacts | None = None
 
     # Tool tracking
@@ -1572,6 +1606,10 @@ class CopilotContext(AgentContext):
     proposal_adoptions_seen_by_model: int = 0
     proposal_canonical_fingerprint: str | None = None
     proposal_workflow_run_id: str | None = None
+    # When set, a run binds only while the stored run id still equals proposal_workflow_run_id, so two turns
+    # resuming one account pick cannot both bind a run.
+    proposal_bind_checks_run_id: bool = False
+    run_card_saved_workflow: Workflow | None = None
     # A restored candidate whose request private settings differ from its own; its stored bytes cannot vouch
     # for what a test under this token would run, so binding a run to it is refused.
     settings_diverged_proposal_token: tuple[str, int] | None = None
@@ -1589,6 +1627,9 @@ class CopilotContext(AgentContext):
     narrative_block_attempts: dict[str, NarrativeBlockAttempt] = field(default_factory=dict)
     turn_started_at: str | None = None
     turn_ended_at: str | None = None
+    # Browser predicted for the latest browser tool call, as on its tool_call frame; kept when a call predicts none.
+    tool_browser_session_id: str | None = None
+    live_narrative_task: asyncio.Task[None] | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         parent_post_init = getattr(super(), "__post_init__", None)
@@ -1646,9 +1687,6 @@ class CopilotContext(AgentContext):
     def edited_after_dispatch(self, workflow_run_id: str) -> bool:
         # A run whose dispatch was never recorded is treated as preceding every edit, so it never vouches for one.
         return self.block_edits_recorded_this_turn > self.block_edits_recorded_at_dispatch.get(workflow_run_id, 0)
-
-    def google_connection_notice_payloads(self) -> list[GoogleConnectionNoticePayload]:
-        return [notice.to_payload() for notice in (*self.google_setup_notices, *self.google_connection_notices)]
 
     def genuine_attempt_parity_fields(self) -> dict[str, bool | int | str | None]:
         return {

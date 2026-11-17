@@ -374,3 +374,35 @@ async def test_execute_pins_the_blocks_caller_urls_before_the_template_render() 
     assert caller_authored_block_urls(
         context, workflow_run_id="wr_task_block_test", block_label="open_vendor_url"
     ) == frozenset({"https://portal.example.test/faq"})
+
+
+@pytest.mark.asyncio
+async def test_synthetic_extraction_creates_task_on_inherited_about_blank() -> None:
+    from skyvern.forge.sdk.workflow.models.block import ExtractionBlock
+
+    browser_state = MagicMock()
+    browser_state.get_working_page = AsyncMock(return_value=SimpleNamespace(url="about:blank"))
+    created_task = SimpleNamespace(
+        task_id="tsk_blank_eval", organization_id="o_test", url="about:blank", title="branch", proxy_location=None
+    )
+    tasks_db = MagicMock()
+    tasks_db.create_task = AsyncMock(return_value=created_task)
+    tasks_db.update_task = AsyncMock(return_value=created_task)
+    tasks_db.create_step = AsyncMock(return_value=SimpleNamespace(order=0, retry_index=0))
+    block = ExtractionBlock(label="branch", data_extraction_goal="condition", output_parameter=output_parameter())
+    block._allow_blank_start = True
+
+    with patch("skyvern.forge.agent.app") as mock_app:
+        mock_app.BROWSER_MANAGER.get_for_workflow_run.return_value = browser_state
+        mock_app.DATABASE.tasks = tasks_db
+        task, _ = await ForgeAgent().create_task_and_step_from_block(
+            task_block=block,
+            workflow=SimpleNamespace(workflow_id="w_test"),
+            workflow_run=_workflow_run_for_create_task(),
+            workflow_run_context=SimpleNamespace(get_value=MagicMock(), attempt_number=1),
+            task_order=1,
+            task_retry=0,
+        )
+
+    assert task is created_task
+    assert tasks_db.create_task.await_args.kwargs["url"] == "about:blank"

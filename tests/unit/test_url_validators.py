@@ -106,7 +106,16 @@ def test_public_run_callback_error_names_field_without_value(field_name: str, mo
         ("https://[2001:db8::1]:8443/sms?token=secret", "https://[2001:db8::1]:8443/sms"),
         ("HTTPS://Hooks.Example/sms%2Fpath#fragment", "HTTPS://Hooks.Example/sms%2Fpath#fragment"),
         ("https://hooks.example/sms#fragment?not-a-query", "https://hooks.example/sms#fragment?not-a-query"),
+        (
+            "https://bucket.s3.amazonaws.com/docs/report?X-Amz-Signature=deadbeef&X-Amz-Credential=AKIA",
+            "https://bucket.s3.amazonaws.com/docs/report",
+        ),
+        # Unsplittable: the query cannot be located, so nothing of the URL may be written down.
+        ("https://[::1/download?X-Amz-Signature=deadbeef", "<redacted>"),
         ("", ""),
+        ("https://bucket.example/docs/report?X-Amz-Signature=deadbeef", "https://bucket.example/docs/report"),
+        ("not-a-url", "not-a-url"),
+        ("http://[::1/p?q=1", "<redacted>"),
     ],
 )
 def test_redact_url_query(url: str, expected: str) -> None:

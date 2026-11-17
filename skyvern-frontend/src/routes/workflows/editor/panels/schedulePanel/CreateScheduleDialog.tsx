@@ -116,15 +116,18 @@ function CreateScheduleDialog({
           Add
         </Button>
       </DialogTrigger>
-      <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-lg">
-        <DialogHeader>
+      <DialogContent className="flex max-h-[85vh] flex-col overflow-hidden sm:max-w-lg">
+        <DialogHeader className="shrink-0">
           <DialogTitle>Create Schedule</DialogTitle>
           <DialogDescription>
             Configure when this agent should run automatically.
           </DialogDescription>
         </DialogHeader>
 
-        <div className="space-y-6 py-4">
+        <div
+          data-testid="create-schedule-dialog-body"
+          className="min-h-0 flex-1 space-y-6 overflow-y-auto py-4"
+        >
           <div className="space-y-2">
             <Label>Name (optional)</Label>
             <Input
@@ -161,7 +164,7 @@ function CreateScheduleDialog({
           />
         </div>
 
-        <DialogFooter>
+        <DialogFooter className="shrink-0 border-t border-border pt-4">
           <Button variant="secondary" onClick={() => setOpen(false)}>
             Cancel
           </Button>

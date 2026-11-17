@@ -1,3 +1,4 @@
+import base64
 import json
 from typing import Any
 
@@ -5,6 +6,16 @@ import curlparser
 import structlog
 
 LOG = structlog.get_logger()
+
+
+def _basic_auth_header_value(auth: tuple[str, ...]) -> str:
+    # curlparser splits the -u value on every colon, while curl treats only the first one as the
+    # user/password separator, so rejoin the parts to recover the credential as curl read it.
+    credential = ":".join(auth)
+    if ":" not in credential:
+        credential += ":"
+    encoded = base64.b64encode(credential.encode("utf-8")).decode("ascii")
+    return f"Basic {encoded}"
 
 
 def parse_curl_command(curl_command: str) -> dict[str, Any]:
@@ -36,16 +47,23 @@ def parse_curl_command(curl_command: str) -> dict[str, Any]:
                 curl_command=curl_command,
             )
 
+        # Process headers - curlparser returns headers as an OrderedDict
+        headers: dict[str, str] = {}
+        if parsed.header:
+            headers = {k: v.strip() for k, v in parsed.header.items()}
+
+        if parsed.auth:
+            if any(key.lower() == "authorization" for key in headers):
+                LOG.info("Curl command sets an Authorization header explicitly, ignoring its -u credentials")
+            else:
+                headers["Authorization"] = _basic_auth_header_value(parsed.auth)
+
         result = {
             "method": method,
             "url": parsed.url,
-            "headers": {},
+            "headers": headers,
             "body": None,
         }
-
-        # Process headers - curlparser returns headers as an OrderedDict
-        if parsed.header:
-            result["headers"] = {k: v.strip() for k, v in parsed.header.items()}
 
         # Process body/data
         if parsed.data:

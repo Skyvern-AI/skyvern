@@ -11,13 +11,24 @@ import {
   type ReactNode,
 } from "react";
 import { cn } from "@/util/utils";
-import { LockClosedIcon, PlusIcon } from "@radix-ui/react-icons";
+import {
+  ExclamationTriangleIcon,
+  LockClosedIcon,
+  PlusIcon,
+} from "@radix-ui/react-icons";
 import { isWorkflowBlockNode, type AppNode } from "../nodes";
 import { workflowBlockTitle } from "../nodes/types";
-import { countDocSteps, type DocItem, type DocNoteItem } from "./buildDocTree";
+import { loopSchemaStepId } from "./docProblems";
+import {
+  countDocSteps,
+  isNumberedItem,
+  type DocItem,
+  type DocNoteItem,
+} from "./buildDocTree";
 import { WorkflowDocActionsContext } from "./WorkflowDocActionsContext";
 import {
   docBlockType,
+  docStepCaption,
   getDocMissingSettings,
   getDocProseFields,
 } from "./docStepRegistry";
@@ -30,9 +41,15 @@ import {
   DocProposalStepMark,
 } from "./DocProposalView";
 import { DocEditableLine, DocInsertPopover } from "./DocEditing";
-import { NOTE_MAX_LENGTH, type DocScopeRef } from "./docGraphEdits";
+import {
+  docImagesOf,
+  NOTE_MAX_LENGTH,
+  type DocScopeRef,
+} from "./docGraphEdits";
+import { DocImagePicker, DocImages } from "./DocImages";
+import { docImageDropProps, useDocImageFiles } from "./useDocImageFiles";
+import type { WorkflowBlockImage } from "../../types/workflowTypes";
 import { TOP_SCOPE, type DocPlace } from "./docEditApi";
-import { DocStepResult } from "./DocStepResult";
 import { DocDemonstrationLine } from "./DocDemonstrationLine";
 import { demonstrationLineIndex } from "./docDemonstration";
 import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
@@ -46,7 +63,6 @@ import {
   type LineSplit,
   type PickerOpener,
 } from "./docKeys";
-import { DocOneActionHint } from "./DocOneActionHint";
 import {
   announceAdded,
   announceMoved,
@@ -172,13 +188,23 @@ function previousReason(items: DocItem[], index: number) {
 function DocStepProblem({
   nodeId,
   problems,
+  byId,
+  editable,
 }: {
   nodeId: string;
   problems: ReadonlyMap<string, DocNoteProblem>;
+  byId: Map<string, AppNode>;
+  editable: boolean;
 }) {
+  const actions = useContext(WorkflowDocActionsContext);
   const problem = problems.get(`${nodeId}:step`);
   // What the step still needs before it can run, found as the draft is typed.
   const fix = problems.get(`${nodeId}:fix`);
+  const node = byId.get(nodeId);
+  const schemaStep =
+    fix && node && editable && actions.edit
+      ? byId.get(loopSchemaStepId(node, [...byId.values()]) ?? "")
+      : undefined;
   return (
     <>
       {fix && (
@@ -186,12 +212,25 @@ function DocStepProblem({
           {fix.message.split("\n").map((message) => (
             <li
               key={message}
-              className="text-[13px] leading-[1.55] text-muted-foreground [overflow-wrap:anywhere]"
+              className="flex gap-1.5 text-[13px] leading-[1.55] text-amber-700 [overflow-wrap:anywhere] dark:text-amber-300"
             >
-              {message}
+              <ExclamationTriangleIcon
+                aria-hidden
+                className="mt-[3px] size-3.5 shrink-0"
+              />
+              <span className="min-w-0">{message}</span>
             </li>
           ))}
         </ul>
+      )}
+      {schemaStep && (
+        <button
+          type="button"
+          onClick={() => actions.openSettings(schemaStep.id)}
+          className="mt-1 rounded-md border border-border px-2 py-0.5 text-[12.5px] text-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          {`Open ${docStepCaption(schemaStep) ?? schemaStep.data.label}'s Data Schema`}
+        </button>
       )}
       {problem && (
         <p
@@ -210,14 +249,18 @@ function DocNode({
   byId,
   readOnly,
   place,
+  number,
   onEnter,
+  onAddNote,
   noteProblems,
 }: {
   item: Exclude<PlacedItem, { kind: "unplaced" }>;
   byId: Map<string, AppNode>;
   readOnly: boolean;
   place?: DocStepPlace;
+  number: string;
   onEnter?: (split: LineSplit | null, key?: string) => void;
+  onAddNote?: () => void;
   noteProblems: ReadonlyMap<string, DocNoteProblem>;
 }) {
   const [inserting, setInserting] = useState(false);
@@ -225,6 +268,20 @@ function DocNode({
   const actions = useContext(WorkflowDocActionsContext);
   const open = actions.loopOpen(item.nodeId);
   const node = byId.get(item.nodeId);
+  const canEdit = Boolean(
+    node &&
+    actions.editable &&
+    !readOnly &&
+    !item.readOnlyReason &&
+    node.data.editable,
+  );
+  useLayoutEffect(() => {
+    if (!canEdit && inserting) {
+      finishSlash.current?.(false);
+      finishSlash.current = null;
+      setInserting(false);
+    }
+  }, [canEdit, inserting]);
   if (!node || !isWorkflowBlockNode(node)) return null;
   const editable =
     actions.editable && !readOnly && !item.readOnlyReason && node.data.editable;
@@ -248,6 +305,7 @@ function DocNode({
           editable={editable}
           showRunControl={showRunControl}
           place={place}
+          number={number}
           onEnter={onEnter}
           renderChildren={(children, scope, branchId) => (
             <>
@@ -263,7 +321,12 @@ function DocNode({
             </>
           )}
         />
-        <DocStepProblem nodeId={item.nodeId} problems={noteProblems} />
+        <DocStepProblem
+          nodeId={item.nodeId}
+          problems={noteProblems}
+          byId={byId}
+          editable={editable}
+        />
       </>
     );
   const inside = item.kind === "loop" ? countDocSteps(item.children) : 0;
@@ -275,6 +338,7 @@ function DocNode({
           editable={editable}
           showRunControl={showRunControl}
           place={place}
+          number={number}
           disclosure={
             item.kind === "loop"
               ? { open, onToggle: () => actions.toggleLoop(item.nodeId) }
@@ -342,7 +406,10 @@ function DocNode({
             <DocStepBody
               node={node}
               editable={editable && Boolean(actions.edit)}
+              hasFix={noteProblems.has(`${node.id}:fix`)}
+              renamable={editable && Boolean(place)}
               onEnter={onEnter}
+              onAddNote={item.kind === "step" ? onAddNote : undefined}
               onMove={
                 place && actions.edit && !place.isFinally
                   ? (delta) => {
@@ -400,9 +467,12 @@ function DocNode({
             />
           </div>
         </DocInsertPopover>
-        <DocStepProblem nodeId={item.nodeId} problems={noteProblems} />
-        {editable && <DocOneActionHint node={node} />}
-        <DocStepResult label={node.data.label} />
+        <DocStepProblem
+          nodeId={item.nodeId}
+          problems={noteProblems}
+          byId={byId}
+          editable={editable}
+        />
       </div>
       {item.kind === "loop" && open && (
         <div className="mb-1 ml-[11px] mt-0.5 border-l border-border pl-4">
@@ -593,7 +663,7 @@ export function DocAddStep({
   );
 }
 
-function DocNote({
+function DocNoteLine({
   ownerNodeId,
   placement,
   text,
@@ -602,6 +672,7 @@ function DocNote({
   place,
   nestsInto,
   into,
+  onFiles,
 }: {
   ownerNodeId: string;
   placement: "above" | "trailing";
@@ -613,6 +684,8 @@ function DocNote({
   nestsInto?: "loop" | "branch";
   // Set when Tab put this line in an empty loop or branch: the picked step goes in there, holding the line's text.
   into?: DocScopeRef;
+  // Files pasted into the line, for its screenshots.
+  onFiles?: (files: File[]) => void;
 }) {
   const actions = useContext(WorkflowDocActionsContext);
   const [inserting, setInserting] = useState(false);
@@ -680,6 +753,7 @@ function DocNote({
         className="text-base leading-[1.55] text-muted-foreground"
       >
         <DocEditableLine
+          onFiles={onFiles}
           value={text}
           editable={editable && Boolean(actions.edit)}
           multiline
@@ -793,6 +867,41 @@ function DocNote({
   );
 }
 
+/** A note line with its screenshots: paste, drop or the picker add one under the line. */
+function DocNote({
+  images = [],
+  ...line
+}: Omit<Parameters<typeof DocNoteLine>[0], "onFiles"> & {
+  images?: WorkflowBlockImage[];
+}) {
+  const actions = useContext(WorkflowDocActionsContext);
+  const { ownerNodeId, placement } = line;
+  const imageFiles = useDocImageFiles({ ownerNodeId, placement });
+  const addFiles = line.editable && actions.edit ? imageFiles.addFiles : null;
+  return (
+    <div className="group/note" {...docImageDropProps(addFiles)}>
+      <div className="flex items-start gap-1">
+        <div className="min-w-0 flex-1">
+          <DocNoteLine {...line} onFiles={addFiles ?? undefined} />
+        </div>
+        {addFiles && (
+          <DocImagePicker
+            slot={{ ownerNodeId, placement }}
+            onFiles={addFiles}
+            className="mt-0.5 opacity-0 focus-visible:opacity-100 group-focus-within/note:opacity-100 group-hover/note:opacity-100 [@media(hover:none)]:opacity-100"
+          />
+        )}
+      </div>
+      <DocImages
+        slot={{ ownerNodeId, placement }}
+        images={images}
+        editable={line.editable && Boolean(actions.edit)}
+        onRetry={imageFiles.retry}
+      />
+    </div>
+  );
+}
+
 export function DocScope({
   items,
   byId,
@@ -810,10 +919,7 @@ export function DocScope({
   noteProblems?: ReadonlyMap<string, DocNoteProblem>;
 }) {
   const actions = useContext(WorkflowDocActionsContext);
-  const steps = items.filter(
-    (i): i is Exclude<PlacedItem, { kind: "unplaced" }> =>
-      i.kind !== "note" && i.kind !== "unplaced",
-  );
+  const steps = items.filter(isNumberedItem);
   // Steps shared by several branches sit in this list but belong to the branches.
   const structural =
     Boolean(actions.edit && scope) &&
@@ -839,7 +945,13 @@ export function DocScope({
         i.ownerNodeId === owner &&
         i.placement === placement,
     );
+  // A step's own note stays on screen right below it after a step is added under it, so a new note goes to that note.
   const noteBelow = (nodeId: string) => {
+    if (notePresent(nodeId, "trailing"))
+      return actions.setPendingNote({
+        ownerNodeId: nodeId,
+        placement: "trailing",
+      });
     const at = steps.findIndex((s) => s.nodeId === nodeId);
     const next = steps[at + 1];
     const note = next
@@ -904,6 +1016,10 @@ export function DocScope({
     Boolean(pending.into);
   const pendingInto =
     pending?.into && sameScope(pending.into, scope) ? pending : null;
+  const noteImages = (owner: string, placement: "above" | "trailing") =>
+    docImagesOf(byId.get(owner)).filter(
+      (image) => image.placement === placement,
+    );
   // The loop or If that Tab would put a line in: the one it trails, or the step just above it.
   const nestsInto = (owner: string, placement: "above" | "trailing") => {
     const container =
@@ -979,8 +1095,7 @@ export function DocScope({
   // The insert line above a step goes above its note too, as the drop line does. The doc's first step has none:
   // the top of the doc is not between steps.
   const insertBefore = (index: number) => {
-    if (dropping || actions.runGoing || !structural || !editable || !scope)
-      return null;
+    if (dropping || !structural || !editable || !scope) return null;
     const item = items[index]!;
     const owner =
       item.kind === "note"
@@ -1076,6 +1191,7 @@ export function DocScope({
           ownerNodeId={pendingInto.ownerNodeId}
           placement={pendingInto.placement}
           text={noteTextOfNode(byId, pendingInto)}
+          images={noteImages(pendingInto.ownerNodeId, pendingInto.placement)}
           editable={editable}
           into={scope}
         />
@@ -1109,6 +1225,7 @@ export function DocScope({
               ownerNodeId={item.ownerNodeId}
               placement={item.placement}
               text={item.text}
+              images={noteImages(item.ownerNodeId, item.placement)}
               title={noteReaders(item, byId, actions.previousNoteReader)}
               nestsInto={nestsInto(item.ownerNodeId, item.placement)}
               editable={editable && !previousReason(items, index + 1)}
@@ -1142,9 +1259,16 @@ export function DocScope({
                 <DocProposalStepMark key={id} node={node}>
                   <div data-doc-node-id={id}>
                     <DocStepHeader node={node} editable={false} />
-                    <DocStepBody node={node} />
-                    <DocStepProblem nodeId={id} problems={noteProblems} />
-                    <DocStepResult label={node.data.label} />
+                    <DocStepBody
+                      node={node}
+                      hasFix={noteProblems.has(`${id}:fix`)}
+                    />
+                    <DocStepProblem
+                      nodeId={id}
+                      problems={noteProblems}
+                      byId={byId}
+                      editable={false}
+                    />
                     {node.type === "loop" && (
                       <DocProposalLoopRemovals loopLabel={node.data.label} />
                     )}
@@ -1186,9 +1310,16 @@ export function DocScope({
               byId={byId}
               readOnly={readOnly}
               place={placeOf(item.nodeId)}
+              // A numbering mismatch leaves the step unnumbered rather than breaking the render.
+              number={actions.stepNumbers.get(item.nodeId) ?? ""}
               onEnter={
                 editable
                   ? (split, key) => enterAfter(item.nodeId, split, key)
+                  : undefined
+              }
+              onAddNote={
+                editable && actions.edit
+                  ? () => noteBelow(item.nodeId)
                   : undefined
               }
               noteProblems={noteProblems}

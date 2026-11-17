@@ -28,10 +28,10 @@ import {
   commitYamlDraft,
   isWorkflowYamlDirty,
   subscribeToYamlDraftChanges,
-  beginCopilotAcceptance,
+  beginEmberAcceptance,
   beginSaveTransaction,
   finishSaveTransaction,
-  finishCopilotAcceptance,
+  finishEmberAcceptance,
   registerEditorOwner,
   unregisterEditorOwner,
   beginYamlCommit,
@@ -71,8 +71,8 @@ import {
   resolveFinallyBlockLabel,
   buildWorkflowYamlDocument,
   buildWorkflowSaveRequest,
-  buildWorkflowCopilotContext,
-  restoreWorkflowCopilotSettings,
+  buildEmberContext,
+  restoreEmberSettings,
 } from "./workflowYamlDocument";
 import {
   normalizeRetryPolicy,
@@ -255,6 +255,9 @@ describe("buildWorkflowYamlDocument", () => {
             notes: "Old note",
             trailing_notes: "Old trailing note",
             description: "Old description",
+            doc_images: [
+              { file_id: "file_old", caption: null, placement: "above" },
+            ],
           },
           {
             block_type: "for_loop",
@@ -322,6 +325,7 @@ describe("buildWorkflowYamlDocument", () => {
       notes: "Pick the cheapest option",
       trailing_notes: null,
       description: null,
+      doc_images: null,
     });
     expect(loop).toHaveProperty("notes", null);
     for (const key of ["trailing_notes", "description"] as const) {
@@ -382,7 +386,7 @@ describe("buildWorkflowYamlDocument", () => {
 });
 
 describe("settings patch validation and merge", () => {
-  test("round-trips a null proxy through YAML, canvas, save, and Copilot context", () => {
+  test("round-trips a null proxy through YAML, canvas, save, and Ember context", () => {
     const data = input();
     data.settings.proxyLocation = null;
     const yaml = stringify(buildWorkflowYamlDocument(data));
@@ -409,7 +413,7 @@ describe("settings patch validation and merge", () => {
       { extraHttpHeaders: null, cdpConnectHeaders: null },
     );
     expect(apiWorkflowToSettings(version).proxyLocation).toBeNull();
-    const context = buildWorkflowCopilotContext(saveData);
+    const context = buildEmberContext(saveData);
     expect(parse(stringify(context.document))).toHaveProperty(
       "proxy_location",
       null,
@@ -425,13 +429,13 @@ describe("settings patch validation and merge", () => {
         proxy_location: null,
       });
       const applied = { ...workflow, proxy_location: proxy };
-      const restored = restoreWorkflowCopilotSettings(applied, snapshot);
+      const restored = restoreEmberSettings(applied, snapshot);
       expect(restored.settings.proxyLocation).toEqual(proxy);
       expect(restored.settingsChanged).toBe(false);
     },
   );
 
-  test("round-trips browser type through YAML, canvas, save, hydration, and public Copilot context", () => {
+  test("round-trips browser type through YAML, canvas, save, hydration, and public Ember context", () => {
     const stored = { ...workflow, browser_type: "chromium" };
     const data = {
       ...input(),
@@ -461,12 +465,11 @@ describe("settings patch validation and merge", () => {
         { extraHttpHeaders: null, cdpConnectHeaders: null },
       );
       expect(apiWorkflowToSettings(version).browserType).toBe(browserType);
-      const context = buildWorkflowCopilotContext(saveData);
+      const context = buildEmberContext(saveData);
       expect(context.document.browser_type).toBe(browserType);
       expect(context.snapshot.browser_type).toBe(browserType);
       expect(
-        restoreWorkflowCopilotSettings(version, data.settings).settings
-          .browserType,
+        restoreEmberSettings(version, data.settings).settings.browserType,
       ).toBe(browserType);
     }
 
@@ -551,14 +554,14 @@ describe("settings patch validation and merge", () => {
       editedProxy: { url: "http://proxy.example.test" },
     },
   ])(
-    "withholds private proxy $proxy from Copilot and preserves it through a turn, Accept, and YAML edits",
+    "withholds private proxy $proxy from Ember and preserves it through a turn, Accept, and YAML edits",
     ({ proxy, editedProxy }) => {
       const stored = {
         ...workflow,
         proxy_location: proxy,
       } as unknown as WorkflowApiResponse;
       const data = { ...input(), settings: apiWorkflowToSettings(stored) };
-      const context = buildWorkflowCopilotContext(data);
+      const context = buildEmberContext(data);
       expect(context.document).not.toHaveProperty("proxy_location");
       expect(parse(stringify(context.document))).not.toHaveProperty(
         "proxy_location",
@@ -566,7 +569,7 @@ describe("settings patch validation and merge", () => {
       expect(stringify(context.document)).not.toContain("test-password");
       expect(context.snapshot.proxy_location).toEqual(proxy);
 
-      const restored = restoreWorkflowCopilotSettings(
+      const restored = restoreEmberSettings(
         { ...stored, proxy_location: null },
         data.settings,
       );
@@ -630,7 +633,7 @@ describe("settings patch validation and merge", () => {
         proxy_location: proxy,
       } as unknown as WorkflowApiResponse;
       const settings = apiWorkflowToSettings(stored);
-      const context = buildWorkflowCopilotContext({ ...input(), settings });
+      const context = buildEmberContext({ ...input(), settings });
       expect(parse(stringify(context.document))).not.toHaveProperty(
         "proxy_location",
       );
@@ -647,7 +650,7 @@ describe("settings patch validation and merge", () => {
         const applied = { ...workflow } as Partial<WorkflowApiResponse>;
         if (appliedProxy === undefined) delete applied.proxy_location;
         else applied.proxy_location = appliedProxy;
-        const restored = restoreWorkflowCopilotSettings(
+        const restored = restoreEmberSettings(
           applied as WorkflowApiResponse,
           settings,
         );
@@ -664,22 +667,22 @@ describe("settings patch validation and merge", () => {
     { country: "US", isISP: true },
     { country: "US", isISP: false },
     null,
-  ])("keeps public proxy %j in Copilot and allows updates", (proxy) => {
+  ])("keeps public proxy %j in Ember and allows updates", (proxy) => {
     const data = input();
     data.settings.proxyLocation = proxy;
-    const context = buildWorkflowCopilotContext(data);
+    const context = buildEmberContext(data);
     expect(parse(stringify(context.document)).proxy_location).toEqual(proxy);
     expect(() =>
       validateSettingsPatch({ proxy_location: proxy }),
     ).not.toThrow();
     const applied = { ...workflow, proxy_location: null };
-    const restored = restoreWorkflowCopilotSettings(applied, data.settings);
+    const restored = restoreEmberSettings(applied, data.settings);
     expect(restored.settings.proxyLocation).toBeNull();
     expect(restored.settingsChanged).toBe(false);
 
     const omitted = { ...workflow } as Partial<WorkflowApiResponse>;
     delete omitted.proxy_location;
-    const unchanged = restoreWorkflowCopilotSettings(
+    const unchanged = restoreEmberSettings(
       omitted as WorkflowApiResponse,
       data.settings,
     );
@@ -711,7 +714,7 @@ describe("settings patch validation and merge", () => {
     { country: "US", subdivision: "CA" },
     { country: "US", city: "San Francisco" },
   ])(
-    "preserves the full geo target in Copilot context and through an unchanged proposal: %j",
+    "preserves the full geo target in Ember context and through an unchanged proposal: %j",
     (proxy) => {
       const stored = { ...workflow, proxy_location: proxy as ProxyLocation };
       const data = {
@@ -719,14 +722,14 @@ describe("settings patch validation and merge", () => {
         workflow: stored,
         settings: apiWorkflowToSettings(stored),
       };
-      const context = buildWorkflowCopilotContext(data);
+      const context = buildEmberContext(data);
       expect(context.document.proxy_location).toEqual(proxy);
       const proposal = parse(stringify(context.document));
       expect(proposal.proxy_location).toEqual(proxy);
       expect(context.snapshot.proxy_location).toEqual(proxy);
       expect(data.settings.proxyLocation).toEqual(proxy);
       const applied = { ...workflow, proxy_location: proposal.proxy_location };
-      const restored = restoreWorkflowCopilotSettings(applied, data.settings);
+      const restored = restoreEmberSettings(applied, data.settings);
       expect(restored.settings.proxyLocation).toEqual(proxy);
       expect(restored.settingsChanged).toBe(false);
       const { nodes } = getElements([], restored.settings, true);
@@ -757,7 +760,7 @@ describe("settings patch validation and merge", () => {
           isISP: true,
         },
       };
-      const restored = restoreWorkflowCopilotSettings(
+      const restored = restoreEmberSettings(
         {
           ...workflow,
           proxy_location: appliedProxy,
@@ -781,7 +784,7 @@ describe("settings patch validation and merge", () => {
         },
       };
       const appliedProxy = { country: "US", subdivision, city: null };
-      const restored = restoreWorkflowCopilotSettings(
+      const restored = restoreEmberSettings(
         {
           ...workflow,
           proxy_location: appliedProxy,
@@ -820,11 +823,7 @@ describe("settings patch validation and merge", () => {
         proxy_location: appliedProxy,
       } as unknown as WorkflowApiResponse;
       const settings = apiWorkflowToSettings(applied);
-      const restored = restoreWorkflowCopilotSettings(
-        applied,
-        snapshot,
-        settings,
-      );
+      const restored = restoreEmberSettings(applied, snapshot, settings);
       expect(restored).toEqual({ settings, settingsChanged: false });
     },
   );
@@ -853,8 +852,7 @@ describe("settings patch validation and merge", () => {
       } as unknown as WorkflowApiResponse;
       const snapshot = apiWorkflowToSettings(stored);
       expect(
-        buildWorkflowCopilotContext({ ...input(), settings: snapshot })
-          .document,
+        buildEmberContext({ ...input(), settings: snapshot }).document,
       ).not.toHaveProperty("proxy_location");
       const applied = {
         ...workflow,
@@ -863,7 +861,7 @@ describe("settings patch validation and merge", () => {
       if (appliedProxy === undefined) {
         delete (applied as Partial<WorkflowApiResponse>).proxy_location;
       }
-      const restored = restoreWorkflowCopilotSettings(applied, snapshot);
+      const restored = restoreEmberSettings(applied, snapshot);
       const expectedProxy = appliedProxy ?? proxy;
       expect(restored.settings.proxyLocation).toEqual(expectedProxy);
       expect(restored.settingsChanged).toBe(appliedProxy == null);
@@ -911,7 +909,7 @@ describe("settings patch validation and merge", () => {
         ...workflow,
         proxy_location: appliedProxy,
       } as unknown as WorkflowApiResponse;
-      const restored = restoreWorkflowCopilotSettings(
+      const restored = restoreEmberSettings(
         applied,
         apiWorkflowToSettings(stored),
       );
@@ -925,7 +923,7 @@ describe("settings patch validation and merge", () => {
       ...workflow,
       proxy_location: { url: "http://proxy.example.test" },
     } as unknown as WorkflowApiResponse);
-    const restored = restoreWorkflowCopilotSettings(
+    const restored = restoreEmberSettings(
       { ...workflow, proxy_location: null },
       snapshot,
     );
@@ -937,7 +935,7 @@ describe("settings patch validation and merge", () => {
     ["extraHttpHeaders", "extra_http_headers"],
     ["cdpConnectHeaders", "cdp_connect_headers"],
   ] as const)(
-    "keeps %s strict for saves and safe for Copilot",
+    "keeps %s strict for saves and safe for Ember",
     (setting, field) => {
       const data = input();
       data.settings[setting] = '{"Authorization":"raw-token"}';
@@ -948,7 +946,7 @@ describe("settings patch validation and merge", () => {
           : "https://test-user:test-password@example.test/totp";
       data.settings.webhookCallbackUrl =
         "https://example.test/webhook/private-path?signature=private-value";
-      const context = buildWorkflowCopilotContext(data);
+      const context = buildEmberContext(data);
       for (const [field, setting] of [
         ["totp_identifier", "totpIdentifier"],
         ["totp_verification_url", "totpVerificationUrl"],
@@ -971,7 +969,7 @@ describe("settings patch validation and merge", () => {
         }),
       ).toThrow(field);
       expect(() => buildWorkflowYamlDocument(data)).toThrow(field);
-      expect(buildWorkflowCopilotContext(data).document[field]).toBeUndefined();
+      expect(buildEmberContext(data).document[field]).toBeUndefined();
     },
   );
 
@@ -984,7 +982,7 @@ describe("settings patch validation and merge", () => {
       data.settings.totpIdentifier = "test-totp-id";
       data.settings.totpVerificationUrl = "https://example.test/totp";
       data.settings.webhookCallbackUrl = "https://example.test/webhook";
-      const context = buildWorkflowCopilotContext(data);
+      const context = buildEmberContext(data);
       const applied: Partial<WorkflowApiResponse> = { ...workflow };
       for (const field of [
         "extra_http_headers",
@@ -999,7 +997,7 @@ describe("settings patch validation and merge", () => {
           Object.assign(applied, { [field]: context.snapshot[field] });
         } else applied[field] = null;
       }
-      const restored = restoreWorkflowCopilotSettings(
+      const restored = restoreEmberSettings(
         applied as WorkflowApiResponse,
         data.settings,
       );
@@ -1031,7 +1029,7 @@ describe("settings patch validation and merge", () => {
         applied.webhook_callback_url =
           "https://example.test/webhook?signature=other-value";
       }
-      const restored = restoreWorkflowCopilotSettings(
+      const restored = restoreEmberSettings(
         applied as WorkflowApiResponse,
         data.settings,
       );
@@ -1052,7 +1050,7 @@ describe("settings patch validation and merge", () => {
       const applied: Partial<WorkflowApiResponse> = { ...workflow };
       if (appliedUrl === undefined) delete applied.webhook_callback_url;
       else applied.webhook_callback_url = appliedUrl;
-      const restored = restoreWorkflowCopilotSettings(
+      const restored = restoreEmberSettings(
         applied as WorkflowApiResponse,
         input().settings,
       );
@@ -1100,7 +1098,7 @@ describe("settings patch validation and merge", () => {
         { extraHttpHeaders: null, cdpConnectHeaders: null },
       );
       expect(apiWorkflowToSettings(version).webhookCallbackUrl).toBe(url);
-      const context = buildWorkflowCopilotContext(saveData);
+      const context = buildEmberContext(saveData);
       expect(context.snapshot).toHaveProperty("webhook_callback_url", url);
       expect(parse(stringify(context.document))).not.toHaveProperty(
         "webhook_callback_url",
@@ -1273,7 +1271,7 @@ describe("settings patch validation and merge", () => {
     expect(draft).toEqual(before);
   });
 
-  test("keeps YAML note clears in the Visual save and Copilot context", () => {
+  test("keeps YAML note clears in the Visual save and Ember context", () => {
     const draft = input();
     draft.blocks = [
       {
@@ -1435,13 +1433,14 @@ describe("settings patch validation and merge", () => {
       delete visualBlock.notes;
       return visualBlock;
     });
-    const copilotContext = buildWorkflowCopilotContext({
+    const emberContext = buildEmberContext({
       ...draft,
       blocks: visualBlocks,
     });
-    expect(
-      copilotContext.document.workflow_definition.blocks[0],
-    ).toHaveProperty("notes", null);
+    expect(emberContext.document.workflow_definition.blocks[0]).toHaveProperty(
+      "notes",
+      null,
+    );
   });
 });
 
@@ -1949,29 +1948,28 @@ describe("metadata lifecycle", () => {
 
   test("scopes recorded metadata edits to the workflow and proposal identity", () => {
     const titles = useWorkflowTitleStore.getState();
-    titles.trackCopilotMetadata("wpid_fixture", "chat:turn:1");
+    titles.trackEmberMetadata("wpid_fixture", "chat:turn:1");
     titles.setTitle("Authored title");
     titles.setDescriptionFromUser("Authored description");
-    titles.trackCopilotMetadata("wpid_fixture", "chat:turn:1");
+    titles.trackEmberMetadata("wpid_fixture", "chat:turn:1");
     titles.syncTitleFromWorkflow("Draft title");
     titles.setDescriptionFromWorkflow("Draft description");
     expect(
-      useWorkflowTitleStore.getState().copilotMetadataEdits["wpid_fixture"]
+      useWorkflowTitleStore.getState().emberMetadataEdits["wpid_fixture"]
         ?.edits,
     ).toEqual({ title: "Authored title", description: "Authored description" });
-    titles.trackCopilotMetadata("wpid_other", "chat:turn:1");
+    titles.trackEmberMetadata("wpid_other", "chat:turn:1");
     expect(
-      useWorkflowTitleStore.getState().copilotMetadataEdits["wpid_other"]
-        ?.edits,
+      useWorkflowTitleStore.getState().emberMetadataEdits["wpid_other"]?.edits,
     ).toEqual({});
-    titles.trackCopilotMetadata("wpid_fixture", "chat:turn:1");
+    titles.trackEmberMetadata("wpid_fixture", "chat:turn:1");
     expect(
-      useWorkflowTitleStore.getState().copilotMetadataEdits["wpid_fixture"]
-        ?.edits.title,
+      useWorkflowTitleStore.getState().emberMetadataEdits["wpid_fixture"]?.edits
+        .title,
     ).toBe("Authored title");
-    titles.trackCopilotMetadata("wpid_fixture", "chat:turn:2");
+    titles.trackEmberMetadata("wpid_fixture", "chat:turn:2");
     expect(
-      useWorkflowTitleStore.getState().copilotMetadataEdits["wpid_fixture"]
+      useWorkflowTitleStore.getState().emberMetadataEdits["wpid_fixture"]
         ?.edits,
     ).toEqual({});
   });
@@ -2054,7 +2052,7 @@ describe("metadata lifecycle", () => {
       titleHasBeenGenerated: false,
       description: "Reopened workflow",
     });
-    store.setTitleFromCopilotIfDefault("Copilot title");
+    store.setTitleFromEmberIfDefault("Copilot title");
     store.initializeTitle("New Agent", "wpid_next");
     store.syncTitleFromWorkflow("New Workflow");
     expect(useWorkflowTitleStore.getState()).toMatchObject({
@@ -2533,7 +2531,7 @@ describe("YAML persistence callbacks", () => {
           cm.dispatch({
             changes: { from: 0, to: cm.state.doc.length, insert: draft },
           });
-          reservation = beginCopilotAcceptance()!;
+          reservation = beginEmberAcceptance()!;
         });
         expect(reservation).not.toBeNull();
         expect(useWorkflowYamlEditorStore.getState().draft).toBe(initial);
@@ -2541,7 +2539,7 @@ describe("YAML persistence callbacks", () => {
         if (discard) clearDeferredEdits(firstId);
         editor = openEditor(secondId);
         await act(async () => {
-          finishCopilotAcceptance(reservation);
+          finishEmberAcceptance(reservation);
           await vi.advanceTimersByTimeAsync(300);
         });
         expect(useWorkflowYamlEditorStore.getState().draft).toBe(initial);
@@ -2899,14 +2897,14 @@ describe("regular save transactions", () => {
     });
     return { owner, view, client };
   }
-  test("legacy save is disabled under a Copilot lock without an unhandled rejection", async () => {
+  test("legacy save is disabled under an Ember lock without an unhandled rejection", async () => {
     const { view, client } = mountSave();
     client.setDefaultOptions({
       queries: { staleTime: Infinity, retry: false },
     });
     client.setQueryData(["globalWorkflows"], []);
     client.setQueryData(["workflow", workflow.workflow_permanent_id], workflow);
-    expect(beginCopilotAcceptance()).not.toBeNull();
+    expect(beginEmberAcceptance()).not.toBeNull();
     const unhandled = vi.fn();
     process.on("unhandledRejection", unhandled);
     const control = render(
@@ -2949,7 +2947,7 @@ describe("regular save transactions", () => {
     const { owner, view, client } = mountSave();
     if (lock === "yaml") beginYamlCommit(owner);
     else if (lock === "save") beginSaveTransaction(owner);
-    else beginCopilotAcceptance();
+    else beginEmberAcceptance();
     await act(async () => {
       await expect(view.result.current.mutateAsync(undefined)).rejects.toEqual(
         new SaveRefusedError(message),
@@ -3290,7 +3288,7 @@ describe("regular save transactions", () => {
   );
 });
 
-describe("copilot block highlight", () => {
+describe("Ember block highlight", () => {
   beforeEach(() => {
     vi.mocked(toast).mockClear();
     useWorkflowYamlEditorStore.setState(
@@ -3303,7 +3301,7 @@ describe("copilot block highlight", () => {
       useWorkflowYamlEditorStore.getInitialState(),
     );
   });
-  test("flashes a block while a Copilot turn holds the edit lock", () => {
+  test("flashes a block while an Ember turn holds the edit lock", () => {
     vi.useFakeTimers();
     const initial = getElements([], input().settings, true);
     initial.nodes.push(createNode({ id: "url-node" }, "url", "open_page"));
@@ -3311,13 +3309,13 @@ describe("copilot block highlight", () => {
       useWorkflowGraphState(initial.nodes, initial.edges),
     );
     const revision = useWorkflowYamlEditorStore.getState().revision;
-    expect(beginCopilotAcceptance()).not.toBeNull();
+    expect(beginEmberAcceptance()).not.toBeNull();
     const highlighted = () =>
       view.result.current.nodes.find((node) => node.id === "url-node")
         ?.className;
 
     act(() => view.result.current.highlightBlock("open_page"));
-    expect(highlighted()).toBe("sk-copilot-block-highlight");
+    expect(highlighted()).toBe("sk-ember-block-highlight");
     act(() => vi.advanceTimersByTime(1500));
     expect(highlighted()).toBeUndefined();
 

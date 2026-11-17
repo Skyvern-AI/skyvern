@@ -23,7 +23,7 @@ from skyvern.forge.agent_functions import STANDALONE_BROWSER_SESSION_FEATURE_NAM
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
-from skyvern.forge.sdk.routes.agent_protocol import _redact_workflow_run_list
+from skyvern.forge.sdk.routes.agent_protocol import _project_run_list_for_role, _redact_workflow_run_list
 from skyvern.forge.sdk.routes.code_samples import (
     CLOSE_BROWSER_SESSION_CODE_SAMPLE_PYTHON,
     CLOSE_BROWSER_SESSION_CODE_SAMPLE_TS,
@@ -389,6 +389,7 @@ async def create_browser_session(
             created_by=user_id if user_id is not None else API_BROWSER_SESSION_CREATED_BY,
             session_kind=BrowserSessionKind.api,
             browser_settings=browser_session_request.browser_settings,
+            bot_protection=browser_session_request.bot_protection,
         )
     response = await BrowserSessionResponse.from_browser_session(browser_session)
     response.warning = timeout_warning
@@ -771,7 +772,7 @@ async def get_workflow_runs_for_browser_session(
     )
     workflow_runs = await _redact_workflow_run_list(workflow_runs, current_org.organization_id)
     await _redact_browser_session_addresses(workflow_runs, current_org.organization_id)
-    return workflow_runs
+    return await _project_run_list_for_role(workflow_runs)
 
 
 @base_router.get(

@@ -27,6 +27,7 @@ from urllib.parse import urlparse
 import structlog
 from fastapi import HTTPException
 
+from skyvern.config import settings
 from skyvern.constants import SCRUBBED_VALUE
 from skyvern.exceptions import (
     BrowserSessionClosed,
@@ -53,9 +54,6 @@ from skyvern.forge.sdk.copilot.agent_context import (
     RegisteredDownloadTextError,
 )
 from skyvern.forge.sdk.copilot.authoring_parameter_binding import _literal_locator_selector
-from skyvern.forge.sdk.copilot.blocker_signal import (
-    stash_blocker_signal,
-)
 from skyvern.forge.sdk.copilot.budget_expiry import (
     BudgetExpiryState,
     RecordedBlockState,
@@ -124,11 +122,6 @@ from skyvern.forge.sdk.copilot.challenge_evidence import (
     composition_challenge_carrier,
     first_carrier_backed_anti_bot_source,
 )
-from skyvern.forge.sdk.copilot.code_block_security import (
-    COPILOT_CODE_SECURITY_FAILURE_CATEGORY,
-    CodeBlockSecurityInput,
-    runtime_code_security_errors,
-)
 from skyvern.forge.sdk.copilot.completion_output_grounding import page_evidence_prose_text
 from skyvern.forge.sdk.copilot.completion_verification import (
     CompletionVerificationResult,
@@ -192,7 +185,6 @@ from skyvern.forge.sdk.copilot.output_utils import (
     sanitize_tool_result_for_llm,
     screened_recorded_url,
 )
-from skyvern.forge.sdk.copilot.reached_download_target import generated_file_artifact_ids
 from skyvern.forge.sdk.copilot.repair_origin_run import (
     OriginExecutionSettings,
     OriginOutputRefusal,
@@ -246,8 +238,9 @@ from skyvern.forge.sdk.copilot.screenshot_utils import (
     ScreenshotActionRelation,
     ScreenshotProvenance,
     enqueue_screenshot,
+    enqueue_screenshot_from_result,
+    stored_run_frame_provenance,
 )
-from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt, redact_totp_runtime_values
 from skyvern.forge.sdk.copilot.secret_scrub import (
     is_registered_scrub_value,
     register_secret_scrub_values_from_structure,
@@ -265,12 +258,17 @@ from skyvern.forge.sdk.copilot.workflow_yaml import (
     _process_workflow_yaml,
     runner_code_block_associations,
     stored_block_code,
-    workflow_to_copilot_yaml,
 )
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.db._sentinels import _UNSET
 from skyvern.forge.sdk.db.enums import BrowserSeedSource
 from skyvern.forge.sdk.db.exceptions import CopilotProposalConflictError, CopilotProposalConflictReason
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
+from skyvern.forge.sdk.integrations.connected_accounts import (
+    COPILOT_RUN_CREATOR,
+    org_connections_by_id,
+    record_run_connection_ids,
+)
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import DeliveredOutputFile
 from skyvern.forge.sdk.schemas.credentials import CredentialVaultType
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
@@ -286,7 +284,13 @@ from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.services.request_principal import get_request_principal, requesting_user_id
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.utils.pdf_parser import PdfExtractStats
+from skyvern.forge.sdk.workflow.authoring_yaml import workflow_to_authoring_yaml
 from skyvern.forge.sdk.workflow.block_notes import drop_submitted_note_fields
+from skyvern.forge.sdk.workflow.code_block_security import (
+    CodeBlockSecurityError,
+    CodeBlockSecurityInput,
+    runtime_code_security_errors,
+)
 from skyvern.forge.sdk.workflow.document_text import SUPPORTED_DOCUMENT_EXTENSIONS, DocumentText
 from skyvern.forge.sdk.workflow.exceptions import FileParseTimeout
 from skyvern.forge.sdk.workflow.models.block import (
@@ -317,6 +321,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatus,
     workflow_definition_sha256,
 )
+from skyvern.forge.sdk.workflow.reached_download_target import generated_file_artifact_ids
 from skyvern.forge.sdk.workflow.runtime_secret_bridge import consume_copilot_runtime_secret_values
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
@@ -324,6 +329,7 @@ from skyvern.schemas.proxy_location import ProxyLocationInput, runtime_proxy_loc
 from skyvern.schemas.self_heal import HealEpisodeDetail, HealStatus
 from skyvern.schemas.workflows import BlockStatus, BlockType
 from skyvern.utils.files import initialize_skyvern_state_file
+from skyvern.utils.raw_secret_redaction import redact_raw_secrets_for_prompt, redact_totp_runtime_values
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, ActionStatus
 from skyvern.webeye.utils.page import SkyvernFrame
@@ -361,17 +367,9 @@ from .composition_capture import (
     store_post_run_page_evidence,
 )
 from .credentials import (
-    _approve_server_verified_google_sheet_bindings,
     _credential_ids_validation_error,
-    _credential_run_approval_blocker_signal,
     _credential_run_approval_error,
-    _extract_credential_ids_for_labels,
-    _extract_credential_ids_from_tool_value,
-    _extract_credential_ids_from_workflow_definition,
-    _google_connection_reference_ids,
-    _google_sheet_connection_bindings_from_workflow_definition,
-    _retire_stale_google_connection_denial,
-    _server_verified_google_account_choices,
+    run_credential_gate,
     run_input_vault_placement_error,
 )
 from .frontier import (
@@ -403,6 +401,17 @@ from .workflow_update import (
 )
 
 LOG = structlog.get_logger()
+
+COPILOT_CODE_SECURITY_FAILURE_CATEGORY = "COPILOT_CODE_SECURITY"
+
+
+def _code_security_failure_category(error: CodeBlockSecurityError) -> dict[str, str | float]:
+    return {
+        "category": COPILOT_CODE_SECURITY_FAILURE_CATEGORY,
+        "reason_code": error.reason_code,
+        "confidence_float": 0.99,
+        "reasoning": f"{error.reason_code}: blocked {error.surface} before browser dispatch",
+    }
 
 
 _MAX_REGISTERED_ARTIFACTS = 3
@@ -602,8 +611,8 @@ def resolve_copilot_run_lane(*, rollout_dispatches: bool, inline_opt_in: bool) -
 
     The rollout decides where a run *may* execute; an explicit inline opt-in decides where this one
     does. Honouring the opt-in under an enrolled runner is what lets a developer stack exercise a
-    workflow whose target is host-local, which the runner's egress guard refuses. Only a developer
-    checkout reaches it: the hook returns False for cloud and packaged deployments.
+    workflow whose target is host-local, which the runner's egress guard refuses. Open source always
+    opts in, having no sandbox; a cloud image opts in only from a developer checkout.
     """
     if inline_opt_in:
         return False, True
@@ -681,6 +690,7 @@ def _reconcile_narrative_block_attempts(ctx: CopilotContext, blocks: list[Workfl
             ctx.narrative_block_attempts,
             workflow_run_block_id=block.workflow_run_block_id,
             workflow_run_id=block.workflow_run_id,
+            parent_workflow_run_block_id=block.parent_workflow_run_block_id,
             label=block.label,
             block_type=block.block_type.value,
             status=block.status,
@@ -1796,7 +1806,7 @@ def _runtime_code_security_failure_for_selected_labels(
             "planned_block_labels": list(labels_to_execute),
             "frontier_start_label": frontier_start_label,
             "blocks": [],
-            "failure_categories": [error.to_failure_category() for error in errors],
+            "failure_categories": [_code_security_failure_category(error) for error in errors],
             "failure_category": COPILOT_CODE_SECURITY_FAILURE_CATEGORY,
         },
     }
@@ -4507,7 +4517,7 @@ async def _run_blocks_with_minted_browser_claim(
     workflow = snapshot.workflow
     execution = _RunExecution(
         snapshot=snapshot,
-        workflow_yaml=snapshot.workflow_yaml or workflow_to_copilot_yaml(workflow),
+        workflow_yaml=snapshot.workflow_yaml or workflow_to_authoring_yaml(workflow),
         metadata=copy.deepcopy(ctx.code_artifact_metadata),
         associations=copy.deepcopy(ctx.runner_code_block_associations_by_label),
         source_at_start=(
@@ -4656,60 +4666,23 @@ async def _run_blocks_with_minted_browser_claim(
         selected_labels=set(labels_that_may_execute),
     )
 
-    tool_credential_ids = _extract_credential_ids_from_tool_value(params.get("parameters") or {})
-    credential_ids = list(
-        dict.fromkeys(
-            tool_credential_ids + _extract_credential_ids_from_workflow_definition(workflow.workflow_definition)
-        )
-    )
-    definition_credential_ids = _extract_credential_ids_for_labels(
-        workflow.workflow_definition, labels_that_may_execute
-    )
-    approval_credential_ids = list(dict.fromkeys(tool_credential_ids + definition_credential_ids))
-    admitted_sheet_ids = await _approve_server_verified_google_sheet_bindings(
-        _google_sheet_connection_bindings_from_workflow_definition(
-            workflow.workflow_definition,
-            selected_labels=labels_that_may_execute,
-        ),
-        tool_activity=ctx.tool_activity,
-        organization_id=ctx.organization_id,
-        request_policy=ctx.request_policy,
-    )
-    non_sheet_credential_ids = set(tool_credential_ids) | set(
-        _extract_credential_ids_for_labels(
-            workflow.workflow_definition,
-            labels_that_may_execute,
-            excluded_block_types={"google_sheets_read", "google_sheets_write"},
-        )
-    )
-    dispatch_scoped_sheet_ids = set(admitted_sheet_ids) - non_sheet_credential_ids
-    google_approval_blocker = _credential_run_approval_blocker_signal(
-        approval_credential_ids,
-        ctx.request_policy,
-        additional_approved_ids=dispatch_scoped_sheet_ids,
-        google_reference_ids=_google_connection_reference_ids(workflow.workflow_definition, labels_that_may_execute),
-    )
-    if google_approval_blocker is not None:
-        ctx.connected_account_recovery_choices = (
-            await _server_verified_google_account_choices(ctx.organization_id) or []
-        )
-        tool_error = stash_blocker_signal(ctx, google_approval_blocker)
-        stash_turn_halt_from_blocker_signal(ctx, google_approval_blocker, source="run_execution")
-        return _refused_before_dispatch(ctx, tool_error, user_reason=google_approval_blocker.user_facing_reason)
-    _retire_stale_google_connection_denial(
+    credential_gate = await run_credential_gate(
         ctx,
-        workflow_definition=workflow.workflow_definition,
-        additional_approved_ids=dispatch_scoped_sheet_ids,
+        workflow.workflow_definition,
+        labels=labels_that_may_execute,
+        run_parameters=params.get("parameters"),
+        narrow_agent_step_accounts=True,
     )
-    credential_approval_error = _credential_run_approval_error(
-        approval_credential_ids,
-        ctx.request_policy,
-        additional_approved_ids=dispatch_scoped_sheet_ids,
-    )
-    if credential_approval_error is not None:
-        return _refused_before_dispatch(ctx, credential_approval_error, user_reason=_UNCONFIRMED_LOGIN_REASON)
-
-    credential_error = await _credential_ids_validation_error(credential_ids, ctx)
+    if credential_gate.blocker is not None:
+        stash_turn_halt_from_blocker_signal(ctx, credential_gate.blocker, source="run_execution")
+    if credential_gate.error is not None:
+        user_reason = (
+            credential_gate.blocker.user_facing_reason
+            if credential_gate.blocker is not None
+            else _UNCONFIRMED_LOGIN_REASON
+        )
+        return _refused_before_dispatch(ctx, credential_gate.error, user_reason=user_reason)
+    credential_error = await _credential_ids_validation_error(list(credential_gate.definition_credential_ids), ctx)
     if credential_error is not None:
         return _refused_before_dispatch(ctx, credential_error)
     placement_error = await run_input_vault_placement_error(workflow.workflow_definition, params.get("parameters"), ctx)
@@ -4924,7 +4897,7 @@ async def _run_blocks_with_minted_browser_claim(
         discard_build_test_prestart(ctx, "seeded")
 
     # Without a session, the workflow service launches the browser in-process,
-    # which only works in worker pods (cloakbrowser isn't in the API image).
+    # which only works in worker pods (the API image does not ship the browser runs use).
     if use_fresh_session:
         # The chat's browser holds whatever page scouting left open, so a run from the head is
         # given its own; the chat keeps its session and the minted id is threaded in explicitly.
@@ -5021,6 +4994,7 @@ async def _run_blocks_with_minted_browser_claim(
     run_task: asyncio.Task | None = None
     secret_run_session_lock: asyncio.Lock | None = None
     interim_run_id: str | None = None
+    prepared_run_id: str | None = None
     # Set only where the run may already be executing, so an unwind before either executor call
     # can still retract the run-start record.
     run_submission_attempted = False
@@ -5247,9 +5221,10 @@ async def _run_blocks_with_minted_browser_claim(
                     app.AGENT_FUNCTION.resolve_copilot_dispatch_trigger_type() if dispatch_to_worker else None
                 ),
                 copilot_session_id=ctx.workflow_copilot_chat_id,
-                created_by="copilot",
+                created_by=COPILOT_RUN_CREATOR,
                 requested_by=requesting_user_id(ctx.organization_id),
             )
+            prepared_run_id = workflow_run.workflow_run_id
         except (BrowserSessionClosed, BrowserSessionStartupTimeout) as refused:
             # Submission refuses a session that has already ended, so no run exists to carry the
             # lease-seam reason code; report the same typed browser loss that run would have.
@@ -5307,6 +5282,48 @@ async def _run_blocks_with_minted_browser_claim(
                 browser_seed_source=browser_seed_source,
             )
 
+        agent_step_accounts: list[dict[str, Any]] | None = None
+        if credential_gate.agent_step_connection_ids is not None:
+            try:
+                await record_run_connection_ids(
+                    ctx.organization_id, workflow_run.workflow_run_id, credential_gate.agent_step_connection_ids
+                )
+            except Exception:
+                LOG.warning(
+                    "copilot_agent_step_run_accounts_record_failed",
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    exc_info=True,
+                )
+                # Off, the record holds every account and a worker without one offers every account anyway.
+                if settings.EMBER_NARROW_AGENT_STEP_ACCOUNTS:
+                    await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final(
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        failure_reason="The test run's approved accounts could not be recorded.",
+                    )
+                    if dispatch_draft_workflow_id is not None:
+                        await _delete_dispatch_draft(dispatch_draft_workflow_id, ctx.organization_id)
+                        dispatch_draft_workflow_id = None
+                    return {
+                        "ok": False,
+                        "error": "The test run's approved accounts could not be recorded; execution was not started.",
+                    }
+            if settings.EMBER_NARROW_AGENT_STEP_ACCOUNTS:
+                # The result names the accounts the agent steps got, so a switch the model read can raise the card.
+                offered = set(credential_gate.agent_step_connection_ids)
+                try:
+                    agent_step_accounts = [
+                        {key: value for key, value in connection.facts().items() if key != "state"}
+                        # Read as the worker reads them, so the list is what the step can select.
+                        for connection in await org_connections_by_id(ctx.organization_id, workflow_run.created_by)
+                        if connection.id in offered and connection.active
+                    ]
+                except Exception:
+                    LOG.warning(
+                        "copilot_agent_step_accounts_read_failed",
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        exc_info=True,
+                    )
+
         if (
             ctx.workflow_copilot_chat_id
             and execution.proposal_owner_turn_id is not None
@@ -5323,6 +5340,9 @@ async def _run_blocks_with_minted_browser_claim(
                         expected_revision=execution.proposal_revision,
                         expected_workflow_yaml=execution.snapshot.proposal_bind_yaml or execution.workflow_yaml,
                         workflow_run_id=workflow_run.workflow_run_id,
+                        expected_workflow_run_id=ctx.proposal_workflow_run_id
+                        if ctx.proposal_bind_checks_run_id
+                        else _UNSET,
                     )
                 except CopilotProposalConflictError as conflict:
                     # A token or source this call no longer shares with ctx belongs to a candidate the turn replaced.
@@ -5330,9 +5350,12 @@ async def _run_blocks_with_minted_browser_claim(
                         execution.proposal_owner_turn_id,
                         execution.proposal_revision,
                     ) and execution.source_is_current(ctx)
+                    # Adopting on run_bound would take the other turn's run id, letting a retry bind a second run.
                     bind_conflict = (
                         conflict.reason,
-                        await adopt_stored_workflow_candidate(ctx) if ctx_holds_call_token else "kept",
+                        await adopt_stored_workflow_candidate(ctx)
+                        if ctx_holds_call_token and conflict.reason != "run_bound"
+                        else "kept",
                     )
                 except Exception:
                     bind_unexpected = True
@@ -5354,6 +5377,8 @@ async def _run_blocks_with_minted_browser_claim(
                     cancel_reason = "The Copilot test run could not be bound to its proposal."
                 elif bind_conflict[0] == "being_accepted":
                     cancel_reason = "The Copilot proposal was being accepted, so its test run was not started."
+                elif bind_conflict[0] == "run_bound":
+                    cancel_reason = "Another test of this Copilot proposal had already started, so this one was not."
                 else:
                     cancel_reason = "The Copilot proposal changed before its test run started."
                 await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled_if_not_final(
@@ -5414,7 +5439,7 @@ async def _run_blocks_with_minted_browser_claim(
             ctx,
             workflow_run_id=workflow_run.workflow_run_id,
             parameter_values=data,
-            credential_ids=approval_credential_ids,
+            credential_ids=list(credential_gate.credential_ids),
             sensitive_parameter_keys=_sensitive_parameter_keys_requiring_resolved_values(snapshot.workflow),
         )
         if origin_registry.contains_sensitive_values and run_session_id:
@@ -5462,11 +5487,10 @@ async def _run_blocks_with_minted_browser_claim(
                     block_outputs=block_outputs_to_seed or None,
                 )
         else:
-            if allow_inline_code_execution:
-                LOG.error(
-                    "UNSANDBOXED: executing copilot workflow code in the API process because "
-                    "COPILOT_ALLOW_INLINE_CODE_EXECUTION is enabled. This is a local-development path "
-                    "with no sandbox isolation; the run below is NOT a sandboxed run.",
+            if allow_inline_code_execution and requires_sandbox:
+                LOG.warning(
+                    "UNSANDBOXED: executing copilot workflow code in the API process because no sandbox "
+                    "can take this run; the run below is NOT a sandboxed run.",
                     workflow_run_id=workflow_run.workflow_run_id,
                     workflow_permanent_id=ctx.workflow_permanent_id,
                     organization_id=ctx.organization_id,
@@ -5528,6 +5552,17 @@ async def _run_blocks_with_minted_browser_claim(
             secret_run_session_lock = None
         if interim_run_id is not None and not run_submission_attempted:
             _forget_interim_run_start(ctx, interim_run_id)
+        # No executor ever received this run, and a proposal it is bound to must not read as having a live test.
+        if prepared_run_id is not None and not run_submission_attempted:
+            try:
+                await asyncio.shield(
+                    app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final(
+                        workflow_run_id=prepared_run_id,
+                        failure_reason="The test run could not be set up, so execution was not started.",
+                    )
+                )
+            except Exception:
+                LOG.warning("copilot_unsubmitted_run_fail_write_failed", workflow_run_id=prepared_run_id, exc_info=True)
         # The poll's finally never runs on this path, and a None entry is neither superseded nor checked for a run
         # still using the browser at turn end.
         if (
@@ -5818,6 +5853,8 @@ async def _run_blocks_with_minted_browser_claim(
                 if execution.reused_origin_input_keys:
                     result["data"]["reused_origin_input_keys"] = list(execution.reused_origin_input_keys)
                 _attach_reused_origin_outputs(result["data"], execution)
+                if agent_step_accounts is not None:
+                    result["data"]["agent_step_accounts"] = agent_step_accounts
                 if new_exit_receipt is not None:
                     result["data"]["new_exit"] = new_exit_receipt.model_dump(mode="json")
                 if run_cancelled_by_watchdog:
@@ -6016,6 +6053,8 @@ async def _run_blocks_with_minted_browser_claim(
         if execution.reused_origin_input_keys:
             result_data["reused_origin_input_keys"] = list(execution.reused_origin_input_keys)
         _attach_reused_origin_outputs(result_data, execution)
+        if agent_step_accounts is not None:
+            result_data["agent_step_accounts"] = agent_step_accounts
         if not run_ok and run and run.failure_reason:
             result_data["failure_reason"] = redact_totp_runtime_values(_without_typed_input(run.failure_reason))
         if not run_ok and run and run.failure_category:
@@ -6403,6 +6442,14 @@ async def _get_run_results(
         "action_trace_summary": action_trace_summary,
         "action_observations": action_observations,
     }
+    run_status = WorkflowRunStatus(run.status)
+    at_failure_screenshot_b64 = _resolve_run_screenshot_b64(
+        live_capture=None,
+        results=results,
+        run_ok=not run_status.is_final() or run_status == WorkflowRunStatus.completed,
+    )
+    if at_failure_screenshot_b64 is not None:
+        result_data["screenshot_base64"] = at_failure_screenshot_b64
     if workflow_run_id == ctx.proposal_workflow_run_id:
         if run_workflow is not None:
             result_data["execution_source"] = _execution_source_facts(run_workflow, provenance="staged")
@@ -8513,8 +8560,8 @@ def build_test_evidence_packet(
         workflow_yaml = result.execution.workflow_yaml
         workflow_source = f"{result.execution.snapshot.provenance}_execution_snapshot"
     workflow_yaml = strip_copilot_yaml_headers(workflow_yaml)
-    if workflow_yaml is not None and not copilot_sees_notes(copilot_ctx):
-        workflow_yaml = drop_submitted_note_fields(workflow_yaml)
+    if workflow_yaml is not None:
+        workflow_yaml = drop_submitted_note_fields(workflow_yaml, keep_notes=copilot_sees_notes(copilot_ctx))
     if workflow_yaml is None:
         omission_notices.append(
             "canonical_workflow_yaml omitted: no accepted or turn-start persistence readback exists."
@@ -8788,6 +8835,7 @@ async def hydrate_prior_run_packet(
     copilot_ctx: CopilotContext,
     *,
     workflow_run_id: str | None,
+    queue_failure_frame: bool = False,
 ) -> dict[str, Any] | None:
     """The persisted facts of a run this turn did not perform, as the one shared packet. Diagnosis
     shadow recording is off: nothing was diagnosed here, the run already happened."""
@@ -8824,6 +8872,11 @@ async def hydrate_prior_run_packet(
     except Exception:
         LOG.warning("copilot prior-run packet unavailable", workflow_run_id=workflow_run_id, exc_info=True)
         return None
+    if queue_failure_frame:
+        try:
+            enqueue_screenshot_from_result(copilot_ctx, result, provenance=stored_run_frame_provenance(result))
+        except Exception:
+            LOG.warning("copilot prior-run frame not queued", workflow_run_id=workflow_run_id, exc_info=True)
     # The prompt already carries the workflow in its own section; a second copy here would sit
     # unlabelled beside it, and disagree with it whenever the editor holds an unsaved draft.
     for field in ("canonical_workflow_yaml", "canonical_workflow_yaml_complete", "canonical_workflow_source"):

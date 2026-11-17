@@ -12,7 +12,7 @@ import {
 import { useGlobalWorkflowsQuery } from "./useGlobalWorkflowsQuery";
 
 // Infinite (scroll-paged) history of a workflow's runs, for the Past Runs
-// selector. Mirrors useFolderWorkflowsQuery / useInfiniteCopilotChatsQuery.
+// selector. Mirrors useFolderWorkflowsQuery / useInfiniteEmberChatsQuery.
 function useInfiniteWorkflowRunsQuery({
   workflowPermanentId,
   pageSize = 20,

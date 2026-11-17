@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypedDict, TypeVar
@@ -162,8 +163,32 @@ function() {
                               : this.scrollIntoView({block: 'center', inline: 'center'});
   const rect = this.getBoundingClientRect();
   if (rect.width === 0 || rect.height === 0) return null;
+  const style = getComputedStyle(this);
   return {x: rect.left + rect.width / 2, y: rect.top + rect.height / 2,
-          width: rect.width, height: rect.height, left: rect.left, top: rect.top};
+          width: rect.width, height: rect.height, left: rect.left, top: rect.top,
+          borderLeft: parseInt(style.borderLeftWidth, 10) || 0, borderTop: parseInt(style.borderTopWidth, 10) || 0};
+}
+"""
+
+# Playwright's hit-target check: hit-test each root from the document down to this element's own, which reaches closed
+# shadow roots a walk down from the document cannot. Returns null when the topmost element is this one or inside it.
+_HIT_TARGET_JS = """
+function(p) {
+  const roots = [];
+  for (let n = this; ; n = roots[0].host) { roots.unshift(n.getRootNode()); if (!roots[0].host) break; }
+  let hit = null;
+  for (let i = 0; i < roots.length; i++) {
+    const e = roots[i].elementFromPoint(p.x, p.y);
+    if (!e) break;
+    hit = e;
+    if (i + 1 < roots.length && e !== roots[i + 1].host) break;
+  }
+  if (!hit) return 'outside';
+  for (let n = hit; n; n = n.parentNode || n.host) if (n === this) return null;
+  // Slotted light-DOM content is drawn inside the target; assignedSlot is null under a closed root, so ask the slots.
+  for (const s of [this, ...this.querySelectorAll('slot')])
+    if (s.localName === 'slot' && s.assignedElements({flatten: true}).some((a) => a.contains(hit))) return null;
+  return '<' + hit.localName + '>';
 }
 """
 
@@ -317,6 +342,9 @@ class ElementHandle(JSHandle):
     async def owner_frame(self) -> Frame:
         return self._frame
 
+    async def query_selector_all(self, selector: str) -> list[ElementHandle]:
+        return await self._frame.query_selector_all(selector, root=self)
+
     # -- actions ------------------------------------------------------------
 
     async def scroll_into_view_if_needed(self, *, timeout: float | None = None) -> None:
@@ -331,23 +359,56 @@ class ElementHandle(JSHandle):
         )
 
     async def _click_point(self) -> tuple[float, float]:
-        if self._session is not self._frame.page.session:
-            # Chrome routes input into an out-of-process frame by browser-side hit testing, which only
-            # knows the frame once every embedder above it has rendered it in. Until then a correctly
-            # addressed click is delivered to an embedding <iframe> element instead, and nothing raises.
-            await self.scroll_into_view_if_needed()
-            await _wait_presented(self._bound(_PRESENTED_JS))
-            embedder = self._frame.parent_frame
-            while embedder is not None:
-                await _wait_presented(embedder.evaluate(_PRESENTED_JS))
-                embedder = embedder.parent_frame
+        await self._wait_frames_presented()
+        return await self._measure_point()
+
+    async def _wait_frames_presented(self) -> None:
+        if self._session is self._frame.page.session:
+            return
+        # Chrome routes input into an out-of-process frame by browser-side hit testing, which only
+        # knows the frame once every embedder above it has rendered it in. Until then a correctly
+        # addressed click is delivered to an embedding <iframe> element instead, and nothing raises.
+        await self.scroll_into_view_if_needed()
+        await _wait_presented(self._bound(_PRESENTED_JS))
+        embedder = self._frame.parent_frame
+        while embedder is not None:
+            await _wait_presented(embedder.evaluate(_PRESENTED_JS))
+            embedder = embedder.parent_frame
+
+    async def _measure_point(self, position: dict[str, float] | None = None) -> tuple[float, float]:
         point = await self._bound(_CLICK_POINT_JS)
         if not point:
             raise CdpError("element has no layout box and cannot be clicked")
         # Viewport coordinates from the element's own frame need the frame's offset added before
         # they mean anything to the Input domain, which speaks in top-level viewport space.
         offset_x, offset_y = await self._frame.viewport_offset()
+        if position is not None:
+            # Playwright measures `position` from the top-left of the padding box.
+            x = point["left"] + point["borderLeft"] + position["x"]
+            y = point["top"] + point["borderTop"] + position["y"]
+            return x + offset_x, y + offset_y
         return point["x"] + offset_x, point["y"] + offset_y
+
+    async def _hit_elsewhere(self, x: float, y: float) -> str | None:
+        """What a click at top-level (x, y) lands on instead of this element: checked in its own frame, then in each
+        embedder against the <iframe> holding the frame below."""
+        frame = self._frame
+        element: ElementHandle = self
+        try:
+            while True:
+                offset_x, offset_y = await frame.viewport_offset()
+                found = await element._bound(_HIT_TARGET_JS, {"x": x - offset_x, "y": y - offset_y})
+                parent = frame.parent_frame
+                if found is not None or parent is None:
+                    return found
+                owner = await frame.frame_element()
+                if element is not self:
+                    await element.dispose()
+                element, frame = owner, parent
+        finally:
+            if element is not self:
+                with contextlib.suppress(CdpError):
+                    await element.dispose()
 
     async def click(
         self,
@@ -357,12 +418,27 @@ class ElementHandle(JSHandle):
         timeout: float | None = None,
         delay: float | None = None,
         force: bool = False,
+        position: dict[str, float] | None = None,
         **_: Any,
     ) -> None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + seconds_from_ms(timeout)
         # The other way a caller triggers a request right after subscribing, and the one
         # production actually uses: ScopedXhrDownloadCapture subscribes, then clicks.
         await self._frame.page._network.settled()
-        x, y = await self._click_point()
+        await self._wait_frames_presented()
+        while True:
+            # Re-measured each attempt: the cover can lift as the element moves, leaving something else at the old point.
+            x, y = await self._measure_point(position)
+            if force or (found := await self._hit_elsewhere(x, y)) is None:
+                break
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                budget = DEFAULT_ACTION_TIMEOUT_MS if timeout is None else timeout
+                if found == "outside":
+                    raise CdpTimeoutError(f"click: element is outside of the viewport within {budget}ms")
+                raise CdpTimeoutError(f"click: {found} intercepts pointer events within {budget}ms")
+            await asyncio.sleep(min(0.05, remaining))
         await self._frame.page.mouse.click(x, y, button=button, click_count=click_count)
 
     async def dblclick(self, **_: Any) -> None:
@@ -418,11 +494,11 @@ class ElementHandle(JSHandle):
 
     async def check(self, *, timeout: float | None = None, **_: Any) -> None:
         if not await self.is_checked():
-            await self.click()
+            await self.click(timeout=timeout)
 
     async def uncheck(self, *, timeout: float | None = None, **_: Any) -> None:
         if await self.is_checked():
-            await self.click()
+            await self.click(timeout=timeout)
 
     async def select_option(
         self,

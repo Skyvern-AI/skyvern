@@ -25,11 +25,7 @@ from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Collection
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import litellm
 import pytest
-from litellm.completion_extras.litellm_responses_transformation.transformation import (
-    LiteLLMResponsesTransformationHandler,
-)
 from structlog.testing import capture_logs
 
 import skyvern.webeye.action_deadline as action_deadline_module
@@ -41,8 +37,6 @@ from skyvern.exceptions import (
     SkyvernContextWindowExceededError,
     StepTerminationError,
 )
-from skyvern.forge.sdk.api.llm import api_handler_factory
-from skyvern.forge.sdk.api.llm.api_handler_factory import LLMCaller
 from skyvern.forge.sdk.api.llm.exceptions import LLMContentFilteredError, LLMProviderErrorRetryableTask
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -143,7 +137,6 @@ from skyvern.forge.taskv3.loop import (
 )
 from skyvern.forge.taskv3.opaque_refs import mask_opaque_urls
 from skyvern.forge.taskv3.tools import build_browser_tools
-from skyvern.schemas.llm import LLMRouterConfig, LLMRouterModelConfig
 from skyvern.utils.url_validators import validate_fetch_url
 from tests.unit.helpers import held_finish_restated
 from tests.unit.scoped_asyncio import ScopedAsyncio
@@ -661,6 +654,66 @@ async def test_a_raising_look_hook_does_not_change_the_run() -> None:
     assert outcome.status == "completed"
     assert caller.screenshots_per_call == [None, images]
     assert any(log["event"] == "taskv3 on_look_screenshots callback failed" for log in logs)
+
+
+def _scripted_image_tool(name: str, results: list[ToolResult | Exception]) -> ToolSpec:
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        item = results.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    return ToolSpec(name=name, description=name, parameters={"type": "object", "properties": {}}, handler=handler)
+
+
+@pytest.mark.asyncio
+async def test_look_and_observe_images_each_ride_the_next_call_once_in_latest_result_order() -> None:
+    observe_tool = _scripted_image_tool(
+        "observe", [ToolResult.ok(f"read {n}", screenshots=[f"o{n}".encode()]) for n in (1, 2, 3)]
+    )
+    look_tool = _scripted_image_tool(
+        "look", [ToolResult.ok(f"marks {n}", screenshots=[f"l{n}".encode()]) for n in (1, 2)]
+    )
+    script = [
+        [("look", {}), ("observe", {})],
+        [("observe", {}), ("look", {}), ("observe", {})],
+        [("click", {})],
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    outcome, caller = await _run(script, [observe_tool, look_tool, _recording_tool("click", []), make_finish_tool()])
+
+    assert outcome.status == "completed"
+    assert caller.screenshots_per_call == [None, [b"l1", b"o1"], [b"l2", b"o3"], None]
+
+
+@pytest.mark.parametrize(
+    ("second_observe", "expected_images"),
+    [
+        pytest.param(
+            ToolResult.ok("read 2\nscreenshot: not attached (timed out after 3s)", data={"screenshot_at": 6}),
+            [b"l1"],
+            id="ok_not_attached_drops_it",
+        ),
+        pytest.param(
+            ToolResult.error("observe could not read this page's controls"), [b"l1", b"o1"], id="error_keeps_it"
+        ),
+        pytest.param(RuntimeError("page crashed"), [b"l1", b"o1"], id="raises_keeps_it"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_later_observe_replaces_the_earlier_observe_image_only_when_it_succeeds(
+    second_observe: ToolResult | Exception, expected_images: list[bytes]
+) -> None:
+    observe_tool = _scripted_image_tool("observe", [ToolResult.ok("read 1", screenshots=[b"o1"]), second_observe])
+    look_tool = _scripted_image_tool("look", [ToolResult.ok("marks 1", screenshots=[b"l1"])])
+    script = [
+        [("look", {}), ("observe", {}), ("observe", {})],
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    outcome, caller = await _run(script, [observe_tool, look_tool, make_finish_tool()])
+
+    assert outcome.status == "completed"
+    assert caller.screenshots_per_call == [None, expected_images]
 
 
 def test_loop_takes_no_screenshot_of_its_own() -> None:
@@ -5925,6 +5978,37 @@ async def test_finish_completed_is_held_on_text_a_result_in_its_own_batch_report
 
 
 @pytest.mark.asyncio
+async def test_unseen_text_never_holds_the_observe_screenshot_line() -> None:
+    failure = "\nRequest failed: POST /api/export returned HTTP 503"
+    line = "\nscreenshot: attached (observe) to your next turn, the viewport as rendered now (768x432)"
+    content = "observed" + _ROWS_SECTION + failure + line
+    data = {
+        "delta_at": 8,
+        "delta_end": 8 + len(_ROWS_SECTION),
+        "download_failure_at": 8 + len(_ROWS_SECTION),
+        "screenshot_at": len(content) - len(line),
+    }
+
+    async def observe(_args: dict[str, Any]) -> ToolResult:
+        return ToolResult(status="ok", content=content, data=data)
+
+    observe_spec = ToolSpec(
+        name="observe", description="observe", parameters={"type": "object", "properties": {}}, handler=observe
+    )
+    unseen = _unseen([])
+    finish = make_finish_tool(settle_wait_seconds=0.0, unseen_text=unseen)
+    script = [
+        [("observe", {}), ("finish", {"status": "completed", "reason": "the list is empty"})],
+        [("finish", {"status": "completed", "reason": "deleted the listed item"})],
+    ]
+    outcome, _ = await _run(script, [observe_spec, finish], unseen_text=unseen)
+
+    finish_contents = [str(m.get("content")) for m in outcome.messages if m.get("name") == "finish"]
+    assert any('"Cart A"' in c for c in finish_contents), finish_contents
+    assert not any("screenshot:" in c for c in finish_contents), finish_contents
+
+
+@pytest.mark.asyncio
 async def test_finish_held_on_unseen_text_has_its_own_budget_even_with_settle_deferrals_off() -> None:
     # Bare tasks run with settle deferrals off; the hold still applies there, and still ends.
     unseen = _unseen([f'\npage newly shows: "Rotating banner {i}"' for i in range(20)])
@@ -6181,6 +6265,8 @@ _OBSERVE_SUMMARY_FIELDS = (
     "modal_listed",
     "modal_truncated",
     "ready_state_when_empty",
+    "links_listed",
+    "link_capped",
 )
 
 
@@ -6247,6 +6333,51 @@ def _perception_tool(name: str, contents: str | list[str]) -> ToolSpec:
     return ToolSpec(
         name=name, description=name, parameters={"type": "object", "properties": {}}, handler=handler, compactable=True
     )
+
+
+def _observe_with_alternating_screenshot_lines(body: str) -> ToolSpec:
+    lines = [
+        "screenshot: attached (observe) to your next turn, the viewport as rendered now (768x432); "
+        "a later observe in this turn replaces it",
+        "screenshot: not attached (timed out after 3s)",
+    ]
+    calls = {"n": 0}
+
+    async def observe(_args: dict[str, Any]) -> ToolResult:
+        calls["n"] += 1
+        return ToolResult.ok(f"{body}\n{lines[calls['n'] % 2]}", data={"screenshot_at": len(body)})
+
+    return ToolSpec(
+        name="observe",
+        description="observe",
+        parameters={"type": "object", "properties": {}},
+        handler=observe,
+        compactable=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_observe_screenshot_line_never_makes_an_unchanged_page_look_changed() -> None:
+    body = "url=x frozen behind a gate"
+    script = [[("observe", {})] for _ in range(20)]
+    script.append([("finish", {"status": "completed", "reason": "done"})])
+    kwargs: dict[str, Any] = {"max_turns": 200, "max_tool_calls": 500, "stall_terminate_after": 3}
+    outcome, caller = await _run(
+        script, [_observe_with_alternating_screenshot_lines(body), make_finish_tool()], **kwargs
+    )
+    baseline, baseline_caller = await _run(script, [_perception_tool("observe", body), make_finish_tool()], **kwargs)
+
+    assert baseline.guard == PERCEPTION_STALL_GUARD
+    assert outcome.guard == PERCEPTION_STALL_GUARD
+    assert caller.calls == baseline_caller.calls
+
+    # A re-read of the same page is marked unchanged, and the new screenshot line still reaches the model.
+    long_body = "url=x " + "frozen behind a gate " * 40
+    reread = [[("observe", {})], [("observe", {})], [("finish", {"status": "completed", "reason": "done"})]]
+    outcome, _ = await _run(reread, [_observe_with_alternating_screenshot_lines(long_body), make_finish_tool()])
+    reads = _tool_contents(outcome, "observe")
+    assert reads[1].startswith(f"[observe returned the same {len(long_body)} chars")
+    assert reads[1].split("\n", 1)[1].startswith("screenshot: attached (observe)")
 
 
 @pytest.mark.asyncio
@@ -10629,6 +10760,102 @@ async def test_download_settle_accepts_a_completed_finish_it_could_record(settle
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["canceled", "many_files", "one_over"])
+async def test_a_failed_finish_on_a_download_block_yields_to_a_cancel_and_names_at_most_a_hundred_files(
+    case: str,
+) -> None:
+    canceled = False
+    landed = [f"Downloaded: report-{i}.csv (1.0 KB)" for i in range(101 if case == "one_over" else 105)]
+
+    async def settle(_staged: frozenset[str]) -> str | None:
+        nonlocal canceled
+        # The agent's settle declines to finalize a canceled run and returns None.
+        canceled = case == "canceled"
+        return None if canceled else "\n".join(landed)
+
+    async def should_cancel() -> bool:
+        return canceled
+
+    finish = ("finish", {"status": "failed", "reason": "the export page returned an error"})
+    outcome, _ = await _run(
+        [[finish], [finish]],
+        [make_finish_tool(download_settle=settle, should_cancel=should_cancel, file_landed_hold=True)],
+        should_cancel=should_cancel,
+    )
+
+    if case == "canceled":
+        assert outcome.status == "canceled"
+        return
+    assert outcome.status == "failed"
+    held = next(m["content"] for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "finish")
+    lines = str(held).splitlines()
+    assert [line for line in lines if line.startswith("Downloaded:")] == landed[:100]
+    assert ("and 1 more file, not listed" if case == "one_over" else "and 5 more files, not listed") in lines
+
+
+_REPORT_LANDED = "Downloaded: report.csv (1.0 KB)"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "statuses", "settles", "unsaved_held", "landed_held"),
+    [
+        ("held_then_completed", ["completed", "completed"], [None, None], [0], []),
+        ("held_then_failed", ["completed", "failed"], [None, None], [0], []),
+        ("nothing_unsaved", ["completed"], [None], [], []),
+        ("file_landed", ["completed"], [_REPORT_LANDED], [], []),
+        ("hold_switched_off", ["completed"], [None], [], []),
+        ("landed_hold_first", ["failed", "completed", "completed"], [_REPORT_LANDED, None, None], [1], [0]),
+        ("unsaved_hold_first", ["completed", "failed", "failed"], [None, _REPORT_LANDED, _REPORT_LANDED], [0], [1]),
+        ("justification_hold_not_stacked", ["completed", "terminated"], [None, None], [0], []),
+        ("no_verdict_turn_left", ["completed"], [None], [], []),
+        ("read_raises", ["completed"], [None], [], []),
+    ],
+)
+async def test_a_completed_finish_with_no_file_and_unsaved_downloads_is_handed_back_once(
+    case: str, statuses: list[str], settles: list[str | None], unsaved_held: list[int], landed_held: list[int]
+) -> None:
+    # One settle per finish the run should take: a held finish is followed by another one.
+    settle_results = iter(settles)
+    reads: list[int] = []
+
+    async def settle(_staged: frozenset[str]) -> str | None:
+        return next(settle_results, None)
+
+    async def unsaved_downloads() -> dict[str, int]:
+        reads.append(1)
+        if case == "read_raises":
+            raise RuntimeError("tally unavailable")
+        return {} if case == "nothing_unsaved" else {"capture_failed": 2}
+
+    activity = None if case not in ("no_verdict_turn_left", "justification_hold_not_stacked") else ActivityRecency()
+    outcome, _ = await _run(
+        [[("finish", {"status": status, "reason": "the export finished"})] for status in statuses],
+        [
+            make_finish_tool(
+                download_settle=settle,
+                file_landed_hold=case != "hold_switched_off",
+                unsaved_downloads=unsaved_downloads,
+                activity=activity,
+                justify_stops=case == "justification_hold_not_stacked",
+            )
+        ],
+        **({"max_turns": 1} if case == "no_verdict_turn_left" else {}),
+        **({"activity": activity} if activity is not None else {}),
+    )
+
+    results = [str(m["content"]) for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "finish"]
+    assert len(results) == len(statuses), results
+    assert outcome.status == statuses[-1]
+    assert [i for i, result in enumerate(results) if "capture_failed: 2" in result] == unsaved_held
+    assert [i for i, result in enumerate(results) if "these files landed" in result] == landed_held
+    for index in unsaved_held:
+        assert "no new file has landed" in results[index] and "retry it" in results[index]
+    if case == "file_landed":
+        assert reads == []
+
+
+@pytest.mark.asyncio
 async def test_a_held_finish_leaves_download_failures_and_files_for_the_accepted_finish() -> None:
     facts = DownloadFailureFacts()
     facts.add("Request failed: POST /api/export returned HTTP 503", repeat=True)
@@ -12203,27 +12430,53 @@ def _finish_that_also_signals_refresh() -> ToolSpec:
 
 
 @pytest.mark.asyncio
-async def test_refresh_signal_never_voids_a_terminal_finish() -> None:
+@pytest.mark.parametrize("status", ["completed", "failed", "terminated"])
+async def test_refresh_signal_never_voids_a_terminal_finish(status: str) -> None:
     reload_calls: list[None] = []
 
     async def reload_page() -> None:
         reload_calls.append(None)
 
     tools = [_finish_that_also_signals_refresh()]
-    script: list[list[tuple[str, dict[str, Any]]]] = [[("finish", {"status": "completed", "reason": "done"})]]
+    script: list[list[tuple[str, dict[str, Any]]]] = [[("finish", {"status": status, "reason": "done"})]]
 
-    ctx = SkyvernContext(task_id="tsk_refresh_terminal")
+    ctx = SkyvernContext(task_id="tsk_refresh_terminal", page_reload_request=object())
+    seal = AsyncMock(return_value=False)
     skyvern_context.set(ctx)
     try:
-        outcome, caller = await _run(script, tools, reload_page=reload_page)
+        outcome, caller = await _run(script, tools, reload_page=reload_page, settle_reload_signal=seal)
     finally:
         skyvern_context.reset()
 
-    assert outcome.status == "completed"
+    assert outcome.status == status
+    assert seal.await_args_list == ([((True,), {})] if status == "completed" else [])
     assert reload_calls == []
     assert ctx.refresh_working_page is False
     contents = [str(m.get("content", "")) for m in caller.message_history]
     assert not any("refresh" in c.lower() or "skipped" in c.lower() for c in contents)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_shared_flag", [False, True], ids=["private_only", "shared_flag_too"])
+async def test_private_requests_do_not_spend_the_shared_refresh_budget(with_shared_flag: bool) -> None:
+    reload_page = AsyncMock()
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    request = object()
+    ctx = SkyvernContext(task_id="tsk_withheld_reload", refresh_working_page=with_shared_flag)
+    ctx.page_reload_request = request
+    skyvern_context.set(ctx)
+    try:
+        outcome, _ = await _run(
+            [[("click", {"selector": "#next"})], [("finish", {"status": "completed", "reason": "done"})]],
+            [_recording_tool("click", clicks, billable=True), make_finish_tool()],
+            reload_page=reload_page,
+            max_refresh_cycles=1 if with_shared_flag else 0,
+        )
+    finally:
+        skyvern_context.reset()
+    assert outcome.status == "completed"
+    assert reload_page.await_count == int(with_shared_flag) and len(clicks) == int(not with_shared_flag)
+    assert ctx.page_reload_request is request and ctx.refresh_working_page is False
 
 
 @pytest.mark.asyncio
@@ -12779,307 +13032,6 @@ async def test_loop_drops_a_rejected_optional_param_for_the_rest_of_the_run(
     assert outcome.status == "completed"
     first_without = caller.sent_param.index(False)
     assert first_without > 0 and not any(caller.sent_param[first_without:])
-
-
-class _ReasoningCaller(_ScriptedCaller):
-    """Returns a reasoning item with every response, as litellm's Responses bridge does, and records the history each
-    call sent; ``reject`` refuses calls whose history carries one (``always`` refuses every call once one was refused),
-    as a leg that cannot read the reasoning would, raising ``rejection()`` when given."""
-
-    def __init__(
-        self,
-        script: list[list[tuple[str, dict[str, Any]]]],
-        *,
-        items: bool = True,
-        reject: bool = False,
-        always: bool = False,
-        rejection: Callable[[], Exception] | None = None,
-        fail_first: int = 0,
-    ) -> None:
-        super().__init__(script)
-        self.items, self.reject, self.always, self.rejection = items, reject, always, rejection
-        self.fail_first = fail_first
-        self.sent: list[list[dict[str, Any]]] = []
-        self.sent_effort: list[bool] = []
-        self.refused = False
-
-    async def call(self, **kwargs: Any) -> dict[str, Any]:
-        self.sent.append(copy.deepcopy(self.message_history))
-        self.sent_effort.append(kwargs.pop("reasoning_effort", None) is not None)
-        if (
-            (self.reject and any(m.get("reasoning_items") for m in self.message_history))
-            or (self.always and self.refused)
-            or len(self.sent) <= self.fail_first
-        ):
-            self.refused = True
-            raise self.rejection() if self.rejection else LLMProviderErrorRetryableTask("TEST_KEY")
-        response = await super().call(**kwargs)
-        if self.items:
-            response["choices"][0]["message"]["reasoning_items"] = [
-                {
-                    "type": "reasoning",
-                    "id": f"rs_{self.calls}",
-                    "encrypted_content": f"opaque{self.calls}",
-                    "summary": [],
-                }
-            ]
-        return response
-
-
-def _distinct_observe_tool() -> ToolSpec:
-    reads = itertools.count(1)
-
-    async def handler(args: dict[str, Any]) -> ToolResult:
-        return ToolResult.ok(f"OBSERVE_{next(reads)} " + "x" * 400)
-
-    return ToolSpec(
-        name="observe", description="observe", parameters={}, handler=handler, compactable=True, issues_handles=True
-    )
-
-
-async def _run_reasoning(caller: _ReasoningCaller, *, carry: bool, **loop_kwargs: Any) -> LoopOutcome:
-    return await run_agent_tool_loop(
-        llm_caller=caller,
-        system_prompt="sys",
-        user_prompt="goal",
-        tools=[_distinct_observe_tool(), make_finish_tool()],
-        max_turns=6,
-        max_tool_calls=10,
-        retryable_call_exceptions=(LLMProviderErrorRetryableTask,),
-        call_retry_base_delay=0.0,
-        carry_reasoning=carry,
-        **{"max_call_retries": 1, **loop_kwargs},
-    )
-
-
-_REASONING_SCRIPT: list[list[tuple[str, dict[str, Any]]]] = [
-    [("observe", {})],
-    [("observe", {})],
-    [("observe", {})],
-    [("finish", {"status": "completed", "reason": "ok"})],
-]
-
-
-@pytest.mark.asyncio
-async def test_carried_reasoning_goes_back_right_before_the_calls_it_produced() -> None:
-    caller = _ReasoningCaller(_REASONING_SCRIPT)
-    outcome = await _run_reasoning(caller, carry=True)
-
-    assert outcome.status == "completed"
-    wire, _ = LiteLLMResponsesTransformationHandler().convert_chat_completion_messages_to_responses_api(caller.sent[-1])
-    shape = [(item["type"], item.get("id") or item.get("call_id")) for item in wire if item["type"] != "message"]
-    # Each turn's reasoning precedes that turn's call, and its result follows the call.
-    assert shape == [
-        ("reasoning", "rs_1"),
-        ("function_call", "call_0"),
-        ("function_call_output", "call_0"),
-        ("reasoning", "rs_2"),
-        ("function_call", "call_0"),
-        ("function_call_output", "call_0"),
-        ("reasoning", "rs_3"),
-        ("function_call", "call_0"),
-        ("function_call_output", "call_0"),
-    ]
-    assert [item.get("encrypted_content") for item in wire if item["type"] == "reasoning"] == [
-        "opaque1",
-        "opaque2",
-        "opaque3",
-    ]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(("carry", "items"), [(False, True), (True, False)])
-async def test_no_carried_reasoning_leaves_every_request_as_before(carry: bool, items: bool) -> None:
-    baseline = _ReasoningCaller(_REASONING_SCRIPT, items=False)
-    await _run_reasoning(baseline, carry=False)
-    caller = _ReasoningCaller(_REASONING_SCRIPT, items=items)
-    await _run_reasoning(caller, carry=carry)
-
-    assert json.dumps(caller.sent) == json.dumps(baseline.sent)
-
-
-@pytest.mark.asyncio
-async def test_compaction_keeps_each_reasoning_item_with_its_own_calls() -> None:
-    caller = _ReasoningCaller(_REASONING_SCRIPT)
-    await _run_reasoning(caller, carry=True)
-
-    final = caller.sent[-1]
-    assert any("elided" in str(m.get("content")) for m in final if m.get("role") == "tool")
-    carried = [m for m in final if m.get("reasoning_items")]
-    assert all(m["role"] == "assistant" and m.get("tool_calls") for m in carried)
-    assert [m["reasoning_items"][0]["id"] for m in carried] == ["rs_1", "rs_2", "rs_3"]
-    assert len(carried) == sum(1 for m in final if m.get("role") == "assistant")
-
-
-@pytest.mark.asyncio
-async def test_a_rejected_carry_stops_for_the_run_and_retries_the_turn_once() -> None:
-    caller = _ReasoningCaller(_REASONING_SCRIPT, reject=True)
-    with capture_logs() as logs:
-        outcome = await _run_reasoning(caller, carry=True)
-
-    assert outcome.status == "completed"
-    carried = [sum(1 for m in history if m.get("reasoning_items")) for history in caller.sent]
-    # Turn 2 carries, is refused twice (one transient retry), then goes once without; nothing carries after.
-    assert carried[:4] == [0, 1, 1, 0] and not any(carried[3:])
-    assert [e["dropped"] for e in logs if e["event"] == "taskv3 loop retrying without optional call param"] == [
-        "reasoning_items"
-    ]
-
-    still_failing = _ReasoningCaller(_REASONING_SCRIPT, reject=True, always=True)
-    outcome = await _run_reasoning(still_failing, carry=True)
-    assert outcome.status == "loop_error" and len(still_failing.sent) == 4
-
-
-@pytest.mark.asyncio
-async def test_a_fallback_leg_that_cannot_read_carried_reasoning_fails_loudly_once_then_the_turn_runs_without_it(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = LLMRouterConfig(
-        model_name="scope-router",
-        required_env_vars=[],
-        supports_vision=False,
-        add_assistant_prefix=False,
-        model_list=[
-            LLMRouterModelConfig(model_name="primary", litellm_params={"model": "openai/gpt-test", "api_key": "a"}),
-            LLMRouterModelConfig(
-                model_name="other-endpoint",
-                litellm_params={"model": "azure/gpt-test", "api_base": "https://other.example.test", "api_key": "b"},
-            ),
-        ],
-        main_model_group="primary",
-        fallback_model_group="other-endpoint",
-        num_retries=0,
-        disable_cooldowns=True,
-    )
-    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: config)
-    monkeypatch.setattr(api_handler_factory, "_LLMCALLER_ROUTER_CACHE", {})
-    monkeypatch.setattr(api_handler_factory, "_validate_custom_llm_api_base", AsyncMock())
-    artifact_manager = MagicMock()
-    artifact_manager.bulk_create_artifacts = AsyncMock()
-    monkeypatch.setattr(api_handler_factory.app, "ARTIFACT_MANAGER", artifact_manager)
-    sent: list[tuple[str, bool]] = []
-
-    async def provider(**kwargs: Any) -> Any:
-        provider_name = "azure" if kwargs["model"].startswith("azure") else "openai"
-        carried = any(m.get("reasoning_items") for m in kwargs["messages"])
-        sent.append((provider_name, carried))
-        if provider_name == "openai" and len(sent) > 1:
-            raise litellm.InternalServerError("primary down", model="gpt-test", llm_provider="openai")
-        if carried:
-            raise litellm.BadRequestError("Item with id 'rs_1' not found.", model="gpt-test", llm_provider="azure")
-        turn = (
-            [{"name": "observe", "arguments": "{}"}]
-            if len(sent) == 1
-            else [{"name": "finish", "arguments": json.dumps({"status": "completed", "reason": "ok"})}]
-        )
-        message = {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [{"id": f"call_{len(sent)}", "type": "function", "function": f} for f in turn],
-        }
-        if provider_name == "openai":
-            message["reasoning_items"] = [{"type": "reasoning", "id": "rs_1", "summary": []}]
-        return litellm.ModelResponse(
-            model="gpt-test" if provider_name == "openai" else "gpt-test-azure",
-            choices=[{"index": 0, "message": message, "finish_reason": "tool_calls"}],
-            usage={"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11},
-        )
-
-    monkeypatch.setattr(litellm, "acompletion", provider)
-    # The mocked provider returns no deployment id, so name the serving group from the provider that answered.
-    monkeypatch.setattr(
-        api_handler_factory.LLMAPIHandlerFactory,
-        "_served_model_group",
-        staticmethod(lambda _router, response: "primary" if response.model == "gpt-test" else "other-endpoint"),
-    )
-    with capture_logs() as logs:
-        outcome = await run_agent_tool_loop(
-            llm_caller=LLMCaller("TEST_REASONING_SCOPE_ROUTER"),
-            system_prompt="sys",
-            user_prompt="goal",
-            tools=[_distinct_observe_tool(), make_finish_tool()],
-            max_turns=4,
-            max_tool_calls=10,
-            retryable_call_exceptions=(LLMProviderErrorRetryableTask,),
-            max_call_retries=0,
-            call_retry_base_delay=0.0,
-            carry_reasoning=True,
-        )
-
-    assert outcome.status == "completed"
-    # The other endpoint gets the items once and refuses them; the turn then reaches it without them. The router
-    # re-raises the primary's error, so the refusal is read from the fallback error it records.
-    assert sent == [("openai", False), ("openai", True), ("azure", True), ("openai", False), ("azure", False)]
-    stripped = [e for e in logs if e.get("carry_reasoning_stripped_on_error")]
-    assert [(e["carry_reasoning_stripped_on_error"], e["status_code"], e["fallback_error"]) for e in stripped] == [
-        ("InternalServerError", 500, "BadRequestError")
-    ]
-
-
-def _rejected_carry() -> Exception:
-    cause = litellm.BadRequestError("Item with id 'rs_1' not found.", model="gpt-test", llm_provider="azure")
-    error = LLMProviderErrorRetryableTask("TEST_KEY", cause=cause)
-    error.__cause__ = cause
-    return error
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("rejection", "call_kwargs"),
-    [
-        (_rejected_carry, None),
-        (lambda: SkyvernContextWindowExceededError(model="gpt-test"), None),
-        (lambda: RuntimeError("provider rejected the request"), {"reasoning_effort": {"effort": "high"}}),
-    ],
-    ids=["deterministic_4xx", "context_window", "non_retryable_with_reasoning_effort"],
-)
-async def test_a_carry_rejection_strips_on_the_first_failure(
-    rejection: Callable[[], Exception], call_kwargs: dict[str, Any] | None
-) -> None:
-    caller = _ReasoningCaller(_REASONING_SCRIPT, reject=True, rejection=rejection)
-    with capture_logs() as logs:
-        outcome = await _run_reasoning(caller, carry=True, max_call_retries=2, call_kwargs=call_kwargs)
-
-    assert outcome.status == "completed"
-    assert outcome.carry_reasoning_stripped is True and outcome.carried_reasoning_turns == 1
-    carried = [sum(1 for m in history if m.get("reasoning_items")) for history in caller.sent]
-    # The carrying call is sent once, not once per transient retry, and nothing carries after it.
-    assert carried[:3] == [0, 1, 0] and not any(carried[2:])
-    dropped = [e["dropped"] for e in logs if e["event"] == "taskv3 loop retrying without optional call param"]
-    assert dropped == ["reasoning_items"]
-    assert all(caller.sent_effort) is (call_kwargs is not None)
-
-
-@pytest.mark.asyncio
-async def test_a_rejection_before_anything_is_carried_retries_as_control_does() -> None:
-    sends: dict[bool, tuple[int, list[bool]]] = {}
-    for carry in (True, False):
-        caller = _ReasoningCaller(_REASONING_SCRIPT, rejection=_rejected_carry, fail_first=2)
-        outcome = await _run_reasoning(
-            caller, carry=carry, max_call_retries=2, call_kwargs={"reasoning_effort": {"effort": "high"}}
-        )
-        assert outcome.status == "completed" and outcome.carry_reasoning_stripped is False
-        sends[carry] = (len(caller.sent), caller.sent_effort)
-
-    assert sends[True] == sends[False] and all(sends[True][1])
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("main_group", "served", "carries"),
-    [("primary", "primary", True), ("primary", "other-endpoint", False), ("primary", None, False), (None, None, True)],
-    ids=["router_main_served", "router_fallback_served", "router_unknown", "direct"],
-)
-async def test_only_reasoning_the_main_group_is_known_to_have_returned_is_carried(
-    main_group: str | None, served: str | None, carries: bool
-) -> None:
-    caller = _ReasoningCaller(_REASONING_SCRIPT)
-    caller.llm_config = SimpleNamespace(supports_vision=True, main_model_group=main_group)
-    caller.last_served_model_group = served
-    outcome = await _run_reasoning(caller, carry=True)
-
-    assert outcome.carried_reasoning_turns == (4 if carries else 0)
-    assert any(m.get("reasoning_items") for history in caller.sent for m in history) is carries
 
 
 def test_canonical_progress_tracker_counts_targets_and_clears_on_progress() -> None:
@@ -14221,260 +14173,6 @@ def test_every_driver_timeout_type_installed_here_classifies_as_a_driver_timeout
     # And the classes that merely LOOK like one stay out of that cohort.
     assert _raised_error_class(TimeoutError("a source fetch, not the driver")) == "timeout_other"
     assert _raised_error_class(RuntimeError("something else")) == "handler_raised"
-
-
-def test_tools_error_sites_without_a_class_only_go_down() -> None:
-    # An error with no class reaches telemetry as "other", which merges unrelated failures into one bucket.
-    # Exact, so labelling one more site lowers the number here and a new unlabelled site fails.
-    import ast  # noqa: PLC0415
-    import pathlib  # noqa: PLC0415
-
-    from skyvern.forge.taskv3 import tools  # noqa: PLC0415
-
-    unlabelled = []
-    for node in ast.walk(ast.parse(pathlib.Path(tools.__file__).read_text(encoding="utf-8"))):
-        if not isinstance(node, ast.Call) or any(k.arg == "error_class" for k in node.keywords):
-            continue
-        func = node.func
-        if isinstance(func, ast.Attribute) and func.attr == "error" and getattr(func.value, "id", None) == "ToolResult":
-            unlabelled.append(node.lineno)
-        elif (
-            isinstance(func, ast.Name)
-            and func.id == "ToolResult"
-            and node.args
-            and getattr(node.args[0], "value", None) == "error"
-            # error_class is the dataclass's fifth field, so fewer positional arguments leave it unset.
-            and len(node.args) < 5
-        ):
-            unlabelled.append(node.lineno)
-    assert len(unlabelled) == 29, sorted(unlabelled)
-
-
-@pytest.mark.parametrize(
-    ("field", "alias", "anti_vacuity"),
-    [
-        ("error_class", "ToolErrorClass", {"stale_selector", "disabled", "ambiguous_frame"}),
-        ("ok_class", "ToolOkClass", {"solved", "absent", "attempts_exhausted"}),
-    ],
-)
-def test_every_outcome_class_written_anywhere_is_in_the_closed_set(
-    field: str, alias: str, anti_vacuity: set[str]
-) -> None:
-    """The `Literal` alias is the declaration; this is what actually checks it.
-
-    Runs over BOTH closed vocabularies on `ToolResult`. They are the same mechanism on either side
-    of the status and share every hazard below, so one census covers both -- a second copy would be
-    the one that goes stale when the scan is next widened.
-
-    `mypy.ini` sets `follow_imports = skip`, so `ToolResult` resolves to `Any` in every module that
-    imports it -- the annotation is enforced inside loop.py and nowhere else, and all but a handful
-    of the write sites are in tools.py. A typo or a near-synonym added there would split the facet
-    with nothing going red, which is the whole hazard of a closed vocabulary written at many sites.
-    Read out of the source rather than by calling, because the sites are error branches that a test
-    cannot all reach.
-
-    The population is DERIVED, not listed: every `ToolResult` construction under `skyvern/` and
-    `cloud/`, plus every `<field>=` kwarg anywhere in the taskv3 package. A named module list is
-    the same shape of hazard one level up -- it holds until someone writes the value somewhere the
-    list does not name, which is exactly what a tool registered through `extra_tools` does.
-    """
-    import ast  # noqa: PLC0415
-    import dataclasses  # noqa: PLC0415
-    import pathlib  # noqa: PLC0415
-    from typing import get_args  # noqa: PLC0415
-
-    import skyvern  # noqa: PLC0415
-    from skyvern.forge.taskv3 import loop as loop_for_census  # noqa: PLC0415
-    from skyvern.forge.taskv3.loop import ToolResult  # noqa: PLC0415
-
-    # Derived, not a literal index: the positional read is a coupling to FIELD ORDER, and a reorder
-    # would otherwise move the census onto a different argument without anything going red.
-    field_position = [f.name for f in dataclasses.fields(ToolResult)].index(field)
-
-    def _is_tool_result_constructor(node: ast.Call, names: set[str], qualified: bool) -> bool:
-        # Every spelling of the CONSTRUCTOR -- bare, module-qualified, and import-aliased. It matters
-        # more than the classmethods because the positional write site exists only here.
-        func = node.func
-        if isinstance(func, ast.Name):
-            return func.id in names
-        return qualified and isinstance(func, ast.Attribute) and func.attr == "ToolResult"
-
-    def _is_replace_call(node: ast.Call, names: set[str]) -> bool:
-        # `dataclasses.replace(result, error_class=...)` rebuilds the record, so it is a write site
-        # too -- and it is neither a `ToolResult` call nor necessarily inside this package. Aliased
-        # for the same reason the constructor is: `from dataclasses import replace as clone`.
-        func = node.func
-        if isinstance(func, ast.Name):
-            return func.id in names
-        return isinstance(func, ast.Attribute) and func.attr == "replace"
-
-    def _is_tool_result_call(node: ast.Call, names: set[str], qualified: bool) -> bool:
-        if _is_tool_result_constructor(node, names, qualified):
-            return True
-        # ...and the classmethods on it, under either spelling of the owner.
-        func = node.func
-        if not isinstance(func, ast.Attribute):
-            return False
-        owner = func.value
-        if isinstance(owner, ast.Name):
-            return owner.id in names
-        return qualified and isinstance(owner, ast.Attribute) and owner.attr == "ToolResult"
-
-    repo_root = pathlib.Path(skyvern.__file__).resolve().parent.parent
-    taskv3 = repo_root / "skyvern" / "forge" / "taskv3"
-    declared = set(get_args(getattr(loop_for_census, alias)))
-    written: set[str] = set()
-    computed: set[str] = set()
-    for root in (repo_root / "skyvern", repo_root / "cloud"):
-        if not root.is_dir():
-            continue
-        for path in root.rglob("*.py"):
-            source = path.read_text(encoding="utf-8", errors="replace")
-            # `ToolResult` as well as the field name: a `**overrides` that carries the class need not
-            # spell it, so prefiltering on the field alone drops the file before it is ever parsed.
-            if field not in source and "ToolResult" not in source:
-                continue
-            in_taskv3 = taskv3 in path.parents
-            tree = ast.parse(source)
-            # `from ... import ToolResult as TResult` renames the constructor, and a name-matching
-            # scan then stops seeing it. Read the aliases the module actually bound.
-            # Resolved by IMPORT ORIGIN, not by name. `ToolResult` is not a unique name in this
-            # tree -- `skyvern/cli/mcp_tools/argument_validation.py` builds FastMCP's -- and a
-            # name-only match would read an unrelated class's arguments as if they were this facet.
-            loop_module = "skyvern.forge.taskv3.loop"
-            constructor_names = {"ToolResult"} if in_taskv3 else set()
-            replace_names = {"replace"}
-            imports_loop_module = in_taskv3
-            for node in ast.walk(tree):
-                if isinstance(node, ast.ImportFrom):
-                    for alias in node.names:
-                        bound = alias.asname or alias.name
-                        if alias.name == "ToolResult" and node.module == loop_module:
-                            constructor_names.add(bound)
-                        elif alias.name == "replace" and node.module == "dataclasses":
-                            replace_names.add(bound)
-                        elif alias.name == "loop" and node.module == "skyvern.forge.taskv3":
-                            imports_loop_module = True
-                elif isinstance(node, ast.Import):
-                    for alias in node.names:
-                        if alias.name == loop_module:
-                            imports_loop_module = True
-            # A file that never mentions the type cannot be assigning to one of its fields. This is
-            # what keeps `cloud/webeye`'s unrelated `error_class` out while still reaching a tool
-            # registered from outside this package, which the call census already supports.
-            builds_results = bool(constructor_names) or imports_loop_module
-            for node in ast.walk(tree):
-                # Not a frozen dataclass, so the field can also be set after construction; that
-                # reaches the same telemetry by a route no call-shaped scan would ever see.
-                # Scoped to this package for the same reason the call filter is: `cloud/webeye`
-                # carries an unrelated `error_class`, the very collision the emitted field was
-                # renamed to escape, and a scan that cannot tell them apart reports that instead.
-                if builds_results and isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
-                    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-                    assigned = node.value if not isinstance(node, ast.AugAssign) else None
-                    for target in targets:
-                        if not (isinstance(target, ast.Attribute) and target.attr == field):
-                            continue
-                        if isinstance(assigned, ast.Constant) and isinstance(assigned.value, str):
-                            written.add(assigned.value)
-                        else:
-                            computed.add(path.relative_to(repo_root).as_posix())
-                if not isinstance(node, ast.Call):
-                    continue
-                # Scoped by the CALL, not by a list of modules. `auth_tools` and `captcha_tools`
-                # register through `extra_tools` into the same loop and land on the same facet, and a
-                # registrar could live outside this package entirely -- a named module list drops
-                # whichever site nobody thought to add. Scoping by `ToolResult` also keeps
-                # `cloud/webeye`'s unrelated `error_class` out, which is the collision the emitted
-                # field was renamed to escape.
-                # BEFORE the call-shape filter, and on the same scope as the assignment scan: a
-                # `setattr` is none of the shapes that filter admits, so anywhere but this package it
-                # was skipped before it could be read. A computed attribute NAME is the one shape no
-                # static scan can close, and it is recorded as unreadable rather than argued away.
-                if (
-                    builds_results
-                    and isinstance(node.func, ast.Name)
-                    and node.func.id == "setattr"
-                    and len(node.args) == 3
-                ):
-                    attribute, assigned = node.args[1], node.args[2]
-                    named = isinstance(attribute, ast.Constant) and attribute.value == field
-                    if named and isinstance(assigned, ast.Constant) and isinstance(assigned.value, str):
-                        written.add(assigned.value)
-                    elif named:
-                        computed.add(path.relative_to(repo_root).as_posix())
-                    elif in_taskv3 and not isinstance(attribute, ast.Constant):
-                        # A computed attribute NAME could be this field or any other, and the target
-                        # object is not knowable either. Flagged only inside this package, where the
-                        # shape is rare enough to be worth a look; anywhere else it is ordinary
-                        # reflection -- `setattr(ctx, field_name, ...)` -- and flagging it would
-                        # report unrelated code instead of the thing asked about.
-                        computed.add(path.relative_to(repo_root).as_posix())
-                if not (
-                    in_taskv3
-                    or _is_tool_result_call(node, constructor_names, imports_loop_module)
-                    or _is_replace_call(node, replace_names)
-                ):
-                    continue
-                here = path.relative_to(repo_root).as_posix()
-                # The dataclass constructor accepts either field positionally, at the index derived
-                # above. The classmethods cannot: each takes its own class keyword-only.
-                if _is_tool_result_constructor(node, constructor_names, imports_loop_module):
-                    if any(isinstance(argument, ast.Starred) for argument in node.args):
-                        # `ToolResult(*args)` -- the arity is a runtime property, so whether anything
-                        # lands in the fifth slot is not decidable here. Unreadable, not absent.
-                        computed.add(here)
-                    elif len(node.args) > field_position:
-                        positional = node.args[field_position]
-                        if isinstance(positional, ast.Constant) and isinstance(positional.value, str):
-                            written.add(positional.value)
-                        else:
-                            computed.add(here)
-                for keyword in node.keywords:
-                    value = keyword.value
-                    # `**mapping` on a result construction: `arg` is None and the keys are not
-                    # knowable here, so the call may or may not carry the field. Unreadable, and the
-                    # point of this half of the census is that unreadable is not the same as absent.
-                    if keyword.arg is None:
-                        if _is_tool_result_call(node, constructor_names, imports_loop_module) or _is_replace_call(
-                            node, replace_names
-                        ):
-                            computed.add(here)
-                        continue
-                    if keyword.arg != field:
-                        continue
-                    if isinstance(value, ast.Constant) and isinstance(value.value, str):
-                        written.add(value.value)
-                    else:
-                        # Counted, not skipped. A value this scan cannot read -- a name, an f-string, a
-                        # call -- is invisible to the subset check below, so silently ignoring one would
-                        # make the census read clean over exactly the site it cannot vouch for.
-                        computed.add(here)
-
-    # Anti-vacuity: a walk that matched nothing would satisfy the subset check silently. Each seed
-    # lives in the module that field is actually written from -- tools.py for `error_class`,
-    # captcha_tools.py for `ok_class` -- which is the module the subset check exists to cover.
-    assert anti_vacuity <= written, f"{field} census found none of its seed values; it is not looking"
-    assert written <= declared, f"{field} values written but not declared: {sorted(written - declared)}"
-    if field == "error_class":
-        # Produced by the loop's fallback for an erroring call whose site named nothing, not by a
-        # kwarg, so it is never `written` and has to be asserted against `declared` directly. There
-        # is deliberately no `ok_class` equivalent: an ok call that names no class emits no facet.
-        assert "other" in declared
-    # The other half of the guarantee, and the reason it is a set of FILES rather than a count: a
-    # non-literal value is unreadable here, so the only thing that can vouch for it is the `Literal`
-    # annotation -- which `follow_imports = skip` binds inside loop.py and nowhere else. Both sites
-    # there are pass-throughs of an already-typed parameter. One appearing anywhere else is checked by
-    # neither mypy nor this scan, which is the gap a reader would otherwise assume was covered.
-    accessor_module = "skyvern/forge/taskv3/loop.py"
-    # Split from the check below so each message is true on its own terms: asserting one equality
-    # would report "outside loop.py: []" in the case where the scan simply stopped finding the
-    # sites it is anchored on, which claims a violation while naming nothing.
-    assert accessor_module in computed, "the scan found no unreadable write at all; it is not looking"
-    assert not computed - {accessor_module}, (
-        f"{field} written from an unreadable expression outside loop.py, where the Literal "
-        f"annotation does not bind: {sorted(computed - {accessor_module})}"
-    )
 
 
 def test_the_loop_core_imports_with_no_browser_driver_installed() -> None:
@@ -16080,8 +15778,9 @@ async def test_action_loop_verdict_names_a_control_the_customer_can_find() -> No
     # itself, so it matches nothing in the customer's markup and points at an element they cannot
     # locate. The control's own accessible name is what they can.
     clicks: list[tuple[str, dict[str, Any]]] = []
+    data = {"target_label": "Continue", "target_kind": "button", "target_shown_text": "Next step"}
     tools = [
-        _billable_tool("click", clicks, data={"target_label": "Continue", "target_kind": "button"}),
+        _billable_tool("click", clicks, data=data),
         _perception_tool("observe", _REJECTION_OBSERVE),
         make_finish_tool(),
     ]
@@ -16091,7 +15790,10 @@ async def test_action_loop_verdict_names_a_control_the_customer_can_find() -> No
     )
 
     _assert_customer_facing_verdict(
-        outcome, guard=ACTION_LOOP_GUARD, names='the "Continue" button', hides=("#submit", "[data-tv3")
+        outcome,
+        guard=ACTION_LOOP_GUARD,
+        names='the "Next step" button (labeled "Continue")',
+        hides=("#submit", "[data-tv3"),
     )
 
 

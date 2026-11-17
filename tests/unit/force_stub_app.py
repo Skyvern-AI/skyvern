@@ -104,6 +104,9 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.AGENT_FUNCTION.execute_code_block_override = AsyncMock(return_value=None)
     base_agent_function = AgentFunction()
     fake_app_module.AGENT_FUNCTION.note_page_action = base_agent_function.note_page_action
+    fake_app_module.AGENT_FUNCTION.page_submission_evidence = base_agent_function.page_submission_evidence
+    fake_app_module.AGENT_FUNCTION.settle_page_reload_signal = base_agent_function.settle_page_reload_signal
+    fake_app_module.AGENT_FUNCTION.agent_skills = base_agent_function.agent_skills
     fake_app_module.AGENT_FUNCTION.enforce_platform_aws_secret_ownership = (
         base_agent_function.enforce_platform_aws_secret_ownership
     )
@@ -127,6 +130,7 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.AGENT_FUNCTION.copilot_browser_pattern_accepting_calls = (
         base_agent_function.copilot_browser_pattern_accepting_calls
     )
+    fake_app_module.AGENT_FUNCTION.copilot_trigger_sources = base_agent_function.copilot_trigger_sources
     # Class constant, not a method — _LazyNamespace would auto-mock it into a non-iterable AsyncMock
     # and break every caller that scans it for close-page phrases.
     fake_app_module.AGENT_FUNCTION.MAGIC_LINK_CLOSE_SIGNALS = base_agent_function.MAGIC_LINK_CLOSE_SIGNALS
@@ -160,6 +164,10 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.AGENT_FUNCTION.is_backup_queue_organization = base_agent_function.is_backup_queue_organization
     fake_app_module.AGENT_FUNCTION.resolve_mcp_oauth_org_lookups = MagicMock(return_value=None)
     fake_app_module.AGENT_FUNCTION.resolve_mcp_oauth_member_api_key = AsyncMock(return_value=None)
+    fake_app_module.AGENT_FUNCTION.resolve_copilot_loopback_api_key = (
+        base_agent_function.resolve_copilot_loopback_api_key
+    )
+    fake_app_module.AGENT_FUNCTION.copilot_turn_control_allowed = base_agent_function.copilot_turn_control_allowed
     fake_app_module.AGENT_FUNCTION.resolve_api_key_profile = AsyncMock(
         return_value=APIKeyAuthProfile("full_org", None, True)
     )

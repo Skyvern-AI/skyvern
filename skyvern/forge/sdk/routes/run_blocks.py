@@ -239,9 +239,6 @@ async def login(
                 bitwarden_item_id=login_request.bitwarden_item_id,
                 url_parameter_key=login_request.url,
                 description="The ID of the bitwarden collection to use for login",
-                bitwarden_client_id_aws_secret_key="SKYVERN_BITWARDEN_CLIENT_ID",
-                bitwarden_client_secret_aws_secret_key="SKYVERN_BITWARDEN_CLIENT_SECRET",
-                bitwarden_master_password_aws_secret_key="SKYVERN_BITWARDEN_MASTER_PASSWORD",
                 totp_identifier=resolved_totp_identifier,
             )
         ]

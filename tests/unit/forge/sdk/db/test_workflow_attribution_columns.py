@@ -8,6 +8,7 @@ import pytest_asyncio
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.workflow.models.workflow import (
+    COPILOT_TEST_WORKFLOW_CREATOR,
     MIXED_RUN_DEFINITION_DIGEST,
     WorkflowRunStatus,
     workflow_definition_sha256,
@@ -306,3 +307,38 @@ async def test_a_run_created_before_digests_is_never_stamped_by_a_later_attempt(
     )
 
     assert retried is not None and retried.workflow_definition_sha256 is None
+
+
+@pytest.mark.asyncio
+async def test_own_profile_link_skips_live_copilot_test_version(agent_db: AgentDB, org_id: str) -> None:
+    saved = await agent_db.workflows.create_workflow(
+        title="saved",
+        workflow_definition={"parameters": [], "blocks": []},
+        organization_id=org_id,
+    )
+    test_copy = await agent_db.workflows.create_workflow(
+        title="copilot-test",
+        workflow_definition={"parameters": [], "blocks": []},
+        organization_id=org_id,
+        workflow_permanent_id=saved.workflow_permanent_id,
+        version=2,
+        created_by=COPILOT_TEST_WORKFLOW_CREATOR,
+    )
+    assert test_copy.deleted_at is None
+    assert test_copy.browser_profile_id is None
+    before = await agent_db.workflows.get_workflow(test_copy.workflow_id, organization_id=org_id)
+    assert before is not None
+
+    linked = await agent_db.workflows.link_workflow_browser_profile_if_unset(
+        workflow_permanent_id=saved.workflow_permanent_id,
+        organization_id=org_id,
+        browser_profile_id="bp_own",
+    )
+
+    assert linked is True
+    saved_after = await agent_db.workflows.get_workflow(saved.workflow_id, organization_id=org_id)
+    test_after = await agent_db.workflows.get_workflow(test_copy.workflow_id, organization_id=org_id)
+    assert saved_after is not None and test_after is not None
+    assert saved_after.browser_profile_id == "bp_own"
+    assert test_after.browser_profile_id is None
+    assert test_after.modified_at == before.modified_at

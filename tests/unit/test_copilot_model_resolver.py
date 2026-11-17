@@ -234,6 +234,8 @@ class TestModelResolver:
     def test_maps_basic_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from skyvern.schemas.llm import LLMConfig
 
+        monkeypatch.delenv("EMBER_TRACING_ENABLED", raising=False)
+
         monkeypatch.delenv("COPILOT_TRACING_ENABLED", raising=False)
         config = LLMConfig(
             model_name="anthropic/claude-sonnet-4-20250514",
@@ -285,7 +287,7 @@ class TestModelResolver:
     def test_maps_basic_config_with_tracing_enabled(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from skyvern.schemas.llm import LLMConfig
 
-        monkeypatch.setenv("COPILOT_TRACING_ENABLED", "1")
+        monkeypatch.setenv("EMBER_TRACING_ENABLED", "1")
         config = LLMConfig(
             model_name="anthropic/claude-sonnet-4-20250514",
             required_env_vars=[],

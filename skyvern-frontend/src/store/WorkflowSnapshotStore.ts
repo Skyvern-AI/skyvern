@@ -24,7 +24,7 @@ type WorkflowSnapshotStore = {
   // (edit) vs. arrived on its own (post-load materialization).
   noteDraftChange: (userDriven: boolean) => void;
   // Mark the workflow user-edited for a change that has no canvas gesture but is
-  // still user-driven — a Copilot build. Keeps the next draft change from being
+  // still user-driven — an Ember build. Keeps the next draft change from being
   // absorbed as materialization; captures a baseline first if none exists yet.
   markUserEdit: () => void;
 };
@@ -70,7 +70,7 @@ export const useWorkflowSnapshotStore = create<WorkflowSnapshotStore>(
       set((state) => {
         const saveData = useWorkflowHasChangesStore.getState().getSaveData();
         // Capture the pre-change state as the baseline if there isn't one yet
-        // (e.g. a Copilot build before any manual edit), so the incoming change
+        // (e.g. an Ember build before any manual edit), so the incoming change
         // diffs against it rather than being absorbed.
         const snapshot =
           state.snapshot ?? (saveData ? snapshotOf(saveData) : null);

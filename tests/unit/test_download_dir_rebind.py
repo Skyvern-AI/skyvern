@@ -36,7 +36,7 @@ from skyvern.webeye.browser_factory import (
 )
 from skyvern.webeye.native_downloads import NativeDownloads
 from skyvern.webeye.real_browser_manager import RealBrowserManager
-from tests.unit.helpers import make_organization, make_step, make_task
+from tests.unit.helpers import connected_accounts_are, make_organization, make_step, make_task
 
 
 @pytest_asyncio.fixture
@@ -1579,6 +1579,7 @@ async def test_file_upload_block_uploads_downloads_to_google_drive(tmp_path) -> 
         ),
         patch("skyvern.forge.sdk.workflow.models.block.skyvern_context.current", return_value=None),
         patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+        connected_accounts_are(agent_app=mock_app),
     ):
         mock_app.AGENT_FUNCTION.get_google_workspace_credentials = AsyncMock(return_value=SimpleNamespace(token="at-1"))
         mock_app.AGENT_FUNCTION.upload_file_to_customer_storage = AsyncMock(

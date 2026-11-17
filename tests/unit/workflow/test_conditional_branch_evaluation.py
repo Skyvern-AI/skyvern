@@ -4,26 +4,30 @@ import copy
 import json
 from collections.abc import Iterator
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 import skyvern.forge.sdk.workflow.models.block as block_module
 from skyvern.config import settings
-from skyvern.exceptions import BranchEvaluationContextTooLargeError, ConditionalBranchEvaluationError
+from skyvern.exceptions import BranchEvaluationContextTooLargeError, ConditionalBranchEvaluationError, MissingStarterUrl
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import MissingJinjaVariables
 from skyvern.forge.sdk.workflow.models.block import (
+    BaseTaskBlock,
     BranchCondition,
     BranchEvaluationContext,
     ConditionalBlock,
     ExtractionBlock,
     JinjaBranchCriteria,
     PromptBranchCriteria,
+    TaskBlock,
     _build_branch_evaluation_schema,
     _coerce_condition_index,
     _make_empty_params_explicit,
@@ -34,6 +38,7 @@ from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinit
 from skyvern.schemas.run_enums import RunEngine
 from skyvern.schemas.workflows import BlockResult, BlockStatus
 from skyvern.utils.token_counter import count_tokens
+from tests.unit._task_block_fakes import mock_block_execute_deps
 from tests.unit.fake_workflow_run_context import FakeWorkflowRunContext
 
 BRANCH_CONTEXT_TOO_LARGE_FAILURE_REASON = (
@@ -1919,3 +1924,81 @@ async def test_jinja_only_conditional_never_constructs_extraction_block(
 
     mock_extraction_cls.assert_not_called()
     assert mock_build_result.await_args.kwargs["executed_branch_next_block"] == "fallback_block"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("page_url", "previous_task", "child_frames", "allow_blank", "reroll"),
+    [
+        ("about:blank", False, [], True, False),
+        ("about:blank", False, [], True, True),
+        ("https://example.com", False, [], False, False),
+        ("about:blank", True, [], True, True),
+        ("about:blank", False, [SimpleNamespace(url="https://example.com")], False, False),
+    ],
+)
+async def test_first_prompt_conditional_uses_blank_page_but_task_requires_url(
+    scoped_context: SkyvernContext,
+    page_url: str,
+    previous_task: bool,
+    child_frames: list,
+    allow_blank: bool,
+    reroll: bool,
+) -> None:
+    block = _conditional_block()
+    with mock_block_execute_deps(page_url) as deps:
+        page = await deps.browser_state.must_get_working_page()
+        page.main_frame = SimpleNamespace(child_frames=child_frames)
+        last_task = SimpleNamespace(order=0, retry=0)
+        if previous_task:
+            deps.tasks_db.get_last_task_for_workflow_run.return_value = last_task
+        elif reroll:
+            deps.tasks_db.get_last_task_for_workflow_run.side_effect = [None, last_task]
+        deps.browser_manager.get_for_workflow_run.return_value = deps.browser_state
+        observed_blank = []
+        deps.agent.execute_step.side_effect = lambda **kwargs: observed_blank.append(
+            kwargs["task_block"]._allow_blank_start
+        )
+        deps.task.status = TaskStatus.completed
+        deps.task.failure_reason = None
+        deps.tasks_db.get_task = AsyncMock(return_value=deps.task)
+        app = block_module.app
+        app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context.return_value = None
+        app.STORAGE.get_current_attempt_downloaded_files = AsyncMock(return_value=None)
+        app.WORKFLOW_SERVICE.get_recent_task_screenshot_artifacts = AsyncMock(return_value=[])
+        app.WORKFLOW_SERVICE.get_recent_workflow_screenshot_artifacts = AsyncMock(return_value=[])
+        task_output = SimpleNamespace(
+            model_dump=lambda: {
+                "extracted_information": {
+                    "evaluations": [{"condition_index": 1, "reasoning": "matched", "result": True}]
+                }
+            }
+        )
+        with (
+            patch.object(
+                block_module.TaskOutput,
+                "from_task",
+                side_effect=[SimpleNamespace(model_dump=dict), task_output] if reroll else [task_output],
+            ),
+            patch.object(BaseTaskBlock, "record_output_parameter_value", new_callable=AsyncMock),
+            patch.object(BaseTaskBlock, "build_block_result", new_callable=AsyncMock) as extraction_result,
+            patch.object(ConditionalBlock, "build_block_result", new_callable=AsyncMock) as conditional_result,
+        ):
+            extraction_result.side_effect = lambda **kwargs: BlockResult(
+                success=kwargs["success"],
+                output_parameter=block.output_parameter,
+                output_parameter_value=kwargs["output_parameter_value"],
+                status=kwargs["status"],
+            )
+            await block.execute(workflow_run_id="wr", workflow_run_block_id="wrb", organization_id="org")
+            assert conditional_result.await_args.kwargs["executed_branch_next_block"] == "next"
+            assert observed_blank == [allow_blank] * (2 if reroll else 1)
+
+        if reroll or page_url != "about:blank" or previous_task or child_frames:
+            return
+        real_task = TaskBlock(label="real", output_parameter=_output_parameter("real_output"))
+        with (
+            patch.object(BaseTaskBlock, "_handle_task_failure_with_error_detection", new_callable=AsyncMock),
+            pytest.raises(MissingStarterUrl),
+        ):
+            await real_task.execute(workflow_run_id="wr", workflow_run_block_id="wrb", organization_id="org")

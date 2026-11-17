@@ -277,3 +277,13 @@ async def test_idle_only_evict_leaves_a_generation_a_concurrent_operation_is_dri
     assert await holder == "completed"
     assert manager._browser_sessions["pbs_local"].browser_state is browser_state
     browser_state.detach_remote_driver.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_wait_for_browser_launch_reports_a_browser_registered_after_the_callers_lookup(
+    manager: DefaultPersistentSessionsManager,
+) -> None:
+    assert await manager.wait_for_browser_launch("pbs_unknown", "org-1") is False
+    # The launch already finished and dropped its task, but its browser is registered.
+    manager._browser_sessions["pbs_launched"] = BrowserSession(browser_state=MagicMock())
+    assert await manager.wait_for_browser_launch("pbs_launched", "org-1") is True

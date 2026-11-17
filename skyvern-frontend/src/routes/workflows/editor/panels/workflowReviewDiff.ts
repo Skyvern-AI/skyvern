@@ -249,17 +249,19 @@ function redactSecrets(key: string, value: unknown): unknown {
   return value;
 }
 
+/** A field value as the review card shows it: plain text, secrets hidden. */
+export const reviewFieldValue = (key: string, value: unknown) =>
+  formatValue(redactSecrets(key, value));
+
 function toReviewChange(
   change: RawFieldChange,
   label = humanizeKey(change.key),
   hidden = false,
 ): ReviewFieldChange {
   const shown = (value: unknown) =>
-    formatValue(
-      hidden && !isEmptyValue(value)
-        ? HIDDEN_VALUE
-        : redactSecrets(change.key, value),
-    );
+    hidden && !isEmptyValue(value)
+      ? formatValue(HIDDEN_VALUE)
+      : reviewFieldValue(change.key, value);
   return {
     key: change.key,
     label,
@@ -408,7 +410,7 @@ function recordSubtree(
   }
 }
 
-// A removed block can share its label with a block Copilot added (a type
+// A removed block can share its label with a block Ember added (a type
 // change), and the canvas needs unique labels, so a clashing one is renamed.
 function removedCopy(block: WorkflowBlock, state: DiffState): WorkflowBlock {
   const copy = clone(block);
@@ -929,7 +931,7 @@ const SETTING_LABELS: Record<keyof WorkflowSettings, string> = {
   proxyLocation: "Proxy location",
   browserType: "Browser type",
   runWith: "Run with",
-  aiFallback: "AI fallback (cached scripts)",
+  aiFallback: "AI fallback",
   scriptCacheKey: "Code key",
   codeVersion: "Code version",
   maskSecrets: "Mask secrets",

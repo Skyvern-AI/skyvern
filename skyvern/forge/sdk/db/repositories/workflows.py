@@ -1077,6 +1077,9 @@ class WorkflowsRepository(BaseRepository):
                 .where(WorkflowModel.organization_id == organization_id)
                 .where(WorkflowModel.deleted_at.is_(None))
                 .where(WorkflowModel.browser_profile_id.is_(None))
+                .where(
+                    or_(WorkflowModel.created_by.is_(None), WorkflowModel.created_by != COPILOT_TEST_WORKFLOW_CREATOR)
+                )
                 .values(browser_profile_id=browser_profile_id)
             )
             await session.commit()

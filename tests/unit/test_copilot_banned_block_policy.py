@@ -1185,6 +1185,25 @@ def test_renaming_a_legacy_block_while_adding_notes_is_refused(note_field: str) 
     assert "sign_in_step" in validation.reject.error
 
 
+def test_renaming_a_legacy_block_that_drops_its_doc_images_is_not_a_re_authoring() -> None:
+    prior = _yaml({**_GOAL, "engine": "skyvern-1.0", "doc_images": [{"file_id": "file_1", "placement": "block"}]})
+    submitted = _yaml({**_GOAL, "label": "sign_in_step", "engine": "skyvern-1.0"})
+
+    validation = _accepted(CODE_BLOCKS_ONLY, submitted, prior)
+
+    assert validation.reject is None
+
+
+@pytest.mark.parametrize(("image_field", "refused"), [("doc_images", False), ("prompt_images", True)])
+def test_only_prompt_images_are_new_content_on_a_grandfathered_banned_block(image_field: str, refused: bool) -> None:
+    prior = _yaml({**_GOAL, "engine": "skyvern-1.0", image_field: [{"file_id": "file_1", "placement": "block"}]})
+    submitted = _yaml({**_GOAL, "engine": "skyvern-1.0", image_field: [{"file_id": "file_2", "placement": "block"}]})
+
+    validation = _accepted(CODE_BLOCKS_ONLY, submitted, prior)
+
+    assert (validation.reject is not None) is refused
+
+
 def test_replacing_a_legacy_block_with_an_unrelated_one_of_the_same_type_is_not_a_rename() -> None:
     """Rename detection may only match on the block's content. Type and engine alone would let a
     rewrite delete legacy block A and add unrelated block B of the same type without the engine pin."""
@@ -1521,6 +1540,69 @@ def test_agent_step_neighbours_follow_conditional_branches_not_list_order() -> N
     }
 
 
+def test_agent_step_neighbours_in_a_loop_body_keep_the_merge_an_empty_branch_cannot_loop_back_from() -> None:
+    final = _yaml(
+        {
+            "block_type": "for_loop",
+            "label": "each_item",
+            "loop_over_parameter_key": "items",
+            "loop_blocks": [
+                {
+                    "block_type": "conditional",
+                    "label": "route",
+                    "next_block_label": "submit",
+                    "branch_conditions": [
+                        {"criteria": {"expression": "{{ true }}"}, "next_block_label": "prepare"},
+                        {"is_default": True, "next_block_label": "submit"},
+                    ],
+                },
+                {"block_type": "agent_step", "label": "prepare", "prompt": "p", "data_schema": {}},
+                {"block_type": "code", "label": "submit", "next_block_label": "settle", "code": "return {}"},
+                {
+                    "block_type": "conditional",
+                    "label": "settle",
+                    "next_block_label": "prepare",
+                    "branch_conditions": [
+                        {"criteria": {"expression": "{{ true }}"}, "next_block_label": None},
+                        {"is_default": True, "next_block_label": None},
+                    ],
+                },
+            ],
+        },
+    )
+
+    assert authoring_turn_summary(None, final)["agent_step_blocks"] == {
+        "prepare": {"before": ["conditional"], "after": ["code"]},
+    }
+
+
+def test_agent_step_neighbours_in_a_loop_body_skip_a_conditional_reached_only_by_an_empty_branch() -> None:
+    final = _yaml(
+        {
+            "block_type": "for_loop",
+            "label": "each_item",
+            "loop_over_parameter_key": "items",
+            "loop_blocks": [
+                {
+                    "block_type": "conditional",
+                    "label": "check",
+                    "next_block_label": "summarize",
+                    "branch_conditions": [
+                        {"criteria": {"expression": "{{ true }}"}, "next_block_label": "prep"},
+                        {"is_default": True, "next_block_label": None},
+                    ],
+                },
+                {"block_type": "code", "label": "prep", "next_block_label": "summarize", "code": "return {}"},
+                {"block_type": "agent_step", "label": "summarize", "prompt": "p", "data_schema": {}},
+            ],
+        },
+    )
+
+    assert authoring_turn_summary(None, final)["agent_step_blocks"] == {
+        "summarize": {"before": ["code"], "after": []},
+    }
+
+
 def test_repeated_same_family_rewrites_after_failed_tests_are_counted() -> None:
     """Under-switching is a block rewritten in its own family after each failed test; the type never
     changes, so only a count of those rewrites makes it visible."""
@@ -1814,7 +1896,7 @@ async def test_agent_step_is_served_listed_and_saved_only_with_the_org_grant_and
 async def test_the_agent_step_grant_survives_from_the_request_config_to_the_turn_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_CODE_BLOCK_MODE", True)
+    monkeypatch.setattr(settings, "EMBER_CODE_BLOCK_MODE", True)
     agent_function = AgentFunction()
     monkeypatch.setattr(agent_function, "has_code_block_access", AsyncMock(return_value=True))
     monkeypatch.setattr(agent_function, "agent_step_enabled", AsyncMock(return_value=True))

@@ -21,6 +21,7 @@ in-process adapter over ``do_observe``/``do_execute`` for shared hardening + act
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import dataclasses
 import functools
@@ -39,6 +40,7 @@ from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderErrorRetryableTask
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import RunArm
+from skyvern.forge.sdk.experimentation.providers import NoOpExperimentationProvider
 from skyvern.forge.sdk.workflow.models.credential_release import CredentialReleaseGuard
 from skyvern.forge.taskv3.answer_basis_audit import apply_answer_basis_audit
 from skyvern.forge.taskv3.application_context import DECLARE_NOTICE, ApplicationContext, payload_check_reasons
@@ -63,7 +65,7 @@ from skyvern.forge.taskv3.goal_check import (
 )
 from skyvern.forge.taskv3.goal_composition import CodeTypedValue, build_user_prompt, typed_value_rows
 from skyvern.forge.taskv3.intercepted_submission import InterceptedSubmission
-from skyvern.forge.taskv3.llm_call_params import build_call_kwargs, carry_reasoning_route
+from skyvern.forge.taskv3.llm_call_params import build_call_kwargs
 from skyvern.forge.taskv3.loop import (
     DEFAULT_MAX_SETTLE_DEFERRALS,
     PERCEPTION_RETAIN_CHARS_HIGH,
@@ -78,6 +80,7 @@ from skyvern.forge.taskv3.loop import (
     ToolSpec,
     TurnEnd,
     TurnStart,
+    UnsavedDownloads,
     UnseenPageText,
     VerificationBlocker,
     make_finish_tool,
@@ -88,7 +91,6 @@ from skyvern.forge.taskv3.opaque_refs import OpaqueUrlRefs, is_signed_url, mask_
 from skyvern.forge.taskv3.run_arms import (
     ANSWER_AUDIT_LOG_ONLY_FLAG,
     APPLICATION_CONTEXT_FLAG,
-    CARRY_REASONING_FLAG,
     current_run_arm,
     run_arm_enabled,
 )
@@ -117,6 +119,7 @@ DEFAULT_DEADLINE_SECONDS = 1800  # wall-clock runaway guard
 # runaway trips this as budget_exhausted instead of surfacing as a provider context-window error.
 DEFAULT_MAX_TOKENS = 1_500_000
 DEFAULT_MAX_CALL_RETRIES = 2
+FILE_LANDED_HOLD_KILL_SWITCH = "DISABLE_TASK_V3_FILE_LANDED_HOLD"
 # A productive action round is at most a few perception turns plus one (possibly heavily batched)
 # action turn. Size the turn/tool-call runaway guards off the action-step budget with generous
 # per-round headroom so a real run is bounded by max_action_steps, not by these guards; only a run
@@ -190,6 +193,25 @@ def taskv3_runaway_backstops(max_action_steps: int | None) -> tuple[int, int, in
         max(DEFAULT_MAX_TOOL_CALLS, max_action_steps * MAX_TOOL_CALLS_PER_ACTION_STEP),
         min(MAX_TOKENS_CEILING, max(DEFAULT_MAX_TOKENS, max_action_steps * MAX_TOKENS_PER_ACTION_STEP)),
     )
+
+
+async def _file_landed_hold_enabled(task_id: str | None, organization_id: str | None) -> bool:
+    if settings.DISABLE_TASK_V3_FILE_LANDED_HOLD:
+        return False
+    provider = app.EXPERIMENTATION_PROVIDER
+    distinct_id = task_id or organization_id
+    if not distinct_id or isinstance(provider, NoOpExperimentationProvider):
+        return True
+    try:
+        disabled = await provider.is_feature_enabled_cached(
+            FILE_LANDED_HOLD_KILL_SWITCH, distinct_id, {"organization_id": organization_id}
+        )
+    except Exception:
+        LOG.warning("taskv3 file landed hold kill switch lookup failed; hold on", exc_info=True)
+        return True
+    if disabled:
+        LOG.info("taskv3 file landed hold disabled", organization_id=organization_id, task_id=task_id)
+    return not disabled
 
 
 def coerce_v3_parameters(navigation_payload: dict[str, Any] | list[Any] | str | None) -> dict[str, Any] | None:
@@ -307,6 +329,7 @@ async def run_task_v3_agent_loop(
     pending_marker: Callable[[str], Awaitable[str | None]] | None = None,
     download_wait: DownloadWait | None = None,
     download_settle: DownloadSettle | None = None,
+    unsaved_downloads: UnsavedDownloads | None = None,
     native_download_attempt: NativeDownloadAttempt | None = None,
     completion_gate: CompletionGate | None = None,
     staged_downloads: set[str] | None = None,
@@ -321,6 +344,9 @@ async def run_task_v3_agent_loop(
     page_probe: Callable[[], Awaitable[str | None]] | None = None,
     document_identity: Callable[[], Awaitable[str | None]] | None = None,
     reload_page: Callable[[], Awaitable[None]] | None = None,
+    settle_reload_signal: Callable[[bool], Awaitable[bool | None]] | None = None,
+    submission_evidence: Callable[[], Awaitable[str | None]] | None = None,
+    recover_page: Callable[[Any], Awaitable[bool | None]] | None = None,
     restore_page_url: Callable[[Any, str], Awaitable[None]] | None = None,
     download_attempts: Callable[[], int | None] | None = None,
     block_type: str | None = None,
@@ -418,6 +444,11 @@ async def run_task_v3_agent_loop(
             is_vision_fallback_prompt=prompt_name in VISION_FALLBACK_PROMPT_NAMES
         )
     )
+    observe_screenshot_width = (
+        await app.AGENT_FUNCTION.task_v3_observe_screenshot_width(organization_id=organization_id)
+        if vision_enabled and not page_free
+        else 0
+    )
     # Page-free mode is structural, not advisory: no browser tools exist to call and the system
     # prompt never mentions perception, so a data-only validation cannot read the live DOM.
     # The tier only ever increments under the verify flag, so the kill switch and the omit-vs-zero
@@ -445,6 +476,13 @@ async def run_task_v3_agent_loop(
             staged_downloads=staged_downloads,
         )
     )
+
+    async def _recover(page: Any) -> bool | None:
+        if recover_page is None:
+            return None
+        async with asyncio.timeout(_deadline_remaining()):
+            return await recover_page(page)
+
     unseen_text = None if page_free else UnseenPageText()
     failure_watch = (
         None
@@ -463,12 +501,36 @@ async def run_task_v3_agent_loop(
             resolve_totp_placeholder=resolve_totp_placeholder,
             opaque_refs=refs,
             vision_enabled=vision_enabled,
+            observe_screenshot_width=observe_screenshot_width,
             semantic_commit_stats=semantic_commit_stats,
             unseen_text=unseen_text,
             download_failures=failure_watch,
             download_wait=download_wait,
+            recover_page=_recover if recover_page is not None else None,
         )
     )
+    last_submission_evidence: str | None = None
+
+    async def _submission_news() -> str:
+        nonlocal last_submission_evidence
+        if page_free or submission_evidence is None:
+            return ""
+        try:
+            async with asyncio.timeout(_deadline_remaining()):
+                evidence = await submission_evidence()
+        except TimeoutError:
+            return ""
+        news = evidence if evidence != last_submission_evidence else ""
+        last_submission_evidence = evidence
+        return news or ""
+
+    if unseen_text is not None and unseen_text.unreported is not None and submission_evidence is not None:
+        page_news = unseen_text.unreported
+
+        async def _unreported() -> str:
+            return "\n".join(filter(None, (await page_news(), await _submission_news())))
+
+        unseen_text.unreported = _unreported
 
     # Withheld whenever offered: code driving the page bypasses the realm ledger the native action tools
     # write, so in-frame fills and submits would be invisible to the data-loss guard and the completion gate.
@@ -508,6 +570,9 @@ async def run_task_v3_agent_loop(
         and await app.AGENT_FUNCTION.task_v3_justify_hold_enabled(
             task_id=ctx.task_id if ctx is not None else None, organization_id=organization_id
         )
+    )
+    file_landed_hold = download_settle is not None and await _file_landed_hold_enabled(
+        ctx.task_id if ctx is not None else None, organization_id
     )
     block_check_on = single_action_block and block_completion_judge is not None and judge_eligible
     tool_trail = ToolTrail() if reask_on or premise_on or block_check_on else None
@@ -676,6 +741,8 @@ async def run_task_v3_agent_loop(
         error_code_mapping=error_code_mapping,
         intercepted_submissions=block_submissions,
         justify_stops=justify_on,
+        file_landed_hold=file_landed_hold,
+        unsaved_downloads=unsaved_downloads,
     )
     # An extraction block cannot enter input, so a yes has nothing to act on there and offering the tool cost a turn.
     context_texts = (
@@ -781,9 +848,6 @@ async def run_task_v3_agent_loop(
     # After the data, never in the system prompt: the data and the task's own instructions outrank the default.
     if defaults_text:
         user_prompt += f"\n\n{defaults_text}"
-    arm_context = skyvern_context.current()
-    carry_reasoning_pin = arm_context.run_arms.get(CARRY_REASONING_FLAG) if arm_context is not None else None
-    carry_route = carry_reasoning_route(llm_caller)
     try:
         outcome = await run_agent_tool_loop(
             llm_caller=llm_caller,
@@ -829,6 +893,8 @@ async def run_task_v3_agent_loop(
             page_fingerprint=None if page_free else page_fingerprint,
             action_effect_fingerprint=None if page_free else action_effect_fingerprint,
             reload_page=None if page_free else reload_page,
+            settle_reload_signal=None if page_free else settle_reload_signal,
+            submission_evidence=_submission_news,
             final_turn_token_reserve=MAX_TOKENS_PER_ACTION_STEP,
             backstops_for_cap=taskv3_runaway_backstops,
             semantic_commit_stats=semantic_commit_stats,
@@ -840,7 +906,6 @@ async def run_task_v3_agent_loop(
             block_completion_check=_block_completion_check if block_check_on else None,
             unseen_text=unseen_text,
             anthropic_cache_markers=anthropic_cache_markers,
-            carry_reasoning=carry_route == "carries" and run_arm_enabled(CARRY_REASONING_FLAG, forced=False),
         )
     finally:
         loop_ended = True
@@ -849,8 +914,9 @@ async def run_task_v3_agent_loop(
         # The context outlives this run; a signal raised as the loop was cancelled must not fire
         # on the next block's first action.
         _exit_ctx = skyvern_context.current()
-        if _exit_ctx is not None and _exit_ctx.refresh_working_page:
+        if _exit_ctx is not None:
             _exit_ctx.refresh_working_page = False
+            _exit_ctx.page_reload_request = None
         # Backstop for the handoff the ticket rides on: the loop can end without a further tool call
         # (budget, cancellation, a raise), leaving the page blank for the next url-less block. In the
         # `finally` because a raising block can still be followed by another one
@@ -937,10 +1003,6 @@ async def run_task_v3_agent_loop(
         # The run's model, so exposure rates on this line split per model like the re-ask line's.
         llm_key=llm_caller.llm_key,
         llm_route_arm=llm_route_arm,
-        carry_reasoning_arm=carry_reasoning_pin[1] if carry_reasoning_pin is not None else "unrandomized",
-        carry_reasoning_route=carry_route,
-        carried_reasoning_turns=outcome.carried_reasoning_turns,
-        carry_reasoning_stripped=outcome.carry_reasoning_stripped,
         unlisted_reask=outcome.unlisted_reask,
         # The loop's progress signals ride here rather than on records of their own: this line
         # already fires exactly once per run and already carries block_type, so collapsing removes a

@@ -4,11 +4,14 @@ Ensures that _repair_next_block_label_chain stitches orphaned blocks back into t
 reachable chain, without chaining the blocks a conditional's branches reach.
 """
 
+from structlog.testing import capture_logs
+
 from skyvern.forge.sdk.copilot.workflow_yaml import (
     _break_cycles,
     _collect_reachable,
     _find_terminal_label,
     _normalize_copilot_yaml,
+    _normalize_copilot_yaml_with_dropped_links,
     _order_orphaned_blocks,
     _repair_next_block_label_chain,
 )
@@ -292,6 +295,204 @@ workflow_definition:
         _repair_next_block_label_chain(blocks)
         assert inner[0].next_block_label == "l_b"
         assert blocks[1].next_block_label is None
+
+
+def _normalize_and_save_check(workflow_yaml: str) -> tuple[WorkflowCreateYAMLRequest, list[dict]]:
+    with capture_logs() as logs:
+        request, dropped_links = _normalize_copilot_yaml_with_dropped_links(workflow_yaml)
+    assert request.workflow_definition.version == 2
+    WorkflowService().validate_workflow_block_graph(
+        convert_workflow_definition(request.workflow_definition, workflow_id="wf_test")
+    )
+    assert len([entry for entry in logs if entry["event"] == "Copilot dropped link to unknown block"]) == len(
+        dropped_links
+    )
+    return request, dropped_links
+
+
+class TestUnknownLinks:
+    def test_link_to_a_block_that_does_not_exist_is_dropped(self) -> None:
+        request, drops = _normalize_and_save_check("""
+title: One step
+workflow_definition:
+  version: 2
+  parameters: []
+  blocks:
+  - block_type: navigation
+    label: open_page
+    url: https://example.com
+    navigation_goal: Open the page.
+    next_block_label: never_added
+""")
+        assert request.workflow_definition.blocks[0].next_block_label is None
+        assert [(drop["block"], drop["target"]) for drop in drops] == [("open_page", "never_added")]
+
+    def test_branch_to_a_block_that_does_not_exist_falls_through_to_the_conditionals_next_block(self) -> None:
+        request, drops = _normalize_and_save_check("""
+title: Branching
+workflow_definition:
+  version: 2
+  parameters: []
+  blocks:
+  - block_type: code
+    label: check_flag
+    code: "result = {'ready': True}"
+    next_block_label: route
+  - block_type: conditional
+    label: route
+    branch_conditions:
+    - criteria:
+        expression: "{{ check_flag_output.ready }}"
+      next_block_label: never_added
+    - is_default: true
+      next_block_label: read_notice
+    next_block_label: wrap_up
+  - block_type: navigation
+    label: read_notice
+    navigation_goal: Read the notice.
+    next_block_label: null
+  - block_type: navigation
+    label: wrap_up
+    navigation_goal: Close the page.
+    next_block_label: null
+""")
+        route = request.workflow_definition.blocks[1]
+        assert isinstance(route, ConditionalBlockYAML)
+        assert [branch.next_block_label for branch in route.branch_conditions] == ["wrap_up", "read_notice"]
+        assert route.next_block_label == "wrap_up"
+        assert [(drop["block"], drop["target"], drop["branch_index"]) for drop in drops] == [
+            ("route", "never_added", 0)
+        ]
+
+    def test_loop_body_link_to_a_block_outside_the_loop_is_dropped(self) -> None:
+        request, drops = _normalize_and_save_check("""
+title: Loop
+workflow_definition:
+  version: 2
+  parameters: []
+  blocks:
+  - block_type: navigation
+    label: open_list
+    url: https://example.com
+    navigation_goal: Open the list.
+    next_block_label: each_row
+  - block_type: for_loop
+    label: each_row
+    loop_variable_reference: "{{ open_list_output }}"
+    next_block_label: wrap_up
+    loop_blocks:
+    - block_type: navigation
+      label: open_row
+      navigation_goal: Open the row.
+      next_block_label: read_row
+    - block_type: navigation
+      label: read_row
+      navigation_goal: Read the row.
+      next_block_label: wrap_up
+  - block_type: navigation
+    label: wrap_up
+    navigation_goal: Close the page.
+    next_block_label: null
+""")
+        top = request.workflow_definition.blocks
+        assert [block.next_block_label for block in top] == ["each_row", "wrap_up", None]
+        loop = top[1]
+        assert isinstance(loop, ForLoopBlockYAML)
+        assert [block.next_block_label for block in loop.loop_blocks] == ["read_row", None]
+        assert [(drop["block"], drop["target"]) for drop in drops] == [("read_row", "wrap_up")]
+
+    def test_conditional_with_every_routed_branch_dropped_still_reaches_its_next_block(self) -> None:
+        request, drops = _normalize_and_save_check("""
+title: Branching
+workflow_definition:
+  version: 2
+  parameters: []
+  blocks:
+  - block_type: code
+    label: check_flag
+    code: "result = {'ready': True}"
+    next_block_label: route
+  - block_type: conditional
+    label: route
+    branch_conditions:
+    - criteria:
+        expression: "{{ check_flag_output.ready }}"
+      next_block_label: never_added
+    - is_default: true
+      next_block_label: null
+    next_block_label: wrap_up
+  - block_type: navigation
+    label: wrap_up
+    navigation_goal: Close the page.
+    next_block_label: null
+""")
+        route = request.workflow_definition.blocks[1]
+        assert isinstance(route, ConditionalBlockYAML)
+        assert [branch.next_block_label for branch in route.branch_conditions] == ["wrap_up", None]
+        assert drops == [{"block": "route", "branch_index": 0, "target": "never_added", "now": "wrap_up"}]
+
+    def test_dropped_branches_take_the_next_block_the_chain_repair_gives_their_conditional(self) -> None:
+        request, _ = _normalize_and_save_check("""
+title: Branching
+workflow_definition:
+  version: 2
+  parameters: []
+  blocks:
+  - block_type: code
+    label: check_flag
+    code: "result = {'ready': True}"
+    next_block_label: route
+  - block_type: conditional
+    label: route
+    branch_conditions:
+    - criteria:
+        expression: "{{ check_flag_output.ready }}"
+      next_block_label: never_added
+    - is_default: true
+      next_block_label: also_never_added
+    next_block_label: null
+  - block_type: navigation
+    label: wrap_up
+    navigation_goal: Close the page.
+    next_block_label: null
+""")
+        route = request.workflow_definition.blocks[1]
+        assert isinstance(route, ConditionalBlockYAML)
+        assert route.next_block_label == "wrap_up"
+        assert [branch.next_block_label for branch in route.branch_conditions] == ["wrap_up", "wrap_up"]
+
+    def test_dropped_branch_does_not_copy_a_next_block_that_cycle_repair_cuts(self) -> None:
+        request, _ = _normalize_and_save_check("""
+title: Branching
+workflow_definition:
+  version: 2
+  parameters: []
+  blocks:
+  - block_type: code
+    label: check_flag
+    code: "result = {'ready': True}"
+    next_block_label: read_page
+  - block_type: navigation
+    label: read_page
+    navigation_goal: Read the page.
+    next_block_label: route
+  - block_type: conditional
+    label: route
+    branch_conditions:
+    - criteria:
+        expression: "{{ check_flag_output.ready }}"
+      next_block_label: never_added
+    - is_default: true
+      next_block_label: wrap_up
+    next_block_label: read_page
+  - block_type: navigation
+    label: wrap_up
+    navigation_goal: Close the page.
+    next_block_label: null
+""")
+        route = request.workflow_definition.blocks[2]
+        assert isinstance(route, ConditionalBlockYAML)
+        assert [branch.next_block_label for branch in route.branch_conditions] == [None, "wrap_up"]
 
 
 class TestCollectReachable:

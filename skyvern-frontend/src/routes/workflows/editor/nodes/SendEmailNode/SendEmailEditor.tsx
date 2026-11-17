@@ -16,12 +16,12 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
+import { Switch } from "@/components/ui/switch";
 import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 
-import { GoogleOAuthCredentialSelector } from "@/routes/workflows/components/GoogleOAuthCredentialSelector";
+import { CredentialSourceSelector } from "@/routes/workflows/components/CredentialSourceSelector";
 import { type EmailTransport } from "@/routes/workflows/types/workflowTypes";
-import { GOOGLE_GMAIL_SEND_REQUIRED_SCOPES } from "@/util/googleScopes";
 
 import {
   AI_IMPROVE_CONFIGS,
@@ -45,6 +45,9 @@ function SendEmailEditor({ blockId }: { blockId: string }) {
 
 // Saving a workflow that sends only through Gmail removes these parameters, and
 // the server declares them again for an SMTP block that does not name them.
+// The Gmail trigger passes the whole email as the `email` input; `id` is its Gmail message ID.
+const TRIGGER_EMAIL_ID = "{{ email.id }}";
+
 const PLATFORM_SMTP_SECRET_FIELDS = [
   ["smtpHostSecretParameterKey", "smtp_host"],
   ["smtpPortSecretParameterKey", "smtp_port"],
@@ -68,18 +71,31 @@ function SendEmailEditorBody({
     fileAttachments,
     transport,
     credentialId,
+    credentialSource,
+    connectionId,
+    replyToMessageId,
     cc,
     bcc,
   } = data;
   const update = useUpdate<SendEmailNode["data"]>({ id: blockId, editable });
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id: blockId });
   const isGmail = transport === "gmail";
+  const isReply = isGmail && Boolean(replyToMessageId?.trim());
+  const hasCustomReply = isReply && replyToMessageId !== TRIGGER_EMAIL_ID;
 
   // The SMTP settings stay in the node while Gmail is selected, so switching back
   // restores them; a Gmail block is saved without them.
   const changeTransport = (next: EmailTransport) => {
     if (next !== "gmail") {
-      update({ transport: next, credentialId: "", cc: "", bcc: "" });
+      update({
+        transport: next,
+        credentialId: "",
+        credentialSource: "native",
+        connectionId: "",
+        replyToMessageId: "",
+        cc: "",
+        bcc: "",
+      });
       return;
     }
     const namedPlatformSecrets = PLATFORM_SMTP_SECRET_FIELDS.filter(
@@ -123,13 +139,73 @@ function SendEmailEditorBody({
             </Label>
             <HelpTooltip content="The email is sent from this account. Only accounts connected for sending on the Integrations page are listed." />
           </div>
-          <GoogleOAuthCredentialSelector
+          <CredentialSourceSelector
+            provider="gmail"
+            purpose={data.replyToMessageId ? "reply" : "send"}
             nodeId={blockId}
-            value={credentialId}
-            onChange={(value) => update({ credentialId: value })}
-            requiredScopes={GOOGLE_GMAIL_SEND_REQUIRED_SCOPES}
-            gmailSendOnly
+            credentialId={credentialId}
+            credentialSource={credentialSource ?? "native"}
+            connectionId={connectionId ?? ""}
+            disabled={!editable}
+            onChange={(source, id) =>
+              update(
+                source === "native"
+                  ? {
+                      credentialSource: "native",
+                      connectionId: "",
+                      credentialId: id,
+                      ...(id &&
+                        credentialId &&
+                        id !== credentialId && { replyToMessageId: "" }),
+                    }
+                  : {
+                      credentialSource: "nango",
+                      connectionId: id,
+                      credentialId: "",
+                      replyToMessageId: "",
+                    },
+              )
+            }
           />
+        </div>
+      ) : null}
+      {isGmail && credentialSource !== "nango" ? (
+        <div className="space-y-2">
+          <div className="flex items-center justify-between gap-2">
+            <Label
+              htmlFor={`${blockId}-reply`}
+              className="text-xs text-tertiary-foreground"
+            >
+              Reply to the email that started this agent
+            </Label>
+            <Switch
+              id={`${blockId}-reply`}
+              checked={isReply}
+              disabled={!editable}
+              onCheckedChange={(checked) =>
+                update({ replyToMessageId: checked ? TRIGGER_EMAIL_ID : "" })
+              }
+            />
+          </div>
+          {hasCustomReply ? (
+            <div className="space-y-2">
+              <Label
+                htmlFor={`${blockId}-reply-to-message-id`}
+                className="text-xs text-tertiary-foreground"
+              >
+                Message to reply to
+              </Label>
+              <WorkflowBlockInput
+                id={`${blockId}-reply-to-message-id`}
+                name="replyToMessageId"
+                nodeId={blockId}
+                value={replyToMessageId}
+                onChange={(value) => update({ replyToMessageId: value })}
+                disabled={!editable}
+                className="nopan text-xs"
+              />
+            </div>
+          ) : null}
         </div>
       ) : null}
       <Separator />
@@ -149,7 +225,11 @@ function SendEmailEditorBody({
           nodeId={blockId}
           onChange={(value) => update({ recipients: value })}
           value={recipients}
-          placeholder="example@gmail.com, example2@gmail.com..."
+          placeholder={
+            isReply
+              ? "Sender of the original email (leave empty)"
+              : "example@gmail.com, example2@gmail.com..."
+          }
           className="nopan text-xs"
         />
       </div>
@@ -184,8 +264,14 @@ function SendEmailEditorBody({
           name="subject"
           nodeId={blockId}
           onChange={(value) => update({ subject: value })}
-          value={subject}
-          placeholder="Your Run is Finished {{workflow_run_id}}"
+          value={isReply ? "" : subject}
+          disabled={!editable || isReply}
+          hideParameterSelect={isReply}
+          placeholder={
+            isReply
+              ? "Re: <original subject>"
+              : "Your Run is Finished {{workflow_run_id}}"
+          }
           className="nopan text-xs"
         />
       </div>

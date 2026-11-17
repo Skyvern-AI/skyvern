@@ -113,7 +113,10 @@ import { useParameterExpansion } from "./hooks/useParameterExpansion";
 import { Folder } from "./types/folderTypes";
 import { defaultWorkflowRequest } from "./defaultWorkflowRequest";
 
-const FOLDERS_PAGE_SIZE = 10;
+// Load a generous page so the slug map covers every folder a user can pick
+// from "View all" or a shared ?folder= URL, not just the recent few.
+const FOLDERS_PAGE_SIZE = 100;
+const FOLDER_ID_PREFIX = "fld_";
 
 function WorkflowsFlat() {
   const credentialGetter = useCredentialGetter();
@@ -212,6 +215,12 @@ function WorkflowsFlat() {
       resolvedFolderIdBySlug.current.delete(folderSlug);
       return null;
     }
+    // A ?folder= value that isn't a known slug may be the id of a folder past
+    // the loaded page; treat a folder id as the filter directly. Only reachable
+    // on an incomplete list, so a deleted folder still clears the param.
+    if (folderSlug.startsWith(FOLDER_ID_PREFIX)) {
+      return folderSlug;
+    }
     // The folders list is paginated, so a refetch can transiently drop the
     // active folder; reuse the last resolution instead of flapping to null.
     return resolvedFolderIdBySlug.current.get(folderSlug) ?? null;
@@ -244,13 +253,15 @@ function WorkflowsFlat() {
     const params = new URLSearchParams(searchParams);
     if (folderId) {
       const folder = allFolders.find((f) => f.folder_id === folderId);
-      if (folder) {
-        const slug = getUniqueSlugForFolder(folder, allFolders);
-        params.set("folder", slug);
-        params.set("page", "1"); // Reset to page 1 when changing folder
-        setSearchParams(params, { replace: true });
-        return;
-      }
+      // Fall back to the folder id as the slug when the folder is past the
+      // loaded page, so selecting it from "View all" still filters.
+      params.set(
+        "folder",
+        folder ? getUniqueSlugForFolder(folder, allFolders) : folderId,
+      );
+      params.set("page", "1"); // Reset to page 1 when changing folder
+      setSearchParams(params, { replace: true });
+      return;
     }
     // Remove folder filter
     params.delete("folder");

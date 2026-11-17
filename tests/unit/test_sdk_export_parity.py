@@ -114,8 +114,7 @@ def test_type_exports_match_generated_type_modules() -> None:
 
     assert not drift, (
         f"SDK type export drift detected: {drift}. "
-        "Register the listed types in the generated lazy-export tables; for a full regeneration, "
-        "run `fern generate --group python-sdk` and sync the vendored SDK."
+        "Register the listed types in the lazy-export tables of both `__init__.py` files."
     )
 
 

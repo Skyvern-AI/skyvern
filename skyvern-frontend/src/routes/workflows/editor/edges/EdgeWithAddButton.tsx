@@ -13,7 +13,7 @@ import {
   useWorkflowPanelStore,
 } from "@/store/WorkflowPanelStore";
 import { useWorkflowScopeReadOnly } from "../WorkflowScopeContext";
-import { useCopilotActionStore } from "@/store/useCopilotActionStore";
+import { useEmberActionStore } from "@/store/useEmberActionStore";
 import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
 import { cn } from "@/util/utils";
 import { toast } from "@/components/ui/use-toast";
@@ -58,9 +58,7 @@ function EdgeWithAddButton({
   const startDemonstration = useRecordingLauncherStore(
     (state) => state.startDemonstration,
   );
-  const stageAttachment = useCopilotActionStore(
-    (state) => state.stageAttachment,
-  );
+  const stageAttachment = useEmberActionStore((state) => state.stageAttachment);
   const workflowStatePanel = useWorkflowPanelStore();
   const setWorkflowPanelState = useWorkflowPanelStore(
     (state) => state.setWorkflowPanelState,

@@ -22,17 +22,17 @@ describe("Email Inbox validation", () => {
       connectionId: "nc_synthetic",
     };
     expect(validateEmailInboxNode(node)).toEqual([]);
+    node.data = { ...node.data, downloadAttachments: true };
+    expect(validateEmailInboxNode(node)).toEqual([]);
     node.data = {
       ...node.data,
       connectionId: "",
       credentialId: "native_test",
       folder: "{{ folder }}",
-      downloadAttachments: true,
     };
     expect(validateEmailInboxNode(node)).toEqual(
       expect.arrayContaining([
         expect.stringContaining("connection is required"),
-        expect.stringContaining("attachment downloads"),
         expect.stringContaining("must be literal"),
       ]),
     );

@@ -3,20 +3,26 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock
 
 import pytest
 from opentelemetry import trace as otel_trace
+from structlog.testing import capture_logs
 
+from skyvern.forge import app
 from skyvern.forge.sdk.copilot import agent as copilot_agent
+from skyvern.forge.sdk.copilot import live_narrative
+from skyvern.forge.sdk.copilot.context import CopilotContext, LiveTurnNarrative
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatRequest,
     WorkflowCopilotChatSender,
 )
+from tests.unit.test_copilot_credential_pause import _FakeCache
 
 
 def _make_chat_request(
@@ -114,6 +120,101 @@ async def test_copilot_turn_span_parents_inner_spans(
     assert attrs.get("copilot.turn_index") == 1
     assert "copilot.user_message_preview" not in attrs
     assert attrs.get("copilot.user_message_length") == len(chat_request.message)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["raise", "hang"])
+async def test_a_failing_live_narrative_cache_neither_fails_nor_delays_the_turn(
+    span_exporter: Any,
+    patched_request_policy_trust_floor: None,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    attempts: list[str] = []
+    retried = asyncio.Event()
+
+    class _FailingCache(_FakeCache):
+        async def set(self, key: str, value: Any, ex: Any = None) -> None:
+            attempts.append(key)
+            if failure == "hang" or len(attempts) > 1:
+                retried.set()
+            if failure == "raise":
+                raise RuntimeError("cache unavailable")
+            await asyncio.Event().wait()
+
+    async def hydrate_after_a_snapshot_retry(*_args: Any, **_kwargs: Any) -> None:
+        await retried.wait()
+
+    monkeypatch.setattr(live_narrative, "LIVE_TURN_NARRATIVE_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(app, "CACHE", _FailingCache())
+    monkeypatch.setattr(copilot_agent, "hydrate_work_plan", hydrate_after_a_snapshot_retry)
+    ctx_sink: list[CopilotContext] = []
+
+    with capture_logs() as logs:
+        # Shorter than the write's own timeout, so a turn end that waited on the hanging write would miss it.
+        result = await asyncio.wait_for(
+            copilot_agent.run_copilot_agent(
+                stream=object(),
+                organization_id="o_test",
+                chat_request=_make_chat_request(),
+                chat_history=[],
+                global_llm_context=None,
+                llm_api_handler=None,
+                ctx_sink=ctx_sink,
+            ),
+            timeout=3,
+        )
+
+    assert result is not None
+    writer = ctx_sink[0].live_narrative_task
+    assert writer is not None
+    await asyncio.wait({writer}, timeout=1)
+    assert writer.cancelled()
+    assert attempts and set(attempts) == {f"ember:turn_narrative:o_test:chat_abc:{ctx_sink[0].turn_id}"}
+    if failure == "raise":
+        assert [log["event"] for log in logs].count("Live turn narrative write failed") == 1
+
+
+@pytest.mark.asyncio
+async def test_live_narrative_writer_rewrites_an_unchanged_copy_only_on_change_or_after_half_the_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache = _FakeCache()
+    monkeypatch.setattr(app, "CACHE", cache)
+    now = 0.0
+    terminal = "running"
+    builds = 0
+
+    def build() -> LiveTurnNarrative:
+        nonlocal builds
+        builds += 1
+        return cast(LiveTurnNarrative, {"terminal": terminal})
+
+    async def settle(condition: Callable[[], bool]) -> None:
+        # Below the 2 s poll, so only the wake can have started the pass.
+        async with asyncio.timeout(1):
+            while not condition():
+                await asyncio.sleep(0)
+
+    wake = asyncio.Event()
+    writer = asyncio.create_task(live_narrative.write_live_turn_narrative("key", build, wake, clock=lambda: now))
+    try:
+        await settle(lambda: len(cache.set_calls) == 1)
+        builds_before = builds
+        wake.set()
+        await settle(lambda: builds > builds_before)
+        assert len(cache.set_calls) == 1
+
+        terminal = "paused"
+        wake.set()
+        await settle(lambda: len(cache.set_calls) == 2)
+
+        now = live_narrative.LIVE_TURN_NARRATIVE_TTL_SECONDS / 2
+        wake.set()
+        await settle(lambda: len(cache.set_calls) == 3)
+        assert cache.set_calls[2][1] == cache.set_calls[1][1]
+    finally:
+        writer.cancel()
 
 
 @pytest.mark.asyncio

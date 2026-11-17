@@ -3,20 +3,25 @@
 from __future__ import annotations
 
 import io
-from datetime import datetime, timezone
-from typing import Generator
-from unittest.mock import AsyncMock, MagicMock
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from typing import Any, Generator
+from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import parse_qs, urlparse
 
 import boto3
 import pytest
 from moto.server import ThreadedMotoServer
+from structlog.testing import capture_logs
 from types_boto3_s3.client import S3Client
 
 from skyvern.config import settings
 from skyvern.forge.sdk.api.files import _determine_download_filename, get_file_name_and_suffix_from_headers
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
+from skyvern.forge.sdk.schemas.files import UploadedFileSignedUrl
+from skyvern.services import uploaded_file_service
+from tests.unit._uploaded_files_fake import FakeUploadedFilesRepository
 from tests.unit.forge.sdk.artifact.storage.test_s3_storage import (
     TEST_BUCKET,
     S3StorageForTests,
@@ -211,3 +216,119 @@ class TestS3PresignedDownloadDisposition:
         download_query, screenshot_query = (parse_qs(urlparse(url).query) for url in urls)
         assert download_query["response-content-disposition"][0].startswith('attachment; filename="page.html"')
         assert "response-content-disposition" not in screenshot_query
+
+
+_PNG = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde"
+
+
+@pytest.mark.asyncio
+class TestUploadedFileSignedUrl:
+    """Moto ignores the ``response-*`` overrides that real S3 applies, so these assert the signed query."""
+
+    async def _mint(
+        self, s3_storage: S3Storage, boto3_test_client: S3Client, filename: str, body: bytes | None, **seed: Any
+    ) -> UploadedFileSignedUrl | None:
+        repo = FakeUploadedFilesRepository()
+        file_id = repo.seed("o_doc", filename=filename, **seed)
+        if body is not None:
+            parsed = urlparse(repo.rows[file_id].storage_uri)
+            boto3_test_client.put_object(Bucket=parsed.netloc, Key=parsed.path.lstrip("/"), Body=body)
+        fake_app = SimpleNamespace(DATABASE=SimpleNamespace(uploaded_files=repo), STORAGE=s3_storage)
+        with patch.object(uploaded_file_service, "app", fake_app):
+            return await uploaded_file_service.mint_file_url(file_id=file_id, organization_id="o_doc")
+
+    async def test_a_sniffed_raster_image_renders_inline_for_one_hour(
+        self, s3_storage: S3Storage, boto3_test_client: S3Client
+    ) -> None:
+        signed = await self._mint(s3_storage, boto3_test_client, "shot.bin", _PNG + b"\x00" * 10_000)
+
+        assert signed is not None and signed.content_type == "image/png"
+        query = parse_qs(urlparse(signed.signed_url).query)
+        assert query["response-content-type"] == ["image/png"]
+        assert query["response-content-disposition"] == ["inline"]
+        lifetime = (
+            int(query["X-Amz-Expires"][0])
+            if "X-Amz-Expires" in query
+            else int(query["Expires"][0]) - int(datetime.now(timezone.utc).timestamp())
+        )
+        assert 3590 <= lifetime <= 3600
+        assert abs(signed.expires_at - int(datetime.now(timezone.utc).timestamp()) - 3600) <= 10
+
+    @pytest.mark.parametrize(
+        ("filename", "body"),
+        [
+            ("pic.png", b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'),
+            ("page.png", b"<!doctype html><html><script>alert(1)</script></html>"),
+            ("notes.pdf", b"%PDF-1.7 body"),
+            ("clip.mp4", b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom" + b"\x00" * 64),
+        ],
+    )
+    async def test_every_other_type_mints_nothing(
+        self, s3_storage: S3Storage, boto3_test_client: S3Client, filename: str, body: bytes
+    ) -> None:
+        assert await self._mint(s3_storage, boto3_test_client, filename, body) is None
+
+    # uploaded_files.expires_at is a naive UTC column, so a row read back from the database carries no tzinfo.
+    @pytest.mark.parametrize("naive", [False, True], ids=["aware", "naive"])
+    async def test_a_file_expiring_sooner_than_an_hour_caps_the_url_at_its_expiry(
+        self, s3_storage: S3Storage, boto3_test_client: S3Client, naive: bool
+    ) -> None:
+        file_expiry = datetime.now(timezone.utc) + timedelta(seconds=90)
+        seeded_expiry = file_expiry.replace(tzinfo=None) if naive else file_expiry
+
+        signed = await self._mint(s3_storage, boto3_test_client, "soon.png", _PNG, expires_at=seeded_expiry)
+
+        assert signed is not None
+        query = parse_qs(urlparse(signed.signed_url).query)
+        lifetime = (
+            int(query["X-Amz-Expires"][0])
+            if "X-Amz-Expires" in query
+            else int(query["Expires"][0]) - int(datetime.now(timezone.utc).timestamp())
+        )
+        assert 1 <= lifetime <= 90
+        assert signed.expires_at <= int(file_expiry.timestamp())
+
+    async def test_a_zero_byte_upload_mints_nothing_without_an_error_log(
+        self, s3_storage: S3Storage, boto3_test_client: S3Client
+    ) -> None:
+        with capture_logs() as logs:
+            signed = await self._mint(s3_storage, boto3_test_client, "empty.png", b"")
+
+        assert signed is None
+        assert [log for log in logs if log["log_level"] in ("error", "exception", "critical")] == []
+
+    async def test_a_stream_that_fails_partway_reads_no_head(self, s3_storage: S3Storage) -> None:
+        async def failing_chunks(_size: int) -> Any:
+            yield b"\x89PNG"
+            raise ConnectionError("connection reset")
+
+        stream = SimpleNamespace(iter_chunks=failing_chunks, aclose=AsyncMock())
+        uri = f"s3://{settings.AWS_S3_BUCKET_UPLOADS}/{settings.ENV}/o_doc/shot.png"
+
+        with patch.object(s3_storage.async_client, "open_download_stream", AsyncMock(return_value=stream)):
+            assert await s3_storage.read_managed_file_head(uri, "o_doc", 64) is None
+        stream.aclose.assert_awaited_once()
+
+    async def test_the_type_sniff_fetches_only_the_head_of_the_object(
+        self, s3_storage: S3Storage, boto3_test_client: S3Client
+    ) -> None:
+        opened = s3_storage.async_client.open_download_stream
+        fetched: list[int] = []
+
+        async def recording_open(uri: str, **kwargs: Any) -> Any:
+            stream = await opened(uri, **kwargs)
+            fetched.append(stream.content_length)
+            return stream
+
+        with patch.object(s3_storage.async_client, "open_download_stream", recording_open):
+            signed = await self._mint(s3_storage, boto3_test_client, "big.png", _PNG + b"\x00" * 200_000)
+
+        assert signed is not None
+        assert fetched == [uploaded_file_service._IMAGE_HEAD_BYTES]
+
+    async def test_a_missing_object_or_an_expired_row_mints_nothing(
+        self, s3_storage: S3Storage, boto3_test_client: S3Client
+    ) -> None:
+        assert await self._mint(s3_storage, boto3_test_client, "gone.png", None) is None
+        expired = datetime.now(timezone.utc) - timedelta(minutes=1)
+        assert await self._mint(s3_storage, boto3_test_client, "old.png", _PNG, expires_at=expired) is None

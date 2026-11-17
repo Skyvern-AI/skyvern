@@ -15,11 +15,6 @@ export function validateEmailInboxNode(node: EmailInboxNode): Array<string> {
     if (missing(node.data.connectionId ?? "")) {
       errors.push(`${label}: Gmail connection is required.`);
     }
-    if (node.data.downloadAttachments) {
-      errors.push(
-        `${label}: This Gmail account does not support attachment downloads.`,
-      );
-    }
     if (
       [
         node.data.connectionId,

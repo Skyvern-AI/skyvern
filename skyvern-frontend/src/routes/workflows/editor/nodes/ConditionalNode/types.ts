@@ -54,7 +54,6 @@ export const conditionalNodeDefaultData: ConditionalNodeData = {
   label: "",
   continueOnFailure: false,
   model: null,
-  showCode: false,
   branches: initialBranches,
   activeBranchId: initialBranches[0]!.id,
   mergeLabel: null,

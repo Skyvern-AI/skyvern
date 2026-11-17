@@ -1,6 +1,5 @@
 import {
   ExclamationTriangleIcon,
-  LightningBoltIcon,
   MixerHorizontalIcon,
   RocketIcon,
 } from "@radix-ui/react-icons";
@@ -411,14 +410,9 @@ function RunHistory() {
       const taggable = taggingEnabled && isWorkflowRun;
 
       const titleContent =
-        triggerType || run.script_run || run.workflow_deleted ? (
+        triggerType || run.workflow_deleted ? (
           <div className="flex items-center gap-2">
             {triggerType && <TriggerTypeBadge triggerType={triggerType} />}
-            {run.script_run && (
-              <Tip content="Ran with code">
-                <LightningBoltIcon className="text-[gold]" />
-              </Tip>
-            )}
             {run.workflow_deleted && (
               <Tip content="Source agent deleted">
                 <ExclamationTriangleIcon className="text-amber-400" />

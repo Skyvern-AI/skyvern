@@ -8,9 +8,9 @@ unreachable. Saying so explicitly is worth more than it looks:
   ``page.video`` is the cautionary case: recording only exists because a launch configured it, and an
   attach-only worker that still reaches for it gets an attribute error on a code path that has no
   business running at all. The answer is not a better stub, it is not asking.
-- It lets the image drop the browser entirely, which is what makes an arm64 build possible: Chrome
-  and CloakBrowser are x86_64-only on Linux, so a worker that carries a browser is pinned to x86_64
-  and one that does not is free.
+- It lets the image drop the browser entirely, which is what makes an arm64 build possible: the
+  browsers a worker launches are x86_64-only on Linux, so a worker that carries a browser is pinned
+  to x86_64 and one that does not is free.
 - It converts a whole class of mid-run failure into a startup failure, which is the only kind worth
   having.
 """

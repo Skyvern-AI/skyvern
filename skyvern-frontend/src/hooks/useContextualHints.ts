@@ -43,6 +43,12 @@ function selectHint(
   return null;
 }
 
+// The canvas stays mounted, inert, under the Doc: an anchor there is not on screen.
+function anchorAvailable(selector: string): boolean {
+  const el = document.querySelector(selector);
+  return el !== null && el.closest("[inert]") === null;
+}
+
 function useContextualHints(): void {
   const onboarding = useOnboardingStateOptional();
   const { pathname } = useLocation();
@@ -53,7 +59,7 @@ function useContextualHints(): void {
   const showHint = useCallback(
     (hint: ContextualHint) => {
       if (activeHintRef.current) return;
-      if (document.querySelector(hint.anchor) === null) return;
+      if (!anchorAvailable(hint.anchor)) return;
       activeHintRef.current = hint.id;
       try {
         const instance = driver({
@@ -110,7 +116,7 @@ function useContextualHints(): void {
     let showTimeout: ReturnType<typeof setTimeout> | null = null;
     const interval = setInterval(() => {
       polls += 1;
-      if (document.querySelector(hint.anchor) !== null) {
+      if (anchorAvailable(hint.anchor)) {
         clearInterval(interval);
         showTimeout = setTimeout(() => showHint(hint), SHOW_DELAY_MS);
       } else if (polls >= MAX_POLLS) {

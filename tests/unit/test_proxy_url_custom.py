@@ -14,23 +14,7 @@ from skyvern.forge.sdk.schemas.browser_profiles import UpdateBrowserProfileReque
 from skyvern.forge.sdk.schemas.credentials import UpdateCredentialRequest
 from skyvern.schemas.proxy_pinning import RedactedProxyLogValue, redact_proxy_location
 from skyvern.schemas.runs import GeoTarget, ProxyLocation
-from skyvern.webeye.browser_factory import BrowserContextFactory, _redact_url_query
-
-
-def test_redact_url_query_strips_presigned_signature() -> None:
-    redacted = _redact_url_query(
-        "https://bucket.s3.amazonaws.com/docs/report?X-Amz-Signature=deadbeef&X-Amz-Credential=AKIA"
-    )
-    assert redacted == "https://bucket.s3.amazonaws.com/docs/report"
-    assert "X-Amz-Signature" not in redacted
-
-
-def test_redact_url_query_keeps_url_without_query() -> None:
-    assert _redact_url_query("https://example.com/docs/report.pdf") == "https://example.com/docs/report.pdf"
-
-
-def test_redact_url_query_plain_string_passes_through() -> None:
-    assert _redact_url_query("not-a-url") == "not-a-url"
+from skyvern.webeye.browser_factory import BrowserContextFactory
 
 
 def test_build_browser_args_never_sets_proxy() -> None:

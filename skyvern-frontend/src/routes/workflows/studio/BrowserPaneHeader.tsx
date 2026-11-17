@@ -10,6 +10,7 @@ import { AxiosError } from "axios";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useRef, useState } from "react";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
+import { adoptDebugSession } from "@/routes/workflows/hooks/useDebugSessionQuery";
 import { runIsRetryWaiting } from "@/routes/workflows/workflowRun/runRetryState";
 import type { StreamState } from "@/routes/streaming/streamState";
 import { EXTERNAL_BROWSER_DIAGNOSTIC } from "@/routes/streaming/StreamDiagnostics";
@@ -117,7 +118,7 @@ export function BrowserPaneViewPills() {
     visuals,
     inspectingRun,
     liveSurface,
-    copilotBrowserFocused,
+    emberBrowserFocused,
     debugBrowserSessionId,
     runId,
     recordingAvailable,
@@ -212,7 +213,7 @@ export function BrowserPaneViewPills() {
   // the run's own status. Once that run is over this view is the debug browser
   // — a surface the run left behind — so it has to say so.
   const finishedRun = visuals.finalized;
-  // Only Copilot's pin puts a finished run's own browser on the Live view.
+  // Only Ember's pin puts a finished run's own browser on the Live view.
   const liveLabel =
     liveSurface === "run"
       ? finishedRun
@@ -220,7 +221,7 @@ export function BrowserPaneViewPills() {
         : "Live"
       : finishedRun
         ? "Debug browser"
-        : copilotBrowserFocused
+        : emberBrowserFocused
           ? "Copilot browser"
           : "Live";
   const showsDebugBrowserAfterRun = finishedRun && liveSurface === "debug";
@@ -312,13 +313,7 @@ export function BrowserPaneActions() {
       );
     },
     onSuccess: (response) => {
-      queryClient.setQueryData(
-        ["debugSession", workflowPermanentId],
-        response.data,
-      );
-      void queryClient.invalidateQueries({
-        queryKey: ["debugSession", workflowPermanentId],
-      });
+      adoptDebugSession(queryClient, workflowPermanentId, response.data);
       setConfirmRestart(false);
       toast({
         variant: "success",

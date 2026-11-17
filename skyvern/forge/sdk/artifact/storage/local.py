@@ -102,6 +102,8 @@ def _sha256_unless_stopped(path: str, stop: threading.Event) -> str | None:
 
 
 class LocalStorage(BaseStorage):
+    presigned_urls_expire = False
+
     def __init__(self, artifact_path: str = settings.ARTIFACT_STORAGE_PATH) -> None:
         self.artifact_path = artifact_path
         register_local_download_root(os.path.join(self.artifact_path, "downloads"))
@@ -722,9 +724,8 @@ class LocalStorage(BaseStorage):
         ``organization_id`` is auth-derived and ``filename`` is reduced to its basename, so the
         destination cannot leave this organization's directory. The returned pair is
         (download URL, storage URI); local has no presigned URL, so both are the same ``file://``
-        URI, which the read and delete paths re-check with ``assert_managed_file_access``. That URI
-        names a path on the server, so it is not something a browser can fetch: a client's handle on
-        the file is its id.
+        URI, which the read and delete paths re-check with ``assert_managed_file_access``. A browser
+        reaches that path only through the artifact server; a client's handle on the file is its id.
         """
         todays_date = datetime.now(tz=UTC).strftime("%Y-%m-%d")
         # Resolved up front: as_uri rejects a relative path, and a relative ARTIFACT_STORAGE_PATH
@@ -860,6 +861,26 @@ class LocalStorage(BaseStorage):
             return os.path.getsize(parse_uri_to_path(uri))
         except OSError:
             return None
+
+    async def read_managed_file_head(self, uri: str, organization_id: str, length: int) -> bytes | None:
+        self.assert_managed_file_access(uri, organization_id)
+        try:
+            async with aiofiles.open(parse_uri_to_path(uri), "rb") as f:
+                return await f.read(length)
+        except OSError:
+            return None
+
+    async def presign_managed_file(
+        self,
+        uri: str,
+        organization_id: str,
+        *,
+        expiry_seconds: int,
+        inline_content_type: str,
+    ) -> str | None:
+        # Like local artifacts, the file:// URI is served by the frontend's local artifact server.
+        self.assert_managed_file_access(uri, organization_id)
+        return uri
 
     async def file_exists(self, uri: str) -> bool:
         """Check if a file exists at the given local URI."""

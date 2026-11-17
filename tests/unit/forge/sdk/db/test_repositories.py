@@ -29,7 +29,6 @@ from skyvern.forge.sdk.db.models import (
 from skyvern.forge.sdk.db.repositories.organizations import OrganizationsRepository
 from skyvern.forge.sdk.db.repositories.scripts import ScriptsRepository
 from skyvern.forge.sdk.db.repositories.tasks import TasksRepository
-from skyvern.forge.sdk.encrypt import encryptor
 from skyvern.forge.sdk.encrypt.base import EncryptMethod
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
@@ -271,7 +270,8 @@ async def test_organizations_repository_persists_and_clears_default_llm_keys(sql
 @pytest.mark.usefixtures("registered_encryption")
 async def test_validate_org_auth_token_matches_by_decrypting_each_row(sqlite_engine: AsyncEngine) -> None:
     session_factory = async_sessionmaker(sqlite_engine, expire_on_commit=False)
-    legacy_ciphertext = await encryptor.encrypt("key-on-cbc", EncryptMethod.AES)
+    # "key-on-cbc" as the retired CBC writer stored it for the registered_encryption deployment (public salt/IV).
+    legacy_ciphertext = "Y2DD0pw4mlwHHSyFjNP6GA=="
     async with session_factory() as session:
         session.add(OrganizationModel(organization_id="o_keys", organization_name="Keys Org"))
         session.add(

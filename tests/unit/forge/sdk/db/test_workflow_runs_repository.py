@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -43,15 +44,21 @@ from skyvern.forge.sdk.db.models import (
     TaskRunModel,
     TaskV2Model,
     WorkflowModel,
+    WorkflowParameterModel,
     WorkflowRunAttemptModel,
     WorkflowRunBlockModel,
     WorkflowRunCredentialSelectionModel,
     WorkflowRunModel,
+    WorkflowRunParameterModel,
 )
 from skyvern.forge.sdk.db.repositories import workflow_run_attempts as attempts_repository_module
 from skyvern.forge.sdk.db.repositories import workflow_runs as workflow_runs_repository
 from skyvern.forge.sdk.db.repositories.workflow_run_attempts import TerminalSideEffectCheckpoint
-from skyvern.forge.sdk.db.repositories.workflow_runs import WorkflowRunsRepository
+from skyvern.forge.sdk.db.repositories.workflow_runs import (
+    RUN_INPUT_SEARCH_ACCESS,
+    RunInputSearchAccess,
+    WorkflowRunsRepository,
+)
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow import service as workflow_service_module
@@ -118,6 +125,13 @@ async def sqlite_engine(sqlite_engine_factory: SqliteEngineFactory) -> AsyncEngi
 @pytest_asyncio.fixture
 async def sqlite_db(sqlite_engine: AsyncEngine) -> AgentDB:
     return AgentDB(str(sqlite_engine.url), db_engine=sqlite_engine)
+
+
+@pytest.fixture
+def run_reader_search() -> Iterator[None]:
+    token = RUN_INPUT_SEARCH_ACCESS.set(RunInputSearchAccess(run_inputs=True, agent_definition=True))
+    yield
+    RUN_INPUT_SEARCH_ACCESS.reset(token)
 
 
 def _workflow_run_model(
@@ -2244,7 +2258,11 @@ async def test_get_all_runs_v2_search_key_matches_parameter_inputs() -> None:
 
     repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session), debug_enabled=False)
 
-    await repo.get_all_runs_v2(organization_id="o_test", search_key="Paris")
+    token = RUN_INPUT_SEARCH_ACCESS.set(RunInputSearchAccess(run_inputs=True, agent_definition=True))
+    try:
+        await repo.get_all_runs_v2(organization_id="o_test", search_key="Paris")
+    finally:
+        RUN_INPUT_SEARCH_ACCESS.reset(token)
 
     primary_where = _where_clause_sql(captured_queries[0])
     # Parameter EXISTS subqueries correlate on the run_id of the primary task_runs row.
@@ -2434,6 +2452,7 @@ async def _seed_run_identifier_runs(sqlite_db: AgentDB, *, with_task_runs: bool)
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("run_reader_search")
 async def test_get_all_runs_v2_search_key_matches_run_identifiers(sqlite_db: AgentDB) -> None:
     await _seed_run_identifier_runs(sqlite_db, with_task_runs=True)
 
@@ -2443,6 +2462,7 @@ async def test_get_all_runs_v2_search_key_matches_run_identifiers(sqlite_db: Age
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("run_reader_search")
 async def test_get_workflow_runs_for_workflow_permanent_id_search_key_matches_run_identifiers(
     sqlite_db: AgentDB,
 ) -> None:
@@ -2460,6 +2480,90 @@ async def test_get_workflow_runs_for_workflow_permanent_id_search_key_matches_ru
 
 
 @pytest.mark.asyncio
+async def test_run_input_search_arms_match_only_what_the_list_route_grants(sqlite_db: AgentDB) -> None:
+    run = _workflow_run_model(workflow_run_id="wr_inputs", queued_at=datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc))
+    run.extra_http_headers = {"X-Api-Token": "hdr-value-981"}
+    async with sqlite_db.Session() as session:
+        session.add(OrganizationModel(organization_id="org_test", organization_name="Test Organization"))
+        await session.flush()
+        session.add(
+            WorkflowModel(
+                workflow_id="wf_test",
+                workflow_permanent_id="wpid_test",
+                title="inputs",
+                workflow_definition={},
+                version=1,
+            )
+        )
+        session.add(
+            WorkflowParameterModel(
+                workflow_parameter_id="wp_member",
+                workflow_parameter_type="string",
+                key="member_number",
+                workflow_id="wf_test",
+            )
+        )
+        session.add(run)
+        await session.flush()
+        session.add(
+            WorkflowRunParameterModel(workflow_run_id="wr_inputs", workflow_parameter_id="wp_member", value="pv-4417")
+        )
+        await session.commit()
+
+    async def matches(search_key: str) -> tuple[set[str], set[str]]:
+        per_agent = await sqlite_db.workflow_runs.get_workflow_runs_for_workflow_permanent_id(
+            workflow_permanent_id="wpid_test", organization_id="org_test", search_key=search_key
+        )
+        org_wide = await sqlite_db.workflow_runs.get_all_runs(organization_id="org_test", search_key=search_key)
+        return {r.workflow_run_id for r in per_agent}, {r.workflow_run_id for r in org_wide}
+
+    async def matches_with(access: RunInputSearchAccess, search_key: str) -> tuple[set[str], set[str]]:
+        token = RUN_INPUT_SEARCH_ACCESS.set(access)
+        try:
+            return await matches(search_key)
+        finally:
+            RUN_INPUT_SEARCH_ACCESS.reset(token)
+
+    found = ({"wr_inputs"}, {"wr_inputs"})
+    # Without a grant from a list route, no input arm matches.
+    for search_key in ("pv-44", "hdr-value", "member_num"):
+        assert await matches(search_key) == (set(), set()), search_key
+    inputs_only = RunInputSearchAccess(run_inputs=True)
+    definition_only = RunInputSearchAccess(agent_definition=True)
+    assert await matches_with(inputs_only, "pv-44") == found
+    assert await matches_with(inputs_only, "hdr-value") == found
+    assert await matches_with(inputs_only, "member_num") == (set(), set())
+    assert await matches_with(definition_only, "member_num") == found
+    assert await matches_with(definition_only, "pv-44") == (set(), set())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("agent_definition", [True, False], ids=["agent-reader", "no-agent-read"])
+async def test_run_identifier_search_without_run_read_matches_only_visible_identifiers(
+    sqlite_db: AgentDB, agent_definition: bool
+) -> None:
+    await _seed_run_identifier_runs(sqlite_db, with_task_runs=False)
+    cases = {
+        "hooks.example.com/notify": set(),
+        "cred_1003": set(),
+        "cred_1004": set(),
+        "cred_1005": {"wr_bound_credential"} if agent_definition else set(),
+        "bp_1001": {"wr_profile"},
+        "pbs_1002": {"wr_session"},
+    }
+    token = RUN_INPUT_SEARCH_ACCESS.set(RunInputSearchAccess(run_inputs=False, agent_definition=agent_definition))
+    try:
+        for search_key, expected in cases.items():
+            runs = await sqlite_db.workflow_runs.get_workflow_runs_for_workflow_permanent_id(
+                workflow_permanent_id="wpid_test", organization_id="org_test", search_key=search_key
+            )
+            assert {run.workflow_run_id for run in runs} == expected, search_key
+    finally:
+        RUN_INPUT_SEARCH_ACCESS.reset(token)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("run_reader_search")
 async def test_partial_run_id_search_keeps_substring_matching(sqlite_db: AgentDB) -> None:
     # Only a complete run id is matched by equality; one still being typed must keep finding every run
     # that mentions it.
@@ -2524,6 +2628,7 @@ async def test_complete_standalone_task_id_search_finds_the_task_within_its_org(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("run_reader_search")
 async def test_credential_search_follows_an_in_place_definition_edit(sqlite_db: AgentDB) -> None:
     # An in-place edit rebinds a workflow version without creating a new one, so each run has to match
     # the credential its version was bound to when that run was created.
@@ -2593,6 +2698,7 @@ async def test_credential_search_follows_an_in_place_definition_edit(sqlite_db: 
     [("cred_1003", "wr_sequential_credential"), ("bp_1001", "wr_profile"), ("pbs_1002", "wr_session")],
 )
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("run_reader_search")
 async def test_get_all_runs_legacy_search_excludes_unmatched_standalone_tasks(
     sqlite_db: AgentDB, search_key: str, expected_run_id: str
 ) -> None:
@@ -2647,6 +2753,7 @@ async def test_get_all_runs_legacy_search_matches_standalone_browser_session(sql
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("run_reader_search")
 async def test_get_all_runs_legacy_webhook_search_excludes_unmatched_standalone_tasks(sqlite_db: AgentDB) -> None:
     await _seed_run_identifier_runs(sqlite_db, with_task_runs=False)
     async with sqlite_db.Session() as session:
@@ -4596,10 +4703,28 @@ async def test_get_all_runs_v2_returns_creator_for_workflow_and_task_v2_rows(sql
                     created_by="user_prompter",
                 ),
                 TaskV2Model(observer_cruise_id="tsk_v2_1", organization_id="org_test", workflow_run_id="wr_task_v2"),
+                TaskV2Model(
+                    observer_cruise_id="tsk_v2_missing", organization_id="org_test", workflow_run_id="wr_missing"
+                ),
+                TaskV2Model(
+                    observer_cruise_id="tsk_v2_foreign", organization_id="org_other", workflow_run_id="wr_task_v2"
+                ),
                 _task_run_model(run_id="wr_member", created_at=now, workflow_permanent_id="wpid_member"),
                 _task_run_model(
                     run_id="tsk_v2_1",
                     created_at=now - timedelta(seconds=1),
+                    workflow_permanent_id=None,
+                    task_run_type=RunType.task_v2.value,
+                ),
+                _task_run_model(
+                    run_id="tsk_v2_missing",
+                    created_at=now - timedelta(seconds=2),
+                    workflow_permanent_id=None,
+                    task_run_type=RunType.task_v2.value,
+                ),
+                _task_run_model(
+                    run_id="tsk_v2_foreign",
+                    created_at=now - timedelta(seconds=3),
                     workflow_permanent_id=None,
                     task_run_type=RunType.task_v2.value,
                 ),
@@ -4612,6 +4737,8 @@ async def test_get_all_runs_v2_returns_creator_for_workflow_and_task_v2_rows(sql
     assert {row["run_id"]: row["created_by"] for row in rows} == {
         "wr_member": "user_member",
         "tsk_v2_1": "user_prompter",
+        "tsk_v2_missing": None,
+        "tsk_v2_foreign": None,
     }
 
 
@@ -5192,6 +5319,7 @@ async def test_get_workflow_runs_filters_by_explicit_created_at_bounds(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("run_reader_search")
 async def test_get_workflow_runs_never_defaults_a_window_and_combines_bounds_with_other_filters(
     org_scoped_db: tuple[AgentDB, AsyncEngine, str],
 ) -> None:
@@ -5260,3 +5388,50 @@ async def test_get_workflow_runs_complete_id_search_still_applies_explicit_creat
         )
         assert [run.workflow_run_id for run in before_window] == [run_id], search_key
         assert in_window == [], search_key
+
+
+@pytest.mark.asyncio
+async def test_latest_finished_run_for_a_version_is_its_newest_final_top_level_run_since_the_start(
+    sqlite_db: AgentDB,
+) -> None:
+    since = datetime(2026, 11, 12, 12, 0)
+    rows = [
+        ("wr_before_write", "wf_test", WorkflowRunStatus.completed, None, -1),
+        ("wr_older", "wf_test", WorkflowRunStatus.completed, None, 1),
+        ("wr_newest", "wf_test", WorkflowRunStatus.completed, None, 2),
+        ("wr_child", "wf_test", WorkflowRunStatus.completed, "wr_newest", 3),
+        ("wr_failed", "wf_test", WorkflowRunStatus.failed, None, 4),
+        ("wr_test_copy", "wf_test_copy", WorkflowRunStatus.completed, None, 5),
+        ("wr_running", "wf_test", WorkflowRunStatus.running, None, 7),
+    ]
+    async with sqlite_db.Session() as session:
+        for run_id, workflow_id, status, parent, offset in rows:
+            run = _workflow_run_model(
+                workflow_run_id=run_id,
+                queued_at=since + timedelta(minutes=offset),
+                workflow_id=workflow_id,
+                status=status.value,
+            )
+            run.parent_workflow_run_id = parent
+            session.add(run)
+        draft_test = _workflow_run_model(
+            workflow_run_id="wr_draft_test",
+            queued_at=since + timedelta(minutes=6),
+            workflow_id="wf_draft",
+            status=WorkflowRunStatus.completed.value,
+        )
+        draft_test.copilot_session_id = "wcc_test"
+        session.add(draft_test)
+        await session.commit()
+
+    run = await sqlite_db.workflow_runs.get_latest_finished_run_for_workflow_version(
+        "org_test", "wpid_test", "wf_test", since
+    )
+
+    assert run is not None and run.workflow_run_id == "wr_failed"
+    assert (
+        await sqlite_db.workflow_runs.get_latest_finished_run_for_workflow_version(
+            "org_test", "wpid_test", "wf_test", since + timedelta(minutes=5)
+        )
+        is None
+    )

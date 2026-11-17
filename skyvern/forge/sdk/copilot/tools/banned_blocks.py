@@ -11,7 +11,6 @@ import yaml
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot.author_time_block import BANNED_BLOCKS_BLOCK_ID, AuthorTimeBlock
 from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
-from skyvern.forge.sdk.copilot.code_block_security import DENIED_PAGE_MEMBERS
 from skyvern.forge.sdk.copilot.config import (
     AGENT_BLOCKS_ONLY,
     ALL_BLOCK_FAMILIES,
@@ -24,6 +23,7 @@ from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.workflow_yaml import dump_workflow_yaml
 from skyvern.forge.sdk.schemas.credentials import CredentialType, TotpType
+from skyvern.forge.sdk.workflow.code_block_security import DENIED_PAGE_MEMBERS
 from skyvern.forge.sdk.workflow.models.block import resolve_conditional_merge_edges
 from skyvern.schemas.runs import RunEngine
 from skyvern.utils.strings import join_phrases
@@ -616,7 +616,7 @@ def _collect_banned_block_items(
     banned_types: frozenset[str] | None = None,
 ) -> list[tuple[str, str]]:
     """Recursively walk ``blocks`` (mirroring
-    :func:`skyvern.forge.sdk.copilot.block_goal_wrapping._wrap_blocks_in_place`)
+    :func:`skyvern.forge.sdk.workflow.block_goal_wrapping._wrap_blocks_in_place`)
     and return ``(label, normalized_block_type)`` for every block whose type is
     in :data:`_COPILOT_BANNED_BLOCK_TYPES`. Blocks missing ``label`` are
     skipped — the downstream Pydantic validator surfaces those errors on its
@@ -816,9 +816,9 @@ def _changed_blocks_in(
 
 
 _RENAME_IGNORED_FIELDS = frozenset(
-    {"label", "next_block_label", "loop_blocks", "description", "notes", "trailing_notes"}
+    {"label", "next_block_label", "loop_blocks", "description", "doc_images", "notes", "trailing_notes"}
 )
-_NEW_CONTENT_IGNORED_FIELDS = frozenset({"label", "next_block_label", "loop_blocks", "description"})
+_NEW_CONTENT_IGNORED_FIELDS = frozenset({"label", "next_block_label", "loop_blocks", "description", "doc_images"})
 
 
 def _rename_identity(block: Mapping[str, object]) -> str:
@@ -1076,7 +1076,7 @@ def _record_authored_families(
         entries.append({"block_type": block_type, "family": family, "after_failed_test": after_failed_test})
 
 
-def _agent_step_neighbours(blocks: list[Any]) -> dict[str, dict[str, list[str]]]:
+def _agent_step_neighbours(blocks: list[Any], *, in_loop: bool = False) -> dict[str, dict[str, list[str]]]:
     """Each agent_step's label with the types of the blocks that run just before and after it, following the
     run's edges (next_block_label, the sequential default, conditional branches and merge points) within the
     list that holds it."""
@@ -1099,7 +1099,7 @@ def _agent_step_neighbours(blocks: list[Any]) -> dict[str, dict[str, list[str]]]
     for label, block in by_label.items():
         targets = (
             [
-                branch.get("next_block_label") or default_next[label]
+                branch.get("next_block_label") or (None if in_loop else default_next[label])
                 for branch in block.get("branch_conditions") or []
                 if isinstance(branch, Mapping)
             ]
@@ -1118,7 +1118,7 @@ def _agent_step_neighbours(blocks: list[Any]) -> dict[str, dict[str, list[str]]]
     for block in listed:
         loop_blocks = block.get("loop_blocks")
         if isinstance(loop_blocks, list):
-            neighbours.update(_agent_step_neighbours(loop_blocks))
+            neighbours.update(_agent_step_neighbours(loop_blocks, in_loop=True))
     return neighbours
 
 

@@ -1,4 +1,4 @@
-import { nodeLibraryTitle } from "./docStepChoices";
+import { nodeLibraryTitle } from "./docStepRegistry";
 import type { DocNestKind, NodeType } from "./docEditApi";
 
 let message = "";

@@ -6,6 +6,7 @@ import random
 import re
 import time
 from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from enum import Enum
@@ -31,7 +32,7 @@ from fastapi import (
 from fastapi import status as http_status
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from opentelemetry import trace
-from pydantic import TypeAdapter, ValidationError
+from pydantic import BaseModel, TypeAdapter, ValidationError
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from starlette.types import Receive, Scope, Send
 
@@ -91,7 +92,9 @@ from skyvern.forge.sdk.db.repositories.tags import (
     TagValueRenameResult,
 )
 from skyvern.forge.sdk.db.repositories.workflow_runs import (
+    RUN_INPUT_SEARCH_ACCESS,
     RUNS_LIST_STATEMENT_TIMEOUT_SECONDS,
+    RunInputSearchAccess,
     is_indexed_runs_list_search_key,
 )
 from skyvern.forge.sdk.db.repositories.workflows import WorkflowCreationLockTimeout, WorkflowFolderChangedError
@@ -134,6 +137,7 @@ from skyvern.forge.sdk.routes.trigger_type import (
     workflow_run_trigger_type_from_user_agent,
 )
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestionBase, AISuggestionRequest
+from skyvern.forge.sdk.schemas.files import UploadedFileSignedUrl
 from skyvern.forge.sdk.schemas.organizations import (
     GetOrganizationAPIKeysResponse,
     GetOrganizationsResponse,
@@ -204,6 +208,7 @@ from skyvern.forge.sdk.workflow.retry_policy import is_retry_pending
 from skyvern.forge.sdk.workflow.secret_encryption import mask_workflow_for_api
 from skyvern.forge.sdk.workflow.service import (
     TimelineDownloads,
+    block_image_ids,
     cap_action_payloads,
     capped_task_v1_response,
     capped_task_v2,
@@ -1438,10 +1443,27 @@ async def create_workflow_from_prompt(
     return workflow.model_dump(by_alias=True)
 
 
-async def _validate_upload(file: UploadFile) -> UploadFile:
+# Depending on the organization makes auth run before any upload bytes are inspected.
+async def _validate_upload(
+    file: UploadFile, current_org: Organization = Depends(org_auth_service.get_current_org)
+) -> UploadFile:
     return await uploaded_file_service.validate_upload(
         file,
+        purpose="upload_file",
+        organization_id=current_org.organization_id,
         max_size_bytes=app.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE,
+    )
+
+
+async def _validate_pdf_upload(
+    file: UploadFile, current_org: Organization = Depends(org_auth_service.get_current_org)
+) -> UploadFile:
+    return await uploaded_file_service.validate_upload(
+        file,
+        purpose="import_pdf",
+        organization_id=current_org.organization_id,
+        max_size_bytes=app.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE,
+        allowed=uploaded_file_service.PDF_UPLOAD_EXTENSIONS,
     )
 
 
@@ -1479,9 +1501,9 @@ async def _validate_upload(file: UploadFile) -> UploadFile:
 )
 async def import_workflow_from_pdf(
     background_tasks: BackgroundTasks,
-    file: UploadFile = Depends(_validate_upload),
-    folder_id: str | None = Query(None, description="Optional folder ID to assign the imported workflow to"),
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    file: UploadFile = Depends(_validate_pdf_upload),
+    folder_id: str | None = Query(None, description="Optional folder ID to assign the imported workflow to"),
     user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
     x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> dict[str, Any]:
@@ -5177,6 +5199,83 @@ async def _redact_workflow_run_list(runs: list[WorkflowRun], organization_id: st
         return await redact_workflow_run_artifact_rows(runs, organization_id)
 
 
+# What a caller without run read access sees in a list of WorkflowRun rows: status and metadata. Any other field,
+# including one added later, is reset to its default, so run inputs, settings and failure text stay with run readers.
+WORKFLOW_RUN_LIST_METADATA_FIELDS = frozenset(
+    {
+        "workflow_run_id",
+        "workflow_id",
+        "workflow_permanent_id",
+        "organization_id",
+        "workflow_title",
+        "browser_session_id",
+        "browser_profile_id",
+        "browser_sink_profile_id",
+        "debug_session_id",
+        "status",
+        "attempt",
+        "retry_pending",
+        "next_attempt_at",
+        "attempts",
+        "retried_from_workflow_run_id",
+        "fallback_attempt",
+        "parent_workflow_run_id",
+        "run_with",
+        "script_run",
+        "job_id",
+        "depends_on_workflow_run_id",
+        "trigger_type",
+        "workflow_schedule_id",
+        "copilot_session_id",
+        "created_by",
+        "credits_used",
+        "cached_credits_used",
+        "queued_at",
+        "started_at",
+        "finished_at",
+        "created_at",
+        "modified_at",
+    }
+)
+WORKFLOW_RUN_ATTEMPT_LIST_METADATA_FIELDS = frozenset(
+    {
+        "attempt_number",
+        "status",
+        "error_codes",
+        "started_at",
+        "finished_at",
+        "retry_decision",
+        "next_attempt_at",
+        "webhook_sent_at",
+    }
+)
+
+
+def _reset_fields_outside(model: BaseModel, kept: frozenset[str]) -> dict[str, Any]:
+    return {
+        name: field.get_default(call_default_factory=True)
+        for name, field in type(model).model_fields.items()
+        if name not in kept
+    }
+
+
+async def _project_run_list_for_role(runs: list[WorkflowRun]) -> list[WorkflowRun]:
+    if await app.AGENT_FUNCTION.role_allows(get_request_principal(), "workflow_run.read"):
+        return runs
+    return [
+        run.model_copy(
+            update={
+                **_reset_fields_outside(run, WORKFLOW_RUN_LIST_METADATA_FIELDS),
+                "attempts": [
+                    attempt.model_copy(update=_reset_fields_outside(attempt, WORKFLOW_RUN_ATTEMPT_LIST_METADATA_FIELDS))
+                    for attempt in run.attempts
+                ],
+            }
+        )
+        for run in runs
+    ]
+
+
 @legacy_base_router.get(
     "/runs",
     tags=["agent"],
@@ -5207,9 +5306,10 @@ async def get_runs(
     if page > 10:
         return []
 
-    runs = await app.DATABASE.workflow_runs.get_all_runs(
-        current_org.organization_id, page=page, page_size=page_size, status=status, search_key=search_key
-    )
+    async with _run_input_search_scope(search_key):
+        runs = await app.DATABASE.workflow_runs.get_all_runs(
+            current_org.organization_id, page=page, page_size=page_size, status=status, search_key=search_key
+        )
     await app.WORKFLOW_SERVICE._attach_latest_attempt_views([run for run in runs if isinstance(run, WorkflowRun)])
     workflow_runs = iter(
         await _redact_workflow_run_list(
@@ -5451,17 +5551,18 @@ async def get_runs_v2(
     run_tags = await _parse_and_gate_tag_filter_terms(tags, current_org)
 
     try:
-        rows = await app.DATABASE.workflow_runs.get_all_runs_v2(
-            current_org.organization_id,
-            page=page,
-            page_size=page_size,
-            status=[s.value for s in status] if status else None,
-            search_key=search_key,
-            run_type=[r.value for r in run_type] if run_type else None,
-            workflow_permanent_ids=workflow_permanent_id,
-            run_tags=run_tags or None,
-            failure_category=failure_category,
-        )
+        async with _run_input_search_scope(search_key):
+            rows = await app.DATABASE.workflow_runs.get_all_runs_v2(
+                current_org.organization_id,
+                page=page,
+                page_size=page_size,
+                status=[s.value for s in status] if status else None,
+                search_key=search_key,
+                run_type=[r.value for r in run_type] if run_type else None,
+                workflow_permanent_ids=workflow_permanent_id,
+                run_tags=run_tags or None,
+                failure_category=failure_category,
+            )
     except SQLAlchemyError as exc:
         if not is_statement_timeout(exc) or not search_key:
             raise
@@ -5950,19 +6051,20 @@ async def get_workflow_runs(
             _ORG_RUNS_SEARCH_DEFAULT_WINDOW
         )
     try:
-        workflow_runs = await app.WORKFLOW_SERVICE.get_workflow_runs(
-            organization_id=current_org.organization_id,
-            page=page,
-            page_size=page_size,
-            status=status,
-            search_key=search_key,
-            error_code=error_code,
-            created_at_start=effective_created_at_start,
-            created_at_end=created_at_end,
-        )
+        async with _run_input_search_scope(search_key):
+            workflow_runs = await app.WORKFLOW_SERVICE.get_workflow_runs(
+                organization_id=current_org.organization_id,
+                page=page,
+                page_size=page_size,
+                status=status,
+                search_key=search_key,
+                error_code=error_code,
+                created_at_start=effective_created_at_start,
+                created_at_end=created_at_end,
+            )
         workflow_runs = await _redact_workflow_run_list(workflow_runs, current_org.organization_id)
         await _redact_browser_session_addresses(workflow_runs, current_org.organization_id)
-        return workflow_runs
+        return await _project_run_list_for_role(workflow_runs)
     except RunsListSearchCanceled as exc:
         LOG.warning(
             "runs_list_statement_timeout",
@@ -6007,6 +6109,23 @@ _PUBLIC_WORKFLOW_RUNS_BY_ID_DESCRIPTION = (
 )
 
 
+@asynccontextmanager
+async def _run_input_search_scope(search_key: str | None) -> AsyncIterator[None]:
+    if not search_key:
+        yield
+        return
+    principal = get_request_principal()
+    access = RunInputSearchAccess(
+        run_inputs=await app.AGENT_FUNCTION.role_allows(principal, "workflow_run.read"),
+        agent_definition=await app.AGENT_FUNCTION.role_allows(principal, "workflow.read"),
+    )
+    token = RUN_INPUT_SEARCH_ACCESS.set(access)
+    try:
+        yield
+    finally:
+        RUN_INPUT_SEARCH_ACCESS.reset(token)
+
+
 async def _get_workflow_runs_by_id(
     *,
     workflow_id: str,
@@ -6034,22 +6153,23 @@ async def _get_workflow_runs_by_id(
         )
 
     try:
-        workflow_runs = await app.WORKFLOW_SERVICE.get_workflow_runs_for_workflow_permanent_id(
-            workflow_permanent_id=workflow_id,
-            organization_id=organization_id,
-            page=page,
-            page_size=page_size,
-            status=status,
-            search_key=search_key,
-            error_code=error_code,
-            exclude_child_runs=exclude_child_runs,
-            created_at_start=created_at_start,
-            created_at_end=created_at_end,
-            run_tags=run_tags,
-        )
+        async with _run_input_search_scope(search_key):
+            workflow_runs = await app.WORKFLOW_SERVICE.get_workflow_runs_for_workflow_permanent_id(
+                workflow_permanent_id=workflow_id,
+                organization_id=organization_id,
+                page=page,
+                page_size=page_size,
+                status=status,
+                search_key=search_key,
+                error_code=error_code,
+                exclude_child_runs=exclude_child_runs,
+                created_at_start=created_at_start,
+                created_at_end=created_at_end,
+                run_tags=run_tags,
+            )
         workflow_runs = await _redact_workflow_run_list(workflow_runs, organization_id)
         await _redact_browser_session_addresses(workflow_runs, organization_id)
-        return workflow_runs
+        return await _project_run_list_for_role(workflow_runs)
     except RunsListSearchCanceled as exc:
         # Only the search statement raises this, so a cancellation in the attempt lookup that
         # follows it stays a server error instead of being reported as a slow search.
@@ -6321,6 +6441,9 @@ async def get_workflow_and_run_from_workflow_run_id(
     x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> WorkflowRunWithWorkflowResponse:
     analytics.capture("skyvern-oss-agent-workflow-run-get")
+    # The route needs run read access; the agent definition it also returns needs agent read access.
+    if not await app.AGENT_FUNCTION.role_allows(get_request_principal(), "workflow.read"):
+        raise HTTPException(status_code=http_status.HTTP_403_FORBIDDEN, detail="Your role can't read this agent.")
     with browser_session_artifact_read(get_request_principal()):
         response = await run_service.coalesce_in_flight(
             _build_workflow_and_run_from_workflow_run_id,
@@ -7203,6 +7326,7 @@ async def get_api_keys(
 @legacy_base_router.post("/upload_file", include_in_schema=False)
 @legacy_base_router.post("/upload_file/", include_in_schema=False)
 async def upload_file(
+    current_org: Organization = Depends(org_auth_service.get_current_org),
     file: UploadFile = Depends(_validate_upload),
     retention_days: Annotated[
         int | None,
@@ -7213,7 +7337,6 @@ async def upload_file(
             ),
         ),
     ] = None,
-    current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> UploadFileResponse:
     # Validated before the upload so a rejected retention period never leaves bytes behind.
     try:
@@ -7259,6 +7382,48 @@ async def delete_file(
     if not deleted:
         raise HTTPException(status_code=404, detail=f"File {file_id} not found")
     return Response(status_code=204)
+
+
+FILE_NO_LONGER_AVAILABLE = "File is no longer available"
+
+
+@base_router.get(
+    "/files/{file_id}/signed-url",
+    tags=["Files"],
+    response_model=UploadedFileSignedUrl,
+    summary="Mint a short-lived URL for a file a workflow names",
+    description=(
+        "Mint an inline URL of at most one hour for an uploaded PNG, JPEG, GIF or WebP image of up to 4 MiB that "
+        "the named workflow version references. Any other file answers 404."
+    ),
+    responses={404: {"description": "The workflow, its reference or the file is not available"}},
+    include_in_schema=False,
+)
+@base_router.get("/files/{file_id}/signed-url/", response_model=UploadedFileSignedUrl, include_in_schema=False)
+async def get_file_signed_url(
+    file_id: str,
+    workflow_permanent_id: str = Query(..., description="The workflow whose definition names the file"),
+    version: Annotated[
+        int | None, Query(ge=1, le=MAX_INT4, description="The workflow version; the latest when omitted")
+    ] = None,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> UploadedFileSignedUrl:
+    await _enforce_folder_access("workflow.read", {"workflow_permanent_id": workflow_permanent_id})
+    try:
+        workflow = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
+            workflow_permanent_id=workflow_permanent_id,
+            organization_id=current_org.organization_id,
+            version=version,
+        )
+    except WorkflowNotFound:
+        raise HTTPException(status_code=404, detail=FILE_NO_LONGER_AVAILABLE) from None
+    if file_id not in {named for _, named in block_image_ids(workflow.workflow_definition.blocks)}:
+        raise HTTPException(status_code=404, detail=FILE_NO_LONGER_AVAILABLE)
+    # The file must belong to the workflow's organization, not only be named by it.
+    signed = await uploaded_file_service.mint_file_url(file_id=file_id, organization_id=workflow.organization_id)
+    if signed is None:
+        raise HTTPException(status_code=404, detail=FILE_NO_LONGER_AVAILABLE)
+    return signed
 
 
 @legacy_v2_router.post(

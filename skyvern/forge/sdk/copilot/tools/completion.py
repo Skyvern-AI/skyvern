@@ -52,13 +52,6 @@ from skyvern.forge.sdk.copilot.composition_evidence import model_visible_composi
 from skyvern.forge.sdk.copilot.llm_config import resolve_main_copilot_handler
 from skyvern.forge.sdk.copilot.outcome_verification_trace import record_completion_verification
 from skyvern.forge.sdk.copilot.output_utils import iter_failure_reasons
-from skyvern.forge.sdk.copilot.reached_download_target import (
-    REGISTERED_DOWNLOAD_OUTPUT_KEYS,
-    REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS,
-    derive_from_block_outputs,
-    generated_file_artifact_ids,
-    registered_download_proof_view,
-)
 from skyvern.forge.sdk.copilot.request_policy import (
     REQUESTED_OUTPUT_PATH_MINT_SOURCES,
     CompletionCriterion,
@@ -69,6 +62,13 @@ from skyvern.forge.sdk.copilot.request_policy import (
 )
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
+from skyvern.forge.sdk.workflow.reached_download_target import (
+    REGISTERED_DOWNLOAD_OUTPUT_KEYS,
+    REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS,
+    derive_from_block_outputs,
+    generated_file_artifact_ids,
+    registered_download_proof_view,
+)
 
 from ._shared import (
     _TASK_ENVELOPE_BLOCK_TYPES,
@@ -632,7 +632,7 @@ async def _maybe_run_completion_verification_from_page_observation(
         if (
             remaining is not None
             and remaining
-            <= settings.COPILOT_COMPLETION_JUDGE_TIMEOUT_SECONDS + _COMPLETION_VERIFICATION_BUDGET_MARGIN_SECONDS
+            <= settings.EMBER_COMPLETION_JUDGE_TIMEOUT_SECONDS + _COMPLETION_VERIFICATION_BUDGET_MARGIN_SECONDS
         ):
             run_result = (
                 _merge_run_verdicts(
@@ -1658,7 +1658,7 @@ async def _completion_verification_from_run_result(
             remaining = RUN_BLOCKS_SAFETY_CEILING_SECONDS - (time.monotonic() - handler_start)
             if (
                 remaining
-                <= settings.COPILOT_COMPLETION_JUDGE_TIMEOUT_SECONDS + _COMPLETION_VERIFICATION_BUDGET_MARGIN_SECONDS
+                <= settings.EMBER_COMPLETION_JUDGE_TIMEOUT_SECONDS + _COMPLETION_VERIFICATION_BUDGET_MARGIN_SECONDS
             ):
                 requested_output_result = _merge_run_verdicts_if_requested_output_exists(
                     run_criteria,
@@ -1738,12 +1738,6 @@ async def _completion_verification_from_run_result(
         contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
         requested_output_criteria_count=requested_output_criteria_count,
     )
-
-
-def _stamp_turn_budget_on_result(copilot_ctx: Any, result: dict[str, Any]) -> dict[str, Any]:
-    """Expose the remaining loop budget without interpreting the run result."""
-    result["turn_seconds_remaining"] = _copilot_seconds_remaining(copilot_ctx)
-    return result
 
 
 def _emit_completion_verification_trace(

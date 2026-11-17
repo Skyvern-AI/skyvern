@@ -108,7 +108,7 @@ Go next: [build your first agent with Copilot](/cloud/quickstart).
 
 ## Studio
 
-**Studio** is where you open and edit an agent in the app. It has four panes: **Copilot**, **Editor** (the blocks, as a flow you can edit directly), **Browser** (the live browser while a block runs) and **Run** (the timeline, inputs and outputs of a run). The top bar holds **Inputs**, **Run** and **Schedule**.
+**Studio** is where you open and edit an agent in the app. It has four panes: **Copilot**, **Editor** (the blocks, as a flow you can edit directly), **Browser** (the live browser while a block runs) and **Run** (the timeline, inputs and outputs of a run). The top bar holds **Inputs**, **Run**, **Schedule** and **Triggers**.
 
 Go next: [Build in Studio](/cloud/studio).
 
@@ -136,7 +136,7 @@ Go next: [Runs and schedules](/cloud/runs).
 
 ## Webhooks
 
-A **webhook** tells your system when a run finishes. Set a URL in the agent's **Webhook Callback URL** setting, or pass `webhook_url` when you start a run from code. Skyvern posts the run result as JSON and signs it with your API key in the `x-skyvern-signature` and `x-skyvern-timestamp` headers, so you can check it came from Skyvern.
+A **webhook** tells your system when a run finishes. Set a URL in the agent's **Webhook Callback URL** setting, or pass `webhook_url` when you start a run from code. Skyvern posts the run result as JSON with an `x-skyvern-signature` header, an HMAC-SHA256 of the body made with your API key, so you can check it came from Skyvern.
 
 Go next: [Going to production](/developers/production) shows how to verify the signature.
 

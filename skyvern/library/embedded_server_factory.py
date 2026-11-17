@@ -7,10 +7,12 @@ from uuid import uuid4
 
 import httpx
 from httpx import ASGITransport
+from pydantic import AliasChoices
 
 from skyvern.config import settings
-from skyvern.forge.api_app import create_api_app, ensure_sqlite_schema
+from skyvern.forge.api_app import create_api_app
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
+from skyvern.forge.sdk.db.sqlite_schema import ensure_sqlite_schema
 from skyvern.schemas.llm import LLMConfig, LLMRouterConfig
 
 _EMBEDDED_ACTIVE: bool = False
@@ -32,6 +34,13 @@ _BOOTSTRAP_RUNTIME_SETTINGS = frozenset({"LLM_KEY", "BROWSER_LOGS_ENABLED", "SKY
 # snapshotting them is a defensive no-op (blocked keys can't be mutated via
 # settings_overrides, but _apply_sqlite_overrides sets them directly).
 _SETTINGS_SNAPSHOT_KEYS = frozenset(_SQLITE_OVERRIDE_VALUES) | _BLOCKED_EMBEDDED_SETTINGS | _BOOTSTRAP_RUNTIME_SETTINGS
+
+
+def _renamed_setting(key: str) -> str | None:
+    for name, field in type(settings).model_fields.items():
+        if isinstance(field.validation_alias, AliasChoices) and key in field.validation_alias.choices:
+            return name
+    return None
 
 
 def _snapshot_settings() -> dict[str, dict[str, Any]]:
@@ -146,11 +155,12 @@ def create_embedded_server(
                         f"Cannot override {blocked} in embedded mode — "
                         f"these require FastAPI lifespan which is not available under ASGITransport."
                     )
-                for key, value in settings_overrides.items():
-                    if hasattr(settings, key):
-                        setattr(settings, key, value)
-                    else:
+                # A renamed setting still accepts its old name; current names apply last so they win.
+                for key, value in sorted(settings_overrides.items(), key=lambda item: hasattr(settings, item[0])):
+                    name = key if hasattr(settings, key) else _renamed_setting(key)
+                    if name is None:
                         raise ValueError(f"Invalid setting: {key}")
+                    setattr(settings, name, value)
 
             if not use_in_memory_db:
                 self._api_key = (
@@ -174,7 +184,7 @@ def create_embedded_server(
                 from skyvern.forge import app as forge_app  # noqa: PLC0415
 
                 if forge_app.DATABASE.engine.dialect.name == "sqlite":
-                    await ensure_sqlite_schema(forge_app.DATABASE)
+                    await ensure_sqlite_schema(forge_app.DATABASE.engine)
 
             self._transport = ASGITransport(app=api_app)
 
@@ -207,7 +217,7 @@ def create_embedded_server(
             forge_app.STORAGE = StorageFactory.get_storage()
 
             db = forge_app.DATABASE
-            await ensure_sqlite_schema(db)
+            await ensure_sqlite_schema(db.engine)
 
             org = await db.organizations.create_organization(organization_name="local")
             token = create_access_token(org.organization_id, expires_delta=timedelta(days=365 * 10))

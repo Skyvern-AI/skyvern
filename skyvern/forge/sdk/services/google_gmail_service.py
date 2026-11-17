@@ -19,6 +19,8 @@ _OTP_QUERY_TERMS = (
     '(verification OR verify OR code OR passcode OR otp OR 2fa OR one-time OR password OR "sign in" OR "sign-in" '
     'OR signin OR "log in" OR "log-in" OR login OR "magic link" OR "access link")'
 )
+# Plus addresses usually serve one site, so broader terms are less likely to match unrelated mail.
+_PLUS_ADDRESS_OTP_QUERY_TERMS = _OTP_QUERY_TERMS[:-1] + " OR activate OR activation OR confirm OR confirmation)"
 _SAFE_EMAIL_QUERY_IDENTIFIER = SAFE_EMAIL_ADDRESS_PATTERN
 _MAX_EXTERNALIZED_TEXT_PART_FETCHES = 4
 _MAX_EXTERNALIZED_TEXT_PART_BYTES = 256 * 1024
@@ -92,7 +94,8 @@ def _build_query(totp_identifier: str, *, created_after: datetime | None = None)
     if not _SAFE_EMAIL_QUERY_IDENTIFIER.fullmatch(identifier):
         return None
     quoted = '"' + identifier.replace("\\", "\\\\").replace('"', '\\"') + '"'
-    return f"{_newer_than_query(created_after)} {_OTP_QUERY_TERMS} (to:{quoted} OR deliveredto:{quoted})"
+    terms = _PLUS_ADDRESS_OTP_QUERY_TERMS if "+" in identifier.split("@", 1)[0] else _OTP_QUERY_TERMS
+    return f"{_newer_than_query(created_after)} {terms} (to:{quoted} OR deliveredto:{quoted})"
 
 
 def _internal_date(message: dict[str, Any]) -> datetime | None:

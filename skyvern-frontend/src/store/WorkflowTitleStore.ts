@@ -23,8 +23,8 @@ const isDefaultTitle = (title: string) =>
 type MetadataEditOptions = { fromYamlCommit?: boolean; source?: "workflow" };
 
 type WorkflowTitleStore = {
-  copilotMetadataWorkflowId: string | null;
-  copilotMetadataEdits: Record<
+  emberMetadataWorkflowId: string | null;
+  emberMetadataEdits: Record<
     string,
     // Undefined covers edits made before history identifies the pending proposal.
     {
@@ -33,13 +33,13 @@ type WorkflowTitleStore = {
       graphEdited?: true;
     }
   >;
-  trackCopilotMetadata: (
+  trackEmberMetadata: (
     workflowPermanentId: string,
     proposal: string | null | undefined,
   ) => void;
-  startCopilotMetadata: (workflowPermanentId: string) => void;
-  clearCopilotMetadata: (workflowPermanentId: string) => void;
-  recordCopilotGraphEdit: () => void;
+  startEmberMetadata: (workflowPermanentId: string) => void;
+  clearEmberMetadata: (workflowPermanentId: string) => void;
+  recordEmberGraphEdit: () => void;
   title: string;
   titleWorkflowPermanentId: string | null;
   description: string | null;
@@ -63,7 +63,7 @@ type WorkflowTitleStore = {
   isNewTitle: () => boolean;
   setTitle: (title: string, options?: MetadataEditOptions) => void;
   setTitleFromGeneration: (title: string) => void;
-  setTitleFromCopilotIfDefault: (title: string) => void;
+  setTitleFromEmberIfDefault: (title: string) => void;
   syncTitleFromWorkflow: (title: string, options?: MetadataEditOptions) => void;
   initializeTitle: (title: string, workflowPermanentId?: string) => void;
   resetTitleSession: (workflowPermanentId: string) => void;
@@ -82,63 +82,63 @@ const useWorkflowTitleStore = create<WorkflowTitleStore>((set, get) => {
     const state = get();
     const workflowId =
       useWorkflowYamlEditorStore.getState().editorOwner?.workflowPermanentId ??
-      state.copilotMetadataWorkflowId;
-    if (!workflowId || !state.copilotMetadataEdits[workflowId]) return;
+      state.emberMetadataWorkflowId;
+    if (!workflowId || !state.emberMetadataEdits[workflowId]) return;
     set({
-      copilotMetadataEdits: {
-        ...state.copilotMetadataEdits,
+      emberMetadataEdits: {
+        ...state.emberMetadataEdits,
         [workflowId]: {
-          ...state.copilotMetadataEdits[workflowId],
-          edits: { ...state.copilotMetadataEdits[workflowId].edits, ...patch },
+          ...state.emberMetadataEdits[workflowId],
+          edits: { ...state.emberMetadataEdits[workflowId].edits, ...patch },
         },
       },
     });
   };
   return {
-    copilotMetadataWorkflowId: null,
-    copilotMetadataEdits: {},
-    startCopilotMetadata: (workflowPermanentId) =>
+    emberMetadataWorkflowId: null,
+    emberMetadataEdits: {},
+    startEmberMetadata: (workflowPermanentId) =>
       set((state) => ({
-        copilotMetadataWorkflowId: workflowPermanentId,
-        copilotMetadataEdits: {
-          ...state.copilotMetadataEdits,
-          [workflowPermanentId]: state.copilotMetadataEdits[
+        emberMetadataWorkflowId: workflowPermanentId,
+        emberMetadataEdits: {
+          ...state.emberMetadataEdits,
+          [workflowPermanentId]: state.emberMetadataEdits[
             workflowPermanentId
           ] ?? { proposal: undefined, edits: {} },
         },
       })),
-    recordCopilotGraphEdit: () => {
+    recordEmberGraphEdit: () => {
       const state = get();
       const workflowId =
         useWorkflowYamlEditorStore.getState().editorOwner?.workflowPermanentId;
-      const previous = workflowId && state.copilotMetadataEdits[workflowId];
+      const previous = workflowId && state.emberMetadataEdits[workflowId];
       if (!workflowId || !previous || previous.graphEdited) return;
       set({
-        copilotMetadataEdits: {
-          ...state.copilotMetadataEdits,
+        emberMetadataEdits: {
+          ...state.emberMetadataEdits,
           [workflowId]: { ...previous, graphEdited: true },
         },
       });
     },
-    clearCopilotMetadata: (workflowPermanentId) =>
+    clearEmberMetadata: (workflowPermanentId) =>
       set((state) => ({
-        copilotMetadataEdits: Object.fromEntries(
-          Object.entries(state.copilotMetadataEdits).filter(
+        emberMetadataEdits: Object.fromEntries(
+          Object.entries(state.emberMetadataEdits).filter(
             ([id]) => id !== workflowPermanentId,
           ),
         ),
-        copilotMetadataWorkflowId:
-          state.copilotMetadataWorkflowId === workflowPermanentId
+        emberMetadataWorkflowId:
+          state.emberMetadataWorkflowId === workflowPermanentId
             ? null
-            : state.copilotMetadataWorkflowId,
+            : state.emberMetadataWorkflowId,
       })),
-    trackCopilotMetadata: (workflowPermanentId, proposal) =>
+    trackEmberMetadata: (workflowPermanentId, proposal) =>
       set((state) => {
-        const previous = state.copilotMetadataEdits[workflowPermanentId];
+        const previous = state.emberMetadataEdits[workflowPermanentId];
         return {
-          copilotMetadataWorkflowId: workflowPermanentId,
-          copilotMetadataEdits: {
-            ...state.copilotMetadataEdits,
+          emberMetadataWorkflowId: workflowPermanentId,
+          emberMetadataEdits: {
+            ...state.emberMetadataEdits,
             [workflowPermanentId]: {
               proposal,
               ...(previous?.graphEdited &&
@@ -251,10 +251,10 @@ const useWorkflowTitleStore = create<WorkflowTitleStore>((set, get) => {
         set({ titleWorkflowPermanentId: null });
       }
     },
-    // A Copilot push must not overwrite a name the user chose, and a push that still
+    // An Ember push must not overwrite a name the user chose, and a push that still
     // carries a placeholder must not count as "generated" — that flag permanently
     // disarms the auto-titler.
-    setTitleFromCopilotIfDefault: (title: string) => {
+    setTitleFromEmberIfDefault: (title: string) => {
       if (refuseMutationDuringYamlCommit()) return;
       if (!isDefaultTitle(get().title)) {
         return;

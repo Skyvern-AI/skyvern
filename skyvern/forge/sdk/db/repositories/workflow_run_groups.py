@@ -31,6 +31,7 @@ from skyvern.forge.sdk.services.request_principal import (
 )
 from skyvern.forge.sdk.workflow.models.workflow import COPILOT_TEST_WORKFLOW_CREATOR
 from skyvern.schemas.workflow_run_groups import (
+    DEFAULT_MAX_CONCURRENCY,
     IN_FLIGHT_ITEM_STATES,
     SCRUBBED_SUBMISSION_KEY_PREFIX,
     WorkflowRunGroup,
@@ -121,6 +122,7 @@ class WorkflowRunGroupsRepository(BaseRepository):
         items: Sequence[tuple[str, dict[str, Any]]],
         expected_workflow_modified_at: datetime | None = None,
         expected_latest_groups: tuple[str, Mapping[str, str]] | None = None,
+        max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
     ) -> WorkflowRunGroup:
         async with self.Session() as session:
             if expected_latest_groups is not None:
@@ -163,6 +165,7 @@ class WorkflowRunGroupsRepository(BaseRepository):
                 workflow_id=workflow_id,
                 submission_key=submission_key,
                 input_fingerprint=input_fingerprint,
+                max_concurrency=max_concurrency,
                 status=WorkflowRunGroupStatus.active.value,
                 created_by=trigger_owner_id(principal, organization_id),
                 requested_by=(
@@ -313,6 +316,11 @@ class WorkflowRunGroupsRepository(BaseRepository):
             if await self._lock_group(session, workflow_run_group_id) != WorkflowRunGroupStatus.active:
                 await session.commit()
                 return None
+            max_concurrency = await session.scalar(
+                select(WorkflowRunGroupModel.max_concurrency).where(
+                    WorkflowRunGroupModel.workflow_run_group_id == workflow_run_group_id
+                )
+            )
             in_flight = await session.scalar(
                 select(func.count())
                 .select_from(WorkflowRunGroupItemModel)
@@ -320,7 +328,7 @@ class WorkflowRunGroupsRepository(BaseRepository):
                 .where(WorkflowRunGroupItemModel.state.in_([state.value for state in IN_FLIGHT_ITEM_STATES]))
             )
             next_position = None
-            if not in_flight:
+            if (in_flight or 0) < (max_concurrency or DEFAULT_MAX_CONCURRENCY):
                 next_position = await session.scalar(
                     select(func.min(WorkflowRunGroupItemModel.position))
                     .where(WorkflowRunGroupItemModel.workflow_run_group_id == workflow_run_group_id)
@@ -431,6 +439,31 @@ class WorkflowRunGroupsRepository(BaseRepository):
             await session.commit()
             return updated is not None
 
+    @db_operation("finish_workflow_run_group_items_done")
+    async def finish_in_flight_items_done(self, workflow_run_group_id: str, positions: Sequence[int]) -> None:
+        in_flight_states = [state.value for state in IN_FLIGHT_ITEM_STATES]
+        async with self.Session() as session:
+            # Reconciles fired by the same burst of terminals skip the group lock once another one has finished these.
+            still_in_flight = (
+                await session.scalars(
+                    select(WorkflowRunGroupItemModel.position)
+                    .where(WorkflowRunGroupItemModel.workflow_run_group_id == workflow_run_group_id)
+                    .where(WorkflowRunGroupItemModel.position.in_(positions))
+                    .where(WorkflowRunGroupItemModel.state.in_(in_flight_states))
+                )
+            ).all()
+            if not still_in_flight:
+                return
+            await self._lock_group(session, workflow_run_group_id)
+            await session.execute(
+                update(WorkflowRunGroupItemModel)
+                .where(WorkflowRunGroupItemModel.workflow_run_group_id == workflow_run_group_id)
+                .where(WorkflowRunGroupItemModel.position.in_(still_in_flight))
+                .where(WorkflowRunGroupItemModel.state.in_(in_flight_states))
+                .values(state=WorkflowRunGroupItemState.done.value, parameters={})
+            )
+            await session.commit()
+
     @db_operation("request_workflow_run_group_cancel")
     async def request_cancel(self, workflow_run_group_id: str, organization_id: str) -> WorkflowRunGroup | None:
         async with self.Session() as session:
@@ -489,11 +522,13 @@ class WorkflowRunGroupsRepository(BaseRepository):
             return True
 
     @db_operation("count_workflow_run_steps")
-    async def count_steps(self, workflow_run_id: str) -> int:
+    async def count_steps(self, workflow_run_ids: Sequence[str]) -> dict[str, int]:
         async with self.Session() as session:
-            count = await session.scalar(
-                select(func.count(StepModel.step_id))
-                .join(TaskModel, TaskModel.task_id == StepModel.task_id)
-                .where(TaskModel.workflow_run_id == workflow_run_id)
+            rows = await session.execute(
+                select(TaskModel.workflow_run_id, func.count(StepModel.step_id))
+                .join(StepModel, StepModel.task_id == TaskModel.task_id)
+                .where(TaskModel.workflow_run_id.in_(workflow_run_ids))
+                .group_by(TaskModel.workflow_run_id)
             )
-            return int(count or 0)
+            counts = {workflow_run_id: int(count) for workflow_run_id, count in rows.all()}
+            return {workflow_run_id: counts.get(workflow_run_id, 0) for workflow_run_id in workflow_run_ids}

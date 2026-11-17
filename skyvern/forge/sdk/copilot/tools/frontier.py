@@ -24,9 +24,7 @@ from pydantic import JsonValue
 from skyvern.constants import SCRUBBED_VALUE
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.agent_context import FrontierStartProvenance
-from skyvern.forge.sdk.copilot.block_goal_wrapping import wrap_workflow_block_goals
 from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome
-from skyvern.forge.sdk.copilot.code_block_steps import bind_referenced_parameters_in_yaml
 from skyvern.forge.sdk.copilot.code_block_synthesis import code_contains_credential_fill
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.failure_tracking import (
@@ -63,7 +61,9 @@ from skyvern.forge.sdk.copilot.runtime import AgentContext, resolve_browser_stat
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.workflow_block_traversal import workflow_block_locations
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml, copilot_round_trip_definition
+from skyvern.forge.sdk.workflow.block_goal_wrapping import wrap_workflow_block_goals
 from skyvern.forge.sdk.workflow.block_notes import definition_step_notes
+from skyvern.forge.sdk.workflow.code_block_steps import bind_referenced_parameters_in_yaml
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar, ForLoopBlock, get_all_blocks
 from skyvern.forge.sdk.workflow.models.parameter import (
     RESERVED_PARAMETER_KEYS,

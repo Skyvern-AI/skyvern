@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import hmac
+import json
 import secrets
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -52,7 +53,7 @@ from skyvern.forge.sdk.schemas.google_oauth import (
     GoogleOAuthClientConfigSafe,
     GoogleOAuthCredentialBase,
 )
-from skyvern.forge.sdk.services import oauth_consent
+from skyvern.forge.sdk.services import oauth_consent, oauth_redirect_uri
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.utils.email_validation import normalize_email_address
 
@@ -100,6 +101,9 @@ _GOOGLE_SCOPE_ALIASES = {
 }
 
 CONSENT_TTL_SECONDS = 600
+ORGANIZATION_CLIENT_CONFIG_RESAVE_MESSAGE = (
+    "Google OAuth client configuration must be re-saved with exact redirect URIs"
+)
 GOOGLE_ACCESS_TOKEN_CACHE_LOCK_TIMEOUT_SECONDS = 120
 GOOGLE_ACCESS_TOKEN_CACHE_LOCK_BLOCKING_TIMEOUT_SECONDS = 125
 
@@ -158,7 +162,7 @@ class CredentialNotReauthorizableError(ValueError):
 
 
 class InvalidRedirectURIError(ValueError):
-    """Raised when the supplied OAuth redirect_uri host is not on the allowlist."""
+    """Raised when the supplied OAuth redirect_uri is not one of the registered redirect URIs."""
 
 
 class InvalidAppOriginError(ValueError):
@@ -271,11 +275,14 @@ class GoogleRefreshResult:
 class GoogleOAuthClientConfigResolution:
     config: GoogleOAuthClientConfig | None
     source: str
+    # A stored org config from before exact redirect URIs (it carries ``redirect_hosts`` or no
+    # ``redirect_uris``) still refreshes tokens, but cannot start a consent until it is re-saved.
+    requires_resave: bool = False
 
     def safe(self) -> GoogleOAuthClientConfigSafe:
         return GoogleOAuthClientConfigSafe(
             client_id=self.config.client_id if self.config else None,
-            redirect_hosts=list(self.config.redirect_hosts) if self.config else [],
+            redirect_uris=list(self.config.redirect_uris) if self.config else [],
             app_origins=list(self.config.app_origins) if self.config else [],
             client_secret_configured=bool(self.config and self.config.client_secret),
             configured=self.config is not None,
@@ -299,7 +306,7 @@ def _settings_client_config() -> GoogleOAuthClientConfig | None:
     return GoogleOAuthClientConfig(
         client_id=settings.GOOGLE_OAUTH_CLIENT_ID,
         client_secret=settings.GOOGLE_OAUTH_CLIENT_SECRET,
-        redirect_hosts=list(settings.GOOGLE_OAUTH_REDIRECT_HOSTS),
+        redirect_uris=list(settings.GOOGLE_OAUTH_REDIRECT_URIS),
         app_origins=list(settings.GOOGLE_OAUTH_APP_ORIGINS),
     )
 
@@ -345,9 +352,12 @@ async def resolve_client_config(
                     "Stored organization Google OAuth client config is invalid"
                 )
             try:
+                raw_config = json.loads(token.token)
+                org_config = GoogleOAuthClientConfig.model_validate(raw_config)
                 return GoogleOAuthClientConfigResolution(
-                    config=GoogleOAuthClientConfig.model_validate_json(token.token),
+                    config=org_config,
                     source="organization",
+                    requires_resave="redirect_hosts" in raw_config or not org_config.redirect_uris,
                 )
             except Exception:
                 LOG.warning(
@@ -456,40 +466,23 @@ def has_required_scopes(
     return all(scope in granted for scope in required_scopes)
 
 
-_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
-
-
 def _validate_redirect_uri(redirect_uri: str, client_config: GoogleOAuthClientConfig | None = None) -> None:
-    """Validate redirect_uri against the allowlist; defense-in-depth alongside Google's check.
-
-    Beyond the host allowlist, we enforce scheme=https for non-loopback hosts so
-    an attacker who controls ``http://allowed-host.com`` can't satisfy a
-    hostname-only allowlist intended for ``https://allowed-host.com``.
-    """
-    allowlist = client_config.redirect_hosts if client_config else settings.GOOGLE_OAUTH_REDIRECT_HOSTS
-    if not allowlist:
-        # Empty allowlist + no client_id = OAuth not configured at all → silent
+    """Require an exact match against the registered redirect URIs; defense-in-depth alongside Google's check."""
+    registered = client_config.redirect_uris if client_config else settings.GOOGLE_OAUTH_REDIRECT_URIS
+    if not registered:
+        # No registered URIs + no client_id = OAuth not configured at all → silent
         # pass-through (the consent flow itself will fail later in
-        # ``_require_client_credentials``). Empty allowlist + client_id = misconfig
+        # ``_require_client_credentials``). No registered URIs + client_id = misconfig
         # we must catch up-front so we don't leak a redirect_uri to Google unchecked.
         configured_client_id = client_config.client_id if client_config else settings.GOOGLE_OAUTH_CLIENT_ID
         if configured_client_id:
             raise InvalidRedirectURIError(
-                "GOOGLE_OAUTH_REDIRECT_HOSTS must be configured when GOOGLE_OAUTH_CLIENT_ID is set"
+                "GOOGLE_OAUTH_REDIRECT_URIS must be configured when GOOGLE_OAUTH_CLIENT_ID is set"
             )
         return
-    try:
-        parsed = urlparse(redirect_uri)
-        scheme = parsed.scheme
-        # ``parsed.hostname`` is already lowercased; lowercase the allowlist too so an
-        # operator who configures ``MyApp.Example.Com`` doesn't reject every redirect.
-        host = parsed.hostname or ""
-    except Exception as exc:
-        raise InvalidRedirectURIError(f"Invalid redirect_uri: {exc}")
-    if host not in {h.strip().lower() for h in allowlist if h and h.strip()}:
-        raise InvalidRedirectURIError(f"redirect_uri host not allowed: {host}")
-    if scheme != "https" and host not in _LOOPBACK_HOSTS:
-        raise InvalidRedirectURIError(f"redirect_uri must use https for non-loopback host: {host}")
+    rejection = oauth_redirect_uri.redirect_uri_rejection(redirect_uri, registered)
+    if rejection:
+        raise InvalidRedirectURIError(rejection)
 
 
 def _validate_app_origin(app_origin: str, client_config: GoogleOAuthClientConfig | None = None) -> None:
@@ -554,7 +547,7 @@ def build_authorize_url(
 ) -> tuple[str, str]:
     """Assemble the Google OAuth 2.0 consent URL the browser should navigate to.
 
-    Self-validates ``redirect_uri`` against the host allowlist (defense-in-depth)
+    Self-validates ``redirect_uri`` against the exact registered redirect URIs (defense-in-depth)
     so direct callers cannot bypass the check. ``start_authorization`` also
     validates up-front to avoid leaking a pending DB row on rejection.
 
@@ -623,6 +616,9 @@ async def start_authorization(
     resolved_config = await resolve_client_config(organization_id)
     if resolved_config.config is None:
         raise ValueError("Google OAuth client credentials are not configured")
+    if resolved_config.requires_resave:
+        LOG.warning("Organization Google OAuth client config needs re-saving", organization_id=organization_id)
+        raise InvalidRedirectURIError(ORGANIZATION_CLIENT_CONFIG_RESAVE_MESSAGE)
     _validate_redirect_uri(redirect_uri, resolved_config.config)
     if app_origin is not None:
         _validate_app_origin(app_origin, resolved_config.config)

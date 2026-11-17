@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
@@ -13,6 +14,7 @@ from pydantic import ValidationError
 from sqlalchemy.sql.elements import BindParameter
 
 from skyvern.exceptions import DownloadFileMaxSizeExceeded
+from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.encrypt.base import DEFAULT_ENCRYPT_METHOD, EncryptMethod
@@ -154,6 +156,9 @@ def test_google_drive_upload_omits_parents_without_folder_id(builder_name: str, 
     [
         ("file_123", "file_123"),
         ("https://drive.google.com/file/d/file_123/view?usp=sharing", "file_123"),
+        ("https://docs.google.com/document/d/doc_123", "doc_123"),
+        ("https://docs.google.com/document/d/doc_123/edit?tab=t.0#heading=h.1", "doc_123"),
+        ("https://docs.google.com/document/u/1/d/doc_123/edit", "doc_123"),
     ],
 )
 def test_google_drive_extract_file_id(value: str, expected: str) -> None:
@@ -167,6 +172,20 @@ def test_google_drive_extract_file_reference_preserves_resource_key() -> None:
 
     assert reference.file_id == "file_123"
     assert reference.resource_key == "resource_key_123"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://docs.google.com/spreadsheets/d/sheet_123/edit",
+        "https://docs.google.com/document/d/e/2PACX-public_123/pub",
+        "https://docs.google.com/file/d/file_123/view",
+        "https://drive.google.com/document/d/doc_123/edit",
+    ],
+)
+def test_google_drive_extract_file_id_rejects_non_drive_docs_links(value: str) -> None:
+    with pytest.raises(ValueError):
+        google_drive_service.extract_file_id(value)
 
 
 def test_google_drive_extract_file_id_rejects_non_drive_host() -> None:
@@ -450,7 +469,82 @@ async def test_google_drive_download_uses_unique_name_for_sanitized_collision(
 
 
 @pytest.mark.asyncio
-async def test_google_drive_download_reports_native_document_as_not_downloadable(
+async def test_google_drive_download_exports_google_doc_as_markdown(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.endswith("/export"):
+            return httpx.Response(200, content=b"# Plan\n")
+        return httpx.Response(
+            200,
+            json={"id": "doc_123", "name": "Plan", "mimeType": "application/vnd.google-apps.document"},
+        )
+
+    _install_google_drive_transport(monkeypatch, handler)
+    output_dir = tmp_path / "downloads"
+
+    downloaded_path = await google_drive_service.download_file(
+        access_token="at-1",
+        file_id="doc_123",
+        output_dir=str(output_dir),
+        max_size_mb=1,
+    )
+
+    assert Path(downloaded_path) == output_dir / "Plan.md"
+    assert Path(downloaded_path).read_bytes() == b"# Plan\n"
+    assert requests[-1].url.path == "/drive/v3/files/doc_123/export"
+    assert requests[-1].url.params["mimeType"] == "text/markdown"
+    assert requests[-1].headers["Authorization"] == "Bearer at-1"
+
+
+@pytest.mark.asyncio
+async def test_google_drive_download_surfaces_doc_export_size_limit_without_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    export_attempts = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal export_attempts
+        if request.url.path.endswith("/export"):
+            export_attempts += 1
+            return httpx.Response(
+                403,
+                json={
+                    "error": {
+                        "code": 403,
+                        "message": "This file is too large to be exported.",
+                        "errors": [{"reason": "exportSizeLimitExceeded"}],
+                    }
+                },
+            )
+        return httpx.Response(
+            200,
+            json={"id": "doc_123", "name": "Big", "mimeType": "application/vnd.google-apps.document"},
+        )
+
+    _install_google_drive_transport(monkeypatch, handler)
+
+    with pytest.raises(google_drive_service.GoogleDriveAPIError) as exc_info:
+        await google_drive_service.download_file(
+            access_token="at-1",
+            file_id="doc_123",
+            output_dir=str(tmp_path / "downloads"),
+            max_size_mb=1,
+        )
+
+    assert exc_info.value.code == "exportSizeLimitExceeded"
+    assert "too large to be exported" in str(exc_info.value)
+    assert export_attempts == 1
+    assert not any((tmp_path / "downloads").iterdir())
+
+
+@pytest.mark.asyncio
+async def test_google_drive_download_reports_other_native_files_as_not_downloadable(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -462,8 +556,8 @@ async def test_google_drive_download_reports_native_document_as_not_downloadable
             200,
             json={
                 "id": "native_123",
-                "name": "Native document",
-                "mimeType": "application/vnd.google-apps.document",
+                "name": "Native sheet",
+                "mimeType": "application/vnd.google-apps.spreadsheet",
             },
         )
 
@@ -1798,7 +1892,7 @@ async def test_resolve_client_config_prefers_org_token(monkeypatch: pytest.Monke
     config = google_oauth_service.GoogleOAuthClientConfig(
         client_id="org-client",
         client_secret="org-secret",
-        redirect_hosts=["oss.example.com"],
+        redirect_uris=["https://oss.example.com/integrations/google/callback"],
         app_origins=["https://oss.example.com"],
     )
     organizations = SimpleNamespace(
@@ -2269,7 +2363,7 @@ async def test_update_client_config_does_not_reuse_environment_secret(
     env_config = google_oauth_service.GoogleOAuthClientConfig(
         client_id="env-client",
         client_secret="env-secret",
-        redirect_hosts=["env.example.com"],
+        redirect_uris=["https://env.example.com/integrations/google/callback"],
     )
     save_mock = AsyncMock()
     monkeypatch.setattr(
@@ -2288,7 +2382,7 @@ async def test_update_client_config_does_not_reuse_environment_secret(
         await google_oauth_routes.update_google_oauth_client_config(
             UpdateGoogleOAuthClientConfigRequest(
                 client_id="org-client",
-                redirect_hosts=["org.example.com"],
+                redirect_uris=["https://org.example.com/integrations/google/callback"],
             ),
             current_org=SimpleNamespace(organization_id="org_1"),
         )
@@ -2310,7 +2404,7 @@ async def test_update_client_config_does_not_reuse_organization_secret_when_clie
     org_config = google_oauth_service.GoogleOAuthClientConfig(
         client_id="old-client",
         client_secret="old-secret",
-        redirect_hosts=["org.example.com"],
+        redirect_uris=["https://org.example.com/integrations/google/callback"],
     )
     save_mock = AsyncMock()
     monkeypatch.setattr(
@@ -2329,13 +2423,47 @@ async def test_update_client_config_does_not_reuse_organization_secret_when_clie
         await google_oauth_routes.update_google_oauth_client_config(
             UpdateGoogleOAuthClientConfigRequest(
                 client_id="new-client",
-                redirect_hosts=["org.example.com"],
+                redirect_uris=["https://org.example.com/integrations/google/callback"],
             ),
             current_org=SimpleNamespace(organization_id="org_1"),
         )
 
     assert exc_info.value.status_code == 400
     assert exc_info.value.detail == "Google OAuth client secret is required"
+    save_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload", "status_code", "detail"),
+    [
+        ({"redirect_hosts": ["org.example.com"]}, 400, "Host-only redirect entries are no longer accepted"),
+        ({"redirect_uris": []}, 400, "Host-only redirect entries are no longer accepted"),
+        ({"redirect_uris": ["http://org.example.com/integrations/google/callback"]}, 422, "https"),
+        ({"redirect_uris": ["https://org.example.com/integrations/google/callback?next=x"]}, 422, "query"),
+    ],
+)
+async def test_update_client_config_rejects_redirect_entries_that_are_not_exact_uris(
+    monkeypatch: pytest.MonkeyPatch, payload: dict[str, list[str]], status_code: int, detail: str
+) -> None:
+    monkeypatch.setattr(
+        google_oauth_routes.SettingsManager,
+        "get_settings",
+        lambda: SimpleNamespace(ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG=True),
+    )
+    save_mock = AsyncMock()
+    monkeypatch.setattr(google_oauth_routes.google_oauth_service, "save_client_config", save_mock)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await google_oauth_routes.update_google_oauth_client_config(
+            UpdateGoogleOAuthClientConfigRequest.model_validate(
+                {"client_id": "org-client", "client_secret": "org-secret", **payload}
+            ),
+            current_org=SimpleNamespace(organization_id="org_1"),
+        )
+
+    assert exc_info.value.status_code == status_code
+    assert detail in exc_info.value.detail
     save_mock.assert_not_awaited()
 
 
@@ -2359,7 +2487,7 @@ async def test_update_client_config_allows_repair_when_stored_config_is_unavaila
     saved_config = google_oauth_service.GoogleOAuthClientConfig(
         client_id="replacement-client",
         client_secret="replacement-secret",
-        redirect_hosts=["org.example.com"],
+        redirect_uris=["https://org.example.com/integrations/google/callback"],
     )
     save_mock = AsyncMock(
         return_value=google_oauth_service.GoogleOAuthClientConfigResolution(
@@ -2373,7 +2501,7 @@ async def test_update_client_config_allows_repair_when_stored_config_is_unavaila
         UpdateGoogleOAuthClientConfigRequest(
             client_id="replacement-client",
             client_secret="replacement-secret",
-            redirect_hosts=["org.example.com"],
+            redirect_uris=["https://org.example.com/integrations/google/callback"],
         ),
         current_org=SimpleNamespace(organization_id="org_1"),
     )
@@ -2406,7 +2534,7 @@ async def test_update_client_config_requires_secret_when_stored_config_is_unavai
         await google_oauth_routes.update_google_oauth_client_config(
             UpdateGoogleOAuthClientConfigRequest(
                 client_id="replacement-client",
-                redirect_hosts=["org.example.com"],
+                redirect_uris=["https://org.example.com/integrations/google/callback"],
             ),
             current_org=SimpleNamespace(organization_id="org_1"),
         )
@@ -2479,6 +2607,66 @@ async def test_authorize_route_forwards_credential_id_for_reconnect(monkeypatch:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("changes", "refused"),
+    [
+        ({}, True),
+        ({"scope_profile": "gmail_read_send"}, True),
+        ({"credential_id": "goac_existing"}, False),
+        ({"scope_profile": "google_sheets"}, False),
+        ({"connected_gmail": False}, False),
+        ({"native_gmail_scopes": ["https://www.googleapis.com/auth/gmail.readonly"]}, False),
+        ({"user_id": None}, False),
+        ({"native_list_fails": True}, False),
+    ],
+)
+async def test_authorize_route_sends_a_new_gmail_connection_to_connected_gmail(
+    monkeypatch: pytest.MonkeyPatch, changes: dict[str, Any], refused: bool
+) -> None:
+    case = {
+        "scope_profile": "gmail",
+        "credential_id": None,
+        "connected_gmail": True,
+        "native_gmail_scopes": None,
+        "user_id": "user_1",
+        "native_list_fails": False,
+        **changes,
+    }
+    start_mock = AsyncMock(
+        return_value=google_oauth_service.GoogleAuthorizationStart(authorize_url="https://auth", state="st")
+    )
+    monkeypatch.setattr(google_oauth_routes.google_oauth_service, "start_authorization", start_mock)
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION, "nango_gmail_catalog_available", AsyncMock(return_value=case["connected_gmail"])
+    )
+    sheets = SimpleNamespace(scopes_requested=list(google_oauth_service.GOOGLE_SHEETS_SCOPES), scopes_granted=[])
+    visible = [sheets]
+    if case["native_gmail_scopes"]:
+        visible.append(SimpleNamespace(scopes_requested=[], scopes_granted=case["native_gmail_scopes"]))
+    monkeypatch.setattr(
+        google_oauth_routes.google_oauth_service,
+        "get_visible_credentials_for_org",
+        AsyncMock(side_effect=RuntimeError("db down"))
+        if case["native_list_fails"]
+        else AsyncMock(return_value=visible),
+    )
+
+    request = CreateGoogleOAuthAuthorizeRequest(
+        redirect_uri="https://x/cb", scope_profile=case["scope_profile"], credential_id=case["credential_id"]
+    )
+    call_route = google_oauth_routes.google_oauth_authorize(
+        request=request, current_org=SimpleNamespace(organization_id="org_1"), current_user_id=case["user_id"]
+    )
+    if refused:
+        with pytest.raises(HTTPException) as exc_info:
+            await call_route
+        assert exc_info.value.status_code == 409
+        start_mock.assert_not_awaited()
+    else:
+        assert (await call_route).authorize_url == "https://auth"
+
+
+@pytest.mark.asyncio
 async def test_authorize_route_returns_404_when_credential_not_reauthorizable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2501,7 +2689,12 @@ async def test_authorize_route_returns_404_when_credential_not_reauthorizable(
 def test_build_authorize_url_includes_required_params(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_ID", "cid", raising=False)
     monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_SECRET", "csecret", raising=False)
-    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_REDIRECT_HOSTS", ["app"], raising=False)
+    monkeypatch.setattr(
+        google_oauth_service.settings,
+        "GOOGLE_OAUTH_REDIRECT_URIS",
+        ["https://app/settings/google/callback"],
+        raising=False,
+    )
 
     url, code_verifier = google_oauth_service.build_authorize_url(
         redirect_uri="https://app/settings/google/callback",
@@ -2532,7 +2725,12 @@ def test_build_authorize_url_uses_exact_scope_profile(
 ) -> None:
     monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_ID", "cid", raising=False)
     monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_SECRET", "csecret", raising=False)
-    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_REDIRECT_HOSTS", ["app"], raising=False)
+    monkeypatch.setattr(
+        google_oauth_service.settings,
+        "GOOGLE_OAUTH_REDIRECT_URIS",
+        ["https://app/settings/google/callback"],
+        raising=False,
+    )
     scopes = google_oauth_service.scopes_for_profile(profile)
 
     url, _ = google_oauth_service.build_authorize_url(
@@ -2550,7 +2748,7 @@ def test_build_authorize_url_passes_autogenerate_code_verifier_explicitly(monkey
     """Explicit ``autogenerate_code_verifier=True`` so a library default flip can't silently drop PKCE."""
     monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_ID", "cid", raising=False)
     monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_SECRET", "csecret", raising=False)
-    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_REDIRECT_HOSTS", ["x"], raising=False)
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_REDIRECT_URIS", ["https://x/cb"], raising=False)
 
     captured: dict = {}
 
@@ -2590,13 +2788,13 @@ def test_build_authorize_url_without_client_secret_raises(monkeypatch: pytest.Mo
 
 def test_build_authorize_url_rejects_redirect_uri_not_in_allowlist(monkeypatch: pytest.MonkeyPatch) -> None:
     """Defense-in-depth: build_authorize_url must self-validate redirect_uri so direct callers
-    (outside start_authorization) cannot bypass the host allowlist."""
+    (outside start_authorization) cannot bypass the registered-URI check."""
     monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_ID", "cid", raising=False)
     monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_SECRET", "csecret", raising=False)
     monkeypatch.setattr(
         google_oauth_service.settings,
-        "GOOGLE_OAUTH_REDIRECT_HOSTS",
-        ["app.skyvern.com"],
+        "GOOGLE_OAUTH_REDIRECT_URIS",
+        ["https://app.skyvern.com/integrations/google/callback"],
         raising=False,
     )
 
@@ -2608,19 +2806,19 @@ def test_build_authorize_url_rejects_redirect_uri_not_in_allowlist(monkeypatch: 
 
 
 def test_build_authorize_url_rejects_http_for_non_loopback_host(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Hostname-only allowlist plus an http URI must be rejected even when called directly."""
+    """An http URI on the registered host must be rejected even when called directly."""
     monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_ID", "cid", raising=False)
     monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_SECRET", "csecret", raising=False)
     monkeypatch.setattr(
         google_oauth_service.settings,
-        "GOOGLE_OAUTH_REDIRECT_HOSTS",
-        ["app.skyvern.com"],
+        "GOOGLE_OAUTH_REDIRECT_URIS",
+        ["https://app.skyvern.com/integrations/google/callback"],
         raising=False,
     )
 
     with pytest.raises(google_oauth_service.InvalidRedirectURIError, match="https"):
         google_oauth_service.build_authorize_url(
-            redirect_uri="http://app.skyvern.com/callback",
+            redirect_uri="http://app.skyvern.com/integrations/google/callback",
             state="abc",
         )
 
@@ -2630,7 +2828,7 @@ async def test_start_authorization_persists_verifier_and_returns_url(monkeypatch
     monkeypatch.setattr(google_oauth_service.settings, "ENABLE_ENCRYPTION", True, raising=False)
     monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_ID", "cid", raising=False)
     monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_SECRET", "csecret", raising=False)
-    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_REDIRECT_HOSTS", ["x"], raising=False)
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_REDIRECT_URIS", ["https://x/cb"], raising=False)
     monkeypatch.setattr(
         google_oauth_service.SettingsManager,
         "get_settings",
@@ -2673,6 +2871,79 @@ async def test_start_authorization_persists_verifier_and_returns_url(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_start_authorization_rejects_unregistered_redirect_uri_before_storing_consent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(google_oauth_service.settings, "ENABLE_ENCRYPTION", True, raising=False)
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_ID", "cid", raising=False)
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_SECRET", "csecret", raising=False)
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_REDIRECT_URIS", [_REGISTERED_REDIRECT_URI])
+    monkeypatch.setattr(
+        google_oauth_service.SettingsManager,
+        "get_settings",
+        lambda: SimpleNamespace(ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG=True),
+    )
+    repo = SimpleNamespace(insert_pending_credential=AsyncMock(), begin_reauthorization=AsyncMock())
+    organizations = SimpleNamespace(get_valid_org_auth_token=AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        google_oauth_service.app,
+        "DATABASE",
+        SimpleNamespace(google_oauth=repo, organizations=organizations),
+        raising=False,
+    )
+
+    with pytest.raises(google_oauth_service.InvalidRedirectURIError):
+        await google_oauth_service.start_authorization(
+            organization_id="org_1",
+            redirect_uri="https://evil.example.com/integrations/google/callback",
+        )
+    repo.insert_pending_credential.assert_not_awaited()
+    repo.begin_reauthorization.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_start_authorization_requires_resave_of_legacy_org_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An org config stored with the old host allowlist must not start a consent, but must still refresh tokens."""
+    monkeypatch.setattr(google_oauth_service.settings, "ENABLE_ENCRYPTION", True, raising=False)
+    monkeypatch.setattr(
+        google_oauth_service.SettingsManager,
+        "get_settings",
+        lambda: SimpleNamespace(ENABLE_ORGANIZATION_GOOGLE_OAUTH_CLIENT_CONFIG=True),
+    )
+    legacy_token = json.dumps(
+        {
+            "client_id": "org-client",
+            "client_secret": "org-secret",
+            "redirect_hosts": ["org.example.com"],
+            "app_origins": ["https://org.example.com"],
+        }
+    )
+    insert_mock = AsyncMock()
+    organizations = SimpleNamespace(
+        get_valid_org_auth_token=AsyncMock(return_value=SimpleNamespace(token=legacy_token))
+    )
+    monkeypatch.setattr(
+        google_oauth_service.app,
+        "DATABASE",
+        SimpleNamespace(
+            google_oauth=SimpleNamespace(insert_pending_credential=insert_mock), organizations=organizations
+        ),
+        raising=False,
+    )
+
+    with pytest.raises(google_oauth_service.InvalidRedirectURIError, match="must be re-saved with exact redirect URIs"):
+        await google_oauth_service.start_authorization(
+            organization_id="org_1",
+            redirect_uri="https://org.example.com/integrations/google/callback",
+        )
+    insert_mock.assert_not_awaited()
+
+    resolved = await google_oauth_service.resolve_client_config("org_1", strict=False)
+    assert resolved.config is not None
+    assert resolved.config.client_id == "org-client"
+
+
+@pytest.mark.asyncio
 async def test_start_authorization_refuses_without_encryption(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(google_oauth_service.settings, "ENABLE_ENCRYPTION", False, raising=False)
     fake_repo = SimpleNamespace(insert_pending_credential=AsyncMock())
@@ -2691,7 +2962,7 @@ async def test_start_authorization_reconnect_reauthorizes_in_place(monkeypatch: 
     monkeypatch.setattr(google_oauth_service.settings, "ENABLE_ENCRYPTION", True, raising=False)
     monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_ID", "cid", raising=False)
     monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_SECRET", "csecret", raising=False)
-    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_REDIRECT_HOSTS", ["x"], raising=False)
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_REDIRECT_URIS", ["https://x/cb"], raising=False)
     monkeypatch.setattr(
         google_oauth_service.SettingsManager,
         "get_settings",
@@ -2742,7 +3013,7 @@ async def test_start_authorization_reconnect_falls_back_to_legacy_granted_scopes
     monkeypatch.setattr(google_oauth_service.settings, "ENABLE_ENCRYPTION", True, raising=False)
     monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_ID", "cid", raising=False)
     monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_SECRET", "csecret", raising=False)
-    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_REDIRECT_HOSTS", ["x"], raising=False)
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_REDIRECT_URIS", ["https://x/cb"], raising=False)
     monkeypatch.setattr(
         google_oauth_service.SettingsManager,
         "get_settings",
@@ -2784,7 +3055,7 @@ async def test_start_authorization_reconnect_raises_when_not_reauthorizable(
     monkeypatch.setattr(google_oauth_service.settings, "ENABLE_ENCRYPTION", True, raising=False)
     monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_ID", "cid", raising=False)
     monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_SECRET", "csecret", raising=False)
-    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_REDIRECT_HOSTS", ["x"], raising=False)
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_REDIRECT_URIS", ["https://x/cb"], raising=False)
     monkeypatch.setattr(
         google_oauth_service.SettingsManager,
         "get_settings",
@@ -3271,6 +3542,7 @@ async def test_list_google_oauth_credentials_surfaces_error_state(monkeypatch: p
         organization_id="org_1",
         credential_name="Needs reconnect",
         state="error",
+        scopes_granted=["https://www.googleapis.com/auth/gmail.readonly"],
         created_at=now,
         modified_at=now,
     )
@@ -3283,6 +3555,9 @@ async def test_list_google_oauth_credentials_surfaces_error_state(monkeypatch: p
 
     assert response.credentials == [credential]
     assert response.credentials[0].state == "error"
+    # Pickers read each account's fit by credential id, from that credential's own grant.
+    fits = response.model_dump(mode="json")["action_fit"]["goac_error"]
+    assert (fits["gmail.read_inbox"], fits["gmail.send_email"]) == ("yes", "no")
     list_mock.assert_awaited_once_with(organization_id="org_1")
 
 
@@ -3549,23 +3824,85 @@ async def test_refresh_and_rotate_rejects_failed_google_token_persistence(
     update_active_refresh_token.assert_awaited_once()
 
 
-def test_validate_redirect_uri_allowlist(monkeypatch: pytest.MonkeyPatch) -> None:
+_REGISTERED_REDIRECT_URI = "https://app.skyvern.com/integrations/google/callback"
+
+
+def test_validate_redirect_uri_requires_exact_registered_uri(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_REDIRECT_URIS", [_REGISTERED_REDIRECT_URI])
+
+    google_oauth_service._validate_redirect_uri(_REGISTERED_REDIRECT_URI)
+
+    for redirect_uri in (
+        "HTTPS://APP.skyvern.com/integrations/google/callback",
+        "https://app.skyvern.com:443/integrations/google/callback",
+        "https://evil.example.com/integrations/google/callback",
+        "https://app.skyvern.com/integrations/google/callback/other",
+        "https://app.skyvern.com/other/callback",
+        "https://app.skyvern.com/integrations/google/callback?next=x",
+        "https://app.skyvern.com/integrations/google/callback#frag",
+        "https://app.skyvern.com:8443/integrations/google/callback",
+        "https://app.skyvern.com@evil.example.com/integrations/google/callback",
+        "https://app.skyvern.com/integrations/google/../google/callback",
+        "https://app.skyvern.com/integrations/google/%2e%2e/google/callback",
+        "https://app.skyvern.com/integrations/google/%2e/callback",
+        "https://app.skyvern.com/integrations/google/%2E%2E/google/callback",
+        "https://app.skyvern.com/integrations/google/.%2E/google/callback",
+        "https://app.skyvern.com/integrations/google/call%62ack",
+        "https://app.skyvern.com/integ\trations/google/callback",
+        "https://app.skyvern.com/integ\rrations/google/callback",
+        "https://app.skyvern.com/integ\nrations/google/callback",
+        "https://app.skyvern.com/integrations/google/callback ",
+    ):
+        with pytest.raises(google_oauth_service.InvalidRedirectURIError):
+            google_oauth_service._validate_redirect_uri(redirect_uri)
+
+
+def test_validate_redirect_uri_rejects_http_on_registered_host(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         google_oauth_service.settings,
-        "GOOGLE_OAUTH_REDIRECT_HOSTS",
-        ["app.skyvern.com"],
-        raising=False,
+        "GOOGLE_OAUTH_REDIRECT_URIS",
+        [_REGISTERED_REDIRECT_URI, "http://app.skyvern.com/integrations/google/callback"],
+    )
+    with pytest.raises(google_oauth_service.InvalidRedirectURIError, match="https"):
+        google_oauth_service._validate_redirect_uri("http://app.skyvern.com/integrations/google/callback")
+
+
+def test_validate_redirect_uri_loopback_requires_registered_port(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A web-application client gets no RFC 8252 loopback port variance."""
+    monkeypatch.setattr(
+        google_oauth_service.settings,
+        "GOOGLE_OAUTH_REDIRECT_URIS",
+        ["http://localhost:5173/integrations/google/callback"],
+    )
+    google_oauth_service._validate_redirect_uri("http://localhost:5173/integrations/google/callback")
+    for redirect_uri in (
+        "http://localhost:8080/integrations/google/callback",
+        "http://localhost:8080/other",
+        "http://127.0.0.1:5173/integrations/google/callback",
+        "https://localhost:5173/integrations/google/callback",
+    ):
+        with pytest.raises(google_oauth_service.InvalidRedirectURIError):
+            google_oauth_service._validate_redirect_uri(redirect_uri)
+
+
+def test_validate_redirect_uri_uses_organization_registered_uris(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_REDIRECT_URIS", [_REGISTERED_REDIRECT_URI])
+    client_config = google_oauth_service.GoogleOAuthClientConfig(
+        client_id="org-client",
+        client_secret="org-secret",
+        redirect_uris=["https://org.example.com/integrations/google/callback"],
     )
 
-    google_oauth_service._validate_redirect_uri("https://app.skyvern.com/google/callback")
-
+    google_oauth_service._validate_redirect_uri("https://org.example.com/integrations/google/callback", client_config)
     with pytest.raises(google_oauth_service.InvalidRedirectURIError):
-        google_oauth_service._validate_redirect_uri("https://evil.example.com/callback")
+        google_oauth_service._validate_redirect_uri(_REGISTERED_REDIRECT_URI, client_config)
+    with pytest.raises(google_oauth_service.InvalidRedirectURIError):
+        google_oauth_service._validate_redirect_uri("https://org.example.com/other", client_config)
 
 
 def test_validate_redirect_uri_empty_allowlist_dev_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Empty allowlist + no client_id = dev fallback; keeps local dev ergonomic."""
-    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_REDIRECT_HOSTS", [], raising=False)
+    """No registered URIs + no client_id = dev fallback; keeps local dev ergonomic."""
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_REDIRECT_URIS", [], raising=False)
     monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_ID", None, raising=False)
     google_oauth_service._validate_redirect_uri("https://anywhere.example.com/cb")
 
@@ -3573,50 +3910,11 @@ def test_validate_redirect_uri_empty_allowlist_dev_fallback(monkeypatch: pytest.
 def test_validate_redirect_uri_empty_allowlist_raises_when_client_id_set(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Empty allowlist + client_id configured = misconfigured prod; must fail closed."""
-    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_REDIRECT_HOSTS", [], raising=False)
+    """No registered URIs + client_id configured = misconfigured prod; must fail closed."""
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_REDIRECT_URIS", [], raising=False)
     monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_ID", "cid", raising=False)
     with pytest.raises(google_oauth_service.InvalidRedirectURIError):
-        google_oauth_service._validate_redirect_uri("https://app.skyvern.com/cb")
-
-
-def test_validate_redirect_uri_rejects_http_for_non_loopback(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Hostname-only allowlist plus an http URI is the bypass claude[bot] flagged:
-    an attacker on http://allowed-host.com:9999 should not satisfy a check intended
-    for https://allowed-host.com."""
-    monkeypatch.setattr(
-        google_oauth_service.settings,
-        "GOOGLE_OAUTH_REDIRECT_HOSTS",
-        ["app.skyvern.com"],
-        raising=False,
-    )
-    with pytest.raises(google_oauth_service.InvalidRedirectURIError, match="https"):
-        google_oauth_service._validate_redirect_uri("http://app.skyvern.com/cb")
-
-
-def test_validate_redirect_uri_allows_http_for_loopback(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Local dev needs http://localhost; loopback hosts are exempted from the https requirement."""
-    monkeypatch.setattr(
-        google_oauth_service.settings,
-        "GOOGLE_OAUTH_REDIRECT_HOSTS",
-        ["localhost", "127.0.0.1"],
-        raising=False,
-    )
-    google_oauth_service._validate_redirect_uri("http://localhost:5173/cb")
-    google_oauth_service._validate_redirect_uri("http://127.0.0.1:8080/cb")
-
-
-def test_validate_redirect_uri_normalizes_allowlist_case(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``urlparse().hostname`` lowercases the URI host; the allowlist is lowercased
-    too so an operator who configures mixed-case entries doesn't reject every redirect."""
-    monkeypatch.setattr(
-        google_oauth_service.settings,
-        "GOOGLE_OAUTH_REDIRECT_HOSTS",
-        ["MyApp.Example.Com"],
-        raising=False,
-    )
-    google_oauth_service._validate_redirect_uri("https://myapp.example.com/cb")
-    google_oauth_service._validate_redirect_uri("https://MYAPP.EXAMPLE.COM/cb")
+        google_oauth_service._validate_redirect_uri(_REGISTERED_REDIRECT_URI)
 
 
 @pytest.mark.asyncio
@@ -4487,7 +4785,10 @@ async def test_start_authorization_persists_app_origin(monkeypatch: pytest.Monke
     monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_ID", "cid", raising=False)
     monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_SECRET", "csecret", raising=False)
     monkeypatch.setattr(
-        google_oauth_service.settings, "GOOGLE_OAUTH_REDIRECT_HOSTS", ["app-staging.skyvern.com"], raising=False
+        google_oauth_service.settings,
+        "GOOGLE_OAUTH_REDIRECT_URIS",
+        ["https://app-staging.skyvern.com/integrations/google/callback"],
+        raising=False,
     )
     monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_APP_ORIGINS", ["*.vercel.app"], raising=False)
     monkeypatch.setattr(
@@ -4526,7 +4827,10 @@ async def test_start_authorization_rejects_bad_app_origin(monkeypatch: pytest.Mo
     monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_ID", "cid", raising=False)
     monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_SECRET", "csecret", raising=False)
     monkeypatch.setattr(
-        google_oauth_service.settings, "GOOGLE_OAUTH_REDIRECT_HOSTS", ["app-staging.skyvern.com"], raising=False
+        google_oauth_service.settings,
+        "GOOGLE_OAUTH_REDIRECT_URIS",
+        ["https://app-staging.skyvern.com/integrations/google/callback"],
+        raising=False,
     )
     monkeypatch.setattr(
         google_oauth_service.settings, "GOOGLE_OAUTH_APP_ORIGINS", ["https://app.skyvern.com"], raising=False
@@ -4634,7 +4938,7 @@ def _install_consent_flow_doubles(monkeypatch: pytest.MonkeyPatch, repo: _Consen
     monkeypatch.setattr(google_oauth_service.settings, "ENABLE_ENCRYPTION", True, raising=False)
     monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_ID", "cid", raising=False)
     monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_CLIENT_SECRET", "csecret", raising=False)
-    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_REDIRECT_HOSTS", ["x"], raising=False)
+    monkeypatch.setattr(google_oauth_service.settings, "GOOGLE_OAUTH_REDIRECT_URIS", ["https://x/cb"], raising=False)
     monkeypatch.setattr(
         google_oauth_service.SettingsManager,
         "get_settings",

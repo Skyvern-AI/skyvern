@@ -1,6 +1,5 @@
 import { useCallback } from "react";
 
-import { useShowAllCodeStore } from "@/store/ShowAllCodeStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 
 export function useToggleHistoryPanel(): () => void {
@@ -8,14 +7,11 @@ export function useToggleHistoryPanel(): () => void {
   const setWorkflowPanelState = useWorkflowPanelStore(
     (s) => s.setWorkflowPanelState,
   );
-  const setShowAllCode = useShowAllCodeStore((s) => s.setShowAllCode);
 
   return useCallback(() => {
     const wasInComparisonMode = workflowPanelState.data?.showComparison;
     const isHistoryPanelOpen =
       workflowPanelState.active && workflowPanelState.content === "history";
-
-    setShowAllCode(false);
 
     const active = !(wasInComparisonMode || isHistoryPanelOpen);
     setWorkflowPanelState({
@@ -27,5 +23,5 @@ export function useToggleHistoryPanel(): () => void {
         version2: undefined,
       },
     });
-  }, [workflowPanelState, setWorkflowPanelState, setShowAllCode]);
+  }, [workflowPanelState, setWorkflowPanelState]);
 }

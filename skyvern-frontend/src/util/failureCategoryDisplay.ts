@@ -104,6 +104,11 @@ const FAILURE_CATEGORY_DISPLAY = {
     description:
       "An internal setup step for this run's parameters failed. Retry, or contact support if it persists.",
   },
+  BUSINESS_OUTCOME: {
+    label: "Stopped for a business reason",
+    description:
+      "The run stopped because of a real condition on the site or in its inputs, such as a record that doesn't exist or a closed posting. Check the failure reason and the run's inputs.",
+  },
   UNKNOWN: {
     label: "Unknown failure",
     description:

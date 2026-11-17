@@ -11,6 +11,7 @@ function CopyButton({
   id,
   tabIndex,
   onFocus,
+  onCopied,
 }: {
   // A getter defers building the copied text until click, so callers rendering
   // many buttons (e.g. per JSON-tree row) don't serialize on every render.
@@ -22,6 +23,7 @@ function CopyButton({
   id?: string;
   tabIndex?: number;
   onFocus?: () => void;
+  onCopied?: () => void;
 }) {
   const [copied, setCopied] = useState(false);
 
@@ -33,6 +35,7 @@ function CopyButton({
     }
     if (await copyText(typeof value === "function" ? value() : value)) {
       setCopied(true);
+      onCopied?.();
       setTimeout(() => setCopied(false), 1500);
     }
   };

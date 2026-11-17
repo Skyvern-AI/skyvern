@@ -17,6 +17,7 @@ import dataclasses
 import enum
 import math
 import typing as t
+import uuid
 
 import structlog
 from fastapi import WebSocket, WebSocketDisconnect
@@ -38,6 +39,7 @@ from skyvern.forge.sdk.streaming.registries import (
     del_message_channel,
     get_vnc_channel,
 )
+from skyvern.forge.sdk.streaming.user_control import mark_user_control, release_user_control
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
 
 LOG = structlog.get_logger()
@@ -317,6 +319,9 @@ class MessageChannel:
     out_queue: asyncio.Queue[MessageOut | dict] = dataclasses.field(default_factory=asyncio.Queue)  # warn: unbounded
     browser_session: AddressablePersistentBrowserSession | None = None
     workflow_run: WorkflowRun | None = None
+    control_holder: str = dataclasses.field(default_factory=lambda: uuid.uuid4().hex)
+    # Kept apart from browser_session, which the verify loops clear when a run ends or a lookup fails.
+    controlled_browser_session_id: str | None = None
 
     def __post_init__(self) -> None:
         add_message_channel(self)
@@ -337,9 +342,24 @@ class MessageChannel:
 
         return base
 
+    async def hold_control(self) -> None:
+        if self.browser_session is None:
+            return
+        browser_session_id = self.browser_session.persistent_browser_session_id
+        if self.controlled_browser_session_id != browser_session_id:
+            await self.cede_control()
+        self.controlled_browser_session_id = browser_session_id
+        await mark_user_control(self.organization_id, browser_session_id, self.control_holder)
+
+    async def cede_control(self) -> None:
+        held, self.controlled_browser_session_id = self.controlled_browser_session_id, None
+        if held is not None:
+            await release_user_control(self.organization_id, held, self.control_holder)
+
     async def close(self, code: int = 1000, reason: str | None = None) -> "MessageChannel":
         LOG.debug(f"{self.class_name} closing message stream.", reason=reason, code=code, **self.identity)
 
+        await self.cede_control()
         self.browser_session = None
         self.workflow_run = None
 
@@ -485,6 +505,7 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                     )
                     return
                 vnc_channel.interactor = "agent"
+                await message_channel.cede_control()
 
             case MessageKind.CLEAR_ALL_DATA:
                 try:
@@ -656,6 +677,7 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                     )
                     return
                 vnc_channel.interactor = "user"
+                await message_channel.hold_control()
 
             case MessageKind.TAKE_SCREENSHOT:
                 try:

@@ -27,7 +27,7 @@ function inputHas(selector: string, value: string) {
   return document.querySelector<HTMLInputElement>(selector)?.value === value;
 }
 
-// Walks the user from the copilot credential card through the credential modal for a known demo site.
+// Walks the user from the Ember credential card through the credential modal for a known demo site.
 // Each step advances when the user does it, so the popovers carry no Next button.
 function useDemoLoginGuide(loginUrl: string | undefined, active: boolean) {
   const login = active ? getDemoLogin(loginUrl) : null;

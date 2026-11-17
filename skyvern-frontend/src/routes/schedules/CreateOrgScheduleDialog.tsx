@@ -174,15 +174,18 @@ function CreateOrgScheduleDialog({ open, onOpenChange }: Readonly<Props>) {
         onOpenChange(nextOpen);
       }}
     >
-      <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-lg">
-        <DialogHeader>
+      <DialogContent className="flex max-h-[85vh] flex-col overflow-hidden sm:max-w-lg">
+        <DialogHeader className="shrink-0">
           <DialogTitle>Create Schedule</DialogTitle>
           <DialogDescription>
             Choose an agent and configure when it should run automatically.
           </DialogDescription>
         </DialogHeader>
 
-        <div className="space-y-6 py-4">
+        <div
+          data-testid="create-schedule-dialog-body"
+          className="min-h-0 flex-1 space-y-6 overflow-y-auto py-4"
+        >
           {/* Agent Picker */}
           <div className="space-y-2">
             <Label>Agent</Label>
@@ -269,7 +272,7 @@ function CreateOrgScheduleDialog({ open, onOpenChange }: Readonly<Props>) {
           />
         </div>
 
-        <DialogFooter>
+        <DialogFooter className="shrink-0 border-t border-border pt-4">
           <Button variant="secondary" onClick={() => onOpenChange(false)}>
             Cancel
           </Button>

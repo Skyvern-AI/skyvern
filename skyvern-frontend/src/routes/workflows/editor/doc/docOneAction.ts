@@ -1,4 +1,5 @@
 import type { Node } from "@xyflow/react";
+import type { DocPromptUrlOffer } from "./docPromptUrl";
 import { getDocProseFields } from "./docStepRegistry";
 
 // A Browser Action runs one action. An instruction that joins steps ("search, then read the price")
@@ -19,5 +20,20 @@ export function docOneActionStepWantsTask(node: Node): boolean {
   return (
     typeof value === "string" &&
     SEVERAL_ACTIONS.test(value.replace(/\{\{[\s\S]*?\}\}/g, ""))
+  );
+}
+
+// Dismissals survive branch switches that unmount a step.
+export const dismissedDocSuggestions = new Set<string>();
+
+export function isDocUrlOfferVisible(
+  node: Node,
+  offer: DocPromptUrlOffer | null,
+) {
+  return Boolean(
+    offer &&
+    !dismissedDocSuggestions.has(`url:${node.id}:${offer.url}`) &&
+    (dismissedDocSuggestions.has(`one-action:${node.id}`) ||
+      !docOneActionStepWantsTask(node)),
   );
 }

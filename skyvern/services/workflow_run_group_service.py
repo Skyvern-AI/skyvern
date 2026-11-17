@@ -38,6 +38,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
 )
 from skyvern.forge.sdk.workflow.retry_policy import resolve_workflow_retry_policy
 from skyvern.schemas.workflow_run_groups import (
+    DEFAULT_MAX_CONCURRENCY,
     IN_FLIGHT_ITEM_STATES,
     WorkflowRunGroup,
     WorkflowRunGroupCreateRequest,
@@ -72,6 +73,9 @@ def submission_fingerprint(request: WorkflowRunGroupCreateRequest) -> str:
         "version": request.version,
         "items": [{"key": item.key, "parameters": item.parameters} for item in request.items],
     }
+    # Left out at the default so fingerprints stored before the field existed still match a retry.
+    if request.max_concurrency != DEFAULT_MAX_CONCURRENCY:
+        payload["max_concurrency"] = request.max_concurrency
     serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hmac.new(settings.SECRET_KEY.encode(), _FINGERPRINT_DOMAIN + serialized.encode(), sha256).hexdigest()
 
@@ -136,6 +140,17 @@ async def submit_workflow_run_group(
             "Workflow run group submission is disabled", status_code=HTTPStatus.SERVICE_UNAVAILABLE
         )
     await app.RATE_LIMITER.rate_limit_submit_run(organization_id)
+    limits = await app.AGENT_FUNCTION.workflow_run_group_limits(organization_id=organization_id)
+    if len(request.items) > limits.max_items:
+        raise SkyvernHTTPException(
+            f"A workflow run group can have at most {limits.max_items} items for this organization",
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+    if request.max_concurrency > limits.max_concurrency:
+        raise SkyvernHTTPException(
+            f"max_concurrency can be at most {limits.max_concurrency} for this organization",
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
 
     workflow = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
         workflow_permanent_id=request.workflow_id,
@@ -149,12 +164,12 @@ async def submit_workflow_run_group(
             f"Workflow version {workflow.version} cannot run as a group because it has {reason}",
             status_code=HTTPStatus.BAD_REQUEST,
         )
-    input_parameters = {
-        parameter.key: parameter
-        for parameter in await app.WORKFLOW_SERVICE.get_workflow_parameters(workflow_id=workflow.workflow_id)
-    }
+    workflow_parameters = await app.WORKFLOW_SERVICE.get_workflow_parameters(workflow_id=workflow.workflow_id)
+    input_parameters = {parameter.key: parameter for parameter in workflow_parameters}
     for item in request.items:
-        await app.WORKFLOW_SERVICE.validate_schedule_parameters(workflow, organization, item.parameters)
+        await app.WORKFLOW_SERVICE.validate_schedule_parameters(
+            workflow, organization, item.parameters, workflow_parameters=workflow_parameters
+        )
         # Values are otherwise converted only when a child is created, so a mistyped one would fail mid-group.
         for key, value in item.parameters.items():
             if value is not None and key in input_parameters:
@@ -172,6 +187,7 @@ async def submit_workflow_run_group(
             # Without a reviewed timestamp, bind to the row validation read so an edit landing after it is refused.
             expected_workflow_modified_at=expected_workflow_modified_at or workflow.modified_at,
             expected_latest_groups=expected_latest_groups,
+            max_concurrency=request.max_concurrency,
         )
     except IntegrityError:
         raced = await app.DATABASE.workflow_run_groups.get_group_by_submission_key(
@@ -250,18 +266,19 @@ async def get_workflow_run_group(workflow_run_group_id: str, organization_id: st
             [item.workflow_run_id for item in items], organization_id=organization_id
         )
     }
-    task_family_only: bool | None = None
+    failed_child_ids = [
+        run.workflow_run_id
+        for run in children.values()
+        if run.status in (WorkflowRunStatus.failed, WorkflowRunStatus.terminated)
+    ]
+    task_family_only = bool(failed_child_ids) and _is_task_family_only(
+        await app.DATABASE.workflows.get_workflow(group.workflow_id, organization_id)
+    )
+    step_counts = await app.DATABASE.workflow_run_groups.count_steps(failed_child_ids) if task_family_only else {}
     item_responses = []
     for item in items:
         child = children.get(item.workflow_run_id)
-        step_count = None
-        if child is not None and child.status in (WorkflowRunStatus.failed, WorkflowRunStatus.terminated):
-            if task_family_only is None:
-                task_family_only = _is_task_family_only(
-                    await app.DATABASE.workflows.get_workflow(group.workflow_id, organization_id)
-                )
-            if task_family_only:
-                step_count = await app.DATABASE.workflow_run_groups.count_steps(item.workflow_run_id)
+        step_count = step_counts.get(item.workflow_run_id)
         item_responses.append(
             WorkflowRunGroupItemResponse(
                 key=item.item_key,
@@ -270,7 +287,7 @@ async def get_workflow_run_group(workflow_run_group_id: str, organization_id: st
                 state=item.state,
                 run_status=child.status if child else None,
                 outcome=classify_item_outcome(
-                    item.state, child, task_family_only=bool(task_family_only), step_count=step_count
+                    item.state, child, task_family_only=task_family_only, step_count=step_count
                 ),
                 failure_reason=item.failure_reason or (child.failure_reason if child else None),
             )
@@ -517,6 +534,7 @@ async def _reconcile_in_flight(group: WorkflowRunGroup, items: list[WorkflowRunG
         )
     }
     stale_before = naive_utc_now() - DISPATCH_GRACE
+    finished_positions: list[int] = []
     for item in in_flight:
         child = children.get(item.workflow_run_id)
         claimed_at = to_naive_utc(item.claimed_at)
@@ -530,12 +548,7 @@ async def _reconcile_in_flight(group: WorkflowRunGroup, items: list[WorkflowRunG
             # A canceling group starts nothing after this item, so only an active one has to wait out the settle.
             if not canceling and _worker_may_still_be_stopping(child):
                 continue
-            await app.DATABASE.workflow_run_groups.finish_item(
-                group.workflow_run_group_id,
-                item.position,
-                state=WorkflowRunGroupItemState.done,
-                from_states=IN_FLIGHT_ITEM_STATES,
-            )
+            finished_positions.append(item.position)
             continue
         if not is_stale:
             continue
@@ -577,6 +590,10 @@ async def _reconcile_in_flight(group: WorkflowRunGroup, items: list[WorkflowRunG
             )
             continue
         await _dispatch_item(group, reclaimed, dispatch_token)
+    if finished_positions:
+        await app.DATABASE.workflow_run_groups.finish_in_flight_items_done(
+            group.workflow_run_group_id, finished_positions
+        )
 
 
 async def advance_workflow_run_group(workflow_run_group_id: str) -> None:
@@ -587,8 +604,10 @@ async def advance_workflow_run_group(workflow_run_group_id: str) -> None:
     while True:
         dispatch_token = uuid.uuid4().hex
         item = await app.DATABASE.workflow_run_groups.claim_next_item(workflow_run_group_id, dispatch_token)
-        if item is None or await _dispatch_item(group, item, dispatch_token):
+        if item is None:
             break
+        # The claim alone enforces the group's bound, so keep filling free slots whatever this dispatch returned.
+        await _dispatch_item(group, item, dispatch_token)
     await app.DATABASE.workflow_run_groups.finish_group_if_complete(workflow_run_group_id)
 
 

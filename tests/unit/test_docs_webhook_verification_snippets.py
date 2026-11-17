@@ -5,6 +5,7 @@ outbound webhooks and TOTP requests, so a snippet that passes here matches serve
 """
 
 import re
+import time
 from pathlib import Path
 
 import pytest
@@ -71,6 +72,25 @@ def test_python_snippet_rejects_forged_and_missing_signatures(monkeypatch: pytes
     verify = namespace["verify_skyvern_signature"]
 
     _assert_verdicts({label: verify(RAW_BODY, signature) for label, signature, _ in CASES})
+
+
+@pytest.fixture
+def host_outside_utc(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("TZ", "America/Los_Angeles")
+    time.tzset()
+    yield
+    monkeypatch.undo()
+    time.tzset()
+
+
+@pytest.mark.usefixtures("host_outside_utc")
+def test_timestamp_header_is_unix_time_on_a_host_outside_utc() -> None:
+    # Receivers check the documented "Unix timestamp when the request was sent" for freshness.
+    before = int(time.time())
+    signed = generate_skyvern_webhook_signature(payload=PAYLOAD, api_key=API_KEY)
+    after = int(time.time())
+
+    assert before <= int(signed.headers["x-skyvern-timestamp"]) <= after
 
 
 # A discarded timingSafeEqual call and a timing-unsafe equality compare: the two shapes

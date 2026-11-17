@@ -1153,12 +1153,7 @@ def _soft_deleted_test_copy(workflow: Workflow, edited_after_delete: timedelta =
     [
         ({"copilot_session_id": "wcc_chat"}, "test_copy", None),
         ({"copilot_session_id": "wcc_chat"}, "test_copy_edited_after_delete", OriginOutputRefusal.OUTPUT_UNAVAILABLE),
-        ({"copilot_session_id": "wcc_chat", "workflow_definition_sha256": "digest"}, "profile_stamped_test_copy", None),
-        (
-            {"copilot_session_id": "wcc_chat", "browser_session_id": None},
-            "profile_stamped_then_soft_deleted_test_copy",
-            None,
-        ),
+        ({"copilot_session_id": "wcc_chat", "browser_session_id": None}, "pre_fix_profile_stamped_test_copy", None),
         ({"workflow_definition_sha256": "digest"}, "edited_after_run", None),
         ({"workflow_definition_sha256": "0" * 64}, "saved", OriginOutputRefusal.CHANGED_PRODUCER),
         ({}, "soft_deleted_saved_version", OriginOutputRefusal.OUTPUT_UNAVAILABLE),
@@ -1174,8 +1169,7 @@ def _soft_deleted_test_copy(workflow: Workflow, edited_after_delete: timedelta =
     ids=[
         "soft_deleted_copilot_test_copy",
         "test_copy_changed_after_its_soft_delete",
-        "test_copy_another_runs_link_stamped_a_profile_on",
-        "browserless_test_copy_stamped_before_its_soft_delete_hid_the_stamp",
+        "test_copy_stamped_before_the_link_skipped_test_versions",
         "saved_version_settings_edited_after_the_run",
         "recorded_digest_mismatch",
         "soft_deleted_saved_version",
@@ -1200,14 +1194,7 @@ async def test_a_named_run_is_loaded_under_the_origin_rules_for_one_call(
     workflow = {
         "saved": saved,
         "test_copy": _soft_deleted_test_copy(saved),
-        "profile_stamped_test_copy": saved.model_copy(
-            update={
-                "created_by": COPILOT_TEST_WORKFLOW_CREATOR,
-                "browser_profile_id": "bp_stamped",
-                "modified_at": _NAMED_RUN_CREATED_AT + timedelta(seconds=30),
-            }
-        ),
-        "profile_stamped_then_soft_deleted_test_copy": _soft_deleted_test_copy(saved).model_copy(
+        "pre_fix_profile_stamped_test_copy": _soft_deleted_test_copy(saved).model_copy(
             update={"browser_profile_id": "bp_stamped"}
         ),
         "test_copy_edited_after_delete": _soft_deleted_test_copy(saved, edited_after_delete=timedelta(seconds=1)),
@@ -1236,10 +1223,7 @@ async def test_a_named_run_is_loaded_under_the_origin_rules_for_one_call(
             assert named.snapshot.outputs["approval"].value == {"authorized": True}
             assert named.snapshot.input_values == {"request_id": "req-1"}
             settings = named.snapshot.settings
-            assert (settings is None) == (
-                version
-                in ("profile_stamped_test_copy", "profile_stamped_then_soft_deleted_test_copy", "edited_after_run")
-            )
+            assert (settings is None) == (version in ("pre_fix_profile_stamped_test_copy", "edited_after_run"))
             assert settings is None or settings.browser_profile_id is None
         else:
             assert named == RefusedOutputSource(run.workflow_run_id, expected)

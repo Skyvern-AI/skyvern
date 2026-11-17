@@ -39,7 +39,7 @@ vi.mock("@/components/ModelSelector", () => ({
 afterEach(() => {
   cleanup();
   clearDeferredEdits();
-  useWorkflowYamlEditorStore.setState({ copilotAcceptance: null });
+  useWorkflowYamlEditorStore.setState({ emberAcceptance: null });
   update.mockClear();
 });
 
@@ -92,7 +92,7 @@ describe("WebSearchEditor deferred edits", () => {
 
       act(() => {
         useWorkflowYamlEditorStore.setState({
-          copilotAcceptance: Symbol("recovery"),
+          emberAcceptance: Symbol("recovery"),
         });
         first.unmount();
       });
@@ -100,9 +100,7 @@ describe("WebSearchEditor deferred edits", () => {
       act(() => vi.advanceTimersByTime(300));
       expect(update).not.toHaveBeenCalled();
 
-      act(() =>
-        useWorkflowYamlEditorStore.setState({ copilotAcceptance: null }),
-      );
+      act(() => useWorkflowYamlEditorStore.setState({ emberAcceptance: null }));
       expect(update).toHaveBeenCalledExactlyOnceWith({
         jsonSchema: pendingValue,
       });
@@ -149,7 +147,7 @@ describe("WebSearchEditor deferred edits", () => {
 
         act(() => {
           useWorkflowYamlEditorStore.setState({
-            copilotAcceptance: Symbol("recovery"),
+            emberAcceptance: Symbol("recovery"),
           });
           first.unmount();
         });
@@ -158,7 +156,7 @@ describe("WebSearchEditor deferred edits", () => {
         expect(update).not.toHaveBeenCalled();
 
         act(() =>
-          useWorkflowYamlEditorStore.setState({ copilotAcceptance: null }),
+          useWorkflowYamlEditorStore.setState({ emberAcceptance: null }),
         );
         expect(update).toHaveBeenCalledExactlyOnceWith({
           [field]: pendingValue,

@@ -1,4 +1,4 @@
-import type { CopilotAcceptSnapshot } from "@/routes/workflows/editor/editorStateSnapshot";
+import type { EmberAcceptSnapshot } from "@/routes/workflows/editor/editorStateSnapshot";
 import { create } from "zustand";
 import { toast } from "@/components/ui/use-toast";
 
@@ -25,7 +25,7 @@ type WorkflowYamlEditorState = {
   authoringInProgress: boolean;
   authoringAction: symbol | null;
   authoringActionOwner: YamlCommitOwner | null;
-  lockKind: "yaml" | "save" | "copilot" | null;
+  lockKind: "yaml" | "save" | "ember" | null;
   commitOwner: YamlCommitOwner | null;
   persistingOwner: YamlCommitOwner | null;
   // Pending writes outlive their editor; the scalar lock fields describe the active workflow.
@@ -42,12 +42,12 @@ type WorkflowYamlEditorState = {
   >;
   pendingAccepts: Record<
     string,
-    { reservation: symbol; snapshot: CopilotAcceptSnapshot }
+    { reservation: symbol; snapshot: EmberAcceptSnapshot }
   >;
   editorOwner: YamlCommitOwner | null;
   // Reserved by each send and manual acceptance through terminal/recovery handling.
-  copilotAcceptance: symbol | null;
-  applyingCopilotOwner: symbol | undefined;
+  emberAcceptance: symbol | null;
+  applyingEmberOwner: symbol | undefined;
   revision: number;
   bumpRevision: () => void;
   setCommitInProgress: (value: boolean) => void;
@@ -85,7 +85,7 @@ type WorkflowYamlEditorState = {
 export function selectEditorMutationLocked(
   state: WorkflowYamlEditorState,
 ): boolean {
-  return state.commitInProgress || state.copilotAcceptance !== null;
+  return state.commitInProgress || state.emberAcceptance !== null;
 }
 
 export const AUTHORING_SAVE_MESSAGE =
@@ -123,8 +123,8 @@ export const useWorkflowYamlEditorStore = create<WorkflowYamlEditorState>(
     pendingAccepts: {},
     pendingSaves: {},
     editorOwner: null,
-    copilotAcceptance: null,
-    applyingCopilotOwner: undefined,
+    emberAcceptance: null,
+    applyingEmberOwner: undefined,
     revision: 0,
     bumpRevision: () => set((state) => ({ revision: state.revision + 1 })),
     setCommitInProgress: (commitInProgress) =>
@@ -136,8 +136,8 @@ export const useWorkflowYamlEditorStore = create<WorkflowYamlEditorState>(
               committing: commitInProgress,
               lockKind: commitInProgress
                 ? "yaml"
-                : state.copilotAcceptance
-                  ? "copilot"
+                : state.emberAcceptance
+                  ? "ember"
                   : null,
             },
       ),
@@ -284,14 +284,14 @@ export async function commitYamlDraft(
   }
   // A programmatic save can start before CodeMirror blurs or debounces.
   if (store.flushDraft?.() === false) return false;
-  // Leaving an unedited draft writes nothing, so a Copilot turn or authoring
+  // Leaving an unedited draft writes nothing, so an Ember turn or authoring
   // action does not need to hold it open.
   if (!persist && !isWorkflowYamlDirty(useWorkflowYamlEditorStore.getState())) {
     store.close();
     return true;
   }
   if (
-    refuseYamlCommitDuringCopilotAcceptance() ||
+    refuseYamlCommitDuringEmberAcceptance() ||
     refuseMutationDuringAuthoring()
   )
     return false;
@@ -335,7 +335,7 @@ function beginWorkflowTransaction(
 ): boolean {
   if (
     !owner.active ||
-    refuseYamlCommitDuringCopilotAcceptance() ||
+    refuseYamlCommitDuringEmberAcceptance() ||
     refuseMutationDuringAuthoring()
   )
     return false;
@@ -384,7 +384,7 @@ function finishWorkflowTransaction(owner: YamlCommitOwner): void {
     commitOwner: null,
     persistingOwner: null,
     commitInProgress: false,
-    lockKind: state.copilotAcceptance ? "copilot" : null,
+    lockKind: state.emberAcceptance ? "ember" : null,
     committing: false,
   }));
 }
@@ -478,23 +478,34 @@ export function canInitializeWorkflow(workflowPermanentId: string): boolean {
       (state.commitOwner !== null &&
         state.commitOwner.workflowPermanentId !== workflowPermanentId)) &&
     !state.pendingAccepts[workflowPermanentId] &&
-    (!state.copilotAcceptance ||
+    (!state.emberAcceptance ||
       (state.editorOwner !== null &&
         state.editorOwner.workflowPermanentId !== workflowPermanentId))
   );
 }
 
-type StoredAccept = Pick<CopilotAcceptSnapshot, "chatId" | "acceptAttempt"> & {
+// Shown to the user and matched by AutoAcceptChip, so every thrower and the matcher share it.
+export const EMBER_CHANGE_PENDING_MESSAGE =
+  "Wait for the Copilot change to finish";
+
+type StoredAccept = Pick<EmberAcceptSnapshot, "chatId" | "acceptAttempt"> & {
   alwaysAccept: boolean;
 };
-const acceptStorageKey = (workflowPermanentId: string) =>
-  `copilot-pending-accept:${workflowPermanentId}`;
+export const PENDING_ACCEPT_KEY_PREFIX = "ember-pending-accept:";
+// Read when the Ember key is absent: older bundles wrote this key.
+export const LEGACY_PENDING_ACCEPT_KEY_PREFIX = "copilot-pending-accept:";
 
 export function readStoredAccept(
   workflowPermanentId: string,
 ): StoredAccept | null {
   try {
-    const raw = sessionStorage.getItem(acceptStorageKey(workflowPermanentId));
+    const raw =
+      sessionStorage.getItem(
+        `${PENDING_ACCEPT_KEY_PREFIX}${workflowPermanentId}`,
+      ) ??
+      sessionStorage.getItem(
+        `${LEGACY_PENDING_ACCEPT_KEY_PREFIX}${workflowPermanentId}`,
+      );
     if (!raw) return null;
     const stored = JSON.parse(raw) as StoredAccept;
     return typeof stored.chatId === "string" && stored.chatId.length > 0
@@ -511,7 +522,7 @@ export function storePendingAccept(
 ): boolean {
   try {
     sessionStorage.setItem(
-      acceptStorageKey(workflowPermanentId),
+      `${PENDING_ACCEPT_KEY_PREFIX}${workflowPermanentId}`,
       JSON.stringify(value),
     );
     return true;
@@ -526,40 +537,43 @@ export function isYamlCommitOwnerCurrent(owner: YamlCommitOwner): boolean {
   );
 }
 
-function refuseYamlCommitDuringCopilotAcceptance(): boolean {
+function refuseYamlCommitDuringEmberAcceptance(): boolean {
   const store = useWorkflowYamlEditorStore.getState();
-  if (!store.copilotAcceptance) return false;
-  store.setError("Wait for the Copilot change to finish");
+  if (!store.emberAcceptance) return false;
+  store.setError(EMBER_CHANGE_PENDING_MESSAGE);
   toast({
-    title: "Wait for the Copilot change to finish",
+    title: EMBER_CHANGE_PENDING_MESSAGE,
     variant: "destructive",
   });
   return true;
 }
 
-export function beginCopilotAcceptance(): symbol | null {
+export function beginEmberAcceptance(): symbol | null {
   // Recorded blocks wait for this lock to release before they apply.
   if (refuseMutationDuringYamlCommit() || refuseMutationDuringAuthoring())
     return null;
-  if (useWorkflowYamlEditorStore.getState().copilotAcceptance) {
+  if (useWorkflowYamlEditorStore.getState().emberAcceptance) {
     toast({ title: getWorkflowLockMessage(), variant: "destructive" });
     return null;
   }
-  const token = Symbol("copilot change");
+  const token = Symbol("ember change");
   useWorkflowYamlEditorStore.setState({
-    copilotAcceptance: token,
-    lockKind: "copilot",
+    emberAcceptance: token,
+    lockKind: "ember",
   });
   return token;
 }
 
-export function finishCopilotAcceptance(token: symbol): void {
+export function finishEmberAcceptance(token: symbol): void {
   for (const [workflowId, pending] of Object.entries(
     useWorkflowYamlEditorStore.getState().pendingAccepts,
   )) {
     if (pending.reservation === token) {
       try {
-        sessionStorage.removeItem(acceptStorageKey(workflowId));
+        sessionStorage.removeItem(`${PENDING_ACCEPT_KEY_PREFIX}${workflowId}`);
+        sessionStorage.removeItem(
+          `${LEGACY_PENDING_ACCEPT_KEY_PREFIX}${workflowId}`,
+        );
       } catch {
         /* A stale marker keeps recovery conservative on reload. */
       }
@@ -572,31 +586,31 @@ export function finishCopilotAcceptance(token: symbol): void {
       ),
     ),
   }));
-  if (useWorkflowYamlEditorStore.getState().copilotAcceptance === token) {
+  if (useWorkflowYamlEditorStore.getState().emberAcceptance === token) {
     useWorkflowYamlEditorStore.setState((state) => ({
-      copilotAcceptance: null,
+      emberAcceptance: null,
       lockKind: state.commitInProgress ? state.lockKind : null,
     }));
   }
 }
 
-export function withCopilotAcceptance(
+export function withEmberAcceptance(
   token: symbol | undefined,
   apply: () => void,
 ): boolean {
-  const reservation = useWorkflowYamlEditorStore.getState().copilotAcceptance;
+  const reservation = useWorkflowYamlEditorStore.getState().emberAcceptance;
   if ((token ?? null) !== reservation) return false;
   const previousOwner =
-    useWorkflowYamlEditorStore.getState().applyingCopilotOwner;
-  useWorkflowYamlEditorStore.setState({ applyingCopilotOwner: token });
+    useWorkflowYamlEditorStore.getState().applyingEmberOwner;
+  useWorkflowYamlEditorStore.setState({ applyingEmberOwner: token });
   try {
     if (refuseMutationDuringYamlCommit()) return false;
     apply();
     return true;
   } finally {
-    if (useWorkflowYamlEditorStore.getState().applyingCopilotOwner === token)
+    if (useWorkflowYamlEditorStore.getState().applyingEmberOwner === token)
       useWorkflowYamlEditorStore.setState({
-        applyingCopilotOwner: previousOwner,
+        applyingEmberOwner: previousOwner,
       });
   }
 }
@@ -606,10 +620,10 @@ export function getWorkflowLockMessage(
 ): string {
   if (state.lockKind === "save") return "A save is in progress";
   if (
-    state.lockKind === "copilot" ||
-    (!state.commitInProgress && state.copilotAcceptance)
+    state.lockKind === "ember" ||
+    (!state.commitInProgress && state.emberAcceptance)
   )
-    return "Wait for the Copilot change to finish";
+    return EMBER_CHANGE_PENDING_MESSAGE;
   return "A YAML commit is in progress";
 }
 
@@ -617,12 +631,12 @@ export function isLockedByOther(
   owner:
     | YamlCommitOwner
     | symbol
-    | undefined = useWorkflowYamlEditorStore.getState().applyingCopilotOwner,
+    | undefined = useWorkflowYamlEditorStore.getState().applyingEmberOwner,
 ): boolean {
   const state = useWorkflowYamlEditorStore.getState();
   return (
     (state.commitInProgress && state.commitOwner !== owner) ||
-    (state.copilotAcceptance !== null && state.copilotAcceptance !== owner)
+    (state.emberAcceptance !== null && state.emberAcceptance !== owner)
   );
 }
 
@@ -668,10 +682,10 @@ export function registerEditorOwner(owner: YamlCommitOwner): void {
     previousOwner?.workflowPermanentId === owner.workflowPermanentId;
   const pending = state.pendingAccepts[owner.workflowPermanentId];
   const leavingAccept = Object.values(state.pendingAccepts).some(
-    (item) => item.reservation === state.copilotAcceptance,
+    (item) => item.reservation === state.emberAcceptance,
   );
-  const copilotAcceptance =
-    pending?.reservation ?? (leavingAccept ? null : state.copilotAcceptance);
+  const emberAcceptance =
+    pending?.reservation ?? (leavingAccept ? null : state.emberAcceptance);
   let pendingSave = state.pendingSaves[owner.workflowPermanentId];
   if (!pendingSave) {
     const restored = readStoredSave(owner.workflowPermanentId);
@@ -696,12 +710,8 @@ export function registerEditorOwner(owner: YamlCommitOwner): void {
     persistingOwner: pendingSave?.persisting ? pendingSave.owner : null,
     commitInProgress: Boolean(pendingSave),
     committing: Boolean(pendingSave),
-    copilotAcceptance,
-    lockKind: pendingSave
-      ? pendingSave.kind
-      : copilotAcceptance
-        ? "copilot"
-        : null,
+    emberAcceptance,
+    lockKind: pendingSave ? pendingSave.kind : emberAcceptance ? "ember" : null,
     editorOwner: owner,
     authoringAction: canResume ? state.authoringAction : null,
     authoringActionOwner: canResume ? owner : null,

@@ -1,7 +1,7 @@
 """An attach-only worker must refuse a browser it would have to launch, at startup.
 
 The worker this guards carries no browser binary at all -- that is what lets its image be arm64,
-since Chrome and CloakBrowser are x86_64-only on Linux. Configured with a launching browser type it
+since the browsers a worker launches are x86_64-only on Linux. Configured with a launching browser type it
 would not fail at boot but somewhere inside the first run, as an unclassified crash on a code path
 that should have been unreachable.
 """

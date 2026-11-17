@@ -32,7 +32,6 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
 )
 from skyvern.forge.sdk.copilot.challenge_evidence import stamp_challenge_frame_fact
 from skyvern.forge.sdk.copilot.completion_output_grounding import (
-    _boundary_delimited_present,
     grade_requested_output_criteria,
     page_evidence_prose_text,
 )
@@ -45,7 +44,6 @@ from skyvern.forge.sdk.copilot.completion_verification import (
 )
 from skyvern.forge.sdk.copilot.composition_browser_expressions import DECLARED_IFRAME_SRC_EXPRESSION
 from skyvern.forge.sdk.copilot.context import CopilotContext
-from skyvern.forge.sdk.copilot.reached_download_target import GENERATED_FILE_ARTIFACT_IDS_KEY
 from skyvern.forge.sdk.copilot.request_policy import (
     _classifier_fallback_policy,
     build_classifier_fallback_floor,
@@ -65,7 +63,9 @@ from skyvern.forge.sdk.workflow import runtime_secret_bridge
 from skyvern.forge.sdk.workflow.context_manager import RANDOM_SECRET_ID_PREFIX, WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import FileParseTimeout
 from skyvern.forge.sdk.workflow.models.block import _register_code_block_secret
+from skyvern.forge.sdk.workflow.reached_download_target import GENERATED_FILE_ARTIFACT_IDS_KEY
 from skyvern.utils.secret_redaction import REDACTED_SECRET_PLACEHOLDER
+from skyvern.utils.strings import boundary_delimited_present
 from tests.unit.copilot_test_helpers import (
     DISPATCHED_NAV_ONLY_HTML,
     harness_run,
@@ -233,10 +233,10 @@ def test_no_authored_contract_confirms_with_carrier_and_stays_unproducible_witho
 
 
 def test_boundary_predicate_rejects_alnum_neighbors() -> None:
-    assert _boundary_delimited_present("demo", "the demo runs") is True
-    assert _boundary_delimited_present("demo", "demonstrate") is False
-    assert _boundary_delimited_present("1842", "order #1842.") is True
-    assert _boundary_delimited_present("1842", "18429") is False
+    assert boundary_delimited_present("demo", "the demo runs") is True
+    assert boundary_delimited_present("demo", "demonstrate") is False
+    assert boundary_delimited_present("1842", "order #1842.") is True
+    assert boundary_delimited_present("1842", "18429") is False
 
 
 def test_page_evidence_prose_text_skips_stamp_keys_and_booleans() -> None:
@@ -2642,7 +2642,7 @@ _TILE_EVIDENCE = "Visitors\n-15.0%\n8.45K\nvs. 9.99K prior"
 def test_literal_containment_alone_would_miss_the_correct_extraction() -> None:
     # Pins why the numeric-equivalence half is load-bearing: the correct value is not a substring of
     # the tile that displays it, so a containment-only rule leaves a right answer unconfirmable.
-    assert _boundary_delimited_present("8450", _TILE_EVIDENCE) is False
+    assert boundary_delimited_present("8450", _TILE_EVIDENCE) is False
 
 
 def _exact_value_criterion(value: str) -> object:

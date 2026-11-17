@@ -1,6 +1,7 @@
 import { useEdges, useNodes, useNodesData } from "@xyflow/react";
 
 import { HelpTooltip } from "@/components/HelpTooltip";
+import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 import {
   Accordion,
@@ -100,12 +101,16 @@ function EmailInboxEditorBody({
     blockId,
   );
 
+  // A message ID belongs to one mailbox, so it does not survive a client or connection change.
+  const clearMessageId = data.messageId ? { messageId: "" } : {};
+
   const updateEmailClient = (emailClient: EmailClient) => {
     update({
       emailClient,
       credentialId: "",
       credentialSource: "native",
       connectionId: "",
+      ...clearMessageId,
     });
   };
 
@@ -116,9 +121,13 @@ function EmailInboxEditorBody({
     const parameterKey = getTemplateParameterKey(credentialId);
     const previousParameterKey = getTemplateParameterKey(data.credentialId);
     const previousParameterKeyIsUsedElsewhere = previousParameterKey
-      ? [data.folder, data.prompt, data.sender, data.subject].some((value) =>
-          containsJinjaReference(value, previousParameterKey),
-        )
+      ? [
+          data.folder,
+          data.prompt,
+          data.sender,
+          data.subject,
+          data.messageId,
+        ].some((value) => containsJinjaReference(value, previousParameterKey))
       : false;
     const parameterKeys = previousParameterKeyIsUsedElsewhere
       ? [...data.parameterKeys]
@@ -180,17 +189,18 @@ function EmailInboxEditorBody({
               disabled={!editable || readOnly}
               onChange={(credentialSource, id) => {
                 if (credentialSource === "native") {
-                  updateCredentialId(
-                    id,
-                    data.credentialSource === "nango" || data.connectionId
+                  updateCredentialId(id, {
+                    ...(data.credentialSource === "nango" || data.connectionId
                       ? { credentialSource: "native", connectionId: "" }
-                      : {},
-                  );
+                      : {}),
+                    ...(id !== data.credentialId ? clearMessageId : {}),
+                  });
                 } else {
                   update({
                     credentialSource,
                     connectionId: id,
                     credentialId: "",
+                    ...clearMessageId,
                   });
                 }
               }}
@@ -209,8 +219,7 @@ function EmailInboxEditorBody({
           <p className="text-xs text-muted-foreground">
             This Gmail account requires an eligible human-initiated root run.
             Scheduled, event, and child runs are unsupported. Folder, sender,
-            and subject must be literal; attachment downloads are unsupported.
-            Reads return at most 100 messages.
+            and subject must be literal. Reads return at most 100 messages.
           </p>
         ) : null}
       </div>
@@ -222,6 +231,30 @@ function EmailInboxEditorBody({
           <AccordionTrigger className="py-2">Data</AccordionTrigger>
           <AccordionContent className="pl-6 pr-1 pt-4">
             <div className="space-y-3">
+              {data.emailClient === "gmail" && !isNango ? (
+                <div className="space-y-2">
+                  <Label
+                    htmlFor={`${blockId}-message-id`}
+                    className="text-xs text-tertiary-foreground"
+                  >
+                    Message ID (optional)
+                  </Label>
+                  <WorkflowBlockInput
+                    id={`${blockId}-message-id`}
+                    name="messageId"
+                    nodeId={blockId}
+                    value={data.messageId}
+                    onChange={(value) => update({ messageId: value })}
+                    disabled={!editable}
+                    className="nopan text-xs"
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    {
+                      "Fetches only this email instead of searching. In an agent started by a Gmail trigger, use {{ email.id }}."
+                    }
+                  </p>
+                </div>
+              ) : null}
               <div className="space-y-2">
                 <FieldLabel
                   field="folder"
@@ -360,7 +393,6 @@ function EmailInboxEditorBody({
                 <Switch
                   aria-label="Download Attachments"
                   checked={data.downloadAttachments}
-                  disabled={isNango && !data.downloadAttachments}
                   onCheckedChange={(checked) =>
                     update({ downloadAttachments: checked })
                   }
