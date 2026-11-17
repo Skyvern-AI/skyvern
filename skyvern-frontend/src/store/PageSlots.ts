@@ -45,6 +45,8 @@ export type BrokerCredentialSelectorProps = BrokerCredentialSelectorBase &
         credentialId: string;
         // send filters the native accounts to those that can send; reply also omits connected accounts.
         purpose?: "read" | "send" | "reply";
+        // false hides "Use template expression" where a real account is required.
+        allowTemplates?: boolean;
       }>
   );
 
