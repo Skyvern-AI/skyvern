@@ -70,8 +70,10 @@ from skyvern.forge.sdk.integrations.connected_accounts import (
 )
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
+from skyvern.forge.sdk.schemas.google_oauth import GOOGLE_GMAIL_SEND_SCOPE
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import AgentStepToolCall
+from skyvern.forge.sdk.services.google_oauth_service import GOOGLE_GMAIL_READONLY_SCOPE, GOOGLE_SHEETS_DATA_SCOPE
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager, WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import InvalidWorkflowDefinition
@@ -1016,15 +1018,12 @@ def test_every_block_type_is_an_agent_tool_or_says_why_not() -> None:
             continue
         assert tool.yaml_class.model_fields["block_type"].default == block_type
         assert set(tool.fields) - {"credential", "files"} <= set(tool.yaml_class.model_fields)
-
-
-def test_each_block_tool_offers_exactly_the_account_fields_its_schema_marks() -> None:
+    # The account fields each tool offers: one dropped here leaves that tool unable to pick an account.
     offered = {
         block_type.value: tool.arguments[len(tool.fields) :]
         for block_type, tool in agent_step_tools.AGENT_BLOCK_TOOLS.items()
         if isinstance(tool, agent_step_tools.BlockTool) and len(tool.arguments) > len(tool.fields)
     }
-
     assert offered == {
         "file_upload": ("google_credential_id",),
         "send_email": ("credential_id",),
@@ -1034,7 +1033,7 @@ def test_each_block_tool_offers_exactly_the_account_fields_its_schema_marks() ->
     }
 
 
-SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets.readonly"
+SHEETS_SCOPE = GOOGLE_SHEETS_DATA_SCOPE
 
 
 async def _google_accounts(database: AgentDB) -> None:
@@ -1286,6 +1285,66 @@ async def test_an_account_outside_the_runs_active_accounts_is_refused_with_the_v
         assert "goc_active" in output and "goc_errored@" not in output and "goc_foreign@" not in output
     rows = await database.observer.get_workflow_run_blocks(workflow_run_id=RUN, organization_id=ORG)
     assert [row.block_type for row in rows] == [BlockType.AGENT_STEP]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("accounts", "senders", "readers", "refusal_names"),
+    [
+        (
+            [
+                ("goc_reader", [GOOGLE_GMAIL_READONLY_SCOPE]),
+                ("goc_sender", [GOOGLE_GMAIL_READONLY_SCOPE, GOOGLE_GMAIL_SEND_SCOPE]),
+                # No recorded grant: whether it can send is unknown, so it must stay offered everywhere.
+                ("goc_unrecorded", []),
+            ],
+            ["goc_sender", "goc_unrecorded"],
+            ["goc_reader", "goc_sender", "goc_unrecorded"],
+            "goc_sender",
+        ),
+        # Only a read-only account: none can send, so the refusal names the permission to reconnect with.
+        ([("goc_reader", [GOOGLE_GMAIL_READONLY_SCOPE])], [], ["goc_reader"], GOOGLE_GMAIL_SEND_SCOPE),
+    ],
+)
+async def test_a_read_only_gmail_account_is_not_offered_for_send_but_stays_for_reading(
+    monkeypatch: pytest.MonkeyPatch,
+    database: AgentDB,
+    accounts: list[tuple[str, list[str]]],
+    senders: list[str],
+    readers: list[str],
+    refusal_names: str,
+) -> None:
+    async with database.Session() as session:
+        for account_id, scopes in accounts:
+            session.add(
+                GoogleOAuthCredentialModel(
+                    id=account_id,
+                    organization_id=ORG,
+                    credential_name=account_id,
+                    email_address=f"{account_id}@example.com",
+                    state="active",
+                    scopes_granted=scopes,
+                )
+            )
+        await session.commit()
+    monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
+    email = {**EMAIL, "transport": "gmail", "recipients": ["ops@example.com"], "credential_id": "goc_reader"}
+    model = _ScriptedModel(
+        [[scripted_call("run_block", {"block_type": "send_email", "arguments": email}, call_id="send")], VALID_FINISH]
+    )
+
+    await _run_agent_block(monkeypatch, LUNA_MEDIUM, model, tools=["email_inbox", "send_email"])
+
+    (run_block,) = (tool for tool in model.tools[0] if isinstance(tool, FunctionTool) and tool.name == "run_block")
+    schema = run_block.params_json_schema
+
+    def offered(field: str) -> list[str]:
+        branch = next(b for b in schema["properties"]["arguments"]["anyOf"] if field in b["properties"])
+        return sorted(schema["$defs"][branch["properties"]["credential_id"]["$ref"].rpartition("/")[2]].get("enum", []))
+
+    assert (offered("recipients"), offered("folder")) == (senders, readers)
+    (refused,) = tool_outputs_for(model.inputs[1][1], "send")
+    assert "invalid_arguments" in refused and refusal_names in refused and "goc_reader@" not in refused
 
 
 CHILD_OUTPUT = "agent_text_prompt_1_output"
