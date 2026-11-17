@@ -1,5 +1,7 @@
 import { Navigate, useLocation, useParams } from "react-router-dom";
 
+import { usePageSlots } from "@/store/PageSlots";
+
 import { LegacyBuildRedirect } from "./LegacyBuildRedirect";
 import { WorkflowEditor } from "./editor/WorkflowEditor";
 import { toReadableSearch } from "./studio/panes";
@@ -23,6 +25,18 @@ export function EditRoute() {
     <Navigate
       to={`/agents/${workflowPermanentId}/studio${location.search}`}
       state={location.state}
+      replace
+    />
+  );
+}
+
+export function TriggersRoute() {
+  const { workflowPermanentId } = useParams();
+  // Builds without the Triggers pane (on-prem) open the agent's Studio as usual.
+  const hasTriggersPane = Boolean(usePageSlots().workflowTriggersPanel);
+  return (
+    <Navigate
+      to={`/agents/${workflowPermanentId}/studio${hasTriggersPane ? "?panes=triggers" : ""}`}
       replace
     />
   );

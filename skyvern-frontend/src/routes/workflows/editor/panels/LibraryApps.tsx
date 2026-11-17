@@ -1,7 +1,5 @@
 import { useState } from "react";
 
-import { usePageSlots } from "@/store/PageSlots";
-import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import {
   ChevronDownIcon,
   ChevronRightIcon,
@@ -24,6 +22,7 @@ import {
   type IntegrationCatalogEntryWithActions,
 } from "../nodes/IntegrationActionNode/types";
 import { appRowMeta, appRows, matchingAppActions } from "./appLibrary";
+import { useStudioPaneIds, useStudioPanes } from "../../studio/useStudioPanes";
 
 function AppBadge({ name }: { name: string }) {
   return (
@@ -56,13 +55,10 @@ function LibraryApps({ catalog, search, onAdd }: Props) {
     enabled: hasActions("microsoft"),
   });
   const [expandedApp, setExpandedApp] = useState<string | null>(null);
-  // Triggers are not blocks: a trigger row opens the agent's Triggers panel, which only the cloud app provides.
-  const canOpenTriggers = Boolean(usePageSlots().workflowTriggersPanel);
-  const setWorkflowPanelState = useWorkflowPanelStore(
-    (state) => state.setWorkflowPanelState,
-  );
-  const openTriggers = () =>
-    setWorkflowPanelState({ active: true, content: "triggers" });
+  // Triggers are not blocks: a trigger row opens the agent's Triggers pane, which only Cloud provides for a changeable agent.
+  const canOpenTriggers = useStudioPaneIds().includes("triggers");
+  const { openPane } = useStudioPanes();
+  const openTriggers = () => openPane("triggers");
   const apps = appRows(catalog, (entry) => {
     const scopes = entry.capabilityScopes ?? entry.requiredScopes ?? [];
     if (entry.oauthProvider === "google") {

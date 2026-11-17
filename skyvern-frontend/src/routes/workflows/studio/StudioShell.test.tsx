@@ -6,6 +6,7 @@ import { type ReactNode } from "react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
+import { PageSlotsProvider } from "@/store/PageSlots";
 import { useEmberHeaderStore } from "@/store/useEmberHeaderStore";
 import { useManualSignInStore } from "@/store/useManualSignInStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
@@ -99,6 +100,13 @@ vi.mock("./useRunVisuals", () => ({
     recordingUrls: [],
   }),
 }));
+const globalWorkflow = vi.hoisted(() => ({
+  value: false as boolean | undefined,
+}));
+vi.mock("../hooks/useIsGlobalWorkflow", () => ({
+  useIsGlobalWorkflow: () => globalWorkflow.value ?? false,
+  useGlobalWorkflowStatus: () => globalWorkflow.value,
+}));
 vi.mock("../workflowRun/WorkflowRunVerificationCodeForm", () => ({
   WorkflowRunVerificationCodeForm: ({
     workflowRunId,
@@ -146,6 +154,78 @@ describe("StudioShell inspected run header", () => {
       within(header).queryByRole("button", { name: "Copy to clipboard" }),
     ).toBeNull();
   });
+});
+
+describe("StudioShell Triggers pane", () => {
+  afterEach(() => {
+    globalWorkflow.value = false;
+  });
+
+  test.each([
+    {
+      agent: "a live agent",
+      panes: "triggers",
+      deletedAt: null,
+      global: false,
+      mounted: true,
+    },
+    {
+      agent: "a live agent",
+      panes: "editor",
+      deletedAt: null,
+      global: false,
+      mounted: false,
+    },
+    {
+      agent: "a deleted agent",
+      panes: "triggers",
+      deletedAt: "2026-08-12T00:00:00Z",
+      global: false,
+      mounted: false,
+    },
+    {
+      agent: "a global agent",
+      panes: "triggers",
+      deletedAt: null,
+      global: true,
+      mounted: false,
+    },
+    {
+      agent: "an agent whose global status is loading",
+      panes: "triggers",
+      deletedAt: null,
+      global: undefined,
+      mounted: false,
+    },
+  ])(
+    "?panes=$panes on $agent mounts the trigger UI: $mounted",
+    ({ panes, deletedAt, global, mounted }) => {
+      globalWorkflow.value = global;
+      const props = {
+        workflow: {
+          workflow_permanent_id: "wpid_synthetic",
+          organization_id: "org_synthetic",
+          deleted_at: deletedAt,
+          workflow_definition: { blocks: [] },
+        },
+        initialTitle: "Synthetic workflow",
+      } as unknown as StudioWorkspaceProps;
+
+      render(
+        <MemoryRouter
+          initialEntries={[`/workflows/wpid_synthetic/studio?panes=${panes}`]}
+        >
+          <PageSlotsProvider
+            value={{ workflowTriggersPanel: () => <p>Trigger management</p> }}
+          >
+            <StudioShell {...props} />
+          </PageSlotsProvider>
+        </MemoryRouter>,
+      );
+
+      expect(screen.queryByText("Trigger management") !== null).toBe(mounted);
+    },
+  );
 });
 
 describe("StudioShell with a pane folded for the Doc", () => {
