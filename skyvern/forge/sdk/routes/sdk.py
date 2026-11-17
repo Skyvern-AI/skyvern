@@ -25,8 +25,12 @@ from skyvern.forge.sdk.db.enums import TaskType, WorkflowRunTriggerType
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.sdk_actions import (
+    ClickAction,
+    InputTextAction,
     RunSdkActionRequest,
     RunSdkActionResponse,
+    SelectOptionAction,
+    UploadFileAction,
 )
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.services import org_auth_service
@@ -433,6 +437,11 @@ async def _run_sdk_action(
                 action_type=action.type,
                 browser_session_id=browser_session_id,
                 error=str(e),
+                error_type=type(e).__name__,
+                selector_supplied=(
+                    isinstance(action, (ClickAction, InputTextAction, SelectOptionAction, UploadFileAction))
+                    and bool(action.selector)
+                ),
             )
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
