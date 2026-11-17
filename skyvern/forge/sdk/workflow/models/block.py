@@ -206,7 +206,7 @@ from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.credential_site_policy import LoginSite, describe_release_scope
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
-from skyvern.forge.sdk.db.enums import TaskType, WorkflowRunTriggerType
+from skyvern.forge.sdk.db.enums import PERSON_STARTED_TRIGGER_TYPES, TaskType, WorkflowRunTriggerType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.id import generate_action_id, generate_workflow_run_id
 from skyvern.forge.sdk.db.repositories.google_oauth import DISPATCH_ACCEPTED, DISPATCH_FAILED, GmailSendDispatch
@@ -13966,15 +13966,8 @@ GMAIL_SEND_FAILURE_MESSAGES: dict[GmailSendErrorCode, str] = {
 
 # The trigger kinds a connected account's capability may be prepared for; never for the rest. A child run carries
 # its chain root's kind, so admitting a kind admits that kind's children too.
-_CONNECTED_ACCOUNT_TRIGGER_TYPES = frozenset(
-    {
-        None,
-        WorkflowRunTriggerType.manual,
-        WorkflowRunTriggerType.mcp,
-        WorkflowRunTriggerType.api,
-        WorkflowRunTriggerType.scheduled,
-        WorkflowRunTriggerType.event,
-    }
+_CONNECTED_ACCOUNT_TRIGGER_TYPES = PERSON_STARTED_TRIGGER_TYPES | frozenset(
+    {WorkflowRunTriggerType.scheduled, WorkflowRunTriggerType.event}
 )
 
 
