@@ -105,8 +105,8 @@ def _internal_date(message: dict[str, Any]) -> datetime | None:
         return None
 
 
-def _externalized_text_parts(payload: dict[str, Any]) -> list[tuple[str, int | None]]:
-    externalized_parts: list[tuple[str, int | None]] = []
+def _externalized_text_parts(payload: dict[str, Any]) -> list[tuple[str, int | None, str]]:
+    externalized_parts: list[tuple[str, int | None, str]] = []
     raw_body = payload.get("body")
     body = raw_body if isinstance(raw_body, dict) else {}
     mime_type = str(payload.get("mimeType") or "").lower()
@@ -119,7 +119,7 @@ def _externalized_text_parts(payload: dict[str, Any]) -> list[tuple[str, int | N
         and attachment_id
     ):
         size = body.get("size")
-        externalized_parts.append((attachment_id, size if isinstance(size, int) else None))
+        externalized_parts.append((attachment_id, size if isinstance(size, int) else None, mime_type))
     for part in payload.get("parts") or []:
         if isinstance(part, dict):
             externalized_parts.extend(_externalized_text_parts(part))
@@ -140,7 +140,7 @@ async def _extract_otp_body_texts(
     attempts = 0
     # Shared per-message budget so the assembled content stays bounded for the parse prompt.
     remaining = _MAX_EXTERNALIZED_TEXT_PART_BYTES
-    for attachment_id, size in _externalized_text_parts(payload):
+    for attachment_id, size, mime_type in _externalized_text_parts(payload):
         if size is not None and size > remaining:
             skipped += 1
             continue
@@ -191,7 +191,7 @@ async def _extract_otp_body_texts(
         if not decoded:
             failed += 1
             continue
-        texts.append(decoded)
+        texts.append(gmail_client.body_text(decoded, mime_type))
         fetched += 1
         remaining -= len(decoded)
     return _BodyExtraction(
