@@ -265,6 +265,8 @@ skyvern run server
 
 `skyvern init` runs the database migrations. Back up the database before upgrading. Release notes are in the [changelog](/changelog).
 
+If the API server and the web UI are separate deployments, as on Kubernetes, upgrade the API with or before the UI. A newer UI can call API paths that an older server does not serve.
+
 ## Next
 
 - [Configuration](/reference/configuration): every environment variable and model key
