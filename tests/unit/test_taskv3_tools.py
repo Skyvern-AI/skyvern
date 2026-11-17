@@ -4237,6 +4237,7 @@ async def test_observe_result_carries_count_only_summary_for_the_call_record() -
         "unnamed_not_icon",
         "links_listed",
         "link_capped",
+        "qualified_by_destination",
     }
     assert all(type(v) is int for v in summary.values())
     assert summary["invalid_fields"] == 1
@@ -7626,6 +7627,7 @@ async def test_observe_clip_count_does_not_tell_two_same_caption_controls_apart(
     assert len(adds) == 2, r.content
     assert "section='Work History'" in adds[0] and "section='Education'" in adds[1], adds
     assert r.data["summary"]["duplicate_digest_lines"] == 0, r.data
+    assert r.data["summary"]["qualified_by_destination"] == 0, r.data
 
 
 @pytest.mark.asyncio
@@ -7642,6 +7644,157 @@ async def test_observe_counts_lines_that_differ_only_in_their_clip_count_as_dupl
     ).handler({})
     assert r.status == "ok"
     assert r.data["summary"]["duplicate_digest_lines"] == 2, r.data
+    for case in _DESTINATION_SPLIT_RECORDS:
+        elements, expected, qualified = case.values
+        page = _digest_page({"text": [], "elements": elements})
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+        assert r.status == "ok", case.id
+        listed = [line for line in r.content.splitlines() if line.startswith(("ref=", "(in= left off"))]
+        assert listed == expected, (case.id, r.content)
+        assert r.data["summary"]["qualified_by_destination"] == qualified, (case.id, r.data)
+
+
+def _placed_link(i: int, label: str, to: str, section: str, box: str = "") -> dict[str, Any]:
+    return {
+        "i": i,
+        "tag": "a",
+        "type": None,
+        "selector": f"#l{i}",
+        "label": label,
+        "to": to,
+        "placement": [["section", section]] + ([["in.apart", box]] if box else []),
+    }
+
+
+_KESTREL = ("/tools/launch-kestrel", "Retirement plans", "Retirement plans Open planner")
+_PLANNER_SOFTWARE = ("/tools/launch-planner-software", "Education plans", "Education plans Open planner")
+
+
+# Lines a destination already tells apart get in= only where every one has its own, different box text.
+_BUDGET_BOXES = [f"Card {n:02d} " + "x" * 105 for n in range(21)] + ["Card 21"]
+_DESTINATION_SPLIT_RECORDS = [
+    pytest.param(
+        [_placed_link(n, "View", f"/item/{n:02d}", "Items", box) for n, box in enumerate(_BUDGET_BOXES)],
+        [
+            f"ref={n + 1} a 'View' to='/item/{n:02d}'" + (f" in='{box}'" if n < 20 else "")
+            for n, box in enumerate(_BUDGET_BOXES)
+        ]
+        + ["(in= left off 2 more link(s): this reading's budget for it ran out.)"],
+        20,
+        id="past_the_reading_budget",
+    ),
+    pytest.param(
+        [_placed_link(0, "Open planner", *_KESTREL), _placed_link(1, "Open planner", *_PLANNER_SOFTWARE)],
+        [
+            "ref=1 a 'Open planner' to='/tools/launch-kestrel' in='Retirement plans Open planner'",
+            "ref=2 a 'Open planner' to='/tools/launch-planner-software' in='Education plans Open planner'",
+        ],
+        2,
+        id="own_box_text",
+    ),
+    pytest.param(
+        [
+            {
+                **link,
+                "placement": [["within.data-testid", f"tool-card-{link['i'] + 1}"], *link["placement"]],
+            }
+            for link in (
+                _placed_link(0, "Open planner", *_KESTREL),
+                _placed_link(1, "Open planner", *_PLANNER_SOFTWARE),
+            )
+        ],
+        [
+            "ref=1 a 'Open planner' to='/tools/launch-kestrel' in='Retirement plans Open planner'",
+            "ref=2 a 'Open planner' to='/tools/launch-planner-software' in='Education plans Open planner'",
+        ],
+        2,
+        id="ids_not_offered",
+    ),
+    pytest.param(
+        [
+            {**_placed_link(0, "Open", *_KESTREL), "shows": "Open planner"},
+            {**_placed_link(1, "Open", *_PLANNER_SOFTWARE), "shows": "Open planner"},
+        ],
+        [
+            "ref=1 a 'Open' shows='Open planner' to='/tools/launch-kestrel' in='Retirement plans Open planner'",
+            "ref=2 a 'Open' shows='Open planner' to='/tools/launch-planner-software' in='Education plans Open planner'",
+        ],
+        2,
+        id="shows_before_to",
+    ),
+    pytest.param(
+        [
+            _placed_link(0, "Open planner", *_KESTREL[:2], "Plans Open planner"),
+            _placed_link(1, "Open planner", *_PLANNER_SOFTWARE[:2], "Plans Open planner"),
+        ],
+        [
+            "ref=1 a 'Open planner' to='/tools/launch-kestrel'",
+            "ref=2 a 'Open planner' to='/tools/launch-planner-software'",
+        ],
+        0,
+        id="same_box_text",
+    ),
+    pytest.param(
+        [_placed_link(0, "Open planner", *_KESTREL), _placed_link(1, "Open planner", *_PLANNER_SOFTWARE[:2])],
+        [
+            "ref=1 a 'Open planner' to='/tools/launch-kestrel'",
+            "ref=2 a 'Open planner' to='/tools/launch-planner-software'",
+        ],
+        0,
+        id="one_box_declined",
+    ),
+    pytest.param(
+        [
+            _placed_link(0, "Manage", "/rows/alpha", "Rows", "Row one Manage"),
+            _placed_link(1, "Manage", "/rows/alpha", "Rows", "Row two Manage"),
+            _placed_link(2, "Manage", "/rows/beta", "Other rows", "Row three Manage"),
+        ],
+        [
+            "ref=1 a 'Manage' to='/rows/alpha'",
+            "ref=2 a 'Manage' to='/rows/alpha'",
+            "ref=3 a 'Manage' to='/rows/beta'",
+        ],
+        0,
+        id="identical_pair_plus_a_third",
+    ),
+    pytest.param(
+        [
+            _placed_link(0, "Open planner", *_KESTREL),
+            _placed_link(1, "Read the guide", "/docs/handbook", "Education plans", "Education plans Read the guide"),
+        ],
+        ["ref=1 a 'Open planner' to='/tools/launch-kestrel'", "ref=2 a 'Read the guide' to='/docs/handbook'"],
+        0,
+        id="unique_names",
+    ),
+    pytest.param(
+        [
+            {**_placed_link(0, "Name", "", "Work"), "tag": "input", "type": "text", "value": "Ann"},
+            {**_placed_link(1, "Name", "", "School"), "tag": "input", "type": "text", "value": "Bo"},
+        ],
+        ["ref=1 input/text 'Name' value='Ann'", "ref=2 input/text 'Name' value='Bo'"],
+        0,
+        id="same_label_different_value",
+    ),
+    pytest.param(
+        [
+            {
+                **_placed_link(i, "Share", f"/social/{n}", "Contact"),
+                "icon": True,
+                "placement": [["nth", f"{i + 1} of 2"]],
+            }
+            for i, n in enumerate(("one", "two"))
+        ],
+        ["ref=1 a 'Share' to='/social/one' nth=1 of 2", "ref=2 a 'Share' to='/social/two' nth=2 of 2"],
+        0,
+        id="icons_main_already_numbers",
+    ),
+    pytest.param(
+        [_placed_link(0, "", *_KESTREL), _placed_link(1, "", *_PLANNER_SOFTWARE)],
+        ["ref=1 a '' to='/tools/launch-kestrel'", "ref=2 a '' to='/tools/launch-planner-software'"],
+        0,
+        id="text_less_links",
+    ),
+]
 
 
 @_skip_no_browser
@@ -24445,6 +24598,21 @@ async def test_a_link_whose_label_does_not_name_its_destination_shows_where_it_g
     for same in ("Do Not Sell My Info", "Home", "Email us", "Questions", "State"):
         assert " to=" not in lines[same], observed.content
     assert "from=home" not in observed.content and "ref=home" not in observed.content, observed.content
+
+    for case in _DESTINATION_SPLIT_PAGES:
+        links, expected, qualified = case.values
+        async with _page_context(viewport={"width": 1024, "height": 900}) as context:
+            page = await context.new_page()
+            await page.route("http://site.test/**", serve)
+            await page.goto("http://site.test/advisor")
+            r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+            raw = (await _observe_data(page))["elements"]
+        assert r.status == "ok", (case.id, r.content)
+        boxed = [e["label"] for e in raw if any(kind == "in.apart" for kind, _ in e.get("placement") or [])]
+        assert all([e["label"] for e in raw if e.get("to")].count(caption) > 1 for caption in boxed), (case.id, boxed)
+        listed = [ln for ln in (re.sub(r"^ref=\d+ ", "", ln) for ln in _lines(r.content)) if ln.startswith("a ")]
+        assert listed == expected, (case.id, r.content)
+        assert r.data["summary"]["qualified_by_destination"] == qualified, (case.id, r.data)
 
 
 @_skip_no_browser
@@ -42906,6 +43074,201 @@ async def test_observe_says_nothing_rather_than_naming_the_wrong_section() -> No
         assert len([line for line in gos if "Personal" in line]) == 1, r.content
         assert len(set(gos)) == 3, r.content
         assert r.data["summary"]["duplicate_digest_lines"] == 0, r.data
+
+
+_PLAN_CARDS = (("Retirement plans", "launch-kestrel"), ("Education plans", "launch-planner-software"))
+_CARD_IMG = '<img alt="" width="200" height="100" src="data:image/gif;base64,R0lGODlhAQABAAAAACw=">'
+
+
+def _plan_cards(template: str) -> str:
+    return "".join(template.format(h=h, s=s, n=n) for n, (h, s) in enumerate(_PLAN_CARDS, 1))
+
+
+_MIG69_CARDS = _plan_cards(
+    '<div class="card"><a href="/tools/{s}/">' + _CARD_IMG + '</a><div class="content"><h2>{h}</h2>'
+    '<a class="button" href="/tools/{s}/">Open planner</a></div></div>'
+)
+_OPEN_PLANNER_IN = [
+    "a 'Open planner' to='/tools/launch-kestrel/' in='Retirement plans Open planner'",
+    "a 'Open planner' to='/tools/launch-planner-software/' in='Education plans Open planner'",
+]
+_CONTACT_US_BARE = ["a 'Contact us' to='/about/reach'", "a 'Contact us' to='/help/reach-out'"]
+_PROMO_AND_SECTION = (
+    '<section><h3>Retirement plans</h3><a href="/tools/launch-kestrel/">Open planner</a></section>',
+    '<a href="/promo/spring">Open planner</a>',
+)
+_LONG_CAPTION = "Open the planner and its guide " * 5
+_HEALTH_CARD = (
+    '<div class="wrap"><section><h3>Health plans</h3><a href="/tools/health-planner/">Open planner</a></section></div>'
+)
+
+
+_DESTINATION_SPLIT_PAGES = [
+    pytest.param(
+        f"<main><h2>Planner Software</h2>{_MIG69_CARDS}</main>",
+        [
+            "a '' to='/tools/launch-kestrel/'",
+            _OPEN_PLANNER_IN[0],
+            "a '' to='/tools/launch-planner-software/'",
+            _OPEN_PLANNER_IN[1],
+        ],
+        2,
+        id="A_heading_then_link_in_each_card",
+    ),
+    pytest.param(
+        "<main><h2>Planner Software</h2>"
+        + _plan_cards(
+            '<div class="card"><a href="/tools/{s}/">Planner preview</a><div class="content"><h2>{h}</h2>'
+            "<p>Plan details</p></div></div>"
+        )
+        + "</main>",
+        [
+            "a 'Planner preview' to='/tools/launch-kestrel/' in='Planner preview Retirement plans Plan details'",
+            "a 'Planner preview' to='/tools/launch-planner-software/'"
+            " in='Planner preview Education plans Plan details'",
+        ],
+        2,
+        id="B_link_before_its_own_cards_heading",
+    ),
+    pytest.param(
+        '<header><nav><a href="/about/reach">Contact us</a></nav></header>'
+        "<main><h1>Welcome</h1><h2>News</h2><p>Body</p></main>"
+        '<footer><nav><a href="/help/reach-out">Contact us</a></nav></footer>',
+        _CONTACT_US_BARE,
+        0,
+        id="C2_header_and_footer_nav",
+    ),
+    pytest.param(
+        '<header><nav><a href="/about/reach">Contact us</a></nav></header>'
+        "<main><h1>Welcome</h1><p>Body</p></main>"
+        '<footer><nav><a href="/help/reach-out">Contact us</a></nav></footer>',
+        _CONTACT_US_BARE,
+        0,
+        id="C3_header_and_footer_nav_on_a_one_heading_page",
+    ),
+    pytest.param(
+        '<section><h2>Personal</h2><div><a href="/next/personal">Continue</a></div></section>'
+        "<section><h2>Billing</h2><aside><h3>Help</h3><p>Call us</p></aside>"
+        '<div><a href="/next/billing">Continue</a></div></section>',
+        [
+            "a 'Continue' to='/next/personal' in='Personal Continue'",
+            "a 'Continue' to='/next/billing' in='Billing Help Call us Continue'",
+        ],
+        2,
+        id="D_aside_heading_inside_a_section",
+    ),
+    pytest.param(
+        "<main><h2>Planner Software</h2>"
+        + _plan_cards(
+            '<div class="card" data-testid="tool-card-{n}"><div class="content"><h2>{h}</h2>'
+            '<a class="button" href="/tools/{s}/">Open planner</a></div></div>'
+        )
+        + "</main>",
+        _OPEN_PLANNER_IN,
+        2,
+        id="E_cards_with_test_ids",
+    ),
+    pytest.param(
+        '<main><h2>Retirement plans</h2><p>Text</p><a href="/tools/launch-kestrel/">Open planner</a>'
+        '<h2>Education plans</h2><p>Text</p><a href="/tools/launch-planner-software/">Open planner</a></main>',
+        ["a 'Open planner' to='/tools/launch-kestrel/'", "a 'Open planner' to='/tools/launch-planner-software/'"],
+        0,
+        id="F_flat_list",
+    ),
+    pytest.param(
+        "<div class=row><div class=card><h3>Retirement plans</h3><a href=/r>Learn more</a></div>"
+        "<div class=card><b>Education plans</b><a href=/tools/edu-planner>Open planner</a></div></div>"
+        "<div class=row><div class=card><h3>Health plans</h3>"
+        "<a href=/tools/health-planner>Open planner</a></div></div>",
+        [
+            "a 'Learn more'",
+            "a 'Open planner' to='/tools/edu-planner' in='Education plansOpen planner'",
+            "a 'Open planner' to='/tools/health-planner' in='Health plans Open planner'",
+        ],
+        2,
+        id="G_card_row_with_a_bold_title",
+    ),
+    pytest.param(
+        '<div class="wrap"><section><h2>Retirement plans</h2><p>Text</p></section>'
+        '<div class="promo"><a href="/promo/spring">Open planner</a></div></div>'
+        '<section><h2>Education plans</h2><a href="/tools/launch-planner-software/">Open planner</a></section>',
+        [
+            "a 'Open planner' to='/promo/spring' in='Retirement plans Text Open planner'",
+            "a 'Open planner' to='/tools/launch-planner-software/' in='Education plans Open planner'",
+        ],
+        2,
+        id="H_promo_after_a_headed_section_in_one_wrapper",
+    ),
+    *(
+        pytest.param(
+            f'<div class="wrap">{first}{second}</div>{_HEALTH_CARD}',
+            [f"a 'Open planner' to='{to}'" for to in order],
+            0,
+            id=f"J_wrapper_holding_two_of_the_set_{name}",
+        )
+        for name, (first, second), order in (
+            (
+                "section_first",
+                _PROMO_AND_SECTION,
+                ("/tools/launch-kestrel/", "/promo/spring", "/tools/health-planner/"),
+            ),
+            (
+                "promo_first",
+                _PROMO_AND_SECTION[::-1],
+                ("/promo/spring", "/tools/launch-kestrel/", "/tools/health-planner/"),
+            ),
+        )
+    ),
+    pytest.param(
+        f'<div class="wrap"><p>Offers</p><section><h3>Plans</h3><a href="/tools/launch-kestrel/">{_LONG_CAPTION}'
+        f'today</a></section><a href="/promo/spring">{_LONG_CAPTION}now</a></div>'
+        f'<section><h3>Health plans</h3><a href="/tools/health-planner/">{_LONG_CAPTION}today</a></section>'
+        f'<section><h3>Education plans</h3><a href="/tools/edu-planner/">{_LONG_CAPTION}now</a></section>',
+        [
+            f"a '{_LONG_CAPTION[:140]}' …[+{more} chars] to='{to}'"
+            for more, to in (
+                (20, "/tools/launch-kestrel/"),
+                (18, "/promo/spring"),
+                (20, "/tools/health-planner/"),
+                (18, "/tools/edu-planner/"),
+            )
+        ],
+        0,
+        id="J_wrapper_holding_two_captions_that_differ_past_the_display_width",
+    ),
+    pytest.param(
+        '<div class="card"><h2>Retirement plans</h2><a href="/tools/launch-kestrel/">Open planner</a>'
+        '<button>Open planner</button></div><div class="card"><h2>Education plans</h2>'
+        '<a href="/tools/launch-planner-software/">Open planner</a></div>',
+        ["a 'Open planner' to='/tools/launch-kestrel/'", "a 'Open planner' to='/tools/launch-planner-software/'"],
+        0,
+        id="J_box_holding_a_button_of_the_same_caption",
+    ),
+    pytest.param(
+        "<main>"
+        + _plan_cards('<div class="card"><h2>{h}</h2><a href="/tools/{s}/">Open planner</a></div>').replace(
+            "/tools/launch-planner-software/", "#education"
+        )
+        + "</main>",
+        ["a 'Open planner' to='/tools/launch-kestrel/'", "a 'Open planner'"],
+        0,
+        id="K_one_link_without_a_destination",
+    ),
+    pytest.param(
+        "<main>"
+        + _plan_cards(
+            '<div class="card"><h2>{h}</h2><a href="/share/{s}" aria-label="Share">'
+            '<svg width="16" height="16"><rect width="16" height="16"></rect></svg></a></div>'
+        )
+        + "</main>",
+        [
+            "a 'Share' to='/share/launch-kestrel' in='Retirement plans'",
+            "a 'Share' to='/share/launch-planner-software' in='Education plans'",
+        ],
+        2,
+        id="L_graphic_links_named_by_aria_label",
+    ),
+]
 
 
 @_skip_no_browser

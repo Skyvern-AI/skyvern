@@ -6403,6 +6403,7 @@ _OBSERVE_SUMMARY_FIELDS = (
     "ready_state_when_empty",
     "links_listed",
     "link_capped",
+    "qualified_by_destination",
 )
 
 
