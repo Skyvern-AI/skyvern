@@ -9,8 +9,6 @@ AGENT_STEP_TOOL_NAMES = frozenset(
         "file_upload",
         "file_url_parser",
         "finish",
-        "google_sheets_read",
-        "google_sheets_write",
         "http_request",
         "human_interaction",
         "load_skill",
@@ -32,7 +30,32 @@ AGENT_STEP_TOOL_NAMES = frozenset(
 )
 # Offered whatever the step's list says: neither changes anything outside the step.
 ALWAYS_OFFERED_TOOLS = frozenset({"finish", "read_run_data"})
-LEGACY_AGENT_STEP_TOOL_NAMES = {"pdf_parser": "file_url_parser"}
+LEGACY_AGENT_STEP_TOOL_NAMES = {
+    "pdf_parser": "file_url_parser",
+    "google_sheets_read": "google_sheets__read_rows",
+    "google_sheets_write": "google_sheets__write_rows",
+}
+# The built-in catalog actions a step may list, as "<integration id>__<action id>"; a names-only copy so this module
+# need not import the catalog. agent_step_tools.py raises at import if it differs from the catalog.
+CATALOG_TOOL_NAMES = frozenset(
+    {
+        "gmail__read_inbox",
+        "gmail__send_email",
+        "google_drive__upload_files",
+        "google_sheets__read_rows",
+        "google_sheets__write_rows",
+        "outlook__read_inbox",
+        "powerbi__query",
+    }
+)
+
+
+def catalog_tool_name(integration_id: str, action_id: str) -> str:
+    return f"{integration_id}__{action_id}"
+
+
+def is_known_tool_name(name: str) -> bool:
+    return name in AGENT_STEP_TOOL_NAMES or name in CATALOG_TOOL_NAMES
 
 
 def current_tool_names(names: list[str]) -> list[str]:
