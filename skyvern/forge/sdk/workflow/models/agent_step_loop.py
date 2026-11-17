@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
@@ -59,6 +59,7 @@ from skyvern.forge.sdk.copilot.model_telemetry import (
 )
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.executor.run_liveness import run_write_authority
+from skyvern.forge.sdk.integrations.account_fit import block_fit, block_needs
 from skyvern.forge.sdk.integrations.connected_accounts import (
     COPILOT_RUN_CREATOR,
     OrgConnection,
@@ -541,10 +542,14 @@ def _arguments_schema(tool: BlockTool, state: _RunState) -> dict[str, Any]:
     if "files" in pseudo:
         params["properties"]["files"] = {"type": "array", "items": {"type": "string"}, "description": FILES_DESCRIPTION}
     account_fields = settable_connected_account_fields(tool.yaml_class, tool.fields)
+    accounts = _tool_accounts(tool, state) if account_fields else []
+    # run_block merges every branch's $defs, so a list narrowed for one block type needs a name of its own.
+    narrowed = bool(account_fields) and accounts != state.connected_accounts
+    account_def = f"{_ACCOUNT_DEF}_{_block_type(tool).value}" if narrowed else _ACCOUNT_DEF
     for name in account_fields:
         described = schema["properties"][name].get("description")
         params["properties"][name] = {
-            "$ref": f"#/$defs/{_ACCOUNT_DEF}",
+            "$ref": f"#/$defs/{account_def}",
             **({"description": described} if described else {}),
         }
     # Only the definitions a kept field reaches; the rest describe fields the model never sees.
@@ -555,10 +560,10 @@ def _arguments_schema(tool: BlockTool, state: _RunState) -> dict[str, Any]:
         used |= {name: defs[name] for name in names}
         reached = json.dumps([defs[name] for name in names])
     if account_fields:
-        used[_ACCOUNT_DEF] = {
+        used[account_def] = {
             "type": "string",
-            "description": f"The id of {_account_choices(state)}",
-            **({"enum": [account.id for account in state.connected_accounts]} if state.connected_accounts else {}),
+            "description": f"The id of {_account_choices(accounts, state, _tool_needs(tool, state))}",
+            **({"enum": [account.id for account in accounts]} if accounts else {}),
         }
     if used:
         params["$defs"] = used
@@ -568,10 +573,31 @@ def _arguments_schema(tool: BlockTool, state: _RunState) -> dict[str, Any]:
 _ACCOUNT_DEF = "ConnectedAccountId"
 
 
-def _account_choices(state: _RunState) -> str:
-    if not state.connected_accounts:
+def _block_type(tool: BlockTool) -> BlockType:
+    return BlockType(tool.yaml_class.model_fields["block_type"].default)
+
+
+def _tool_accounts(tool: BlockTool, state: _RunState) -> list[OrgConnection]:
+    """The run's accounts minus those known to lack the permission this tool's block needs; unknown ones stay."""
+    return [account for account in state.connected_accounts if block_fit(account, _block_type(tool)) != "no"]
+
+
+def _tool_needs(tool: BlockTool, state: _RunState) -> list[str]:
+    return block_needs(_block_type(tool), {account.provider for account in state.connected_accounts})
+
+
+def _account_choices(accounts: list[OrgConnection], state: _RunState, needs: Sequence[str] = ()) -> str:
+    if not accounts and state.connected_accounts:
+        # Several scopes come from different providers' actions, so any one of them is enough.
+        listed = needs[0] if len(needs) == 1 else f"one of {', '.join(needs)}"
+        permission = f"the permission this block needs ({listed})" if needs else "the permission it needs"
+        return (
+            f"a connected account with {permission}, and none of the run's connected accounts has it; reconnect an "
+            "account with that permission on the Integrations page"
+        )
+    if not accounts:
         return "a connected account, and no connected account is available to this run"
-    choices = [{k: v for k, v in a.facts().items() if k != "state"} for a in state.connected_accounts]
+    choices = [{k: v for k, v in a.facts().items() if k != "state"} for a in accounts]
     return f"one of the run's connected accounts: {json.dumps(choices)}"
 
 
@@ -579,11 +605,13 @@ def _yaml_arguments(tool: BlockTool, written: dict[str, Any], state: _RunState) 
     if unknown := sorted(set(written) - set(tool.arguments)):
         raise ValueError(f"Unknown arguments {unknown}; the allowed arguments are {list(tool.arguments)}.")
     arguments = dict(written)
-    account_ids = {account.id for account in state.connected_accounts}
-    for name in settable_connected_account_fields(tool.yaml_class, tool.fields):
+    account_fields = settable_connected_account_fields(tool.yaml_class, tool.fields)
+    accounts = _tool_accounts(tool, state) if account_fields else []
+    account_ids = {account.id for account in accounts}
+    for name in account_fields:
         value = arguments.get(name)
         if value is not None and not (isinstance(value, str) and value in account_ids):
-            raise ValueError(f"{name} must be the id of {_account_choices(state)}.")
+            raise ValueError(f"{name} must be the id of {_account_choices(accounts, state, _tool_needs(tool, state))}.")
     pseudo = _pseudo_fields(tool)
     parameter_keys: list[str] = []
     if "credential" in pseudo:

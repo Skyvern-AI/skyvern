@@ -12,6 +12,7 @@ from oauthlib.oauth2 import InvalidGrantError, OAuth2Error
 
 from skyvern.forge import app
 from skyvern.forge.agent_functions import record_request_audit_event
+from skyvern.forge.sdk.integrations.account_fit import action_fits
 from skyvern.forge.sdk.integrations.catalog import has_native_gmail_credential
 from skyvern.forge.sdk.schemas.google_oauth import (
     CreateGoogleOAuthAuthorizeRequest,
@@ -520,7 +521,10 @@ async def list_google_oauth_credentials(
             LOG.warning("Timed out backfilling Google account emails")
         except Exception:
             LOG.warning("Failed to backfill Google account emails", exc_info=True)
-    return GoogleOAuthCredentialListResponse(credentials=credentials)
+    return GoogleOAuthCredentialListResponse(
+        credentials=credentials,
+        action_fit={credential.id: action_fits("google", credential.scopes_granted) for credential in credentials},
+    )
 
 
 @google_oauth_router.patch("/oauth/credentials/{credential_id}")

@@ -113,6 +113,8 @@ class GoogleOAuthCredentialResponse(BaseModel):
 
 class GoogleOAuthCredentialListResponse(BaseModel):
     credentials: list[GoogleOAuthCredentialBase]
+    # Per credential id, its fit for each catalog action keyed "<integration id>.<action id>". Labels only.
+    action_fit: dict[str, dict[str, Literal["yes", "no", "unknown"]]] = Field(default_factory=dict)
 
 
 class CreateGoogleOAuthAuthorizeRequest(BaseModel):
