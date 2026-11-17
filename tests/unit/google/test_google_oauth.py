@@ -3542,6 +3542,7 @@ async def test_list_google_oauth_credentials_surfaces_error_state(monkeypatch: p
         organization_id="org_1",
         credential_name="Needs reconnect",
         state="error",
+        scopes_granted=["https://www.googleapis.com/auth/gmail.readonly"],
         created_at=now,
         modified_at=now,
     )
@@ -3554,6 +3555,9 @@ async def test_list_google_oauth_credentials_surfaces_error_state(monkeypatch: p
 
     assert response.credentials == [credential]
     assert response.credentials[0].state == "error"
+    # Pickers read each account's fit by credential id, from that credential's own grant.
+    fits = response.model_dump(mode="json")["action_fit"]["goac_error"]
+    assert (fits["gmail.read_inbox"], fits["gmail.send_email"]) == ("yes", "no")
     list_mock.assert_awaited_once_with(organization_id="org_1")
 
 
