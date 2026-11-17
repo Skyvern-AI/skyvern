@@ -308,13 +308,16 @@ class CopilotOrganizationUsage:
 
 COPILOT_TRIGGERS_UNAVAILABLE = "Triggers are not available in this deployment."
 
+# Each workflow input key maps to a JSON Pointer into the event, or to {"value": <JSON>} for a fixed value.
+TriggerMapping = dict[str, str | dict[str, JsonValue]]
+
 
 @dataclass(frozen=True)
 class CopilotTriggerSummary:
     event_trigger_id: str
     workflow_permanent_id: str
     source_kind: str
-    mapping: dict[str, str]
+    mapping: TriggerMapping
     settings: dict[str, JsonValue]
     enabled: bool
     created_at: str
@@ -2117,7 +2120,7 @@ class AgentFunction:
         workflow_permanent_id: str,
         source_kind: str,
         settings: dict[str, JsonValue],
-        mapping: dict[str, str],
+        mapping: TriggerMapping,
         enabled: bool,
     ) -> CopilotTriggerResult:
         return CopilotTriggerResult(error=COPILOT_TRIGGERS_UNAVAILABLE)
@@ -2128,7 +2131,7 @@ class AgentFunction:
         organization_id: str,
         workflow_permanent_id: str,
         source_kind: str,
-        mapping: dict[str, str],
+        mapping: TriggerMapping,
         payload: dict[str, JsonValue] | None,
     ) -> CopilotTriggerResult:
         return CopilotTriggerResult(error=COPILOT_TRIGGERS_UNAVAILABLE)
