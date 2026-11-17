@@ -384,7 +384,7 @@ describe("ConnectionCard", () => {
 
     expect(screen.getByText("nc_existing")).toBeTruthy();
   });
-  it("settles on a user's one Connected Gmail account instead of offering Connect", () => {
+  it("says a user's one Connected Gmail account is already connected instead of offering Connect", () => {
     const flow: ConnectedGmailFlow = {
       status: "default",
       canConnect: false,
@@ -418,7 +418,8 @@ describe("ConnectionCard", () => {
       </PageSlotsProvider>,
     );
 
-    expect(screen.getByText("Connected")).toBeTruthy();
+    expect(screen.getByText("Already connected")).toBeTruthy();
+    expect(screen.getByText(/allows one account per user/)).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Connect" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Admin required" })).toBeNull();
   });

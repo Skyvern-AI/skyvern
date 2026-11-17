@@ -14,7 +14,12 @@ from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
-from skyvern.forge.sdk.integrations.catalog import IntegrationEntry, copilot_payload, integrations_for_org
+from skyvern.forge.sdk.integrations.catalog import (
+    IntegrationAccount,
+    IntegrationEntry,
+    copilot_payload,
+    integrations_for_org,
+)
 from skyvern.forge.sdk.integrations.connected_accounts import OrgConnection, org_connections_by_id
 from skyvern.forge.sdk.schemas.google_oauth import STATE_ACTIVE, GoogleOAuthCredentialBase
 from skyvern.forge.sdk.services import google_oauth_service, google_sheets_service
@@ -121,7 +126,28 @@ async def _request_connection(integration_id: str, connection_id: str | None, ct
     }
     if connection_id is not None:
         data["connection"] = target.facts() if target is not None else {"connection_id": connection_id, "found": False}
+    elif (own_gmail := _own_connected_gmail(entry)) is not None:
+        data["connected_gmail_limit"] = {
+            "connection_id": own_gmail.connection_id,
+            "can_add_another": False,
+            "rule": "Connected Gmail allows one active account per user, and this user already has theirs. The card "
+            "shows that account and cannot add a second one. To use a different Gmail account, the user reconnects "
+            "or disconnects this one on the Integrations page.",
+        }
     return {"ok": True, "data": data}
+
+
+def _own_connected_gmail(entry: IntegrationEntry) -> IntegrationAccount | None:
+    # A visible native Gmail credential keeps native sign-in as the card's flow, and that can add another account.
+    if "nango" not in (entry.additional_credential_backends or []):
+        return None
+    accounts = entry.accounts or []
+    if any(account.provider == "google" for account in accounts):
+        return None
+    return next(
+        (account for account in accounts if account.provider == "nango" and account.state == STATE_ACTIVE),
+        None,
+    )
 
 
 def _sheets_capable(connections: list[GoogleOAuthCredentialBase]) -> list[GoogleOAuthCredentialBase]:

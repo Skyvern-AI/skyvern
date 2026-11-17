@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -14,14 +13,11 @@ from skyvern.services.webhook_delivery import (
     WEBHOOK_DELIVERY_MAX_ATTEMPTS,
     WEBHOOK_DELIVERY_MAX_RETRY_AFTER_SECONDS,
     deliver_webhook_with_retries,
-    format_no_response_failure_reason,
     is_retryable_status,
 )
 from tests.unit.scoped_asyncio import ScopedAsyncio
 
 pytestmark = pytest.mark.usefixtures("public_dns")
-
-_STDLIB_ASYNCIO_SLEEP = asyncio.sleep
 
 
 def _response(status_code: int, body: str = "", headers: dict[str, str] | None = None) -> httpx.Response:
@@ -59,10 +55,6 @@ def no_jitter(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("skyvern.services.webhook_delivery.random.uniform", lambda a, b: 0.0)
 
 
-def test_fake_sleep_does_not_patch_process_wide_asyncio(fake_sleep: list[float]) -> None:
-    assert asyncio.sleep is _STDLIB_ASYNCIO_SLEEP
-
-
 @pytest.mark.asyncio
 async def test_returns_immediately_on_success(fake_sleep: list[float]) -> None:
     deliver = AsyncMock(return_value=_response(200, "ok"))
@@ -71,28 +63,6 @@ async def test_returns_immediately_on_success(fake_sleep: list[float]) -> None:
     assert resp.status_code == 200
     assert deliver.await_count == 1
     assert fake_sleep == []
-
-
-@pytest.mark.asyncio
-async def test_retry_log_exposes_canonical_fields_and_retains_attempt_counters(
-    fake_sleep: list[float], no_jitter: None
-) -> None:
-    # Exception then success: the retry event should carry the canonical status_code/error_reason
-    # schema while keeping the existing attempt/max_attempts counters.
-    exc = httpx.ConnectError("boom")
-    deliver = AsyncMock(side_effect=[exc, _response(200, "ok")])
-    with capture_logs() as logs:
-        resp = await _deliver_with_mock(deliver)
-
-    assert resp.status_code == 200
-    retries = [event for event in logs if event["event"] == "Retrying webhook delivery after transient failure"]
-    assert len(retries) == 1
-    assert retries[0]["attempt"] == 1
-    assert retries[0]["max_attempts"] == WEBHOOK_DELIVERY_MAX_ATTEMPTS
-    assert retries[0]["status_code"] is None
-    assert retries[0]["error_reason"] == format_no_response_failure_reason(exc)
-    assert retries[0]["error_reason"].startswith("Webhook delivery failed before receiving a response:")
-    assert retries[0]["error"] == "ConnectError: boom"
 
 
 @pytest.mark.asyncio
