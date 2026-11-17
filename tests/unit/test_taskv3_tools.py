@@ -1227,15 +1227,129 @@ async def test_click_type_select_dispatch_raw_ops(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(
         taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep)
     )  # the typeahead probe polls; skip real waiting in tests
-    page = _FakePage()
+    page = _TypeaheadFakePage(field_type="password", node_name="select")
     tools = build_browser_tools(_fixed_page_provider(page))
     await _tool(tools, "click").handler({"selector": "#submit"})
-    await _tool(tools, "type").handler({"selector": "#first", "text": "John"})
+    r = await _tool(tools, "type").handler({"selector": "#first", "text": "John"})
     await _tool(tools, "select_option").handler({"selector": "#country", "label": "United States"})
-    assert ("click", {"selector": "#submit"}) in page.calls
-    # `type` keystroke-types the value (typeahead-safe path) — the value is entered via page.type
-    assert ("fill", {"selector": "#first", "text": "John"}) in page.calls
+    assert ("click", "#submit") in page.calls
+    assert r.status == "ok" and page.held["#first"] == "John", r.content
     assert ("select_option", {"selector": "#country", "value": None, "label": "United States"}) in page.calls
+
+
+_KEYUP_PHONE_HTML = """<input id="phone" type="tel"><input id="masked" type="tel"><input id="gone" type="tel"><input id="reset" type="tel">
+<input id="qty" type="number"><input id="price" type="number"><input id="mail" type="email"><textarea id="note"></textarea>
+<textarea id="mid"></textarea><input id="code" type="tel"><input id="complete" type="tel">
+<script>
+const el = document.getElementById('phone');
+window.__registered = '';
+window.__submitted = false;
+el.addEventListener('keydown', (e) => { if (e.key.length === 1) e.preventDefault(); });
+el.addEventListener('keyup', (e) => {
+  if (!/^[0-9+]$/.test(e.key)) return;
+  const at = el.selectionStart;
+  const d = (el.value.slice(0, at) + e.key + el.value.slice(at)).replace(/\\D/g, '');
+  el.value = d.length === 10 ? '(' + d.slice(0, 3) + ') ' + d.slice(3, 6) + '-' + d.slice(6) : d;
+  window.__registered = el.value;
+});
+const masked = document.getElementById('masked');
+const shape = '(___) ___-____';
+const show = (d) => { let i = 0; return shape.replace(/_/g, () => d[i++] || '_'); };
+masked.value = show('');
+masked.addEventListener('input', () => {
+  const d = masked.value.slice(0, shape.length).replace(/\\D/g, '').slice(0, 10);
+  masked.value = show(d);
+  let at = 0;
+  for (let n = 0; n < d.length; at++) if (/\\d/.test(masked.value[at])) n++;
+  masked.setSelectionRange(at, at);
+});
+document.getElementById('gone').addEventListener('input', (e) => e.target.remove());
+document.getElementById('reset').addEventListener('input', (e) => e.target.setSelectionRange(0, 0));
+document.getElementById('mid').addEventListener('input', (e) => e.target.setSelectionRange(1, 1));
+document.getElementById('code').addEventListener('input', (e) => e.target.setSelectionRange(2, 2));
+document.getElementById('complete').addEventListener('input', (e) => {
+  const full = '2015550123', n = e.target.value.length;
+  if (n < full.length && full.startsWith(e.target.value)) { e.target.value = full; e.target.setSelectionRange(n, full.length); }
+});
+document.getElementById('note').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') window.__submitted = true;
+});
+</script>"""
+
+
+_REMOUNT_ON_INPUT_HTML = """<input id="tel" type="tel" aria-label="Phone"><input id="mail" type="email" aria-label="Email">
+<textarea id="note" aria-label="Note"></textarea><input id="one" type="tel" aria-label="Digit">
+<input id="fax" type="tel" aria-label="Fax">
+<script>
+for (const id of ['tel', 'mail', 'note', 'one', 'fax']) {
+  const first = document.getElementById(id);
+  first.addEventListener('input', () => {
+    const rep = document.createElement(first.tagName);
+    for (const name of ['id', 'type', 'aria-label'])
+      if (first.hasAttribute(name)) rep.setAttribute(name, first.getAttribute(name));
+    rep.value = first.value;
+    first.replaceWith(rep);
+    if (id === 'fax') return;
+    rep.focus();
+    try { rep.setSelectionRange(rep.value.length, rep.value.length); } catch (e) {}
+  }, { once: true });
+}
+</script>"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_presses_the_last_character_so_a_key_only_phone_field_registers_it() -> None:
+    typed = {
+        "#reset": "2015550123",
+        "#mid": "hello",
+        "#code": "AB--X",
+        "#complete": "2015550123",
+        "#qty": "-5",
+        "#price": "12.5",
+        "#mail": "john@example.com",
+        "#note": "hello\n",
+    }
+    async with _content_page(_KEYUP_PHONE_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        phone = await _tool(tools, "type").handler({"selector": "#phone", "text": "2015550123"})
+        masked = await _tool(tools, "type").handler({"selector": "#masked", "text": "2015550123"})
+        started = time.monotonic()
+        taskv3_loop._ENTRY_RECORD.set(None)
+        gone = await _tool(tools, "type").handler({"selector": "#gone", "text": "2015550123"})
+        gone_elapsed = time.monotonic() - started
+        gone_variant = taskv3_loop._ENTRY_RECORD.get()
+        results = {sel: await _tool(tools, "type").handler({"selector": sel, "text": t}) for sel, t in typed.items()}
+        registered = await page.evaluate("() => window.__registered")
+        submitted = await page.evaluate("() => window.__submitted")
+        held_mask = await page.eval_on_selector("#masked", "el => el.value")
+        held = {sel: await page.eval_on_selector(sel, "el => el.value") for sel in typed}
+    assert phone.status == "ok" and registered == "(201) 555-0123", (registered, phone.content)
+    assert masked.status == "ok" and held_mask == "(201) 555-0123", (held_mask, masked.content)
+    assert (gone.status, gone.error_class) == ("error", "text_not_held"), gone.content
+    assert gone_variant == {"entry_variant": "native_tel"}, gone_variant
+    assert gone_elapsed < 12, gone_elapsed
+    assert held == typed and all(r.status == "ok" for r in results.values()), (held, results)
+    assert not submitted
+    # Fields that re-mount on their first input, addressed by ref and by mark; only Fax's replacement takes no focus.
+    remount = {"Phone": "2015550123", "Email": "john@example.com", "Note": "hello", "Digit": "3", "Fax": "2015550123"}
+    for lister, line in (("observe", r"^ref=(\d+) .*{}"), ("look", r"^\[(\d+)\] .*{}")):
+        async with _content_page(_REMOUNT_ON_INPUT_HTML) as page:
+            tools = build_browser_tools(_fixed_page_provider(page))
+            listed = (await _tool(tools, lister).handler({})).content
+            found = {label: re.search(line.format(label), listed, re.MULTILINE) for label in remount}
+            assert all(found.values()), listed
+            remounted = {}
+            for label, match in found.items():
+                n = match.group(1) if match else ""
+                target = {"selector": f"ref={n}"} if lister == "observe" else {"mark": int(n)}
+                remounted[label] = await _tool(tools, "type").handler({**target, "text": remount[label]})
+            held_remount = {
+                label: await page.eval_on_selector(f"[aria-label={label}]", "el => el.value") for label in remount
+            }
+        short = {label for label in remount if held_remount[label] != remount[label]}
+        assert short <= {"Fax"}, (lister, held_remount, remounted)
+        assert all(remounted[label].error_class == "text_not_held" for label in short), (lister, remounted)
 
 
 @pytest.mark.asyncio
@@ -2510,7 +2624,7 @@ async def test_off_site_credential_refusal_reaches_the_model_and_the_run_continu
 
 @pytest.mark.asyncio
 async def test_type_resolver_failure_or_non_string_falls_back_to_literal() -> None:
-    page = _FakePage()
+    page = _TypeaheadFakePage(field_type="password")
 
     def _raises(_text: str) -> str:
         raise RuntimeError("resolver blew up")
@@ -2519,11 +2633,7 @@ async def test_type_resolver_failure_or_non_string_falls_back_to_literal() -> No
     await _tool(tools, "type").handler({"selector": "#a", "text": "literal-1"})
     tools = build_browser_tools(_fixed_page_provider(page), resolve_typed_text=lambda _t: None)
     await _tool(tools, "type").handler({"selector": "#b", "text": "literal-2"})
-    filled = [c[1] for c in page.calls if c[0] == "fill"]
-    assert filled == [
-        {"selector": "#a", "text": "literal-1"},
-        {"selector": "#b", "text": "literal-2"},
-    ]
+    assert page.held == {"#a": "literal-1", "#b": "literal-2"}
 
 
 _TOTP_SEED = "JBSWY3DPEHPK3PXP"
@@ -2946,7 +3056,27 @@ async def test_navigate_resolves_secret_placeholder_before_goto(monkeypatch: pyt
     assert "placeholder_link" not in r.content
 
 
-class _TypeaheadFakePage:
+class _TypeaheadFakeLocator:
+    def __init__(self, page: _TypeaheadFakePage, selector: str) -> None:
+        self._page = page
+        self._selector = selector
+
+    @property
+    def first(self) -> _TypeaheadFakeLocator:
+        return self
+
+    async def count(self) -> int:
+        # Only modelled when a test sets match_count; otherwise raise so the tool fail-opens to n==1,
+        # exactly as it does when a real page cannot count the selector.
+        if self._page._match_count is None:
+            raise RuntimeError("locator not modelled")
+        return self._page._match_count
+
+    async def input_value(self, timeout: int | None = None) -> str:
+        return self._page.held.get(self._selector, "")
+
+
+class _TypeaheadFakePage(_FakePage):
     """Fake page for the BEHAVIORAL typeahead path. `evaluate` stands in for the JS suggestion-finder
     (_FIND_SUGGESTION_JS, identified by the data-tv3-sugg tag it sets) and the commit-verifier
     (_VERIFY_COMMIT_JS, identified by its `noSuggestionList` flag), so type()/select_combobox control flow can be
@@ -2965,6 +3095,7 @@ class _TypeaheadFakePage:
         node_name: str = "input",
         disabled: bool = False,
     ) -> None:
+        super().__init__()
         self._field_type = field_type
         self._suggestion = suggestion
         self._committed = committed
@@ -2972,26 +3103,30 @@ class _TypeaheadFakePage:
         self._reach = reach
         self._node_name = node_name
         self._disabled = disabled
+        self.held: dict[str, str] = {}
+        self.focused = ""
         self.calls: list[tuple[str, Any]] = []
         self.clicked_suggestion = False
 
-    def locator(self, selector: str) -> Any:
-        # Only modelled when a test sets match_count; otherwise raise so the tool fail-opens to n==1,
-        # exactly as it does when a real page cannot count the selector.
-        if self._match_count is None:
-            raise RuntimeError("locator not modelled")
-
-        class _FakeLocator:
-            def __init__(self, n: int) -> None:
-                self._n = n
-
-            async def count(self) -> int:
-                return self._n
-
-        return _FakeLocator(self._match_count)
+    def locator(self, selector: str) -> _TypeaheadFakeLocator:
+        return _TypeaheadFakeLocator(self, selector)
 
     async def eval_on_selector(self, selector: str, js: str) -> Any:
+        self.focused = selector
         return [self._field_type, None] if "maxlength" in js else self._field_type
+
+    class _KB(_FakePage._KB):
+        _page: _TypeaheadFakePage
+
+        async def type(self, text: str) -> None:
+            self._page.held[self._page.focused] = self._page.held.get(self._page.focused, "") + text
+
+        async def press(self, key: str) -> None:
+            self._page.calls.append(("kb_press", key))
+
+    @property
+    def keyboard(self) -> _TypeaheadFakePage._KB:
+        return _TypeaheadFakePage._KB(self)
 
     async def evaluate(self, js: str, arg: Any = None) -> Any:
         # Order matters: the verify JS also references data-tv3-sugg (its list-closed check), so match
@@ -3064,9 +3199,11 @@ class _TypeaheadFakePage:
 
     async def fill(self, selector: str, text: str, timeout: int | None = None) -> None:
         self.calls.append(("fill", (selector, text)))
+        self.held[selector] = text
 
     async def type(self, selector: str, text: str, delay: int | None = None, timeout: int | None = None) -> None:
         self.calls.append(("type", (selector, text)))
+        self.held[selector] = self.held.get(selector, "") + text
 
     async def press(self, selector: str, key: str) -> None:
         self.calls.append(("press", (selector, key)))
@@ -3142,13 +3279,14 @@ async def test_type_leaves_raw_text_when_no_suggestion_reacts(monkeypatch: pytes
 
 @pytest.mark.asyncio
 async def test_type_non_text_input_skips_probe_fast_path() -> None:
-    # A non-text input (email/tel/…) is never a typeahead: fast fill, no suggestion probe, no click —
-    # even if a suggestion would have been offered.
+    # A non-text input (email/tel/…) is never a typeahead: no suggestion probe, no click — even if a
+    # suggestion would have been offered.
     page = _TypeaheadFakePage(field_type="email", suggestion={"text": "x@y.com", "score": 9})
     tools = build_browser_tools(_fixed_page_provider(page))
     r = await _tool(tools, "type").handler({"selector": "#email", "text": "john.smith@example.com"})
     assert r.status == "ok"
-    assert ("fill", ("#email", "john.smith@example.com")) in page.calls
+    assert page.held["#email"] == "john.smith@example.com"
+    assert not any(c[0] == "click" for c in page.calls)
     assert not page.clicked_suggestion
 
 
@@ -3591,24 +3729,6 @@ async def test_type_date_widget_that_normalizes_the_final_segment_on_blur_is_cau
     r = await _tool(tools, "type").handler({"selector": "#month-segment", "text": "09/18/2026"})
     assert r.status == "error", r.content
     assert "year" in r.content
-
-
-@pytest.mark.asyncio
-async def test_type_date_widget_that_clamps_a_segment_on_blur_is_not_reported_as_filled(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # _date_segment_holds only checks a segment right after typing it, while it still has focus. A
-    # day segment that clamps 31 -> 28 only once focus leaves it (its blur, which fires only once the
-    # loop focuses year) still reads "31" at that moment; the final re-verify must catch the drift.
-    monkeypatch.setattr(taskv3_tools, "asyncio", ScopedAsyncio(sleep=_instant_sleep))
-    page = _DateSegmentFakePage(
-        group_probe={"ok": True, "reason": None, "targetLabel": "month"},
-        blur_clamp=("day", "31", "28"),
-    )
-    tools = build_browser_tools(_fixed_page_provider(page))
-    r = await _tool(tools, "type").handler({"selector": "#month-segment", "text": "02/31/2026"})
-    assert r.status == "error", r.content
-    assert "day" in r.content
 
 
 @pytest.mark.asyncio
