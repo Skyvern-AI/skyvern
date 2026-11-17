@@ -15,6 +15,7 @@ export type WorkflowTriggersPanelProps = Readonly<{
   // Changes on every request to focus, so asking again for the same trigger reopens it.
   focusRequest?: number;
 }>;
+export type AgentStartsBadgeProps = Readonly<{ workflowPermanentId: string }>;
 export type TriggerCreatedCardSlotProps = Readonly<{
   trigger: CreatedTrigger;
   onOpen?: () => void;
@@ -121,6 +122,8 @@ export type PageSlots = {
   >;
   workflowAnalyticsPanel?: React.ComponentType<WorkflowAnalyticsPanelProps>;
   workflowTriggersPanel?: React.ComponentType<WorkflowTriggersPanelProps>;
+  // How an agent starts (triggers, schedule, manual), on the Agents list.
+  agentStartsBadge?: React.ComponentType<AgentStartsBadgeProps>;
   // The Ember trigger card with the trigger's live state and a Turn on switch.
   triggerCreatedCard?: React.ComponentType<TriggerCreatedCardSlotProps>;
   workflowRunsFilterControls?: React.ComponentType;
