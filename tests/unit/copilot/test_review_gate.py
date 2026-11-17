@@ -8,6 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from skyvern.forge import app
+from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot.data_write_defaults import DATA_WRITE_BLOCK_TYPES
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
@@ -580,7 +582,9 @@ def test_sheets_identity_resolves_account_and_ignores_representational_url_query
         assert destination_value not in wire
 
 
-def test_sheets_identity_resolves_fixed_credential_parameters() -> None:
+def test_sheets_identity_resolves_fixed_credential_parameters(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(app, "AGENT_FUNCTION", AgentFunction())
+    # The second write is an app action, which counts as the Sheets write it runs.
     staged = _workflow(
         """    - block_type: google_sheets_write
       label: first
@@ -588,12 +592,15 @@ def test_sheets_identity_resolves_fixed_credential_parameters() -> None:
       sheet_name: Summary
       credential_id: '{{ account }}'
       values: one
-    - block_type: google_sheets_write
+    - block_type: integration_action
       label: second
-      spreadsheet_url: spreadsheet-reference-123456
-      sheet_name: Summary
-      credential_id: '{{ account }}'
-      values: two
+      integration_id: google_sheets
+      action_id: write_rows
+      connection_id: '{{ account }}'
+      inputs:
+        spreadsheet_url: spreadsheet-reference-123456
+        sheet_name: Summary
+        values: two
 """,
         parameters="""
     - key: account

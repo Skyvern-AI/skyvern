@@ -3,6 +3,10 @@ from __future__ import annotations
 import textwrap
 from typing import Any
 
+import pytest
+
+from skyvern.forge import app
+from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.copilot.data_write_defaults import (
     DATA_WRITE_BLOCK_TYPES,
     default_data_write_continue_on_failure,
@@ -20,16 +24,21 @@ def _wf(blocks_yaml: str) -> str:
     return "workflow_definition:\n  blocks:\n" + textwrap.indent(textwrap.dedent(blocks_yaml).strip() + "\n", "  ")
 
 
-def test_new_data_write_block_with_true_is_forced_false() -> None:
-    new_yaml = _wf(
-        """
-        - block_type: google_sheets_write
-          label: write_rows
-          continue_on_failure: true
-        """
-    )
+@pytest.mark.parametrize(
+    "block_yaml",
+    [
+        "block_type: google_sheets_write",
+        "block_type: split_pdf",
+        # An app action counts by the block it runs, so a wrapped write is defaulted too.
+        "block_type: integration_action\n  integration_id: google_sheets\n  action_id: write_rows",
+        "block_type: integration_action\n  integration_id: google_drive\n  action_id: upload_files",
+    ],
+)
+def test_new_data_write_block_with_true_is_forced_false(block_yaml: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(app, "AGENT_FUNCTION", AgentFunction())
+    new_yaml = _wf(f"- {block_yaml}\n  label: write\n  continue_on_failure: true\n")
     result = default_data_write_continue_on_failure(new_yaml, None)
-    assert _continue_on_failure_by_label(result)["write_rows"] is False
+    assert _continue_on_failure_by_label(result)["write"] is False
 
 
 def test_existing_explicit_true_is_preserved() -> None:
@@ -185,15 +194,3 @@ def test_data_write_set_excludes_reads_and_notifications() -> None:
     assert "http_request" not in DATA_WRITE_BLOCK_TYPES
     assert "google_sheets_write" in DATA_WRITE_BLOCK_TYPES
     assert "split_pdf" in DATA_WRITE_BLOCK_TYPES
-
-
-def test_split_pdf_block_with_true_is_forced_false() -> None:
-    new_yaml = _wf(
-        """
-        - block_type: split_pdf
-          label: split_docs
-          continue_on_failure: true
-        """
-    )
-    result = default_data_write_continue_on_failure(new_yaml, None)
-    assert _continue_on_failure_by_label(result)["split_docs"] is False
