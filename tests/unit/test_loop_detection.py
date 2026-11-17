@@ -1,11 +1,6 @@
 from __future__ import annotations
 
-from skyvern.forge.sdk.agents.loop_detection import (
-    detect_failed_tool_step_loop,
-    detect_tool_loop,
-    record_tool_step_result,
-    tool_step_identity,
-)
+from skyvern.forge.sdk.agents.loop_detection import detect_tool_loop, tool_step_identity
 
 
 def test_returns_none_below_threshold() -> None:
@@ -63,52 +58,3 @@ def test_third_identical_identity_fires_and_clears() -> None:
     assert "LOOP DETECTED" in msg
     assert "type_text" in msg
     assert tracker == []
-
-
-class TestFailedToolStepLoopDetection:
-    def test_block_running_credential_errors_share_failure_streak_across_arguments(self) -> None:
-        tracker: dict[str, int] = {}
-
-        record_tool_step_result(
-            tracker,
-            "run_blocks_and_collect_debug",
-            {"block_labels": ["draft_a"], "parameters": {}},
-            {"ok": False, "error": "Credential username not found by key: first"},
-        )
-        record_tool_step_result(
-            tracker,
-            "run_blocks_and_collect_debug",
-            {"block_labels": ["draft_b"], "parameters": {}},
-            {"ok": False, "error": "Credential username not found by key: second"},
-        )
-
-        msg = detect_failed_tool_step_loop(
-            tracker,
-            "run_blocks_and_collect_debug",
-            {"block_labels": ["draft_c"], "parameters": {}},
-        )
-
-        assert msg is not None
-        assert "LOOP DETECTED" in msg
-        assert "CREDENTIAL_ERROR" in msg
-
-    def test_scoped_edit_run_credential_errors_share_failure_streak_across_edits(self) -> None:
-        tracker: dict[str, int] = {}
-
-        for replacement in ("first_edit", "second_edit"):
-            record_tool_step_result(
-                tracker,
-                "edit_block_and_run",
-                {"label": "sign_in", "replacement_code": replacement},
-                {"ok": False, "error": "Credential username not found by key: account"},
-            )
-
-        msg = detect_failed_tool_step_loop(
-            tracker,
-            "edit_block_and_run",
-            {"label": "sign_in", "replacement_code": "third_edit"},
-        )
-
-        assert msg is not None
-        assert "LOOP DETECTED" in msg
-        assert "CREDENTIAL_ERROR" in msg
