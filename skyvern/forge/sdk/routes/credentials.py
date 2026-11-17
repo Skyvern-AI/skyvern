@@ -30,9 +30,10 @@ exfiltrate stored passwords, card numbers, and secrets — which is the
 exact threat the vault architecture is designed to prevent.
 
 The invariant also covers the secrets an organization saves to connect its
-own vault: the Bitwarden master password and client secret, the 1Password
-service account token, the Azure client secret, and the custom credential
-service API token. Responses omit them or mask them as ``********``.
+own vault. The Bitwarden and 1Password responses have no field for the secret.
+The Azure and custom credential service responses do, so each route that
+returns one must first pass it through ``_redact_azure_client_secret`` or
+``_redact_custom_credential_secret``; no type enforces that.
 """
 
 import asyncio
