@@ -865,6 +865,7 @@ class WorkflowScheduleModel(Base):
     name = Column(String, nullable=True)
     description = Column(String, nullable=True)
     created_by = Column(String, nullable=True)
+    requested_by = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(

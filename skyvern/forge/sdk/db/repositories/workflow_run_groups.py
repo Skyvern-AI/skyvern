@@ -25,7 +25,9 @@ from skyvern.forge.sdk.db.models import (
     WorkflowRunGroupModel,
 )
 from skyvern.forge.sdk.services.request_principal import (
+    AuthKind,
     get_request_principal,
+    key_requester_id,
     scoped_api_key_actor_id,
     trigger_owner_id,
 )
@@ -173,6 +175,8 @@ class WorkflowRunGroupsRepository(BaseRepository):
                     if principal is not None
                     and principal.api_key_access_mode == "scoped"
                     and principal.api_key_token_id is not None
+                    else key_requester_id(principal, organization_id)
+                    if principal is not None and principal.auth_kind == AuthKind.member_api_key
                     else None
                 ),
             )

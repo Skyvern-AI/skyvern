@@ -18,6 +18,7 @@ from skyvern.forge.sdk.schemas.google_oauth import GOOGLE_GMAIL_SEND_SCOPE, Goog
 from skyvern.forge.sdk.schemas.microsoft_oauth import MicrosoftOAuthCredentialBase
 from skyvern.forge.sdk.services import google_oauth_service, microsoft_oauth_service
 from skyvern.forge.sdk.settings_manager import SettingsManager
+from skyvern.schemas.emails import ORGANIZE_ACTIONS_WITH_LABEL, EmailOrganizeAction
 from skyvern.schemas.workflows import (
     BlockType,
     BlockYAML,
@@ -215,6 +216,39 @@ def _read_inbox_action(email_client: str, needs: list[str]) -> IntegrationAction
     )
 
 
+_ORGANIZE_FIELDS = ("folder", "prompt", "sender", "subject", "newer_than_days", "max_results")
+
+
+def _organize_action(action_id: str, action: EmailOrganizeAction, name: str, description: str) -> IntegrationAction:
+    fields = (*_ORGANIZE_FIELDS, "organize_label") if action in ORGANIZE_ACTIONS_WITH_LABEL else _ORGANIZE_FIELDS
+    inputs = block_inputs(
+        EmailInboxBlockYAML,
+        fields,
+        email_client="gmail",
+        credential_source="nango",
+        organize_action=action.value,
+    )
+    if action in ORGANIZE_ACTIONS_WITH_LABEL:
+        label = inputs["properties"]["organize_label"]
+        inputs["properties"]["organize_label"] = {
+            **label["anyOf"][0],
+            "title": label["title"],
+            "description": label["description"],
+            "pattern": r"\S",
+        }
+        inputs["required"].append("organize_label")
+    return IntegrationAction(
+        id=action_id,
+        name=name,
+        description=f"{description} Works only with a Connected Gmail account.",
+        inputs=inputs,
+        acts=True,
+        runs_via=_block(BlockType.EMAIL_INBOX),
+        # Connected accounts report no scopes, so needs stays empty; a saved block is what the run capability binds.
+        agent_step="saved_block_only",
+    )
+
+
 def listed_oauth_accounts(integrations: Sequence[Any]) -> list[dict[str, Any]]:
     # Older captures listed the accounts themselves as rows; current results nest them per entry.
     rows: list[dict[str, Any]] = []
@@ -332,6 +366,30 @@ SKYVERN_INTEGRATIONS: tuple[IntegrationEntry, ...] = (
                 needs=[GOOGLE_GMAIL_SEND_SCOPE],
                 acts=True,
                 runs_via=_block(BlockType.SEND_EMAIL),
+            ),
+            _organize_action(
+                "label_email",
+                EmailOrganizeAction.LABEL,
+                "Label email",
+                "Find emails by sender, subject or age and add an existing label to each.",
+            ),
+            _organize_action(
+                "archive_email",
+                EmailOrganizeAction.ARCHIVE,
+                "Archive email",
+                "Find emails by sender, subject or age and archive each.",
+            ),
+            _organize_action(
+                "move_email",
+                EmailOrganizeAction.MOVE,
+                "Move email",
+                "Find emails by sender, subject or age and move each from its folder to an existing label.",
+            ),
+            _organize_action(
+                "mark_email_read",
+                EmailOrganizeAction.MARK_READ,
+                "Mark email read",
+                "Find emails by sender, subject or age and mark each read.",
             ),
         ],
     ),

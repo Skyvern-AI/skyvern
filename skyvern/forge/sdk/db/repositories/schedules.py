@@ -23,7 +23,7 @@ from skyvern.forge.sdk.schemas.workflow_schedules import (
     OrganizationScheduleItem,
     WorkflowSchedule,
 )
-from skyvern.forge.sdk.services.request_principal import get_request_principal, trigger_owner_id
+from skyvern.forge.sdk.services.request_principal import get_request_principal, key_requester_id, trigger_owner_id
 from skyvern.forge.sdk.workflow.schedules import as_utc, compute_next_run
 
 if TYPE_CHECKING:
@@ -58,6 +58,7 @@ def _adopt_schedule(workflow_schedule: WorkflowScheduleModel, organization_id: s
         return
     # An unidentified editor clears it instead, so the next run fails closed in restricted folders.
     workflow_schedule.created_by = trigger_owner_id(principal, organization_id)
+    workflow_schedule.requested_by = key_requester_id(principal, organization_id)
 
 
 class SchedulesRepository(BaseRepository):
@@ -105,6 +106,7 @@ class SchedulesRepository(BaseRepository):
                 name=name,
                 description=description,
                 created_by=trigger_owner_id(get_request_principal(), organization_id),
+                requested_by=key_requester_id(get_request_principal(), organization_id),
             )
             session.add(workflow_schedule)
             await session.commit()
@@ -231,6 +233,7 @@ class SchedulesRepository(BaseRepository):
                 name=name,
                 description=description,
                 created_by=trigger_owner_id(get_request_principal(), organization_id),
+                requested_by=key_requester_id(get_request_principal(), organization_id),
             )
             session.add(workflow_schedule)
             await session.commit()

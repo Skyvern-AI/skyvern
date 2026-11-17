@@ -39,6 +39,10 @@ LEGACY_AGENT_STEP_TOOL_NAMES = {
 # need not import the catalog. agent_step_tools.py raises at import if it differs from the catalog.
 CATALOG_TOOL_NAMES = frozenset(
     {
+        "gmail__archive_email",
+        "gmail__label_email",
+        "gmail__mark_email_read",
+        "gmail__move_email",
         "gmail__read_inbox",
         "gmail__send_email",
         "google_drive__upload_files",
