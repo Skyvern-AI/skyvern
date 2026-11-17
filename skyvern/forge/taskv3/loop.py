@@ -2639,6 +2639,7 @@ OBSERVE_SUMMARY_FIELDS = frozenset(
         "near_texts_found",
         "a11y_removed_listed",
         "duplicate_digest_lines",
+        "qualified_by_destination",
         "frames_same_origin",
         "frames_cross_origin",
         "frames_same_origin_interactive",
