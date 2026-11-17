@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
@@ -19,6 +20,7 @@ from skyvern.webeye.attach_only import forbid
 from skyvern.webeye.skycdp.connection import CdpConnection, CdpSession
 from skyvern.webeye.skycdp.errors import CdpConnectionError, CdpError, CdpUnsupportedOperation
 from skyvern.webeye.skycdp.facade.artifacts import Download
+from skyvern.webeye.skycdp.facade.network import FetchRouter
 from skyvern.webeye.skycdp.facade.page import Page
 from skyvern.webeye.skycdp.facade.routing import RouteHandler, RouteTable, URLMatcher
 from skyvern.webeye.skycdp.transport import CdpTransport
@@ -39,11 +41,14 @@ class BrowserContext:
         self._pages: list[Page] = []
         self._listeners: dict[str, list[Callable[..., Any]]] = {}
         self._closed = False
+        self._close_task: asyncio.Task[None] | None = None
         # A target reaches adoption from two directions at once: the caller that created it, and the
         # auto-attach event announcing it. Both must end at one Page and one "page" event, so
         # concurrent adopters share a single in-flight task rather than interleaving.
         self._adoptions: dict[str, asyncio.Task[Page]] = {}
         self._routes = RouteTable()
+        self._route_lock = asyncio.Lock()
+        self._fetch = FetchRouter(self._routes)
 
     @property
     def pages(self) -> list[Page]:
@@ -94,11 +99,27 @@ class BrowserContext:
 
     async def route(self, url: URLMatcher, handler: RouteHandler) -> None:
         """Intercept matching requests on every page in this context, including ones opened later."""
+        if any(self._fetch.is_draining_current_dispatch(page.session) for page in self._pages):
+            raise asyncio.CancelledError
+        async with self._route_lock:
+            await self._install_route(url, handler)
+
+    async def _install_route(self, url: URLMatcher, handler: RouteHandler) -> None:
         first = len(self._routes) == 0
         self._routes.add(url, handler)
         if first:
-            for page in self.pages:
-                await page._enable_interception()
+            try:
+                for page in list(self._pages):
+                    if page._close_task is not None:
+                        with suppress(CdpError):
+                            await asyncio.shield(page._close_task)
+                    if not page.is_closed():
+                        await page._enable_interception()
+            except BaseException:
+                self._routes.remove(url, handler)
+                for page in self.pages:
+                    await page._disable_interception_if_idle()
+                raise
 
     async def unroute(self, url: URLMatcher, handler: RouteHandler | None = None) -> None:
         self._routes.remove(url, handler)
@@ -174,11 +195,38 @@ class BrowserContext:
         await self.browser.connection.transport.send("Browser.grantPermissions", params)
 
     async def close(self, *, reason: str | None = None) -> None:
+        if any(self._fetch.is_draining_current_dispatch(page.session) for page in self._pages):
+            raise asyncio.CancelledError
+        if self._close_task is None:
+            if self._closed:
+                return
+            self._close_task = asyncio.create_task(self._close(), name="skycdp-context-close")
+        closing = self._close_task
+        try:
+            await asyncio.shield(closing)
+        except asyncio.CancelledError:
+            # A dispatcher being drained must unwind instead of awaiting its own cleanup.
+            if any(self._fetch.is_draining_current_dispatch(page.session) for page in self._pages):
+                raise
+            try:
+                await asyncio.shield(closing)
+            except CdpError:
+                pass
+            raise
+        finally:
+            if closing.done() and self._close_task is closing:
+                self._close_task = None
+
+    async def _close(self) -> None:
         if self._closed:
             return
         self._closed = True
-        for page in list(self._pages):
-            await page.close()
+        try:
+            for page in list(self._pages):
+                await page._close_owned()
+        except BaseException:
+            self._closed = False
+            raise
         if self.browser_context_id:
             try:
                 await self.browser.connection.transport.send(
@@ -262,6 +310,8 @@ class Browser:
             self._downloads.pop(str(params.get("guid")), None)
 
     def _on_connection_lost(self) -> None:
+        for context in self._contexts.values():
+            context._fetch.disconnected()
         if not self._closed:
             self._closed = True
             self._emit("disconnected", self)
@@ -284,6 +334,7 @@ class Browser:
 
     def _on_session_detached(self, session: CdpSession) -> None:
         for context in self._contexts.values():
+            context._fetch.detached(session)
             for page in list(context._pages):
                 page.drop_frame_session(session)
 
