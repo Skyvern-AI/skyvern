@@ -1089,9 +1089,11 @@ ACTION_BUDGET_EXTENSION_MAX_FACTOR = 3
 # Refusals left uncharged in a row before a refusal is charged like any failed call. The repeat guard cannot
 # bound them (a stale address resets it), so this does.
 UNCHARGED_REFUSAL_GRACE = ACTION_LOOP_NUDGE_AFTER
-# Rounds a single-action block may spend past its cap before its own action has landed. The step engine
+# Rounds an action block may spend past its cap before its own action has landed. The step engine
 # completes such a block on one SUCCESSFUL step after retrying failed ones, and lets that step batch a
 # precursor; a v3 cap of 1 is spent by a hover, a precursor, or a click that failed without moving the page.
+# A block that completes on a download has no judge, so it gets a round only while nothing has committed and no
+# call has reported a new file.
 ACTION_BLOCK_TARGET_ACTION_RESERVE = 2
 # Appended to a held type's refusal. The full typing path was not run for it.
 LAYER_HELD_NOTE = (
@@ -4301,7 +4303,8 @@ class LoopState:
     # A billable action that succeeded moved the tab's URL: evidence the block's action took effect.
     block_action_transitioned: bool = False
     # A billable call that succeeded and did more than reveal state, as a hover or a menu-opening click does. One that
-    # may have submitted, or a failed call that may have moved the page, also sets the second flag: no round follows it.
+    # may have submitted, a failed call that may have moved the page, a call that entered a secret, or on a block that
+    # completes on a download any call that reported a new file, sets the second flag: no round follows it.
     block_action_committed: bool = False
     block_action_may_have_landed: bool = False
     # A billable call that succeeded, did more than reveal state, and confirmed any value it entered.
@@ -4405,8 +4408,11 @@ async def run_agent_tool_loop(
     # A block whose contract is one action: once one succeeded, a follow-up the step cap refuses offers
     # finish(completed) instead of failing the block, as the step engine completes it after that step.
     single_action_block: bool = False,
-    # Rounds such a block may add, one per cap trip, while its own action has not landed.
+    # Rounds an action block may add, one per cap trip, while its own action has not landed. Without a
+    # block_completion_check a round is granted only while nothing has committed.
     target_action_reserve: int = 0,
+    # The block completes on a download: any call that reports a new file, ok or failed, ends its reserve.
+    completes_on_download: bool = False,
     # The goal judge's verdict on that completion; the completion is offered only on its grounded "achieved".
     block_completion_check: Callable[[], Awaitable[GoalVerdict]] | None = None,
     # Tick-masked page fingerprint sampled around a single-action block's billable non-entry calls, None when any
@@ -4893,8 +4899,7 @@ async def run_agent_tool_loop(
     async def _reserve_target_action_round(tool_name: str) -> bool:
         st.block_reserve_verdict = None
         if (
-            not single_action_block
-            or st.target_action_rounds_granted >= target_action_reserve
+            st.target_action_rounds_granted >= target_action_reserve
             or st.block_action_transitioned
             or st.final_turn_granted
         ):
@@ -6323,6 +6328,9 @@ async def run_agent_tool_loop(
             ) or (dispatch_ctx is not None and len(dispatch_ctx.runtime_secret_values) > runtime_secrets_before)
             if call_entered_secret and (result.touched_page or not result.refused):
                 # A second round after a secret, ok or failed, could submit it again and spend a lockout attempt.
+                st.block_action_may_have_landed = True
+            if completes_on_download and (result.data or {}).get("download_new"):
+                # A file reached this block, ok or failed: another round could start a second download.
                 st.block_action_may_have_landed = True
             if tool_trail is not None and spec is not None and not spec.terminal:
                 tool_trail.record(
