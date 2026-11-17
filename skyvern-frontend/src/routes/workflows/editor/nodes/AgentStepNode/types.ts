@@ -14,6 +14,8 @@ export const agentStepToolTitles: Record<string, string> = {
   page_fill: ReadableActionTypes.input_text,
   page_extract: ReadableActionTypes.extract,
   read_run_data: "Read run data",
+  load_skill: "Load skill",
+  read_skill_resource: "Read skill file",
   finish: "Finish",
 };
 

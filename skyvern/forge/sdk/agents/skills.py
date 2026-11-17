@@ -226,6 +226,12 @@ class SkillSession:
     def catalog_lines(self) -> list[str]:
         return [f"{name} [{skill.owner}]: {skill.package.description}" for name, skill in self._skills.items()]
 
+    def public_catalog_lines(self) -> list[str]:
+        return [
+            f"{EVERYONE_SKILL_LABEL} [everyone]" if skill.owner == "everyone" else line
+            for line, skill in zip(self.catalog_lines(), self._skills.values(), strict=True)
+        ]
+
     def owner(self, name: str) -> SkillOwner | None:
         skill = self._skills.get(name)
         return skill.owner if skill else None
@@ -304,3 +310,17 @@ class SkillSession:
             message=f"No skill is named {name!r}.",
             names=[skill_name for skill_name, skill in self._skills.items() if skill.owner != "everyone"],
         )
+
+
+def render_skills_catalog(session: SkillSession) -> str:
+    lines = session.catalog_lines()
+    catalog = "\n".join(lines)
+    if lines:
+        LOG.info(
+            "agent_skill_list_shown",
+            agent=session.agent,
+            count=len(lines),
+            list_chars=len(catalog),
+            **session.log_fields,
+        )
+    return catalog

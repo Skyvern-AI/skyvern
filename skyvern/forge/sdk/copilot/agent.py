@@ -40,7 +40,7 @@ from pydantic import JsonValue, TypeAdapter, ValidationError
 from skyvern.exceptions import NO_ADDRESS_RECORD_NAV_ERROR_MARKER
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.agents.skills import LOAD_SKILL_TOOL_NAME, SkillSession
+from skyvern.forge.sdk.agents.skills import LOAD_SKILL_TOOL_NAME, SkillSession, render_skills_catalog
 from skyvern.forge.sdk.copilot.agent_naming import schedule_agent_naming
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
@@ -285,7 +285,6 @@ from skyvern.forge.sdk.copilot.tools.scouting import (
     hydrate_prior_carried_trajectory,
     read_page_state_on_page,
 )
-from skyvern.forge.sdk.copilot.tools.skills import render_skills_catalog
 from skyvern.forge.sdk.copilot.tools.workflow_update import (
     CANONICAL_WORKFLOW_UNAVAILABLE_ERROR,
     CopilotCanonicalWorkflowUnavailableError,

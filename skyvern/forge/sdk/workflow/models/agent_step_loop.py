@@ -37,6 +37,16 @@ from pydantic import JsonValue, ValidationError
 from skyvern.config import settings
 from skyvern.exceptions import WorkflowRunNotFound
 from skyvern.forge import app
+from skyvern.forge.sdk.agents.skills import (
+    EVERYONE_SKILL_LABEL,
+    LOAD_SKILL_TOOL_NAME,
+    READ_SKILL_RESOURCE_TOOL_NAME,
+    SKILL_TOOL_NAMES,
+    SkillLoadResult,
+    SkillReadResult,
+    SkillSession,
+    render_skills_catalog,
+)
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.copilot_model_usage import copilot_usage_observer
 from skyvern.forge.sdk.artifact.models import ArtifactType
@@ -66,6 +76,7 @@ from skyvern.forge.sdk.workflow.models.agent_step_tools import (
     DEDICATED_BLOCK_TOOLS,
     FILES_DESCRIPTION,
     FINISH_DESCRIPTION,
+    READ_SKILL_RESOURCE_DESCRIPTION,
     RUN_BLOCK_TYPES,
     RUN_TOOL_DESCRIPTIONS,
     BlockTool,
@@ -110,6 +121,8 @@ _INSTRUCTIONS = (
     "and returns its status, output and error. When you have the answer, call finish with it."
 )
 _FINISH_ONLY = "Only finish can run now. Call finish with the best answer the tool results support."
+_SKILL_LIST_HEADER = "load_skill(name) returns a skill's instructions and file list."
+_HIDDEN_SKILL_ARGUMENTS = json.dumps({"name": EVERYONE_SKILL_LABEL})
 
 
 class _RunEnded(Exception):
@@ -157,6 +170,9 @@ class _RunState:
     running: AgentStepToolCall | None = None
     pending_trail: list[AgentStepToolCall] | None = None
     trail_writer: asyncio.Task[None] | None = None
+    skills: SkillSession | None = None
+    # The exact text appended to the instructions, so stored model requests can swap it for the public list.
+    skill_list: str | None = None
 
 
 def _capped(text: str) -> str:
@@ -228,7 +244,8 @@ def _running_entry(
         displayed = _redacted_json(state, shown)
     except Exception:
         # Redacted before encoding: a secret the model already escaped would not match once escaped again.
-        block_type, displayed = None, json.dumps(_scrubbed(state, arguments))
+        block_type = None
+        displayed = _HIDDEN_SKILL_ARGUMENTS if tool in SKILL_TOOL_NAMES else json.dumps(_scrubbed(state, arguments))
     return AgentStepToolCall(
         index=len(state.trail) + 1,
         tool=tool,
@@ -349,7 +366,7 @@ class _LoopHooks(RunHooks[Any]):
 
     async def _store(self, artifact_type: ArtifactType, payload: dict[str, object]) -> None:
         try:
-            data = json.dumps(pydantic_core.to_jsonable_python(payload)).encode("utf-8")
+            data = json.dumps(_stored_view(self.state, pydantic_core.to_jsonable_python(payload))).encode("utf-8")
             await app.ARTIFACT_MANAGER.create_workflow_run_block_artifacts(
                 workflow_run_block=self.block_row, artifacts=[(artifact_type, data)]
             )
@@ -360,6 +377,47 @@ class _LoopHooks(RunHooks[Any]):
                 workflow_run_block_id=self.block_row.workflow_run_block_id,
                 exc_info=True,
             )
+
+
+def _skill_call_name(arguments: JsonValue) -> JsonValue:
+    try:
+        parsed = json.loads(arguments) if isinstance(arguments, str) else None
+    except json.JSONDecodeError:
+        return None
+    return parsed.get("name") if isinstance(parsed, dict) else None
+
+
+def _stored_view(state: _RunState, data: JsonValue) -> JsonValue:
+    """Hide everyone skills from a stored model call; data is a fresh copy, so it is edited in place."""
+    session, skill_list = state.skills, state.skill_list
+    if session is None or skill_list is None or not isinstance(data, dict):
+        return data
+    system_prompt = data.get("system_prompt")
+    if isinstance(system_prompt, str):
+        data["system_prompt"] = system_prompt.replace(
+            skill_list, "\n".join([_SKILL_LIST_HEADER, *session.public_catalog_lines()])
+        )
+    items = [
+        item
+        for key in ("input", "output")
+        if isinstance(listed := data.get(key), list)
+        for item in listed
+        if isinstance(item, dict)
+    ]
+    hidden_calls: set[str] = set()
+    for item in items:
+        if (
+            item.get("type") == "function_call"
+            and item.get("name") in SKILL_TOOL_NAMES
+            and not session.shows_name(_skill_call_name(item.get("arguments")))
+        ):
+            item["arguments"] = _HIDDEN_SKILL_ARGUMENTS
+            if isinstance(call_id := item.get("call_id"), str):
+                hidden_calls.add(call_id)
+    for item in items:
+        if item.get("type") == "function_call_output" and item.get("call_id") in hidden_calls:
+            item["output"] = _HIDDEN_SKILL_ARGUMENTS
+    return data
 
 
 def _scrubbed(state: _RunState, text: str) -> str:
@@ -642,6 +700,7 @@ def _run_tool(
     required: list[str],
     run: Callable[..., Awaitable[Any]],
     state: _RunState,
+    describe: Callable[[JsonValue], tuple[BlockType | None, JsonValue]] | None = None,
 ) -> FunctionTool:
     async def invoke(arguments: str) -> str:
         try:
@@ -655,7 +714,7 @@ def _run_tool(
             raise
         except Exception as e:
             report = {"status": "failed", "output": None, "error": f"{type(e).__name__}: {e}"}
-        _record_call(state, written, tool=name, status=report["status"])
+        _record_call(state, describe(written)[1] if describe else written, tool=name, status=report["status"])
         # A read_run_data window is already masked text cut from a longer result.
         if name == "read_run_data" and report["status"] == "completed":
             return report["output"]
@@ -670,7 +729,7 @@ def _run_tool(
             "required": required,
             "additionalProperties": False,
         },
-        on_invoke_tool=_in_turn(state, invoke),
+        on_invoke_tool=_in_turn(state, invoke, describe),
         strict_json_schema=False,
     )
 
@@ -808,7 +867,7 @@ _RUN_TOOLS: tuple[tuple[str, dict[str, Any], list[str], Callable[..., Awaitable[
     ("page_fill", {"prompt": _TEXT, "value": _TEXT}, ["prompt", "value"], _page_fill),
     ("page_extract", {"prompt": _TEXT, "schema": {"type": "object"}}, ["prompt"], _page_extract),
 )
-if {name for name, *_ in _RUN_TOOLS} != set(RUN_TOOL_DESCRIPTIONS):
+if {name for name, *_ in _RUN_TOOLS} != set(RUN_TOOL_DESCRIPTIONS) - {LOAD_SKILL_TOOL_NAME}:
     raise RuntimeError("_RUN_TOOLS and RUN_TOOL_DESCRIPTIONS must name the same tools.")
 
 
@@ -835,6 +894,63 @@ def _tools(state: _RunState) -> list[FunctionTool]:
             if _offers(state, name)
         ),
     ]
+
+
+def _skill_tools(state: _RunState, session: SkillSession) -> list[FunctionTool]:
+    async def load(_state: _RunState, name: str) -> SkillLoadResult:
+        return session.load(name)
+
+    async def read(_state: _RunState, name: str, path: str) -> SkillReadResult:
+        return session.read_resource(name, path)
+
+    def describe(written: JsonValue) -> tuple[BlockType | None, JsonValue]:
+        return None, session.public_arguments(written if isinstance(written, dict) else {})
+
+    return [
+        _run_tool(
+            LOAD_SKILL_TOOL_NAME,
+            RUN_TOOL_DESCRIPTIONS[LOAD_SKILL_TOOL_NAME],
+            {"name": _TEXT},
+            ["name"],
+            load,
+            state,
+            describe,
+        ),
+        _run_tool(
+            READ_SKILL_RESOURCE_TOOL_NAME,
+            READ_SKILL_RESOURCE_DESCRIPTION,
+            {"name": _TEXT, "path": _TEXT},
+            ["name", "path"],
+            read,
+            state,
+            describe,
+        ),
+    ]
+
+
+async def _skill_session(state: _RunState) -> SkillSession | None:
+    if not _offers(state, LOAD_SKILL_TOOL_NAME) or state.organization_id is None:
+        return None
+    try:
+        skills = await app.AGENT_FUNCTION.agent_skills(
+            organization_id=state.organization_id,
+            workflow_permanent_id=state.run_context.workflow_permanent_id,
+            agent="agent_step",
+        )
+    except Exception:
+        LOG.warning(
+            "Failed to list the agent step's skills", workflow_run_block_id=state.workflow_run_block_id, exc_info=True
+        )
+        return None
+    if not skills:
+        return None
+    return SkillSession(
+        skills,
+        agent="agent_step",
+        organization_id=state.organization_id,
+        workflow_run_id=state.workflow_run_id,
+        workflow_run_block_id=state.workflow_run_block_id,
+    )
 
 
 def _tool_not_found_formatter(
@@ -1126,8 +1242,11 @@ async def run_agent_step(
         state.connected_accounts = await _connected_accounts(organization_id, workflow_run_id)
     effort = LLMConfigRegistry.get_config(llm_key).reasoning_effort
     model, run_config = resolve_agent_model(llm_key)
+    state.skills = await _skill_session(state)
+    if state.skills:
+        state.skill_list = f"{_SKILL_LIST_HEADER}\n{render_skills_catalog(state.skills)}"
     finish = _finish_tool(block.data_schema, state)
-    tools = [*_tools(state), finish]
+    tools = [*_tools(state), *(_skill_tools(state, state.skills) if state.skills else []), finish]
     run_config = replace(
         run_config,
         tool_not_found_behavior="return_error_to_model",
@@ -1141,7 +1260,8 @@ async def run_agent_step(
         instructions=CacheableSystemInstructions(
             _INSTRUCTIONS,
             f"\n\nCurrent UTC datetime: {datetime.now(UTC).isoformat(timespec='seconds')}"
-            + (f"\n\n{block.workflow_system_prompt}" if block.workflow_system_prompt else ""),
+            + (f"\n\n{block.workflow_system_prompt}" if block.workflow_system_prompt else "")
+            + (f"\n\n{state.skill_list}" if state.skill_list else ""),
             cache_namespace=workflow_run_block_id,
         ),
         tools=tools,
