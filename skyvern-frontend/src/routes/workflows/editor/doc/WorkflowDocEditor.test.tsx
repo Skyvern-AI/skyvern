@@ -267,7 +267,7 @@ describe("WorkflowDocEditor navigation", () => {
     test("Try Ember opens the Ember pane and the suggestion does not come back", () => {
       renderDoc([], edits);
       fireEvent.click(screen.getByRole("button", { name: "Try Copilot" }));
-      expect(openPane).toHaveBeenCalledWith("copilot");
+      expect(openPane).toHaveBeenCalledWith("ember");
       expect(nudge()).toBeNull();
       cleanup();
       renderDoc([], edits);
@@ -351,7 +351,7 @@ describe("WorkflowDocEditor navigation", () => {
                     setEditorStreamSlot: () => {},
                     setBrowserStreamSlot: () => {},
                     setRunStreamSlot: () => {},
-                    isPaneOnScreen: (id) => onScreen && id === "copilot",
+                    isPaneOnScreen: (id) => onScreen && id === "ember",
                   }}
                 >
                   <WorkflowDocEditor nodes={[]} edges={[]} edits={edits} />

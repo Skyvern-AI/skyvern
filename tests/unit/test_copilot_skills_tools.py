@@ -7,8 +7,7 @@ import pytest
 from structlog.testing import capture_logs
 
 from skyvern.forge import app
-from skyvern.forge.agent_functions import AgentFunction
-from skyvern.forge.sdk.agents.skills import AvailableSkill, SkillSession
+from skyvern.forge.sdk.agents.skills import AvailableSkill, SkillSession, render_skills_catalog
 from skyvern.forge.sdk.copilot import agent as copilot_agent
 from skyvern.forge.sdk.copilot.agent import _build_narrative_payload, _build_user_context, _copilot_skill_session
 from skyvern.forge.sdk.copilot.browser_ablation import resolve_copilot_tool_surface
@@ -19,13 +18,14 @@ from skyvern.forge.sdk.copilot.output_utils import (
 )
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.tools import copilot_native_tools, load_skill_tool, read_skill_resource_tool
-from skyvern.forge.sdk.copilot.tools.skills import load_skill, read_skill_resource, render_skills_catalog
+from skyvern.forge.sdk.copilot.tools.skills import load_skill, read_skill_resource
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.forge_log import add_log_context
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest, WorkflowCopilotStreamMessageType
 from tests.unit.conftest import invoke_copilot_tool, make_copilot_context
 from tests.unit.copilot_test_helpers import (
     REPLY_ARGUMENTS,
+    RecordingSkills,
     ScriptedModel,
     available_skill,
     make_copilot_ctx,
@@ -34,19 +34,6 @@ from tests.unit.copilot_test_helpers import (
 )
 
 LOGIN_BODY = "ORG-BODY-SENTINEL: tick 'Remember this device' at https://example.com/login.\n"
-
-
-class _Skills(AgentFunction):
-    def __init__(self, skills: list[AvailableSkill]) -> None:
-        super().__init__()
-        self.skills = skills
-        self.calls: list[tuple[str, str | None, str]] = []
-
-    async def agent_skills(
-        self, *, organization_id: str, workflow_permanent_id: str | None, agent: str
-    ) -> list[AvailableSkill]:
-        self.calls.append((organization_id, workflow_permanent_id, agent))
-        return self.skills
 
 
 def _context(turn_origin: TurnOrigin = TurnOrigin.interactive):
@@ -62,7 +49,7 @@ def _user_context(catalog: str) -> str:
 
 @pytest.mark.asyncio
 async def test_interactive_turn_lists_skills_with_fences_escaped(monkeypatch: pytest.MonkeyPatch) -> None:
-    hook = _Skills(
+    hook = RecordingSkills(
         [available_skill("example-portal-login", "organization", LOGIN_BODY, description="Use ```fenced``` logins.")]
     )
     monkeypatch.setattr(app, "AGENT_FUNCTION", hook)
@@ -99,7 +86,7 @@ async def test_interactive_turn_lists_skills_with_fences_escaped(monkeypatch: py
 async def test_no_list_without_skills_or_on_ai_fallback_turns(
     monkeypatch: pytest.MonkeyPatch, skills: list[AvailableSkill], turn_origin: TurnOrigin
 ) -> None:
-    hook = _Skills(skills)
+    hook = RecordingSkills(skills)
     monkeypatch.setattr(app, "AGENT_FUNCTION", hook)
 
     session = await _copilot_skill_session(_context(turn_origin))
@@ -146,7 +133,7 @@ async def test_a_turn_with_skills_sends_the_tools_and_the_list_together(monkeypa
     async def default_policy(*_args: object, **_kwargs: object) -> RequestPolicy:
         return RequestPolicy()
 
-    hook = _Skills([available_skill("example-portal-login", "organization", LOGIN_BODY)])
+    hook = RecordingSkills([available_skill("example-portal-login", "organization", LOGIN_BODY)])
     monkeypatch.setattr(app, "AGENT_FUNCTION", hook)
     monkeypatch.setattr(copilot_agent, "build_request_policy_trust_floor", default_policy)
     monkeypatch.setattr(copilot_agent, "_run_agent_loop_with_surface", capture_model_loop)
@@ -302,7 +289,7 @@ def test_formatters_show_fixed_text_for_every_skill_failure() -> None:
 @pytest.mark.asyncio
 async def test_skill_events_carry_the_request_fields(monkeypatch: pytest.MonkeyPatch) -> None:
     org = available_skill("example-portal-login", "organization", LOGIN_BODY)
-    monkeypatch.setattr(app, "AGENT_FUNCTION", _Skills([org]))
+    monkeypatch.setattr(app, "AGENT_FUNCTION", RecordingSkills([org]))
     session = await _copilot_skill_session(_context())
 
     with capture_logs() as logs:

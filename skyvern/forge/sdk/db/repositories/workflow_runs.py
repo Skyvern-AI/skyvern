@@ -2190,10 +2190,10 @@ class WorkflowRunsRepository(BaseRepository):
             )
             workflow_deleted_expr = self._workflow_deleted_expr(effective_wpid, TaskRunModel.organization_id)
             # A task v2 row's run_id is the task v2 id, so its creator lives on the task's own workflow run.
-            task_v2_workflow_run = aliased(WorkflowRunModel)
+            task_v2_workflow_run = WorkflowRunModel.__table__.alias()
             task_v2_created_by = (
-                select(task_v2_workflow_run.created_by)
-                .join(TaskV2Model, TaskV2Model.workflow_run_id == task_v2_workflow_run.workflow_run_id)
+                select(task_v2_workflow_run.c.created_by)
+                .join(TaskV2Model, TaskV2Model.workflow_run_id == task_v2_workflow_run.c.workflow_run_id)
                 .where(TaskV2Model.observer_cruise_id == TaskRunModel.run_id)
                 .where(TaskV2Model.organization_id == TaskRunModel.organization_id)
                 .scalar_subquery()
@@ -2238,8 +2238,8 @@ class WorkflowRunsRepository(BaseRepository):
             )
             # A task v2 row records no workflow, and the join above skips its run, so it follows its own workflow run.
             task_v2_wpid = (
-                select(task_v2_workflow_run.workflow_permanent_id)
-                .join(TaskV2Model, TaskV2Model.workflow_run_id == task_v2_workflow_run.workflow_run_id)
+                select(task_v2_workflow_run.c.workflow_permanent_id)
+                .join(TaskV2Model, TaskV2Model.workflow_run_id == task_v2_workflow_run.c.workflow_run_id)
                 .where(TaskV2Model.observer_cruise_id == TaskRunModel.run_id)
                 .where(TaskV2Model.organization_id == TaskRunModel.organization_id)
                 .scalar_subquery()

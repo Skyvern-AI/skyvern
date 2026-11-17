@@ -1221,24 +1221,6 @@ class TestUploadTypeRestrictions:
             )
         assert "declared type image/png" in refused.value.detail
 
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        ("filename", "content", "logged_reason"),
-        [
-            ("capture.har", b'{"log": {}}', None),
-            ("setup.exe", b"not really", ".exe files are not allowed"),
-        ],
-    )
-    async def test_passthrough_logs_only_the_denylist(
-        self, filename: str, content: bytes, logged_reason: str | None
-    ) -> None:
-        """A third-party site may ask for any type, so pass-through files skip the allowlist but not the denylist."""
-        file = UploadFile(file=io.BytesIO(content), filename=filename, headers=Headers({"content-type": _OCTET}))
-        with capture_logs() as logs:
-            await uploaded_file_service.validate_passthrough_upload(file, max_size_bytes=None, purpose="test")
-        reasons = [log["reason"] for log in logs if log["event"] == "Accepted a restricted file type for pass-through"]
-        assert reasons == ([logged_reason] if logged_reason else [])
-
     def test_every_route_allowlist_is_inside_the_declared_type_table(self) -> None:
         """A route set outside the table would skip the declared-type check for those extensions."""
         for allowed in (

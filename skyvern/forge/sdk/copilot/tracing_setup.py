@@ -58,8 +58,8 @@ class _LogfireAgentSpan(Protocol):
 
 
 def is_tracing_enabled() -> bool:
-    """Check COPILOT_TRACING_ENABLED env var (1/true/yes)."""
-    value = os.getenv("COPILOT_TRACING_ENABLED", "")
+    """Check EMBER_TRACING_ENABLED env var (1/true/yes)."""
+    value = os.getenv("EMBER_TRACING_ENABLED") or os.getenv("COPILOT_TRACING_ENABLED") or ""
     return value.strip().lower() in _TRACING_ENABLED_VALUES
 
 
@@ -76,7 +76,7 @@ def _clear_sdk_trace_processors() -> None:
 def ensure_tracing_initialized() -> None:
     """Initialize Agents SDK tracing processors once.
 
-    When ``COPILOT_TRACING_ENABLED`` is set, logfire is configured as the
+    When ``EMBER_TRACING_ENABLED`` is set, logfire is configured as the
     trace exporter.  Otherwise the SDK's built-in tracing to OpenAI servers
     is disabled to avoid 403/401 errors.
     """
@@ -119,7 +119,7 @@ def ensure_tracing_initialized() -> None:
             logfire.instrument_openai_agents()
         except ImportError as exc:
             # `instrument_openai_agents` imports the optional `agents` SDK at call time;
-            # self-hosted installs without it still need to boot under COPILOT_TRACING_ENABLED.
+            # self-hosted installs without it still need to boot under EMBER_TRACING_ENABLED.
             LOG.warning("Copilot tracing requested but openai-agents SDK not installed", error=repr(exc))
         _patch_agent_span_attributes()
         # Logfire instruments via OpenTelemetry independently of the SDK's

@@ -59,7 +59,7 @@ vi.mock("./EditorTab", async () => {
   return {
     EditorTab: () => (
       <span data-testid="copilot-on-screen">
-        {String(useStudioShellContext().isPaneOnScreen?.("copilot"))}
+        {String(useStudioShellContext().isPaneOnScreen?.("ember"))}
       </span>
     ),
   };
@@ -214,11 +214,11 @@ describe("StudioShell with a pane folded for the Doc", () => {
     screen.getAllByTestId("copilot-on-screen")[0]!.textContent;
 
   test("Ember folded into a strip is not on screen", () => {
-    const open = renderDoc("editor,copilot");
+    const open = renderDoc("editor,ember");
     expect(emberOnScreen()).toBe("true");
     open.unmount();
-    docFold.folded = ["copilot"];
-    renderDoc("editor,copilot");
+    docFold.folded = ["ember"];
+    renderDoc("editor,ember");
     expect(emberOnScreen()).toBe("false");
   });
 
@@ -235,7 +235,7 @@ describe("StudioShell with a pane folded for the Doc", () => {
       value: () => ({ cancel: () => {}, onfinish: null }),
     });
     try {
-      renderDoc("editor,copilot");
+      renderDoc("editor,ember");
       expect(emberOnScreen()).toBe("true");
       fireEvent.click(
         screen.getByRole("button", {
@@ -250,8 +250,8 @@ describe("StudioShell with a pane folded for the Doc", () => {
   });
 
   test("a folded Ember opened over the stage is on screen", () => {
-    docFold.folded = ["copilot"];
-    renderDoc("editor,copilot");
+    docFold.folded = ["ember"];
+    renderDoc("editor,ember");
     expect(emberOnScreen()).toBe("false");
     fireEvent.click(screen.getByRole("button", { name: /^Show Copilot pane/ }));
     expect(emberOnScreen()).toBe("true");
@@ -419,7 +419,7 @@ describe("StudioShell at phone width", () => {
   });
 
   test("signing in yourself shows a Browser open behind another pane", () => {
-    renderPhone("/workflows/wpid_synthetic/studio?panes=copilot,browser");
+    renderPhone("/workflows/wpid_synthetic/studio?panes=ember,browser");
     expect(shown()).toEqual(["Copilot"]);
     try {
       act(() => {
@@ -484,7 +484,7 @@ describe("StudioPane header", () => {
   const dataTransfer = () => ({ setData: vi.fn(), effectAllowed: "" });
 
   const renderPane = ({
-    id = "copilot",
+    id = "ember",
     headerActions,
     expanded = false,
     expansionTransitioning = false,
@@ -686,7 +686,7 @@ describe("StudioPane header", () => {
 
     expect(dt.setData).toHaveBeenCalledWith(
       "application/x-skyvern-studio-pane",
-      "copilot",
+      "ember",
     );
     expect(reorder.onStart).not.toHaveBeenCalled();
 

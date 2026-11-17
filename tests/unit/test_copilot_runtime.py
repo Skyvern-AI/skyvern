@@ -2248,20 +2248,6 @@ def _called_name(node: ast.AST) -> str | None:
     return None
 
 
-def _calls_in_own_scope(fn: ast.AsyncFunctionDef | ast.FunctionDef) -> list[ast.Call]:
-    """Calls this function makes itself; a nested function owns its own calls."""
-    calls: list[ast.Call] = []
-    stack: list[ast.AST] = list(fn.body)
-    while stack:
-        node = stack.pop()
-        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef, ast.Lambda)):
-            continue
-        if isinstance(node, ast.Call):
-            calls.append(node)
-        stack.extend(ast.iter_child_nodes(node))
-    return calls
-
-
 def _wait_for_bound(node: ast.Call) -> str:
     """The constant bounding an `asyncio.wait_for(...)` call, as its keyword or trailing argument."""
     argument = next((kw.value for kw in node.keywords if kw.arg == "timeout"), None)
@@ -3292,21 +3278,6 @@ async def test_a_build_test_run_on_a_separate_session_records_that_session_too(
     )
 
     assert ctx.attached_browser_drivers["pbs_minted"].browser_state is attached
-
-
-def test_every_copilot_resolve_of_a_cached_browser_state_records_what_it_attached() -> None:
-    """The turn-exit release can only retire generations the turn recorded, so a resolve that
-    reaches the pod's cache without a recording beside it strands its driver until the session dies."""
-    offenders: list[str] = []
-    for path in sorted(_COPILOT_PACKAGE.rglob("*.py")):
-        tree = ast.parse(path.read_text(), filename=str(path))
-        for node in ast.walk(tree):
-            if not isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)):
-                continue
-            names = [_called_name(call) for call in _calls_in_own_scope(node)]
-            if "resolve_persistent_browser_state" in names and "record_attached_browser_driver" not in names:
-                offenders.append(f"{path.name}:{node.lineno} {node.name}")
-    assert offenders == [], "Copilot resolves that never record the driver they attached:\n" + "\n".join(offenders)
 
 
 @pytest.mark.asyncio

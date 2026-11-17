@@ -24,7 +24,7 @@ import pytest_asyncio
 import yaml
 from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, SecretStr, ValidationError
 from sqlalchemy import update
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -39,6 +39,7 @@ from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot import credential_pause, live_narrative, streaming_adapter
 from skyvern.forge.sdk.copilot import tools as copilot_tools
 from skyvern.forge.sdk.copilot.ask_user import (
+    DETACHED_QUESTION_CLIENT_GRACE,
     AskUserArguments,
     QuestionInteraction,
     QuestionResponse,
@@ -2913,7 +2914,7 @@ async def test_browser_ablation_selector_is_rejected_while_disabled(
     monkeypatch: pytest.MonkeyPatch, anon_request: MagicMock, organization: SimpleNamespace
 ) -> None:
     anon_request.headers = {"x-copilot-eval-mode": "browser_ablation"}
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_BROWSER_ABLATION_ENABLED", False)
+    monkeypatch.setattr(settings, "EMBER_BROWSER_ABLATION_ENABLED", False)
 
     with pytest.raises(HTTPException) as exc_info:
         await workflow_copilot_chat_post(anon_request, _make_chat_request(), organization)
@@ -2934,8 +2935,8 @@ async def test_browser_ablation_selector_forces_v2_when_enabled(
     monkeypatch: pytest.MonkeyPatch, anon_request: MagicMock, organization: SimpleNamespace, headers: dict[str, str]
 ) -> None:
     anon_request.headers = headers
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_BROWSER_ABLATION_ENABLED", True)
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_BROWSER_ABLATION_ORGANIZATION_IDS", ["org-1"])
+    monkeypatch.setattr(settings, "EMBER_BROWSER_ABLATION_ENABLED", True)
+    monkeypatch.setattr(settings, "EMBER_BROWSER_ABLATION_ORGANIZATION_IDS", ["org-1"])
     new_copilot = AsyncMock(return_value=object())
     monkeypatch.setattr(workflow_copilot_route, "_new_copilot_chat_post", new_copilot)
 
@@ -2950,8 +2951,8 @@ async def test_browser_ablation_selector_is_rejected_for_a_non_eval_organization
     monkeypatch: pytest.MonkeyPatch, anon_request: MagicMock, organization: SimpleNamespace
 ) -> None:
     anon_request.headers = {"x-copilot-eval-mode": "browser_ablation"}
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_BROWSER_ABLATION_ENABLED", True)
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_BROWSER_ABLATION_ORGANIZATION_IDS", ["org-eval"])
+    monkeypatch.setattr(settings, "EMBER_BROWSER_ABLATION_ENABLED", True)
+    monkeypatch.setattr(settings, "EMBER_BROWSER_ABLATION_ORGANIZATION_IDS", ["org-eval"])
     new_copilot = AsyncMock(return_value=object())
     monkeypatch.setattr(workflow_copilot_route, "_new_copilot_chat_post", new_copilot)
 
@@ -7025,7 +7026,7 @@ async def test_redis_failure_briefly_protects_a_recent_question_handoff(
 async def test_redis_failure_eventually_releases_an_old_question_handoff(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    age = RECONCILE_ABANDON_AFTER_SECONDS + settings.WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS + 60
+    age = RECONCILE_ABANDON_AFTER_SECONDS + settings.EMBER_CREDENTIAL_PAUSE_TIMEOUT_SECONDS + 60
     interaction = QuestionInteraction(
         interaction_id="question-1",
         turn_id="turn-a",
@@ -7916,6 +7917,9 @@ async def test_chat_history_serves_the_running_turns_live_narrative_only_when_as
         assert any(item["status"] == "pending" for item in default["question_interactions"])
         limited = await history(workflow_copilot_chat_id=chat_id, message_limit=2)
         assert limited["chat_history"] == default["chat_history"][-2:]
+        # Each read checks the question's client in, which moves its deadline.
+        for read in (limited, default):
+            read["in_flight_turn"].pop("question_open_until")
         assert {**limited, "chat_history": None} == {**default, "chat_history": None}
         assert (
             await client.get("/history", params={"workflow_copilot_chat_id": chat_id, "message_limit": 0})
@@ -8165,7 +8169,7 @@ async def test_browser_allocation_recorder_requires_admitted_request_override(
     _, workflow_params = setup_new_copilot_mocks(
         monkeypatch, chat, SimpleNamespace(workflow_id="wf-canonical", workflow_definition=None), result
     )
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_EVAL_LLM_OVERRIDES_ORGANIZATION_IDS", ["org-1"])
+    monkeypatch.setattr(settings, "EMBER_EVAL_LLM_OVERRIDES_ORGANIZATION_IDS", ["org-1"])
     monkeypatch.setattr(
         eval_llm_overrides.LLMConfigRegistry,
         "_configs",
@@ -8742,10 +8746,10 @@ def _eval_header_request(header: str = "x-copilot-eval") -> MagicMock:
 def _install_v2_dispatch(
     monkeypatch: pytest.MonkeyPatch, *, eval_inputs_enabled: bool, eval_organization_ids: list[str] | None = None
 ) -> AsyncMock:
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_ODYSSEYS_EVAL_INPUTS_ENABLED", eval_inputs_enabled)
+    monkeypatch.setattr(settings, "EMBER_ODYSSEYS_EVAL_INPUTS_ENABLED", eval_inputs_enabled)
     monkeypatch.setattr(
         settings,
-        "WORKFLOW_COPILOT_ODYSSEYS_EVAL_ORGANIZATION_IDS",
+        "EMBER_ODYSSEYS_EVAL_ORGANIZATION_IDS",
         ["org-1"] if eval_organization_ids is None else eval_organization_ids,
     )
     new_copilot_mock = AsyncMock(return_value=object())
@@ -8860,8 +8864,8 @@ async def test_an_admitted_eval_entrypoint_url_reaches_the_agent_path_byte_exact
     eval_mode_header: str,
 ) -> None:
     new_copilot_mock = _install_v2_dispatch(monkeypatch, eval_inputs_enabled=True)
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_BROWSER_ABLATION_ENABLED", True)
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_BROWSER_ABLATION_ORGANIZATION_IDS", [organization.organization_id])
+    monkeypatch.setattr(settings, "EMBER_BROWSER_ABLATION_ENABLED", True)
+    monkeypatch.setattr(settings, "EMBER_BROWSER_ABLATION_ORGANIZATION_IDS", [organization.organization_id])
     request = _eval_header_request(eval_header)
     if eval_mode is not None:
         request.headers[eval_mode_header] = eval_mode.value
@@ -8881,7 +8885,7 @@ async def test_the_entrypoint_gate_answers_before_the_eval_mode_gate(
     monkeypatch: pytest.MonkeyPatch, organization: SimpleNamespace
 ) -> None:
     new_copilot_mock = _install_v2_dispatch(monkeypatch, eval_inputs_enabled=False)
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_BROWSER_ABLATION_ENABLED", False)
+    monkeypatch.setattr(settings, "EMBER_BROWSER_ABLATION_ENABLED", False)
     request = _eval_header_request()
     request.headers["x-copilot-eval-mode"] = CopilotEvalMode.BROWSER_ABLATION.value
 
@@ -10581,6 +10585,47 @@ async def test_a_copilot_turn_records_the_person_who_started_it(
 
     pending_turn = app.DATABASE.workflow_params.start_copilot_turn.await_args.kwargs["pending_turn"]
     assert pending_turn.starter_user_id == recorded
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("client_detached", [True, False])
+async def test_a_detached_turn_stores_the_longer_question_grace(
+    monkeypatch: pytest.MonkeyPatch,
+    api_key_request: MagicMock,
+    copilot_stream: MagicMock,
+    organization: SimpleNamespace,
+    client_detached: bool,
+) -> None:
+    captured = install_fake_create(monkeypatch)
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(
+        workflow_id="wf-canonical", title="Original", description="Original description", workflow_definition=None
+    )
+    result = AgentResult(user_response="done", updated_workflow=None, global_llm_context=None)
+    setup_new_copilot_mocks(monkeypatch, chat, original_workflow, result)
+    monkeypatch.setattr(workflow_copilot_route, "run_copilot_agent", AsyncMock(return_value=result))
+    chat_request = _make_chat_request().model_copy(
+        update={
+            "client_detached": client_detached,
+            "supports_credential_pause": True,
+            "supports_credential_pause_recovery": True,
+            "credential_recovery_token": SecretStr("a" * 64),
+        }
+    )
+
+    await workflow_copilot_chat_post(api_key_request, chat_request, organization)
+    await captured["handler"](copilot_stream)
+
+    pending_turn = app.DATABASE.workflow_params.start_copilot_turn.await_args.kwargs["pending_turn"]
+    assert pending_turn.question_client_grace_seconds == (
+        DETACHED_QUESTION_CLIENT_GRACE.total_seconds() if client_detached else None
+    )
 
 
 @pytest_asyncio.fixture

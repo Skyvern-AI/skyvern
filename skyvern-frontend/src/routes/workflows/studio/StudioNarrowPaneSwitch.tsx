@@ -32,7 +32,7 @@ export function StudioNarrowPaneSwitch({
         const active = id === shown;
         // Only another pane's news needs a dot; the shown pane says it itself.
         const activity = id === "browser" && browserActivity && !active;
-        const awaiting = id === "copilot" && !active ? emberAttention : null;
+        const awaiting = id === "ember" && !active ? emberAttention : null;
         return (
           <button
             key={id}

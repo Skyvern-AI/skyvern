@@ -4703,10 +4703,28 @@ async def test_get_all_runs_v2_returns_creator_for_workflow_and_task_v2_rows(sql
                     created_by="user_prompter",
                 ),
                 TaskV2Model(observer_cruise_id="tsk_v2_1", organization_id="org_test", workflow_run_id="wr_task_v2"),
+                TaskV2Model(
+                    observer_cruise_id="tsk_v2_missing", organization_id="org_test", workflow_run_id="wr_missing"
+                ),
+                TaskV2Model(
+                    observer_cruise_id="tsk_v2_foreign", organization_id="org_other", workflow_run_id="wr_task_v2"
+                ),
                 _task_run_model(run_id="wr_member", created_at=now, workflow_permanent_id="wpid_member"),
                 _task_run_model(
                     run_id="tsk_v2_1",
                     created_at=now - timedelta(seconds=1),
+                    workflow_permanent_id=None,
+                    task_run_type=RunType.task_v2.value,
+                ),
+                _task_run_model(
+                    run_id="tsk_v2_missing",
+                    created_at=now - timedelta(seconds=2),
+                    workflow_permanent_id=None,
+                    task_run_type=RunType.task_v2.value,
+                ),
+                _task_run_model(
+                    run_id="tsk_v2_foreign",
+                    created_at=now - timedelta(seconds=3),
                     workflow_permanent_id=None,
                     task_run_type=RunType.task_v2.value,
                 ),
@@ -4719,6 +4737,8 @@ async def test_get_all_runs_v2_returns_creator_for_workflow_and_task_v2_rows(sql
     assert {row["run_id"]: row["created_by"] for row in rows} == {
         "wr_member": "user_member",
         "tsk_v2_1": "user_prompter",
+        "tsk_v2_missing": None,
+        "tsk_v2_foreign": None,
     }
 
 

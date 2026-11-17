@@ -56,6 +56,7 @@ from skyvern.forge.sdk.copilot.ask_user import (
     CREDENTIAL_DELETE_RECORD_ATTEMPTS,
     CREDENTIAL_DELETE_RECORD_RETRY_DELAY,
     CREDENTIAL_DELETE_TIMEOUT,
+    DETACHED_QUESTION_CLIENT_GRACE,
     CredentialDeleteOutcome,
     QuestionInteraction,
     QuestionResponse,
@@ -304,10 +305,7 @@ _process_workflow_yaml = _copilot_process_workflow_yaml
 # Wall clock, unlike TOTAL_TIMEOUT_SECONDS: that budget excludes time parked in a
 # credential pause, so a legitimately live turn can outlast it in real time.
 RECONCILE_ABANDON_AFTER_SECONDS = (
-    TOTAL_TIMEOUT_SECONDS
-    + settings.WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS
-    + EXPIRED_TURN_REPLY_SECONDS
-    + 120
+    TOTAL_TIMEOUT_SECONDS + settings.EMBER_CREDENTIAL_PAUSE_TIMEOUT_SECONDS + EXPIRED_TURN_REPLY_SECONDS + 120
 )
 ALLOWED_WORKFLOW_COPILOT_AUDIO_CONTENT_TYPES = {
     "audio/mp4",
@@ -847,10 +845,7 @@ RouteExit = Literal["completed", "error", "cancelled", "duplicate", "refused"]
 
 
 def _copilot_eval_cost_enabled(organization_id: str) -> bool:
-    return (
-        settings.WORKFLOW_COPILOT_EVAL_COST_ENABLED
-        and organization_id in settings.WORKFLOW_COPILOT_EVAL_COST_ORGANIZATION_IDS
-    )
+    return settings.EMBER_EVAL_COST_ENABLED and organization_id in settings.EMBER_EVAL_COST_ORGANIZATION_IDS
 
 
 def _copilot_eval_cost_headers(ledger: CopilotCostLedger | None) -> dict[str, str]:
@@ -3212,6 +3207,9 @@ async def _new_copilot_chat_post(
                         turn_id=turn_id,
                         started_at=datetime.now(UTC),
                         cancel_token=chat_request.cancel_token,
+                        question_client_grace_seconds=int(DETACHED_QUESTION_CLIENT_GRACE.total_seconds())
+                        if chat_request.client_detached
+                        else None,
                         starter_user_id=human_user_id(get_request_principal(), organization.organization_id),
                         request_browser_allocations=CopilotRequestBrowserAllocations(
                             organization_id=organization.organization_id,
@@ -4006,8 +4004,8 @@ def _validated_eval_entrypoint_url(
         return None
     eval_entrypoint_url = chat_request.eval_entrypoint_url
     if (
-        not settings.WORKFLOW_COPILOT_ODYSSEYS_EVAL_INPUTS_ENABLED
-        or organization.organization_id not in settings.WORKFLOW_COPILOT_ODYSSEYS_EVAL_ORGANIZATION_IDS
+        not settings.EMBER_ODYSSEYS_EVAL_INPUTS_ENABLED
+        or organization.organization_id not in settings.EMBER_ODYSSEYS_EVAL_ORGANIZATION_IDS
         or (request.headers.get("x-ember-eval") or request.headers.get("x-copilot-eval")) != "odysseys"
     ):
         raise HTTPException(
@@ -4093,8 +4091,8 @@ async def workflow_copilot_chat_post(
                 detail="Unsupported Copilot eval mode",
             ) from exc
         if (
-            not settings.WORKFLOW_COPILOT_BROWSER_ABLATION_ENABLED
-            or organization.organization_id not in settings.WORKFLOW_COPILOT_BROWSER_ABLATION_ORGANIZATION_IDS
+            not settings.EMBER_BROWSER_ABLATION_ENABLED
+            or organization.organization_id not in settings.EMBER_BROWSER_ABLATION_ORGANIZATION_IDS
         ):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Copilot eval mode is disabled")
         return await _new_copilot_chat_post(
@@ -4269,8 +4267,7 @@ async def _reconcile_interrupted_copilot_turns(chat: WorkflowCopilotChat, organi
         if (
             credential_pause_active is None
             and has_recovery_handoff
-            and last_activity
-            > abandoned_before - timedelta(seconds=settings.WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS)
+            and last_activity > abandoned_before - timedelta(seconds=settings.EMBER_CREDENTIAL_PAUSE_TIMEOUT_SECONDS)
         ):
             # A transient Redis failure must not reclaim a possible second
             # credential wait, while an unrelated stale turn must eventually
@@ -4618,6 +4615,16 @@ async def workflow_copilot_chat_history(
                 latest_draft_at=live_entry.latest_draft_at,
                 steer_messages=[item for item in live_entry.steer_messages if item.delivered_at is not None],
                 narrative=live_narrative,
+                question_open_until=min(
+                    (
+                        live_entry.question_client_deadline(item)
+                        for item in live_entry.question_interactions
+                        if item.awaiting_answer
+                    ),
+                    default=None,
+                )
+                if live_entry.turn_id not in turns_without_answer
+                else None,
             )
             if live_entry is not None
             else None
@@ -5540,10 +5547,20 @@ async def workflow_copilot_demonstration_upload(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"A demonstration can attach at most {MAX_ATTACHED_FILES_PER_MESSAGE} files",
         )
-    # Demonstrations replay the user's own file into the target site, so any type that site accepts must pass.
-    await uploaded_file_service.validate_passthrough_upload(
-        file, max_size_bytes=app.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE, purpose="copilot_demonstration"
-    )
+    try:
+        await uploaded_file_service.validate_upload(
+            file,
+            purpose="copilot_demonstration",
+            organization_id=organization.organization_id,
+            max_size_bytes=app.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE,
+        )
+    except HTTPException as refused:
+        if refused.status_code != status.HTTP_415_UNSUPPORTED_MEDIA_TYPE:
+            raise
+        raise HTTPException(
+            status_code=refused.status_code,
+            detail=f"{refused.detail}. Choose another file type, or skip the file: the upload step is still recorded.",
+        ) from refused
     try:
         uploaded, _ = await uploaded_file_service.save_uploaded_file(
             file=file, organization_id=organization.organization_id

@@ -144,14 +144,7 @@ import {
 } from "../../collapse/useNodeCollapseStore";
 import { useWorkflowEditorMode } from "../../hooks/useWorkflowEditorMode";
 import { useWorkflowScopeReadOnly } from "../../WorkflowScopeContext";
-
-class ValidationFailureError extends Error {
-  readonly isValidationFailure = true;
-  constructor() {
-    super("workflow validation failed");
-    this.name = "ValidationFailureError";
-  }
-}
+import { ValidationFailureError } from "./ValidationFailureError";
 
 function formatLabelList(labels: string[]): string {
   if (labels.length <= 1) return labels[0] ?? "";

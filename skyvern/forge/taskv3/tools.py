@@ -38,7 +38,7 @@ from urllib.parse import unquote, urlparse
 
 import structlog
 from PIL import Image, ImageDraw
-from playwright.async_api import BrowserContext, Download, Page, Request, Response
+from playwright.async_api import BrowserContext, Download, ElementHandle, Page, Request, Response
 
 from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX
@@ -439,15 +439,14 @@ def _escape_tags_in_text(text: str) -> str:
 
 # The exact selector shapes our own enrichment mints: data-tv3 by observe(), data-tv3-menu by the
 # click menu probe, data-tv3-act by act-by-mark (written on the look-resolved element at act time and
-# kept for the life of the document, so the submit watch can still resolve it turns later), data-tv3-close by
-# the covered probe for an unmarked onclick close. Each
-# exists only where we set it, so one that matches nothing now cannot reappear without a fresh
-# observe / menu-opening click / look.
+# kept for the life of the document, so the submit watch can still resolve it turns later), data-tv3-ctl by
+# the covered probe for a covering layer's control that has no other address. These exist only where we set them,
+# so one that matches nothing now cannot reappear without a fresh observe / menu-opening click / look / covered probe.
 _TV3_MARKER_SELECTOR_RE = re.compile(
-    r'^\[data-tv3(?:(?:-menu|-act|-close)?="[^"\\]+"\]|-sugg="[^"\\]+"\](?:\[data-tv3-pick="[^"\\]+"\])?)$'
+    r'^\[data-tv3(?:(?:-menu|-act|-ctl)?="[^"\\]+"\]|-sugg="[^"\\]+"\](?:\[data-tv3-pick="[^"\\]+"\])?)$'
 )
 # Any v3 marker inside a selector, including one observe composed a host-anchored selector around.
-_TV3_MARKER_ANYWHERE_RE = re.compile(r'\[data-tv3(?:-menu|-act|-sugg|-close)?="')
+_TV3_MARKER_ANYWHERE_RE = re.compile(r'\[data-tv3(?:-menu|-act|-sugg|-ctl)?="')
 # An opaque identifier (a uuid, or a run of 12+ hex digits) does not survive a model's copy: one
 # transposed pair sends every later call to a selector that matches nothing. observe addresses its
 # own elements by ref for that reason; this is what look()'s legend refuses to use as a label.
@@ -1866,6 +1865,16 @@ OBSERVE_POINTER_ROOT_CAP = 40
 # Pointer roots the collector records per realm, ahead of the listing cap, before it stops scanning; elements it rejects
 # do not count toward it.
 _POINTER_ROOT_SCAN_CEILING = 400
+
+
+def _pointer_state_js(retain: str) -> str:
+    return (
+        "{ pointer: new Map(), covered: new Set(), roots: new Map(), holders: new Set(), represented: new Set(), "
+        "held: new Set(), extra: new Set(), extraCount: 0, icons: new Set(), iconCount: 0, iconOverflow: 0, "
+        f"notIcon: 0, notIconRoots: new Set(), heldCount: 0, heldCap: {OBSERVE_POINTER_ROOT_CAP}, count: 0, "
+        f"retain: {retain}, ceiling: {_POINTER_ROOT_SCAN_CEILING} }}"
+    )
+
 
 # A color paints nothing only when its ALPHA is zero. Parse the alpha channel, never a trailing ",0)",
 # which also matches an opaque color whose last channel is 0 (`rgb(0,0,0)`, `rgb(255,0,0)`). A form that
@@ -5744,7 +5753,7 @@ _LOOK_ENUM_JS = (
 )
 
 _ACT_ATTR_RE = re.compile(r'\s*data-tv3-act="[^"]*"')
-_CLOSE_ATTR_RE = re.compile(r' data-tv3-close="[^"]*"')
+_CTL_ATTR_RE = re.compile(r' data-tv3-ctl="[^"]*"')
 # A withheld menu's rows carry a salted tag so no position can be guessed; printing it would hand the model one.
 _SALTED_MENU_ATTR_RE = re.compile(r'\s*data-tv3-menu="w[^"]*"')
 # Visible only: a closed menu's lingering rows are stale, not an open menu whose rows went unnumbered.
@@ -6118,13 +6127,16 @@ _NATIVE_LABEL_JS = r"""
   };
 """
 
-# A visible stand-in resolved by THIS realm: the control's native label first, else the first
-# aria-labelledby target looked up through the prototype in the element's own root. Requires the
-# helpers of _NATIVE_LABEL_JS in scope, and an `arg` whose allowOwnLabel is false in a patchable realm.
+# A visible stand-in: the control's native label first, else the first aria-labelledby target looked up through the
+# prototype in the element's own root. Requires the helpers of _NATIVE_LABEL_JS in scope.
 _NATIVE_PROXY_JS = r"""
   const _nativeProxy = (el) => {
-    if (arg.allowOwnLabel === false) return null;
-    const vis = (n) => { try { const b = n.getBoundingClientRect(); return b.width > 0 && b.height > 0; } catch (e) { return false; } };
+    const vis = (n) => {
+      try {
+        const b = n.getBoundingClientRect();
+        return b.width > 0 && b.height > 0 && getComputedStyle(n).visibility !== 'hidden';
+      } catch (e) { return false; }
+    };
     for (const l of nativeLabelsOf(el)) if (vis(l)) return l;
     const lbId = _attr(el, 'aria-labelledby');
     if (!lbId) return null;
@@ -6135,12 +6147,69 @@ _NATIVE_PROXY_JS = r"""
   };
 """
 
+# What a label holds besides its control that a click on the label may activate instead.
+_LABEL_HELD_CONTROLS = "button,a[href],input:not([type=hidden]),select,textarea"
+
+# Of the candidate labels, the first visible one in tree order that is the control's own (nativeControlOf) and holds no
+# other control, else the first own one, marked `held`. Needs _NATIVE_LABEL_JS.
+_OWN_LABEL_PICK_JS = (
+    r"""(el, labels) => {
+  const shown = (n) => {
+    const b = n.getBoundingClientRect();
+    return b.width > 0 && b.height > 0 && getComputedStyle(n).visibility !== 'hidden';
+  };
+  const own = labels.filter((l) => nativeControlOf(l) === el && shown(l))
+    .sort((x, y) => (x.compareDocumentPosition(y) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1));
+  const held = (l) => _qsa(l, '"""
+    + _LABEL_HELD_CONTROLS
+    + r"""').filter((c) => c !== el);
+  const clear = own.find((l) => held(l).length === 0);
+  if (clear) return { index: labels.indexOf(clear), held: false };
+  return own[0] ? { index: labels.indexOf(own[0]), held: true } : null;
+}"""
+)
+
+# Opacity does not stop hit-testing and multiplies down the tree, so a faded-out panel, or stacked translucent wrappers,
+# hide an input that elementFromPoint still returns. The input's own opacity is excluded.
+_FADED_ANCESTRY_JS = r"""(el) => {
+  let o = 1;
+  for (let n = el.assignedSlot || el.parentNode || el.host, hops = 0; n && hops < 256; hops++, n = n.assignedSlot || n.parentNode || n.host || null) {
+    if (n.nodeType === 1) o *= parseFloat(getComputedStyle(n).opacity || '1');
+  }
+  return o < 0.05;
+}"""
+
+# The pick run on an element handle, over label handles the driver found.
+_OWN_LABEL_PICK_CALL_JS = (
+    r"""(el, labels) => {
+"""
+    + _NATIVE_LABEL_JS
+    + r"""
+  return ("""
+    + _OWN_LABEL_PICK_JS
+    + r""")(el, labels);
+}"""
+)
+
+# The element every skinned-toggle probe resolves, as a handle the driver can act from.
+_PROBE_TARGET_JS = (
+    r"""(arg) => {
+  const _q = """
+    + _ROOT_QUERY_JS
+    + r""";
+  return _q.find(arg.sel) || (arg.el && arg.el.isConnected ? arg.el : null);
+}"""
+)
+
+
+def _css_string(value: str) -> str:
+    return '"' + re.sub(r'["\\\x00-\x1f\x7f]', lambda m: f"\\{ord(m.group()):x} ", value) + '"'
+
 
 # Whether a visible label (or aria-labelledby proxy) of this hidden element reaches it while the rendered
 # match is not that label: click's label path would act on this element, not on the rendered one.
 _LABEL_REACHES_OTHER_THAN_JS = (
     r"""(el, rendered) => {
-  const arg = {};
 """
     + _NATIVE_LABEL_JS
     + _NATIVE_PROXY_JS
@@ -6170,6 +6239,9 @@ _PER_KEY_TIMEOUT_MS = 250
 _TYPING_TIMEOUT_CAP_MS = 120_000
 # How long a click on a matched suggestion row waits to land before the pick is reported as not clicked.
 _SUGGESTION_ROW_CLICK_TIMEOUT_MS = 3000
+# How long the driver may take to click the own label of a hidden radio or checkbox. It outlasts the driver's retry
+# backoff, not a cover that needs dismissing.
+_LABEL_CLICK_TIMEOUT_MS = 3000
 # How long one box of a one-character-per-box code field may stay disabled once the box before it holds a character.
 _CODE_BOX_ENABLE_WAIT_MS = 1500
 # Fewer adjacent one-character boxes (initials, a two-box suffix) are separate fields, not one segmented field.
@@ -6729,7 +6801,6 @@ _TYPE_TARGET_PROBE_JS = (
     + r"""
   try { _q.all('[data-tv3-cover]').forEach((n) => n.removeAttribute('data-tv3-cover')); } catch (e) { /* best-effort */ }
   try { _q.all('[data-tv3-catcher]').forEach((n) => n.removeAttribute('data-tv3-catcher')); } catch (e) { /* best-effort */ }
-  try { _q.all('[data-tv3-close]').forEach((n) => n.removeAttribute('data-tv3-close')); } catch (e) { /* best-effort */ }
 """
     + _TARGET_READONLY_JS
     + r"""  const RETEST_SCROLLABLE_CLIP = false;
@@ -7453,15 +7524,30 @@ _TYPE_TARGET_PROBE_JS = (
     const _shownText = """
     + _SHOWN_TEXT_JS
     + r""";
-    for (const c of found) {
+    // observe's pointer-cursor scan, run on this layer alone, merged with the named controls in document order, so an
+    // href-less <a> or a <div> styled as a button is listed.
+    const pointerState = """
+    + _pointer_state_js("60")
+    + r""";
+    const ordered = [];
+    try {
+      const _withPointerRoots = """
+    + _WITH_POINTER_ROOTS_JS
+    + r""";
+      _withPointerRoots(layer, """
+    + json.dumps(_BASE_CONTROL_SEL)
+    + r""", found, pointerState, (n) => { ordered.push(n); }, (c) => visible(c) && !isDisabled(c));
+    } catch (e) { ordered.length = 0; for (const c of found) ordered.push(c); }
+    const picked = [];
+    for (const c of ordered) {
       if (c === el || !visible(c) || isDisabled(c)) continue;
-      const csel = idSelector(c) || markerSelector(c);
+      const pointerRoot = pointerState.roots.has(c);
+      if (pointerRoot && c.contains(el)) continue;
       // ownName covers aria-label and root-scoped aria-labelledby, same priority order and same
       // shadow-aware resolution the layer's own name uses.
-      const label = boundedClean(ownName(c) || c.textContent || c.value || (c.getAttribute && c.getAttribute('title')) || '', 60);
-      if (!label && !csel) continue;
-      const shows = boundedClean(_shownText(c, label), 60);
-      allControls.push(shows ? { selector: csel, label, shows } : { selector: csel, label });
+      const label = boundedClean(ownName(c) || c.textContent || c.value || (c.getAttribute && c.getAttribute('title'))
+        || (pointerRoot ? pointerState.roots.get(c) : '') || '', 60);
+      picked.push({ c, label });
     }
     // A real dismisser (Accept, Confirm, Close) routinely comes AFTER a list of category rows or
     // toggles in document order -- a Privacy Preference Center's footer buttons follow its list of
@@ -7469,13 +7555,44 @@ _TYPE_TARGET_PROBE_JS = (
     // needs and keep only the toggles it was already flailing between, reproducing the ticket's own
     // motivating bug with more words. Keep both ends: the first few for context, the last few
     // because that is where a footer actually lives.
-    const truncated = allControls.length > 8;
+    const truncated = picked.length > 8;
+    // Page script can replace Math.random, so a key passed in from Python is used whenever one is given.
+    const ctlNonce = typeof arg.ctl === 'string' && /^[a-z0-9]{5}$/.test(arg.ctl)
+      ? arg.ctl : Math.random().toString(36).slice(2, 7);
+    let minted = 0;
+    // A key an earlier probe minted is reused while this element alone holds it, and taken off every holder once a
+    // clone copies it, so a printed address finds its element or nothing. A new key is kept only if it names it alone.
+    const ctlAddress = (c) => {
+      const prior = c.getAttribute && c.getAttribute('data-tv3-ctl');
+      if (prior && /^[a-z0-9]{1,8}-\d{1,4}$/.test(prior)) {
+        const priorSel = '[data-tv3-ctl="' + prior + '"]';
+        const s = uniqueSelector(priorSel, c);
+        if (s) return s;
+        try { _q.all(priorSel).forEach((n) => n.removeAttribute('data-tv3-ctl')); } catch (e) { /* best-effort */ }
+      }
+      for (let tries = 0; tries < 8; tries++) {
+        const key = ctlNonce + '-' + minted++;
+        try { c.setAttribute('data-tv3-ctl', key); } catch (e) { return null; }
+        const s = uniqueSelector('[data-tv3-ctl="' + key + '"]', c);
+        if (s) return s;
+        try { c.removeAttribute('data-tv3-ctl'); } catch (e) { return null; }
+      }
+      return null;
+    };
+    const listed = new Set();
+    for (const { c, label } of truncated ? picked.slice(0, 5).concat(picked.slice(-3)) : picked) {
+      const csel = idSelector(c) || markerSelector(c) || ctlAddress(c);
+      if (!label && !csel) continue;
+      const shows = boundedClean(_shownText(c, label), 60);
+      allControls.push(shows ? { selector: csel, label, shows } : { selector: csel, label });
+      listed.add(c);
+    }
     // An icon-only close is often a bare <div onclick>, which no tag or role above names. Only a leaf
     // handler counts (a row, card or body handler wraps other controls), and at most two are added
     // after the named ones, so a list of row handlers cannot displace the layer's own controls.
     const leaves = [];
     for (const c of deepAll(layer, '[onclick]').slice(0, 200)) {
-      if (c === layer || c === el || !visible(c) || isDisabled(c)) continue;
+      if (c === layer || c === el || !visible(c) || isDisabled(c) || listed.has(c)) continue;
       if (c.matches && c.matches(controlSel)) continue;
       if (c.contains(el) || c.querySelector('[onclick],' + controlSel)) continue;
       if (c.parentElement && c.parentElement.closest(controlSel)) continue;
@@ -7484,23 +7601,18 @@ _TYPE_TARGET_PROBE_JS = (
     }
     // An icon close has no text, so unlabeled leaves go first; a run of labelled rows cannot fill the slots ahead of it.
     leaves.sort((a, b) => (a.label ? 1 : 0) - (b.label ? 1 : 0));
-    // Fresh per probe, so a selector an earlier probe printed matches nothing rather than another element.
-    const closeNonce = Math.random().toString(36).slice(2, 7);
     const onclickControls = [];
     for (const { c, label } of leaves) {
       if (onclickControls.length >= 2) break;
-      let csel = idSelector(c) || markerSelector(c);
-      if (!csel) {
-        // A close that appeared after the last observe carries no marker, so the probe names it itself.
-        const key = closeNonce + '-' + onclickControls.length;
-        try { c.setAttribute('data-tv3-close', key); csel = '[data-tv3-close="' + key + '"]'; } catch (e) { continue; }
-      }
+      const csel = idSelector(c) || markerSelector(c) || ctlAddress(c);
+      if (!csel) continue;
       onclickControls.push({ selector: csel, label });
     }
-    const controls = (truncated ? allControls.slice(0, 5).concat(allControls.slice(-3)) : allControls)
-      .concat(onclickControls);
+    const controls = allControls.concat(onclickControls);
     try { layer.setAttribute('data-tv3-cover', '1'); } catch (e) { /* best-effort */ }
     out.occluder = { selector: layerSelector, name: layerName, controls, truncated };
+    // The scan above reads only this document, so a frame's own controls are never listed.
+    if (/^i?frame$/i.test(String(layer.tagName || ''))) out.occluder.frame = true;
     if (layerText.join('').trim()) { out.occluder.text = layerText; out.occluder.textCut = layerTextCut; }
     out.occluder.layerKind = layerKind;
     // Which layer node this is, and the state of its controls, kept only in a realm the page cannot read or patch
@@ -8194,13 +8306,15 @@ _SELECT_VISIBILITY_JS = (
     const r = el.getBoundingClientRect();
     const cs = getComputedStyle(el);
     // Forcing a value onto a select nothing stands in for carries a value the user never saw into
-    // whatever the run submits next -- so the stand-in is resolved by this realm, never by the page's.
+    // whatever the run submits next -- so the stand-in is read from the label association, never from the
+    // page's `labels`. In the page's own realm that is only as honest as the page, as observe's listing is.
     return {
       exists: true,
       nodeName: (el.nodeName || '').toLowerCase(),
       visible: r.width > 0 && r.height > 0 && cs.visibility !== 'hidden',
       disabled: !!el.disabled,
-      proxied: !!_nativeProxy(el),
+      // A page-realm answer is not trusted to force a hidden select.
+      proxied: arg.allowOwnLabel !== false && !!_nativeProxy(el),
       multiple: el.multiple === true,
     };
   } catch (e) { return { exists: false, visible: false }; }
@@ -8614,12 +8728,15 @@ _SELECT_READBACK_JS = (
 # The native radio/checkbox a click on `el` actually toggles: itself, its <label>'s control, or the
 # sole native input a thin host wraps. An ARIA-only or ARIA-toggle-role host resolves to null on
 # purpose -- aria-checked is app-set on its own schedule, not a readback bearer.
-_TOGGLE_OWNER_JS = r"""(el) => {
+_TOGGLE_OWNER_JS = (
+    r"""(el) => {
   if (_isToggle(el)) return el;
   if (_isLabel(el)) {
     const ctl = nativeControlOf(el);
     if (!_isToggle(ctl)) return null;
-    const wrapsOther = _qsa(el, 'button,a[href],input,select,textarea').some((c) => c !== ctl);
+    const wrapsOther = _qsa(el, '"""
+    + _LABEL_HELD_CONTROLS
+    + r"""').some((c) => c !== ctl);
     return wrapsOther ? null : ctl;
   }
   // A control that is itself interactive (a trigger, a menu row, a link, an ARIA toggle) may wrap
@@ -8640,6 +8757,7 @@ _TOGGLE_OWNER_JS = r"""(el) => {
   try { if (el.shadowRoot) others = others.concat(_qsa(el.shadowRoot, 'button,a[href],select,textarea,input:not([type=hidden])')); } catch (e) {}
   return others.some((c) => c !== owner) ? null : owner;
 }"""
+)
 
 # A skinned checkbox/radio is a zero-size or invisible native input whose visible <label> is the
 # real click target; the label is tagged (stale tags cleared first) so click can act on it.
@@ -8661,29 +8779,34 @@ _SKINNED_CHECKBOX_PROBE_JS = (
   const _toggleOwner = """
     + _TOGGLE_OWNER_JS
     + r""";
+  const _ownLabelPick = """
+    + _OWN_LABEL_PICK_JS
+    + r""";
+  const _fadedAncestry = """
+    + _FADED_ANCESTRY_JS
+    + r""";
   const toggleFields = (owner) =>
     owner ? { toggle: true, radio: String(_attr(owner, 'type') || '').toLowerCase() === 'radio', toggleDisabled: !!owner.disabled } : {};
   try {
     const el = _q.find(sel) || _executorEl;
-    if (!el) return { exists: false, skinned: false, labelClick: null };
+    if (!el) return { exists: false, skinned: false };
     const type = String(el.type || '').toLowerCase();
-    if (el.tagName === 'INPUT' && type === 'file') return { exists: true, skinned: false, labelClick: null, file: true };
+    if (el.tagName === 'INPUT' && type === 'file') return { exists: true, skinned: false, file: true };
     const r = el.getBoundingClientRect();
     const cs = getComputedStyle(el);
     const invisible = r.width === 0 || r.height === 0 || cs.visibility === 'hidden' || parseFloat(cs.opacity || '1') < 0.05;
     if (el.tagName === 'SELECT') {
-      return { exists: true, skinned: false, labelClick: null, select: true, invisible, proxied: !!_nativeProxy(el) };
+      return { exists: true, skinned: false, select: true, invisible, proxied: arg.allowOwnLabel !== false && !!_nativeProxy(el) };
     }
     if (el.tagName !== 'INPUT' || (type !== 'checkbox' && type !== 'radio')) {
-      return { exists: true, skinned: false, labelClick: null, ...toggleFields(_toggleOwner(el)) };
+      return { exists: true, skinned: false, ...toggleFields(_toggleOwner(el)) };
     }
-    const drawn = { exists: true, skinned: false, labelClick: null, ...toggleFields(_toggleOwner(el)) };
+    const drawn = { exists: true, skinned: false, ...toggleFields(_toggleOwner(el)) };
     const radio = type === 'radio';
     // :disabled covers a disabled <fieldset>, unlike el.disabled.
     const disabled = el.matches(':disabled');
-    // The click lands on coordinates this realm measured, never through a marker the page could move
-    // onto something else, so the point has to be the target's own: a cover there is a cover.
-    // Returns the point on a hit on the target, false under an unrelated element, null for no hit or a clipped-off point.
+    // A cover at the target's own centre is a cover. Returns true on a hit on the target, false under an unrelated
+    // element, null for no hit or a clipped-off point.
     // A clip that can scroll (a long list) is scrolled once to bring the target into it; only one that cannot is final.
     let lastHit = null;
     const centreHit = (t, retried) => {
@@ -8706,7 +8829,7 @@ _SKINNED_CHECKBOX_PROBE_JS = (
       }
       lastHit = hit;
       for (let n = hit, hops = 0; n && hops < 256; hops++, n = n.assignedSlot || n.parentNode || n.host || null) {
-        if (n === t || n === el) return { x, y };
+        if (n === t || n === el) return true;
       }
       if (!hit) return null;
       for (let n = t.assignedSlot || t.parentNode || t.host, hops = 0; n && hops < 256; hops++, n = n.assignedSlot || n.parentNode || n.host || null) {
@@ -8721,53 +8844,50 @@ _SKINNED_CHECKBOX_PROBE_JS = (
       }
       return false;
     };
-    // Opacity does not stop hit-testing and multiplies down the tree, so a faded-out panel, or stacked
-    // translucent wrappers, hide an input that elementFromPoint still returns. The input's own is excluded.
-    const fadedAncestry = () => {
-      let o = 1;
-      for (let n = el.assignedSlot || el.parentNode || el.host, hops = 0; n && hops < 256; hops++, n = n.assignedSlot || n.parentNode || n.host || null) {
-        if (n.nodeType === 1) o *= parseFloat(getComputedStyle(n).opacity || '1');
-      }
-      return o < 0.05;
+    // The driver aims only at a part of the box holding more than a square pixel of the viewport, however far it
+    // scrolls, so a box parked off-screen or drawn sub-pixel is one no pointer is ever sent to.
+    const aimless = () => {
+      const b = el.getBoundingClientRect();
+      const w = Math.min(b.right, innerWidth) - Math.max(b.left, 0);
+      const h = Math.min(b.bottom, innerHeight) - Math.max(b.top, 0);
+      return !(w > 0 && h > 0 && w * h > 0.99);
     };
-    // A label that also wraps another control (a button, link, or a second input) is not a safe
-    // proxy: a real click on it can activate that control instead.
-    const wrapsOther = (l) => Array.from(_qsa(l, 'button,a[href],input,select,textarea')).some((c) => c !== el);
-    const ownLabel = () => nativeLabelsOf(el).find((l) => {
-      const b = l.getBoundingClientRect();
-      return b.width > 0 && b.height > 0 && !wrapsOther(l);
-    }) || null;
     if (!invisible) {
       // A drawn input the pointer cannot reach at its own centre (a 1px clipped box, one stacked under a
       // sibling's label) is clicked through its own clear label; anything else keeps the plain click's diagnosis.
-      if (arg.allowOwnLabel === false || !_nativeProxy(el) || fadedAncestry() || disabled) return drawn;
-      if (centreHit(el) !== false) return drawn;
-      const label = ownLabel();
-      const at = label && nativeControlOf(label) === el ? centreHit(label) : null;
-      if (!at || !ownLabelHitClear(lastHit, el, label)) return drawn;
-      return { ...drawn, skinned: true, labelClick: at, radio, disabled: false, drawnLabel: true };
-    }
-    if (!_nativeProxy(el)) {
+      if (_fadedAncestry(el) || disabled) return drawn;
+      const proxied = !!_nativeProxy(el);
+      const reach = centreHit(el);
+      // Measured after centreHit's scroll. A clip only refuses a box wholly in the viewport, the one case where every
+      // driver aims at the same clipped-off centre; a proxied one with no point at all is reached as an invisible one is.
+      const b = el.getBoundingClientRect();
+      const clipped = reach === null && b.left >= 0 && b.top >= 0 && b.right <= innerWidth && b.bottom <= innerHeight;
+      if (!proxied && (clipped || aimless())) return { exists: true, skinned: false, radio, unnamed: true, clipped };
+      if (!aimless()) {
+        if (!proxied || reach !== false) return drawn;
+        const labels = nativeLabelsOf(el);
+        const pick = _ownLabelPick(el, labels);
+        const label = pick && !pick.held ? labels[pick.index] : null;
+        if (!label || !centreHit(label) || !ownLabelHitClear(lastHit, el, label)) return drawn;
+        return { ...drawn, skinned: true, radio, disabled: false, drawnLabel: true };
+      }
+    } else {
       // Only the input's own transparency is waived: it still needs a box, no visibility:hidden, visible
       // ancestors, and to be on top at its own centre, so it is clicked directly and read back as a toggle.
-      const at = r.width > 0 && r.height > 0 && cs.visibility !== 'hidden' && !fadedAncestry() ? centreHit(el) : null;
-      if (at) return { exists: true, skinned: false, labelClick: null, ...toggleFields(_toggleOwner(el)) };
-      if (at === false) return { exists: true, skinned: false, labelClick: null, radio, covered: true };
-      return { exists: true, skinned: false, labelClick: null, radio, unproxied: true };
+      const at = r.width > 0 && r.height > 0 && cs.visibility !== 'hidden' && !_fadedAncestry(el) ? centreHit(el) : null;
+      if (at && !aimless()) return { exists: true, skinned: false, ...toggleFields(_toggleOwner(el)) };
+      if (!_nativeProxy(el)) {
+        if (at === false) return { exists: true, skinned: false, radio, covered: true };
+        return { exists: true, skinned: false, radio, unnamed: true };
+      }
     }
-    const none = { exists: true, skinned: true, labelClick: null, radio, disabled };
-    // `none` still gets a script click, so a proxy inside a faded panel is refused outright.
-    if (fadedAncestry()) return { ...none, unproxied: true };
-    // Only a real <label> activates its control on click, and only the association THIS realm derives
-    // counts: an `el.labels` the page shadows names a decoy, not a proxy. A realm the page can patch
-    // (the main-world fallback) never offers one.
-    if (arg.allowOwnLabel === false) return none;
-    const label = ownLabel();
-    if (!label || nativeControlOf(label) !== el) return none;
-    const at = centreHit(label);
-    if (!at) return { ...none, labelCovered: true };
-    return { exists: true, skinned: true, labelClick: at, radio, disabled };
-  } catch (e) { return { exists: false, skinned: false, labelClick: null }; }
+    // Something visible names the control, so it takes the label route; no point is measured here, because one from
+    // this realm is frame-relative and, in the page's own realm, forgeable. The driver finds and clicks the label.
+    const none = { exists: true, skinned: true, radio, disabled };
+    // `none` may still get a script click, so a proxy inside a faded panel is refused outright.
+    if (_fadedAncestry(el)) return { ...none, unproxied: true };
+    return none;
+  } catch (e) { return { exists: false, skinned: false }; }
 }"""
 )
 
@@ -10976,6 +11096,19 @@ async (__tv3TextArgs) => {
   const _visibleProxy = """
     + _VISIBLE_PROXY_JS
     + r""";
+  // One inlining per observe, so the id map behind nativeControlOf is built once per root, not once per control.
+  const _ownLabelPick = (() => {
+"""
+    + _NATIVE_LABEL_JS
+    + r"""
+    const pick = """
+    + _OWN_LABEL_PICK_JS
+    + r""";
+    return (el) => pick(el, nativeLabelsOf(el));
+  })();
+  const _fadedAncestry = """
+    + _FADED_ANCESTRY_JS
+    + r""";
   const _labelText = """
     + _LABEL_TEXT_JS
     + r""";
@@ -11135,11 +11268,9 @@ async (__tv3TextArgs) => {
   const _screenListable = (el) => {
     try { return _screen(el, false).why === null; } catch (e) { return false; }
   };
-  const _pointerState = { pointer: new Map(), covered: new Set(), roots: new Map(), holders: new Set(), represented: new Set(), held: new Set(), extra: new Set(), extraCount: 0, icons: new Set(), iconCount: 0, iconOverflow: 0, notIcon: 0, notIconRoots: new Set(), heldCount: 0, heldCap: """
-    + str(OBSERVE_POINTER_ROOT_CAP)
-    + r""", count: 0, retain: _RETAIN_WIDTH, ceiling: """
-    + str(_POINTER_ROOT_SCAN_CEILING)
-    + r""" };
+  const _pointerState = """
+    + _pointer_state_js("_RETAIN_WIDTH")
+    + r""";
   let pointerListed = 0;
   // Anchors listed beside the root that misses them (`extra`): a budget of their own, so none takes a root's place.
   let extraListed = 0;
@@ -12234,6 +12365,10 @@ async (__tv3TextArgs) => {
     const to = _linkDestination(el);
     if (to) rec.to = to.slice(0, _RETAIN_WIDTH);
     if (hidden) rec.hidden = true;
+    if (hidden && (el.type === 'checkbox' || el.type === 'radio')) {
+      // click picks its label the same way and refuses one under a faded ancestry, so the promise is printed only where it delivers.
+      try { const pick = _ownLabelPick(el); if (pick && !pick.held && !_fadedAncestry(el)) rec.labelDelivers = true; } catch (e) { /* none */ }
+    }
     if (removedBy) rec.a11yRemoved = removedBy;
     // A widget role is what the element IS -- a <div role="switch"> renders as a bare div otherwise,
     // and the model cannot tell it from decoration. The role travels with its state below, or it is
@@ -14595,7 +14730,8 @@ def _probe_was_isolated() -> bool | None:
 
 async def _probe_evaluate(target: Any, js: str, selector: str, arg: dict[str, Any]) -> Any:
     """Isolated-world probe, falling back to the realm's OWN world with own-label granting disabled --
-    a realm the page can patch must not be able to hand a label a hit-test bypass.
+    a realm the page can patch must not be able to hand a label a hit-test bypass. `allowOwnLabel` is read by
+    _REACH_PROBE_NEEDED_JS and _TYPE_TARGET_PROBE_JS.
 
     `target` is the realm the element lives in. The fallback deliberately stays in THAT realm rather
     than dropping to the page's: losing isolation is the trade this fallback has always made, but
@@ -15539,6 +15675,8 @@ def build_browser_tools(
                     extra += " [hidden-native: styled proxy; file_upload works on it directly]"
                 elif e.get("tag") == "select":
                     extra += " [hidden-native: styled proxy; select_option acts on it directly]"
+                elif e.get("type") in ("checkbox", "radio") and not e.get("labelDelivers"):
+                    extra += " [hidden-native: styled proxy]"
                 else:
                     extra += " [hidden-native: styled proxy; click acts on it directly]"
             missing_key = (_realm_of(_render_idx), e.get("group_missing"))
@@ -16430,7 +16568,7 @@ def build_browser_tools(
         # The click/type reaction gate stamps data-tv3-pre on every visible element and the reach probe
         # marks the layer it names; bookkeeping that, left in place, costs truncation budget in noise.
         html = html.replace(' data-tv3-pre="1"', "").replace(' data-tv3-cover="1"', "")
-        html = _CLOSE_ATTR_RE.sub("", html)
+        html = _CTL_ATTR_RE.sub("", html)
         html = _COLLATERAL_ATTR_RE.sub("", html)
         html = _DATE_SEGMENT_ATTR_RE.sub("", html)
         # The act-by-mark tag outlives its call, so unlike the other data-tv3-* bookkeeping it is
@@ -16491,19 +16629,13 @@ def build_browser_tools(
             data = {**data, "notice_at": data["notice_at"] + len(line)}
         return dataclasses.replace(result, content=line + result.content, data=data)
 
-    async def _unreachable_error(selector: str) -> ToolResult:
-        # A native checkbox or <select> inside a hidden template is refused HERE, by a visibility
-        # pre-gate, before anything raises -- so it never reaches the guard's diagnosis and used to be
-        # told its section is collapsed and to go find the trigger, which a template does not have.
-        # Same question, same probe, asked one layer earlier.
+    async def _unreachable_error(selector: str, *, stand_in_checked: bool = True) -> ToolResult:
+        # A native checkbox or <select> inside a hidden template is refused here by a visibility pre-gate, before
+        # anything raises, so it is told it is in a template rather than sent to look for a trigger it does not have.
         if await _target_is_inert(selector):
             return _inert_target_error(selector)
-        return ToolResult.error(
-            f"{selector} is not rendered and nothing visible stands in for it — its section is collapsed, "
-            "closed or inactive, so a person could not reach this control either. Act on whatever reveals "
-            "it (the section header, the step, the modal trigger), then re-observe.",
-            error_class="unreachable",
-        )
+        tail = ", and no label or element naming it is drawn where a click could reach it" if stand_in_checked else ""
+        return ToolResult.error(f"{selector} is not rendered on screen{tail}.", error_class="unreachable")
 
     def _not_editable_error(exc: _FieldNotEditable) -> ToolResult:
         if exc.read_only:
@@ -16654,6 +16786,8 @@ def build_browser_tools(
         controls_desc = "; ".join(parts) if parts else "none named"
         if (occluder or {}).get("truncated"):
             controls_desc += "; more controls exist (re-observe to see the rest)"
+        is_frame = bool((occluder or {}).get("frame"))
+        frame_note = "It is a frame, and the probe does not read inside frames"
         if branch == "challenge":
             return ToolResult.error(
                 f"{selector} is covered by {layer_desc}, which contains a challenge frame "
@@ -16684,10 +16818,14 @@ def build_browser_tools(
         # A layer that is quoted is reported, not prescribed for: its text may be the page answering the last action,
         # which closing it and retrying the same field does not address.
         if said and not parts:
+            none_found = (
+                frame_note
+                if is_frame
+                else "The probe found no named controls on it; one without a label (an icon or an ×) would show "
+                f"in get_html of {layer_selector or 'the layer'}"
+            )
             return ToolResult.error(
-                f"{selector} is covered by {layer_desc}, so it cannot be {verb}{also}.{said} The probe found no "
-                f"named controls on it; one without a label (an icon or an ×) would show in get_html of "
-                f"{layer_selector or 'the layer'}.",
+                f"{selector} is covered by {layer_desc}, so it cannot be {verb}{also}.{said} {none_found}.",
                 data=blocker,
                 error_class="covered",
             )
@@ -16699,12 +16837,17 @@ def build_browser_tools(
                 error_class="covered",
             )
         if not parts:
-            # The probe names controls by tag, role and inline onclick; a close wired by a script listener is
-            # none of those, so an empty list is no evidence the layer has no way out.
+            # The probe names controls by tag, role, pointer cursor and inline onclick; a close wired by a script
+            # listener is none of those, so an empty list is no evidence the layer has no way out.
+            none_found = (
+                frame_note
+                if is_frame
+                else "The probe found no named controls on it, but it may still have an unlabeled close (an icon or "
+                f"an ×): read get_html of {layer_selector or 'the layer'} to find it, close the layer, then retry "
+                f"{selector}"
+            )
             return ToolResult.error(
-                f"{selector} is covered by {layer_desc}, so it cannot be {verb}{also}. The probe found no named "
-                "controls on it, but it may still have an unlabeled close (an icon or an ×): read get_html of "
-                f"{layer_selector or 'the layer'} to find it, close the layer, then retry {selector}.",
+                f"{selector} is covered by {layer_desc}, so it cannot be {verb}{also}. {none_found}.",
                 data=blocker,
                 error_class="covered",
             )
@@ -16734,13 +16877,109 @@ def build_browser_tools(
         # action will actually land on -- consulted only where the per-root lookup finds nothing.
         # Only a composed selector needs it, and hostAnchored composes with a space, so anything
         # without one keeps its single round trip. A quoted space costs a spare lookup, never a miss.
+        ctl = secrets.token_hex(3)[:5]
         if " " not in selector:
-            return {"sel": selector, "el": None}
+            return {"sel": selector, "el": None, "ctl": ctl}
         try:
             element = await page.query_selector(selector)
         except Exception:
             element = None
-        return {"sel": selector, "el": element}
+        return {"sel": selector, "el": element, "ctl": ctl}
+
+    def _no_point_refusal(selector: str, cause: str) -> str:
+        return f"{selector} was not clicked: it has no on-screen point of its own, and {cause}"
+
+    def _left_page_error(selector: str) -> ToolResult:
+        return ToolResult.error(
+            f"{selector} left the page before the click could land — it was replaced by a "
+            "re-render; re-observe and act on fresh selectors",
+            data={"page_state_changed": True},
+            error_class="stale_selector",
+        )
+
+    def _label_click_refusal(selector: str, exc: Exception) -> ToolResult:
+        # Only the driver's own fixed phrases are echoed: its call log also quotes the page's markup.
+        if "intercepts pointer events" in str(exc):
+            _record_covered(None, "unnamed", controls=[])
+            return ToolResult.error(
+                _no_point_refusal(selector, "another element is drawn over its label where the click would land"),
+                error_class="covered",
+            )
+        states = re.findall(r"element is (not visible|not stable|not enabled|outside of the viewport)", str(exc))
+        found = f"was {states[-1]}" if states else f"could not be clicked ({type(exc).__name__})"
+        return ToolResult.error(
+            _no_point_refusal(selector, f"its label {found} after {_LABEL_CLICK_TIMEOUT_MS / 1000:g} s"),
+            error_class="unreachable",
+        )
+
+    async def _probe_target(realm: input_dispatch.Realm, arg: dict[str, Any]) -> ElementHandle | None:
+        try:
+            return (await realm.evaluate_handle(_PROBE_TARGET_JS, arg)).as_element()
+        except Exception:
+            return None
+
+    async def _driver_own_label(target: ElementHandle) -> tuple[ElementHandle, dict[str, float] | None] | None:
+        # The driver finds the candidates from DOM attributes; only the choice among them runs in the page's world. A
+        # page that forges that choice can at worst steer a real, hit-tested click onto an element inside a label the
+        # driver found for this target.
+        labels: list[ElementHandle] = []
+        picked = None
+        try:
+            labels = await target.query_selector_all("xpath=ancestor::label[not(@for)]")
+            dom_id = await target.get_attribute("id")
+            frame = await target.owner_frame()
+            if dom_id and frame is not None:
+                labels += await frame.query_selector_all(f"label[for={_css_string(dom_id)}]")
+            if labels:
+                picked = await target.evaluate(_OWN_LABEL_PICK_CALL_JS, labels)
+        except Exception:
+            picked = None
+        index = picked.get("index") if isinstance(picked, dict) else None
+        chosen = labels[index] if isinstance(index, int) and 0 <= index < len(labels) else None
+        for handle in labels:
+            if handle is not chosen:
+                with contextlib.suppress(Exception):
+                    await handle.dispose()
+        if chosen is None or not isinstance(picked, dict):
+            return None
+        if picked.get("held") is not True:
+            return chosen, None
+        position = None
+        with contextlib.suppress(Exception):
+            position = await _off_control_position(chosen, target)
+        if position is None:
+            with contextlib.suppress(Exception):
+                await chosen.dispose()
+            return None
+        return chosen, position
+
+    async def _off_control_position(label: ElementHandle, target: ElementHandle) -> dict[str, float] | None:
+        # Driver boxes, all in the label's own frame on either engine: mid-height at the centre, then 3 px in from either
+        # side, the first off every other control the label holds, as the padding-box offset `position` takes.
+        box = await label.bounding_box()
+        if box is None:
+            return None
+        held = await label.query_selector_all(_LABEL_HELD_CONTROLS)
+        boxes: list[dict[str, float]] = []
+        try:
+            for control in held:
+                if not await control.evaluate("(c, el) => c === el", target):
+                    held_box = await control.bounding_box()
+                    if held_box is not None:
+                        boxes.append(held_box)
+        finally:
+            for control in held:
+                with contextlib.suppress(Exception):
+                    await control.dispose()
+        border_left, border_top = await label.evaluate(
+            "(l) => { const s = getComputedStyle(l);"
+            " return [parseInt(s.borderLeftWidth, 10) || 0, parseInt(s.borderTopWidth, 10) || 0]; }"
+        )
+        y = box["y"] + box["height"] / 2
+        for x in (box["x"] + box["width"] / 2, box["x"] + 3, box["x"] + box["width"] - 3):
+            if not any(b["x"] <= x <= b["x"] + b["width"] and b["y"] <= y <= b["y"] + b["height"] for b in boxes):
+                return {"x": x - box["x"] - border_left, "y": y - box["y"] - border_top}
+        return None
 
     def _with_target_label(handler: ToolHandler) -> ToolHandler:
         """Capture the target's page-visible name and kind BEFORE the handler runs and carry both on
@@ -16847,7 +17086,21 @@ def build_browser_tools(
             return None
         # The element the driver waited on, which is not always the one the caller named.
         acted = _acted_selector.get(selector, selector)
-        return _inert_target_error(acted) if await _target_is_inert(acted) else None
+        probe: str | None = acted
+        if _ENGINE_SELECTOR_RE.match(acted.strip()) and _acted_page:
+            # The isolated probe reads CSS only, so a text= or xpath target is first named by the driver's own engine.
+            realm = _acted_realm[0] if _acted_realm else _acted_page[0]
+            handle = None
+            try:
+                handle = await realm.locator(acted).first.element_handle(timeout=1000)
+                probe = await _resolve_handle_selector(realm, handle) if handle is not None else None
+            except Exception:
+                probe = None
+            finally:
+                if handle is not None:
+                    with contextlib.suppress(Exception):
+                        await handle.dispose()
+        return _inert_target_error(acted) if probe is not None and await _target_is_inert(probe) else None
 
     async def _typing_target(page: Any, selector: str) -> str:
         """The element a type call acts on: the one its selector names, or the control a named shadow host mirrors."""
@@ -17485,8 +17738,8 @@ def build_browser_tools(
             if not (isinstance(skin_probe, dict) and "radio" in skin_probe):
                 break
             if await _engine_enabled(page, selector):
-                # A page that enables a control can move it in the same step, so the label point is measured after
-                # the enabled read, never before it.
+                # A page that enables a control can move it in the same step, so the probe runs again after the
+                # enabled read.
                 pre_click_arg = await _probe_arg(page, selector)
                 with contextlib.suppress(Exception):
                     skin_probe = await _probe_evaluate(page, _SKINNED_CHECKBOX_PROBE_JS, selector, pre_click_arg)
@@ -17497,24 +17750,23 @@ def build_browser_tools(
                     error_class="disabled",
                 )
             await asyncio.sleep(0.1)
-            # Enabling can re-render or move the control, so the label point is measured again after the wait.
+            # Enabling can re-render or move the control, so the probe runs again after the wait.
             pre_click_arg = await _probe_arg(page, selector)
+        # Read now: the readback probes below overwrite it.
+        skin_isolated = _probe_was_isolated()
         if isinstance(skin_probe, dict) and "radio" in skin_probe and (kinds := _CLICK_CHOICE_KIND.get()) is not None:
             kinds.append("radio" if skin_probe["radio"] else "checkbox")
-        if isinstance(skin_probe, dict) and skin_probe.get("drawnLabel") and (label_over_control or _acted_realm):
-            # A drawn input under its own label is already force-clicked below, and a frame's label point is
-            # frame-relative, so neither takes the label route.
-            skin_probe = {**skin_probe, "skinned": False, "labelClick": None}
+        if isinstance(skin_probe, dict) and skin_probe.get("drawnLabel") and label_over_control:
+            # A drawn input under its own label is already force-clicked below.
+            skin_probe = {**skin_probe, "skinned": False}
         if isinstance(skin_probe, dict) and skin_probe.get("file"):
             return ToolResult.error(
                 f"{selector} is a file input — clicking it opens a native picker the run cannot drive; "
                 "use file_upload with this selector instead"
             )
         if isinstance(skin_probe, dict) and skin_probe.get("select") and skin_probe.get("invisible"):
-            # Playwright's actionability wait never resolves against it, so a click here is 15s of pure
-            # loss followed by a raise; select_option forces past that on the same selector — but only
-            # for one something visible stands in for, so an unreachable select is sent to reveal first
-            # rather than to a tool that would refuse it a turn later.
+            # Playwright's actionability wait never resolves against it, so a click here is 15s of loss and a raise.
+            # select_option forces past that only for one something visible stands in for, so any other is refused here.
             if not skin_probe.get("proxied"):
                 return await _unreachable_error(selector)
             return ToolResult.error(
@@ -17523,12 +17775,21 @@ def build_browser_tools(
             )
         if isinstance(skin_probe, dict) and skin_probe.get("unproxied"):
             return await _unreachable_error(selector)
+        if isinstance(skin_probe, dict) and skin_probe.get("unnamed"):
+            if await _target_is_inert(selector):
+                return _inert_target_error(selector)
+            if skin_probe.get("clipped"):
+                return ToolResult.error(
+                    f"{selector} was not clicked: a container clips off the point a click aims at, and no <label> or "
+                    "element naming it is drawn",
+                    error_class="unreachable",
+                )
+            return ToolResult.error(
+                _no_point_refusal(selector, "no <label> or element naming it is drawn"), error_class="unreachable"
+            )
         skinned = bool(isinstance(skin_probe, dict) and skin_probe.get("skinned"))
-        if isinstance(skin_probe, dict) and (skin_probe.get("covered") or (skinned and skin_probe.get("labelCovered"))):
+        if isinstance(skin_probe, dict) and skin_probe.get("covered"):
             return _covered_error(selector, None, verb="clicked")
-        label_click = skin_probe.get("labelClick") if isinstance(skin_probe, dict) else None
-        if not isinstance(label_click, dict):
-            label_click = None
         # A forced own-label click can land on something inside the label that is not the control (a
         # nested <details>, a scripted link); a toggle target earns a before/after readback.
         toggle_target = isinstance(reach_pre, dict) and bool(reach_pre.get("toggle"))
@@ -17576,41 +17837,49 @@ def build_browser_tools(
                 checked_before = None
 
         document_replaced = False
-        if skinned and label_click:
-            if _acted_realm:
-                # The coordinates come from a getBoundingClientRect inside the element's own realm, so
-                # in a child frame they are FRAME-relative while page.mouse takes viewport coordinates.
-                # Clicking them anyway would land wherever that offset happens to point -- a click on
-                # something else, reported as a click on this. Refused instead, because nothing here can
-                # be verified afterwards: the wrong element may well have accepted the click.
-                # Translating them by the frame's own offset (and by each ancestor frame's) is the
-                # follow-up; it is not free and it is not this change.
-                return ToolResult.error(
-                    f"{selector} is a styled control whose only clickable surface is its label, and it "
-                    "sits inside a frame where that label cannot be aimed at reliably — act on a "
-                    "different control, or use the native control directly if the page exposes one"
-                )
+        label_clicked = False
+        if skinned:
+            target = await _probe_target(page, pre_click_arg)
             try:
-                await input_dispatch.click_at(_current_page(), float(label_click["x"]), float(label_click["y"]))
-            except Exception as e:
-                return ToolResult.error(
-                    f"click on {selector} via its label failed ({type(e).__name__}) — the page may have "
-                    "re-rendered; re-observe and act on fresh selectors"
-                )
-            base = f"clicked {clicked_name} via its label — now at {await _url(page)}"
-        elif skinned:
-            # Resolved again here rather than reused: this evaluate is the action, not a probe, and a
-            # selector naming a control through its host resolves ONLY through the handle -- a node the
-            # page replaced while the probes ran would be clicked off-document, silently.
-            fired = await input_dispatch.js_click(page, _ROOT_QUERY_JS, await _probe_arg(page, selector))
-            if not fired:
-                return ToolResult.error(
-                    f"{selector} left the page before the click could land — it was replaced by a "
-                    "re-render; re-observe and act on fresh selectors",
-                    data={"page_state_changed": True},
-                    error_class="stale_selector",
-                )
-            base = f"clicked {clicked_name} (hidden native control, toggled directly) — now at {await _url(page)}"
+                picked = await _driver_own_label(target) if target is not None else None
+                if picked is not None:
+                    label, position = picked
+                    try:
+                        await input_dispatch.click_handle(
+                            page, label, timeout=_LABEL_CLICK_TIMEOUT_MS, position=position
+                        )
+                    except Exception as e:
+                        return _label_click_refusal(selector, e)
+                    finally:
+                        with contextlib.suppress(Exception):
+                            await label.dispose()
+                    label_clicked = True
+                    base = f"clicked {clicked_name} via its label — now at {await _url(page)}"
+                elif skin_isolated is not True:
+                    # What a script toggle finds and reads back in a realm the page can patch is the page's to forge.
+                    connected = None
+                    if target is not None:
+                        with contextlib.suppress(Exception):
+                            connected = await target.evaluate("(el) => el.isConnected")
+                    if target is None or connected is False:
+                        return _left_page_error(selector)
+                    return ToolResult.error(
+                        _no_point_refusal(selector, "no <label> that can be clicked away from other controls"),
+                        error_class="unreachable",
+                    )
+                else:
+                    # Resolved again by the probe's rule, with the probe's element as the fallback, so a node the page
+                    # replaced while the probes ran is refused rather than clicked off-document.
+                    fired = await input_dispatch.js_click(page, _ROOT_QUERY_JS, {"sel": selector, "el": target})
+                    if not fired:
+                        return _left_page_error(selector)
+                    base = (
+                        f"clicked {clicked_name} (hidden native control, toggled directly) — now at {await _url(page)}"
+                    )
+            finally:
+                if target is not None:
+                    with contextlib.suppress(Exception):
+                        await target.dispose()
         else:
             marker_armed = True
             try:
@@ -17815,19 +18084,16 @@ def build_browser_tools(
                 # pre-read raced): as before the unified verdict, fall through to the ordinary post path
                 # rather than claim the control left the page.
             if verdict is CommitStatus.DID_NOT_COMMIT:
-                drawn_label = skinned and bool(skin_probe.get("drawnLabel"))
-                if skinned and not drawn_label:
+                if skinned and not label_clicked:
                     return ToolResult.error(
-                        f"click on {selector} did NOT commit: the control still reads checked={checked_after!r} — "
-                        "the styled proxy may not sync from its hidden control; re-observe and act on the visible "
-                        "proxy instead",
+                        f"click on {selector} did NOT commit: it was toggled directly and still reads "
+                        f"checked={checked_after!r}",
                         data=transition_data,
                     )
-                if verify_toggle or drawn_label:
+                if verify_toggle or label_clicked:
                     return ToolResult.error(
-                        f"click on {selector} did NOT commit: the control still reads checked={checked_after!r} — "
-                        "its label took the click but the control did not change (the page may refuse the toggle, "
-                        "or something inside the label took it); re-observe before retrying",
+                        f"click on {selector} did NOT commit: it was clicked through its label and still reads "
+                        f"checked={checked_after!r}",
                         data=transition_data,
                     )
                 # The click may have done something other than toggle (opened a menu, selected an
@@ -18028,7 +18294,7 @@ def build_browser_tools(
         occluder = probe.get("occluder") if isinstance(probe, dict) else None
         if occluded and probe.get("unrendered"):
             # Whatever the hit test met is drawn where the undrawn field sits, so it covers nothing.
-            raise ToolRefusal.of(await _unreachable_error(selector))
+            raise ToolRefusal.of(await _unreachable_error(selector, stand_in_checked=False))
         if occluded and not probe.get("skinned"):
             await _annotate_challenge_frame(page, _current_page(), occluder)
             return False, occluded, occluder
@@ -25103,7 +25369,8 @@ def build_browser_tools(
             'menu of options, the result lists them with [data-tv3-menu="N"] selectors — click one of '
             "those to select (verified: you get a loud error, not a silent no-op, if the selection does "
             "not commit; do not blindly repeat a failed click). If the click triggers a file download, "
-            "the tool result reports it when detected.",
+            "the tool result reports it when detected. For text that observe and look do not list, selector "
+            'text="<exact visible text>" clicks the element showing exactly that text.',
             _obj(
                 {
                     "selector": {"type": "string"},

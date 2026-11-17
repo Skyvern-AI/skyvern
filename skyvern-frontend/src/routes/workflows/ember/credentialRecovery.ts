@@ -1,7 +1,9 @@
 import type { AxiosInstance, AxiosRequestConfig, AxiosResponse } from "axios";
 
+import { EMBER_API_PREFIX } from "./emberTypes";
+
 export const CREDENTIAL_RECOVERY_KEY_PREFIX = "ember-credential-recovery";
-// Still the key this bundle writes, so a tab rolled back to an older bundle finds the token.
+// Read when the Ember key is absent: older bundles wrote this key.
 export const LEGACY_CREDENTIAL_RECOVERY_KEY_PREFIX =
   "copilot-credential-recovery";
 
@@ -44,7 +46,7 @@ export function ensureCredentialRecoveryToken(
       (byte) => byte.toString(16).padStart(2, "0"),
     ).join("");
     sessionStorage.setItem(
-      `${LEGACY_CREDENTIAL_RECOVERY_KEY_PREFIX}:${workflowId}`,
+      `${CREDENTIAL_RECOVERY_KEY_PREFIX}:${workflowId}`,
       token,
     );
     return token;
@@ -57,7 +59,7 @@ export function credentialRecoveryHeaders(
   workflowId: string | undefined,
 ): Record<string, string> {
   const token = currentCredentialRecoveryToken(workflowId);
-  return token ? { "X-Copilot-Credential-Recovery-Token": token } : {};
+  return token ? { "X-Ember-Credential-Recovery-Token": token } : {};
 }
 
 export class CredentialRecoveryHistoryError extends Error {
@@ -87,7 +89,7 @@ export async function readCredentialRecoveryHistory<T>(
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     try {
       const recoveryHeaders = credentialRecoveryHeaders(workflowId);
-      const response = await client.get<T>("/workflow/copilot/chat-history", {
+      const response = await client.get<T>(`${EMBER_API_PREFIX}/chat-history`, {
         ...config,
         headers: {
           ...config.headers,
@@ -97,7 +99,7 @@ export async function readCredentialRecoveryHistory<T>(
       return {
         ...response,
         hadCredentialRecoveryToken: Boolean(
-          recoveryHeaders["X-Copilot-Credential-Recovery-Token"],
+          recoveryHeaders["X-Ember-Credential-Recovery-Token"],
         ),
       };
     } catch (error) {

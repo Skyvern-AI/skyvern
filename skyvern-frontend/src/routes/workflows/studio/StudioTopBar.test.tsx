@@ -338,7 +338,7 @@ describe("RunStopButton concurrency with a live block run", () => {
 
   test("an editor-open layout is NOT carried into the run form (full runs reset)", () => {
     mockRun(Status.Completed);
-    renderAt("/workflows/wpid_1/studio?wr=wr_1&panes=editor,copilot");
+    renderAt("/workflows/wpid_1/studio?wr=wr_1&panes=editor,ember");
 
     fireEvent.click(screen.getByRole("button", { name: "Re-run" }));
 

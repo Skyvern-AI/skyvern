@@ -452,7 +452,7 @@ function CollapsedPaneStrip({
   const browserActivity = useStudioBrowserStore((s) => s.hasUnseenActivity);
   const emberAttention = useEmberHeaderStore((s) => s.attention);
   const activity = id === "browser" && browserActivity;
-  const awaiting = id === "copilot" ? emberAttention : null;
+  const awaiting = id === "ember" ? emberAttention : null;
   const news = activity
     ? ", new activity"
     : awaiting
@@ -1184,7 +1184,7 @@ function StudioStage(props: StudioWorkspaceProps) {
               )}
             >
               <StudioPane
-                {...paneProps("copilot")}
+                {...paneProps("ember")}
                 headerActions={<EmberPaneControls />}
                 iconBadge={<EmberActiveDot />}
               >

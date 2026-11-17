@@ -128,14 +128,26 @@ class Frame:
     async def query_selector(self, selector: str) -> ElementHandle | None:
         return await self.query_selector_indexed(selector, 0)
 
-    async def query_selector_indexed(self, selector: str, index: int) -> ElementHandle | None:
-        handle = await evaluate(
-            self.session,
-            f"(spec) => {{ {_QUERY_ALL_JS} return __queryAll(document, spec.selector)[spec.index] || null; }}",
-            {"selector": selector, "index": index},
-            context_id=await self._context_id(),
-            by_value=False,
-        )
+    async def query_selector_indexed(
+        self, selector: str, index: int, root: ElementHandle | None = None
+    ) -> ElementHandle | None:
+        spec = {"selector": selector, "index": index}
+        if root is None:
+            handle = await evaluate(
+                self.session,
+                f"(spec) => {{ {_QUERY_ALL_JS} return __queryAll(document, spec.selector)[spec.index] || null; }}",
+                spec,
+                context_id=await self._context_id(),
+                by_value=False,
+            )
+        else:
+            handle = await evaluate(
+                root._session,
+                f"function(spec) {{ {_QUERY_ALL_JS} return __queryAll(this, spec.selector)[spec.index] || null; }}",
+                spec,
+                object_id=root._object_id,
+                by_value=False,
+            )
         if not isinstance(handle, RemoteHandle) or handle.subtype != "node":
             if isinstance(handle, RemoteHandle):
                 await handle.dispose()
@@ -159,13 +171,18 @@ class Frame:
             return None
         return ElementHandle(self, handle)
 
-    async def query_selector_all(self, selector: str) -> list[ElementHandle]:
-        total = int(
-            await self.evaluate(f"(s) => {{ {_QUERY_ALL_JS} return __queryAll(document, s).length; }}", selector)
-        )
+    async def query_selector_all(self, selector: str, root: ElementHandle | None = None) -> list[ElementHandle]:
+        if root is None:
+            total = int(
+                await self.evaluate(f"(s) => {{ {_QUERY_ALL_JS} return __queryAll(document, s).length; }}", selector)
+            )
+        else:
+            total = int(
+                await root._bound(f"function(s) {{ {_QUERY_ALL_JS} return __queryAll(this, s).length; }}", selector)
+            )
         found = []
         for index in range(total):
-            handle = await self.query_selector_indexed(selector, index)
+            handle = await self.query_selector_indexed(selector, index, root)
             if handle is not None:
                 found.append(handle)
         return found

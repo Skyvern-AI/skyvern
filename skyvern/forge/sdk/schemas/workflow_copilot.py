@@ -21,7 +21,12 @@ from pydantic import (
     model_validator,
 )
 
-from skyvern.forge.sdk.copilot.ask_user import AccountGroupDecision, QuestionInteraction, QuestionResponse
+from skyvern.forge.sdk.copilot.ask_user import (
+    QUESTION_CLIENT_GRACE,
+    AccountGroupDecision,
+    QuestionInteraction,
+    QuestionResponse,
+)
 from skyvern.forge.sdk.copilot.code_write_diff import CodeWriteDiff
 from skyvern.forge.sdk.copilot.context import (
     ActivityBucket,
@@ -80,6 +85,17 @@ _CHAT_ID_ALIASES = AliasChoices("ember_chat_id", "workflow_copilot_chat_id")
 _CHAT_MESSAGE_ID_ALIASES = AliasChoices("ember_chat_message_id", "workflow_copilot_chat_message_id")
 COPILOT_PROPOSAL_METADATA_KEY = "_copilot_proposal"
 COPILOT_PRIVATE_SETTINGS_KEY = "_copilot_private_settings"
+
+
+def credential_recovery_token_is_valid(token: str) -> bool:
+    if len(token) != 64:
+        return False
+    try:
+        return len(bytes.fromhex(token)) == 32
+    except ValueError:
+        return False
+
+
 CopilotCandidateDisposition = Literal[
     "no_proposal",
     "auto_applicable",
@@ -191,6 +207,7 @@ class CopilotPendingTurn(BaseModel):
     question_interactions: list[QuestionInteraction] = Field(default_factory=list)
     question_heartbeat_at: datetime | None = None
     question_client_seen_at: datetime | None = None
+    question_client_grace_seconds: int | None = None
     cancel_token: str | None = None
     # The person who started the turn; None for a turn started by an organization API key or before this was recorded.
     starter_user_id: str | None = None
@@ -202,6 +219,14 @@ class CopilotPendingTurn(BaseModel):
     # Each draft frame overwrites this, never appends, so an entry holds at most one workflow.
     latest_draft: ClientVisibleProposedWorkflow | None = None
     latest_draft_at: datetime | None = None
+
+    def question_client_deadline(self, item: QuestionInteraction) -> datetime:
+        grace = (
+            timedelta(seconds=self.question_client_grace_seconds)
+            if self.question_client_grace_seconds is not None
+            else QUESTION_CLIENT_GRACE
+        )
+        return (self.question_client_seen_at or item.created_at) + grace
 
 
 CopilotTurnControl = Literal["steer", "answer", "cancel"]
@@ -215,6 +240,7 @@ class CopilotInFlightTurn(BaseModel):
     steer_messages: list[CopilotSteerMessage] = Field(default_factory=list)
     # The running turn's narrative as last copied to the cache; set only when the caller asks for it.
     narrative: LiveTurnNarrative | None = None
+    question_open_until: datetime | None = None
 
 
 class CopilotAcceptedTestedRun(BaseModel):
@@ -560,6 +586,14 @@ class WorkflowCopilotChatRequest(BaseModel):
     supports_credential_pause_recovery: bool = Field(
         False, description="The client restores pending credential cards from chat history."
     )
+    client_detached: bool = Field(
+        False,
+        description=(
+            "The client closes the stream after turn_start and follows the turn through chat history. "
+            "Requires supports_credential_pause, supports_credential_pause_recovery and a valid "
+            "credential_recovery_token."
+        ),
+    )
     supports_credential_generation: bool = Field(
         False, description="The client can render a registration card and post its Generate and save answer."
     )
@@ -599,6 +633,20 @@ class WorkflowCopilotChatRequest(BaseModel):
             "are both present; never sent by the product."
         ),
     )
+
+    @model_validator(mode="after")
+    def _detached_client_can_recover_cards(self) -> "WorkflowCopilotChatRequest":
+        if self.client_detached and not (
+            self.supports_credential_pause
+            and self.supports_credential_pause_recovery
+            and self.credential_recovery_token is not None
+            and credential_recovery_token_is_valid(self.credential_recovery_token.get_secret_value())
+        ):
+            raise ValueError(
+                "client_detached requires supports_credential_pause, supports_credential_pause_recovery "
+                "and a valid credential_recovery_token"
+            )
+        return self
 
 
 class WorkflowCopilotCancelRequest(BaseModel):

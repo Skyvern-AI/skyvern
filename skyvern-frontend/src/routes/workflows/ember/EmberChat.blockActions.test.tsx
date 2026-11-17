@@ -1285,7 +1285,7 @@ describe("EmberChat — Ember's own browser in the studio pane", () => {
   });
 
   it("pins the pane to the browser a tool call acts in, replacing the entry", async () => {
-    window.history.replaceState(null, "", "/?wr=wr_1&wrs=copilot");
+    window.history.replaceState(null, "", "/?wr=wr_1&wrs=ember");
     await renderChat(makeDockedProps());
     await submit("build a workflow");
 
@@ -1301,7 +1301,7 @@ describe("EmberChat — Ember's own browser in the studio pane", () => {
     navigate.mockImplementation((to: { search: string }) =>
       window.history.replaceState(null, "", `/${to.search}`),
     );
-    window.history.replaceState(null, "", "/?wr=wr_1&wrs=copilot");
+    window.history.replaceState(null, "", "/?wr=wr_1&wrs=ember");
     await renderChat(makeDockedProps());
     await submit("build a workflow");
 
@@ -1314,11 +1314,11 @@ describe("EmberChat — Ember's own browser in the studio pane", () => {
   });
 
   it.each([
-    ["undocked", {}, "?wr=wr_1&wrs=copilot", {}],
+    ["undocked", {}, "?wr=wr_1&wrs=ember", {}],
     [
       "carrying no browser id",
       makeDockedProps(),
-      "?wr=wr_1&wrs=copilot",
+      "?wr=wr_1&wrs=ember",
       { browser_session_id: null },
     ],
     ["on a run the user opened", makeDockedProps(), "?wr=wr_user", {}],
@@ -1343,7 +1343,7 @@ describe("EmberChat — Ember's own browser in the studio pane", () => {
     await submit("build a workflow");
 
     expect(navigate).toHaveBeenCalledWith(
-      expect.objectContaining({ search: "?wr=wr_1&wrs=copilot" }),
+      expect.objectContaining({ search: "?wr=wr_1&wrs=ember" }),
       expect.objectContaining({ replace: true }),
     );
   });
@@ -1454,7 +1454,7 @@ describe("EmberChat — build follow", () => {
       ],
       focusBlock,
     });
-    window.history.pushState(null, "", "/?panes=copilot,editor");
+    window.history.pushState(null, "", "/?panes=ember,editor");
   });
 
   afterEach(() => {
@@ -1500,7 +1500,7 @@ describe("EmberChat — build follow", () => {
   });
 
   it("does not follow when the editor pane is closed", async () => {
-    window.history.pushState(null, "", "/?panes=copilot");
+    window.history.pushState(null, "", "/?panes=ember");
     await renderChat(makeDockedProps());
     await submit("build it");
 

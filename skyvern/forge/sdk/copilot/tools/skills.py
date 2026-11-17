@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from typing import Literal, TypedDict
 
-import structlog
-
 from skyvern.forge.sdk.agents.skills import (
     SkillAlreadyLoaded,
     SkillError,
@@ -16,8 +14,6 @@ from skyvern.forge.sdk.agents.skills import (
     SkillSession,
     is_refusal,
 )
-
-LOG = structlog.get_logger()
 
 LOAD_SKILL_DESCRIPTION = (
     "Returns the named skill's instructions as `body`, its `version`, `owner`, and `files`, the paths of its other "
@@ -49,20 +45,6 @@ class SkillToolSuccess(TypedDict):
 
 
 SkillToolResult = SkillToolSuccess | SkillToolError
-
-
-def render_skills_catalog(session: SkillSession) -> str:
-    lines = session.catalog_lines()
-    catalog = "\n".join(lines)
-    if lines:
-        LOG.info(
-            "agent_skill_list_shown",
-            agent=session.agent,
-            count=len(lines),
-            list_chars=len(catalog),
-            **session.log_fields,
-        )
-    return catalog
 
 
 def _tool_error(refusal: SkillRefusal) -> SkillToolError:

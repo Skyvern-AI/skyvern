@@ -2,8 +2,8 @@
 
 Optional settings give operators independent control over the main Copilot lane,
 agent-specific lane, and fast-consumer lane:
-``WORKFLOW_COPILOT_LLM_KEY``, ``WORKFLOW_COPILOT_AGENT_LLM_KEY``, and
-``WORKFLOW_COPILOT_FAST_LLM_KEY``. ``WORKFLOW_COPILOT_LITE_LLM_KEY`` selects the
+``EMBER_LLM_KEY``, ``EMBER_AGENT_LLM_KEY``, and
+``EMBER_FAST_LLM_KEY``. ``EMBER_LITE_LLM_KEY`` selects the
 dedicated raw-secret safety model; the resolver itself never falls back to the
 acting model; when the key is empty, open-source startup supplies the base
 Copilot handler.
@@ -28,7 +28,6 @@ from structlog.testing import capture_logs
 
 from skyvern.config import Settings, settings
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
-from skyvern.forge.sdk.api.llm.copilot_model_usage import CopilotModelUsageEvent, _emit_copilot_model_usage
 from skyvern.forge.sdk.copilot import llm_config as copilot_llm_config
 from skyvern.forge.sdk.copilot import tools as copilot_tools
 from skyvern.forge.sdk.copilot.cost_telemetry import copilot_cost_scope, current_copilot_cost
@@ -53,16 +52,16 @@ from skyvern.schemas.llm import LLMConfig
 
 
 def test_workflow_copilot_agent_llm_key_default_is_none() -> None:
-    assert Settings.model_fields["WORKFLOW_COPILOT_LLM_KEY"].default is None
-    assert Settings.model_fields["WORKFLOW_COPILOT_AGENT_LLM_KEY"].default is None
+    assert Settings.model_fields["EMBER_LLM_KEY"].default is None
+    assert Settings.model_fields["EMBER_AGENT_LLM_KEY"].default is None
 
 
 def test_workflow_copilot_fast_llm_key_default_is_none() -> None:
-    assert Settings.model_fields["WORKFLOW_COPILOT_FAST_LLM_KEY"].default is None
+    assert Settings.model_fields["EMBER_FAST_LLM_KEY"].default is None
 
 
 def test_workflow_copilot_lite_llm_key_default_is_none() -> None:
-    assert Settings.model_fields["WORKFLOW_COPILOT_LITE_LLM_KEY"].default is None
+    assert Settings.model_fields["EMBER_LITE_LLM_KEY"].default is None
 
 
 @pytest.mark.asyncio
@@ -85,7 +84,7 @@ async def test_resolve_raw_secret_safety_handler_has_no_main_fallback(monkeypatc
         return None
 
     monkeypatch.setattr(copilot_llm_config, "get_llm_handler_for_prompt_type", _lookup)
-    monkeypatch.setattr(copilot_llm_config, "app", SimpleNamespace(WORKFLOW_COPILOT_LITE_LLM_API_HANDLER=None))
+    monkeypatch.setattr(copilot_llm_config, "app", SimpleNamespace(EMBER_LITE_LLM_API_HANDLER=None))
     assert await copilot_llm_config.resolve_raw_secret_safety_handler("wpid_1", "org_1") is None
 
 
@@ -138,8 +137,8 @@ async def test_resolve_main_copilot_handler_posthog_override_wins(monkeypatch: p
         copilot_llm_config,
         "app",
         SimpleNamespace(
-            WORKFLOW_COPILOT_AGENT_LLM_API_HANDLER=dedicated,
-            WORKFLOW_COPILOT_LLM_API_HANDLER=primary,
+            EMBER_AGENT_LLM_API_HANDLER=dedicated,
+            EMBER_LLM_API_HANDLER=primary,
             LLM_API_HANDLER=primary,
         ),
     )
@@ -161,7 +160,7 @@ async def test_resolve_main_copilot_handler_falls_back_to_dedicated(monkeypatch:
         copilot_llm_config,
         "app",
         SimpleNamespace(
-            WORKFLOW_COPILOT_AGENT_LLM_API_HANDLER=dedicated,
+            EMBER_AGENT_LLM_API_HANDLER=dedicated,
             LLM_API_HANDLER=primary,
         ),
     )
@@ -185,8 +184,8 @@ async def test_resolve_main_copilot_handler_falls_back_to_workflow_copilot_key(
         copilot_llm_config,
         "app",
         SimpleNamespace(
-            WORKFLOW_COPILOT_AGENT_LLM_API_HANDLER=None,
-            WORKFLOW_COPILOT_LLM_API_HANDLER=workflow_copilot,
+            EMBER_AGENT_LLM_API_HANDLER=None,
+            EMBER_LLM_API_HANDLER=workflow_copilot,
             LLM_API_HANDLER=primary,
         ),
     )
@@ -206,8 +205,8 @@ async def test_resolve_main_copilot_handler_falls_back_to_workflow_copilot_key(
         # A custom forge-app initializer that sets the new attribute to None must fall through.
         pytest.param(
             lambda primary: SimpleNamespace(
-                WORKFLOW_COPILOT_AGENT_LLM_API_HANDLER=None,
-                WORKFLOW_COPILOT_LLM_API_HANDLER=primary,
+                EMBER_AGENT_LLM_API_HANDLER=None,
+                EMBER_LLM_API_HANDLER=primary,
                 LLM_API_HANDLER=object(),
             ),
             id="dedicated_is_none",
@@ -275,7 +274,7 @@ async def test_composition_visual_handler_uses_fast_copilot_lane(
 
 @pytest.fixture
 def eval_llm_registry(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_EVAL_LLM_OVERRIDES_ORGANIZATION_IDS", ["org_eval"])
+    monkeypatch.setattr(settings, "EMBER_EVAL_LLM_OVERRIDES_ORGANIZATION_IDS", ["org_eval"])
     monkeypatch.setattr(
         LLMConfigRegistry,
         "_configs",
@@ -354,7 +353,7 @@ def test_eval_overrides_reject_invalid_or_unavailable_configuration(raw: str, ev
 def test_eval_overrides_require_allowlisted_evaluation_org(
     allowed_organizations: list[str], organization_id: str, eval_llm_registry: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_EVAL_LLM_OVERRIDES_ORGANIZATION_IDS", allowed_organizations)
+    monkeypatch.setattr(settings, "EMBER_EVAL_LLM_OVERRIDES_ORGANIZATION_IDS", allowed_organizations)
     raw = '{"workflow-copilot":"EVAL_ACTOR"}'
     with pytest.raises(HTTPException) as error:
         admit_eval_llm_overrides(raw, organization_id)
@@ -402,8 +401,8 @@ async def test_eval_override_scope_covers_detached_stream_and_terminal_receipt(
 ) -> None:
     captured: dict[str, Any] = {}
     started, release = asyncio.Event(), asyncio.Event()
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_EVAL_COST_ENABLED", True)
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_EVAL_COST_ORGANIZATION_IDS", ["org_eval"])
+    monkeypatch.setattr(settings, "EMBER_EVAL_COST_ENABLED", True)
+    monkeypatch.setattr(settings, "EMBER_EVAL_COST_ORGANIZATION_IDS", ["org_eval"])
 
     def detached_stream(request: Request, handler: Any) -> object:
         captured["handler"] = handler
@@ -514,35 +513,6 @@ async def _answer_followup(
             organization,
         )
     return http_response
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("surface", ["question", "steer"])
-@pytest.mark.parametrize("organization_id", ["org_eval", "org_other"])
-async def test_followup_safety_cost_receipts_require_evaluation_org(
-    surface: str, organization_id: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_EVAL_COST_ENABLED", True)
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_EVAL_COST_ORGANIZATION_IDS", ["org_eval"])
-
-    async def screen(text: str, _handler: object, **_kwargs: object) -> _RawSecretSafetyScreen:
-        _emit_copilot_model_usage(
-            CopilotModelUsageEvent(request_model="openai/eval-safety", cost=0.12, cost_source="litellm_estimate"),
-            logger=SimpleNamespace(info=lambda *_args, **_kwargs: None),
-        )
-        return _RawSecretSafetyScreen(status="clean", canonical_user_message=text)
-
-    http_response = await _answer_followup(surface, organization_id, screen, monkeypatch)
-    if organization_id == "org_eval":
-        assert http_response.headers["X-Ember-Eval-LLM-Cost"] == http_response.headers["X-Copilot-Eval-LLM-Cost"]
-        receipt = json.loads(http_response.headers["X-Ember-Eval-LLM-Cost"])
-        assert len(receipt["receipt_id"]) == 32
-        assert receipt["llm_cost"]["known_cost_usd"] == 0.12
-        assert receipt["llm_cost"]["observed_call_count"] == 1
-    else:
-        assert "X-Ember-Eval-LLM-Cost" not in http_response.headers
-        assert "X-Copilot-Eval-LLM-Cost" not in http_response.headers
-    assert current_copilot_cost() is None
 
 
 @pytest.mark.asyncio

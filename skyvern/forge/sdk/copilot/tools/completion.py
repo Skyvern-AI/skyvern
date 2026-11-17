@@ -632,7 +632,7 @@ async def _maybe_run_completion_verification_from_page_observation(
         if (
             remaining is not None
             and remaining
-            <= settings.COPILOT_COMPLETION_JUDGE_TIMEOUT_SECONDS + _COMPLETION_VERIFICATION_BUDGET_MARGIN_SECONDS
+            <= settings.EMBER_COMPLETION_JUDGE_TIMEOUT_SECONDS + _COMPLETION_VERIFICATION_BUDGET_MARGIN_SECONDS
         ):
             run_result = (
                 _merge_run_verdicts(
@@ -1658,7 +1658,7 @@ async def _completion_verification_from_run_result(
             remaining = RUN_BLOCKS_SAFETY_CEILING_SECONDS - (time.monotonic() - handler_start)
             if (
                 remaining
-                <= settings.COPILOT_COMPLETION_JUDGE_TIMEOUT_SECONDS + _COMPLETION_VERIFICATION_BUDGET_MARGIN_SECONDS
+                <= settings.EMBER_COMPLETION_JUDGE_TIMEOUT_SECONDS + _COMPLETION_VERIFICATION_BUDGET_MARGIN_SECONDS
             ):
                 requested_output_result = _merge_run_verdicts_if_requested_output_exists(
                     run_criteria,
@@ -1738,12 +1738,6 @@ async def _completion_verification_from_run_result(
         contingent_antecedent_output_path_by_criterion_id=contingent_path_by_id,
         requested_output_criteria_count=requested_output_criteria_count,
     )
-
-
-def _stamp_turn_budget_on_result(copilot_ctx: Any, result: dict[str, Any]) -> dict[str, Any]:
-    """Expose the remaining loop budget without interpreting the run result."""
-    result["turn_seconds_remaining"] = _copilot_seconds_remaining(copilot_ctx)
-    return result
 
 
 def _emit_completion_verification_trace(

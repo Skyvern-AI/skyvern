@@ -197,7 +197,7 @@ export function StudioPaneToggles() {
         const showActivityDot =
           id === "browser" && hasUnseenBrowserActivity && (!open || folded);
         // Shown even with the pane open: the request can still be off-screen behind other panes.
-        const awaiting = id === "copilot" ? emberAttention : null;
+        const awaiting = id === "ember" ? emberAttention : null;
         const showRunStatusDot = isRunControl && Boolean(runStatus);
         const ariaLabel = showActivityDot
           ? "Browser, new activity"

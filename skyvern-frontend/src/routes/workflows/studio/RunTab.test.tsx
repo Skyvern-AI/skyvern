@@ -314,7 +314,7 @@ describe("RunTab selection mirroring behind the Doc", () => {
       presentation: "doc",
       docMounted: true,
     });
-    renderAt("/workflows/wpid_abc/studio?panes=copilot,editor");
+    renderAt("/workflows/wpid_abc/studio?panes=ember,editor");
     expect(mirror()).toBe("no");
   });
 
@@ -331,7 +331,7 @@ describe("RunTab selection mirroring behind the Doc", () => {
       presentation: "visual",
       docMounted: false,
     });
-    renderAt("/workflows/wpid_abc/studio?panes=copilot,editor");
+    renderAt("/workflows/wpid_abc/studio?panes=ember,editor");
     expect(mirror()).toBe("yes");
   });
 });

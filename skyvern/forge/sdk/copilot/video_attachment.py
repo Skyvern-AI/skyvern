@@ -552,7 +552,7 @@ async def screen_video_frames_for_copilot(
         for start in range(0, len(file_frames), VIDEO_PERCEPTION_CHUNK_SIZE)
     )
     try:
-        async with asyncio.timeout(settings.COPILOT_RAW_SECRET_SAFETY_TIMEOUT_SECONDS):
+        async with asyncio.timeout(settings.EMBER_RAW_SECRET_SAFETY_TIMEOUT_SECONDS):
             chunk_results = await asyncio.gather(*(screen_chunk(chunk) for chunk in chunks))
     except TimeoutError:
         LOG.warning("Copilot video secret safety unavailable", reason="timeout")

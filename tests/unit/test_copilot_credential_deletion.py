@@ -657,7 +657,7 @@ async def test_the_card_needs_both_the_client_capability_and_the_flag(
     chat: Chat, monkeypatch: pytest.MonkeyPatch, withheld_by: str | None
 ) -> None:
     if withheld_by == "flag":
-        monkeypatch.setattr(settings, "COPILOT_CREDENTIAL_DELETE_ENABLED", False)
+        monkeypatch.setattr(settings, "EMBER_CREDENTIAL_DELETE_ENABLED", False)
     surface = resolve_copilot_tool_surface(
         mode=None,
         native_tools=copilot_native_tools(

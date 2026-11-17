@@ -241,6 +241,7 @@ from skyvern.forge.taskv3.loop import (
     LoopOutcome,
     RoundAction,
     TurnRecord,
+    UnsavedDownloads,
     submissions_across_contexts,
 )
 from skyvern.forge.taskv3.pre_submit_capture import PreSubmitCaptureRing, is_run_sampled, pre_submit_screenshot
@@ -405,6 +406,7 @@ from skyvern.webeye.cdp_download_interceptor import (
     record_download_artifact_outcome_for_context,
     replay_candidate_holds,
     settle_browser_downloads_for_context,
+    unsaved_downloads_since,
 )
 from skyvern.webeye.dom_inspection import read_current_url
 from skyvern.webeye.native_downloads import NativeDownloadAttempt, NativeDownloads
@@ -752,7 +754,7 @@ _PAGE_FINGERPRINT_PROBE_JS = (
     # action, so a page that never moved would still hash differently the first time a tool touches it: the stall
     # detector reads that as progress and the action-effect check as an effect. Page-authored data-tv3 values stay
     # significant, as in loop.py's canonicalization. OTP bookkeeping attributes are ignored for the same reason.
-    " const scrub = (s) => s.replace(/ data-(?:tv3-(?:act|catcher|cellgrid|close|codebox|collateral|cover|dateseg"
+    " const scrub = (s) => s.replace(/ data-(?:tv3-(?:act|catcher|cellgrid|codebox|collateral|cover|ctl|dateseg"
     "|filter-base|focus|liveparent|look|menu|menu-scroller|pick|popup-filter|pre|prerow|sugg|sugglist)"
     '|skyvern-otp-[^\\s=]+)="[^"]*"'
     "| data-tv3=\"t\\d+(?:-\\d+)?\"/gi, '');"
@@ -3440,6 +3442,7 @@ class ForgeAgent:
         download_wait_exhausted: set[str] = set()
 
         download_finalized = False
+        capture_tally_before = download_tally_for_context(browser_state.browser_context)
         # Files settle already recorded, as the finalizer left them, so a later settle records only files new since.
         recorded_files: list[str] = []
         download_completion_reason: str | None = None
@@ -3509,8 +3512,26 @@ class ForgeAgent:
             quiet = await native_download_attempt.failed_and_quiescent()
             return quiet and _native_attempt_eligible()
 
+        async def _unfinalized_file_landed() -> bool:
+            # No download settle finalized this block's file; clean_up_task below does.
+            # Same local-plus-session listing as the baseline, and a partial is not a delivered file.
+            if workflow_download_directory is None or download_baseline_files is None:
+                return False
+            landed = set(list_files_in_directory(workflow_download_directory, attempt_started_at=attempt_started_at))
+            if task.browser_session_id:
+                landed |= set(
+                    await app.STORAGE.list_downloaded_files_in_browser_session(
+                        organization_id=organization.organization_id,
+                        browser_session_id=task.browser_session_id,
+                    )
+                )
+            landed -= set(download_baseline_files)
+            landed -= {str(workflow_download_directory / name) for name in staged_downloads}
+            return any(Path(name).suffix != BROWSER_DOWNLOADING_SUFFIX for name in landed)
+
         download_wait: DownloadWait | None = None
         download_settle: DownloadSettle | None = None
+        unsaved_downloads: UnsavedDownloads | None = None
         if task_block is not None and task_block.complete_on_download and task.workflow_run_id:
             complete_on_download_block = task_block
 
@@ -3647,6 +3668,13 @@ class ForgeAgent:
                 return download_completion_reason
 
             download_settle = _settle_downloads
+
+            async def _unsaved_downloads() -> dict[str, int]:
+                tally_now = download_tally_for_context(browser_state.browser_context)
+                unsaved = unsaved_downloads_since(capture_tally_before, tally_now)
+                return {} if download_finalized or not unsaved or await _unfinalized_file_landed() else unsaved
+
+            unsaved_downloads = _unsaved_downloads
         if (
             task_block is not None
             and (task_block.complete_on_download or task_block.download_timeout is not None)
@@ -4351,6 +4379,7 @@ class ForgeAgent:
                 ),
                 download_wait=download_wait,
                 download_settle=download_settle,
+                unsaved_downloads=unsaved_downloads,
                 native_download_attempt=native_download_attempt,
                 completion_gate=_completion_gate,
                 settle_reload_signal=lambda accept: app.AGENT_FUNCTION.settle_page_reload_signal(
@@ -4476,27 +4505,8 @@ class ForgeAgent:
                             return False
 
                     blank_page = await _v3_page_left_blank(first_sample, _fingerprint_page, _settle_should_stop)
-                    # No download settle finalized this block's file; clean_up_task below does.
-                    # Same local-plus-session listing as the baseline, and a partial is not a delivered file.
-                    if (
-                        blank_page is not None
-                        and workflow_download_directory is not None
-                        and download_baseline_files is not None
-                    ):
-                        landed = set(
-                            list_files_in_directory(workflow_download_directory, attempt_started_at=attempt_started_at)
-                        )
-                        if task.browser_session_id:
-                            landed |= set(
-                                await app.STORAGE.list_downloaded_files_in_browser_session(
-                                    organization_id=organization.organization_id,
-                                    browser_session_id=task.browser_session_id,
-                                )
-                            )
-                        landed -= set(download_baseline_files)
-                        landed -= {str(workflow_download_directory / name) for name in staged_downloads}
-                        if any(Path(name).suffix != BROWSER_DOWNLOADING_SUFFIX for name in landed):
-                            blank_page = None
+                    if blank_page is not None and await _unfinalized_file_landed():
+                        blank_page = None
                 except Exception:
                     blank_page = None
                     LOG.warning(
@@ -4660,6 +4670,7 @@ class ForgeAgent:
         if verification_state.last_status is not None:
             LOG.info(
                 "task_v3 ended on a verification code status",
+                last_status=redact_secrets_from_text(verification_state.last_status, run_secrets),
                 task_id=task.task_id,
                 organization_id=task.organization_id,
                 workflow_run_id=task.workflow_run_id,

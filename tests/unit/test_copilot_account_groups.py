@@ -589,7 +589,7 @@ def test_withholding_submission_hides_only_the_run_tool(
     monkeypatch: pytest.MonkeyPatch, withheld_by: str | None
 ) -> None:
     if withheld_by == "rollback_flag":
-        monkeypatch.setattr(settings, "COPILOT_ACCOUNT_GROUP_SUBMIT_ENABLED", False)
+        monkeypatch.setattr(settings, "EMBER_ACCOUNT_GROUP_SUBMIT_ENABLED", False)
     surface = resolve_copilot_tool_surface(
         mode=None,
         native_tools=copilot_native_tools(
@@ -1084,7 +1084,7 @@ async def test_a_credential_input_with_no_value_runs_without_a_credential_as_run
 def test_the_single_run_tool_is_offered_only_to_clients_that_render_its_card(
     monkeypatch: pytest.MonkeyPatch, supports_single_run_card: bool, submit_enabled: bool
 ) -> None:
-    monkeypatch.setattr(settings, "COPILOT_ACCOUNT_GROUP_SUBMIT_ENABLED", submit_enabled)
+    monkeypatch.setattr(settings, "EMBER_ACCOUNT_GROUP_SUBMIT_ENABLED", submit_enabled)
     names = {
         tool.name
         for tool in copilot_native_tools(

@@ -48,6 +48,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
     MCP_RESULT_PROVENANCE_VALUE,
     OUTPUT_VALUE_MAX_CHARS,
     REGISTERED_OUTPUTS_NOTICE_PREFIX,
+    TURN_CLOCK_KEY,
 )
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion
 from skyvern.forge.sdk.copilot.session_factory import _summarize_older_tool_items
@@ -838,23 +839,23 @@ def test_aggressive_prune_logs_content_free_pair_validity_telemetry() -> None:
 
 def test_copilot_config_qa_budget_defaults_off(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "ENV", "local")
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_QA_TOKEN_BUDGET", None)
+    monkeypatch.setattr(settings, "EMBER_QA_TOKEN_BUDGET", None)
 
     assert CopilotConfig().token_budget is None
 
 
 def test_copilot_config_uses_typed_qa_budget_locally(monkeypatch: pytest.MonkeyPatch) -> None:
-    local_settings = Settings(_env_file=None, ENV="local", WORKFLOW_COPILOT_QA_TOKEN_BUDGET=3_000)
-    assert local_settings.WORKFLOW_COPILOT_QA_TOKEN_BUDGET == 3_000
+    local_settings = Settings(_env_file=None, ENV="local", EMBER_QA_TOKEN_BUDGET=3_000)
+    assert local_settings.EMBER_QA_TOKEN_BUDGET == 3_000
     monkeypatch.setattr(settings, "ENV", "local")
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_QA_TOKEN_BUDGET", 3_000)
+    monkeypatch.setattr(settings, "EMBER_QA_TOKEN_BUDGET", 3_000)
 
     assert CopilotConfig().token_budget == 3_000
 
 
 def test_copilot_config_ignores_qa_budget_in_cloud(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "ENV", "production")
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_QA_TOKEN_BUDGET", 3_000)
+    monkeypatch.setattr(settings, "EMBER_QA_TOKEN_BUDGET", 3_000)
 
     assert CopilotConfig().token_budget is None
 
@@ -1332,6 +1333,41 @@ def test_summarize_short_output_is_unchanged() -> None:
     assert _summarize_tool_output("small") == "small"
 
 
+def _padded_to(chars: int, result: dict[str, Any]) -> dict[str, Any]:
+    padding = chars - len(json.dumps({**result, "data": ""}))
+    return {**result, "data": "x" * padding}
+
+
+def test_turn_clock_does_not_push_a_short_native_result_into_compaction() -> None:
+    short = _padded_to(290, {"ok": True})
+    output = json.dumps({TURN_CLOCK_KEY: 870, **short})
+    assert len(output) > _TOOL_OUTPUT_SUMMARIZE_THRESHOLD
+
+    assert _summarize_tool_output(output) == output
+
+
+def test_turn_clock_does_not_push_a_short_non_ascii_result_into_compaction() -> None:
+    short = {"ok": True, "text": "東京の天気" * 54}
+    output = json.dumps({TURN_CLOCK_KEY: 870, **short}, ensure_ascii=False)
+    assert len(json.dumps(short, ensure_ascii=False)) <= _TOOL_OUTPUT_SUMMARIZE_THRESHOLD < len(output)
+
+    assert _summarize_tool_output(output) == output
+
+
+def test_turn_clock_and_page_state_together_do_not_push_a_short_browser_result_into_compaction() -> None:
+    short = _padded_to(250, {"ok": True})
+    output = json.dumps({TURN_CLOCK_KEY: 870, "page_state": {"url": "https://example.com/", "title": "t"}, **short})
+
+    assert _summarize_tool_output(output) == output
+
+
+def test_an_mcp_result_cannot_use_a_turn_clock_to_escape_compaction() -> None:
+    short = _padded_to(250, {"ok": True, MCP_RESULT_PROVENANCE_KEY: MCP_RESULT_PROVENANCE_VALUE})
+    output = json.dumps({TURN_CLOCK_KEY: int("9" * 200), **short})
+
+    assert _summarize_tool_output(output) != output
+
+
 def test_recent_large_output_is_head_truncated_not_summarized() -> None:
     large = '{"ok":true,"data":{"value":"' + ("y" * (_RECENT_TOOL_OUTPUT_CHAR_CAP + 1000)) + '"}}'
     pruned = _summarize_older_tool_items([_fco("c_recent", large)])
@@ -1542,7 +1578,7 @@ def test_deadline_flag_still_written_when_fingerprint_is_suppressed() -> None:
 
 def test_shared_tools_bind_the_configured_total_timeout() -> None:
     assert shared_total_timeout_seconds == TOTAL_TIMEOUT_SECONDS
-    assert TOTAL_TIMEOUT_SECONDS == (settings.WORKFLOW_COPILOT_TOTAL_TIMEOUT_SECONDS or 900)
+    assert TOTAL_TIMEOUT_SECONDS == (settings.EMBER_TOTAL_TIMEOUT_SECONDS or 900)
 
 
 class TestMcpProvenanceSurvivesPruning:

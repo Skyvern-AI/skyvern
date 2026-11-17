@@ -326,7 +326,7 @@ def _maybe_dump_model_input(data: CallModelData[Any], model_data: ModelInputData
     environment rather than the path alone.
     """
     clear_pending_model_input_capture()
-    dump_dir = os.getenv("COPILOT_DUMP_MODEL_INPUTS")
+    dump_dir = os.getenv("EMBER_DUMP_MODEL_INPUTS") or os.getenv("COPILOT_DUMP_MODEL_INPUTS")
     if not dump_dir or settings.ENV != "local":
         return
     try:

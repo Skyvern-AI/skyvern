@@ -89,7 +89,7 @@ _LANDING_URL = "https://example.com/results"
 @pytest.fixture(autouse=True)
 def _page_evidence_fingerprint_key(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "SECRET_KEY", "test-page-evidence-key")
-    monkeypatch.setattr(settings, "COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS", 0.05)
+    monkeypatch.setattr(settings, "EMBER_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS", 0.05)
 
 
 _SCHEMA_LESS_PACKET_KEYS = {
@@ -992,7 +992,7 @@ class TestActObserveSuccess:
     async def test_result_summary_omits_in_form_disclosures_when_channel_is_disabled(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(settings, "COPILOT_CLICKABLE_CONTROLS_EVIDENCE_ENABLED", False)
+        monkeypatch.setattr(settings, "EMBER_CLICKABLE_CONTROLS_EVIDENCE_ENABLED", False)
         payload = _bounded_extractor_payload()
         payload["forms"][0]["submit_controls"].append(
             {
@@ -1308,7 +1308,7 @@ class TestActObserveDegrade:
 
     @pytest.mark.asyncio
     async def test_first_hollow_with_no_recapture_budget_records_outcome(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(settings, "COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS", 1.0)
+        monkeypatch.setattr(settings, "EMBER_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS", 1.0)
         monkeypatch.setattr(scouting_module.time, "monotonic", _monotonic_sequence([0.0, 2.0, 2.0]))
         payload = {"page_title": "Loading", "forms": [], "body": "<main></main>"}
         ctx = _ctx(server=_server_returning_sequence([payload]))
@@ -1371,7 +1371,7 @@ class TestActObserveDegrade:
     async def test_timeout_degrades_to_schema_less_packet_and_keeps_marker(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(settings, "COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS", 0.05)
+        monkeypatch.setattr(settings, "EMBER_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS", 0.05)
 
         async def slow_extract(*_args: object, **_kwargs: object) -> dict[str, Any]:
             await asyncio.sleep(0.25)
@@ -1493,7 +1493,7 @@ class TestActObserveRecaptureSettle:
 
         result = await _run_click(ctx)
 
-        assert sleeps == [settings.COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS]
+        assert sleeps == [settings.EMBER_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS]
         assert ctx.last_scout_act_observe_recapture_attempted is True
         assert ctx.last_scout_act_observe_recapture_result == "attached"
         assert ctx.last_scout_act_observe_outcome == "attached"
@@ -1634,7 +1634,7 @@ class TestActObserveRecaptureSettle:
 
     @pytest.mark.asyncio
     async def test_bounded_settle_paid_before_single_recapture(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(settings, "COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS", 0.6)
+        monkeypatch.setattr(settings, "EMBER_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS", 0.6)
         sleeps: list[float] = []
 
         async def record_sleep(seconds: float) -> None:
@@ -1653,7 +1653,7 @@ class TestActObserveRecaptureSettle:
 
     @pytest.mark.asyncio
     async def test_zero_settle_pays_no_sleep(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(settings, "COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS", 0.0)
+        monkeypatch.setattr(settings, "EMBER_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS", 0.0)
         sleeps: list[float] = []
 
         async def record_sleep(seconds: float) -> None:
@@ -1671,7 +1671,7 @@ class TestActObserveRecaptureSettle:
 
     @pytest.mark.asyncio
     async def test_attached_first_capture_pays_no_settle(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(settings, "COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS", 0.6)
+        monkeypatch.setattr(settings, "EMBER_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS", 0.6)
         sleeps: list[float] = []
 
         async def record_sleep(seconds: float) -> None:
@@ -1689,7 +1689,7 @@ class TestActObserveRecaptureSettle:
     async def test_attached_challenge_without_carrier_settles_and_recaptures(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(settings, "COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS", 0.6)
+        monkeypatch.setattr(settings, "EMBER_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS", 0.6)
         sleeps: list[float] = []
 
         async def record_sleep(seconds: float) -> None:
@@ -1716,7 +1716,7 @@ class TestActObserveRecaptureSettle:
     async def test_attached_keyword_only_challenge_recapture_still_yields_no_carrier(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(settings, "COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS", 0.6)
+        monkeypatch.setattr(settings, "EMBER_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS", 0.6)
 
         async def record_sleep(_seconds: float) -> None:
             return None
@@ -1740,7 +1740,7 @@ class TestActObserveRecaptureSettle:
     async def test_recapture_may_not_erase_the_challenge_signal(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A recapture that still reports a bounded schema but has lost the challenge signal
         must not replace the signalled packet: the signal is the visual fallback's only trigger."""
-        monkeypatch.setattr(settings, "COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS", 0.6)
+        monkeypatch.setattr(settings, "EMBER_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS", 0.6)
 
         async def record_sleep(_seconds: float) -> None:
             return None
@@ -1757,7 +1757,7 @@ class TestActObserveRecaptureSettle:
 
     @pytest.mark.asyncio
     async def test_attached_packet_survives_a_hollow_recapture(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(settings, "COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS", 0.6)
+        monkeypatch.setattr(settings, "EMBER_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS", 0.6)
 
         async def record_sleep(_seconds: float) -> None:
             return None
@@ -1793,7 +1793,7 @@ class TestActObserveRecaptureSettle:
 class TestActObserveNoRace:
     @pytest.mark.asyncio
     async def test_appended_entry_never_mutates_after_hook_returns(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(settings, "COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS", 0.05)
+        monkeypatch.setattr(settings, "EMBER_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS", 0.05)
 
         async def slow_extract(*_args: object, **_kwargs: object) -> dict[str, Any]:
             await asyncio.sleep(0.2)

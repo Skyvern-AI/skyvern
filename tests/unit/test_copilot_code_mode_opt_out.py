@@ -326,7 +326,7 @@ def test_authoring_capability_for_request(
 
 
 def test_base_agent_function_default_config_authors_agent_blocks_only(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_CODE_BLOCK_MODE", True)
+    monkeypatch.setattr(settings, "EMBER_CODE_BLOCK_MODE", True)
 
     config = AgentFunction().get_copilot_config()
 
@@ -354,7 +354,7 @@ async def test_request_config_resolver_matrix(
 ) -> None:
     # The rows read the request against an org's access, so the dial is held on; that it drops an
     # unstated mode to agent blocks when off is the rollback, covered by the code-block flag suite.
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_CODE_BLOCK_MODE", True)
+    monkeypatch.setattr(settings, "EMBER_CODE_BLOCK_MODE", True)
     agent_function = AgentFunction()
     monkeypatch.setattr(agent_function, "has_code_block_access", AsyncMock(return_value=has_code_block_access))
 
@@ -383,7 +383,7 @@ async def test_request_config_authors_agent_blocks_only_when_access_lookup_fails
 async def test_base_agent_function_request_config_honors_code_block_kill_switch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_CODE_BLOCK_MODE", True)
+    monkeypatch.setattr(settings, "EMBER_CODE_BLOCK_MODE", True)
     monkeypatch.setattr(settings, "CODE_BLOCK_MODE", CodeBlockMode.disabled)
 
     config = await AgentFunction().get_copilot_config_for_request("o_test", code_block_mode=True)

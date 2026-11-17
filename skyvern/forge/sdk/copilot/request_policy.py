@@ -434,7 +434,7 @@ def _raw_secret_safety_fallback_key(handler: LLMAPIHandler) -> str | None:
     llm_key = handler_llm_key(handler)
     overrides = current_eval_llm_overrides()
     if (
-        not settings.COPILOT_RAW_SECRET_SAFETY_HEDGE_ENABLED
+        not settings.EMBER_RAW_SECRET_SAFETY_HEDGE_ENABLED
         or llm_key is None
         or (overrides is not None and handler is overrides.handlers.get(WORKFLOW_COPILOT_RAW_SECRET_SAFETY_PROMPT_TYPE))
     ):
@@ -453,8 +453,8 @@ class _RawSecretSafetyRace(NamedTuple):
 
 async def _race_raw_secret_safety(prompt: str, handler: LLMAPIHandler) -> _RawSecretSafetyRace:
     started_at = time.monotonic()
-    deadline = started_at + settings.COPILOT_RAW_SECRET_SAFETY_TIMEOUT_SECONDS
-    hedge_at = started_at + settings.COPILOT_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS
+    deadline = started_at + settings.EMBER_RAW_SECRET_SAFETY_TIMEOUT_SECONDS
+    hedge_at = started_at + settings.EMBER_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS
     fallback_key = _raw_secret_safety_fallback_key(handler)
 
     async def _ask(leg_handler: LLMAPIHandler) -> object:
