@@ -9,7 +9,7 @@ from agents.run_context import RunContextWrapper
 from pydantic import JsonValue
 
 from skyvern.forge import app
-from skyvern.forge.agent_functions import CopilotTriggerResult, CopilotTriggerSource
+from skyvern.forge.agent_functions import CopilotTriggerResult, CopilotTriggerSource, TriggerMapping
 from skyvern.forge.sdk.copilot.context import CREATE_WEBHOOK_TRIGGER_TOOL_NAME, CopilotContext
 from skyvern.forge.sdk.copilot.loop_detection import record_tool_step_result_for_ctx
 from skyvern.forge.sdk.copilot.output_utils import sanitize_tool_result_for_llm
@@ -24,7 +24,8 @@ CREATE_WEBHOOK_TRIGGER_DESCRIPTION = (
     "Create an event trigger on the saved workflow: each accepted event from the source starts one run.\n"
     "\n"
     "`source_kind` is a source below that can be created here; `settings` must fit that source's settings schema.\n"
-    '`mapping` maps each workflow input key to a JSON Pointer into the event body, e.g. {"order_id": "/order_id"}.\n'
+    '`mapping` maps each workflow input key to a JSON Pointer into the event body, e.g. {"order_id": "/order_id"}, or\n'
+    'to {"value": <JSON>} for a fixed value every run gets, e.g. {"region": {"value": "emea"}}.\n'
     "The trigger is created switched off and starts no run. A card shown in this chat lets the user turn it on (a\n"
     "source that fires on its own) or open it in the Studio Triggers panel; no tool turns a trigger on. A source that\n"
     "can't be created here is set up where its entry says."
@@ -36,7 +37,8 @@ TEST_TRIGGER_MAPPING_DESCRIPTION = (
     "would be (omit `sample_payload` to use that source's made-up example event, listed in the\n"
     f"`{CREATE_WEBHOOK_TRIGGER_TOOL_NAME}` description; `sample` then says `source_example_event`), then\n"
     "validates the inputs against this workflow's saved inputs. A rejection's `reason_code` is `mapping_path_missing`\n"
-    "(a pointer finds nothing), `invalid_mapping` (a value is not a JSON Pointer), `invalid_parameters` (inputs unknown,\n"
+    "(a pointer finds nothing), `invalid_mapping` (a value is neither a JSON Pointer nor a fixed value),\n"
+    "`invalid_parameters` (inputs unknown,\n"
     "missing or invalid for the saved workflow), `owner_lookup_failed` (role lookup failed; retry later) or\n"
     "`owner_not_authorized` (the trigger owner cannot access a required credential; fix credential access). The user\n"
     "sees each resolved `input = value` pair in this step's result row."
@@ -80,7 +82,7 @@ def render_trigger_sources(sources: list[CopilotTriggerSource]) -> str:
 async def create_webhook_trigger_tool(
     ctx: RunContextWrapper[CopilotContext],
     source_kind: str,
-    mapping: dict[str, str],
+    mapping: TriggerMapping,
     settings: dict[str, JsonValue] | None = None,
 ) -> str:
     copilot_ctx = ctx.context
@@ -131,7 +133,7 @@ async def create_webhook_trigger_tool(
 async def test_trigger_mapping_tool(
     ctx: RunContextWrapper[CopilotContext],
     source_kind: str,
-    mapping: dict[str, str],
+    mapping: TriggerMapping,
     sample_payload: dict[str, JsonValue] | None = None,
 ) -> str:
     copilot_ctx = ctx.context
