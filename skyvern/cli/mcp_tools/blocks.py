@@ -57,6 +57,8 @@ async def _available_block_summaries() -> dict[str, str]:
         available.pop(BlockType.POWERBI_QUERY.value)
     if not await _agent_step_enabled():
         available.pop(BlockType.AGENT_STEP.value)
+    # Not offered until the editor can open it and Copilot's write safeguards see the block it wraps.
+    available.pop(BlockType.INTEGRATION_ACTION.value, None)
     return available
 
 
@@ -110,6 +112,7 @@ BLOCK_SUMMARIES: dict[str, str] = {
     "google_sheets_write": "Write rows to a Google Sheet (append new rows or update existing cells)",
     "powerbi_query": "Run one read-only DAX query against a user's authorized Power BI dataset",
     "agent_step": AGENT_STEP_BLOCK_SUMMARY,
+    "integration_action": "Run one integration catalog action (e.g. Google Sheets read rows) as a connected account",
 }
 
 # ---------------------------------------------------------------------------
@@ -674,6 +677,17 @@ async def skyvern_block_schema(
     if task_redirect:
         normalized = "navigation"
 
+    if normalized == BlockType.INTEGRATION_ACTION.value:
+        return make_result(
+            action,
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                "Integration action blocks are not available to author yet.",
+                f"Available types: {', '.join(sorted(await _available_block_summaries()))}.",
+            ),
+        )
+
     if normalized == BlockType.POWERBI_QUERY.value and not _powerbi_queries_available():
         return make_result(
             action,
@@ -808,6 +822,17 @@ async def skyvern_block_validate(
                 ErrorCode.INVALID_INPUT,
                 f"Expected a JSON object, got {type(raw).__name__}",
                 "Provide a JSON object with at least block_type and label fields",
+            ),
+        )
+
+    if _contains_block_type(raw, BlockType.INTEGRATION_ACTION.value):
+        return make_result(
+            action,
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                "Integration action blocks are not available to author yet.",
+                "Use a currently available block type from skyvern_block_schema.",
             ),
         )
 

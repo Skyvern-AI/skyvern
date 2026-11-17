@@ -7,7 +7,7 @@ import json
 import re
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import get_args
+from typing import Any, get_args
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -312,38 +312,54 @@ async def test_block_schema_no_type_lists_all() -> None:
     assert result["data"]["count"] > 0
 
 
+@pytest.mark.parametrize(
+    ("hidden_block", "message"),
+    [
+        (
+            {
+                "block_type": "powerbi_query",
+                "label": "read_powerbi",
+                "connection_id": "moc_owner",
+                "dataset_id": "{{ dataset_id }}",
+                "query": "{{ dax_query }}",
+            },
+            "Power BI queries are not currently available.",
+        ),
+        (
+            {
+                "block_type": "integration_action",
+                "label": "read_rows",
+                "integration_id": "google_sheets",
+                "action_id": "read_rows",
+                "connection_id": "goac_owner",
+            },
+            "Integration action blocks are not available to author yet.",
+        ),
+    ],
+    ids=["unavailable-powerbi", "integration-action"],
+)
 @pytest.mark.asyncio
-async def test_unavailable_powerbi_is_hidden_from_schema_and_nested_validation(
-    monkeypatch: pytest.MonkeyPatch,
+async def test_hidden_block_types_are_left_out_of_schema_and_nested_validation(
+    monkeypatch: pytest.MonkeyPatch, hidden_block: dict[str, str], message: str
 ) -> None:
     monkeypatch.setattr(blocks, "_powerbi_queries_available", lambda: False)
 
     listed = await skyvern_block_schema()
-    specific = await skyvern_block_schema(block_type="powerbi_query")
+    specific = await skyvern_block_schema(block_type=hidden_block["block_type"])
     nested = await skyvern_block_validate(
         block_json=json.dumps(
             {
                 "block_type": "for_loop",
                 "label": "outer_loop",
                 "loop_over_parameter_key": "rows",
-                "loop_blocks": [
-                    {
-                        "block_type": "powerbi_query",
-                        "label": "read_powerbi",
-                        "connection_id": "moc_owner",
-                        "dataset_id": "{{ dataset_id }}",
-                        "query": "{{ dax_query }}",
-                    }
-                ],
+                "loop_blocks": [hidden_block],
             }
         )
     )
 
-    assert "powerbi_query" not in listed["data"]["block_types"]
-    assert specific["ok"] is False
-    assert "Power BI queries are not currently available." in specific["error"]["message"]
-    assert nested["ok"] is False
-    assert "Power BI queries are not currently available." in nested["error"]["message"]
+    assert hidden_block["block_type"] not in listed["data"]["block_types"]
+    assert specific["ok"] is False and message in specific["error"]["message"]
+    assert nested["ok"] is False and message in nested["error"]["message"]
 
 
 _AGENT_STEP_BLOCK = {"block_type": "agent_step", "label": "decide", "prompt": "Pick the cheapest plan"}
@@ -520,15 +536,17 @@ def test_block_schema_takes_block_type_only_not_a_definition() -> None:
         skyvern_block_schema(definition="{}", format="json")  # type: ignore[call-arg]
 
 
-def test_block_schema_docstring_routes_full_definitions_to_block_validate() -> None:
-    doc = skyvern_block_schema.__doc__ or ""
-    assert "block_type" in doc
-    assert "skyvern_block_validate" in doc
-
-
-def test_block_validate_docstring_cross_refs_block_schema() -> None:
-    doc = skyvern_block_validate.__doc__ or ""
-    assert "skyvern_block_schema" in doc
+@pytest.mark.parametrize(
+    ("tool", "references"),
+    [
+        (skyvern_block_schema, ("block_type", "skyvern_block_validate")),
+        (skyvern_block_validate, ("skyvern_block_schema",)),
+    ],
+    ids=["schema-routes-definitions-to-validate", "validate-cross-refs-schema"],
+)
+def test_block_tool_docstrings_route_callers_to_the_right_tool(tool: Any, references: tuple[str, ...]) -> None:
+    doc = tool.__doc__ or ""
+    assert all(reference in doc for reference in references)
 
 
 @pytest.mark.asyncio

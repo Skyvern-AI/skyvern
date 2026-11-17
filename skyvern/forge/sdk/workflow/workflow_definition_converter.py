@@ -67,6 +67,7 @@ from skyvern.forge.sdk.workflow.models.google_sheets_blocks import (
     GoogleSheetsReadBlock,
     GoogleSheetsWriteBlock,
 )
+from skyvern.forge.sdk.workflow.models.integration_action_block import IntegrationActionBlock
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
     PLATFORM_SMTP_AWS_KEYS,
@@ -1097,6 +1098,15 @@ def block_yaml_to_block(
             query=block_yaml.query,
             max_rows=block_yaml.max_rows,
             parameters=powerbi_query_parameters,
+        )
+    elif block_yaml.block_type == BlockType.INTEGRATION_ACTION:
+        return IntegrationActionBlock(
+            **base_kwargs,
+            integration_id=block_yaml.integration_id,
+            action_id=block_yaml.action_id,
+            connection_id=block_yaml.connection_id,
+            inputs=block_yaml.inputs,
+            parameters=_resolve_block_parameters(block_yaml, parameters),
         )
 
     raise ValueError(f"Invalid block type {block_yaml.block_type}")

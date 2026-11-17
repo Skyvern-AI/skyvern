@@ -129,6 +129,13 @@ _KNOWN_DRIFT_ALLOWLIST: tuple[BlockDriftEntry, ...] = (
         added_at=date(2026, 10, 29),
         notes="Offline Power BI block is accepted by raw-HTTP MCP; the typed SDK client does not have it yet.",
     ),
+    BlockDriftEntry(
+        block_type="integration_action",
+        ticket="SKY-20689",
+        owner="@cindehaa",
+        added_at=date(2026, 11, 16),
+        notes="Generic integration action block is not in the SDK client yet.",
+    ),
 )
 
 

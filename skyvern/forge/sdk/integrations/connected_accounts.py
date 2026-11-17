@@ -11,6 +11,7 @@ import structlog
 from pydantic import BaseModel
 
 from skyvern.forge import app
+from skyvern.forge.sdk.integrations.catalog import all_integration_entries, entry_action
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice
 from skyvern.forge.sdk.schemas.google_oauth import STATE_ACTIVE, GoogleOAuthCredentialBase
 from skyvern.forge.sdk.schemas.microsoft_oauth import MicrosoftOAuthCredentialBase
@@ -83,13 +84,24 @@ def settable_connected_account_fields(
     )
 
 
+def _integration_action_acts(block: Mapping[str, Any]) -> bool:
+    # An unknown action counts as acting, so its account still gets the stricter approval.
+    found = entry_action(
+        all_integration_entries(),
+        str(block.get("integration_id")),
+        str(block.get("action_id")),
+    )
+    return found is None or found[1].acts
+
+
 def connected_account_fields(block: Mapping[str, Any], *, acting_only: bool = False) -> tuple[str, ...]:
     """The marked fields this block reads, given the sibling values each mark's condition names. With
-    `acting_only`, only those the schema marks as acting on the outside world."""
+    `acting_only`, only those acting on the outside world: the schema's mark, or an integration action's `acts`."""
+    acts = block.get("block_type") == BlockType.INTEGRATION_ACTION.value and _integration_action_acts(block)
     return tuple(
         field.name
         for field in _connected_account_fields().get(str(block.get("block_type")), ())
-        if (field.acts or not acting_only)
+        if (field.acts or acts or not acting_only)
         and all(block.get(key, default) == value for key, (value, default) in field.condition.items())
     )
 

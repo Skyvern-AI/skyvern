@@ -574,6 +574,7 @@ class BlockType(StrEnum):
     DATA_EXPORT = "data_export"
     TERMINATE = "terminate"
     AGENT_STEP = "agent_step"
+    INTEGRATION_ACTION = "integration_action"
 
 
 class AIFallbackMode(StrEnum):
@@ -1980,6 +1981,21 @@ class PowerBIQueryBlockYAML(BlockYAML):
         return value
 
 
+class IntegrationActionBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.INTEGRATION_ACTION] = BlockType.INTEGRATION_ACTION  # type: ignore
+    integration_id: str = Field(min_length=1, description="Integration catalog entry id, e.g. 'google_sheets'.")
+    action_id: str = Field(min_length=1, description="Action id within that entry, e.g. 'read_rows'.")
+    connection_id: str | None = Field(
+        default=None,
+        description="ID of the connected account the action runs as.",
+        json_schema_extra=_connected_account_field(),
+    )
+    inputs: dict[str, Any] = Field(
+        default_factory=dict, description="Values for the action's inputs, keyed by the catalog action's input names."
+    )
+    parameter_keys: list[str] | None = None
+
+
 PARAMETER_YAML_SUBCLASSES = (
     AWSSecretParameterYAML
     | BitwardenLoginCredentialParameterYAML
@@ -2030,6 +2046,7 @@ BLOCK_YAML_SUBCLASSES = (
     | EmailInboxBlockYAML
     | GoogleSheetsWriteBlockYAML
     | PowerBIQueryBlockYAML
+    | IntegrationActionBlockYAML
 )
 BLOCK_YAML_TYPES = Annotated[BLOCK_YAML_SUBCLASSES, Field(discriminator="block_type")]
 BLOCK_TYPE_MAP: dict[str, type[BlockYAML]] = {
