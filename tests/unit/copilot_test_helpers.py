@@ -33,6 +33,7 @@ from PIL import Image
 from playwright.async_api import Page, Route, async_playwright
 
 from skyvern.forge import app as forge_app
+from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.agents.skills import AvailableSkill, SkillOwner, SkillPackage, SkillSession
 from skyvern.forge.sdk.api.llm import api_handler_factory
 from skyvern.forge.sdk.artifact.models import ArtifactType
@@ -1552,6 +1553,21 @@ def available_skill(
 ) -> AvailableSkill:
     package = SkillPackage.from_files({"SKILL.md": skill_md(name, body, description), **files})
     return AvailableSkill(package=package, owner=owner, version=package.version)
+
+
+class RecordingSkills(AgentFunction):
+    def __init__(self, skills: list[AvailableSkill] | Exception) -> None:
+        super().__init__()
+        self.skills = skills
+        self.calls: list[tuple[str, str | None, str]] = []
+
+    async def agent_skills(
+        self, *, organization_id: str, workflow_permanent_id: str | None, agent: str
+    ) -> list[AvailableSkill]:
+        self.calls.append((organization_id, workflow_permanent_id, agent))
+        if isinstance(self.skills, Exception):
+            raise self.skills
+        return self.skills
 
 
 def load_skill_items(call_id: str, name: str, body: str) -> list[dict[str, Any]]:
