@@ -585,9 +585,11 @@ Set these in `.env` (or the backend secret on Kubernetes) and restart the server
 | `BROWSER_TIMEZONE` | `America/New_York` | IANA timezone |
 | `BROWSER_WIDTH` / `BROWSER_HEIGHT` | `1920` / `1080` | Viewport size |
 | `BROWSER_ACTION_TIMEOUT_MS` | `5000` | Wait for one click or keystroke |
+| `BROWSER_ELEMENT_LOOKUP_TIMEOUT_MS` | `5000` | Wait for one element lookup that Playwright can't bound itself, such as counting matches or walking an iframe chain. Skyvern adds 5 seconds of headroom, then fails the action instead of waiting on a page that stopped answering. |
 | `BROWSER_SCREENSHOT_TIMEOUT_MS` | `20000` | Wait for a screenshot |
 | `BROWSER_LOADING_TIMEOUT_MS` | `60000` | Wait for a page load |
 | `BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS` | `60000` | Wait for DOM analysis on large pages |
+| `AUTO_COMPLETION_LADDER_BUDGET_SECONDS` | `60` | Budget for the extra values Skyvern types into an autocomplete field when the first one matches nothing, measured from the first attempt. Past it, Skyvern doesn't start another guess (one already running can finish), then clears the field and tries to pick from the full option list instead. `0` removes the limit. |
 | `BROWSER_MAX_PAGES_NUMBER` | `10` | Open tabs per browser. Lower it to save memory. |
 | `BROWSER_LOGS_ENABLED` | `true` | Save the browser console log as an artifact |
 | `VIDEO_PATH` | `./video` (`.env.example` sets `./videos`) | Where recordings are written while the browser runs |
