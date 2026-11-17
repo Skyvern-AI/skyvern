@@ -18047,6 +18047,7 @@ class WorkflowService:
                     status_code=status_code,
                     attempts=attempts.count,
                     finished_at=webhook.execution_finished_at,
+                    replay=finalizer == "replay",
                     proxy_hop_retries=attempts.proxy_hop_retries,
                 )
 
@@ -18068,6 +18069,16 @@ class WorkflowService:
                     stale_before=claim_stale_before,
                 )
             except Exception:
+                # A replay is late by definition, so it must never risk a duplicate:
+                # it sends only under its own run claim.
+                if finalizer == "replay":
+                    LOG.warning(
+                        "Failed to claim the final workflow webhook; not replaying it unclaimed",
+                        workflow_run_id=webhook.workflow_run_id,
+                        finalizer=finalizer,
+                        exc_info=True,
+                    )
+                    return False
                 LOG.warning(
                     "Failed to claim the final workflow webhook; delivering it unclaimed",
                     workflow_run_id=webhook.workflow_run_id,
@@ -18080,6 +18091,13 @@ class WorkflowService:
                         webhook, finalizer=finalizer, stale_before=claim_stale_before
                     )
                     return False
+        if finalizer == "replay" and run_claim is None:
+            LOG.warning(
+                "Skipping a replayed final workflow webhook that took no run claim",
+                workflow_run_id=webhook.workflow_run_id,
+                attempt_claimed=attempt_claimed,
+            )
+            return False
 
         async def release_run_claim_unless_terminal(projection: WebhookDeliveryStatus | None) -> None:
             # No current caller sends a final webhook without an exhausted projection, the only kind that fails with no

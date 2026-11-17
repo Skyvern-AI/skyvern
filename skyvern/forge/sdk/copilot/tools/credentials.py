@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import re
-from collections.abc import Collection, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -64,6 +64,7 @@ from skyvern.forge.sdk.integrations.connected_accounts import (
     IncompleteConnectionRead,
     OrgConnection,
     agent_step_org_connections,
+    as_run_block,
     block_connection_refs,
     connected_account_fields,
     org_connections,
@@ -671,7 +672,8 @@ def _retire_stale_connection_denial(
     ctx.connected_account_recovery_choices = []
 
 
-def _block_can_use(block: dict[str, Any], connection: OrgConnection) -> bool:
+def _block_can_use(written: Mapping[str, Any], connection: OrgConnection) -> bool:
+    block = as_run_block(written)
     if block.get("credential_source") == "nango":
         return connection.provider == "nango"
     # The catalog actions this block runs: same block type, and every input the action pins (e.g. email_client).

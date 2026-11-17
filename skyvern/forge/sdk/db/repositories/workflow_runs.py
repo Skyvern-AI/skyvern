@@ -568,6 +568,11 @@ def _final_webhook_claim_is_free(stale_before: datetime) -> ColumnElement[bool]:
     )
 
 
+class FinalWebhookDeliveryState(NamedTuple):
+    status: str | None
+    finalized_at: datetime | None
+
+
 class WorkflowRunsRepository(BaseRepository):
     """Database operations for workflow runs."""
 
@@ -1271,6 +1276,22 @@ class WorkflowRunsRepository(BaseRepository):
                 )
             )
         return free_run_id is not None
+
+    @db_operation("get_final_webhook_delivery_state")
+    async def get_final_webhook_delivery_state(self, workflow_run_id: str) -> FinalWebhookDeliveryState | None:
+        async with self.Session() as session:
+            row = (
+                await session.execute(
+                    select(
+                        WorkflowRunModel.webhook_delivery_status, WorkflowRunModel.webhook_delivery_finalized_at
+                    ).where(WorkflowRunModel.workflow_run_id == workflow_run_id)
+                )
+            ).first()
+        if row is None:
+            return None
+        return FinalWebhookDeliveryState(
+            status=row.webhook_delivery_status, finalized_at=row.webhook_delivery_finalized_at
+        )
 
     @db_operation("release_final_webhook_delivery_claim")
     async def release_final_webhook_delivery_claim(self, workflow_run_id: str, *, claimed_at: datetime) -> None:

@@ -1401,6 +1401,9 @@ async def request_connection_tool(
 
     With `connection_id`, the card reauthorizes that connection in place when `reconnect_in_place`
     is true: its id stays the same. Otherwise the user connects a new account, which gets a new id.
+
+    When `connected_gmail_limit` is present, the user already has their one Connected Gmail account and the card
+    cannot add another: say so, and never tell the user a second Gmail account is being added.
     """
     copilot_ctx = ctx.context
     arguments: dict[str, Any] = {"integration_id": integration_id, "connection_id": connection_id}

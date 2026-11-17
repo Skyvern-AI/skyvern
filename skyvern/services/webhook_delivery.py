@@ -57,6 +57,7 @@ FinalWebhookFinalizer = Literal[
     "terminal_side_effects",
     "failed_before_execution",
     "sequential_credential_rejection",
+    "replay",
 ]
 
 
