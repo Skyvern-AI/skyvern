@@ -94,7 +94,7 @@ from skyvern.forge.sdk.services.request_principal import (
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, BlockTypeVar, CodeFailure
 from skyvern.forge.sdk.workflow.retry_policy import WORKFLOW_WEBHOOK_HTTP_TIMEOUT_SECONDS
-from skyvern.schemas.emails import GmailSendErrorCode, GmailSendOutcome
+from skyvern.schemas.emails import EmailOrganizeAction, GmailSendErrorCode, GmailSendOutcome
 from skyvern.schemas.run_enums import RunEngine, RunType
 from skyvern.schemas.workflow_run_groups import DEFAULT_RUN_GROUP_LIMITS, RunGroupLimits
 from skyvern.schemas.workflows import BlockResult, CodeBlockFailureKind, FileStorageType, FileUploadDestination
@@ -276,6 +276,9 @@ class ScriptExecutionPolicyDecision:
     # (ADR-0012 mint-time validation); a rollout verdict sets this False so the run reaches the
     # agent instead. Defaults closed so a new denial reason has to opt into degrading.
     fail_closed: bool = True
+    # A fail-open denial the policy issues on every run logs at debug; any other logs at warning so the
+    # fail-open denial monitor sees it at production LOG_LEVEL=INFO.
+    steady_state: bool = False
 
 
 class CopilotCandidateNetworkHop(TypedDict):
@@ -1139,6 +1142,23 @@ class AgentFunction:
         destination: BinaryIO,
     ) -> int:
         """Stream one attachment of a connected account into destination and return the bytes written."""
+        raise GmailAPIError(status=404, code="integration_unavailable", message="Gmail integration unavailable")
+
+    async def organize_gmail_for_run(
+        self,
+        *,
+        organization_id: str,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        connection_id: str,
+        hop_token: str | None,
+        action: EmailOrganizeAction,
+        label: str | None,
+        folder: str,
+        message_ids: list[str],
+        grants: list[str],
+    ) -> None:
+        """Apply the block's saved organize action to emails its own connected-account listing returned."""
         raise GmailAPIError(status=404, code="integration_unavailable", message="Gmail integration unavailable")
 
     async def send_gmail_for_run(

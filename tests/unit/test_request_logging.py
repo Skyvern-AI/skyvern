@@ -612,9 +612,13 @@ class TestSanitizeBody:
         assert _sanitize_body(request, body.encode(), "application/json") == body
         assert _sanitize_response_body(request, body, "application/json") == body
 
-    def test_sensitive_endpoint_request_fully_redacted(self) -> None:
-        request = _make_request("POST", "/v1/credentials")
-        result = _sanitize_body(request, b'{"password": "hunter2"}', "application/json")
+    @pytest.mark.parametrize("path", ["/v1/credentials", "/api/v1/internal/gmail/organize"])
+    def test_sensitive_endpoint_request_fully_redacted(self, path: str) -> None:
+        request = _make_request("POST", path)
+        body = (
+            b'{"password": "synthetic", "folder": "synthetic", "message_ids": ["synthetic"], "grants": ["synthetic"]}'
+        )
+        result = _sanitize_body(request, body, "application/json")
         assert result == REDACTED
 
     @pytest.mark.parametrize(

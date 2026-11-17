@@ -1597,6 +1597,15 @@ async def test_final_release_retries_keep_own_claim_and_completed_hook(
         ("failed", "failed", ["A"], set(), 0, (False, "no_match")),
         ("completed", "failed", None, set(), 0, (False, "no_match")),
         ("failed", "failed", None, {"browser_connection_lost"}, 0, (False, "browser_connection_lost")),
+        ("failed", "failed", None, {"gmail_organize_uncertain"}, 0, (False, "gmail_organize_uncertain")),
+        (
+            "failed",
+            "failed",
+            ["gmail_organize_uncertain"],
+            {"gmail_organize_uncertain"},
+            0,
+            (False, "gmail_organize_uncertain"),
+        ),
         ("failed", "failed", [], {"ANY", "browser_connection_lost"}, 0, (False, "browser_connection_lost")),
     ],
 )

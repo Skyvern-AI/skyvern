@@ -53,7 +53,14 @@ from skyvern.schemas.agent_step_tool_names import (
     is_known_tool_name,
 )
 from skyvern.schemas.browser_settings import BrowserSettings, require_known_timezone
-from skyvern.schemas.emails import EmailBodyFormat, EmailTransport
+from skyvern.schemas.emails import (
+    GMAIL_IMMUTABLE_LABELS,
+    GMAIL_ORGANIZE_FORBIDDEN_TARGETS,
+    ORGANIZE_ACTIONS_WITH_LABEL,
+    EmailBodyFormat,
+    EmailOrganizeAction,
+    EmailTransport,
+)
 from skyvern.schemas.runs import GeoTarget, ProxyLocation, RunEngine, normalize_browser_type
 from skyvern.utils.secret_headers import mask_header_values
 from skyvern.utils.strings import sanitize_identifier
@@ -1949,7 +1956,49 @@ class EmailInboxBlockYAML(BlockYAML):
     download_attachments: bool = Field(
         default=False, description="Download non-inline attachments from matched emails for downstream blocks."
     )
+    organize_action: EmailOrganizeAction | None = Field(
+        default=None,
+        description="Change every matched email: add a label, archive, move to a label, or mark read. Needs a "
+        "Connected Gmail account (credential_source nango).",
+    )
+    organize_label: str | None = Field(
+        default=None,
+        max_length=256,
+        description="Existing Gmail label name for organize_action label or move. Must be literal text.",
+    )
     parameter_keys: list[str] | None = None
+
+    @model_validator(mode="after")
+    def _validate_organize(self) -> "EmailInboxBlockYAML":
+        if self.organize_action is None:
+            if self.organize_label is not None:
+                raise ValueError("organize_label is only used with organize_action")
+            return self
+        if self.email_client != "gmail":
+            raise ValueError("organize_action is only supported with gmail")
+        if self.credential_source != "nango":
+            raise ValueError("organize_action requires a Connected Gmail account")
+        if self.message_id:
+            raise ValueError("organize_action does not support message_id")
+        if (self.organize_action in ORGANIZE_ACTIONS_WITH_LABEL) != bool(
+            self.organize_label and self.organize_label.strip()
+        ):
+            raise ValueError("organize_label is required for label and move, and not allowed otherwise")
+        if any(
+            marker in value for value in (self.organize_label or "", self.folder or "") for marker in ("{{", "{%", "{#")
+        ):
+            raise ValueError("organize_label and folder must be literal for organize actions")
+        if (self.organize_label or "").strip().upper() in GMAIL_ORGANIZE_FORBIDDEN_TARGETS or (
+            self.organize_action == EmailOrganizeAction.MOVE
+            and (self.folder or "").strip().upper() in GMAIL_IMMUTABLE_LABELS
+        ):
+            raise ValueError("SENT, DRAFT, SPAM and TRASH cannot be organize targets; SENT and DRAFT cannot be sources")
+        if (
+            self.organize_action == EmailOrganizeAction.MOVE
+            and (self.organize_label or "").strip().casefold() == ((self.folder or "").strip() or "INBOX").casefold()
+        ):
+            raise ValueError("move source and target must differ")
+        return self
 
 
 class GoogleSheetsWriteBlockYAML(BlockYAML):

@@ -427,7 +427,7 @@ function computeCustomSettings(
   ].flatMap(({ key, after }) => {
     if (shown.has(key)) return [];
     // A setting the user cleared still differs from its default.
-    const value = reviewFieldValue(key, after) ?? docDetailsText.notSet;
+    const value = reviewFieldValue(key, after, saved) ?? docDetailsText.notSet;
     return [{ key, label: humanizeKey(key), value: shortValue(value) }];
   });
 }

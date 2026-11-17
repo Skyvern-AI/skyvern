@@ -120,7 +120,13 @@ from skyvern.forge.sdk.log_artifacts import save_workflow_run_logs, workflow_log
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE, is_final_status
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.services.audit_events import record_run_cancel_audit
-from skyvern.forge.sdk.services.request_principal import RequestPrincipal, api_key_actor_id, get_request_principal
+from skyvern.forge.sdk.services.request_principal import (
+    AuthKind,
+    RequestPrincipal,
+    api_key_actor_id,
+    get_request_principal,
+    key_requester_id,
+)
 from skyvern.forge.sdk.workflow.constants import INTERIM_OUTPUT_SNAPSHOT_MAX_BYTES
 from skyvern.forge.sdk.workflow.credential_selection import clear_credential_selections_for_retry
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter
@@ -1131,8 +1137,12 @@ class WorkflowRunsRepository(BaseRepository):
                 kwargs["browser_settings"] = browser_settings.model_dump(mode="json")
             principal = get_request_principal()
             api_key_actor = api_key_actor_id(organization_id)
-            if principal is not None and principal.api_key_access_mode == "scoped":
-                requested_by = api_key_actor
+            if principal is not None and (
+                principal.auth_kind == AuthKind.member_api_key or principal.api_key_access_mode == "scoped"
+            ):
+                requested_by = key_requester_id(principal, organization_id)
+                if principal.auth_kind == AuthKind.member_api_key:
+                    created_by = principal.user_id
             workflow_run = WorkflowRunModel(
                 workflow_permanent_id=workflow_permanent_id,
                 workflow_id=workflow_id,

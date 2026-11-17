@@ -1553,6 +1553,8 @@ function convertToNode(
           includeBody: block.include_body ?? true,
           downloadAttachments: block.download_attachments ?? false,
           messageId: block.message_id ?? "",
+          organizeAction: block.organize_action,
+          organizeLabel: block.organize_label,
           parameterKeys: (block.parameters ?? []).map((p) => p.key),
         },
       };
@@ -4199,6 +4201,10 @@ function getWorkflowBlock(
       };
     }
     case "emailInbox": {
+      const keepOrganize =
+        node.data.organizeAction == null ||
+        (node.data.emailClient === "gmail" &&
+          node.data.credentialSource === "nango");
       return {
         ...base,
         block_type: "email_inbox",
@@ -4218,6 +4224,14 @@ function getWorkflowBlock(
           node.data.emailClient === "gmail" &&
           node.data.credentialSource !== "nango" && {
             message_id: node.data.messageId,
+          }),
+        ...(keepOrganize &&
+          node.data.organizeAction !== undefined && {
+            organize_action: node.data.organizeAction,
+          }),
+        ...(keepOrganize &&
+          node.data.organizeLabel !== undefined && {
+            organize_label: node.data.organizeLabel,
           }),
         parameter_keys: node.data.parameterKeys,
       };
@@ -5888,6 +5902,12 @@ function convertBlocksToBlockYAML(
           include_body: block.include_body,
           download_attachments: block.download_attachments,
           message_id: block.message_id ?? null,
+          ...(block.organize_action !== undefined && {
+            organize_action: block.organize_action,
+          }),
+          ...(block.organize_label !== undefined && {
+            organize_label: block.organize_label,
+          }),
           parameter_keys: (block.parameters ?? []).map((p) => p.key),
         };
         return blockYaml;

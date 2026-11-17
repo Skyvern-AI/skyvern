@@ -41,6 +41,7 @@ _SENSITIVE_ENDPOINTS = {
     # The internal Power BI hop carries a run capability and customer query/result data.
     "POST /api/v1/internal/powerbi/query",
     "POST /api/v1/internal/gmail/inbox",
+    "POST /api/v1/internal/gmail/organize",
     "POST /api/v1/internal/gmail/send",
     "POST /api/v1/internal/gmail/attachment",
     "POST /api/v1/internal/gmail/trigger-read",
