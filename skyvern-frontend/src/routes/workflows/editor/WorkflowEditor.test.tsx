@@ -1952,7 +1952,7 @@ describe("save failures stop navigation and block runs", () => {
       );
       expect(put).not.toHaveBeenCalled();
       expect(post).not.toHaveBeenCalledWith(
-        "/workflow/copilot/convert-yaml-to-blocks",
+        "/workflow/convert-yaml-to-blocks",
         expect.anything(),
       );
       expect(saveSpy).not.toHaveBeenCalled();
@@ -4171,7 +4171,7 @@ describe("A49 metadata authorship through editor actions", () => {
           element: <EditorRoute />,
         },
       ],
-      { initialEntries: ["/agents/wpid_live/studio?panes=editor,copilot"] },
+      { initialEntries: ["/agents/wpid_live/studio?panes=editor,ember"] },
     );
     const tree = () => (
       <QueryClientProvider client={client}>

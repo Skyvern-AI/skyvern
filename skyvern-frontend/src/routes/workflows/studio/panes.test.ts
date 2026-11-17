@@ -37,16 +37,16 @@ describe("parsePanesParam", () => {
   });
 
   test("preserves order", () => {
-    expect(parsePanesParam("timeline,copilot,editor")).toEqual([
+    expect(parsePanesParam("timeline,ember,editor")).toEqual([
       "overview",
-      "copilot",
+      "ember",
       "editor",
     ]);
   });
 
   test("accepts the pre-rename 'run' alias as overview, in place", () => {
-    expect(parsePanesParam("copilot,run,browser")).toEqual([
-      "copilot",
+    expect(parsePanesParam("ember,run,browser")).toEqual([
+      "ember",
       "overview",
       "browser",
     ]);
@@ -59,26 +59,26 @@ describe("parsePanesParam", () => {
 
   test("drops unknown values", () => {
     expect(parsePanesParam("copilot,bogus,browser")).toEqual([
-      "copilot",
+      "ember",
       "browser",
     ]);
   });
 
   test("drops duplicates, keeping the first occurrence's position", () => {
-    expect(parsePanesParam("browser,copilot,browser")).toEqual([
+    expect(parsePanesParam("browser,ember,browser")).toEqual([
       "browser",
-      "copilot",
+      "ember",
     ]);
   });
 
-  test("accepts ember for the Ember pane before it is the canonical id", () => {
-    expect(parsePanesParam("ember,editor")).toEqual(["copilot", "editor"]);
-    expect(parsePanesParam("ember,copilot")).toEqual(["copilot"]);
+  test("accepts the pre-rename copilot id as ember, forever", () => {
+    expect(parsePanesParam("copilot,editor")).toEqual(["ember", "editor"]);
+    expect(parsePanesParam("copilot,ember")).toEqual(["ember"]);
   });
 
   test("tolerates whitespace around entries", () => {
     expect(parsePanesParam(" copilot , browser ")).toEqual([
-      "copilot",
+      "ember",
       "browser",
     ]);
   });
@@ -116,13 +116,13 @@ describe("panesFromDeepLink", () => {
   test("no deep link (Edit) opens only Ember and Editor", () => {
     expect(
       panesFromDeepLink({ runId: null, active: null, blockLabel: null }),
-    ).toEqual(["copilot", "editor"]);
+    ).toEqual(["ember", "editor"]);
   });
 });
 
 describe("resolveOpenPanes", () => {
   test("no params resolves to the default panes", () => {
-    expect(resolveOpenPanes("")).toEqual(["copilot", "editor"]);
+    expect(resolveOpenPanes("")).toEqual(["ember", "editor"]);
   });
 
   test("?wr= resolves to Overview and Browser", () => {
@@ -141,15 +141,15 @@ describe("resolveOpenPanes", () => {
   });
 
   test("an explicit ?panes= wins over the deep-link params", () => {
-    expect(resolveOpenPanes("?wr=wr_123&bl=block_1&panes=copilot")).toEqual([
-      "copilot",
+    expect(resolveOpenPanes("?wr=wr_123&bl=block_1&panes=ember")).toEqual([
+      "ember",
     ]);
   });
 
   test("an explicit ?panes=run keeps working as the Overview pane", () => {
     expect(resolveOpenPanes("?panes=run")).toEqual(["overview"]);
-    expect(resolveOpenPanes("?wr=wr_123&panes=copilot,run")).toEqual([
-      "copilot",
+    expect(resolveOpenPanes("?wr=wr_123&panes=ember,run")).toEqual([
+      "ember",
       "overview",
     ]);
   });
@@ -159,56 +159,53 @@ describe("resolveOpenPanes", () => {
   });
 
   test("a link to the removed code view still opens the Overview pane", () => {
-    expect(resolveOpenPanes("?view=code&panes=copilot,editor")).toEqual([
+    expect(resolveOpenPanes("?view=code&panes=ember,editor")).toEqual([
       "overview",
-      "copilot",
+      "ember",
       "editor",
     ]);
   });
 
   test("unrelated params do not affect the default", () => {
-    expect(resolveOpenPanes("?cache-key-value=x")).toEqual([
-      "copilot",
-      "editor",
-    ]);
+    expect(resolveOpenPanes("?cache-key-value=x")).toEqual(["ember", "editor"]);
   });
 });
 
 describe("resolveOpenPanes with custom defaults", () => {
   test("no params resolves to the given defaults", () => {
-    expect(resolveOpenPanes("", ["copilot", "editor"])).toEqual([
-      "copilot",
+    expect(resolveOpenPanes("", ["ember", "editor"])).toEqual([
+      "ember",
       "editor",
     ]);
   });
 
   test("deep links are unaffected by custom defaults", () => {
-    expect(resolveOpenPanes("?wr=wr_123", ["copilot", "editor"])).toEqual([
+    expect(resolveOpenPanes("?wr=wr_123", ["ember", "editor"])).toEqual([
       "overview",
       "browser",
     ]);
     expect(
-      resolveOpenPanes("?wr=wr_123&bl=block_1", ["copilot", "editor"]),
+      resolveOpenPanes("?wr=wr_123&bl=block_1", ["ember", "editor"]),
     ).toEqual(["overview", "browser"]);
   });
 
   test("an explicit ?panes= is never overridden by custom defaults", () => {
-    expect(resolveOpenPanes("?panes=browser", ["copilot", "editor"])).toEqual([
+    expect(resolveOpenPanes("?panes=browser", ["ember", "editor"])).toEqual([
       "browser",
     ]);
-    expect(resolveOpenPanes("?panes=", ["copilot", "editor"])).toEqual([]);
+    expect(resolveOpenPanes("?panes=", ["ember", "editor"])).toEqual([]);
   });
 });
 
 describe("panesListEqual", () => {
   test("compares contents and order", () => {
-    expect(panesListEqual(["copilot", "browser"], ["copilot", "browser"])).toBe(
+    expect(panesListEqual(["ember", "browser"], ["ember", "browser"])).toBe(
       true,
     );
-    expect(panesListEqual(["copilot", "browser"], ["browser", "copilot"])).toBe(
+    expect(panesListEqual(["ember", "browser"], ["browser", "ember"])).toBe(
       false,
     );
-    expect(panesListEqual(["copilot"], ["copilot", "browser"])).toBe(false);
+    expect(panesListEqual(["ember"], ["ember", "browser"])).toBe(false);
     expect(panesListEqual([], [])).toBe(true);
   });
 });
@@ -224,18 +221,18 @@ describe("panesFitWidth", () => {
   });
 
   test("fits exactly at the min-width sum plus stage chrome", () => {
-    const panes = ["copilot", "browser"] as const;
+    const panes = ["ember", "browser"] as const;
     expect(panesFitWidth(panes, width(panes))).toBe(true);
     expect(panesFitWidth(panes, width(panes) - 1)).toBe(false);
   });
 });
 
 describe("panesCollapsedForDoc", () => {
-  const four = ["copilot", "editor", "overview", "browser"] as const;
+  const four = ["ember", "editor", "overview", "browser"] as const;
 
   test("collapses nothing when the Doc keeps 360px", () => {
     expect(panesCollapsedForDoc(four, 1440)).toEqual([]);
-    expect(panesCollapsedForDoc(["copilot", "browser"], 300)).toEqual([]);
+    expect(panesCollapsedForDoc(["ember", "browser"], 300)).toEqual([]);
   });
 
   test("the Browser gives way first, then Run, then Ember; never the Editor", () => {
@@ -246,7 +243,7 @@ describe("panesCollapsedForDoc", () => {
     expect(panesCollapsedForDoc(four, 200)).toEqual([
       "browser",
       "overview",
-      "copilot",
+      "ember",
     ]);
   });
 });
@@ -254,22 +251,22 @@ describe("panesCollapsedForDoc", () => {
 describe("fitPanesToWidth", () => {
   test("returns the list unchanged when everything fits", () => {
     expect(
-      fitPanesToWidth(["copilot", "editor", "browser", "overview"], 2000),
-    ).toEqual(["copilot", "editor", "browser", "overview"]);
+      fitPanesToWidth(["ember", "editor", "browser", "overview"], 2000),
+    ).toEqual(["ember", "editor", "browser", "overview"]);
   });
 
   test("keeps the longest leading prefix that fits", () => {
     // Ember(260) + editor(220) + padding(24) + gap(12) = 516 fits in 600;
     // adding browser(260) + gap(12) = 788 does not.
     expect(
-      fitPanesToWidth(["copilot", "editor", "browser", "overview"], 600),
-    ).toEqual(["copilot", "editor"]);
+      fitPanesToWidth(["ember", "editor", "browser", "overview"], 600),
+    ).toEqual(["ember", "editor"]);
   });
 
   test("degrades deterministically by order, not by pane size", () => {
-    expect(fitPanesToWidth(["overview", "copilot", "browser"], 600)).toEqual([
+    expect(fitPanesToWidth(["overview", "ember", "browser"], 600)).toEqual([
       "overview",
-      "copilot",
+      "ember",
     ]);
   });
 
@@ -284,22 +281,22 @@ describe("fitPanesToWidth", () => {
 
 describe("pane list operations", () => {
   test("toggling a closed pane appends it (click order)", () => {
-    expect(togglePane(["copilot", "browser"], "overview")).toEqual([
-      "copilot",
+    expect(togglePane(["ember", "browser"], "overview")).toEqual([
+      "ember",
       "browser",
       "overview",
     ]);
   });
 
   test("toggling an open pane splices it out, preserving the others' order", () => {
-    expect(togglePane(["copilot", "overview", "browser"], "overview")).toEqual([
-      "copilot",
+    expect(togglePane(["ember", "overview", "browser"], "overview")).toEqual([
+      "ember",
       "browser",
     ]);
   });
 
   test("closed panes keep their slots through later closes and reopen in any order", () => {
-    let panes: StudioPaneId[] = ["copilot", "editor", "browser"];
+    let panes: StudioPaneId[] = ["ember", "editor", "browser"];
     let slots: StudioPaneId[] = [...panes];
     const apply = (next: StudioPaneId[]) => {
       panes = next;
@@ -310,47 +307,43 @@ describe("pane list operations", () => {
     apply(withPaneClosed(panes, "browser"));
     apply(withPaneOpen(panes, "browser", slots));
     apply(withPaneOpen(panes, "editor", slots));
-    expect(panes).toEqual(["copilot", "editor", "browser"]);
+    expect(panes).toEqual(["ember", "editor", "browser"]);
 
-    apply(withPaneClosed(panes, "copilot"));
+    apply(withPaneClosed(panes, "ember"));
     apply(withPaneClosed(panes, "editor"));
     apply(withPaneOpen(panes, "editor", slots));
-    apply(withPaneOpen(panes, "copilot", slots));
-    expect(panes).toEqual(["copilot", "editor", "browser"]);
+    apply(withPaneOpen(panes, "ember", slots));
+    expect(panes).toEqual(["ember", "editor", "browser"]);
   });
 
   test("withPaneOpen is a no-op re-order-wise when already open", () => {
-    expect(withPaneOpen(["overview", "copilot"], "copilot")).toEqual([
+    expect(withPaneOpen(["overview", "ember"], "ember")).toEqual([
       "overview",
-      "copilot",
+      "ember",
     ]);
   });
 
   test("withPanesOpen appends only the missing panes, in the given order", () => {
     expect(
-      withPanesOpen(["copilot", "browser"], ["overview", "browser"]),
-    ).toEqual(["copilot", "browser", "overview"]);
+      withPanesOpen(["ember", "browser"], ["overview", "browser"]),
+    ).toEqual(["ember", "browser", "overview"]);
   });
 
   test("withPaneClosed removes the pane", () => {
-    expect(withPaneClosed(["copilot", "browser"], "copilot")).toEqual([
-      "browser",
-    ]);
+    expect(withPaneClosed(["ember", "browser"], "ember")).toEqual(["browser"]);
   });
 });
 
 describe("toReadableSearch", () => {
   test("keeps ?panes= commas readable after an unrelated param write", () => {
-    const params = new URLSearchParams("?panes=copilot,browser");
+    const params = new URLSearchParams("?panes=ember,browser");
     params.set("active", "act_1");
-    expect(toReadableSearch(params)).toBe(
-      "?panes=copilot,browser&active=act_1",
-    );
+    expect(toReadableSearch(params)).toBe("?panes=ember,browser&active=act_1");
   });
 
   test("leaves non-comma encoding intact", () => {
-    const params = new URLSearchParams("?panes=copilot,browser&bl=Block A");
-    expect(toReadableSearch(params)).toBe("?panes=copilot,browser&bl=Block+A");
+    const params = new URLSearchParams("?panes=ember,browser&bl=Block A");
+    expect(toReadableSearch(params)).toBe("?panes=ember,browser&bl=Block+A");
   });
 
   test("returns an empty string when no params remain", () => {
@@ -363,13 +356,13 @@ describe("block-run starts append the run surfaces (continuity rule)", () => {
   // navigates to the bare deep link); only block ▶ appends.
   test("block ▶ from the workflow layout appends Overview only", () => {
     expect(
-      withPanesOpen(["copilot", "browser", "editor"], RUN_APPEND_PANES),
-    ).toEqual(["copilot", "browser", "editor", "overview"]);
+      withPanesOpen(["ember", "browser", "editor"], RUN_APPEND_PANES),
+    ).toEqual(["ember", "browser", "editor", "overview"]);
   });
 
   test("a block ▶ from a Browser-less layout appends Overview then Browser", () => {
-    expect(withPanesOpen(["copilot", "editor"], RUN_APPEND_PANES)).toEqual([
-      "copilot",
+    expect(withPanesOpen(["ember", "editor"], RUN_APPEND_PANES)).toEqual([
+      "ember",
       "editor",
       "overview",
       "browser",
@@ -378,8 +371,8 @@ describe("block-run starts append the run surfaces (continuity rule)", () => {
 
   test("a block ▶ from the run layout changes nothing", () => {
     expect(
-      withPanesOpen(["copilot", "browser", "overview"], RUN_APPEND_PANES),
-    ).toEqual(["copilot", "browser", "overview"]);
+      withPanesOpen(["ember", "browser", "overview"], RUN_APPEND_PANES),
+    ).toEqual(["ember", "browser", "overview"]);
   });
 
   test("a block ▶ from an empty stage opens just the run surfaces", () => {
@@ -393,7 +386,7 @@ describe("block-run starts append the run surfaces (continuity rule)", () => {
 describe("panesWithoutDeletedBlocked", () => {
   test("drops the workflow-mutating panes and keeps run-view order", () => {
     expect(
-      panesWithoutDeletedBlocked(["copilot", "browser", "overview", "editor"]),
+      panesWithoutDeletedBlocked(["ember", "browser", "overview", "editor"]),
     ).toEqual(["browser", "overview"]);
   });
 
@@ -405,7 +398,7 @@ describe("panesWithoutDeletedBlocked", () => {
   });
 
   test("blocks exactly the Ember and editor panes", () => {
-    expect(WORKFLOW_AUTHORING_PANES).toEqual(["copilot", "editor"]);
+    expect(WORKFLOW_AUTHORING_PANES).toEqual(["ember", "editor"]);
   });
 });
 
@@ -419,7 +412,7 @@ describe("isAuthoringLayout", () => {
 
   test("any open editor or Ember pane makes the layout authoring", () => {
     expect(isAuthoringLayout(DEFAULT_STUDIO_PANES)).toBe(true);
-    expect(isAuthoringLayout(["browser", "overview", "copilot"])).toBe(true);
+    expect(isAuthoringLayout(["browser", "overview", "ember"])).toBe(true);
   });
 });
 
@@ -437,7 +430,7 @@ describe("system run focus (?wrs=)", () => {
 
   test("does not remap deep-link panes to the run layout", () => {
     expect(
-      resolveOpenPanes("?wr=wr_1&wrs=copilot", ["editor", "browser"]),
+      resolveOpenPanes("?wr=wr_1&wrs=ember", ["editor", "browser"]),
     ).toEqual(["editor", "browser"]);
     expect(resolveOpenPanes("?wr=wr_1", ["editor", "browser"])).toEqual([
       "overview",
@@ -457,9 +450,9 @@ describe("searchWithRunReference", () => {
   test("drops a stale marker so a path run keeps its run class", () => {
     // The marker belongs to an Ember focus that is gone; leaving it would pin
     // a run the user opened to the edit layout.
-    expect(searchWithRunReference("?wrs=copilot", "wr_123")).toBe("?wr=wr_123");
+    expect(searchWithRunReference("?wrs=ember", "wr_123")).toBe("?wr=wr_123");
     expect(
-      resolveOpenPanes(searchWithRunReference("?wrs=copilot", "wr_123")),
+      resolveOpenPanes(searchWithRunReference("?wrs=ember", "wr_123")),
     ).toEqual(RUN_APPEND_PANES);
   });
 

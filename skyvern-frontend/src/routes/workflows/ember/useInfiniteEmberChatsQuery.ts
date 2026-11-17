@@ -1,7 +1,7 @@
 import { useInfiniteQuery } from "@tanstack/react-query";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { EmberChatSummary } from "./emberTypes";
+import { EMBER_API_PREFIX, EmberChatSummary } from "./emberTypes";
 
 interface UseInfiniteEmberChatsQueryParams {
   workflow_permanent_id?: string;
@@ -36,7 +36,7 @@ function useInfiniteEmberChatsQuery({
         searchParams.append("search", search);
       }
       return client
-        .get<Array<EmberChatSummary>>("/workflow/copilot/chats", {
+        .get<Array<EmberChatSummary>>(`${EMBER_API_PREFIX}/chats`, {
           params: searchParams,
         })
         .then((response) => response.data);

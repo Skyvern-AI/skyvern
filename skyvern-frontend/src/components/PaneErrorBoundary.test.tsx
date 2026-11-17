@@ -50,7 +50,7 @@ describe("PaneErrorBoundary", () => {
 
     const view = render(
       <PaneErrorBoundary
-        pane="copilot"
+        pane="ember"
         fallbackContainer={fallbackContainer}
         onError={() => undefined}
       >

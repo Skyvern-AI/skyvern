@@ -1079,7 +1079,7 @@ describe("PromptBox", () => {
       },
     );
     expect(
-      sessionStorage.getItem("skyvern.discoverCopilotHandoff:wpid_studio"),
+      sessionStorage.getItem("skyvern.discoverEmberHandoff:wpid_studio"),
     ).toBe("Build this in studio");
   });
 

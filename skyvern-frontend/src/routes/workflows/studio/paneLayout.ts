@@ -85,14 +85,14 @@ export function paneFlex(
   // Browser remains greedy so pinned widths and minimums take precedence.
   let share: number;
   if (panes.length === 2) {
-    share = id === "copilot" && greedy === "browser" ? 30 : 35;
+    share = id === "ember" && greedy === "browser" ? 30 : 35;
   } else if (
     panes.length === 3 &&
-    panes.includes("copilot") &&
+    panes.includes("ember") &&
     panes.includes("browser") &&
     panes.includes("editor")
   ) {
-    share = id === "copilot" ? 25 : 30;
+    share = id === "ember" ? 25 : 30;
   } else {
     return `0 1 ${STUDIO_PANE_DEFAULT_WIDTH}px`;
   }

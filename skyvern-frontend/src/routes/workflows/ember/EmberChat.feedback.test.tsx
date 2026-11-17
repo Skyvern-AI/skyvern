@@ -11,7 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FeatureFlagContext } from "@/hooks/useFeatureFlag";
 import { EmberChat } from "./EmberChat";
 
-type StreamBody = { message: string };
+type StreamBody = { message: string; cancel_token: string };
 type StreamCall = {
   body: StreamBody;
   onMessage: (payload: unknown) => boolean;
@@ -199,6 +199,9 @@ describe("EmberChat — turn feedback", () => {
       fireEvent.keyDown(textarea, { key: "Enter" });
     });
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    expect(sessionStorage.getItem("ember-request-cancel-token:wpid_1")).toBe(
+      streamCalls[0]!.body.cancel_token,
+    );
     expect(screen.queryByTestId("feedback-thumbs")).toBeNull();
 
     await act(async () => {
@@ -220,9 +223,9 @@ describe("EmberChat — turn feedback", () => {
     fireEvent.click(screen.getByLabelText("Thumbs down"));
     await waitFor(() =>
       expect(clientPost).toHaveBeenCalledWith(
-        "/workflow/copilot/message-feedback",
+        "/ember/message-feedback",
         expect.objectContaining({
-          workflow_copilot_chat_id: "chat-1",
+          ember_chat_id: "chat-1",
           turn_id: "turn-1",
           rating: "down",
         }),
@@ -288,5 +291,17 @@ describe("EmberChat — turn feedback", () => {
     ).toEqual(["true", "false"]);
     expect(screen.queryByText("Thanks, that helps.")).toBeNull();
     expect(screen.queryByLabelText("Feedback reason")).toBeNull();
+
+    fireEvent.click(screen.getAllByLabelText("Thumbs down")[1]!);
+    await waitFor(() =>
+      expect(clientPost).toHaveBeenCalledWith(
+        "/ember/message-feedback",
+        expect.objectContaining({
+          ember_chat_id: "chat-1",
+          ember_chat_message_id: "msg-ai-1",
+          turn_id: "turn-1",
+        }),
+      ),
+    );
   });
 });

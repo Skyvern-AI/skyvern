@@ -12,7 +12,7 @@ export const STUDIO_PANE_META: Record<
   StudioPaneId,
   { label: string; icon: ComponentType<{ className?: string }> }
 > = {
-  copilot: { label: "Copilot", icon: ChatBubbleIcon },
+  ember: { label: "Copilot", icon: ChatBubbleIcon },
   editor: { label: "Editor", icon: Share1Icon },
   browser: { label: "Browser", icon: GlobeIcon },
   // The internal "overview" pane is displayed as "Run" in Studio.

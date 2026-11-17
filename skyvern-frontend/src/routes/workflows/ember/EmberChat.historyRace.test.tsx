@@ -108,7 +108,7 @@ vi.mock("@/api/AxiosClient", () => ({
         path: string,
         config?: { params?: Record<string, unknown>; signal?: AbortSignal },
       ) => {
-        if (path === "/workflow/copilot/chat-history") {
+        if (path === "/ember/chat-history") {
           historyParams.push(config?.params);
           historySignals.push(config?.signal);
           return new Promise((resolve, reject) => {
@@ -398,7 +398,7 @@ describe("EmberChat — history-race action-card gating (item 1)", () => {
       expect(screen.queryByRole("button", { name: "Accept" })).toBeNull(),
     );
     expect(cancelPost).not.toHaveBeenCalledWith(
-      "/workflow/copilot/apply-proposed-workflow",
+      "/ember/apply-proposed-workflow",
       expect.anything(),
       { timeout: 30_000, signal: expect.any(AbortSignal) },
     );
@@ -487,9 +487,9 @@ describe("EmberChat — auto-accept Turn off across a chat switch", () => {
 
       expect(cancelPost).toHaveBeenCalledWith(
         expect.stringMatching(
-          /\/workflow\/copilot\/(disable-auto-accept|clear-proposed-workflow)/,
+          /\/ember\/(disable-auto-accept|clear-proposed-workflow)/,
         ),
-        expect.objectContaining({ workflow_copilot_chat_id: "chat-1" }),
+        expect.objectContaining({ ember_chat_id: "chat-1" }),
       );
       expect(
         screen.getByRole("button", { name: /Auto-accepting/ }),
@@ -512,7 +512,7 @@ describe("EmberChat — auto-accept Turn off across a chat switch", () => {
       });
     const heldDisables: Array<(value: unknown) => void> = [];
     cancelPost.mockImplementation((path: string) =>
-      path === "/workflow/copilot/disable-auto-accept"
+      path === "/ember/disable-auto-accept"
         ? new Promise((resolve) => heldDisables.push(resolve))
         : Promise.resolve({}),
     );
@@ -568,7 +568,7 @@ describe("EmberChat — auto-accept Turn off across a chat switch", () => {
       });
     const heldDisables: Array<(value: unknown) => void> = [];
     cancelPost.mockImplementation((path: string) =>
-      path === "/workflow/copilot/disable-auto-accept"
+      path === "/ember/disable-auto-accept"
         ? new Promise((resolve) => heldDisables.push(resolve))
         : Promise.resolve({}),
     );
@@ -632,7 +632,7 @@ describe("EmberChat — auto-accept Turn off across a chat switch", () => {
       });
     let finishApply: (value: unknown) => void = () => {};
     cancelPost.mockImplementation((path: string) =>
-      path === "/workflow/copilot/apply-proposed-workflow"
+      path === "/ember/apply-proposed-workflow"
         ? new Promise((resolve) => (finishApply = resolve))
         : Promise.resolve({}),
     );
@@ -677,7 +677,7 @@ describe("EmberChat — auto-accept Turn off across a chat switch", () => {
       });
     let failApply: (reason: unknown) => void = () => {};
     cancelPost.mockImplementation((path: string) =>
-      path === "/workflow/copilot/apply-proposed-workflow"
+      path === "/ember/apply-proposed-workflow"
         ? new Promise((_resolve, reject) => (failApply = reject))
         : Promise.resolve({}),
     );
@@ -702,7 +702,7 @@ describe("EmberChat — auto-accept Turn off across a chat switch", () => {
       expect(
         historyParams
           .slice(readsBeforeFailure)
-          .map((params) => params?.workflow_copilot_chat_id),
+          .map((params) => params?.ember_chat_id),
       ).toContain("chat-1"),
     );
     expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
@@ -724,10 +724,10 @@ describe("EmberChat — auto-accept Turn off across a chat switch", () => {
     const clearBodies: Array<Record<string, unknown>> = [];
     cancelPost.mockImplementation(
       (path: string, body: Record<string, unknown>) => {
-        if (path === "/workflow/copilot/apply-proposed-workflow") {
+        if (path === "/ember/apply-proposed-workflow") {
           return new Promise((_resolve, reject) => (failApply = reject));
         }
-        if (path === "/workflow/copilot/clear-proposed-workflow") {
+        if (path === "/ember/clear-proposed-workflow") {
           clearBodies.push(body);
           return Promise.reject({ response: { status: 404 } });
         }
@@ -771,7 +771,7 @@ describe("EmberChat — auto-accept Turn off across a chat switch", () => {
       }),
     );
     cancelPost.mockImplementation((path: string) =>
-      path === "/workflow/copilot/apply-proposed-workflow"
+      path === "/ember/apply-proposed-workflow"
         ? new Promise(() => {})
         : Promise.resolve({}),
     );
@@ -786,7 +786,7 @@ describe("EmberChat — auto-accept Turn off across a chat switch", () => {
     expect(historyQueue).toHaveLength(0);
     expect(
       cancelPost.mock.calls.some(
-        ([path]) => path === "/workflow/copilot/disable-auto-accept",
+        ([path]) => path === "/ember/disable-auto-accept",
       ),
     ).toBe(false);
     expect(
@@ -1142,14 +1142,11 @@ describe("EmberChat — recovery poll after a non-terminal stream close", () => 
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Skip" }));
     });
-    expect(cancelPost).toHaveBeenCalledWith(
-      "/workflow/copilot/question-response",
-      {
-        workflow_copilot_chat_id: capturedHistory.workflow_copilot_chat_id,
-        interaction_id: "recovered-question",
-        skipped: true,
-      },
-    );
+    expect(cancelPost).toHaveBeenCalledWith("/ember/question-response", {
+      ember_chat_id: capturedHistory.workflow_copilot_chat_id,
+      interaction_id: "recovered-question",
+      skipped: true,
+    });
   });
 
   it("keeps polling while the only assistant row belongs to another turn", async () => {
@@ -1279,7 +1276,7 @@ describe("EmberChat — recovery poll after a non-terminal stream close", () => 
         await Promise.resolve();
       });
       expect(cancelPost).toHaveBeenCalledWith(
-        "/workflow/copilot/cancel",
+        "/ember/cancel",
         expect.anything(),
         expect.objectContaining({
           timeout: 15_000,
@@ -1313,7 +1310,7 @@ describe("EmberChat — recovery poll after a non-terminal stream close", () => 
     const reservation = useWorkflowYamlEditorStore.getState().emberAcceptance;
     await act(async () => fireEvent.keyDown(document, { key: "Escape" }));
     expect(cancelPost).toHaveBeenCalledWith(
-      "/workflow/copilot/cancel",
+      "/ember/cancel",
       expect.anything(),
       expect.objectContaining({
         timeout: 15_000,
@@ -1424,7 +1421,7 @@ describe("EmberChat — recovery poll after a non-terminal stream close", () => 
     await advance(2_000);
     expect(historyQueue).toHaveLength(1);
     expect(historyParams[historyParams.length - 1]).toEqual({
-      workflow_copilot_chat_id: "chat-1",
+      ember_chat_id: "chat-1",
     });
     await resolveNextHistory(recoveredHistory());
     expect(useWorkflowYamlEditorStore.getState().emberAcceptance).toBeNull();
@@ -1632,7 +1629,7 @@ describe("EmberChat — recovery poll after a non-terminal stream close", () => 
 
     await advance(3_000);
     expect(historyParams[historyParams.length - 1]).toEqual({
-      workflow_copilot_chat_id: "chat_of_this_turn",
+      ember_chat_id: "chat_of_this_turn",
     });
   });
 
@@ -1817,7 +1814,7 @@ describe("EmberChat — recovery poll after a non-terminal stream close", () => 
       await Promise.resolve();
     });
     expect(cancelPost).toHaveBeenCalledWith(
-      "/workflow/copilot/cancel",
+      "/ember/cancel",
       expect.anything(),
       expect.objectContaining({
         timeout: 15_000,
@@ -1933,12 +1930,12 @@ describe("EmberChat — recovery poll after a non-terminal stream close", () => 
         reservation,
       );
       expect(cancelPost).toHaveBeenCalledWith(
-        "/workflow/copilot/cancel",
+        "/ember/cancel",
         {
           cancel_token: (
             postStreaming.mock.calls[0]![1] as { cancel_token: string }
           ).cancel_token,
-          workflow_copilot_chat_id: "chat-1",
+          ember_chat_id: "chat-1",
           source: "stop_button",
         },
         { timeout: 5_000 },
@@ -2066,10 +2063,10 @@ describe("EmberChat — recovery poll after a non-terminal stream close", () => 
         fireEvent.click(screen.getByRole("button", { name: "Reject" }));
       });
       expect(cancelPost).toHaveBeenCalledWith(
-        "/workflow/copilot/cancel",
+        "/ember/cancel",
         {
           cancel_token: requestId,
-          workflow_copilot_chat_id: "chat-1",
+          ember_chat_id: "chat-1",
           source: "stop_button",
         },
         { timeout: 5_000 },
@@ -2265,17 +2262,17 @@ describe("EmberChat — recovery poll after a non-terminal stream close", () => 
       fireEvent.click(screen.getByRole("button", { name: "Reject" }));
     });
     expect(cancelPost).toHaveBeenCalledWith(
-      "/workflow/copilot/cancel",
+      "/ember/cancel",
       {
         cancel_token: requestId,
-        workflow_copilot_chat_id: null,
+        ember_chat_id: null,
         source: "stop_button",
       },
       { timeout: 5_000 },
     );
     expect(historyQueue).toHaveLength(1);
     expect(historyParams[historyParams.length - 1]).toMatchObject({
-      workflow_copilot_chat_id: "chat-1",
+      ember_chat_id: "chat-1",
       request_cancel_token: requestId,
     });
     await resolveNextHistory(paused);
@@ -2631,7 +2628,7 @@ describe("EmberChat — recovery poll after a non-terminal stream close", () => 
     await advance(30_000);
     expect(historyQueue.length).toBe(1);
     expect(historyParams[historyParams.length - 1]).toEqual({
-      workflow_copilot_chat_id: "chat-1",
+      ember_chat_id: "chat-1",
     });
     await resolveNextHistory(recoveredHistory());
     expect(renderedText()).not.toContain(capturedAiText);
@@ -2844,11 +2841,9 @@ describe("EmberChat — question transport", () => {
     });
     await waitFor(() => expect(cancelPost).toHaveBeenCalled());
     expect(postStreaming).not.toHaveBeenCalled();
-    expect(cancelPost.mock.calls[0]?.[0]).toBe(
-      "/workflow/copilot/question-response",
-    );
+    expect(cancelPost.mock.calls[0]?.[0]).toBe("/ember/question-response");
     expect(cancelPost.mock.calls[0]?.[1]).toEqual({
-      workflow_copilot_chat_id: "chat-1",
+      ember_chat_id: "chat-1",
       interaction_id: "interaction",
       answers: [{ part_id: "part", text: "why do you need this?" }],
     });
@@ -2917,7 +2912,7 @@ describe("EmberChat — question transport", () => {
     });
     await waitFor(() => expect(cancelPost).toHaveBeenCalled());
     expect(cancelPost.mock.calls[0]?.[1]).toEqual({
-      workflow_copilot_chat_id: "chat-1",
+      ember_chat_id: "chat-1",
       interaction_id: "interaction",
       answers: [
         { part_id: "structure", choice_id: "llc", text: "Single member" },
@@ -3179,8 +3174,8 @@ describe("EmberChat — question transport", () => {
       fireEvent.click(screen.getByRole("button", { name: "Reject" })),
     );
     expect(cancelPost.mock.calls.map(([path]) => path)).toEqual([
-      "/workflow/copilot/question-response",
-      "/workflow/copilot/cancel",
+      "/ember/question-response",
+      "/ember/cancel",
     ]);
     await act(async () =>
       resolveAnswer({
@@ -3255,9 +3250,9 @@ describe("EmberChat — first chat selection", () => {
     expect(
       (
         postStreaming.mock.calls[0]![1] as {
-          workflow_copilot_chat_id?: string | null;
+          ember_chat_id?: string | null;
         }
-      ).workflow_copilot_chat_id,
+      ).ember_chat_id,
     ).toBe("chat_other");
   });
 });
@@ -3279,7 +3274,7 @@ describe("EmberChat — ?chat= link seeds the first history read", () => {
       .map(([to]) => (to as { search: string }).search);
 
   it("opens the linked chat and drops chat= from the URL", async () => {
-    routeSearch.current = "?chat=chat_a&panes=copilot,editor";
+    routeSearch.current = "?chat=chat_a&panes=ember,editor";
     await renderChat({ docked: true });
     await flushHistory(
       historyData({
@@ -3291,14 +3286,14 @@ describe("EmberChat — ?chat= link seeds the first history read", () => {
 
     expect(historyParams[0]).toEqual({
       workflow_permanent_id: "wpid_1",
-      workflow_copilot_chat_id: "chat_a",
+      ember_chat_id: "chat_a",
     });
     await waitFor(() =>
       expect(screen.getByText("message in linked chat")).toBeTruthy(),
     );
     expect(historyParams).toHaveLength(1);
     await waitFor(() =>
-      expect(strippedSearches()).toEqual(["?panes=copilot,editor"]),
+      expect(strippedSearches()).toEqual(["?panes=ember,editor"]),
     );
   });
 
@@ -3344,7 +3339,7 @@ describe("EmberChat — ?chat= link seeds the first history read", () => {
     await flushHistory(newestChat);
 
     expect(historyParams).toEqual([
-      { workflow_permanent_id: "wpid_1", workflow_copilot_chat_id: "chat_c" },
+      { workflow_permanent_id: "wpid_1", ember_chat_id: "chat_c" },
       { workflow_permanent_id: "wpid_1" },
     ]);
     await waitFor(() =>
@@ -3376,7 +3371,7 @@ describe("EmberChat — ?chat= link seeds the first history read", () => {
 
     expect(historyParams[0]).toEqual({
       workflow_permanent_id: "wpid_1",
-      workflow_copilot_chat_id: "chat_stored",
+      ember_chat_id: "chat_stored",
     });
   });
 

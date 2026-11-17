@@ -153,7 +153,7 @@ export async function convertWorkflowReviewBaseline(
 ): Promise<WorkflowVersion> {
   const definition = baseline.workflow_definition;
   const { data } = await client.post<WorkflowYAMLConversionResponse>(
-    "/workflow/copilot/convert-yaml-to-blocks",
+    "/workflow/convert-yaml-to-blocks",
     {
       workflow_definition_yaml: convertToYAML({
         version: definition.version,

@@ -815,7 +815,7 @@ beforeEach(() => {
   cancelPost.mockReset();
   cancelPost.mockImplementation((path: string) =>
     Promise.resolve(
-      path === "/workflow/copilot/apply-proposed-workflow"
+      path === "/ember/apply-proposed-workflow"
         ? { data: proposedWorkflowPayload() }
         : {},
     ),
@@ -1089,8 +1089,8 @@ describe("EmberChat — g2 review gate", () => {
 
     await waitFor(() =>
       expect(cancelPost).toHaveBeenCalledWith(
-        "/workflow/copilot/apply-proposed-workflow",
-        expect.objectContaining({ workflow_copilot_chat_id: "chat-1" }),
+        "/ember/apply-proposed-workflow",
+        expect.objectContaining({ ember_chat_id: "chat-1" }),
         expect.anything(),
       ),
     );
@@ -1147,8 +1147,8 @@ describe("EmberChat — g2 review gate", () => {
       const proposalWrites = () =>
         cancelPost.mock.calls.filter(
           ([path]) =>
-            path === "/workflow/copilot/apply-proposed-workflow" ||
-            path === "/workflow/copilot/clear-proposed-workflow",
+            path === "/ember/apply-proposed-workflow" ||
+            path === "/ember/clear-proposed-workflow",
         ).length;
       const writesBefore = proposalWrites();
       // jsdom delivers a click to a button inside a disabled fieldset, so this reaches the
@@ -1265,7 +1265,7 @@ describe("EmberChat — g2 review gate", () => {
       await settle("reject");
     });
     expect(cancelPost).toHaveBeenCalledWith(
-      "/workflow/copilot/clear-proposed-workflow",
+      "/ember/clear-proposed-workflow",
       expect.anything(),
     );
     expect(restore).not.toHaveBeenCalled();
@@ -1328,7 +1328,7 @@ describe("EmberChat — g2 review gate", () => {
     });
 
     expect(cancelPost).not.toHaveBeenCalledWith(
-      "/workflow/copilot/apply-proposed-workflow",
+      "/ember/apply-proposed-workflow",
       expect.anything(),
     );
     expect(toast).toHaveBeenCalledWith(
@@ -1367,7 +1367,7 @@ describe("EmberChat — g2 review gate", () => {
     });
 
     expect(cancelPost).not.toHaveBeenCalledWith(
-      "/workflow/copilot/clear-proposed-workflow",
+      "/ember/clear-proposed-workflow",
       expect.anything(),
     );
     expect(toast).toHaveBeenCalledWith(
@@ -1723,16 +1723,13 @@ describe("EmberChat — g2 review gate", () => {
           : null,
       };
       historyGet.mockImplementation(
-        (
-          path: string,
-          config?: { params?: { workflow_copilot_chat_id?: string } },
-        ) =>
+        (path: string, config?: { params?: { ember_chat_id?: string } }) =>
           Promise.resolve(
             path === "/workflows/wpid_1"
               ? { data: canonical }
               : {
                   data:
-                    config?.params?.workflow_copilot_chat_id === "chat-2"
+                    config?.params?.ember_chat_id === "chat-2"
                       ? other
                       : { ...historyResponse.data, proposed_workflow: null },
                 },
@@ -2200,7 +2197,7 @@ describe("EmberChat — g2 review gate", () => {
         ).toBeNull();
         if (outcome === "cleared unchanged") {
           expect(historyGet.mock.calls.map(([path]) => path)).toEqual([
-            "/workflow/copilot/chat-history",
+            "/ember/chat-history",
             "/workflows/wpid_1",
           ]);
           expect(apply).toHaveBeenCalledWith(
@@ -2217,7 +2214,7 @@ describe("EmberChat — g2 review gate", () => {
           ].includes(outcome)
         ) {
           expect(historyGet.mock.calls.map(([path]) => path)).toEqual([
-            "/workflow/copilot/chat-history",
+            "/ember/chat-history",
           ]);
           expect(apply).not.toHaveBeenCalled();
           expect(beginSaveTransaction(owner)).toBe(false);
@@ -2228,11 +2225,11 @@ describe("EmberChat — g2 review gate", () => {
         return;
       }
       expect(historyGet.mock.calls.map(([path]) => path)).toEqual([
-        "/workflow/copilot/chat-history",
+        "/ember/chat-history",
         "/workflows/wpid_1",
       ]);
       expect(historyGet.mock.calls[0]?.[1]?.params).toEqual({
-        workflow_copilot_chat_id: "chat-1",
+        ember_chat_id: "chat-1",
       });
       if (committed)
         expect(apply).toHaveBeenCalledWith(
@@ -2447,13 +2444,13 @@ describe("EmberChat — g2 review gate", () => {
         fireEvent.click(screen.getByRole("button", { name: "Reject" })),
       );
       expect(cancelPost).toHaveBeenCalledWith(
-        "/workflow/copilot/cancel",
+        "/ember/cancel",
         {
           cancel_token:
             kind === "credential"
               ? streamCalls[0]!.body.cancel_token
               : "original-cancel-token",
-          workflow_copilot_chat_id: "chat-1",
+          ember_chat_id: "chat-1",
           source: "stop_button",
         },
         expect.anything(),
@@ -2643,7 +2640,7 @@ describe("EmberChat — g2 review gate", () => {
       expect(streamCalls[0]!.signal?.aborted).toBe(true);
       if (lateResult !== "client")
         expect(cancelPost).toHaveBeenCalledWith(
-          "/workflow/copilot/cancel",
+          "/ember/cancel",
           expect.any(Object),
           expect.objectContaining({
             timeout: 15_000,
@@ -2930,7 +2927,7 @@ describe("EmberChat — g2 review gate", () => {
       ).toBe(mode === "unresolved chat");
       expect(
         cancelPost.mock.calls.some(
-          ([path]) => path === "/workflow/copilot/clear-proposed-workflow",
+          ([path]) => path === "/ember/clear-proposed-workflow",
         ),
       ).toBe(false);
     },
@@ -3131,7 +3128,7 @@ describe("EmberChat — g2 review gate", () => {
         await vi.advanceTimersByTimeAsync(0);
       });
       expect(historyGet).toHaveBeenCalledWith(
-        "/workflow/copilot/chat-history",
+        "/ember/chat-history",
         expect.objectContaining({
           params: expect.objectContaining({
             request_cancel_token: streamCalls[0]!.body.cancel_token,
@@ -3149,7 +3146,7 @@ describe("EmberChat — g2 review gate", () => {
         );
       else
         expect(cancelPost).toHaveBeenCalledWith(
-          "/workflow/copilot/cancel",
+          "/ember/cancel",
           expect.objectContaining({
             cancel_token: streamCalls[0]!.body.cancel_token,
           }),
@@ -3704,7 +3701,7 @@ describe("EmberChat — g2 review gate", () => {
     );
     let finishApply: (value: unknown) => void = () => {};
     cancelPost.mockImplementation((path: string) =>
-      path === "/workflow/copilot/apply-proposed-workflow"
+      path === "/ember/apply-proposed-workflow"
         ? new Promise((resolve) => (finishApply = resolve))
         : Promise.resolve({}),
     );
@@ -3928,7 +3925,7 @@ describe("EmberChat — g2 review gate", () => {
         historyResponse.data.request_turn_id = "turn-1";
         await act(async () => vi.advanceTimersByTimeAsync(2_000));
         expect(historyGet).toHaveBeenCalledWith(
-          "/workflow/copilot/chat-history",
+          "/ember/chat-history",
           expect.objectContaining({
             params: expect.objectContaining({
               request_cancel_token: streamCalls[0]!.body.cancel_token,
@@ -4157,7 +4154,7 @@ describe("EmberChat — g2 review gate", () => {
       await vi.advanceTimersByTimeAsync(0);
     });
     expect(cancelPost).toHaveBeenCalledWith(
-      "/workflow/copilot/cancel",
+      "/ember/cancel",
       expect.objectContaining({ source: "stop_button" }),
       expect.anything(),
     );
@@ -4196,7 +4193,7 @@ describe("EmberChat — g2 review gate", () => {
     historyGet.mockClear();
     await act(async () => vi.advanceTimersByTimeAsync(30_000));
     expect(historyGet.mock.calls.map(([path]) => path)).toEqual([
-      "/workflow/copilot/chat-history",
+      "/ember/chat-history",
       "/workflows/wpid_1",
     ]);
     expect(apply).toHaveBeenCalledExactlyOnceWith(
@@ -4281,7 +4278,7 @@ describe("EmberChat — g2 review gate", () => {
         historyGet.mockClear();
         await act(async () => vi.advanceTimersByTimeAsync(30_000));
         expect(historyGet.mock.calls.map(([path]) => path)).toEqual([
-          "/workflow/copilot/chat-history",
+          "/ember/chat-history",
           "/workflows/wpid_1",
         ]);
         expect(apply).toHaveBeenCalledExactlyOnceWith(
@@ -4308,7 +4305,7 @@ describe("EmberChat — g2 review gate", () => {
       });
       expect(Date.now()).toBe(retryTime);
       expect(historyGet.mock.calls.map(([path]) => path)).toEqual([
-        "/workflow/copilot/chat-history",
+        "/ember/chat-history",
         "/workflows/wpid_1",
       ]);
       expect(apply).toHaveBeenCalledExactlyOnceWith(
@@ -4406,7 +4403,7 @@ describe("EmberChat — g2 review gate", () => {
       expect(readSignal?.aborted).toBe(true);
       if (action === "Reject") {
         expect(cancelPost).toHaveBeenCalledExactlyOnceWith(
-          "/workflow/copilot/cancel",
+          "/ember/cancel",
           expect.objectContaining({ source: "stop_button" }),
           { timeout: 5_000 },
         );
@@ -4414,7 +4411,7 @@ describe("EmberChat — g2 review gate", () => {
       await act(async () => vi.advanceTimersByTimeAsync(0));
       expect(Date.now()).toBe(retryTime);
       expect(historyGet.mock.calls.map(([path]) => path)).toEqual([
-        "/workflow/copilot/chat-history",
+        "/ember/chat-history",
         "/workflows/wpid_1",
       ]);
       expect(apply).toHaveBeenCalledExactlyOnceWith(
@@ -4474,7 +4471,7 @@ describe("EmberChat — g2 review gate", () => {
     historyGet.mockClear();
     await act(async () => vi.advanceTimersByTimeAsync(2_000));
     expect(historyGet).toHaveBeenCalledWith(
-      "/workflow/copilot/chat-history",
+      "/ember/chat-history",
       expect.anything(),
     );
     expect(beginYamlCommit(createYamlCommitOwner("wpid_1"))).toBe(false);
@@ -4547,7 +4544,7 @@ describe("EmberChat — g2 review gate", () => {
     );
     await waitFor(() =>
       expect(cancelPost).toHaveBeenCalledWith(
-        "/workflow/copilot/apply-proposed-workflow",
+        "/ember/apply-proposed-workflow",
         expect.anything(),
         { timeout: 30_000, signal: expect.any(AbortSignal) },
       ),
@@ -4617,7 +4614,7 @@ describe("EmberChat — g2 review gate", () => {
         ];
         await act(async () => vi.advanceTimersByTimeAsync(2_000));
         expect(historyGet).toHaveBeenCalledWith(
-          "/workflow/copilot/chat-history",
+          "/ember/chat-history",
           expect.objectContaining({
             params: expect.objectContaining({
               request_cancel_token: streamCalls[0]!.body.cancel_token,
@@ -4790,7 +4787,7 @@ describe("EmberChat — g2 review gate", () => {
     );
     await waitFor(() =>
       expect(cancelPost).toHaveBeenCalledWith(
-        "/workflow/copilot/apply-proposed-workflow",
+        "/ember/apply-proposed-workflow",
         expect.anything(),
         { timeout: 30_000, signal: expect.any(AbortSignal) },
       ),
@@ -4939,7 +4936,7 @@ describe("EmberChat — g2 review gate", () => {
       await waitFor(() => expect(historyGet).toHaveBeenCalledTimes(1));
       expect(historyGet.mock.calls[0]?.[1]?.headers).toEqual(
         hadToken
-          ? { "X-Copilot-Credential-Recovery-Token": "original-capability" }
+          ? { "X-Ember-Credential-Recovery-Token": "original-capability" }
           : {},
       );
       if (tokenState === "created during request")
@@ -5120,7 +5117,7 @@ describe("EmberChat — g2 review gate", () => {
       fireEvent.click(screen.getByRole("button", { name: "Reject" })),
     );
     expect(cancelPost).toHaveBeenCalledWith(
-      "/workflow/copilot/clear-proposed-workflow",
+      "/ember/clear-proposed-workflow",
       expect.anything(),
     );
     const owner = createYamlCommitOwner("wpid_1");
@@ -5184,7 +5181,7 @@ describe("EmberChat — g2 review gate", () => {
 
     await waitFor(() => expect(historyGet).toHaveBeenCalled());
     expect(cancelPost).toHaveBeenCalledWith(
-      "/workflow/copilot/apply-proposed-workflow",
+      "/ember/apply-proposed-workflow",
       expect.objectContaining({ owner_turn_id: "turn-1", revision: 1 }),
       { timeout: 30_000, signal: expect.any(AbortSignal) },
     );
@@ -5293,7 +5290,7 @@ describe("EmberChat — g2 review gate", () => {
 
     expect(screen.queryByText("Accepted and saved to the workflow")).toBeNull();
     expect(cancelPost).not.toHaveBeenCalledWith(
-      "/workflow/copilot/clear-proposed-workflow",
+      "/ember/clear-proposed-workflow",
       expect.anything(),
     );
     expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
@@ -6563,7 +6560,7 @@ describe("EmberChat — g2 review gate", () => {
     });
     expect(
       cancelPost.mock.calls.find(
-        ([path]) => path === "/workflow/copilot/apply-proposed-workflow",
+        ([path]) => path === "/ember/apply-proposed-workflow",
       )?.[1],
     ).toMatchObject({ owner_turn_id: "turn-3", revision: 1 });
   }, 15_000);
@@ -6613,7 +6610,7 @@ describe("EmberChat — g2 review gate", () => {
     });
     const fallback = historyGet.getMockImplementation();
     historyGet.mockImplementation((path: string, ...rest: unknown[]) =>
-      path === "/workflow/copilot/chat-history"
+      path === "/ember/chat-history"
         ? new Promise(() => {})
         : fallback!(path, ...rest),
     );
@@ -8458,7 +8455,7 @@ describe("EmberChat — g2 review gate", () => {
       });
 
       expect(cancelPost).toHaveBeenCalledWith(
-        "/workflow/copilot/apply-proposed-workflow",
+        "/ember/apply-proposed-workflow",
         expect.objectContaining({ owner_turn_id: "turn-1", revision: 1 }),
         expect.anything(),
       );
@@ -8511,8 +8508,8 @@ describe("EmberChat — g2 review gate", () => {
       streamCalls[0]!.resolve();
     });
 
-    expect(historyGet).toHaveBeenCalledWith("/workflow/copilot/chat-history", {
-      params: { workflow_copilot_chat_id: "chat-1" },
+    expect(historyGet).toHaveBeenCalledWith("/ember/chat-history", {
+      params: { ember_chat_id: "chat-1" },
       timeout: 30_000,
       signal: expect.any(AbortSignal),
     });
@@ -8574,8 +8571,8 @@ describe("EmberChat — g2 review gate", () => {
     });
     await waitFor(() =>
       expect(cancelPost).toHaveBeenCalledWith(
-        "/workflow/copilot/apply-proposed-workflow",
-        expect.objectContaining({ workflow_copilot_chat_id: "chat-1" }),
+        "/ember/apply-proposed-workflow",
+        expect.objectContaining({ ember_chat_id: "chat-1" }),
         { timeout: 30_000, signal: expect.any(AbortSignal) },
       ),
     );
@@ -8606,10 +8603,9 @@ describe("EmberChat — g2 review gate", () => {
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: /Auto-accepting/ }));
     });
-    expect(cancelPost).toHaveBeenCalledWith(
-      "/workflow/copilot/disable-auto-accept",
-      { workflow_copilot_chat_id: "chat-1" },
-    );
+    expect(cancelPost).toHaveBeenCalledWith("/ember/disable-auto-accept", {
+      ember_chat_id: "chat-1",
+    });
     historyResponse.data.auto_accept = false;
 
     // The server committed the write and finished the turn before the browser saw the POST resolve.
@@ -8685,7 +8681,7 @@ describe("EmberChat — g2 review gate", () => {
       });
 
       expect(cancelPost).toHaveBeenLastCalledWith(
-        "/workflow/copilot/apply-proposed-workflow",
+        "/ember/apply-proposed-workflow",
         expect.objectContaining({ auto_accept: false }),
         { timeout: 30_000, signal: expect.any(AbortSignal) },
       );
@@ -8708,7 +8704,7 @@ describe("EmberChat — g2 review gate", () => {
     });
     const finishApplies: Array<(value: unknown) => void> = [];
     cancelPost.mockImplementation((path: string) => {
-      if (path === "/workflow/copilot/apply-proposed-workflow") {
+      if (path === "/ember/apply-proposed-workflow") {
         return new Promise((resolve) => {
           finishApplies.push((value) => {
             historyResponse.data.auto_accept = true;
@@ -8716,7 +8712,7 @@ describe("EmberChat — g2 review gate", () => {
           });
         });
       }
-      if (path === "/workflow/copilot/disable-auto-accept") {
+      if (path === "/ember/disable-auto-accept") {
         historyResponse.data.auto_accept = false;
       }
       return Promise.resolve({});
@@ -8741,23 +8737,17 @@ describe("EmberChat — g2 review gate", () => {
     expect(
       useWorkflowYamlEditorStore.getState().emberAcceptance,
     ).not.toBeNull();
-    expect(requestedPaths()).not.toContain(
-      "/workflow/copilot/disable-auto-accept",
-    );
+    expect(requestedPaths()).not.toContain("/ember/disable-auto-accept");
 
     await act(async () => {
       finishApplies[0]!({ data: proposedWorkflowPayload() });
     });
     await waitFor(() =>
-      expect(requestedPaths()).toContain(
-        "/workflow/copilot/disable-auto-accept",
-      ),
+      expect(requestedPaths()).toContain("/ember/disable-auto-accept"),
     );
     expect(
-      requestedPaths().lastIndexOf("/workflow/copilot/apply-proposed-workflow"),
-    ).toBeLessThan(
-      requestedPaths().indexOf("/workflow/copilot/disable-auto-accept"),
-    );
+      requestedPaths().lastIndexOf("/ember/apply-proposed-workflow"),
+    ).toBeLessThan(requestedPaths().indexOf("/ember/disable-auto-accept"));
     await waitFor(() =>
       expect(
         screen.queryByRole("button", { name: /Auto-accepting/ }),
@@ -8780,7 +8770,7 @@ describe("EmberChat — g2 review gate", () => {
     ).toBeTruthy();
     let finishTurnOff: (value: unknown) => void = () => {};
     cancelPost.mockImplementation((path: string) =>
-      path === "/workflow/copilot/disable-auto-accept"
+      path === "/ember/disable-auto-accept"
         ? new Promise((resolve) => (finishTurnOff = resolve))
         : Promise.resolve({}),
     );
@@ -8819,7 +8809,7 @@ describe("EmberChat — g2 review gate", () => {
     });
     // An apply that never answers: without a ceiling the chat's gate would stay without Accept.
     cancelPost.mockImplementation((path: string) =>
-      path === "/workflow/copilot/apply-proposed-workflow"
+      path === "/ember/apply-proposed-workflow"
         ? new Promise(() => {})
         : Promise.resolve({}),
     );
@@ -8845,7 +8835,7 @@ describe("EmberChat — g2 review gate", () => {
     ).toBeTruthy();
     // The disable never went out, so the chip still reports the row's state.
     expect(cancelPost.mock.calls.map(([path]) => path)).not.toContain(
-      "/workflow/copilot/disable-auto-accept",
+      "/ember/disable-auto-accept",
     );
     expect(screen.getByRole("button", { name: /Auto-accepting/ })).toBeTruthy();
     expect(toast).toHaveBeenCalledWith(
@@ -8863,7 +8853,7 @@ describe("EmberChat — g2 review gate", () => {
     });
     let finishApply: (value: unknown) => void = () => {};
     cancelPost.mockImplementation((path: string) =>
-      path === "/workflow/copilot/apply-proposed-workflow"
+      path === "/ember/apply-proposed-workflow"
         ? new Promise((resolve) => (finishApply = resolve))
         : Promise.resolve({}),
     );
@@ -8967,7 +8957,7 @@ describe("EmberChat — g2 review gate", () => {
     // Arm auto-accept the way a user does, not by seeding the row: an Always accept goes through
     // setAutoAcceptFromWrite and bumps the write counter, which a seeded history read never does.
     cancelPost.mockImplementation((path: string) =>
-      path === "/workflow/copilot/apply-proposed-workflow"
+      path === "/ember/apply-proposed-workflow"
         ? Promise.resolve({ data: proposedWorkflowPayload() })
         : Promise.resolve({}),
     );
@@ -8994,7 +8984,7 @@ describe("EmberChat — g2 review gate", () => {
 
     const heldDisables: Array<(value: unknown) => void> = [];
     cancelPost.mockImplementation((path: string) =>
-      path === "/workflow/copilot/disable-auto-accept"
+      path === "/ember/disable-auto-accept"
         ? new Promise((resolve) => heldDisables.push(resolve))
         : Promise.resolve({}),
     );
@@ -9039,7 +9029,7 @@ describe("EmberChat — g2 review gate", () => {
       streamCalls[0]!.resolve();
     });
     cancelPost.mockImplementation((path: string) =>
-      path === "/workflow/copilot/apply-proposed-workflow"
+      path === "/ember/apply-proposed-workflow"
         ? Promise.resolve({ data: proposedWorkflowPayload() })
         : Promise.resolve({}),
     );
@@ -9061,7 +9051,7 @@ describe("EmberChat — g2 review gate", () => {
 
     let failTurnOff: (reason: unknown) => void = () => {};
     cancelPost.mockImplementation((path: string) =>
-      path === "/workflow/copilot/disable-auto-accept"
+      path === "/ember/disable-auto-accept"
         ? new Promise((_resolve, reject) => (failTurnOff = reject))
         : Promise.resolve({}),
     );
@@ -9103,7 +9093,7 @@ describe("EmberChat — g2 review gate", () => {
     });
     let finishRowWrite: (value: unknown) => void = () => {};
     cancelPost.mockImplementation((path: string) => {
-      if (path === "/workflow/copilot/apply-proposed-workflow") {
+      if (path === "/ember/apply-proposed-workflow") {
         return new Promise((resolve) => (finishRowWrite = resolve));
       }
       return Promise.resolve({});
@@ -9118,7 +9108,7 @@ describe("EmberChat — g2 review gate", () => {
       fireEvent.click(screen.getByRole("button", { name: /Auto-accepting/ }));
     });
     expect(cancelPost.mock.calls.map(([path]) => path)).not.toContain(
-      "/workflow/copilot/disable-auto-accept",
+      "/ember/disable-auto-accept",
     );
 
     await act(async () => {
@@ -9128,7 +9118,7 @@ describe("EmberChat — g2 review gate", () => {
     });
     await waitFor(() =>
       expect(cancelPost.mock.calls.map(([path]) => path)).toContain(
-        "/workflow/copilot/disable-auto-accept",
+        "/ember/disable-auto-accept",
       ),
     );
     await waitFor(() =>
@@ -9483,18 +9473,18 @@ describe("EmberChat — g2 review gate", () => {
       (
         _path: string,
         body: {
-          workflow_copilot_chat_id: string;
+          ember_chat_id: string;
           owner_turn_id?: string | null;
           revision?: number | null;
         },
       ) => {
-        if (body.workflow_copilot_chat_id === "chat-1") {
+        if (body.ember_chat_id === "chat-1") {
           return Promise.reject({ response: { status: 404 } });
         }
         // The backend infers legacy proposal tokens from the named row, which is
         // exactly why a tokenless retry against chat-2 would clear this proposal.
         if (body.owner_turn_id === null && body.revision === null) {
-          persistedProposals.set(body.workflow_copilot_chat_id, null);
+          persistedProposals.set(body.ember_chat_id, null);
           return Promise.resolve({ data: {} });
         }
         return Promise.reject({ response: { status: 409 } });
@@ -9542,8 +9532,8 @@ describe("EmberChat — g2 review gate", () => {
 
     await waitFor(() =>
       expect(cancelPost).toHaveBeenCalledWith(
-        "/workflow/copilot/clear-proposed-workflow",
-        expect.objectContaining({ workflow_copilot_chat_id: "chat-1" }),
+        "/ember/clear-proposed-workflow",
+        expect.objectContaining({ ember_chat_id: "chat-1" }),
       ),
     );
     expect(
@@ -10362,9 +10352,9 @@ describe("EmberChat — g2 review gate", () => {
     expect(await screen.findByText("Confirming…")).toBeTruthy();
     await waitFor(() =>
       expect(historyGet).toHaveBeenCalledWith(
-        "/workflow/copilot/chat-history",
+        "/ember/chat-history",
         expect.objectContaining({
-          params: { workflow_copilot_chat_id: "chat-1" },
+          params: { ember_chat_id: "chat-1" },
         }),
       ),
     );
@@ -10405,15 +10395,15 @@ describe("EmberChat — g2 review gate", () => {
       releaseLatest();
     });
     expect(cancelPost).not.toHaveBeenCalledWith(
-      "/workflow/copilot/clear-proposed-workflow",
+      "/ember/clear-proposed-workflow",
       expect.anything(),
     );
 
     await submit("start over");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
     expect(
-      (streamCalls[1]!.body as { workflow_copilot_chat_id?: string | null })
-        .workflow_copilot_chat_id ?? null,
+      (streamCalls[1]!.body as { ember_chat_id?: string | null })
+        .ember_chat_id ?? null,
     ).toBeNull();
   });
 
@@ -10834,7 +10824,7 @@ describe("EmberChat — g2 review gate", () => {
 
     let releaseHistory!: (value: unknown) => void;
     const hangTheChatRead = (path: string) =>
-      path === "/workflow/copilot/chat-history"
+      path === "/ember/chat-history"
         ? new Promise((resolve) => {
             releaseHistory = resolve;
           })
@@ -11217,7 +11207,7 @@ describe("EmberChat — g2 review gate", () => {
     );
     await waitFor(() =>
       expect(cancelPost).toHaveBeenCalledWith(
-        "/workflow/copilot/apply-proposed-workflow",
+        "/ember/apply-proposed-workflow",
         expect.anything(),
         expect.objectContaining({ signal: expect.any(AbortSignal) }),
       ),
@@ -11470,10 +11460,10 @@ describe("EmberChat — g2 review gate", () => {
       ).not.toBeNull();
       expect(recovery.rollback?.snapshot).toEqual(snapshot);
       expect(cancelPost).toHaveBeenCalledWith(
-        "/workflow/copilot/cancel",
+        "/ember/cancel",
         {
           cancel_token: recovery.poll!.requestId,
-          workflow_copilot_chat_id: "chat-1",
+          ember_chat_id: "chat-1",
           source: "stop_button",
         },
         { timeout: 5_000 },
@@ -11713,9 +11703,9 @@ describe("EmberChat — g2 review gate", () => {
         ];
         await advance(2_000);
         expect(historyGet).toHaveBeenCalledWith(
-          "/workflow/copilot/chat-history",
+          "/ember/chat-history",
           expect.objectContaining({
-            params: { workflow_copilot_chat_id: "chat-1" },
+            params: { ember_chat_id: "chat-1" },
           }),
         );
         expect(apply).not.toHaveBeenCalled();
@@ -11728,7 +11718,7 @@ describe("EmberChat — g2 review gate", () => {
         finishOnServer(saved);
         await advance(5_000);
         expect(historyGet.mock.calls.map(([path]) => path)).toEqual([
-          "/workflow/copilot/chat-history",
+          "/ember/chat-history",
           "/workflows/wpid_1",
         ]);
         if (interruption === "navigation") await discardRecoveryDraft();
@@ -11800,14 +11790,11 @@ describe("EmberChat — g2 review gate", () => {
           ],
         };
         historyGet.mockImplementation(
-          (
-            path: string,
-            config?: { params?: { workflow_copilot_chat_id?: string } },
-          ) =>
+          (path: string, config?: { params?: { ember_chat_id?: string } }) =>
             Promise.resolve(
               path === "/workflows/wpid_1"
                 ? { data: saved.current }
-                : config?.params?.workflow_copilot_chat_id === "chat-other"
+                : config?.params?.ember_chat_id === "chat-other"
                   ? { data: selectedHistory }
                   : historyResponse,
             ),
@@ -12311,7 +12298,7 @@ describe("EmberChat — g2 review gate", () => {
         }
         await advance(2_000);
         expect(historyGet).toHaveBeenCalledWith(
-          "/workflow/copilot/chat-history",
+          "/ember/chat-history",
           expect.objectContaining({
             params: expect.objectContaining({
               request_cancel_token: streamCalls[0]!.body.cancel_token,
@@ -12346,7 +12333,7 @@ describe("EmberChat — g2 review gate", () => {
       historyGet.mockClear();
       await advance(2_000);
       expect(historyGet).toHaveBeenCalledWith(
-        "/workflow/copilot/chat-history",
+        "/ember/chat-history",
         expect.objectContaining({
           params: expect.objectContaining({
             request_cancel_token: streamCalls[0]!.body.cancel_token,
@@ -12470,7 +12457,7 @@ describe("EmberChat — g2 review gate", () => {
       finishTurnHistory();
       await act(async () => vi.advanceTimersByTimeAsync(2_000));
       expect(historyGet).toHaveBeenCalledWith(
-        "/workflow/copilot/chat-history",
+        "/ember/chat-history",
         expect.objectContaining({
           params: expect.objectContaining({
             request_cancel_token: streamCalls[0]!.body.cancel_token,
@@ -12642,7 +12629,7 @@ describe("EmberChat — g2 review gate", () => {
       await act(async () => vi.advanceTimersByTimeAsync(0));
       if (action === "Reject")
         expect(cancelPost).toHaveBeenCalledWith(
-          "/workflow/copilot/cancel",
+          "/ember/cancel",
           expect.anything(),
           { timeout: 5_000 },
         );
@@ -12801,10 +12788,10 @@ describe("EmberChat — g2 review gate", () => {
           fireEvent.click(screen.getByRole("button", { name: "Reject" })),
         );
         expect(cancelPost).toHaveBeenCalledWith(
-          "/workflow/copilot/cancel",
+          "/ember/cancel",
           {
             cancel_token: streamCalls[0]!.body.cancel_token,
-            workflow_copilot_chat_id: "chat-1",
+            ember_chat_id: "chat-1",
             source: "stop_button",
           },
           { timeout: 5_000 },
@@ -12831,7 +12818,7 @@ describe("EmberChat — g2 review gate", () => {
     });
     let finishRowWrite: (value: unknown) => void = () => {};
     cancelPost.mockImplementation((path: string) => {
-      if (path === "/workflow/copilot/apply-proposed-workflow") {
+      if (path === "/ember/apply-proposed-workflow") {
         return new Promise((resolve) => (finishRowWrite = resolve));
       }
       return Promise.resolve({});
@@ -12846,7 +12833,7 @@ describe("EmberChat — g2 review gate", () => {
       fireEvent.click(screen.getByRole("button", { name: /Auto-accepting/ }));
     });
     expect(cancelPost.mock.calls.map(([path]) => path)).not.toContain(
-      "/workflow/copilot/disable-auto-accept",
+      "/ember/disable-auto-accept",
     );
 
     await act(async () => {
@@ -12854,7 +12841,7 @@ describe("EmberChat — g2 review gate", () => {
     });
     await waitFor(() =>
       expect(cancelPost.mock.calls.map(([path]) => path)).toContain(
-        "/workflow/copilot/disable-auto-accept",
+        "/ember/disable-auto-accept",
       ),
     );
     await waitFor(() =>
@@ -12929,7 +12916,7 @@ describe("EmberChat — g2 review gate", () => {
     );
     await waitFor(() =>
       expect(cancelPost).toHaveBeenCalledWith(
-        "/workflow/copilot/apply-proposed-workflow",
+        "/ember/apply-proposed-workflow",
         expect.anything(),
         expect.objectContaining({ signal: expect.any(AbortSignal) }),
       ),
@@ -13062,7 +13049,7 @@ describe("EmberChat — g2 review gate", () => {
         ];
         await act(async () => vi.advanceTimersByTimeAsync(2_000));
         expect(historyGet).toHaveBeenCalledWith(
-          "/workflow/copilot/chat-history",
+          "/ember/chat-history",
           expect.objectContaining({
             params: expect.objectContaining({
               request_cancel_token: streamCalls[0]!.body.cancel_token,
@@ -13171,7 +13158,7 @@ describe("EmberChat — g2 review gate", () => {
     });
     expect(apply).not.toHaveBeenCalled();
     expect(cancelPost).toHaveBeenCalledWith(
-      "/workflow/copilot/cancel",
+      "/ember/cancel",
       expect.objectContaining({ source: "stop_button" }),
       expect.anything(),
     );
@@ -13218,7 +13205,7 @@ describe("EmberChat — g2 review gate", () => {
     historyGet.mockClear();
     await act(async () => vi.advanceTimersByTimeAsync(2_000));
     expect(historyGet.mock.calls.map(([path]) => path)).toEqual([
-      "/workflow/copilot/chat-history",
+      "/ember/chat-history",
       "/workflows/wpid_1",
     ]);
     expect(apply).toHaveBeenCalledExactlyOnceWith(
@@ -13352,10 +13339,10 @@ describe("EmberChat — g2 review gate", () => {
         fireEvent.click(screen.getByRole("button", { name: "Reject" })),
       );
       expect(cancelPost).toHaveBeenCalledWith(
-        "/workflow/copilot/cancel",
+        "/ember/cancel",
         {
           cancel_token: cancellationToken,
-          workflow_copilot_chat_id: "chat-1",
+          ember_chat_id: "chat-1",
           source: "stop_button",
         },
         expect.anything(),
@@ -13493,7 +13480,7 @@ describe("A46 Accept recovery", () => {
     });
     expect(
       cancelPost.mock.calls.filter(
-        ([path]) => path === "/workflow/copilot/apply-proposed-workflow",
+        ([path]) => path === "/ember/apply-proposed-workflow",
       ),
     ).toHaveLength(2);
     expect(beginSaveTransaction(owner)).toBe(false);
@@ -13525,8 +13512,8 @@ describe("A46 Accept recovery", () => {
     const accept = await screen.findByRole("button", { name: "Accept" });
     await act(async () => fireEvent.click(accept));
     expect(cancelPost).toHaveBeenCalledWith(
-      "/workflow/copilot/apply-proposed-workflow",
-      expect.objectContaining({ workflow_copilot_chat_id: "chat-ember" }),
+      "/ember/apply-proposed-workflow",
+      expect.objectContaining({ ember_chat_id: "chat-ember" }),
       expect.anything(),
     );
   });
@@ -13538,7 +13525,7 @@ describe("A46 Accept recovery", () => {
     cancelPost.mockRejectedValueOnce(new Error("lost response"));
     await act(async () => fireEvent.click(accept));
     expect(
-      JSON.parse(sessionStorage.getItem("copilot-pending-accept:wpid_1")!),
+      JSON.parse(sessionStorage.getItem("ember-pending-accept:wpid_1")!),
     ).toMatchObject({
       chatId: "chat-1",
       acceptAttempt: { owner_turn_id: "turn-pending", revision: 1 },
@@ -13552,12 +13539,9 @@ describe("A46 Accept recovery", () => {
     const original = structuredClone(historyResponse);
     historyGet.mockClear();
     historyGet.mockImplementation(
-      (
-        _path: string,
-        config?: { params?: { workflow_copilot_chat_id?: string } },
-      ) =>
+      (_path: string, config?: { params?: { ember_chat_id?: string } }) =>
         Promise.resolve(
-          config?.params?.workflow_copilot_chat_id === "chat-1"
+          config?.params?.ember_chat_id === "chat-1"
             ? original
             : {
                 data: {
@@ -13572,9 +13556,7 @@ describe("A46 Accept recovery", () => {
     );
     await renderChat();
     await act(async () => {});
-    expect(historyGet.mock.calls[0]?.[1]?.params.workflow_copilot_chat_id).toBe(
-      "chat-1",
-    );
+    expect(historyGet.mock.calls[0]?.[1]?.params.ember_chat_id).toBe("chat-1");
     expect(
       useWorkflowYamlEditorStore.getState().emberAcceptance,
     ).not.toBeNull();
@@ -13635,7 +13617,7 @@ describe("A46 Accept recovery", () => {
       }
       expect(
         cancelPost.mock.calls.find(
-          ([path]) => path === "/workflow/copilot/apply-proposed-workflow",
+          ([path]) => path === "/ember/apply-proposed-workflow",
         )?.[1],
       ).toMatchObject({ owner_turn_id: "turn-tokenless" });
     },
@@ -13680,14 +13662,11 @@ describe("A46 Accept recovery", () => {
     let acceptingHistoryReads = 0;
     historyGet.mockClear();
     historyGet.mockImplementation(
-      (
-        path: string,
-        config?: { params?: { workflow_copilot_chat_id?: string } },
-      ) =>
+      (path: string, config?: { params?: { ember_chat_id?: string } }) =>
         Promise.resolve(
           path === "/workflows/wpid_1"
             ? { data: saveData.workflow }
-            : config?.params?.workflow_copilot_chat_id === "chat-1"
+            : config?.params?.ember_chat_id === "chat-1"
               ? ++acceptingHistoryReads === 1
                 ? claimedHistory
                 : acceptedHistory
@@ -13877,7 +13856,7 @@ describe("A46 Accept recovery", () => {
     );
     expect(
       cancelPost.mock.calls.filter(
-        ([path]) => path === "/workflow/copilot/disable-auto-accept",
+        ([path]) => path === "/ember/disable-auto-accept",
       ),
     ).toHaveLength(0);
     expect(
@@ -13902,7 +13881,7 @@ describe("A46 Accept recovery", () => {
     );
     expect(
       cancelPost.mock.calls.filter(
-        ([path]) => path === "/workflow/copilot/disable-auto-accept",
+        ([path]) => path === "/ember/disable-auto-accept",
       ),
     ).toHaveLength(0);
     expect(toast).toHaveBeenCalledWith(
@@ -13920,7 +13899,7 @@ describe("A46 Accept recovery", () => {
     );
     expect(
       cancelPost.mock.calls.filter(
-        ([path]) => path === "/workflow/copilot/disable-auto-accept",
+        ([path]) => path === "/ember/disable-auto-accept",
       ),
     ).toHaveLength(0);
     historyResponse.data.proposed_workflow = null;
@@ -13947,7 +13926,7 @@ describe("A46 Accept recovery", () => {
     );
     expect(
       cancelPost.mock.calls.filter(
-        ([path]) => path === "/workflow/copilot/disable-auto-accept",
+        ([path]) => path === "/ember/disable-auto-accept",
       ),
     ).toHaveLength(1);
   });
@@ -14095,7 +14074,7 @@ describe("A46 Accept recovery", () => {
     expect(
       useWorkflowYamlEditorStore.getState().pendingAccepts["wpid_1"],
     ).toBeUndefined();
-    expect(sessionStorage.getItem("copilot-pending-accept:wpid_1")).toBeNull();
+    expect(sessionStorage.getItem("ember-pending-accept:wpid_1")).toBeNull();
   });
 
   it("A49 presents a definitive rejection to the remounted editor", async () => {
@@ -14140,7 +14119,7 @@ describe("A46 Accept recovery", () => {
     expect(
       useWorkflowYamlEditorStore.getState().pendingAccepts["wpid_1"],
     ).toBeUndefined();
-    expect(sessionStorage.getItem("copilot-pending-accept:wpid_1")).toBeNull();
+    expect(sessionStorage.getItem("ember-pending-accept:wpid_1")).toBeNull();
   });
 
   it.each([
@@ -14175,7 +14154,7 @@ describe("A46 Accept recovery", () => {
         useWorkflowYamlEditorStore.getState().emberAcceptance === null,
       ).toBe(releases);
       expect(
-        sessionStorage.getItem("copilot-pending-accept:wpid_1") === null,
+        sessionStorage.getItem("ember-pending-accept:wpid_1") === null,
       ).toBe(releases);
       if (releases) {
         if (
@@ -14194,7 +14173,7 @@ describe("A46 Accept recovery", () => {
         );
         expect(
           cancelPost.mock.calls.some(
-            ([path]) => path === "/workflow/copilot/clear-proposed-workflow",
+            ([path]) => path === "/ember/clear-proposed-workflow",
           ),
         ).toBe(true);
         expect(beginSaveTransaction(owner)).toBe(true);
@@ -14548,7 +14527,7 @@ it("never adopts a later proposal into a stored Accept that outlived its own Acc
 
   expect(
     cancelPost.mock.calls.filter(
-      ([path]) => path === "/workflow/copilot/apply-proposed-workflow",
+      ([path]) => path === "/ember/apply-proposed-workflow",
     ),
   ).toHaveLength(1);
 });
@@ -14581,7 +14560,7 @@ it("never sends an Accept from the recovery banner after another chat's refused 
   await act(async () => vi.advanceTimersByTimeAsync(30_000));
 
   expect(cancelPost.mock.calls.map(([path]) => path)).not.toContain(
-    "/workflow/copilot/apply-proposed-workflow",
+    "/ember/apply-proposed-workflow",
   );
   expect(useWorkflowYamlEditorStore.getState().emberAcceptance).toBeNull();
 });
@@ -15048,7 +15027,7 @@ describe("editor-state rollback lifecycle", () => {
           data:
             path === "/workflows/wpid_1"
               ? canonical
-              : path.includes("copilot")
+              : path.includes("/ember/")
                 ? historyResponse.data
                 : [],
         }),
@@ -15474,10 +15453,10 @@ describe("editor-state rollback lifecycle", () => {
             fireEvent.click(screen.getByRole("button", { name: "Reject" })),
           );
           expect(cancelPost).toHaveBeenCalledWith(
-            "/workflow/copilot/cancel",
+            "/ember/cancel",
             {
               cancel_token: call.body.cancel_token,
-              workflow_copilot_chat_id: "chat-1",
+              ember_chat_id: "chat-1",
               source: "stop_button",
             },
             { timeout: 5_000 },
@@ -15568,7 +15547,7 @@ describe("editor-state rollback lifecycle", () => {
           await act(async () => vi.advanceTimersByTimeAsync(15_000));
         }
         expect(cancelPost).toHaveBeenCalledWith(
-          "/workflow/copilot/cancel",
+          "/ember/cancel",
           expect.anything(),
           expect.objectContaining({
             timeout: 15_000,

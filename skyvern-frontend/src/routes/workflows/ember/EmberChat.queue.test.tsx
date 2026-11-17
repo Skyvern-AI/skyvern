@@ -932,7 +932,7 @@ describe("EmberChat — keep the chat live during a turn", () => {
 
     await waitFor(() => expect(cancelPost).toHaveBeenCalledTimes(1));
     expect(cancelPost).toHaveBeenCalledWith(
-      "/workflow/copilot/chat-audio",
+      "/ember/chat-audio",
       expect.any(FormData),
       expect.any(Object),
     );
@@ -1375,7 +1375,7 @@ describe("EmberChat — keep the chat live during a turn", () => {
     await submit("dictated prompt");
     await waitFor(() =>
       expect(cancelPost).toHaveBeenCalledWith(
-        "/workflow/copilot/chat-audio",
+        "/ember/chat-audio",
         expect.any(FormData),
         expect.any(Object),
       ),
@@ -1415,7 +1415,7 @@ describe("EmberChat — keep the chat live during a turn", () => {
     await submit("dictated prompt");
     await waitFor(() =>
       expect(cancelPost).toHaveBeenCalledWith(
-        "/workflow/copilot/chat-audio",
+        "/ember/chat-audio",
         expect.any(FormData),
         expect.any(Object),
       ),
@@ -1796,7 +1796,7 @@ describe("EmberChat — keep the chat live during a turn", () => {
     await submit("parse my sheet");
     await waitFor(() =>
       expect(cancelPost).toHaveBeenCalledWith(
-        "/workflow/copilot/chat-audio",
+        "/ember/chat-audio",
         expect.any(FormData),
         expect.any(Object),
       ),
@@ -1839,7 +1839,7 @@ describe("EmberChat — keep the chat live during a turn", () => {
     await submit("parse my sheet");
     await waitFor(() =>
       expect(cancelPost).toHaveBeenCalledWith(
-        "/workflow/copilot/chat-audio",
+        "/ember/chat-audio",
         expect.any(FormData),
         expect.any(Object),
       ),
@@ -1909,7 +1909,7 @@ describe("EmberChat — keep the chat live during a turn", () => {
     await submit("first message");
     await waitFor(() =>
       expect(cancelPost).toHaveBeenCalledWith(
-        "/workflow/copilot/chat-audio",
+        "/ember/chat-audio",
         expect.any(FormData),
         expect.any(Object),
       ),
@@ -1940,9 +1940,7 @@ describe("EmberChat — keep the chat live during a turn", () => {
 
     await waitFor(() =>
       expect(
-        cancelPost.mock.calls.filter(
-          ([path]) => path === "/workflow/copilot/chat-audio",
-        ),
+        cancelPost.mock.calls.filter(([path]) => path === "/ember/chat-audio"),
       ).toHaveLength(2),
     );
 
@@ -2477,7 +2475,7 @@ describe("EmberChat — keep the chat live during a turn", () => {
     });
 
     expect(cancelPost).not.toHaveBeenCalledWith(
-      "/workflow/copilot/cancel",
+      "/ember/cancel",
       expect.anything(),
       expect.objectContaining({
         timeout: 15_000,
@@ -2503,7 +2501,7 @@ describe("EmberChat — keep the chat live during a turn", () => {
     });
 
     expect(cancelPost).toHaveBeenCalledWith(
-      "/workflow/copilot/cancel",
+      "/ember/cancel",
       expect.objectContaining({
         cancel_token: expect.any(String),
         source: "escape_key",
@@ -2583,7 +2581,7 @@ describe("EmberChat — keep the chat live during a turn", () => {
       });
 
       expect(cancelPost).not.toHaveBeenCalledWith(
-        "/workflow/copilot/cancel",
+        "/ember/cancel",
         expect.anything(),
         expect.anything(),
       );
@@ -2655,9 +2653,9 @@ describe("EmberChat — keep the chat live during a turn", () => {
     });
 
     expect(useEmberActionStore.getState().stopBlockedReason).toBeTruthy();
-    expect(
-      cancelPost.mock.calls.some(([url]) => url === "/workflow/copilot/cancel"),
-    ).toBe(false);
+    expect(cancelPost.mock.calls.some(([url]) => url === "/ember/cancel")).toBe(
+      false,
+    );
   });
 
   it("keeps Stop blocked after a deletion confirm whose response was lost and whose history reload failed", async () => {
@@ -2718,9 +2716,9 @@ describe("EmberChat — keep the chat live during a turn", () => {
     );
 
     expect(useEmberActionStore.getState().stopBlockedReason).toBeTruthy();
-    expect(
-      cancelPost.mock.calls.some(([url]) => url === "/workflow/copilot/cancel"),
-    ).toBe(false);
+    expect(cancelPost.mock.calls.some(([url]) => url === "/ember/cancel")).toBe(
+      false,
+    );
 
     // A fresh server copy showing the card still unclaimed means the confirm never landed, so Stop frees up.
     await act(async () => {
@@ -2804,8 +2802,7 @@ describe("EmberChat — keep the chat live during a turn", () => {
       let refreshStarted = false;
       let releaseRefresh: () => void = () => {};
       get.mockImplementation((path: string, config?: AxiosRequestConfig) => {
-        if (path !== "/workflow/copilot/chat-history")
-          return original!(path, config);
+        if (path !== "/ember/chat-history") return original!(path, config);
         if (
           (config?.params as { workflow_permanent_id?: string } | undefined)
             ?.workflow_permanent_id
@@ -2866,7 +2863,7 @@ describe("EmberChat — keep the chat live during a turn", () => {
       fireEvent.click(pending);
     });
     expect(cancelPost).not.toHaveBeenCalledWith(
-      "/workflow/copilot/cancel",
+      "/ember/cancel",
       expect.anything(),
       expect.objectContaining({
         timeout: 15_000,
@@ -2882,7 +2879,7 @@ describe("EmberChat — keep the chat live during a turn", () => {
     });
 
     expect(cancelPost).toHaveBeenCalledWith(
-      "/workflow/copilot/cancel",
+      "/ember/cancel",
       expect.objectContaining({
         cancel_token: expect.any(String),
         source: "stop_button",
@@ -2907,7 +2904,7 @@ describe("EmberChat — keep the chat live during a turn", () => {
         fireEvent.click(screen.getByRole("button", { name: "Starting…" }));
       });
       expect(cancelPost).not.toHaveBeenCalledWith(
-        "/workflow/copilot/cancel",
+        "/ember/cancel",
         expect.anything(),
         expect.objectContaining({
           timeout: 15_000,
@@ -2923,7 +2920,7 @@ describe("EmberChat — keep the chat live during a turn", () => {
         fireEvent.click(screen.getByRole("button", { name: "Stop" }));
       });
       expect(cancelPost).toHaveBeenCalledWith(
-        "/workflow/copilot/cancel",
+        "/ember/cancel",
         expect.objectContaining({ source: "stop_button" }),
         expect.objectContaining({
           timeout: 15_000,
@@ -2960,7 +2957,7 @@ describe("EmberChat — keep the chat live during a turn", () => {
         fireEvent.click(screen.getByRole("button", { name: "Starting…" }));
       });
       expect(cancelPost).not.toHaveBeenCalledWith(
-        "/workflow/copilot/cancel",
+        "/ember/cancel",
         expect.anything(),
         expect.objectContaining({
           timeout: 15_000,
@@ -2973,7 +2970,7 @@ describe("EmberChat — keep the chat live during a turn", () => {
         fireEvent.click(screen.getByRole("button", { name: "Stop" }));
       });
       expect(cancelPost).toHaveBeenCalledWith(
-        "/workflow/copilot/cancel",
+        "/ember/cancel",
         expect.anything(),
         expect.objectContaining({
           timeout: 15_000,
@@ -3135,7 +3132,7 @@ describe("EmberChat — keep the chat live during a turn", () => {
     });
     expect(useEmberActionStore.getState().generatingBlockLabel).toBeNull();
     expect(cancelPost).not.toHaveBeenCalledWith(
-      "/workflow/copilot/cancel",
+      "/ember/cancel",
       expect.anything(),
       expect.objectContaining({
         timeout: 15_000,
@@ -3513,8 +3510,8 @@ describe("EmberChat — keep the chat live during a turn", () => {
       expect(screen.queryByRole("button", { name: "Accept" })).toBeNull(),
     );
     expect(cancelPost).toHaveBeenCalledWith(
-      "/workflow/copilot/apply-proposed-workflow",
-      expect.objectContaining({ workflow_copilot_chat_id: "chat-1" }),
+      "/ember/apply-proposed-workflow",
+      expect.objectContaining({ ember_chat_id: "chat-1" }),
       { timeout: 30_000, signal: expect.any(AbortSignal) },
     );
     expect(screen.getByText("Applied changes")).toBeTruthy();
@@ -4263,7 +4260,7 @@ describe("EmberChat — delivered output files", () => {
 describe("EmberChat — send now delivers a queued message into the running turn", () => {
   const steerPosts = () =>
     cancelPost.mock.calls.filter(
-      ([path]) => (path as string) === "/workflow/copilot/steer",
+      ([path]) => (path as string) === "/ember/steer",
     ) as unknown as [string, Record<string, string>][];
 
   async function queueDuringTurn(text: string) {
@@ -4290,7 +4287,7 @@ describe("EmberChat — send now delivers a queued message into the running turn
 
     const [, body] = steerPosts()[0]!;
     expect(body).toMatchObject({
-      workflow_copilot_chat_id: "chat-1",
+      ember_chat_id: "chat-1",
       cancel_token: (call.body as unknown as { cancel_token: string })
         .cancel_token,
       message: "also grab the page title",

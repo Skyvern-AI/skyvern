@@ -3,6 +3,8 @@ import {
   WorkflowDefinition,
 } from "@/routes/workflows/types/workflowTypes";
 
+export const EMBER_API_PREFIX = "/ember";
+
 // The API sends both chat-id keys while the rename window is open; an older API sends only the old key.
 export function emberChatIdOf<
   T extends {
@@ -247,7 +249,7 @@ export interface EmberChatRequest {
   selected_connected_account_id?: string | null;
   workflow_permanent_id: string;
   workflow_id: string;
-  workflow_copilot_chat_id?: string | null;
+  ember_chat_id?: string | null;
   workflow_run_id?: string | null;
   browser_session_id?: string | null;
   message: string;
@@ -290,7 +292,7 @@ export interface EmberCancelRequest {
 }
 
 export interface EmberSteerRequest {
-  workflow_copilot_chat_id: string;
+  ember_chat_id: string;
   cancel_token: string;
   steer_id: string;
   message: string;
@@ -327,8 +329,8 @@ export interface EmberMessageFeedback {
 }
 
 export interface EmberMessageFeedbackRequest {
-  workflow_copilot_chat_id: string;
-  workflow_copilot_chat_message_id?: string | null;
+  ember_chat_id: string;
+  ember_chat_message_id?: string | null;
   turn_id?: string | null;
   rating: EmberMessageFeedbackRating | null;
   reason?: string | null;
@@ -432,14 +434,14 @@ export interface EmberChatSummary {
 }
 
 export interface EmberClearProposedWorkflowRequest {
-  workflow_copilot_chat_id: string;
+  ember_chat_id: string;
   auto_accept: boolean;
   owner_turn_id?: string | null;
   revision?: number | null;
 }
 
 export interface EmberApplyProposedWorkflowRequest {
-  workflow_copilot_chat_id: string;
+  ember_chat_id: string;
   auto_accept: boolean;
   owner_turn_id?: string | null;
   revision?: number | null;

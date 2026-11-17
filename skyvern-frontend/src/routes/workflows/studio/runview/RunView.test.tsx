@@ -1116,7 +1116,7 @@ describe("RunView cold-open selection", () => {
     seedTerminalRunWithActions();
     const view = renderRunView(
       {},
-      "/?wr=wr_1&wrs=copilot",
+      "/?wr=wr_1&wrs=ember",
       false,
       <ReleaseEmberRunFocus />,
     );
@@ -1298,7 +1298,7 @@ describe("RunView live-watch terminal transition", () => {
 
   test("an Ember-focused watched run stays unselected when it finishes", () => {
     seedWatchedRun(Status.Running);
-    const view = renderRunView({}, "/?wr=wr_1&wrs=copilot");
+    const view = renderRunView({}, "/?wr=wr_1&wrs=ember");
 
     seedWatchedRun(Status.Completed);
     view.rerenderRunView();
@@ -1311,7 +1311,7 @@ describe("RunView live-watch terminal transition", () => {
 
   test("an explicit timeline pin still wins during Ember focus", () => {
     seedWatchedRun(Status.Running);
-    const view = renderRunView({}, "/?wr=wr_1&wrs=copilot");
+    const view = renderRunView({}, "/?wr=wr_1&wrs=ember");
 
     act(() => useRunViewStore.getState().pinFrame("act_1"));
 
@@ -1753,7 +1753,7 @@ describe("RunView failure presentation", () => {
 
   test("a failed Ember-focused run does not auto-pin its failing block", () => {
     seedFailedCodeRun();
-    const { getByTestId } = renderRunView({}, "/?wr=wr_1&wrs=copilot");
+    const { getByTestId } = renderRunView({}, "/?wr=wr_1&wrs=ember");
 
     expect(useRunViewStore.getState().pinnedFrameId).toBeNull();
     expect(getByTestId("location-search").textContent).not.toContain("active=");
@@ -1761,7 +1761,7 @@ describe("RunView failure presentation", () => {
 
   test("an Ember-focused latest failed run does not auto-pin its failing block", () => {
     seedFailedCodeRun();
-    const { getByTestId } = renderRunView({}, "/?wrs=copilot");
+    const { getByTestId } = renderRunView({}, "/?wrs=ember");
 
     expect(useRunViewStore.getState().pinnedFrameId).toBeNull();
     expect(getByTestId("location-search").textContent).not.toContain("active=");
@@ -2506,7 +2506,7 @@ describe("RunView output signals", () => {
     const corroboratingProse =
       "Copilot found 22.9k stars, matching the value visible in the source.";
     getSpy.mockImplementation((path: string) => {
-      if (path === "/workflow/copilot/chat-history") {
+      if (path === "/ember/chat-history") {
         return Promise.resolve({
           data: {
             workflow_copilot_chat_id: "chat_1",

@@ -1,7 +1,7 @@
-export type StudioPaneId = "copilot" | "editor" | "browser" | "overview";
+export type StudioPaneId = "ember" | "editor" | "browser" | "overview";
 
 export const SYSTEM_RUN_FOCUS_PARAM = "wrs";
-export const EMBER_RUN_FOCUS = "copilot";
+export const EMBER_RUN_FOCUS = "ember";
 // Both values mark an Ember-owned focus, whichever one a link was written with.
 const EMBER_RUN_FOCUS_MARKERS = new Set(["copilot", "ember"]);
 
@@ -15,7 +15,7 @@ export function emberBrowserFocusSessionId(
 }
 
 export const STUDIO_PANE_IDS: readonly StudioPaneId[] = [
-  "copilot",
+  "ember",
   "editor",
   "browser",
   "overview",
@@ -25,20 +25,19 @@ export const STUDIO_PANES_PARAM = "panes";
 export const STUDIO_CHAT_PARAM = "chat";
 
 // Accepted forever on parse so pre-rename ?panes= links keep working; the
-// canonical id is what serializes back out. "ember" is accepted before it
-// becomes the canonical id, so a tab on this bundle can open newer links.
+// canonical id is what serializes back out.
 const STUDIO_PANE_ID_ALIASES: Record<string, StudioPaneId> = {
   run: "overview",
   timeline: "overview",
-  ember: "copilot",
+  copilot: "ember",
 };
 
 export const CREATE_STUDIO_PANES: readonly StudioPaneId[] = [
-  "copilot",
+  "ember",
   "browser",
 ];
 export const DEFAULT_STUDIO_PANES: readonly StudioPaneId[] = [
-  "copilot",
+  "ember",
   "editor",
 ];
 
@@ -54,7 +53,7 @@ export const RUN_APPEND_PANES: readonly StudioPaneId[] = [
 // the ones that only watch a run. The top bar keys its authoring controls off
 // this, and it is also what a deleted agent blocks.
 export const WORKFLOW_AUTHORING_PANES: readonly StudioPaneId[] = [
-  "copilot",
+  "ember",
   "editor",
 ];
 
@@ -73,7 +72,7 @@ export function panesWithoutDeletedBlocked(
 // over-tight opens against these numbers (fitPanesToWidth below), and divider
 // resizes clamp against them too.
 export const STUDIO_PANE_MIN_WIDTH: Record<StudioPaneId, number> = {
-  copilot: 260,
+  ember: 260,
   editor: 260,
   browser: 300,
   overview: 260,
@@ -92,7 +91,7 @@ export const STUDIO_PANE_STRIP_WIDTH_PX = 36;
 const DOC_COLLAPSE_ORDER: readonly StudioPaneId[] = [
   "browser",
   "overview",
-  "copilot",
+  "ember",
 ];
 
 // Panes to collapse into strips so the Editor's Doc keeps STUDIO_DOC_MIN_WIDTH.
@@ -307,7 +306,7 @@ export function withPaneClosed(
   return panes.filter((p) => p !== id);
 }
 // Commas are legal unencoded in query values and parse back identically; keep
-// ?panes=copilot,browser readable no matter which writer serialized last.
+// ?panes=ember,browser readable no matter which writer serialized last.
 export function toReadableSearch(params: URLSearchParams): string {
   const raw = params.toString().replace(/%2C/g, ",");
   return raw ? `?${raw}` : "";
