@@ -33,6 +33,7 @@ from skyvern.exceptions import (
 )
 from skyvern.forge import app
 from skyvern.forge.async_operations import AsyncOperation
+from skyvern.forge.failure_classifier import classify_from_failure_reason
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.agents.skills import AvailableSkill
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
@@ -1193,6 +1194,29 @@ class AgentFunction:
 
     def resolve_download_failure(self, failure_key: str) -> None:
         return None
+
+    def classify_failure(
+        self,
+        failure_reason: str | None,
+        exception: Exception | None = None,
+        fallback_to_unknown: bool = False,
+        exception_name: str | None = None,
+        unsolved_captcha_exception: str | None = None,
+        *,
+        status: str | None = None,
+        block_type: str | None = None,
+    ) -> list[dict] | None:
+        """Failure categories for one failure (a task's, a block's, or a tool error), most likely first.
+
+        ``status`` and ``block_type`` describe where the failure happened; the default implementation is the rule
+        classifier and does not use them."""
+        return classify_from_failure_reason(
+            failure_reason,
+            exception=exception,
+            fallback_to_unknown=fallback_to_unknown,
+            exception_name=exception_name,
+            unsolved_captcha_exception=unsolved_captcha_exception,
+        )
 
     def should_log_request_bodies(self, organization_id: str) -> bool:
         return True
