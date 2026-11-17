@@ -171,6 +171,31 @@ async def test_scoped_group_dispatch_preserves_key_actor(
     child = await run_group_env.database.workflow_runs.get_workflow_run(child_id)
     assert child is not None and child.requested_by == scoped_api_key_actor_id(token_id)
 
+    principal = RequestPrincipal(
+        ORG,
+        AuthKind.member_api_key,
+        "user_member",
+        "org:member",
+        api_key_token_id="oat_member",
+        api_key_access_mode="member",
+    )
+    monkeypatch.setattr(workflow_run_groups_repository, "get_request_principal", lambda: principal)
+    group = await run_group_env.database.workflow_run_groups.create_group(
+        organization_id=ORG,
+        workflow_permanent_id=WPID,
+        requested_version=1,
+        workflow_id="wf_1",
+        submission_key="member-key-group",
+        input_fingerprint="fingerprint",
+        items=[("item", {})],
+    )
+    await group_service.advance_workflow_run_group(group.workflow_run_group_id)
+    item = (await run_group_env.database.workflow_run_groups.get_items(group.workflow_run_group_id))[0]
+    child = await run_group_env.database.workflow_runs.get_workflow_run(item.workflow_run_id)
+    assert child is not None
+    assert child.created_by == "user_member"
+    assert child.requested_by == "member_api_key:oat_member"
+
 
 def test_debug_fields_show_when_normalized_token_still_fails() -> None:
     raw_api_key = '"Bearer definitely-not-a-jwt"'
