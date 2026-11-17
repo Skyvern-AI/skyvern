@@ -5,6 +5,7 @@ import {
   CredentialFallbackTrigger,
   CredentialSelectionStrategy,
   EmailBodyFormat,
+  EmailOrganizeAction,
   EmailTransport,
   WorkflowBlockDocFields,
   WorkflowBlockType,
@@ -606,6 +607,8 @@ export type EmailInboxBlockYAML = BlockYAMLBase & {
   include_body: boolean;
   download_attachments: boolean;
   message_id?: string | null;
+  organize_action?: EmailOrganizeAction | null;
+  organize_label?: string | null;
   parameter_keys?: Array<string> | null;
 };
 

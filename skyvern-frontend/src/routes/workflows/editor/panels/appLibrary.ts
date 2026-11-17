@@ -15,12 +15,18 @@ export function appRows(
   isConnected: (entry: IntegrationCatalogEntryWithActions) => boolean,
 ): AppRow[] {
   const rows = (catalog ?? [])
-    // The integration action block cannot run on a Nango-only account yet, so those apps offer no actions.
-    .map((entry) =>
-      entry.credentialBackend === "nango" && !entry.oauthProvider
-        ? { ...entry, actions: [] }
-        : entry,
-    )
+    // The integration action block cannot run on a Nango account yet, so Nango-only apps and actions pinned to a
+    // Nango account are not offered.
+    .map((entry) => ({
+      ...entry,
+      actions:
+        entry.credentialBackend === "nango" && !entry.oauthProvider
+          ? []
+          : entry.actions?.filter(
+              (action) =>
+                action.inputs.properties?.credential_source?.const !== "nango",
+            ),
+    }))
     .filter(
       (entry) =>
         entry.status === "live" &&

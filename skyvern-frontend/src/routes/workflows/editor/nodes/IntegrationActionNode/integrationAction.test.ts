@@ -48,6 +48,12 @@ const catalog: IntegrationCatalogEntryWithActions[] = [
     actions: [
       sendEmail(["gmail.send"]),
       { id: "read_inbox", name: "Read inbox", description: "", inputs: {} },
+      {
+        id: "archive_email",
+        name: "Archive email",
+        description: "",
+        inputs: { properties: { credential_source: { const: "nango" } } },
+      },
     ],
     triggers: [{ id: "new_email", name: "New email" }],
   },
@@ -86,6 +92,11 @@ describe("integration action library and validation", () => {
       ),
     ).toEqual(["Gmail: Send email", "Outlook: Send email"]);
     expect(matchingAppActions(rows, "gmail inbox")).toHaveLength(1);
+    expect(rows[0]?.entry.actions?.map((action) => action.id)).toEqual([
+      "send_email",
+      "read_inbox",
+    ]);
+    expect(matchingAppActions(rows, "archive")).toEqual([]);
   });
 
   test("flags a missing account, missing required inputs and bad typed text", () => {

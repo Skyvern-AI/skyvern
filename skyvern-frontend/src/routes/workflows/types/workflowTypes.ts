@@ -762,6 +762,8 @@ export type WorkflowTriggerBlock = WorkflowBlockBase & {
   parameters: Array<WorkflowParameter>;
 };
 
+export type EmailOrganizeAction = "label" | "archive" | "move" | "mark_read";
+
 export type EmailInboxBlock = WorkflowBlockBase & {
   block_type: "email_inbox";
   email_client: "gmail" | "outlook";
@@ -777,6 +779,8 @@ export type EmailInboxBlock = WorkflowBlockBase & {
   include_body: boolean;
   download_attachments: boolean;
   message_id?: string | null;
+  organize_action?: EmailOrganizeAction | null;
+  organize_label?: string | null;
   parameters: Array<WorkflowParameter>;
 };
 
