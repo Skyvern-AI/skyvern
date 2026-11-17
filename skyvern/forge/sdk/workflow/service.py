@@ -280,6 +280,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     takes_default_engine,
     v3_ab_ineligibility_reason,
 )
+from skyvern.forge.sdk.workflow.models.integration_action_block import IntegrationActionBlock
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
     AzureVaultCredentialParameter,
@@ -371,6 +372,8 @@ from skyvern.forge.sdk.workflow.runtime_completion import (
 )
 from skyvern.forge.sdk.workflow.runtime_secret_bridge import publish_copilot_runtime_secret_values
 from skyvern.forge.sdk.workflow.secret_encryption import (
+    SENSITIVE_DESTINATION_FIELDS,
+    SENSITIVE_SEND_EMAIL_FIELDS,
     encrypt_workflow_definition_secrets,
     preserve_workflow_definition_secrets,
 )
@@ -1501,6 +1504,18 @@ def _agent_step_count(workflow_definition: WorkflowDefinition | None) -> int:
     return sum(block.block_type == BlockType.AGENT_STEP for block in get_all_blocks(workflow_definition.blocks))
 
 
+def _validate_integration_action_secret_inputs(workflow_definition: WorkflowDefinition) -> None:
+    # Secrets are encrypted only in their own block fields, so one passed as an action input would be stored in clear.
+    secret_fields = SENSITIVE_DESTINATION_FIELDS | SENSITIVE_SEND_EMAIL_FIELDS
+    for block in get_all_blocks(workflow_definition.blocks):
+        if isinstance(block, IntegrationActionBlock) and (held := sorted(secret_fields & set(block.inputs))):
+            raise SkyvernHTTPException(
+                f"{block.label}: an integration action input cannot hold {held[0]}; set it on the built-in block type instead.",
+                status_code=HTTPStatus.BAD_REQUEST,
+                error_code="integration_action_secret_input",
+            )
+
+
 async def _validate_agent_step_workflow_save(
     organization_id: str,
     workflow_definition: WorkflowDefinition,
@@ -1519,36 +1534,6 @@ async def _validate_agent_step_workflow_save(
         AGENT_STEP_NOT_ENABLED_MESSAGE,
         status_code=HTTPStatus.BAD_REQUEST,
         error_code="agent_step_not_enabled",
-    )
-
-
-INTEGRATION_ACTION_NOT_AVAILABLE_MESSAGE = (
-    "The integration_action block cannot be saved yet: the workflow editor cannot open it. Use the integration's own "
-    "block instead."
-)
-
-
-def _integration_action_count(workflow_definition: WorkflowDefinition | None) -> int:
-    if workflow_definition is None:
-        return 0
-    return sum(block.block_type == BlockType.INTEGRATION_ACTION for block in get_all_blocks(workflow_definition.blocks))
-
-
-async def _validate_integration_action_workflow_save(
-    workflow_definition: WorkflowDefinition,
-    prior_definition: Callable[[], Awaitable[WorkflowDefinition | None]] | None = None,
-) -> None:
-    """Refuse a save that adds integration_action blocks until the editor can open them. Counts against the replaced
-    version, like the agent step, so an existing workflow is never wedged."""
-    count = _integration_action_count(workflow_definition)
-    if not count:
-        return
-    if prior_definition is not None and count <= _integration_action_count(await prior_definition()):
-        return
-    raise SkyvernHTTPException(
-        INTEGRATION_ACTION_NOT_AVAILABLE_MESSAGE,
-        status_code=HTTPStatus.BAD_REQUEST,
-        error_code="integration_action_not_available",
     )
 
 
@@ -12378,6 +12363,7 @@ class WorkflowService:
             await self._validate_bitwarden_ownership_on_save(organization_id, workflow_definition.parameters)
             self._validate_code_block_templates(workflow_definition)
             self._validate_block_engines(workflow_definition)
+            _validate_integration_action_secret_inputs(workflow_definition)
             if encrypt_secrets:
                 await encrypt_workflow_definition_secrets(workflow_definition, organization_id)
             created_workflow = await app.DATABASE.workflows.create_workflow(
@@ -13090,9 +13076,7 @@ class WorkflowService:
                 workflow_definition,
                 lambda: self._replaced_definition(workflow_id, organization_id, prior_definition),
             )
-            await _validate_integration_action_workflow_save(
-                workflow_definition, lambda: self._replaced_definition(workflow_id, organization_id, prior_definition)
-            )
+            _validate_integration_action_secret_inputs(workflow_definition)
             if validate_code_block_templates:
                 self._validate_code_block_templates(workflow_definition)
             if validate_block_image_files and block_image_ids(workflow_definition.blocks):
@@ -18962,7 +18946,7 @@ class WorkflowService:
             organization_id, workflow_definition, workflow_permanent_id=workflow_permanent_id
         )
         await _validate_agent_step_workflow_save(organization_id, workflow_definition)
-        await _validate_integration_action_workflow_save(workflow_definition)
+        _validate_integration_action_secret_inputs(workflow_definition)
         self.validate_workflow_block_graph(workflow_definition)
         self._validate_payload_templates(workflow_definition)
         self._validate_new_code_block_safety(workflow_definition, None)

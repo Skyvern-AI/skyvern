@@ -106,6 +106,26 @@ def connected_account_fields(block: Mapping[str, Any], *, acting_only: bool = Fa
     )
 
 
+def as_run_block(block: Mapping[str, Any]) -> Mapping[str, Any]:
+    """An integration_action block seen as the existing block it runs, with the same field precedence the block uses
+    at run time; any other block, or an action that runs no existing block, comes back unchanged."""
+    if block.get("block_type") != BlockType.INTEGRATION_ACTION.value:
+        return block
+    found = entry_action(all_integration_entries(), str(block.get("integration_id")), str(block.get("action_id")))
+    kind, _, block_type = found[1].runs_via.partition(":") if found else ("", "", "")
+    if found is None or kind != "block":
+        return block
+    pins = {
+        name: schema["const"] for name, schema in found[1].inputs.get("properties", {}).items() if "const" in schema
+    }
+    inputs = block.get("inputs")
+    view = {**block, **pins, **(inputs if isinstance(inputs, dict) else {}), "block_type": block_type}
+    account_fields = connected_account_fields(view)
+    if account_fields and block.get("connection_id"):
+        view[account_fields[0]] = block["connection_id"]
+    return view
+
+
 def block_connection_refs(block: Mapping[str, Any], *, acting_only: bool = False) -> list[str]:
     """The values of the block fields the block schema marks as connected-account ids, as written."""
     return [
