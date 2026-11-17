@@ -258,7 +258,7 @@ import { TestRunOutputCard } from "./cards/TestRunOutputCard";
 import { ConnectionCard } from "./cards/ConnectionCard";
 import { TriggerCreatedCard } from "./cards/TriggerCreatedCard";
 import { usePageSlots } from "@/store/PageSlots";
-import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
+import { useTriggerFocusStore } from "@/store/TriggerFocusStore";
 import {
   CredentialAskMarker,
   CredentialCard,
@@ -1718,17 +1718,14 @@ export function EmberChat({
     triggerCreatedCard: LiveTriggerCreatedCard = TriggerCreatedCard,
   } = usePageSlots();
   const hasTriggersPanel = Boolean(workflowTriggersPanel);
-  const setWorkflowPanelState = useWorkflowPanelStore(
-    (state) => state.setWorkflowPanelState,
-  );
   const openTriggerInPanel = (eventTriggerId: string) => {
-    // The panel's trigger list may be cached from before Ember created this one.
+    // The pane's trigger list may be cached from before Ember created this one.
     void queryClient.invalidateQueries({ queryKey: ["eventTriggers"] });
-    setWorkflowPanelState({
-      active: true,
-      content: "triggers",
-      data: { focusTriggerId: eventTriggerId, focusRequest: Date.now() },
+    useTriggerFocusStore.setState({
+      triggerId: eventTriggerId,
+      request: Date.now(),
     });
+    openPane("triggers");
   };
   const docEditorEnabled = useWorkflowDocEditorFlag();
   const logging = useLogging();

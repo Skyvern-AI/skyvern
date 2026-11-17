@@ -24,6 +24,7 @@ const NARROW_RUN_PANE_RANK: Record<StudioPaneId, number> = {
   ember: 1,
   overview: 2,
   editor: 3,
+  triggers: 4,
 };
 
 // Point the studio at a different run: set ?wr=, drop the per-run selection

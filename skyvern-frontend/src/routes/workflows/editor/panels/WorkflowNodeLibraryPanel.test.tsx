@@ -1,6 +1,12 @@
 // @vitest-environment jsdom
 
-import { fireEvent, render, screen } from "@testing-library/react";
+import {
+  fireEvent,
+  render as renderInDom,
+  screen,
+} from "@testing-library/react";
+import type { ReactNode } from "react";
+import { MemoryRouter } from "react-router-dom";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 
 const catalogState = vi.hoisted(() => ({
@@ -28,8 +34,33 @@ vi.mock("@/hooks/useMicrosoftOAuthCredentials", async (importOriginal) => ({
   useMicrosoftOAuthCredentials: () => ({ credentials: [] }),
 }));
 
-import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
+import {
+  StudioPaneDefaultsContext,
+  useStudioPaneDefaults,
+} from "../../studio/StudioPaneDefaultsContext";
+import type { StudioPaneId } from "../../studio/panes";
 import { WorkflowNodeLibraryPanel } from "./WorkflowNodeLibraryPanel";
+
+let openPanes: StudioPaneId[] = [];
+function Studio({ children }: { children: ReactNode }) {
+  const defaults = useStudioPaneDefaults();
+  return (
+    <MemoryRouter>
+      <StudioPaneDefaultsContext.Provider
+        value={{
+          ...defaults,
+          updatePanes: (compute) => {
+            const next = compute(openPanes, openPanes, 0);
+            openPanes = Array.isArray(next) ? next : next.panes;
+          },
+        }}
+      >
+        {children}
+      </StudioPaneDefaultsContext.Provider>
+    </MemoryRouter>
+  );
+}
+const render = (ui: React.ReactElement) => renderInDom(ui, { wrapper: Studio });
 
 describe("WorkflowNodeLibraryPanel Power BI availability", () => {
   beforeEach(() => {
@@ -111,10 +142,7 @@ describe("WorkflowNodeLibraryPanel apps", () => {
     fireEvent.click(
       screen.getByTestId("block-library-app-trigger-gmail-new_email"),
     );
-    expect(useWorkflowPanelStore.getState().workflowPanelState).toMatchObject({
-      active: true,
-      content: "triggers",
-    });
+    expect(openPanes).toContain("triggers");
   });
 
   test("search finds the action in every app next to the built-in block", () => {

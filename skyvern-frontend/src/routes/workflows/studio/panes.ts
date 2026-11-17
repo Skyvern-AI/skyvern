@@ -1,4 +1,9 @@
-export type StudioPaneId = "ember" | "editor" | "browser" | "overview";
+export type StudioPaneId =
+  | "ember"
+  | "editor"
+  | "browser"
+  | "overview"
+  | "triggers";
 
 export const SYSTEM_RUN_FOCUS_PARAM = "wrs";
 export const EMBER_RUN_FOCUS = "ember";
@@ -19,6 +24,7 @@ export const STUDIO_PANE_IDS: readonly StudioPaneId[] = [
   "editor",
   "browser",
   "overview",
+  "triggers",
 ];
 
 export const STUDIO_PANES_PARAM = "panes";
@@ -76,6 +82,7 @@ export const STUDIO_PANE_MIN_WIDTH: Record<StudioPaneId, number> = {
   editor: 260,
   browser: 300,
   overview: 260,
+  triggers: 300,
 };
 
 // Stage chrome for the fit math; must match the stage p-3 and the divider
@@ -89,6 +96,7 @@ export const STUDIO_DOC_MIN_WIDTH = 360;
 export const STUDIO_PANE_STRIP_WIDTH_PX = 36;
 // Panes give way to the Doc in this order; the Editor never collapses.
 const DOC_COLLAPSE_ORDER: readonly StudioPaneId[] = [
+  "triggers",
   "browser",
   "overview",
   "ember",

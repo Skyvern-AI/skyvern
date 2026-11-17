@@ -2,6 +2,7 @@ import { type ComponentType } from "react";
 import {
   ChatBubbleIcon,
   GlobeIcon,
+  LightningBoltIcon,
   ReaderIcon,
   Share1Icon,
 } from "@radix-ui/react-icons";
@@ -17,6 +18,7 @@ export const STUDIO_PANE_META: Record<
   browser: { label: "Browser", icon: GlobeIcon },
   // The internal "overview" pane is displayed as "Run" in Studio.
   overview: { label: "Overview", icon: ReaderIcon },
+  triggers: { label: "Triggers", icon: LightningBoltIcon },
 };
 
 export function paneLabel(id: StudioPaneId): string {

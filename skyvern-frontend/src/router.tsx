@@ -4,6 +4,7 @@ import {
   DebugRoute,
   EditRoute,
   StudioRoute,
+  TriggersRoute,
   WorkflowRunRoute,
 } from "@/routes/workflows/StudioRouteGates";
 import { LegacyWorkflowsRedirect } from "@/routes/workflows/LegacyWorkflowsRedirect";
@@ -265,6 +266,10 @@ const router = createBrowserRouter([
               {
                 path: "studio",
                 element: <StudioRoute />,
+              },
+              {
+                path: "triggers",
+                element: <TriggersRoute />,
               },
               {
                 path: "run",

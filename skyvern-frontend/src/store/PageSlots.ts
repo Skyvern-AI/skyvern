@@ -10,7 +10,6 @@ export type WorkflowAnalyticsPanelProps = {
 };
 export type WorkflowTriggersPanelProps = Readonly<{
   workflowPermanentId: string;
-  onClose: () => void;
   // Opens this trigger's detail with its on switch highlighted.
   focusTriggerId?: string;
   // Changes on every request to focus, so asking again for the same trigger reopens it.
