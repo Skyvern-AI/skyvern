@@ -23,6 +23,7 @@ from skyvern.forge.failure_classifier import (
     classify_from_failure_reason,
     derive_failure_attribution,
     partition_failure_categories,
+    with_root_user_errors,
 )
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError as ProviderLLMError
 from skyvern.utils.prompt_engine import MaxStepsReasonResponse
@@ -141,12 +142,10 @@ def _categories_for(
     return [result["category"] for result in _classify(reason, exception, fallback_to_unknown=fallback_to_unknown)]
 
 
-def test_none_input_returns_none() -> None:
-    assert classify_from_failure_reason(None) is None
-
-
-def test_empty_string_returns_none() -> None:
-    assert classify_from_failure_reason("") is None
+@pytest.mark.parametrize("failure_reason", [None, ""])
+@pytest.mark.parametrize("fallback_to_unknown", [False, True])
+def test_no_failure_text_returns_none(failure_reason: str | None, fallback_to_unknown: bool) -> None:
+    assert classify_from_failure_reason(failure_reason, fallback_to_unknown=fallback_to_unknown) is None
 
 
 @pytest.mark.parametrize(
@@ -488,14 +487,6 @@ def test_unrecognized_with_fallback_returns_unknown() -> None:
 
 def test_unrecognized_without_fallback_returns_none() -> None:
     assert classify_from_failure_reason("The Resume/CV field is required but empty") is None
-
-
-def test_none_input_with_fallback_returns_none() -> None:
-    assert classify_from_failure_reason(None, fallback_to_unknown=True) is None
-
-
-def test_empty_input_with_fallback_returns_none() -> None:
-    assert classify_from_failure_reason("", fallback_to_unknown=True) is None
 
 
 def test_keyword_match_ignores_fallback() -> None:
@@ -920,22 +911,20 @@ _ALLOWED_ATTRIBUTION_KEYS = {
 }
 
 
-def test_derive_maps_proxy_error_to_proxy_component() -> None:
-    fc = [{"category": "PROXY_ERROR", "confidence_float": 0.9, "reasoning": "Exception: NoProxyAvailable"}]
+@pytest.mark.parametrize(
+    ("category", "exception_name", "component"),
+    [
+        ("PROXY_ERROR", "NoProxyAvailable", "proxy"),
+        ("BROWSER_ERROR", "TargetClosedError", "browser"),
+        ("LLM_ERROR", "RateLimitError", "llm"),
+    ],
+)
+def test_derive_maps_an_infra_category_to_its_component(category: str, exception_name: str, component: str) -> None:
+    fc = [{"category": category, "confidence_float": 0.9, "reasoning": f"Exception: {exception_name}"}]
     doc = derive_failure_attribution(fc)
-    assert doc["primary_infra_component"] == "proxy"
-    assert doc["failure_category"] == "PROXY_ERROR"
+    assert doc["primary_infra_component"] == component
+    assert doc["failure_category"] == category
     assert doc["evidence_source"] == "exception_type"
-
-
-def test_derive_maps_browser_error_to_browser_component() -> None:
-    fc = [{"category": "BROWSER_ERROR", "confidence_float": 0.9, "reasoning": "Exception: TargetClosedError"}]
-    assert derive_failure_attribution(fc)["primary_infra_component"] == "browser"
-
-
-def test_derive_maps_llm_error_to_llm_component() -> None:
-    fc = [{"category": "LLM_ERROR", "confidence_float": 0.9, "reasoning": "Exception: RateLimitError"}]
-    assert derive_failure_attribution(fc)["primary_infra_component"] == "llm"
 
 
 def test_derive_infrastructure_codeblock_reason_code_maps_to_codeblock() -> None:
@@ -1449,3 +1438,11 @@ def test_summary_ignores_model_provided_rejected_categories(untrusted_rejected_c
     assert summary.reasoning == "valid model reasoning"
     assert summary.failure_categories == [{"category": "AUTH_FAILURE", "confidence_float": 0.9}]
     assert summary._rejected_failure_categories == []
+
+
+def test_root_user_errors_repeat_the_classifier_primary_not_a_model_label_entry() -> None:
+    label = {"category": "CREDENTIAL_ERROR", "confidence_float": 0.6, "reason_code": "failure_classifier_v2"}
+    rules = [{"category": "MAX_STEPS_EXCEEDED", "confidence_float": 0.9}]
+    merged = with_root_user_errors([label, *rules], [{"error_code": "LOGIN_REJECTED"}])
+    assert merged[-1]["category"] == "MAX_STEPS_EXCEEDED"
+    assert with_root_user_errors([label], [{"error_code": "LOGIN_REJECTED"}]) == [label]

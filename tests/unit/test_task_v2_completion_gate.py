@@ -14,6 +14,7 @@ import pytest
 
 from skyvern.config import Settings
 from skyvern.exceptions import BROWSER_CONNECTION_LOST_ERROR_CODE
+from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.prompting import PromptEngine
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition, WorkflowRunStatus
@@ -274,6 +275,7 @@ async def test_first_iteration_goto_url_has_no_completion_criterion(
     agent_function = SimpleNamespace(
         has_code_block_access=AsyncMock(return_value=False),
         validate_task_execution=AsyncMock(),
+        classify_failure=lambda *_args, **_kwargs: [],
     )
     goto_task = AsyncMock(return_value=(block, [], []))
     context = SimpleNamespace(run_id=None, root_workflow_run_id=None, tz_info=timezone.utc)
@@ -299,7 +301,6 @@ async def test_first_iteration_goto_url_has_no_completion_criterion(
     monkeypatch.setattr(task_v2_service, "_get_extracted_data_from_block_result", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(task_v2_service, "handle_block_result", AsyncMock(return_value=running_run))
     monkeypatch.setattr(task_v2_service, "_should_run_post_block_completion_check", lambda *_args, **_kwargs: False)
-    monkeypatch.setattr(task_v2_service, "classify_from_failure_reason", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(
         task_v2_service,
         "_best_effort_failure_deliverable",
@@ -401,6 +402,7 @@ async def test_missing_task_type_failure_finalizes_with_organization_scope(
         has_code_block_access=AsyncMock(return_value=False),
         validate_task_execution=AsyncMock(),
         cleanup_element_tree_factory=MagicMock(return_value=MagicMock()),
+        classify_failure=AgentFunction().classify_failure,
     )
     context = SimpleNamespace(run_id=None, root_workflow_run_id=None, tz_info=timezone.utc)
     llm_handler = AsyncMock(
