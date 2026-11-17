@@ -179,6 +179,10 @@ class IntegrationActionBlock(Block):
             inner = rendered.inner_block()
         except IntegrationActionError as e:
             return await self._failure(str(e), workflow_run_block_id, effective_org_id)
+        # Values an agent wrote are text, never templates, so the inner block must not render them either.
+        if "inputs" in self._prerendered_fields:
+            inner.mark_fields_prerendered(self.inputs)
+        inner._agent_smtp_isolation = self._agent_smtp_isolation
         try:
             return await inner.execute(
                 workflow_run_id,
