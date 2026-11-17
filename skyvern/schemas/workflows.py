@@ -46,7 +46,12 @@ from skyvern.forge.sdk.workflow.models.run_limits import (
     reject_bool_max_elapsed_time_minutes,
 )
 from skyvern.forge.sdk.workflow.models.validators import normalize_run_with
-from skyvern.schemas.agent_step_tool_names import AGENT_STEP_TOOL_NAMES, current_tool_names
+from skyvern.schemas.agent_step_tool_names import (
+    AGENT_STEP_TOOL_NAMES,
+    CATALOG_TOOL_NAMES,
+    current_tool_names,
+    is_known_tool_name,
+)
 from skyvern.schemas.browser_settings import BrowserSettings, require_known_timezone
 from skyvern.schemas.emails import EmailBodyFormat, EmailTransport
 from skyvern.schemas.runs import GeoTarget, ProxyLocation, RunEngine, normalize_browser_type
@@ -1660,9 +1665,10 @@ class AgentStepBlockYAML(BlockYAML):
     tools: list[str] | None = Field(
         default=None,
         description="The tools the step may call. A block it runs through run_block is named by its block type, such "
-        "as http_request. finish and read_run_data are always offered, and login only when parameter_keys lists a "
-        "credential parameter. load_skill also offers read_skill_resource, and both are offered only when the run "
-        "has skills. Without a list the step has no other tools.",
+        "as http_request, and an integration action by <integration id>__<action id>, such as gmail__read_inbox. "
+        "finish and read_run_data are always offered, and login only when parameter_keys lists a credential "
+        "parameter. load_skill also offers read_skill_resource, and both are offered only when the run has skills. "
+        "Without a list the step has no other tools.",
     )
 
     @field_validator("tools")
@@ -1671,8 +1677,9 @@ class AgentStepBlockYAML(BlockYAML):
         if value is None:
             return None
         value = current_tool_names(value)
-        if unknown := sorted(set(value) - AGENT_STEP_TOOL_NAMES):
-            raise ValueError(f"Unknown tools {unknown}. Valid tools: {', '.join(sorted(AGENT_STEP_TOOL_NAMES))}.")
+        if unknown := sorted(name for name in set(value) if not is_known_tool_name(name)):
+            valid = sorted(AGENT_STEP_TOOL_NAMES | CATALOG_TOOL_NAMES)
+            raise ValueError(f"Unknown tools {unknown}. Valid tools: {', '.join(valid)}.")
         return value
 
     @field_validator("data_schema")
