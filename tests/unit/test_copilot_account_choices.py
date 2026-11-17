@@ -278,8 +278,19 @@ async def test_a_microsoft_read_failure_still_verifies_google_choices(monkeypatc
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "upload_block",
+    [
+        "    - block_type: file_upload\n      label: upload\n      storage_type: google_drive\n"
+        "      google_credential_id: goac_staged\n      google_drive_folder_id: folder\n",
+        "    - block_type: integration_action\n      label: upload\n      integration_id: google_drive\n"
+        "      action_id: upload_files\n      connection_id: goac_staged\n"
+        "      inputs:\n        google_drive_folder_id: folder\n",
+    ],
+    ids=["file_upload", "integration_action"],
+)
 async def test_recovery_choices_for_a_drive_upload_offer_the_staged_account_then_only_drive_accounts(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, upload_block: str
 ) -> None:
     drive = ["https://www.googleapis.com/auth/drive"]
 
@@ -296,14 +307,15 @@ async def test_recovery_choices_for_a_drive_upload_offer_the_staged_account_then
         return [row.model_copy(update={"scopes_granted": drive}) if row.id == "goac_drive" else row for row in rows]
 
     monkeypatch.setattr(google_oauth_service, "get_visible_credentials_for_org", visible_drive_scopes)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "get_cloud_integration_entries", list)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "get_cloud_integration_triggers", dict)
     policy = request_policy_module.RequestPolicy(
         existing_workflow_connection_ids=["goac_staged", "goac_sheets"],
         run_approved_connection_ids=["goac_sheets"],
     )
     staged = (
         "workflow_definition:\n  parameters: []\n  blocks:\n"
-        "    - block_type: file_upload\n      label: upload\n      storage_type: google_drive\n"
-        "      google_credential_id: goac_staged\n      google_drive_folder_id: folder\n"
+        f"{upload_block}"
         "    - block_type: agent_step\n      label: unrelated_agent\n      prompt: Summarize the page\n"
         "    - block_type: google_sheets_read\n      label: read\n      credential_id: goac_sheets\n"
         "      spreadsheet_url: https://docs.google.com/spreadsheets/d/sheet-reference-123/edit\n"
