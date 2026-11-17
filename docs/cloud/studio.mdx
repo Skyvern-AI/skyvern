@@ -25,7 +25,7 @@ To open Studio, click an agent on **Agents** → **All Agents**, or create one w
 
 ## The layout
 
-Studio has four panes. Toggle each one from the center of the top bar. You can open several side by side.
+Studio has five panes. Toggle each one from the center of the top bar. You can open several side by side.
 
 | Pane | What it does |
 |---|---|
@@ -33,6 +33,7 @@ Studio has four panes. Toggle each one from the center of the top bar. You can o
 | **Editor** | The agent's blocks as a flow you edit by hand, in **Visual** or **YAML** view |
 | **Browser** | The browser the agent drives: **Live** while something runs, then **Recording** and **Screenshots** |
 | **Run** | One run's **Timeline**, **Inputs** and **Outputs**. With no run open, the control reads **Past Runs** and lists earlier runs. |
+| **Triggers** | The agent's [event triggers](/developers/event-triggers), which start it from a signed HTTP request. Not shown for read-only or deleted agents. |
 
 The right side of the top bar holds the agent's controls:
 
@@ -40,7 +41,6 @@ The right side of the top bar holds the agent's controls:
 |---|---|
 | Save (disk icon) | Saves your hand edits. A dot on the icon means unsaved changes. It is disabled, and its tooltip says why, while Copilot is working on a request or applying changes and while YAML edits are being applied. When Copilot pauses saving so you don't overwrite a newer change (for example, the agent changed after Copilot proposed its changes), Save stays clickable and opens **Save is paused**, which explains why and offers **Reload and discard my edits**. |
 | **Schedule** (calendar icon) | Lists this agent's schedules and adds new ones. See [Runs and schedules](/cloud/runs#schedule-an-agent). |
-| **Triggers** (lightning icon) | Starts this agent from a signed HTTP request. See [Event triggers](/developers/event-triggers). |
 | **More actions** (⋯) | **Code**, **Version history**, **Save as Template**, **Take a tour** |
 | **Inputs** | The values the agent takes on each run. See [Inputs](#inputs). |
 | **Run** | Opens the run form. Shows **Stop** while a run is in progress and **Re-run** after one ends. See [Runs and schedules](/cloud/runs). |
