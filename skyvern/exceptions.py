@@ -464,6 +464,12 @@ class FailedToSendWebhook(SkyvernException):
         super().__init__(f"Failed to send webhook. {workflow_run_str} {workflow_str} {task_str} {task_v2_str}")
 
 
+class ProxyPolicyError(ValueError):
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(f"Proxy policy refused ({reason})")
+
+
 class ProxyLocationNotSupportedError(SkyvernException):
     def __init__(self, proxy_location: str | None = None):
         super().__init__(f"Unknown proxy location: {proxy_location}")

@@ -1484,6 +1484,7 @@ async def _provision_browser_session(
                     created_by="copilot",
                     session_kind=BrowserSessionKind.copilot,
                     created_for_workflow_permanent_id=ctx.workflow_permanent_id,
+                    workflow_permanent_id=ctx.workflow_permanent_id,
                     **creation_kwargs,
                 )
 

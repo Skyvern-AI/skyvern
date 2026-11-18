@@ -241,6 +241,7 @@ class PersistentSessionsManager(Protocol):
         created_for_workflow_run_id: str | None = None,
         created_for_workflow_permanent_id: str | None = None,
         bot_protection: BotProtection | None = None,
+        workflow_permanent_id: str | None = None,
     ) -> PersistentBrowserSession:
         """Create a new browser session.
 
@@ -248,6 +249,14 @@ class PersistentSessionsManager(Protocol):
         cancellable caller shields the create and closes the session it returns.
         """
         ...
+
+    async def resolve_session_proxy_location(
+        self,
+        browser_session: PersistentBrowserSession,
+        proxy_location: ProxyLocationInput,
+        *,
+        workflow_permanent_id: str | None = None,
+    ) -> ProxyLocationInput: ...
 
     async def create_fresh_exit_session(
         self,

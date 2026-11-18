@@ -21518,6 +21518,7 @@ class WorkflowTriggerBlock(Block):
                     proxy_location=proxy_location,
                     timeout_minutes=30,
                     session_kind=BrowserSessionKind.workflow_run,
+                    workflow_permanent_id=resolved_workflow_permanent_id,
                     **child_session_kwargs,
                 )
                 resolved_browser_session_id = child_browser_session.persistent_browser_session_id

@@ -25,6 +25,9 @@ from skyvern.webeye.persistent_session_errors import BrowserSessionCreditAdmissi
 
 @contextmanager
 def _patched_app(app_mock: MagicMock) -> Iterator[None]:
+    app_mock.PERSISTENT_SESSIONS_MANAGER.resolve_session_proxy_location = AsyncMock(
+        side_effect=lambda session, location, **kwargs: location
+    )
     with patch.object(debug_sessions_mod, "app", app_mock), patch.object(debug_session_browser_mod, "app", app_mock):
         yield
 
@@ -239,6 +242,7 @@ async def test_get_debug_session_claims_a_compatible_prewarm(already_started: bo
         created_at=debug_sessions_mod.datetime.now(debug_sessions_mod.timezone.utc),
         browser_profile_id=None,
         runnable_type=debug_sessions_mod.PREWARM_DISPATCHED_RUNNABLE_TYPE,
+        proxy_session_id=None,
     )
     app_mock = MagicMock()
     app_mock.DATABASE.debug.get_debug_session = AsyncMock(return_value=None)
@@ -249,7 +253,7 @@ async def test_get_debug_session_claims_a_compatible_prewarm(already_started: bo
     app_mock.DATABASE.browser_sessions.get_persistent_browser_session = AsyncMock(return_value=browser_session)
     app_mock.DATABASE.browser_sessions.clear_prewarm_binding = AsyncMock(return_value=True)
     app_mock.WORKFLOW_SERVICE.get_workflow_by_permanent_id = AsyncMock(
-        return_value=SimpleNamespace(proxy_location=None)
+        return_value=SimpleNamespace(proxy_location=None, browser_profile_id=None)
     )
     app_mock.PERSISTENT_SESSIONS_MANAGER.renew_or_close_session = AsyncMock(return_value=browser_session)
     app_mock.PERSISTENT_SESSIONS_MANAGER.seconds_until_fixed_deadline = AsyncMock(return_value=None)
@@ -289,6 +293,7 @@ async def test_claim_prewarm_reuses_debug_session_created_by_concurrent_request(
         browser_profile_id=None,
         started_at=None,
         runnable_type=debug_sessions_mod.PREWARM_DISPATCHED_RUNNABLE_TYPE,
+        proxy_session_id=None,
     )
     claimed = SimpleNamespace(
         debug_session_id="ds_prewarm",
@@ -303,7 +308,7 @@ async def test_claim_prewarm_reuses_debug_session_created_by_concurrent_request(
     app_mock.DATABASE.browser_sessions.get_persistent_browser_session = AsyncMock(return_value=browser_session)
     app_mock.DATABASE.debug.get_debug_session = AsyncMock(return_value=claimed)
     app_mock.WORKFLOW_SERVICE.get_workflow_by_permanent_id = AsyncMock(
-        return_value=SimpleNamespace(proxy_location=None)
+        return_value=SimpleNamespace(proxy_location=None, browser_profile_id=None)
     )
 
     with _patched_app(app_mock):
@@ -326,6 +331,7 @@ async def test_claim_prewarm_closes_the_browser_when_debug_session_creation_fail
         browser_profile_id=None,
         started_at=None,
         runnable_type=debug_sessions_mod.PREWARM_DISPATCHED_RUNNABLE_TYPE,
+        proxy_session_id=None,
     )
     app_mock = MagicMock()
     app_mock.DATABASE.browser_sessions.get_live_bound_persistent_browser_session = AsyncMock(
@@ -334,7 +340,7 @@ async def test_claim_prewarm_closes_the_browser_when_debug_session_creation_fail
     app_mock.DATABASE.browser_sessions.clear_prewarm_binding = AsyncMock(return_value=True)
     app_mock.DATABASE.debug.create_debug_session = AsyncMock(side_effect=RuntimeError("db unavailable"))
     app_mock.WORKFLOW_SERVICE.get_workflow_by_permanent_id = AsyncMock(
-        return_value=SimpleNamespace(proxy_location=None)
+        return_value=SimpleNamespace(proxy_location=None, browser_profile_id=None)
     )
     app_mock.PERSISTENT_SESSIONS_MANAGER.close_session = AsyncMock()
 
@@ -355,13 +361,15 @@ async def test_claim_prewarm_rejects_a_started_session_that_cannot_be_renewed() 
         proxy_location=ProxyLocation.RESIDENTIAL,
         started_at=debug_sessions_mod.datetime.now(debug_sessions_mod.timezone.utc),
         runnable_type=debug_sessions_mod.PREWARM_DISPATCHED_RUNNABLE_TYPE,
+        proxy_session_id=None,
+        browser_profile_id=None,
     )
     app_mock = MagicMock()
     app_mock.DATABASE.browser_sessions.get_live_bound_persistent_browser_session = AsyncMock(
         return_value=browser_session
     )
     app_mock.WORKFLOW_SERVICE.get_workflow_by_permanent_id = AsyncMock(
-        return_value=SimpleNamespace(proxy_location=None)
+        return_value=SimpleNamespace(proxy_location=None, browser_profile_id=None)
     )
     app_mock.PERSISTENT_SESSIONS_MANAGER.renew_or_close_session = AsyncMock(
         side_effect=debug_sessions_mod.BrowserSessionNotRenewable("Session has expired", "pbs_expiring")
@@ -386,6 +394,8 @@ async def test_claim_prewarm_does_not_adopt_a_session_before_dispatch_finishes()
         proxy_location=ProxyLocation.RESIDENTIAL,
         runnable_type=debug_sessions_mod.PREWARM_PENDING_RUNNABLE_TYPE,
         started_at=None,
+        proxy_session_id=None,
+        browser_profile_id=None,
     )
     app_mock = MagicMock()
     app_mock.DATABASE.browser_sessions.get_live_bound_persistent_browser_session = AsyncMock(
@@ -412,6 +422,8 @@ async def test_claim_prewarm_retires_an_incompatible_proxy() -> None:
         proxy_location=ProxyLocation.RESIDENTIAL_GB,
         runnable_type=debug_sessions_mod.PREWARM_DISPATCHED_RUNNABLE_TYPE,
         started_at=None,
+        proxy_session_id=None,
+        browser_profile_id=None,
     )
     app_mock = MagicMock()
     app_mock.DATABASE.browser_sessions.get_live_bound_persistent_browser_session = AsyncMock(
@@ -442,13 +454,15 @@ async def test_claim_prewarm_retires_a_fixed_deadline_without_a_fresh_debug_wind
         proxy_location=ProxyLocation.RESIDENTIAL,
         runnable_type=debug_sessions_mod.PREWARM_DISPATCHED_RUNNABLE_TYPE,
         started_at=debug_sessions_mod.datetime.now(debug_sessions_mod.timezone.utc),
+        proxy_session_id=None,
+        browser_profile_id=None,
     )
     app_mock = MagicMock()
     app_mock.DATABASE.browser_sessions.get_live_bound_persistent_browser_session = AsyncMock(
         return_value=browser_session
     )
     app_mock.WORKFLOW_SERVICE.get_workflow_by_permanent_id = AsyncMock(
-        return_value=SimpleNamespace(proxy_location=None)
+        return_value=SimpleNamespace(proxy_location=None, browser_profile_id=None)
     )
     app_mock.PERSISTENT_SESSIONS_MANAGER.renew_or_close_session = AsyncMock(return_value=browser_session)
     app_mock.PERSISTENT_SESSIONS_MANAGER.seconds_until_fixed_deadline = AsyncMock(return_value=5 * 60)
@@ -560,6 +574,7 @@ async def test_new_debug_session_uses_workflow_proxy_default_for_created_browser
         created_by="user_123",
         session_kind=BrowserSessionKind.editor,
         created_for_workflow_permanent_id="wpid_test",
+        workflow_permanent_id="wpid_test",
     )
     app_mock.DATABASE.debug.create_debug_session.assert_awaited_once_with(
         browser_session_id="pbs_new",
@@ -588,7 +603,7 @@ async def test_new_debug_session_records_no_vnc_when_the_infrastructure_cannot_s
     app_mock.DATABASE.debug.create_debug_session = AsyncMock(return_value=created_debug_session)
     app_mock.DATABASE.browser_sessions.get_persistent_browser_session = AsyncMock()
     app_mock.WORKFLOW_SERVICE.get_workflow_by_permanent_id = AsyncMock(
-        return_value=SimpleNamespace(proxy_location=None)
+        return_value=SimpleNamespace(proxy_location=None, browser_profile_id=None)
     )
     app_mock.PERSISTENT_SESSIONS_MANAGER.close_session = AsyncMock()
     app_mock.PERSISTENT_SESSIONS_MANAGER.create_session = AsyncMock(return_value=new_browser_session)
@@ -624,7 +639,7 @@ async def test_new_debug_session_logs_a_credit_refusal_below_error_and_a_real_fa
     app_mock.DATABASE.debug.complete_debug_sessions = AsyncMock(return_value=[])
     app_mock.DATABASE.debug.create_debug_session = AsyncMock()
     app_mock.WORKFLOW_SERVICE.get_workflow_by_permanent_id = AsyncMock(
-        return_value=SimpleNamespace(proxy_location=None)
+        return_value=SimpleNamespace(proxy_location=None, browser_profile_id=None)
     )
     app_mock.PERSISTENT_SESSIONS_MANAGER.create_session = AsyncMock(side_effect=create_error)
 
@@ -742,7 +757,7 @@ async def test_new_debug_session_response_carries_pbs_browser_profile_id() -> No
     app_mock.DATABASE.debug.create_debug_session = AsyncMock(return_value=created_debug_session)
     app_mock.DATABASE.browser_sessions.get_persistent_browser_session = AsyncMock()
     app_mock.WORKFLOW_SERVICE.get_workflow_by_permanent_id = AsyncMock(
-        return_value=SimpleNamespace(proxy_location=None)
+        return_value=SimpleNamespace(proxy_location=None, browser_profile_id=None)
     )
     app_mock.PERSISTENT_SESSIONS_MANAGER.create_session = AsyncMock(return_value=new_browser_session)
     app_mock.AGENT_FUNCTION.supports_live_view = AsyncMock(return_value=True)

@@ -819,6 +819,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         created_for_workflow_run_id: str | None = None,
         created_for_workflow_permanent_id: str | None = None,
         bot_protection: BotProtection | None = None,
+        workflow_permanent_id: str | None = None,
     ) -> PersistentBrowserSession:
         """Create a new browser session for an organization and return its ID with the browser state."""
         # The browser launches after this returns, so a dialed CDP browser that cannot take a timezone is refused now.
@@ -1015,6 +1016,15 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 browser_session_id=session_id,
                 organization_id=organization_id,
             )
+
+    async def resolve_session_proxy_location(
+        self,
+        browser_session: PersistentBrowserSession,
+        proxy_location: ProxyLocationInput,
+        *,
+        workflow_permanent_id: str | None = None,
+    ) -> ProxyLocationInput:
+        return proxy_location
 
     async def create_fresh_exit_session(
         self,

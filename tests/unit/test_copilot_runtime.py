@@ -908,6 +908,7 @@ async def test_ensure_browser_session_waits_for_browser_context(monkeypatch: pyt
         "created_by",
         "session_kind",
         "created_for_workflow_permanent_id",
+        "workflow_permanent_id",
     }
     assert mock_manager.create_session.call_args.kwargs["session_kind"] == BrowserSessionKind.copilot
 
@@ -1955,6 +1956,7 @@ async def test_a_seeded_build_test_mint_loads_the_profile_without_exporting_over
         "created_by": "copilot",
         "session_kind": BrowserSessionKind.copilot,
         "created_for_workflow_permanent_id": ctx.workflow_permanent_id,
+        "workflow_permanent_id": ctx.workflow_permanent_id,
         "browser_profile_id": "bp_saved",
         "profile_read_only": True,
         "generate_browser_profile": True,
