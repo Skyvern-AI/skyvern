@@ -30,16 +30,8 @@ RUN pip install --no-cache-dir websockify
 
 COPY .nvmrc /app/.nvmrc
 COPY nodesource-repo.gpg.key /tmp/nodesource-repo.gpg.key
-RUN cat /tmp/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg && \
-    NODE_MAJOR=$(cut -d. -f1 < /app/.nvmrc) && \
-    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${NODE_MAJOR}.x nodistro main" >> /etc/apt/sources.list.d/nodesource.list && \
-    apt-get update && \
-    apt-get install -y nodejs && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/* && \
-    rm /tmp/nodesource-repo.gpg.key && \
-    # confirm installation
-    npm -v && node -v
+COPY ./scripts/install_node.sh /tmp/install_node.sh
+RUN bash /tmp/install_node.sh && rm /tmp/install_node.sh
 
 
 # install bitwarden cli
