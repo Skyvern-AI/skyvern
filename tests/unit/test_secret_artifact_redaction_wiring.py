@@ -349,7 +349,9 @@ def test_task_artifact_gate_floors_runtime_secret_for_har_and_console(monkeypatc
     assert llm_out == f"code={RUNTIME_SECRET}".encode()
 
 
-def test_task_artifact_gate_untouched_when_no_runtime_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_task_artifact_gate_redacts_har_names_when_no_runtime_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
+    # #8621: a mask-off run with no runtime secrets still gets name-based HAR redaction under the
+    # global switch; the console log (value-based only) stays untouched.
     from skyvern.forge.sdk.artifact import manager as artifact_manager_module
 
     fake_app = SimpleNamespace(
@@ -359,6 +361,28 @@ def test_task_artifact_gate_untouched_when_no_runtime_secrets(monkeypatch: pytes
         )
     )
     monkeypatch.setattr(artifact_manager_module, "app", fake_app)
+    monkeypatch.setattr(artifact_manager_module.settings, "ENABLE_SECRET_ARTIFACT_REDACTION", True)
+    har_out = artifact_manager_module._maybe_redact_artifact_data(ArtifactType.HAR, _har_bytes(SECRET), WORKFLOW_RUN_ID)
+    console = f"code={SECRET}".encode()
+    console_out = artifact_manager_module._maybe_redact_artifact_data(
+        ArtifactType.BROWSER_CONSOLE_LOG, console, WORKFLOW_RUN_ID
+    )
+    assert SECRET.encode() not in har_out
+    assert REDACTED_SECRET_PLACEHOLDER.encode() in har_out
+    assert console_out == console
+
+
+def test_task_artifact_gate_untouched_when_global_switch_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skyvern.forge.sdk.artifact import manager as artifact_manager_module
+
+    fake_app = SimpleNamespace(
+        WORKFLOW_CONTEXT_MANAGER=SimpleNamespace(
+            artifact_redaction_enabled=Mock(return_value=False),
+            runtime_secret_values_for_artifacts=Mock(return_value=set()),
+        )
+    )
+    monkeypatch.setattr(artifact_manager_module, "app", fake_app)
+    monkeypatch.setattr(artifact_manager_module.settings, "ENABLE_SECRET_ARTIFACT_REDACTION", False)
     payload = _har_bytes(SECRET)
     out = artifact_manager_module._maybe_redact_artifact_data(ArtifactType.HAR, payload, WORKFLOW_RUN_ID)
     assert out == payload
