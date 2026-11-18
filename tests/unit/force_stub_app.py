@@ -103,6 +103,8 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.AGENT_FUNCTION.copilot_browser_code_mode = AsyncMock(return_value=CopilotBrowserCodeMode.OFF)
     fake_app_module.AGENT_FUNCTION.execute_code_block_override = AsyncMock(return_value=None)
     base_agent_function = AgentFunction()
+    fake_app_module.AGENT_FUNCTION.relay_http_request_hop = base_agent_function.relay_http_request_hop
+    fake_app_module.AGENT_FUNCTION.relay_http_download_hop = base_agent_function.relay_http_download_hop
     fake_app_module.AGENT_FUNCTION.classify_failure = base_agent_function.classify_failure
     fake_app_module.AGENT_FUNCTION.note_page_action = base_agent_function.note_page_action
     fake_app_module.AGENT_FUNCTION.page_submission_evidence = base_agent_function.page_submission_evidence

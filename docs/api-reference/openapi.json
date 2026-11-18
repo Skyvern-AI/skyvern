@@ -19384,6 +19384,7 @@
           },
           "timeout": {
             "type": "integer",
+            "minimum": 1.0,
             "title": "Timeout",
             "default": 30
           },
@@ -19598,6 +19599,7 @@
           },
           "timeout": {
             "type": "integer",
+            "minimum": 1.0,
             "title": "Timeout",
             "default": 30
           },
