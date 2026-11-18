@@ -2805,6 +2805,7 @@ class RealBrowserManager(BrowserManager):
                 script_id=script_id,
                 organization_id=organization_id,
                 browser_session_id=browser_session_id,
+                workflow_permanent_id=context.workflow_permanent_id if context else None,
             )
 
         if script_id:

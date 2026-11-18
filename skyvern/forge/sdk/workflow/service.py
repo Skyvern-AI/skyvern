@@ -6043,6 +6043,7 @@ class WorkflowService:
                 **browser_type_kwargs,
                 browser_settings=browser_settings,
                 created_for_workflow_run_id=created_for_workflow_run_id,
+                workflow_permanent_id=workflow.workflow_permanent_id,
             )
 
             return browser_session
@@ -6913,6 +6914,7 @@ class WorkflowService:
                     **browser_type_kwargs,
                     browser_settings=workflow_run.browser_settings,
                     created_for_workflow_run_id=workflow_run_id,
+                    workflow_permanent_id=workflow_permanent_id,
                 )
                 if browser_dispatch:
                     browser_dispatch["expected_browser_session_id"] = browser_session.persistent_browser_session_id
@@ -13888,6 +13890,7 @@ class WorkflowService:
                         **creation_options,
                         browser_settings=workflow_run.browser_settings,
                         created_for_workflow_run_id=workflow_run.workflow_run_id,
+                        workflow_permanent_id=workflow_permanent_id,
                     )
             except (WorkflowAttemptDispatchSuperseded, BrowserSessionCreditAdmissionRefusal):
                 raise
