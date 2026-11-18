@@ -240,6 +240,51 @@ async def test_custom_llm_routes_register_update_and_delete_config(
     assert fake_organizations.tokens[0].valid is False
 
 
+@pytest.mark.parametrize("api_key", [None, "", "  "])
+@pytest.mark.asyncio
+async def test_openai_compatible_config_can_save_and_clear_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_organizations: FakeOrganizationsRepository,
+    api_key: str | None,
+) -> None:
+    monkeypatch.setattr(routes, "_validate_custom_llm_api_base", AsyncMock())
+    org = _org()
+    config = CustomLLMConfig(
+        display_name="Custom endpoint",
+        provider="openai_compatible",
+        model_name="example-model",
+        api_base="https://llm.example.test/v1",
+        api_key=api_key,
+    )
+    created = await routes.create_custom_llm(CustomLLMCreateRequest(config=config), org)
+    assert created.custom_llm.config.api_key is None
+    listed = await routes.list_custom_llms(org)
+    assert listed.custom_llms[0].config.api_key is None
+
+    custom_llm_id = created.custom_llm.id
+    keyed = config.model_copy(update={"api_key": "configured-key"})
+    updated = await routes.update_custom_llm(CustomLLMUpdateRequest(config=keyed), custom_llm_id, org)
+    assert updated.custom_llm.config.api_key == CUSTOM_LLM_API_KEY_MASK
+    await routes.update_custom_llm(CustomLLMUpdateRequest(config=updated.custom_llm.config), custom_llm_id, org)
+    assert CustomLLMConfig.model_validate_json(fake_organizations.tokens[0].token).api_key == "configured-key"
+
+    cleared = await routes.update_custom_llm(CustomLLMUpdateRequest(config=config), custom_llm_id, org)
+    assert cleared.custom_llm.config.api_key is None
+    assert CustomLLMConfig.model_validate_json(fake_organizations.tokens[0].token).api_key is None
+    assert "api_key" not in LLMConfigRegistry.get_config(custom_llm_key(custom_llm_id)).litellm_params
+
+
+@pytest.mark.parametrize("provider", ["openrouter", "gemini"])
+def test_keyed_custom_providers_still_require_api_key(provider: str) -> None:
+    with pytest.raises(ValueError, match="api_key is required"):
+        CustomLLMConfig(display_name="Custom", provider=provider, model_name="example-model")
+
+
+def test_keyless_openai_compatible_config_still_requires_api_base() -> None:
+    with pytest.raises(ValueError, match="api_base is required"):
+        CustomLLMConfig(display_name="Custom", provider="openai_compatible", model_name="example-model")
+
+
 @pytest.mark.asyncio
 async def test_update_custom_llm_preserves_masked_api_key(
     monkeypatch: pytest.MonkeyPatch,
