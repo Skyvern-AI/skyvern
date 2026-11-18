@@ -721,7 +721,7 @@ With `ENABLE_ENCRYPTION=true`, Skyvern encrypts stored secrets such as organizat
 | Variable | Default | What it does |
 |---|---|---|
 | `ENABLE_ENCRYPTION` | `false` | Turn on AES encryption of stored secrets |
-| `ENCRYPTOR_AES_SECRET_KEY` | `fillmein` | AES key. Generate with `openssl rand -base64 32`. The server refuses to start with encryption on and this empty or still `fillmein`. |
+| `ENCRYPTOR_AES_SECRET_KEY` | `fillmein` | AES key. Generate with `openssl rand -base64 32`. The server refuses to start with encryption on and this empty or still `fillmein`. Skyvern also computes its Bitwarden device identifier from this key, with or without `ENABLE_ENCRYPTION`. |
 | `ENCRYPTOR_AES_SALT` | derived from the key | AES salt |
 | `ENCRYPTOR_AES_IV` | derived from the key | AES initialization vector |
 
