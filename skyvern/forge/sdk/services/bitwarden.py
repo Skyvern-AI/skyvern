@@ -318,9 +318,10 @@ class _VaultIdentity:
 class _CliSession:
     """A logged-in, unlocked CLI session and the data directory holding its copy of the vault."""
 
-    def __init__(self, identity: _VaultIdentity, appdata_dir: str) -> None:
+    def __init__(self, identity: _VaultIdentity, appdata_dir: str, fixed_device: bool = False) -> None:
         self.identity = identity
         self.appdata_dir = appdata_dir
+        self.fixed_device = fixed_device
         # Serializes the steps that write to the data directory (login, unlock, sync). Reads against
         # an established session run concurrently.
         self.lock = asyncio.Lock()
@@ -366,13 +367,27 @@ class _CliSession:
         shutil.rmtree(self.appdata_dir, ignore_errors=True)
 
 
-def _seed_cli_device(appdata_dir: str, identity: _VaultIdentity) -> None:
+def _seed_cli_device(appdata_dir: str, identity: _VaultIdentity) -> bool:
     device_id = identity.device_id
     if device_id is None:
-        return
+        return False
     path = os.path.join(appdata_dir, _CLI_STATE_FILE_NAME)
     with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as state_file:
         state_file.write(json.dumps({_CLI_DEVICE_ID_STATE_KEY: device_id}))
+    return True
+
+
+# A read signs in as a new device only after Bitwarden refused this many of its own fixed-device logins in a row.
+# One refusal is not enough: the next attempt of the read heals a short failure as the fixed device, with no email.
+_FIXED_DEVICE_REFUSALS_BEFORE_NEW_DEVICE = 2
+# (vault fingerprint, refused fixed-device logins in a row) of the read in progress. Per read, not per vault:
+# a batch of concurrent reads would otherwise reach the limit inside one short failure.
+_fixed_device_refusals: ContextVar[tuple[str, int]] = ContextVar("bitwarden_fixed_device_refusals", default=("", 0))
+
+
+def _refused_fixed_device_logins(identity: _VaultIdentity) -> int:
+    fingerprint, refusals = _fixed_device_refusals.get()
+    return refusals if fingerprint == identity.fingerprint else 0
 
 
 class _CliSessionCache:
@@ -406,8 +421,8 @@ class _CliSessionCache:
                 self._generation += 1
                 appdata_dir = os.path.join(self._root_dir(), f"{identity.fingerprint[:16]}-{self._generation}")
                 os.makedirs(appdata_dir, mode=0o700, exist_ok=True)
-                _seed_cli_device(appdata_dir, identity)
-                session = _CliSession(identity, appdata_dir)
+                fixed_device = _seed_cli_device(appdata_dir, identity)
+                session = _CliSession(identity, appdata_dir, fixed_device=fixed_device)
                 self._sessions[identity.fingerprint] = session
             os.makedirs(session.appdata_dir, mode=0o700, exist_ok=True)
             self._sessions.move_to_end(identity.fingerprint)
@@ -1049,6 +1064,21 @@ class BitwardenService:
         """Log in (which already runs a full sync), then unlock unless an email login printed a key to trust.
         The caller holds `session.lock`."""
         identity = session.identity
+        refusals = _refused_fixed_device_logins(identity)
+        new_device = refusals >= _FIXED_DEVICE_REFUSALS_BEFORE_NEW_DEVICE
+        if identity.device_id is not None and (new_device or not session.fixed_device):
+            # This session never finished logging in, so nothing in its directory is in use. The device follows the
+            # read that logs in now: a read that waited out another read's failed new-device login starts fixed.
+            shutil.rmtree(session.appdata_dir, ignore_errors=True)
+            os.makedirs(session.appdata_dir, mode=0o700, exist_ok=True)
+            session.fixed_device = not new_device and _seed_cli_device(session.appdata_dir, identity)
+            if new_device:
+                _fixed_device_refusals.set((identity.fingerprint, 0))
+                LOG.warning(
+                    "Bitwarden refused the fixed device; signing in as a new device",
+                    fingerprint=identity.fingerprint[:12],
+                    refusals=refusals,
+                )
         usage = _session_usage.get()
         started = time.monotonic()
         try:
@@ -1061,6 +1091,28 @@ class BitwardenService:
                 appdata_dir=session.appdata_dir,
                 use_api_key=not identity.uses_email_auth,
             )
+            if session.fixed_device:
+                _fixed_device_refusals.set((identity.fingerprint, 0))
+            LOG.info(
+                "Bitwarden CLI session logged in",
+                fingerprint=identity.fingerprint[:12],
+                fixed_device=session.fixed_device,
+            )
+        except BitwardenLoginError as error:
+            # No error text is known that names a refused device, so each other login error counts, a network or
+            # server error included. A timeout is not a BitwardenLoginError: no answer says nothing about the device.
+            if session.fixed_device and not isinstance(
+                error, (BitwardenCredentialsRejectedError, BitwardenVerificationRequiredError)
+            ):
+                refusals = _refused_fixed_device_logins(identity) + 1
+                _fixed_device_refusals.set((identity.fingerprint, refusals))
+                LOG.warning(
+                    "Bitwarden login with the fixed device failed",
+                    fingerprint=identity.fingerprint[:12],
+                    refusals=refusals,
+                    reason=_bitwarden_failure_reason(error),
+                )
+            raise
         finally:
             if usage is not None:
                 usage.login_seconds = (usage.login_seconds or 0.0) + time.monotonic() - started
@@ -1398,6 +1450,7 @@ class BitwardenService:
 
         await BitwardenService._apply_jitter()
         identity = _VaultIdentity.resolve(client_id, client_secret, email, master_password)
+        _fixed_device_refusals.set(("", 0))
         async with asyncio.timeout(timeout):
             # Someone browsing their own vault expects to see an item they just added, so this path
             # always syncs first. It still reuses the login, which is what a run's fetch pays for.
@@ -1439,6 +1492,7 @@ class BitwardenService:
         attempt_deadline = _attempt_deadline_seconds(
             timeout, _VaultIdentity.resolve(client_id, client_secret, email, master_password)
         )
+        _fixed_device_refusals.set(("", 0))
         for attempt in range(max_retries):
             try:
                 # A cold login (and an API-key unlock) gets `login_timeout` and every other CLI command gets
@@ -1669,6 +1723,7 @@ class BitwardenService:
         if not bw_organization_id and bw_collection_ids and collection_id not in bw_collection_ids:
             raise BitwardenAccessDeniedError()
         if not fail_reasons:
+            _fixed_device_refusals.set(("", 0))
             await BitwardenService._apply_jitter()
         try:
             vault_identity = _VaultIdentity.resolve(client_id, client_secret, email, master_password)
@@ -2000,6 +2055,7 @@ class BitwardenService:
             raise BitwardenGetItemError(f"Invalid item ID: {item_id}. Check if the item ID is correct")
 
         if not fail_reasons:
+            _fixed_device_refusals.set(("", 0))
             await BitwardenService._apply_jitter()
         try:
             timeout = settings.BITWARDEN_TIMEOUT_SECONDS
