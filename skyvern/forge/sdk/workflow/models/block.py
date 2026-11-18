@@ -18555,7 +18555,7 @@ class HttpRequestBlock(Block):
     headers: dict[str, str] | None = None
     body: dict[str, Any] | None = None  # Changed to consistently be dict only
     files: dict[str, str] | None = None  # Dictionary mapping field names to file paths for multipart file uploads
-    timeout: int = 30
+    timeout: int = Field(default=30, ge=1)
     follow_redirects: bool = True
     download_filename: str | None = None
     save_response_as_file: bool = False
@@ -19122,12 +19122,14 @@ class HttpRequestBlock(Block):
             status_code, response_headers, response_body = await aiohttp_request(
                 method=self.method,
                 url=self.url,
+                organization_id=organization_id,
                 headers=self.headers,
                 data=self.body,
                 files=self.files,
                 timeout=self.timeout,
                 follow_redirects=self.follow_redirects,
                 authorize_redirect=self._authorize_redirect if self._confined_references else None,
+                use_controlled_egress=True,
             )
 
             success = 200 <= status_code < 300

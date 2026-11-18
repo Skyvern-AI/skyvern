@@ -53,6 +53,7 @@ from skyvern.forge.sdk.copilot.config import (
     authoring_capability_for_request,
 )
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.http_request_authorization import GuardedHTTPHopResponse, GuardedHTTPHopStream
 from skyvern.forge.sdk.credential_site_policy import LoginSite
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.experimentation.billing_tier import BillingTier
@@ -3555,6 +3556,39 @@ class AgentFunction:
                 headers=headers,
                 timeout=httpx.Timeout(timeout_seconds),
             )
+
+    async def relay_http_request_hop(
+        self,
+        *,
+        organization_id: str | None = None,
+        method: str,
+        target_url: str,
+        headers: dict[str, str] | None = None,
+        data: Any | None = None,
+        json_data: dict[str, Any] | None = None,
+        files: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
+        timeout_seconds: float,
+        response_limit_bytes: int,
+        resolved_ips: Callable[[], tuple[str, ...]],
+    ) -> GuardedHTTPHopResponse | None:
+        """Relay one validated HTTP hop in Cloud; OSS keeps its guarded direct transport."""
+        return None
+
+    @asynccontextmanager
+    async def relay_http_download_hop(
+        self,
+        *,
+        organization_id: str | None = None,
+        target_url: str,
+        headers: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
+        timeout_seconds: float,
+        response_limit_bytes: int,
+        resolved_ips: Callable[[], tuple[str, ...]],
+    ) -> AsyncIterator[GuardedHTTPHopStream | None]:
+        """Stream one validated download hop in Cloud; OSS keeps its guarded direct transport."""
+        yield None
 
     async def post_totp_verification_request(
         self,

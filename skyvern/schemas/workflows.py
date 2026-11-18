@@ -1851,7 +1851,7 @@ class HttpRequestBlockYAML(BlockYAML):
     headers: dict[str, str] | None = None
     body: dict[str, Any] | None = None  # Changed to consistently be dict only
     files: dict[str, str] | None = None  # Dictionary mapping field names to file paths/URLs for multipart file uploads
-    timeout: int = 30
+    timeout: int = Field(default=30, ge=1)
     follow_redirects: bool = True
     download_filename: str | None = None
     save_response_as_file: bool = False
