@@ -1,0 +1,79 @@
+syntax = "proto3";
+
+package skyvern.file_parser.v1;
+
+service FileParser {
+  rpc Parse(stream ParseRequest) returns (stream ParseResponse);
+}
+
+message ParseStart {
+  string file_name = 1;
+  string configured_file_type = 2;
+  string worksheet = 3;
+  bool force_ocr = 4;
+  uint64 max_input_bytes = 5;
+  uint64 max_output_bytes = 6;
+  uint32 max_tokens = 7;
+  uint32 max_pdf_ocr_pages = 8;
+  uint64 pdf_memory_bytes = 9;
+  uint64 pdf_result_bytes = 10;
+}
+
+message TransferChunk {
+  uint32 sequence = 1;
+  bytes data = 2;
+}
+
+message TransferEnd {
+  uint32 chunk_count = 1;
+  uint64 total_bytes = 2;
+  bytes sha256 = 3;
+}
+
+message ParseRequest {
+  oneof message {
+    ParseStart start = 1;
+    TransferChunk chunk = 2;
+    TransferEnd end = 3;
+  }
+}
+
+message ResultStart {
+  string file_type = 1;
+  string detection_source = 2;
+  string kind = 3;
+  string metadata_json = 4;
+  uint32 part_count = 5;
+}
+
+message PartStart {
+  uint32 index = 1;
+  string name = 2;
+  uint64 size = 3;
+}
+
+message PartEnd {
+  uint32 index = 1;
+  uint32 chunk_count = 2;
+  bytes sha256 = 3;
+}
+
+message ParseError {
+  string code = 1;
+  string message = 2;
+}
+
+message ResultEnd {
+  uint64 total_bytes = 1;
+}
+
+message ParseResponse {
+  oneof message {
+    ResultStart start = 1;
+    PartStart part_start = 2;
+    TransferChunk chunk = 3;
+    PartEnd part_end = 4;
+    ResultEnd end = 5;
+    ParseError error = 6;
+  }
+}

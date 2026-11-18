@@ -151,6 +151,8 @@ from skyvern.exceptions import (
     WorkflowRunContextNotInitialized,
     get_user_facing_exception_message,
 )
+from skyvern.file_parser.client import IsolatedParserResult, parse_file_remotely
+from skyvern.file_parser.transport import MAX_PARSER_INPUT_BYTES, MAX_PARSER_OUTPUT_BYTES
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api import email
@@ -15841,13 +15843,24 @@ class FileParserBlock(Block):
         organization_id: str | None = None,
     ) -> str:
         """Parse image file using vision LLM for OCR."""
+        with open(file_path, "rb") as file:
+            image_bytes = file.read()
+        return await self._ocr_image_bytes(
+            image_bytes,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+        )
+
+    async def _ocr_image_bytes(
+        self,
+        image_bytes: bytes | list[bytes],
+        workflow_run_block_id: str | None = None,
+        organization_id: str | None = None,
+    ) -> str:
         if self.ocr_validation_max_attempts <= 0:
             raise ValueError("OCR validation max attempts must be greater than 0.")
 
         try:
-            with open(file_path, "rb") as f:
-                image_bytes = f.read()
-
             llm_prompt = prompt_engine.load_prompt("extract-text-from-image")
             default_handler = await self._resolve_file_parser_handler(
                 "extract-text-from-image", workflow_run_block_id, organization_id
@@ -15865,7 +15878,7 @@ class FileParserBlock(Block):
                         llm_response = await llm_api_handler(
                             prompt=prompt_for_attempt,
                             prompt_name="extract-text-from-image",
-                            screenshots=[image_bytes],
+                            screenshots=image_bytes if isinstance(image_bytes, list) else [image_bytes],
                             # Schema validation must inspect the raw parsed root; dict coercion can hide bad OCR JSON.
                             force_dict=False,
                             workflow_run_block_id=workflow_run_block_id,
@@ -16438,39 +16451,40 @@ class FileParserBlock(Block):
             run_id = context.run_id if context and context.run_id else workflow_run_id
             file_path = await resolve_local_or_download_file(self.file_url, run_id, organization_id=organization_id)
 
-            # Resolve AUTO_DETECT (and legacy CSV-as-default) via URL/magic-byte detection;
-            # IMAGE/EXCEL/PDF/DOCX/ZIP are honored as user overrides.
-            auto_detected_csv_fallback = False
-            if self.file_type not in (FileType.IMAGE, FileType.EXCEL, FileType.PDF, FileType.DOCX, FileType.ZIP):
-                configured_file_type = self.file_type
-                detected_file_type = self._detect_file_type_from_url(self.file_url, file_path=file_path)
-                auto_detected_csv_fallback = (
-                    configured_file_type in (FileType.AUTO_DETECT, FileType.CSV)
-                    and detected_file_type == FileType.CSV
-                    and Path(urlparse(self.file_url).path).suffix.lower() not in {".csv", ".tsv"}
-                )
-                self.file_type = detected_file_type
-            else:
-                self._telemetry.detection_source = "explicit"
-                self._telemetry.file_type_detected = self.file_type
+            if not settings.FILE_PARSER_SERVICE_TARGET.strip():
+                # Resolve AUTO_DETECT (and legacy CSV-as-default) via URL/magic-byte detection;
+                # IMAGE/EXCEL/PDF/DOCX/ZIP are honored as user overrides.
+                auto_detected_csv_fallback = False
+                if self.file_type not in (FileType.IMAGE, FileType.EXCEL, FileType.PDF, FileType.DOCX, FileType.ZIP):
+                    configured_file_type = self.file_type
+                    detected_file_type = self._detect_file_type_from_url(self.file_url, file_path=file_path)
+                    auto_detected_csv_fallback = (
+                        configured_file_type in (FileType.AUTO_DETECT, FileType.CSV)
+                        and detected_file_type == FileType.CSV
+                        and Path(urlparse(self.file_url).path).suffix.lower() not in {".csv", ".tsv"}
+                    )
+                    self.file_type = detected_file_type
+                else:
+                    self._telemetry.detection_source = "explicit"
+                    self._telemetry.file_type_detected = self.file_type
 
-            # Validation opens the document, so on a large file it is as slow as the parse itself.
-            try:
-                await _run_blocking_parse_step(
-                    "file type validation", self.file_url, self.validate_file_type, self.file_url, file_path
-                )
-            except InvalidFileType as e:
-                if auto_detected_csv_fallback:
-                    validation_error = str(e).partition("Error: ")[2] or str(e)
-                    raise InvalidFileType(
-                        file_url=self.file_url,
-                        file_type="auto-detect",
-                        error=(
-                            "Unable to auto-detect a supported file type from the downloaded file. "
-                            f"Underlying validation error: {validation_error}"
-                        ),
-                    ) from e
-                raise
+                # Validation opens the document, so on a large file it is as slow as the parse itself.
+                try:
+                    await _run_blocking_parse_step(
+                        "file type validation", self.file_url, self.validate_file_type, self.file_url, file_path
+                    )
+                except InvalidFileType as e:
+                    if auto_detected_csv_fallback:
+                        validation_error = str(e).partition("Error: ")[2] or str(e)
+                        raise InvalidFileType(
+                            file_url=self.file_url,
+                            file_type="auto-detect",
+                            error=(
+                                "Unable to auto-detect a supported file type from the downloaded file. "
+                                f"Underlying validation error: {validation_error}"
+                            ),
+                        ) from e
+                    raise
         except Exception as e:
             return await self._record_failure(
                 workflow_run_context,
@@ -16498,7 +16512,63 @@ class FileParserBlock(Block):
         # Parse the file based on type
         parsed_data: str | list[dict[str, Any]]
         try:
-            if self.file_type == FileType.ZIP:
+            parser_target = settings.FILE_PARSER_SERVICE_TARGET.strip()
+            if parser_target:
+                zip_stem = sanitize_filename(Path(file_path).stem, default="archive")
+                isolated_result: IsolatedParserResult = await parse_file_remotely(
+                    parser_target,
+                    Path(file_path),
+                    file_name=Path(urlparse(self.file_url).path).name or Path(file_path).name,
+                    configured_file_type=self.file_type.value,
+                    worksheet=self.worksheet,
+                    force_ocr=self.force_ocr,
+                    output_dir=(
+                        get_path_for_workflow_download_directory(run_id)
+                        / "unzipped"
+                        / f"{zip_stem}_{workflow_run_block_id}"
+                    ),
+                    timeout_seconds=FILE_PARSE_STEP_TIMEOUT_SECONDS,
+                    max_input_bytes=MAX_PARSER_INPUT_BYTES,
+                    max_output_bytes=MAX_PARSER_OUTPUT_BYTES,
+                    max_tokens=MAX_FILE_PARSE_INPUT_TOKENS,
+                    max_pdf_ocr_pages=MAX_PDF_OCR_PAGES,
+                    pdf_memory_bytes=settings.PDFPLUMBER_MAX_MEMORY_BYTES,
+                    pdf_result_bytes=settings.PDFPLUMBER_MAX_RESULT_BYTES,
+                )
+                self.file_type = FileType(isolated_result.file_type)
+                self._telemetry.file_type_detected = self.file_type
+                self._telemetry.detection_source = cast(DetectionSource, isolated_result.detection_source)
+                self._telemetry.total_pages = isolated_result.metadata.get("total_pages")
+                if isolated_result.metadata.get("truncated"):
+                    content = isolated_result.content if isinstance(isolated_result.content, str) else ""
+                    self._telemetry.mark_platform_cap(
+                        limit="token_limit",
+                        tokens_included=count_tokens(content),
+                        token_limit=MAX_FILE_PARSE_INPUT_TOKENS,
+                    )
+                if isolated_result.kind == "files":
+                    parsed_data = isolated_result.files or []
+                elif isolated_result.kind == "images":
+                    images = isolated_result.images or []
+                    if self.file_type == FileType.PDF:
+                        parsed_data = await self._ocr_pdf_pages(
+                            images,
+                            workflow_run_block_id=workflow_run_block_id,
+                            organization_id=organization_id,
+                        )
+                    elif self.file_type == FileType.IMAGE and images:
+                        parsed_data = await self._ocr_image_bytes(
+                            images if len(images) > 1 else images[0],
+                            workflow_run_block_id=workflow_run_block_id,
+                            organization_id=organization_id,
+                        )
+                    else:
+                        raise ValueError("Isolated parser returned an invalid image result")
+                elif isolated_result.content is not None:
+                    parsed_data = isolated_result.content
+                else:
+                    raise ValueError("Isolated parser returned no content")
+            elif self.file_type == FileType.ZIP:
                 extracted_zip_files = await asyncio.to_thread(
                     self._extract_zip_file, file_path, workflow_run_id, workflow_run_block_id
                 )

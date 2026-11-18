@@ -19,7 +19,6 @@ import structlog
 from pypdf import PdfReader, get_configuration
 from pypdf.errors import LimitReachedError
 
-from skyvern.config import settings
 from skyvern.constants import FILE_PARSE_STEP_TIMEOUT_SECONDS, MAX_FILE_PARSE_INPUT_TOKENS, MAX_PDF_OCR_PAGES
 from skyvern.exceptions import PDFParsingError
 from skyvern.forge.sdk.utils import docx_child, pdfplumber_child
@@ -239,13 +238,18 @@ def _run_parser_child(
     log_identifier: str,
     started_at: float,
     budget_seconds: float | None = None,
+    memory_limit_bytes: int | None = None,
 ) -> _T:
     # A crafted document can grow a parser's memory until the pod is OOM-killed (pdfminer decodes PDF streams with no
     # size limit, and a .docx is a zip). The child is capped and gets what is left of the caller's parse budget.
+    if memory_limit_bytes is None:
+        from skyvern.config import settings  # noqa: PLC0415
+
+        memory_limit_bytes = settings.PDFPLUMBER_MAX_MEMORY_BYTES
     return run_in_capped_subprocess(
         func,
         *args,
-        memory_limit_bytes=settings.PDFPLUMBER_MAX_MEMORY_BYTES,
+        memory_limit_bytes=memory_limit_bytes,
         max_result_bytes=result.max_bytes,
         result_memory_factor=result.memory_factor,
         timeout_seconds=max(
@@ -277,6 +281,7 @@ def extract_pdf_file(
     file_identifier: str | None = None,
     max_tokens: int = MAX_FILE_PARSE_INPUT_TOKENS,
     stats: PdfExtractStats | None = None,
+    memory_limit_bytes: int | None = None,
 ) -> str:
     """
     Extract text from a PDF file with fallback support.
@@ -369,6 +374,7 @@ def extract_pdf_file(
                 result=_TEXT_RESULT,
                 log_identifier=log_identifier,
                 started_at=started_at,
+                memory_limit_bytes=memory_limit_bytes,
             )
             extracted_text, truncated_at_page = _join_within_token_limit(page_texts, max_tokens)
             read_on_failed = False
@@ -382,6 +388,7 @@ def extract_pdf_file(
                         result=_TEXT_RESULT,
                         log_identifier=log_identifier,
                         started_at=started_at,
+                        memory_limit_bytes=memory_limit_bytes,
                     )
                 except CappedSubprocessError as read_on_error:
                     # The first pass already holds usable text, so a second pass that fails does not lose it.
@@ -445,6 +452,7 @@ def extract_docx_file(
     file_path: str,
     file_identifier: str | None = None,
     max_tokens: int = MAX_FILE_PARSE_INPUT_TOKENS,
+    memory_limit_bytes: int | None = None,
 ) -> str:
     """Return a Word .docx file's paragraph and table-row text in document order, cut at max_tokens. Raises
     CappedSubprocessError when the file cannot be parsed or the capped child fails."""
@@ -457,6 +465,7 @@ def extract_docx_file(
         result=_TEXT_RESULT,
         log_identifier=log_identifier,
         started_at=time.monotonic(),
+        memory_limit_bytes=memory_limit_bytes,
     )
     extracted_text, truncated_at_block = _join_within_token_limit(block_texts, max_tokens)
     if truncated_at_block is not None:
@@ -480,6 +489,8 @@ def extract_docx_file(
 def validate_pdf_file(
     file_path: str,
     file_identifier: str | None = None,
+    *,
+    memory_limit_bytes: int | None = None,
 ) -> bool:
     """
     Validate that a file is a readable PDF.
@@ -535,6 +546,7 @@ def validate_pdf_file(
                 result=_PAGE_COUNT_RESULT,
                 log_identifier=log_identifier,
                 started_at=started_at,
+                memory_limit_bytes=memory_limit_bytes,
             )
 
             LOG.info(
@@ -564,6 +576,8 @@ def render_pdf_pages_as_images(
     max_pages: int | None = MAX_PDF_OCR_PAGES,
     resolution: int = 150,
     timeout_seconds: float | None = None,
+    memory_limit_bytes: int | None = None,
+    max_result_bytes: int | None = None,
 ) -> list[bytes]:
     """Render PDF pages as PNG images using pdfplumber.
 
@@ -574,16 +588,21 @@ def render_pdf_pages_as_images(
     """
     identifier = file_identifier or file_path
     log_identifier = identifier.partition("?")[0]
+    if max_result_bytes is None:
+        from skyvern.config import settings  # noqa: PLC0415
+
+        max_result_bytes = settings.PDFPLUMBER_MAX_RESULT_BYTES
     page_images, total_pages = _run_parser_child(
         pdfplumber_child.page_images,
         file_path,
         max_pages,
         resolution,
-        settings.PDFPLUMBER_MAX_RESULT_BYTES,
-        result=_ResultLimit(settings.PDFPLUMBER_MAX_RESULT_BYTES, _PAGE_IMAGES_MEMORY_FACTOR),
+        max_result_bytes,
+        result=_ResultLimit(max_result_bytes, _PAGE_IMAGES_MEMORY_FACTOR),
         log_identifier=log_identifier,
         started_at=time.monotonic(),
         budget_seconds=timeout_seconds,
+        memory_limit_bytes=memory_limit_bytes,
     )
     if len(page_images) < total_pages:
         LOG.warning(
