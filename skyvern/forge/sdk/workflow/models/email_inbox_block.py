@@ -41,6 +41,27 @@ from skyvern.services.email.gmail_client import GMAIL_API_BASE, get_json
 
 LOG = structlog.get_logger()
 
+_CONNECTED_ACCOUNT_RUN_NOT_SUPPORTED_REASON = (
+    "This Gmail account cannot be read in a run started with an API key, or in a webhook, job recipe or directory "
+    "submission run; use a natively connected Google account for those."
+)
+_CONNECTED_ACCOUNT_UNAVAILABLE_REASON = (
+    "The selected Gmail account is not available to this run. Choose an account you connected on the Integrations "
+    "page directly in this block, and keep its folder, sender and subject free of template variables."
+)
+# Refusals whose message is the whole failure reason, with no HTTP status wrapped around it.
+_CONNECTED_ACCOUNT_REFUSAL_CODES = frozenset(
+    {
+        "resave_required",
+        "owner_unconfirmed",
+        "copilot_test_run_unsupported",
+        "run_not_supported",
+        "account_unavailable",
+        "organize_failed",
+        GMAIL_ORGANIZE_UNCERTAIN_ERROR_CODE,
+    }
+)
+
 
 class EmailInboxBlock(Block):
     block_type: Literal[BlockType.EMAIL_INBOX] = BlockType.EMAIL_INBOX  # type: ignore
@@ -443,6 +464,14 @@ class EmailInboxBlock(Block):
                             code="copilot_test_run_unsupported",
                             message=CONNECTED_ACCOUNT_COPILOT_TEST_RUN_REASON,
                         )
+                    if refusal == GmailHopRefusal.run_not_supported:
+                        raise email.GmailAPIError(
+                            status=403, code="run_not_supported", message=_CONNECTED_ACCOUNT_RUN_NOT_SUPPORTED_REASON
+                        )
+                    if refusal == GmailHopRefusal.account_unavailable:
+                        raise email.GmailAPIError(
+                            status=403, code="account_unavailable", message=_CONNECTED_ACCOUNT_UNAVAILABLE_REASON
+                        )
                 data = await app.AGENT_FUNCTION.execute_gmail_inbox_for_run(
                     organization_id=effective_org_id,
                     workflow_run_id=workflow_run_id,
@@ -647,12 +676,7 @@ class EmailInboxBlock(Block):
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, error_data)
         if exc.code == "reconnect_required":
             failure_reason = f"Reconnect the {provider} account: {exc.message}"
-        elif exc.code in {
-            "resave_required",
-            "owner_unconfirmed",
-            "organize_failed",
-            GMAIL_ORGANIZE_UNCERTAIN_ERROR_CODE,
-        }:
+        elif exc.code in _CONNECTED_ACCOUNT_REFUSAL_CODES:
             failure_reason = exc.message
         else:
             failure_reason = f"{provider} email fetch failed (HTTP {exc.status}): {exc.message}"

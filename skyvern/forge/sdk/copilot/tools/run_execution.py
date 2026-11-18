@@ -5469,6 +5469,8 @@ async def _run_blocks_with_minted_browser_claim(
         ctx.run_outcome_trace.append(interim_run_start_outcome(interim_run_id))
         ctx.open_step_run_ids.append(interim_run_id)
         await _send_run_started_update(ctx, workflow_run.workflow_run_id)
+        # A test run never gets a Gmail capability, but its blocks must still read why it was refused.
+        await app.AGENT_FUNCTION.prepare_gmail_hop_tokens(workflow_run=workflow_run, workflow=snapshot.workflow)
 
         if dispatch_to_worker:
             # Submit through the cloud executor (Temporal). The run was created against the
