@@ -22,6 +22,7 @@ from skyvern.forge.failure_classifier import (
     FailureCategory,
     classify_from_failure_reason,
     derive_failure_attribution,
+    failure_category_for_exception_name,
     partition_failure_categories,
     with_root_user_errors,
 )
@@ -809,13 +810,16 @@ async def test_non_timeout_scraping_reason_stays_data_extraction(canvas_app: boo
     assert _categories_for(generic_reason, ScrapingFailed(reason=generic_reason)) == ["DATA_EXTRACTION_FAILURE"]
 
 
-def test_exception_name_classifies_when_instance_absent() -> None:
-    """A bare cause-type name classifies via exception_name — the Temporal activity-failure
-    path only carries the class name across the serialization boundary, not the instance."""
-    result = classify_from_failure_reason(None, exception_name="BitwardenVaultError", fallback_to_unknown=True)
+@pytest.mark.parametrize(
+    ("exception_name", "expected"), [("BitwardenVaultError", "CREDENTIAL_ERROR"), ("ValueError", None)]
+)
+def test_a_bare_exception_name_classifies_when_the_instance_is_absent(
+    exception_name: str, expected: str | None
+) -> None:
+    """The Temporal activity-failure path only carries the class name across the serialization boundary."""
+    result = classify_from_failure_reason(None, exception_name=exception_name)
 
-    assert result is not None
-    assert result[0]["category"] == "CREDENTIAL_ERROR"
+    assert (result[0]["category"] if result else None) == expected
 
 
 def test_exception_name_is_ignored_when_instance_provided() -> None:
@@ -825,10 +829,6 @@ def test_exception_name_is_ignored_when_instance_provided() -> None:
 
     assert result is not None
     assert result[0]["category"] == "ELEMENT_NOT_FOUND"
-
-
-def test_exception_name_alone_returns_none_when_unrecognized() -> None:
-    assert classify_from_failure_reason(None, exception_name="ValueError") is None
 
 
 _LOCATOR_WAIT_TIMEOUT = (
@@ -1438,6 +1438,52 @@ def test_summary_ignores_model_provided_rejected_categories(untrusted_rejected_c
     assert summary.reasoning == "valid model reasoning"
     assert summary.failure_categories == [{"category": "AUTH_FAILURE", "confidence_float": 0.9}]
     assert summary._rejected_failure_categories == []
+
+
+_SKYVERN_EXCEPTION_NAMES = sorted(
+    name
+    for name, value in vars(skyvern_exceptions).items()
+    if isinstance(value, type) and issubclass(value, BaseException)
+)
+
+
+@pytest.mark.parametrize(
+    ("exception_name", "expected"),
+    [
+        (WORKER_CONTAINER_RESTARTED_REASON_CODE, ["INFRASTRUCTURE_ERROR"]),
+        ("NoProxyAvailable", ["PROXY_ERROR"]),
+        ("BrowserProxyError", ["PROXY_ERROR"]),
+        ("UnknownErrorWhileCreatingBrowserContext", ["BROWSER_ERROR"]),
+        ("TargetClosedError", ["BROWSER_ERROR"]),
+        ("BrowserSessionStartupTimeout", ["BROWSER_ERROR", "PAGE_LOAD_TIMEOUT"]),
+        ("FailedToNavigateToUrl", ["NAVIGATION_FAILURE"]),
+        ("Http404", ["NAVIGATION_FAILURE"]),
+        ("TimeoutError", ["PAGE_LOAD_TIMEOUT"]),
+        ("socket.timeout", ["PAGE_LOAD_TIMEOUT"]),
+        ("BitwardenGetItemError", ["CREDENTIAL_ERROR"]),
+        ("OnePasswordRateLimitError", ["LLM_ERROR", "AUTH_FAILURE"]),
+        ("ScrapingFailed", ["DATA_EXTRACTION_FAILURE"]),
+        ("scraping_error", ["DATA_EXTRACTION_FAILURE"]),
+        ("ElementNotFoundError", ["ELEMENT_NOT_FOUND"]),
+        ("CaptchaSolveError", ["ANTI_BOT_DETECTION"]),
+        ("HallucinatedParameterError", ["LLM_REASONING_ERROR"]),
+        ("ValueError", ["UNKNOWN"]),
+        # Every exception class in skyvern.exceptions keeps the categories its fixed failure message got.
+        *((name, None) for name in _SKYVERN_EXCEPTION_NAMES),
+    ],
+)
+def test_an_exception_name_alone_maps_to_the_categories_its_fixed_failure_message_gets(
+    exception_name: str, expected: list[str] | None
+) -> None:
+    assert _SKYVERN_EXCEPTION_NAMES
+    mapped = failure_category_for_exception_name(exception_name)
+    if expected is not None:
+        assert [c["category"] for c in mapped] == expected
+    # A finalizer's failure reason only names the exception, so the reason text adds nothing to the name.
+    message = f"Workflow run failed: the workflow activity failed before completion ({exception_name})."
+    from_message = classify_from_failure_reason(message, exception_name=exception_name, fallback_to_unknown=True)
+    fields = ("category", "confidence_float", "reason_code", "evidence_source", "reasoning")
+    assert [{k: c.get(k) for k in fields} for c in mapped] == [{k: c.get(k) for k in fields} for c in from_message]
 
 
 def test_root_user_errors_repeat_the_classifier_primary_not_a_model_label_entry() -> None:
