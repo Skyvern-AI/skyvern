@@ -81,7 +81,11 @@ class _FakeDownloadSession:
         self._raise_for_status = raise_for_status
 
     def get(
-        self, url: object, headers: dict[str, str] | None = None, allow_redirects: bool = True
+        self,
+        url: object,
+        headers: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
+        allow_redirects: bool = True,
     ) -> _FakeDownloadResponse:
         self._response.auto_raise_for_status = self._raise_for_status
         return self._response
@@ -562,7 +566,11 @@ class _FakeSequencedDownloadSession:
         self.cookie_jar = aiohttp.CookieJar()
 
     def get(
-        self, url: object, headers: dict[str, str] | None = None, allow_redirects: bool = True
+        self,
+        url: object,
+        headers: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
+        allow_redirects: bool = True,
     ) -> _FakeDownloadResponse:
         self.requested_urls.append(str(url))
         return self._responses.pop(0)
