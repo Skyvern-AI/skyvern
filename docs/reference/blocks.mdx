@@ -63,7 +63,6 @@ Browser-based blocks (Browser Task, Browser Action, Extraction, Login, File Down
 | **URL** | All except Extraction | Starting URL. Leave blank to continue from the previous block's page. |
 | **Engine** | All five | AI engine for this block. On Skyvern Cloud, **Default** runs on Skyvern 3.0 in agents created since October 1, 2026. The selector labels Skyvern 3.0 **Recommended** and Skyvern 1.0 and 2.0 **Legacy**. See [Choose an engine per block](/cloud/studio#choose-an-engine-per-block). |
 | **Max Steps Override** | All except Browser Action | Cap the number of AI reasoning steps |
-| **Disable Cache** | All five | Skip cached script execution |
 | **2FA Identifier** | All except Extraction | ID that links 2FA codes to this block. When empty, the block uses the selected credential's identifier, if it has one. |
 | **2FA Verification URL** | All except Extraction | Endpoint this block polls when it needs a 2FA code |
 | **Error Messages** | All except Extraction | Map error conditions to custom error codes (JSON) |
@@ -96,7 +95,6 @@ The block shows the same fields for every engine except Skyvern 2.0. Skyvern 2.0
 | **URL** | text | Starting URL (optional) |
 | **Prompt** | text | Natural language instructions for the AI |
 | **Max Steps** | number | Maximum AI steps |
-| **Disable Cache** | boolean | Skip cached script execution |
 
 Additional fields in **Advanced Settings** (not on Skyvern 2.0 blocks):
 
@@ -143,6 +141,14 @@ Extract structured data from the current page using AI.
 |-------|------|-------------|
 | **Data Extraction Goal** | text | What data to extract |
 | **Data Schema** | JSON | [JSON Schema](https://json-schema.org/) defining the output format. Enable the checkbox to reveal the editor. Click **Generate with AI** to auto-suggest a schema from your extraction goal. |
+
+Turn on **Export as Parquet** in the **Export** section to also write the extracted data to a downloadable Parquet file, without a separate Data Export block. It adds these fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| **Data Schema** | JSON | Schema of the exported records. Starts from the extraction's Data Schema when it can be derived. |
+| **Filename (optional)** | text | Name of the Parquet file. Leave it empty to use the block's label. Inside a loop, each iteration's file ends in its number, such as `-0001`. |
+| **Records (optional)** | text | What to export. Defaults to this block's extracted data; use `{{ parameter_name }}` to export something else. |
 
 *Plus [common browser fields](#common-fields).*
 
@@ -292,8 +298,16 @@ Very large files can exceed the parser's time budget and fail the block. When a 
 | Field | Type | Description |
 |-------|------|-------------|
 | **File URL** | text | URL or parameter reference to the file |
+| **File Type** | select | **Auto detect**, **CSV**, **Excel**, **PDF**, **Image**, **DOCX** or **ZIP**. Auto detect reads the type from the URL's extension when it can. |
+| **Worksheet** | text | Excel only: the exact name of the worksheet to read. Leave it empty to read the first worksheet. The run fails if the workbook has no worksheet with that name. |
 | **Data Schema** | JSON | Schema for the extracted output. Enable the checkbox to reveal the editor. |
 | **Model** | selector | Which LLM model to use |
+
+Additional fields in **Advanced Settings:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| **Force OCR** | switch | PDF only: ignore the PDF's text layer and read the pages with vision OCR. Skyvern already does this when the text layer is empty or scrambled; turn it on when the text layer is unreadable in another way. OCR is slower, costs more, and reads at most the first 50 pages. |
 
 <Frame>
 <img width="400" src="/images/cloud/file_parse_block.png" alt="File Parser block configuration with File URL, Data Schema, and Model fields" />
@@ -558,18 +572,22 @@ error_code: PRECHECK_UNREACHABLE
 
 ### File Download
 
-Navigate the browser to download a file.
+Navigate the browser to download a file. The block can keep the file in Skyvern or send it to cloud storage, and it can read the file from an SFTP server instead of a website.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| **URL** | text | Starting URL (optional) |
-| **Download Goal** | text | Instructions for finding and downloading the file |
-| **Download Timeout (sec)** | number | Seconds to wait for the download to complete |
+| **URL** | text | Starting URL (optional). Not needed when the block reads from SFTP. |
+| **Download Goal** | text | Instructions for finding and downloading the file. Hidden when the block reads from SFTP. |
+| **Download Timeout (sec)** | number | Seconds to wait for the download to complete. Defaults to 120 when empty. Hidden when the block reads from SFTP. |
+| **Download Target** | select | **Website** keeps the downloaded files in Skyvern. **AWS S3**, **Azure Blob Storage**, **Google Drive** and **SFTP** send them to that storage, with the same fields as the [Cloud Storage](#cloud-storage) block. |
+| **Files to Send (Optional)** | text | Shown when the target is not **Website**. Describes which downloaded files to send, such as only the PDF files whose names contain "invoice". Leave it empty to send all of them. |
+| **Google Drive Source Account (Optional)** | selector | Shown when the URL is a Google Drive link and the target is AWS S3, Azure Blob Storage or SFTP. For a private Drive link, the file is fetched through this connected account instead of the browser. |
 
 Additional fields in **Advanced Settings:**
 
 | Field | Type | Description |
 |-------|------|-------------|
+| **SFTP Source Path** | text | Under **Read from SFTP (Optional)**: the path of a file to read from an SFTP server instead of browsing for it. It replaces the URL, Download Goal and Download Timeout, and shows the SFTP connection fields, where **Host Key** is then required. When the target is also SFTP, one connection serves both. |
 | **File Name** | text | Custom filename for the download. Replaces the site's filename, keeping the extension. Reference `{{ original_filename }}` to keep the site's name instead — `{{ fund }}_{{ original_filename }}` prefixes it, which separates documents that several pages name identically. |
 
 *Plus [common browser fields](#common-fields).*
@@ -706,15 +724,15 @@ Fields in **Advanced Settings** (SMTP only):
 
 ### HTTP Request
 
-Make an API call to an external service. Click **Import cURL** in the block header to populate fields from a cURL command.
+Make an API call to an external service. Click **Import cURL**, above the **Method** field, to populate fields from a cURL command.
 
 | Field | Type | Description |
 |-------|------|-------------|
 | **Method** | select | GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS |
 | **URL** | text | Request URL. Supports parameter references. |
 | **Headers** | JSON | HTTP headers. Use **Quick Headers** to add common headers. |
-| **Body** | JSON | Request body (POST/PUT/PATCH only) |
-| **Files** | JSON | File uploads (POST/PUT/PATCH only) |
+| **Body** | JSON | Request body. Hidden for GET, HEAD and DELETE. |
+| **Files** | JSON | File uploads. Hidden for GET, HEAD and DELETE. |
 
 Additional fields in **Advanced Settings:**
 
@@ -725,6 +743,7 @@ Additional fields in **Advanced Settings:**
 | **Continue on Failure** | boolean | Continue agent if the request fails |
 | **Save Response as File** | boolean | Save the response body as a downloadable file |
 | **Download Filename** | text | Filename for the saved response (shown when Save Response as File is enabled) |
+| **Secret Response Paths** | text | One dot-path per line into the JSON response body, such as `data.ssn`. Matching values are stored as secrets: hidden from outputs, logs and the AI, and usable in later blocks like credentials. A path that does not resolve to a non-empty string fails the block, and the response body is left out of its output. You cannot combine it with **Save Response as File**: the editor lets you turn on both, but saving the agent fails. |
 
 <Frame>
 <img width="400" src="/images/cloud/http_block.png" alt="HTTP Request block configuration with Method, URL, Headers, and Body fields" />
