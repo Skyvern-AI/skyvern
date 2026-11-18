@@ -149,7 +149,7 @@ from skyvern.forge.sdk.workflow.status_mapping import (
 from skyvern.schemas.browser_settings import BrowserSettings, BrowserSettingsReceipt, requested_timezone_id
 from skyvern.schemas.run_enums import WebhookDeliveryStatus, resolve_webhook_delivery_projection
 from skyvern.schemas.runs import MAX_SEARCH_FETCH_LIMIT, TERMINAL_STATUSES, ProxyLocationInput, RunType
-from skyvern.schemas.workflows import BlockStatus
+from skyvern.schemas.workflows import BlockStatus, BlockType
 
 LOG = structlog.get_logger()
 
@@ -4352,14 +4352,26 @@ class WorkflowRunsRepository(BaseRepository):
         workflow_run_id: str,
         organization_id: str | None = None,
         attempt_number: int | None = None,
+        *,
+        only_error_output: bool = False,
     ) -> list[WorkflowRunBlockErrorRow]:
         """Return block provenance and error details for errored blocks in stable creation order."""
+        output = (
+            case(
+                (
+                    WorkflowRunBlockModel.block_type.in_((BlockType.CODE.value, BlockType.WEB_SEARCH.value)),
+                    WorkflowRunBlockModel.output,
+                ),
+            ).label("output")
+            if only_error_output
+            else WorkflowRunBlockModel.output
+        )
         async with self.Session() as session:
             query = select(
                 WorkflowRunBlockModel.workflow_run_block_id,
                 WorkflowRunBlockModel.error_codes,
                 WorkflowRunBlockModel.failure_reason,
-                WorkflowRunBlockModel.output,
+                output,
                 WorkflowRunBlockModel.block_type,
                 WorkflowRunBlockModel.label,
                 WorkflowRunBlockModel.current_index,
