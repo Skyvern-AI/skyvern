@@ -107,6 +107,14 @@ from .credential import (
     skyvern_onepassword_config_set,
     skyvern_onepassword_items,
 )
+from .ember import (
+    skyvern_ember_answer,
+    skyvern_ember_check,
+    skyvern_ember_decide,
+    skyvern_ember_list,
+    skyvern_ember_send,
+    skyvern_ember_stop,
+)
 from .feedback import skyvern_feedback
 from .folder import (
     skyvern_folder_create,
@@ -560,6 +568,14 @@ mcp.tool(description=FINISH_DESCRIPTION, tags={"lean"}, annotations=_ro("Declare
 # Additive page-read surface; intentionally excluded from every existing scope.
 mcp.tool(tags={"page_read", "lean"}, annotations=_web_ro("Read Page"))(size_capped(skyvern_page))
 
+# -- Ember --
+mcp.tool(tags={"ember"}, annotations=_web_dest("Ember: Send Message"))(size_capped(skyvern_ember_send))
+mcp.tool(tags={"ember"}, annotations=_ro("Ember: Check Chat"))(size_capped(skyvern_ember_check))
+mcp.tool(tags={"ember"}, annotations=_ro("Ember: List Chats"))(size_capped(skyvern_ember_list))
+mcp.tool(tags={"ember"}, annotations=_mut("Ember: Stop Turn"))(size_capped(skyvern_ember_stop))
+mcp.tool(tags={"ember"}, annotations=_web_mut("Ember: Answer"))(size_capped(skyvern_ember_answer))
+mcp.tool(tags={"ember"}, annotations=_web_dest("Ember: Decide"))(size_capped(skyvern_ember_decide))
+
 # -- Feedback --
 mcp.tool(tags={"feedback"}, annotations=_mut("Send Feedback to Skyvern"))(skyvern_feedback)
 
@@ -707,6 +723,13 @@ __all__ = [
     # Schema-constrained output
     "skyvern_extract_structured",
     "skyvern_finish",
+    # Ember
+    "skyvern_ember_send",
+    "skyvern_ember_check",
+    "skyvern_ember_list",
+    "skyvern_ember_stop",
+    "skyvern_ember_answer",
+    "skyvern_ember_decide",
     # Feedback
     "skyvern_feedback",
 ]

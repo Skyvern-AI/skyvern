@@ -1870,6 +1870,8 @@ async def skyvern_workflow_create(
 
     Skill instructions can be stored in `workflow_definition.workflow_system_prompt`; see
     skyvern_workflow_get for the read/preserve flow and format caveats.
+
+    If the user asks Ember or Copilot to build the workflow, use skyvern_ember_send instead.
     """
     if format not in ("json", "yaml", "auto"):
         return make_result(

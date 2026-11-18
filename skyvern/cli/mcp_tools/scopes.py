@@ -7,11 +7,9 @@ from fastmcp.server.transforms.visibility import Visibility
 
 MCPScope = Literal["all", "operate", "build", "browser", "lean"]
 
-# `operate` is deliberately browser-free: run, monitor and inspect automations that already
-# exist. `state` lives with `build` rather than here because both its tools are Save/Load
-# *Browser* State and return no_browser_error() without a live page — in a scope with no way
-# to open one they are dead surface.
-OPERATE_SCOPE = {"workflow", "schedule", "folder", "script", "feedback"}
+# `operate` opens no MCP-side browser (`ember` fits because Ember drives its own server-side browser).
+# `state` lives with `build` because its Save/Load *Browser* State tools need a live page and are dead surface here.
+OPERATE_SCOPE = {"workflow", "schedule", "folder", "script", "feedback", "ember"}
 SCOPES: dict[MCPScope, set[str]] = {
     "operate": OPERATE_SCOPE,
     # `session` is required, not cosmetic: without it build's inspection and state tools have no

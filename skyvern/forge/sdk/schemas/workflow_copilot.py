@@ -586,6 +586,10 @@ class WorkflowCopilotChatRequest(BaseModel):
     supports_credential_pause_recovery: bool = Field(
         False, description="The client restores pending credential cards from chat history."
     )
+    refuse_if_turn_running: bool = Field(
+        False,
+        description="Refuse this message, instead of stopping it, when another turn is still running on this workflow.",
+    )
     client_detached: bool = Field(
         False,
         description=(

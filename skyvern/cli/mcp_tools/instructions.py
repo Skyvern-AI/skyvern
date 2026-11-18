@@ -109,6 +109,19 @@ parameters all inside); flat top-level fields are rejected.
 navigate, run steps with execute, using the returned session_id. session_list returns ALL sessions (no pagination).
 - block_schema takes a block_type string only (no definition/format); validate a full block with block_validate(block_json=...).
 
+## Ember
+
+Ember (the new name for Skyvern's Workflow Copilot; the app may still say Copilot) is Skyvern's workflow-building \
+agent. Older chats, runs (copilot_session_id) and workflow versions may say Copilot. Use the skyvern_ember_* tools \
+only when the user names Ember or Copilot.
+- skyvern_ember_send starts a turn that takes minutes. Keep calling skyvern_ember_check with since=progress.cursor \
+until the turn pauses for the user or ends.
+- Do not send while a turn is working, unless the user wants to add to it (if_turn_running='steer') or stop it \
+(skyvern_ember_stop).
+- After an interrupted call, call skyvern_ember_check or skyvern_ember_list before sending again.
+- Show Ember's questions and approvals to the user, and hand over its browser and Studio links. Pass on only the \
+user's own answers (skyvern_ember_answer) and choices (skyvern_ember_decide); never answer or decide for them.
+
 ## Session Lifecycle
 
 Create session -> navigate -> work -> close. Session state persists between calls.

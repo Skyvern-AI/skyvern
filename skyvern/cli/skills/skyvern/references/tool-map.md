@@ -62,6 +62,20 @@
 | `skyvern_workflow_retry` | Retry a terminal workflow run |
 | `skyvern_workflow_cancel` | Cancel a running workflow |
 
+## Ask Ember to build
+
+Ember (the new name for Skyvern's Workflow Copilot; the app may still say Copilot) builds, tests and fixes workflows
+with its own browser. Use these only when the user names Ember or Copilot.
+
+| Tool | Purpose |
+|------|---------|
+| `skyvern_ember_send` | Start an Ember turn, or steer a running one with `if_turn_running='steer'` |
+| `skyvern_ember_check` | Watch a turn: progress (pass `since`), questions, reply, proposal and diff |
+| `skyvern_ember_list` | List or search Ember chats and see which are running or waiting on the user |
+| `skyvern_ember_stop` | Stop a running turn when the user asks |
+| `skyvern_ember_answer` | Pass the user's answer to an Ember question, or their thumbs rating of a turn |
+| `skyvern_ember_decide` | Pass the user's choice on an approval, deletion, login card or proposal; never choose for them |
+
 ## Workflow blocks
 
 | Tool | Purpose |
