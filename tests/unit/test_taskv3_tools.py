@@ -4481,20 +4481,155 @@ async def test_observe_omits_an_offcanvas_role_button() -> None:
 
 @_skip_no_browser
 @pytest.mark.asyncio
-async def test_observe_omits_a_visibility_hidden_control() -> None:
-    # visibility:hidden keeps a non-zero layout box, so it sails past the zero-rect gate. v1 drops it
-    # on isElementStyleVisibilityVisible (domUtils.js); observe must too -- a hidden field is noise
-    # the agent could mis-fill.
+@pytest.mark.parametrize("hidden_style", ["visibility:hidden", "opacity:0"])
+async def test_observe_omits_a_visibility_hidden_control(hidden_style: str) -> None:
     html = (
         "<!doctype html><html><body>"
-        '<input aria-label="VISSHOWNMARK">'
-        '<input aria-label="VISHIDDENMARK" style="visibility:hidden">'
+        '<label>VISSHOWNMARK<input id="shown"></label>'
+        f'<section id="panel" style="{hidden_style}"><h2>HIDDENQUESTION</h2>'
+        '<label>HIDDENCHOICE<input type="radio" name="choice"></label></section>'
+        "<button id=\"mutate\" onclick=\"document.querySelector('#panel h2').textContent='HIDDENCHANGE'\">"
+        "Update background</button><h2>Visible heading</h2>"
+        '<svg role="heading" width="180" height="40"><text x="0" y="20">Vector heading</text></svg>'
+        '<table><tr><td>A<span style="opacity:0">HIDDENTABLE</span></td><td>B</td></tr></table>'
         "</body></html>"
     )
     async with _content_page(html) as page:
-        data = await _observe_data(page)
-    assert _surfaces(data, "VISSHOWNMARK"), "control regression: visible input vanished"
-    assert not _surfaces(data, "VISHIDDENMARK"), "visibility:hidden control must not be surfaced"
+        tools = build_browser_tools(_fixed_page_provider(page))
+        observe = _tool(tools, "observe")
+        result = await observe.handler({})
+        assert "VISSHOWNMARK" in result.content
+        assert "Vector heading" in result.content and "Visible heading" in result.content
+        assert not _surfaces(await _observe_data(page), "HIDDENCHOICE")
+        mutated = await _tool(tools, "click").handler({"selector": "#mutate"})
+        assert mutated.status == "ok"
+        rendered = await _tool(tools, "get_html").handler({"format": "text"})
+        assert rendered.content.strip() == (await page.inner_text("body")).strip()
+        entered = await _tool(tools, "type").handler({"selector": "#shown", "text": "Invented"})
+        assert entered.status == "ok" and await page.locator("#shown").input_value() == "Invented"
+        await page.set_content(
+            '<h2>OUTSIDEDRAIN</h2><button id="stable">STABLEDRAIN</button>'
+            '<section id="fading"><h2>FADEDQUESTION</h2><button aria-label="FADEDACTION">Continue</button></section>'
+            "<script>window.faded = 0; new MutationObserver(records => {"
+            'if (!window.faded && records.some(r => r.attributeName === "data-tv3" && r.target.closest("#fading"))) {'
+            'document.getElementById("fading").style.opacity = "0"; window.faded++;}'
+            '}).observe(document, {subtree:true, attributes:true, attributeFilter:["data-tv3"]});</script>'
+        )
+        for _ in range(2):
+            result = await observe.handler({})
+            assert await page.evaluate("window.faded") == 1
+            assert await page.locator("#fading").evaluate("el => getComputedStyle(el).opacity") == "0"
+            assert "STABLEDRAIN" in result.content and "OUTSIDEDRAIN" in result.content
+            assert not _surfaces(await _observe_data(page), "FADEDACTION")
+            assert result.data["summary"]["hidden_dropped_visibility"] == 1, result.data
+            assert result.data["summary"]["elements_dropped"] == 0, result.data
+            assert "could not be described" not in result.content
+        for control in (
+            '<input aria-label="Fading field">',
+            '<label style="display:block">Fading choice<input type="checkbox"'
+            ' style="position:absolute;width:0;height:0;padding:0;border:0"></label>',
+        ):
+            await page.set_content(
+                f'<section id="fading">{control}</section>'
+                '<script>new MutationObserver(() => {document.getElementById("fading").style.opacity="0"})'
+                '.observe(document,{subtree:true,attributes:true,attributeFilter:["data-tv3"]});</script>'
+            )
+            for _ in range(2):
+                result = await observe.handler({})
+                assert result.status == "ok", result.content
+                summary = result.data["summary"]
+                assert summary["elements_listed"] == 0 and summary["hidden_listed"] == 0, summary
+                assert summary["hidden_dropped"] == summary["hidden_dropped_visibility"] == 1, summary
+                assert summary["elements_dropped"] == 0, summary
+                assert "present but not visible" in result.content
+                assert "could not be described" not in result.content
+        rows = "".join(
+            f'<div><label for="field{i}">{name}</label><input id="field{i}">'
+            '<section class="fading"><input aria-label="Fading field"></section>'
+            "<button>Search</button></div>"
+            for i, name in enumerate(("Account", "Policy"))
+        )
+        await page.set_content(
+            rows + '<script>new MutationObserver(() => {document.querySelectorAll(".fading")'
+            '.forEach(el => el.style.opacity="0")}).observe(document,'
+            '{subtree:true,attributes:true,attributeFilter:["data-tv3"]});</script>'
+        )
+        for _ in range(2):
+            result = await observe.handler({})
+            icons = [line for line in _lines(result.content) if "'Search'" in line]
+            assert len(icons) == 2, result.content
+            for name in ("Account", "Policy"):
+                assert sum(f"field={name!r}" in line for line in icons) == 1, result.content
+            assert result.data["summary"]["hidden_dropped_visibility"] == 2, result.data
+            assert result.data["summary"]["elements_dropped"] == 0, result.data
+        cases = [
+            ('<button id="kept" style="opacity:0">Own opacity</button>', True),
+            ('<div style="opacity:0"><button id="kept">Hidden panel</button></div>', False),
+            ('<div style="display:contents;opacity:0"><button id="kept">Contents</button></div>', True),
+            (
+                '<div style="visibility:hidden"><button id="kept" style="visibility:visible">Override</button></div>',
+                True,
+            ),
+            ('<div style="opacity:.5;pointer-events:none"><button id="kept">Partial</button></div>', True),
+            (
+                '<div style="opacity:0"><dialog id="layer"><button id="kept">Modal</button></dialog></div>'
+                '<script>document.getElementById("layer").showModal()</script>',
+                True,
+            ),
+            (
+                '<div style="opacity:0"><div id="layer" popover><button id="kept">Popover</button></div></div>'
+                '<script>document.getElementById("layer").showPopover()</script>',
+                True,
+            ),
+            ('<div style="opacity:0" role="dialog" aria-modal="true"><button id="kept">Declared</button></div>', False),
+            (
+                '<div style="opacity:0"><input type="checkbox" id="kept"></div>'
+                '<label for="kept" style="display:block">External proxy</label>',
+                True,
+            ),
+            (
+                '<div style="opacity:0"><input type="checkbox" id="kept">'
+                '<label for="kept" style="display:block">Hidden proxy</label></div>',
+                False,
+            ),
+            (
+                '<div id="host"><button id="kept">Slotted</button></div>'
+                '<script>host.attachShadow({mode:"open"}).innerHTML='
+                "'<section style=\"opacity:0\"><slot></slot></section>'</script>",
+                False,
+            ),
+            (
+                "<style>.panel:has([data-tv3]){opacity:0}</style>"
+                '<section class="panel"><button aria-label="kept">Marker panel</button></section>',
+                False,
+            ),
+            ('<style>[data-tv3]{opacity:0}</style><button aria-label="kept">Marker own</button>', True),
+        ]
+        for markup, expected in cases:
+            await page.set_content('<button id="outside">Outside</button>' + markup)
+            for _ in range(2):
+                data = await _observe_data(page)
+                assert _surfaces(data, "outside")
+                assert bool(_surfaces(data, "kept")) is expected, markup
+        for markup in (
+            '<details><summary>Summary</summary>Closed body<span style="opacity:0">Opaque</span></details>',
+            '<canvas>Fallback<span style="opacity:0">Opaque</span></canvas>',
+            '<video>Fallback<span style="opacity:0">Opaque</span></video>',
+            '<div hidden="until-found">Unfound<span style="opacity:0">Opaque</span></div>',
+            '<div id="host">Unslotted<span style="opacity:0">Opaque</span></div>'
+            '<script>host.attachShadow({mode:"open"}).innerHTML="<b>Shadow</b>"</script>',
+            '<svg width="100" height="30"><title>Metadata</title><text y="20">Vector</text></svg>'
+            '<span style="opacity:0">Opaque</span>',
+            '<table><tr><td>A</td><td style="opacity:0">Hidden</td><td>B</td></tr></table>',
+        ):
+            await page.set_content(markup)
+            native = await page.evaluate(
+                "() => [document.body.innerText, ...Array.from(document.querySelectorAll('*'))"
+                ".filter(el => el.shadowRoot).flatMap(el => Array.from(el.shadowRoot.children)"
+                ".map(child => child.innerText))].join(' ').trim()"
+            )
+            rendered = await _tool(tools, "get_html").handler({"format": "text"})
+            assert rendered.content.strip() == native.strip()
 
 
 @_skip_no_browser
@@ -4569,22 +4704,38 @@ async def test_observe_omits_a_display_contents_host_whose_only_text_does_not_re
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_observe_keeps_a_shadow_dom_native_input_hidden_behind_a_styled_overlay() -> None:
-    # Web-component libraries hide the native input via CSS (visibility:hidden) inside a shadow root
-    # while rendering a styled overlay the user actually clicks. v1 force-keeps such a control
-    # (domUtils.js isElementVisible), so the visibility gate must not drop it -- doing so silently
-    # strips a real, interactable control.
+    # A visible component may hide its fillable native fields. Keep that existing carve-out for
+    # each field's own CSS, but opacity on the host or containing panel still hides the component.
     html = (
         "<!doctype html><html><body>"
-        '<div id="host"></div>'
+        '<input id="plain" aria-label="PLAINMARK"><section id="panel"><div id="host"></div></section>'
         "<script>"
         "const r = document.getElementById('host').attachShadow({mode:'open'});"
         'r.innerHTML = \'<label class="ovl">Accept terms</label>'
-        '<input type="checkbox" aria-label="SHADOWHIDDENMARK" style="visibility:hidden;position:absolute">\';'
+        '<input type="checkbox" aria-label="SHADOWHIDDENMARK" style="visibility:hidden;position:absolute">'
+        '<label for="shadow-text">SHADOWTEXTMARK</label>'
+        '<input id="shadow-text" aria-label="SHADOWTEXTMARK" style="opacity:0">'
+        '<label for="shadow-area">SHADOWAREAMARK</label>'
+        '<textarea id="shadow-area" aria-label="SHADOWAREAMARK" style="opacity:0"></textarea>\';'
         "</script></body></html>"
     )
     async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        for selector, text in [("#plain", "Visible"), ("#shadow-text", "Invented"), ("#shadow-area", "Notes")]:
+            entered = await _tool(tools, "type").handler({"selector": selector, "text": text})
+            assert entered.status == "ok" and await page.locator(selector).input_value() == text
         data = await _observe_data(page)
-    assert _surfaces(data, "SHADOWHIDDENMARK"), "a native form control hidden inside a shadow overlay must stay listed"
+        for marker in ["SHADOWHIDDENMARK", "SHADOWTEXTMARK", "SHADOWAREAMARK"]:
+            assert _surfaces(data, marker), "a fillable native control in a visible shadow component must stay listed"
+        for hidden in ["host", "panel"]:
+            await page.evaluate(
+                "id => { for (const key of ['host', 'panel']) document.getElementById(key).style.opacity = key === id ? '0' : '1'; }",
+                hidden,
+            )
+            data = await _observe_data(page)
+            assert _surfaces(data, "PLAINMARK")
+            for marker in ["SHADOWHIDDENMARK", "SHADOWTEXTMARK", "SHADOWAREAMARK"]:
+                assert not _surfaces(data, marker), "a transparent host or panel must hide its shadow controls"
 
 
 @_skip_no_browser
@@ -16807,16 +16958,197 @@ async def test_a_control_whose_name_a_later_marking_rewrote_is_not_listed_under_
 
 @_skip_no_browser
 @pytest.mark.asyncio
-async def test_observe_lists_skinned_checkbox_with_visible_label() -> None:
-    async with _content_page(_HIDDEN_NATIVE_HTML) as page:
+@pytest.mark.parametrize(
+    ("label_order", "zero_size", "during_drain"),
+    [
+        ("original", False, False),
+        ("off-canvas-first-only", False, False),
+        ("off-canvas-first-only", False, True),
+        ("off-canvas-first-visible-later", False, False),
+        ("off-canvas-later-only", True, False),
+        ("off-canvas-scrolled", False, False),
+        ("off-canvas-default", True, False),
+        ("negative-y-proxy", False, False),
+        ("down-page-proxy", False, False),
+        ("hidden-first-only", False, False),
+        ("hidden-first-visible-later", False, False),
+        ("later-label-drain", True, True),
+        ("later-label-drain", True, False),
+        ("opaque-hidden-later", True, False),
+        ("hidden-later", False, False),
+        ("hidden-later", True, True),
+        ("first-proxy-default", True, False),
+        ("faded-first", False, False),
+        ("visible-first", False, False),
+        ("faded-first", True, False),
+        ("visible-first", True, False),
+        ("zero-first", True, False),
+        ("all-hidden", False, False),
+        ("all-hidden", True, False),
+        ("no-label", True, False),
+        ("faded-first", False, True),
+        ("visible-first", False, True),
+        ("faded-first", True, True),
+        ("visible-first", True, True),
+    ],
+)
+async def test_observe_lists_skinned_checkbox_with_visible_label(
+    label_order: str, zero_size: bool, during_drain: bool
+) -> None:
+    if label_order == "original":
+        async with _content_page(_HIDDEN_NATIVE_HTML) as page:
+            tools = build_browser_tools(_fixed_page_provider(page))
+            r = await _tool(tools, "observe").handler({})
+            assert r.status == "ok"
+            assert _ref_line(r.content, "I agree")
+            assert "hidden-native" in r.content
+            # #nolabel carries no readable name: only the three skinned controls are listed.
+            assert re.search(r"\((\d+) interactive elements\)", r.content).group(1) == "3"
+        return
+    native_style = "position:absolute;width:0;height:0;padding:0;border:0" if zero_size else ""
+    faded = '<label for="skinbox" style="display:inline-block;width:160px;height:24px">First label</label>'
+    visible = '<label for="skinbox" id="visible" style="display:block;width:160px;height:24px">Visible choice</label>'
+    external_first = ""
+    if label_order in ("hidden-first-only", "hidden-first-visible-later"):
+        external_first = (
+            '<label for="skinbox" id="hidden-first" style="visibility:hidden;display:block;width:160px;height:24px">'
+            "First label</label>"
+        )
+        faded = ""
+        if label_order == "hidden-first-only":
+            visible = ""
+    proxy_style = {
+        "off-canvas-first-only": "position:absolute;left:-9999px",
+        "off-canvas-first-visible-later": "position:absolute;left:-9999px",
+        "off-canvas-later-only": "position:absolute;left:-9999px",
+        "off-canvas-scrolled": "",
+        "off-canvas-default": "position:absolute;left:-9999px",
+        "negative-y-proxy": "position:absolute;left:24px;top:-9999px",
+        "down-page-proxy": "position:absolute;left:24px;top:9999px",
+    }.get(label_order)
+    if proxy_style is not None:
+        proxy = (
+            f'<label for="skinbox" id="positioned-proxy" style="display:block;width:160px;height:24px;{proxy_style}">'
+            "Positioned choice</label>"
+        )
+        if label_order == "off-canvas-scrolled":
+            proxy = (
+                '<div id="proxy-scroll" style="width:200px;overflow-x:auto">'
+                f'<div style="width:3000px">{proxy}</div></div>'
+            )
+        if label_order == "off-canvas-later-only":
+            visible = proxy
+        else:
+            external_first = proxy
+            faded = ""
+            if label_order != "off-canvas-first-visible-later":
+                visible = ""
+    if label_order in ("zero-first", "opaque-hidden-later", "later-label-drain", "off-canvas-later-only"):
+        faded = '<label for="skinbox" style="display:none">First label</label>'
+    if label_order in ("all-hidden", "opaque-hidden-later"):
+        visible = f'<div style="opacity:0">{visible}</div>'
+    if label_order == "hidden-later":
+        visible = f'<div style="visibility:hidden">{visible}</div>'
+    if label_order == "first-proxy-default":
+        faded = f'<div style="opacity:0">{faded}</div>'
+        visible = ""
+    if label_order == "no-label":
+        faded = visible = ""
+    if label_order == "later-label-drain":
+        visible = f'<div id="proxy-panel">{visible}</div>'
+    opaque_panel = label_order in (
+        "opaque-hidden-later",
+        "first-proxy-default",
+        "later-label-drain",
+        "off-canvas-later-only",
+        "off-canvas-default",
+    )
+    panel = (
+        f'<section id="panel" style="opacity:{1 if during_drain or opaque_panel else 0}">'
+        f'<input id="skinbox" type="checkbox" style="{native_style}">{faded}</section>'
+    )
+    ordered = visible + panel if label_order == "visible-first" else panel + visible
+    script = """<script>window.fades = 0; new MutationObserver(records => {
+      if (!window.fades && records.some(r => r.attributeName === 'data-tv3')) {
+        document.getElementById('panel').style.opacity = '0'; window.fades++;
+      }
+    }).observe(document,{subtree:true,attributes:true,attributeFilter:['data-tv3']});</script>"""
+    if label_order == "later-label-drain":
+        script = script.replace("getElementById('panel')", "getElementById('proxy-panel')")
+    html = (
+        '<!doctype html><button id="ordinary">Ordinary</button>' + external_first + ordered + "<button>Marker</button>"
+    )
+    async with _content_page(html + (script if during_drain else "")) as page:
+        if proxy_style is not None:
+            if label_order == "off-canvas-scrolled":
+                scroll_left = await page.locator("#proxy-scroll").evaluate(
+                    "el => { el.scrollLeft = 1000; return el.scrollLeft; }"
+                )
+                assert scroll_left > 0
+            label_index = 1 if label_order == "off-canvas-later-only" else 0
+            assert (
+                await page.locator("#skinbox").evaluate("(el, i) => el.labels[i].id", label_index) == "positioned-proxy"
+            )
+            box = await page.locator("#positioned-proxy").bounding_box()
+            assert box is not None and box["width"] > 0 and box["height"] > 0
+            scroll_x = await page.evaluate("window.scrollX")
+            if label_order.startswith("off-canvas"):
+                assert box["x"] + box["width"] + scroll_x < 0
+            else:
+                assert box["x"] + scroll_x >= 0
+                if label_order == "negative-y-proxy":
+                    assert box["y"] + box["height"] < 0
+                else:
+                    assert box["y"] > await page.evaluate("window.innerHeight")
+        elif external_first:
+            assert await page.locator("#skinbox").evaluate("el => Array.from(el.labels, label => label.id)") == (
+                ["hidden-first"] if label_order == "hidden-first-only" else ["hidden-first", "visible"]
+            )
+            first = page.locator("#hidden-first")
+            box = await first.bounding_box()
+            assert box is not None and box["width"] > 0 and box["height"] > 0
+            assert await first.evaluate("el => getComputedStyle(el).visibility") == "hidden"
         tools = build_browser_tools(_fixed_page_provider(page))
-        r = await _tool(tools, "observe").handler({})
-        assert r.status == "ok"
-        assert _ref_line(r.content, "I agree")
-        assert "hidden-native" in r.content
-        # #nolabel carries no readable name: the header count (not a selector substring, since none
-        # is printed anymore) is what proves it was dropped.
-        assert re.search(r"\((\d+) interactive elements\)", r.content).group(1) == "3"
+        observations = []
+        for _ in range(2):
+            r = await _tool(tools, "observe").handler({})
+            assert r.status == "ok", r.content
+            assert _ref_line(r.content, "Ordinary")
+            assert await page.locator("#panel").evaluate("el => getComputedStyle(el).opacity") == (
+                "1" if opaque_panel else "0"
+            )
+            if label_order in ("opaque-hidden-later", "hidden-later"):
+                box = await page.locator("#visible").bounding_box()
+                assert box is not None and box["width"] > 0 and box["height"] > 0
+            if label_order == "hidden-later":
+                assert await page.locator("#visible").evaluate("el => getComputedStyle(el).visibility") == "hidden"
+            if during_drain:
+                assert await page.evaluate("window.fades") == 1
+                assert await page.locator("button[data-tv3]").count() == 1
+            kept = [line for line in _lines(r.content) if "input/checkbox" in line]
+            if label_order == "later-label-drain":
+                assert await page.locator("#proxy-panel").evaluate("el => getComputedStyle(el).opacity") == (
+                    "0" if during_drain else "1"
+                )
+                observations.append(r.content)
+                continue
+            assert bool(kept) is (
+                label_order
+                not in (
+                    "all-hidden",
+                    "no-label",
+                    "opaque-hidden-later",
+                    "hidden-later",
+                    "hidden-first-only",
+                    "off-canvas-first-only",
+                    "off-canvas-later-only",
+                )
+            ), r.content
+            if kept and zero_size:
+                assert "hidden-native: styled proxy" in kept[0]
+
+        if label_order == "later-label-drain":
+            assert ["input/checkbox" in content for content in observations] == [not during_drain] * 2, observations
 
 
 @_skip_no_browser
@@ -44002,6 +44334,10 @@ async def test_observe_withholds_the_field_when_the_box_holds_a_second_one_it_al
         icons = [line for line in _lines(r.content) if "'Search'" in line]
         assert len(icons) == 2, r.content
         assert all("field=" not in line for line in icons), r.content
+        if source == "dropped-but-still-live":
+            assert r.data["summary"]["elements_dropped"] == 2, r.data
+            assert r.data["summary"]["hidden_dropped_visibility"] == 0, r.data
+            assert "could not be described" in r.content
 
 
 @_skip_no_browser
