@@ -322,6 +322,8 @@ class CopilotTriggerSummary:
     enabled: bool
     created_at: str
     note: str | None = None
+    # Whether anyone has seen its signing secret; None for sources that never hand one out.
+    secret_shown: bool | None = None
     # Whether its source starts runs by itself once on (a poller), so switching it on is the only step left.
     fires_on_its_own: bool = False
     # The connected account the source reads through, when it has one, so the card can name it.
