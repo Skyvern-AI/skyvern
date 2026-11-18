@@ -666,50 +666,66 @@ async def test_a_failed_refresh_still_reads_the_cached_vault(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("login_error", "expected_logins", "expected_error"),
+    ("login_error", "seeded_per_read", "expected_error"),
     [
-        (bitwarden_module.BitwardenLoginError, 2, bitwarden_module.BitwardenListItemsError),
-        (bitwarden_module.BitwardenCredentialsRejectedError, 2, bitwarden_module.BitwardenListItemsError),
-        (bitwarden_module.BitwardenVerificationRequiredError, 1, bitwarden_module.BitwardenVerificationRequiredError),
-        (TimeoutError, 2, bitwarden_module.BitwardenListItemsError),
+        (
+            bitwarden_module.BitwardenLoginError,
+            [[True, True], [True, True, False]],
+            bitwarden_module.BitwardenListItemsError,
+        ),
+        (
+            bitwarden_module.BitwardenCredentialsRejectedError,
+            [[True, True], [True, True, True]],
+            bitwarden_module.BitwardenListItemsError,
+        ),
+        (
+            bitwarden_module.BitwardenVerificationRequiredError,
+            [[True], [True]],
+            bitwarden_module.BitwardenVerificationRequiredError,
+        ),
+        (TimeoutError, [[True, True], [True, True, True]], bitwarden_module.BitwardenListItemsError),
     ],
 )
 async def test_a_login_that_fails_leaves_no_half_built_session_behind(
     cli: FakeVaultCli,
     monkeypatch: pytest.MonkeyPatch,
     login_error: type[Exception],
-    expected_logins: int,
+    seeded_per_read: list[list[bool]],
     expected_error: type[Exception],
 ) -> None:
     monkeypatch.setattr(bitwarden_module.settings, "ENCRYPTOR_AES_SECRET_KEY", "unit-test-server-key")
     monkeypatch.setattr(bitwarden_module.settings, "ENCRYPTOR_AES_SALT", "unit-test-salt")
-    logins = 0
     seeded_devices: list[bool] = []
+    login_dirs: list[str] = []
 
     async def failing_login(*_: object, **kwargs: object) -> None:
-        nonlocal logins
-        logins += 1
-        seeded_devices.append(os.path.exists(os.path.join(kwargs["appdata_dir"], "data.json")))
+        login_dirs.append(str(kwargs["appdata_dir"]))
+        seeded_devices.append(os.path.exists(os.path.join(login_dirs[-1], "data.json")))
         raise login_error("new device verification required")
 
     monkeypatch.setattr(BitwardenService, "login", failing_login)
 
-    with pytest.raises(expected_error) as excinfo:
-        await BitwardenService.get_secret_value_from_url(
-            client_id="client-id",
-            client_secret="client-secret",
-            master_password="master-password",
-            bw_organization_id="org-id",
-            bw_collection_ids=None,
-            item_id=ITEM_ID,
-            max_retries=2,
-        )
+    # One login per attempt, each on a new session. Only the third attempt of a read whose two logins
+    # Bitwarden refused uses a new device; the count starts again with each read, and a timeout, rejected
+    # credentials and a verification prompt never count.
+    for seeded_in_read in seeded_per_read:
+        seeded_devices.clear()
+        login_dirs.clear()
+        with pytest.raises(expected_error) as excinfo:
+            await BitwardenService.get_secret_value_from_url(
+                client_id="client-id",
+                client_secret="client-secret",
+                master_password="master-password",
+                bw_organization_id="org-id",
+                bw_collection_ids=None,
+                item_id=ITEM_ID,
+                max_retries=max(2, len(seeded_in_read)),
+            )
 
-    assert type(excinfo.value) is expected_error
-    # Each attempt logs in again on a new session with the same seeded device; a failed login never
-    # changes the device. A verification prompt stops after the first login.
-    assert logins == expected_logins
-    assert seeded_devices == [True] * expected_logins
+        assert type(excinfo.value) is expected_error
+        assert seeded_devices == seeded_in_read
+        assert len(set(login_dirs)) == len(seeded_in_read)
+        assert not any(os.path.exists(login_dir) for login_dir in login_dirs)
 
 
 @pytest.mark.asyncio
