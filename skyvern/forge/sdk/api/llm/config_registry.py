@@ -22,6 +22,7 @@ GPT6_MODEL_NAMES: dict[str, str] = {
     "sol": "gpt-6-sol",
     "1_sol": "gpt-6.1-sol",
     "1_terra": "gpt-6.1-terra",
+    "2_sol": "gpt-6.2-sol",
     "luna": "gpt-6-luna",
 }
 GPT6_REASONING_EFFORT: dict[str, str] = {
@@ -29,6 +30,7 @@ GPT6_REASONING_EFFORT: dict[str, str] = {
     "sol": "medium",
     "1_sol": "medium",
     "1_terra": "medium",
+    "2_sol": "medium",
     "luna": settings.GPT6_LUNA_REASONING_EFFORT,
 }
 XAI_GROK_4_5_MODEL = "xai/grok-4.5"
