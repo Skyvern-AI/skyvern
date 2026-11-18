@@ -408,7 +408,9 @@ async def test_auto_create_browser_session_for_human_interaction_loads_managed_p
     create_session = AsyncMock(return_value=SimpleNamespace(persistent_browser_session_id="pbs_test"))
     monkeypatch.setattr(app.PERSISTENT_SESSIONS_MANAGER, "create_session", create_session)
     human_interaction = SimpleNamespace(block_type=BlockType.HUMAN_INTERACTION, timeout_seconds=60)
-    workflow = SimpleNamespace(workflow_definition=SimpleNamespace(blocks=[human_interaction]))
+    workflow = SimpleNamespace(
+        workflow_permanent_id="wpid_test", workflow_definition=SimpleNamespace(blocks=[human_interaction])
+    )
 
     browser_session = await WorkflowService().auto_create_browser_session_if_needed(
         "o_test",
@@ -427,6 +429,7 @@ async def test_auto_create_browser_session_for_human_interaction_loads_managed_p
         session_kind=BrowserSessionKind.workflow_run,
         browser_settings=None,
         created_for_workflow_run_id=None,
+        workflow_permanent_id="wpid_test",
     )
 
 
