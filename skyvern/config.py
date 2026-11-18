@@ -486,6 +486,9 @@ class Settings(BaseSettings):
     # a bare comma list fails at startup. The executable and markup denylist still applies.
     UPLOAD_EXTRA_ALLOWED_EXTENSIONS: list[str] = []
     MAX_HTTP_DOWNLOAD_FILE_SIZE: int = 500 * 1024 * 1024  # 500 MB
+    # Cluster-local gRPC endpoint for credential-free FileParserBlock decoding. Empty keeps the OSS/local parser;
+    # managed worker charts always set it and therefore fail closed rather than parsing beside worker credentials.
+    FILE_PARSER_SERVICE_TARGET: str = ""
     # Most memory a pdfplumber child may add (RLIMIT_AS on Linux, an RSS watchdog everywhere); rendering a 300 dpi A0
     # or A1 scan for OCR can need more than 512 MiB. A pod with less free memory than this, after a 256 MiB margin and
     # the result reserve, gets what is left, and under 128 MiB the call fails, because memory.oom.group kills the whole
