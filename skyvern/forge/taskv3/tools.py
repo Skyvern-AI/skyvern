@@ -11264,6 +11264,35 @@ async (__tv3TextArgs) => {
     }
     return false;
   };
+  const _transparentContainer = (el, includeSelf = false) => {
+    for (let node = el; node; node = _assignedSlotOf.call(node) || _composedParent(node)) {
+      if (node !== el || includeSelf) {
+        const cs = getComputedStyle(node);
+        if (cs.display !== 'contents' && Number(cs.opacity) === 0) return true;
+      }
+      // Native top-layer boxes paint independently of their DOM containers.
+      if (_matches.call(node, ':modal,:popover-open')) break;
+    }
+    return false;
+  };
+  const _controlProxy = (el, accept = () => true) => {
+    const proxy = _visibleProxy(el);
+    if (proxy && accept(proxy)) return proxy;
+    for (const label of el.labels || []) {
+      const r = _bcr.call(label);
+      if (r.width > 0 && r.height > 0 && getComputedStyle(label).visibility === 'visible'
+          && !_transparentContainer(label, true) && !_offCanvas(label, r) && accept(label)) return label;
+    }
+    return null;
+  };
+  const _paintedControl = (el) => {
+    if (!_transparentContainer(el)) return true;
+    const tag = String(el.tagName || '').toLowerCase(), type = String(el.type || '').toLowerCase();
+    const skin = tag === 'select' || (tag === 'input' && /^(checkbox|radio|file)$/.test(type));
+    return skin && !!_controlProxy(el, proxy =>
+      getComputedStyle(proxy).visibility === 'visible' && !_transparentContainer(proxy, true)
+      && !_offCanvas(proxy, _bcr.call(proxy)));
+  };
   // The element loop's own drop decision for `el`, made before it builds a record: `why` names the
   // hidden-counter a drop lands in, and a skinned native it keeps comes back `hidden`. The pointer-root
   // pass asks the same of the controls inside a candidate, so a wrapper stands aside exactly when the
@@ -11283,6 +11312,7 @@ async (__tv3TextArgs) => {
       if (gp) { gateEl = gp; gr = _bcr.call(gp); }
     }
     const s = { why: null, hidden: false, r, gr, gateEl, ownGated };
+    if (!_paintedControl(el)) { s.why = 'visibility'; return s; }
     // Off-canvas gate, mirroring v1 isElementVisible (domUtils.js): an element whose horizontal
     // center sits left of the page is off-screen and not interactable, unless a horizontally
     // scrolled ancestor explains it. X only, never Y -- an overflow ancestor makes Y unreliable, so
@@ -11303,7 +11333,7 @@ async (__tv3TextArgs) => {
       const tag = el.tagName;
       const type = String(el.type || '').toLowerCase();
       const skinnable = tag === 'SELECT' || (tag === 'INPUT' && (type === 'checkbox' || type === 'radio' || type === 'file'));
-      if (skinnable && _visibleProxy(el)) {
+      if (skinnable && _controlProxy(el)) {
         s.hidden = true;
       } else if (!_unseen(el) && _contentsRenders(el, 0)) {
         // A display:contents host has a zero rect of its own but is not hidden -- its rendered
@@ -12685,14 +12715,25 @@ async (__tv3TextArgs) => {
         }
       } else if (rec.selector) { checkInconclusive = false; ok = resolvesTo(rec.selector, el) || checkInconclusive; }
     }
+    let visibilityRejected = false;
+    if (ok && stamp && (mutated || pageCodeEpoch > 0)) {
+      try {
+        visibilityRejected = !_paintedControl(el) || (rec.hidden && !_controlProxy(el));
+        ok = !visibilityRejected;
+      } catch (e) { ok = false; }
+    }
     if (!ok) {
       // Dropped from the digest, but the control can still BE there -- a page that changes a second
       // field's label mid-run fails the fingerprint without detaching it. It must not name anything
       // (it has no line for the model to read), and it must still COUNT, or the box it sits in reads
       // as holding one field when it holds two.
-      if (el && connected) droppedStillLive.push(el);
+      if (el && connected && !visibilityRejected) droppedStillLive.push(el);
       labelOfControl.delete(el); boundLabelOfControl.delete(el); out.splice(k, 1);
-      if (rec.pointerRoot) { if (rec.pointerExtra) extraListed--; else pointerListed--; pointerDropped++; } else dropped++;
+      if (rec.hidden) hiddenListed--;
+      if (rec.pointerRoot) { if (rec.pointerExtra) extraListed--; else pointerListed--; }
+      if (visibilityRejected) { hiddenDropped++; hiddenDroppedVisibility++; }
+      else if (rec.pointerRoot) pointerDropped++;
+      else dropped++;
     }
     else if (el) {
       // Recomputed after the drain rather than added to the fingerprint above: a page's own observer
