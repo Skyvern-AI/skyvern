@@ -16788,7 +16788,10 @@ class WorkflowService:
                 attempt.failure_reason = truncate_oversized_response_text(attempt.failure_reason)
         current_attempt = attempt_view.attempt
         block_errors = await app.DATABASE.workflow_runs.get_workflow_run_block_errors(
-            workflow_run_id=workflow_run_id, organization_id=organization_id, attempt_number=current_attempt
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            attempt_number=current_attempt,
+            only_error_output=True,
         )
         historical_outputs: list[WorkflowRunOutputParameter] | None = None
         omitted_output_count = 0
