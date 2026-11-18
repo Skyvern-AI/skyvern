@@ -254,6 +254,7 @@ def make_workflow_run_attempts_fake() -> SimpleNamespace:
         get_attempts=AsyncMock(return_value=[]),
         get_interim_payload_snapshot=AsyncMock(return_value={}),
         get_latest_attempts_for_runs=AsyncMock(return_value={}),
+        get_latest_attempt_summaries_for_runs=AsyncMock(return_value={}),
         list_stale_pending_retries=AsyncMock(return_value=[]),
         list_attempts_needing_recovery=AsyncMock(return_value=[]),
         list_stale_dispatch_claims=AsyncMock(return_value=[]),
