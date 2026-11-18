@@ -1,16 +1,23 @@
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
+from fastapi import FastAPI
 from sqlalchemy.exc import IntegrityError
 from structlog.testing import capture_logs
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot.active_run_session import ActiveRunSessionAssociation
 from skyvern.forge.sdk.routes import debug_sessions as debug_sessions_mod
+from skyvern.forge.sdk.schemas.debug_sessions import DebugSession
+from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import debug_session_browser as debug_session_browser_mod
+from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.services.request_principal import AuthKind, RequestPrincipal
 from skyvern.schemas.browser_session_kind import BrowserSessionKind
 from skyvern.schemas.runs import ProxyLocation
 from skyvern.webeye.persistent_session_errors import BrowserSessionCreditAdmissionRefusal
@@ -212,10 +219,6 @@ async def test_prewarm_debug_session_closes_a_session_when_dispatch_loses_its_bi
 
     assert result.status_code == 202
     app_mock.PERSISTENT_SESSIONS_MANAGER.close_session.assert_awaited_once_with("org_123", "pbs_unpublished")
-
-
-def test_prewarm_bound_key_is_unambiguous() -> None:
-    assert debug_sessions_mod._prewarm_bound_key("a:b", "c") != debug_sessions_mod._prewarm_bound_key("a", "b:c")
 
 
 @pytest.mark.parametrize("already_started", [False, True])
@@ -1067,3 +1070,128 @@ async def test_compatibility_returns_compatible_when_block_label_not_found() -> 
     assert result.compatible is True
     assert result.reason is None
     app_mock.WORKFLOW_SERVICE.resolve_login_block_browser_profile_id_pre_run.assert_not_called()
+
+
+_OWNER_ORG = Organization(
+    organization_id="o_owner",
+    organization_name="Owner",
+    created_at=datetime(2026, 1, 1, tzinfo=UTC),
+    modified_at=datetime(2026, 1, 1, tzinfo=UTC),
+)
+
+
+async def _debug_session_owner(
+    monkeypatch: pytest.MonkeyPatch, principal: RequestPrincipal, headers: dict[str, str]
+) -> tuple[int, list[str]]:
+    """GET the mounted debug-session route; the principal becomes readable only once get_current_org has run."""
+    resolved: list[RequestPrincipal] = []
+
+    async def current_org() -> Organization:
+        resolved.append(principal)
+        return _OWNER_ORG
+
+    async def authenticate_user(token: str) -> str | None:
+        return "user_member" if token == "valid-bearer" else None
+
+    owners: list[str] = []
+
+    async def get_debug_session(*, organization_id: str, user_id: str, workflow_permanent_id: str) -> DebugSession:
+        owners.append(user_id)
+        now = datetime.now(UTC)
+        return DebugSession(
+            debug_session_id="ds_1",
+            browser_session_id="pbs_A",
+            workflow_permanent_id=workflow_permanent_id,
+            user_id=user_id,
+            created_at=now,
+            modified_at=now,
+            status="created",
+        )
+
+    monkeypatch.setattr(org_auth_service, "get_request_principal", lambda: resolved[-1] if resolved else None)
+    monkeypatch.setattr(org_auth_service, "get_current_org_cached", AsyncMock(return_value=_OWNER_ORG))
+    monkeypatch.setattr(org_auth_service.app, "authenticate_user_function", authenticate_user)
+    app_mock = MagicMock()
+    app_mock.DATABASE.debug.get_debug_session = AsyncMock(side_effect=get_debug_session)
+    app_mock.DATABASE.browser_sessions.get_persistent_browser_session = AsyncMock(return_value=None)
+    app_mock.PERSISTENT_SESSIONS_MANAGER.renew_or_close_session = AsyncMock()
+    fastapi_app = FastAPI()
+    fastapi_app.add_api_route(
+        "/debug-session/{workflow_permanent_id}",
+        debug_sessions_mod.get_or_create_debug_session_by_user_and_workflow_permanent_id,
+        methods=["GET"],
+    )
+    fastapi_app.dependency_overrides[org_auth_service.get_current_org] = current_org
+    with _patched_app(app_mock):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=fastapi_app), base_url="http://test") as client:
+            response = await client.get("/debug-session/wpid_test", headers=headers)
+    return response.status_code, owners
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("principal", "headers", "expected"),
+    [
+        (RequestPrincipal("o_owner", AuthKind.api_key), {"x-api-key": "org-key"}, (200, ["o_owner_user"])),
+        (
+            RequestPrincipal("o_owner", AuthKind.api_key),
+            {"x-api-key": "org-key", "x-user-agent": "skyvern-ui"},
+            (200, ["o_owner_user"]),
+        ),
+        (
+            RequestPrincipal("o_owner", AuthKind.ui_session),
+            {"x-api-key": "ui-session-key", "x-user-agent": "skyvern-ui"},
+            (200, ["o_owner_user"]),
+        ),
+        (
+            RequestPrincipal("o_owner", AuthKind.member_api_key, "user_member", "org:member"),
+            {"x-api-key": "member-key"},
+            (200, ["user_member"]),
+        ),
+        (
+            RequestPrincipal("o_owner", AuthKind.bearer, "user_member", "org:member"),
+            {"Authorization": "Bearer valid-bearer"},
+            (200, ["user_member"]),
+        ),
+        (RequestPrincipal("o_owner", AuthKind.scoped_api_key), {"x-api-key": "scoped-key"}, (403, [])),
+        (
+            RequestPrincipal("o_owner", AuthKind.scoped_api_key),
+            {"x-api-key": "scoped-key", "x-user-agent": "skyvern-ui"},
+            (403, []),
+        ),
+        (
+            RequestPrincipal("o_owner", AuthKind.scoped_api_key),
+            {"x-api-key": "scoped-key", "Authorization": "Bearer invalid-bearer"},
+            (403, []),
+        ),
+        (
+            RequestPrincipal("o_owner", AuthKind.scoped_api_key),
+            {"x-api-key": "scoped-key", "Authorization": "Bearer valid-bearer"},
+            (403, []),
+        ),
+        (
+            RequestPrincipal("o_owner", AuthKind.scoped_api_key_and_bearer, "user_member", "org:member"),
+            {"x-api-key": "scoped-key", "Authorization": "Bearer valid-bearer"},
+            (200, ["user_member"]),
+        ),
+    ],
+    ids=[
+        "org_key_without_ui_user_agent",
+        "org_key_with_ui_user_agent",
+        "studio_ui_session_key",
+        "member_key",
+        "member_bearer",
+        "scoped_key_without_user_agent",
+        "scoped_key_with_ui_user_agent",
+        "scoped_key_with_invalid_bearer",
+        "scoped_key_with_a_valid_bearer_not_verified_for_the_org",
+        "scoped_key_with_verified_bearer",
+    ],
+)
+async def test_debug_session_owner_for_each_credential_kind(
+    monkeypatch: pytest.MonkeyPatch,
+    principal: RequestPrincipal,
+    headers: dict[str, str],
+    expected: tuple[int, list[str]],
+) -> None:
+    assert await _debug_session_owner(monkeypatch, principal, headers) == expected

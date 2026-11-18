@@ -305,6 +305,45 @@ def _write_state_file(path: Path, *, cookies: list | None = None, url: str = "ht
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("tool", ["save", "load"])
+@pytest.mark.parametrize(
+    "request_organization", [None, "o_standalone"], ids=["no_organization", "api_key_organization"]
+)
+async def test_state_tools_on_http_keep_each_organization_apart(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tool: str, request_organization: str | None
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    request_state = SimpleNamespace(organization_id=request_organization) if request_organization else SimpleNamespace()
+    monkeypatch.setattr("fastmcp.server.dependencies.get_http_request", lambda: SimpleNamespace(state=request_state))
+    monkeypatch.setattr(mcp_state.app, "AGENT_FUNCTION", SimpleNamespace(get_mcp_request_organization_id=lambda: None))
+    _write_state_file(tmp_path / "shared.json", cookies=[{"name": "sid", "value": "abc", "domain": "example.com"}])
+    browser = _make_mock_browser()
+    _patch_get_page(monkeypatch, _make_mock_page(), BrowserContext(mode="local"))
+    _patch_session(monkeypatch, _make_session_state(browser))
+
+    if tool == "save":
+        result = await mcp_state.skyvern_state_save(file_path="new.json")
+    else:
+        result = await mcp_state.skyvern_state_load(file_path="shared.json")
+
+    assert not (tmp_path / "new.json").exists()
+    if request_organization is None:
+        assert result["ok"] is False and "organization" in result["error"]["message"]
+    elif tool == "save":
+        assert result["ok"], result
+        assert list((tmp_path / ".mcp-state").glob("*/new.json"))
+    else:
+        # The shared pre-upgrade file is never read; the error names where the operator moves it for this organization.
+        message = result["error"]["message"]
+        assert result["ok"] is False and "saved before" in message and str(tmp_path / "shared.json") in message
+        assert list((tmp_path / ".mcp-state").glob("*")) == [] and ".mcp-state" in message
+        # Any other file under the working directory is never named, so the error can't confirm it exists.
+        (tmp_path / "notes").write_text("API_KEY=secret")
+        other = await mcp_state.skyvern_state_load(file_path="notes")
+        assert other["ok"] is False and "saved before" not in other["error"]["message"]
+
+
+@pytest.mark.asyncio
 async def test_state_load_happy_path(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

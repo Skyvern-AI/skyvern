@@ -1659,6 +1659,8 @@ async def run_turn_to_exit(
     attach_through: str = "resolve",
     on_attached: Callable[[CopilotContext], Awaitable[None]] | None = None,
     get_browser_state: AsyncMock | None = None,
+    live_browser_session_id: str | None = None,
+    browser_manager: RealBrowserManager | None = None,
 ) -> tuple[AgentResult | None, BaseException | None]:
     """Drive one real ``run_copilot_agent`` turn to ``exit_path`` against ``manager``, attaching
     through the real resolve funnel so the finalizer releases only what that funnel recorded."""
@@ -1692,6 +1694,10 @@ async def run_turn_to_exit(
         return SimpleNamespace(final_output=json.dumps({"type": "REPLY", "user_response": "ok"}), new_items=[])
 
     stub_copilot_agent_loop(monkeypatch, fake_turn)
+    if live_browser_session_id is not None:
+        monkeypatch.setattr(
+            copilot_agent, "_resolve_live_browser_session_id", AsyncMock(return_value=live_browser_session_id)
+        )
     workflow_run_id: str | None = None
     if attach_through == "prior_run_hydration":
         assert session_id is not None
@@ -1713,6 +1719,8 @@ async def run_turn_to_exit(
         monkeypatch.setattr(copilot_agent, "hydrate_prior_run_packet", hydrate_and_exit)
     mock_app = MagicMock()
     mock_app.PERSISTENT_SESSIONS_MANAGER = manager
+    if browser_manager is not None:
+        mock_app.BROWSER_MANAGER = browser_manager
     monkeypatch.setattr(copilot_runtime, "app", mock_app)
     monkeypatch.setattr(copilot_agent, "_manager_can_probe_registered_browser_state", lambda: True)
 

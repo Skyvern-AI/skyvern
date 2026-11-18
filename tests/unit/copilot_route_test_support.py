@@ -238,6 +238,7 @@ def setup_new_copilot_mocks(
                 created_at=datetime(2026, 4, 14, tzinfo=timezone.utc),
             )
         ),
+        get_ended_copilot_turn_ids=AsyncMock(return_value=set()),
         replace_workflow_copilot_chat_message=AsyncMock(),
         claim_pending_copilot_turn=AsyncMock(return_value="claimed"),
         claim_pending_copilot_turn_for_finalisation=AsyncMock(return_value="claimed"),

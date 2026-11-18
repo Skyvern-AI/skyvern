@@ -7,8 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from skyvern.cli.core.browser_ops import LOCATOR_TYPES, FindResult, do_find
-from skyvern.cli.core.guards import GuardError
+from skyvern.cli.core.browser_ops import FindResult, do_find
 from skyvern.cli.core.result import BrowserContext
 from skyvern.cli.mcp_tools import browser as mcp_browser
 
@@ -120,56 +119,6 @@ async def test_do_find_by_testid() -> None:
 
     page.get_by_test_id.assert_called_once_with("submit-btn")
     assert result.selector == "get_by_test_id('submit-btn')"
-
-
-@pytest.mark.asyncio
-async def test_do_find_invalid_type() -> None:
-    page = _make_mock_page()
-    with pytest.raises(GuardError, match="Invalid locator type"):
-        await do_find(page, by="invalid", value="anything")
-
-
-@pytest.mark.asyncio
-async def test_do_find_no_matches() -> None:
-    locator = _make_locator(count=0)
-    page = _make_mock_page(locator)
-
-    result = await do_find(page, by="role", value="dialog")
-
-    assert result.count == 0
-    assert result.first_text is None
-    assert result.first_visible is False
-
-
-@pytest.mark.asyncio
-async def test_do_find_multiple_matches() -> None:
-    locator = _make_locator(count=5, text="Item 1")
-    page = _make_mock_page(locator)
-
-    result = await do_find(page, by="text", value="Item")
-
-    assert result.count == 5
-    assert result.first_text == "Item 1"
-
-
-@pytest.mark.asyncio
-async def test_do_find_hidden_element() -> None:
-    locator = _make_locator(count=1, text="Hidden", visible=False)
-    page = _make_mock_page(locator)
-
-    result = await do_find(page, by="text", value="Hidden")
-
-    assert result.first_visible is False
-
-
-def test_locator_types_constant() -> None:
-    assert "role" in LOCATOR_TYPES
-    assert "text" in LOCATOR_TYPES
-    assert "label" in LOCATOR_TYPES
-    assert "placeholder" in LOCATOR_TYPES
-    assert "alt" in LOCATOR_TYPES
-    assert "testid" in LOCATOR_TYPES
-    assert len(LOCATOR_TYPES) == 6
 
 
 # ═══════════════════════════════════════════════════

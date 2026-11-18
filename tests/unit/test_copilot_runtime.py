@@ -46,6 +46,7 @@ from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.demonstration_recorder import claim_demonstration_recording
 from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
+from skyvern.forge.sdk.copilot.human_input_wait import pause_human_input
 from skyvern.forge.sdk.copilot.mcp_adapter import (
     HeldPageFacts,
     ReportedPageCrash,
@@ -1236,6 +1237,8 @@ async def test_replace_browser_session_moves_the_studio_browser_unless_it_is_in_
 ) -> None:
     debug = make_debug()
     manager: MagicMock | None = None
+    browser_manager = stamping_browser_manager(monkeypatch)
+    monkeypatch.setattr(app, "BROWSER_MANAGER", browser_manager)
 
     async def drive_at_boot() -> None:
         assert manager is not None
@@ -1245,13 +1248,20 @@ async def test_replace_browser_session_moves_the_studio_browser_unless_it_is_in_
     if not at_boot:
         await drive(debug, manager, monkeypatch)
 
-    result = await start_fresh_browser(ctx)
-    was_minted = "pbs_fresh" in ctx.minted_browser_sessions
-    await run_execution.close_minted_browser_sessions(ctx)
+    try:
+        result = await start_fresh_browser(ctx)
+        renewed = browser_manager._renewable_session_ids()
+        was_minted = "pbs_fresh" in ctx.minted_browser_sessions
+        runtime.end_minted_browser_renewals(ctx)
+        await run_execution.close_minted_browser_sessions(ctx)
+        assert browser_manager._renewable_session_ids() == set()
+    finally:
+        await stop_activity_renewer(browser_manager)
 
     active = debug.active("user_1")
     replaced = row_browser == "pbs_fresh"
     kept = debug.complete_error is not None
+    assert renewed == (set() if kept else {"pbs_fresh"})
     assert ctx.browser_session_id == ("pbs_studio" if kept else "pbs_fresh")
     assert (active.browser_session_id if active else None) == row_browser
     assert [call.args[1] for call in manager.close_session.await_args_list] == closed
@@ -1265,8 +1275,23 @@ async def test_replace_browser_session_moves_the_studio_browser_unless_it_is_in_
 
 
 @pytest.mark.asyncio
-async def test_a_cancel_during_the_studio_commit_finishes_the_move_before_it_raises(
+@pytest.mark.parametrize(
+    ("cancel_at", "drive", "at_boot", "row_browser", "replacements", "closed"),
+    [
+        ("studio_commit", _nobody_drives, False, "pbs_fresh", {"pbs_studio": "pbs_fresh"}, {"pbs_studio"}),
+        ("renewal_start", _take_control, True, "pbs_studio", {"pbs_studio": "pbs_fresh"}, {"pbs_fresh"}),
+        ("renewal_start", _take_control, False, "pbs_studio", {}, {"pbs_fresh"}),
+    ],
+    ids=["studio_commit", "renewal_start_after_take_control_during_boot", "renewal_start_after_take_control"],
+)
+async def test_a_cancel_during_a_studio_browser_replacement_leaves_its_rows_and_browsers_consistent(
     monkeypatch: pytest.MonkeyPatch,
+    cancel_at: str,
+    drive: Drive,
+    at_boot: bool,
+    row_browser: str,
+    replacements: dict[str, str],
+    closed: set[str],
 ) -> None:
     entered = asyncio.Event()
     release = asyncio.Event()
@@ -1275,21 +1300,38 @@ async def test_a_cancel_during_the_studio_commit_finishes_the_move_before_it_rai
         entered.set()
         await release.wait()
 
-    debug = _FakeDebugSessions([], complete_hook=hold_the_commit)
-    ctx, manager = _install_studio_browser(monkeypatch, debug)
+    debug = _FakeDebugSessions([], complete_hook=hold_the_commit if cancel_at == "studio_commit" else None)
+    manager: MagicMock | None = None
+    touch = AsyncMock(side_effect=asyncio.CancelledError) if cancel_at == "renewal_start" else None
+    browser_manager = stamping_browser_manager(monkeypatch, touch=touch)
+    monkeypatch.setattr(app, "BROWSER_MANAGER", browser_manager)
 
-    task = asyncio.create_task(start_fresh_browser(ctx))
-    await entered.wait()
-    task.cancel()
-    release.set()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+    async def drive_at_boot() -> None:
+        assert manager is not None
+        await drive(debug, manager, monkeypatch)
+
+    ctx, manager = _install_studio_browser(monkeypatch, debug, drive_at_boot if at_boot else None)
+    if not at_boot:
+        await drive(debug, manager, monkeypatch)
+
+    try:
+        task = asyncio.create_task(start_fresh_browser(ctx))
+        if cancel_at == "studio_commit":
+            await entered.wait()
+            task.cancel()
+            release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        runtime.end_minted_browser_renewals(ctx)
+        await run_execution.close_minted_browser_sessions(ctx)
+        assert browser_manager._renewable_session_ids() == set()
+    finally:
+        await stop_activity_renewer(browser_manager)
 
     active = debug.active("user_1")
-    assert active is not None and active.browser_session_id == "pbs_fresh"
-    assert [call.args[1] for call in manager.close_session.await_args_list] == ["pbs_studio"]
-    assert "pbs_fresh" not in ctx.minted_browser_sessions
-    assert ctx.browser_session_id == "pbs_fresh"
+    assert (active.browser_session_id if active else None) == row_browser
+    assert ctx.browser_session_replacements == replacements
+    assert {call.args[1] for call in manager.close_session.await_args_list} == closed
 
 
 @pytest.mark.asyncio
@@ -2910,18 +2952,44 @@ def _release_manager(*, evict: AsyncMock | None = None, supported: bool = True) 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("exit_path", TURN_EXIT_PATHS)
-async def test_every_turn_exit_releases_the_driver_it_attached(monkeypatch: pytest.MonkeyPatch, exit_path: str) -> None:
+async def test_every_turn_exit_releases_its_borrowed_browser_unclosed_after_renewing_it_through_a_long_question(
+    monkeypatch: pytest.MonkeyPatch, exit_path: str
+) -> None:
     attached = MagicMock()
     manager = _release_manager()
+    browser_manager = stamping_browser_manager(monkeypatch)
+    monkeypatch.setattr(runtime, "MINTED_BROWSER_RENEWAL_CHECK_SECONDS", 0.01)
+    renewable_during_turn: list[set[str]] = []
+    minted_during_turn: list[set[str]] = []
 
-    with capture_logs() as logs:
-        result, _ = await run_turn_to_exit(
-            monkeypatch,
-            manager=manager,
-            exit_path=exit_path,
-            session_id="pbs_turn",
-            browser_state=attached,
-        )
+    async def wait_on_a_question(ctx: CopilotContext) -> None:
+        question_seconds = 2 * runtime.MINTED_BROWSER_RENEWAL_TURN_SECONDS - 60
+        ctx.copilot_run_start_monotonic = time.monotonic() - 2 * runtime.MINTED_BROWSER_RENEWAL_TURN_SECONDS
+        with pause_human_input(ctx, "question") as waiter:
+            waiter.started_at = ctx.human_input_wait.started_at = time.monotonic() - question_seconds
+            await asyncio.sleep(0.1)
+            renewable_during_turn.append(browser_manager._renewable_session_ids())
+        await asyncio.sleep(0.1)
+        renewable_during_turn.append(browser_manager._renewable_session_ids())
+        minted_during_turn.append(set(ctx.minted_browser_sessions))
+
+    try:
+        with capture_logs() as logs:
+            result, _ = await run_turn_to_exit(
+                monkeypatch,
+                manager=manager,
+                exit_path=exit_path,
+                session_id="pbs_turn",
+                browser_state=attached,
+                on_attached=wait_on_a_question,
+                live_browser_session_id="pbs_turn",
+                browser_manager=browser_manager,
+            )
+        assert renewable_during_turn == [{"pbs_turn"}, {"pbs_turn"}]
+        assert minted_during_turn == [set()]
+        assert browser_manager._renewable_session_ids() == set()
+    finally:
+        await stop_activity_renewer(browser_manager)
 
     manager.evict_cached_browser_state.assert_awaited_once_with(
         "pbs_turn",
