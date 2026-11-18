@@ -22,7 +22,8 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.db.exceptions import RunsListSearchCanceled
-from skyvern.forge.sdk.db.models import WorkflowModel, WorkflowRunAttemptModel
+from skyvern.forge.sdk.db.models import WorkflowModel
+from skyvern.forge.sdk.db.repositories.workflow_run_attempts import WorkflowRunAttemptSummary
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.routes import agent_protocol
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -74,33 +75,25 @@ async def test_get_runs_enriches_retry_state_preserving_tasks_and_order(monkeypa
     )
     task_before = task.model_dump()
     attempts = make_workflow_run_attempts_fake()
-    attempts.get_latest_attempts_for_runs.return_value = {
-        "wr_retrying": WorkflowRunAttemptModel(
+    attempts.get_latest_attempt_summaries_for_runs.return_value = {
+        "wr_retrying": WorkflowRunAttemptSummary(
             workflow_run_id="wr_retrying",
-            organization_id="org_123",
             attempt_number=1,
-            status="failed",
-            finished_at=now,
             retry_decision="retry",
             next_attempt_at=next_attempt_at,
             next_attempt_prepared_at=None,
         ),
-        "wr_completed": WorkflowRunAttemptModel(
+        "wr_completed": WorkflowRunAttemptSummary(
             workflow_run_id="wr_completed",
-            organization_id="org_123",
             attempt_number=2,
-            status="completed",
-            finished_at=now,
             retry_decision="final",
             next_attempt_at=None,
+            next_attempt_prepared_at=None,
         ),
         # A cancel during the delay keeps the scheduled time on the row; the list must not advertise it.
-        "wr_revoked": WorkflowRunAttemptModel(
+        "wr_revoked": WorkflowRunAttemptSummary(
             workflow_run_id="wr_revoked",
-            organization_id="org_123",
             attempt_number=1,
-            status="failed",
-            finished_at=now,
             retry_decision="revoked",
             next_attempt_at=next_attempt_at,
             next_attempt_prepared_at=None,

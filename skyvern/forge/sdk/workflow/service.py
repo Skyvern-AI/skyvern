@@ -13518,15 +13518,20 @@ class WorkflowService:
         workflow_run_ids = [workflow_run.workflow_run_id for workflow_run in workflow_runs]
         if not workflow_run_ids:
             return workflow_runs
-        latest_attempts = await app.DATABASE.workflow_run_attempts.get_latest_attempts_for_runs(workflow_run_ids)
+        latest_attempts = await app.DATABASE.workflow_run_attempts.get_latest_attempt_summaries_for_runs(
+            workflow_run_ids
+        )
         for workflow_run in workflow_runs:
             latest_attempt = latest_attempts.get(workflow_run.workflow_run_id)
             if latest_attempt is None:
                 continue
-            attempt_view = compute_attempt_view(workflow_run, [latest_attempt])
-            workflow_run.attempt = attempt_view.attempt
-            workflow_run.retry_pending = attempt_view.retry_pending
-            workflow_run.next_attempt_at = attempt_view.next_attempt_at
+            # The retry predicate reads only retry_decision and next_attempt_prepared_at from the attempt.
+            retry_pending = is_retry_pending(
+                workflow_run.status, workflow_run.finished_at, cast(WorkflowRunAttemptModel, latest_attempt)
+            )
+            workflow_run.attempt = latest_attempt.attempt_number
+            workflow_run.retry_pending = retry_pending
+            workflow_run.next_attempt_at = latest_attempt.next_attempt_at if retry_pending else None
         return workflow_runs
 
     async def get_workflow_runs_count(
