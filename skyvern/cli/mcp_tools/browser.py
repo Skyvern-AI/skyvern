@@ -159,19 +159,19 @@ _LOCAL_UPLOAD_MAX_BYTES = 50 * 1024 * 1024
 _LOCAL_UPLOAD_SUPPORTS_DIR_FD = os.open in getattr(os, "supports_dir_fd", set())
 
 
-def _read_run_owned_upload(candidate_path: str, run_id: str, max_bytes: int) -> FilePayload:
+def read_local_file_under(candidate_path: str, allowed_roots: list[Path], max_bytes: int) -> FilePayload:
     nofollow_flag = getattr(os, "O_NOFOLLOW", None)
     directory_flag = getattr(os, "O_DIRECTORY", None)
     nonblocking_flag = getattr(os, "O_NONBLOCK", None)
     if nofollow_flag is None or directory_flag is None or nonblocking_flag is None or not _LOCAL_UPLOAD_SUPPORTS_DIR_FD:
         raise PermissionError("Secure local file access is not supported on this platform")
 
-    allowed_root = (Path(settings.DOWNLOAD_PATH) / run_id).resolve(strict=True)
     resolved_candidate = Path(candidate_path).resolve(strict=True)
-    try:
-        relative_path = resolved_candidate.relative_to(allowed_root)
-    except ValueError as exc:
-        raise PermissionError("Local file is outside the run upload directory") from exc
+    matching_roots = [root for root in allowed_roots if resolved_candidate.is_relative_to(root)]
+    if not matching_roots:
+        raise PermissionError("Local file is outside the allowed directories")
+    allowed_root = max(matching_roots, key=lambda root: len(root.parts))
+    relative_path = resolved_candidate.relative_to(allowed_root)
     if not relative_path.parts:
         raise PermissionError("Local upload path must identify a file")
 
@@ -204,6 +204,11 @@ def _read_run_owned_upload(candidate_path: str, run_id: str, max_bytes: int) -> 
 
     mime_type = mimetypes.guess_type(resolved_candidate.name)[0] or "application/octet-stream"
     return FilePayload(name=resolved_candidate.name, mimeType=mime_type, buffer=content)
+
+
+def _read_run_owned_upload(candidate_path: str, run_id: str, max_bytes: int) -> FilePayload:
+    allowed_root = (Path(settings.DOWNLOAD_PATH) / run_id).resolve(strict=True)
+    return read_local_file_under(candidate_path, [allowed_root], max_bytes)
 
 
 def _read_run_owned_uploads(file_paths: list[str], run_id: str | None) -> list[FilePayload]:

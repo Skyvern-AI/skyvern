@@ -8,7 +8,7 @@ import json
 import re
 import time
 import uuid
-from collections.abc import Awaitable, Coroutine, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any, Literal, TypeVar, cast, get_args
@@ -188,6 +188,7 @@ from skyvern.forge.sdk.core.event_source_stream import EventSourceStream, FastAP
 from skyvern.forge.sdk.db.enums import WorkflowBuildSource
 from skyvern.forge.sdk.db.exceptions import (
     CopilotProposalConflictError,
+    CopilotTurnRunningError,
     CredentialSitesChangedError,
     DatabaseConnectionUnavailableError,
     DuplicateCopilotTurnError,
@@ -627,6 +628,7 @@ def _copilot_cancel_key(organization_id: str, cancel_token: str) -> str:
     return f"copilot_cancel:{organization_id}:{cancel_token}"
 
 
+COPILOT_TURN_RUNNING_REFUSED = "Another Copilot turn is still running on this workflow, so this message was not sent."
 COPILOT_SUPERSEDE_REFUSED = (
     "Another member's Copilot turn is still running in this chat. Wait for it to finish, or ask an Admin to stop it."
 )
@@ -722,8 +724,8 @@ async def _turns_a_new_turn_supersedes(
     own_cancel_token: str | None,
 ) -> list[CopilotPendingTurn]:
     # A turn already told to stop is skipped: its entry can outlive a dead task until reconcile claims it,
-    # and an Admin Stop has to unblock the chat before then.
-    return [
+    # and an Admin Stop has to unblock the chat before then. So is one whose outcome is already saved.
+    live = [
         entry
         for entry in chat.pending_turns.values()
         if entry.turn_id != turn_id
@@ -732,6 +734,19 @@ async def _turns_a_new_turn_supersedes(
         and entry.recovering_at is None
         and not await _cancel_already_requested(cache, organization_id, entry.cancel_token)
     ]
+    if not live:
+        return live
+    ended = await app.DATABASE.workflow_params.get_ended_copilot_turn_ids(
+        organization_id, chat.workflow_copilot_chat_id, [entry.turn_id for entry in live]
+    )
+    return [entry for entry in live if entry.turn_id not in ended]
+
+
+def _cancelled_tokens(cache: BaseCache | None, organization_id: str) -> Callable[[list[str]], Awaitable[set[str]]]:
+    async def cancelled(tokens: list[str]) -> set[str]:
+        return {token for token in tokens if await _cancel_already_requested(cache, organization_id, token)}
+
+    return cancelled
 
 
 async def _require_control_of_superseded_turns(organization_id: str, turns: list[CopilotPendingTurn]) -> None:
@@ -2363,7 +2378,7 @@ async def _commit_staged_workflow(
         run_sequentially=staged_workflow.run_sequentially,
         sequential_key=staged_workflow.sequential_key,
         edited_by="copilot",
-        build_source=WorkflowBuildSource.copilot,
+        build_source=WorkflowBuildSource.ember,
         preserve_completion_contract=not clear_persisted_completion_contract,
         validate_code_block_templates=False,
         preserve_redacted_credential_references_from=canonical,
@@ -3029,6 +3044,9 @@ async def _new_copilot_chat_post(
             superseded_turns = await _turns_a_new_turn_supersedes(
                 getattr(app, "CACHE", None), organization.organization_id, chat, turn_id, chat_request.cancel_token
             )
+            # A client's own check for a running turn can race another client's start; this refusal can't.
+            if chat_request.refuse_if_turn_running and superseded_turns:
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=COPILOT_TURN_RUNNING_REFUSED)
             await _require_control_of_superseded_turns(organization.organization_id, superseded_turns)
             # Before any await that could raise into the recovery writer: that writer opens the row
             # with the product sender, so the caller's prose must already be gone.
@@ -3244,7 +3262,21 @@ async def _new_copilot_chat_post(
                     audio_artifact_id=chat_request.audio_artifact_id,
                     attached_files=new_attached_files,
                     sender=_turn_opener_sender(chat_request),
+                    cancelled_tokens=_cancelled_tokens(getattr(app, "CACHE", None), organization.organization_id)
+                    if chat_request.refuse_if_turn_running
+                    else None,
                 )
+            except CopilotTurnRunningError:
+                route_exit = "refused"
+                terminal_frame_emitted = True
+                await stream.send(
+                    WorkflowCopilotStreamErrorUpdate(
+                        type=WorkflowCopilotStreamMessageType.ERROR,
+                        error=COPILOT_TURN_RUNNING_REFUSED,
+                        narrative_summary=None,
+                    )
+                )
+                return
             except DuplicateCopilotTurnError as exc:
                 route_exit = "duplicate"
                 turn_id_for_log = exc.turn_id

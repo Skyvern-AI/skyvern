@@ -289,7 +289,10 @@ class Workflow(BaseModel):
     edited_for: str | None = Field(default=None, exclude=True)
     build_source: WorkflowBuildSource | None = Field(
         default=None,
-        description="Which surface wrote this version: ui, copilot, mcp, cli, api, or internal. Null before tracking began.",
+        description=(
+            "Which surface wrote this version: ui, copilot (Ember), mcp, cli, api, or internal. "
+            "Null before tracking began."
+        ),
     )
     # Lineage-derived (any version copilot-stamped); populated by the detail GET route only —
     # user saves re-stamp created_by/edited_by, so the current version alone is not durable.

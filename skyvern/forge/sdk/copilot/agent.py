@@ -233,6 +233,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     BrowserProbeOutcome,
     _browser_context_attachability,
+    begin_turn_browser_renewal,
     cancel_ledgered_build_test_prestarts,
     close_browser_session_quietly,
     end_minted_browser_renewals,
@@ -5788,6 +5789,8 @@ async def _run_copilot_turn_impl(
 
     validated_browser_session_id = await _resolve_live_browser_session_id(chat_request, organization_id, ctx)
     ctx.browser_session_id = validated_browser_session_id
+    if validated_browser_session_id is not None:
+        await begin_turn_browser_renewal(ctx, validated_browser_session_id)
 
     direct_test_handoff = None
     if chat_request.product_action == "test_end_to_end":

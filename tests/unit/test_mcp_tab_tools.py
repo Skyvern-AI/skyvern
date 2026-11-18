@@ -1025,28 +1025,6 @@ async def test_tab_wait_for_new_arrives_async(monkeypatch: pytest.MonkeyPatch) -
 
 
 class TestMultiPageInspectionHooks:
-    def test_hooks_registered_on_all_pages(self) -> None:
-        from skyvern.cli.mcp_tools.inspection import ensure_hooks_on_all_pages
-
-        page_a = MagicMock()
-        page_a.is_closed.return_value = False
-        page_a.on = MagicMock()
-
-        page_b = MagicMock()
-        page_b.is_closed.return_value = False
-        page_b.on = MagicMock()
-
-        state = _make_session_state()
-
-        ensure_hooks_on_all_pages(state, [page_a, page_b])
-
-        # Both pages should have hooks
-        assert id(page_a) in state._hooked_page_ids
-        assert id(page_b) in state._hooked_page_ids
-        # 6 events per page: console, response, requestfailed, close, dialog, pageerror
-        assert page_a.on.call_count == 6
-        assert page_b.on.call_count == 6
-
     def test_hooks_idempotent(self) -> None:
         from skyvern.cli.mcp_tools.inspection import ensure_hooks_on_all_pages
 

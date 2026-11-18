@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator, Callable, Collection, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Mapping
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
@@ -37,6 +37,7 @@ from skyvern.forge.sdk.db.base_repository import BaseRepository
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
 from skyvern.forge.sdk.db.exceptions import (
     CopilotProposalConflictError,
+    CopilotTurnRunningError,
     DatabaseConnectionUnavailableError,
     DuplicateCopilotTurnError,
     NotFoundError,
@@ -258,6 +259,21 @@ def _parse_pending_turn_timestamp(value: object) -> datetime | None:
     except ValueError:
         return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+async def _ended_copilot_turn_ids(
+    session: AsyncSession, organization_id: str, chat_ids: Collection[str], turn_ids: Collection[str]
+) -> set[str]:
+    # A turn whose outcome is saved has ended even if clearing its pending entry failed, as chat-history reads it.
+    outcome_turn_id = WorkflowCopilotChatMessageModel.turn_outcome["copilot_turn_id"].as_string()
+    return set(
+        await session.scalars(
+            select(outcome_turn_id)
+            .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
+            .where(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id.in_(list(chat_ids)))
+            .where(outcome_turn_id.in_(list(turn_ids)))
+        )
+    )
 
 
 def _prune_pending_turns(pending_turns: object) -> dict[str, Any]:
@@ -1231,6 +1247,7 @@ class WorkflowParametersRepository(BaseRepository):
         audio_artifact_id: str | None = None,
         attached_files: list[CopilotAttachedFile] | None = None,
         sender: WorkflowCopilotChatSender = WorkflowCopilotChatSender.USER,
+        cancelled_tokens: Callable[[list[str]], Awaitable[Collection[str]]] | None = None,
     ) -> WorkflowCopilotChatMessage:
         """Write the turn's opening row and its pending marker in one transaction.
 
@@ -1238,14 +1255,46 @@ class WorkflowParametersRepository(BaseRepository):
         message exists with no marker to reconcile it.
         """
         async with self.Session() as session:
-            chat = (
-                await session.scalars(
-                    select(WorkflowCopilotChatModel)
+            workflow_chats: list[WorkflowCopilotChatModel] = []
+            stopped: Collection[str] = ()
+            if cancelled_tokens is not None:
+                workflow_permanent_id = await session.scalar(
+                    select(WorkflowCopilotChatModel.workflow_permanent_id)
                     .where(WorkflowCopilotChatModel.organization_id == organization_id)
                     .where(WorkflowCopilotChatModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
-                    .with_for_update()
                 )
-            ).first()
+                on_workflow = (
+                    select(WorkflowCopilotChatModel)
+                    .where(WorkflowCopilotChatModel.organization_id == organization_id)
+                    .where(WorkflowCopilotChatModel.workflow_permanent_id == workflow_permanent_id)
+                    .order_by(WorkflowCopilotChatModel.workflow_copilot_chat_id)
+                )
+                # Read before any row is locked, so a slow cache behind cancelled_tokens never holds the locks.
+                stopped = await cancelled_tokens(
+                    [
+                        token
+                        for pending_turns in await session.scalars(
+                            on_workflow.with_only_columns(WorkflowCopilotChatModel.pending_turns)
+                        )
+                        for entry in _prune_pending_turns(pending_turns).values()
+                        if isinstance(token := entry.get("cancel_token"), str) and token
+                    ]
+                )
+                # Every chat on the workflow, locked in one order: two requests in different chats can't both
+                # start, and neither holds a row the other locks first.
+                workflow_chats = list(await session.scalars(on_workflow.with_for_update()))
+                chat = next(
+                    (row for row in workflow_chats if row.workflow_copilot_chat_id == workflow_copilot_chat_id), None
+                )
+            else:
+                chat = (
+                    await session.scalars(
+                        select(WorkflowCopilotChatModel)
+                        .where(WorkflowCopilotChatModel.organization_id == organization_id)
+                        .where(WorkflowCopilotChatModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                        .with_for_update()
+                    )
+                ).first()
             if chat is None:
                 raise NotFoundError(f"workflow copilot chat {workflow_copilot_chat_id}")
             pending = _prune_pending_turns(chat.pending_turns)
@@ -1255,6 +1304,21 @@ class WorkflowParametersRepository(BaseRepository):
             )
             if existing_turn_id is not None:
                 raise DuplicateCopilotTurnError(existing_turn_id)
+            # The turns a new turn would supersede: a stopped one waiting for reconcile no longer counts. A token
+            # that appeared after the cache read belongs to a turn that just started, so it counts.
+            running = {
+                turn_id
+                for row in workflow_chats
+                for turn_id, entry in _prune_pending_turns(row.pending_turns).items()
+                if turn_id != pending_turn.turn_id
+                and entry.get("cancel_token")
+                and entry["cancel_token"] not in stopped
+                and entry.get("recovering_at") is None
+            }
+            if running and running - await _ended_copilot_turn_ids(
+                session, organization_id, [row.workflow_copilot_chat_id for row in workflow_chats], running
+            ):
+                raise CopilotTurnRunningError(workflow_copilot_chat_id)
             if pending_turn.idempotency_digest is not None:
                 completed_outcomes = list(
                     await session.scalars(
@@ -2454,6 +2518,15 @@ class WorkflowParametersRepository(BaseRepository):
             operation="get_workflow_copilot_chat_messages",
             workflow_copilot_chat_id=workflow_copilot_chat_id,
         )
+
+    @db_operation("get_ended_copilot_turn_ids")
+    async def get_ended_copilot_turn_ids(
+        self, organization_id: str, workflow_copilot_chat_id: str, turn_ids: Collection[str]
+    ) -> set[str]:
+        if not turn_ids:
+            return set()
+        async with self.Session() as session:
+            return await _ended_copilot_turn_ids(session, organization_id, [workflow_copilot_chat_id], turn_ids)
 
     @db_operation("get_workflow_copilot_chat_by_id")
     async def get_workflow_copilot_chat_by_id(

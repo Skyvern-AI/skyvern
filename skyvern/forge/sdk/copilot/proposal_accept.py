@@ -236,7 +236,7 @@ async def accept_copilot_proposal(
                 request=yaml_request,
                 workflow_permanent_id=chat.workflow_permanent_id,
                 edited_by="copilot",
-                build_source=WorkflowBuildSource.copilot,
+                build_source=WorkflowBuildSource.ember,
                 validate_code_block_templates=False,
                 expected_version=canonical.version if metadata is not None else base_version,
                 return_write_result=True,

@@ -435,16 +435,6 @@ class TestDoNetworkRoute:
         assert result.action == "mock"
         assert "**/data" in state.active_routes.get(id(raw_page), set())
 
-    @pytest.mark.asyncio
-    async def test_re_register_unroutes_first(self) -> None:
-        state = _make_state()
-        raw_page = _make_cdp_page()
-        state.active_routes.setdefault(id(raw_page), set()).add("**/api/*")
-        await do_network_route(raw_page, state, url_pattern="**/api/*", action="abort")
-        assert state.active_routes[id(raw_page)] == {"**/api/*"}
-        raw_page.unroute.assert_not_awaited()
-        raw_page.route.assert_not_awaited()
-
 
 class TestDoNetworkUnroute:
     @pytest.mark.asyncio

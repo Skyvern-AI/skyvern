@@ -7,10 +7,12 @@ vendored SDK is behind the backend enum.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import structlog
 
+from skyvern.client.core.request_options import RequestOptions
 from skyvern.client.errors import BadRequestError, NotFoundError
 
 from ._session import get_skyvern
@@ -153,11 +155,16 @@ async def retry_workflow_run_raw(workflow_run_id: str) -> dict[str, Any]:
     return payload
 
 
+def _request_options(timeout: float | None) -> RequestOptions | None:
+    return RequestOptions(timeout_in_seconds=max(1, math.ceil(timeout))) if timeout is not None else None
+
+
 async def create_workflow_raw(
     *,
     json_definition: dict[str, Any] | None,
     yaml_definition: str | None,
     folder_id: str | None,
+    timeout: float | None = None,
 ) -> dict[str, Any]:
     """POST /v1/workflows — returns the created workflow as a raw dict."""
     skyvern = get_skyvern()
@@ -174,6 +181,7 @@ async def create_workflow_raw(
         method="POST",
         params=params,
         json=body,
+        request_options=_request_options(timeout),
     )
     if response.status_code >= 400:
         raise RuntimeError(f"HTTP {response.status_code}: {extract_error_detail(response)}")
@@ -231,7 +239,9 @@ async def update_workflow_folder_raw(workflow_id: str, *, folder_id: str | None)
     return payload
 
 
-async def get_workflow_by_id(workflow_id: str, version: int | None = None) -> dict[str, Any]:
+async def get_workflow_by_id(
+    workflow_id: str, version: int | None = None, *, timeout: float | None = None
+) -> dict[str, Any]:
     """GET /api/v1/workflows/{id} — returns a single workflow as a raw dict.
 
     Uses ``INTERNAL_WORKFLOW_ROUTE`` because the Fern-generated client's public
@@ -246,6 +256,7 @@ async def get_workflow_by_id(workflow_id: str, version: int | None = None) -> di
         f"{INTERNAL_WORKFLOW_ROUTE}/{workflow_id}",
         method="GET",
         params=params,
+        request_options=_request_options(timeout),
     )
     if response.status_code == 404:
         raise NotFoundError(body={"detail": f"Workflow {workflow_id!r} not found"})

@@ -1353,6 +1353,13 @@ async def _record_minted_browser(ctx: AgentContext, session_id: str) -> None:
         return
     # Ledgered first: the turn ends renewal for every ledgered id, and begin takes its refcount before it can raise.
     ctx.minted_browser_sessions[session_id] = None
+    await begin_turn_browser_renewal(ctx, session_id)
+
+
+async def begin_turn_browser_renewal(ctx: AgentContext, session_id: str) -> None:
+    """Keep a browser alive until the turn ends; closing it is left to the minted ledger."""
+    if session_id in ctx.minted_browser_renewal_checks:
+        return
     _arm_minted_browser_renewal_check(ctx, session_id)
     try:
         await app.BROWSER_MANAGER.begin_session_activity_renewal(session_id)
@@ -1924,11 +1931,13 @@ async def _replace_studio_browser(
         # A row that might name the new browser must outlive the turn, so only a browser no row names is minted.
         # ponytail: an unknown row leaks the new browser until it times out; read the row back again if that matters.
         if not row_unknown:
-            await _record_minted_browser(ctx, new_session_id)
+            ctx.minted_browser_sessions[new_session_id] = None
         replacement = BrowserSessionReplacement(
             old_session_id, new_session_id, old_closed, studio_browser_kept=studio_browser_kept
         )
     _record_browser_session_replacement(ctx, replacement)
+    # Renewal starts after the replacement is recorded, so a cancel inside the renewal start cannot skip that record.
+    await begin_turn_browser_renewal(ctx, new_session_id)
     if cancelled is not None:
         raise cancelled
     return replacement

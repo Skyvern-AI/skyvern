@@ -18786,7 +18786,7 @@ class WorkflowService:
                 status=WorkflowStatus.auto_generated,
                 created_by=COPILOT_TEST_WORKFLOW_CREATOR,
                 edited_by="copilot",
-                build_source=WorkflowBuildSource.copilot,
+                build_source=WorkflowBuildSource.ember,
                 description=runtime_workflow.description,
                 proxy_location=runtime_workflow.proxy_location,
                 webhook_callback_url=runtime_workflow.webhook_callback_url,

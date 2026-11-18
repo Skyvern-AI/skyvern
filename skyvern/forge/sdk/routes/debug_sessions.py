@@ -398,7 +398,7 @@ async def get_debug_session_viewer_state(
 async def get_or_create_debug_session_by_user_and_workflow_permanent_id(
     workflow_permanent_id: str,
     current_org: Organization = Depends(org_auth_service.get_current_org),
-    current_user_id: str = Depends(org_auth_service.get_current_user_id),
+    current_user_id: str = Depends(org_auth_service.get_debug_session_owner_id),
 ) -> DebugSession:
     """
     `current_user_id` is a unique identifier for a user, but does not map to an
@@ -407,7 +407,7 @@ async def get_or_create_debug_session_by_user_and_workflow_permanent_id(
     If the debug session does not exist, a new one will be created.
 
     In addition, the timeout for the debug session's browser session will be
-    extended to 4 hours from the time of the request. If the browser session
+    extended to DEBUG_SESSION_TIMEOUT_MINUTES (20 minutes) from the time of the request. If the browser session
     cannot be renewed, a new one will be created and assigned to the debug
     session. The browser_session that could not be renewed will be closed.
     """
