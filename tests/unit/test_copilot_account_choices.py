@@ -14,6 +14,7 @@ import pytest_asyncio
 
 from skyvern.config import settings
 from skyvern.forge import app
+from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot import request_policy as request_policy_module
 from skyvern.forge.sdk.copilot import tools as tools_module
@@ -987,14 +988,14 @@ CITED_ACCOUNT_NAME = "Blog Metrics Connection"
 AMBIGUOUS_ACCOUNT_ID = "goac_ambiguous"
 
 
-def _named_sheets_yaml(reference: str) -> str:
-    return (
-        "workflow_definition:\n"
-        "  blocks:\n"
-        f"    - label: {SHEETS_BLOCK_LABEL}\n"
-        "      block_type: google_sheets_write\n"
-        f'      credential_id: "{reference}"\n'
+def _named_sheets_yaml(reference: str, *, catalog_action: bool = False) -> str:
+    block = (
+        "      block_type: integration_action\n      integration_id: google_sheets\n"
+        f'      action_id: write_rows\n      connection_id: "{reference}"\n'
+        if catalog_action
+        else f'      block_type: google_sheets_write\n      credential_id: "{reference}"\n'
     )
+    return f"workflow_definition:\n  blocks:\n    - label: {SHEETS_BLOCK_LABEL}\n{block}"
 
 
 def _canonicalization_ctx(workflow_yaml: str, user_message: str) -> CopilotContext:
@@ -1021,9 +1022,11 @@ def _patch_visible_credentials(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("citation", [CITED_ACCOUNT_NAME, CITED_ACCOUNT_NAME.casefold()])
+@pytest.mark.parametrize("catalog_action", [False, True], ids=["native_block", "catalog_action"])
 async def test_cited_connection_name_canonicalizes_and_keeps_run_authority(
     monkeypatch: pytest.MonkeyPatch,
     citation: str,
+    catalog_action: bool,
 ) -> None:
     accounts = [_google(CITED_ACCOUNT_ID, CITED_ACCOUNT_NAME, email_address="metrics@example.test")]
     _patch_visible_credentials(monkeypatch, accounts)
@@ -1031,7 +1034,9 @@ async def test_cited_connection_name_canonicalizes_and_keeps_run_authority(
         "skyvern.forge.sdk.services.google_oauth_service.get_visible_credentials_for_org",
         AsyncMock(return_value=accounts),
     )
-    draft = _named_sheets_yaml(citation)
+    # The catalog lookup behind an integration_action reads the real catalog.
+    monkeypatch.setattr(app, "AGENT_FUNCTION", AgentFunction())
+    draft = _named_sheets_yaml(citation, catalog_action=catalog_action)
     ctx = _canonicalization_ctx(draft, f'write the rows with the "{citation}" account')
 
     canonical_yaml, facts = await canonicalize_named_connection_bindings(draft, ctx)

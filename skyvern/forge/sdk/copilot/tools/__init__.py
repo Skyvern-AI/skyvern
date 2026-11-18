@@ -1347,6 +1347,19 @@ async def list_integrations_tool(ctx: RunContextWrapper) -> str:
     exactly as the user wrote it in this turn. The server resolves it when the
     workflow is saved, and `connection_resolution` in the save result says what
     happened to that slot.
+
+    An entry may list `actions` and `triggers`. An `integration_action` block runs
+    one action: `integration_id` is the entry's `id`, `action_id` the action's `id`,
+    `inputs` holds values for the names in the action's `inputs` schema, and
+    `connection_id` is the account field. `needs` lists the scopes the account must
+    have granted, and `acts` is true when the action sends, writes or uploads. An
+    action runs as the block type its `runs_via` names (`block:<type>`); that block
+    type can also be written directly instead of an `integration_action`. An
+    `integration_action` does not run for an entry whose `credential_backend` is
+    `nango` and that has no `oauth_provider`, or with an account whose `provider` is
+    `nango` (a Connected Gmail account); the block type written directly takes those
+    accounts. A trigger's `source_kind` is the `source_kind` that
+    `create_webhook_trigger` takes.
     """
     copilot_ctx = ctx.context
     arguments: dict[str, Any] = {}
