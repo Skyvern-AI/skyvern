@@ -3,6 +3,7 @@ import atexit
 import base64
 import contextlib
 import hashlib
+import hmac
 import ipaddress
 import json
 import os
@@ -48,6 +49,7 @@ from skyvern.exceptions import (
 from skyvern.forge.sdk.api.aws import get_aws_client
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_delete, aiohttp_get_json, aiohttp_post
 from skyvern.forge.sdk.credential_site_policy import LoginSite
+from skyvern.forge.sdk.encrypt.bootstrap import PLACEHOLDER_SECRET_KEY
 from skyvern.forge.sdk.schemas.credentials import (
     BitwardenItemOverview,
     CredentialItem,
@@ -90,6 +92,12 @@ def _attempt_deadline_seconds(timeout: int, identity: "_VaultIdentity") -> int:
 # vault identity at its own directory lets sessions for different organizations coexist, so a run
 # never has to log another organization out to make room for its own login.
 _BITWARDEN_APPDATA_ENV_VAR = "BITWARDENCLI_APPDATA_DIR"
+# The Bitwarden CLI names its device from this key of data.json; a legacy top-level "appId" is ignored.
+# Checked against @bitwarden/cli 2026.9.0; check again when the pinned CLI version changes.
+_CLI_DEVICE_ID_STATE_KEY = "global_applicationId_appId"
+_CLI_STATE_FILE_NAME = "data.json"
+# Changing this label or the derivation gives every account a new device, and Bitwarden emails each one.
+_DEVICE_ID_DERIVATION_LABEL = "skyvern.bitwarden.cli-device.v1"
 
 # Each `bw` invocation is a Node process. Bound how many run at once so a burst of runs cannot starve
 # the browsers sharing the pod, and so one slow command no longer blocks every other run's fetch.
@@ -275,6 +283,20 @@ class _VaultIdentity:
         return bool(self.email and self.master_password)
 
     @cached_property
+    def device_id(self) -> str | None:
+        """Keep the device stable because Bitwarden emails the account for each sign-in from an unseen device."""
+        if self.uses_email_auth or not self.client_id or not self.client_secret:
+            return None
+        if not settings.ENCRYPTOR_AES_SECRET_KEY or settings.ENCRYPTOR_AES_SECRET_KEY == PLACEHOLDER_SECRET_KEY:
+            # Without a deployment secret, an API key holder could present this device and avoid the new-device email.
+            return None
+        material = "\x00".join(
+            [_DEVICE_ID_DERIVATION_LABEL, settings.ENCRYPTOR_AES_SALT or "", self.client_id, self.client_secret]
+        )
+        digest = hmac.new(settings.ENCRYPTOR_AES_SECRET_KEY.encode(), material.encode(), hashlib.sha256).digest()
+        return str(uuid.UUID(bytes=digest[:16], version=4))
+
+    @cached_property
     def fingerprint(self) -> str:
         """A stable, non-reversible name for this identity, safe to log and to use as a directory."""
         material = (
@@ -344,6 +366,15 @@ class _CliSession:
         shutil.rmtree(self.appdata_dir, ignore_errors=True)
 
 
+def _seed_cli_device(appdata_dir: str, identity: _VaultIdentity) -> None:
+    device_id = identity.device_id
+    if device_id is None:
+        return
+    path = os.path.join(appdata_dir, _CLI_STATE_FILE_NAME)
+    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as state_file:
+        state_file.write(json.dumps({_CLI_DEVICE_ID_STATE_KEY: device_id}))
+
+
 class _CliSessionCache:
     """Per-process store of live CLI sessions, keyed by vault identity and bounded by an LRU."""
 
@@ -374,6 +405,8 @@ class _CliSessionCache:
                 # request still held it must never be able to delete its own replacement's data.
                 self._generation += 1
                 appdata_dir = os.path.join(self._root_dir(), f"{identity.fingerprint[:16]}-{self._generation}")
+                os.makedirs(appdata_dir, mode=0o700, exist_ok=True)
+                _seed_cli_device(appdata_dir, identity)
                 session = _CliSession(identity, appdata_dir)
                 self._sessions[identity.fingerprint] = session
             os.makedirs(session.appdata_dir, mode=0o700, exist_ok=True)
@@ -1805,7 +1838,7 @@ class BitwardenService:
         if login_result.stderr and not BitwardenService._is_ignorable_login_stderr(login_result.stderr):
             raise _login_failure(login_result.stderr)
 
-        LOG.info("Bitwarden login successful")
+        LOG.info("Bitwarden login successful", api_key_login=login_command == ["bw", "login", "--apikey"])
         return BitwardenService._extract_session_key(login_result.stdout)
 
     @staticmethod
