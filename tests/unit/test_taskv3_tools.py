@@ -18461,20 +18461,15 @@ async def test_a_group_declared_on_a_shadow_host_still_bounds_the_repair() -> No
         assert held == ""
 
 
-# The page's own write, resolving ASYNCHRONOUSLY. The capture sits after the focus click so that a
-# focus-driven write is already in the snapshot -- but one that resolves on a timer lands after it, in
-# the window the suggestion poll holds open, and target equality cannot tell it from our keystrokes.
 _ASYNC_PAGE_WRITE_HTML = (
     _SEGMENTED_DATE_HTML
     + """
 <script>
   const _y = document.getElementById("year");
   _y.addEventListener("keydown", (e) => e.preventDefault());
-  _y.addEventListener(
-    "focus",
-    () => { setTimeout(() => { document.getElementById("month").value = "PAGE"; }, 250); },
-    { once: true }
-  );
+  window.__yearKeyups = [];
+  _y.addEventListener("keyup", (e) => window.__yearKeyups.push(e.key));
+  window.__completePageWrite = () => { document.getElementById("month").value = "PAGE"; };
 </script>
 """
 )
@@ -18483,15 +18478,54 @@ _ASYNC_PAGE_WRITE_HTML = (
 @pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
-async def test_an_async_page_write_after_the_keys_is_not_collateral() -> None:
-    # The target takes nothing, so `ours` is true and the restore runs -- and the sibling holds a value
-    # the PAGE wrote a quarter-second after the keys stopped. Attribution from the target alone cannot
-    # see the difference; only the timing can, so the moved set is taken the moment the keys stop.
+async def test_an_async_page_write_after_the_keys_is_not_collateral(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Resolve the deferred write at suggestion polling, independently of collateral sampling, so
+    # moving or removing the post-key sample cannot move the write with it.
     async with _content_page(_ASYNC_PAGE_WRITE_HTML) as page:
-        tools = build_browser_tools(_fixed_page_provider(page))
-        with contextlib.suppress(Exception):
-            await _tool(tools, "type").handler({"selector": "#year", "text": "2026"})
-        assert await page.eval_on_selector("#month", "el => el.value") == "PAGE"
+        evaluate = page.evaluate
+        pending = True
+        snapshots: list[list[str | None]] = []
+        completed_keys: list[str] = []
+        sampled_keyups: list[str] = []
+        phases: list[str] = []
+
+        async def complete_on_poll(expression: str, arg: Any = None) -> Any:
+            nonlocal pending
+            if (
+                pending
+                and expression == taskv3_tools._FIND_SUGGESTION_JS
+                and isinstance(arg, dict)
+                and arg.get("field") == "#year"
+                and arg.get("value") == "2026"
+            ):
+                pending = False
+                completed_keys.append(
+                    await evaluate("() => window.__yearKeyups.filter(key => /^[0-9]$/.test(key)).join('')")
+                )
+                await evaluate("() => window.__completePageWrite()")
+                phases.append("page")
+            snapshot = await evaluate(expression, arg)
+            if expression == taskv3_tools._COLLATERAL_READBACK_JS:
+                sampled_keyups.append(
+                    await evaluate("() => window.__yearKeyups.filter(key => /^[0-9]$/.test(key)).join('')")
+                )
+                snapshots.append(snapshot)
+                phases.append("sample")
+            return snapshot
+
+        with monkeypatch.context() as evaluator_patch:
+            evaluator_patch.setattr(page, "evaluate", complete_on_poll)
+            tools = build_browser_tools(_fixed_page_provider(page))
+            result = await _tool(tools, "type").handler({"selector": "#year", "text": "2026"})
+            assert await page.eval_on_selector("#month", "el => el.value") == "PAGE"
+            assert await page.eval_on_selector("#year", "el => el.value") == ""
+            assert result.status == "error", result.content
+            assert result.error_class == "text_not_held", result.content
+            assert completed_keys == ["2026"]
+            assert sampled_keyups == ["2026"]
+            assert snapshots == [[""]]
+            assert phases == ["sample", "page"]
+        assert page.evaluate == evaluate
 
 
 # A field the page owns, OUTSIDE the declared group, rewritten while the keys are being sent. The
