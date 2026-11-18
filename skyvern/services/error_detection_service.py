@@ -14,6 +14,7 @@ import structlog
 from playwright.async_api import Page
 
 from skyvern.errors.errors import UserDefinedError, filter_to_user_defined_codes
+from skyvern.exceptions import FailedToTakeScreenshot, MissingBrowserStatePage, ScrapingFailed
 from skyvern.forge import app
 from skyvern.forge.antibot_evidence import prompt_evidence_str
 from skyvern.forge.prompts import prompt_engine
@@ -35,22 +36,7 @@ async def detect_user_defined_errors_for_task(
     browser_state: BrowserState | None = None,
     failure_reason: str | None = None,
 ) -> list[UserDefinedError]:
-    """
-    Detect user-defined errors for a failed task.
-
-    This function uses the existing extract_user_defined_errors when browser_state
-    and page are available. When they're not available (early failures), it falls
-    back to detecting errors from the failure context.
-
-    Args:
-        task: The task that failed
-        step: The last step executed
-        browser_state: Optional browser state (may be None in early failures)
-        failure_reason: The reason for task failure (used when browser_state unavailable)
-
-    Returns:
-        List of detected UserDefinedError objects (empty if detection fails)
-    """
+    """Uses the page when it can be read, otherwise the failure context; returns [] when detection fails."""
     # Skip detection if no error_code_mapping defined
     if not task.error_code_mapping:
         LOG.debug(
@@ -62,7 +48,17 @@ async def detect_user_defined_errors_for_task(
 
     detected: list[UserDefinedError] = []
     try:
-        page = await browser_state.get_working_page() if browser_state is not None else None
+        page = None
+        if browser_state is not None:
+            try:
+                page = await browser_state.get_working_page()
+            except Exception:
+                LOG.warning(
+                    "Could not get working page for error detection",
+                    task_id=task.task_id,
+                    step_id=step.step_id,
+                    exc_info=True,
+                )
         if browser_state is not None and page is not None:
             LOG.info(
                 "Using page-based error detection",
@@ -70,7 +66,17 @@ async def detect_user_defined_errors_for_task(
                 step_id=step.step_id,
                 url=page.url,
             )
-            detected = await _detect_errors_from_page(task, step, page, browser_state, failure_reason)
+            from_page = await _detect_errors_from_page(task, step, page, browser_state, failure_reason)
+            if from_page is None:
+                LOG.info(
+                    "Page could not be read for error detection, using context-based error detection",
+                    task_id=task.task_id,
+                    step_id=step.step_id,
+                    has_failure_reason=failure_reason is not None,
+                )
+                detected = await _detect_errors_from_context(task, step, failure_reason)
+            else:
+                detected = from_page
         else:
             LOG.info(
                 "Browser state or page not available, using context-based error detection",
@@ -106,20 +112,15 @@ async def _detect_errors_from_page(
     page: Page,
     browser_state: BrowserState,
     failure_reason: str | None,
-) -> list[UserDefinedError]:
-    """
-    Detect errors using full page context (screenshots, HTML, action history).
-
-    Reuses the existing extract_user_defined_errors function.
-    """
+) -> list[UserDefinedError] | None:
+    """Returns None when the page could not be read; [] when the detector read it and named no code."""
+    LOG.info(
+        "Scraping page for error detection",
+        task_id=task.task_id,
+        step_id=step.step_id,
+        url=page.url,
+    )
     try:
-        # Scrape the current page
-        LOG.info(
-            "Scraping page for error detection",
-            task_id=task.task_id,
-            step_id=step.step_id,
-            url=page.url,
-        )
         scraped_page = await browser_state.scrape_website(
             url=page.url,
             cleanup_element_tree=app.AGENT_FUNCTION.cleanup_element_tree_factory(
@@ -130,16 +131,24 @@ async def _detect_errors_from_page(
             take_screenshots=True,
             draw_boxes=False,
         )
+    except Exception:
+        LOG.warning(
+            "Failed to scrape page for error detection",
+            task_id=task.task_id,
+            step_id=step.step_id,
+            exc_info=True,
+        )
+        return None
 
-        if scraped_page is None:
-            LOG.warning(
-                "Failed to scrape page for error detection",
-                task_id=task.task_id,
-                step_id=step.step_id,
-            )
-            return []
+    if scraped_page is None:
+        LOG.warning(
+            "Failed to scrape page for error detection",
+            task_id=task.task_id,
+            step_id=step.step_id,
+        )
+        return None
 
-        # Use the existing extract_user_defined_errors function
+    try:
         LOG.info(
             "Calling extract_user_defined_errors with full page context",
             task_id=task.task_id,
@@ -162,14 +171,16 @@ async def _detect_errors_from_page(
 
         return user_defined_errors
 
-    except Exception:
+    except Exception as exc:
         LOG.warning(
             "Failed to detect errors from page",
             task_id=task.task_id,
             step_id=step.step_id,
             exc_info=True,
         )
-        return []
+        # The detector re-scrapes before its model call, so a scrape error here also means the page went unread. A
+        # failed model call is not retried through the context path, which would send the same request again.
+        return None if isinstance(exc, (ScrapingFailed, FailedToTakeScreenshot, MissingBrowserStatePage)) else []
 
 
 async def _detect_errors_from_context(
