@@ -10,6 +10,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from structlog.testing import capture_logs
 
+from skyvern.exceptions import FailedToTakeScreenshot, MissingBrowserStatePage, ScrapingFailedBlankPage
+from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import Step, StepStatus
@@ -277,6 +279,65 @@ async def test_detect_errors_llm_call_fails(mock_browser_state, mock_step):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("page_read", "expected"),
+    [
+        ("page_lookup_raises", ["PAGE_BLANK"]),
+        ("scrape_raises", ["PAGE_BLANK"]),
+        ("scrape_returns_nothing", ["PAGE_BLANK"]),
+        ("detector_rescrape_raises", ["PAGE_BLANK"]),
+        ("detector_screenshot_raises", ["PAGE_BLANK"]),
+        ("detector_page_missing", ["PAGE_BLANK"]),
+        # The page was read, so the detector's answer or its failed model call stands; the request is not sent twice.
+        ("detector_model_call_raises", []),
+        ("detector_names_no_code", []),
+    ],
+)
+async def test_a_page_that_could_not_be_read_falls_back_to_the_failure_context(
+    mock_browser_state, mock_step, page_read: str, expected: list[str]
+) -> None:
+    now = datetime.now()
+    task = make_task(
+        now,
+        make_organization(now),
+        error_code_mapping={"PAGE_BLANK": "the page is blank", "LOGIN_REQUIRED": "a login form is shown"},
+    )
+    if page_read == "page_lookup_raises":
+        mock_browser_state.get_working_page = AsyncMock(side_effect=Exception("browser gone"))
+    if page_read == "scrape_raises":
+        mock_browser_state.scrape_website = AsyncMock(side_effect=ScrapingFailedBlankPage())
+    if page_read == "scrape_returns_nothing":
+        mock_browser_state.scrape_website = AsyncMock(return_value=None)
+    detector_failure = {
+        "detector_rescrape_raises": ScrapingFailedBlankPage(),
+        "detector_screenshot_raises": FailedToTakeScreenshot("target closed"),
+        "detector_page_missing": MissingBrowserStatePage(),
+        "detector_model_call_raises": LLMProviderError("provider timed out"),
+    }.get(page_read)
+
+    with (
+        patch("skyvern.services.error_detection_service.app") as mock_app,
+        patch(
+            "skyvern.services.error_detection_service.extract_user_defined_errors",
+            new_callable=AsyncMock,
+            side_effect=detector_failure,
+            return_value=[],
+        ),
+    ):
+        mock_app.EXTRACTION_LLM_API_HANDLER = AsyncMock(
+            return_value={"errors": [{"error_code": "PAGE_BLANK", "reasoning": "blank page", "confidence_float": 0.9}]}
+        )
+        detected = await detect_user_defined_errors_for_task(
+            task=task,
+            step=mock_step,
+            browser_state=mock_browser_state,
+            failure_reason="It's a blank page. Please ensure there is a non-blank page for Skyvern to work with.",
+        )
+
+    assert [error.error_code for error in detected] == expected
+
+
+@pytest.mark.asyncio
 async def test_detect_errors_multiple_errors(mock_browser_state, mock_step):
     """Test detection of multiple errors."""
     now = datetime.now()
@@ -348,32 +409,6 @@ async def test_detect_errors_invalid_error_format(mock_browser_state, mock_step)
         # Only valid error should be returned
         assert len(detected_errors) == 1
         assert detected_errors[0].error_code == "payment_failed"
-
-
-@pytest.mark.asyncio
-async def test_detect_errors_empty_llm_response(mock_browser_state, mock_step):
-    """Test handling of empty LLM response."""
-    now = datetime.now()
-    organization = make_organization(now)
-    task = make_task(
-        now,
-        organization,
-        error_code_mapping={
-            "payment_failed": "Credit card was declined",
-        },
-    )
-
-    # Mock extract_user_defined_errors to return empty list
-    with patch(
-        "skyvern.services.error_detection_service.extract_user_defined_errors", new_callable=AsyncMock
-    ) as mock_extract:
-        mock_extract.return_value = []
-
-        detected_errors = await detect_user_defined_errors_for_task(
-            task=task, step=mock_step, browser_state=mock_browser_state
-        )
-
-        assert detected_errors == []
 
 
 @pytest.mark.asyncio
