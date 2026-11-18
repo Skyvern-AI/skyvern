@@ -900,6 +900,12 @@ class Settings(BaseSettings):
     AZURE_GPT6_1_TERRA_API_BASE: str | None = None
     AZURE_GPT6_1_TERRA_API_VERSION: str = "2025-04-01-preview"
 
+    ENABLE_AZURE_GPT6_2_SOL: bool = False
+    AZURE_GPT6_2_SOL_DEPLOYMENT: str = "gpt-6.2-sol"
+    AZURE_GPT6_2_SOL_API_KEY: str | None = None
+    AZURE_GPT6_2_SOL_API_BASE: str | None = None
+    AZURE_GPT6_2_SOL_API_VERSION: str = "2025-04-01-preview"
+
     ENABLE_AZURE_GPT6_LUNA: bool = False
     AZURE_GPT6_LUNA_DEPLOYMENT: str = "gpt-6-luna"
     AZURE_GPT6_LUNA_API_KEY: str | None = None
