@@ -42,7 +42,7 @@ _REASONING_SCOPE_KEYS = ("model", "base_url", "api_key", "api_version")
 
 
 class CacheableSystemInstructions(str):
-    """The joined system prompt string, carrying its stable prefix and dynamic suffix so ``CopilotLitellmModel`` can
+    """The joined system prompt string, carrying its stable prefix and dynamic suffix so ``SkyvernLitellmModel`` can
     cache the prefix: as a GPT Responses envelope, or as two Claude system blocks with the same text."""
 
     stable_prefix: str
@@ -70,7 +70,7 @@ class CacheableSystemInstructions(str):
 
 @dataclass(slots=True)
 class ExplicitCacheEnvelope:
-    """Logical and Responses API views of one cacheable Copilot request."""
+    """Logical and Responses API views of one cacheable model request."""
 
     logical_messages: list[Any]
     responses_input: list[Any]
@@ -212,7 +212,7 @@ def _cache_key(
     digest = hashlib.sha256(json.dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     # Keep the routing key opaque: it binds the relevant inputs without
     # disclosing a chat/session identifier to request logs.
-    return f"copilot:{digest[:48]}"
+    return f"skyvern:{digest[:48]}"
 
 
 def model_chain(model: str, model_settings: ModelSettings) -> list[str]:

@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal, Protocol, TypeAlias
 
 from skyvern.forge.sdk.forge_log import _generated_log_value, _model_log_value
@@ -11,6 +11,8 @@ from skyvern.forge.sdk.forge_log import _generated_log_value, _model_log_value
 UsageScalar: TypeAlias = str | int | float
 CacheMode: TypeAlias = Literal["implicit", "explicit"]
 CostSource: TypeAlias = Literal["provider_reported", "litellm_estimate"]
+PROMPT_NAME_KEY = "llm.prompt_name"
+_GENERATED_AGENT_NAMES = frozenset({"ember", "agent_step"})
 
 _PROVIDER_NAMES = {
     "anthropic": "anthropic",
@@ -68,7 +70,7 @@ def normalize_gen_ai_provider(provider_name: str | None, model: str) -> str | No
 
 
 @dataclass(frozen=True, slots=True)
-class CopilotModelUsageEvent:
+class ModelUsageEvent:
     request_model: str
     response_model: str | None = None
     provider_name: str | None = None
@@ -84,6 +86,7 @@ class CopilotModelUsageEvent:
     cache_breakpoint_count: int | None = None
     cache_stable_prefix_chars: int | None = None
     ref_tool_outputs_escaped: int | None = None
+    agent_name: str | None = None
 
     def log_fields(self) -> dict[str, UsageScalar]:
         provider_name = None
@@ -99,7 +102,7 @@ class CopilotModelUsageEvent:
         if provider_name is None and self.response_model is not None:
             provider_name = normalize_gen_ai_provider(None, self.response_model)
         fields: dict[str, UsageScalar] = {
-            "log_code": "copilot_model_usage",
+            "log_code": "model_usage",
             "gen_ai.operation.name": "chat",
             "gen_ai.request.model": self.request_model,
         }
@@ -114,24 +117,23 @@ class CopilotModelUsageEvent:
             ("gen_ai.usage.cache_read.input_tokens", self.cache_read_tokens),
             ("gen_ai.usage.cache_creation.input_tokens", self.cache_creation_tokens),
             ("operation.cost", self.cost),
-            ("copilot.prompt_name", self.prompt_name),
-            ("copilot.model_call_index", self.model_call_index),
-            ("copilot.cache.mode", self.cache_mode),
-            ("copilot.cache.breakpoint_count", self.cache_breakpoint_count),
-            ("copilot.cache.stable_prefix_chars", self.cache_stable_prefix_chars),
-            ("copilot.ref_tool_outputs_escaped", self.ref_tool_outputs_escaped),
+            ("gen_ai.agent.name", self.agent_name),
+            (PROMPT_NAME_KEY, self.prompt_name),
+            ("llm.model_call_index", self.model_call_index),
+            ("llm.cache.mode", self.cache_mode),
+            ("llm.cache.breakpoint_count", self.cache_breakpoint_count),
+            ("llm.cache.stable_prefix_chars", self.cache_stable_prefix_chars),
+            ("llm.ref_tool_outputs_escaped", self.ref_tool_outputs_escaped),
         )
         fields.update((key, value) for key, value in optional_fields if value is not None)
         return fields
 
 
-_usage_observer: ContextVar[Callable[[CopilotModelUsageEvent], None] | None] = ContextVar(
-    "copilot_usage_observer", default=None
-)
+_usage_observer: ContextVar[Callable[[ModelUsageEvent], None] | None] = ContextVar("model_usage_observer", default=None)
 
 
 @contextmanager
-def copilot_usage_observer(observer: Callable[[CopilotModelUsageEvent], None] | None) -> Iterator[None]:
+def model_usage_observer(observer: Callable[[ModelUsageEvent], None] | None) -> Iterator[None]:
     token = _usage_observer.set(observer)
     try:
         yield
@@ -139,26 +141,27 @@ def copilot_usage_observer(observer: Callable[[CopilotModelUsageEvent], None] | 
         _usage_observer.reset(token)
 
 
-def _observe_copilot_model_usage(event: CopilotModelUsageEvent) -> None:
+def _observe_model_usage(event: ModelUsageEvent) -> None:
     observer = _usage_observer.get()
     if observer is not None:
         with suppress(Exception):
             observer(event)
 
 
-def _emit_copilot_model_usage(event: CopilotModelUsageEvent, *, logger: UsageEventLogger) -> None:
-    _observe_copilot_model_usage(event)
+def _emit_model_usage(event: ModelUsageEvent, *, logger: UsageEventLogger) -> None:
+    _observe_model_usage(event)
     fields = event.log_fields()
     for key, value in fields.items():
         if key in {"gen_ai.request.model", "gen_ai.response.model"} and isinstance(value, str):
             fields[key] = _model_log_value(key, value)
-        elif key != "copilot.prompt_name":
+        # Generated values skip secret matching, so a caller-supplied label must not get the mark.
+        elif key != PROMPT_NAME_KEY and (key != "gen_ai.agent.name" or value in _GENERATED_AGENT_NAMES):
             fields[key] = _generated_log_value(key, value)
-    logger.info("Copilot model usage", **fields)
+    logger.info("Model usage", **fields)
 
 
-def _emit_direct_copilot_model_usage(event: CopilotModelUsageEvent, *, logger: UsageEventLogger) -> bool:
+def _emit_direct_copilot_model_usage(event: ModelUsageEvent, *, logger: UsageEventLogger) -> bool:
     if not is_workflow_copilot_prompt_name(event.prompt_name):
         return False
-    _emit_copilot_model_usage(event, logger=logger)
+    _emit_model_usage(replace(event, agent_name="ember"), logger=logger)
     return True

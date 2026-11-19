@@ -7,8 +7,9 @@ import json
 import math
 import re
 import time
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
+from itertools import count
 from types import SimpleNamespace
 from typing import Any, Literal, TypeVar, cast, overload
 from urllib.parse import urlparse
@@ -17,13 +18,15 @@ import litellm
 import structlog
 from agents.agent_output import AgentOutputSchemaBase
 from agents.extensions.models.litellm_model import LitellmModel
+from agents.extensions.models.litellm_provider import LitellmProvider
 from agents.handoffs import Handoff
 from agents.items import ModelResponse, TResponseInputItem, TResponseStreamEvent
 from agents.model_settings import ModelSettings
 from agents.models._retry_runtime import should_disable_provider_managed_retries
 from agents.models.chatcmpl_converter import Converter
+from agents.models.default_models import get_default_model
 from agents.models.fake_id import FAKE_RESPONSES_ID
-from agents.models.interface import ModelTracing
+from agents.models.interface import Model, ModelTracing
 from agents.models.openai_responses import Converter as OpenAIResponsesConverter
 from agents.tool import FunctionTool, Tool
 from agents.tracing.span_data import GenerationSpanData
@@ -42,15 +45,15 @@ from openai.types.responses.response_function_call_output_item_list_param import
     ResponseFunctionCallOutputItemListParam,
 )
 
-from skyvern.forge.sdk.api.llm.copilot_model_usage import (
-    CopilotModelUsageEvent,
-    _emit_copilot_model_usage,
-    _observe_copilot_model_usage,
+from skyvern.forge.sdk.api.llm.litellm_pricing import long_prompt_cost_multiplier
+from skyvern.forge.sdk.api.llm.model_input_capture import attach_tool_surface_to_pending_capture
+from skyvern.forge.sdk.api.llm.model_usage import (
+    ModelUsageEvent,
+    _emit_model_usage,
+    _observe_model_usage,
     normalize_gen_ai_provider,
 )
-from skyvern.forge.sdk.api.llm.litellm_pricing import long_prompt_cost_multiplier
-from skyvern.forge.sdk.api.llm.utils import is_anthropic_model
-from skyvern.forge.sdk.copilot.cache_envelope import (
+from skyvern.forge.sdk.api.llm.prompt_cache_envelope import (
     CacheableSystemInstructions,
     ExplicitCacheEnvelope,
     anthropic_cached_system_blocks,
@@ -58,9 +61,8 @@ from skyvern.forge.sdk.copilot.cache_envelope import (
     model_chain,
     responses_route_model,
 )
-from skyvern.forge.sdk.copilot.enforcement import stable_prefix_anchors
-from skyvern.forge.sdk.copilot.model_input_capture import attach_tool_surface_to_pending_capture
-from skyvern.forge.sdk.copilot.pending_operation import pending_operation
+from skyvern.forge.sdk.api.llm.utils import is_anthropic_model
+from skyvern.forge.sdk.core.pending_operation import pending_operation
 
 LOG = structlog.get_logger()
 _DATED_MODEL_SUFFIX = re.compile(r"-\d{4}-\d{2}-\d{2}$")
@@ -68,9 +70,11 @@ _DATED_MODEL_SUFFIX = re.compile(r"-\d{4}-\d{2}-\d{2}$")
 # above the time to write the largest argument (~29k tokens at the slowest observed Sonnet rate).
 _STREAM_PROGRESS_TIMEOUT_SECONDS = 300.0
 
+PrefixAnchors = Callable[[Sequence[TResponseInputItem]], list[int]]
+
 
 @dataclass(frozen=True, slots=True)
-class CopilotModelStopMetadata:
+class ModelStopMetadata:
     model_call_index: int | None
     finish_reason: str | None = None
     incomplete_details: dict[str, str] | None = None
@@ -79,7 +83,7 @@ class CopilotModelStopMetadata:
     usage_missing: bool = True
 
     @classmethod
-    def unknown(cls) -> CopilotModelStopMetadata:
+    def unknown(cls) -> ModelStopMetadata:
         return cls(model_call_index=None)
 
     def log_fields(self) -> dict[str, int | str | bool | dict[str, str] | None]:
@@ -94,10 +98,10 @@ class CopilotModelStopMetadata:
 
 
 @dataclass(slots=True)
-class CopilotModelAttemptTelemetry:
-    latest_stop_metadata: CopilotModelStopMetadata = field(default_factory=CopilotModelStopMetadata.unknown)
+class ModelAttemptTelemetry:
+    latest_stop_metadata: ModelStopMetadata = field(default_factory=ModelStopMetadata.unknown)
 
-    def record(self, metadata: CopilotModelStopMetadata) -> None:
+    def record(self, metadata: ModelStopMetadata) -> None:
         current_index = self.latest_stop_metadata.model_call_index
         next_index = metadata.model_call_index
         if next_index is not None and (current_index is None or next_index >= current_index):
@@ -117,7 +121,7 @@ def _usage_field(value: Any, *keys: str) -> Any:
 
 
 @dataclass(slots=True)
-class CopilotModelCallTelemetry:
+class ModelCallTelemetry:
     model_call_index: int
     response_model: str | None = None
     served_provider: str | None = None
@@ -165,8 +169,8 @@ class CopilotModelCallTelemetry:
             if isinstance(cache_write, int) and not isinstance(cache_write, bool):
                 self.cache_write_tokens = cache_write
 
-    def stop_metadata(self) -> CopilotModelStopMetadata:
-        return CopilotModelStopMetadata(
+    def stop_metadata(self) -> ModelStopMetadata:
+        return ModelStopMetadata(
             model_call_index=self.model_call_index,
             finish_reason=self.finish_reason,
             incomplete_details=self.incomplete_details,
@@ -176,27 +180,27 @@ class CopilotModelCallTelemetry:
         )
 
 
-_current_model_call_telemetry: contextvars.ContextVar[CopilotModelCallTelemetry | None] = contextvars.ContextVar(
+_current_model_call_telemetry: contextvars.ContextVar[ModelCallTelemetry | None] = contextvars.ContextVar(
     "_current_model_call_telemetry",
     default=None,
 )
-_current_model_attempt_telemetry: contextvars.ContextVar[CopilotModelAttemptTelemetry | None] = contextvars.ContextVar(
+_current_model_attempt_telemetry: contextvars.ContextVar[ModelAttemptTelemetry | None] = contextvars.ContextVar(
     "_current_model_attempt_telemetry",
     default=None,
 )
 
 
-def current_model_call_telemetry() -> CopilotModelCallTelemetry | None:
+def current_model_call_telemetry() -> ModelCallTelemetry | None:
     return _current_model_call_telemetry.get()
 
 
-def current_model_attempt_telemetry() -> CopilotModelAttemptTelemetry | None:
+def current_model_attempt_telemetry() -> ModelAttemptTelemetry | None:
     return _current_model_attempt_telemetry.get()
 
 
 @contextlib.contextmanager
-def model_attempt_telemetry_scope() -> Iterator[CopilotModelAttemptTelemetry]:
-    telemetry = CopilotModelAttemptTelemetry()
+def model_attempt_telemetry_scope() -> Iterator[ModelAttemptTelemetry]:
+    telemetry = ModelAttemptTelemetry()
     token = _current_model_attempt_telemetry.set(telemetry)
     try:
         yield telemetry
@@ -204,7 +208,7 @@ def model_attempt_telemetry_scope() -> Iterator[CopilotModelAttemptTelemetry]:
         _current_model_attempt_telemetry.reset(token)
 
 
-def _model_call_cost(telemetry: CopilotModelCallTelemetry, model: str) -> float | None:
+def _model_call_cost(telemetry: ModelCallTelemetry, model: str) -> float | None:
     if telemetry.reported_cost is not None:
         return telemetry.reported_cost
     if telemetry.input_tokens is None or telemetry.output_tokens is None:
@@ -268,14 +272,15 @@ def _otel_provider_name(model: str, base_url: str | None) -> str | None:
 
 
 def _log_model_call_usage(
-    telemetry: CopilotModelCallTelemetry,
+    telemetry: ModelCallTelemetry,
     model: str,
     base_url: str | None,
+    agent_name: str | None,
 ) -> None:
     """Emit one Datadog-searchable usage event after provider usage arrives."""
 
     if telemetry.input_tokens is None and telemetry.output_tokens is None and telemetry.reported_cost is None:
-        _observe_copilot_model_usage(CopilotModelUsageEvent(request_model=model))
+        _observe_model_usage(ModelUsageEvent(request_model=model, agent_name=agent_name))
         return
 
     billing_model = telemetry.response_model or model
@@ -285,8 +290,8 @@ def _log_model_call_usage(
         if telemetry.served_provider
         else _otel_provider_name(billing_model, base_url)
     )
-    _emit_copilot_model_usage(
-        CopilotModelUsageEvent(
+    _emit_model_usage(
+        ModelUsageEvent(
             request_model=model,
             response_model=telemetry.response_model,
             provider_name=provider_name,
@@ -301,6 +306,7 @@ def _log_model_call_usage(
             cache_breakpoint_count=telemetry.cache_breakpoint_count,
             cache_stable_prefix_chars=telemetry.cache_stable_prefix_chars,
             ref_tool_outputs_escaped=telemetry.ref_tool_outputs_escaped or None,
+            agent_name=agent_name,
         ),
         logger=LOG,
     )
@@ -312,8 +318,9 @@ def _model_call_telemetry_scope(
     *,
     model: str | None = None,
     base_url: str | None = None,
-) -> Iterator[CopilotModelCallTelemetry]:
-    telemetry = CopilotModelCallTelemetry(model_call_index=model_call_index)
+    agent_name: str | None = None,
+) -> Iterator[ModelCallTelemetry]:
+    telemetry = ModelCallTelemetry(model_call_index=model_call_index)
     token = _current_model_call_telemetry.set(telemetry)
     try:
         with pending_operation(f"model.call:{model}" if model else "model.call"):
@@ -321,7 +328,7 @@ def _model_call_telemetry_scope(
     finally:
         try:
             if model is not None:
-                _log_model_call_usage(telemetry, model, base_url)
+                _log_model_call_usage(telemetry, model, base_url, agent_name)
         except Exception:
             pass
         finally:
@@ -331,7 +338,7 @@ def _model_call_telemetry_scope(
             _current_model_call_telemetry.reset(token)
 
 
-def _capture_served_provider(telemetry: CopilotModelCallTelemetry, response: object) -> None:
+def _capture_served_provider(telemetry: ModelCallTelemetry, response: object) -> None:
     hidden_params = getattr(response, "_hidden_params", None)
     provider = hidden_params.get("custom_llm_provider") if isinstance(hidden_params, dict) else None
     if isinstance(provider, str) and provider:
@@ -346,7 +353,7 @@ def _capture_served_provider(telemetry: CopilotModelCallTelemetry, response: obj
         telemetry.service_tier = tier
 
 
-def _capture_chat_stop_metadata(telemetry: CopilotModelCallTelemetry, response: object) -> None:
+def _capture_chat_stop_metadata(telemetry: ModelCallTelemetry, response: object) -> None:
     """Capture only typed transport exit facts; no model text reaches logs."""
 
     choices = _usage_field(response, "choices")
@@ -370,7 +377,7 @@ def _capture_chat_stop_metadata(telemetry: CopilotModelCallTelemetry, response: 
             telemetry.refusal = False
 
 
-def _capture_responses_stop_metadata(telemetry: CopilotModelCallTelemetry, response: object) -> None:
+def _capture_responses_stop_metadata(telemetry: ModelCallTelemetry, response: object) -> None:
     status = _usage_field(response, "status")
     incomplete = _usage_field(response, "incomplete_details")
     reason = _usage_field(incomplete, "reason") if incomplete is not None else None
@@ -416,7 +423,7 @@ class _ProgressGuardedStream:
         self,
         stream: AsyncStream[ChatCompletionChunk],
         model: str,
-        telemetry: CopilotModelCallTelemetry | None,
+        telemetry: ModelCallTelemetry | None,
     ) -> None:
         self._stream = stream
         self._iterator = stream.__aiter__()
@@ -444,14 +451,14 @@ class _ProgressGuardedStream:
             if served_provider is None and isinstance(self._stream, CustomStreamWrapper):
                 served_provider = self._stream.custom_llm_provider
             LOG.warning(
-                "Copilot model stream made no progress",
+                "Model stream made no progress",
                 model=self._model,
                 served_provider=served_provider,
                 made_progress=self._made_progress,
                 chunks_seen=self._chunks_seen,
             )
             raise litellm.Timeout(
-                f"Copilot model stream made no progress for {_STREAM_PROGRESS_TIMEOUT_SECONDS:g} s",
+                f"Model stream made no progress for {_STREAM_PROGRESS_TIMEOUT_SECONDS:g} s",
                 model=self._model,
                 llm_provider=served_provider or "",
             ) from None
@@ -466,7 +473,7 @@ class _UsageCapturingStream:
     def __init__(
         self,
         stream: AsyncIterator[ChatCompletionChunk],
-        telemetry: CopilotModelCallTelemetry,
+        telemetry: ModelCallTelemetry,
     ) -> None:
         self._stream = stream
         self._iterator = stream.__aiter__()
@@ -513,7 +520,7 @@ class _ResponsesUsageCapturingStream:
     """Capture raw Responses usage before LiteLLM drops cache-write tokens, and the encrypted reasoning it drops."""
 
     def __init__(
-        self, stream: AsyncIterator[Any], telemetry: CopilotModelCallTelemetry, reasoning_model: str | None = None
+        self, stream: AsyncIterator[Any], telemetry: ModelCallTelemetry, reasoning_model: str | None = None
     ) -> None:
         self._iterator = stream.__aiter__()
         self._telemetry = telemetry
@@ -555,13 +562,13 @@ async def _typed_stream_errors(stream: AsyncIterator[Any], model: str, provider:
 
 
 def _capture_usage(
-    telemetry: CopilotModelCallTelemetry,
+    telemetry: ModelCallTelemetry,
     usage: Any | None,
 ) -> None:
     try:
         telemetry.capture(usage)
     except Exception as exc:
-        LOG.warning("Failed to capture Copilot model usage", error=repr(exc))
+        LOG.warning("Failed to capture model usage", error=repr(exc))
 
 
 _GEMINI_PROVIDERS = frozenset({"vertex_ai", "vertex_ai_beta", "gemini"})
@@ -678,10 +685,15 @@ def drop_tool_schema_titles(tools: list[_ToolT], model: str, model_settings: Mod
     ]
 
 
-class CopilotLitellmModel(LitellmModel):
-    # True for a caller without Copilot's call_model_input_filter: nothing rewrites its recent tool outputs.
-    history_append_only = False
+def _every_tool_output_and_user_message(items: Sequence[TResponseInputItem]) -> list[int]:
+    return [
+        index
+        for index, item in enumerate(items)
+        if _usage_field(item, "type") == "function_call_output" or _usage_field(item, "role") == "user"
+    ]
 
+
+class SkyvernLitellmModel(LitellmModel):
     def __init__(
         self,
         model: str,
@@ -689,9 +701,14 @@ class CopilotLitellmModel(LitellmModel):
         next_model_call_index: Callable[[], int],
         base_url: str | None = None,
         api_key: str | None = None,
+        agent_name: str | None = None,
+        prefix_anchors: PrefixAnchors | None = None,
     ) -> None:
         super().__init__(model=model, base_url=base_url, api_key=api_key)
         self.next_model_call_index = next_model_call_index
+        self.agent_name = agent_name
+        # The default suits a caller whose input only grows; one that rewrites earlier items must pass its own.
+        self.prefix_anchors = prefix_anchors or _every_tool_output_and_user_message
 
     async def get_response(
         self,
@@ -710,6 +727,7 @@ class CopilotLitellmModel(LitellmModel):
             self.next_model_call_index(),
             model=self.model,
             base_url=self.base_url,
+            agent_name=self.agent_name,
         ) as telemetry:
             response = await super().get_response(
                 system_instructions,
@@ -743,6 +761,7 @@ class CopilotLitellmModel(LitellmModel):
             self.next_model_call_index(),
             model=self.model,
             base_url=self.base_url,
+            agent_name=self.agent_name,
         ) as telemetry:
             async with contextlib.aclosing(
                 super().stream_response(
@@ -812,7 +831,7 @@ class CopilotLitellmModel(LitellmModel):
         input = _escape_ref_tool_outputs_for_gemini(input, self.model, model_settings)
         tools = drop_tool_schema_titles(tools, self.model, model_settings)
         attach_tool_surface_to_pending_capture(tools)
-        anchors = stable_prefix_anchors(input, append_only=self.history_append_only) if isinstance(input, list) else []
+        anchors = self.prefix_anchors(input) if isinstance(input, list) else []
         anchor = anchors[-1] if anchors else None
         explicit_cache_envelope = build_explicit_cache_envelope(
             model=self.model,
@@ -1018,7 +1037,7 @@ class CopilotLitellmModel(LitellmModel):
                 break
             except Exception as exc:
                 LOG.warning(
-                    "Copilot Responses hop failed",
+                    "Responses hop failed",
                     hop_index=hop_index,
                     model=hop_kwargs["model"],
                     error_type=type(exc).__name__,
@@ -1089,3 +1108,32 @@ class CopilotLitellmModel(LitellmModel):
             api_key=self.api_key,
         )
         return cast(LiteLLMModelResponse, model_response)
+
+
+class SkyvernLitellmProvider(LitellmProvider):
+    """LitellmProvider that passes per-run base_url/api_key to LitellmModel."""
+
+    def __init__(
+        self,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        *,
+        agent_name: str | None = None,
+        prefix_anchors: PrefixAnchors | None = None,
+    ):
+        super().__init__()
+        self._base_url = base_url
+        self._api_key = api_key
+        self._agent_name = agent_name
+        self._prefix_anchors = prefix_anchors
+        self._model_call_indices = count(1)
+
+    def get_model(self, model_name: str | None) -> Model:
+        return SkyvernLitellmModel(
+            model=model_name or get_default_model(),
+            base_url=self._base_url,
+            api_key=self._api_key,
+            next_model_call_index=self._model_call_indices.__next__,
+            agent_name=self._agent_name,
+            prefix_anchors=self._prefix_anchors,
+        )

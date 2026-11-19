@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 
-from skyvern.forge.sdk.api.llm.copilot_model_usage import CopilotModelUsageEvent, copilot_usage_observer
+from skyvern.forge.sdk.api.llm.model_usage import ModelUsageEvent, model_usage_observer
 
 
 @dataclass
@@ -17,7 +17,7 @@ class CopilotCostLedger:
     pricing_sources: set[str] = field(default_factory=set)
     active: bool = True
 
-    def record(self, event: CopilotModelUsageEvent) -> None:
+    def record(self, event: ModelUsageEvent) -> None:
         if not self.active:
             return
         self.observed_call_count += 1
@@ -59,7 +59,7 @@ def copilot_cost_scope() -> Iterator[CopilotCostLedger]:
     ledger = CopilotCostLedger()
     token = _current_ledger.set(ledger)
     try:
-        with copilot_usage_observer(ledger.record):
+        with model_usage_observer(ledger.record):
             yield ledger
     finally:
         ledger.active = False
@@ -75,7 +75,7 @@ def current_copilot_cost() -> dict[str, object] | None:
 def exclude_workflow_block_cost() -> Iterator[None]:
     token = _current_ledger.set(None)
     try:
-        with copilot_usage_observer(None):
+        with model_usage_observer(None):
             yield
     finally:
         _current_ledger.reset(token)

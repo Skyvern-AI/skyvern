@@ -48,16 +48,12 @@ from skyvern.forge.sdk.agents.skills import (
     SkillSession,
     render_skills_catalog,
 )
+from skyvern.forge.sdk.api.llm.agents_model import current_model_attempt_telemetry, model_attempt_telemetry_scope
+from skyvern.forge.sdk.api.llm.agents_model_resolver import resolve_agents_model
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
-from skyvern.forge.sdk.api.llm.copilot_model_usage import copilot_usage_observer
+from skyvern.forge.sdk.api.llm.model_usage import model_usage_observer
+from skyvern.forge.sdk.api.llm.prompt_cache_envelope import CacheableSystemInstructions
 from skyvern.forge.sdk.artifact.models import ArtifactType
-from skyvern.forge.sdk.copilot.cache_envelope import CacheableSystemInstructions
-from skyvern.forge.sdk.copilot.model_resolver import resolve_model_config
-from skyvern.forge.sdk.copilot.model_telemetry import (
-    CopilotLitellmModel,
-    current_model_attempt_telemetry,
-    model_attempt_telemetry_scope,
-)
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.executor.run_liveness import run_write_authority
 from skyvern.forge.sdk.integrations.account_fit import block_fit, block_needs, connection_fit
@@ -74,7 +70,6 @@ from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import AgentStepToolCall, WorkflowRunBlock
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext, _is_platform_smtp_aws_key
 from skyvern.forge.sdk.workflow.exceptions import InvalidWorkflowDefinition
-from skyvern.forge.sdk.workflow.models.agent_step_block import AgentStepBlock
 from skyvern.forge.sdk.workflow.models.agent_step_tools import (
     CATALOG_ACTION_TOOLS,
     DEDICATED_BLOCK_TOOLS,
@@ -116,6 +111,7 @@ from skyvern.webeye.actions.actions import UploadFileAction
 
 if TYPE_CHECKING:
     from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
+    from skyvern.forge.sdk.workflow.models.agent_step_block import AgentStepBlock
 
 LOG = structlog.get_logger()
 _MAX_TOOL_RESULT_CHARS = 20_000
@@ -498,16 +494,11 @@ def _record_call(
 
 
 def resolve_agent_model(llm_key: str) -> tuple[str | Model, RunConfig]:
-    model_name, copilot_run_config, _, _ = resolve_model_config(None, llm_key_override=llm_key)
-    model = copilot_run_config.model
-    # Copilot's RunConfig also carries session callbacks that read its chat context, and an input filter that rewrites
-    # recent tool outputs. Without that filter this history only grows, so its newest tool output can be cached.
-    if isinstance(model, CopilotLitellmModel):
-        model.history_append_only = True
-    return model_name, RunConfig(
-        model=model,
-        model_provider=copilot_run_config.model_provider,
-        model_settings=copilot_run_config.model_settings,
+    resolved = resolve_agents_model(llm_key, agent_name="agent_step")
+    return resolved.model_name, RunConfig(
+        model=resolved.model,
+        model_provider=resolved.provider,
+        model_settings=resolved.model_settings,
         tracing_disabled=True,
     )
 
@@ -1270,7 +1261,7 @@ async def _execute_child(child: Block, written: dict[str, Any], state: _RunState
     child._agent_smtp_isolation = True
     child.mark_fields_prerendered(written)
     # Children write their own LLM cost to their own rows.
-    with copilot_usage_observer(None):
+    with model_usage_observer(None):
         result = await child.execute_safe(
             workflow_run_id=state.workflow_run_id,
             parent_workflow_run_block_id=state.workflow_run_block_id,
@@ -1457,7 +1448,7 @@ async def run_agent_step(
     agent = Agent(
         name=block.label,
         # LiteLLM's chat-to-Responses bridge drops the served service tier, which leaves GPT calls unpriced;
-        # Copilot's cacheable instructions take its direct Responses path, which keeps it.
+        # Cacheable instructions take the model's direct Responses path, which keeps it.
         # web_search needs today's date, which follows the cached prefix and stays fixed for the run.
         instructions=CacheableSystemInstructions(
             _INSTRUCTIONS,
@@ -1543,7 +1534,7 @@ async def run_agent_step(
                         await asyncio.shield(_publish_trail(state))
 
     try:
-        with copilot_usage_observer(lambda event: costs.append(event.cost or 0.0)), model_attempt_telemetry_scope():
+        with model_usage_observer(lambda event: costs.append(event.cost or 0.0)), model_attempt_telemetry_scope():
             result = await Runner.run(
                 agent,
                 prompt,

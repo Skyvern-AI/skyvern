@@ -23,8 +23,12 @@ from skyvern.forge.sdk.agents.context import (
     pair_tool_calls_with_outputs,
     replace_agent_message_field,
 )
+from skyvern.forge.sdk.api.llm.model_input_capture import (
+    clear_pending_model_input_capture,
+    register_pending_model_input_capture,
+)
+from skyvern.forge.sdk.api.llm.prompt_cache_envelope import is_replayable_reasoning
 from skyvern.forge.sdk.copilot.browser_ablation import prompt_sha256
-from skyvern.forge.sdk.copilot.cache_envelope import is_replayable_reasoning
 from skyvern.forge.sdk.copilot.config import SCREENSHOT_DROPPED_NUDGE
 from skyvern.forge.sdk.copilot.enforcement import (
     _TOOL_OUTPUT_HEAD_TRUNCATION_SUFFIX,
@@ -47,10 +51,6 @@ from skyvern.forge.sdk.copilot.enforcement import (
     pending_screenshot_message,
     unread_tool_output_indices,
     whole_output_indices,
-)
-from skyvern.forge.sdk.copilot.model_input_capture import (
-    clear_pending_model_input_capture,
-    register_pending_model_input_capture,
 )
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.screenshot_utils import (

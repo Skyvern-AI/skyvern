@@ -79,7 +79,6 @@ from skyvern.forge.sdk.copilot.output_utils import (
     TURN_CLOCK_KEY,
     sanitize_tool_result_for_llm,
 )
-from skyvern.forge.sdk.copilot.pending_operation import pending_operation
 from skyvern.forge.sdk.copilot.repair_origin_run import use_named_output_source
 from skyvern.forge.sdk.copilot.runtime import (
     bound_call_browser_session,
@@ -144,6 +143,7 @@ from skyvern.forge.sdk.copilot.workflow_yaml import (
     stored_block_code,
     stored_workflow_yaml,
 )
+from skyvern.forge.sdk.core.pending_operation import pending_operation
 from skyvern.forge.sdk.schemas.workflow_copilot import CredentialRegistration
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
 from skyvern.forge.sdk.workflow.web_search import MAX_RESULTS_LIMIT
