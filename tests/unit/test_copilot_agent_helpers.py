@@ -55,6 +55,7 @@ from structlog.testing import capture_logs
 
 from skyvern.exceptions import BrowserSessionExpired
 from skyvern.forge import app as forge_app
+from skyvern.forge.sdk.api.llm.agents_model import SkyvernLitellmProvider, current_model_attempt_telemetry
 from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMConfigError, LLMProviderError
 from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot import enforcement as enforcement_module
@@ -134,8 +135,6 @@ from skyvern.forge.sdk.copilot.interruption import (
     INTERRUPTED_TERMINAL_RETRY,
     INTERRUPTED_TERMINAL_SUPERSEDED_HEADLINE,
 )
-from skyvern.forge.sdk.copilot.model_resolver import CopilotLitellmProvider
-from skyvern.forge.sdk.copilot.model_telemetry import current_model_attempt_telemetry
 from skyvern.forge.sdk.copilot.output_policy import OutputPolicyReason, OutputPolicyVerdict
 from skyvern.forge.sdk.copilot.recoverable_failure import build_recoverable_failure
 from skyvern.forge.sdk.copilot.request_policy import (
@@ -2404,7 +2403,7 @@ class _EnforcementAttempt:
     runs_tool: bool = True
     returns_tool_call: bool = False
     error: BaseException | None = None
-    stop_metadata: agent_module.CopilotModelStopMetadata | None = None
+    stop_metadata: agent_module.ModelStopMetadata | None = None
 
 
 @dataclass(frozen=True)
@@ -2574,7 +2573,7 @@ async def test_a_refusal_or_content_filter_stop_ends_the_turn_with_the_empty_com
     async def fake_acompletion(**_kwargs: object) -> AsyncIterator[ChatCompletionChunk]:
         return stream()
 
-    run_config = RunConfig(model_provider=CopilotLitellmProvider(), tracing_disabled=True)
+    run_config = RunConfig(model_provider=SkyvernLitellmProvider(), tracing_disabled=True)
     monkeypatch.setattr("litellm.acompletion", fake_acompletion)
     monkeypatch.setattr(
         "skyvern.forge.sdk.copilot.model_resolver.resolve_model_config",
@@ -7489,14 +7488,14 @@ class TestCopilotConfig:
             ctx=ctx,
             tool_call_count_start=0,
             llm_key="PRIMARY",
-            stop_metadata=agent_module.CopilotModelStopMetadata.unknown(),
+            stop_metadata=agent_module.ModelStopMetadata.unknown(),
         )
         tool_bearing = agent_module._empty_completion_error(
             SimpleNamespace(final_output="", new_items=[_tool_call_item()]),
             ctx=ctx,
             tool_call_count_start=0,
             llm_key="PRIMARY",
-            stop_metadata=agent_module.CopilotModelStopMetadata.unknown(),
+            stop_metadata=agent_module.ModelStopMetadata.unknown(),
         )
 
         assert error is not None
@@ -7513,7 +7512,7 @@ class TestCopilotConfig:
             ctx=ctx,
             tool_call_count_start=7,
             llm_key="PRIMARY",
-            stop_metadata=agent_module.CopilotModelStopMetadata.unknown(),
+            stop_metadata=agent_module.ModelStopMetadata.unknown(),
         )
 
         assert error is not None
@@ -7528,7 +7527,7 @@ class TestCopilotConfig:
             ctx=ctx,
             tool_call_count_start=7,
             llm_key="PRIMARY",
-            stop_metadata=agent_module.CopilotModelStopMetadata.unknown(),
+            stop_metadata=agent_module.ModelStopMetadata.unknown(),
         )
 
         assert error is not None
@@ -7547,14 +7546,14 @@ class TestCopilotConfig:
             ctx=ctx,
             tool_call_count_start=0,
             llm_key="PRIMARY",
-            stop_metadata=agent_module.CopilotModelStopMetadata.unknown(),
+            stop_metadata=agent_module.ModelStopMetadata.unknown(),
         )
 
         assert error is None
 
     @pytest.mark.parametrize("field", ["refusal", "content_filter"])
     def test_empty_completion_with_explicit_safety_stop_is_not_retriable(self, field: str) -> None:
-        stop_metadata = agent_module.CopilotModelStopMetadata(
+        stop_metadata = agent_module.ModelStopMetadata(
             model_call_index=1,
             **{field: True},
         )
@@ -7685,7 +7684,7 @@ class TestCopilotConfig:
     async def test_tool_bearing_empty_completion_after_safety_stop_skips_final_reply(
         self, monkeypatch: pytest.MonkeyPatch, field: str
     ) -> None:
-        stop_metadata = agent_module.CopilotModelStopMetadata(model_call_index=1, **{field: True})
+        stop_metadata = agent_module.ModelStopMetadata(model_call_index=1, **{field: True})
 
         run = await _run_tool_bearing_empty_completion_turn(
             monkeypatch,

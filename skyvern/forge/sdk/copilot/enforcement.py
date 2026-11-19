@@ -107,11 +107,6 @@ from skyvern.forge.sdk.copilot.output_utils import (
     parse_final_response,
     screened_recorded_url,
 )
-from skyvern.forge.sdk.copilot.pending_operation import (
-    install_pending_operation_slot,
-    pending_operation,
-    pending_operation_fields,
-)
 from skyvern.forge.sdk.copilot.request_policy import (
     CompletionCriterion,
     RequestPolicy,
@@ -155,6 +150,11 @@ from skyvern.forge.sdk.copilot.unrecoverable_tool_error import (
 )
 from skyvern.forge.sdk.copilot.unrecoverable_tool_error import (
     _maybe_raise_unrecoverable_tool_error as _maybe_raise_unrecoverable_tool_error,
+)
+from skyvern.forge.sdk.core.pending_operation import (
+    install_pending_operation_slot,
+    pending_operation,
+    pending_operation_fields,
 )
 from skyvern.forge.sdk.workflow.code_block_steps import CREDENTIAL_FILL_TOOL_NAME
 from skyvern.schemas.proxy_location import ProxyLocationInput
@@ -1147,28 +1147,24 @@ def whole_output_indices(items: Sequence[Any]) -> set[int]:
     return kept
 
 
-def stable_prefix_anchors(items: Sequence[TResponseInputItem], *, append_only: bool = False) -> list[int]:
+def stable_prefix_anchors(items: Sequence[TResponseInputItem]) -> list[int]:
     """Return, oldest first, the index of every tool output or real user message that later model calls resend
-    unchanged: all of them when nothing rewrites the input, else those before every unread output, every unpruned
-    screenshot and, when this call summarized older tool items, the window it kept whole."""
+    unchanged: those before every unread output, every unpruned screenshot and, when this call summarized older tool
+    items, the window it kept whole."""
     window: set[int] = set()
     if TOOL_WINDOW_SUMMARIZED.get():
         fc_indices = [i for i, item in enumerate(items) if _item_field(item, "type") == "function_call"]
         fco_indices = [i for i, item in enumerate(items) if _item_field(item, "type") == "function_call_output"]
         window = {*fc_indices[-KEEP_RECENT_TOOL_OUTPUTS:], *fco_indices[-KEEP_RECENT_TOOL_OUTPUTS:]}
-    unstable = (
-        set()
-        if append_only
-        else {
-            *window,
-            *unread_tool_output_indices(items),
-            *(
-                i
-                for i, item in enumerate(items)
-                if is_screenshot_message(item) and _item_field(item, "content") != SCREENSHOT_PLACEHOLDER
-            ),
-        }
-    )
+    unstable = {
+        *window,
+        *unread_tool_output_indices(items),
+        *(
+            i
+            for i, item in enumerate(items)
+            if is_screenshot_message(item) and _item_field(item, "content") != SCREENSHOT_PLACEHOLDER
+        ),
+    }
     return [
         index
         for index, item in enumerate(items[: min(unstable, default=len(items))])

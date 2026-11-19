@@ -37,10 +37,6 @@ from skyvern.forge import app
 from skyvern.forge.forge_openai_client import ForgeAsyncHttpxClientWrapper
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler, dummy_llm_api_handler
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
-from skyvern.forge.sdk.api.llm.copilot_model_usage import (
-    CopilotModelUsageEvent,
-    _emit_direct_copilot_model_usage,
-)
 from skyvern.forge.sdk.api.llm.custom_llm_registry import (
     CUSTOM_LLM_KEY_PREFIX,
     custom_llm_passthrough_parameters,
@@ -60,6 +56,10 @@ from skyvern.forge.sdk.api.llm.exceptions import (
 from skyvern.forge.sdk.api.llm.litellm_pricing import long_prompt_cost_multiplier
 from skyvern.forge.sdk.api.llm.litellm_transport import configure_litellm_transport
 from skyvern.forge.sdk.api.llm.litellm_usage import use_anthropic_reported_thinking_tokens
+from skyvern.forge.sdk.api.llm.model_usage import (
+    ModelUsageEvent,
+    _emit_direct_copilot_model_usage,
+)
 from skyvern.forge.sdk.api.llm.ui_tars_response import UITarsResponse
 from skyvern.forge.sdk.api.llm.utils import (
     is_content_filtered_response,
@@ -879,7 +879,7 @@ def _copilot_model_usage_event(
     provider_name: str | None,
     cost: float | None,
     prompt_name: str | None,
-) -> CopilotModelUsageEvent:
+) -> ModelUsageEvent:
     try:
         response_model = getattr(response, "model", None)
     except Exception:
@@ -901,7 +901,7 @@ def _copilot_model_usage_event(
         cache_read_tokens = None
         cache_creation_tokens = None
     hidden_params = getattr(response, "_hidden_params", None)
-    return CopilotModelUsageEvent(
+    return ModelUsageEvent(
         request_model=request_model,
         response_model=response_model if isinstance(response_model, str) else None,
         provider_name=provider_name,
@@ -944,7 +944,7 @@ def _emit_copilot_model_usage_for_response(
         )
     except Exception:
         try:
-            LOG.warning("Failed to emit Copilot model usage", exc_info=True)
+            LOG.warning("Failed to emit model usage", exc_info=True)
         except Exception:
             pass
 

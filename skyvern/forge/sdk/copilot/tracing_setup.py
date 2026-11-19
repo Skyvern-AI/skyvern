@@ -23,7 +23,7 @@ from skyvern.forge.log_redaction import redact_sensitive_fields
 from skyvern.forge.sdk.core import skyvern_context
 
 if TYPE_CHECKING:
-    from skyvern.forge.sdk.copilot.model_telemetry import CopilotModelCallTelemetry
+    from skyvern.forge.sdk.api.llm.agents_model import ModelCallTelemetry
 
 LOG = structlog.get_logger()
 
@@ -155,17 +155,17 @@ def _calculate_price(calc_price: Any, usage: Any, model: str) -> Any:
         return calc_price(usage, model_ref=model_ref, provider_id=provider)
 
 
-def _model_call_cost(telemetry: CopilotModelCallTelemetry, model: str) -> float | None:
+def _model_call_cost(telemetry: ModelCallTelemetry, model: str) -> float | None:
     # ``tracing_setup`` is imported by lightweight CLI/browser modules that do
     # not install the server-only OpenAI Agents SDK. Keep the model adapter
-    # behind the runtime Copilot seam instead of importing it at module load.
-    from skyvern.forge.sdk.copilot.model_telemetry import _model_call_cost as calculate_model_call_cost
+    # behind this lazy import instead of importing it at module load.
+    from skyvern.forge.sdk.api.llm.agents_model import _model_call_cost as calculate_model_call_cost
 
     return calculate_model_call_cost(telemetry, model)
 
 
-def current_model_call_telemetry() -> CopilotModelCallTelemetry | None:
-    from skyvern.forge.sdk.copilot.model_telemetry import current_model_call_telemetry as get_model_call_telemetry
+def current_model_call_telemetry() -> ModelCallTelemetry | None:
+    from skyvern.forge.sdk.api.llm.agents_model import current_model_call_telemetry as get_model_call_telemetry
 
     return get_model_call_telemetry()
 
@@ -208,7 +208,7 @@ def _attach_legacy_cost_attr(attrs: dict[str, Any], usage: Any, model: str | Non
 
 def _attach_cost_attr(
     attrs: dict[str, Any],
-    telemetry: CopilotModelCallTelemetry,
+    telemetry: ModelCallTelemetry,
     model: str | None,
 ) -> None:
     if model is None or telemetry.input_tokens is None or telemetry.output_tokens is None:
@@ -233,14 +233,14 @@ def _attach_cost_attr(
 
 def _attach_copilot_model_call_attrs(
     attrs: dict[str, Any],
-    telemetry: CopilotModelCallTelemetry,
+    telemetry: ModelCallTelemetry,
     model: str | None,
 ) -> None:
-    attrs["copilot.model_call_index"] = telemetry.model_call_index
-    attrs["copilot.cache.mode"] = telemetry.cache_mode
-    attrs["copilot.cache.breakpoint_count"] = telemetry.cache_breakpoint_count
+    attrs["llm.model_call_index"] = telemetry.model_call_index
+    attrs["llm.cache.mode"] = telemetry.cache_mode
+    attrs["llm.cache.breakpoint_count"] = telemetry.cache_breakpoint_count
     if telemetry.cache_stable_prefix_chars is not None:
-        attrs["copilot.cache.stable_prefix_chars"] = telemetry.cache_stable_prefix_chars
+        attrs["llm.cache.stable_prefix_chars"] = telemetry.cache_stable_prefix_chars
 
     if telemetry.input_tokens is not None:
         attrs["gen_ai.usage.input_tokens"] = telemetry.input_tokens

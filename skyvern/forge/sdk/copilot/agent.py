@@ -41,6 +41,12 @@ from skyvern.exceptions import NO_ADDRESS_RECORD_NAV_ERROR_MARKER
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.agents.skills import LOAD_SKILL_TOOL_NAME, SkillSession, render_skills_catalog
+from skyvern.forge.sdk.api.llm.agents_model import (
+    ModelStopMetadata,
+    model_attempt_telemetry_scope,
+)
+from skyvern.forge.sdk.api.llm.prompt_cache_envelope import CacheableSystemInstructions
+from skyvern.forge.sdk.api.llm.router_fallback import router_fallback_llm_key
 from skyvern.forge.sdk.copilot.agent_naming import schedule_agent_naming
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
@@ -80,7 +86,6 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     observed_value_extraction_scaffold_lines,
     redacted_terminal_text,
 )
-from skyvern.forge.sdk.copilot.cache_envelope import CacheableSystemInstructions
 from skyvern.forge.sdk.copilot.completion_criteria_store import (
     StoredCriteriaSnapshot,
     apply_requested_output_producer_floor,
@@ -160,10 +165,6 @@ from skyvern.forge.sdk.copilot.live_narrative import live_turn_narrative_key, wr
 from skyvern.forge.sdk.copilot.llm_errors import CopilotEmptyCompletionError
 from skyvern.forge.sdk.copilot.llm_errors import is_retriable_llm_error as _is_retriable_llm_error
 from skyvern.forge.sdk.copilot.model_resolver import copilot_token_budget
-from skyvern.forge.sdk.copilot.model_telemetry import (
-    CopilotModelStopMetadata,
-    model_attempt_telemetry_scope,
-)
 from skyvern.forge.sdk.copilot.narration import NarratorState
 from skyvern.forge.sdk.copilot.outcome_verification_trace import (
     finalize_outcome_verification_trace,
@@ -222,7 +223,6 @@ from skyvern.forge.sdk.copilot.review_gate import (
     build_review_projection,
     serialize_execution_receipts,
 )
-from skyvern.forge.sdk.copilot.router_fallback import router_fallback_llm_key
 from skyvern.forge.sdk.copilot.run_outcome import (
     RecordedRunOutcome,
     is_interim_run_outcome,
@@ -4369,7 +4369,7 @@ def _empty_completion_error(
     ctx: CopilotContext,
     tool_call_count_start: int,
     llm_key: str,
-    stop_metadata: CopilotModelStopMetadata,
+    stop_metadata: ModelStopMetadata,
 ) -> CopilotEmptyCompletionError | None:
     if ctx.budget_expiry_state.drain_attempted or isinstance(ctx.turn_halt, TurnHalt):
         return None
@@ -4390,7 +4390,7 @@ def _dump_model_attempt_packet(
     model_name: str,
     llm_key: str,
     is_fallback: bool,
-    stop_metadata: CopilotModelStopMetadata,
+    stop_metadata: ModelStopMetadata,
     outcome: str,
     tool_call_count: int,
     retry_allowed: bool | None,

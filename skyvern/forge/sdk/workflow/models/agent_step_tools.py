@@ -1,5 +1,5 @@
-"""The agent step's tool table, kept out of agent_step_loop: the loop imports Copilot's model resolver, which imports
-mcp_hooks, and mcp_hooks reads this table at load."""
+"""The agent step's tool table, kept out of agent_step_loop so Ember's tools and the agent-protocol route can read
+it without loading the loop."""
 
 from __future__ import annotations
 

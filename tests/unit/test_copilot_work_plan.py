@@ -8,8 +8,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from skyvern.forge import app
+from skyvern.forge.sdk.api.llm.prompt_cache_envelope import CacheableSystemInstructions
 from skyvern.forge.sdk.copilot import agent as agent_module
-from skyvern.forge.sdk.copilot.cache_envelope import CacheableSystemInstructions
 from skyvern.forge.sdk.copilot.context import AgentResult, CopilotContext
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.work_plan import (

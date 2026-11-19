@@ -18,6 +18,7 @@ from skyvern.forge.log_redaction import redact_sensitive_fields
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler, handler_llm_key
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
+from skyvern.forge.sdk.api.llm.router_fallback import router_fallback_llm_key
 from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
 from skyvern.forge.sdk.copilot.ask_user import QuestionInteraction
 from skyvern.forge.sdk.copilot.config import CopilotConfig
@@ -48,7 +49,6 @@ from skyvern.forge.sdk.copilot.request_slots import (
     request_slot_source_text,
     request_slot_sources,
 )
-from skyvern.forge.sdk.copilot.router_fallback import router_fallback_llm_key
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.vault_logins import vault_login_credential, vault_login_ref
 from skyvern.forge.sdk.copilot.workflow_credential_utils import (

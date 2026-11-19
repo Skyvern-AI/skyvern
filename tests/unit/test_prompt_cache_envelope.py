@@ -9,13 +9,13 @@ from typing import Any
 import pytest
 from agents import ModelSettings, function_tool
 
-from skyvern.forge.sdk.copilot import agent as agent_module
-from skyvern.forge.sdk.copilot.cache_envelope import (
+from skyvern.forge.sdk.api.llm.prompt_cache_envelope import (
     CacheableSystemInstructions,
     ExplicitCacheEnvelope,
     build_explicit_cache_envelope,
     item_parts_key,
 )
+from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import (
     CopilotContext,
@@ -96,7 +96,7 @@ def test_responses_envelope_marks_only_the_stable_system_prefix() -> None:
         ],
     }
     assert result.extra_body == {"prompt_cache_options": {"mode": "explicit"}}
-    assert result.prompt_cache_key.startswith("copilot:")
+    assert result.prompt_cache_key.startswith("skyvern:")
 
 
 _ASSISTANT_TEXT_THEN_CALL: list[Any] = [
