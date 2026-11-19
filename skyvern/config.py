@@ -1109,8 +1109,13 @@ class Settings(BaseSettings):
     """
 
     ENCRYPTOR_AES_SECRET_KEY: str = "fillmein"
+    ENCRYPTOR_AES_SCOPED_SECRET_KEY: str | None = None
+    ENCRYPTOR_AES_WRITE_SCOPED: bool = False
     ENCRYPTOR_AES_SALT: str | None = None
     ENCRYPTOR_AES_IV: str | None = None
+    ENCRYPTOR_AES_SECRET_KEY_V2: str | None = None
+    ENCRYPTOR_AES_SALT_V2: str | None = None
+    ENCRYPTOR_AES_WRITE_VERSION: Literal["v1"] = "v1"
     ENABLE_ENCRYPTION: bool = False
 
     # Google OAuth settings (used by the Google Sheets connector)
