@@ -57,6 +57,9 @@ from skyvern.forge.sdk.copilot.tools.composition_capture import CompositionEvide
 from skyvern.forge.sdk.copilot.tools.credentials import (
     _extract_credential_ids_from_workflow_definition,
 )
+from skyvern.forge.sdk.encrypt import VERSIONED_CIPHERTEXT_PREFIX, Encryptor
+from skyvern.forge.sdk.encrypt.base import EncryptMethod
+from skyvern.forge.sdk.encrypt.bootstrap import create_aes_gcm_encryptor
 from skyvern.forge.sdk.schemas.credentials import CredentialVaultType, PasswordCredential
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.workflow import runtime_secret_bridge
@@ -1356,7 +1359,6 @@ async def test_a_short_worker_resolved_secret_is_scrubbed_like_one_the_api_holds
 @pytest.mark.asyncio
 async def test_runtime_secret_bridge_encrypts_shared_cache_payload(monkeypatch: pytest.MonkeyPatch) -> None:
     values: dict[str, str] = {}
-    plaintext: str | None = None
 
     class FakeSharedCache:
         is_shared = True
@@ -1370,21 +1372,18 @@ async def test_runtime_secret_bridge_encrypts_shared_cache_payload(monkeypatch: 
         async def get(self, key: str) -> str | None:
             return values.get(key)
 
-    async def fake_encrypt(value: str, _method: object) -> str:
-        nonlocal plaintext
-        plaintext = value
-        return "opaque-ciphertext"
-
-    async def fake_decrypt_unlabeled(_value: str) -> str:
-        assert plaintext is not None
-        return plaintext
-
     monkeypatch.setattr(runtime_secret_bridge, "app", SimpleNamespace(CACHE=FakeSharedCache()))
-    monkeypatch.setattr(
-        runtime_secret_bridge,
-        "encryptor",
-        SimpleNamespace(encrypt=fake_encrypt, decrypt_unlabeled=fake_decrypt_unlabeled),
+    local_encryptor = Encryptor()
+    local_encryptor.add_encrypt_method(
+        create_aes_gcm_encryptor(secret_key="runtime-cache-v1-key", salt="runtime-cache-v1-salt")
     )
+    v2_fixture_encryptor = create_aes_gcm_encryptor(
+        secret_key="runtime-cache-v2-key",
+        salt="runtime-cache-v2-salt",
+        method=EncryptMethod.AES_GCM_V2,
+    )
+    local_encryptor.add_encrypt_method(v2_fixture_encryptor)
+    monkeypatch.setattr(runtime_secret_bridge, "encryptor", local_encryptor)
     workflow_run_context = SimpleNamespace(
         secrets={"password": "private-pass", "runtime": "654321"},
         runtime_otp_values={"654321"},
@@ -1396,6 +1395,18 @@ async def test_runtime_secret_bridge_encrypts_shared_cache_payload(monkeypatch: 
         workflow_run_context=workflow_run_context,
     )
     assert all("private-pass" not in stored and "654321" not in stored for stored in values.values())
+    assert await runtime_secret_bridge.consume_copilot_runtime_secret_values(
+        organization_id="o_1",
+        workflow_run_id="wr_origin",
+    ) == {"654321"}
+
+    payload = json.dumps(
+        {"organization_id": "o_1", "workflow_run_id": "wr_origin", "values": ["654321"]},
+        separators=(",", ":"),
+    )
+    v2_ciphertext = await v2_fixture_encryptor.encrypt(payload)
+    key = runtime_secret_bridge._cache_key("o_1", "wr_origin")
+    values[key] = f"aes:{VERSIONED_CIPHERTEXT_PREFIX}{EncryptMethod.AES_GCM_V2.value}:{v2_ciphertext}"
     assert await runtime_secret_bridge.consume_copilot_runtime_secret_values(
         organization_id="o_1",
         workflow_run_id="wr_origin",
