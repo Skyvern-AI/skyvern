@@ -29,7 +29,7 @@ from structlog.testing import capture_logs
 
 from skyvern.config import settings
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
+from skyvern.forge.sdk.db.utils import hydrate_action
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.code_block_recorder import (
     CODE_BLOCK_FILENAME,
@@ -50,6 +50,7 @@ from skyvern.webeye.actions.actions import (
     ActionStatus,
     ActionType,
     ClickAction,
+    GotoUrlAction,
     SelectOption,
     SelectOptionAction,
 )
@@ -67,6 +68,7 @@ from tests.unit.conftest import (
     skycdp_engine_selection,
 )
 from tests.unit.fake_workflow_run_context import FakeWorkflowRunContext
+from tests.unit.helpers import make_action_row
 
 _RECORDING_PATH = "skyvern.forge.sdk.workflow.models.code_block_recording.app"
 _RECORDING_MODULE = "skyvern.forge.sdk.workflow.models.code_block_recording"
@@ -188,10 +190,6 @@ async def test_a_secret_straddling_the_response_bound_is_masked_whole() -> None:
     )
     recording = _recording(page)
     recording._workflow_run_context.secrets = {"api_token": secret}
-    unbound_mask = WorkflowRunContext.mask_secrets_in_data
-    recording._workflow_run_context.mask_secrets_in_data = unbound_mask.__get__(  # type: ignore[method-assign]
-        recording._workflow_run_context
-    )
     recording.recording_page = RecordingPage(page, on_action=recording._recorded_action_sink)
     upsert = AsyncMock()
 
@@ -221,10 +219,6 @@ async def test_synthetic_failure_row_is_masked_before_it_is_bounded() -> None:
     )
     recording = _recording(page)
     recording._workflow_run_context.secrets = {"api_token": secret}
-    unbound_mask = WorkflowRunContext.mask_secrets_in_data
-    recording._workflow_run_context.mask_secrets_in_data = unbound_mask.__get__(  # type: ignore[method-assign]
-        recording._workflow_run_context
-    )
     upsert = AsyncMock()
 
     with patch(f"{_RECORDING_PATH}.DATABASE.workflow_params.upsert_recorded_action", upsert):
@@ -711,27 +705,42 @@ def test_an_in_memory_upload_payload_records_its_filename_as_a_typed_upload_acti
 
 
 @pytest.mark.asyncio
-async def test_recorded_action_code_line_survives_masking_and_upsert() -> None:
-    """Falsifier: the generation-side receipt relies on the DURABLE recorded-action rows (no separate
-    success event is emitted). Prove the ``output.code_line`` join coordinate survives the persistence
-    masking round-trip; if this ever fails, the durable rows are not a valid receipt substrate and a
-    dedicated receipt event would be required."""
-    action = Action(
-        action_type=ActionType.CLICK,
-        status=ActionStatus.completed,
-        output={"code_line": 7, "duration_ms": 12},
-    )
+@pytest.mark.parametrize(
+    ("action", "secrets"),
+    [
+        pytest.param(Action(action_type=ActionType.CLICK), {}, id="plain_click"),
+        pytest.param(
+            GotoUrlAction(url="https://example.test/items/url", description="page.goto"),
+            {"short": "url"},
+            id="secret_equals_field_name",
+        ),
+    ],
+)
+async def test_recorded_action_code_line_survives_masking_and_upsert(action: Action, secrets: dict[str, str]) -> None:
+    """The durable rows are the generation-side receipt, so ``output.code_line`` and the completed status must survive
+    secret masking, upsert and hydration, even when a registered secret equals a schema field name."""
+    action.status = ActionStatus.completed
+    action.output = {"code_line": 7, "duration_ms": 12}
     page = SimpleNamespace(
         url="https://example.com/", screenshot=AsyncMock(return_value=b"png"), is_closed=lambda: False
     )
     recording = _recording(page)
+    recording._workflow_run_context.secrets = secrets
     upsert = AsyncMock()
     with patch(f"{_RECORDING_PATH}.DATABASE.workflow_params.upsert_recorded_action", upsert):
         await recording._persist_action(action, recording._remember_action_metadata(action))
 
     persisted = upsert.await_args.args[0]
-    assert isinstance(persisted.output, dict)
-    assert persisted.output.get("code_line") == 7
+    rehydrated = hydrate_action(
+        make_action_row(action_type=persisted.action_type, action_json=persisted.model_dump(mode="json"))
+    )
+    for row in (persisted, rehydrated):
+        assert type(row) is Action
+        assert row.status == ActionStatus.completed
+        assert isinstance(row.output, dict)
+        assert row.output.get("code_line") == 7
+        assert "url" not in row.model_dump()
+        assert "example.test" not in repr(row.model_dump())
 
 
 async def _sink_upload(
