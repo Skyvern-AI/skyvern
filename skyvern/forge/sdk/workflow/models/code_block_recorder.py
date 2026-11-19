@@ -22,7 +22,7 @@ from skyvern.forge.sdk.db.id import generate_action_id
 from skyvern.forge.sdk.workflow.models.credential_release import CredentialReleaseGuard
 from skyvern.utils.url_validators import redacted_url_origin
 from skyvern.webeye.actions.action_types import ActionType
-from skyvern.webeye.actions.actions import Action, ActionStatus, SelectOption
+from skyvern.webeye.actions.actions import ACTION_TYPE_TO_CLASS, Action, ActionStatus, SelectOption
 from skyvern.webeye.actions.handler_utils import strategy_aware_input
 from skyvern.webeye.navigation import driver_nav_error_code, reported_nav_error_code
 from skyvern.webeye.playwright_input import PlaywrightInputDefaults
@@ -442,16 +442,17 @@ def _recorded_action_fields(
     return {key: value for key, value in fields.items() if value is not None}
 
 
+def recorded_action_class(action_type: str | None) -> type[Action]:
+    return ACTION_TYPE_TO_CLASS.get(action_type, Action) if isinstance(action_type, str) else Action
+
+
 def _action_from_fields(
     action_type: ActionType,
     fields: dict[str, Any],
     *,
     warning: str,
 ) -> Action:
-    # Import lazily: db.utils imports workflow models through schema conversion helpers.
-    from skyvern.forge.sdk.db.utils import ACTION_TYPE_TO_CLASS
-
-    action_class = ACTION_TYPE_TO_CLASS.get(action_type, Action)
+    action_class = recorded_action_class(action_type)
     if action_class is Action:
         return Action(**fields)
     try:

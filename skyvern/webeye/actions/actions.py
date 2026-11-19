@@ -527,6 +527,38 @@ class ExecuteJsAction(Action):
     js_code: str
 
 
+ACTION_TYPE_TO_CLASS: dict[str, type[Action]] = {
+    ActionType.CLICK: ClickAction,
+    ActionType.INPUT_TEXT: InputTextAction,
+    ActionType.PASTE_TEXT: PasteTextAction,
+    ActionType.UPLOAD_FILE: UploadFileAction,
+    ActionType.DOWNLOAD_FILE: DownloadFileAction,
+    ActionType.NULL_ACTION: NullAction,
+    ActionType.TERMINATE: TerminateAction,
+    ActionType.COMPLETE: CompleteAction,
+    ActionType.SELECT_OPTION: SelectOptionAction,
+    ActionType.CHECKBOX: CheckboxAction,
+    ActionType.WAIT: WaitAction,
+    ActionType.HOVER: HoverAction,
+    ActionType.SOLVE_CAPTCHA: SolveCaptchaAction,
+    ActionType.RELOAD_PAGE: ReloadPageAction,
+    ActionType.CLOSE_PAGE: ClosePageAction,
+    ActionType.NEW_TAB: NewTabAction,
+    ActionType.SWITCH_TAB: SwitchTabAction,
+    ActionType.EXTRACT: ExtractAction,
+    ActionType.SCROLL: ScrollAction,
+    ActionType.KEYPRESS: KeypressAction,
+    ActionType.MOVE: MoveAction,
+    ActionType.DRAG: DragAction,
+    ActionType.VERIFICATION_CODE: VerificationCodeAction,
+    ActionType.LEFT_MOUSE: LeftMouseAction,
+    ActionType.GOTO_URL: GotoUrlAction,
+    ActionType.GO_BACK: GoBackAction,
+    ActionType.GO_FORWARD: GoForwardAction,
+    ActionType.EXECUTE_JS: ExecuteJsAction,
+}
+
+
 class ScrapeResult(BaseModel):
     """
     Scraped response from a webpage, including:

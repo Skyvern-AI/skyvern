@@ -93,36 +93,8 @@ from skyvern.schemas.runs import GeoTarget, ProxyLocation, ProxyLocationInput, S
 from skyvern.schemas.scripts import Script, ScriptBlock, ScriptFile
 from skyvern.schemas.workflows import BlockStatus, BlockType
 from skyvern.webeye.actions.actions import (
+    ACTION_TYPE_TO_CLASS,
     Action,
-    ActionType,
-    CheckboxAction,
-    ClickAction,
-    ClosePageAction,
-    CompleteAction,
-    DownloadFileAction,
-    DragAction,
-    ExecuteJsAction,
-    ExtractAction,
-    GoBackAction,
-    GoForwardAction,
-    GotoUrlAction,
-    HoverAction,
-    InputTextAction,
-    KeypressAction,
-    LeftMouseAction,
-    MoveAction,
-    NewTabAction,
-    NullAction,
-    PasteTextAction,
-    ReloadPageAction,
-    ScrollAction,
-    SelectOptionAction,
-    SolveCaptchaAction,
-    SwitchTabAction,
-    TerminateAction,
-    UploadFileAction,
-    VerificationCodeAction,
-    WaitAction,
 )
 
 LOG = structlog.get_logger()
@@ -265,39 +237,6 @@ def serialize_proxy_location(proxy_location: ProxyLocationInput) -> str | None:
         serialized_value=redact_proxy_location(result),
     )
     return result
-
-
-# Mapping of action types to their corresponding action classes
-ACTION_TYPE_TO_CLASS = {
-    ActionType.CLICK: ClickAction,
-    ActionType.INPUT_TEXT: InputTextAction,
-    ActionType.PASTE_TEXT: PasteTextAction,
-    ActionType.UPLOAD_FILE: UploadFileAction,
-    ActionType.DOWNLOAD_FILE: DownloadFileAction,
-    ActionType.NULL_ACTION: NullAction,
-    ActionType.TERMINATE: TerminateAction,
-    ActionType.COMPLETE: CompleteAction,
-    ActionType.SELECT_OPTION: SelectOptionAction,
-    ActionType.CHECKBOX: CheckboxAction,
-    ActionType.WAIT: WaitAction,
-    ActionType.HOVER: HoverAction,
-    ActionType.SOLVE_CAPTCHA: SolveCaptchaAction,
-    ActionType.RELOAD_PAGE: ReloadPageAction,
-    ActionType.CLOSE_PAGE: ClosePageAction,
-    ActionType.NEW_TAB: NewTabAction,
-    ActionType.SWITCH_TAB: SwitchTabAction,
-    ActionType.EXTRACT: ExtractAction,
-    ActionType.SCROLL: ScrollAction,
-    ActionType.KEYPRESS: KeypressAction,
-    ActionType.MOVE: MoveAction,
-    ActionType.DRAG: DragAction,
-    ActionType.VERIFICATION_CODE: VerificationCodeAction,
-    ActionType.LEFT_MOUSE: LeftMouseAction,
-    ActionType.GOTO_URL: GotoUrlAction,
-    ActionType.GO_BACK: GoBackAction,
-    ActionType.GO_FORWARD: GoForwardAction,
-    ActionType.EXECUTE_JS: ExecuteJsAction,
-}
 
 
 def _scrub_nul_chars(obj: typing.Any) -> typing.Any:

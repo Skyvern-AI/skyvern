@@ -19,6 +19,7 @@ from skyvern.forge.sdk.workflow.models.code_block_recorder import (
     PendingAction,
     PlaywrightInputDefaults,
     RecordingPage,
+    recorded_action_class,
     recorded_action_from_payload,
 )
 from skyvern.forge.sdk.workflow.models.credential_release import CredentialReleaseGuard
@@ -95,10 +96,28 @@ def redact_recorded_action_payload(
     payload: dict[str, Any], workflow_run_context: WorkflowRunContext, redaction_parameters: dict[str, Any]
 ) -> dict[str, Any]:
     masked = workflow_run_context.mask_secrets_in_data([payload])[0]
-    masked = app.AGENT_FUNCTION.redact_codeblock_parameter_values(masked, redaction_parameters)
+    if not isinstance(masked, dict):
+        return _withhold_values(payload)
+    action_class = recorded_action_class(payload.get("action_type"))
+    # The parameter redactor rewrites dict keys, so a value contained in a schema field name would mangle that field.
+    # Declared field names pass as a list beside their values, keeping the redactor's whole-payload size budget.
+    trusted = [key for key in masked if key in action_class.model_fields]
+    extras = {key: value for key, value in masked.items() if key not in action_class.model_fields}
+    redacted = app.AGENT_FUNCTION.redact_codeblock_parameter_values(
+        [trusted, [masked[key] for key in trusted], extras], redaction_parameters
+    )
+    if not (
+        isinstance(redacted, list)
+        and len(redacted) == 3
+        and isinstance(redacted[1], list)
+        and len(redacted[1]) == len(trusted)
+        and isinstance(redacted[2], dict)
+    ):
+        return _withhold_values(payload)
+    rebuilt = {**redacted[2], **dict(zip(trusted, redacted[1]))}
     # A matching bool/number becomes a string placeholder, which typed Action fields reject.
     # Null it recursively so subclass defaults cannot silently restore user-controlled values.
-    return _null_redacted_scalars(payload, masked) if isinstance(masked, dict) else _withhold_values(payload)
+    return _null_redacted_scalars(payload, rebuilt)
 
 
 def _page_closed(page: Page) -> bool | None:
@@ -328,6 +347,7 @@ class CodeBlockActionRecording:
             return
         try:
             payload = action.model_dump(mode="json", warnings=False)
+            payload["action_type"] = metadata["action_type"]
             masked = redact_recorded_action_payload(payload, self._workflow_run_context, self._redaction_parameters)
             response = masked.get("response")
             if isinstance(response, str):
